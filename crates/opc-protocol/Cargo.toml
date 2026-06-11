@@ -8,6 +8,11 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Zero-copy protocol codec framework for OpenPacketCore: traits, context, errors, and fuzzing contracts"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-protocol"
+keywords = ["5g", "cnf", "protocol", "telecom", "packet-core"]
+categories = ["network-programming", "encoding"]
 [dependencies]
 bytes = { workspace = true }
 thiserror = { workspace = true }

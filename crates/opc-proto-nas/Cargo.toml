@@ -1,22 +1,24 @@
 [package]
-name = "opc-proto-gtpu"
+name = "opc-proto-nas"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "GTP-U protocol crate for OpenPacketCore"
-
-
+description = "NAS-5GS (TS 24.501) v0 codec: plain headers, security-envelope recognition, and 5GS mobile identity"
 readme = "README.md"
-documentation = "https://docs.rs/opc-proto-gtpu"
-keywords = ["5g", "cnf", "gtp-u", "telecom", "packet-core"]
+documentation = "https://docs.rs/opc-proto-nas"
+keywords = ["5g", "nas", "packet-core", "codec", "telecom"]
 categories = ["network-programming", "encoding"]
+publish = true
+
 [dependencies]
 opc-protocol = { path = "../opc-protocol", version = "0.1.0" }
 bytes = { workspace = true }
-thiserror = { workspace = true }
+
+[dev-dependencies]
+quickcheck = "1"
 
 [lints]
 workspace = true

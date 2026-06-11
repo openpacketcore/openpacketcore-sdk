@@ -72,34 +72,45 @@ pub enum DecodeErrorCode {
     /// (e.g. exceeds parent length, is misaligned, or is smaller than the
     /// fixed header size).
     #[error("length field invalid: {reason}")]
-    InvalidLength { reason: &'static str },
+    InvalidLength {
+        /// Human-readable reason the length field is invalid.
+        reason: &'static str,
+    },
     /// An integer overflow occurred while computing a length or offset.
     #[error("integer overflow in length calculation")]
     LengthOverflow,
-    /// Nested IE depth exceeded the configured [`DecodeContext::max_depth`] limit.
+    /// Nested IE depth exceeded the configured `DecodeContext::max_depth` limit.
     #[error("nested IE depth exceeded limit")]
     DepthExceeded,
-    /// Total IE count exceeded the configured [`DecodeContext::max_ies`] limit.
+    /// Total IE count exceeded the configured `DecodeContext::max_ies` limit.
     #[error("IE count exceeded limit")]
     IeCountExceeded,
-    /// Message byte length exceeded the configured [`DecodeContext::max_message_len`] limit.
+    /// Message byte length exceeded the configured `DecodeContext::max_message_len` limit.
     #[error("message length exceeded limit")]
     MessageLengthExceeded,
     /// An unknown IE was encountered with the critical flag set and the
-    /// current [`DecodeContext::unknown_ie_policy`] does not allow it.
+    /// current `DecodeContext::unknown_ie_policy` does not allow it.
     #[error("unknown IE with critical flag")]
     UnknownCriticalIe,
     /// A duplicate IE was encountered where the current
-    /// [`DecodeContext::duplicate_ie_policy`] forbids duplicates.
+    /// `DecodeContext::duplicate_ie_policy` forbids duplicates.
     #[error("duplicate IE where forbidden")]
     DuplicateIe,
     /// An enum field contained a value outside the defined valid range.
     #[error("invalid enum value {value} for field {field}")]
-    InvalidEnumValue { field: &'static str, value: u64 },
+    InvalidEnumValue {
+        /// Name of the field containing the invalid enum value.
+        field: &'static str,
+        /// The out-of-range enum value.
+        value: u64,
+    },
     /// Structural validation failed (e.g. missing mandatory IE, wrong
     /// container type, or invalid padding).
     #[error("structural validation failed: {reason}")]
-    Structural { reason: &'static str },
+    Structural {
+        /// Human-readable reason structural validation failed.
+        reason: &'static str,
+    },
     /// A known-length message was declared but the available buffer is shorter
     /// than the declared length. Distinct from `Truncated`: `Incomplete` means
     /// the boundary is known but the data has not yet arrived; `Truncated`
@@ -115,13 +126,21 @@ pub enum DecodeErrorCode {
 pub enum EncodeErrorCode {
     /// Required output capacity exceeds the available or configured maximum.
     #[error("capacity exceeded: required {required}, available {available}")]
-    CapacityExceeded { required: usize, available: usize },
+    CapacityExceeded {
+        /// Bytes required to complete the encode.
+        required: usize,
+        /// Bytes available in the output buffer.
+        available: usize,
+    },
     /// An integer overflow occurred while computing wire length.
     #[error("integer overflow in length calculation")]
     LengthOverflow,
     /// Structural validation failed before encoding could begin.
     #[error("structural validation failed: {reason}")]
-    Structural { reason: &'static str },
+    Structural {
+        /// Human-readable reason structural validation failed.
+        reason: &'static str,
+    },
 }
 
 /// Structured decode error with offset and optional spec reference.

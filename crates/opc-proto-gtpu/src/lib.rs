@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+#![deny(missing_docs)]
 
 //! GTP-U protocol crate for OpenPacketCore.
 //!
@@ -29,20 +30,35 @@ fn validation_strictness(level: ValidationLevel) -> u8 {
 /// @conformance full
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GtpuHeader {
+    /// GTP-U version (must be 1).
     pub version: u8,
+    /// Protocol type flag (must be true for GTP).
     pub protocol_type: bool,
+    /// Reserved bit (must be 0 in strict mode).
     pub reserved: u8,
+    /// Extension header flag.
     pub ext_hdr_flag: bool,
+    /// Sequence number flag.
     pub seq_num_flag: bool,
+    /// N-PDU number flag.
     pub npdu_num_flag: bool,
+    /// GTP-U message type.
     pub message_type: u8,
+    /// Length of the payload plus optional fields.
     pub length: u16,
+    /// Tunnel Endpoint Identifier.
     pub teid: u32,
+    /// Parsed sequence number, if present.
     pub sequence_number: Option<u16>,
+    /// Parsed N-PDU number, if present.
     pub npdu_number: Option<u8>,
+    /// Type of the next extension header, if any.
     pub next_ext_type: Option<u8>,
+    /// Raw sequence number before flag interpretation.
     pub raw_sequence_number: Option<u16>,
+    /// Raw N-PDU number before flag interpretation.
     pub raw_npdu_number: Option<u8>,
+    /// Raw next extension type before flag interpretation.
     pub raw_next_ext_type: Option<u8>,
 }
 
@@ -53,8 +69,11 @@ pub struct GtpuHeader {
 /// @conformance full
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GtpuMessage<'a> {
+    /// Parsed GTP-U header.
     pub header: GtpuHeader,
+    /// Raw extension header bytes.
     pub raw_extension_headers: &'a [u8],
+    /// GTP-U payload.
     pub payload: &'a [u8],
 }
 
@@ -79,8 +98,11 @@ impl<'a> GtpuMessage<'a> {
 /// @conformance full
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedGtpuMessage {
+    /// Parsed GTP-U header.
     pub header: GtpuHeader,
+    /// Raw extension header bytes.
     pub raw_extension_headers: Bytes,
+    /// GTP-U payload.
     pub payload: Bytes,
 }
 
@@ -105,8 +127,11 @@ impl OwnedGtpuMessage {
 /// @conformance full
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GtpuExtensionHeader<'a> {
+    /// Extension header type identifier.
     pub ext_type: u8,
+    /// Extension header content bytes.
     pub content: &'a [u8],
+    /// Type of the next extension header (0 if none).
     pub next_ext_type: u8,
 }
 
@@ -116,11 +141,14 @@ pub struct GtpuExtensionHeader<'a> {
 /// @req REQ-3GPP-TS29281-R18-5.2.1-004
 /// @conformance full
 pub struct GtpuExtensionHeaderIterator<'a> {
+    /// Remaining extension header bytes.
     buffer: &'a [u8],
+    /// Type of the next extension header to parse.
     next_ext_type: u8,
 }
 
 impl<'a> GtpuExtensionHeaderIterator<'a> {
+    /// Create a new iterator over extension headers.
     pub fn new(buffer: &'a [u8], first_ext_type: u8) -> Self {
         Self {
             buffer,
@@ -188,10 +216,14 @@ impl<'a> Iterator for GtpuExtensionHeaderIterator<'a> {
 /// @conformance full
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PduSessionContainer {
-    pub pdu_type: u8,    // 0 = DL, 1 = UL
-    pub qfi: u8,         // 6-bit QoS Flow Identifier
-    pub ppi: Option<u8>, // Paging Policy Indicator (DL only)
-    pub rqi: bool,       // Reflective QoS Indicator (DL only)
+    /// PDU type: 0 = DL, 1 = UL.
+    pub pdu_type: u8,
+    /// 6-bit QoS Flow Identifier.
+    pub qfi: u8,
+    /// Paging Policy Indicator (DL only).
+    pub ppi: Option<u8>,
+    /// Reflective QoS Indicator (DL only).
+    pub rqi: bool,
 }
 
 impl PduSessionContainer {

@@ -1,0 +1,21 @@
+[package]
+name = "opc-proto-nas-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+opc-protocol = { path = "../../opc-protocol" }
+opc-proto-nas = { path = ".." }
+bytes = "1.8"
+
+[workspace]
+
+[[bin]]
+name = "decode_nas"
+path = "fuzz_targets/decode_nas.rs"
+test = false

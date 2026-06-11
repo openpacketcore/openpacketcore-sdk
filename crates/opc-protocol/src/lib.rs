@@ -14,6 +14,7 @@
 //! - [`DecodeError`] / [`EncodeError`] – structured, log-safe error types.
 
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
 
 mod context;
 mod error;
