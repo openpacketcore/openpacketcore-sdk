@@ -8,6 +8,11 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Data classification taxonomy and identifier types for OpenPacketCore privacy governance"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-data-governance"
+keywords = ["5g", "cnf", "privacy", "telecom", "packet-core"]
+categories = ["network-programming"]
 [dependencies]
 serde = { workspace = true }
 

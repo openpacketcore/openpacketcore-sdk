@@ -1,11 +1,20 @@
 [package]
 name = "opc-alarm-k8s"
-version = "0.1.0"
-edition = "2021"
-description = "Kubernetes condition and event mappings for OpenPacketCore alarms (RFC 013)"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Kubernetes condition and event mappings for OpenPacketCore alarms"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-alarm-k8s"
+keywords = ["5g", "cnf", "alarm", "kubernetes", "telecom"]
+categories = ["network-programming"]
 [dependencies]
-opc-alarm = { path = "../opc-alarm" }
+opc-alarm = { path = "../opc-alarm", version = "0.1.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 time = { workspace = true, features = ["formatting"] }

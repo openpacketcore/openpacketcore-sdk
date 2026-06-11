@@ -1,7 +1,25 @@
-# opc-alarm
+# Opc Alarm
 
-OpenPacketCore alarm model, severity taxonomy, dedup/update/clear manager, and in-memory store
+Alarm model, severity taxonomy, dedup/update/clear manager, and in-memory store for OpenPacketCore CNFs.
+
+## Status
+
+**Production-ready**
+
+## Reference
+
+[RFC](docs/rfc/013-fault-management-alarm-substrate.md)
+
+## Quick start
+
+```rust,no_run
+use opc_alarm::...;
+
+fn main() {
+    // See the crate documentation for full API usage.
+}
+```
 
 ## License
 
-Licensed under the Apache License, Version 2.0.
+This crate is licensed under the [Apache License, Version 2.0](../../LICENSE).

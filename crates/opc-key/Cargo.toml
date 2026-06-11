@@ -8,11 +8,16 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Key-provider traits, in-memory adapters, and tenant-bound AEAD payload helpers for OpenPacketCore"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-key"
+keywords = ["5g", "cnf", "cryptography", "telecom", "packet-core"]
+categories = ["cryptography", "network-programming"]
 [dependencies]
 aes-gcm-siv = { workspace = true }
 async-trait = { workspace = true }
 hkdf = { workspace = true }
-opc-types = { path = "../opc-types" }
+opc-types = { path = "../opc-types", version = "0.1.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -22,8 +27,8 @@ zeroize = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "time"] }
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
-opc-tls = { path = "../opc-tls" }
-opc-identity = { path = "../opc-identity" }
+opc-tls = { path = "../opc-tls", version = "0.1.0" }
+opc-identity = { path = "../opc-identity", version = "0.1.0" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

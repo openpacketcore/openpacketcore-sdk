@@ -8,8 +8,13 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Production-grade session cache with key-scoped invalidation, sequence tracking, and resume recovery (GAP-004-006)"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-session-cache"
+keywords = ["5g", "cnf", "session", "telecom", "packet-core"]
+categories = ["network-programming", "data-structures"]
 [dependencies]
-opc-session-store = { path = "../opc-session-store" }
+opc-session-store = { path = "../opc-session-store", version = "0.1.0" }
 tokio = { workspace = true, features = ["time", "sync", "macros", "rt"] }
 tracing = { workspace = true }
 futures-util = "0.3"
@@ -18,6 +23,6 @@ async-trait = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["time", "sync", "test-util"] }
 opc-session-testkit = { path = "../opc-session-testkit" }
-opc-types = { path = "../opc-types" }
+opc-types = { path = "../opc-types", version = "0.1.0" }
 bytes = { workspace = true }
 zeroize = { workspace = true }

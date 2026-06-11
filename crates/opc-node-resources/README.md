@@ -1,7 +1,25 @@
-# opc-node-resources
+# Opc Node Resources
 
-Node resource validation: ResourceProfile compatibility against NodeCapabilityReport
+Validates ResourceProfile compatibility against observed NodeCapabilityReport.
+
+## Status
+
+**Production-ready**
+
+## Reference
+
+[RFC](docs/rfc/011-node-dataplane-resource-contract.md)
+
+## Quick start
+
+```rust,no_run
+use opc_node_resources::...;
+
+fn main() {
+    // See the crate documentation for full API usage.
+}
+```
 
 ## License
 
-Licensed under the Apache License, Version 2.0.
+This crate is licensed under the [Apache License, Version 2.0](../../LICENSE).

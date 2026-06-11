@@ -8,6 +8,11 @@ repository.workspace = true
 rust-version.workspace = true
 description = "OpenPacketCore shared SBI client/server, auth, NRF, retry, and testkit primitives"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-sbi"
+keywords = ["5g", "cnf", "sbi", "telecom", "packet-core"]
+categories = ["network-programming"]
 [features]
 testkit = []
 runtime-hooks = ["dep:opc-runtime"]
@@ -15,8 +20,8 @@ runtime-hooks = ["dep:opc-runtime"]
 [dependencies]
 async-trait = { workspace = true }
 http = "1"
-opc-types = { path = "../opc-types" }
-opc-runtime = { path = "../opc-runtime", optional = true }
+opc-types = { path = "../opc-types", version = "0.1.0" }
+opc-runtime = { path = "../opc-runtime", version = "0.1.0", optional = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
@@ -44,7 +49,7 @@ rand.workspace = true
 [dev-dependencies]
 serde_json = { workspace = true }
 # Enable testkit for integration tests (self-referential dev-dep is valid in Cargo).
-opc-sbi = { path = ".", features = ["testkit"] }
+opc-sbi = { path = ".", version = "0.1.0", features = ["testkit"] }
 
 [lints]
 workspace = true

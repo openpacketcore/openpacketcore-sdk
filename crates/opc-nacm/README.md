@@ -1,7 +1,25 @@
-# opc-nacm
+# Opc Nacm
 
-Normalized YANG path parsing and NACM authorization evaluation for OpenPacketCore
+Normalized YANG path parsing and NACM authorization evaluation.
+
+## Status
+
+**Production-ready**
+
+## Reference
+
+[RFC](docs/rfc/001-management-substrate.md)
+
+## Quick start
+
+```rust,no_run
+use opc_nacm::...;
+
+fn main() {
+    // See the crate documentation for full API usage.
+}
+```
 
 ## License
 
-Licensed under the Apache License, Version 2.0.
+This crate is licensed under the [Apache License, Version 2.0](../../LICENSE).

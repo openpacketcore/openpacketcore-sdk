@@ -8,9 +8,14 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Normalized YANG path parsing and NACM authorization evaluation for OpenPacketCore"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-nacm"
+keywords = ["5g", "cnf", "yang", "telecom", "packet-core"]
+categories = ["network-programming"]
 [dependencies]
 thiserror = { workspace = true }
-opc-redaction = { path = "../opc-redaction" }
+opc-redaction = { path = "../opc-redaction", version = "0.1.0" }
 
 [lints]
 workspace = true

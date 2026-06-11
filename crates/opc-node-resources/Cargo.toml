@@ -8,6 +8,11 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Node resource validation: ResourceProfile compatibility against NodeCapabilityReport"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-node-resources"
+keywords = ["5g", "cnf", "kubernetes", "telecom", "packet-core"]
+categories = ["network-programming"]
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 

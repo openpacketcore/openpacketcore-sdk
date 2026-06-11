@@ -8,6 +8,11 @@ repository.workspace = true
 rust-version.workspace = true
 description = "OpenPacketCore alarm model, severity taxonomy, dedup/update/clear manager, and in-memory store"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-alarm"
+keywords = ["5g", "cnf", "alarm", "telecom", "packet-core"]
+categories = ["network-programming"]
 [features]
 default = []
 nacm = ["dep:opc-nacm"]
@@ -20,9 +25,9 @@ serde_json = { workspace = true }
 time = { workspace = true, features = ["serde"] }
 uuid = { workspace = true }
 sha2 = { workspace = true }
-opc-nacm = { path = "../opc-nacm", optional = true }
-opc-persist = { path = "../opc-persist", optional = true }
-opc-redaction = { path = "../opc-redaction" }
+opc-nacm = { path = "../opc-nacm", version = "0.1.0", optional = true }
+opc-persist = { path = "../opc-persist", version = "0.1.0", optional = true }
+opc-redaction = { path = "../opc-redaction", version = "0.1.0" }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 async-trait = { workspace = true }
 thiserror = { workspace = true }

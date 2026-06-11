@@ -8,8 +8,13 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Redaction levels, keyed digests, and safe rendering for OpenPacketCore sensitive data"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-redaction"
+keywords = ["5g", "cnf", "privacy", "telecom", "packet-core"]
+categories = ["network-programming"]
 [dependencies]
-opc-data-governance = { path = "../opc-data-governance" }
+opc-data-governance = { path = "../opc-data-governance", version = "0.1.0" }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }

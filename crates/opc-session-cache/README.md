@@ -1,7 +1,25 @@
-# opc-session-cache
+# Opc Session Cache
 
-Production-grade session cache with key-scoped invalidation, sequence tracking, and resume recovery (GAP-004-006)
+Production-grade session cache with key-scoped invalidation, sequence tracking, and resume recovery.
+
+## Status
+
+**Production-ready**
+
+## Reference
+
+[RFC](docs/rfc/004-session-store.md)
+
+## Quick start
+
+```rust,no_run
+use opc_session_cache::...;
+
+fn main() {
+    // See the crate documentation for full API usage.
+}
+```
 
 ## License
 
-Licensed under the Apache License, Version 2.0.
+This crate is licensed under the [Apache License, Version 2.0](../../LICENSE).

@@ -8,11 +8,16 @@ repository.workspace = true
 rust-version.workspace = true
 description = "High-performance session store substrate for OpenPacketCore: state classes, keys, CAS, leases, fencing, and testkit backends (RFC 004)"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-session-store"
+keywords = ["5g", "cnf", "session", "telecom", "packet-core"]
+categories = ["network-programming", "data-structures"]
 [dependencies]
-opc-crypto = { path = "../opc-crypto" }
-opc-key = { path = "../opc-key" }
-opc-types = { path = "../opc-types" }
-opc-redaction = { path = "../opc-redaction" }
+opc-crypto = { path = "../opc-crypto", version = "0.1.0" }
+opc-key = { path = "../opc-key", version = "0.1.0" }
+opc-types = { path = "../opc-types", version = "0.1.0" }
+opc-redaction = { path = "../opc-redaction", version = "0.1.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

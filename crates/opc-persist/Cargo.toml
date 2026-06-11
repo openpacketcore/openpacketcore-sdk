@@ -8,6 +8,11 @@ repository.workspace = true
 rust-version.workspace = true
 description = "ConfigStore trait and SQLite backend for OpenPacketCore persistence and audit"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-persist"
+keywords = ["5g", "cnf", "storage", "telecom", "packet-core"]
+categories = ["network-programming", "data-structures"]
 [dependencies]
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -30,14 +35,14 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 rand = { workspace = true }
 
 # Shared types across the SDK
-opc-types = { path = "../opc-types" }
-opc-redaction = { path = "../opc-redaction" }
-opc-data-governance = { path = "../opc-data-governance" }
-opc-identity = { path = "../opc-identity" }
-opc-tls = { path = "../opc-tls" }
-opc-nacm = { path = "../opc-nacm" }
-opc-key = { path = "../opc-key" }
-opc-crypto = { path = "../opc-crypto" }
+opc-types = { path = "../opc-types", version = "0.1.0" }
+opc-redaction = { path = "../opc-redaction", version = "0.1.0" }
+opc-data-governance = { path = "../opc-data-governance", version = "0.1.0" }
+opc-identity = { path = "../opc-identity", version = "0.1.0" }
+opc-tls = { path = "../opc-tls", version = "0.1.0" }
+opc-nacm = { path = "../opc-nacm", version = "0.1.0" }
+opc-key = { path = "../opc-key", version = "0.1.0" }
+opc-crypto = { path = "../opc-crypto", version = "0.1.0" }
 
 [features]
 default = []
@@ -50,4 +55,4 @@ workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process"] }
 rcgen = { workspace = true }
-opc-alarm = { path = "../opc-alarm" }
+opc-alarm = { path = "../opc-alarm", version = "0.1.0" }

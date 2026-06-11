@@ -6,8 +6,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Lightweight JSON Schema validation engine for OpenPacketCore workspace internal use"
-publish = false
+description = "Lightweight JSON Schema validation engine for OpenPacketCore"
+readme = "README.md"
+documentation = "https://docs.rs/opc-schema-validate"
+keywords = ["json-schema", "validation", "5g", "cnf"]
+categories = ["data-structures", "parser-implementations"]
 
 [dependencies]
 serde_json = { workspace = true }

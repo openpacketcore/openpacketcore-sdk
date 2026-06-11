@@ -8,14 +8,19 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Atomic config snapshots, commit worker sequencing, and bounded subscriber fanout for OpenPacketCore"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-config-bus"
+keywords = ["5g", "cnf", "config", "telecom", "packet-core"]
+categories = ["network-programming", "data-structures"]
 [dependencies]
 async-trait = { workspace = true }
 futures-util = "0.3"
-opc-alarm = { path = "../opc-alarm" }
-opc-config-model = { path = "../opc-config-model" }
-opc-crypto = { path = "../opc-crypto" }
-opc-key = { path = "../opc-key" }
-opc-types = { path = "../opc-types" }
+opc-alarm = { path = "../opc-alarm", version = "0.1.0" }
+opc-config-model = { path = "../opc-config-model", version = "0.1.0" }
+opc-crypto = { path = "../opc-crypto", version = "0.1.0" }
+opc-key = { path = "../opc-key", version = "0.1.0" }
+opc-types = { path = "../opc-types", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -23,7 +28,7 @@ time = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
 sha2 = { workspace = true }
-opc-redaction = { path = "../opc-redaction" }
+opc-redaction = { path = "../opc-redaction", version = "0.1.0" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

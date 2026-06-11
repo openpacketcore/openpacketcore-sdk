@@ -8,6 +8,11 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Shared identifier, version, time, and redaction types for OpenPacketCore"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-types"
+keywords = ["5g", "cnf", "types", "telecom", "packet-core"]
+categories = ["network-programming", "data-structures"]
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }

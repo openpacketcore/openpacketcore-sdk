@@ -8,9 +8,14 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Signed and classified export metadata contracts for OpenPacketCore"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-export"
+keywords = ["5g", "cnf", "backup", "telecom", "packet-core"]
+categories = ["network-programming"]
 [dependencies]
-opc-data-governance = { path = "../opc-data-governance" }
-opc-redaction = { path = "../opc-redaction" }
+opc-data-governance = { path = "../opc-data-governance", version = "0.1.0" }
+opc-redaction = { path = "../opc-redaction", version = "0.1.0" }
 serde = { workspace = true }
 
 [dev-dependencies]

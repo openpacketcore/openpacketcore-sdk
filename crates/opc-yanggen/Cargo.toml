@@ -8,6 +8,11 @@ repository.workspace = true
 rust-version.workspace = true
 description = "OpenPacketCore YANG Projection and Codegen Engine IR Skeleton"
 
+
+readme = "README.md"
+documentation = "https://docs.rs/opc-yanggen"
+keywords = ["5g", "cnf", "yang", "telecom", "packet-core"]
+categories = ["network-programming", "encoding"]
 [dependencies]
 proc-macro2 = "1.0.106"
 quote = "1.0.45"
