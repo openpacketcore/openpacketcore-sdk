@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"openpacketcore.io/operator-sdk-go/rollout"
+
 	"gopkg.in/yaml.v2"
 )
 
@@ -167,6 +169,56 @@ func assertGolden(t *testing.T, filename string, dep interface{}) {
 	gotStr := strings.TrimSpace(string(got))
 	if want != gotStr {
 		t.Errorf("golden mismatch for %s\n---want---\n%s\n---got---\n%s", filename, want, gotStr)
+	}
+}
+
+func TestRenderDeploymentRolloutStrategy(t *testing.T) {
+	spec := NetworkFunctionSpec{
+		Name:        "test-amf",
+		Namespace:   "default",
+		Version:     "1.0.0",
+		RuntimeMode: "production",
+		ResourceProfile: &ResourceProfile{
+			NfKind:           "amf",
+			DataPlaneProfile: "ControlPlaneOnly",
+		},
+	}
+
+	tests := []struct {
+		name         string
+		strategy     rollout.Strategy
+		wantType     string
+		wantSurge    string
+		wantUnavail  string
+	}{
+		{"rolling", rollout.StrategyRolling, "RollingUpdate", "25%", "25%"},
+		{"canary", rollout.StrategyCanary, "RollingUpdate", "1", "0"},
+		{"blue-green", rollout.StrategyBlueGreen, "Recreate", "", ""},
+		{"manual", rollout.StrategyManual, "RollingUpdate", "0", "1"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := DefaultRenderOptions()
+			opts.RolloutParams = &rollout.Params{Strategy: tc.strategy}
+
+			dep, err := RenderDeployment(spec, opts)
+			if err != nil {
+				t.Fatalf("RenderDeployment failed: %v", err)
+			}
+
+			if string(dep.Spec.Strategy.Type) != tc.wantType {
+				t.Errorf("Strategy.Type = %v, want %v", dep.Spec.Strategy.Type, tc.wantType)
+			}
+			if dep.Spec.Strategy.RollingUpdate != nil {
+				if tc.wantSurge != "" && dep.Spec.Strategy.RollingUpdate.MaxSurge.String() != tc.wantSurge {
+					t.Errorf("MaxSurge = %v, want %v", dep.Spec.Strategy.RollingUpdate.MaxSurge.String(), tc.wantSurge)
+				}
+				if tc.wantUnavail != "" && dep.Spec.Strategy.RollingUpdate.MaxUnavailable.String() != tc.wantUnavail {
+					t.Errorf("MaxUnavailable = %v, want %v", dep.Spec.Strategy.RollingUpdate.MaxUnavailable.String(), tc.wantUnavail)
+				}
+			}
+		})
 	}
 }
 

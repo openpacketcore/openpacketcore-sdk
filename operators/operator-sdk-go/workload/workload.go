@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sort"
 
+	"openpacketcore.io/operator-sdk-go/rollout"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -19,6 +21,8 @@ type RenderOptions struct {
 	Replicas       int32
 	AdminPort      int32
 	OwnerReference *metav1.OwnerReference
+	// RolloutParams, when non-nil, configures the Deployment update strategy.
+	RolloutParams *rollout.Params
 }
 
 // DefaultRenderOptions returns options with safe defaults.
@@ -77,6 +81,10 @@ func RenderDeployment(spec NetworkFunctionSpec, opts RenderOptions) (*appsv1.Dep
 
 	if opts.OwnerReference != nil {
 		dep.OwnerReferences = []metav1.OwnerReference{*opts.OwnerReference}
+	}
+
+	if opts.RolloutParams != nil {
+		dep.Spec.Strategy = rollout.BuildDeploymentStrategy(*opts.RolloutParams)
 	}
 
 	return dep, nil
