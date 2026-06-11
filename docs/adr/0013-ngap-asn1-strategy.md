@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted — amended 2026-06 with first implementation experience
 
 ## Date
 
@@ -110,6 +110,33 @@ Phased plan:
   given the alternative of FFI or hand-written bugs).
 - If `hampi`/`rasn` fails the spike, we fall back to Option B with a license
   review gate.
+
+## Implementation experience (2026-06)
+
+The first `opc-proto-ngap` attempt followed the phased plan and stalled at
+step 1 on toolchain compatibility, not on the codec approach itself:
+
+- **`rasn` (0.22 and 0.25) failed the then-declared MSRV of 1.81.** Its
+  derive implementation transitively requires `uuid ^1.11`, which resolves
+  to a `getrandom` release whose manifest uses `edition2024` — unparseable
+  by Cargo 1.81. No pinning escape existed within `rasn`'s requirements.
+- Investigating the failure exposed that the **workspace's own dependency
+  graph had already drifted past MSRV 1.81** through the same `getrandom`
+  release (reached via `uuid`, `tempfile`, and `quickcheck`), i.e. the MSRV
+  declaration no longer reflected reality independent of NGAP.
+- **`hampi` was not pursued**: no meaningful release since 2021 and its APER
+  encoder was still marked work-in-progress then — unacceptable abandonment
+  risk for a protocol codec.
+
+Consequences acted on:
+
+- The workspace MSRV was raised to **1.88**, the actual floor of the
+  resolved dependency graph (set by `time`; `edition2024` support needs
+  ≥ 1.85, the `icu` stack ≥ 1.86). This repairs the MSRV gate and removes
+  the blocker on Option A. See ADR 0014 for the toolchain/dependency policy.
+- The Option A spike should be re-run against `rasn` on the raised MSRV before
+  any consideration of Option B (`asn1-codecs`, which still carries its
+  license-review gate per the comparison above).
 
 ## Evidence
 

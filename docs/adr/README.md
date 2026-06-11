@@ -23,3 +23,6 @@ record why the shape of the SDK is what it is.
 | [0010](0010-release-assurance-evidence-pipeline.md) | RFC 006 evidence, SBOM/VEX, provenance, bundle verification, performance baselines, and gates are first-class release inputs. |
 | [0011](0011-first-nf-vertical-proof.md) | `opc-amf-lite` is the SDK vertical integration proof, not a product NF. |
 | [0012](0012-diagnostics-safety-privacy-governance.md) | Diagnostics safety and privacy governance boundaries are structured, fail-closed, and compile-gated. |
+| [0013](0013-ngap-asn1-strategy.md) | NGAP requires generated ASN.1 APER code; hand-written and FFI codecs are rejected. |
+| [0014](0014-dependency-toolchain-policy.md) | rustls/tokio-only dependency policy, no gRPC stack in SDK crates, and a measured (not aspirational) MSRV. |
+| [0015](0015-protocol-codec-conformance-policy.md) | Protocol codecs are proven against spec-authored byte fixtures, never only their own encoder output. |

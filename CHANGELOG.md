@@ -89,7 +89,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   coverage verifies strategy fields are persisted correctly on a real
   API server.
 
+- ADR 0014 (dependency and toolchain policy) and ADR 0015 (protocol codec
+  conformance policy); ADR 0013 amended with the outcome of the first NGAP
+  codec attempt.
+
 ### Fixed
+- MSRV raised from 1.81 to 1.88, the measured floor of the resolved
+  dependency graph (transitive dependencies had silently drifted past the
+  declared version, so the previous MSRV claim was untrue); the CI gate now
+  compiles the full workspace on exactly the declared version.
 - `opc-proto-pfcp` wire format corrected to TS 29.244: octet-1 flag layout
   (S = bit 1, MP = bit 2, FO = bit 3, spare = bits 5–4 — previously scrambled),
   message priority encoded/decoded in the final header octet's high nibble

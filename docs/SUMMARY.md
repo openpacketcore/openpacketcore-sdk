@@ -37,6 +37,8 @@
   - [0011 — First NF Vertical Proof](adr/0011-first-nf-vertical-proof.md)
   - [0012 — Diagnostics Safety Privacy Governance](adr/0012-diagnostics-safety-privacy-governance.md)
   - [0013 — NGAP ASN.1 Strategy](adr/0013-ngap-asn1-strategy.md)
+  - [0014 — Dependency & Toolchain Policy](adr/0014-dependency-toolchain-policy.md)
+  - [0015 — Protocol Codec Conformance Policy](adr/0015-protocol-codec-conformance-policy.md)
 
 # Operator Guide
 
