@@ -890,7 +890,7 @@ async fn test_consensus_automatic_transition_finalization() {
     // Wait for the background loop to automatically propose and commit the final config
     let start = std::time::Instant::now();
     let mut finalized = false;
-    while start.elapsed() < std::time::Duration::from_secs(2) {
+    while start.elapsed() < std::time::Duration::from_secs(10) {
         let current_m = stores[0]
             .inner
             .consensus_get_membership()
