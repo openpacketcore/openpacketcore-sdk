@@ -1,0 +1,300 @@
+use std::fmt;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use futures_util::StreamExt;
+use opc_session_store::quorum::SessionStoreBackend;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tracing;
+
+use crate::error::ProtocolError;
+use crate::protocol::{
+    read_frame, write_frame, Request, Response, CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE,
+};
+
+/// Handle to a running [`SessionReplicationServer`].
+#[derive(Debug)]
+pub struct ServerHandle {
+    abort_handle: tokio::task::AbortHandle,
+    _shutdown_tx: tokio::sync::mpsc::Sender<()>,
+}
+
+impl ServerHandle {
+    /// Abort the server task immediately.
+    pub fn abort(&self) {
+        self.abort_handle.abort();
+    }
+
+    /// Request graceful shutdown.
+    pub fn shutdown(self) {
+        drop(self._shutdown_tx);
+    }
+}
+
+/// Networked session replication server.
+pub struct SessionReplicationServer {
+    backend: Arc<dyn SessionStoreBackend>,
+    tls_config: Option<Arc<opc_tls::ServerConfig>>,
+    max_connections: usize,
+    max_frame_size: usize,
+}
+
+impl fmt::Debug for SessionReplicationServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionReplicationServer")
+            .field("tls_config", &self.tls_config.is_some())
+            .field("max_connections", &self.max_connections)
+            .field("max_frame_size", &self.max_frame_size)
+            .finish()
+    }
+}
+
+impl SessionReplicationServer {
+    /// Create a new server with optional TLS.
+    pub fn new(
+        backend: Arc<dyn SessionStoreBackend>,
+        tls_config: Option<Arc<opc_tls::ServerConfig>>,
+    ) -> Self {
+        Self {
+            backend,
+            tls_config,
+            max_connections: 128,
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+        }
+    }
+
+    /// Create a new plaintext server (requires `insecure-test` feature).
+    #[cfg(feature = "insecure-test")]
+    pub fn new_insecure(backend: Arc<dyn SessionStoreBackend>) -> Self {
+        Self {
+            backend,
+            tls_config: None,
+            max_connections: 128,
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+        }
+    }
+
+    /// Set the maximum number of concurrent connections.
+    pub fn with_max_connections(mut self, max: usize) -> Self {
+        self.max_connections = max;
+        self
+    }
+
+    /// Set the maximum frame size in bytes.
+    pub fn with_max_frame_size(mut self, size: usize) -> Self {
+        self.max_frame_size = size;
+        self
+    }
+
+    /// Bind and start accepting connections.
+    pub async fn listen(
+        self,
+        bind_addr: SocketAddr,
+    ) -> std::io::Result<(ServerHandle, SocketAddr)> {
+        let listener = TcpListener::bind(bind_addr).await?;
+        let bound_addr = listener.local_addr()?;
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let sem = Arc::new(Semaphore::new(self.max_connections));
+        let tls_config = self.tls_config.clone();
+        let backend = self.backend.clone();
+        let max_frame_size = self.max_frame_size;
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let permit = match sem.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => break,
+                    accept_res = listener.accept() => {
+                        match accept_res {
+                            Ok((stream, peer)) => {
+                                let backend = backend.clone();
+                                let tls_config = tls_config.clone();
+                                tracing::debug!(%peer, "accepted connection");
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    if let Err(e) = handle_connection(
+                                        backend,
+                                        stream,
+                                        tls_config,
+                                        max_frame_size,
+                                    )
+                                    .await
+                                    {
+                                        tracing::debug!(%peer, error = ?e, "connection handler exited");
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = ?e, "accept failed");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok((
+            ServerHandle {
+                abort_handle: handle.abort_handle(),
+                _shutdown_tx: shutdown_tx,
+            },
+            bound_addr,
+        ))
+    }
+}
+
+async fn handle_connection(
+    backend: Arc<dyn SessionStoreBackend>,
+    stream: TcpStream,
+    tls_config: Option<Arc<opc_tls::ServerConfig>>,
+    max_frame_size: usize,
+) -> Result<(), ProtocolError> {
+    if let Some(tls_config) = tls_config {
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+        let tls_stream = acceptor.accept(stream).await.map_err(ProtocolError::Io)?;
+        let (mut r, mut w) = tokio::io::split(tls_stream);
+        dispatch(backend, &mut r, &mut w, max_frame_size).await
+    } else {
+        let (mut r, mut w) = tokio::io::split(stream);
+        dispatch(backend, &mut r, &mut w, max_frame_size).await
+    }
+}
+
+async fn dispatch<R, W>(
+    backend: Arc<dyn SessionStoreBackend>,
+    reader: &mut R,
+    writer: &mut W,
+    max_frame_size: usize,
+) -> Result<(), ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // Hello handshake
+    let hello: Request = read_frame(reader, max_frame_size).await?;
+    match hello {
+        Request::Hello {
+            contract_version, ..
+        } => {
+            if contract_version != CONTRACT_VERSION {
+                return Err(ProtocolError::VersionMismatch {
+                    local: CONTRACT_VERSION,
+                    remote: contract_version,
+                });
+            }
+            write_frame(
+                writer,
+                &Response::HelloAck {
+                    contract_version: CONTRACT_VERSION,
+                },
+            )
+            .await?;
+        }
+        _ => {
+            return Err(ProtocolError::BackendUnavailable(
+                "expected Hello request".into(),
+            ));
+        }
+    }
+
+    // Dispatch loop
+    loop {
+        let req: Request = match read_frame(reader, max_frame_size).await {
+            Ok(r) => r,
+            Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        };
+
+        match req {
+            Request::Capabilities => {
+                let caps = backend.capabilities().await;
+                write_frame(writer, &Response::Capabilities(caps)).await?;
+            }
+            Request::Get { key } => {
+                let res = backend.get(&key).await;
+                write_frame(writer, &Response::Get(res)).await?;
+            }
+            Request::CompareAndSet { op } => {
+                let res = backend.compare_and_set(op).await;
+                write_frame(writer, &Response::CompareAndSet(res)).await?;
+            }
+            Request::DeleteFenced { lease } => {
+                let res = backend.delete_fenced(&lease).await;
+                write_frame(writer, &Response::DeleteFenced(res)).await?;
+            }
+            Request::RefreshTtl { lease, ttl } => {
+                let res = backend.refresh_ttl(&lease, ttl).await;
+                write_frame(writer, &Response::RefreshTtl(res)).await?;
+            }
+            Request::Batch { ops } => {
+                let res = backend.batch(ops).await;
+                write_frame(writer, &Response::Batch(res)).await?;
+            }
+            Request::MaxReplicationSequence => {
+                let res = backend.max_replication_sequence().await;
+                write_frame(writer, &Response::MaxReplicationSequence(res)).await?;
+            }
+            Request::GetReplicationLog { start, limit } => {
+                let res = backend.get_replication_log(start, limit).await;
+                write_frame(writer, &Response::GetReplicationLog(res)).await?;
+            }
+            Request::ReplicateEntry { entry } => {
+                let res = backend.replicate_entry(entry).await;
+                write_frame(writer, &Response::ReplicateEntry(res)).await?;
+            }
+            Request::RebuildReplicationState { entries } => {
+                let res = backend.rebuild_replication_state(entries).await;
+                write_frame(writer, &Response::RebuildReplicationState(res)).await?;
+            }
+            Request::Watch { start_sequence } => match backend.watch(start_sequence).await {
+                Ok(mut stream) => {
+                    write_frame(writer, &Response::WatchStream).await?;
+                    while let Some(item) = stream.next().await {
+                        if write_frame(writer, &Response::WatchEntry(item))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    write_frame(writer, &Response::WatchEntry(Err(e))).await?;
+                }
+            },
+            Request::NextLeaseInfo => {
+                let res = backend.next_lease_info().await;
+                write_frame(writer, &Response::NextLeaseInfo(res)).await?;
+            }
+            Request::AcquireLease { key, owner, ttl } => {
+                let res = backend.acquire(&key, owner, ttl).await;
+                write_frame(writer, &Response::AcquireLease(res)).await?;
+            }
+            Request::RenewLease { lease, ttl } => {
+                let res = backend.renew(&lease, ttl).await;
+                write_frame(writer, &Response::RenewLease(res)).await?;
+            }
+            Request::ReleaseLease { lease } => {
+                let res = backend.release(lease).await;
+                write_frame(writer, &Response::ReleaseLease(res)).await?;
+            }
+            Request::Hello { .. } => {
+                write_frame(
+                    writer,
+                    &Response::Error {
+                        message: "duplicate Hello".into(),
+                    },
+                )
+                .await?;
+            }
+        }
+    }
+
+    Ok(())
+}

@@ -1,0 +1,40 @@
+[package]
+name = "opc-session-net"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Networked session replication transport for OpenPacketCore (experimental)"
+readme = "README.md"
+documentation = "https://docs.rs/opc-session-net"
+keywords = ["5g", "cnf", "session", "replication", "packet-core"]
+categories = ["network-programming", "data-structures"]
+publish = true
+
+[features]
+default = []
+insecure-test = []
+
+[dependencies]
+opc-session-store = { path = "../opc-session-store", version = "0.1.0" }
+opc-tls = { path = "../opc-tls", version = "0.1.0" }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+futures-util = "0.3"
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+
+[dev-dependencies]
+opc-types = { path = "../opc-types" }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros", "test-util"] }
+bytes = { workspace = true }
+futures-util = "0.3"
+
+[lints]
+workspace = true
