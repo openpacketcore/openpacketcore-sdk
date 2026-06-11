@@ -10,9 +10,7 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{DecodeContext, EncodeContext};
 
-use crate::ie::{
-    CauseValue, NodeIdType, TypedIe,
-};
+use crate::ie::{CauseValue, NodeIdType, TypedIe};
 
 /// Helper: encode a typed IE to raw bytes.
 fn encode_typed(ie: &TypedIe) -> Bytes {

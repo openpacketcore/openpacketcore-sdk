@@ -1133,6 +1133,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-api-nnrf"
+version = "0.1.0"
+dependencies = [
+ "opc-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "opc-config-bus"
 version = "0.1.0"
 dependencies = [
