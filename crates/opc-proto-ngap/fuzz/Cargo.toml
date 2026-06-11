@@ -1,0 +1,24 @@
+[package]
+name = "opc-proto-ngap-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1.8"
+libfuzzer-sys = "0.4"
+opc-protocol = { path = "../../opc-protocol" }
+
+[dependencies.opc-proto-ngap]
+path = ".."
+
+[workspace]
+
+[[bin]]
+name = "decode_ngap"
+path = "fuzz_targets/decode_ngap.rs"
+test = false
+doc = false
