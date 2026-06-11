@@ -8,6 +8,7 @@
 //! See `CONFORMANCE.md` for coverage details.
 
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
 
 mod types;
 

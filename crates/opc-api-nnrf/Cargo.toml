@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Generated Rust types for 3GPP TS 29.510 Nnrf NFManagement / NFDiscovery (pilot)."
+readme = "README.md"
+documentation = "https://docs.rs/opc-api-nnrf"
+keywords = ["5g", "nrf", "sbi", "openapi", "telecom"]
+categories = ["network-programming", "api-bindings"]
 
 [lints]
 workspace = true

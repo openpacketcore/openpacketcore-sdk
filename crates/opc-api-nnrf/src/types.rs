@@ -3,266 +3,530 @@
 
 use serde::{Deserialize, Serialize};
 
+/// NF types known to NRF
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NfType {
+    /// Wire value `NRF`.
     Nrf,
+    /// Wire value `UDM`.
     Udm,
+    /// Wire value `AMF`.
     Amf,
+    /// Wire value `SMF`.
     Smf,
+    /// Wire value `AUSF`.
     Ausf,
+    /// Wire value `NEF`.
     Nef,
+    /// Wire value `PCF`.
     Pcf,
+    /// Wire value `SMSF`.
     Smsf,
+    /// Wire value `NSSF`.
     Nssf,
+    /// Wire value `UDR`.
     Udr,
+    /// Wire value `LMF`.
     Lmf,
+    /// Wire value `GMLC`.
     Gmlc,
+    /// Wire value `5G_EIR`.
     FiveGEir,
+    /// Wire value `SEPP`.
     Sepp,
+    /// Wire value `UPF`.
     Upf,
+    /// Wire value `N3IWF`.
     N3iwf,
+    /// Wire value `AF`.
     Af,
+    /// Wire value `UDSF`.
     Udsf,
+    /// Wire value `BSF`.
     Bsf,
+    /// Wire value `CHF`.
     Chf,
+    /// Wire value `NWDAF`.
     Nwdaf,
+    /// Wire value `PCSCF`.
     Pcscf,
+    /// Wire value `CBCF`.
     Cbcf,
+    /// Wire value `HSS`.
     Hss,
+    /// Wire value `UCMF`.
     Ucmf,
+    /// Wire value `SOR_AF`.
     SorAf,
+    /// Wire value `SPAF`.
     Spaf,
+    /// Wire value `MME`.
     Mme,
+    /// Wire value `SCSAS`.
     Scsas,
+    /// Wire value `SCEF`.
     Scef,
+    /// Wire value `SCP`.
     Scp,
+    /// Wire value `NSSAAF`.
     Nssaaf,
+    /// Wire value `ICSCF`.
     Icscf,
+    /// Wire value `SCSCF`.
     Scscf,
+    /// Wire value `DRA`.
     Dra,
+    /// Wire value `IMS_AS`.
     ImsAs,
+    /// Wire value `AANF`.
     Aanf,
+    /// Wire value `5G_DDNMF`.
     FiveGDdnmf,
+    /// Wire value `NSACF`.
     Nsacf,
+    /// Wire value `MFAF`.
     Mfaf,
+    /// Wire value `EASDF`.
     Easdf,
+    /// Wire value `DCCF`.
     Dccf,
+    /// Wire value `MB_SMF`.
     MbSmf,
+    /// Wire value `TSCTSF`.
     Tsctsf,
+    /// Wire value `ADRF`.
     Adrf,
+    /// Wire value `GBA_BSF`.
     GbaBsf,
+    /// Wire value `CEF`.
     Cef,
+    /// Wire value `MB_UPF`.
     MbUpf,
+    /// Wire value `NSWOF`.
     Nswof,
+    /// Wire value `PKMF`.
     Pkmf,
+    /// Wire value `MNPF`.
     Mnpf,
+    /// Wire value `SMS_GMSC`.
     SmsGmsc,
+    /// Wire value `SMS_IWMSC`.
     SmsIwmsc,
+    /// Wire value `MBSF`.
     Mbsf,
+    /// Wire value `MBSTF`.
     Mbstf,
+    /// Wire value `PANF`.
     Panf,
+    /// Wire value `IP_SM_GW`.
     IpSmGw,
+    /// Wire value `SMS_ROUTER`.
     SmsRouter,
+    /// Wire value `DCSF`.
     Dcsf,
+    /// Wire value `MRF`.
     Mrf,
+    /// Wire value `MRFP`.
     Mrfp,
+    /// Wire value `MF`.
     Mf,
+    /// Wire value `SLPKMF`.
     Slpkmf,
+    /// Wire value `RH`.
     Rh,
+    /// Forward-compatibility catch-all for values not in this release.
     #[serde(untagged)]
     Other(String),
 }
 
+/// Status of a given NF Instance stored in NRF
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NfStatus {
+    /// Wire value `REGISTERED`.
     Registered,
+    /// Wire value `SUSPENDED`.
     Suspended,
+    /// Wire value `UNDISCOVERABLE`.
     Undiscoverable,
+    /// Wire value `CANARY_RELEASE`.
     CanaryRelease,
+    /// Forward-compatibility catch-all for values not in this release.
     #[serde(untagged)]
     Other(String),
 }
 
+/// Status of a given NF Service Instance of an NF Instance stored in NRF
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NfServiceStatus {
+    /// Wire value `REGISTERED`.
     Registered,
+    /// Wire value `SUSPENDED`.
     Suspended,
+    /// Wire value `UNDISCOVERABLE`.
     Undiscoverable,
+    /// Wire value `CANARY_RELEASE`.
     CanaryRelease,
+    /// Forward-compatibility catch-all for values not in this release.
     #[serde(untagged)]
     Other(String),
 }
 
+/// Contains the version details of an NF service
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NfServiceVersion {
+    /// Mandatory `apiFullVersion` attribute per TS 29.510.
     pub api_full_version: String,
+    /// Mandatory `apiVersionInUri` attribute per TS 29.510.
     pub api_version_in_uri: String,
+    /// Optional `expiry` attribute per TS 29.510.
     pub expiry: Option<String>,
 }
 
+/// IP addressing information of a given NFService; it consists on, e.g. IP
+/// address, TCP port, transport protocol...
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IpEndPoint {
+    /// Optional `ipv4Address` attribute per TS 29.510.
     pub ipv4_address: Option<String>,
+    /// Optional `ipv6Address` attribute per TS 29.510.
     pub ipv6_address: Option<String>,
+    /// Optional `port` attribute per TS 29.510.
     pub port: Option<u16>,
+    /// Optional `transport` attribute per TS 29.510.
     pub transport: Option<String>,
 }
 
+/// List of network slices (S-NSSAIs) for a given PLMN ID
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlmnSnssai {
+    /// Optional `nid` attribute per TS 29.510.
     pub nid: Option<String>,
+    /// Mandatory `plmnId` attribute per TS 29.510.
     pub plmn_id: opc_types::PlmnId,
+    /// Mandatory `sNssaiList` attribute per TS 29.510.
     pub s_nssai_list: Vec<opc_types::Snssai>,
 }
 
+/// Information of an NF Instance registered in the NRF
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NfProfile {
+    /// Optional `5gDdnmfInfo` attribute per TS 29.510.
     pub _5g_ddnmf_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of AanfInfo
     pub aanf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of AdrfInfo
     pub adrf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `allowedNfDomains` attribute per TS 29.510.
     pub allowed_nf_domains: Option<Vec<String>>,
+    /// Optional `allowedNfTypes` attribute per TS 29.510.
     pub allowed_nf_types: Option<Vec<NfType>>,
+    /// Optional `allowedNssais` attribute per TS 29.510.
     pub allowed_nssais: Option<Vec<opc_types::Snssai>>,
+    /// Optional `allowedPlmns` attribute per TS 29.510.
     pub allowed_plmns: Option<Vec<opc_types::PlmnId>>,
+    /// A map (list of key-value pairs) where a valid JSON pointer Id serves as
+    /// key
     pub allowed_rule_set: Option<std::collections::HashMap<String, String>>,
+    /// Optional `allowedSnpns` attribute per TS 29.510.
     pub allowed_snpns: Option<Vec<serde_json::Value>>,
+    /// Optional `amfInfo` attribute per TS 29.510.
     pub amf_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of AmfInfo
     pub amf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `ausfInfo` attribute per TS 29.510.
     pub ausf_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of AusfInfo
     pub ausf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `bsfInfo` attribute per TS 29.510.
     pub bsf_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of BsfInfo
     pub bsf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `canaryRelease` attribute per TS 29.510.
     pub canary_release: Option<bool>,
+    /// Optional `capacity` attribute per TS 29.510.
     pub capacity: Option<u16>,
+    /// Optional `chfInfo` attribute per TS 29.510.
     pub chf_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of ChfInfo
     pub chf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `collocatedNfInstances` attribute per TS 29.510.
     pub collocated_nf_instances: Option<Vec<String>>,
+    /// Optional `customInfo` attribute per TS 29.510.
     pub custom_info: Option<serde_json::Value>,
+    /// Optional `dccfInfo` attribute per TS 29.510.
     pub dccf_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of DcsfInfo
     pub dcsf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `defaultNotificationSubscriptions` attribute per TS 29.510.
     pub default_notification_subscriptions: Option<Vec<String>>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of EasdfInfo
     pub easdf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `exclusiveCanaryReleaseSelection` attribute per TS 29.510.
     pub exclusive_canary_release_selection: Option<bool>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key representing a type of locality
     pub ext_locality: Option<std::collections::HashMap<String, String>>,
+    /// Optional `fqdn` attribute per TS 29.510.
     pub fqdn: Option<String>,
+    /// Optional `gmlcInfo` attribute per TS 29.510.
     pub gmlc_info: Option<serde_json::Value>,
+    /// Optional `heartBeatTimer` attribute per TS 29.510.
     pub heart_beat_timer: Option<i64>,
+    /// Optional `hniList` attribute per TS 29.510.
     pub hni_list: Option<Vec<String>>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of HssInfo
     pub hss_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `interPlmnFqdn` attribute per TS 29.510.
     pub inter_plmn_fqdn: Option<String>,
+    /// Optional `ipv4Addresses` attribute per TS 29.510.
     pub ipv4_addresses: Option<Vec<String>>,
+    /// Optional `ipv6Addresses` attribute per TS 29.510.
     pub ipv6_addresses: Option<Vec<String>>,
+    /// Optional `iwmscInfo` attribute per TS 29.510.
     pub iwmsc_info: Option<serde_json::Value>,
+    /// Optional `lcHSupportInd` attribute per TS 29.510.
     pub lc_h_support_ind: Option<bool>,
+    /// Optional `lmfInfo` attribute per TS 29.510.
     pub lmf_info: Option<serde_json::Value>,
+    /// Optional `load` attribute per TS 29.510.
     pub load: Option<u8>,
+    /// Optional `loadTimeStamp` attribute per TS 29.510.
     pub load_time_stamp: Option<String>,
+    /// Optional `locality` attribute per TS 29.510.
     pub locality: Option<String>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of MbSmfInfo
     pub mb_smf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of MbUpfInfo
     pub mb_upf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of MfInfo
     pub mf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `mfafInfo` attribute per TS 29.510.
     pub mfaf_info: Option<serde_json::Value>,
+    /// Optional `mnpfInfo` attribute per TS 29.510.
     pub mnpf_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of MrfInfo
     pub mrf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of MrfpInfo
     pub mrfp_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `nefInfo` attribute per TS 29.510.
     pub nef_info: Option<serde_json::Value>,
+    /// Mandatory `nfInstanceId` attribute per TS 29.510.
     pub nf_instance_id: opc_types::NfInstanceId,
+    /// Optional `nfInstanceName` attribute per TS 29.510.
     pub nf_instance_name: Option<String>,
+    /// Optional `nfProfileChangesInd` attribute per TS 29.510.
     pub nf_profile_changes_ind: Option<bool>,
+    /// Optional `nfProfileChangesSupportInd` attribute per TS 29.510.
     pub nf_profile_changes_support_ind: Option<bool>,
+    /// Optional `nfProfilePartialUpdateChangesSupportInd` attribute per TS
+    /// 29.510.
     pub nf_profile_partial_update_changes_support_ind: Option<bool>,
+    /// A map (list of key-value pairs) where serviceInstanceId serves as key of
+    /// NFService
     pub nf_service_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `nfServicePersistence` attribute per TS 29.510.
     pub nf_service_persistence: Option<bool>,
+    /// Optional `nfServices` attribute per TS 29.510.
     pub nf_services: Option<Vec<serde_json::Value>>,
+    /// Optional `nfSetIdList` attribute per TS 29.510.
     pub nf_set_id_list: Option<Vec<String>>,
+    /// A map (list of key-value pairs) where NfSetId serves as key of DateTime
     pub nf_set_recovery_time_list: Option<std::collections::HashMap<String, String>>,
+    /// Mandatory `nfStatus` attribute per TS 29.510.
     pub nf_status: NfStatus,
+    /// Mandatory `nfType` attribute per TS 29.510.
     pub nf_type: NfType,
+    /// Optional `nrfInfo` attribute per TS 29.510.
     pub nrf_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of NsacfInfo
     pub nsacf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `nsiList` attribute per TS 29.510.
     pub nsi_list: Option<Vec<String>>,
+    /// Optional `nssaafInfo` attribute per TS 29.510.
     pub nssaaf_info: Option<serde_json::Value>,
+    /// Optional `nwdafInfo` attribute per TS 29.510.
     pub nwdaf_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of NwdafInfo
     pub nwdaf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `olcHSupportInd` attribute per TS 29.510.
     pub olc_h_support_ind: Option<bool>,
+    /// Optional `pcfInfo` attribute per TS 29.510.
     pub pcf_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of PcfInfo
     pub pcf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of PcscfInfo
     pub pcscf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `perPlmnSnssaiList` attribute per TS 29.510.
     pub per_plmn_snssai_list: Option<Vec<PlmnSnssai>>,
+    /// Optional `plmnList` attribute per TS 29.510.
     pub plmn_list: Option<Vec<opc_types::PlmnId>>,
+    /// Optional `priority` attribute per TS 29.510.
     pub priority: Option<u16>,
+    /// Optional `recoveryTime` attribute per TS 29.510.
     pub recovery_time: Option<String>,
+    /// Optional `sNssais` attribute per TS 29.510.
     pub s_nssais: Option<Vec<opc_types::Snssai>>,
+    /// Optional `scpDomains` attribute per TS 29.510.
     pub scp_domains: Option<Vec<String>>,
+    /// Optional `scpInfo` attribute per TS 29.510.
     pub scp_info: Option<serde_json::Value>,
+    /// Optional `selectionConditions` attribute per TS 29.510.
     pub selection_conditions: Option<String>,
+    /// Optional `seppInfo` attribute per TS 29.510.
     pub sepp_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where NfServiceSetId serves as key of
+    /// DateTime
     pub service_set_recovery_time_list: Option<std::collections::HashMap<String, String>>,
+    /// Optional `servingScope` attribute per TS 29.510.
     pub serving_scope: Option<Vec<String>>,
+    /// Optional `sharedProfileDataId` attribute per TS 29.510.
     pub shared_profile_data_id: Option<String>,
+    /// Optional `smfInfo` attribute per TS 29.510.
     pub smf_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of SmfInfo
     pub smf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `smsfInfo` attribute per TS 29.510.
     pub smsf_info: Option<serde_json::Value>,
+    /// Optional `snpnList` attribute per TS 29.510.
     pub snpn_list: Option<Vec<serde_json::Value>>,
+    /// The key of the map is the IANA-assigned SMI Network Management Private
+    /// Enterprise Codes
     pub supported_vendor_specific_features: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// Optional `trustAfInfo` attribute per TS 29.510.
     pub trust_af_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of TsctsfInfo
     pub tsctsf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `udmInfo` attribute per TS 29.510.
     pub udm_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of UdmInfo
     pub udm_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `udrInfo` attribute per TS 29.510.
     pub udr_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of UdrInfo
     pub udr_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `udsfInfo` attribute per TS 29.510.
     pub udsf_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of UdsfInfo
     pub udsf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `upfInfo` attribute per TS 29.510.
     pub upf_info: Option<serde_json::Value>,
+    /// A map (list of key-value pairs) where a (unique) valid JSON string
+    /// serves as key of UpfInfo
     pub upf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Optional `vendorId` attribute per TS 29.510.
     pub vendor_id: Option<u32>,
 }
 
+/// Information of a given NF Service Instance; it is part of the NFProfile
+/// of an NF Instance
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NfService {
+    /// Optional `allowedNfDomains` attribute per TS 29.510.
     pub allowed_nf_domains: Option<Vec<String>>,
+    /// Optional `allowedNfTypes` attribute per TS 29.510.
     pub allowed_nf_types: Option<Vec<NfType>>,
+    /// Optional `allowedNssais` attribute per TS 29.510.
     pub allowed_nssais: Option<Vec<opc_types::Snssai>>,
+    /// A map (list of key-value pairs) where NF Instance Id serves as key
     pub allowed_operations_per_nf_instance: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// Optional `allowedOperationsPerNfInstanceOverrides` attribute per TS
+    /// 29.510.
     pub allowed_operations_per_nf_instance_overrides: Option<bool>,
+    /// A map (list of key-value pairs) where NF Type serves as key
     pub allowed_operations_per_nf_type: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// Optional `allowedPlmns` attribute per TS 29.510.
     pub allowed_plmns: Option<Vec<opc_types::PlmnId>>,
+    /// A map (list of key-value pairs) where a valid JSON pointer Id serves as
+    /// key
     pub allowed_scopes_rule_set: Option<std::collections::HashMap<String, String>>,
+    /// Optional `allowedSnpns` attribute per TS 29.510.
     pub allowed_snpns: Option<Vec<serde_json::Value>>,
+    /// Optional `apiPrefix` attribute per TS 29.510.
     pub api_prefix: Option<String>,
+    /// Optional `callbackUriPrefixList` attribute per TS 29.510.
     pub callback_uri_prefix_list: Option<Vec<String>>,
+    /// Optional `canaryRelease` attribute per TS 29.510.
     pub canary_release: Option<bool>,
+    /// Optional `capacity` attribute per TS 29.510.
     pub capacity: Option<u16>,
+    /// Optional `defaultNotificationSubscriptions` attribute per TS 29.510.
     pub default_notification_subscriptions: Option<Vec<String>>,
+    /// Optional `exclusiveCanaryReleaseSelection` attribute per TS 29.510.
     pub exclusive_canary_release_selection: Option<bool>,
+    /// Optional `fqdn` attribute per TS 29.510.
     pub fqdn: Option<String>,
+    /// Optional `interPlmnFqdn` attribute per TS 29.510.
     pub inter_plmn_fqdn: Option<String>,
+    /// Optional `ipEndPoints` attribute per TS 29.510.
     pub ip_end_points: Option<Vec<IpEndPoint>>,
+    /// Optional `load` attribute per TS 29.510.
     pub load: Option<u8>,
+    /// Optional `loadTimeStamp` attribute per TS 29.510.
     pub load_time_stamp: Option<String>,
+    /// Optional `nfServiceSetIdList` attribute per TS 29.510.
     pub nf_service_set_id_list: Option<Vec<String>>,
+    /// Mandatory `nfServiceStatus` attribute per TS 29.510.
     pub nf_service_status: NfServiceStatus,
+    /// Optional `oauth2Required` attribute per TS 29.510.
     pub oauth2_required: Option<bool>,
+    /// Optional `perPlmnOauth2ReqList` attribute per TS 29.510.
     pub per_plmn_oauth2_req_list: Option<String>,
+    /// Optional `perPlmnSnssaiList` attribute per TS 29.510.
     pub per_plmn_snssai_list: Option<Vec<PlmnSnssai>>,
+    /// Optional `priority` attribute per TS 29.510.
     pub priority: Option<u16>,
+    /// Optional `recoveryTime` attribute per TS 29.510.
     pub recovery_time: Option<String>,
+    /// Optional `sNssais` attribute per TS 29.510.
     pub s_nssais: Option<Vec<opc_types::Snssai>>,
+    /// Mandatory `scheme` attribute per TS 29.510.
     pub scheme: String,
+    /// Optional `selectionConditions` attribute per TS 29.510.
     pub selection_conditions: Option<String>,
+    /// Mandatory `serviceInstanceId` attribute per TS 29.510.
     pub service_instance_id: String,
+    /// Mandatory `serviceName` attribute per TS 29.510.
     pub service_name: String,
+    /// Optional `sharedServiceDataId` attribute per TS 29.510.
     pub shared_service_data_id: Option<String>,
+    /// Optional `supportedFeatures` attribute per TS 29.510.
     pub supported_features: Option<String>,
+    /// A map (list of key-value pairs) where IANA-assigned SMI Network
+    /// Management Private Enterprise Codes serves as key
     pub supported_vendor_specific_features: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// Optional `vendorId` attribute per TS 29.510.
     pub vendor_id: Option<u32>,
+    /// Mandatory `versions` attribute per TS 29.510.
     pub versions: Vec<NfServiceVersion>,
 }

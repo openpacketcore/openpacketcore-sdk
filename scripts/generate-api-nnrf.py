@@ -10,8 +10,15 @@ Usage:
     python3 scripts/generate-api-nnrf.py --output crates/opc-api-nnrf/src/types.rs
 
 Determinism: fields are emitted in alphabetical order; enum variants are emitted
-in the order declared in the YAML.  Pinning the input YAML commit SHA guarantees
-bit-identical output.
+in the order declared in the YAML.  Inputs are pinned by content hash
+(EXPECTED_HASHES): a fetched or cached file that does not match the recorded
+SHA-256 aborts generation, so identical inputs always produce bit-identical
+output.  Files are fetched once into target/api-codegen-cache/ and subsequent
+runs are fully offline.
+
+Requires: Python 3.9+ and PyYAML (`pip install pyyaml`). Cargo builds never
+run this script; types.rs is committed and only regenerated explicitly via
+`make generate-api`.
 """
 
 import argparse
@@ -21,15 +28,21 @@ import sys
 from pathlib import Path
 from typing import Any, Optional, Set
 
-import yaml
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    sys.stderr.write(
+        "error: PyYAML is required to regenerate the API types "
+        "(pip install pyyaml). Cargo builds do not need it.\n"
+    )
+    raise SystemExit(1)
 
 BASE_URL = "https://raw.githubusercontent.com/jdegre/5GC_APIs/master/"
-# Pin to a specific commit for reproducibility.  Update this when bumping
-# the 3GPP release used by the SDK.
-PINNED_COMMIT = "d30f41eddee4dc76ba0d2ce2746f9e75f026cbf8377565794baffda0f6f69c7d"
-# We actually pin by downloading from the master branch but verifying the
-# downloaded file hash matches expectations.  In production this would pin
-# a git tag or release tarball.
+# Inputs are pinned by content hash, not by URL: whatever BASE_URL serves is
+# verified against EXPECTED_HASHES and generation aborts on any mismatch
+# (e.g. when upstream master moves on). To bump the 3GPP release: delete
+# target/api-codegen-cache/, refresh EXPECTED_HASHES from the new files, and
+# review the regenerated diff.
 FILES = [
     "TS29510_Nnrf_NFManagement.yaml",
     "TS29571_CommonData.yaml",
@@ -214,25 +227,56 @@ def to_pascal_case(name: str) -> str:
     return "".join(result)
 
 
+def doc_comment(text: Optional[str], fallback: str, indent: str = "") -> list[str]:
+    """Render a rustdoc comment from an OpenAPI description, wrapping long
+    lines; falls back to a generated sentence when the schema has none."""
+    content = " ".join((text or fallback).split())
+    lines: list[str] = []
+    line = ""
+    for word in content.split(" "):
+        candidate = f"{line} {word}".strip()
+        if len(candidate) > 72 and line:
+            lines.append(f"{indent}/// {line}")
+            line = word
+        else:
+            line = candidate
+    if line:
+        lines.append(f"{indent}/// {line}")
+    return lines
+
+
 def emit_enum(name: str, schema: Any, docs: dict[str, Any]) -> list[str]:
     """Emit Rust enum for an anyOf [enum, string] schema."""
     lines: list[str] = []
-    lines.append(f"#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]")
-    lines.append(f'#[serde(rename_all = "SCREAMING_SNAKE_CASE")]')
+    lines.extend(
+        doc_comment(
+            schema.get("description"),
+            f"`{name}` enumeration generated from 3GPP TS 29.510.",
+        )
+    )
+    lines.append("#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]")
+    lines.append('#[serde(rename_all = "SCREAMING_SNAKE_CASE")]')
     lines.append(f"pub enum {name} {{")
 
     any_of = schema.get("anyOf", schema.get("oneOf", []))
-    variants: list[str] = []
+    variants: list[tuple[str, str]] = []
     for alt in any_of:
         if isinstance(alt, dict) and alt.get("type") == "string" and "enum" in alt:
             for val in alt["enum"]:
-                variant = to_pascal_case(val)
-                variants.append(variant)
+                variants.append((to_pascal_case(val), val))
 
-    for v in variants:
+    for v, wire in variants:
+        lines.extend(doc_comment(None, f"Wire value `{wire}`.", indent="    "))
         lines.append(f"    {v},")
 
     # Add catch-all for extensible enums.
+    lines.extend(
+        doc_comment(
+            None,
+            "Forward-compatibility catch-all for values not in this release.",
+            indent="    ",
+        )
+    )
     lines.append("    #[serde(untagged)]")
     lines.append("    Other(String),")
     lines.append("}")
@@ -266,8 +310,14 @@ def sanitize_ident(name: str) -> str:
 def emit_struct(name: str, schema: Any, docs: dict[str, Any]) -> list[str]:
     """Emit Rust struct for an object schema."""
     lines: list[str] = []
-    lines.append(f"#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]")
-    lines.append(f'#[serde(rename_all = "camelCase")]')
+    lines.extend(
+        doc_comment(
+            schema.get("description"),
+            f"`{name}` generated from the 3GPP TS 29.510 OpenAPI schema.",
+        )
+    )
+    lines.append("#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]")
+    lines.append('#[serde(rename_all = "camelCase")]')
     lines.append(f"pub struct {name} {{")
 
     props = schema.get("properties", {})
@@ -278,6 +328,14 @@ def emit_struct(name: str, schema: Any, docs: dict[str, Any]) -> list[str]:
         is_required = prop_name in required
         ty = rust_type_for(prop_schema, docs, required=is_required)
         rust_name = sanitize_ident(prop_name)
+        requirement = "Mandatory" if is_required else "Optional"
+        lines.extend(
+            doc_comment(
+                prop_schema.get("description") if isinstance(prop_schema, dict) else None,
+                f"{requirement} `{prop_name}` attribute per TS 29.510.",
+                indent="    ",
+            )
+        )
         lines.append(f"    pub {rust_name}: {ty},")
 
     lines.append("}")
