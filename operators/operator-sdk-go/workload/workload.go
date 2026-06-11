@@ -84,7 +84,11 @@ func RenderDeployment(spec NetworkFunctionSpec, opts RenderOptions) (*appsv1.Dep
 	}
 
 	if opts.RolloutParams != nil {
-		dep.Spec.Strategy = rollout.BuildDeploymentStrategy(*opts.RolloutParams)
+		strategy, err := rollout.BuildDeploymentStrategy(*opts.RolloutParams)
+		if err != nil {
+			return nil, fmt.Errorf("rollout strategy: %w", err)
+		}
+		dep.Spec.Strategy = strategy
 	}
 
 	return dep, nil

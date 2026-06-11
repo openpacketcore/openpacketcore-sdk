@@ -185,11 +185,11 @@ func TestRenderDeploymentRolloutStrategy(t *testing.T) {
 	}
 
 	tests := []struct {
-		name         string
-		strategy     rollout.Strategy
-		wantType     string
-		wantSurge    string
-		wantUnavail  string
+		name        string
+		strategy    rollout.Strategy
+		wantType    string
+		wantSurge   string
+		wantUnavail string
 	}{
 		{"rolling", rollout.StrategyRolling, "RollingUpdate", "25%", "25%"},
 		{"canary", rollout.StrategyCanary, "RollingUpdate", "1", "0"},

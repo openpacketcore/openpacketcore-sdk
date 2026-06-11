@@ -75,11 +75,11 @@ func TestEvaluate(t *testing.T) {
 
 func TestBuildDeploymentStrategy(t *testing.T) {
 	tests := []struct {
-		name             string
-		params           Params
-		wantType         appsv1.DeploymentStrategyType
-		wantMaxSurge     string
-		wantMaxUnavail   string
+		name           string
+		params         Params
+		wantType       appsv1.DeploymentStrategyType
+		wantMaxSurge   string
+		wantMaxUnavail string
 	}{
 		{
 			name:           "rolling defaults",
@@ -118,7 +118,10 @@ func TestBuildDeploymentStrategy(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := BuildDeploymentStrategy(tc.params)
+			got, err := BuildDeploymentStrategy(tc.params)
+			if err != nil {
+				t.Fatalf("BuildDeploymentStrategy() error = %v", err)
+			}
 			if got.Type != tc.wantType {
 				t.Errorf("Type = %v, want %v", got.Type, tc.wantType)
 			}
@@ -134,13 +137,10 @@ func TestBuildDeploymentStrategy(t *testing.T) {
 	}
 }
 
-func TestBuildDeploymentStrategyPanicsOnUnknown(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("expected panic for unknown strategy")
-		}
-	}()
-	BuildDeploymentStrategy(Params{Strategy: "unknown"})
+func TestBuildDeploymentStrategyRejectsUnknown(t *testing.T) {
+	if _, err := BuildDeploymentStrategy(Params{Strategy: "unknown"}); err == nil {
+		t.Error("expected error for unknown strategy")
+	}
 }
 
 func slicesEqual(a, b []Strategy) bool {

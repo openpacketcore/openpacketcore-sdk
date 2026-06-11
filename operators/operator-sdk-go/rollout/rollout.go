@@ -86,23 +86,24 @@ type Params struct {
 }
 
 // BuildDeploymentStrategy synthesizes an appsv1.DeploymentStrategy from the
-// requested rollout parameters.  It panics if params.Strategy is unsupported;
-// callers MUST validate via Evaluate first.
-func BuildDeploymentStrategy(params Params) appsv1.DeploymentStrategy {
+// requested rollout parameters. An unsupported strategy returns an error
+// rather than panicking, so a reconciler fed an unvalidated CR degrades
+// gracefully instead of crash-looping; validate intent first via Evaluate.
+func BuildDeploymentStrategy(params Params) (appsv1.DeploymentStrategy, error) {
 	switch params.Strategy {
 	case StrategyRolling:
-		return rollingStrategy(params)
+		return rollingStrategy(params), nil
 	case StrategyPartitioned:
-		return partitionedStrategy(params)
+		return partitionedStrategy(params), nil
 	case StrategyCanary:
-		return canaryStrategy(params)
+		return canaryStrategy(params), nil
 	case StrategyBlueGreen:
-		return blueGreenStrategy(params)
+		return blueGreenStrategy(params), nil
 	case StrategyManual:
-		return manualStrategy(params)
+		return manualStrategy(params), nil
 	default:
 		// Fail closed for unknown strategies.
-		panic(fmt.Sprintf("unsupported rollout strategy: %q", params.Strategy))
+		return appsv1.DeploymentStrategy{}, fmt.Errorf("unsupported rollout strategy: %q", params.Strategy)
 	}
 }
 
