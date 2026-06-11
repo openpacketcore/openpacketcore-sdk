@@ -66,6 +66,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rustdoc for the entire public API of `opc-runtime`, `opc-sbi`,
   `opc-config-bus`, `opc-session-store`, and `opc-alarm`, now enforced with
   `#![deny(missing_docs)]` across all eight core crates.
+- `opc-proto-pfcp` typed IE layer: decode/encode for Cause, Node ID, F-SEID,
+  F-TEID, PDR/FAR/QER/URR ID, Precedence, Apply Action, Source/Destination
+  Interface, Network Instance, UE IP Address, Outer Header Creation/Removal,
+  Recovery Time Stamp; grouped-IE recursion (Create/Created PDR, PDI, Create
+  FAR, Forwarding Parameters, Create QER, Create URR) with configurable
+  `max_depth` enforcement; unknown and vendor IEs preserved byte-exact via
+  `TypedIe::Raw`. 54 conformance tests with hand-authored spec-byte fixtures
+  citing TS 29.244 section numbers; negative tests for truncation, wrong
+  length, and depth exceedance. Fuzz target extended with typed-IE decode loop.
+- `opc-api-nnrf` (experimental): generated Rust types for 3GPP TS 29.510
+  `NfProfile` and `NfService` from official OpenAPI YAML. Python generator
+  `scripts/generate-api-nnrf.py` resolves `$refs`, maps primitives to Rust,
+  and emits serde-friendly structs with extensible string enums
+  (`NfType`, `NfStatus`, `NfServiceStatus`). `make generate-api` target
+  produces deterministic output.
+- `operator-sdk-go/rollout`: RFC 009 §12 rollout strategy policy evaluation.
+  `AllowedStrategies` and `Evaluate` decide safe strategies from NF
+  characteristics; `BuildDeploymentStrategy` synthesises Kubernetes
+  `DeploymentStrategy` for rolling, partitioned, canary, blue-green, and
+  manual strategies. Integrated into `workload.RenderDeployment`. Envtest
+  coverage verifies strategy fields are persisted correctly on a real
+  API server.
 
 ### Fixed
 - `opc-proto-pfcp` wire format corrected to TS 29.244: octet-1 flag layout

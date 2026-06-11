@@ -84,6 +84,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
 | [`opc-sbi`](crates/opc-sbi/) | Shared SBI client/server, auth, NRF, retry, and testkit primitives. | [RFC 007](docs/rfc/007-sbi-service-framework.md) |
+| [`opc-api-nnrf`](crates/opc-api-nnrf/) | Generated Rust types for 3GPP TS 29.510 NRF `NfProfile` / `NfService` *(experimental)*. | [Design note](docs/design/openapi-codegen-plan.md) |
 
 ### Release Assurance (`crates/`)
 
