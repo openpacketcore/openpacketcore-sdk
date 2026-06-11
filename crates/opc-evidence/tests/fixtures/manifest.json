@@ -1,0 +1,31 @@
+{
+  "schema_version": "1.0.0",
+  "sdk_version": "0.1.0",
+  "git_commit": "abc123def456",
+  "artifact_digests": [
+    {
+      "path": "target/release/opc-cnf",
+      "digest": "sha256:7f83b1657ff1fc8fbc97f9c2d110e6811602261a9a923d3bb23adc8b7f83b165"
+    }
+  ],
+  "file_digests": [
+    {
+      "path": "conformance-report.json",
+      "digest": "sha256:3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"
+    },
+    {
+      "path": "sbom/workspace.cdx.json",
+      "digest": "sha256:7d865e959b2466918c9863afca942d0fb89d7c9ac0c99bafc3749504ded97730"
+    }
+  ],
+  "signing_identity": "release-bot@openpacketcore.dev",
+  "generation_tool": "opc-evidence",
+  "generation_tool_version": "0.1.0",
+  "generation_timestamp": "2026-05-27T17:25:13Z",
+  "known_incomplete_sections": [
+    "5.3-gtp-v2-extension-headers"
+  ],
+  "metadata": {
+    "environment": "staging"
+  }
+}

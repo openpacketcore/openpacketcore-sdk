@@ -1,0 +1,27 @@
+{
+  "schema_version": "1.0.0",
+  "generated_at": "2026-05-27T17:25:13Z",
+  "benchmark": "gtpu-header-parse",
+  "metrics": [
+    {
+      "name": "throughput",
+      "unit": "packets_per_second",
+      "value": 1000000
+    },
+    {
+      "name": "latency_p99",
+      "unit": "microseconds",
+      "value": 125.5
+    }
+  ],
+  "environment": {
+    "os": "linux",
+    "arch": "x86_64",
+    "rust_version": "rustc 1.81.0",
+    "cpu_summary": "generic logical CPUs",
+    "test_profile": "release",
+    "command": "cargo bench -p opc-proto-gtp",
+    "timestamp": "2026-05-27T17:25:13Z"
+  },
+  "regression_status": "pass"
+}

@@ -1,0 +1,22 @@
+[package]
+name = "opc-yanggen"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenPacketCore YANG Projection and Codegen Engine IR Skeleton"
+
+[dependencies]
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

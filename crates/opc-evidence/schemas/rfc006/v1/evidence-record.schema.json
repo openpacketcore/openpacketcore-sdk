@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.openpacketcore.dev/rfc006/v1/evidence-record.schema.json",
+  "title": "OpenPacketCore RFC 006 evidence record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["requirement_id", "status"],
+  "properties": {
+    "requirement_id": {
+      "type": "string",
+      "format": "opc-requirement-id"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "implemented",
+        "tested",
+        "partial",
+        "not-implemented",
+        "not-applicable",
+        "gap",
+        "waived",
+        "full",
+        "implemented-untested"
+      ]
+    },
+    "source_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "test_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "gap_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "opc-gap-id"
+      }
+    },
+    "artifact_digests": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "opc-sha256"
+      }
+    },
+    "reviewed_by": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "last_updated": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

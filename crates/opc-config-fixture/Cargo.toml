@@ -1,0 +1,23 @@
+[package]
+name = "opc-config-fixture"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Generated-like config fixture for OpenPacketCore integration testing"
+
+[dependencies]
+opc-config-model = { path = "../opc-config-model" }
+opc-types = { path = "../opc-types" }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+opc-config-bus = { path = "../opc-config-bus" }
+opc-nacm = { path = "../opc-nacm" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

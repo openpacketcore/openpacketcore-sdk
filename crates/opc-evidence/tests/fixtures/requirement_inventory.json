@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0.0",
+  "generated_at": "2026-05-27T17:25:13Z",
+  "requirements": [
+    {
+      "id": "REQ-3GPP-TS29281-R18-5.1-001",
+      "title": "Parse GTP-U header fields",
+      "source": "3GPP",
+      "document": "TS29281",
+      "release": "R18",
+      "section": "5.1"
+    }
+  ]
+}

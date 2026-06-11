@@ -1,0 +1,21 @@
+[package]
+name = "opc-crypto"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "AEAD envelope encoding, decoding, and provider-driven encryption for OpenPacketCore"
+
+[dependencies]
+opc-key = { path = "../opc-key" }
+rand = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+opc-types = { path = "../opc-types" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

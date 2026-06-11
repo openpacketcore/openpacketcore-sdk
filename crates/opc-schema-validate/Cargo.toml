@@ -1,0 +1,16 @@
+[package]
+name = "opc-schema-validate"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Lightweight JSON Schema validation engine for OpenPacketCore workspace internal use"
+publish = false
+
+[dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

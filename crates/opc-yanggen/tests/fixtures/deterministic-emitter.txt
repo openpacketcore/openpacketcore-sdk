@@ -1,0 +1,17 @@
+generator-version 0.1.0
+profile carrier-default
+schema-digest fnv1a64:22bedbc321e5c931
+lockfile
+  module ietf-interfaces@2026-05-19 namespace=urn:ietf:params:xml:ns:yang:ietf-interfaces checksum=sha256:abc1234567890abcdef imports=[ietf-yang-types@2023-01-01]
+  module upf-slice@2026-05-20 namespace=urn:openpacketcore:yang:upf-slice checksum=sha256:fedcba0987654321cba imports=[]
+schema-modules
+  module ietf-interfaces prefix=if revision=2026-05-19 namespace=urn:ietf:params:xml:ns:yang:ietf-interfaces source=ietf-interfaces.yang:1:1
+schema-nodes
+  node path=/upf:system module=upf-slice kind=container config=true type=none keys=[] children=[/upf:system/interfaces] source=upf-slice.yang:10:5
+  node path=/upf:system/interfaces module=upf-slice kind=container config=true type=none keys=[] children=[/upf:system/interfaces/interface] source=upf-slice.yang:15:5
+  node path=/upf:system/interfaces/interface module=upf-slice kind=list config=true type=none keys=[name] children=[] source=upf-slice.yang:20:5
+constraints
+  must target=/upf:system/interfaces/interface source=upf-slice.yang:20:7 expr=boolean(and, current()/enabled = true)
+stack-shapes
+  nested generated::Interface path=/upf:system/interfaces/interface estimated=1536 budget=1024 allocation=boxed status=boxed-to-fit
+  root generated::System path=/upf:system estimated=736 budget=4096 allocation=inline status=within-budget

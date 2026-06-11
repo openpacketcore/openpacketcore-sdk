@@ -1,0 +1,43 @@
+[package]
+name = "opc-sdk-integration"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Toy OpenPacketCore NF integration crate wiring runtime, config bus, alarms, and testbed evidence"
+
+[dependencies]
+opc-alarm = { path = "../opc-alarm" }
+opc-config-bus = { path = "../opc-config-bus" }
+opc-config-model = { path = "../opc-config-model" }
+opc-runtime = { path = "../opc-runtime" }
+opc-testbed = { path = "../opc-testbed" }
+opc-types = { path = "../opc-types" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+opc-alarm-testkit = { path = "../opc-alarm-testkit" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+opc-crypto = { path = "../opc-crypto" }
+opc-evidence = { path = "../opc-evidence" }
+opc-key = { path = "../opc-key" }
+opc-nacm = { path = "../opc-nacm" }
+opc-session-store = { path = "../opc-session-store" }
+opc-persist = { path = "../opc-persist", features = ["dangerous-test-hooks"] }
+opc-redaction = { path = "../opc-redaction" }
+opc-data-governance = { path = "../opc-data-governance" }
+opc-privacy = { path = "../opc-privacy" }
+opc-export = { path = "../opc-export" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+{
+  "scenario_id": "TOY-NF-001",
+  "requirements": [
+    "REQ-3GPP-TS23502-R17-4.2.2-001"
+  ],
+  "mode": "in-process",
+  "seed": 7,
+  "artifacts": [
+    "artifacts/health.json",
+    "artifacts/alarms.json",
+    "artifacts/scenario-state.json"
+  ],
+  "outcome": "pass",
+  "started_at": "2026-01-01T00:00:00Z",
+  "finished_at": "2026-01-01T00:00:01Z"
+}

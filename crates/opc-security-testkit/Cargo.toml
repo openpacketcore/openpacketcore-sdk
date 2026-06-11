@@ -1,0 +1,30 @@
+[package]
+name = "opc-security-testkit"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Fake fixtures and fault injection test utilities for OpenPacketCore security validation"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0"
+tokio = { workspace = true, features = ["sync", "net", "time", "rt-multi-thread", "io-util"] }
+tracing = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rcgen = { workspace = true }
+opc-types = { path = "../opc-types" }
+time = { workspace = true }
+opc-identity = { path = "../opc-identity" }
+opc-tls = { path = "../opc-tls" }
+opc-key = { path = "../opc-key" }
+opc-crypto = { path = "../opc-crypto" }
+tokio-rustls = { workspace = true }
+tempfile = "3"
+
+[lints]
+workspace = true

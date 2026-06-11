@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.openpacketcore.dev/rfc006/v1/vex-policy-result.schema.json",
+  "title": "OpenPacketCore RFC 006 VEX policy result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_at", "vulnerability_id", "decision", "justification"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "vulnerability_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decision": {
+      "type": "string",
+      "enum": ["not_affected", "affected", "fixed", "under_investigation"]
+    },
+    "justification": {
+      "type": "string",
+      "minLength": 1
+    },
+    "action": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

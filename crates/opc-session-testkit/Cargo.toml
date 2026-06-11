@@ -1,0 +1,20 @@
+[package]
+name = "opc-session-testkit"
+version = "0.1.0"
+publish = false
+edition = "2021"
+description = "Chaos and failure testing testkit for OpenPacketCore session replication (RFC 004)"
+
+[dependencies]
+opc-session-store = { path = "../opc-session-store" }
+opc-types = { path = "../opc-types" }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "test-util"] }
+time = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+futures-util = "0.3"

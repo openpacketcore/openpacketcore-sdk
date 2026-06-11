@@ -1,0 +1,21 @@
+[package]
+name = "opc-config-model"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared config-model request, result, identity, and error types for OpenPacketCore"
+
+[dependencies]
+opc-types = { path = "../opc-types" }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

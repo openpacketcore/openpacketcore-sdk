@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0.0",
+  "sdk_version": "0.1.0",
+  "git_commit": "abc123def456",
+  "generated_at": "2026-05-27T17:25:13Z",
+  "requirements": [
+    {
+      "requirement_id": "REQ-3GPP-TS29281-R18-5.1-001",
+      "calculated_status": "partial",
+      "raw_evidence": [
+        {
+          "requirement_id": "REQ-3GPP-TS29281-R18-5.1-001",
+          "status": "partial",
+          "source_refs": ["crates/opc-proto-gtp/src/header.rs:Gtpv1uHeader"],
+          "test_refs": ["crates/opc-proto-gtp/tests/roundtrip.rs:test_gtpu_header"],
+          "gap_refs": ["GAP-000123"],
+          "artifact_digests": ["sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"],
+          "reviewed_by": ["standards-reviewer"],
+          "last_updated": "2026-05-19T00:00:00Z"
+        }
+      ],
+      "gap_refs": ["GAP-000123"]
+    }
+  ],
+  "summary": {
+    "partial": 1,
+    "full": 0,
+    "gap": 0
+  }
+}

@@ -1,0 +1,12 @@
+# This kustomization.yaml forces kustomize to load bases and patch conversion webhooks
+resources:
+- bases/reference.openpacketcore.io_sdkmanagednetworkfunctions.yaml
+# +kubebuilder:scaffold:crdkustomizeresources
+
+patches:
+# [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix.
+# patches here are for enabling the admission webhook for each CRD
+- path: patches/webhook_in_sdkmanagednetworkfunctions.yaml
+# [CERTMANAGER] To enable cert-manager, uncomment all the sections with [CERTMANAGER] prefix.
+# patches here are for enabling the caBundle injection into each CRD
+- path: patches/crd_conversion_webhook.yaml

@@ -1,0 +1,16 @@
+[package]
+name = "opc-protocol"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Zero-copy protocol codec framework for OpenPacketCore: traits, context, errors, and fuzzing contracts"
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

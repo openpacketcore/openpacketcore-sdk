@@ -1,0 +1,28 @@
+use thiserror::Error;
+
+/// Parse or validation failure for a shared OpenPacketCore type.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{kind}: {message}")]
+pub struct ParseError {
+    kind: &'static str,
+    message: String,
+}
+
+impl ParseError {
+    pub(crate) fn new(kind: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// Returns the stable type/category label associated with the failure.
+    pub fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    /// Returns the human-readable validation message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}

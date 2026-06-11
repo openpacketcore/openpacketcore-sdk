@@ -1,0 +1,32 @@
+[package]
+name = "opc-config-bus"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Atomic config snapshots, commit worker sequencing, and bounded subscriber fanout for OpenPacketCore"
+
+[dependencies]
+async-trait = { workspace = true }
+futures-util = "0.3"
+opc-alarm = { path = "../opc-alarm" }
+opc-config-model = { path = "../opc-config-model" }
+opc-crypto = { path = "../opc-crypto" }
+opc-key = { path = "../opc-key" }
+opc-types = { path = "../opc-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+opc-redaction = { path = "../opc-redaction" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

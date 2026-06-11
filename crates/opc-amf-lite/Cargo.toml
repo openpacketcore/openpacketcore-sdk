@@ -1,0 +1,45 @@
+[package]
+name = "opc-amf-lite"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Realistic AMF-lite control-plane vertical slice integration proving OpenPacketCore SDK seams"
+
+[dependencies]
+opc-alarm = { path = "../opc-alarm" }
+opc-config-bus = { path = "../opc-config-bus" }
+opc-config-model = { path = "../opc-config-model" }
+opc-runtime = { path = "../opc-runtime" }
+opc-session-store = { path = "../opc-session-store" }
+opc-types = { path = "../opc-types" }
+opc-nacm = { path = "../opc-nacm" }
+opc-persist = { path = "../opc-persist" }
+opc-key = { path = "../opc-key" }
+opc-crypto = { path = "../opc-crypto" }
+opc-redaction = { path = "../opc-redaction" }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time", "net"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+opc-security-testkit = { path = "../opc-security-testkit" }
+opc-session-testkit = { path = "../opc-session-testkit" }
+tempfile = "3"
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+{
+  "id": "nas-reg-request-v1",
+  "source": "synthetic-generator v0.2",
+  "standard_ref": "3GPP TS 24.501",
+  "release": "3GPP TS 24.501 R17",
+  "synthetic": true,
+  "sanitization": "none",
+  "expected_decode": "DecodeSuccess(RegistrationRequest)",
+  "requirements": ["REQ-3GPP-TS24501-R17-5.2-001"],
+  "notes": "Purely synthetic NAS registration request for unit tests"
+}

@@ -1,0 +1,24 @@
+[package]
+name = "opc-identity"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SPIFFE Workload Identity and SVID reload support for OpenPacketCore"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "net", "time", "rt", "io-util"] }
+tracing = { workspace = true }
+x509-parser = { workspace = true }
+rustls-pki-types = { workspace = true }
+rustls = { workspace = true }
+time = { workspace = true }
+opc-types = { path = "../opc-types" }
+
+[lints]
+workspace = true

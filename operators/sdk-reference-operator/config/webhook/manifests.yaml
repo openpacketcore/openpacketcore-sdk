@@ -1,0 +1,25 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: validating-webhook-configuration
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-reference-openpacketcore-io-v1beta1-sdkmanagednetworkfunction
+  failurePolicy: Fail
+  name: vsdkmanagednetworkfunction.reference.openpacketcore.io
+  rules:
+  - apiGroups:
+    - reference.openpacketcore.io
+    apiVersions:
+    - v1beta1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - sdkmanagednetworkfunctions
+  sideEffects: None

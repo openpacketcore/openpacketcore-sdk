@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.openpacketcore.dev/rfc006/v1/performance-baseline.schema.json",
+  "title": "OpenPacketCore RFC 006 performance baseline",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_at", "benchmark", "metrics"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "benchmark": {
+      "type": "string",
+      "minLength": 1
+    },
+    "metrics": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "unit", "value"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "unit": {
+            "type": "string",
+            "minLength": 1
+          },
+          "value": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "arch", "test_profile", "command", "timestamp"],
+      "properties": {
+        "os": {
+          "type": "string",
+          "minLength": 1
+        },
+        "arch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rust_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cpu_summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "test_profile": {
+          "type": "string",
+          "minLength": 1
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "regression_status": {
+      "type": "string",
+      "enum": ["pass", "fail", "regression"]
+    }
+  }
+}

@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.openpacketcore.dev/rfc006/v1/bundle-manifest.schema.json",
+  "title": "OpenPacketCore RFC 006 release evidence bundle manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sdk_version",
+    "git_commit",
+    "artifact_digests",
+    "file_digests",
+    "signing_identity",
+    "generation_tool",
+    "generation_tool_version",
+    "generation_timestamp",
+    "known_incomplete_sections"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "sdk_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "git_commit": {
+      "type": "string",
+      "minLength": 1
+    },
+    "artifact_digests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "digest"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "digest": {
+            "type": "string",
+            "format": "opc-sha256"
+          }
+        }
+      }
+    },
+    "file_digests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "digest"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "digest": {
+            "type": "string",
+            "format": "opc-sha256"
+          }
+        }
+      }
+    },
+    "signing_identity": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generation_tool": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generation_tool_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generation_timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "known_incomplete_sections": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    }
+  }
+}

@@ -1,0 +1,53 @@
+[package]
+name = "opc-persist"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ConfigStore trait and SQLite backend for OpenPacketCore persistence and audit"
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "net", "io-util", "rt"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+serde_json = { workspace = true }
+zeroize = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+x509-parser = { workspace = true }
+
+# SQLite with bundled static library (no system SQLite needed)
+rusqlite = { version = "0.32", features = ["bundled"] }
+rand = { workspace = true }
+
+# Shared types across the SDK
+opc-types = { path = "../opc-types" }
+opc-redaction = { path = "../opc-redaction" }
+opc-data-governance = { path = "../opc-data-governance" }
+opc-identity = { path = "../opc-identity" }
+opc-tls = { path = "../opc-tls" }
+opc-nacm = { path = "../opc-nacm" }
+opc-key = { path = "../opc-key" }
+opc-crypto = { path = "../opc-crypto" }
+
+[features]
+default = []
+dangerous-test-hooks = []
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process"] }
+rcgen = { workspace = true }
+opc-alarm = { path = "../opc-alarm" }

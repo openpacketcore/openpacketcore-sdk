@@ -1,0 +1,66 @@
+name: Release Validation
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  validate:
+    name: Validate release candidate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: operators/sdk-reference-operator/go.mod
+          cache-dependency-path: operators/sdk-reference-operator/go.sum
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Rust release gates
+        run: |
+          cargo fmt --all --check
+          git diff --check
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+          cargo test --locked --workspace --all-features --quiet -- --test-threads=4
+
+      - name: Run Go reference operator tests
+        working-directory: operators/sdk-reference-operator
+        env:
+          CGO_ENABLED: "0"
+        run: go test ./...
+
+      - name: Build release evidence
+        run: |
+          mkdir -p release-artifacts
+          cargo metadata --locked --format-version 1 > release-artifacts/cargo-metadata.json
+          kubectl kustomize operators/sdk-reference-operator/config/default > release-artifacts/sdk-reference-operator.yaml
+          git rev-parse HEAD > release-artifacts/git-revision.txt
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: openpacketcore-sdk-release-evidence
+          path: release-artifacts/

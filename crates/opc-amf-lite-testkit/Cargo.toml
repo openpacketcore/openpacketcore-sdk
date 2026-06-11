@@ -1,0 +1,27 @@
+[package]
+name = "opc-amf-lite-testkit"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Reusable test fixtures and builders for opc-amf-lite"
+
+[dependencies]
+opc-alarm = { path = "../opc-alarm" }
+opc-alarm-testkit = { path = "../opc-alarm-testkit" }
+opc-config-bus = { path = "../opc-config-bus" }
+opc-session-store = { path = "../opc-session-store" }
+opc-runtime = { path = "../opc-runtime" }
+opc-nacm = { path = "../opc-nacm" }
+opc-testbed = { path = "../opc-testbed" }
+opc-types = { path = "../opc-types" }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[lints]
+workspace = true

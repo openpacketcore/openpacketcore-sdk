@@ -1,0 +1,125 @@
+namespace: system
+
+namePrefix: sdk-reference-operator-
+
+resources:
+- ../crd
+- ../rbac
+- ../manager
+- ../webhook
+- ../certmanager
+
+# Inject CA certificate details into annotations and update references
+replacements:
+- source:
+    kind: Certificate
+    group: cert-manager.io
+    version: v1
+    name: serving-cert
+    fieldPath: metadata.namespace
+  targets:
+  - select:
+      kind: CustomResourceDefinition
+      name: sdkmanagednetworkfunctions.reference.openpacketcore.io
+    fieldPaths:
+    - metadata.annotations.[cert-manager.io/inject-ca-from]
+    options:
+      delimiter: '/'
+      index: 0
+      create: true
+  - select:
+      kind: ValidatingWebhookConfiguration
+      name: validating-webhook-configuration
+    fieldPaths:
+    - metadata.annotations.[cert-manager.io/inject-ca-from]
+    options:
+      delimiter: '/'
+      index: 0
+      create: true
+- source:
+    kind: Certificate
+    group: cert-manager.io
+    version: v1
+    name: serving-cert
+    fieldPath: metadata.name
+  targets:
+  - select:
+      kind: CustomResourceDefinition
+      name: sdkmanagednetworkfunctions.reference.openpacketcore.io
+    fieldPaths:
+    - metadata.annotations.[cert-manager.io/inject-ca-from]
+    options:
+      delimiter: '/'
+      index: 1
+      create: true
+  - select:
+      kind: ValidatingWebhookConfiguration
+      name: validating-webhook-configuration
+    fieldPaths:
+    - metadata.annotations.[cert-manager.io/inject-ca-from]
+    options:
+      delimiter: '/'
+      index: 1
+      create: true
+- source:
+    kind: Issuer
+    group: cert-manager.io
+    version: v1
+    name: selfsigned-issuer
+    fieldPath: metadata.name
+  targets:
+  - select:
+      kind: Certificate
+      name: serving-cert
+    fieldPaths:
+    - spec.issuerRef.name
+    options:
+      create: true
+- source:
+    kind: Service
+    version: v1
+    name: webhook-service
+    fieldPath: metadata.name
+  targets:
+  - select:
+      kind: CustomResourceDefinition
+      name: sdkmanagednetworkfunctions.reference.openpacketcore.io
+    fieldPaths:
+    - spec.conversion.webhook.clientConfig.service.name
+    options:
+      create: true
+  - select:
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: serving-cert
+    fieldPaths:
+    - spec.dnsNames.0
+    - spec.dnsNames.1
+    options:
+      delimiter: '.'
+      index: 0
+- source:
+    kind: Service
+    version: v1
+    name: webhook-service
+    fieldPath: metadata.namespace
+  targets:
+  - select:
+      kind: CustomResourceDefinition
+      name: sdkmanagednetworkfunctions.reference.openpacketcore.io
+    fieldPaths:
+    - spec.conversion.webhook.clientConfig.service.namespace
+    options:
+      create: true
+  - select:
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: serving-cert
+    fieldPaths:
+    - spec.dnsNames.0
+    - spec.dnsNames.1
+    options:
+      delimiter: '.'
+      index: 1

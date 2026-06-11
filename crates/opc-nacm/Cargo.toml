@@ -1,0 +1,16 @@
+[package]
+name = "opc-nacm"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Normalized YANG path parsing and NACM authorization evaluation for OpenPacketCore"
+
+[dependencies]
+thiserror = { workspace = true }
+opc-redaction = { path = "../opc-redaction" }
+
+[lints]
+workspace = true

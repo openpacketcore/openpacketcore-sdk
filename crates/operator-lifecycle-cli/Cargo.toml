@@ -1,0 +1,21 @@
+[package]
+name = "operator-lifecycle-cli"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "CLI interface exposing Rust SDK lifecycle contracts to Go controller-runtime operators via JSON"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+time = { workspace = true, features = ["serde"] }
+opc-alarm = { path = "../opc-alarm" }
+opc-types = { path = "../opc-types" }
+opc-node-resources = { path = "../opc-node-resources" }
+opc-runtime = { path = "../opc-runtime" }
+operator-lifecycle = { path = "../operator-lifecycle" }
+operator-controller = { path = "../operator-controller" }

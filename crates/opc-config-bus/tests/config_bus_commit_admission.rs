@@ -1,0 +1,428 @@
+#![allow(unused_imports)]
+use std::str::FromStr;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use time::OffsetDateTime;
+use tokio::{sync::Notify, time::timeout};
+
+use opc_alarm::{Alarm, AlarmState, ProbableCause, Severity, SharedAlarmManager};
+use opc_config_bus::{
+    ConfigBus, ConfigEvent, ConfigSnapshot, DriftState, ManagedDatastore, MockManagedDatastore,
+    StoreError, StoreErrorCode, StoredConfig, SubscriberLagPolicy,
+};
+use opc_config_model::{
+    CommitErrorCode, CommitMode, CommitRequest, ConfigError, ConfigOperation, IdempotencyKey,
+    OpcConfig, RequestId, RequestSource, RollbackTarget, TransportType, TrustedPrincipal,
+    ValidationContext, ValidationError, WorkloadIdentity, YangPath,
+};
+use opc_types::{ConfigVersion, SchemaDigest, TenantId, Timestamp};
+
+mod config_bus_common;
+use config_bus_common::*;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_load_does_not_wait_on_a_commit() {
+    let store = Arc::new(BlockingStore::new());
+    let bus = ConfigBus::new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
+        .await
+        .expect("startup succeeds");
+
+    let submit = {
+        let bus = bus.clone();
+        tokio::spawn(async move {
+            bus.submit(commit_request(
+                "next",
+                Instant::now() + Duration::from_secs(1),
+            ))
+            .await
+        })
+    };
+
+    store.wait_until_append_started().await;
+
+    let loaded = bus.load();
+    assert_eq!(loaded.name, "initial");
+    assert_eq!(bus.version(), ConfigVersion::INITIAL);
+
+    store.release();
+
+    let result = submit
+        .await
+        .expect("submit task completed")
+        .expect("commit succeeds");
+    assert_eq!(result.new_version, Some(ConfigVersion::new(1)));
+    assert_eq!(bus.load().name, "next");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_only_does_not_publish_or_notify() {
+    let store = Arc::new(MockManagedDatastore::new());
+    let bus = ConfigBus::new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
+        .await
+        .expect("startup succeeds");
+    let subscriber = bus.subscribe(SubscriberLagPolicy::DropOldest, 1);
+
+    let result = bus
+        .submit(CommitRequest::validate_only(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            TestConfig::new("validated-only"),
+            vec![changed_path()],
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .await
+        .expect("validate-only succeeds");
+
+    assert_eq!(result.status, opc_config_model::CommitStatus::Validated);
+    assert_eq!(bus.version(), ConfigVersion::INITIAL);
+    assert_eq!(bus.load().name, "initial");
+    assert_eq!(store.history().await.len(), 0);
+    assert!(timeout(Duration::from_millis(25), subscriber.recv())
+        .await
+        .is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_only_surfaces_diff_failures_without_publish() {
+    let store = Arc::new(MockManagedDatastore::new());
+    let bus = ConfigBus::new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
+        .await
+        .expect("startup succeeds");
+
+    let err = bus
+        .submit(CommitRequest::validate_only(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            TestConfig::with_diff_error("validated-only", "delta generation failed"),
+            vec![changed_path()],
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .await
+        .expect_err("validate-only should surface diff errors");
+
+    assert_eq!(err.code, CommitErrorCode::DiffFailed);
+    assert_eq!(bus.version(), ConfigVersion::INITIAL);
+    assert_eq!(bus.load().name, "initial");
+    assert_eq!(store.history().await.len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validation_failure_raises_warning_commit_alarm_and_success_clears_it() {
+    let store = Arc::new(MockManagedDatastore::new());
+    let alarms = SharedAlarmManager::default();
+    let bus = ConfigBus::new_with_alarm_manager_dev_only(
+        TestConfig::new("initial"),
+        Arc::clone(&store),
+        alarms.clone(),
+    )
+    .await
+    .expect("startup succeeds");
+
+    let err = bus
+        .submit(CommitRequest::validate_only(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            TestConfig::new(""),
+            vec![changed_path()],
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .await
+        .expect_err("invalid candidate should fail validation");
+
+    assert_eq!(err.code, CommitErrorCode::SyntaxValidationFailed);
+    let alarm = single_active_alarm(&alarms, "config-bus.commit.failure");
+    assert_eq!(alarm.severity, Severity::Warning);
+    assert_eq!(alarm.probable_cause, ProbableCause::ConfigApplyFailed);
+    assert_eq!(
+        alarm.text.as_str(),
+        "Config bus commit failure: syntax_validation_failed"
+    );
+    assert_alarm_details_code(&alarm, "syntax_validation_failed");
+
+    bus.submit(commit_request(
+        "next",
+        Instant::now() + Duration::from_secs(1),
+    ))
+    .await
+    .expect("subsequent valid commit succeeds");
+
+    assert_eq!(alarms.active_count(), 0);
+    assert_eq!(
+        alarms
+            .all_alarms()
+            .iter()
+            .map(|alarm| alarm.state)
+            .collect::<Vec<_>>(),
+        vec![AlarmState::Raised, AlarmState::Cleared]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_only_success_clears_config_apply_commit_alarm() {
+    let store = Arc::new(MockManagedDatastore::new());
+    let alarms = SharedAlarmManager::default();
+    let bus = ConfigBus::new_with_alarm_manager_dev_only(
+        TestConfig::new("initial"),
+        Arc::clone(&store),
+        alarms.clone(),
+    )
+    .await
+    .expect("startup succeeds");
+
+    let err = bus
+        .submit(CommitRequest::validate_only(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            TestConfig::new(""),
+            vec![changed_path()],
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .await
+        .expect_err("invalid validate-only request should fail validation");
+
+    assert_eq!(err.code, CommitErrorCode::SyntaxValidationFailed);
+    let alarm = single_active_alarm(&alarms, "config-bus.commit.failure");
+    assert_eq!(alarm.severity, Severity::Warning);
+    assert_eq!(alarm.probable_cause, ProbableCause::ConfigApplyFailed);
+    assert_alarm_details_code(&alarm, "syntax_validation_failed");
+
+    let result = bus
+        .submit(CommitRequest::validate_only(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            TestConfig::new("validated-only"),
+            vec![changed_path()],
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .await
+        .expect("successful validate-only retry should clear validation alarm");
+
+    assert_eq!(result.status, opc_config_model::CommitStatus::Validated);
+    assert_eq!(alarms.active_count(), 0);
+    assert_eq!(
+        alarms
+            .all_alarms()
+            .iter()
+            .map(|alarm| alarm.state)
+            .collect::<Vec<_>>(),
+        vec![AlarmState::Raised, AlarmState::Cleared]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistence_failure_raises_major_storage_commit_alarm() {
+    let alarms = SharedAlarmManager::default();
+    let bus = ConfigBus::new_with_alarm_manager_dev_only(
+        TestConfig::new("initial"),
+        ErrorStore::append_fails("dsn=postgres://user:secret@db/internal"),
+        alarms.clone(),
+    )
+    .await
+    .expect("startup succeeds");
+
+    let err = bus
+        .submit(commit_request(
+            "next",
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .await
+        .expect_err("append failure should fail commit");
+
+    assert_eq!(err.code, CommitErrorCode::PersistFailed);
+    let alarm = single_active_alarm(&alarms, "config-bus.commit.failure");
+    assert_eq!(alarm.severity, Severity::Major);
+    assert_eq!(alarm.probable_cause, ProbableCause::StorageCorruption);
+    assert_eq!(
+        alarm.text.as_str(),
+        "Config bus commit failure: persist_failed"
+    );
+    assert!(!serde_json::to_string(&alarms.all_alarms())
+        .expect("alarm history serializes")
+        .contains("secret"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_only_success_does_not_clear_active_commit_path_alarm() {
+    let alarms = SharedAlarmManager::default();
+    let bus = ConfigBus::new_with_alarm_manager_dev_only(
+        TestConfig::new("initial"),
+        ErrorStore::append_fails("storage remains unavailable"),
+        alarms.clone(),
+    )
+    .await
+    .expect("startup succeeds");
+
+    bus.submit(commit_request(
+        "commit-fails",
+        Instant::now() + Duration::from_secs(1),
+    ))
+    .await
+    .expect_err("append failure should raise a commit-path alarm");
+    let original_alarm = single_active_alarm(&alarms, "config-bus.commit.failure");
+    assert_eq!(
+        original_alarm.text.as_str(),
+        "Config bus commit failure: persist_failed"
+    );
+
+    let validated = bus
+        .submit(CommitRequest::validate_only(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            TestConfig::new("validated-only"),
+            vec![changed_path()],
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .await
+        .expect("validate-only should not exercise persistence");
+
+    assert_eq!(validated.status, opc_config_model::CommitStatus::Validated);
+    let still_active = single_active_alarm(&alarms, "config-bus.commit.failure");
+    assert_eq!(still_active.alarm_id, original_alarm.alarm_id);
+    assert_eq!(still_active.text.as_str(), original_alarm.text.as_str());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_full_rejection_raises_warning_commit_alarm() {
+    let store = Arc::new(BlockingStore::new());
+    let alarms = SharedAlarmManager::default();
+    let bus = ConfigBus::with_queue_capacity_and_alarm_manager_dev_only(
+        TestConfig::new("initial"),
+        Arc::clone(&store),
+        1,
+        alarms.clone(),
+    )
+    .await
+    .expect("startup succeeds");
+
+    let first = {
+        let bus = bus.clone();
+        tokio::spawn(async move {
+            bus.submit(commit_request(
+                "first",
+                Instant::now() + Duration::from_secs(5),
+            ))
+            .await
+        })
+    };
+    store.wait_until_append_started().await;
+
+    let mut second = {
+        let bus = bus.clone();
+        tokio::spawn(async move {
+            bus.submit(commit_request(
+                "second",
+                Instant::now() + Duration::from_secs(5),
+            ))
+            .await
+        })
+    };
+    let mut third = {
+        let bus = bus.clone();
+        tokio::spawn(async move {
+            bus.submit(commit_request(
+                "third",
+                Instant::now() + Duration::from_secs(5),
+            ))
+            .await
+        })
+    };
+
+    let second_rejected;
+    let err = tokio::select! {
+        result = &mut second => {
+            second_rejected = true;
+            result
+                .expect("second submit task completed")
+                .expect_err("one queued request should be rejected")
+        }
+        result = &mut third => {
+            second_rejected = false;
+            result
+                .expect("third submit task completed")
+                .expect_err("one queued request should be rejected")
+        }
+        _ = tokio::time::sleep(Duration::from_millis(100)) => {
+            panic!("full commit queue did not reject a concurrent submission");
+        }
+    };
+
+    assert_eq!(err.code, CommitErrorCode::AdmissionRejected);
+    let alarm = single_active_alarm(&alarms, "config-bus.commit.failure");
+    assert_eq!(alarm.severity, Severity::Warning);
+    assert_eq!(alarm.probable_cause, ProbableCause::ConfigApplyFailed);
+    assert_alarm_details_code(&alarm, "admission_rejected");
+
+    store.release();
+
+    let first_result = first
+        .await
+        .expect("first submit task completed")
+        .expect("first commit succeeds");
+    assert_eq!(first_result.new_version, Some(ConfigVersion::new(1)));
+
+    let queued_result = if second_rejected {
+        third
+            .await
+            .expect("third submit task completed")
+            .expect("queued commit succeeds")
+    } else {
+        second
+            .await
+            .expect("second submit task completed")
+            .expect("queued commit succeeds")
+    };
+    assert_eq!(queued_result.new_version, Some(ConfigVersion::new(2)));
+    assert_eq!(alarms.active_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_only_rejects_unsupported_operations() {
+    let store = Arc::new(MockManagedDatastore::new());
+    let bus = ConfigBus::new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
+        .await
+        .expect("startup succeeds");
+
+    let err = bus
+        .submit(CommitRequest::validate_only(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Delete,
+            TestConfig::new("validated-only"),
+            vec![changed_path()],
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .await
+        .expect_err("unsupported validate-only operation should be rejected");
+
+    assert_eq!(err.code, CommitErrorCode::AdmissionRejected);
+    assert_eq!(
+        err.message,
+        "validate-only only supports replace operations in this skeleton config bus"
+    );
+    assert_eq!(store.history().await.len(), 0);
+}

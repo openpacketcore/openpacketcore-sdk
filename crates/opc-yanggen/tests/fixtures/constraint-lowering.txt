@@ -1,0 +1,3 @@
+raw: current()/enabled = true
+lowered: current()/enabled = true
+source: upf-slice.yang:20:7

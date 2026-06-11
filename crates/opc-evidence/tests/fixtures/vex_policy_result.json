@@ -1,0 +1,8 @@
+{
+  "schema_version": "1.0.0",
+  "generated_at": "2026-05-27T17:25:13Z",
+  "vulnerability_id": "CVE-2026-12345",
+  "decision": "not_affected",
+  "justification": "Affected code path is not compiled into the carrier profile.",
+  "action": "Continue release gating with documented evidence bundle."
+}

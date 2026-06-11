@@ -1,0 +1,15 @@
+[package]
+name = "opc-data-governance"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Data classification taxonomy and identifier types for OpenPacketCore privacy governance"
+
+[dependencies]
+serde = { workspace = true }
+
+[lints]
+workspace = true

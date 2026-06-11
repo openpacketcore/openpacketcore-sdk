@@ -1,0 +1,51 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - reference.openpacketcore.io
+  resources:
+  - sdkmanagednetworkfunctions
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - reference.openpacketcore.io
+  resources:
+  - sdkmanagednetworkfunctions/status
+  verbs:
+  - get
+  - update
+  - patch
+- apiGroups:
+  - reference.openpacketcore.io
+  resources:
+  - sdkmanagednetworkfunctions/finalizers
+  verbs:
+  - update

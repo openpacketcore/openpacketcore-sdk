@@ -1,0 +1,27 @@
+[package]
+name = "opc-evidence"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Conformance evidence, gap tracking, and release-gate logic for OpenPacketCore"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+time = { workspace = true, features = ["formatting", "parsing", "serde"] }
+once_cell = "1.21"
+serde_json = { workspace = true }
+num_cpus = { workspace = true }
+opc-data-governance = { path = "../opc-data-governance" }
+
+[dev-dependencies]
+serde_json = "1.0"
+opc-schema-validate = { path = "../opc-schema-validate" }
+tempfile = "3"
+
+[lints]
+workspace = true

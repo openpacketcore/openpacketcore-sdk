@@ -1,0 +1,13 @@
+{
+  "id": "GAP-000123",
+  "title": "GTP-U extension headers not fully decoded",
+  "status": "open",
+  "severity": "medium",
+  "applies_to": ["REQ-3GPP-TS29281-R18-5.2-004"],
+  "owner": "opc-proto-gtp",
+  "created": "2026-05-19",
+  "target_release": "0.3.0",
+  "mitigation": "Reject unsupported extension headers in strict mode.",
+  "security_impact": "Low if strict mode is enabled.",
+  "performance_impact": "None."
+}

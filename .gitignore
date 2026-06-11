@@ -1,0 +1,72 @@
+# Rust build output
+/target/
+**/target/
+# Keep Cargo.lock tracked for reproducible workspace/CNF builds.
+
+# Rust tool and coverage output
+*.profraw
+*.profdata
+coverage/
+tarpaulin-report.html
+lcov.info
+criterion/
+flamegraph.svg
+perf.data
+perf.data.old
+*.rs.bk
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+!fixtures/**/*.pem
+!fixtures/**/*.crt
+!tests/fixtures/**/*.pem
+!tests/fixtures/**/*.crt
+
+# Logs and runtime state
+*.log
+logs/
+tmp/
+temp/
+.cache/
+
+# Editor, IDE, and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local scratch
+scratch/
+_scratch/
+
+# Generated reports and evidence drafts
+coverage-report/
+conformance-report.json
+conformance-report.md
+evidence-bundle/
+evidence-bundle.tar.gz
+evidence-bundle.tar.gz.sig
+performance-baseline.json
+vulnerability-report.json
+sbom*.json
+*.cdx.json
+
+# Local test artifacts
+junit.xml
+test-results/
+playwright-report/
+**/fuzz/artifacts/
+
+# Generated docs site
+book/

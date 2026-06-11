@@ -1,0 +1,20 @@
+[package]
+name = "opc-redaction"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Redaction levels, keyed digests, and safe rendering for OpenPacketCore sensitive data"
+
+[dependencies]
+opc-data-governance = { path = "../opc-data-governance" }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true

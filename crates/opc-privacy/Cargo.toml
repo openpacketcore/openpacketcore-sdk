@@ -1,0 +1,20 @@
+[package]
+name = "opc-privacy"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Privacy minimization and k-anonymity utilities for OpenPacketCore analytics"
+
+[dependencies]
+opc-data-governance = { path = "../opc-data-governance" }
+opc-redaction = { path = "../opc-redaction" }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

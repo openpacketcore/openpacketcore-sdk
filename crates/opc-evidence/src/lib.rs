@@ -1,0 +1,49 @@
+//! Conformance evidence, gap tracking, and release-gate logic for OpenPacketCore.
+//!
+//! Implements the RFC 006 evidence pipeline: SBOM generation, VEX scanning,
+//! bundle signing, and gate policy enforcement.
+
+pub mod bundle;
+pub mod data_governance;
+pub mod error;
+pub mod evidence;
+pub mod extract;
+pub mod gap;
+pub mod manifest;
+pub mod performance;
+pub mod policy;
+pub mod provenance;
+pub mod requirement;
+pub mod sbom;
+pub mod status;
+pub mod tag;
+pub mod vex;
+
+pub use bundle::{
+    manifest_signing_bytes, verify_bundle, BundleSigner, BundleVerifier, EvidenceBundle,
+    MockSigner, MockVerifier,
+};
+pub use data_governance::DataGovernanceEvidenceReport;
+pub use error::EvidenceError;
+pub use evidence::EvidenceRecord;
+pub use extract::{scan_directory, scan_file, ExtractedTag, ExtractionError};
+pub use gap::{validate_status_for_gaps, Gap, GapError, GapOptions, GapSeverity, GapStatus};
+pub use manifest::{compute_digest, Manifest, ManifestEntry};
+pub use performance::{
+    capture_environment, evaluate_threshold, redact_secrets_and_paths, EnvironmentMetadata,
+    PerformanceBaseline, PerformanceMetric, RegressionStatus,
+};
+pub use policy::{GateEvaluator, GatePolicy, PolicyMode};
+pub use provenance::{
+    generate_provenance, BuildMetadata, BuilderIdentity, InvocationDetails, InvocationEnvironment,
+    ProvenanceDigest, ProvenanceMaterial, ProvenancePredicate, ProvenanceStatement,
+    ProvenanceSubject,
+};
+pub use requirement::RequirementId;
+pub use sbom::{
+    generate_sbom, generate_sbom_at, Sbom, SbomComponent, SbomDependency, SbomHash, SbomLicense,
+    SbomLicenseChoice, SbomMetadata,
+};
+pub use status::{calculate_status, ConformanceStatus, StatusInputs};
+pub use tag::{parse_tags, ConformanceTag};
+pub use vex::{validate_vex_record, VexDecision, VexPolicyResult, VexRecord};

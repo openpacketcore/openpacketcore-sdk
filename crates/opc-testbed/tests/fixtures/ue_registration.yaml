@@ -1,0 +1,27 @@
+# Canonical example from RFC 012
+id: AMF-REG-001
+title: UE registration success
+schema_version: "0.1.0"
+requirements:
+  - REQ-3GPP-TS23502-R17-4.2.2-001
+topology:
+  nfs:
+    amf: { image: opc-amf:test }
+    nrf: { simulator: nrf-basic }
+    ausf: { simulator: ausf-5g-aka }
+    udm: { simulator: udm-auth-sdm }
+steps:
+  - kind: send_ngap
+    from: gnb-1
+    to: amf
+    message: InitialUEMessage.registration_request
+  - kind: expect_sbi
+    from: amf
+    to: ausf
+    operation: Nausf_UEAuthentication.Authenticate
+  - kind: expect_ngap
+    from: amf
+    to: gnb-1
+    message: InitialContextSetupRequest
+assertions:
+  - expr: amf.ue_context.state == REGISTERED

@@ -1,0 +1,414 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.openpacketcore.dev/rfc012/v1/scenario.schema.json",
+  "title": "OpenPacketCore RFC 012 scenario DSL",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "title", "schema_version", "topology", "steps"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "0.1.0"
+    },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "opc-requirement-id"
+      }
+    },
+    "seed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nfs"],
+      "properties": {
+        "nfs": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "image": {
+                "type": "string",
+                "minLength": 1
+              },
+              "simulator": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "anyOf": [
+              {
+                "required": ["image"]
+              },
+              {
+                "required": ["simulator"]
+              }
+            ]
+          }
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "from", "to", "message"],
+            "properties": {
+              "kind": {
+                "const": "send_ngap"
+              },
+              "from": {
+                "type": "string",
+                "minLength": 1
+              },
+              "to": {
+                "type": "string",
+                "minLength": 1
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "from", "to", "operation"],
+            "properties": {
+              "kind": {
+                "const": "expect_sbi"
+              },
+              "from": {
+                "type": "string",
+                "minLength": 1
+              },
+              "to": {
+                "type": "string",
+                "minLength": 1
+              },
+              "operation": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "from", "to", "message"],
+            "properties": {
+              "kind": {
+                "const": "expect_ngap"
+              },
+              "from": {
+                "type": "string",
+                "minLength": 1
+              },
+              "to": {
+                "type": "string",
+                "minLength": 1
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["send_ngap"],
+            "properties": {
+              "send_ngap": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["from", "to", "message"],
+                "properties": {
+                  "from": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "to": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "message": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["expect_sbi"],
+            "properties": {
+              "expect_sbi": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["from", "to", "operation"],
+                "properties": {
+                  "from": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "to": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "operation": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["expect_ngap"],
+            "properties": {
+              "expect_ngap": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["from", "to", "message"],
+                "properties": {
+                  "from": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "to": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "message": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "target"],
+            "properties": {
+              "kind": { "const": "peer_unavailable" },
+              "target": { "type": "string", "minLength": 1 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["peer_unavailable"],
+            "properties": {
+              "peer_unavailable": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["target"],
+                "properties": {
+                  "target": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "target", "delay_ms"],
+            "properties": {
+              "kind": { "const": "delayed_response" },
+              "target": { "type": "string", "minLength": 1 },
+              "delay_ms": { "type": "integer", "minimum": 0 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["delayed_response"],
+            "properties": {
+              "delayed_response": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["target", "delay_ms"],
+                "properties": {
+                  "target": { "type": "string", "minLength": 1 },
+                  "delay_ms": { "type": "integer", "minimum": 0 }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "target"],
+            "properties": {
+              "kind": { "const": "malformed_response" },
+              "target": { "type": "string", "minLength": 1 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["malformed_response"],
+            "properties": {
+              "malformed_response": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["target"],
+                "properties": {
+                  "target": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "target"],
+            "properties": {
+              "kind": { "const": "dependency_timeout" },
+              "target": { "type": "string", "minLength": 1 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["dependency_timeout"],
+            "properties": {
+              "dependency_timeout": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["target"],
+                "properties": {
+                  "target": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "duration_ms"],
+            "properties": {
+              "kind": { "const": "clock_jump" },
+              "duration_ms": { "type": "integer", "minimum": 0 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["clock_jump"],
+            "properties": {
+              "clock_jump": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["duration_ms"],
+                "properties": {
+                  "duration_ms": { "type": "integer", "minimum": 0 }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "target"],
+            "properties": {
+              "kind": { "const": "process_restart" },
+              "target": { "type": "string", "minLength": 1 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["process_restart"],
+            "properties": {
+              "process_restart": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["target"],
+                "properties": {
+                  "target": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "node_a", "node_b"],
+            "properties": {
+              "kind": { "const": "network_partition" },
+              "node_a": { "type": "string", "minLength": 1 },
+              "node_b": { "type": "string", "minLength": 1 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["network_partition"],
+            "properties": {
+              "network_partition": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["node_a", "node_b"],
+                "properties": {
+                  "node_a": { "type": "string", "minLength": 1 },
+                  "node_b": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "assertions": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["expr"],
+            "properties": {
+              "expr": {
+                "type": "string",
+                "minLength": 1
+              },
+              "order_independent": {
+                "type": "boolean"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

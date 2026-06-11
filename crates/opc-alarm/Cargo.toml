@@ -1,0 +1,36 @@
+[package]
+name = "opc-alarm"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenPacketCore alarm model, severity taxonomy, dedup/update/clear manager, and in-memory store"
+
+[features]
+default = []
+nacm = ["dep:opc-nacm"]
+persist = ["dep:opc-persist"]
+persist-test-hooks = ["persist", "opc-persist/dangerous-test-hooks"]
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+time = { workspace = true, features = ["serde"] }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+opc-nacm = { path = "../opc-nacm", optional = true }
+opc-persist = { path = "../opc-persist", optional = true }
+opc-redaction = { path = "../opc-redaction" }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

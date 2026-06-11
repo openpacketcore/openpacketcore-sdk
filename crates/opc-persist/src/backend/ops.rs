@@ -1,0 +1,675 @@
+use async_trait::async_trait;
+use rusqlite::{params, OptionalExtension};
+use std::str::FromStr;
+use std::sync::Arc;
+use tracing::debug;
+
+use opc_types::{ConfigVersion, SchemaDigest, Timestamp, TxId};
+
+use crate::error::PersistError;
+use crate::preflight::PersistCapabilities;
+use crate::types::{
+    AlarmAuditEventRecord, AuditKey, AuditOpType, AuditRecord, CommitRecord, CommitSource,
+    ConfigStore, RollbackTarget, StoredConfig,
+};
+
+use super::{
+    deserialize_audit_op_type, deserialize_commit_source, uuid_from_bytes, validate_uuid_bytes,
+    SqliteBackend, StoredConfigRow,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ConfigStore implementation
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl ConfigStore for SqliteBackend {
+    async fn load_latest(&self) -> Result<Option<StoredConfig>, PersistError> {
+        let conn = Arc::clone(&self.conn);
+        let guard = conn.lock_owned().await;
+        let res = Self::load_latest_impl(&guard, self.audit_key.as_ref());
+        if res.is_ok() {
+            opc_redaction::metrics::METRICS
+                .persist_read_success
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            opc_redaction::metrics::METRICS
+                .persist_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    }
+
+    async fn load_rollback(&self, target: RollbackTarget) -> Result<StoredConfig, PersistError> {
+        let conn = Arc::clone(&self.conn);
+        let guard = conn.lock_owned().await;
+        let res = Self::load_rollback_impl(&guard, &target, self.audit_key.as_ref());
+        if res.is_ok() {
+            opc_redaction::metrics::METRICS
+                .persist_read_success
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            opc_redaction::metrics::METRICS
+                .persist_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    }
+
+    async fn append_commit(
+        &self,
+        record: CommitRecord,
+        audit: Vec<AuditRecord>,
+    ) -> Result<(), PersistError> {
+        let conn = Arc::clone(&self.conn);
+        let guard = conn.lock_owned().await;
+        let res = Self::append_commit_impl(&guard, record, audit, self.audit_key.as_ref());
+        if res.is_ok() {
+            opc_redaction::metrics::METRICS
+                .persist_write_success
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            opc_redaction::metrics::METRICS
+                .persist_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    }
+
+    async fn mark_confirmed(&self, tx_id: TxId) -> Result<(), PersistError> {
+        let conn = Arc::clone(&self.conn);
+        let guard = conn.lock_owned().await;
+        let tx_id_bytes = tx_id.as_uuid().as_bytes().to_vec();
+        let now = Timestamp::now_utc().to_string();
+
+        let res = (|| -> Result<(), PersistError> {
+            let rows = guard
+                .execute(
+                    "UPDATE config_history SET confirmed_at = ?1 WHERE tx_id = ?2",
+                    params![now, &tx_id_bytes],
+                )
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+            if rows == 0 {
+                return Err(PersistError::rollback_not_found());
+            }
+            debug!(tx_id = %tx_id, "commit marked confirmed");
+            Ok(())
+        })();
+
+        if res.is_ok() {
+            opc_redaction::metrics::METRICS
+                .persist_write_success
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            opc_redaction::metrics::METRICS
+                .persist_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    }
+
+    async fn create_rollback_point(
+        &self,
+        tx_id: TxId,
+        label: Option<String>,
+    ) -> Result<(), PersistError> {
+        let conn = Arc::clone(&self.conn);
+        let guard = conn.lock_owned().await;
+        let tx_id_bytes = tx_id.as_uuid().as_bytes().to_vec();
+
+        let res = (|| -> Result<(), PersistError> {
+            guard
+                .execute(
+                    "UPDATE config_history SET rollback_point = 1 WHERE tx_id = ?1",
+                    params![&tx_id_bytes],
+                )
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+            if let Some(lbl) = &label {
+                guard
+                    .execute(
+                        "INSERT OR REPLACE INTO rollback_labels (label, tx_id, created_at) VALUES (?1, ?2, ?3)",
+                        params![lbl, &tx_id_bytes, Timestamp::now_utc().to_string()],
+                    )
+                    .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            }
+
+            debug!(tx_id = %tx_id, label = ?label, "rollback point created");
+            Ok(())
+        })();
+
+        if res.is_ok() {
+            opc_redaction::metrics::METRICS
+                .persist_write_success
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            opc_redaction::metrics::METRICS
+                .persist_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    }
+
+    async fn preflight(&self) -> Result<PersistCapabilities, PersistError> {
+        if let Some(caps) = self.cached_caps.get() {
+            return Ok(caps.clone());
+        }
+
+        let caps = Self::run_preflight(&self.db_path, self.ephemeral, self.min_free_bytes).await?;
+        // Best-effort cache; OnceLock may already be set by open().
+        let _ = self.cached_caps.set(caps.clone());
+        Ok(caps)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Synchronous helper implementations
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl SqliteBackend {
+    /// Verify an already-loaded audit chain using this backend's audit key.
+    pub fn verify_audit_chain(&self, stored: &StoredConfig) -> Result<(), PersistError> {
+        let res = stored.verify_audit_chain(self.audit_key.as_ref());
+        if res.is_ok() {
+            opc_redaction::metrics::METRICS
+                .persist_audit_chain_verification_success
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            opc_redaction::metrics::METRICS
+                .persist_audit_chain_verification_failure
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    }
+
+    /// Load the most recent configuration (confirmed or pending).
+    fn load_latest_impl(
+        conn: &rusqlite::Connection,
+        audit_key: &AuditKey,
+    ) -> Result<Option<StoredConfig>, PersistError> {
+        // Find the highest version (absolute latest)
+        let tx_id_bytes: Option<Vec<u8>> = conn
+            .query_row(
+                r#"
+                SELECT tx_id FROM config_history
+                ORDER BY version DESC
+                LIMIT 1
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+        let Some(tx_id_bytes) = tx_id_bytes else {
+            return Ok(None);
+        };
+
+        Self::load_by_tx_id_bytes(conn, &tx_id_bytes, audit_key)
+    }
+
+    /// Load a rollback target.
+    fn load_rollback_impl(
+        conn: &rusqlite::Connection,
+        target: &RollbackTarget,
+        audit_key: &AuditKey,
+    ) -> Result<StoredConfig, PersistError> {
+        let tx_id_bytes = match target {
+            RollbackTarget::Previous => {
+                // Find the parent_tx_id of the newest confirmed/non-pending commit,
+                // then load that parent record — not the newest row itself.
+                let parent_bytes: Option<Vec<u8>> = conn
+                    .query_row(
+                        r#"
+                        SELECT parent_tx_id FROM config_history
+                        WHERE (confirmed_at IS NOT NULL OR confirmed_deadline IS NULL)
+                          AND parent_tx_id IS NOT NULL
+                        ORDER BY version DESC
+                        LIMIT 1
+                        "#,
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| PersistError::sqlite(e.to_string()))?;
+                parent_bytes
+            }
+            RollbackTarget::ByTxId(tx_id) => Some(tx_id.as_uuid().as_bytes().to_vec()),
+            RollbackTarget::ByVersion(version) => conn
+                .query_row(
+                    "SELECT tx_id FROM config_history WHERE version = ?1",
+                    [version.get() as i64],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .map_err(|e| PersistError::sqlite(e.to_string()))?,
+            RollbackTarget::ByLabel(label) => conn
+                .query_row(
+                    "SELECT tx_id FROM rollback_labels WHERE label = ?1",
+                    [label],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .map_err(|e| PersistError::sqlite(e.to_string()))?,
+        };
+
+        let Some(bytes) = tx_id_bytes else {
+            return Err(PersistError::rollback_not_found());
+        };
+
+        // Reject if target is a pending commit
+        let is_pending: bool = conn
+            .query_row(
+                "SELECT 1 FROM config_history WHERE tx_id = ?1 AND confirmed_deadline IS NOT NULL AND confirmed_at IS NULL",
+                [&bytes],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|e| PersistError::sqlite(e.to_string()))?
+            .unwrap_or(false);
+        if is_pending {
+            return Err(PersistError::rollback_not_found());
+        }
+
+        Self::load_by_tx_id_bytes(conn, &bytes, audit_key)?
+            .ok_or_else(PersistError::rollback_not_found)
+    }
+
+    /// Append a commit record and its audit trail atomically.
+    pub(crate) fn append_commit_raw(
+        conn: &rusqlite::Connection,
+        record: CommitRecord,
+        audit: Vec<AuditRecord>,
+        audit_key: &AuditKey,
+    ) -> Result<(), PersistError> {
+        // Insert commit record
+        let tx_id_bytes = record.tx_id.as_uuid().as_bytes().to_vec();
+        let parent_tx_id_bytes = record.parent_tx_id.map(|t| t.as_uuid().as_bytes().to_vec());
+
+        let source_str = match record.source {
+            CommitSource::Gnmi => "gnmi",
+            CommitSource::Netconf => "netconf",
+            CommitSource::LocalOperator => "local_operator",
+            CommitSource::StartupRestore => "startup_restore",
+            CommitSource::Rollback => "rollback",
+            CommitSource::CommitConfirmedRestore => "commit_confirmed_restore",
+        };
+
+        conn.execute(
+            r#"
+            INSERT INTO config_history
+                (tx_id, parent_tx_id, version, committed_at, principal, source,
+                 schema_digest, plaintext_digest, encrypted_blob, rollback_point,
+                 confirmed_deadline)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "#,
+            params![
+                &tx_id_bytes,
+                parent_tx_id_bytes.as_deref(),
+                record.version.get() as i64,
+                record.committed_at.to_string(),
+                &record.principal,
+                source_str,
+                record.schema_digest.as_bytes(),
+                &record.plaintext_digest,
+                &record.encrypted_blob,
+                record.rollback_point as i32,
+                record.confirmed_deadline.map(|t| t.to_string()),
+            ],
+        )
+        .map_err(PersistError::from)?;
+
+        let tenant = crate::types::extract_tenant(&record.principal);
+        let mut prev_hash = [0u8; 32];
+        let mut audit = audit;
+
+        // Insert audit records
+        for entry in &mut audit {
+            crate::types::redact_entry(
+                &entry.yang_path,
+                &mut entry.previous_value,
+                &mut entry.redaction_applied,
+            );
+            crate::types::redact_entry(
+                &entry.yang_path,
+                &mut entry.new_value,
+                &mut entry.redaction_applied,
+            );
+
+            entry.previous_hash = prev_hash;
+            entry.entry_hmac = entry.calculate_hmac(audit_key, &tenant);
+            prev_hash = entry.entry_hmac;
+
+            let op_type_str = match entry.op_type {
+                AuditOpType::Create => "CREATE",
+                AuditOpType::Update => "UPDATE",
+                AuditOpType::Replace => "REPLACE",
+                AuditOpType::Delete => "DELETE",
+            };
+
+            conn.execute(
+                r#"
+                INSERT INTO audit_trail
+                    (tx_id, sequence, yang_path, op_type, previous_value, new_value,
+                     redaction_applied, previous_hash, entry_hmac)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+                params![
+                    &tx_id_bytes,
+                    entry.sequence as i32,
+                    &entry.yang_path,
+                    op_type_str,
+                    &entry.previous_value,
+                    &entry.new_value,
+                    entry.redaction_applied as i32,
+                    &entry.previous_hash[..],
+                    &entry.entry_hmac[..],
+                ],
+            )
+            .map_err(PersistError::from)?;
+        }
+        Ok(())
+    }
+
+    fn append_commit_impl(
+        conn: &rusqlite::Connection,
+        record: CommitRecord,
+        audit: Vec<AuditRecord>,
+        audit_key: &AuditKey,
+    ) -> Result<(), PersistError> {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+        Self::append_commit_raw(&tx, record.clone(), audit, audit_key)?;
+
+        tx.commit()
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    fn load_by_tx_id_bytes(
+        conn: &rusqlite::Connection,
+        tx_id_bytes: &[u8],
+        audit_key: &AuditKey,
+    ) -> Result<Option<StoredConfig>, PersistError> {
+        // Load raw column values first; do validation after so we can fail closed
+        // on corrupt data rather than silently coercing.
+        let (
+            tx_id_out,
+            parent_tx_id_out,
+            version,
+            committed_at_str,
+            principal,
+            source_str,
+            schema_digest_bytes,
+            plaintext_digest,
+            encrypted_blob,
+            rollback_point,
+            _rollback_label,
+            confirmed_deadline_str,
+            confirmed_at,
+        ): StoredConfigRow = match conn.query_row(
+            r#"
+            SELECT tx_id, parent_tx_id, version, committed_at, principal, source,
+                   schema_digest, plaintext_digest, encrypted_blob, rollback_point,
+                   rollback_label, confirmed_deadline, confirmed_at
+            FROM config_history
+            WHERE tx_id = ?1
+            "#,
+            [tx_id_bytes],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, i32>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                ))
+            },
+        ) {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(PersistError::sqlite(e.to_string())),
+        };
+
+        // Fail closed: validate fixed-size fields
+        if tx_id_out.len() != 16 {
+            return Err(PersistError::corrupt_blob());
+        }
+        if schema_digest_bytes.len() != 32 {
+            return Err(PersistError::corrupt_blob());
+        }
+
+        // Fail closed: validate timestamp
+        let committed_at = Timestamp::from_str(&committed_at_str)
+            .map_err(|_| PersistError::inconsistent_state("corrupt timestamp in config_history"))?;
+
+        // Fail closed: validate CommitSource
+        let source = deserialize_commit_source(&source_str)?;
+
+        // Fail closed: validate parent_tx_id length (must be exactly 16 bytes if present)
+        let parent_tx_id = match parent_tx_id_out {
+            Some(ref b) => {
+                validate_uuid_bytes("parent_tx_id", b)?;
+                Some(TxId::from_uuid(uuid_from_bytes(b)))
+            }
+            None => None,
+        };
+
+        // Fail closed: validate version is non-negative and fits in u64
+        let version = if version < 0 {
+            return Err(PersistError::inconsistent_state(
+                "negative version in config_history",
+            ));
+        } else {
+            ConfigVersion::new(version as u64)
+        };
+
+        // Fail closed: confirmed_deadline must be parseable if present
+        let mut confirmed_deadline = match confirmed_deadline_str {
+            Some(s) => Some(Timestamp::from_str(&s).map_err(|_| {
+                PersistError::inconsistent_state("corrupt confirmed_deadline in config_history")
+            })?),
+            None => None,
+        };
+        let confirmed_at = match confirmed_at {
+            Some(s) => Some(Timestamp::from_str(&s).map_err(|_| {
+                PersistError::inconsistent_state("corrupt confirmed_at in config_history")
+            })?),
+            None => None,
+        };
+        if confirmed_at.is_some() {
+            confirmed_deadline = None;
+        }
+
+        let record = CommitRecord {
+            tx_id: TxId::from_uuid(uuid_from_bytes(&tx_id_out)),
+            parent_tx_id,
+            version,
+            committed_at,
+            principal,
+            source,
+            schema_digest: SchemaDigest::from_bytes(
+                schema_digest_bytes
+                    .try_into()
+                    .expect("schema_digest length validated above"),
+            ),
+            plaintext_digest,
+            encrypted_blob,
+            rollback_point: rollback_point != 0,
+            confirmed_deadline,
+        };
+
+        // Load audit trail — use `query` to get rows, validate each in safe Rust,
+        // and fail closed on corrupt data rather than silently dropping rows.
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT tx_id, sequence, yang_path, op_type, previous_value, new_value,
+                       redaction_applied, previous_hash, entry_hmac
+                FROM audit_trail
+                WHERE tx_id = ?1
+                ORDER BY sequence ASC
+                "#,
+            )
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+        let mut rows = stmt
+            .query([tx_id_bytes])
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+        let mut audit = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| PersistError::sqlite(e.to_string()))?
+        {
+            let tx_id_bytes: Vec<u8> = row
+                .get(0)
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let sequence: u32 = row
+                .get(1)
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let yang_path: String = row
+                .get(2)
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let op_type: String = row
+                .get(3)
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let previous_value: Option<String> = row
+                .get(4)
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let new_value: Option<String> = row
+                .get(5)
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let redaction_applied: i32 = row
+                .get(6)
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let previous_hash: Vec<u8> = row
+                .get(7)
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let entry_hmac: Vec<u8> = row
+                .get(8)
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+            // Fail closed on corrupt fixed-size hash fields
+            if previous_hash.len() != 32 {
+                return Err(PersistError::corrupt_blob());
+            }
+            if entry_hmac.len() != 32 {
+                return Err(PersistError::corrupt_blob());
+            }
+
+            // Validate audit tx_id length too
+            validate_uuid_bytes("audit tx_id", &tx_id_bytes)?;
+
+            audit.push(AuditRecord {
+                tx_id: TxId::from_uuid(uuid_from_bytes(&tx_id_bytes)),
+                sequence,
+                yang_path,
+                op_type: deserialize_audit_op_type(&op_type)?,
+                previous_value,
+                new_value,
+                redaction_applied: redaction_applied != 0,
+                previous_hash: previous_hash
+                    .try_into()
+                    .expect("previous_hash length validated above"),
+                entry_hmac: entry_hmac
+                    .try_into()
+                    .expect("entry_hmac length validated above"),
+            });
+        }
+
+        let stored = StoredConfig { record, audit };
+        stored.verify_audit_chain(audit_key)?;
+        Ok(Some(stored))
+    }
+
+    /// Records an alarm audit event.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_alarm_audit(
+        &self,
+        action: &str,
+        outcome: &str,
+        alarm_id: &str,
+        alarm_type: &str,
+        probable_cause: &str,
+        principal: &str,
+        tenant: Option<&str>,
+        reason: &str,
+        scope: &str,
+        correlation_id: Option<&str>,
+        occurred_at: &str,
+    ) -> Result<(), PersistError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO alarm_audit (action, outcome, alarm_id, alarm_type, probable_cause, principal, tenant, reason, scope, correlation_id, occurred_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                action,
+                outcome,
+                alarm_id,
+                alarm_type,
+                probable_cause,
+                principal,
+                tenant,
+                reason,
+                scope,
+                correlation_id,
+                occurred_at,
+            ],
+        )
+        .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Query recorded alarm audits, sorted by ID ascending.
+    pub async fn query_alarm_audits(&self) -> Result<Vec<AlarmAuditEventRecord>, PersistError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT action, outcome, alarm_id, alarm_type, probable_cause, principal, tenant, reason, scope, correlation_id, occurred_at FROM alarm_audit ORDER BY id ASC")
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(AlarmAuditEventRecord {
+                    action: row.get(0)?,
+                    outcome: row.get(1)?,
+                    alarm_id: row.get(2)?,
+                    alarm_type: row.get(3)?,
+                    probable_cause: row.get(4)?,
+                    principal: row.get(5)?,
+                    tenant: row.get(6)?,
+                    reason: row.get(7)?,
+                    scope: row.get(8)?,
+                    correlation_id: row.get(9)?,
+                    occurred_at: row.get(10)?,
+                })
+            })
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+        let mut results = Vec::new();
+        for r in rows {
+            results.push(r.map_err(|e| PersistError::sqlite(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
+    /// Executes raw SQL on the database for testing.
+    #[cfg(feature = "dangerous-test-hooks")]
+    pub async fn execute_raw_for_test(&self, sql: &str) -> Result<(), PersistError> {
+        let conn = self.conn.lock().await;
+        conn.execute(sql, [])
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        Ok(())
+    }
+}

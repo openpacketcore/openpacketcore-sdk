@@ -1,0 +1,129 @@
+# OpenPacketCore High Availability and Consensus Design
+
+This document details the High Availability (HA) architecture and implementation for the
+OpenPacketCore config and session persistence surfaces.
+
+- **Config Store**: The config persistence layer uses `ConsensusConfigStore` (implemented in the `opc-persist` crate), a hardened HA consensus persistence backend with durable fixed membership, transport-level mTLS/SPIFFE identity validation, controlled server lifecycle, complete Raft-like safety/no-op commit gating, caught-up non-voter promotion guardrails, snapshot HMAC verification, and consensus metrics dump hooks. Checked via multi-process chaos and failover test suites. This closes the config-store HA backend gap, while broader platform hardening concerns such as SVID/bundle hot reload (`GAP-003-001`), Prometheus export (`GAP-001-004`), KMS-backed key provider support (`GAP-003-004`), and storage-fault injection (`GAP-001-005`) have been fully closed and integrated.
+- **Session Store**: The session persistence layer uses `QuorumSessionStore`, a quorum ordered-log replication adapter for authoritative session state. It closes `GAP-004-004` and `GAP-004-007` with durable ordered log replication, committed-prefix repair, watch cursors, stale-replica catch-up, and session HA chaos evidence. The dedicated local-cache invalidation contract is closed by `opc-session-cache`; remaining deferred boundaries are tracked in `docs/implementation-status.md`.
+
+---
+
+## 1. Durable Config Store Consensus Prototype: `ConsensusConfigStore`
+
+`ConsensusConfigStore` implements a durable prototype for config commits,
+confirmations, and rollback points using a replicated, transaction-safe
+consensus log on top of local SQLite databases.
+
+### Consensus & Log Model
+The backend implements a term-based Raft-like state machine. 
+- Log entries are appended to a durable SQL log table (`consensus_log`) on the leader.
+- The leader replicates log entries to peers using `AppendEntries` RPCs.
+- An entry is considered **committed by this prototype** once it is appended to
+  a majority of node logs and applied by the leader.
+- Committed entries are applied to the state machine (the core config history and audit tables) in strict sequential order. Log replay is completely idempotent.
+
+### Durable Metadata & Node Identity
+Each replica has a unique, durable node ID configured at startup. The SQLite database stores the following state across restarts:
+- **Consensus State** (`consensus_state`): Persists `current_term` (epoch) and `voted_for` (candidate ID who received this node's vote in the current term) to ensure election safety across restarts.
+- **Consensus Log** (`consensus_log`): Persists log index, term, operation type, and operation payload.
+- **Consensus Applied** (`consensus_applied`): Tracks the `applied_index` to guarantee that each applied entry is applied exactly once to the underlying config store.
+
+### Leader Fencing
+To prevent split-brain issues:
+- Candidates must secure votes from a majority of nodes to become the leader.
+- Nodes reject `AppendEntries` and `RequestVote` RPCs from any sender with a term lower than the node's durable `current_term`.
+- If a leader receives an RPC response indicating a peer is running a higher term, the leader immediately steps down to the `Follower` role and updates its term.
+- Writes attempted on a non-leader node are rejected immediately with a `stale leader: not the leader` error.
+
+- When the leader receives a read, it verifies its leadership by obtaining current-term responses from a majority of the cluster before serving the read. This prevents minority reads and ensures linearizability.
+
+### Replica Catch-Up & Rejoin
+Rejoining replicas are caught up before they can participate as authoritative readers/writers:
+- The leader tracks the log progress of peers.
+- If a peer's log is stale or it has missed commits, the leader performs log probing to find the last common log entry and replicates all missing entries sequentially.
+- A newly elected leader does not automatically apply every local log entry. It
+  only applies entries through the committed/applied path, preventing failed
+  local no-quorum writes from becoming visible just because the node later wins
+  an election.
+
+### Failure & Operator Assumptions
+- **Quorum Sizing**: A cluster of $N$ nodes requires a majority quorum of $\lfloor N/2 \rfloor + 1$ online nodes to commit writes or serve reads.
+- **Failure Closed**: If a partition splits the cluster such that no group has a majority, both sides fail closed. Reads and writes fail immediately, preventing split-brain or data divergence.
+- **Membership**: Durable fixed-membership configuration is persisted in the SQLite schema (`consensus_membership` table) at startup, ensuring that quorum sizing is fixed and cannot shrink accidentally. Startup is rejected if the configured node ID does not match the persisted node identity.
+
+### Config-Store HA Consensus State (GAP-001-006 Closed)
+
+`ConsensusConfigStore` has closed the config-store HA backend gap with these validated properties:
+
+- **Transport-level mTLS & SPIFFE Peer Identity**: RPC communication is secured over transport-level mTLS using `rustls`. Client and server certificates are verified against the configured CA bundle, certificate SAN SPIFFE IDs are parsed with `x509-parser`, and peer identity is bound to the local node's configured SPIFFE workload profile, the expected node ID, the request cluster ID, and active cluster membership. The legacy JSON certificate fields are ignored for trust decisions.
+- **Controlled Server Concurrency & Lifecycle**: The TCP server handles connection binding with `SO_REUSEADDR` socket option enablement, implements an explicit oneshot shutdown hook, limits server-side concurrency to 100 connections via semaphore, and enforces connection handshake, read, and write timeouts (5s).
+- **Raft Safety & No-Op Commits**: Newly elected leaders block client operations until they commit and apply a `NoOp` log entry in the current term, enforcing complete Raft commit rules.
+- **Caught-up Non-voter Promotion**: Non-voting members can be promoted only after catching up to the leader's log index. Node removal rejects self-removal and preserves replica node identities.
+- **Snapshot HMAC Validation**: Compacted snapshots are cryptographically validated using HMAC-SHA256 keyed by the local `AuditKey`.
+- **Operator Metrics Hooks**: Detailed atomic counters and dump output track elections, leader changes, RPC failures/timeouts, snapshot installs/failures, peer lag, active connections, authentication failures, and read/write quorum failures. Prometheus/runtime telemetry export (`GAP-001-004`) has been fully implemented.
+- **Multi-Process Failure Evidence**: Integration tests simulate multi-process stores and verify leader/follower crashes, network partitions, split-brain resistance, partition heal catch-up, no-quorum writes rejection, schema mismatches, and audit-chain integrity.
+- **Process-Level HA Test Harness (Milestone 4)**: The process-level HA test harness has been fully implemented and verified. This covers process campaigns, failovers, network partitions, and pending commits surviving process restarts.
+- **Out-of-Process Raft Joint Consensus Transitions**: Raft joint consensus transitions (voter membership changes) are fully implemented and verified out-of-process.
+
+Platform hardening concerns—including TLS/SPIFFE SVID and bundle watch/reload (`GAP-003-001`), KMS-backed durable key providers over mTLS TCP or local Unix-socket KMS agents (`GAP-003-004`), and storage-fault injection (`GAP-001-005`)—have been fully implemented, verified, and closed.
+
+
+---
+
+## 2. Replicated Session Store Ordered Log: `QuorumSessionStore`
+
+`QuorumSessionStore` coordinates session leases and CAS mutations across a set of `SessionStoreBackend` replicas using quorum-backed ordered replication. It is not a Raft implementation; its safety contract is a durable committed log prefix where an entry is authoritative only after the same sequence entry is present on a majority of reachable replicas.
+
+### Log & Replication Model
+- **Durable Ordered Log**: Replicated mutations (AcquireLease, RenewLease, ReleaseLease, CompareAndSet, DeleteFenced, RefreshTtl, Batch) are assigned monotonically increasing sequence numbers and written to a durable SQL table (`session_replication_log`).
+- **Idempotency & Replay Semantics**: Duplicate delivery is handled safely. Before appending, replicas check if the entry's sequence has already been applied. If the transaction ID (`tx_id`) matches, the duplicate is accepted as an idempotent success; if it differs, the replica fails closed on sequence divergence. Replaying operations does not mutate the state twice.
+- **Committed Prefix Safety**: The coordinator computes the committed prefix from entries that have majority support at the same sequence. A single-replica or minority uncommitted tail is not promoted during catch-up. Stale or divergent replicas are rebuilt from the committed prefix before new writes are attempted.
+- **Resume Tokens / Watch Cursors**: Exposes watches backed by sequence numbers, allowing consumers to supply sequence cursors and resume receiving updates from the exact sequence they left off.
+- **Replica Catch-Up & Read Repair**: The coordinator queries replica log progress on every write or read. Stale replicas are repaired from the committed prefix before the operation completes. Reads require identical records on a majority quorum and fail closed if no quorum result exists.
+- **Failed-Write Rollback**: If a new replication entry reaches fewer than a majority of replicas, successful partial writes are rebuilt back to the prior committed prefix so that the failed write cannot be resurrected by a future catch-up.
+- **Capabilities**: Backends report `ordered_replication_log = true` and `watch = true` truthfully under replicated profiles, while standalone SQLite reports `false`.
+
+---
+
+## 3. Local Session Cache Invalidation: `SessionCache`
+
+`SessionCache` (implemented in the `opc-session-cache` crate) provides a local, in-memory read-through cache for session records in downstream CNFs. It keeps cache hits behind an explicit coherence gate: local values are served only when the background watch stream is active and the processed sequence is caught up to the backend's committed replication sequence. If the cursor cannot be verified, reads bypass local memory and go directly to the authoritative backend.
+
+### Coherence & Invalidation Model
+- **Read-Through Population**: When `get` misses the local cache, the record is fetched from the authoritative backend. It is populated in memory only after the cache verifies that the watch cursor is caught up to `max_replication_sequence`. If the cursor is lagging, unavailable, or syncing, the read succeeds from the backend but the value is not cached.
+- **Coherent Cache Hits Only**: Before serving a cached value, the cache checks that the watched sequence is at least the backend's current committed sequence. If the backend is ahead, the cache clears local state, marks the watch unhealthy, and bypasses cache hits until the watch loop catches up or resyncs.
+- **Background Watch Subscription**: Spawns a background task that subscribes to `watch(last_sequence + 1)` on the session store, receiving replication entries in monotonic order. Any mutation (CompareAndSet, DeleteFenced, RefreshTtl, AcquireLease, RenewLease, ReleaseLease) to a key results in the key being evicted from the cache.
+- **Monotonic Sequence Tracking & Gaps**: The cache tracks the processed sequence number globally. If a gap is detected (`sequence > last_sequence + 1`), indicating missed log entries, the cache invalidates its entire state and triggers a full resync from the current maximum sequence number of the backend.
+- **Idempotency**: Duplicate events (`sequence <= last_sequence`) are detected and ignored, preserving the sequence cursor and cache safety.
+- **Fail-Closed & Gap Recovery**: If the watch stream encounters a connection error, reports a gap, lacks ordered-watch capabilities, or cannot prove the cursor is current, the cache clears its local entries and bypasses local reads. It attempts to re-establish the watch from the latest sequence after querying `max_replication_sequence`; subsequent `get` calls fall back to direct backend lookups until coherence is restored.
+- **Write-Through Wrapper Safety**: `SessionCache` implements the `SessionBackend` trait and delegates mutations to the authoritative backend. Mutating calls through the wrapper evict affected keys before and after successful writes, so callers do not need to wait for the async watch stream to invalidate their own local writes.
+- **Redacted Diagnostics**: Key operations and lifecycle state transitions (such as resyncs and stream restarts) are logged with redacted session keys, protecting subscriber identifiers from diagnostics exposure.
+
+---
+
+## 4. Chaos Testkit Status: `opc-session-testkit`
+
+`opc-session-testkit` and `crates/opc-persist/tests/consensus_tests.rs` provide focused failure-mode simulation tests.
+
+### Config Store HA Failure Tests (Persisted)
+- **3-node happy path**: Verifies that commits persist on a majority and survive replica restarts.
+- **Stale leader fencing**: Proves stale leader writes are rejected after a newer leader is elected in a higher term.
+- **Partition split-brain**: Verifies that a minority partition cannot commit writes or serve reads, while the majority partition functions correctly.
+- **Partition healing & catch-up**: Proves that a stale replica successfully catches up to the leader's state after a partition heals.
+- **Crashed replica rejoin**: Verifies a crashed replica with stale logs cannot overwrite newer committed data and is caught up by the leader.
+- **Commit-confirmed failover**: Verifies that pending commit-confirmed deadlines survive leader crash and failover to a new leader.
+- **Rollback target safety**: Verifies that rollback target selection rejects uncommitted or pending minority states.
+- **Duplicate log idempotency**: Confirms replayed/duplicate log entries are idempotent and apply exactly once.
+- **Failed-write regression**: Confirms a no-quorum write that returned an error is not resurrected after a later campaign or successful commit.
+- **Snapshot regression**: Confirms stale snapshot installation cannot move a follower back to older applied state.
+- **Compaction appendability**: Confirms compacted leaders retain the snapshot index/term needed to append later committed entries.
+
+### Session Store HA Failure Tests (Ordered Replication)
+- **Split-brain healing**: Proves the coordinator can recover and heal after partitions are resolved.
+- **Durable catch-up**: Rejoining replicas are caught up automatically with log replication.
+- **Duplicate delivery**: Duplicate entries are resolved idempotently without duplicate mutations.
+- **Partial-write recovery**: Failing mid-flight writes are recovered and reconciled to majority nodes.
+- **Stale-fence replay**: Stale fence updates are rejected monotonically.
+- **Read repair**: Divergent nodes are updated and verified on read.
+- **Restart/rejoin across profiles**: Ensures restart/rejoin safety under fake, SQLite, and replicated profiles.
+- **No wall-clock LWW**: Strict consensus logic ensures that clock drift/jumps do not compromise write correctness.

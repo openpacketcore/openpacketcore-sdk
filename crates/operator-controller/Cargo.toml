@@ -1,0 +1,30 @@
+[package]
+name = "operator-controller"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Kubernetes operator controller execution layer, including CRD conversion, state migration, out-of-process drain execution, and multi-cluster status orchestration"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["serde"] }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "time"] }
+opc-types = { path = "../opc-types" }
+opc-config-model = { path = "../opc-config-model" }
+opc-node-resources = { path = "../opc-node-resources" }
+opc-alarm = { path = "../opc-alarm" }
+opc-runtime = { path = "../opc-runtime" }
+opc-config-bus = { path = "../opc-config-bus" }
+operator-lifecycle = { path = "../operator-lifecycle" }
+semver = "1.0"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

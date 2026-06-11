@@ -1,0 +1,17 @@
+schema_version: "0.1.0"
+id: TOY-NF-001
+title: Toy NF registration scenario
+requirements:
+  - REQ-3GPP-TS23502-R17-4.2.2-001
+seed: 7
+topology:
+  nfs:
+    toy-nf:
+      simulator: "fake"
+steps:
+  - kind: send_ngap
+    from: ran-1
+    to: toy-nf
+    message: registration
+assertions:
+  - expr: "toy-nf.state == REGISTERED"

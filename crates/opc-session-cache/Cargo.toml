@@ -1,0 +1,23 @@
+[package]
+name = "opc-session-cache"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Production-grade session cache with key-scoped invalidation, sequence tracking, and resume recovery (GAP-004-006)"
+
+[dependencies]
+opc-session-store = { path = "../opc-session-store" }
+tokio = { workspace = true, features = ["time", "sync", "macros", "rt"] }
+tracing = { workspace = true }
+futures-util = "0.3"
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["time", "sync", "test-util"] }
+opc-session-testkit = { path = "../opc-session-testkit" }
+opc-types = { path = "../opc-types" }
+bytes = { workspace = true }
+zeroize = { workspace = true }

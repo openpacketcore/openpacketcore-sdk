@@ -1,0 +1,15 @@
+[package]
+name = "opc-node-resources"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Node resource validation: ResourceProfile compatibility against NodeCapabilityReport"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+
+[lints]
+workspace = true

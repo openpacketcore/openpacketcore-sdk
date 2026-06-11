@@ -1,0 +1,3 @@
+stack-budget root=4096 nested=1024
+  nested generated::Interface path=/upf:system/interfaces/interface estimated=1536 budget=1024 allocation=boxed status=boxed-to-fit
+  root generated::System path=/upf:system estimated=736 budget=4096 allocation=inline status=within-budget

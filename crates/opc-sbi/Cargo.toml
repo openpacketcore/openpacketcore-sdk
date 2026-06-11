@@ -1,0 +1,50 @@
+[package]
+name = "opc-sbi"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenPacketCore shared SBI client/server, auth, NRF, retry, and testkit primitives"
+
+[features]
+testkit = []
+runtime-hooks = ["dep:opc-runtime"]
+
+[dependencies]
+async-trait = { workspace = true }
+http = "1"
+opc-types = { path = "../opc-types" }
+opc-runtime = { path = "../opc-runtime", optional = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+axum = { version = "0.8.9", features = ["http2"] }
+tower = "0.5.3"
+hyper = { version = "1.10.1", features = ["full", "client", "server", "http1", "http2"] }
+h2 = "0.4.14"
+jsonwebtoken = "9.3.1"
+tower-http = { version = "0.6.11", features = ["limit", "timeout", "trace"] }
+opc-tls = { version = "0.1.0", path = "../opc-tls" }
+serde_json.workspace = true
+opc-redaction = { version = "0.1.0", path = "../opc-redaction" }
+tokio = { workspace = true, features = ["sync", "time"] }
+rustls.workspace = true
+opc-identity = { version = "0.1.0", path = "../opc-identity" }
+hyper-util = { version = "0.1.20", features = ["client", "server", "tokio", "server-auto"] }
+futures-util = "0.3.32"
+tokio-rustls.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+http-body-util = "0.1"
+rustls-pki-types.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+serde_json = { workspace = true }
+# Enable testkit for integration tests (self-referential dev-dep is valid in Cargo).
+opc-sbi = { path = ".", features = ["testkit"] }
+
+[lints]
+workspace = true

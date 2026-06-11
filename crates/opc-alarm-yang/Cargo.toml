@@ -1,0 +1,11 @@
+[package]
+name = "opc-alarm-yang"
+version = "0.1.0"
+edition = "2021"
+description = "YANG schema and operational projections for OpenPacketCore alarms (RFC 013)"
+
+[dependencies]
+opc-alarm = { path = "../opc-alarm" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+time = { workspace = true, features = ["formatting"] }

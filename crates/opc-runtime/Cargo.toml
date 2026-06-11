@@ -1,0 +1,32 @@
+[package]
+name = "opc-runtime"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenPacketCore CNF runtime chassis — startup phases, task supervision, health, and shutdown"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync", "time", "signal", "io-util"] }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+num_cpus = { workspace = true }
+futures-util = "0.3"
+opc-alarm = { path = "../opc-alarm" }
+opc-redaction = { path = "../opc-redaction" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+opc-sbi = { path = "../opc-sbi", features = ["testkit", "runtime-hooks"] }
+opc-types = { path = "../opc-types" }
