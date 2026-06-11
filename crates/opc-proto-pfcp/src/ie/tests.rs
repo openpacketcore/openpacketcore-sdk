@@ -572,23 +572,72 @@ fn test_recovery_time_stamp_spec_bytes() {
 // Outer Header Creation (§8.2.12)
 // ---------------------------------------------------------------------------
 
-/// Outer Header Creation IE, GTP-U/UDP/IPv4 per §8.2.12.
-/// Description = 0x0001, TEID = 0x12345678, IPv4 = 192.0.2.1.
+/// Outer Header Creation IE, GTP-U/UDP/IPv4 per §8.2.56: octet 5 bit 1 set,
+/// i.e. wire octets `01 00` (octet 5 is the high byte of the description).
+/// TEID and IPv4 address follow; no UDP port for GTP-U encapsulations.
 #[test]
 fn test_outer_header_creation_gtpu_ipv4_spec_bytes() {
     let bytes: &[u8] = &[
         0x00, 0x54, // IE type 84 (Outer Header Creation)
         0x00, 0x0A, // length 10 (2 + 4 + 4)
-        0x00, 0x01, // description: GTP-U/UDP/IPv4 (§8.2.12)
+        0x01, 0x00, // description: GTP-U/UDP/IPv4 (octet 5 bit 1, §8.2.56)
         0x12, 0x34, 0x56, 0x78, // TEID
-        0xC0, 0x00, 0x02, 0x01, // IPv4
+        0xC0, 0x00, 0x02, 0x01, // IPv4 192.0.2.1
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::OuterHeaderCreation(o) => {
+            assert_eq!(o.description, 0x0100);
+            assert_eq!(o.teid, Some(0x1234_5678));
+            assert_eq!(o.ipv4, Some([0xC0, 0x00, 0x02, 0x01]));
+            assert_eq!(o.port, None, "GTP-U encapsulation carries no UDP port");
+        }
+        other => panic!("expected OuterHeaderCreation, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Outer Header Creation IE, UDP/IPv4 per §8.2.56: octet 5 bit 3 set
+/// (wire octets `04 00`). A non-GTP UDP encapsulation carries an IPv4
+/// address and a UDP port but NO TEID.
+#[test]
+fn test_outer_header_creation_udp_ipv4_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x54, // IE type 84 (Outer Header Creation)
+        0x00, 0x08, // length 8 (2 + 4 + 2)
+        0x04, 0x00, // description: UDP/IPv4 (octet 5 bit 3, §8.2.56)
+        0xC0, 0x00, 0x02, 0x02, // IPv4 192.0.2.2
+        0x08, 0x68, // UDP port 2152
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::OuterHeaderCreation(o) => {
+            assert_eq!(o.description, 0x0400);
+            assert_eq!(o.teid, None, "UDP/IPv4 encapsulation carries no TEID");
+            assert_eq!(o.ipv4, Some([0xC0, 0x00, 0x02, 0x02]));
+            assert_eq!(o.port, Some(2152));
+        }
+        other => panic!("expected OuterHeaderCreation, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Outer Header Creation IE with only octet 6 bit 1 set (N19 Indication,
+/// wire octets `00 01`): no conditional fields are present at all.
+#[test]
+fn test_outer_header_creation_n19_indication_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x54, // IE type 84 (Outer Header Creation)
+        0x00, 0x02, // length 2 (description only)
+        0x00, 0x01, // description: N19 Indication (octet 6 bit 1, §8.2.56)
     ];
     let ie = decode_typed(bytes);
     match ie {
         TypedIe::OuterHeaderCreation(o) => {
             assert_eq!(o.description, 0x0001);
-            assert_eq!(o.teid, Some(0x1234_5678));
-            assert_eq!(o.ipv4, Some([0xC0, 0x00, 0x02, 0x01]));
+            assert_eq!(o.teid, None);
+            assert_eq!(o.ipv4, None);
+            assert_eq!(o.port, None);
         }
         other => panic!("expected OuterHeaderCreation, got {:?}", other),
     }
@@ -765,7 +814,7 @@ fn test_outer_header_creation_truncated_teid_rejected() {
     let bytes: &[u8] = &[
         0x00, 0x54, // IE type 84 (Outer Header Creation)
         0x00, 0x05, // length 5 (2 desc + 3 partial TEID)
-        0x00, 0x01, // description GTP-U/UDP/IPv4
+        0x01, 0x00, // description GTP-U/UDP/IPv4 (octet 5 bit 1)
         0x12, 0x34, 0x56, // partial TEID
     ];
     let result = TypedIe::decode(bytes, DecodeContext::default(), 0);
@@ -855,7 +904,7 @@ fn test_forwarding_parameters_roundtrip() {
     let ohc: &[u8] = &[
         0x00, 0x54, // IE type 84 (Outer Header Creation)
         0x00, 0x0A, // length 10
-        0x00, 0x01, // GTP-U/UDP/IPv4
+        0x01, 0x00, // GTP-U/UDP/IPv4 (octet 5 bit 1, §8.2.56)
         0x00, 0x00, 0x00, 0x01, // TEID
         0xC0, 0x00, 0x02, 0x01, // IPv4
     ];

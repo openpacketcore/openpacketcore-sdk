@@ -68,9 +68,21 @@ arithmetic, truncation/overflow rejection, and negative tests.
 | Destination Interface | 42 | §8.2.3 | 1 octet; spare nibble preserved. |
 | Network Instance | 22 | §8.2.4 | Variable-length DNN octet string. |
 | UE IP Address | 93 | §8.2.62 | V4/V6/SD/IPv4D/IPv6D/CHV4/CHV6/CH flags; prefix lengths. |
-| Outer Header Creation | 84 | §8.2.12 | Description, TEID, IPv4/IPv6, port, C-TAG, S-TAG. |
+| Outer Header Creation | 84 | §8.2.56 | 16-bit description (octet 5 = high byte); TEID iff GTP-U (octet 5 bits 1-2), UDP port iff non-GTP UDP (bits 3-4), addresses per bits 1/3/5 and 2/4/6; C-TAG/S-TAG. |
 | Outer Header Removal | 95 | §8.2.57 | 1 octet description. |
-| Recovery Time Stamp | 96 | §8.2.69 | 4 octets, seconds since epoch. |
+| Recovery Time Stamp | 96 | §8.2.69 | 4 octets, NTP short-format seconds (RFC 5905, 1900 era), carried opaquely. |
+
+#### Canonicalizing re-encode
+
+The typed layer canonicalizes on re-encode: spare flag bits that the spec
+requires to be zero are emitted as zero, and trailing octets beyond the
+fields this release knows (which §8.1.1 forward compatibility requires a
+receiver to ignore) are dropped rather than preserved. A typed decode →
+encode round-trip is therefore byte-exact for spec-canonical messages —
+which is what every fixture in the test suite asserts — but not for
+messages carrying non-zero spare bits or future extension octets. Use the
+raw `InformationElement` layer when byte-exact forwarding of arbitrary
+peer traffic is required.
 
 ### 5. Typed Grouped IEs (§7.5.2)
 Grouped IEs decode their members recursively as `TypedIe`, enforcing

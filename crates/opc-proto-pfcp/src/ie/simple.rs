@@ -244,10 +244,10 @@ impl SimpleIe for NodeId {
 /// F-SEID IE (type 57).
 ///
 /// TS 29.244 §8.2.40:
-/// - octet 5: bit 6 V4, bit 7 V6, bits 5-1 spare (0)
+/// - octet 5: bit 2 V4, bit 1 V6, bits 8-3 spare (0)
 /// - octets 6-13: SEID (8 octets)
 /// - octets 14-17: IPv4 address if V4
-/// - octets 14-29: IPv6 address if V6
+/// - then IPv6 address (16 octets) if V6
 ///
 /// When both V4 and V6 are set, IPv4 precedes IPv6.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,9 +273,10 @@ impl SimpleIe for FSeid {
             );
         }
         let flags = value[0];
-        let v4 = (flags & 0x02) != 0; // bit 6
-        let v6 = (flags & 0x01) != 0; // bit 7
-                                      // bits 5-1 must be 0 in strict mode; we preserve them for re-encode.
+        let v4 = (flags & 0x02) != 0; // bit 2
+        let v6 = (flags & 0x01) != 0; // bit 1
+                                      // Bits 8-3 are spare; senders set them to 0
+                                      // and the typed re-encode canonicalizes them to 0.
         let spare = flags & 0xFC;
 
         let seid = u64::from_be_bytes([
@@ -308,12 +309,12 @@ impl SimpleIe for FSeid {
             // pos not needed beyond this point; trailing bytes are ignored for typed decode.
         }
 
-        // Any trailing bytes are preserved for raw re-encode, but for the typed
-        // struct we simply ignore them (the encoder will only emit what we know).
-        // To maintain byte-exact round-trip for *known* F-SEIDs, we require that
-        // the length exactly matches.
+        // Trailing octets beyond the known fields are ignored on decode for
+        // forward compatibility (later releases may append fields) and are
+        // NOT re-emitted by the typed encoder; see the canonicalization note
+        // in CONFORMANCE.md. Use the raw layer for byte-exact forwarding.
         let _ = pos;
-        let _ = spare; // preserved in strict mode checks if needed later
+        let _ = spare;
         Ok(Self {
             v4,
             v6,
@@ -1050,25 +1051,28 @@ impl SimpleIe for OuterHeaderCreation {
         let description = u16::from_be_bytes([value[0], value[1]]);
         let mut pos = 2usize;
 
-        // Determine expected fields from description bits.
-        // Bit 1 (0x0001) = GTP-U/UDP/IPv4
-        // Bit 2 (0x0002) = GTP-U/UDP/IPv6
-        // Bit 3 (0x0004) = UDP/IPv4
-        // Bit 4 (0x0008) = UDP/IPv6
-        // Bit 5 (0x0010) = IPv4
-        // Bit 6 (0x0020) = IPv6
-        // Bit 7 (0x0040) = C-TAG
-        // Bit 8 (0x0080) = S-TAG
-        // Bit 9 (0x0100) = N19
-        // Bit 10 (0x0200) = N6
-        // Bit 11 (0x0400) = GTP-U/UDP/IP with UDP port
-        // Bits with TEID: GTP-U (bits 1,2,11), GRE (not in v1 scope)
-        let has_teid = (description & 0x0407) != 0; // bits 1,2,3,4,11
-        let has_ipv4 = (description & 0x0017) != 0; // bits 1,2,3,5
-        let has_ipv6 = (description & 0x002A) != 0; // bits 2,4,6
-        let has_port = (description & 0x0400) != 0; // bit 11
-        let has_c_tag = (description & 0x0040) != 0; // bit 7
-        let has_s_tag = (description & 0x0080) != 0; // bit 8
+        // The Description field is two octets; octet 5 (the FIRST octet on
+        // the wire) is the high byte of the big-endian u16. Per §8.2.56:
+        //   octet 5 bit 1 (0x0100) = GTP-U/UDP/IPv4
+        //   octet 5 bit 2 (0x0200) = GTP-U/UDP/IPv6
+        //   octet 5 bit 3 (0x0400) = UDP/IPv4
+        //   octet 5 bit 4 (0x0800) = UDP/IPv6
+        //   octet 5 bit 5 (0x1000) = IPv4
+        //   octet 5 bit 6 (0x2000) = IPv6
+        //   octet 5 bit 7 (0x4000) = C-TAG
+        //   octet 5 bit 8 (0x8000) = S-TAG
+        //   octet 6 bit 1 (0x0001) = N19 Indication
+        //   octet 6 bit 2 (0x0002) = N6 Indication
+        // Field presence per §8.2.56:
+        //   TEID iff a GTP-U encapsulation is requested (octet 5 bits 1-2);
+        //   IPv4 address iff octet 5 bit 1, 3, or 5; IPv6 iff bit 2, 4, or 6;
+        //   UDP port iff a non-GTP UDP encapsulation (octet 5 bits 3-4).
+        let has_teid = (description & 0x0300) != 0;
+        let has_ipv4 = (description & 0x1500) != 0;
+        let has_ipv6 = (description & 0x2A00) != 0;
+        let has_port = (description & 0x0C00) != 0;
+        let has_c_tag = (description & 0x4000) != 0;
+        let has_s_tag = (description & 0x8000) != 0;
 
         let mut teid = None;
         let mut ipv4 = None;
@@ -1218,10 +1222,12 @@ impl SimpleIe for OuterHeaderRemoval {
 
 /// Recovery Time Stamp IE (type 96).
 ///
-/// TS 29.244 §8.2.69: four octets, seconds since 1970-01-01 00:00:00 UTC.
+/// TS 29.244 §8.2.69: four octets in the format of the first 32 bits of an
+/// NTP timestamp (IETF RFC 5905), i.e. seconds since the NTP era origin
+/// 1900-01-01 00:00:00 UTC. The value is carried opaquely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryTimeStamp {
-    /// Seconds since Unix epoch.
+    /// Seconds in NTP short format (era origin 1900-01-01, RFC 5905).
     pub seconds: u32,
 }
 
