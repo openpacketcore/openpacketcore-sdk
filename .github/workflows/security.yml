@@ -36,6 +36,23 @@ jobs:
       - name: Run cargo audit
         run: cargo audit --db "${RUNNER_TEMP}/cargo-advisory-db" --deny warnings
 
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
+
   go-vulnerabilities:
     name: Go vulnerability scan
     runs-on: ubuntu-latest

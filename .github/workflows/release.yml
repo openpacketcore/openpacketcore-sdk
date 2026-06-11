@@ -59,6 +59,16 @@ jobs:
           kubectl kustomize operators/sdk-reference-operator/config/default > release-artifacts/sdk-reference-operator.yaml
           git rev-parse HEAD > release-artifacts/git-revision.txt
 
+      - name: Generate Rust SBOM
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --format json --output release-artifacts/
+
+      - name: Generate Go SBOM
+        run: |
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+          cyclonedx-gomod app -json -output release-artifacts/sdk-reference-operator.bom.json operators/sdk-reference-operator
+
       - name: Upload release evidence
         uses: actions/upload-artifact@v4
         with:

@@ -43,6 +43,43 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace --all-features --quiet -- --test-threads=4
 
+  msrv:
+    name: MSRV check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.81)
+        uses: dtolnay/rust-toolchain@1.81
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check MSRV
+        run: cargo check --workspace --all-targets --all-features
+
+      - name: Publish-order graph check
+        run: python3 scripts/publish-order.py --check
+
+  docs:
+    name: Rust documentation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+
   go-operator:
     name: Go reference operator
     runs-on: ubuntu-latest
@@ -61,6 +98,39 @@ jobs:
           go-version-file: operators/sdk-reference-operator/go.mod
           cache-dependency-path: operators/sdk-reference-operator/go.sum
 
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: Run Go vet
+        run: go vet ./...
+
+      - name: Run Go tests
+        run: go test ./...
+
+  go-sdk:
+    name: Go operator SDK
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+    defaults:
+      run:
+        working-directory: operators/operator-sdk-go
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: operators/operator-sdk-go/go.mod
+          cache-dependency-path: operators/operator-sdk-go/go.sum
+
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: Run Go vet
+        run: go vet ./...
+
       - name: Run Go tests
         run: go test ./...
 
@@ -76,3 +146,25 @@ jobs:
 
       - name: Render Kustomize manifests
         run: kubectl kustomize operators/sdk-reference-operator/config/default
+
+  helm:
+    name: Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Helm lint
+        run: helm lint operators/helm/sdk-reference-operator/
+
+      - name: Helm template (cert-manager)
+        run: helm template sdk-ref operators/helm/sdk-reference-operator/ | kubectl apply --dry-run=client -f -
+
+      - name: Helm template (manual cert)
+        run: helm template sdk-ref operators/helm/sdk-reference-operator/ --set webhook.certMode=manual --set webhook.secretName=my-secret | kubectl apply --dry-run=client -f -
