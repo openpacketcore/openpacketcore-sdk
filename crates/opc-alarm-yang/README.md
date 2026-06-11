@@ -8,7 +8,7 @@ YANG schema and operational projections for OpenPacketCore alarms.
 
 ## Reference
 
-[RFC](docs/rfc/013-fault-management-alarm-substrate.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/013-fault-management-alarm-substrate.md)
 
 ## Quick start
 

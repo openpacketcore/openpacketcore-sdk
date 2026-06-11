@@ -1,5 +1,11 @@
 # OpenAPI SBI Codegen Design Note
 
+> **Status:** the pilot described here has shipped as
+> [`opc-api-nnrf`](https://github.com/openpacketcore/openpacketcore-sdk/tree/main/crates/opc-api-nnrf)
+> (generated `NfProfile`/`NfService` types from pinned TS 29.510 YAML, with a
+> deterministic `make generate-api` target). The remainder of this note —
+> extending generation to further TS 29.5xx interfaces — is future work.
+
 ## Goal
 
 Eliminate per-NF hand-writing of 3GPP SBI type definitions (TS 29.5xx series)
@@ -61,7 +67,7 @@ Each crate:
 - `server/` — `axum`/`hyper` route trait stubs (optional, behind feature)
 - `CONFORMANCE.md` — which operations are generated vs. hand-written vs. out-of-scope
 
-## Why deferred to v0.3.0
+## Why this was initially deferred
 
 1. **MSRV risk** — `typify` and `openapiv3` may require newer Rust features.
 2. **3GPP YAML quality** — the published OpenAPI files contain vendor-specific

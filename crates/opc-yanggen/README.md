@@ -8,7 +8,7 @@ YANG-to-Rust type projection, RFC 7951 JSON serde, iterative semantic constraint
 
 ## Reference
 
-[RFC](docs/rfc/002-yang-projection.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/002-yang-projection.md)
 
 ## Quick start
 

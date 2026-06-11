@@ -8,7 +8,7 @@ Key-provider traits, in-memory adapters, and tenant-bound AEAD payload helpers.
 
 ## Reference
 
-[RFC](docs/rfc/003-security-substrate.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/003-security-substrate.md)
 
 ## Quick start
 

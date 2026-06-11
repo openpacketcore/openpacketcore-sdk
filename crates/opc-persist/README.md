@@ -8,7 +8,7 @@ Tamper-evident SQLite datastores, consensus config store membership, and fail-cl
 
 ## Reference
 
-[RFC](docs/rfc/001-management-substrate.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/001-management-substrate.md)
 
 ## Quick start
 

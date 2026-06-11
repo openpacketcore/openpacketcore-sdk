@@ -21,7 +21,7 @@ The OpenPacketCore SDK follows a **Rust policy / Go orchestration** split:
 This split is deliberate: Rust gives us memory safety and auditable policy
 execution, while Go gives us native Kubernetes client ergonomics.
 
-For the full rationale see [ADR 0007](docs/adr/0007-operator-lifecycle-rust-policy-core.md).
+For the full rationale see [ADR 0007](adr/0007-operator-lifecycle-rust-policy-core.md).
 
 ---
 
@@ -108,7 +108,7 @@ these fields are required for SDK integration:
 - `adminAuthRef` — secret holding the admin auth token for the NF
 
 See the reference CRD for the complete schema:
-[operators/sdk-reference-operator/api/v1beta1/sdkmanagednetworkfunction_types.go](operators/sdk-reference-operator/api/v1beta1/sdkmanagednetworkfunction_types.go)
+[operators/sdk-reference-operator/api/v1beta1/sdkmanagednetworkfunction_types.go](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/operators/sdk-reference-operator/api/v1beta1/sdkmanagednetworkfunction_types.go)
 
 ---
 
@@ -121,7 +121,7 @@ contract-version handshake on first use and returns typed errors so you can
 distinguish terminal mismatches from transient failures.
 
 Excerpt from the reference controller:
-[operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go](operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go)
+[operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go)
 
 ```go
 client, err := bridge.NewClient("/usr/local/bin/operator-lifecycle-cli")
@@ -136,7 +136,7 @@ if err != nil {
 `LastTransitionTime` rules. Use it instead of hand-rolling condition updates.
 
 Excerpt from the reference controller:
-[operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go](operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go)
+[operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go)
 
 ```go
 cm := conditions.NewConditionManager(crd.Status.ObservedGeneration)
@@ -154,7 +154,7 @@ Add the `lifecycle.openpacketcore.io/drain` finalizer. On deletion, call
 `drain.Orchestrator.Start()` and poll `Status()` before removing the finalizer.
 
 Excerpt from the reference controller:
-[operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go](operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go)
+[operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go)
 
 ```go
 const drainFinalizer = "lifecycle.openpacketcore.io/drain"
@@ -180,7 +180,7 @@ if !crd.DeletionTimestamp.IsZero() {
 correct resources, capabilities, hugepage volumes, and probes.
 
 Excerpt from the reference controller:
-[operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go](operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go)
+[operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go)
 
 ```go
 wSpec := workload.NetworkFunctionSpec{
@@ -202,7 +202,7 @@ Import `openpacketcore.io/operator-sdk-go/opmetrics` and instrument your
 reconciler. All collectors are pre-registered on controller-runtime's registry.
 
 Excerpt from the reference controller:
-[operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go](operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go)
+[operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go)
 
 ```go
 start := time.Now()
@@ -218,7 +218,7 @@ defer func() {
 ## 5. Packaging with Helm
 
 Use the reference Helm chart as a template:
-[operators/helm/sdk-reference-operator/](operators/helm/sdk-reference-operator/)
+[operators/helm/sdk-reference-operator/](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/operators/helm/sdk-reference-operator/)
 
 Key files to copy and adapt:
 
@@ -247,7 +247,7 @@ helm template my-nf operators/helm/my-nf-operator/ \
 The SDK is intentionally narrow. You must bring your own:
 
 - **Rollout strategies** — canary, blue/green, percentage-based traffic shift.
-  See [RFC 009 §11](docs/rfc/009-operator-lifecycle-upgrade.md).
+  See [RFC 009 §11](rfc/009-operator-lifecycle-upgrade.md).
 - **Multi-cluster federation** — the reconciler is single-cluster.
 - **Backup / restore** — etcd-level snapshots are outside scope.
 - **NF-specific protocol codecs** — PFCP, NAS-5GS, GTP-U are separate crates
@@ -274,7 +274,7 @@ reconciliation without a real cluster:
 - Verify events are emitted via `record.NewFakeRecorder()`.
 
 Example from the reference operator:
-[operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller_test.go](operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller_test.go)
+[operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller_test.go](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller_test.go)
 
 ### 7.2 NF Side Tests (opc-testbed)
 
@@ -292,7 +292,7 @@ fn test_preflight_rejects_missing_bpf() {
 ```
 
 See the existing test suites in:
-[crates/operator-lifecycle-cli/tests/integration_tests.rs](crates/operator-lifecycle-cli/tests/integration_tests.rs)
+[crates/operator-lifecycle-cli/tests/integration_tests.rs](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/operator-lifecycle-cli/tests/integration_tests.rs)
 
 ---
 

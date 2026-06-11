@@ -8,7 +8,7 @@ Kubernetes production-readiness lifecycle foundation, config-apply, admission, a
 
 ## Reference
 
-[RFC](docs/rfc/009-operator-lifecycle-upgrade.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/009-operator-lifecycle-upgrade.md)
 
 ## Quick start
 

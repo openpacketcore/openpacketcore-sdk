@@ -8,7 +8,7 @@ Validates ResourceProfile compatibility against observed NodeCapabilityReport.
 
 ## Reference
 
-[RFC](docs/rfc/011-node-dataplane-resource-contract.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/011-node-dataplane-resource-contract.md)
 
 ## Quick start
 

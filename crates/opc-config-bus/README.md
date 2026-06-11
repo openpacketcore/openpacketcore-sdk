@@ -8,7 +8,7 @@ Transactional config bus supporting schema validation, tenant segregation, AAD-b
 
 ## Reference
 
-[RFC](docs/rfc/001-management-substrate.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/001-management-substrate.md)
 
 ## Quick start
 

@@ -8,7 +8,7 @@ Release assurance pipeline: SBOM generation, VEX scanning, and gate policy enfor
 
 ## Reference
 
-[RFC](docs/rfc/006-conformance-pipeline.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/006-conformance-pipeline.md)
 
 ## Quick start
 

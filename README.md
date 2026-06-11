@@ -30,7 +30,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | [`opc-runtime`](crates/opc-runtime/) | CNF runtime chassis: process startup phases, task supervision, health probes, and graceful SIGTERM drains. | [RFC 008](docs/rfc/008-cnf-runtime-chassis.md) |
 | [`opc-protocol`](crates/opc-protocol/) | Zero-copy protocol codec framework: traits, context, errors, and fuzzing contracts. | [RFC 005](docs/rfc/005-protocol-framework.md) |
 | [`opc-proto-gtpu`](crates/opc-proto-gtpu/) | GTP-U protocol codec for the user-plane data path. | — |
-| [`opc-proto-pfcp`](crates/opc-proto-pfcp/) | PFCP protocol codec (TS 29.244) for the 5G control plane *(experimental v0)*. | — |
+| [`opc-proto-pfcp`](crates/opc-proto-pfcp/) | PFCP codec (TS 29.244): message layer, raw TLV preservation, and typed session-management IEs *(experimental)*. | — |
 | [`opc-proto-nas`](crates/opc-proto-nas/) | NAS-5GS (TS 24.501) v0 codec: plain headers, security-envelope recognition, 5GS mobile identity *(experimental v0)*. | — |
 | [`opc-node-resources`](crates/opc-node-resources/) | Validates `ResourceProfile` compatibility against observed `NodeCapabilityReport`. | [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md) |
 
@@ -104,7 +104,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
-| [`opc-testbed`](crates/opc-testbed/) | Scenario DSL, virtual time, assertions, fixture provenance, and simulator framework. | [RFC 012](docs/rfc/012-cnf-simulators-and-testbeds.md) |
+| [`opc-testbed`](crates/opc-testbed/) | Scenario DSL, virtual time, assertions, fixture provenance, and simulator framework. | [RFC 012](docs/rfc/012-testbed-simulator-framework.md) |
 | [`opc-sdk-integration`](crates/opc-sdk-integration/) | Integration crate wiring runtime, config bus, alarms, and testbed evidence *(internal, not published)*. | — |
 | [`opc-config-fixture`](crates/opc-config-fixture/) | Generated-like config fixture for integration testing *(internal, not published)*. | — |
 | [`opc-amf-lite`](crates/opc-amf-lite/) | Realistic AMF-lite control-plane vertical slice integration proving SDK seams *(internal, not published)*. | [ADR 0011](docs/adr/0011-first-nf-vertical-proof.md) |

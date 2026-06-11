@@ -8,7 +8,7 @@ Client-side privacy: cohort binning and k-anonymity validation.
 
 ## Reference
 
-[RFC](docs/rfc/010-data-governance-privacy.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/010-data-governance-privacy.md)
 
 ## Quick start
 

@@ -122,6 +122,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-testbed` could not be published: it depends on `opc-schema-validate`,
   which was marked `publish = false`; the dependency crate is now
   publishable (caught by the new publish-order graph gate).
+- The consensus e2e harness deadlocked on Linux when reaping killed cluster
+  nodes: teardown awaited a child's exit on a second tokio runtime, but
+  Linux child-exit notifications (SIGCHLD) dispatch through the runtime
+  that spawned the child, which was parked at that moment. Teardown now
+  reaps synchronously with bounded `try_wait` polling; macOS was unaffected
+  (kqueue process events) which is why the suites only hung in CI.
 
 ## [0.1.0] — 2026-06-09
 

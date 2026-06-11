@@ -8,7 +8,7 @@ Shared SBI client/server, auth, NRF, retry, and testkit primitives.
 
 ## Reference
 
-[RFC](docs/rfc/007-sbi-service-framework.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/007-sbi-service-framework.md)
 
 ## Quick start
 

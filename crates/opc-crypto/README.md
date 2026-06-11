@@ -8,7 +8,7 @@ AEAD envelope encoding, decoding, and provider-driven encryption for OpenPacketC
 
 ## Reference
 
-[RFC](docs/rfc/003-security-substrate.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/003-security-substrate.md)
 
 ## Quick start
 

@@ -8,7 +8,7 @@ Zero-copy protocol codec framework: traits, context, errors, and fuzzing contrac
 
 ## Reference
 
-[RFC](docs/rfc/005-protocol-framework.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/005-protocol-framework.md)
 
 ## Quick start
 

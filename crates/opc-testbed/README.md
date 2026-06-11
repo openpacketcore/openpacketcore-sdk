@@ -8,7 +8,7 @@ Scenario DSL, virtual time, assertions, fixture provenance, and simulator framew
 
 ## Reference
 
-[RFC](docs/rfc/012-cnf-simulators-and-testbeds.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/012-cnf-simulators-and-testbeds.md)
 
 ## Quick start
 

@@ -8,7 +8,7 @@ Quorum-replicated session database supporting lease management, CAS operations, 
 
 ## Reference
 
-[RFC](docs/rfc/004-session-store.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/004-session-store.md)
 
 ## Quick start
 

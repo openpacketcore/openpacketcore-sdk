@@ -8,7 +8,7 @@ Production-grade session cache with key-scoped invalidation, sequence tracking, 
 
 ## Reference
 
-[RFC](docs/rfc/004-session-store.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/004-session-store.md)
 
 ## Quick start
 

@@ -8,7 +8,7 @@ CNF runtime chassis: process startup phases, task supervision, health probes, an
 
 ## Reference
 
-[RFC](docs/rfc/008-cnf-runtime-chassis.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/008-cnf-runtime-chassis.md)
 
 ## Quick start
 

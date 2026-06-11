@@ -8,7 +8,7 @@ Shared config-model request, result, identity, and error types for OpenPacketCor
 
 ## Reference
 
-[RFC](docs/rfc/001-management-substrate.md)
+[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/001-management-substrate.md)
 
 ## Quick start
 

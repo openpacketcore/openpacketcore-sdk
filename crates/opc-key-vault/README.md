@@ -8,7 +8,7 @@ HashiCorp Vault Transit KMS adapter for `opc-key`.
 
 ## Reference
 
-[RFC 003 — Security Substrate](../docs/rfc/003-security-substrate.md)
+[RFC 003 — Security Substrate](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/003-security-substrate.md)
 
 ## Quick start
 
