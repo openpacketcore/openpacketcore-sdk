@@ -543,10 +543,16 @@ async fn test_cross_split_brain_dual_membership() {
     cluster.heal(0, 1);
     cluster.heal(0, 2);
 
-    // Force sync and reconcile (poll Node 0 database)
+    // Force sync and reconcile (poll Node 0 database).
+    //
+    // Post-heal convergence needs node 0 to observe the new leader and
+    // replicate the membership change; with wall-clock election timeouts of
+    // 1-2s this can exceed 5s when the host is saturated by a parallel
+    // workspace test run. The deadline is ~20s (>= 10x election_timeout_max)
+    // so only a genuine convergence failure trips the assertion.
     let db0_path = cluster.nodes.get(&0).unwrap().db_path.clone();
     let mut success = false;
-    for _ in 0..25 {
+    for _ in 0..50 {
         let _ = cluster
             .nodes
             .get_mut(&1)
@@ -560,7 +566,7 @@ async fn test_cross_split_brain_dual_membership() {
             success = true;
             break;
         }
-        sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(400)).await;
     }
     assert!(
         success,

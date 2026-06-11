@@ -21,8 +21,16 @@ use opc_nacm::{
     YangPathPattern,
 };
 
+/// Serializes the tests in this binary: every test resets and asserts on the
+/// process-global `METRICS`, so parallel execution races `reset_all()`
+/// against another test's increments (observed as intermittent `left: 0`
+/// assertion failures). Poisoning is ignored — a previous test's panic must
+/// not cascade.
+static METRICS_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_nacm_eval_metrics() {
+    let _guard = METRICS_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     METRICS.reset_all();
 
     let mut modules = ModuleRegistry::new();
@@ -109,6 +117,7 @@ async fn send_admin_request(addr: SocketAddr, path: &str, token: Option<&str>) -
 
 #[test]
 fn test_alarm_audit_and_active_metrics() {
+    let _guard = METRICS_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     METRICS.reset_all();
 
     let store = InMemoryStore::new();
@@ -159,6 +168,7 @@ fn test_alarm_audit_and_active_metrics() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_admin_http_routes() {
+    let _guard = METRICS_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     METRICS.reset_all();
 
     // Start conformance runtime
