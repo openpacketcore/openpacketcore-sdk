@@ -1,12 +1,20 @@
 # OpenPacketCore SDK
 
-A robust, polyglot software development kit for building resilient, cloud-native 5G/LTE packet core network functions (CNFs). This SDK provides the standardized runtime chassis, quorum-replicated session storage, encrypted config persistence, data-governance/redaction boundary enforcement, and release-assurance evidence pipelines for packet core software with high-assurance deployment requirements.
+[![CI](https://github.com/openpacketcore/openpacketcore-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/openpacketcore/openpacketcore-sdk/actions/workflows/ci.yml)
+
+A robust, polyglot software development kit for building resilient, cloud-native 5G packet core network functions (CNFs). This SDK provides the standardized runtime chassis, quorum-replicated session storage, encrypted config persistence, data-governance/redaction boundary enforcement, and release-assurance evidence pipelines for packet core software with high-assurance deployment requirements.
+
+The GTP-U user-plane codec is also applicable to LTE/EPC user plane. No EPC control-plane protocols (GTP-C, Diameter, S1AP) are provided.
 
 > [!IMPORTANT]
 > **Production Readiness & Reference Boundaries**
 > * **Rust SDK Core**: The core Rust libraries have passed the current P0 SDK release-readiness gates. Downstream CNFs still need product-specific integration, deployment, and carrier acceptance validation.
 > * **Go Reference Operator**: The Go operator located under `operators/sdk-reference-operator/` is a **reference harness and development utility only**. It is explicitly not a production-grade controller. Downstream product teams are responsible for implementing product-specific Kubernetes operators.
 > * **No Unconditional Claims**: Standard deployments require integration with your local platform security policies, hardware topologies, and external KMS/SPIFFE infrastructure.
+
+## Getting started
+
+See [`docs/quickstart.md`](docs/quickstart.md) for a guided first build and a minimal CNF example.
 
 ---
 
@@ -18,9 +26,12 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
+| [`opc-sdk`](crates/opc-sdk/) | Facade crate: feature-gated re-exports of the core composition surface, a `prelude`, and the `minimal_cnf` end-to-end example. | [Quickstart](docs/quickstart.md) |
 | [`opc-runtime`](crates/opc-runtime/) | CNF runtime chassis: process startup phases, task supervision, health probes, and graceful SIGTERM drains. | [RFC 008](docs/rfc/008-cnf-runtime-chassis.md) |
 | [`opc-protocol`](crates/opc-protocol/) | Zero-copy protocol codec framework: traits, context, errors, and fuzzing contracts. | [RFC 005](docs/rfc/005-protocol-framework.md) |
 | [`opc-proto-gtpu`](crates/opc-proto-gtpu/) | GTP-U protocol codec for the user-plane data path. | — |
+| [`opc-proto-pfcp`](crates/opc-proto-pfcp/) | PFCP protocol codec (TS 29.244) for the 5G control plane *(experimental v0)*. | — |
+| [`opc-proto-nas`](crates/opc-proto-nas/) | NAS-5GS (TS 24.501) v0 codec: plain headers, security-envelope recognition, 5GS mobile identity *(experimental v0)*. | — |
 | [`opc-node-resources`](crates/opc-node-resources/) | Validates `ResourceProfile` compatibility against observed `NodeCapabilityReport`. | [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md) |
 
 ### Config & Management (`crates/`)
@@ -41,13 +52,15 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | [`opc-key`](crates/opc-key/) | Key-provider traits, in-memory adapters, and tenant-bound AEAD payload helpers. | [RFC 003](docs/rfc/003-security-substrate.md) |
 | [`opc-crypto`](crates/opc-crypto/) | AEAD envelope encoding, decoding, and provider-driven encryption. | [RFC 003](docs/rfc/003-security-substrate.md) |
 | [`opc-tls`](crates/opc-tls/) | Reloadable SPIFFE-aware mTLS client and server support. | [RFC 003](docs/rfc/003-security-substrate.md) |
+| [`opc-key-vault`](crates/opc-key-vault/) | HashiCorp Vault Transit `KeyProvider` adapter using the wrapped-data-key envelope pattern *(experimental)*. | [RFC 003](docs/rfc/003-security-substrate.md) |
 
 ### Session & State (`crates/`)
 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
-| [`opc-session-store`](crates/opc-session-store/) | Quorum-replicated session database supporting lease management, CAS operations, and change-stream watches. | [RFC 004](docs/rfc/004-session-store.md) |
+| [`opc-session-store`](crates/opc-session-store/) | Quorum-replicated session database supporting lease management, CAS operations, and change-stream watches. Quorum semantics (fencing, leases, CAS, read-repair) are production-grade within a process; networked replication is experimental and provided by `opc-session-net`. | [RFC 004](docs/rfc/004-session-store.md) |
 | [`opc-session-cache`](crates/opc-session-cache/) | Production-grade session cache with key-scoped invalidation, sequence tracking, and resume recovery. | [RFC 004](docs/rfc/004-session-store.md) |
+| [`opc-session-net`](crates/opc-session-net/) | Networked session replication transport: mTLS length-prefixed wire protocol, replication server, and remote backend client *(experimental)*. | [RFC 004](docs/rfc/004-session-store.md) |
 
 ### Alarms & Observability (`crates/`)
 
@@ -103,17 +116,18 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | [`opc-security-testkit`](crates/opc-security-testkit/) | Fake fixtures and fault injection for security validation *(internal)*. |
 | [`opc-session-testkit`](crates/opc-session-testkit/) | Chaos and failure testing for session replication *(internal)*. |
 | [`opc-amf-lite-testkit`](crates/opc-amf-lite-testkit/) | Reusable test fixtures and builders for `opc-amf-lite` *(internal)*. |
-| [`opc-schema-validate`](crates/opc-schema-validate/) | Lightweight JSON Schema validation engine for workspace internal use *(internal)*. |
 
 ### Shared Types (`crates/`)
 
 | Crate | Purpose |
 | :--- | :--- |
 | [`opc-types`](crates/opc-types/) | Shared identifier, version, time, and redaction types. |
+| [`opc-schema-validate`](crates/opc-schema-validate/) | Lightweight JSON Schema validation engine (subset used by testbed/evidence schemas). |
 
 ### Kubernetes Operators (`operators/`)
 
 * [`sdk-reference-operator`](operators/sdk-reference-operator/): A minimal Kubernetes `controller-runtime` operator in Go that consumes Rust SDK policy decisions (admission validation, conversion, and migration planning) through a schema-driven CLI boundary.
+* [`operator-sdk-go`](operators/operator-sdk-go/): Reusable Go packages (`conditions`, `bridge`, `drain`, `workload`, `opmetrics`, `testing`) for building CNF operators.
 
 ---
 
@@ -157,6 +171,15 @@ Compile and validate Kustomize reference manifests:
 ```bash
 kubectl kustomize operators/sdk-reference-operator/config/default
 ```
+
+---
+
+## Community
+
+* [Contributing](CONTRIBUTING.md) — development setup, validation gates, and commit conventions.
+* [Code of Conduct](CODE_OF_CONDUCT.md) — Contributor Covenant v2.1.
+* [Security](SECURITY.md) — vulnerability reporting and disclosure policy.
+* [Governance](GOVERNANCE.md) — decision process and maintainer criteria.
 
 ---
 
