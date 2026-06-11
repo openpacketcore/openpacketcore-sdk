@@ -10,7 +10,7 @@ use opc_runtime::profile::RuntimeMode;
 use operator_lifecycle::{
     evaluate_admission, evaluate_config_apply, sanitize_denial_message, AdmissionRequest,
     CandidateMetadata, CompatibilityEvidence, CompatibilityMatrix, LifecycleStatus,
-    NfReleaseDescriptor, OperatorReleaseDescriptor, PendingConfirmationState,
+    NfReleaseDescriptor, OperatorReleaseDescriptor, PendingConfirmationState, CONTRACT_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read};
@@ -73,6 +73,24 @@ pub struct PreflightRequest {
 #[derive(Serialize)]
 struct ErrorResponse {
     pub error: String,
+    #[serde(rename = "contractVersion", skip_serializing_if = "Option::is_none")]
+    pub contract_version: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct SuccessResponse<T> {
+    #[serde(rename = "contractVersion")]
+    pub contract_version: u32,
+    #[serde(flatten)]
+    pub payload: T,
+}
+
+#[derive(Serialize)]
+struct VersionResponse {
+    #[serde(rename = "contractVersion")]
+    pub contract_version: u32,
+    #[serde(rename = "crateVersion")]
+    pub crate_version: &'static str,
 }
 
 fn parse_data_plane_profile(value: &str) -> Option<opc_node_resources::DataPlaneProfile> {
@@ -219,29 +237,80 @@ fn evaluate_preflight(req: &PreflightRequest) -> Result<DataPlanePreflightReport
 
 fn write_error(err: &str) -> ! {
     let sanitized = sanitize_denial_message(err);
-    let resp = ErrorResponse { error: sanitized };
+    let resp = ErrorResponse {
+        error: sanitized,
+        contract_version: Some(CONTRACT_VERSION),
+    };
     let _ = serde_json::to_writer(io::stdout(), &resp);
     println!();
     std::process::exit(1);
 }
 
+fn write_contract_mismatch(expected: u64) -> ! {
+    let resp = ErrorResponse {
+        error: format!("Contract version mismatch: expected {expected}, actual {CONTRACT_VERSION}"),
+        contract_version: Some(CONTRACT_VERSION),
+    };
+    let _ = serde_json::to_writer(io::stdout(), &resp);
+    println!();
+    std::process::exit(2);
+}
+
 fn write_success<T: Serialize>(val: &T) {
-    if let Err(e) = serde_json::to_writer(io::stdout(), val) {
+    let resp = SuccessResponse {
+        contract_version: CONTRACT_VERSION,
+        payload: val,
+    };
+    if let Err(e) = serde_json::to_writer(io::stdout(), &resp) {
         write_error(&format!("Failed to serialize response: {e}"));
     }
     println!();
     std::process::exit(0);
 }
 
+fn parse_request<T: serde::de::DeserializeOwned>(buffer: &str, command_name: &str) -> T {
+    let mut value: serde_json::Value = match serde_json::from_str(buffer) {
+        Ok(v) => v,
+        Err(e) => write_error(&format!("Invalid JSON: {e}")),
+    };
+
+    if let Some(expected) = value
+        .get("expectedContractVersion")
+        .and_then(|v| v.as_u64())
+    {
+        if expected as u32 != CONTRACT_VERSION {
+            write_contract_mismatch(expected);
+        }
+    }
+
+    // Remove expectedContractVersion so it does not interfere with deserialization.
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("expectedContractVersion");
+    }
+
+    match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => write_error(&format!("Invalid {command_name} JSON: {e}")),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         write_error(
-            "Usage: operator-lifecycle-cli <admission|compatibility|config-apply|preflight>",
+            "Usage: operator-lifecycle-cli <admission|compatibility|config-apply|preflight|version>",
         );
     }
 
     let command = args[1].as_str();
+
+    if command == "version" {
+        let resp = VersionResponse {
+            contract_version: CONTRACT_VERSION,
+            crate_version: env!("CARGO_PKG_VERSION"),
+        };
+        write_success(&resp);
+    }
 
     let mut buffer = String::new();
     if let Err(e) = io::stdin().read_to_string(&mut buffer) {
@@ -250,18 +319,12 @@ fn main() {
 
     match command {
         "admission" => {
-            let req: AdmissionRequest = match serde_json::from_str(&buffer) {
-                Ok(r) => r,
-                Err(e) => write_error(&format!("Invalid AdmissionRequest JSON: {e}")),
-            };
+            let req: AdmissionRequest = parse_request(&buffer, "AdmissionRequest");
             let resp = evaluate_admission(&req);
             write_success(&resp);
         }
         "compatibility" => {
-            let req: CompatibilityRequest = match serde_json::from_str(&buffer) {
-                Ok(r) => r,
-                Err(e) => write_error(&format!("Invalid CompatibilityRequest JSON: {e}")),
-            };
+            let req: CompatibilityRequest = parse_request(&buffer, "CompatibilityRequest");
             let resp = req.compatibility_matrix.evaluate_compatibility(
                 &req.operator,
                 &req.nf,
@@ -276,10 +339,7 @@ fn main() {
             write_success(&resp);
         }
         "config-apply" => {
-            let req: ConfigApplyRequest = match serde_json::from_str(&buffer) {
-                Ok(r) => r,
-                Err(e) => write_error(&format!("Invalid ConfigApplyRequest JSON: {e}")),
-            };
+            let req: ConfigApplyRequest = parse_request(&buffer, "ConfigApplyRequest");
             let current_digest = match SchemaDigest::from_str(&req.current_digest) {
                 Ok(d) => d,
                 Err(e) => write_error(&format!("Invalid SchemaDigest hex: {e}")),
@@ -364,10 +424,7 @@ fn main() {
             write_success(&resp);
         }
         "preflight" => {
-            let req: PreflightRequest = match serde_json::from_str(&buffer) {
-                Ok(r) => r,
-                Err(e) => write_error(&format!("Invalid PreflightRequest JSON: {e}")),
-            };
+            let req: PreflightRequest = parse_request(&buffer, "PreflightRequest");
             match evaluate_preflight(&req) {
                 Ok(report) => write_success(&report),
                 Err(e) => write_error(&e),

@@ -13,6 +13,9 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 use x509_parser::prelude::*;
 
+pub mod file_svid;
+pub use file_svid::FileSvidSource;
+
 #[derive(Debug, Clone, thiserror::Error, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum IdentityReloadError {
     #[error("SPIRE socket is unavailable")]

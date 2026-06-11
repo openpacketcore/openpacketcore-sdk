@@ -5,6 +5,10 @@
 
 #![forbid(unsafe_code)]
 
+/// Contract version for the Rust↔Go JSON CLI boundary.
+/// Increment this when the request/response envelope shape changes.
+pub const CONTRACT_VERSION: u32 = 1;
+
 pub mod admission;
 pub mod compatibility;
 pub mod config_apply;

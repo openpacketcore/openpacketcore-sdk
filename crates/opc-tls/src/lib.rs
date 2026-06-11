@@ -311,6 +311,9 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
     }
 }
 
+pub type ServerConfig = rustls::ServerConfig;
+pub type ClientConfig = rustls::ClientConfig;
+
 pub struct TlsConfigBuilder {
     state_rx: watch::Receiver<Option<IdentityState>>,
     policy: PeerPolicy,
