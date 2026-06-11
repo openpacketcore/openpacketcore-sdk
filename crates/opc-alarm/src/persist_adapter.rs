@@ -1,3 +1,11 @@
+//! Durable, SQLite-backed audit sink for alarm admin actions (enabled by the
+//! `persist` feature). Satisfies the fail-closed audit contract of
+//! `AlarmAuditSink`: if the append to the `alarm_audit` table fails, the
+//! manager abandons the suppression/acknowledgement. Free-text audit fields
+//! (principal, reason, correlation id) are scrubbed of long digit runs and
+//! IPv4 literals before persistence as a defense-in-depth layer on top of
+//! caller-side RFC 010 redaction.
+
 use crate::manager::{AlarmActionScope, AlarmAuditEvent, AlarmAuditOutcome, AlarmAuditSink};
 use opc_persist::SqliteBackend;
 use time::format_description::well_known::Rfc3339;

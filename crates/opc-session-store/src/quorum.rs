@@ -1,3 +1,19 @@
+//! In-process quorum coordination over a set of session replicas.
+//!
+//! `QuorumSessionStore` composes its replica backends directly in this
+//! process and drives them through a shared, gap-free replication log: a
+//! mutation commits once a strict majority (`n/2 + 1`) of replicas have
+//! durably appended the identical log entry, and divergent or partially
+//! written replicas are repaired back to the committed prefix before the next
+//! operation proceeds. The networked transport that exposes a replica over a
+//! wire protocol lives in the separate `opc-session-net` crate; from this
+//! module's perspective a remote replica is simply another
+//! `SessionStoreBackend` implementation handed to the coordinator.
+//!
+//! `FencedSessionReplica` wraps each replica with controllable online flags
+//! and artificial lag so partition, failover, and split-brain scenarios can
+//! be exercised in-process without real networking.
+
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -24,14 +40,28 @@ impl<T: SessionBackend + SessionLeaseManager> SessionStoreBackend for T {}
 /// online/offline states, and epoch/fencing checks.
 #[derive(Clone)]
 pub struct FencedSessionReplica {
+    /// Position of this replica in the coordinator's replica set; used to
+    /// address it during read-repair and partial-write rollback.
     pub id: usize,
+    /// The actual backend plus lease manager for this replica — an in-memory
+    /// or SQLite backend in tests, or a remote backend from `opc-session-net`
+    /// in a distributed deployment.
     pub inner: Arc<dyn SessionStoreBackend>,
+    /// Simulates the replica process itself being up. While `false`, every
+    /// call through this wrapper fails with `StoreError::BackendUnavailable`,
+    /// and the replica stops counting toward quorum.
     pub node_online: Arc<tokio::sync::Mutex<bool>>,
+    /// Simulates the network path from this coordinator to the replica.
+    /// Toggling it independently of `node_online` models an asymmetric
+    /// partition: the replica is healthy but unreachable from here.
     pub client_online: Arc<tokio::sync::Mutex<bool>>,
+    /// Optional artificial one-way delay injected before each call, for
+    /// exercising slow-replica and replication-lag behavior.
     pub lag: Arc<tokio::sync::Mutex<Option<Duration>>>,
 }
 
 impl FencedSessionReplica {
+    /// Wrap a backend as replica `id`, initially online with no injected lag.
     pub fn new(id: usize, inner: Arc<dyn SessionStoreBackend>) -> Self {
         Self {
             id,
@@ -42,18 +72,28 @@ impl FencedSessionReplica {
         }
     }
 
+    /// Whether the replica is reachable: both the node itself and the client
+    /// network path must be up. Offline replicas are skipped by the
+    /// coordinator but still count in the quorum denominator.
     pub async fn is_online(&self) -> bool {
         *self.node_online.lock().await && *self.client_online.lock().await
     }
 
+    /// Simulate the replica process going down (`false`) or recovering
+    /// (`true`). A recovered replica is read-repaired to the committed log
+    /// prefix before it serves quorum operations again.
     pub async fn set_node_online(&self, online: bool) {
         *self.node_online.lock().await = online;
     }
 
+    /// Simulate losing (`false`) or restoring (`true`) the network path from
+    /// the coordinator to this replica, independent of node health.
     pub async fn set_client_online(&self, online: bool) {
         *self.client_online.lock().await = online;
     }
 
+    /// Inject (`Some`) or clear (`None`) an artificial delay applied before
+    /// every call to this replica.
     pub async fn set_lag(&self, lag: Option<Duration>) {
         *self.lag.lock().await = lag;
     }
@@ -85,6 +125,15 @@ pub struct QuorumSessionStore {
 }
 
 impl QuorumSessionStore {
+    /// Build a coordinator over `replicas`, timestamping log entries with the
+    /// real system clock.
+    ///
+    /// Quorum is a strict majority of the full replica set — `n/2 + 1` of all
+    /// configured replicas, with offline ones still counted in the
+    /// denominator — so a set of `n` replicas tolerates `(n-1)/2` failures.
+    /// Reads likewise require a majority of replicas to return an identical
+    /// record before a value is trusted, and every operation read-repairs
+    /// divergent replicas to the committed log prefix first.
     pub fn new(replicas: Vec<FencedSessionReplica>) -> Self {
         let caps = BackendCapabilities {
             atomic_compare_and_set: true,
@@ -103,6 +152,9 @@ impl QuorumSessionStore {
         }
     }
 
+    /// Replace the clock used to timestamp replication entries and to compute
+    /// lease `expires_at` deadlines — pair it with the replicas' clocks (e.g.
+    /// a shared `TokioVirtualClock`) so lease-expiry tests are deterministic.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self

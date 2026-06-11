@@ -1,3 +1,9 @@
+//! Global alarm observability hooks (RFC 013 §16), recorded into the shared
+//! `opc_redaction::metrics::METRICS` registry: the active-alarm gauge keyed
+//! by `(severity, probable cause)` — rebuilt from the active set after every
+//! manager mutation — and the audit success/failure counters incremented on
+//! the policy-protected admin paths.
+
 use crate::model::Alarm;
 use std::sync::atomic::Ordering;
 

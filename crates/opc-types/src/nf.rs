@@ -8,20 +8,24 @@ use crate::{validation::validate_slug, InstanceId, ParseError};
 pub struct NfKind(String);
 
 impl NfKind {
+    /// Known 3GPP network-function kinds.
     pub const KNOWN_VALUES: [&'static str; 16] = [
         "amf", "ausf", "bsf", "chf", "nef", "nrf", "nssf", "nwdaf", "pcf", "scp", "sepp", "smf",
         "udm", "udr", "udsf", "upf",
     ];
 
+    /// Parse and validate an NF kind string.
     pub fn new(value: impl Into<String>) -> Result<Self, ParseError> {
         let value = value.into();
         Ok(Self(validate_slug("nf kind", &value, 64)?))
     }
 
+    /// Return the NF kind as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
+    /// Check if this NF kind is in the known 3GPP set.
     pub fn is_known(&self) -> bool {
         Self::KNOWN_VALUES.contains(&self.as_str())
     }

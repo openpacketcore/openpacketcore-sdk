@@ -102,7 +102,7 @@ pub(crate) fn deserialize_audit_op_type(s: &str) -> Result<AuditOpType, PersistE
 
 /// SQLite-backed ConfigStore suitable for the reference management-plane store.
 ///
-/// Created via [`SqliteBackend::open`] or [`SqliteBackend::in_memory_for_test`].
+/// Created via [`SqliteBackend::open`] or `SqliteBackend::in_memory_for_test`.
 #[derive(Debug, Clone)]
 pub struct SqliteBackend {
     /// Path to the database (for preflight reporting).

@@ -1,3 +1,14 @@
+//! Durable SQLite implementation of the storage and lease APIs.
+//!
+//! Intended for single-node and edge/single-replica profiles: it provides
+//! transactional fenced CAS, monotonic per-key fences, server-side lease
+//! expiry, and per-key TTL on one local database file (WAL mode, full sync).
+//! Replication-log application and watch are implemented so a SQLite node
+//! can serve as a quorum replica, but the backend deliberately does not
+//! advertise `ordered_replication_log`/`watch` capabilities and therefore
+//! fails validation for the `replicated-disaster-recovery` profile on its
+//! own.
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -168,6 +179,12 @@ impl SqliteSessionBackend {
         })
     }
 
+    /// Replace the default `SystemClock`.
+    ///
+    /// The clock drives record TTL expiry and server-side lease expiry
+    /// checks; substituting a virtual clock makes expiry behavior testable
+    /// without real waiting. Has no effect on rows already written — only on
+    /// how their deadlines are evaluated.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self

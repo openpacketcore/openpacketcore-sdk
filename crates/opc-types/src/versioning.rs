@@ -18,14 +18,17 @@ impl ConfigVersion {
     /// typically produced by advancing this value to `1`.
     pub const INITIAL: Self = Self(0);
 
+    /// Create a new config version from a raw u64.
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
+    /// Return the underlying u64 value.
     pub const fn get(self) -> u64 {
         self.0
     }
 
+    /// Return the next config version, or `None` on overflow.
     pub const fn next(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(v) => Some(Self(v)),
@@ -46,14 +49,17 @@ impl fmt::Display for ConfigVersion {
 pub struct TxId(Uuid);
 
 impl TxId {
+    /// Generate a new random transaction ID.
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
+    /// Wrap an existing UUID as a transaction ID.
     pub const fn from_uuid(value: Uuid) -> Self {
         Self(value)
     }
 
+    /// Access the underlying UUID.
     pub const fn as_uuid(&self) -> &Uuid {
         &self.0
     }
@@ -86,14 +92,17 @@ impl FromStr for TxId {
 pub struct SchemaDigest([u8; 32]);
 
 impl SchemaDigest {
+    /// Create a digest from raw 32-byte array.
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
+    /// Access the raw 32-byte array.
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
+    /// Render as lowercase hexadecimal string.
     pub fn to_hex(self) -> String {
         const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -159,18 +168,22 @@ impl<'de> Deserialize<'de> for SchemaDigest {
 pub struct Timestamp(OffsetDateTime);
 
 impl Timestamp {
+    /// Current UTC timestamp.
     pub fn now_utc() -> Self {
         Self(OffsetDateTime::now_utc())
     }
 
+    /// Convert an `OffsetDateTime` to UTC and wrap it.
     pub fn from_offset_datetime(value: OffsetDateTime) -> Self {
         Self(value.to_offset(UtcOffset::UTC))
     }
 
+    /// Access the inner `OffsetDateTime`.
     pub const fn as_offset_datetime(&self) -> &OffsetDateTime {
         &self.0
     }
 
+    /// Add seconds to the timestamp.
     pub fn add_seconds(self, seconds: i64) -> Self {
         Self(self.0 + time::Duration::seconds(seconds))
     }

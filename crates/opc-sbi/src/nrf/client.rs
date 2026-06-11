@@ -1,3 +1,7 @@
+//! TS 29.510 NRF client (NFManagement registration/heartbeat and
+//! NFDiscovery), the periodic heartbeat driver, and the cache-fronted
+//! discovery client with stale-if-error and production fail-closed rules.
+
 use crate::nrf::{CacheLookup, DiscoveryCache, DiscoveryQuery, DiscoveryResult, NfProfile};
 use crate::redact::{safe_metric_label, sanitize_error_message};
 use async_trait::async_trait;
@@ -9,9 +13,27 @@ use std::time::Duration;
 /// NRF service client operations
 #[async_trait]
 pub trait NrfOperations: Send + Sync {
+    /// Register (or re-register) the NF profile with the NRF
+    /// (TS 29.510 NFManagement `PUT .../nf-instances/{nfInstanceId}`).
+    ///
+    /// On success returns the heartbeat interval the NF must honor: the
+    /// NRF-supplied `heartbeatTimer` (in seconds) when present, otherwise
+    /// the implementation's default (30 s for `NrfClient`).
     async fn register(&self, profile: &NfProfile) -> Result<Duration, String>;
+    /// Remove the NF instance from the NRF (TS 29.510 `DELETE`), making it
+    /// undiscoverable; used for graceful shutdown.
     async fn deregister(&self, instance_id: &NfInstanceId) -> Result<(), String>;
+    /// Send a keep-alive heartbeat (TS 29.510 `PATCH` of `nfStatus`).
+    ///
+    /// Returns the interval to wait before the next heartbeat — the NRF may
+    /// re-negotiate it on every response.
     async fn heartbeat(&self, instance_id: &NfInstanceId) -> Result<Duration, String>;
+    /// Query the NRF for NF instances matching `query` (TS 29.510
+    /// NFDiscovery).
+    ///
+    /// NRF-level outcomes (found / not-found / NRF error) are reported in
+    /// the `DiscoveryResult`; `Err` is reserved for failures to reach or
+    /// speak to the NRF at all.
     async fn discover(&self, query: &DiscoveryQuery) -> Result<DiscoveryResult, String>;
 }
 
@@ -22,6 +44,10 @@ pub struct NrfClient {
 }
 
 impl NrfClient {
+    /// Wrap an `SbiClient` targeting the NRF at `nrf_uri` (scheme +
+    /// authority, no trailing slash — paths like `/nnrf-nfm/v1/...` are
+    /// appended verbatim). Retry, TLS, and circuit-breaking behavior come
+    /// from the supplied client.
     pub fn new(client: crate::client::SbiClient, nrf_uri: String) -> Self {
         Self { client, nrf_uri }
     }
@@ -191,6 +217,13 @@ pub struct HeartbeatDriver {
 }
 
 impl HeartbeatDriver {
+    /// Assemble a driver (it does nothing until `run` is awaited).
+    ///
+    /// `default_interval` is used until the NRF returns its own heartbeat
+    /// timer; `shutdown_rx` flipping to `true` stops the loop (after a
+    /// best-effort deregistration); `degraded_tx` is the channel on which
+    /// the driver publishes the NF's degraded/healthy state to the rest of
+    /// the process.
     pub fn new(
         nrf_client: Arc<dyn NrfOperations>,
         nf_instance_id: NfInstanceId,
@@ -207,6 +240,16 @@ impl HeartbeatDriver {
         }
     }
 
+    /// Run the heartbeat loop until shutdown is signalled.
+    ///
+    /// Each tick sends up to 3 heartbeat attempts with 1 s doubling backoff
+    /// capped at 5 s between them. A successful heartbeat adopts the
+    /// NRF-returned interval for the next tick and clears the degraded
+    /// flag. After 3 consecutive fully failed ticks the driver publishes
+    /// `degraded = true` on the watch channel — per RFC 007 §10.2 the NF
+    /// keeps serving existing traffic while degraded; it is marked, not
+    /// killed. On shutdown it deregisters from the NRF best-effort before
+    /// returning. Outcomes are counted in `sbi_nrf_heartbeat_total`.
     pub async fn run(mut self) {
         let mut interval = self.default_interval;
         let mut consecutive_failures = 0;
@@ -278,6 +321,11 @@ pub struct CachedDiscoveryClient {
 }
 
 impl CachedDiscoveryClient {
+    /// Front `nrf_client` with `cache`. The cache is shared via
+    /// `Arc<Mutex<..>>` so several consumers (and config-invalidation
+    /// paths) can use one cache. `production_mode` switches stale handling
+    /// for security-sensitive NF types from fail-open to fail-closed (see
+    /// `discover`).
     pub fn new(
         nrf_client: Arc<dyn NrfOperations>,
         cache: Arc<Mutex<DiscoveryCache>>,
@@ -290,6 +338,24 @@ impl CachedDiscoveryClient {
         }
     }
 
+    /// Resolve `query` through the cache, falling back to the NRF.
+    ///
+    /// Behavior by cache state:
+    /// - **Hit** (within TTL): served without touching the NRF.
+    /// - **Stale** (TTL expired, within the stale-if-error window): a fresh
+    ///   NRF lookup is attempted. On failure, non-sensitive targets fall
+    ///   back to the stale profiles (fail-open, keeps routing alive while
+    ///   the NRF is down); but in production mode, targets `UDM`, `AUSF`,
+    ///   `NRF`, and `PCF` are fail-closed — stale data is rejected and an
+    ///   error returned, so authentication/policy paths never run on
+    ///   possibly revoked topology.
+    /// - **Negative**: a cached NotFound is returned as an error without
+    ///   re-querying (protects a struggling NRF from repeat misses).
+    /// - **Miss**: the NRF is queried; Found results populate the cache,
+    ///   NotFound is negatively cached and reported as an error.
+    ///
+    /// Every path increments a distinct `sbi_nrf_discovery_total` outcome
+    /// label; error strings are sanitized before being returned.
     pub async fn discover(&self, query: &DiscoveryQuery) -> Result<Vec<NfProfile>, String> {
         let key = query.to_cache_key();
 

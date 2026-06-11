@@ -20,12 +20,23 @@ use thiserror::Error;
 /// Errors returned by the mock NRF.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MockNrfError {
+    /// `register` was called for an NF instance ID that is already
+    /// registered; the mock requires `update` for profile changes instead
+    /// of silently overwriting.
     #[error("NF instance already registered")]
     AlreadyRegistered,
+    /// The targeted NF instance ID is not registered (update, deregister,
+    /// or heartbeat against an unknown/removed NF).
     #[error("NF instance not found")]
     NotFound,
+    /// Reserved for heartbeat rejection after repeated failures; current
+    /// mock paths report unknown NFs as `NotFound` while tracking the
+    /// degradation flag separately.
     #[error("heartbeat rejected: repeated failures")]
     HeartbeatRejected,
+    /// Fault injection via `set_unavailable(true)` is active: every mock
+    /// operation fails with this error until cleared, simulating a down
+    /// NRF (RFC 007 §18.3).
     #[error("NRF is unavailable")]
     Unavailable,
 }

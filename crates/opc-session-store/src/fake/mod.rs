@@ -1,3 +1,13 @@
+//! Deterministic in-memory test double for the storage and lease APIs.
+//!
+//! `FakeSessionBackend` implements the full `SessionBackend` and
+//! `SessionLeaseManager` contracts — fenced CAS, lease lifecycle, TTL
+//! pruning, the ordered replication log, and watch streams — entirely in
+//! process. Combined with `TokioVirtualClock` it lets split-brain, stale
+//! fence, lease-expiry, and quorum scenarios run deterministically without
+//! I/O or real waiting. Suitable for tests and single-replica development
+//! only; nothing is persisted.
+
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -70,6 +80,11 @@ impl FakeSessionBackend {
         }
     }
 
+    /// Replace the default tokio-virtual-time clock.
+    ///
+    /// The clock decides record TTL expiry, lease expiry, and pruning. Share
+    /// one clock instance across the backends and coordinators under test so
+    /// "owner pauses past its lease TTL" scenarios stay coherent.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self

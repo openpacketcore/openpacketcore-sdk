@@ -1,3 +1,10 @@
+//! Injectable time sources for TTL and lease-expiry decisions.
+//!
+//! Backends and the quorum coordinator never call `Timestamp::now_utc`
+//! directly; they go through a `Clock` so tests can drive record TTLs and
+//! lease expiry deterministically (e.g. "owner pauses past its lease TTL")
+//! with tokio's paused virtual time instead of real sleeps.
+
 use opc_types::Timestamp;
 
 /// Injectable clock source for session expiration and leases.
@@ -24,6 +31,14 @@ pub struct TokioVirtualClock {
 }
 
 impl TokioVirtualClock {
+    /// Anchor the clock at the current wall-clock time and the current
+    /// `tokio::time::Instant`.
+    ///
+    /// Subsequent `now_utc` calls report the anchor plus tokio's elapsed
+    /// time, so under `tokio::time::pause`/`advance` the clock jumps exactly
+    /// as far as the test advances the runtime — letting TTL and lease-expiry
+    /// paths be exercised without real waiting. Must be created inside a
+    /// tokio runtime context.
     pub fn new() -> Self {
         Self {
             base_time: *Timestamp::now_utc().as_offset_datetime(),

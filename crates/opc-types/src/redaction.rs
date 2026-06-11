@@ -12,18 +12,22 @@ const REDACTED_MARKER: &str = "<redacted>";
 pub struct Redacted<T>(T);
 
 impl<T> Redacted<T> {
+    /// Wrap a value in a redacted container.
     pub fn new(value: T) -> Self {
         Self(value)
     }
 
+    /// Access the inner value by reference.
     pub fn expose(&self) -> &T {
         &self.0
     }
 
+    /// Unwrap and return the inner value.
     pub fn into_inner(self) -> T {
         self.0
     }
 
+    /// Map the inner value through a function.
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Redacted<U> {
         Redacted::new(f(self.0))
     }
@@ -52,6 +56,7 @@ impl<T> fmt::Display for Redacted<T> {
 pub struct RedactedDebug<'a, T: ?Sized>(&'a T);
 
 impl<'a, T: ?Sized> RedactedDebug<'a, T> {
+    /// Create a redacted debug adapter for a borrowed value.
     pub fn new(value: &'a T) -> Self {
         Self(value)
     }
@@ -78,6 +83,7 @@ pub fn redact<T: ?Sized>(value: &T) -> RedactedDebug<'_, T> {
 
 /// Convenience extension trait for converting owned values into `Redacted`.
 pub trait IntoRedacted: Sized {
+    /// Wrap this value in a `Redacted` container.
     fn redacted(self) -> Redacted<Self> {
         Redacted::new(self)
     }

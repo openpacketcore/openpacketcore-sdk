@@ -1,3 +1,12 @@
+//! Lease manager and fencing rules for single-owner session mutation
+//! (RFC 004 §9).
+//!
+//! A lease grants one owner the right to mutate a session for a bounded TTL;
+//! the fence token minted at acquisition is what actually protects the data.
+//! Lease expiry is a liveness mechanism only — safety comes from backends
+//! rejecting writes whose fence token is lower than the key's recorded token,
+//! so an owner that pauses past its TTL can never overwrite its successor.
+
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,7 +21,7 @@ use crate::{
 ///
 /// Callers can inspect the lease metadata, but only the lease manager can mint
 /// a valid guard, which makes the guard suitable as proof for fenced mutations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LeaseGuard {
     key: SessionKey,
     owner: OwnerId,
@@ -41,22 +50,37 @@ impl LeaseGuard {
         }
     }
 
+    /// Session key this lease covers; fenced mutations must target exactly
+    /// this key or backends reject them as invalid.
     pub fn key(&self) -> &SessionKey {
         &self.key
     }
 
+    /// Replica the lease was granted to. Records written under this lease
+    /// must carry the same owner or the write is rejected as stale.
     pub fn owner(&self) -> &OwnerId {
         &self.owner
     }
 
+    /// Fence token minted when the lease was acquired. It is constant across
+    /// renewals, and release does not lower the key's recorded token — only a
+    /// later acquisition mints a higher one.
     pub fn fence(&self) -> FenceToken {
         self.fence
     }
 
+    /// When this guard was issued by the lease manager's clock (some
+    /// implementations preserve the original acquisition time across
+    /// renewals, others restamp it at renewal).
     pub fn acquired_at(&self) -> Timestamp {
         self.acquired_at
     }
 
+    /// Deadline after which the guard is no longer valid: fenced mutations
+    /// presented later fail with a lease-expired error and the key becomes
+    /// acquirable by other owners. Renew well before this point — RFC 004
+    /// §9.3 recommends before 50 percent of the TTL has elapsed — and stop
+    /// authoritative writes immediately if a renewal fails.
     pub fn expires_at(&self) -> Timestamp {
         self.expires_at
     }

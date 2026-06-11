@@ -1,8 +1,18 @@
+//! Authorization hooks for alarm admin actions (RFC 013 §10). Suppression
+//! and acknowledgement must be authorized, and security-critical alarms
+//! (critical severity or security/integrity causes) are non-suppressible
+//! unless a policy explicitly opts in.
+
 use crate::manager::admin::{AlarmAction, AlarmActionContext, AlarmActionDenied};
 use crate::model::{Alarm, ProbableCause, Severity};
 
 /// Policy hook for alarm acknowledgement and suppression.
 pub trait AlarmActionAuthorizer {
+    /// Decides whether `context` (principal, tenant, scope) may perform
+    /// `action` on `alarm`. Implementations should verify the principal, that
+    /// the asserted scope actually covers the target alarm, and tenant
+    /// alignment. Returning `Err` yields `AlarmOpResult::Unauthorized` and an
+    /// audited denial; the alarm state is left untouched.
     fn authorize_alarm_action(
         &self,
         action: AlarmAction,

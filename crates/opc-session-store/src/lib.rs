@@ -1,3 +1,4 @@
+#![deny(missing_docs)]
 //! High-performance session store substrate for OpenPacketCore (RFC 004).
 //!
 //! This crate provides the core abstractions for storing, leasing, and mutating

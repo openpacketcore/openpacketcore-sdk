@@ -1,3 +1,11 @@
+//! HTTP/2 SBI client and its builder.
+//!
+//! `SbiClient` pools one HTTP/2 connection per `host:port` authority, gates
+//! every request through a per-(peer, service) circuit breaker, retries per
+//! the configured idempotency-aware `RetryPolicy`, and enforces request and
+//! response body limits. In production mode the builder refuses plaintext
+//! or HTTP/1.1-capable configurations.
+
 use crate::client::circuit_breaker::CircuitBreakers;
 use crate::redact::{safe_metric_label, sanitize_error_message};
 use crate::retry::{RetryOutcome, RetryPolicy};
@@ -26,6 +34,23 @@ pub struct SbiClient {
 }
 
 impl SbiClient {
+    /// Send one SBI request, applying the client's full reliability stack.
+    ///
+    /// Order of operations:
+    /// 1. reject bodies larger than the configured limit before any I/O;
+    /// 2. consult the circuit breaker keyed by (host, first path segment) —
+    ///    an open circuit fails immediately without dialing the peer;
+    /// 3. send over a pooled (or newly dialed) HTTP/2 connection with the
+    ///    configured request timeout, then retry per the `RetryPolicy` with
+    ///    exponential backoff — non-idempotent requests without an
+    ///    `idempotency-key` header are never retried;
+    /// 4. record success/failure into the circuit breaker and the
+    ///    `sbi_requests_total` / `sbi_request_duration_seconds` metrics.
+    ///
+    /// Only 2xx responses count as success; other statuses either retry (if
+    /// listed in the policy) or surface as a sanitized `Err(String)` —
+    /// secrets, hosts, and subscriber identifiers never appear in the error.
+    /// Response bodies are read fully and capped at the same body limit.
     pub async fn send(&self, request: Request<Vec<u8>>) -> Result<Response<Bytes>, String> {
         let uri = request.uri().clone();
         let host = uri
@@ -271,6 +296,10 @@ impl Default for SbiClientBuilder {
 }
 
 impl SbiClientBuilder {
+    /// Start from the defaults: 5 s connect timeout, 10 s request timeout,
+    /// 8 MiB body limit, HTTP/2-only, 256 pooled connections, no TLS, and
+    /// non-production mode. Retry policy and circuit breakers fall back to
+    /// built-in defaults at `build` time if not supplied.
     pub fn new() -> Self {
         Self {
             tls_config: None,
@@ -285,51 +314,88 @@ impl SbiClientBuilder {
         }
     }
 
+    /// Use this rustls client configuration for outbound TLS. Without it
+    /// the client speaks plaintext HTTP/2, which `build` rejects in
+    /// production mode and `send` rejects while `http2_only` is set.
     pub fn with_tls(mut self, config: Arc<rustls::ClientConfig>) -> Self {
         self.tls_config = Some(config);
         self
     }
 
+    /// Cap how long TCP connection establishment may take before the
+    /// attempt is treated as a transport error (default 5 seconds). Must be
+    /// non-zero or `build` fails.
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
     }
 
+    /// Cap the time budget of a **single attempt** from sending the request
+    /// to receiving response headers (default 10 seconds). Retries each get
+    /// their own budget, so worst-case wall time is roughly
+    /// `max_attempts * request_timeout` plus backoff sleeps.
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
     }
 
+    /// Replace the default retry policy (3 attempts, 100 ms base delay
+    /// doubling to a 1 s cap, full jitter, retry on 429/503 and transport
+    /// errors).
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.retry_policy = Some(policy);
         self
     }
 
+    /// Share a circuit-breaker registry with other clients (so failure
+    /// state is pooled per peer/service across them). Defaults to a private
+    /// registry opening after 5 consecutive failures with a 30 s cooldown
+    /// and 3 half-open probes.
     pub fn with_circuit_breakers(mut self, breakers: Arc<CircuitBreakers>) -> Self {
         self.circuit_breakers = Some(breakers);
         self
     }
 
+    /// Set the maximum size in bytes for both outbound request bodies and
+    /// fully buffered response bodies (default 8 MiB). Oversized requests
+    /// fail before any I/O; oversized responses abort mid-read. Zero is
+    /// rejected by `build`.
     pub fn with_body_limit(mut self, limit: usize) -> Self {
         self.body_limit = limit;
         self
     }
 
+    /// Control whether plaintext (non-TLS) connections are permitted.
+    /// `true` (the default) makes `send` fail when TLS is not configured;
+    /// `false` allows unencrypted HTTP/2 for lab/test profiles only and is
+    /// rejected by `build` in production mode.
     pub fn with_http2_only(mut self, enabled: bool) -> Self {
         self.http2_only = enabled;
         self
     }
 
+    /// Toggle production hardening. When enabled, `build` fails unless TLS
+    /// is configured and `http2_only` is on — a production SBI client can
+    /// never silently fall back to plaintext (RFC 007 §6.1).
     pub fn with_production_mode(mut self, enabled: bool) -> Self {
         self.production_mode = enabled;
         self
     }
 
+    /// Cap the number of pooled HTTP/2 connections, one per `host:port`
+    /// authority (default 256). When full, an arbitrary pooled connection
+    /// is dropped to admit the new authority. Zero is rejected by `build`.
     pub fn with_max_pool_entries(mut self, max: usize) -> Self {
         self.max_pool_entries = max;
         self
     }
 
+    /// Validate the configuration and construct the client.
+    ///
+    /// Fails (with a human-readable reason) if the body limit, either
+    /// timeout, or the pool limit is zero, or if production mode is set
+    /// without TLS or without HTTP/2-only. Missing retry policy and circuit
+    /// breakers are filled with the documented defaults.
     pub fn build(self) -> Result<SbiClient, String> {
         if self.body_limit == 0 {
             return Err("SBI client body limit must be greater than zero".to_string());

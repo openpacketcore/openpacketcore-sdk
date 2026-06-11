@@ -1,3 +1,12 @@
+//! Stored record format and encrypted payload envelopes (RFC 004 §8, §14).
+//!
+//! `StoredSessionRecord` is the unit of persistence: payload bytes plus the
+//! generation, owner, fence, and TTL metadata that backends validate on every
+//! fenced write. Payloads are sealed as RFC 003 AEAD envelopes whose AAD
+//! binds tenant, NF kind, a keyed session-key digest, state type, generation,
+//! fence, and backend namespace — so ciphertext copied to another record,
+//! version, tenant, or backend fails to decrypt instead of silently decoding.
+
 use opc_crypto::{
     decrypt_decoded_envelope_with_handle, encrypt_envelope_with_handle, CryptoEnvelopeV1,
 };
@@ -19,11 +28,29 @@ const SESSION_ENVELOPE_MISSING_CIPHERTEXT_MESSAGE: &str = "session envelope ciph
 
 use serde::{Deserialize, Serialize};
 
+/// Declared interpretation of the bytes inside an `EncryptedSessionPayload`.
+///
+/// The encoding decides how `EncryptedSessionPayload::decrypt` treats the
+/// bytes, so durable adapters must persist and restore it faithfully —
+/// mislabeling ciphertext as plaintext (or vice versa) either leaks envelope
+/// bytes to callers or fails decryption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionPayloadEncoding {
+    /// Caller-facing plaintext above the persistence boundary; the
+    /// `EncryptingSessionBackend` wrapper seals it before it reaches a
+    /// backend. `decrypt` returns the bytes unchanged.
     Plaintext,
+    /// Plaintext row written before envelope encryption existed. Only for
+    /// intentional one-time migrations; `decrypt` returns the bytes
+    /// unchanged rather than failing.
     LegacyPlaintext,
+    /// RFC 003 `CryptoEnvelopeV1` AEAD ciphertext — the only encoding that
+    /// should reach a backend outside the deployment's trusted cryptographic
+    /// boundary. `decrypt` requires a valid envelope and matching AAD.
     EnvelopeV1,
+    /// Encoding unknown (e.g. a legacy database row being probed during
+    /// migration). `decrypt` attempts an envelope decode and falls back to
+    /// treating the bytes as plaintext if they do not parse as one.
     Unclassified,
 }
 
@@ -121,22 +148,38 @@ impl EncryptedSessionPayload {
         }
     }
 
+    /// Raw payload bytes in their current encoding: AEAD envelope bytes for
+    /// `EnvelopeV1`, plaintext otherwise. Check `encoding` before
+    /// interpreting them.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 
+    /// How `as_bytes` is to be interpreted (and how `decrypt` will treat it).
     pub fn encoding(&self) -> SessionPayloadEncoding {
         self.encoding
     }
 
+    /// Size of the stored bytes — ciphertext size for envelopes, which is
+    /// what backends compare against their `max_value_bytes` capability.
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
 
+    /// `true` when no payload bytes are present. An empty `EnvelopeV1`
+    /// payload is invalid and fails decryption.
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
 
+    /// Seal `record`'s payload into an RFC 003 AEAD envelope using the
+    /// tenant's active session key from `provider`.
+    ///
+    /// The AAD binds tenant, NF kind, a keyed digest of the session key,
+    /// state type, generation, fence, and `backend_namespace`, so the
+    /// ciphertext only ever decrypts for exactly this record version in this
+    /// namespace. Failures are reported as a deliberately coarse
+    /// `StoreError::Crypto` to avoid acting as an encryption oracle.
     pub async fn encrypt<P: KeyProvider + ?Sized>(
         provider: &P,
         record: &StoredSessionRecord,
@@ -155,6 +198,18 @@ impl EncryptedSessionPayload {
         ))
     }
 
+    /// Recover the plaintext payload according to the declared encoding.
+    ///
+    /// `Plaintext` and `LegacyPlaintext` return the bytes unchanged;
+    /// `Unclassified` tries an envelope decode and falls back to returning
+    /// the bytes as-is. For `EnvelopeV1` the decryption key is looked up by
+    /// the key id embedded in the envelope, and the AAD is rebuilt from the
+    /// `key`, `state_type`, `generation`, `fence`, and `backend_namespace`
+    /// arguments — these must be the values the record was encrypted with
+    /// (i.e. the record's own header fields), otherwise decryption fails with
+    /// `StoreError::Crypto`. That failure is the integrity check: ciphertext
+    /// spliced onto a different record, generation, or namespace cannot
+    /// decode.
     pub async fn decrypt<P: KeyProvider + ?Sized>(
         &self,
         provider: &P,
@@ -212,13 +267,34 @@ impl std::fmt::Debug for EncryptedSessionPayload {
 /// Persistent representation of a session record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredSessionRecord {
+    /// Tenant- and type-scoped identity of the session this record belongs
+    /// to; must match the key the record is stored under.
     pub key: SessionKey,
+    /// Monotonic per-session version. For state classes that require
+    /// monotonic generations, every successful compare-and-set must write a
+    /// strictly greater value, which is how replicas order replicated copies
+    /// without comparing wall clocks.
     pub generation: Generation,
+    /// Replica that performed the last authoritative write; backends require
+    /// it to match the lease presented with the write.
     pub owner: OwnerId,
+    /// Fence token the record was written under. Backends record the highest
+    /// token per key and reject later writes carrying a lower one, which is
+    /// what stops a stale owner from resurrecting old state.
     pub fence: FenceToken,
+    /// Consistency class of this state (RFC 004 §4); decides whether
+    /// monotonic-generation enforcement applies and which backend capability
+    /// profile is required to hold the record.
     pub state_class: StateClass,
+    /// Schema discriminator for the payload. Bound into the encryption AAD,
+    /// so a payload cannot be reinterpreted under a different state type.
     pub state_type: StateType,
+    /// TTL deadline; `None` means the record never expires. Once passed, the
+    /// record reads as absent and may be pruned — refresh it with a fenced
+    /// `refresh_ttl` before the deadline to keep it alive.
     pub expires_at: Option<Timestamp>,
+    /// Payload bytes, either caller-facing plaintext or a sealed envelope
+    /// depending on `EncryptedSessionPayload::encoding`.
     pub payload: EncryptedSessionPayload,
 }
 

@@ -1,3 +1,14 @@
+//! JWT-SVID validation and client token acquisition (RFC 007 §9.2–9.3).
+//!
+//! Server side: `SbiJwtValidator` implements `SbiAuth` by verifying RS256
+//! JWT-SVIDs against a JWKS fetched through a `JwksResolver` and cached
+//! fail-closed in a `JwksCache`. Peer identity (tenant, NF type, instance)
+//! is derived from the SPIFFE ID in the token's `sub` claim.
+//!
+//! Client side: `ClientTokenCache` caches tokens obtained from a
+//! `TokenProvider` per normalized scope set, refreshing shortly before
+//! expiry.
+
 use crate::auth::{SbiAuth, SbiAuthContext, SbiAuthError, SbiAuthRequest, SbiPeer};
 use crate::headers::BearerToken;
 use crate::redact::sanitize_error_message;
@@ -9,25 +20,45 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// JWK representation
+/// Single JSON Web Key (RFC 7517) used for JWT-SVID signature verification.
+///
+/// Only the RSA subset needed for RS256 validation is modeled; keys with
+/// other types or algorithms are skipped during lookup, never rejected
+/// loudly.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Jwk {
+    /// Key type (`kty`). Only `"RSA"` keys are usable for validation here.
     pub kty: String,
+    /// Key ID (`kid`) matched against the JWT header's `kid`; keys without
+    /// one can never be selected.
     pub kid: Option<String>,
+    /// Declared algorithm (`alg`). If present it must be `"RS256"` for the
+    /// key to be eligible; an absent `alg` is treated as RS256-compatible.
     pub alg: Option<String>,
+    /// RSA public modulus (`n`), base64url-encoded per RFC 7518 §6.3.
     pub n: Option<String>, // RSA modulus
+    /// RSA public exponent (`e`), base64url-encoded per RFC 7518 §6.3.
     pub e: Option<String>, // RSA exponent
 }
 
-/// JWKS representation
+/// JSON Web Key Set (RFC 7517 §5): the document fetched from the issuer's
+/// JWKS endpoint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Jwks {
+    /// All published keys; lookup filters by `kid`, RSA key type, and RS256
+    /// compatibility.
     pub keys: Vec<Jwk>,
 }
 
 /// Resolver trait for fetching JWKS dynamically.
 #[async_trait]
 pub trait JwksResolver: Send + Sync {
+    /// Fetch the issuer's current key set (e.g. over HTTPS).
+    ///
+    /// Errors propagate into `JwksCache::get_decoding_key`, which reacts by
+    /// invalidating its cache (fail-closed); the error string is sanitized
+    /// before reaching any caller-visible surface, but implementations
+    /// should still avoid embedding secrets or endpoints in it.
     async fn fetch_jwks(&self) -> Result<Jwks, String>;
 }
 
@@ -39,6 +70,9 @@ pub struct JwksCache {
 }
 
 impl JwksCache {
+    /// Create an empty cache that refreshes through `resolver` and serves a
+    /// fetched key set for `ttl` before refetching. The first
+    /// `get_decoding_key` call always hits the resolver.
     pub fn new(resolver: Arc<dyn JwksResolver>, ttl: Duration) -> Self {
         Self {
             resolver,
@@ -47,6 +81,15 @@ impl JwksCache {
         }
     }
 
+    /// Return the RS256 decoding key for the given JWT `kid`.
+    ///
+    /// Serves from the cached JWKS while it is within TTL; on miss or
+    /// expiry the resolver is queried again. If the refresh fails the
+    /// entire cache is dropped (fail-closed — no token can validate against
+    /// a stale key set) and the `jwks_refresh_failure` outcome is counted
+    /// in the `sbi_oauth_validation_total` metric. A successful refresh
+    /// that still lacks the `kid` is also an error (covers rotated or
+    /// unknown key IDs).
     pub async fn get_decoding_key(&self, kid: &str) -> Result<DecodingKey, String> {
         let now = Instant::now();
         // 1. Check if cached and still fresh
@@ -110,14 +153,27 @@ fn find_key_in_jwks(jwks: &Jwks, kid: &str) -> Option<DecodingKey> {
     None
 }
 
-/// SVID Claims representation
+/// Claim set of a JWT-SVID as validated by `SbiJwtValidator` (RFC 7519
+/// registered claims plus the OAuth2 `scope` claim).
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct SvidClaims {
+    /// Issuer (`iss`); must equal the validator's expected issuer exactly.
     pub iss: String,
+    /// Subject (`sub`): the workload's SPIFFE ID. The validator parses
+    /// tenant, NF type, and NF instance ID out of its path segments.
     pub sub: String,
+    /// Audience (`aud`); either a single string or an array of strings per
+    /// RFC 7519 §4.1.3 — the expected audience must match or be contained.
     pub aud: serde_json::Value,
+    /// Expiry (`exp`) in **seconds** since the Unix epoch; mandatory, and
+    /// tokens past it are denied.
     pub exp: u64,
+    /// Not-before (`nbf`) in seconds since the Unix epoch. Optional in the
+    /// struct, but the validator requires it and rejects tokens used early.
     pub nbf: Option<u64>,
+    /// OAuth2 scopes as a single **space-delimited** string (e.g.
+    /// `"nnrf-disc nnrf-nfm"`); split into individual scopes after
+    /// validation.
     pub scope: Option<String>,
 }
 
@@ -131,6 +187,15 @@ pub struct SbiJwtValidator {
 }
 
 impl SbiJwtValidator {
+    /// Build a validator that verifies RS256 JWT-SVIDs against keys fetched
+    /// through `resolver` (cached for `jwks_ttl`) and requires the given
+    /// audience and issuer, plus mandatory `exp`/`nbf` claims.
+    ///
+    /// `bypass_verification_in_dev` enables a dev/test-only shortcut: tokens
+    /// prefixed `mock-token-` (as issued by the testkit `MockNrf`) are
+    /// accepted without signature verification and yield a fixed mock AMF
+    /// peer. The bypass is **ignored whenever `production_mode` is true**,
+    /// so it cannot weaken a production deployment.
     pub fn new(
         resolver: Arc<dyn JwksResolver>,
         jwks_ttl: Duration,
@@ -338,6 +403,12 @@ fn parse_spiffe_id_segments(spiffe_id: &SpiffeId) -> Option<(String, String, Str
 /// Token Provider trait for client token acquisition
 #[async_trait]
 pub trait TokenProvider: Send + Sync {
+    /// Obtain a fresh access token granting the requested scopes, e.g. via
+    /// the NRF AccessToken service (TS 29.510) or another OAuth2 server.
+    ///
+    /// Implementations should return an error rather than a token with
+    /// fewer scopes than requested; the error string must be free of
+    /// credential material.
     async fn get_token(&self, scopes: &[String]) -> Result<BearerToken, String>;
 }
 
@@ -350,10 +421,19 @@ pub struct ClientTokenCache {
 }
 
 impl ClientTokenCache {
+    /// Create a cache with the default bounds: at most 100 distinct scope
+    /// sets, each token assumed valid for 300 seconds after acquisition.
     pub fn new(provider: Arc<dyn TokenProvider>) -> Self {
         Self::new_with_bounds(provider, 100, Duration::from_secs(300))
     }
 
+    /// Create a cache with explicit bounds.
+    ///
+    /// `max_entries` caps how many distinct (sorted, deduplicated) scope
+    /// sets are cached; `max_token_ttl` is how long an acquired token is
+    /// served before being treated as expired — the cache does not inspect
+    /// the token's own `exp`, so keep this at or below the issuer's actual
+    /// token lifetime. Values are clamped to at least 1 entry / 1 second.
     pub fn new_with_bounds(
         provider: Arc<dyn TokenProvider>,
         max_entries: usize,
@@ -367,6 +447,15 @@ impl ClientTokenCache {
         }
     }
 
+    /// Return a token granting `scopes`, from cache when possible.
+    ///
+    /// The scope set is validated (1–32 scopes, each non-empty, at most 128
+    /// characters, no whitespace) then sorted and deduplicated so order
+    /// does not fragment the cache. A cached token is reused only while
+    /// more than 30 seconds of its TTL remain, refreshing proactively
+    /// before expiry. When the cache is full an arbitrary entry is evicted
+    /// to admit the new one. Provider failures are returned as-is; nothing
+    /// stale is served.
     pub async fn get_token(&self, scopes: &[String]) -> Result<BearerToken, String> {
         if scopes.is_empty() || scopes.len() > 32 {
             return Err("invalid token scope set".to_string());

@@ -1,3 +1,8 @@
+//! Durable datastore contract for the commit worker, an AEAD-encrypting
+//! wrapper that binds records to RFC 001 §9.2 envelope AAD (transaction
+//! lineage, principal, tenant, schema digest, store kind), and an in-memory
+//! mock used by tests.
+
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,16 +26,40 @@ const CONFIG_ENVELOPE_MISSING_BLOB_MESSAGE: &str = "config envelope ciphertext i
 const CONFIG_ENVELOPE_AAD_FAILED_MESSAGE: &str = "config envelope AAD construction failed";
 const RESTORE_SCHEMA_MISMATCH_MESSAGE: &str = "stored running config schema digest mismatch";
 
+/// Durable backend contract consumed by the commit worker.
+///
+/// The bus is the single logical writer: implementations may assume calls are
+/// not raced by other writers, but every mutation must be atomic and durable
+/// before returning `Ok` — a commit the worker reports as persisted must be
+/// visible after a crash, and a failed append must leave no partial record.
 #[async_trait]
 pub trait ManagedDatastore<C: OpcConfig>: Send + Sync {
+    /// Loads the highest-version record, or `None` for an empty store (which
+    /// makes restore fall back to the caller-supplied bootstrap config).
     async fn load_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError>;
+    /// Resolves a rollback selector (previous/version/tx-id/label) to its
+    /// stored record. Must return a `NotFound` error for unknown targets and
+    /// must refuse records still pending commit-confirmed resolution.
     async fn load_rollback(&self, target: RollbackTarget) -> Result<StoredConfig<C>, StoreError>;
+    /// Looks up the most recent record bound to a caller retry key so the
+    /// worker can replay the original result instead of committing twice;
+    /// `Ok(None)` means the key was never used and the commit proceeds.
     async fn load_by_idempotency_key(
         &self,
         idempotency_key: &IdempotencyKey,
     ) -> Result<Option<StoredConfig<C>>, StoreError>;
+    /// Durably appends a commit record. Must be all-or-nothing and must
+    /// reject duplicate transaction ids and duplicate versions so history
+    /// stays a strict sequence. Records arrive with `recovery_required` set;
+    /// the worker clears it only after snapshot publication.
     async fn append_commit(&self, commit: StoredConfig<C>) -> Result<(), StoreError>;
+    /// Durably clears the commit-fencing marker on `tx_id` after the snapshot
+    /// swap. If this fails the bus fences itself, because a restart would
+    /// otherwise refuse to republish the record.
     async fn clear_recovery_required(&self, tx_id: TxId) -> Result<(), StoreError>;
+    /// Durably clears the commit-confirmed deadline on `tx_id`, making the
+    /// tentative commit permanent so it no longer auto-rolls back on expiry
+    /// or restart.
     async fn mark_confirmed(&self, tx_id: TxId) -> Result<(), StoreError>;
 }
 
@@ -79,10 +108,17 @@ pub struct EncryptingManagedDatastore<C, P: ?Sized, S: ?Sized> {
 }
 
 impl<C, P: ?Sized, S: ?Sized> EncryptingManagedDatastore<C, P, S> {
+    /// Wraps `inner` so payloads are sealed/opened with keys from `provider`,
+    /// using the default `"running"` store kind in the envelope AAD. Records
+    /// encrypted under one store kind cannot be decrypted under another.
     pub fn new(inner: Arc<S>, provider: Arc<P>) -> Self {
         Self::with_store_kind(inner, provider, CONFIG_STORE_KIND)
     }
 
+    /// Like `new` but with an explicit store kind (for example
+    /// `"shadow-security"`). The kind is bound into the AAD of every
+    /// envelope, cryptographically separating stores that share a backend
+    /// and key provider.
     pub fn with_store_kind(inner: Arc<S>, provider: Arc<P>, store_kind: impl Into<String>) -> Self {
         Self {
             inner,
@@ -92,14 +128,21 @@ impl<C, P: ?Sized, S: ?Sized> EncryptingManagedDatastore<C, P, S> {
         }
     }
 
+    /// Returns the wrapped backend, which only ever observes sealed records:
+    /// schema digest and commit metadata in the clear, payload as ciphertext.
     pub fn inner(&self) -> &Arc<S> {
         &self.inner
     }
 
+    /// Returns the key provider used for envelope encryption; keys are
+    /// resolved per record using the committing principal's tenant, so one
+    /// tenant's records cannot be opened with another tenant's keys.
     pub fn provider(&self) -> &Arc<P> {
         &self.provider
     }
 
+    /// Returns the store kind bound into every envelope's AAD; mismatched
+    /// kinds make decryption fail closed with a crypto error.
     pub fn store_kind(&self) -> &str {
         &self.store_kind
     }
@@ -282,6 +325,10 @@ struct MockStoreState<C: OpcConfig> {
 }
 
 impl<C: OpcConfig> MockManagedDatastore<C> {
+    /// Creates an empty store. It enforces the same append invariants as a
+    /// real backend (unique tx ids and versions, no rollback to pending
+    /// commit-confirmed records) but keeps everything in process memory, so
+    /// nothing survives a restart.
     pub fn new() -> Self {
         Self {
             state: AsyncMutex::new(MockStoreState {
@@ -292,10 +339,15 @@ impl<C: OpcConfig> MockManagedDatastore<C> {
         }
     }
 
+    /// Returns a copy of every appended record in commit order, letting tests
+    /// assert on lineage, recovery markers, and fingerprints directly.
     pub async fn history(&self) -> Vec<StoredConfig<C>> {
         self.state.lock().await.history.clone()
     }
 
+    /// Returns a copy of the most recently appended record (including
+    /// in-place updates from confirm/recovery clearing), or `None` while the
+    /// store is empty.
     pub async fn latest(&self) -> Option<StoredConfig<C>> {
         self.state.lock().await.latest.clone()
     }

@@ -30,8 +30,16 @@ pub struct RegionId(String);
 /// Validation error returned by [`RegionId::try_new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvalidRegionId {
+    /// The candidate region id was the empty string. Region ids are boundary
+    /// metadata (RFC 010 §9) and must carry at least one byte to be meaningful.
     Empty,
-    TooLong { len: usize, max: usize },
+    /// The candidate region id exceeded the phase-1 maximum of 128 bytes.
+    TooLong {
+        /// Byte length of the rejected input.
+        len: usize,
+        /// Maximum permitted byte length (currently 128).
+        max: usize,
+    },
 }
 
 impl fmt::Display for InvalidRegionId {
@@ -75,6 +83,10 @@ impl RegionId {
         Ok(Self(v))
     }
 
+    /// Returns the validated region id as a string slice.
+    ///
+    /// This is the exact value that participates in dedup-key computation, so
+    /// callers must treat it as case- and byte-sensitive.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -117,6 +129,8 @@ impl AlarmId {
         Self(value.into())
     }
 
+    /// Returns the alarm id as a string slice, e.g. for store lookups, audit
+    /// records, or external sink payloads.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -154,10 +168,19 @@ impl<'de> Deserialize<'de> for AlarmId {
 pub struct AlarmType(String);
 
 impl AlarmType {
+    /// Creates an alarm type identifier from a raw string.
+    ///
+    /// The value participates verbatim in the dedup key, so it must be stable
+    /// across repeated raises of the same fault: two raises with different
+    /// alarm-type strings are treated as distinct alarms even if everything
+    /// else matches. Per-NF types should be namespaced
+    /// (e.g. `"upf.interface.down"`) to avoid collisions across CNFs.
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 
+    /// Returns the alarm type as a string slice (the exact value hashed into
+    /// the dedup key).
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -236,41 +259,93 @@ impl fmt::Display for Severity {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProbableCause {
     // ── Config & Identity ────────────────────────────────────────────────────
+    /// A configuration commit/apply failed (RFC 001 config commit pipeline).
+    /// Canonical form: `config-apply-failed`.
     ConfigApplyFailed,
+    /// Running configuration diverged from the committed intent.
+    /// Canonical form: `config-drift-detected`.
     ConfigDriftDetected,
+    /// A certificate is approaching expiry; raise this before
+    /// `CertificateExpired` so operators can rotate in time.
+    /// Canonical form: `certificate-expiring`.
     CertificateExpiring,
+    /// A certificate has expired; mTLS peers may already be failing.
+    /// Suppressing this cause requires an explicit security policy override.
+    /// Canonical form: `certificate-expired`.
     CertificateExpired,
+    /// NF identity or trust material (RFC 003) cannot be obtained.
+    /// Suppressing this cause requires an explicit security policy override.
+    /// Canonical form: `identity-unavailable`.
     IdentityUnavailable,
+    /// Authorization policy failed validation or could not be loaded, so
+    /// access decisions may fail closed. Suppressing this cause requires an
+    /// explicit security policy override.
+    /// Canonical form: `authorization-policy-invalid`.
     AuthorizationPolicyInvalid,
 
     // ── Session & State ───────────────────────────────────────────────────────
+    /// The session state store (RFC 004) is unreachable or unavailable.
+    /// Canonical form: `session-store-unavailable`.
     SessionStoreUnavailable,
+    /// A held lease or ownership claim (RFC 004) was lost.
+    /// Canonical form: `lease-lost`.
     LeaseLost,
 
     // ── Backend & SBI ─────────────────────────────────────────────────────────
+    /// A backend dependency timed out. Canonical form: `backend-timeout`.
     BackendTimeout,
+    /// The NRF cannot be reached, degrading SBI discovery (RFC 007).
+    /// Canonical form: `nrf-unreachable`.
     NrfUnreachable,
+    /// SBI overload or admission control engaged (RFC 007).
+    /// Canonical form: `sbi-overload`.
     SbiOverload,
+    /// A configured peer is unreachable. Canonical form: `peer-unreachable`.
     PeerUnreachable,
 
     // ── Data Plane ────────────────────────────────────────────────────────────
+    /// Data-plane packet drop ratio crossed a configured threshold (RFC 011).
+    /// Canonical form: `packet-drop-threshold`.
     PacketDropThreshold,
+    /// Data-plane preflight checks failed (RFC 011).
+    /// Canonical form: `dataplane-preflight-failed`.
     DataplanePreflightFailed,
 
     // ── Storage & Integrity ────────────────────────────────────────────────────
+    /// Persistent storage corruption was detected.
+    /// Canonical form: `storage-corruption`.
     StorageCorruption,
+    /// The tamper-evident audit chain failed verification. Suppressing this
+    /// cause requires an explicit security policy override.
+    /// Canonical form: `audit-chain-invalid`.
     AuditChainInvalid,
 
     // ── Security ───────────────────────────────────────────────────────────────
+    /// A cryptographic key required for operation is unavailable.
+    /// Suppressing this cause requires an explicit security policy override.
+    /// Canonical form: `key-unavailable`.
     KeyUnavailable,
 
     // ── LI, Charging, Privacy ─────────────────────────────────────────────────
+    /// Lawful-intercept delivery failed; LI alarms preserve regulated handling
+    /// boundaries (RFC 013 §3.1). Canonical form: `li-delivery-failed`.
     LiDeliveryFailed,
+    /// Charging record export (RFC 010) failed.
+    /// Canonical form: `charging-export-failed`.
     ChargingExportFailed,
+    /// A privacy policy violation (RFC 010) was detected. Suppressing this
+    /// cause requires an explicit security policy override.
+    /// Canonical form: `privacy-policy-violation`.
     PrivacyPolicyViolation,
+    /// A break-glass security override was exercised; raised so the bypass is
+    /// visible and auditable. Canonical form: `security-break-glass`.
     SecurityBreakGlass,
 
     // ── Extensible per-NF namespace ───────────────────────────────────────────
+    /// Namespaced per-NF cause outside the core taxonomy, serialized as
+    /// `other:<nf>.<cause>`. Parsing rejects values without at least one `.`
+    /// separator or containing whitespace, so per-NF causes cannot clash with
+    /// future un-namespaced core additions.
     Other(String),
 }
 
@@ -347,6 +422,11 @@ impl FromStr for ProbableCause {
 pub struct ParseProbableCauseError(String);
 
 impl ParseProbableCauseError {
+    /// Returns the unrecognized input string verbatim for diagnostics.
+    ///
+    /// The value is echoed back unredacted, so callers must not feed
+    /// operator- or subscriber-derived free text into the parser and then log
+    /// this error without applying RFC 010 redaction.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -465,6 +545,8 @@ impl DedupKey {
         Self(hex::encode(&hash[..16])) // first 16 bytes = 128-bit key
     }
 
+    /// Returns the dedup key as its canonical 32-character lowercase hex form
+    /// (the truncated 128-bit SHA-256 digest), suitable as a stable store key.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -482,23 +564,58 @@ impl fmt::Display for DedupKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AffectedObject {
     /// Network function instance.
-    NfInstance { kind: String, instance: String },
+    NfInstance {
+        /// NF kind (e.g. `"upf"`, `"smf"`).
+        kind: String,
+        /// Identifier of the specific NF instance.
+        instance: String,
+    },
     /// Network interface on an NF instance.
-    Interface { nf: String, name: String },
+    Interface {
+        /// Identifier of the NF instance owning the interface.
+        nf: String,
+        /// Interface name, local to that NF instance.
+        name: String,
+    },
     /// Peer entity.
-    Peer { nf: String, peer_id: String },
+    Peer {
+        /// Identifier of the local NF instance that observes the peer.
+        nf: String,
+        /// Peer identifier; must be a node/peer name, never a raw subscriber
+        /// identifier.
+        peer_id: String,
+    },
     /// Session store shard.
-    SessionStore { nf: String, shard: Option<String> },
+    SessionStore {
+        /// Identifier of the NF instance using the store.
+        nf: String,
+        /// Optional shard name; `None` addresses the store as a whole.
+        /// `None` and `Some("")` hash differently, so they identify distinct
+        /// alarms.
+        shard: Option<String>,
+    },
     /// Network slice.
-    Slice { snssai: String },
+    Slice {
+        /// S-NSSAI string identifying the slice.
+        snssai: String,
+    },
     /// Tenant.
-    Tenant { tenant: String },
+    Tenant {
+        /// Tenant identifier.
+        tenant: String,
+    },
     /// Cryptographic key or certificate.
-    Certificate { key_id: String },
+    Certificate {
+        /// Key or certificate identifier; never the key material itself.
+        key_id: String,
+    },
     /// Data-plane queue.
     DataPlaneQueue {
+        /// Identifier of the NF instance owning the data plane.
         nf: String,
+        /// Data-plane interface carrying the queue.
         interface: String,
+        /// Queue index on that interface.
         queue: u16,
     },
 }
@@ -619,11 +736,28 @@ impl AffectedObject {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AlarmState {
+    /// Active: the alarm was newly created by a raise with no matching active
+    /// dedup key.
     Raised,
+    /// Active: a repeated raise with the same dedup key refreshed severity,
+    /// text, and details in place (RFC 013 §8: dedup updates, never
+    /// duplicates). Severity downgrades land here too — they are updates, not
+    /// clear-plus-raise.
     Updated,
+    /// Active: an authorized operator acknowledged the alarm. Acknowledgement
+    /// never clears the fault, and subsequent raises with the same dedup key
+    /// keep the alarm in `Acknowledged` rather than reverting it to `Updated`.
     Acknowledged,
+    /// Active: an authorized, audited suppression hid the alarm from normal
+    /// presentation. Suppression does not delete history, and re-raises keep
+    /// the alarm suppressed.
     Suppressed,
+    /// Terminal: the fault is no longer active. Cleared alarms leave the
+    /// active set, no longer match dedup lookups (a new raise mints a fresh
+    /// alarm id), and never affect readiness.
     Cleared,
+    /// Terminal: the alarm aged out of retention rather than being explicitly
+    /// cleared. Treated like `Cleared` for dedup and readiness purposes.
     Expired,
 }
 
@@ -664,14 +798,20 @@ impl fmt::Display for AlarmState {
 pub struct AlarmDetails(Option<serde_json::Value>);
 
 impl AlarmDetails {
+    /// Creates an empty details payload (serializes as `null`); use when the
+    /// alarm text and taxonomy fields already carry all relevant context.
     pub fn empty() -> Self {
         Self(None)
     }
 
+    /// Wraps a structured JSON payload. Like alarm text, detail values are
+    /// exported to sinks and operational trees, so callers MUST keep them free
+    /// of secrets and raw subscriber identifiers per RFC 010.
     pub fn with_value(value: serde_json::Value) -> Self {
         Self(Some(value))
     }
 
+    /// Returns the JSON payload, or `None` for an empty details value.
     pub fn as_value(&self) -> Option<&serde_json::Value> {
         self.0.as_ref()
     }
@@ -706,6 +846,8 @@ impl RedactedText {
         Self(text.into())
     }
 
+    /// Returns the wrapped text. The value is only as safe as the caller's
+    /// redaction at construction time; no further scrubbing is applied here.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -723,22 +865,48 @@ impl fmt::Display for RedactedText {
 /// Raw subscriber identifiers MUST NOT appear in any field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Alarm {
+    /// Unique alarm identifier, stable for the same active fault instance:
+    /// repeated raises with the same dedup key update this record instead of
+    /// minting a new id. A raise after clear creates a fresh id.
     pub alarm_id: AlarmId,
+    /// Alarm categorization identifier (namespaced per NF); one of the
+    /// dedup-key components, so it must be stable across raises.
     pub alarm_type: AlarmType,
+    /// Current severity. Re-raises overwrite it in place; a downgrade is an
+    /// update, not a clear-plus-raise (RFC 013 §8). Set to
+    /// `Severity::Cleared` when the alarm is cleared.
     pub severity: Severity,
+    /// Probable cause from the versioned taxonomy; dedup-key component.
     pub probable_cause: ProbableCause,
+    /// Structured affected-object name (RFC 013 §7); dedup-key component.
+    /// MUST NOT name raw subscriber identifiers.
     pub affected_object: AffectedObject,
+    /// Optional tenant scope; dedup-key component, so the same fault for two
+    /// tenants yields two independent alarms.
     pub tenant: Option<String>,
+    /// Optional S-NSSAI slice scope; dedup-key component like `tenant`.
     pub slice: Option<String>,
     /// Region boundary metadata per RFC 010 §9 (region-scoped records).
     pub region: Option<RegionId>,
     /// Human-readable alarm text. MUST be pre-redacted per RFC 010. Use [`RedactedText::new`].
     pub text: RedactedText,
+    /// Optional structured details; replaced wholesale (not merged) on every
+    /// update, and subject to the same RFC 010 redaction rules as `text`.
     pub details: AlarmDetails,
+    /// Lifecycle state. Active states (raised/updated/acknowledged/suppressed)
+    /// participate in dedup and readiness; terminal states (cleared/expired)
+    /// exist only in history.
     pub state: AlarmState,
+    /// UTC time of the original raise; never modified by later updates.
     pub raised_at: OffsetDateTime,
+    /// UTC time of the most recent lifecycle change
+    /// (raise/update/acknowledge/suppress/clear).
     pub updated_at: OffsetDateTime,
+    /// UTC time the alarm was cleared; `None` while the alarm is active.
     pub cleared_at: Option<OffsetDateTime>,
+    /// Optional correlation group linking related alarms (e.g. NRF outage and
+    /// resulting discovery failures). Presentation aid only — correlation MUST
+    /// NOT hide critical alarms (RFC 013 §9).
     pub correlation_id: Option<uuid::Uuid>,
 }
 

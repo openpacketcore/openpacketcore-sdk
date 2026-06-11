@@ -1,3 +1,10 @@
+//! Token and payload fixtures for SBI auth tests.
+//!
+//! Ships a fixed RSA test keypair (private key for signing, public JWKS
+//! components for verification) so tests can mint real RS256 JWT-SVIDs that
+//! `SbiJwtValidator` accepts or rejects deterministically. The keypair is
+//! test-only material committed to the repository — never deploy it.
+
 use crate::auth::{Jwk, Jwks, JwksResolver};
 use crate::problem::ProblemDetails;
 use http::StatusCode;
@@ -30,6 +37,9 @@ rsufS/lgYxZbl8AejlVWjwdh1jlkCn7HujiTrt1YcV8LQW6uJjvh/sGPLG/HFxkQ\n\
 UQROADFE5xEO1JlHukp28ZztJBPCV3vXMUKp8+feoA+wtUFzEaBo3WNXxEtnTCP9\n\
 zbBrG2DI7u9XzIYmNzPM5g==\n";
 
+/// Render the fixed RSA **test** private key as a PKCS#8 PEM string, for
+/// signing fixture tokens. This key is public knowledge by design; it must
+/// never guard real traffic.
 pub fn test_private_key_pem() -> String {
     format!(
         "-----BEGIN {}-----\n{}-----END {}-----",
@@ -37,8 +47,14 @@ pub fn test_private_key_pem() -> String {
     )
 }
 
+/// Base64url-encoded RSA modulus (`n`, RFC 7517) of the test keypair —
+/// the public counterpart of `test_private_key_pem`.
 pub const TEST_MODULUS_N: &str = "tjAa-oE8fTTEPRGg55g3TTo_C7D4AmpSeGjicSRkgbVev4JJ0mzNdsuxPmaNWnzYOzwjNVsk2YR2b_2Qz2hg5AO8uYpqYz2-Ub5nszXpGNslsd6a5oLfHxX9JCyy_qMP6uOsyCjKPQQt6kIxTrZoW4_DOnVnKOOwQoSRLolXjz-3dgBxUKlAxbw4Q0pNDWVbiMRIDo_M_H3JWyaqrRWTsLGnSLRLlNfd9mC9_SJEw_MOwv9EB0FxdRVO8ckXc1YOJgg2MaK4JZYYpvIsjy_eEJ1Xhz_tnpVSgJDalnokn0aNe6N1d4rNy-SplcElgrBGsXAMtWZM1BceFEx_IAon3w";
+/// Base64url-encoded RSA public exponent (`e`) of the test keypair; the
+/// conventional 65537.
 pub const TEST_EXPONENT_E: &str = "AQAB";
+/// Key ID stamped into fixture token headers and the mock JWKS; change it
+/// in one place to simulate an unknown-`kid` validation failure.
 pub const TEST_KID: &str = "test-key-id";
 
 /// Mock JWKS Resolver providing the public components of the test key.
@@ -47,6 +63,10 @@ pub struct MockJwksResolver {
 }
 
 impl MockJwksResolver {
+    /// Resolver whose JWKS contains exactly one RS256 key: the test key
+    /// under `TEST_KID`. `fetch_jwks` always succeeds, so it cannot
+    /// exercise fail-closed refresh paths — use a custom resolver for
+    /// those.
     pub fn new() -> Self {
         Self {
             jwks: Jwks {
@@ -76,6 +96,11 @@ impl JwksResolver for MockJwksResolver {
 }
 
 /// Generate a structurally valid and cryptographic signed test token.
+///
+/// RS256-signed with the fixture private key under `TEST_KID`, expiring
+/// `expire_in_secs` seconds from now (negative for an already-expired
+/// token) with `nbf` backdated 10 seconds so the token is immediately
+/// usable.
 pub fn generate_test_token(
     sub: &str,
     aud: &str,
@@ -86,6 +111,9 @@ pub fn generate_test_token(
     generate_test_token_with_nbf_offset(sub, aud, iss, scopes, expire_in_secs, -10)
 }
 
+/// Like `generate_test_token` but with an explicit `nbf` offset in seconds
+/// relative to now: pass a positive offset to mint a not-yet-valid token
+/// and exercise `nbf` rejection in the validator.
 pub fn generate_test_token_with_nbf_offset(
     sub: &str,
     aud: &str,

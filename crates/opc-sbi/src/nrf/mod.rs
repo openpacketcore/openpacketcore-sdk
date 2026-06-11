@@ -34,26 +34,52 @@ pub enum NfStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NfProfile {
+    /// Unique identifier of this NF instance (TS 29.510 `nfInstanceId`);
+    /// the key under which the NF registers and heartbeats with the NRF.
     pub nf_instance_id: NfInstanceId,
+    /// NF type (e.g. `amf`, `smf`); the primary discovery filter.
     pub nf_type: NfType,
+    /// Registration status; only `Registered` instances are returned by
+    /// discovery (the mock NRF filters on this too).
     pub nf_status: NfStatus,
+    /// IPv4 endpoint addresses, as dotted-quad strings, that consumers may
+    /// dial when no FQDN is advertised.
     pub ipv4_addresses: Vec<String>,
+    /// Fully qualified domain name of the NF, when it prefers DNS-based
+    /// dialing over raw addresses.
     pub fqdn: Option<String>,
+    /// PLMNs this NF serves; discovery with a PLMN filter only matches
+    /// profiles whose list contains that PLMN.
     pub plmn_list: Vec<PlmnId>,
+    /// Network slices (S-NSSAIs) this NF serves; used for slice-filtered
+    /// discovery.
     pub s_nssais: Vec<Snssai>,
     /// Advertised SBI service names (e.g. `nnrf-disc`, `nnssf-nsselection`).
     pub nf_services: Vec<String>,
+    /// Selection priority per TS 29.510: **lower values are preferred**;
+    /// used as the primary sort key when ranking discovery results.
     pub priority: u16,
+    /// Relative static capacity per TS 29.510: higher means more capacity;
+    /// the tie-breaker (descending) after `priority` when ranking results.
     pub capacity: u16,
 }
 
 /// Query parameters for NRF discovery (TS 29.510 NFDiscovery).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryQuery {
+    /// NF type being looked up (`target-nf-type` query parameter); the only
+    /// mandatory filter.
     pub target_nf_type: NfType,
+    /// Identity of the requesting NF, when the NRF applies
+    /// requester-specific visibility rules; part of the cache key so
+    /// different requesters never share results.
     pub requester_nf_instance_id: Option<NfInstanceId>,
+    /// Restrict results to NFs serving this PLMN (`target-plmn`).
     pub plmn: Option<PlmnId>,
+    /// Restrict results to NFs serving this network slice.
     pub s_nssai: Option<Snssai>,
+    /// Restrict results to NFs advertising at least one of these SBI
+    /// service names (`service-names`); empty means no service filter.
     pub service_names: Vec<String>,
 }
 
@@ -63,10 +89,17 @@ pub struct DiscoveryQuery {
 /// ordering share the same key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
+    /// NF type filter copied from the originating query.
     pub target_nf_type: NfType,
+    /// Requester identity from the query; kept as a distinct field (rather
+    /// than folded into a string) so it cannot collide with service names.
     pub requester_nf_instance_id: Option<NfInstanceId>,
+    /// PLMN filter from the query.
     pub plmn: Option<PlmnId>,
+    /// Network-slice filter from the query.
     pub s_nssai: Option<Snssai>,
+    /// Service-name filter, **sorted** so order-only variations of the same
+    /// query share one cache entry.
     pub service_names: Vec<String>,
 }
 
@@ -99,6 +132,11 @@ pub enum DiscoveryResult {
     Error(String),
 }
 
+/// Minimal capability used at shutdown to remove an NF from the NRF.
+///
+/// Implemented by `NrfClient` (real TS 29.510 DELETE) and the testkit
+/// `MockNrf`; consumed by `NrfDrainHook` so runtime drain can deregister
+/// gracefully per RFC 007 §10.2.
 #[async_trait::async_trait]
 pub trait NrfDeregNotifier: Send + Sync {
     /// Gracefully deregister the NF instance from the NRF.
@@ -137,6 +175,10 @@ impl<N: NrfDeregNotifier> Clone for NrfDrainHook<N> {
 
 #[cfg(feature = "runtime-hooks")]
 impl<N: NrfDeregNotifier> NrfDrainHook<N> {
+    /// Bind a deregistration notifier to the NF instance ID it should
+    /// remove when the runtime drains. The deregistration is attempted
+    /// once per drain; failures are reported to the runtime, not retried
+    /// here.
     pub fn new(notifier: std::sync::Arc<N>, nf_instance_id: NfInstanceId) -> Self {
         Self {
             notifier,
@@ -160,6 +202,9 @@ impl<N: NrfDeregNotifier> opc_runtime::shutdown::DrainHook for NrfDrainHook<N> {
 /// Extension trait for registering NRF hooks easily on the runtime builder.
 #[cfg(feature = "runtime-hooks")]
 pub trait NrfRuntimeBuilderExt {
+    /// Register a drain hook that deregisters `nf_instance_id` from the NRF
+    /// (via `notifier`) when the runtime begins graceful shutdown, so the
+    /// NF disappears from discovery before its endpoints stop serving.
     fn with_nrf_drain_hook<N: NrfDeregNotifier + 'static>(
         self,
         notifier: std::sync::Arc<N>,

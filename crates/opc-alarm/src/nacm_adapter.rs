@@ -1,3 +1,8 @@
+//! NACM-backed authorization for alarm admin actions (enabled by the `nacm`
+//! feature). Maps acknowledge/suppress to stable `ietf-alarms` YANG action
+//! paths and evaluates them against an `opc_nacm` policy, layered on top of
+//! an explicit allow-list of alarm-admin principals and scope/tenant checks.
+
 use crate::manager::{AlarmAction, AlarmActionAuthorizer, AlarmActionContext, AlarmActionDenied};
 use crate::model::Alarm;
 use opc_nacm::{ModuleRegistry, NacmAction, NacmEvaluator, NacmPolicy, YangPath};

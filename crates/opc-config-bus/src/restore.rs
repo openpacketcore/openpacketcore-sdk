@@ -1,3 +1,8 @@
+//! `ConfigBus` constructors and startup recovery (RFC 001 §12): restore the
+//! highest stored config, fail closed on schema mismatch or unreconciled
+//! recovery markers, validate before publication, and automatically roll back
+//! expired commit-confirmed records on restart.
+
 use opc_alarm::SharedAlarmManager;
 use opc_config_model::{
     CommitMode, ConfigOperation, OpcConfig, RequestId, RequestSource, RollbackTarget,
@@ -240,6 +245,9 @@ impl<C: OpcConfig> ConfigBus<C> {
         .await
     }
 
+    /// Dev/Test variant of `with_queue_capacity` that implicitly installs
+    /// `AllowAllAuthorizer`; never use in production, where authorization
+    /// must be default-deny.
     pub async fn with_queue_capacity_dev_only<S>(
         initial: C,
         store: S,
@@ -252,6 +260,9 @@ impl<C: OpcConfig> ConfigBus<C> {
             .await
     }
 
+    /// Builds a fresh (non-restoring) bus that raises startup and commit
+    /// failure alarms on the supplied shared alarm manager instead of a
+    /// private one, using the default commit queue capacity of 32.
     pub async fn new_with_alarm_manager<S>(
         initial: C,
         store: S,
@@ -271,6 +282,8 @@ impl<C: OpcConfig> ConfigBus<C> {
         .await
     }
 
+    /// Dev/Test variant of `new_with_alarm_manager` that implicitly installs
+    /// `AllowAllAuthorizer`; never use in production.
     pub async fn new_with_alarm_manager_dev_only<S>(
         initial: C,
         store: S,
@@ -296,6 +309,13 @@ impl<C: OpcConfig> ConfigBus<C> {
         Self::new_with_alarm_manager(initial, store, authorizer, alarm_manager).await
     }
 
+    /// Fully explicit fresh-start constructor: validates `initial` (syntax
+    /// then semantics, off the async workers) and fails closed without
+    /// spawning a worker if validation fails, then publishes it at
+    /// `ConfigVersion::INITIAL` and starts the single sequenced commit worker
+    /// behind a bounded queue of `queue_capacity` (floored at 1; submissions
+    /// beyond it are rejected with `AdmissionRejected`). Ignores any existing
+    /// store contents — use the `restore_or_new` family to recover them.
     pub async fn with_queue_capacity_and_alarm_manager<S>(
         initial: C,
         store: S,
@@ -331,6 +351,8 @@ impl<C: OpcConfig> ConfigBus<C> {
         ))
     }
 
+    /// Dev/Test variant of `with_queue_capacity_and_alarm_manager` that
+    /// implicitly installs `AllowAllAuthorizer`; never use in production.
     pub async fn with_queue_capacity_and_alarm_manager_dev_only<S>(
         initial: C,
         store: S,
@@ -368,6 +390,8 @@ impl<C: OpcConfig> ConfigBus<C> {
         .await
     }
 
+    /// Dev/Test variant of `restore_or_new` that implicitly installs
+    /// `AllowAllAuthorizer`; never use in production.
     pub async fn restore_or_new_dev_only<S>(initial: C, store: S) -> Result<Self, StoreError>
     where
         S: ManagedDatastore<C> + 'static,
@@ -387,6 +411,16 @@ impl<C: OpcConfig> ConfigBus<C> {
         Self::restore_or_new(initial, store, authorizer).await
     }
 
+    /// Full restore path (RFC 001 §12) reporting failures on the supplied
+    /// alarm manager. Loads the latest stored record and, before publishing
+    /// it, fails closed on schema-digest mismatch, an unreconciled
+    /// `recovery_required` marker, or failed startup validation. A pending
+    /// commit-confirmed record is honored if its deadline is still in the
+    /// future (the rollback timer is re-armed) and otherwise automatically
+    /// rolled back to its parent as a new durable commit. An empty store
+    /// falls back to validating and publishing `initial` at
+    /// `ConfigVersion::INITIAL`. Write admission only starts after the
+    /// restored snapshot is published.
     pub async fn restore_or_new_with_alarm_manager<S>(
         initial: C,
         store: S,
@@ -529,6 +563,8 @@ impl<C: OpcConfig> ConfigBus<C> {
         ))
     }
 
+    /// Dev/Test variant of `restore_or_new_with_alarm_manager` that
+    /// implicitly installs `AllowAllAuthorizer`; never use in production.
     pub async fn restore_or_new_with_alarm_manager_dev_only<S>(
         initial: C,
         store: S,

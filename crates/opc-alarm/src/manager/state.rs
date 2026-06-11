@@ -1,3 +1,7 @@
+//! Alarm manager core: dedup-keyed raise/update/clear semantics, the
+//! pluggable `AlarmStore` abstraction, and a bounded in-memory store whose
+//! history ring evicts the oldest record on overflow.
+
 use std::collections::{HashMap, VecDeque};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -10,48 +14,109 @@ use crate::model::{
     RedactedText, RegionId, Severity,
 };
 
+/// Default bound on the `InMemoryStore` history ring (4096 lifecycle
+/// records). When the ring is full, the oldest history entry is evicted to
+/// admit the newest one; active-alarm indexes are unaffected by eviction, so
+/// alarm storms cannot grow memory without bound (RFC 013 §19.4).
 pub const DEFAULT_HISTORY_LIMIT: usize = 4_096;
 
 /// Result of a manager operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AlarmOpResult {
     /// Alarm was raised (new active active alarm created).
-    Raised { alarm: Alarm },
+    Raised {
+        /// Snapshot of the newly created alarm (state `Raised`, fresh id).
+        alarm: Alarm,
+    },
     /// Alarm was updated (existing alarm modified).
-    Updated { alarm: Alarm },
+    Updated {
+        /// Post-update snapshot: same alarm id, refreshed severity, text,
+        /// details, and `updated_at`.
+        alarm: Alarm,
+    },
     /// Alarm was cleared.
-    Cleared { alarm_id: AlarmId },
+    Cleared {
+        /// Id of the alarm that transitioned to the terminal `Cleared` state.
+        alarm_id: AlarmId,
+    },
     /// Clear requested but no matching active alarm exists.
     ClearWithoutActive {
+        /// Dedup key computed from the clear request, for which no active
+        /// alarm was found.
         dedup_key: DedupKey,
+        /// Probable cause from the clear request, kept so callers can emit
+        /// the clear-without-active no-op metric per RFC 013 §8/§16.
         cause: ProbableCause,
     },
     /// Alarm was suppressed.
-    Suppressed { alarm: Alarm },
+    Suppressed {
+        /// Snapshot of the alarm after entering the `Suppressed` state; the
+        /// alarm remains active and its history is preserved.
+        alarm: Alarm,
+    },
     /// Alarm was acknowledged.
-    Acknowledged { alarm: Alarm },
+    Acknowledged {
+        /// Snapshot of the alarm after entering the `Acknowledged` state;
+        /// acknowledgement does not clear the fault.
+        alarm: Alarm,
+    },
     /// Operation denied due to authorization failure.
-    Unauthorized { message: String },
+    Unauthorized {
+        /// Human-readable denial reason; no state change was applied, and on
+        /// the policy paths the denial itself has been audited.
+        message: String,
+    },
     /// Operation was authorized but could not be durably audited.
-    AuditFailed { message: String },
+    AuditFailed {
+        /// Reason the audit record could not be written. The state change was
+        /// abandoned: admin actions are fail-closed on audit failure.
+        message: String,
+    },
     /// Alarm ID not found in the store.
-    NotFound { alarm_id: AlarmId },
+    NotFound {
+        /// The requested id; either unknown or referring to an alarm that is
+        /// no longer active (terminal alarms cannot be acknowledged or
+        /// suppressed).
+        alarm_id: AlarmId,
+    },
 }
 
 /// Alarm store trait for dependency injection.
 pub trait AlarmStore {
+    /// Stores a newly raised alarm and appends it to history. When the alarm
+    /// is active, the implementation must also index it by dedup key so later
+    /// raises with the same identity merge into it.
     fn insert(&mut self, alarm: Alarm);
+    /// Replaces the stored record for an existing alarm id and appends the
+    /// new revision to history. A transition to a terminal state
+    /// (cleared/expired) must remove the alarm from the active set and the
+    /// dedup index so a future raise creates a fresh alarm.
     fn update(&mut self, alarm: Alarm);
+    /// Looks up an *active* alarm by id. Terminal alarms return `None`; they
+    /// are only reachable through history queries.
     fn get_by_id(&self, alarm_id: &AlarmId) -> Option<Alarm>;
+    /// Looks up the active alarm carrying this dedup key — the identity the
+    /// manager uses to decide between raise (new alarm) and update (existing
+    /// alarm), and to resolve clears.
     fn get_by_dedup_key(&self, dedup_key: &DedupKey) -> Option<Alarm>;
+    /// Returns a snapshot of every active alarm (raised, updated,
+    /// acknowledged, or suppressed). Ordering is implementation-defined.
     fn active_alarms(&self) -> Vec<Alarm>;
+    /// Returns the retained lifecycle history (active and terminal records),
+    /// bounded by the implementation's retention policy.
     fn all(&self) -> Vec<Alarm>;
+    /// Returns history filtered by tenant and/or slice; `None` acts as a
+    /// wildcard, while `Some(v)` matches only alarms whose scope field equals
+    /// `v`. The default implementation filters the result of `all`.
     fn history_by_scope(&self, tenant: Option<&str>, slice: Option<&str>) -> Vec<Alarm> {
         self.all()
             .into_iter()
             .filter(|alarm| alarm_matches_scope(alarm, tenant, slice))
             .collect()
     }
+    /// Returns the number of active alarms. The default implementation counts
+    /// the `active_alarms` snapshot; implementations should override it with a
+    /// cheaper counter where possible.
     fn active_count(&self) -> usize {
         self.active_alarms().len()
     }
@@ -63,6 +128,9 @@ pub struct AlarmManager<S: AlarmStore> {
 }
 
 impl<S: AlarmStore> AlarmManager<S> {
+    /// Creates a manager over the given store. The store defines retention
+    /// and indexing; the manager layers RFC 013 lifecycle semantics (dedup,
+    /// update-in-place, terminal clears, authorized admin actions) on top.
     pub fn new(store: S) -> Self {
         Self { store }
     }
@@ -200,6 +268,16 @@ impl<S: AlarmStore> AlarmManager<S> {
         res
     }
 
+    /// Acknowledges an active alarm. Acknowledgement marks the alarm as seen
+    /// by an operator but does not clear the fault (RFC 013 §8); the alarm
+    /// stays active and later raises keep it in the acknowledged state.
+    ///
+    /// This path trusts the caller-asserted `SuppressionAuth` flag and writes
+    /// no audit record. Production callers should prefer
+    /// `acknowledge_with_policy`, which evaluates an authorizer and fails
+    /// closed if the action cannot be audited. Returns `Unauthorized` when
+    /// `auth.authorized` is false, and `NotFound` for unknown or no longer
+    /// active alarm ids.
     pub fn acknowledge(&mut self, alarm_id: &AlarmId, auth: &SuppressionAuth) -> AlarmOpResult {
         if !auth.authorized {
             return AlarmOpResult::Unauthorized {
@@ -224,6 +302,12 @@ impl<S: AlarmStore> AlarmManager<S> {
         }
     }
 
+    /// Acknowledges an alarm through the full policy path required for
+    /// production (RFC 013 §10): the authorizer decides whether `context` may
+    /// acknowledge this alarm, both denials and authorizations are written to
+    /// the audit sink, and an authorized action whose audit record cannot be
+    /// persisted is abandoned (`AuditFailed`) — no unaudited admin action can
+    /// take effect.
     pub fn acknowledge_with_policy<A, T>(
         &mut self,
         alarm_id: &AlarmId,
@@ -244,6 +328,16 @@ impl<S: AlarmStore> AlarmManager<S> {
         )
     }
 
+    /// Suppresses an active alarm (e.g. for a maintenance window). The alarm
+    /// stays active and keeps its full history — suppression hides it from
+    /// normal presentation, it does not delete anything (RFC 013 §10).
+    ///
+    /// This path trusts the caller-asserted `SuppressionAuth` flag: it writes
+    /// no audit record and does **not** apply the security-critical
+    /// suppression policy (critical severity / security causes). Production
+    /// callers should use `suppress_with_policy`, which enforces both.
+    /// Returns `Unauthorized` when `auth.authorized` is false, and `NotFound`
+    /// for unknown or no longer active alarm ids.
     pub fn suppress(&mut self, alarm_id: &AlarmId, auth: &SuppressionAuth) -> AlarmOpResult {
         if !auth.authorized {
             return AlarmOpResult::Unauthorized {
@@ -268,6 +362,14 @@ impl<S: AlarmStore> AlarmManager<S> {
         }
     }
 
+    /// Suppresses an alarm through the full policy path required for
+    /// production (RFC 013 §10). In addition to the regular authorization and
+    /// fail-closed audit performed by `acknowledge_with_policy`,
+    /// security-critical alarms (critical severity, or causes such as
+    /// expired certificates, unavailable identity/keys, invalid authorization
+    /// policy, broken audit chains, and privacy violations) are denied unless
+    /// the authorizer explicitly allows security-critical suppression; the
+    /// denial itself is audited.
     pub fn suppress_with_policy<A, T>(
         &mut self,
         alarm_id: &AlarmId,
@@ -374,14 +476,23 @@ impl<S: AlarmStore> AlarmManager<S> {
         }
     }
 
+    /// Returns a snapshot of all active alarms (raised, updated,
+    /// acknowledged, or suppressed). Suppressed alarms are included because
+    /// suppression affects presentation, not activeness.
     pub fn active_alarms(&self) -> Vec<Alarm> {
         self.store.active_alarms()
     }
 
+    /// Returns the number of active alarms without cloning them.
     pub fn active_count(&self) -> usize {
         self.store.active_count()
     }
 
+    /// Returns active alarms whose *current* severity equals `severity`
+    /// exactly (no "at least this severe" semantics — use the `Ord` impl on
+    /// `Severity` for ranked filtering). Note that updates rewrite severity
+    /// in place, so an alarm raised as major and upgraded to critical only
+    /// matches `Critical`.
     pub fn active_by_severity(&self, severity: Severity) -> Vec<Alarm> {
         self.store
             .active_alarms()
@@ -390,10 +501,16 @@ impl<S: AlarmStore> AlarmManager<S> {
             .collect()
     }
 
+    /// Returns the retained lifecycle history (active and terminal records),
+    /// bounded by the store's retention; the oldest records may already have
+    /// been evicted.
     pub fn all_alarms(&self) -> Vec<Alarm> {
         self.store.all()
     }
 
+    /// Returns history filtered by tenant and/or slice. `None` matches
+    /// everything; `Some(v)` matches only alarms whose corresponding scope
+    /// field is exactly `v` (alarms without that scope are excluded).
     pub fn alarm_history_by_scope(&self, tenant: Option<&str>, slice: Option<&str>) -> Vec<Alarm> {
         self.store.history_by_scope(tenant, slice)
     }
@@ -446,10 +563,22 @@ impl Default for InMemoryStore {
 }
 
 impl InMemoryStore {
+    /// Creates a store with the default history bound
+    /// (`DEFAULT_HISTORY_LIMIT`, 4096 records).
     pub fn new() -> Self {
         Self::new_with_history_limit(DEFAULT_HISTORY_LIMIT)
     }
 
+    /// Creates a store whose history ring retains at most `history_limit`
+    /// lifecycle records; when full, the oldest record is evicted to admit
+    /// the newest. Consecutive history entries with identical identity
+    /// (same alarm id, taxonomy fields, scope, severity, and state) are
+    /// coalesced in place, so a duplicate-raise storm does not consume the
+    /// ring. Active-alarm indexes are unbounded by this limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `history_limit` is zero.
     pub fn new_with_history_limit(history_limit: usize) -> Self {
         assert!(
             history_limit > 0,

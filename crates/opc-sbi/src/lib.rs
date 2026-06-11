@@ -1,3 +1,4 @@
+#![deny(missing_docs)]
 //! Shared SBI primitives for OpenPacketCore network functions.
 //!
 //! This crate provides:

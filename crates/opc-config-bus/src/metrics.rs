@@ -1,3 +1,7 @@
+//! Process-wide config-bus metrics recorders: commit queue depth, per-phase
+//! latencies, subscriber overflow, rollback outcomes, and the recovery-fence
+//! gauge, all backed by the shared `opc-redaction` metrics registry.
+
 use std::sync::atomic::Ordering;
 
 pub(crate) fn record_subscriber_notification_failure() {

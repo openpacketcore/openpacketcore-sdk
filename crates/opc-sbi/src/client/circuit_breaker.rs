@@ -1,16 +1,38 @@
+//! Per-(peer, service) outbound circuit breakers (RFC 007 §13.4).
+//!
+//! Breakers count consecutive failures, trip open after a threshold, hold
+//! requests off for a cooldown, then admit a bounded number of half-open
+//! probes before either closing (probe succeeded) or re-opening (probe
+//! failed). State transitions are exported through the
+//! `opc_sbi_circuit_state` metric with redaction-safe labels.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::redact::safe_metric_label;
 
+/// State of a circuit breaker's three-state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitState {
+    /// Normal operation: requests flow and consecutive failures are
+    /// counted; reaching the failure threshold trips the breaker open.
     Closed,
+    /// Tripped: all requests are rejected without dialing the peer until
+    /// the cooldown has elapsed since the stored trip instant, at which
+    /// point the breaker moves to `HalfOpen`.
     Open(Instant),
+    /// Probation: up to `max_probes` trial requests are admitted. The first
+    /// recorded success closes the breaker; any recorded failure re-opens
+    /// it immediately.
     HalfOpen,
 }
 
+/// Failure-tripped breaker guarding one (peer, service) pair.
+///
+/// Not internally synchronized — `CircuitBreakers` wraps each instance in a
+/// `Mutex`. Callers drive it manually: `allow_request` before sending,
+/// then exactly one of `record_success`/`record_failure` per attempt.
 pub struct CircuitBreaker {
     state: CircuitState,
     consecutive_failures: u32,
@@ -21,6 +43,11 @@ pub struct CircuitBreaker {
 }
 
 impl CircuitBreaker {
+    /// Create a breaker in the `Closed` state.
+    ///
+    /// It trips open after `failure_threshold` consecutive failures, stays
+    /// open for `cooldown`, then admits at most `max_probes` half-open
+    /// trial requests.
     pub fn new(failure_threshold: u32, cooldown: Duration, max_probes: u32) -> Self {
         Self {
             state: CircuitState::Closed,
@@ -32,10 +59,18 @@ impl CircuitBreaker {
         }
     }
 
+    /// Current state, for metrics and debug surfaces.
     pub fn state(&self) -> CircuitState {
         self.state
     }
 
+    /// Decide whether a request may proceed at time `now`; may transition
+    /// the breaker.
+    ///
+    /// `Closed` always admits. `Open` rejects (fail-fast, sparing the
+    /// struggling peer) until the cooldown has elapsed, then flips to
+    /// `HalfOpen` and admits. `HalfOpen` admits until `max_probes` probes
+    /// are in flight, rejecting the rest.
     pub fn allow_request(&mut self, now: Instant) -> bool {
         match self.state {
             CircuitState::Closed => true,
@@ -59,6 +94,12 @@ impl CircuitBreaker {
         }
     }
 
+    /// Record a successful attempt against the peer.
+    ///
+    /// In `Closed` this resets the consecutive-failure counter; in
+    /// `HalfOpen` a single success is enough to close the breaker (emitting
+    /// a `closed` state metric). Successes that race a transition to `Open`
+    /// are ignored. `peer`/`service` are only used as metric labels.
     pub fn record_success(&mut self, peer: &str, service: &str) {
         match self.state {
             CircuitState::Closed => {
@@ -74,6 +115,13 @@ impl CircuitBreaker {
         }
     }
 
+    /// Record a failed attempt against the peer at time `now`.
+    ///
+    /// In `Closed`, increments the consecutive-failure counter and trips to
+    /// `Open(now)` when it reaches the threshold. In `HalfOpen`, a single
+    /// failed probe re-opens immediately (restarting the cooldown from
+    /// `now`). Failures while already `Open` are ignored.
+    /// `peer`/`service` are only used as metric labels.
     pub fn record_failure(&mut self, peer: &str, service: &str, now: Instant) {
         match self.state {
             CircuitState::Closed => {
@@ -117,6 +165,8 @@ pub struct CircuitBreakers {
 }
 
 impl CircuitBreakers {
+    /// Create an empty registry; the three parameters become the defaults
+    /// for every breaker it lazily creates (see `CircuitBreaker::new`).
     pub fn new(failure_threshold: u32, cooldown: Duration, max_probes: u32) -> Self {
         Self {
             breakers: Mutex::new(HashMap::new()),
@@ -126,6 +176,10 @@ impl CircuitBreakers {
         }
     }
 
+    /// Fetch the breaker for a (peer, service) pair, creating a fresh
+    /// `Closed` breaker with the registry's defaults on first use. Entries
+    /// are never evicted, so callers should key by bounded identifiers
+    /// (host names and service names), not per-request data.
     pub fn get(&self, peer: &str, service: &str) -> Arc<Mutex<CircuitBreaker>> {
         let mut lock = self.breakers.lock().unwrap();
         let key = (peer.to_string(), service.to_string());

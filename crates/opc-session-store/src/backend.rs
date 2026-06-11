@@ -1,3 +1,12 @@
+//! Storage API for session state (RFC 004 §7): the `SessionBackend` trait,
+//! fenced compare-and-set and batch operations, the ordered replication-log
+//! entry format consumed by the quorum layer, and `EncryptingSessionBackend`,
+//! a wrapper that seals payloads before they leave process memory.
+//!
+//! Every mutation is authorized by a `LeaseGuard`; backends enforce the
+//! fencing rule that a write carrying a token lower than the key's recorded
+//! fence is rejected, so a stale owner can never overwrite a newer one.
+
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -14,21 +23,34 @@ use crate::{
 };
 
 /// Atomic compare-and-set operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CompareAndSet {
+    /// Key being mutated. Must equal both the lease's key and the new
+    /// record's key, otherwise the backend rejects the op with
+    /// `StoreError::InvalidKey` before touching state.
     pub key: SessionKey,
     /// Lease credential authorizing this fenced mutation.
     pub lease: LeaseGuard,
     /// `None` means the key must not exist yet.
     pub expected_generation: Option<Generation>,
+    /// Replacement record written if the expectation holds. Its `owner` and
+    /// `fence` must match the lease, and for state classes that require
+    /// monotonic generations its `generation` must be strictly greater than
+    /// the current record's, or the CAS reports a conflict.
     pub new_record: StoredSessionRecord,
 }
 
 /// Outcome of a compare-and-set operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum CompareAndSetResult {
+    /// The generation expectation held and the new record was written
+    /// (durably, for backends that persist).
     Success,
+    /// The expectation failed — the current generation differed from
+    /// `expected_generation`, or the existence expectation was wrong — and
+    /// nothing was written. Callers should re-read (or use `current`) to
+    /// re-derive the mutation before retrying.
     Conflict {
         /// The current record, if any.
         current: Option<StoredSessionRecord>,
@@ -36,86 +58,189 @@ pub enum CompareAndSetResult {
 }
 
 /// A single operation inside a batch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum SessionOp {
-    Get { key: SessionKey },
+    /// Unfenced point read of one record (expired records read as absent).
+    Get {
+        /// Key to look up.
+        key: SessionKey,
+    },
+    /// Fenced compare-and-set, with the same expectation semantics as
+    /// `SessionBackend::compare_and_set`.
     CompareAndSet(CompareAndSet),
-    DeleteFenced { lease: LeaseGuard },
-    RefreshTtl { lease: LeaseGuard, ttl: Duration },
+    /// Fenced delete of the record covered by the lease. The key's recorded
+    /// fence is retained after deletion so stale owners stay fenced out.
+    DeleteFenced {
+        /// Lease credential naming the key to delete and proving ownership.
+        lease: LeaseGuard,
+    },
+    /// Fenced extension of the record's TTL without changing its payload or
+    /// generation.
+    RefreshTtl {
+        /// Lease credential naming the key and proving ownership.
+        lease: LeaseGuard,
+        /// New time-to-live measured from the backend's current clock; it
+        /// replaces (rather than adds to) the previous deadline.
+        ttl: Duration,
+    },
 }
 
 /// Result of a single batched operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `SessionBackend::batch` returns one entry per submitted op, in submission
+/// order; partial failure is expressed per-slot rather than failing the whole
+/// batch.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionOpResult {
+    /// Outcome of a `SessionOp::Get`: `Ok(None)` means no live record.
     Get(Result<Option<StoredSessionRecord>, StoreError>),
+    /// Outcome of a `SessionOp::CompareAndSet`; a CAS conflict is reported
+    /// inside the `Ok` value, not as a `StoreError`.
     CompareAndSet(Result<CompareAndSetResult, StoreError>),
+    /// Outcome of a `SessionOp::DeleteFenced`.
     DeleteFenced(Result<(), StoreError>),
+    /// Outcome of a `SessionOp::RefreshTtl`; `Err(StoreError::NotFound)`
+    /// means the record no longer exists (e.g. its TTL already elapsed).
     RefreshTtl(Result<(), StoreError>),
+}
+
+/// One position in the ordered replication log (RFC 004 §11.2).
+///
+/// Replicated coordinators (see the `quorum` module) treat the log as the
+/// source of truth: an entry is committed once a majority of replicas have
+/// durably appended the identical entry at the same `sequence`, and replica
+/// state is rebuilt by replaying the committed prefix in order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplicationEntry {
+    /// 1-based, gap-free position in the log. Quorum commitment is decided
+    /// per sequence; replicas reject entries that would create a gap or
+    /// diverge from an already-applied sequence.
+    pub sequence: u64,
+    /// Unique id of the originating write, used to tell idempotent
+    /// re-delivery of the same entry apart from a divergent entry that
+    /// collides on `sequence`.
+    pub tx_id: String,
+    /// The fenced mutation to replay when applying this entry.
+    pub op: ReplicationOp,
+    /// Coordinator wall-clock time when the entry was created. Informational
+    /// (and the basis for TTL deadlines on replay); ordering authority is
+    /// `sequence`, never this timestamp — no wall-clock last-writer-wins.
+    pub timestamp: Timestamp,
+}
+
+/// Mutation payload carried by a `ReplicationEntry`.
+///
+/// Each variant captures everything a replica needs to re-validate the write
+/// during replay: in particular the fence token (so a replica can reject
+/// stale-owner mutations exactly as the original backend would) and, for
+/// lease operations, the credential id that ties guards to lease entries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ReplicationOp {
+    /// Replay of a fenced compare-and-set write.
+    CompareAndSet {
+        /// Key being mutated.
+        key: SessionKey,
+        /// Generation the record must currently have (`None` = must not
+        /// exist); replay fails with a CAS conflict otherwise.
+        expected_generation: Option<Generation>,
+        /// Record to install; its `fence` must not be lower than the
+        /// replica's recorded fence for the key.
+        new_record: StoredSessionRecord,
+    },
+    /// Replay of a fenced record deletion. The fence is retained on the key
+    /// after deletion so stale owners remain fenced out.
+    DeleteFenced {
+        /// Key whose record is removed.
+        key: SessionKey,
+        /// Owner that issued the delete.
+        owner: OwnerId,
+        /// Fence under which the delete was authorized; replicas reject the
+        /// replay if their recorded fence is higher.
+        fence: FenceToken,
+    },
+    /// Replay of a fenced TTL refresh; payload and generation are unchanged.
+    RefreshTtl {
+        /// Key whose record deadline is extended.
+        key: SessionKey,
+        /// Owner that issued the refresh.
+        owner: OwnerId,
+        /// Fence under which the refresh was authorized.
+        fence: FenceToken,
+        /// New time-to-live, applied relative to the replay clock.
+        ttl: Duration,
+    },
+    /// Replay of a lease acquisition, installing the lease entry and bumping
+    /// the key's recorded fence to `fence`.
+    AcquireLease {
+        /// Key being leased.
+        key: SessionKey,
+        /// Replica that acquired the lease.
+        owner: OwnerId,
+        /// Newly minted fence token; must be at least the replica's recorded
+        /// fence for the key or the replay is rejected as stale.
+        fence: FenceToken,
+        /// Credential id minted with the guard; fenced mutations must present
+        /// a guard with this exact id to be accepted.
+        credential_id: u64,
+        /// Lease time-to-live from the replay clock.
+        ttl: Duration,
+    },
+    /// Replay of a lease renewal: the same fence and credential id with an
+    /// extended expiry (renewal never changes the fence).
+    RenewLease {
+        /// Key whose lease is renewed.
+        key: SessionKey,
+        /// Holder renewing the lease.
+        owner: OwnerId,
+        /// Existing fence token, unchanged by renewal.
+        fence: FenceToken,
+        /// Existing credential id, unchanged by renewal.
+        credential_id: u64,
+        /// New time-to-live from the replay clock.
+        ttl: Duration,
+    },
+    /// Replay of an explicit lease release. Marks the lease inactive but does
+    /// NOT lower the key's recorded fence, so writes from the released guard
+    /// keep failing with a stale fence.
+    ReleaseLease {
+        /// Key whose lease is released.
+        key: SessionKey,
+        /// Holder releasing the lease.
+        owner: OwnerId,
+        /// Fence of the released lease (retained as the key's fence floor).
+        fence: FenceToken,
+        /// Credential id of the released guard; only the matching lease entry
+        /// is deactivated.
+        credential_id: u64,
+    },
+    /// Replay of a batch: the nested ops are applied sequentially and the
+    /// first failure aborts the rest of the batch replay.
+    Batch {
+        /// Mutations in original submission order.
+        ops: Vec<ReplicationOp>,
+    },
 }
 
 /// Storage backend trait for session state.
 ///
 /// Implementations MUST enforce their declared [`BackendCapabilities`]. In
 /// particular, backends that do not support `atomic_compare_and_set` or
-/// `monotonic_fencing_token` MUST reject the corresponding operations.
+/// `monotonic_fencing_token` MUST reject the corresponding operations rather
+/// than approximate them. Fenced mutations carry a [`LeaseGuard`] and MUST
+/// fail with `StoreError::StaleFence` when the guard's token is lower than
+/// the key's recorded fence (RFC 004 §9.2).
+///
+/// The replication-log methods (`max_replication_sequence` through `watch`)
+/// have default implementations that return
+/// `StoreError::CapabilityNotSupported`; backends declaring
+/// `ordered_replication_log` or `watch` must override them.
 ///
 /// Durable adapters that reconstruct [`StoredSessionRecord`] from persisted
 /// bytes MUST preserve payload encoding explicitly: use
 /// [`EncryptedSessionPayload::envelope`] for RFC 003 ciphertext rows and
 /// [`EncryptedSessionPayload::legacy_plaintext`] only for intentional
 /// migrations of pre-envelope plaintext rows.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ReplicationEntry {
-    pub sequence: u64,
-    pub tx_id: String,
-    pub op: ReplicationOp,
-    pub timestamp: Timestamp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ReplicationOp {
-    CompareAndSet {
-        key: SessionKey,
-        expected_generation: Option<Generation>,
-        new_record: StoredSessionRecord,
-    },
-    DeleteFenced {
-        key: SessionKey,
-        owner: OwnerId,
-        fence: FenceToken,
-    },
-    RefreshTtl {
-        key: SessionKey,
-        owner: OwnerId,
-        fence: FenceToken,
-        ttl: Duration,
-    },
-    AcquireLease {
-        key: SessionKey,
-        owner: OwnerId,
-        fence: FenceToken,
-        credential_id: u64,
-        ttl: Duration,
-    },
-    RenewLease {
-        key: SessionKey,
-        owner: OwnerId,
-        fence: FenceToken,
-        credential_id: u64,
-        ttl: Duration,
-    },
-    ReleaseLease {
-        key: SessionKey,
-        owner: OwnerId,
-        fence: FenceToken,
-        credential_id: u64,
-    },
-    Batch {
-        ops: Vec<ReplicationOp>,
-    },
-}
-
 #[async_trait]
 pub trait SessionBackend: Send + Sync {
     /// Return the capability declaration for this backend.
@@ -214,6 +339,13 @@ pub struct EncryptingSessionBackend<B: ?Sized, P: ?Sized> {
 }
 
 impl<B: ?Sized, P: ?Sized> EncryptingSessionBackend<B, P> {
+    /// Wrap `inner` so every record payload is sealed with keys from
+    /// `provider` before persistence and unsealed on reads.
+    ///
+    /// `backend_namespace` is bound into the AEAD AAD of every envelope:
+    /// ciphertext written under one namespace cannot be decrypted when read
+    /// back under another, which prevents records from being silently
+    /// replayed across backends or environments.
     pub fn new(inner: Arc<B>, provider: Arc<P>, backend_namespace: impl Into<String>) -> Self {
         Self {
             inner,
@@ -222,14 +354,20 @@ impl<B: ?Sized, P: ?Sized> EncryptingSessionBackend<B, P> {
         }
     }
 
+    /// The wrapped backend. Records obtained through it directly carry
+    /// ciphertext payloads — bypassing this wrapper skips decryption.
     pub fn inner(&self) -> &Arc<B> {
         &self.inner
     }
 
+    /// The key provider used to resolve the tenant's active session key for
+    /// encryption and to look up keys by id for decryption.
     pub fn provider(&self) -> &Arc<P> {
         &self.provider
     }
 
+    /// The namespace string bound into every envelope's AAD (see
+    /// `EncryptingSessionBackend::new`).
     pub fn backend_namespace(&self) -> &str {
         &self.backend_namespace
     }

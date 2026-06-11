@@ -431,7 +431,7 @@ pub struct LabFallbackPolicy {
 /// A complete description of the desired CNF data-plane configuration.
 ///
 /// Combine this with a [`ValidationContext`] (observed node capabilities) and
-/// pass both to [`validate_resource_profile`] to obtain a [`ValidationReport`].
+/// pass both to `validate_resource_profile` to obtain a [`ValidationReport`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceProfile {
     /// The kind of network function (UPF, SMF, AMF, …).
@@ -1080,7 +1080,7 @@ impl fmt::Display for ValidationWarning {
 
 impl Error for ValidationWarning {}
 
-/// Validation report produced by [`validate_resource_profile`].
+/// Validation report produced by `validate_resource_profile`.
 ///
 /// The report is **eligible** for scheduling (`is_eligible() == true`) iff
 /// `errors` is empty.  Warnings do not affect eligibility.

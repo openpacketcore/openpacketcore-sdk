@@ -1,3 +1,12 @@
+//! Core session-state vocabulary (RFC 004 §4–§5, §8–§10): tenant-scoped
+//! session keys, monotonic generations and fence tokens, owner identities,
+//! consistency state classes, and the generic handover phase machine.
+//!
+//! These types carry the crate's correctness invariants: `Generation` orders
+//! versions of one session without wall-clock comparison, and `FenceToken`
+//! orders owners of one session so that a stale owner can never overwrite a
+//! newer one.
+
 use std::fmt;
 use std::str::FromStr;
 
@@ -66,6 +75,11 @@ impl StateClass {
 pub struct StateType(String);
 
 impl StateType {
+    /// Validate and construct a state type.
+    ///
+    /// Returns an error for the empty string or values longer than 128
+    /// characters; the bound keeps the value safe to embed in backend rows
+    /// and AEAD AAD without truncation.
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
         if value.is_empty() {
@@ -77,6 +91,8 @@ impl StateType {
         Ok(Self(value))
     }
 
+    /// The validated string form, as persisted in backend rows and bound into
+    /// the payload encryption AAD.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -118,11 +134,22 @@ impl<'de> Deserialize<'de> for StateType {
 /// Well-known categories of session key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SessionKeyType {
+    /// Subscriber-level context keyed by a SUPI-derived identifier (the
+    /// `stable_id` must be a derived digest, never the raw SUPI/GPSI).
     SubscriberContext,
+    /// Per-PDU-session state, typically keyed by PDU session ID plus a
+    /// subscriber-identifier hash.
     PduSession,
+    /// GTP-U TEID to session mapping used for data-plane lookup.
     TeidMapping,
+    /// PFCP session state keyed by the session endpoint identifier (SEID).
     PfcpSeid,
+    /// Ephemeral handover transaction state, scoped to a `HandoverTxId` and
+    /// normally stored with a TTL.
     HandoverTransaction,
+    /// Deployment-specific key category. The string is the wire form and must
+    /// be non-empty; it shares the namespace with the well-known kebab-case
+    /// names above, so avoid reusing them.
     Other(String),
 }
 
@@ -187,9 +214,20 @@ impl<'de> Deserialize<'de> for SessionKeyType {
 /// deterministic hashing.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionKey {
+    /// Tenant that owns the session. Length-prefixed into the digest input,
+    /// so identical `stable_id` bytes under different tenants can never
+    /// collide on a shared backend.
     pub tenant: TenantId,
+    /// Network function kind (e.g. AMF, SMF, UPF) the state belongs to; part
+    /// of the key so different NFs never share a record namespace.
     pub nf_kind: NetworkFunctionKind,
+    /// Category of the key (PDU session, TEID mapping, ...), separating
+    /// records of different shapes that share the same `stable_id`.
     pub key_type: SessionKeyType,
+    /// Stable identifying bytes within the tenant/NF/type scope. MUST NOT be
+    /// a raw SUPI/GPSI in production; use a derived identifier and rely on
+    /// `SessionKey::digest_with_key` for backend keys. The `Debug` impl
+    /// redacts these bytes to keep subscriber identifiers out of logs.
     #[serde(with = "bytes_serde")]
     pub stable_id: Bytes,
 }
@@ -280,14 +318,24 @@ fn append_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
 pub struct Generation(u64);
 
 impl Generation {
+    /// Wrap a raw counter value, e.g. when rehydrating a record from a
+    /// backend row. New sessions conventionally start at generation 1.
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
+    /// Raw counter value, for persistence and for binding into the payload
+    /// encryption AAD.
     pub const fn get(self) -> u64 {
         self.0
     }
 
+    /// The successor generation to write in a compare-and-set update.
+    ///
+    /// Returns `None` on `u64` overflow instead of wrapping: a wrapped
+    /// generation would compare lower than the current one and break the
+    /// monotonic-version invariant, so callers must surface overflow as an
+    /// error rather than continue.
     pub const fn next(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(v) => Some(Self(v)),
@@ -307,6 +355,12 @@ impl fmt::Display for Generation {
 pub struct OwnerId(String);
 
 impl OwnerId {
+    /// Validate and construct an owner identity.
+    ///
+    /// Rejects the empty string and values over 128 characters. The value
+    /// must be stable for the lifetime of a replica and unique across
+    /// replicas: lease managers compare it verbatim to decide whether an
+    /// acquire attempt is a re-acquire by the holder or a conflict.
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
         if value.is_empty() {
@@ -318,6 +372,8 @@ impl OwnerId {
         Ok(Self(value))
     }
 
+    /// The validated string form, as compared by lease managers and recorded
+    /// in `StoredSessionRecord::owner`.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -343,10 +399,15 @@ impl FromStr for OwnerId {
 pub struct FenceToken(u64);
 
 impl FenceToken {
+    /// Wrap a raw token value. Only lease managers should mint new values;
+    /// they must be strictly increasing per session key across acquisitions.
+    /// Token 0 conventionally means "no fence recorded yet".
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
+    /// Raw token value, for persistence, ordering comparisons, and binding
+    /// into the payload encryption AAD.
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -362,12 +423,47 @@ impl fmt::Display for FenceToken {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HandoverPhase {
+    /// No handover in progress; the record's `owner` field is the single
+    /// authoritative writer.
     Stable,
-    Preparing { tx: HandoverTxId, target: OwnerId },
-    Prepared { tx: HandoverTxId, target: OwnerId },
-    Activating { tx: HandoverTxId, target: OwnerId },
-    Active { owner: OwnerId },
-    Aborting { tx: HandoverTxId },
+    /// The source owner has started a handover under its current lease but
+    /// the target has not yet confirmed. Transitions forward to `Prepared`
+    /// for the same `tx` or to `Aborting`.
+    Preparing {
+        /// Idempotency token for this handover transaction; all subsequent
+        /// steps must present the same id or they are rejected as conflicts.
+        tx: HandoverTxId,
+        /// Replica that will take ownership if the handover activates.
+        target: OwnerId,
+    },
+    /// The target has written its readiness with its own (strictly higher)
+    /// fence token; activation may now proceed.
+    Prepared {
+        /// Transaction this preparation belongs to.
+        tx: HandoverTxId,
+        /// Replica that confirmed readiness and will become owner.
+        target: OwnerId,
+    },
+    /// The target's fenced CAS toward ownership is in flight. Recoverable:
+    /// re-running activation for the same `tx` is a no-op.
+    Activating {
+        /// Transaction being activated.
+        tx: HandoverTxId,
+        /// Replica taking ownership.
+        target: OwnerId,
+    },
+    /// Handover completed; from here on, writes from the old source carry a
+    /// lower fence token and are rejected by the backend.
+    Active {
+        /// The replica that now holds authoritative ownership.
+        owner: OwnerId,
+    },
+    /// A prepared-but-not-activated handover is being rolled back toward
+    /// `Stable` (RFC 004 §10.3 step 7).
+    Aborting {
+        /// Transaction being aborted; abort steps are idempotent by this id.
+        tx: HandoverTxId,
+    },
 }
 
 /// Unique identifier for a handover transaction.
@@ -375,10 +471,16 @@ pub enum HandoverPhase {
 pub struct HandoverTxId(uuid::Uuid);
 
 impl HandoverTxId {
+    /// Mint a fresh random (UUID v4) transaction id. Generate exactly one id
+    /// per handover attempt and reuse it for every step of that attempt —
+    /// step idempotency is keyed on this value.
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4())
     }
 
+    /// Wrap an externally supplied UUID, e.g. one carried in a 3GPP procedure
+    /// message, so that retries and peer NFs converge on the same
+    /// transaction identity.
     pub const fn from_uuid(value: uuid::Uuid) -> Self {
         Self(value)
     }

@@ -9,12 +9,29 @@ use crate::{
 use http::{header::HeaderName, HeaderMap, Request};
 use std::{fmt, time::Duration};
 
+/// Everything the framework can extract from one inbound SBI request,
+/// gathered in a single fail-closed parse for handlers to consume.
+///
+/// `Debug` prints presence flags instead of values for the sensitive
+/// fields, so the whole struct is log-safe.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SbiExtractorData {
+    /// Parsed TS 29.500 common headers.
     pub headers: SbiHeaders,
+    /// Bearer token from the `Authorization` header; `None` when absent or
+    /// when a non-Bearer scheme was used.
     pub bearer_token: Option<crate::headers::BearerToken>,
+    /// Credential-free authorization result placed in request extensions by
+    /// the auth middleware; `None` if the request has not passed (or was
+    /// extracted without) authorization.
     pub auth_context: Option<ErasedAuthContext>,
+    /// Locally established absolute deadline from request extensions
+    /// (monotonic clock); only populated by `extract_from_request`, since a
+    /// bare header map cannot carry extensions.
     pub deadline: Option<RequestDeadline>,
+    /// Relative budget parsed from the peer's `x-opc-deadline-ms` header,
+    /// in milliseconds. Advisory: unlike `deadline` it is the remote
+    /// caller's claim, not a locally enforced deadline.
     pub timeout_hint: Option<Duration>,
 }
 
@@ -36,10 +53,19 @@ impl fmt::Debug for SbiExtractorData {
     }
 }
 
+/// Stateless extractor turning raw requests into `SbiExtractorData`.
+///
+/// Extraction is fail-closed: the first malformed or duplicated SBI header
+/// aborts with a `HeaderParseError` so handlers never observe partially
+/// parsed metadata.
 #[derive(Debug, Default, Clone)]
 pub struct SbiExtractor;
 
 impl SbiExtractor {
+    /// Extract from headers alone: parses the TS 29.500 common headers, the
+    /// bearer token, and the `x-opc-deadline-ms` hint. `auth_context` and
+    /// `deadline` stay `None` because they live in request extensions, not
+    /// headers.
     pub fn extract_from_header_map(
         headers: &HeaderMap,
     ) -> Result<SbiExtractorData, HeaderParseError> {
@@ -56,6 +82,9 @@ impl SbiExtractor {
         })
     }
 
+    /// Extract from a full request: everything `extract_from_header_map`
+    /// yields, plus the `RequestDeadline` and `ErasedAuthContext` (if the
+    /// middleware stack stored them in the request extensions).
     pub fn extract_from_request<B>(
         request: &Request<B>,
     ) -> Result<SbiExtractorData, HeaderParseError> {

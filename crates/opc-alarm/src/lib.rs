@@ -1,3 +1,4 @@
+#![deny(missing_docs)]
 //! OpenPacketCore Alarm Subsystem
 //!
 //! Alarm model, severity taxonomy, probable causes, deduplication/update/clear

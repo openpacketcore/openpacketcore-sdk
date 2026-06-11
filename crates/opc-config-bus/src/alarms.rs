@@ -1,3 +1,7 @@
+//! Alarm bridging for commit and startup failures: maps stable error codes to
+//! severities/probable causes, raises redacted management-plane alarms, and
+//! clears them again once a later commit or validation succeeds.
+
 use opc_alarm::{
     AffectedObject, Alarm, AlarmDetails, AlarmOpResult, AlarmType, ProbableCause, RedactedText,
     Severity, SharedAlarmManager,

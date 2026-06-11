@@ -317,7 +317,7 @@ pub fn format_constraint_expr(expr: &ConstraintExpr) -> String {
 
 /// Result of the canonicalization pre-scan pass.
 ///
-/// Returned by [`canonicalize_constraint_expr_owned`] so callers can inspect
+/// Returned by `canonicalize_constraint_expr_owned` so callers can inspect
 /// how the pre-scan behaved (e.g. which budget check fired, how large the
 /// work queue grew) without depending on a [`tracing`] subscriber.
 #[derive(Debug, Clone)]
@@ -328,7 +328,7 @@ pub struct PreScanResult {
     /// `true` if the pre-scan budget was exceeded and canonicalization was skipped.
     pub skipped: bool,
     /// Maximum number of items present in the pre-scan work queue at any point.
-    /// Useful for regression testing: the [`scan_stack.len()`] budget term in
+    /// Useful for regression testing: the `scan_stack.len()` budget term in
     /// `Boolean`/`Function`/`Compare` pre-checks is what keeps this bounded at
     /// O(MAX_CANONICALIZATION_NODES) rather than growing to O(MAX²).
     pub max_scan_stack_len: usize,

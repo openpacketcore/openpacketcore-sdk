@@ -5,6 +5,7 @@
 //! through [`redact`]) before being emitted to logs, traces, or panic output.
 
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
 
 mod error;
 mod identity;

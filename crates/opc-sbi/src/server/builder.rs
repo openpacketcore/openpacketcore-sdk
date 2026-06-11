@@ -1,3 +1,11 @@
+//! HTTP/2 SBI server builder.
+//!
+//! Wraps a caller-supplied axum `Router` in the framework middleware stack
+//! (timeout, body limit, panic containment, concurrency admission, auth)
+//! and serves it over HTTP/2, optionally with TLS + mTLS-derived SPIFFE
+//! peer identity. Production mode refuses to start without TLS, an auth
+//! policy, and non-empty trust bundles.
+
 use crate::auth::SbiAuth;
 use crate::problem::ProblemDetails;
 use crate::redact::{safe_metric_label, sanitize_error_message};
@@ -33,6 +41,10 @@ pub struct SbiServerBuilder {
 }
 
 impl SbiServerBuilder {
+    /// Start from the defaults for `addr`: plaintext (no TLS), no auth
+    /// policy, 8 MiB body limit, 10 s request timeout, and a 1000-request
+    /// concurrency ceiling. Suitable as-is only for lab/test profiles;
+    /// production deployments must add TLS, trust bundles, and auth.
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             addr,
@@ -47,36 +59,61 @@ impl SbiServerBuilder {
         }
     }
 
+    /// Terminate TLS with this rustls server configuration. Configure
+    /// client-certificate verification in the rustls config itself if mTLS
+    /// peer identity is required.
     pub fn with_tls(mut self, config: Arc<rustls::ServerConfig>) -> Self {
         self.tls_config = Some(config);
         self
     }
 
+    /// Provide the trust bundles used to map a verified client certificate
+    /// to a workload identity (SPIFFE ID, tenant, NF type/instance). With
+    /// no bundles, TLS connections still serve but carry no peer identity
+    /// — which production validation rejects.
     pub fn with_trust_bundles(mut self, bundles: Arc<TrustBundleSet>) -> Self {
         self.trust_bundles = Some(bundles);
         self
     }
 
+    /// Set the maximum accepted request body size in bytes (default
+    /// 8 MiB); larger bodies are rejected by the axum body-limit layer
+    /// before reaching handlers. Zero is rejected at startup.
     pub fn with_body_limit(mut self, limit: usize) -> Self {
         self.body_limit = limit;
         self
     }
 
+    /// Set the per-request handler deadline (default 10 seconds); requests
+    /// exceeding it receive HTTP 504 Gateway Timeout. Zero is rejected at
+    /// startup.
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
     }
 
+    /// Install the authorization policy consulted on every request (e.g.
+    /// `SbiJwtValidator`). Without one the auth middleware admits all
+    /// requests, which production validation refuses.
     pub fn with_auth_policy(mut self, policy: Arc<dyn SbiAuth>) -> Self {
         self.auth_policy = Some(policy);
         self
     }
 
+    /// Cap concurrently in-flight requests (default 1000). Requests beyond
+    /// the cap are rejected up front with 503 + `Retry-After: 30` and a
+    /// ProblemDetails body, counted in `sbi_overload_rejections_total`
+    /// (admission control, RFC 007 §13).
     pub fn with_max_concurrency(mut self, max: usize) -> Self {
         self.max_concurrency = max;
         self
     }
 
+    /// Toggle production hardening: at startup the server then requires
+    /// TLS, an auth policy, non-empty trust bundles, and a non-zero
+    /// concurrency cap, and the auth middleware rejects requests lacking a
+    /// transport-derived peer identity with 401 instead of synthesizing a
+    /// default-tenant peer.
     pub fn with_production_mode(mut self, enabled: bool) -> Self {
         self.production_mode = enabled;
         self
@@ -112,6 +149,20 @@ impl SbiServerBuilder {
         Ok(())
     }
 
+    /// Serve `router` on an already-bound listener (useful for tests that
+    /// bind port 0 first).
+    ///
+    /// Validates the configuration (production requirements included) and
+    /// then accepts connections forever — it only returns early with `Err`
+    /// on validation failure; there is no graceful-shutdown path, so run it
+    /// in a task you can abort. Each request passes through, outermost
+    /// first: request timeout (504 on expiry), body limit, panic
+    /// containment (500 ProblemDetails instead of a torn connection),
+    /// concurrency admission (503 + `Retry-After`), then the auth policy
+    /// (401/403 ProblemDetails on denial). With TLS, the client
+    /// certificate is mapped through the trust bundles to an `SbiPeer`
+    /// inserted into request extensions; without TLS the server speaks
+    /// plaintext HTTP/2 for local/test profiles only.
     pub async fn run_with_listener(
         self,
         listener: TcpListener,
@@ -229,6 +280,10 @@ impl SbiServerBuilder {
         }
     }
 
+    /// Bind the configured address and serve `router` (see
+    /// `run_with_listener` for the middleware stack and lifecycle).
+    /// Returns `Err` if validation fails or the address cannot be bound;
+    /// the bind error is sanitized before being returned.
     pub async fn run(self, router: Router) -> Result<(), String> {
         self.validate()?;
         let listener = TcpListener::bind(self.addr)

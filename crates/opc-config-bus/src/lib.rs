@@ -1,3 +1,4 @@
+#![deny(missing_docs)]
 //! Atomic snapshot publication and bounded config-change fanout.
 //!
 //! `ConfigBus` owns a single logical commit worker, publishes immutable running

@@ -1,3 +1,8 @@
+//! Single-writer commit state machine (RFC 001 §5): bounded admission queue,
+//! sequenced validate/authorize/persist/publish pipeline, commit-confirmed
+//! expiry rollback, and the recovery fence that blocks writes after a partial
+//! durable side effect or worker panic.
+
 #![allow(clippy::too_many_arguments)]
 use futures_util::FutureExt;
 use std::panic::AssertUnwindSafe;
@@ -137,6 +142,16 @@ impl<C: OpcConfig> ConfigBus<C> {
         }
     }
 
+    /// Submits a commit, validate-only, commit-confirmed, or rollback request
+    /// and waits for the sequenced worker to finish it.
+    ///
+    /// Admission never blocks: if the bounded queue (default capacity 32) is
+    /// full the request is rejected immediately with `AdmissionRejected` so
+    /// callers can apply backpressure. While the recovery fence is raised
+    /// every request fails with `RecoveryRequired` before any side effect.
+    /// A request is only reported successful after authorization, validation,
+    /// durable append, and snapshot publication have all succeeded; failures
+    /// before the durable append leave the running config untouched.
     pub async fn submit(&self, request: CommitRequest<C>) -> Result<CommitResult, CommitError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let sent = self.tx.try_send(Submission {
@@ -183,6 +198,13 @@ impl<C: OpcConfig> ConfigBus<C> {
         result
     }
 
+    /// Registers a change subscriber with its own bounded queue (capacity is
+    /// floored at 1) and the given overflow policy.
+    ///
+    /// A slow subscriber only ever degrades itself — overflow drops events,
+    /// disconnects it, or collapses its queue into a resync request according
+    /// to `lag_policy` — and never delays publication or other subscribers.
+    /// Dropping the returned receiver unregisters the subscription.
     pub fn subscribe(&self, lag_policy: SubscriberLagPolicy, capacity: usize) -> ConfigReceiver<C> {
         let subscriber = Arc::new(SubscriberState::new(lag_policy, capacity.max(1)));
         self.subscribers
@@ -192,18 +214,33 @@ impl<C: OpcConfig> ConfigBus<C> {
         ConfigReceiver { inner: subscriber }
     }
 
+    /// Returns the published `(tx_id, version, config)` triple read in a
+    /// single borrow, so the fields are mutually consistent even while a
+    /// commit is publishing concurrently.
     pub fn current_snapshot(&self) -> PublishedSnapshot<C> {
         self.snapshot.current_snapshot()
     }
 
+    /// Returns a shared handle to the publication slot for data-plane
+    /// readers. Reads through it never touch the commit queue, the store, or
+    /// any lock held across await points, and the handle keeps working even
+    /// if the bus itself is dropped or fenced.
     pub fn snapshot_handle(&self) -> Arc<AtomicConfigSnapshot<C>> {
         Arc::clone(&self.snapshot)
     }
 
+    /// Reports whether this bus is the writer of record for the running
+    /// config or a shadow mirror; fixed at construction (built-in
+    /// constructors always create authoritative buses).
     pub fn authority_mode(&self) -> AuthorityMode {
         self.authority_mode
     }
 
+    /// Reports whether the recovery fence is raised. `RecoveryRequired` means
+    /// a durable side effect could not be reconciled (post-deadline persist,
+    /// failed expiry rollback, or a worker panic): all new writes are
+    /// rejected until the bus is rebuilt from the store, while reads keep
+    /// serving the last published snapshot.
     pub fn drift_state(&self) -> DriftState {
         if self.recovery.reason().is_some() {
             DriftState::RecoveryRequired
@@ -212,10 +249,16 @@ impl<C: OpcConfig> ConfigBus<C> {
         }
     }
 
+    /// Returns the shared alarm manager on which the bus raises and clears
+    /// commit/startup failure alarms, so callers can attach the same manager
+    /// to their own components or inspect active alarms.
     pub fn alarm_manager(&self) -> SharedAlarmManager {
         self.alarm_manager.clone()
     }
 
+    /// Returns the authorizer consulted before every commit's durable side
+    /// effects, so northbound layers can reuse the identical policy for
+    /// read-path or pre-flight decisions.
     pub fn authorizer(&self) -> Arc<dyn ConfigAuthorizer> {
         self.authorizer.clone()
     }

@@ -1,21 +1,44 @@
+//! Backend capability declarations and profile validation (RFC 004 §6).
+//!
+//! Backends advertise what semantics they can actually provide via
+//! `BackendCapabilities`; `validate_backend_for_profile` then decides whether
+//! a backend may hold a given class of state. The point of the model is to
+//! fail loudly at wiring time instead of silently running authoritative
+//! session state on a backend that cannot fence stale owners.
+
 /// Capabilities that a session store backend MUST declare.
 ///
 /// NF code MUST NOT assume semantics that the selected backend cannot provide.
 /// Carrier profiles MUST reject a backend for `authoritative-session` state
 /// unless it supports atomic compare-and-set and monotonic fencing tokens (or
 /// an adapter that provides equivalent semantics).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BackendCapabilities {
+    /// Backend can perform generation-checked writes atomically on the server
+    /// side (no read-modify-write race). Required for `authoritative-session`
+    /// profiles; backends without it must reject `compare_and_set`.
     pub atomic_compare_and_set: bool,
+    /// Backend records the highest fence token per key and rejects any write
+    /// carrying a lower token (RFC 004 §9.2). Without this, a paused old
+    /// owner could overwrite a newer owner after resuming, so fenced
+    /// mutations must be rejected outright.
     pub monotonic_fencing_token: bool,
+    /// Backend expires individual records at their `expires_at` deadline and
+    /// supports fenced `refresh_ttl`. Required for `ephemeral-procedure`
+    /// state, which relies on TTL to garbage-collect abandoned transactions.
     pub per_key_ttl: bool,
     /// Advisory: not enforced by the backend trait; consumed by carrier profile validation.
     pub server_side_lease_expiry: bool,
     /// Advisory: not enforced by the backend trait; consumed by carrier profile validation.
     pub ordered_replication_log: bool,
+    /// Backend accepts `SessionBackend::batch`, applying the ops sequentially
+    /// and reporting per-op results instead of failing the whole batch.
     pub batch_write: bool,
     /// Advisory: not enforced by the backend trait; consumed by carrier profile validation.
     pub watch: bool,
+    /// Largest payload (in bytes) the backend accepts for a single record;
+    /// larger writes fail with `StoreError::PayloadTooLarge` without being
+    /// stored.
     pub max_value_bytes: usize,
 }
 

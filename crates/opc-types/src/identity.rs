@@ -16,15 +16,18 @@ macro_rules! string_identifier {
         pub struct $name(String);
 
         impl $name {
+            /// Parse and validate the identifier string.
             pub fn new(value: impl Into<String>) -> Result<Self, ParseError> {
                 let value = value.into();
                 Ok(Self(validate_slug($kind, &value, $max_len)?))
             }
 
+            /// Return the identifier as a string slice.
             pub fn as_str(&self) -> &str {
                 &self.0
             }
 
+            /// Consume and return the underlying String.
             pub fn into_string(self) -> String {
                 self.0
             }
@@ -87,8 +90,18 @@ macro_rules! string_identifier {
     };
 }
 
-string_identifier!(TenantId, "tenant id", 128);
-string_identifier!(InstanceId, "instance id", 128);
+string_identifier!(
+    /// Validated tenant identifier.
+    TenantId,
+    "tenant id",
+    128
+);
+string_identifier!(
+    /// Validated NF instance identifier.
+    InstanceId,
+    "instance id",
+    128
+);
 string_identifier!(
     /// Phase-0 region identifier kept as a validated slug until the topology
     /// model grows into a structured PLMN/tier composite in a later slice.
@@ -102,6 +115,7 @@ string_identifier!(
 pub struct SpiffeId(String);
 
 impl SpiffeId {
+    /// Parse and validate a SPIFFE ID string.
     pub fn new(value: impl Into<String>) -> Result<Self, ParseError> {
         const KIND: &str = "spiffe id";
         const CANONICAL_PATH: &str =
@@ -186,10 +200,12 @@ impl SpiffeId {
         Ok(Self(value))
     }
 
+    /// Return the SPIFFE ID as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
+    /// Extract the trust domain portion.
     pub fn trust_domain(&self) -> &str {
         let rest = &self.0["spiffe://".len()..];
         let slash = rest
@@ -198,6 +214,7 @@ impl SpiffeId {
         &rest[..slash]
     }
 
+    /// Extract the path portion after the trust domain.
     pub fn path(&self) -> &str {
         let rest = &self.0["spiffe://".len()..];
         let slash = rest
@@ -254,16 +271,19 @@ pub struct PlmnId {
 }
 
 impl PlmnId {
+    /// Create a new PLMN identifier from MCC and MNC strings.
     pub fn new(mcc: impl Into<String>, mnc: impl Into<String>) -> Result<Self, ParseError> {
         let mcc = validate_digits("plmn id", &mcc.into(), &[3])?;
         let mnc = validate_digits("plmn id", &mnc.into(), &[2, 3])?;
         Ok(Self { mcc, mnc })
     }
 
+    /// Mobile Country Code.
     pub fn mcc(&self) -> &str {
         &self.mcc
     }
 
+    /// Mobile Network Code.
     pub fn mnc(&self) -> &str {
         &self.mnc
     }
@@ -325,6 +345,7 @@ pub struct Snssai {
 }
 
 impl Snssai {
+    /// Create a new S-NSSAI from SST and optional SD.
     pub fn new(sst: u8, sd: Option<impl Into<String>>) -> Result<Self, ParseError> {
         let sd = match sd {
             Some(sd) => Some(validate_hex("snssai", &sd.into(), 6)?),
@@ -334,10 +355,12 @@ impl Snssai {
         Ok(Self { sst, sd })
     }
 
+    /// Slice/Service Type.
     pub fn sst(&self) -> u8 {
         self.sst
     }
 
+    /// Slice Differentiator, if present.
     pub fn sd(&self) -> Option<&str> {
         self.sd.as_deref()
     }

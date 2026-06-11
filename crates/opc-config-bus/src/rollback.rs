@@ -1,3 +1,7 @@
+//! Candidate resolution for rollback commits: loads the requested rollback
+//! target from the durable store and refuses targets that are unpublishable
+//! (schema drift, pending commit-confirmed, or unreconciled recovery marker).
+
 use crate::datastore::ManagedDatastore;
 use crate::types::{StoreError, StoreErrorCode, StoredConfig};
 use opc_config_model::{CommitError, CommitMode, OpcConfig, RequestId};

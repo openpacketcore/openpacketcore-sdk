@@ -1,3 +1,11 @@
+//! External fault-management sink integration per RFC 013 §14: the pluggable
+//! async `AlarmSink` trait, test (`RecordingSink`) and log-based
+//! (`TracingSink`) adapters, and `BoundedAlarmSink`, a bounded-queue wrapper
+//! with retries that fails closed (`QueueFull` / `RetryExhausted` /
+//! `Shutdown`) instead of blocking, so a sink outage never stalls packet or
+//! request handling. Error text surfaced by this module is scrubbed through
+//! `opc_redaction` before exposure.
+
 use crate::model::Alarm;
 use async_trait::async_trait;
 use serde::Serialize;
