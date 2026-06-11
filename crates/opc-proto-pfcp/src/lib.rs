@@ -8,6 +8,8 @@
 //! @req REQ-3GPP-TS29244-R18-001
 //! @conformance v0 — see CONFORMANCE.md
 
+pub mod ie;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, Encode, EncodeContext,

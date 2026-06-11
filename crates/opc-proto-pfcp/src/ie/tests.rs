@@ -1,0 +1,930 @@
+#![forbid(unsafe_code)]
+#![allow(clippy::unwrap_used)]
+
+//! Conformance tests for typed PFCP IEs.
+//!
+//! Fixtures are hand-authored from 3GPP TS 29.244 R18 with octet-level
+//! comments citing section numbers. Every test asserts byte-exact
+//! decode → encode round-trip, including unknown IEs.
+
+use bytes::{BufMut, Bytes, BytesMut};
+use opc_protocol::{DecodeContext, EncodeContext};
+
+use crate::ie::{
+    CauseValue, NodeIdType, TypedIe,
+};
+
+/// Helper: encode a typed IE to raw bytes.
+fn encode_typed(ie: &TypedIe) -> Bytes {
+    let mut buf = BytesMut::new();
+    ie.encode(&mut buf, EncodeContext::default()).unwrap();
+    buf.freeze()
+}
+
+/// Helper: decode a typed IE from raw bytes.
+fn decode_typed(bytes: &[u8]) -> TypedIe {
+    let (rest, ie) = TypedIe::decode(bytes, DecodeContext::default(), 0).unwrap();
+    assert!(rest.is_empty(), "unexpected trailing bytes after IE decode");
+    ie
+}
+
+/// Assert byte-exact round-trip for a typed IE.
+fn assert_typed_roundtrip(bytes: &[u8]) {
+    let decoded = decode_typed(bytes);
+    let encoded = encode_typed(&decoded);
+    assert_eq!(
+        &encoded[..],
+        bytes,
+        "typed IE round-trip not byte-exact for {:?}",
+        decoded
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cause (§8.2.1)
+// ---------------------------------------------------------------------------
+
+/// Cause IE, value = Request accepted (1) per TS 29.244 §8.2.1.
+/// Octets: type=0x0013, length=0x0001, value=0x01.
+#[test]
+fn test_cause_request_accepted_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x13, // IE type 19 (Cause)
+        0x00, 0x01, // length 1
+        0x01, // Cause value: Request accepted (§8.2.1 Table 8.2.1-1)
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::Cause(c) => assert_eq!(c.value, CauseValue::RequestAccepted),
+        other => panic!("expected Cause, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Cause IE with unknown value (0xFF) must round-trip byte-exact.
+#[test]
+fn test_cause_unknown_value_roundtrip() {
+    let bytes: &[u8] = &[
+        0x00, 0x13, // IE type 19
+        0x00, 0x01, // length 1
+        0xFF, // unknown cause value
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::Cause(c) => assert_eq!(c.value, CauseValue::Unknown(0xFF)),
+        other => panic!("expected Cause, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+#[test]
+fn test_cause_truncated_rejected() {
+    let bytes: &[u8] = &[
+        0x00, 0x13, // IE type 19
+        0x00, 0x01, // length 1
+              // value missing
+    ];
+    let result = TypedIe::decode(bytes, DecodeContext::default(), 0);
+    assert!(result.is_err(), "truncated Cause must be rejected");
+}
+
+// ---------------------------------------------------------------------------
+// Node ID (§8.2.38)
+// ---------------------------------------------------------------------------
+
+/// Node ID IE, IPv4 type (0) with address 192.0.2.1 per §8.2.38.
+/// Octets: type=0x003C, length=0x0005, flags=0x00, addr=4 octets.
+#[test]
+fn test_node_id_ipv4_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x3C, // IE type 60 (Node ID)
+        0x00, 0x05, // length 5 (1 flag + 4 addr)
+        0x00, // Node ID type = IPv4 (§8.2.38)
+        0xC0, 0x00, 0x02, 0x01, // 192.0.2.1
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::NodeId(n) => {
+            assert_eq!(n.node_id_type, NodeIdType::Ipv4);
+            assert_eq!(n.value, &[0xC0, 0x00, 0x02, 0x01]);
+        }
+        other => panic!("expected NodeId, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Node ID IE, IPv6 type (1) with loopback per §8.2.38.
+#[test]
+fn test_node_id_ipv6_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x3C, // IE type 60
+        0x00, 0x11, // length 17 (1 flag + 16 addr)
+        0x01, // Node ID type = IPv6
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, // ::1
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::NodeId(n) => {
+            assert_eq!(n.node_id_type, NodeIdType::Ipv6);
+            assert_eq!(n.value.len(), 16);
+        }
+        other => panic!("expected NodeId, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+#[test]
+fn test_node_id_ipv4_wrong_length_rejected() {
+    let bytes: &[u8] = &[
+        0x00, 0x3C, // IE type 60
+        0x00, 0x04, // length 4 (should be 5 for IPv4)
+        0x00, // IPv4 type
+        0xC0, 0x00, 0x02, // only 3 octets
+    ];
+    let result = TypedIe::decode(bytes, DecodeContext::default(), 0);
+    assert!(
+        result.is_err(),
+        "IPv4 Node ID with wrong length must be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F-SEID (§8.2.40)
+// ---------------------------------------------------------------------------
+
+/// F-SEID IE with V4=1, SEID=0x123456789ABCDEF0, IPv4=192.0.2.1 per §8.2.40.
+/// Octet 5: flags = 0x02 (V4=1, V6=0).
+/// Octets 6-13: SEID (8 octets).
+/// Octets 14-17: IPv4 address.
+#[test]
+fn test_fseid_v4_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x39, // IE type 57 (F-SEID)
+        0x00, 0x0D, // length 13 (1 + 8 + 4)
+        0x02, // flags: V4=1, V6=0, spare bits 0 (§8.2.40)
+        0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, // SEID
+        0xC0, 0x00, 0x02, 0x01, // IPv4
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::FSeid(f) => {
+            assert!(f.v4);
+            assert!(!f.v6);
+            assert_eq!(f.seid, 0x1234_5678_9ABC_DEF0);
+            assert_eq!(f.ipv4, Some([0xC0, 0x00, 0x02, 0x01]));
+            assert_eq!(f.ipv6, None);
+        }
+        other => panic!("expected FSeid, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// F-SEID IE with V4=1, V6=1, SEID, IPv4, IPv6 per §8.2.40.
+/// IPv4 precedes IPv6 when both are present.
+#[test]
+fn test_fseid_v4v6_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x39, // IE type 57
+        0x00, 0x1D, // length 29 (1 + 8 + 4 + 16)
+        0x03, // flags: V4=1, V6=1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // SEID = 1
+        0xC0, 0x00, 0x02, 0x01, // IPv4
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, // IPv6 ::1
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::FSeid(f) => {
+            assert!(f.v4);
+            assert!(f.v6);
+            assert_eq!(f.ipv4, Some([0xC0, 0x00, 0x02, 0x01]));
+            assert_eq!(
+                f.ipv6,
+                Some([0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+            );
+        }
+        other => panic!("expected FSeid, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+#[test]
+fn test_fseid_truncated_rejected() {
+    let bytes: &[u8] = &[
+        0x00, 0x39, // IE type 57
+        0x00, 0x08, // length 8 (too short for even flags+SEID)
+        0x02, // V4=1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // only 7 SEID octets
+    ];
+    let result = TypedIe::decode(bytes, DecodeContext::default(), 0);
+    assert!(result.is_err(), "truncated F-SEID must be rejected");
+}
+
+// ---------------------------------------------------------------------------
+// F-TEID (§8.2.5)
+// ---------------------------------------------------------------------------
+
+/// F-TEID IE with V4=1, TEID=0x12345678, IPv4=192.0.2.1 per §8.2.5.
+/// Octet 5: flags = 0x01 (V4=1).
+/// Octets 6-9: TEID.
+/// Octets 10-13: IPv4.
+#[test]
+fn test_fteid_v4_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x15, // IE type 21 (F-TEID)
+        0x00, 0x09, // length 9 (1 + 4 + 4)
+        0x01, // flags: V4=1 (§8.2.5)
+        0x12, 0x34, 0x56, 0x78, // TEID
+        0xC0, 0x00, 0x02, 0x01, // IPv4
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::FTeid(f) => {
+            assert!(f.v4);
+            assert!(!f.v6);
+            assert!(!f.ch);
+            assert_eq!(f.teid, Some(0x1234_5678));
+            assert_eq!(f.ipv4, Some([0xC0, 0x00, 0x02, 0x01]));
+        }
+        other => panic!("expected FTeid, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// F-TEID IE with CH=1, CHID=1, Choose ID=5 per §8.2.5.
+/// When CH=1 and CHID=1, only flags and CHID are present.
+#[test]
+fn test_fteid_ch_chid_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x15, // IE type 21
+        0x00, 0x02, // length 2
+        0x0C, // flags: CH=1, CHID=1 (bits 3 and 4)
+        0x05, // Choose ID
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::FTeid(f) => {
+            assert!(f.ch);
+            assert!(f.chid);
+            assert_eq!(f.teid, None);
+            assert_eq!(f.choose_id, Some(5));
+        }
+        other => panic!("expected FTeid, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+#[test]
+fn test_fteid_truncated_teid_rejected() {
+    let bytes: &[u8] = &[
+        0x00, 0x15, // IE type 21
+        0x00, 0x04, // length 4 (1 flag + 3 partial TEID)
+        0x01, // V4=1, CH=0
+        0x12, 0x34, 0x56, // partial TEID
+    ];
+    let result = TypedIe::decode(bytes, DecodeContext::default(), 0);
+    assert!(result.is_err(), "truncated F-TEID TEID must be rejected");
+}
+
+// ---------------------------------------------------------------------------
+// PDR ID (§8.2.36)
+// ---------------------------------------------------------------------------
+
+/// PDR ID IE, value = 0x1234 per §8.2.36 (2 octets).
+#[test]
+fn test_pdr_id_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x38, // IE type 56 (PDR ID)
+        0x00, 0x02, // length 2
+        0x12, 0x34, // PDR ID
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::PdrId(p) => assert_eq!(p.value, 0x1234),
+        other => panic!("expected PdrId, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// FAR ID (§8.2.50)
+// ---------------------------------------------------------------------------
+
+/// FAR ID IE, value = 0x12345678 per §8.2.50 (4 octets).
+#[test]
+fn test_far_id_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x6C, // IE type 108 (FAR ID)
+        0x00, 0x04, // length 4
+        0x12, 0x34, 0x56, 0x78, // FAR ID
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::FarId(f) => assert_eq!(f.value, 0x1234_5678),
+        other => panic!("expected FarId, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// QER ID (§8.2.37)
+// ---------------------------------------------------------------------------
+
+/// QER ID IE, value = 0x00000001 per §8.2.37 (4 octets).
+#[test]
+fn test_qer_id_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x6D, // IE type 109 (QER ID)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x01, // QER ID
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::QerId(q) => assert_eq!(q.value, 1),
+        other => panic!("expected QerId, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// URR ID (§8.2.71)
+// ---------------------------------------------------------------------------
+
+/// URR ID IE, value = 0x00000002 per §8.2.71 (4 octets).
+#[test]
+fn test_urr_id_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x51, // IE type 81 (URR ID)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x02, // URR ID
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::UrrId(u) => assert_eq!(u.value, 2),
+        other => panic!("expected UrrId, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Precedence (§8.2.20)
+// ---------------------------------------------------------------------------
+
+/// Precedence IE, value = 0x0000000A per §8.2.20 (4 octets).
+#[test]
+fn test_precedence_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x1D, // IE type 29 (Precedence)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x0A, // precedence 10
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::Precedence(p) => assert_eq!(p.value, 10),
+        other => panic!("expected Precedence, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Apply Action (§8.2.26)
+// ---------------------------------------------------------------------------
+
+/// Apply Action IE with DROP=1, FORW=1 per §8.2.26 (2 octets).
+/// Octet 5: 0x03 (DROP | FORW).
+/// Octet 6: 0x00 (spare).
+#[test]
+fn test_apply_action_drop_forw_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x2C, // IE type 44 (Apply Action)
+        0x00, 0x02, // length 2
+        0x03, // DROP=1, FORW=1 (§8.2.26)
+        0x00, // spare
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::ApplyAction(a) => {
+            assert!(a.drop);
+            assert!(a.forward);
+            assert!(!a.buffer);
+            assert_eq!(a.spare, 0);
+        }
+        other => panic!("expected ApplyAction, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Source Interface (§8.2.2)
+// ---------------------------------------------------------------------------
+
+/// Source Interface IE, value = Access (0) per §8.2.2.
+/// High nibble is spare (0).
+#[test]
+fn test_source_interface_access_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x14, // IE type 20 (Source Interface)
+        0x00, 0x01, // length 1
+        0x00, // Access (0), spare nibble 0 (§8.2.2)
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::SourceInterface(s) => {
+            assert_eq!(s.value, 0);
+            assert_eq!(s.spare, 0);
+        }
+        other => panic!("expected SourceInterface, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Destination Interface (§8.2.3)
+// ---------------------------------------------------------------------------
+
+/// Destination Interface IE, value = Core (1) per §8.2.3.
+#[test]
+fn test_destination_interface_core_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x2A, // IE type 42 (Destination Interface)
+        0x00, 0x01, // length 1
+        0x01, // Core (1), spare nibble 0 (§8.2.3)
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::DestinationInterface(d) => {
+            assert_eq!(d.value, 1);
+            assert_eq!(d.spare, 0);
+        }
+        other => panic!("expected DestinationInterface, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Network Instance (§8.2.4)
+// ---------------------------------------------------------------------------
+
+/// Network Instance IE with DNN "internet" per §8.2.4.
+#[test]
+fn test_network_instance_spec_bytes() {
+    let dnn = b"internet";
+    let mut bytes = BytesMut::from(&[0x00, 0x16][..]); // IE type 22
+    bytes.put_u16(dnn.len() as u16); // length
+    bytes.put_slice(dnn);
+    let ie = decode_typed(&bytes);
+    match ie {
+        TypedIe::NetworkInstance(n) => assert_eq!(n.value, dnn.as_slice()),
+        other => panic!("expected NetworkInstance, got {:?}", other),
+    }
+    assert_typed_roundtrip(&bytes);
+}
+
+// ---------------------------------------------------------------------------
+// UE IP Address (§8.2.62)
+// ---------------------------------------------------------------------------
+
+/// UE IP Address IE with V4=1, IPv4=192.0.2.1 per §8.2.62.
+/// Octet 5: flags = 0x01 (V4=1).
+/// Octets 6-9: IPv4 address.
+#[test]
+fn test_ue_ip_address_v4_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x5D, // IE type 93 (UE IP Address)
+        0x00, 0x05, // length 5
+        0x01, // V4=1 (§8.2.62)
+        0xC0, 0x00, 0x02, 0x01, // IPv4
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::UeIpAddress(u) => {
+            assert!(u.v4);
+            assert!(!u.v6);
+            assert_eq!(u.ipv4, Some([0xC0, 0x00, 0x02, 0x01]));
+        }
+        other => panic!("expected UeIpAddress, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// UE IP Address IE with V4=1, IPv4D=1, prefix length 24 per §8.2.62.
+#[test]
+fn test_ue_ip_address_v4_prefix_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x5D, // IE type 93
+        0x00, 0x06, // length 6
+        0x09, // V4=1, IPv4D=1
+        0xC0, 0x00, 0x02, 0x00, // IPv4
+        0x18, // prefix length 24
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::UeIpAddress(u) => {
+            assert!(u.v4);
+            assert!(u.ipv4d);
+            assert_eq!(u.ipv4_prefix_length, Some(24));
+        }
+        other => panic!("expected UeIpAddress, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Outer Header Removal (§8.2.57)
+// ---------------------------------------------------------------------------
+
+/// Outer Header Removal IE, description = GTP-U/UDP/IPv4 (0) per §8.2.57.
+#[test]
+fn test_outer_header_removal_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x5F, // IE type 95 (Outer Header Removal)
+        0x00, 0x01, // length 1
+        0x00, // description 0 (§8.2.57)
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::OuterHeaderRemoval(o) => assert_eq!(o.description, 0),
+        other => panic!("expected OuterHeaderRemoval, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Recovery Time Stamp (§8.2.69)
+// ---------------------------------------------------------------------------
+
+/// Recovery Time Stamp IE, value = 0x66555A00 per §8.2.69 (4 octets).
+#[test]
+fn test_recovery_time_stamp_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x60, // IE type 96 (Recovery Time Stamp)
+        0x00, 0x04, // length 4
+        0x66, 0x55, 0x5A, 0x00, // seconds since epoch (§8.2.69)
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::RecoveryTimeStamp(r) => assert_eq!(r.seconds, 0x6655_5A00),
+        other => panic!("expected RecoveryTimeStamp, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Outer Header Creation (§8.2.12)
+// ---------------------------------------------------------------------------
+
+/// Outer Header Creation IE, GTP-U/UDP/IPv4 per §8.2.12.
+/// Description = 0x0001, TEID = 0x12345678, IPv4 = 192.0.2.1.
+#[test]
+fn test_outer_header_creation_gtpu_ipv4_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x54, // IE type 84 (Outer Header Creation)
+        0x00, 0x0A, // length 10 (2 + 4 + 4)
+        0x00, 0x01, // description: GTP-U/UDP/IPv4 (§8.2.12)
+        0x12, 0x34, 0x56, 0x78, // TEID
+        0xC0, 0x00, 0x02, 0x01, // IPv4
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::OuterHeaderCreation(o) => {
+            assert_eq!(o.description, 0x0001);
+            assert_eq!(o.teid, Some(0x1234_5678));
+            assert_eq!(o.ipv4, Some([0xC0, 0x00, 0x02, 0x01]));
+        }
+        other => panic!("expected OuterHeaderCreation, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Unknown IE preservation
+// ---------------------------------------------------------------------------
+
+/// An unknown IE type (0xFFFF) must be preserved as `TypedIe::Raw` and
+/// round-trip byte-exact.
+#[test]
+fn test_unknown_ie_raw_preservation() {
+    let bytes: &[u8] = &[
+        0xFF, 0xFF, // unknown IE type 65535
+        0x00, 0x04, // length 4
+        0xDE, 0xAD, 0xBE, 0xEF, // value
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::Raw(raw) => {
+            assert_eq!(raw.ie_type, 0xFFFF);
+            // Vendor IE: enterprise_id is extracted from first 2 octets of value area
+            assert_eq!(raw.enterprise_id, 0xDEAD);
+            assert_eq!(&raw.value[..], &[0xBE, 0xEF]);
+        }
+        other => panic!("expected Raw, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// A vendor-specific IE must be preserved as `TypedIe::Raw` with enterprise
+/// ID intact.
+#[test]
+fn test_vendor_ie_raw_preservation() {
+    let bytes: &[u8] = &[
+        0x80, 0x01, // vendor IE type 0x8001
+        0x00, 0x05, // length 5 = enterprise id (2) + value (3)
+        0x00, 0x42, // enterprise id 0x42
+        0x61, 0x62, 0x63, // value "abc"
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::Raw(raw) => {
+            assert_eq!(raw.ie_type, 0x8001);
+            assert_eq!(raw.enterprise_id, 0x42);
+            assert_eq!(&raw.value[..], b"abc");
+        }
+        other => panic!("expected Raw, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Grouped IE depth limits
+// ---------------------------------------------------------------------------
+
+/// Create PDR containing a PDI containing a Source Interface — depth 2.
+/// Must succeed with default max_depth (16).
+#[test]
+fn test_grouped_ie_nested_success() {
+    // Build: Create PDR (grouped) -> PDI (grouped) -> Source Interface (simple)
+    let source_interface: &[u8] = &[
+        0x00, 0x14, // IE type 20 (Source Interface)
+        0x00, 0x01, // length 1
+        0x00, // Access
+    ];
+    let _pdi: &[u8] = &[
+        0x00,
+        0x02, // IE type 2 (PDI)
+        0x00,
+        (source_interface.len() as u8), // length = size of Source Interface IE
+    ];
+    // Actually build it properly with BytesMut
+    let mut pdi_value = BytesMut::new();
+    pdi_value.put_slice(source_interface);
+    let mut pdi_ie = BytesMut::new();
+    pdi_ie.put_u16(2); // PDI type
+    pdi_ie.put_u16(pdi_value.len() as u16);
+    pdi_ie.put_slice(&pdi_value);
+
+    let mut create_pdr_value = BytesMut::new();
+    create_pdr_value.put_slice(&pdi_ie);
+    let mut create_pdr_ie = BytesMut::new();
+    create_pdr_ie.put_u16(1); // Create PDR type
+    create_pdr_ie.put_u16(create_pdr_value.len() as u16);
+    create_pdr_ie.put_slice(&create_pdr_value);
+
+    let bytes = create_pdr_ie.freeze();
+    let ie = decode_typed(&bytes);
+    match ie {
+        TypedIe::CreatePdr(g) => {
+            assert_eq!(g.members.len(), 1);
+        }
+        other => panic!("expected CreatePdr, got {:?}", other),
+    }
+    assert_typed_roundtrip(&bytes);
+}
+
+/// Grouped IE recursion must be rejected when max_depth is exceeded.
+#[test]
+fn test_grouped_ie_depth_exceeded() {
+    // Build a deeply nested structure: Create PDR -> Create PDR -> ... -> Source Interface
+    let source_interface: &[u8] = &[
+        0x00, 0x14, // IE type 20 (Source Interface)
+        0x00, 0x01, // length 1
+        0x00, // Access
+    ];
+
+    let mut inner = BytesMut::from(source_interface);
+    // Nest 10 levels deep
+    for _ in 0..10 {
+        let mut outer = BytesMut::new();
+        outer.put_u16(1); // Create PDR type
+        outer.put_u16(inner.len() as u16);
+        outer.put_slice(&inner);
+        inner = outer;
+    }
+
+    let ctx = DecodeContext {
+        max_depth: 4,
+        ..DecodeContext::default()
+    };
+    let result = TypedIe::decode(&inner, ctx, 0);
+    assert!(
+        result.is_err(),
+        "deeply nested grouped IE must exceed max_depth"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Negative tests: truncation, overflow
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_far_id_truncated_rejected() {
+    let bytes: &[u8] = &[
+        0x00, 0x6C, // IE type 108 (FAR ID)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, // only 3 octets
+    ];
+    let result = TypedIe::decode(bytes, DecodeContext::default(), 0);
+    assert!(result.is_err(), "truncated FAR ID must be rejected");
+}
+
+#[test]
+fn test_precedence_truncated_rejected() {
+    let bytes: &[u8] = &[
+        0x00, 0x1D, // IE type 29 (Precedence)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, // only 3 octets
+    ];
+    let result = TypedIe::decode(bytes, DecodeContext::default(), 0);
+    assert!(result.is_err(), "truncated Precedence must be rejected");
+}
+
+#[test]
+fn test_recovery_timestamp_truncated_rejected() {
+    let bytes: &[u8] = &[
+        0x00, 0x60, // IE type 96 (Recovery Time Stamp)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, // only 3 octets
+    ];
+    let result = TypedIe::decode(bytes, DecodeContext::default(), 0);
+    assert!(
+        result.is_err(),
+        "truncated Recovery Time Stamp must be rejected"
+    );
+}
+
+#[test]
+fn test_outer_header_creation_truncated_teid_rejected() {
+    let bytes: &[u8] = &[
+        0x00, 0x54, // IE type 84 (Outer Header Creation)
+        0x00, 0x05, // length 5 (2 desc + 3 partial TEID)
+        0x00, 0x01, // description GTP-U/UDP/IPv4
+        0x12, 0x34, 0x56, // partial TEID
+    ];
+    let result = TypedIe::decode(bytes, DecodeContext::default(), 0);
+    assert!(
+        result.is_err(),
+        "truncated Outer Header Creation TEID must be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Grouped IE encode/decode round-trip
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_created_pdr_roundtrip() {
+    // Created PDR containing PDR ID and F-TEID
+    let pdr_id: &[u8] = &[
+        0x00, 0x38, // IE type 56 (PDR ID)
+        0x00, 0x02, // length 2
+        0x00, 0x01, // PDR ID = 1
+    ];
+    let fteid: &[u8] = &[
+        0x00, 0x15, // IE type 21 (F-TEID)
+        0x00, 0x09, // length 9
+        0x01, // V4=1
+        0x00, 0x00, 0x00, 0x01, // TEID = 1
+        0xC0, 0x00, 0x02, 0x01, // IPv4
+    ];
+    let mut value = BytesMut::new();
+    value.put_slice(pdr_id);
+    value.put_slice(fteid);
+
+    let mut raw = BytesMut::new();
+    raw.put_u16(8); // Created PDR type
+    raw.put_u16(value.len() as u16);
+    raw.put_slice(&value);
+
+    let bytes = raw.freeze();
+    let ie = decode_typed(&bytes);
+    match ie {
+        TypedIe::CreatedPdr(g) => assert_eq!(g.members.len(), 2),
+        other => panic!("expected CreatedPdr, got {:?}", other),
+    }
+    assert_typed_roundtrip(&bytes);
+}
+
+#[test]
+fn test_create_far_roundtrip() {
+    // Create FAR containing FAR ID and Apply Action
+    let far_id: &[u8] = &[
+        0x00, 0x6C, // IE type 108 (FAR ID)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x01, // FAR ID = 1
+    ];
+    let apply_action: &[u8] = &[
+        0x00, 0x2C, // IE type 44 (Apply Action)
+        0x00, 0x02, // length 2
+        0x02, // FORW=1
+        0x00, // spare
+    ];
+    let mut value = BytesMut::new();
+    value.put_slice(far_id);
+    value.put_slice(apply_action);
+
+    let mut raw = BytesMut::new();
+    raw.put_u16(3); // Create FAR type
+    raw.put_u16(value.len() as u16);
+    raw.put_slice(&value);
+
+    let bytes = raw.freeze();
+    let ie = decode_typed(&bytes);
+    match ie {
+        TypedIe::CreateFar(g) => assert_eq!(g.members.len(), 2),
+        other => panic!("expected CreateFar, got {:?}", other),
+    }
+    assert_typed_roundtrip(&bytes);
+}
+
+#[test]
+fn test_forwarding_parameters_roundtrip() {
+    // Forwarding Parameters containing Destination Interface and Outer Header Creation
+    let dst_intf: &[u8] = &[
+        0x00, 0x2A, // IE type 42 (Destination Interface)
+        0x00, 0x01, // length 1
+        0x01, // Core
+    ];
+    let ohc: &[u8] = &[
+        0x00, 0x54, // IE type 84 (Outer Header Creation)
+        0x00, 0x0A, // length 10
+        0x00, 0x01, // GTP-U/UDP/IPv4
+        0x00, 0x00, 0x00, 0x01, // TEID
+        0xC0, 0x00, 0x02, 0x01, // IPv4
+    ];
+    let mut value = BytesMut::new();
+    value.put_slice(dst_intf);
+    value.put_slice(ohc);
+
+    let mut raw = BytesMut::new();
+    raw.put_u16(4); // Forwarding Parameters type
+    raw.put_u16(value.len() as u16);
+    raw.put_slice(&value);
+
+    let bytes = raw.freeze();
+    let ie = decode_typed(&bytes);
+    match ie {
+        TypedIe::ForwardingParameters(g) => assert_eq!(g.members.len(), 2),
+        other => panic!("expected ForwardingParameters, got {:?}", other),
+    }
+    assert_typed_roundtrip(&bytes);
+}
+
+#[test]
+fn test_create_qer_roundtrip() {
+    // Create QER containing QER ID
+    let qer_id: &[u8] = &[
+        0x00, 0x6D, // IE type 109 (QER ID)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x01, // QER ID = 1
+    ];
+    let mut value = BytesMut::new();
+    value.put_slice(qer_id);
+
+    let mut raw = BytesMut::new();
+    raw.put_u16(7); // Create QER type
+    raw.put_u16(value.len() as u16);
+    raw.put_slice(&value);
+
+    let bytes = raw.freeze();
+    let ie = decode_typed(&bytes);
+    match ie {
+        TypedIe::CreateQer(g) => assert_eq!(g.members.len(), 1),
+        other => panic!("expected CreateQer, got {:?}", other),
+    }
+    assert_typed_roundtrip(&bytes);
+}
+
+#[test]
+fn test_create_urr_roundtrip() {
+    // Create URR containing URR ID
+    let urr_id: &[u8] = &[
+        0x00, 0x51, // IE type 81 (URR ID)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x02, // URR ID = 2
+    ];
+    let mut value = BytesMut::new();
+    value.put_slice(urr_id);
+
+    let mut raw = BytesMut::new();
+    raw.put_u16(6); // Create URR type
+    raw.put_u16(value.len() as u16);
+    raw.put_slice(&value);
+
+    let bytes = raw.freeze();
+    let ie = decode_typed(&bytes);
+    match ie {
+        TypedIe::CreateUrr(g) => assert_eq!(g.members.len(), 1),
+        other => panic!("expected CreateUrr, got {:?}", other),
+    }
+    assert_typed_roundtrip(&bytes);
+}
