@@ -1,0 +1,48 @@
+name: Feature request
+description: Suggest an enhancement to the OpenPacketCore SDK.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What is missing or painful today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the enhancement and its API surface if applicable.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: nf-types
+    attributes:
+      label: Which NF type(s) does this serve?
+      multiple: true
+      options:
+        - AMF
+        - SMF
+        - UPF
+        - AUSF
+        - UDM
+        - UDR
+        - PCF
+        - NRF
+        - NEF
+        - NSSF
+        - Common / all
+        - Other
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Willingness to contribute
+      options:
+        - label: I am willing to open a PR for this feature
+          required: false

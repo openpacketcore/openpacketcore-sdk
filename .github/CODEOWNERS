@@ -1,0 +1,4 @@
+* @VerifiedOrganic
+/crates/opc-sbi/ @VerifiedOrganic
+/crates/opc-session-store/ @VerifiedOrganic
+/operators/ @VerifiedOrganic

@@ -1,0 +1,95 @@
+name: Bug report
+description: Report a defect in the OpenPacketCore SDK.
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component(s) affected
+      multiple: true
+      options:
+        - opc-alarm
+        - opc-alarm-k8s
+        - opc-alarm-yang
+        - opc-config-bus
+        - opc-config-model
+        - opc-crypto
+        - opc-data-governance
+        - opc-evidence
+        - opc-export
+        - opc-identity
+        - opc-key
+        - opc-nacm
+        - opc-node-resources
+        - opc-persist
+        - opc-privacy
+        - opc-protocol
+        - opc-proto-gtpu
+        - opc-redaction
+        - opc-runtime
+        - opc-sbi
+        - opc-session-cache
+        - opc-session-store
+        - opc-testbed
+        - opc-tls
+        - opc-types
+        - opc-yanggen
+        - operator-lifecycle
+        - operator
+        - other
+    validations:
+      required: true
+
+  - type: input
+    id: sdk-version
+    attributes:
+      label: SDK version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: rust-version
+    attributes:
+      label: Rust version
+      placeholder: "rustc 1.81.0"
+    validations:
+      required: false
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide a minimal code snippet or sequence of commands that reproduces the issue.
+      placeholder: |
+        1. Clone repo
+        2. Run `cargo test -p opc-...`
+        3. Observe failure
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / backtrace
+      description: |
+        ⚠️ **Warning:** Redact sensitive subscriber data before pasting logs.
+        Remove or mask SUPI, IMSI, IP addresses, and key material.
+        Use `opc-redaction` helpers where available.
+      render: text
+    validations:
+      required: false
