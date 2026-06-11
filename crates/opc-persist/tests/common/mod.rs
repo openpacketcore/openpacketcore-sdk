@@ -532,20 +532,25 @@ fn is_pid_alive(pid: u32) -> bool {
 }
 
 fn kill_and_wait(mut proc: tokio::process::Child) {
+    // Reap synchronously via try_wait (waitpid WNOHANG), never via an async
+    // wait on a second runtime: on Linux, tokio observes child exits through
+    // SIGCHLD dispatched to the runtime that spawned the child, and that
+    // runtime is parked while we block here - an async wait on a helper
+    // runtime therefore deadlocks (macOS avoids this via kqueue process
+    // events, which is why the old approach only hung on Linux). SIGKILL is
+    // unmaskable, so polling is bounded in practice; if the child somehow
+    // outlives the window we leak it for the OS to reap at process exit
+    // rather than hang the test suite.
     if let Ok(Some(_)) = proc.try_wait() {
         return;
     }
     let _ = proc.start_kill();
-    let thread = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let _ = proc.wait().await;
-        });
-    });
-    let _ = thread.join();
+    for _ in 0..500 {
+        match proc.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
 }
 
 impl Drop for TestNode {
