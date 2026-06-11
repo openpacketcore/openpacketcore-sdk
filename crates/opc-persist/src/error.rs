@@ -70,7 +70,7 @@ fn sanitize_error_message(msg: &str) -> String {
 
         let lower = token.to_ascii_lowercase();
         if redacting_sql_tail || token_needs_redaction(token, &lower) {
-            if sanitized.last().map_or(true, |last| last != "<redacted>") {
+            if sanitized.last().is_none_or(|last| last != "<redacted>") {
                 sanitized.push("<redacted>".to_string());
             }
             if is_sql_start(&lower) {
@@ -81,7 +81,7 @@ fn sanitize_error_message(msg: &str) -> String {
 
         if is_sql_start(&lower) {
             redacting_sql_tail = true;
-            if sanitized.last().map_or(true, |last| last != "<redacted>") {
+            if sanitized.last().is_none_or(|last| last != "<redacted>") {
                 sanitized.push("<redacted>".to_string());
             }
             continue;

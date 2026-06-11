@@ -35,6 +35,9 @@ jobs:
           path: ./book
 
   deploy:
+    # Pages deployment requires a public repository (or an upgraded plan);
+    # skip cleanly when unavailable so the build job still gates the book.
+    if: ${{ !github.event.repository.private }}
     needs: build
     runs-on: ubuntu-latest
     environment:

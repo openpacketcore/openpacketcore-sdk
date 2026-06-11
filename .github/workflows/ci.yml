@@ -157,14 +157,18 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v4
 
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-
       - name: Helm lint
         run: helm lint operators/helm/sdk-reference-operator/
 
+      # kubectl client-side dry runs cannot resolve CRD kinds (cert-manager
+      # Issuer/Certificate) without a cluster, so rendered output is checked
+      # as strict YAML instead.
       - name: Helm template (cert-manager)
-        run: helm template sdk-ref operators/helm/sdk-reference-operator/ | kubectl apply --dry-run=client -f -
+        run: |
+          helm template sdk-ref operators/helm/sdk-reference-operator/ > /tmp/rendered-certmanager.yaml
+          python3 -c 'import yaml; list(yaml.safe_load_all(open("/tmp/rendered-certmanager.yaml")))'
 
       - name: Helm template (manual cert)
-        run: helm template sdk-ref operators/helm/sdk-reference-operator/ --set webhook.certMode=manual --set webhook.secretName=my-secret | kubectl apply --dry-run=client -f -
+        run: |
+          helm template sdk-ref operators/helm/sdk-reference-operator/ --set webhook.certMode=manual --set webhook.secretName=my-secret > /tmp/rendered-manual.yaml
+          python3 -c 'import yaml; list(yaml.safe_load_all(open("/tmp/rendered-manual.yaml")))' 

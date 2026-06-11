@@ -257,13 +257,13 @@ impl MockNrf {
                 query
                     .plmn
                     .as_ref()
-                    .map_or(true, |plmn| p.plmn_list.contains(plmn))
+                    .is_none_or(|plmn| p.plmn_list.contains(plmn))
             })
             .filter(|p| {
                 query
                     .s_nssai
                     .as_ref()
-                    .map_or(true, |snssai| p.s_nssais.contains(snssai))
+                    .is_none_or(|snssai| p.s_nssais.contains(snssai))
             })
             .filter(|p| {
                 // If the query requests specific services, the NF must advertise at least one.

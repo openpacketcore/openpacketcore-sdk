@@ -58,7 +58,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CGO_ENABLED: "0"
-      GOCACHE: ${{ runner.temp }}/go-build
     defaults:
       run:
         working-directory: operators/sdk-reference-operator

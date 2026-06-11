@@ -714,8 +714,8 @@ impl AlarmStore for InMemoryStore {
 }
 
 fn alarm_matches_scope(alarm: &Alarm, tenant: Option<&str>, slice: Option<&str>) -> bool {
-    let tenant_matches = tenant.map_or(true, |expected| alarm.tenant.as_deref() == Some(expected));
-    let slice_matches = slice.map_or(true, |expected| alarm.slice.as_deref() == Some(expected));
+    let tenant_matches = tenant.is_none_or(|expected| alarm.tenant.as_deref() == Some(expected));
+    let slice_matches = slice.is_none_or(|expected| alarm.slice.as_deref() == Some(expected));
     tenant_matches && slice_matches
 }
 

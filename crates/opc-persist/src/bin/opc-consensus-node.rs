@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 fn decode_hex(hex_str: &str) -> Result<Vec<u8>, String> {
     let hex_str = hex_str.trim_start_matches("0x");
-    if hex_str.len() % 2 != 0 {
+    if !hex_str.len().is_multiple_of(2) {
         return Err("Odd number of hex characters".to_string());
     }
     let mut bytes = Vec::with_capacity(hex_str.len() / 2);

@@ -900,7 +900,7 @@ async fn test_high_concurrency_stress() {
                         let rc = rc.clone();
                         Box::pin(async move {
                             let count = rc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            if count % 2 == 0 {
+                            if count.is_multiple_of(2) {
                                 // Fail
                                 Err(opc_runtime::TaskError::Failed(
                                     "injected stress failure".to_string(),
