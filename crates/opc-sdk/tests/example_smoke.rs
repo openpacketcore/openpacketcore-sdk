@@ -1,0 +1,62 @@
+//! Smoke test that the minimal_cnf example compiles and the runtime
+//! can be instantiated with the SDK facade.
+
+use std::time::Duration;
+
+use opc_sdk::prelude::*;
+
+#[tokio::test]
+async fn sdk_facade_runtime_starts_and_shuts_down() {
+    let profile = RuntimeProfile::dev("smoke-test");
+    let alarms = SharedAlarmManager::default();
+
+    let handle = Builder::new(profile)
+        .with_alarm_manager(alarms)
+        .build()
+        .await
+        .expect("runtime should start");
+
+    assert!(!handle.shutdown_token().is_shutdown_requested());
+
+    handle.shutdown_token().request_shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(handle.shutdown_token().is_shutdown_requested());
+}
+
+#[tokio::test]
+async fn sdk_alarm_raise_clear_roundtrip() {
+    use opc_sdk::opc_alarm::{
+        AffectedObject, AlarmDetails, AlarmType, ProbableCause, RedactedText, Severity,
+    };
+
+    let alarms = SharedAlarmManager::default();
+    let affected = AffectedObject::NfInstance {
+        kind: "smoke".into(),
+        instance: "smoke-01".into(),
+    };
+
+    alarms.raise(
+        AlarmType::new("smoke.test.alarm"),
+        Severity::Warning,
+        ProbableCause::Other("smoke".into()),
+        affected.clone(),
+        None,
+        None,
+        None,
+        RedactedText::new("smoke alarm"),
+        AlarmDetails::empty(),
+    );
+
+    assert_eq!(alarms.active_alarms().len(), 1);
+
+    alarms.clear(
+        &AlarmType::new("smoke.test.alarm"),
+        ProbableCause::Other("smoke".into()),
+        &affected,
+        None,
+        None,
+        None,
+    );
+
+    assert!(alarms.active_alarms().is_empty());
+}

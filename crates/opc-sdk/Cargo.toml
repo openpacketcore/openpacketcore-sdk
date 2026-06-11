@@ -1,0 +1,52 @@
+[package]
+name = "opc-sdk"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenPacketCore SDK facade crate — compose CNFs from a single dependency"
+readme = "README.md"
+documentation = "https://docs.rs/opc-sdk"
+keywords = ["5g", "cnf", "packet-core", "telecom", "sdk"]
+categories = ["network-programming"]
+
+[features]
+default = ["runtime", "config", "session", "sbi", "alarm", "identity", "key", "types"]
+runtime = ["dep:opc-runtime"]
+config = ["dep:opc-config-bus", "dep:opc-config-model"]
+session = ["dep:opc-session-store", "dep:opc-session-cache"]
+sbi = ["dep:opc-sbi"]
+alarm = ["dep:opc-alarm"]
+identity = ["dep:opc-identity", "dep:opc-tls"]
+key = ["dep:opc-key", "dep:opc-crypto"]
+types = ["dep:opc-types"]
+testkit = ["opc-sbi?/testkit"]
+
+[dependencies]
+opc-types = { path = "../opc-types", version = "0.1.0", optional = true }
+opc-runtime = { path = "../opc-runtime", version = "0.1.0", optional = true }
+opc-config-bus = { path = "../opc-config-bus", version = "0.1.0", optional = true }
+opc-config-model = { path = "../opc-config-model", version = "0.1.0", optional = true }
+opc-session-store = { path = "../opc-session-store", version = "0.1.0", optional = true }
+opc-session-cache = { path = "../opc-session-cache", version = "0.1.0", optional = true }
+opc-sbi = { path = "../opc-sbi", version = "0.1.0", optional = true }
+opc-alarm = { path = "../opc-alarm", version = "0.1.0", optional = true }
+opc-identity = { path = "../opc-identity", version = "0.1.0", optional = true }
+opc-tls = { path = "../opc-tls", version = "0.1.0", optional = true }
+opc-key = { path = "../opc-key", version = "0.1.0", optional = true }
+opc-crypto = { path = "../opc-crypto", version = "0.1.0", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "signal"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[[example]]
+name = "minimal_cnf"
+required-features = ["runtime", "testkit"]
+
+[lints]
+workspace = true
