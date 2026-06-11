@@ -28,10 +28,20 @@ pub(crate) struct TaskState {
     pub(crate) last_heartbeat: Option<Instant>,
 }
 
+/// Point-in-time, externally visible snapshot of one supervised task,
+/// returned per task in `SupervisorHealth::task_states`.
 #[derive(Debug, Clone)]
 pub struct TaskStateView {
+    /// Task kind label as rendered by `TaskKind`'s `Display` impl, e.g.
+    /// `listener` or `protocol-worker`.
     pub kind: String,
+    /// Failure criticality as rendered by `Criticality`'s `Display` impl:
+    /// `fatal`, `degrade`, or `best-effort`.
     pub criticality: String,
+    /// True while the task future is still executing (spawned and neither
+    /// finished nor aborted); false before spawn and after exit.
     pub running: bool,
+    /// Number of failures recorded in the current restart-policy window;
+    /// resets to 0 when the window expires.
     pub restart_count: u32,
 }

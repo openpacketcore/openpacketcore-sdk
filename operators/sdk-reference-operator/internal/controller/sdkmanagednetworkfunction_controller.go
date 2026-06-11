@@ -3,14 +3,22 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	"openpacketcore.io/operator-sdk-go/bridge"
+	"openpacketcore.io/operator-sdk-go/conditions"
+	"openpacketcore.io/operator-sdk-go/drain"
+	"openpacketcore.io/operator-sdk-go/opmetrics"
+	"openpacketcore.io/operator-sdk-go/workload"
 	"openpacketcore.io/sdk-reference-operator/api/v1beta1"
 	"openpacketcore.io/sdk-reference-operator/internal/sdkbridge"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -18,27 +26,44 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+const drainFinalizer = "lifecycle.openpacketcore.io/drain"
+
 // SdkManagedNetworkFunctionReconciler reconciles SdkManagedNetworkFunction resources.
 type SdkManagedNetworkFunctionReconciler struct {
-	Client client.Client
-	Scheme *runtime.Scheme
-	Bridge *sdkbridge.Bridge
+	Client   client.Client
+	Scheme   *runtime.Scheme
+	Bridge   *sdkbridge.Bridge
+	Drainer  drain.Orchestrator
+	Recorder record.EventRecorder
+	// EnableWorkloadSynthesis is a reference-grade opt-in flag that causes the
+	// reconciler to create/update a Deployment derived from the CR spec.
+	// It is off by default and should not be enabled in production operators
+	// without additional validation.
+	EnableWorkloadSynthesis bool
 }
 
 // +kubebuilder:rbac:groups=reference.openpacketcore.io,resources=sdkmanagednetworkfunctions,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=reference.openpacketcore.io,resources=sdkmanagednetworkfunctions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=secrets;configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 
 func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	start := time.Now()
+	outcome := "success"
+	defer func() {
+		opmetrics.ReconcileDuration.WithLabelValues("SdkManagedNetworkFunction", outcome).Observe(time.Since(start).Seconds())
+		opmetrics.ReconcileTotal.WithLabelValues("SdkManagedNetworkFunction", outcome).Inc()
+	}()
 
 	// 1. Fetch SdkManagedNetworkFunction resource
 	crd := &v1beta1.SdkManagedNetworkFunction{}
 	err := r.Client.Get(ctx, req.NamespacedName, crd)
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if k8serrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
+		outcome = "error"
 		return ctrl.Result{}, err
 	}
 
@@ -48,15 +73,40 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 		return ctrl.Result{}, nil
 	}
 
+	// ConditionManager drives all condition mutations with RFC 009 semantics.
+	cm := conditions.NewConditionManager(crd.Status.ObservedGeneration)
+	cm.LoadConditions(crd.Status.Conditions)
+
+	// Finalizer handling
+	if !crd.DeletionTimestamp.IsZero() {
+		if r.Drainer != nil && containsString(crd.Finalizers, drainFinalizer) {
+			if err := r.runDrain(ctx, crd, cm); err != nil {
+				logger.Error(err, "Drain during deletion failed")
+			}
+		}
+		crd.Finalizers = removeString(crd.Finalizers, drainFinalizer)
+		if err := r.Client.Update(ctx, crd); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	if !containsString(crd.Finalizers, drainFinalizer) {
+		crd.Finalizers = append(crd.Finalizers, drainFinalizer)
+		if err := r.Client.Update(ctx, crd); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	// 2. Fetch dependencies (NodeCapabilityReport, CompatibilityMatrix, ActiveAlarms)
 	isProd := crd.Spec.RuntimeMode == "production"
 	if isProd && crd.Spec.ResourceProfile == nil {
-		crd.Status.Phase = "Degraded"
-		crd.Status.ObservedGeneration = crd.Generation
+		crd.Status.Phase = string(conditions.PhaseDegraded)
 		crd.Status.BlockedReason = "Production references require a resource profile before rollout"
 		crd.Status.PreflightSummary = "Blocked: resource profile missing"
-		r.setCondition(crd, "Ready", metav1.ConditionFalse, "ResourceProfileMissing", crd.Status.BlockedReason)
-		r.setCondition(crd, "Degraded", metav1.ConditionTrue, "ResourceProfileMissing", crd.Status.BlockedReason)
+		_ = cm.Set(conditions.Ready, metav1.ConditionFalse, "ResourceProfileMissing", crd.Status.BlockedReason, crd.Generation)
+		_ = cm.Set(conditions.Degraded, metav1.ConditionTrue, "ResourceProfileMissing", crd.Status.BlockedReason, crd.Generation)
+		r.syncConditions(crd, cm)
 		if updateErr := r.Client.Status().Update(ctx, crd); updateErr != nil {
 			return ctrl.Result{}, updateErr
 		}
@@ -64,13 +114,13 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 	}
 
 	var nodeCaps *sdkbridge.NodeCapabilityReport
-	cm := &corev1.ConfigMap{}
+	cfgMap := &corev1.ConfigMap{}
 	err = r.Client.Get(ctx, types.NamespacedName{
 		Name:      "node-capability-report",
 		Namespace: crd.Namespace,
-	}, cm)
+	}, cfgMap)
 	if err == nil {
-		if data, ok := cm.Data["report.json"]; ok {
+		if data, ok := cfgMap.Data["report.json"]; ok {
 			var report sdkbridge.NodeCapabilityReport
 			if json.Unmarshal([]byte(data), &report) == nil {
 				nodeCaps = &report
@@ -79,12 +129,12 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 	}
 
 	if isProd && crd.Spec.ResourceProfile != nil && nodeCaps == nil {
-		crd.Status.Phase = "Degraded"
-		crd.Status.ObservedGeneration = crd.Generation
+		crd.Status.Phase = string(conditions.PhaseDegraded)
 		crd.Status.BlockedReason = "Production data-plane preflight requires a node capability report"
 		crd.Status.PreflightSummary = "Blocked: node capability report missing"
-		r.setCondition(crd, "Ready", metav1.ConditionFalse, "NodeCapabilitiesMissing", crd.Status.BlockedReason)
-		r.setCondition(crd, "Degraded", metav1.ConditionTrue, "NodeCapabilitiesMissing", crd.Status.BlockedReason)
+		_ = cm.Set(conditions.Ready, metav1.ConditionFalse, "NodeCapabilitiesMissing", crd.Status.BlockedReason, crd.Generation)
+		_ = cm.Set(conditions.Degraded, metav1.ConditionTrue, "NodeCapabilitiesMissing", crd.Status.BlockedReason, crd.Generation)
+		r.syncConditions(crd, cm)
 		if updateErr := r.Client.Status().Update(ctx, crd); updateErr != nil {
 			return ctrl.Result{}, updateErr
 		}
@@ -166,18 +216,21 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 			}
 		}
 
-		rep, err := r.Bridge.EvaluatePreflight(pReq)
+		rep, err := r.Bridge.EvaluatePreflight(ctx, pReq)
 		if err == nil {
 			preflightReport = rep
 		} else {
 			logger.Error(err, "Failed to run preflight check during reconciliation")
 			if isProd {
-				crd.Status.Phase = "Degraded"
-				crd.Status.ObservedGeneration = crd.Generation
+				crd.Status.Phase = string(conditions.PhaseDegraded)
 				crd.Status.BlockedReason = "Production data-plane preflight evaluation failed"
 				crd.Status.PreflightSummary = "Blocked: preflight evaluation failed"
-				r.setCondition(crd, "Ready", metav1.ConditionFalse, "PreflightEvaluationFailed", crd.Status.BlockedReason)
-				r.setCondition(crd, "Degraded", metav1.ConditionTrue, "PreflightEvaluationFailed", crd.Status.BlockedReason)
+				_ = cm.Set(conditions.Ready, metav1.ConditionFalse, "PreflightEvaluationFailed", crd.Status.BlockedReason, crd.Generation)
+				_ = cm.Set(conditions.Degraded, metav1.ConditionTrue, "PreflightEvaluationFailed", crd.Status.BlockedReason, crd.Generation)
+				if r.Recorder != nil {
+					r.Recorder.Eventf(crd, corev1.EventTypeWarning, "PreflightFailed", "Production preflight evaluation failed: %v", err)
+				}
+				r.syncConditions(crd, cm)
 				if updateErr := r.Client.Status().Update(ctx, crd); updateErr != nil {
 					return ctrl.Result{}, updateErr
 				}
@@ -207,7 +260,7 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 	applyReq := &sdkbridge.ConfigApplyRequest{
 		DesiredGeneration:         crd.Generation,
 		CurrentObservedGeneration: crd.Status.ObservedGeneration,
-		CurrentVersion:            1, // simplifed reference model
+		CurrentVersion:            1, // simplified reference model
 		CurrentDigest:             "0000000000000000000000000000000000000000000000000000000000000000",
 		LifecycleStatus: sdkbridge.LifecycleStatus{
 			Phase:              crd.Status.Phase,
@@ -247,26 +300,38 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 	applyReq.CurrentTime = &nowStr
 
 	// 6. Invoke CLI bridge
-	decision, err := r.Bridge.EvaluateConfigApply(applyReq)
+	decision, err := r.Bridge.EvaluateConfigApply(ctx, applyReq)
 	if err != nil {
 		logger.Error(err, "Failed to evaluate config apply policy")
-		// Update phase to Degraded on bridge failure
-		crd.Status.Phase = "Degraded"
-		r.setCondition(crd, "Ready", metav1.ConditionFalse, "SdkBridgeFailure", err.Error())
-		r.setCondition(crd, "Degraded", metav1.ConditionTrue, "SdkBridgeFailure", err.Error())
+		crd.Status.Phase = string(conditions.PhaseDegraded)
+		_ = cm.Set(conditions.Ready, metav1.ConditionFalse, "SdkBridgeFailure", err.Error(), crd.Generation)
+		_ = cm.Set(conditions.Degraded, metav1.ConditionTrue, "SdkBridgeFailure", err.Error(), crd.Generation)
+
+		var bridgeErr *bridge.Error
+		if errors.As(err, &bridgeErr) && bridgeErr.Kind == bridge.ErrKindContractMismatch {
+			opmetrics.VersionSkew.WithLabelValues("SdkManagedNetworkFunction").Set(1)
+			if r.Recorder != nil {
+				r.Recorder.Eventf(crd, corev1.EventTypeWarning, "ContractMismatch", "Bridge contract version mismatch: %s", bridgeErr.Message)
+			}
+		} else {
+			opmetrics.VersionSkew.WithLabelValues("SdkManagedNetworkFunction").Set(0)
+		}
+
+		r.syncConditions(crd, cm)
 		if updateErr := r.Client.Status().Update(ctx, crd); updateErr != nil {
 			return ctrl.Result{}, updateErr
 		}
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
+	opmetrics.VersionSkew.WithLabelValues("SdkManagedNetworkFunction").Set(0)
 
 	logger.Info("Evaluated policy config-apply decision", "decision", decision.Type)
 
 	// 7. Update CR status based on Decision
+	oldPhase := crd.Status.Phase
 	switch decision.Type {
 	case "Apply":
-		crd.Status.Phase = "Ready"
-		crd.Status.ObservedGeneration = crd.Generation
+		crd.Status.Phase = string(conditions.PhaseReady)
 		crd.Status.LastAdmittedVersion = crd.Spec.Version
 		crd.Status.CompatibilityDecision = "Allowed"
 		crd.Status.BlockedReason = ""
@@ -275,36 +340,66 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 		} else {
 			crd.Status.PreflightSummary = "Skipped"
 		}
-
-		// Update conditions
-		r.setCondition(crd, "Ready", metav1.ConditionTrue, "ConfigApplied", "Configuration applied successfully")
-		r.setCondition(crd, "Degraded", metav1.ConditionFalse, "ConfigApplied", "Configuration applied successfully")
+		_ = cm.Set(conditions.Ready, metav1.ConditionTrue, "ConfigApplied", "Configuration applied successfully", crd.Generation)
+		_ = cm.Set(conditions.Degraded, metav1.ConditionFalse, "ConfigApplied", "Configuration applied successfully", crd.Generation)
+		r.recordPhaseTransition(crd, oldPhase, crd.Status.Phase)
 
 	case "NoOp":
-		crd.Status.ObservedGeneration = crd.Generation
-		r.setCondition(crd, "Ready", metav1.ConditionTrue, "NoOp", "Configuration is already up to date")
+		_ = cm.Set(conditions.Ready, metav1.ConditionTrue, "NoOp", "Configuration is already up to date", crd.Generation)
 
 	case "Reject":
-		crd.Status.Phase = "Degraded"
+		crd.Status.Phase = string(conditions.PhaseDegraded)
 		crd.Status.BlockedReason = decision.RejectReason
 		crd.Status.CompatibilityDecision = "Rejected"
-
-		r.setCondition(crd, "Ready", metav1.ConditionFalse, "ConfigRejected", decision.RejectReason)
-		r.setCondition(crd, "Degraded", metav1.ConditionTrue, "ConfigRejected", decision.RejectReason)
+		_ = cm.Set(conditions.Ready, metav1.ConditionFalse, "ConfigRejected", decision.RejectReason, crd.Generation)
+		_ = cm.Set(conditions.Degraded, metav1.ConditionTrue, "ConfigRejected", decision.RejectReason, crd.Generation)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(crd, corev1.EventTypeWarning, "AdmissionRejected", "Config apply rejected: %s", decision.RejectReason)
+		}
 
 	case "RecoveryRequired":
-		crd.Status.Phase = "RecoveryRequired"
+		crd.Status.Phase = string(conditions.PhaseFailed)
 		crd.Status.BlockedReason = decision.RecoveryReason
-		r.setCondition(crd, "Ready", metav1.ConditionFalse, "RecoveryRequired", decision.RecoveryReason)
+		_ = cm.Set(conditions.Ready, metav1.ConditionFalse, "RecoveryRequired", decision.RecoveryReason, crd.Generation)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(crd, corev1.EventTypeWarning, "RecoveryRequired", "Recovery required: %s", decision.RecoveryReason)
+		}
 
 	case "Rollback":
-		crd.Status.Phase = "RollingBack"
+		crd.Status.Phase = string(conditions.PhaseDegraded) // RollingBack is not a distinct RFC 009 phase; map to Degraded
 		crd.Status.BlockedReason = decision.RollbackReason
-		r.setCondition(crd, "Ready", metav1.ConditionFalse, "RollbackTriggered", fmt.Sprintf("Rollback to version %d: %s", decision.RollbackTarget, decision.RollbackReason))
+		_ = cm.Set(conditions.Ready, metav1.ConditionFalse, "RollbackTriggered", fmt.Sprintf("Rollback to version %d: %s", decision.RollbackTarget, decision.RollbackReason), crd.Generation)
+		opmetrics.RollbackTotal.WithLabelValues("SdkManagedNetworkFunction", "triggered").Inc()
+		if r.Recorder != nil {
+			r.Recorder.Eventf(crd, corev1.EventTypeWarning, "RollbackTriggered", "Rollback to version %d: %s", decision.RollbackTarget, decision.RollbackReason)
+		}
 
 	case "WaitForDrain":
-		crd.Status.Phase = "Draining"
-		r.setCondition(crd, "Ready", metav1.ConditionFalse, "WaitingForDrain", "Workload is draining before config application")
+		crd.Status.Phase = string(conditions.PhaseDraining)
+		_ = cm.Set(conditions.Ready, metav1.ConditionFalse, "WaitingForDrain", "Workload is draining before config application", crd.Generation)
+	}
+
+	// Workload synthesis (reference-grade, opt-in)
+	if r.EnableWorkloadSynthesis {
+		if err := r.reconcileWorkload(ctx, crd); err != nil {
+			logger.Error(err, "Workload synthesis failed")
+			_ = cm.Set(conditions.Degraded, metav1.ConditionTrue, "WorkloadSynthesisFailed", err.Error(), crd.Generation)
+		}
+	}
+
+	// Drain orchestration: if phase is Draining, coordinate with the runtime.
+	if crd.Status.Phase == string(conditions.PhaseDraining) && r.Drainer != nil {
+		res, err := r.orchestrateDrain(ctx, crd, cm)
+		if err != nil {
+			logger.Error(err, "Drain orchestration failed")
+		}
+		if res.Requeue || res.RequeueAfter > 0 {
+			r.syncConditions(crd, cm)
+			if updateErr := r.Client.Status().Update(ctx, crd); updateErr != nil {
+				return ctrl.Result{}, updateErr
+			}
+			return res, nil
+		}
 	}
 
 	// Collect evidence IDs if present
@@ -315,6 +410,8 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 		}
 	}
 
+	r.syncConditions(crd, cm)
+
 	// Write status back to API server
 	if err := r.Client.Status().Update(ctx, crd); err != nil {
 		return ctrl.Result{}, err
@@ -323,32 +420,207 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 	return ctrl.Result{}, nil
 }
 
-func (r *SdkManagedNetworkFunctionReconciler) setCondition(crd *v1beta1.SdkManagedNetworkFunction, cType string, status metav1.ConditionStatus, reason, message string) {
-	for i, cond := range crd.Status.Conditions {
-		if cond.Type == cType {
-			if cond.Status != status || cond.Reason != reason || cond.Message != message {
-				crd.Status.Conditions[i].Status = status
-				crd.Status.Conditions[i].Reason = reason
-				crd.Status.Conditions[i].Message = message
-				crd.Status.Conditions[i].LastTransitionTime = metav1.NewTime(time.Now())
-				crd.Status.Conditions[i].ObservedGeneration = crd.Generation
-			}
-			return
+func (r *SdkManagedNetworkFunctionReconciler) runDrain(ctx context.Context, crd *v1beta1.SdkManagedNetworkFunction, cm *conditions.ConditionManager) error {
+	if r.Drainer == nil {
+		return nil
+	}
+	target := fmt.Sprintf("http://%s:8080", crd.Name) // simplistic target
+	if err := r.Drainer.Start(ctx, target); err != nil {
+		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainStartFailed", err.Error(), crd.Generation)
+		return err
+	}
+	status, err := r.Drainer.Status(ctx, target)
+	if err != nil {
+		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainStatusFailed", err.Error(), crd.Generation)
+		return err
+	}
+	if status.Phase != drain.Complete {
+		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainIncomplete", fmt.Sprintf("drain phase: %s", status.Phase), crd.Generation)
+		return fmt.Errorf("drain incomplete: %s", status.Phase)
+	}
+	_ = cm.Set(conditions.DrainReady, metav1.ConditionTrue, "DrainComplete", "Drain completed successfully", crd.Generation)
+	return nil
+}
+
+func (r *SdkManagedNetworkFunctionReconciler) orchestrateDrain(ctx context.Context, crd *v1beta1.SdkManagedNetworkFunction, cm *conditions.ConditionManager) (ctrl.Result, error) {
+	target := fmt.Sprintf("http://%s:8080", crd.Name)
+	startedAtStr := crd.Annotations["openpacketcore.io/drain-started-at"]
+	if startedAtStr == "" {
+		if err := r.Drainer.Start(ctx, target); err != nil {
+			_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainStartFailed", err.Error(), crd.Generation)
+			opmetrics.DrainTotal.WithLabelValues("SdkManagedNetworkFunction", "start_failed").Inc()
+			return ctrl.Result{}, err
+		}
+		if crd.Annotations == nil {
+			crd.Annotations = make(map[string]string)
+		}
+		crd.Annotations["openpacketcore.io/drain-started-at"] = time.Now().UTC().Format(time.RFC3339)
+		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainInProgress", "Drain started", crd.Generation)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(crd, corev1.EventTypeNormal, "DrainStarted", "Drain started for %s", crd.Name)
+		}
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	startedAt, err := time.Parse(time.RFC3339, startedAtStr)
+	if err != nil {
+		startedAt = time.Now().UTC()
+	}
+	if time.Since(startedAt) > 5*time.Minute {
+		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainTimedOut", "Drain exceeded 5m timeout", crd.Generation)
+		delete(crd.Annotations, "openpacketcore.io/drain-started-at")
+		opmetrics.DrainTotal.WithLabelValues("SdkManagedNetworkFunction", "timeout").Inc()
+		if r.Recorder != nil {
+			r.Recorder.Eventf(crd, corev1.EventTypeWarning, "DrainTimedOut", "Drain exceeded 5m timeout for %s", crd.Name)
+		}
+		return ctrl.Result{}, nil
+	}
+
+	status, err := r.Drainer.Status(ctx, target)
+	if err != nil {
+		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainStatusFailed", err.Error(), crd.Generation)
+		opmetrics.DrainTotal.WithLabelValues("SdkManagedNetworkFunction", "status_failed").Inc()
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
+	}
+
+	switch status.Phase {
+	case drain.Complete:
+		_ = cm.Set(conditions.DrainReady, metav1.ConditionTrue, "DrainComplete", "Drain completed successfully", crd.Generation)
+		delete(crd.Annotations, "openpacketcore.io/drain-started-at")
+		opmetrics.DrainTotal.WithLabelValues("SdkManagedNetworkFunction", "complete").Inc()
+		if r.Recorder != nil {
+			r.Recorder.Eventf(crd, corev1.EventTypeNormal, "DrainComplete", "Drain completed for %s", crd.Name)
+		}
+		return ctrl.Result{}, nil
+	case drain.InProgress:
+		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainInProgress", fmt.Sprintf("sessions remaining: %d", status.SessionsRemaining), crd.Generation)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	case drain.TimedOut, drain.Failed:
+		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainFailed", fmt.Sprintf("drain phase: %s", status.Phase), crd.Generation)
+		delete(crd.Annotations, "openpacketcore.io/drain-started-at")
+		opmetrics.DrainTotal.WithLabelValues("SdkManagedNetworkFunction", string(status.Phase)).Inc()
+		if r.Recorder != nil {
+			r.Recorder.Eventf(crd, corev1.EventTypeWarning, "DrainFailed", "Drain failed for %s: phase=%s", crd.Name, status.Phase)
+		}
+		return ctrl.Result{}, nil
+	default:
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+}
+
+func (r *SdkManagedNetworkFunctionReconciler) reconcileWorkload(ctx context.Context, crd *v1beta1.SdkManagedNetworkFunction) error {
+	logger := log.FromContext(ctx)
+
+	wSpec := workload.NetworkFunctionSpec{
+		Name:         crd.Name,
+		Namespace:    crd.Namespace,
+		Version:      crd.Spec.Version,
+		RuntimeMode:  crd.Spec.RuntimeMode,
+		NodeSelector: crd.Spec.NodeSelector,
+	}
+	if crd.Spec.ResourceProfile != nil {
+		prof := crd.Spec.ResourceProfile
+		wSpec.ResourceProfile = &workload.ResourceProfile{
+			NfKind:                    prof.NfKind,
+			DataPlaneProfile:          prof.DataPlaneProfile,
+			NumaPolicy:                prof.NumaPolicy,
+			GenericXdpFallbackAllowed: prof.GenericXdpFallbackAllowed,
+			IsolatedCores:             append([]uint16(nil), prof.IsolatedCores...),
+			RequireExclusiveCores:     prof.RequireExclusiveCores,
+			DataPlaneInterfaces:       append([]string(nil), prof.DataPlaneInterfaces...),
+			DataPlaneNumaNode:         prof.DataPlaneNumaNode,
+			HugepageNumaNode:          prof.HugepageNumaNode,
+			PodSecurityEvidenceID:     prof.PodSecurityEvidenceID,
+			SriovResourceName:         prof.SriovResourceName,
+			SriovAllowedDeviceDrivers: append([]string(nil), prof.SriovAllowedDeviceDrivers...),
+		}
+		for _, ba := range prof.BpfArtifacts {
+			wSpec.ResourceProfile.BpfArtifacts = append(wSpec.ResourceProfile.BpfArtifacts, workload.BpfArtifact{
+				Name:                ba.Name,
+				Digest:              ba.Digest,
+				SignatureRef:        ba.SignatureRef,
+				SignerIdentity:      ba.SignerIdentity,
+				ProgramType:         ba.ProgramType,
+				ExpectedAttachPoint: ba.ExpectedAttachPoint,
+				AllowedCapabilities: append([]string(nil), ba.AllowedCapabilities...),
+				EvidenceID:          ba.EvidenceID,
+			})
 		}
 	}
 
-	crd.Status.Conditions = append(crd.Status.Conditions, metav1.Condition{
-		Type:               cType,
-		Status:             status,
-		Reason:             reason,
-		Message:            message,
-		LastTransitionTime: metav1.NewTime(time.Now()),
-		ObservedGeneration: crd.Generation,
-	})
+	opts := workload.DefaultRenderOptions()
+	owner := metav1.OwnerReference{
+		APIVersion: crd.APIVersion,
+		Kind:       crd.Kind,
+		Name:       crd.Name,
+		UID:        crd.UID,
+		Controller: func() *bool { b := true; return &b }(),
+	}
+
+	dep, err := workload.BuildDeploymentWithOwnership(wSpec, opts, owner)
+	if err != nil {
+		return fmt.Errorf("render deployment: %w", err)
+	}
+
+	// Ensure the Deployment exists and is up to date
+	existing := &appsv1.Deployment{}
+	key := types.NamespacedName{Name: dep.Name, Namespace: dep.Namespace}
+	if err := r.Client.Get(ctx, key, existing); err != nil {
+		if k8serrors.IsNotFound(err) {
+			logger.Info("Creating Deployment for CNF", "deployment", dep.Name)
+			if createErr := r.Client.Create(ctx, dep); createErr != nil {
+				return fmt.Errorf("create deployment: %w", createErr)
+			}
+			return nil
+		}
+		return fmt.Errorf("get deployment: %w", err)
+	}
+
+	// Update existing deployment spec
+	existing.Spec = dep.Spec
+	existing.Labels = dep.Labels
+	logger.Info("Updating Deployment for CNF", "deployment", dep.Name)
+	if updateErr := r.Client.Update(ctx, existing); updateErr != nil {
+		return fmt.Errorf("update deployment: %w", updateErr)
+	}
+	return nil
+}
+
+func (r *SdkManagedNetworkFunctionReconciler) recordPhaseTransition(crd *v1beta1.SdkManagedNetworkFunction, oldPhase, newPhase string) {
+	if oldPhase == newPhase {
+		return
+	}
+	if r.Recorder != nil {
+		r.Recorder.Eventf(crd, corev1.EventTypeNormal, "PhaseTransition", "Phase changed from %s to %s", oldPhase, newPhase)
+	}
+}
+
+func (r *SdkManagedNetworkFunctionReconciler) syncConditions(crd *v1beta1.SdkManagedNetworkFunction, cm *conditions.ConditionManager) {
+	crd.Status.Conditions = cm.Conditions()
+	crd.Status.ObservedGeneration = cm.ObservedGeneration()
 }
 
 func (r *SdkManagedNetworkFunctionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1beta1.SdkManagedNetworkFunction{}).
 		Complete(r)
+}
+
+func containsString(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+func removeString(slice []string, s string) []string {
+	result := make([]string, 0, len(slice))
+	for _, item := range slice {
+		if item != s {
+			result = append(result, item)
+		}
+	}
+	return result
 }

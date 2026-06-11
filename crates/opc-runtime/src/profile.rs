@@ -21,10 +21,20 @@ pub enum RuntimeMode {
 }
 
 impl RuntimeMode {
+    /// Returns true if this mode must refuse to start (rather than degrade)
+    /// when required bootstrap material is missing, per RFC 008 section 3.1.
+    ///
+    /// True for `Production` and `Conformance`; `Dev`, `Lab`, and `Perf`
+    /// downgrade such failures to warnings.
     pub fn fail_closed(&self) -> bool {
         matches!(self, RuntimeMode::Production | RuntimeMode::Conformance)
     }
 
+    /// Returns true if debug/admin endpoints may be served without being
+    /// authorization-gated in this mode.
+    ///
+    /// True for `Dev`, `Lab`, and `Conformance`; `Production` and `Perf`
+    /// require debug surfaces to be gated or disabled.
     pub fn debug_enabled(&self) -> bool {
         matches!(
             self,
@@ -47,6 +57,11 @@ pub enum SigintHandling {
 }
 
 impl SigintHandling {
+    /// Resolves this policy against a runtime mode, returning true when a
+    /// SIGINT handler should be registered as a graceful drain trigger.
+    ///
+    /// `ModeDefault` enables SIGINT handling only in Dev, Lab, and Conformance
+    /// modes; `GracefulShutdown` always enables it; `Disabled` never does.
     pub fn enables_graceful_shutdown(self, mode: RuntimeMode) -> bool {
         match self {
             Self::ModeDefault => matches!(
@@ -62,12 +77,29 @@ impl SigintHandling {
 /// Declared runtime resource budget per RFC 008 section 9.1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceBudget {
+    /// Heap ceiling in bytes; `None` disables the memory-pressure check.
+    /// When simulated usage reaches this value the supervisor refuses new task
+    /// spawns and reports readiness `NotReady`. Default 256 MiB; must be <= 1 TiB.
     pub max_heap_bytes: Option<usize>,
+    /// Maximum number of supervised tasks; registration and spawn fail once
+    /// reached. Overrides `RuntimeProfile::max_tasks` when a budget is set.
+    /// Default 4096; must be in 1..=100,000.
     pub max_tasks: usize,
+    /// Maximum number of bounded channels the CNF may create. Default 1024;
+    /// must be in 1..=100,000.
     pub max_channels: usize,
+    /// Total bytes that may sit queued across all channels. Overrides
+    /// `RuntimeProfile::max_queued_bytes` when a budget is set. Default
+    /// 64 MiB; must be <= 10 GiB.
     pub max_queue_bytes: usize,
+    /// Maximum accepted size in bytes for a single request body. Default
+    /// 10 MiB; must be <= 1 GiB.
     pub max_request_body_bytes: usize,
+    /// Maximum number of simultaneously open file descriptors. Default 1024;
+    /// must be <= 1,000,000.
     pub max_open_files: usize,
+    /// Maximum number of concurrent connections to backend peers. Default
+    /// 256; must be <= 100,000.
     pub max_backend_connections: usize,
 }
 
@@ -86,6 +118,12 @@ impl Default for ResourceBudget {
 }
 
 impl ResourceBudget {
+    /// Checks every limit against its allowed range (all limits must be
+    /// non-zero and below their documented maxima).
+    ///
+    /// Returns `Err` with a human-readable message naming the first offending
+    /// field. Called automatically by `RuntimeProfile::validate_resource_limits`
+    /// during `Builder::build`.
     pub fn validate(&self) -> Result<(), String> {
         if self.max_tasks == 0 || self.max_tasks > 100_000 {
             return Err("max_tasks must be > 0 and <= 100,000".to_string());

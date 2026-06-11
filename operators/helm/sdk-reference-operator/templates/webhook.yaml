@@ -1,0 +1,34 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: {{ include "sdk-reference-operator.fullname" . }}-validating-webhook-configuration
+  labels:
+    {{- include "sdk-reference-operator.labels" . | nindent 4 }}
+  {{- if eq .Values.webhook.certMode "cert-manager" }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/{{ include "sdk-reference-operator.fullname" . }}-serving-cert
+  {{- end }}
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: {{ include "sdk-reference-operator.fullname" . }}-webhook-service
+      namespace: {{ .Release.Namespace }}
+      path: /validate-reference-openpacketcore-io-v1beta1-sdkmanagednetworkfunction
+    {{- if eq .Values.webhook.certMode "manual" }}
+    caBundle: "Cg=="
+    {{- end }}
+  failurePolicy: Fail
+  name: vsdkmanagednetworkfunction.reference.openpacketcore.io
+  rules:
+  - apiGroups:
+    - reference.openpacketcore.io
+    apiVersions:
+    - v1beta1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - sdkmanagednetworkfunctions
+  sideEffects: None

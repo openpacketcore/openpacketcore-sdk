@@ -1,3 +1,4 @@
+#![deny(missing_docs)]
 //! OpenPacketCore CNF runtime chassis.
 //!
 //! Provides standardized process startup, task supervision, health probes,

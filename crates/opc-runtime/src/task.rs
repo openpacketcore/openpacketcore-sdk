@@ -7,6 +7,11 @@ use thiserror::Error;
 pub struct TaskName(pub String);
 
 impl TaskName {
+    /// Creates a task name from any string-like value.
+    ///
+    /// Names are the supervisor's registry key: registering or spawning two
+    /// tasks with the same name on one supervisor fails with a
+    /// `RuntimeError::Supervisor` error.
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
@@ -236,12 +241,19 @@ impl TaskSpec {
 /// Handle to a supervised task.
 #[derive(Debug, Clone)]
 pub struct TaskHandle {
+    /// Name under which the task is registered with its supervisor; matches
+    /// the name used in restart bookkeeping and `/debug/tasks` output.
     pub name: TaskName,
     abort_handle: tokio::task::AbortHandle,
     pub(crate) exit_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl TaskHandle {
+    /// Assembles a handle from a task name, a Tokio abort handle, and the
+    /// watch receiver that flips to `true` when the supervised task exits.
+    ///
+    /// Normally constructed by `Supervisor::spawn`; only call this directly
+    /// when wiring custom supervision in tests.
     pub fn new(
         name: TaskName,
         abort_handle: tokio::task::AbortHandle,
@@ -268,15 +280,24 @@ impl TaskHandle {
 /// Task execution error.
 #[derive(Debug, Error)]
 pub enum TaskError {
+    /// The task future returned an error. Carries the task name (or a failure
+    /// description) and the shared underlying error; also produced when a
+    /// non-best-effort task exits cleanly outside shutdown or misses its
+    /// heartbeat timeout.
     #[error("task {0} failed: {1}")]
     Failed(
         String,
         #[source] std::sync::Arc<dyn std::error::Error + Send + Sync>,
     ),
 
+    /// The task was forcibly cancelled, e.g. when it failed to drain within
+    /// the shutdown timeout. Carries the task name.
     #[error("task {0} was aborted")]
     Aborted(String),
 
+    /// The task panicked during construction or execution; the supervisor
+    /// caught the unwind. Carries the task name and the panic payload text
+    /// (redacted before exposure on debug endpoints).
     #[error("task {0} panicked: {1}")]
     Panicked(String, String),
 }
@@ -298,15 +319,26 @@ impl Clone for TaskError {
 /// Runtime-level errors.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    /// Startup bootstrap failed (CLI/env parsing, signal registration, budget
+    /// validation, or missing required drain hooks); usually wraps a
+    /// `BootstrapError`. Fail-closed modes abort startup on this.
     #[error("bootstrap error: {0}")]
     Bootstrap(#[source] Box<dyn std::error::Error + Send + Sync>),
 
+    /// The supervisor rejected an operation: duplicate task registration, a
+    /// task already running, an invalid restart policy in production, or a
+    /// resource budget limit being hit.
     #[error("supervisor error: {0}")]
     Supervisor(String),
 
+    /// An invalid startup state-machine transition was attempted (phases must
+    /// advance monotonically through the RFC 008 ordering).
     #[error("phase transition error: {0}")]
     PhaseTransition(String),
 
+    /// A task with `Criticality::Fatal` failed, forcing runtime shutdown.
+    /// Carries the task name and the underlying task error; returned by
+    /// `run`/`run_with_hooks` after the drain sequence completes.
     #[error("task {0} failed critically: {1}")]
     TaskCriticalFailure(String, TaskError),
 }

@@ -6,8 +6,11 @@ require (
 	k8s.io/api v0.36.1
 	k8s.io/apimachinery v0.36.1
 	k8s.io/client-go v0.36.0
+	openpacketcore.io/operator-sdk-go v0.0.0-00010101000000-000000000000
 	sigs.k8s.io/controller-runtime v0.24.1
 )
+
+replace openpacketcore.io/operator-sdk-go => ../operator-sdk-go
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect

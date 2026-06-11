@@ -184,7 +184,7 @@ func (v *SdkManagedNetworkFunctionValidator) validate(ctx context.Context, crd *
 	}
 
 	// 5. Invoke SDK bridge
-	resp, err := v.Bridge.EvaluateAdmission(bridgeReq)
+	resp, err := v.Bridge.EvaluateAdmission(ctx, bridgeReq)
 	if err != nil {
 		if isProd {
 			// Fail closed in production mode

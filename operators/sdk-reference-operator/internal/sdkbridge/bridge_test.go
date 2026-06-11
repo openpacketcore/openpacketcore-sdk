@@ -1,6 +1,13 @@
 package sdkbridge
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 
 	"openpacketcore.io/sdk-reference-operator/internal/testutil"
@@ -32,7 +39,7 @@ func TestBridgeAdmission(t *testing.T) {
 		},
 	}
 
-	resp, err := bridge.EvaluateAdmission(req)
+	resp, err := bridge.EvaluateAdmission(context.Background(), req)
 	if err != nil {
 		t.Fatalf("EvaluateAdmission failed: %v", err)
 	}
@@ -98,7 +105,7 @@ func TestBridgeProductionAdmissionWithPreflight(t *testing.T) {
 		NodeCapabilities: validNodeCapabilityReport(),
 	}
 
-	resp, err := bridge.EvaluateAdmission(req)
+	resp, err := bridge.EvaluateAdmission(context.Background(), req)
 	if err != nil {
 		t.Fatalf("EvaluateAdmission failed: %v", err)
 	}
@@ -129,7 +136,7 @@ func TestBridgeConfigApply(t *testing.T) {
 		ActiveAlarms: []Alarm{},
 	}
 
-	resp, err := bridge.EvaluateConfigApply(req)
+	resp, err := bridge.EvaluateConfigApply(context.Background(), req)
 	if err != nil {
 		t.Fatalf("EvaluateConfigApply failed: %v", err)
 	}
@@ -171,7 +178,7 @@ func TestBridgeConfigApplyExpiredPendingRollsBack(t *testing.T) {
 		CurrentTime: &currentTime,
 	}
 
-	resp, err := bridge.EvaluateConfigApply(req)
+	resp, err := bridge.EvaluateConfigApply(context.Background(), req)
 	if err != nil {
 		t.Fatalf("EvaluateConfigApply failed: %v", err)
 	}
@@ -186,7 +193,7 @@ func TestBridgeConfigApplyExpiredPendingRollsBack(t *testing.T) {
 func TestBridgeExecutionErrorDoesNotLeakCliPath(t *testing.T) {
 	bridge := &Bridge{CliPath: "/tmp/very/secret/operator-lifecycle-cli"}
 	var resp AdmissionResponse
-	err := bridge.CallCLI("admission", AdmissionRequest{}, &resp)
+	err := bridge.CallCLI(context.Background(), "admission", AdmissionRequest{}, &resp)
 	if err == nil {
 		t.Fatalf("Expected missing CLI to fail")
 	}
@@ -204,7 +211,7 @@ func TestBridgePreflightRejectsMissingBpfArtifact(t *testing.T) {
 	}
 
 	numa := uint16(0)
-	resp, err := bridge.EvaluatePreflight(&PreflightRequest{
+	resp, err := bridge.EvaluatePreflight(context.Background(), &PreflightRequest{
 		ResourceProfile: ResourceProfileSpec{
 			NfKind:                "upf",
 			DataPlaneProfile:      "AfXdpFastPath",
@@ -222,6 +229,112 @@ func TestBridgePreflightRejectsMissingBpfArtifact(t *testing.T) {
 	}
 	if resp.Passed {
 		t.Fatalf("Expected missing governed BPF artifact to fail preflight")
+	}
+}
+
+func TestBridgeContractMismatch(t *testing.T) {
+	// Create a mock CLI that returns a response with an unexpected contract version.
+	mockScript := `#!/bin/sh
+cat > /dev/null
+echo '{"contractVersion": 999, "uid": "test", "allowed": true, "status": null}'
+`
+	tmpDir := t.TempDir()
+	mockPath := filepath.Join(tmpDir, "mock-lifecycle-cli")
+	if err := os.WriteFile(mockPath, []byte(mockScript), 0o755); err != nil {
+		t.Fatalf("failed to write mock CLI: %v", err)
+	}
+
+	bridge := &Bridge{CliPath: mockPath}
+	_, err := bridge.EvaluateAdmission(context.Background(), &AdmissionRequest{Uid: "test"})
+	if err == nil {
+		t.Fatalf("expected error for contract mismatch, got nil")
+	}
+	if !errors.Is(err, ErrContractMismatch) {
+		t.Fatalf("expected ErrContractMismatch, got %v", err)
+	}
+}
+
+func TestBridgeBackwardCompatNoContractVersion(t *testing.T) {
+	// Create a mock CLI that returns the old format without contractVersion.
+	mockScript := `#!/bin/sh
+if [ "$1" = "version" ]; then
+  echo '{"contractVersion":1,"crateVersion":"0.1.0"}'
+  exit 0
+fi
+cat > /dev/null
+echo '{"uid": "test-uid", "allowed": true}'
+`
+	tmpDir := t.TempDir()
+	mockPath := filepath.Join(tmpDir, "mock-lifecycle-cli")
+	if err := os.WriteFile(mockPath, []byte(mockScript), 0o755); err != nil {
+		t.Fatalf("failed to write mock CLI: %v", err)
+	}
+
+	bridge := &Bridge{CliPath: mockPath}
+	resp, err := bridge.EvaluateAdmission(context.Background(), &AdmissionRequest{Uid: "test-uid"})
+	if err != nil {
+		t.Fatalf("expected no error for backward compat, got %v", err)
+	}
+	if resp.Uid != "test-uid" {
+		t.Fatalf("expected uid test-uid, got %s", resp.Uid)
+	}
+	if !resp.Allowed {
+		t.Fatalf("expected allowed=true")
+	}
+}
+
+func TestBridgeContractMismatchFromCLIExitCode(t *testing.T) {
+	testutil.BuildOperatorLifecycleCLI(t)
+
+	bridge, err := NewBridge()
+	if err != nil {
+		t.Fatalf("Failed to create bridge: %v", err)
+	}
+
+	adminToken := "secure-token-value-with-long-length-12345"
+	req := &AdmissionRequest{
+		Uid:            "test-uid",
+		RuntimeMode:    RuntimeModeProduction,
+		ClaimsHA:       false,
+		ConfigBackend:  "consensus",
+		SessionBackend: "quorum",
+		AdminAuth: AdminAuthSpec{
+			TokenEnabled: true,
+			AdminToken:   &adminToken,
+		},
+		Identity: IdentitySpec{
+			KmsEnabled:    true,
+			SpiffeEnabled: true,
+		},
+	}
+
+	// Wrap request with wrong expectedContractVersion directly via CallCLI.
+	inputBytes, _ := json.Marshal(req)
+	var wrapped map[string]interface{}
+	json.Unmarshal(inputBytes, &wrapped)
+	wrapped["expectedContractVersion"] = 999
+	wrongBytes, _ := json.Marshal(wrapped)
+
+	cmd := exec.Command(bridge.CliPath, "admission")
+	cmd.Stdin = bytes.NewReader(wrongBytes)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("Expected CLI to fail with wrong contract version")
+	}
+
+	var errResp struct {
+		Error           string `json:"error"`
+		ContractVersion uint32 `json:"contractVersion"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &errResp); err != nil {
+		t.Fatalf("Expected valid error JSON: %v", err)
+	}
+	if errResp.ContractVersion != ExpectedContractVersion {
+		t.Fatalf("Expected contract version %d in error response, got %d", ExpectedContractVersion, errResp.ContractVersion)
+	}
+	if errResp.Error == "" {
+		t.Fatalf("Expected error message in response")
 	}
 }
 

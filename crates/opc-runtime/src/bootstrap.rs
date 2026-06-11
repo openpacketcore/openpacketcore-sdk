@@ -33,30 +33,54 @@ pub(crate) fn panic_hook_test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Errors raised while bootstrapping a CNF process (CLI/env parsing, config
+/// loading, signal registration, drain-hook and budget validation).
+///
+/// During `Builder::build` these convert into `RuntimeError::Bootstrap`. In
+/// fail-closed modes (Production, Conformance) they abort startup; Dev and
+/// Lab downgrade some of them to warnings.
 #[derive(Debug, Error)]
 pub enum BootstrapError {
+    /// Command-line argument parsing failed; wraps the parser's error.
     #[error("CLI parse error: {0}")]
     Cli(#[source] Box<dyn std::error::Error + Send + Sync>),
 
+    /// A bootstrap environment variable was missing or malformed; wraps the
+    /// underlying error.
     #[error("environment error: {0}")]
     Env(#[source] Box<dyn std::error::Error + Send + Sync>),
 
+    /// Loading the initial configuration from the bootstrap `ConfigSource`
+    /// failed; wraps the underlying error.
     #[error("config error: {0}")]
     Config(#[source] Box<dyn std::error::Error + Send + Sync>),
 
+    /// Registering an OS signal stream failed. Fatal in fail-closed modes for
+    /// SIGTERM (and for SIGINT when explicitly requested); otherwise the
+    /// runtime continues with a warning and without that handler.
     #[error("signal registration failed for {signal}: {source}")]
     SignalRegistration {
+        /// Signal that could not be registered, e.g. `"SIGTERM"` or `"SIGINT"`.
         signal: &'static str,
+        /// I/O error returned by the OS when installing the signal stream.
         #[source]
         source: std::io::Error,
     },
 
+    /// Required security material is absent, so the process must fail closed;
+    /// also raised when production mode starts without an explicit config
+    /// source. The message names the missing requirement.
     #[error("security material unavailable: {0}")]
     SecurityUnavailable(String),
 
+    /// A drain hook required by the profile (e.g. `"NrfDrainHook"` for
+    /// AMF/SMF/UPF) was not registered before `Builder::build`. Fatal in
+    /// fail-closed modes; logged as a warning otherwise.
     #[error("missing required drain hook: {0}")]
     MissingRequiredDrainHook(String),
 
+    /// `RuntimeProfile`/`ResourceBudget` validation failed; the message names
+    /// the offending limit and its allowed range.
     #[error("resource budget validation failed: {0}")]
     InvalidResourceBudget(String),
 }

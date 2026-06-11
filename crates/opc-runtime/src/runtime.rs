@@ -1,3 +1,12 @@
+//! Runtime lifecycle: phase state machine, the `RuntimeHandle` returned by
+//! `Builder::build`, and the top-level `run`/`run_with_hooks` entry points.
+//!
+//! `RuntimePhase` mirrors the RFC 008 section 6 startup state machine;
+//! `RuntimeHandle` exposes phase/readiness inspection, config-version
+//! metadata, the shutdown token, and drives the ordered drain sequence on
+//! shutdown (drain hooks, readiness observation window, then supervised task
+//! drain within `drain_timeout`).
+
 use opc_alarm::{ReadinessImpact, SharedAlarmManager};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;

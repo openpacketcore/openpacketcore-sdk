@@ -15,6 +15,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
 
+/// Callback invoked during the drain sequence, before supervised workers are
+/// stopped (e.g. NRF deregistration per RFC 008 section 10.2 step 3).
+///
+/// Register hooks via `Builder::with_drain_hook`; profiles can make a hook
+/// mandatory by name (`requires_nrf_drain_hook` expects `"NrfDrainHook"`).
+/// All hooks run concurrently and share a single timeout of
+/// `min(shutdown_grace, drain_timeout)`; a hook error or timeout raises a
+/// drain-incomplete alarm but does not stop the shutdown sequence.
 #[async_trait]
 pub trait DrainHook: Send + Sync {
     /// Returns the descriptive name of the drain hook, used for logging and startup validation.
@@ -46,6 +54,11 @@ struct ShutdownInner {
     phase_tx: watch::Sender<ShutdownPhase>,
 }
 
+/// Observable position in the RFC 008 section 10.2 drain sequence.
+///
+/// Phases only advance forward (the `Ord` ordering matches drain order);
+/// attempts to move backwards are ignored. Observe transitions through
+/// `ShutdownToken::subscribe`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 #[repr(u8)]
 pub enum ShutdownPhase {

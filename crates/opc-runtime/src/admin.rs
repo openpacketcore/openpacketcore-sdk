@@ -24,8 +24,15 @@ const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024; // 1 MiB
 /// Config version metadata for visibility.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConfigVersionMetadata {
+    /// Identifier of the currently applied config version/transaction (e.g.
+    /// `tx-...`); `None` until the NF reports one through
+    /// `RuntimeHandle::update_config_version`.
     pub current_version: Option<String>,
+    /// Digest of the config schema the version was validated against, e.g.
+    /// `sha256:...`; `None` when not yet reported.
     pub schema_digest: Option<String>,
+    /// Commit lifecycle state of the version per RFC 001 (e.g. `confirmed`);
+    /// `None` when not yet reported.
     pub state: Option<String>,
 }
 
@@ -73,6 +80,14 @@ struct TaskCountsView {
 struct TaskStateCounts {
     running: usize,
     failed: usize,
+}
+
+/// Drain status returned by `/debug/drain`.
+#[derive(Serialize)]
+struct DrainStatus {
+    phase: &'static str,
+    sessions_remaining: u64,
+    started_at: Option<String>,
 }
 
 /// Starts a production-safe HTTP admin/probe server listening on the specified address.
@@ -208,7 +223,7 @@ async fn handle_client(
     let path = parts[1];
     let route = admin_route_label(path);
 
-    if method != "GET" {
+    if method != "GET" && !(method == "POST" && path == "/debug/drain") {
         record_admin_request(route, 405);
         stream
             .write_all(
@@ -447,6 +462,28 @@ async fn handle_client(
             let metadata = sanitized_config_metadata(metadata);
             write_json_response(&mut stream, &metadata).await
         }
+        "/debug/drain" => {
+            if method == "POST" {
+                handle.shutdown_token().request_shutdown();
+            }
+            let shutdown_phase = *handle.shutdown_token().subscribe().borrow();
+            let readiness = handle.readiness().await;
+            let phase = if readiness == crate::Readiness::Draining {
+                "InProgress"
+            } else if shutdown_phase == crate::shutdown::ShutdownPhase::Stopped {
+                "Complete"
+            } else if shutdown_phase > crate::shutdown::ShutdownPhase::Running {
+                "InProgress"
+            } else {
+                "Failed"
+            };
+            let status = DrainStatus {
+                phase,
+                sessions_remaining: 0,
+                started_at: None,
+            };
+            write_json_response(&mut stream, &status).await
+        }
         _ => {
             stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNot Found").await?;
             Ok(404)
@@ -484,6 +521,7 @@ fn admin_route_label(path: &str) -> &'static str {
         "/debug/runtime" => "debug_runtime",
         "/debug/tasks" => "debug_tasks",
         "/debug/config-version" => "debug_config_version",
+        "/debug/drain" => "debug_drain",
         _ => "unknown",
     }
 }
@@ -644,7 +682,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::constant_time_eq;
+    use super::{admin_route_label, constant_time_eq, DrainStatus};
 
     #[test]
     fn token_compare_checks_full_value() {
@@ -657,5 +695,21 @@ mod tests {
             "supersecrettoken124"
         ));
         assert!(!constant_time_eq("short", "shorter"));
+    }
+
+    #[test]
+    fn admin_route_label_includes_drain() {
+        assert_eq!(admin_route_label("/debug/drain"), "debug_drain");
+    }
+
+    #[test]
+    fn drain_status_serializes() {
+        let s = DrainStatus {
+            phase: "InProgress",
+            sessions_remaining: 0,
+            started_at: None,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"phase\":\"InProgress\""));
     }
 }

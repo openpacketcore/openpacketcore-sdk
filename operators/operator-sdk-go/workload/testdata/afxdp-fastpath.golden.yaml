@@ -1,0 +1,329 @@
+typemeta:
+  kind: Deployment
+  apiversion: apps/v1
+objectmeta:
+  name: test-upf
+  generatename: ""
+  namespace: default
+  selflink: ""
+  uid: ""
+  resourceversion: ""
+  generation: 0
+  creationtimestamp: "0001-01-01T00:00:00Z"
+  deletiontimestamp: null
+  deletiongraceperiodseconds: null
+  labels:
+    app: test-upf
+    version: 2.0.0
+  annotations: {}
+  ownerreferences: []
+  finalizers: []
+  managedfields: []
+spec:
+  replicas: 1
+  selector:
+    matchlabels:
+      app: test-upf
+    matchexpressions: []
+  template:
+    objectmeta:
+      name: ""
+      generatename: ""
+      namespace: ""
+      selflink: ""
+      uid: ""
+      resourceversion: ""
+      generation: 0
+      creationtimestamp: "0001-01-01T00:00:00Z"
+      deletiontimestamp: null
+      deletiongraceperiodseconds: null
+      labels:
+        app: test-upf
+        version: 2.0.0
+      annotations: {}
+      ownerreferences: []
+      finalizers: []
+      managedfields: []
+    spec:
+      volumes:
+      - name: bpffs
+        volumesource:
+          hostpath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate
+          emptydir: null
+          gcepersistentdisk: null
+          awselasticblockstore: null
+          gitrepo: null
+          secret: null
+          nfs: null
+          iscsi: null
+          glusterfs: null
+          persistentvolumeclaim: null
+          rbd: null
+          flexvolume: null
+          cinder: null
+          cephfs: null
+          flocker: null
+          downwardapi: null
+          fc: null
+          azurefile: null
+          configmap: null
+          vspherevolume: null
+          quobyte: null
+          azuredisk: null
+          photonpersistentdisk: null
+          projected: null
+          portworxvolume: null
+          scaleio: null
+          storageos: null
+          csi: null
+          ephemeral: null
+          image: null
+      - name: hugepages-2mi
+        volumesource:
+          hostpath: null
+          emptydir:
+            medium: HugePages
+            sizelimit: null
+          gcepersistentdisk: null
+          awselasticblockstore: null
+          gitrepo: null
+          secret: null
+          nfs: null
+          iscsi: null
+          glusterfs: null
+          persistentvolumeclaim: null
+          rbd: null
+          flexvolume: null
+          cinder: null
+          cephfs: null
+          flocker: null
+          downwardapi: null
+          fc: null
+          azurefile: null
+          configmap: null
+          vspherevolume: null
+          quobyte: null
+          azuredisk: null
+          photonpersistentdisk: null
+          projected: null
+          portworxvolume: null
+          scaleio: null
+          storageos: null
+          csi: null
+          ephemeral: null
+          image: null
+      initcontainers: []
+      containers:
+      - name: nf
+        image: openpacketcore/upf:2.0.0
+        command: []
+        args: []
+        workingdir: ""
+        ports: []
+        envfrom: []
+        env: []
+        resources:
+          limits:
+            cpu:
+              format: DecimalSI
+            hugepages-2Mi:
+              format: BinarySI
+            memory:
+              format: BinarySI
+          requests:
+            cpu:
+              format: DecimalSI
+            hugepages-2Mi:
+              format: BinarySI
+            memory:
+              format: BinarySI
+          claims: []
+        resizepolicy: []
+        restartpolicy: null
+        restartpolicyrules: []
+        volumemounts:
+        - name: bpffs
+          readonly: false
+          recursivereadonly: null
+          mountpath: /sys/fs/bpf
+          subpath: ""
+          mountpropagation: null
+          subpathexpr: ""
+        - name: hugepages-2mi
+          readonly: false
+          recursivereadonly: null
+          mountpath: /dev/hugepages
+          subpath: ""
+          mountpropagation: null
+          subpathexpr: ""
+        volumedevices: []
+        livenessprobe:
+          probehandler:
+            exec: null
+            httpget:
+              path: /livez
+              port:
+                type: 0
+                intval: 8080
+                strval: ""
+              host: ""
+              scheme: ""
+              httpheaders: []
+            tcpsocket: null
+            grpc: null
+          initialdelayseconds: 10
+          timeoutseconds: 0
+          periodseconds: 10
+          successthreshold: 0
+          failurethreshold: 0
+          terminationgraceperiodseconds: null
+        readinessprobe:
+          probehandler:
+            exec: null
+            httpget:
+              path: /readyz
+              port:
+                type: 0
+                intval: 8080
+                strval: ""
+              host: ""
+              scheme: ""
+              httpheaders: []
+            tcpsocket: null
+            grpc: null
+          initialdelayseconds: 5
+          timeoutseconds: 0
+          periodseconds: 5
+          successthreshold: 0
+          failurethreshold: 0
+          terminationgraceperiodseconds: null
+        startupprobe:
+          probehandler:
+            exec: null
+            httpget:
+              path: /startupz
+              port:
+                type: 0
+                intval: 8080
+                strval: ""
+              host: ""
+              scheme: ""
+              httpheaders: []
+            tcpsocket: null
+            grpc: null
+          initialdelayseconds: 5
+          timeoutseconds: 0
+          periodseconds: 5
+          successthreshold: 0
+          failurethreshold: 30
+          terminationgraceperiodseconds: null
+        lifecycle: null
+        terminationmessagepath: ""
+        terminationmessagepolicy: ""
+        imagepullpolicy: ""
+        securitycontext:
+          capabilities:
+            add:
+            - CAP_BPF
+            - CAP_NET_ADMIN
+            - CAP_NET_RAW
+            drop:
+            - ALL
+          privileged: null
+          selinuxoptions: null
+          windowsoptions: null
+          runasuser: null
+          runasgroup: null
+          runasnonroot: true
+          readonlyrootfilesystem: true
+          allowprivilegeescalation: false
+          procmount: null
+          seccompprofile: null
+          apparmorprofile: null
+        stdin: false
+        stdinonce: false
+        tty: false
+      ephemeralcontainers: []
+      restartpolicy: ""
+      terminationgraceperiodseconds: null
+      activedeadlineseconds: null
+      dnspolicy: ClusterFirstWithHostNet
+      nodeselector: {}
+      serviceaccountname: ""
+      deprecatedserviceaccount: ""
+      automountserviceaccounttoken: null
+      nodename: ""
+      hostnetwork: true
+      hostpid: false
+      hostipc: false
+      shareprocessnamespace: null
+      securitycontext:
+        selinuxoptions: null
+        windowsoptions: null
+        runasuser: null
+        runasgroup: null
+        runasnonroot: true
+        supplementalgroups: []
+        supplementalgroupspolicy: null
+        fsgroup: null
+        sysctls: []
+        fsgroupchangepolicy: null
+        seccompprofile:
+          type: RuntimeDefault
+          localhostprofile: null
+        apparmorprofile: null
+        selinuxchangepolicy: null
+      imagepullsecrets: []
+      hostname: ""
+      subdomain: ""
+      affinity: null
+      schedulername: ""
+      tolerations: []
+      hostaliases: []
+      priorityclassname: ""
+      priority: null
+      dnsconfig: null
+      readinessgates: []
+      runtimeclassname: null
+      enableservicelinks: null
+      preemptionpolicy: null
+      overhead: {}
+      topologyspreadconstraints:
+      - maxskew: 1
+        topologykey: topology.kubernetes.io/zone
+        whenunsatisfiable: ScheduleAnyway
+        labelselector:
+          matchlabels:
+            app: test-upf
+          matchexpressions: []
+        mindomains: null
+        nodeaffinitypolicy: null
+        nodetaintspolicy: null
+        matchlabelkeys: []
+      sethostnameasfqdn: null
+      os: null
+      hostusers: null
+      schedulinggates: []
+      resourceclaims: []
+      resources: null
+      hostnameoverride: null
+      schedulinggroup: null
+  strategy:
+    type: ""
+    rollingupdate: null
+  minreadyseconds: 0
+  revisionhistorylimit: null
+  paused: false
+  progressdeadlineseconds: null
+status:
+  observedgeneration: 0
+  replicas: 0
+  updatedreplicas: 0
+  readyreplicas: 0
+  availablereplicas: 0
+  unavailablereplicas: 0
+  terminatingreplicas: null
+  conditions: []
+  collisioncount: null

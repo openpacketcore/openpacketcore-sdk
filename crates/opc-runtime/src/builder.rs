@@ -1,3 +1,11 @@
+//! Runtime construction through the RFC 008 startup state machine.
+//!
+//! `Builder` drives a CNF process from `ProcessInit` through `TelemetryInit`,
+//! `SecurityInit`, `ConfigBootstrap`, `ResourcePreflight`, `ServiceBind`, and
+//! `PeerWarmup`, installs the redacting panic hook and Unix signal handlers,
+//! validates resource budgets and required drain hooks, and only promotes the
+//! runtime to `Ready` once supervised tasks report readiness.
+
 use opc_alarm::SharedAlarmManager;
 use std::sync::Arc;
 
@@ -13,6 +21,11 @@ use crate::testkit::{Clock, RealClock};
 #[cfg(unix)]
 use crate::runtime::{SignalHandlerGuard, UnixSignalFactory, UnixSignalKind};
 
+/// Boxed one-shot initialization callback passed to `Builder::with_init`.
+///
+/// Receives the runtime's `Supervisor` and `ShutdownToken` and is awaited
+/// after `PeerWarmup` but before the runtime can transition to `Ready`, so it
+/// is the place to register and spawn all supervised tasks.
 pub type InitFn = Box<
     dyn FnOnce(
             Supervisor,
@@ -21,6 +34,11 @@ pub type InitFn = Box<
         + Send,
 >;
 
+/// Telemetry bootstrap callback stored in `StartupPhases::init_telemetry`.
+///
+/// Invoked with the runtime profile during the `TelemetryInit` phase to set
+/// up metrics/tracing/logging exporters; returning a `BootstrapError` aborts
+/// startup.
 pub type TelemetryInitFn = dyn Fn(
         &RuntimeProfile,
     )
@@ -435,11 +453,19 @@ impl Builder {
 #[derive(Default)]
 /// Startup phases callback container.
 pub struct StartupPhases {
+    /// Optional logging bootstrap callback run during `ProcessInit`; `None`
+    /// is a no-op. Skipped entirely in Conformance mode to keep test output
+    /// deterministic. A `BootstrapError` aborts startup.
     pub init_logging: Option<Box<dyn Fn() -> Result<(), BootstrapError> + Send + Sync>>,
+    /// Optional exporter bootstrap callback run during the `TelemetryInit`
+    /// phase with the runtime profile; `None` is a no-op. A `BootstrapError`
+    /// aborts startup.
     pub init_telemetry: Option<Box<TelemetryInitFn>>,
 }
 
 impl StartupPhases {
+    /// Runs the configured logging callback, or returns `Ok(())` when none is
+    /// set. An `Err` from the callback aborts `Builder::build`.
     pub fn init_logging(&self) -> Result<(), BootstrapError> {
         if let Some(f) = &self.init_logging {
             f()
@@ -448,6 +474,9 @@ impl StartupPhases {
         }
     }
 
+    /// Runs the configured telemetry callback with the given profile, or
+    /// returns `Ok(())` when none is set. An `Err` from the callback aborts
+    /// `Builder::build` during the `TelemetryInit` phase.
     pub async fn init_telemetry(&self, profile: &RuntimeProfile) -> Result<(), BootstrapError> {
         if let Some(f) = &self.init_telemetry {
             f(profile).await

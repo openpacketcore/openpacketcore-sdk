@@ -1,0 +1,244 @@
+typemeta:
+  kind: Deployment
+  apiversion: apps/v1
+objectmeta:
+  name: test-upf
+  generatename: ""
+  namespace: default
+  selflink: ""
+  uid: ""
+  resourceversion: ""
+  generation: 0
+  creationtimestamp: "0001-01-01T00:00:00Z"
+  deletiontimestamp: null
+  deletiongraceperiodseconds: null
+  labels:
+    app: test-upf
+    version: 2.1.0
+  annotations: {}
+  ownerreferences: []
+  finalizers: []
+  managedfields: []
+spec:
+  replicas: 1
+  selector:
+    matchlabels:
+      app: test-upf
+    matchexpressions: []
+  template:
+    objectmeta:
+      name: ""
+      generatename: ""
+      namespace: ""
+      selflink: ""
+      uid: ""
+      resourceversion: ""
+      generation: 0
+      creationtimestamp: "0001-01-01T00:00:00Z"
+      deletiontimestamp: null
+      deletiongraceperiodseconds: null
+      labels:
+        app: test-upf
+        version: 2.1.0
+      annotations: {}
+      ownerreferences: []
+      finalizers: []
+      managedfields: []
+    spec:
+      volumes: []
+      initcontainers: []
+      containers:
+      - name: nf
+        image: openpacketcore/upf:2.1.0
+        command: []
+        args: []
+        workingdir: ""
+        ports: []
+        envfrom: []
+        env: []
+        resources:
+          limits:
+            cpu:
+              format: DecimalSI
+            intel.com/ice_sriov:
+              format: DecimalSI
+            memory:
+              format: BinarySI
+          requests:
+            cpu:
+              format: DecimalSI
+            intel.com/ice_sriov:
+              format: DecimalSI
+            memory:
+              format: BinarySI
+          claims: []
+        resizepolicy: []
+        restartpolicy: null
+        restartpolicyrules: []
+        volumemounts: []
+        volumedevices: []
+        livenessprobe:
+          probehandler:
+            exec: null
+            httpget:
+              path: /livez
+              port:
+                type: 0
+                intval: 8080
+                strval: ""
+              host: ""
+              scheme: ""
+              httpheaders: []
+            tcpsocket: null
+            grpc: null
+          initialdelayseconds: 10
+          timeoutseconds: 0
+          periodseconds: 10
+          successthreshold: 0
+          failurethreshold: 0
+          terminationgraceperiodseconds: null
+        readinessprobe:
+          probehandler:
+            exec: null
+            httpget:
+              path: /readyz
+              port:
+                type: 0
+                intval: 8080
+                strval: ""
+              host: ""
+              scheme: ""
+              httpheaders: []
+            tcpsocket: null
+            grpc: null
+          initialdelayseconds: 5
+          timeoutseconds: 0
+          periodseconds: 5
+          successthreshold: 0
+          failurethreshold: 0
+          terminationgraceperiodseconds: null
+        startupprobe:
+          probehandler:
+            exec: null
+            httpget:
+              path: /startupz
+              port:
+                type: 0
+                intval: 8080
+                strval: ""
+              host: ""
+              scheme: ""
+              httpheaders: []
+            tcpsocket: null
+            grpc: null
+          initialdelayseconds: 5
+          timeoutseconds: 0
+          periodseconds: 5
+          successthreshold: 0
+          failurethreshold: 30
+          terminationgraceperiodseconds: null
+        lifecycle: null
+        terminationmessagepath: ""
+        terminationmessagepolicy: ""
+        imagepullpolicy: ""
+        securitycontext:
+          capabilities:
+            add: []
+            drop:
+            - ALL
+          privileged: null
+          selinuxoptions: null
+          windowsoptions: null
+          runasuser: null
+          runasgroup: null
+          runasnonroot: true
+          readonlyrootfilesystem: true
+          allowprivilegeescalation: false
+          procmount: null
+          seccompprofile: null
+          apparmorprofile: null
+        stdin: false
+        stdinonce: false
+        tty: false
+      ephemeralcontainers: []
+      restartpolicy: ""
+      terminationgraceperiodseconds: null
+      activedeadlineseconds: null
+      dnspolicy: ""
+      nodeselector: {}
+      serviceaccountname: ""
+      deprecatedserviceaccount: ""
+      automountserviceaccounttoken: null
+      nodename: ""
+      hostnetwork: false
+      hostpid: false
+      hostipc: false
+      shareprocessnamespace: null
+      securitycontext:
+        selinuxoptions: null
+        windowsoptions: null
+        runasuser: null
+        runasgroup: null
+        runasnonroot: true
+        supplementalgroups: []
+        supplementalgroupspolicy: null
+        fsgroup: null
+        sysctls: []
+        fsgroupchangepolicy: null
+        seccompprofile:
+          type: RuntimeDefault
+          localhostprofile: null
+        apparmorprofile: null
+        selinuxchangepolicy: null
+      imagepullsecrets: []
+      hostname: ""
+      subdomain: ""
+      affinity: null
+      schedulername: ""
+      tolerations: []
+      hostaliases: []
+      priorityclassname: ""
+      priority: null
+      dnsconfig: null
+      readinessgates: []
+      runtimeclassname: null
+      enableservicelinks: null
+      preemptionpolicy: null
+      overhead: {}
+      topologyspreadconstraints:
+      - maxskew: 1
+        topologykey: topology.kubernetes.io/zone
+        whenunsatisfiable: ScheduleAnyway
+        labelselector:
+          matchlabels:
+            app: test-upf
+          matchexpressions: []
+        mindomains: null
+        nodeaffinitypolicy: null
+        nodetaintspolicy: null
+        matchlabelkeys: []
+      sethostnameasfqdn: null
+      os: null
+      hostusers: null
+      schedulinggates: []
+      resourceclaims: []
+      resources: null
+      hostnameoverride: null
+      schedulinggroup: null
+  strategy:
+    type: ""
+    rollingupdate: null
+  minreadyseconds: 0
+  revisionhistorylimit: null
+  paused: false
+  progressdeadlineseconds: null
+status:
+  observedgeneration: 0
+  replicas: 0
+  updatedreplicas: 0
+  readyreplicas: 0
+  availablereplicas: 0
+  unavailablereplicas: 0
+  terminatingreplicas: null
+  conditions: []
+  collisioncount: null

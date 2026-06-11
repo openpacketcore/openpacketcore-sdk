@@ -1,0 +1,38 @@
+# Default values for sdk-reference-operator.
+replicaCount: 1
+
+image:
+  repository: openpacketcore/sdk-reference-operator
+  pullPolicy: IfNotPresent
+  tag: ""
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 100m
+    memory: 64Mi
+
+leaderElection:
+  enabled: true
+
+webhook:
+  certMode: cert-manager
+  secretName: ""
+
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: false
+
+cliBridge:
+  path: "/usr/local/bin/operator-lifecycle"
+
+workloadSynthesis:
+  enabled: false
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""

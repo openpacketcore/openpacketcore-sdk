@@ -1,3 +1,12 @@
+//! Task supervision per RFC 008 section 7: registry, restart policy with
+//! backoff and jitter, criticality-based failure handling, heartbeat-based
+//! hang detection, readiness aggregation, and ordered task shutdown.
+//!
+//! All long-lived CNF tasks must be registered with (or spawned through) the
+//! `Supervisor`. Fatal task failures trigger runtime shutdown, degrade
+//! failures lower readiness to `Degraded`, and best-effort failures are only
+//! logged. Restart loops are bounded by `RestartPolicy` windows.
+
 use futures_util::FutureExt;
 use opc_alarm::SharedAlarmManager;
 use std::collections::hash_map::RandomState;
@@ -43,15 +52,21 @@ pub struct MemoryLimiter {
 }
 
 impl MemoryLimiter {
+    /// Creates a limiter with zero simulated usage (no memory pressure).
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Records a simulated heap usage in bytes. When the value reaches the
+    /// budget's `max_heap_bytes`, the supervisor rejects new task spawns,
+    /// raises a memory-budget alarm, and reports readiness `NotReady`.
     pub fn set_usage(&self, bytes: usize) {
         self.simulated_usage
             .store(bytes, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Returns the currently simulated heap usage in bytes (0 unless a test
+    /// has called `set_usage`).
     pub fn usage(&self) -> usize {
         self.simulated_usage
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -432,6 +447,10 @@ impl Supervisor {
         self.state_tx.subscribe()
     }
 
+    /// Returns the first `Criticality::Fatal` task failure recorded by this
+    /// supervisor as a `(task name, error)` pair, or `None` if no fatal task
+    /// has failed. `run`/`run_with_hooks` use this after the drain sequence to
+    /// surface the failure as `RuntimeError::TaskCriticalFailure`.
     pub async fn fatal_task_failure(&self) -> Option<(TaskName, TaskError)> {
         self.fatal_failure_error
             .read()

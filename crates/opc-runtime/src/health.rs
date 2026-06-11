@@ -206,21 +206,41 @@ impl HealthModel {
 /// Standardized health check response.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HealthResponse {
+    /// Overall verdict: `"ok"`, `"degraded"`, or `"not_ok"`.
     pub status: &'static str,
+    /// Short machine-readable cause for a non-ok status (e.g. a failed
+    /// startup phase name); omitted from JSON when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
+    /// Per-signal breakdown backing the verdict; omitted from JSON when
+    /// `None` (the cheap probe variants skip it).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<HealthDetails>,
 }
 
+/// Per-signal health snapshot embedded in detailed probe responses.
+///
+/// Mirrors the `HealthModel` aggregation signals, with enum states rendered
+/// as their `Display` strings for JSON serialization.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HealthDetails {
+    /// Readiness state rendered as text: `NotReady`, `Degraded`, `Ready`, or
+    /// `Draining`.
     pub readiness: String,
+    /// Startup phase rendered as text, e.g. `Pending`, `InProgress(ConfigBootstrap)`,
+    /// `Complete`, or `Failed(...)`.
     pub startup: String,
+    /// True once the initial configuration has been loaded and applied.
     pub config_applied: bool,
+    /// True while no fatal/degrade-criticality task is in a failed state.
     pub critical_tasks_healthy: bool,
+    /// True once all required listeners have bound their sockets.
     pub listeners_bound: bool,
+    /// True while identity/trust material (certificates, keys) is present and
+    /// unexpired.
     pub security_material_valid: bool,
+    /// True while required backends are reachable per NF policy; false here
+    /// downgrades readiness to `Degraded` rather than `NotReady`.
     pub backends_reachable: bool,
 }
 

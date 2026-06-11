@@ -2,8 +2,13 @@ package sdkbridge
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
+
+const ExpectedContractVersion uint32 = 1
+
+var ErrContractMismatch = errors.New("contract version mismatch between Go SDK and Rust lifecycle CLI")
 
 type RuntimeMode string
 
@@ -209,6 +214,11 @@ func (c *CompatibilityDecision) UnmarshalJSON(data []byte) error {
 			}
 			return nil
 		}
+		// New format where unit variants are objects with null values.
+		if _, exists := m["Allowed"]; exists {
+			c.Type = "Allowed"
+			return nil
+		}
 	}
 	return json.Unmarshal(data, &c.Type) // fallback
 }
@@ -252,6 +262,19 @@ func (c *ConfigApplyDecision) UnmarshalJSON(data []byte) error {
 					c.RollbackReason, _ = r.(string)
 				}
 			}
+			return nil
+		}
+		// New format where unit variants are objects with null values.
+		if _, ok := m["Apply"]; ok {
+			c.Type = "Apply"
+			return nil
+		}
+		if _, ok := m["NoOp"]; ok {
+			c.Type = "NoOp"
+			return nil
+		}
+		if _, ok := m["WaitForDrain"]; ok {
+			c.Type = "WaitForDrain"
 			return nil
 		}
 	}

@@ -23,9 +23,11 @@ use tokio::sync::RwLock;
 pub struct Timestamp(u64);
 
 impl Timestamp {
+    /// Creates a timestamp from a raw nanosecond count since the UNIX epoch.
     pub fn from_nanos(nanos: u64) -> Self {
         Self(nanos)
     }
+    /// Returns the timestamp as nanoseconds since the UNIX epoch.
     pub fn as_nanos(&self) -> u64 {
         self.0
     }
@@ -327,6 +329,8 @@ pub struct FakeClockGlobal {
 }
 
 impl FakeClockGlobal {
+    /// Creates an empty slot with no clock installed; `get` falls back to a
+    /// real-time-synchronized `FakeClock` until `set` is called.
     pub fn new() -> Self {
         Self {
             clock: RwLock::new(None),
@@ -369,10 +373,15 @@ pub struct ScopedFakeClock {
 }
 
 impl ScopedFakeClock {
+    /// Wraps a shared global clock slot so tests can install clocks for a
+    /// bounded scope via `scope`.
     pub fn new(global: Arc<FakeClockGlobal>) -> Self {
         Self { global }
     }
 
+    /// Installs `clock` into the global slot, awaits `f`, then clears the
+    /// slot and returns `f`'s output. The slot is not cleared if `f` panics,
+    /// and overlapping scopes on the same global slot will clobber each other.
     pub async fn scope<F: std::future::Future>(&self, clock: FakeClock, f: F) -> F::Output {
         self.global.set(clock).await;
         let result = f.await;
@@ -384,6 +393,8 @@ impl ScopedFakeClock {
 /// Test harness for SIGTERM-style shutdown testing per RFC 008 section 17.2.
 #[derive(Debug)]
 pub struct ShutdownTestHarness {
+    /// Token under test; clone it into the code under test, then trigger and
+    /// observe drain behavior through `trigger_shutdown`/`is_shutdown_requested`.
     pub shutdown_token: ShutdownToken,
 }
 
