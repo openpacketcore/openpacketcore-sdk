@@ -52,7 +52,7 @@ body:
     id: rust-version
     attributes:
       label: Rust version
-      placeholder: "rustc 1.81.0"
+      placeholder: "rustc 1.88.0"
     validations:
       required: false
 

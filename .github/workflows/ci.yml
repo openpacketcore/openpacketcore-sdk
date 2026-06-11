@@ -50,8 +50,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (1.81)
-        uses: dtolnay/rust-toolchain@1.81
+      - name: Install Rust toolchain (1.88)
+        uses: dtolnay/rust-toolchain@1.88
 
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2

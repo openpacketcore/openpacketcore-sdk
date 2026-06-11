@@ -6,7 +6,7 @@ Thank you for your interest in contributing to the OpenPacketCore SDK. This docu
 
 ### Required toolchain
 
-- **Rust** ≥ 1.81 (install via [rustup](https://rustup.rs/))
+- **Rust** ≥ 1.88 (install via [rustup](https://rustup.rs/))
 - **Go** ≥ 1.26
 - **kubectl**
 - **kustomize**
@@ -75,7 +75,7 @@ Before requesting review, please confirm:
 
 - [ ] Tests added or updated for the change.
 - [ ] Documentation updated (`README.md`, crate-level rustdoc, or `docs/` as appropriate).
-- [ ] No new dependencies without justification in the PR description (must be Apache-2.0/MIT/BSD-compatible and build on Rust 1.81).
+- [ ] No new dependencies without justification in the PR description (must be Apache-2.0/MIT/BSD-compatible and build on Rust 1.88).
 - [ ] RFC or ADR updated if the change alters a behavior contract.
 - [ ] All validation gates pass locally.
 - [ ] Commits are signed-off (`git commit -s`).
