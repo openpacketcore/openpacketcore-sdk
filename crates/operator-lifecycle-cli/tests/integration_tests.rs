@@ -2,7 +2,9 @@ use std::process::{Command, Stdio};
 
 fn cli_path() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    format!("{manifest_dir}/../../target/debug/operator-lifecycle-cli")
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .unwrap_or_else(|_| format!("{manifest_dir}/../../target"));
+    format!("{target_dir}/debug/operator-lifecycle-cli")
 }
 
 fn run_json(subcommand: &str, input: &str) -> (String, i32) {
