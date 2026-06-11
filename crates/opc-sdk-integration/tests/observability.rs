@@ -24,8 +24,9 @@ use opc_nacm::{
 /// Serializes the tests in this binary: every test resets and asserts on the
 /// process-global `METRICS`, so parallel execution races `reset_all()`
 /// against another test's increments (observed as intermittent `left: 0`
-/// assertion failures). Poisoning is ignored — a previous test's panic must
-/// not cascade.
+/// assertion failures). A tokio mutex is used so async tests may hold the
+/// guard across await points; unlike `std::sync::Mutex` it does not poison,
+/// so one test's panic cannot cascade into the others.
 static METRICS_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test(flavor = "current_thread")]
