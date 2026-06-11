@@ -36,7 +36,13 @@ impl DirLock {
                         if let Ok(metadata) = std::fs::metadata(&lock_path) {
                             if let Ok(modified) = metadata.modified() {
                                 if let Ok(elapsed) = modified.elapsed() {
-                                    if elapsed > std::time::Duration::from_secs(10) {
+                                    // A holder legitimately keeps this lock across an
+                                    // entire cluster bootstrap (proxy starts, subprocess
+                                    // spawns), which can exceed 10s on loaded CI runners;
+                                    // stealing a live holder's lock double-allocates port
+                                    // blocks and cross-wires clusters. 60s only reclaims
+                                    // locks from genuinely dead processes.
+                                    if elapsed > std::time::Duration::from_secs(60) {
                                         // Stale lock, remove it
                                         let _ = std::fs::remove_dir_all(&lock_path);
                                         attempts = 0;

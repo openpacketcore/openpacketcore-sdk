@@ -19,6 +19,7 @@ jobs:
   rust:
     name: Rust workspace
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,7 +42,14 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --locked --workspace --all-features --quiet -- --test-threads=4
+        run: cargo test --locked --workspace --exclude opc-persist --all-features --quiet -- --test-threads=4
+
+      # The opc-persist e2e suites drive real consensus subprocess clusters
+      # (3-4 nodes plus TCP proxies per test). Running several clusters
+      # concurrently oversubscribes shared runners and destabilizes the
+      # port-block allocator, so these suites run single-threaded in CI.
+      - name: Run consensus e2e tests (serial)
+        run: cargo test --locked -p opc-persist --all-features --quiet -- --test-threads=1
 
   msrv:
     name: MSRV check
