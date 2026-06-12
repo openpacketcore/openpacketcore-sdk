@@ -12,7 +12,7 @@ use opc_key::{
     AeadAlgorithm, EnvelopeAad, KeyHandle, KeyId, KeyProvider, Zeroizing, AEAD_TAG_LEN,
     AES_256_GCM_SIV_NONCE_LEN,
 };
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::SysRng, TryRng};
 use thiserror::Error;
 
 const ENVELOPE_MAGIC: [u8; 4] = *b"OPCE";
@@ -128,8 +128,8 @@ pub async fn encrypt_envelope<P: KeyProvider + ?Sized>(
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
     let mut nonce = [0_u8; AES_256_GCM_SIV_NONCE_LEN];
-    let mut rng = OsRng;
-    rng.try_fill_bytes(&mut nonce)
+    SysRng
+        .try_fill_bytes(&mut nonce)
         .map_err(|_| CryptoError::EncryptionFailed)?;
     encrypt_envelope_with_nonce(provider, aad, plaintext, nonce).await
 }
@@ -157,8 +157,8 @@ pub fn encrypt_envelope_with_handle(
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
     let mut nonce = [0_u8; AES_256_GCM_SIV_NONCE_LEN];
-    let mut rng = OsRng;
-    rng.try_fill_bytes(&mut nonce)
+    SysRng
+        .try_fill_bytes(&mut nonce)
         .map_err(|_| CryptoError::EncryptionFailed)?;
     encrypt_envelope_with_handle_and_nonce(handle, aad, plaintext, nonce)
 }

@@ -643,14 +643,12 @@ impl ConsensusConfigStore {
     }
 
     fn get_random_timeout(clock: &ConsensusClock) -> std::time::Duration {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
         let min_ms = clock.election_timeout_min.as_millis() as u64;
         let max_ms = clock.election_timeout_max.as_millis() as u64;
         if min_ms >= max_ms {
             clock.election_timeout_min
         } else {
-            let ms = rng.gen_range(min_ms..max_ms);
+            let ms = rand::random_range(min_ms..max_ms);
             std::time::Duration::from_millis(ms)
         }
     }

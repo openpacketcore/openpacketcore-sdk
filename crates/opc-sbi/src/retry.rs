@@ -133,7 +133,7 @@ impl RetryPolicy {
                 if ms == 0 {
                     Duration::ZERO
                 } else {
-                    let rand_ms = rand::random::<u64>() % ms;
+                    let rand_ms = rand::random_range(0..ms);
                     Duration::from_millis(rand_ms)
                 }
             }
@@ -143,7 +143,7 @@ impl RetryPolicy {
                 if half_ms == 0 {
                     half
                 } else {
-                    let rand_ms = rand::random::<u64>() % half_ms;
+                    let rand_ms = rand::random_range(0..half_ms);
                     half + Duration::from_millis(rand_ms)
                 }
             }
