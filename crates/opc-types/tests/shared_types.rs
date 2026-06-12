@@ -293,8 +293,7 @@ fn spiffe_id_rejects_malformed_trust_domains() {
     assert!(
         err.to_string()
             .contains("trust domain labels must not be empty"),
-        "expected 'empty label' error, got: {}",
-        err
+        "expected 'empty label' error, got: {err}"
     );
 
     // Leading dot: split(".core.example") → ["" ,"core", "example"].
@@ -305,8 +304,7 @@ fn spiffe_id_rejects_malformed_trust_domains() {
     assert!(
         err.to_string()
             .contains("trust domain labels must not be empty"),
-        "expected 'empty label' error, got: {}",
-        err
+        "expected 'empty label' error, got: {err}"
     );
 
     // Label starting with hyphen.
@@ -316,8 +314,7 @@ fn spiffe_id_rejects_malformed_trust_domains() {
     .expect_err("label starting with hyphen should be rejected");
     assert!(
         err.to_string().contains("must not start or end with '-'"),
-        "expected hyphen-boundary error, got: {}",
-        err
+        "expected hyphen-boundary error, got: {err}"
     );
 
     // Label ending with hyphen.
@@ -327,8 +324,7 @@ fn spiffe_id_rejects_malformed_trust_domains() {
     .expect_err("label ending with hyphen should be rejected");
     assert!(
         err.to_string().contains("must not start or end with '-'"),
-        "expected hyphen-boundary error, got: {}",
-        err
+        "expected hyphen-boundary error, got: {err}"
     );
 
     // Uppercase character in trust domain (labels must be lowercase).
@@ -339,8 +335,7 @@ fn spiffe_id_rejects_malformed_trust_domains() {
     assert!(
         err.to_string()
             .contains("trust domain labels must contain only lowercase"),
-        "expected lowercase-only error, got: {}",
-        err
+        "expected lowercase-only error, got: {err}"
     );
 }
 

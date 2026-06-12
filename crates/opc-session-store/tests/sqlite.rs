@@ -368,7 +368,7 @@ async fn test_sqlite_concurrent_cas_race() {
         tasks.push(tokio::spawn(async move {
             let record_new = StoredSessionRecord {
                 generation: Generation::new(2),
-                payload: EncryptedSessionPayload::new(Bytes::from(format!("payload-{}", i))),
+                payload: EncryptedSessionPayload::new(Bytes::from(format!("payload-{i}"))),
                 ..record_clone
             };
             backend_clone

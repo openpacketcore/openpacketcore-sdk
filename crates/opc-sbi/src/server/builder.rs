@@ -288,7 +288,7 @@ impl SbiServerBuilder {
         self.validate()?;
         let listener = TcpListener::bind(self.addr)
             .await
-            .map_err(|e| sanitize_error_message(format!("Failed to bind port: {}", e)))?;
+            .map_err(|e| sanitize_error_message(format!("Failed to bind port: {e}")))?;
         self.run_with_listener(listener, router).await
     }
 }

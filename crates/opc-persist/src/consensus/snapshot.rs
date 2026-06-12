@@ -114,8 +114,7 @@ impl ConsensusConfigStore {
                     .persist_snapshot_verify_failures
                     .fetch_add(1, Ordering::Relaxed);
                 return Err(PersistError::inconsistent_state(format!(
-                    "Corrupt snapshot JSON: {}",
-                    e
+                    "Corrupt snapshot JSON: {e}"
                 )));
             }
         };
@@ -175,8 +174,7 @@ impl ConsensusConfigStore {
                 .persist_snapshot_verify_failures
                 .fetch_add(1, Ordering::Relaxed);
             return Err(PersistError::inconsistent_state(format!(
-                "Snapshot config audit chain invalid: {}",
-                e
+                "Snapshot config audit chain invalid: {e}"
             )));
         }
 

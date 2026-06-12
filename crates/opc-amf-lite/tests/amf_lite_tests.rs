@@ -59,14 +59,10 @@ async fn query_admin(addr: SocketAddr, path: &str, token: Option<&str>) -> (u16,
     };
     let req = if let Some(t) = token {
         format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-            path, addr, t
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {t}\r\nConnection: close\r\n\r\n"
         )
     } else {
-        format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            path, addr
-        )
+        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
     };
     stream.write_all(req.as_bytes()).await.unwrap();
     stream.flush().await.unwrap();
@@ -106,8 +102,7 @@ fn generate_test_ca_and_identities(
             .push(rcgen::DnType::CommonName, "localhost");
 
         let spiffe = format!(
-            "spiffe://test/trust-domain/tenant/test/ns/default/sa/svc/nf/test/instance/{}",
-            node_id
+            "spiffe://test/trust-domain/tenant/test/ns/default/sa/svc/nf/test/instance/{node_id}"
         );
 
         node_params.subject_alt_names = vec![
@@ -184,7 +179,7 @@ async fn setup_tcp_consensus_group(
 
     let mut backends = Vec::new();
     for i in 0..3 {
-        let db_path = temp_dir.path().join(format!("tcp_consensus_{}.db", i));
+        let db_path = temp_dir.path().join(format!("tcp_consensus_{i}.db"));
         let backend = SqliteBackend::open_with_audit_key(&db_path, true, 0, test_audit_key())
             .await
             .expect("open backend");
@@ -194,7 +189,7 @@ async fn setup_tcp_consensus_group(
     let free_ports = get_free_ports(3);
     let mut addrs = Vec::new();
     for port in free_ports {
-        addrs.push(format!("127.0.0.1:{}", port));
+        addrs.push(format!("127.0.0.1:{port}"));
     }
 
     let mut stores = Vec::new();
@@ -258,7 +253,7 @@ async fn test_amf_lite_e2e_happy_path() {
         .await
         .unwrap();
     let kms_endpoint = kms.endpoint().to_string();
-    println!("[E2E] FakeKms endpoint: {}", kms_endpoint);
+    println!("[E2E] FakeKms endpoint: {kms_endpoint}");
 
     let key_config = [1u8; 32];
     kms.insert_key("key-config-1", "config", "system", key_config);
@@ -306,7 +301,7 @@ async fn test_amf_lite_e2e_happy_path() {
     let admin_ports = get_free_ports(1);
     let admin_addr: SocketAddr = format!("127.0.0.1:{}", admin_ports[0]).parse().unwrap();
     let auth_token = "secure-amf-token".to_string();
-    println!("[E2E] Allocated admin server port: {}", admin_addr);
+    println!("[E2E] Allocated admin server port: {admin_addr}");
 
     // 6. Launch AMF-lite
     println!("[E2E] Starting AMF-lite...");
@@ -692,7 +687,7 @@ async fn test_amf_lite_ha_failover_and_recovery() {
     };
 
     let stale_res = amf_1.session_store().compare_and_set(stale_cas).await;
-    println!("[HA] stale_res was: {:?}", stale_res);
+    println!("[HA] stale_res was: {stale_res:?}");
     assert!(matches!(
         stale_res,
         Err(StoreError::StaleFence) | Err(StoreError::LeaseExpired)

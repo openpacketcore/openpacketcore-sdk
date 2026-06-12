@@ -525,7 +525,7 @@ mod tests {
                 assert_eq!(profiles[0].nf_instance_id.as_str(), "amf-02");
                 assert_eq!(profiles[1].nf_instance_id.as_str(), "amf-01");
             }
-            other => panic!("expected Found, got {:?}", other),
+            other => panic!("expected Found, got {other:?}"),
         }
     }
 
@@ -559,7 +559,7 @@ mod tests {
             DiscoveryResult::Found(profiles) => {
                 assert_eq!(profiles.len(), 2);
             }
-            other => panic!("expected Found 2 AMFs, got {:?}", other),
+            other => panic!("expected Found 2 AMFs, got {other:?}"),
         }
 
         // Query for NAMF-MT should return only amf-01.
@@ -575,7 +575,7 @@ mod tests {
                 assert_eq!(profiles.len(), 1);
                 assert_eq!(profiles[0].nf_instance_id.as_str(), "amf-01");
             }
-            other => panic!("expected Found 1 AMF, got {:?}", other),
+            other => panic!("expected Found 1 AMF, got {other:?}"),
         }
 
         // Query for NSMF-PDUSESSION with target NF type SMF should return smf-01.
@@ -591,7 +591,7 @@ mod tests {
                 assert_eq!(profiles.len(), 1);
                 assert_eq!(profiles[0].nf_instance_id.as_str(), "smf-01");
             }
-            other => panic!("expected Found 1 SMF, got {:?}", other),
+            other => panic!("expected Found 1 SMF, got {other:?}"),
         }
 
         // Query for a non-existent service should return NotFound.

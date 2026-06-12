@@ -36,7 +36,7 @@ async fn test_election_single_node() {
         300,
         150,
     );
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
     let mut success = false;
     for _ in 0..300 {
         if let Ok(stream) = tokio::net::TcpStream::connect(&addr).await {
@@ -50,11 +50,11 @@ async fn test_election_single_node() {
     if !success {
         let err_path = certs_dir.join("node_0.err");
         if let Ok(err_content) = std::fs::read_to_string(&err_path) {
-            println!("--- NODE 0 STDERR --- \n{}", err_content);
+            println!("--- NODE 0 STDERR --- \n{err_content}");
         } else {
             println!("--- NODE 0 STDERR (not found/unread) ---");
         }
-        panic!("Port {} did not become available in time", port);
+        panic!("Port {port} did not become available in time");
     }
 
     let resp = node
@@ -285,7 +285,7 @@ async fn test_election_stale_term_rejected() {
 
     let node_0_port = cluster.base_port;
     let identity = cluster.identities.get(&1).unwrap().clone();
-    let mut tls_stream = connect_raw_tls(&format!("127.0.0.1:{}", node_0_port), &identity)
+    let mut tls_stream = connect_raw_tls(&format!("127.0.0.1:{node_0_port}"), &identity)
         .await
         .unwrap();
 
@@ -492,8 +492,7 @@ async fn test_membership_promote_non_voter_success() {
     })).await.unwrap();
     assert!(
         resp2["success"].as_bool().unwrap(),
-        "resp2 failed: {:?}",
-        resp2
+        "resp2 failed: {resp2:?}"
     );
 }
 
@@ -609,21 +608,21 @@ async fn test_membership_epoch_monotonicity() {
 
     let node_0_port = cluster.base_port;
     let identity = cluster.identities.get(&1).unwrap().clone();
-    let mut tls_stream =
-        match connect_raw_tls(&format!("127.0.0.1:{}", node_0_port), &identity).await {
-            Ok(s) => s,
-            Err(e) => {
-                for nid in 0..3 {
-                    let err_path = cluster.certs_dir.join(format!("node_{}.err", nid));
-                    if let Ok(err_content) = std::fs::read_to_string(&err_path) {
-                        println!("--- NODE {} STDERR --- \n{}", nid, err_content);
-                    } else {
-                        println!("--- NODE {} STDERR (not found/unread) ---", nid);
-                    }
+    let mut tls_stream = match connect_raw_tls(&format!("127.0.0.1:{node_0_port}"), &identity).await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            for nid in 0..3 {
+                let err_path = cluster.certs_dir.join(format!("node_{nid}.err"));
+                if let Ok(err_content) = std::fs::read_to_string(&err_path) {
+                    println!("--- NODE {nid} STDERR --- \n{err_content}");
+                } else {
+                    println!("--- NODE {nid} STDERR (not found/unread) ---");
                 }
-                panic!("failed to connect to 127.0.0.1:{}: {}", node_0_port, e);
             }
-        };
+            panic!("failed to connect to 127.0.0.1:{node_0_port}: {e}");
+        }
+    };
 
     let stale_membership = ClusterMembership {
         cluster_id: "tcp-test-cluster".to_string(),

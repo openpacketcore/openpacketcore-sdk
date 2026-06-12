@@ -75,7 +75,7 @@ async fn test_svid_rotation_and_handshake() {
     });
 
     // Client connects
-    let client_conn = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+    let client_conn = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .unwrap();
     let connector = tokio_rustls::TlsConnector::from(client_config);
@@ -101,7 +101,7 @@ async fn test_svid_rotation_and_handshake() {
         .unwrap()
         .unwrap();
     if let opc_identity::IdentityReloadEvent::Failure { error } = event {
-        panic!("Rotation failed: {}", error);
+        panic!("Rotation failed: {error}");
     }
 
     // Verify next TLS connection uses rotated cert

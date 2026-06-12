@@ -43,7 +43,7 @@ fn test_exhaustive_capabilities_validation() {
                         assert_eq!(profile, SessionStateProfile::AuthoritativeSession);
                         assert_eq!(missing, expected_missing);
                     }
-                    _ => panic!("Expected MissingCapabilities error, got {:?}", res),
+                    _ => panic!("Expected MissingCapabilities error, got {res:?}"),
                 }
             }
         }
@@ -67,7 +67,7 @@ fn test_exhaustive_capabilities_validation() {
                         assert_eq!(profile, SessionStateProfile::EphemeralProcedure);
                         assert_eq!(missing, expected_missing);
                     }
-                    _ => panic!("Expected MissingCapabilities error, got {:?}", res),
+                    _ => panic!("Expected MissingCapabilities error, got {res:?}"),
                 }
             }
         }
@@ -84,7 +84,7 @@ fn test_exhaustive_capabilities_validation() {
                         assert_eq!(profile, SessionStateProfile::ReadThroughCache);
                         assert_eq!(missing, vec!["watch or per_key_ttl"]);
                     }
-                    _ => panic!("Expected MissingCapabilities error, got {:?}", res),
+                    _ => panic!("Expected MissingCapabilities error, got {res:?}"),
                 }
             }
         }
@@ -109,7 +109,7 @@ fn test_exhaustive_capabilities_validation() {
                         assert_eq!(profile, SessionStateProfile::ReplicatedDisasterRecovery);
                         assert_eq!(missing, expected_missing);
                     }
-                    _ => panic!("Expected MissingCapabilities error, got {:?}", res),
+                    _ => panic!("Expected MissingCapabilities error, got {res:?}"),
                 }
             }
         }

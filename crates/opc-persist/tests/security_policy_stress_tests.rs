@@ -14,10 +14,7 @@ use opc_types::TenantId;
 static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn get_tenant_admin_principal(tenant: &str) -> String {
-    format!(
-        "spiffe://test-domain/tenant/{}/ns/default/sa/security-admin/nf/amf/instance/0",
-        tenant
-    )
+    format!("spiffe://test-domain/tenant/{tenant}/ns/default/sa/security-admin/nf/amf/instance/0")
 }
 
 fn make_valid_policy(version: u64) -> NacmPolicy {
@@ -106,8 +103,7 @@ async fn test_tenant_separation_strictness() {
         .await;
     assert!(
         matches!(res, Err(SecurityPolicyError::Unauthorized(_))),
-        "Tenant B principal must be unauthorized to stage for Tenant A: {:?}",
-        res
+        "Tenant B principal must be unauthorized to stage for Tenant A: {res:?}"
     );
 
     // Stage successfully with principal A
@@ -120,16 +116,14 @@ async fn test_tenant_separation_strictness() {
     let res = service.validate_policy("tenant-a", &principal_b).await;
     assert!(
         matches!(res, Err(SecurityPolicyError::Unauthorized(_))),
-        "Tenant B principal must be unauthorized to validate for Tenant A: {:?}",
-        res
+        "Tenant B principal must be unauthorized to validate for Tenant A: {res:?}"
     );
 
     // 3. Apply: principal B cannot apply policy for tenant A
     let res = service.apply_policy("tenant-a", &principal_b).await;
     assert!(
         matches!(res, Err(SecurityPolicyError::Unauthorized(_))),
-        "Tenant B principal must be unauthorized to apply for Tenant A: {:?}",
-        res
+        "Tenant B principal must be unauthorized to apply for Tenant A: {res:?}"
     );
 
     // Apply successfully with principal A
@@ -149,8 +143,7 @@ async fn test_tenant_separation_strictness() {
         .await;
     assert!(
         matches!(res, Err(SecurityPolicyError::Unauthorized(_))),
-        "Tenant B principal must be unauthorized to dry run for Tenant A: {:?}",
-        res
+        "Tenant B principal must be unauthorized to dry run for Tenant A: {res:?}"
     );
 
     // 5. Rollback: principal B cannot rollback policy for tenant A
@@ -159,8 +152,7 @@ async fn test_tenant_separation_strictness() {
         .await;
     assert!(
         matches!(res, Err(SecurityPolicyError::Unauthorized(_))),
-        "Tenant B principal must be unauthorized to rollback for Tenant A: {:?}",
-        res
+        "Tenant B principal must be unauthorized to rollback for Tenant A: {res:?}"
     );
 }
 
@@ -192,8 +184,7 @@ async fn test_key_lane_separation_enforced() {
     let res_b = service.get_active_policy_compiled("tenant-b").await;
     assert!(
         matches!(res_b, Err(SecurityPolicyError::StaleVersion(_))),
-        "Tenant B has no active policy, should return StaleVersion: {:?}",
-        res_b
+        "Tenant B has no active policy, should return StaleVersion: {res_b:?}"
     );
 }
 
@@ -213,8 +204,7 @@ async fn test_lockout_rules_enforcement() {
     let res_val = service.validate_policy(tenant, &principal).await;
     assert!(
         matches!(res_val, Err(SecurityPolicyError::ValidationFailed(_))),
-        "Empty policy must fail validation check: {:?}",
-        res_val
+        "Empty policy must fail validation check: {res_val:?}"
     );
 
     // 2. Rejects policy denying security-admin access to /security:policy
@@ -226,8 +216,7 @@ async fn test_lockout_rules_enforcement() {
     let res_val2 = service.validate_policy(tenant, &principal).await;
     assert!(
         matches!(res_val2, Err(SecurityPolicyError::ValidationFailed(_))),
-        "Policy denying SecurityAdmin access to /security:policy must fail: {:?}",
-        res_val2
+        "Policy denying SecurityAdmin access to /security:policy must fail: {res_val2:?}"
     );
 
     // 3. Rejects policy denying security-admin access via wildcard /security:*
@@ -239,8 +228,7 @@ async fn test_lockout_rules_enforcement() {
     let res_val3 = service.validate_policy(tenant, &principal).await;
     assert!(
         matches!(res_val3, Err(SecurityPolicyError::ValidationFailed(_))),
-        "Policy denying SecurityAdmin access via wildcard must fail: {:?}",
-        res_val3
+        "Policy denying SecurityAdmin access via wildcard must fail: {res_val3:?}"
     );
 }
 
@@ -270,8 +258,7 @@ async fn test_stale_version_prevention() {
     let res_apply9 = service.apply_policy(tenant, &principal).await;
     assert!(
         matches!(res_apply9, Err(SecurityPolicyError::StaleVersion(_))),
-        "Apply must reject older version (9 < 10): {:?}",
-        res_apply9
+        "Apply must reject older version (9 < 10): {res_apply9:?}"
     );
 
     // Stage version 10 (equal to active 10)
@@ -285,8 +272,7 @@ async fn test_stale_version_prevention() {
     let res_apply10 = service.apply_policy(tenant, &principal).await;
     assert!(
         matches!(res_apply10, Err(SecurityPolicyError::StaleVersion(_))),
-        "Apply must reject equal version (10 == 10): {:?}",
-        res_apply10
+        "Apply must reject equal version (10 == 10): {res_apply10:?}"
     );
 
     // Stage version 11 (newer than active 10)
@@ -473,8 +459,7 @@ async fn test_adversarial_aad_injection_mismatched_tenant() {
     // The validation must fail with Internal error because decryption fails due to mismatched tenant key and AAD context.
     assert!(
         matches!(res, Err(SecurityPolicyError::Internal)),
-        "Decryption of Tenant A's blob using Tenant B's expected AAD must fail closed with Internal: {:?}",
-        res
+        "Decryption of Tenant A's blob using Tenant B's expected AAD must fail closed with Internal: {res:?}"
     );
 }
 
@@ -508,7 +493,6 @@ async fn test_adversarial_version_mismatched_tampering() {
     // The validation must fail with Internal error because decryption fails due to mismatched version.
     assert!(
         matches!(res, Err(SecurityPolicyError::Internal)),
-        "Decryption of version-tampered metadata must fail closed with Internal: {:?}",
-        res
+        "Decryption of version-tampered metadata must fail closed with Internal: {res:?}"
     );
 }

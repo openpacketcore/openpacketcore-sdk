@@ -582,8 +582,7 @@ async fn test_fence_tokens_boundary_conditions() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::FencingMismatch { provided, current }) if provided == fence_t1 && current == fence_s),
-        "Expected FencingMismatch, got {:?}",
-        res
+        "Expected FencingMismatch, got {res:?}"
     );
 
     // Release lease_s so Target can acquire lease_t2
@@ -610,8 +609,7 @@ async fn test_fence_tokens_boundary_conditions() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::FencingMismatch { provided, current }) if provided == fence_t1 && current == fence_t2),
-        "Expected FencingMismatch, got {:?}",
-        res
+        "Expected FencingMismatch, got {res:?}"
     );
 
     // 8. Target successfully activates using lease_t2
@@ -627,8 +625,7 @@ async fn test_fence_tokens_boundary_conditions() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::FencingMismatch { provided, current }) if provided == fence_t1 && current == fence_t2),
-        "Expected FencingMismatch, got {:?}",
-        res
+        "Expected FencingMismatch, got {res:?}"
     );
     backend.release(lease_t2).await.unwrap();
 }
@@ -670,8 +667,7 @@ async fn test_lease_expiration_and_owner_conflict() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::OwnerConflict { .. })),
-        "Got {:?}",
-        res
+        "Got {res:?}"
     );
 
     // Release lease_wrong, re-acquire lease_s
@@ -701,8 +697,7 @@ async fn test_lease_expiration_and_owner_conflict() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::OwnerConflict { .. })),
-        "Got {:?}",
-        res
+        "Got {res:?}"
     );
 
     // Release lease_wrong2, acquire lease_t
@@ -732,8 +727,7 @@ async fn test_lease_expiration_and_owner_conflict() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::OwnerConflict { .. })),
-        "Got {:?}",
-        res
+        "Got {res:?}"
     );
 
     // Release lease_wrong3, acquire lease_t_2
@@ -763,8 +757,7 @@ async fn test_lease_expiration_and_owner_conflict() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::OwnerConflict { .. })),
-        "Got {:?}",
-        res
+        "Got {res:?}"
     );
 
     // Release lease_wrong4, acquire lease_t_3
@@ -799,8 +792,7 @@ async fn test_lease_expiration_and_owner_conflict() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::InvalidLease { .. })),
-        "Got {:?}",
-        res
+        "Got {res:?}"
     );
 
     let res = manager
@@ -808,8 +800,7 @@ async fn test_lease_expiration_and_owner_conflict() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::InvalidLease { .. })),
-        "Got {:?}",
-        res
+        "Got {res:?}"
     );
 
     let res = manager
@@ -817,8 +808,7 @@ async fn test_lease_expiration_and_owner_conflict() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::InvalidLease { .. })),
-        "Got {:?}",
-        res
+        "Got {res:?}"
     );
 
     let res = manager
@@ -826,8 +816,7 @@ async fn test_lease_expiration_and_owner_conflict() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::InvalidLease { .. })),
-        "Got {:?}",
-        res
+        "Got {res:?}"
     );
 
     let res = manager
@@ -835,8 +824,7 @@ async fn test_lease_expiration_and_owner_conflict() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::InvalidLease { .. })),
-        "Got {:?}",
-        res
+        "Got {res:?}"
     );
 
     let res = manager
@@ -844,8 +832,7 @@ async fn test_lease_expiration_and_owner_conflict() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::InvalidLease { .. })),
-        "Got {:?}",
-        res
+        "Got {res:?}"
     );
 }
 
@@ -1007,7 +994,7 @@ async fn test_concurrent_handover_stress() {
         let tx_sender = tx_chan.clone();
 
         let handle = tokio::spawn(async move {
-            let owner_t = OwnerId::new(format!("owner-target-{}", i)).unwrap();
+            let owner_t = OwnerId::new(format!("owner-target-{i}")).unwrap();
             let tx = HandoverTxId::new();
 
             // S acquires a temporary lease to prepare on behalf of this target.
@@ -1044,7 +1031,7 @@ async fn test_concurrent_handover_stress() {
                     // Expected failures due to concurrent prepare
                     Ok(false)
                 }
-                Err(e) => Err(format!("Unexpected error: {:?}", e)),
+                Err(e) => Err(format!("Unexpected error: {e:?}")),
             }
         });
         join_handles.push(handle);
@@ -1068,15 +1055,14 @@ async fn test_concurrent_handover_stress() {
                     success_count += 1;
                 }
             }
-            Err(e) => panic!("Task failed with error: {}", e),
+            Err(e) => panic!("Task failed with error: {e}"),
         }
     }
 
     // Assert that exactly one prepare succeeded (due to strict locking/CAS)
     assert_eq!(
         success_count, 1,
-        "Expected exactly one prepare to succeed, but got {}",
-        success_count
+        "Expected exactly one prepare to succeed, but got {success_count}"
     );
     assert_eq!(successful_prepares.len(), 1);
 

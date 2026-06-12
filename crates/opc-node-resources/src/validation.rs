@@ -175,10 +175,10 @@ pub fn run_data_plane_preflight(
 
     // Collect redaction-safe messages
     for err in &report.errors {
-        messages.push(format!("{}", err));
+        messages.push(format!("{err}"));
     }
     for warning in &report.warnings {
-        messages.push(format!("{}", warning));
+        messages.push(format!("{warning}"));
     }
 
     // Evidence IDs

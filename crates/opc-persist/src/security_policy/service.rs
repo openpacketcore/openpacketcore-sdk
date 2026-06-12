@@ -103,8 +103,7 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
 
         if !roles.iter().any(|r| r == "security-admin") {
             return Err(SecurityPolicyError::Unauthorized(format!(
-                "Principal '{}' lacks 'security-admin' role",
-                validated_spiffe
+                "Principal '{validated_spiffe}' lacks 'security-admin' role"
             )));
         }
 
@@ -319,7 +318,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
             })?;
         }
 
-        let details = format!("Staged policy version {}", version);
+        let details = format!("Staged policy version {version}");
         self.audit_event(tenant, &validated_spiffe, "STAGE", &details)
             .await?;
 
@@ -441,8 +440,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
         if let Ok(active_version) = active_version_res {
             if version <= active_version {
                 let reason = format!(
-                    "Apply rejected: candidate version {} is not newer than active version {}",
-                    version, active_version
+                    "Apply rejected: candidate version {version} is not newer than active version {active_version}"
                 );
                 let _ = self
                     .audit_event(tenant, &validated_spiffe, "APPLY_FAILURE", &reason)
@@ -457,7 +455,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
                     tenant,
                     &validated_spiffe,
                     "APPLY_FAILURE",
-                    &format!("Validation failed: {}", e),
+                    &format!("Validation failed: {e}"),
                 )
                 .await;
             return Err(e);
@@ -543,7 +541,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
         }
 
         if let Err(e) = tx_result {
-            let reason = format!("Apply transaction failed: {:?}", e);
+            let reason = format!("Apply transaction failed: {e:?}");
             let _ = self
                 .audit_event(tenant, &validated_spiffe, "APPLY_FAILURE", &reason)
                 .await;
@@ -563,7 +561,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
             cache.insert(tenant.to_string(), compiled);
         }
 
-        let details = format!("Successfully applied policy version {}", version);
+        let details = format!("Successfully applied policy version {version}");
         self.audit_event(tenant, &validated_spiffe, "APPLY_SUCCESS", &details)
             .await?;
 
@@ -712,8 +710,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
                     res.map_err(|e| {
                         if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
                             SecurityPolicyError::StaleVersion(format!(
-                                "No history found for version {}",
-                                version_val
+                                "No history found for version {version_val}"
                             ))
                         } else {
                             tracing::error!(err = ?e, "Failed to query policy history by version");
@@ -731,8 +728,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
                     res.map_err(|e| {
                         if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
                             SecurityPolicyError::StaleVersion(format!(
-                                "No history found for tx_id {:?}",
-                                tx_id
+                                "No history found for tx_id {tx_id:?}"
                             ))
                         } else {
                             tracing::error!(err = ?e, "Failed to query policy history by tx_id");
@@ -749,8 +745,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
                     res.map_err(|e| {
                         if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
                             SecurityPolicyError::StaleVersion(format!(
-                                "No history found for label {}",
-                                label
+                                "No history found for label {label}"
                             ))
                         } else {
                             tracing::error!(err = ?e, "Failed to query policy history by label");
@@ -782,7 +777,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
             let mut evaluator = NacmEvaluator::new();
             let decision = evaluator.evaluate(&candidate_policy, &path, NacmAction::SecurityAdmin);
             if !decision.is_allowed() {
-                let reason = format!("Rollback rejected: target policy version {} denies security-admin role access to /security:policy", version);
+                let reason = format!("Rollback rejected: target policy version {version} denies security-admin role access to /security:policy");
                 return Err(SecurityPolicyError::ValidationFailed(reason));
             }
 
@@ -792,7 +787,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
         let (version, encrypted_blob) = match prepare_result {
             Ok(res) => res,
             Err(e) => {
-                let reason = format!("{}", e);
+                let reason = format!("{e}");
                 let _ = self
                     .audit_event(tenant, &validated_spiffe, "ROLLBACK_FAILURE", &reason)
                     .await;
@@ -834,7 +829,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
         }.await;
 
         if let Err(e) = tx_result {
-            let reason = format!("Rollback transaction failed: {:?}", e);
+            let reason = format!("Rollback transaction failed: {e:?}");
             let _ = self
                 .audit_event(tenant, &validated_spiffe, "ROLLBACK_FAILURE", &reason)
                 .await;
@@ -846,7 +841,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
             cache.insert(tenant.to_string(), compiled);
         }
 
-        let details = format!("Rolled back active policy to version {}", version);
+        let details = format!("Rolled back active policy to version {version}");
         self.audit_event(tenant, &validated_spiffe, "ROLLBACK", &details)
             .await?;
 

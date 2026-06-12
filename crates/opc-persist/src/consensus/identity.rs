@@ -80,7 +80,7 @@ pub fn extract_spiffe_id_from_cert_der(cert_der: &[u8]) -> Result<String, Persis
 
 pub fn parse_local_spiffe_profile(identity: &NodeIdentity) -> Result<ParsedSpiffeId, PersistError> {
     let certs = load_certs_from_pem(&identity.cert_chain_pem).map_err(|e| {
-        PersistError::inconsistent_state(format!("failed to load local cert chain: {}", e))
+        PersistError::inconsistent_state(format!("failed to load local cert chain: {e}"))
     })?;
     let leaf = certs.first().ok_or_else(|| {
         PersistError::inconsistent_state("local identity certificate chain is empty")
@@ -207,7 +207,7 @@ pub fn build_client_tls_connector(
 
     let builder = opc_tls::TlsConfigBuilder::new(rx).with_policy(policy);
     let client_config = builder.build_client_config().map_err(|e| {
-        PersistError::inconsistent_state(format!("Failed to build client config: {}", e))
+        PersistError::inconsistent_state(format!("Failed to build client config: {e}"))
     })?;
 
     Ok(tokio_rustls::TlsConnector::from(Arc::new(client_config)))
@@ -219,7 +219,7 @@ pub fn build_server_tls_acceptor(
     let rx = create_identity_state_receiver(identity);
     let builder = opc_tls::TlsConfigBuilder::new(rx);
     let server_config = builder.build_server_config().map_err(|e| {
-        PersistError::inconsistent_state(format!("Failed to build server config: {}", e))
+        PersistError::inconsistent_state(format!("Failed to build server config: {e}"))
     })?;
 
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server_config)))

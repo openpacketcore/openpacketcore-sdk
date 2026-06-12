@@ -33,8 +33,7 @@ fn assert_typed_roundtrip(bytes: &[u8]) {
     assert_eq!(
         &encoded[..],
         bytes,
-        "typed IE round-trip not byte-exact for {:?}",
-        decoded
+        "typed IE round-trip not byte-exact for {decoded:?}"
     );
 }
 
@@ -54,7 +53,7 @@ fn test_cause_request_accepted_spec_bytes() {
     let ie = decode_typed(bytes);
     match ie {
         TypedIe::Cause(c) => assert_eq!(c.value, CauseValue::RequestAccepted),
-        other => panic!("expected Cause, got {:?}", other),
+        other => panic!("expected Cause, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -70,7 +69,7 @@ fn test_cause_unknown_value_roundtrip() {
     let ie = decode_typed(bytes);
     match ie {
         TypedIe::Cause(c) => assert_eq!(c.value, CauseValue::Unknown(0xFF)),
-        other => panic!("expected Cause, got {:?}", other),
+        other => panic!("expected Cause, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -106,7 +105,7 @@ fn test_node_id_ipv4_spec_bytes() {
             assert_eq!(n.node_id_type, NodeIdType::Ipv4);
             assert_eq!(n.value, &[0xC0, 0x00, 0x02, 0x01]);
         }
-        other => panic!("expected NodeId, got {:?}", other),
+        other => panic!("expected NodeId, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -127,7 +126,7 @@ fn test_node_id_ipv6_spec_bytes() {
             assert_eq!(n.node_id_type, NodeIdType::Ipv6);
             assert_eq!(n.value.len(), 16);
         }
-        other => panic!("expected NodeId, got {:?}", other),
+        other => panic!("expected NodeId, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -173,7 +172,7 @@ fn test_fseid_v4_spec_bytes() {
             assert_eq!(f.ipv4, Some([0xC0, 0x00, 0x02, 0x01]));
             assert_eq!(f.ipv6, None);
         }
-        other => panic!("expected FSeid, got {:?}", other),
+        other => panic!("expected FSeid, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -202,7 +201,7 @@ fn test_fseid_v4v6_spec_bytes() {
                 Some([0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
             );
         }
-        other => panic!("expected FSeid, got {:?}", other),
+        other => panic!("expected FSeid, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -245,7 +244,7 @@ fn test_fteid_v4_spec_bytes() {
             assert_eq!(f.teid, Some(0x1234_5678));
             assert_eq!(f.ipv4, Some([0xC0, 0x00, 0x02, 0x01]));
         }
-        other => panic!("expected FTeid, got {:?}", other),
+        other => panic!("expected FTeid, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -268,7 +267,7 @@ fn test_fteid_ch_chid_spec_bytes() {
             assert_eq!(f.teid, None);
             assert_eq!(f.choose_id, Some(5));
         }
-        other => panic!("expected FTeid, got {:?}", other),
+        other => panic!("expected FTeid, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -300,7 +299,7 @@ fn test_pdr_id_spec_bytes() {
     let ie = decode_typed(bytes);
     match ie {
         TypedIe::PdrId(p) => assert_eq!(p.value, 0x1234),
-        other => panic!("expected PdrId, got {:?}", other),
+        other => panic!("expected PdrId, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -320,7 +319,7 @@ fn test_far_id_spec_bytes() {
     let ie = decode_typed(bytes);
     match ie {
         TypedIe::FarId(f) => assert_eq!(f.value, 0x1234_5678),
-        other => panic!("expected FarId, got {:?}", other),
+        other => panic!("expected FarId, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -340,7 +339,7 @@ fn test_qer_id_spec_bytes() {
     let ie = decode_typed(bytes);
     match ie {
         TypedIe::QerId(q) => assert_eq!(q.value, 1),
-        other => panic!("expected QerId, got {:?}", other),
+        other => panic!("expected QerId, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -360,7 +359,7 @@ fn test_urr_id_spec_bytes() {
     let ie = decode_typed(bytes);
     match ie {
         TypedIe::UrrId(u) => assert_eq!(u.value, 2),
-        other => panic!("expected UrrId, got {:?}", other),
+        other => panic!("expected UrrId, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -380,7 +379,7 @@ fn test_precedence_spec_bytes() {
     let ie = decode_typed(bytes);
     match ie {
         TypedIe::Precedence(p) => assert_eq!(p.value, 10),
-        other => panic!("expected Precedence, got {:?}", other),
+        other => panic!("expected Precedence, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -408,7 +407,7 @@ fn test_apply_action_drop_forw_spec_bytes() {
             assert!(!a.buffer);
             assert_eq!(a.spare, 0);
         }
-        other => panic!("expected ApplyAction, got {:?}", other),
+        other => panic!("expected ApplyAction, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -432,7 +431,7 @@ fn test_source_interface_access_spec_bytes() {
             assert_eq!(s.value, 0);
             assert_eq!(s.spare, 0);
         }
-        other => panic!("expected SourceInterface, got {:?}", other),
+        other => panic!("expected SourceInterface, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -455,7 +454,7 @@ fn test_destination_interface_core_spec_bytes() {
             assert_eq!(d.value, 1);
             assert_eq!(d.spare, 0);
         }
-        other => panic!("expected DestinationInterface, got {:?}", other),
+        other => panic!("expected DestinationInterface, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -474,7 +473,7 @@ fn test_network_instance_spec_bytes() {
     let ie = decode_typed(&bytes);
     match ie {
         TypedIe::NetworkInstance(n) => assert_eq!(n.value, dnn.as_slice()),
-        other => panic!("expected NetworkInstance, got {:?}", other),
+        other => panic!("expected NetworkInstance, got {other:?}"),
     }
     assert_typed_roundtrip(&bytes);
 }
@@ -501,7 +500,7 @@ fn test_ue_ip_address_v4_spec_bytes() {
             assert!(!u.v6);
             assert_eq!(u.ipv4, Some([0xC0, 0x00, 0x02, 0x01]));
         }
-        other => panic!("expected UeIpAddress, got {:?}", other),
+        other => panic!("expected UeIpAddress, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -523,7 +522,7 @@ fn test_ue_ip_address_v4_prefix_spec_bytes() {
             assert!(u.ipv4d);
             assert_eq!(u.ipv4_prefix_length, Some(24));
         }
-        other => panic!("expected UeIpAddress, got {:?}", other),
+        other => panic!("expected UeIpAddress, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -543,7 +542,7 @@ fn test_outer_header_removal_spec_bytes() {
     let ie = decode_typed(bytes);
     match ie {
         TypedIe::OuterHeaderRemoval(o) => assert_eq!(o.description, 0),
-        other => panic!("expected OuterHeaderRemoval, got {:?}", other),
+        other => panic!("expected OuterHeaderRemoval, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -563,7 +562,7 @@ fn test_recovery_time_stamp_spec_bytes() {
     let ie = decode_typed(bytes);
     match ie {
         TypedIe::RecoveryTimeStamp(r) => assert_eq!(r.seconds, 0x6655_5A00),
-        other => panic!("expected RecoveryTimeStamp, got {:?}", other),
+        other => panic!("expected RecoveryTimeStamp, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -592,7 +591,7 @@ fn test_outer_header_creation_gtpu_ipv4_spec_bytes() {
             assert_eq!(o.ipv4, Some([0xC0, 0x00, 0x02, 0x01]));
             assert_eq!(o.port, None, "GTP-U encapsulation carries no UDP port");
         }
-        other => panic!("expected OuterHeaderCreation, got {:?}", other),
+        other => panic!("expected OuterHeaderCreation, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -617,7 +616,7 @@ fn test_outer_header_creation_udp_ipv4_spec_bytes() {
             assert_eq!(o.ipv4, Some([0xC0, 0x00, 0x02, 0x02]));
             assert_eq!(o.port, Some(2152));
         }
-        other => panic!("expected OuterHeaderCreation, got {:?}", other),
+        other => panic!("expected OuterHeaderCreation, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -639,7 +638,7 @@ fn test_outer_header_creation_n19_indication_spec_bytes() {
             assert_eq!(o.ipv4, None);
             assert_eq!(o.port, None);
         }
-        other => panic!("expected OuterHeaderCreation, got {:?}", other),
+        other => panic!("expected OuterHeaderCreation, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -665,7 +664,7 @@ fn test_unknown_ie_raw_preservation() {
             assert_eq!(raw.enterprise_id, 0xDEAD);
             assert_eq!(&raw.value[..], &[0xBE, 0xEF]);
         }
-        other => panic!("expected Raw, got {:?}", other),
+        other => panic!("expected Raw, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -687,7 +686,7 @@ fn test_vendor_ie_raw_preservation() {
             assert_eq!(raw.enterprise_id, 0x42);
             assert_eq!(&raw.value[..], b"abc");
         }
-        other => panic!("expected Raw, got {:?}", other),
+        other => panic!("expected Raw, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -733,7 +732,7 @@ fn test_grouped_ie_nested_success() {
         TypedIe::CreatePdr(g) => {
             assert_eq!(g.members.len(), 1);
         }
-        other => panic!("expected CreatePdr, got {:?}", other),
+        other => panic!("expected CreatePdr, got {other:?}"),
     }
     assert_typed_roundtrip(&bytes);
 }
@@ -856,7 +855,7 @@ fn test_created_pdr_roundtrip() {
     let ie = decode_typed(&bytes);
     match ie {
         TypedIe::CreatedPdr(g) => assert_eq!(g.members.len(), 2),
-        other => panic!("expected CreatedPdr, got {:?}", other),
+        other => panic!("expected CreatedPdr, got {other:?}"),
     }
     assert_typed_roundtrip(&bytes);
 }
@@ -888,7 +887,7 @@ fn test_create_far_roundtrip() {
     let ie = decode_typed(&bytes);
     match ie {
         TypedIe::CreateFar(g) => assert_eq!(g.members.len(), 2),
-        other => panic!("expected CreateFar, got {:?}", other),
+        other => panic!("expected CreateFar, got {other:?}"),
     }
     assert_typed_roundtrip(&bytes);
 }
@@ -921,7 +920,7 @@ fn test_forwarding_parameters_roundtrip() {
     let ie = decode_typed(&bytes);
     match ie {
         TypedIe::ForwardingParameters(g) => assert_eq!(g.members.len(), 2),
-        other => panic!("expected ForwardingParameters, got {:?}", other),
+        other => panic!("expected ForwardingParameters, got {other:?}"),
     }
     assert_typed_roundtrip(&bytes);
 }
@@ -946,7 +945,7 @@ fn test_create_qer_roundtrip() {
     let ie = decode_typed(&bytes);
     match ie {
         TypedIe::CreateQer(g) => assert_eq!(g.members.len(), 1),
-        other => panic!("expected CreateQer, got {:?}", other),
+        other => panic!("expected CreateQer, got {other:?}"),
     }
     assert_typed_roundtrip(&bytes);
 }
@@ -971,7 +970,7 @@ fn test_create_urr_roundtrip() {
     let ie = decode_typed(&bytes);
     match ie {
         TypedIe::CreateUrr(g) => assert_eq!(g.members.len(), 1),
-        other => panic!("expected CreateUrr, got {:?}", other),
+        other => panic!("expected CreateUrr, got {other:?}"),
     }
     assert_typed_roundtrip(&bytes);
 }
@@ -992,7 +991,7 @@ fn test_qfi_spec_bytes() {
     let ie = decode_typed(bytes);
     match ie {
         TypedIe::Qfi(q) => assert_eq!(q.value, 5),
-        other => panic!("expected Qfi, got {:?}", other),
+        other => panic!("expected Qfi, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -1012,7 +1011,7 @@ fn test_gate_status_open_spec_bytes() {
             assert_eq!(g.ul, crate::ie::Gate::Open);
             assert_eq!(g.dl, crate::ie::Gate::Open);
         }
-        other => panic!("expected GateStatus, got {:?}", other),
+        other => panic!("expected GateStatus, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -1032,7 +1031,7 @@ fn test_gate_status_closed_spec_bytes() {
             assert_eq!(g.ul, crate::ie::Gate::Closed);
             assert_eq!(g.dl, crate::ie::Gate::Closed);
         }
-        other => panic!("expected GateStatus, got {:?}", other),
+        other => panic!("expected GateStatus, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -1054,7 +1053,7 @@ fn test_mbr_spec_bytes() {
             assert_eq!(m.ul_kbps, 1);
             assert_eq!(m.dl_kbps, 2);
         }
-        other => panic!("expected Mbr, got {:?}", other),
+        other => panic!("expected Mbr, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -1076,7 +1075,7 @@ fn test_gbr_spec_bytes() {
             assert_eq!(g.ul_kbps, 1000);
             assert_eq!(g.dl_kbps, 2000);
         }
-        other => panic!("expected Gbr, got {:?}", other),
+        other => panic!("expected Gbr, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
 }
@@ -1154,7 +1153,7 @@ fn test_create_qer_with_qos_members_roundtrip() {
         TypedIe::CreateQer(g) => {
             assert_eq!(g.members.len(), 5);
         }
-        other => panic!("expected CreateQer, got {:?}", other),
+        other => panic!("expected CreateQer, got {other:?}"),
     }
     assert_typed_roundtrip(&bytes);
 }
@@ -1189,7 +1188,7 @@ fn test_update_qer_roundtrip() {
         TypedIe::UpdateQer(g) => {
             assert_eq!(g.members.len(), 2);
         }
-        other => panic!("expected UpdateQer, got {:?}", other),
+        other => panic!("expected UpdateQer, got {other:?}"),
     }
     assert_typed_roundtrip(&bytes);
 }

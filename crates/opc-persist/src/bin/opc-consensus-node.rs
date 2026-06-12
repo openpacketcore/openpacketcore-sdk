@@ -42,7 +42,7 @@ fn print_success<T: serde::Serialize>(data: T) {
         "success": true,
         "data": data
     });
-    println!("{}", resp);
+    println!("{resp}");
     std::io::stdout().flush().ok();
 }
 
@@ -51,7 +51,7 @@ fn print_error(err: &str) {
         "success": false,
         "error": err
     });
-    println!("{}", resp);
+    println!("{resp}");
     std::io::stdout().flush().ok();
 }
 
@@ -61,7 +61,7 @@ async fn handle_command_line(
     audit_key: &AuditKey,
 ) -> Result<(), String> {
     let val: serde_json::Value =
-        serde_json::from_str(line).map_err(|e| format!("invalid JSON: {}", e))?;
+        serde_json::from_str(line).map_err(|e| format!("invalid JSON: {e}"))?;
     let cmd = val["command"]
         .as_str()
         .or_else(|| val["cmd"].as_str())
@@ -376,7 +376,7 @@ async fn handle_command_line(
                 .map_err(|e| e.to_string())?;
             print_success(serde_json::Value::Null);
         }
-        _ => return Err(format!("unknown command: {}", cmd)),
+        _ => return Err(format!("unknown command: {cmd}")),
     }
     Ok(())
 }
@@ -477,7 +477,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rpc_timeout = v.parse::<u64>().expect("invalid rpc-timeout");
             }
             _ => {
-                panic!("unknown argument: {}", name);
+                panic!("unknown argument: {name}");
             }
         }
         i += 1;

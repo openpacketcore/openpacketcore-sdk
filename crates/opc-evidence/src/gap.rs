@@ -418,8 +418,7 @@ pub fn validate_status_for_gaps(
                 .filter(|g| g.status != GapStatus::Closed)
                 .count();
             Err(EvidenceError::GapGateFailed(format!(
-                "status {:?} is inconsistent with {} active gap(s) in the evidence store",
-                status, active_count
+                "status {status:?} is inconsistent with {active_count} active gap(s) in the evidence store"
             )))
         }
         // Partial / NotImplemented may coexist with active gaps (expected outcomes).

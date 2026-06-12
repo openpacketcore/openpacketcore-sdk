@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn digest_key_debug_is_redacted() {
         let key = DigestKey::new([0x42; 32]);
-        let debug = format!("{:?}", key);
+        let debug = format!("{key:?}");
         assert!(debug.contains("DigestKey"));
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("42"));

@@ -71,7 +71,7 @@ pub fn validate_formats_on_object(
     path: &str,
 ) -> Option<String> {
     for (key, value) in obj {
-        let field_path = format!("{}.{}", path, key);
+        let field_path = format!("{path}.{key}");
         if let Some(s) = value.as_str() {
             let format_hint = match key.as_str() {
                 "created" | "created_date" => Some("date"),
@@ -81,8 +81,7 @@ pub fn validate_formats_on_object(
             if let Some(fmt) = format_hint {
                 if let Err(err) = validate_date_format(s, fmt) {
                     return Some(format!(
-                        "{} (format '{}') validation failed: {}; value: {:?}",
-                        field_path, fmt, err, s
+                        "{field_path} (format '{fmt}') validation failed: {err}; value: {s:?}"
                     ));
                 }
             }

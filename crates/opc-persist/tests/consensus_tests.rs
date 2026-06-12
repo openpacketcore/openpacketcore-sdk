@@ -49,7 +49,7 @@ fn make_audit_record(tx_id: TxId, sequence: u32, path: &str) -> AuditRecord {
 async fn setup_consensus_group(temp_dir: &TempDir) -> Vec<Arc<ConsensusConfigStore>> {
     let mut backends = Vec::new();
     for i in 0..3 {
-        let db_path = temp_dir.path().join(format!("consensus_{}.db", i));
+        let db_path = temp_dir.path().join(format!("consensus_{i}.db"));
         let backend = SqliteBackend::open_with_audit_key(&db_path, true, 0, test_audit_key())
             .await
             .expect("open backend");
@@ -619,7 +619,7 @@ async fn test_consensus_double_majority_quorum() {
     let temp_dir = TempDir::new().unwrap();
     let mut backends = Vec::new();
     for i in 0..4 {
-        let db_path = temp_dir.path().join(format!("consensus_four_{}.db", i));
+        let db_path = temp_dir.path().join(format!("consensus_four_{i}.db"));
         let backend = SqliteBackend::open_with_audit_key(&db_path, true, 0, test_audit_key())
             .await
             .expect("open backend");
@@ -825,7 +825,7 @@ async fn test_consensus_automatic_transition_finalization() {
     let temp_dir = TempDir::new().unwrap();
     let mut backends = Vec::new();
     for i in 0..3 {
-        let db_path = temp_dir.path().join(format!("final_consensus_{}.db", i));
+        let db_path = temp_dir.path().join(format!("final_consensus_{i}.db"));
         let backend = SqliteBackend::open_with_audit_key(&db_path, true, 0, test_audit_key())
             .await
             .unwrap();
@@ -918,7 +918,7 @@ async fn test_consensus_snapshot_membership_bug() {
     // 1. Create a 3-node group: 0, 1, 2
     let mut backends = Vec::new();
     for i in 0..4 {
-        let db_path = temp_dir.path().join(format!("snap_bug_{}.db", i));
+        let db_path = temp_dir.path().join(format!("snap_bug_{i}.db"));
         let backend = SqliteBackend::open_with_audit_key(&db_path, true, 0, test_audit_key())
             .await
             .expect("open backend");
@@ -1023,7 +1023,7 @@ async fn test_consensus_snapshot_membership_bug() {
 
     // Check if the membership was updated to the cluster's membership [0, 1, 2]
     // If there is a bug, node 3's membership will still be the initial [3]!
-    println!("Node 3 membership: {:?}", membership_3);
+    println!("Node 3 membership: {membership_3:?}");
     assert_eq!(
         membership_3.voting_members,
         vec![0, 1, 2],
@@ -1067,7 +1067,7 @@ async fn test_consensus_non_voter_becomes_leader_bug() {
     // Create 4 backends
     let mut backends = Vec::new();
     for i in 0..4 {
-        let db_path = temp_dir.path().join(format!("non_voter_leader_{}.db", i));
+        let db_path = temp_dir.path().join(format!("non_voter_leader_{i}.db"));
         let backend = SqliteBackend::open_with_audit_key(&db_path, true, 0, test_audit_key())
             .await
             .expect("open backend");

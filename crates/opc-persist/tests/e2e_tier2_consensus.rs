@@ -131,7 +131,7 @@ async fn test_boundary_stale_log_candidate() {
     });
 
     let resp = send_tls_rpc(
-        &format!("127.0.0.1:{}", node_0_port),
+        &format!("127.0.0.1:{node_0_port}"),
         2,
         0,
         &cluster.cluster_id,
@@ -181,7 +181,7 @@ async fn test_boundary_out_of_date_term_rpc() {
     });
 
     let resp = send_tls_rpc(
-        &format!("127.0.0.1:{}", node_1_port),
+        &format!("127.0.0.1:{node_1_port}"),
         0,
         1,
         &cluster.cluster_id,
@@ -234,7 +234,7 @@ async fn test_boundary_log_term_gap_recovery() {
             "audit_paths": [format!("/path/{}", v)]
         })).await.unwrap();
         if !res["success"].as_bool().unwrap_or(false) {
-            panic!("AppendCommit failed: {:?}", res);
+            panic!("AppendCommit failed: {res:?}");
         }
     }
 
@@ -288,7 +288,7 @@ async fn test_boundary_empty_snapshot() {
     });
 
     let resp = send_tls_rpc(
-        &format!("127.0.0.1:{}", node_port),
+        &format!("127.0.0.1:{node_port}"),
         0,
         0,
         &cluster.cluster_id,
@@ -357,7 +357,7 @@ async fn test_boundary_snapshot_hmac_mismatch() {
     });
 
     let resp = send_tls_rpc(
-        &format!("127.0.0.1:{}", node_port),
+        &format!("127.0.0.1:{node_port}"),
         0,
         0,
         &cluster.cluster_id,
@@ -421,7 +421,7 @@ async fn test_boundary_future_snapshot_index() {
     });
 
     let resp = send_tls_rpc(
-        &format!("127.0.0.1:{}", node_port),
+        &format!("127.0.0.1:{node_port}"),
         0,
         0,
         &cluster.cluster_id,
@@ -541,7 +541,7 @@ async fn test_boundary_membership_change_during_snapshot() {
             }
         });
         send_tls_rpc(
-            &format!("127.0.0.1:{}", node_port),
+            &format!("127.0.0.1:{node_port}"),
             0,
             0,
             &cluster_id,
@@ -618,8 +618,7 @@ async fn test_boundary_pending_commit_survives_failover_and_can_be_confirmed() {
         .unwrap();
     assert!(
         resp["success"].as_bool().unwrap(),
-        "AppendCommit failed: {:?}",
-        resp
+        "AppendCommit failed: {resp:?}"
     );
 
     sleep(Duration::from_millis(500)).await;
@@ -652,15 +651,11 @@ async fn test_boundary_pending_commit_survives_failover_and_can_be_confirmed() {
         sleep(Duration::from_millis(200)).await;
     }
     let new_leader = new_leader.unwrap_or_else(|| {
-        panic!(
-            "No surviving node could campaign and become new leader: {:?}",
-            last_camp_resp
-        )
+        panic!("No surviving node could campaign and become new leader: {last_camp_resp:?}")
     });
     assert!(
         [1usize, 2usize].contains(&new_leader),
-        "unexpected new leader: {}",
-        new_leader
+        "unexpected new leader: {new_leader}"
     );
     sleep(Duration::from_millis(1500)).await;
 
@@ -675,8 +670,7 @@ async fn test_boundary_pending_commit_survives_failover_and_can_be_confirmed() {
         .unwrap();
     assert!(
         load_resp["success"].as_bool().unwrap(),
-        "LoadLatest failed: {:?}",
-        load_resp
+        "LoadLatest failed: {load_resp:?}"
     );
     let latest = &load_resp["data"];
     assert_eq!(
@@ -685,8 +679,7 @@ async fn test_boundary_pending_commit_survives_failover_and_can_be_confirmed() {
     );
     assert!(
         latest["record"]["confirmed_deadline"].is_string(),
-        "confirmed_deadline is missing or not a string: {:?}",
-        latest
+        "confirmed_deadline is missing or not a string: {latest:?}"
     );
 
     let confirm_resp = cluster
@@ -701,8 +694,7 @@ async fn test_boundary_pending_commit_survives_failover_and_can_be_confirmed() {
         .unwrap();
     assert!(
         confirm_resp["success"].as_bool().unwrap(),
-        "MarkConfirmed failed: {:?}",
-        confirm_resp
+        "MarkConfirmed failed: {confirm_resp:?}"
     );
     sleep(Duration::from_millis(300)).await;
 
@@ -717,8 +709,7 @@ async fn test_boundary_pending_commit_survives_failover_and_can_be_confirmed() {
         .unwrap();
     assert!(
         load_resp2["success"].as_bool().unwrap(),
-        "LoadLatest 2 failed: {:?}",
-        load_resp2
+        "LoadLatest 2 failed: {load_resp2:?}"
     );
     let latest2 = &load_resp2["data"];
     assert_eq!(
@@ -727,7 +718,6 @@ async fn test_boundary_pending_commit_survives_failover_and_can_be_confirmed() {
     );
     assert!(
         latest2["record"]["confirmed_deadline"].is_null(),
-        "confirmed_deadline was not cleared: {:?}",
-        latest2
+        "confirmed_deadline was not cleared: {latest2:?}"
     );
 }

@@ -130,8 +130,7 @@ pub fn evaluate_config_apply(
                 crate::compatibility::CompatibilityDecision::Allowed => {}
                 crate::compatibility::CompatibilityDecision::Blocked(reason) => {
                     return ConfigApplyDecision::Reject(format!(
-                        "Compatibility check blocked: {}",
-                        reason
+                        "Compatibility check blocked: {reason}"
                     ));
                 }
             }
@@ -145,8 +144,7 @@ pub fn evaluate_config_apply(
                     crate::compatibility::CompatibilityDecision::Allowed => {}
                     crate::compatibility::CompatibilityDecision::Blocked(reason) => {
                         return ConfigApplyDecision::Reject(format!(
-                            "Migration path blocked: {}",
-                            reason
+                            "Migration path blocked: {reason}"
                         ));
                     }
                 }

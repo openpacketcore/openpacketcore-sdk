@@ -371,8 +371,7 @@ mod tests {
         let lookup = cache.lookup_at(&key, after_ttl);
         assert!(
             matches!(lookup, CacheLookup::Stale(ref p) if p[0].nf_instance_id.as_str() == "ausf-01"),
-            "expected Stale hit for ausf-01, got {:?}",
-            lookup
+            "expected Stale hit for ausf-01, got {lookup:?}"
         );
     }
 

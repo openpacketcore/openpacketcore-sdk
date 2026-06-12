@@ -518,8 +518,8 @@ pub fn evaluate_admission(req: &AdmissionRequest) -> AdmissionResponse {
                     crate::compatibility::CompatibilityDecision::Allowed => {}
                     crate::compatibility::CompatibilityDecision::Blocked(block_reason) => {
                         allowed = false;
-                        message = format!("Compatibility policy block: {}", block_reason);
-                        reason = format!("{:?}", block_reason);
+                        message = format!("Compatibility policy block: {block_reason}");
+                        reason = format!("{block_reason:?}");
                         reason = reason.chars().filter(|c| c.is_alphanumeric()).collect();
                     }
                 }
@@ -548,8 +548,8 @@ pub fn evaluate_admission(req: &AdmissionRequest) -> AdmissionResponse {
                     crate::compatibility::CompatibilityDecision::Allowed => {}
                     crate::compatibility::CompatibilityDecision::Blocked(block_reason) => {
                         allowed = false;
-                        message = format!("Compatibility policy block: {}", block_reason);
-                        reason = format!("{:?}", block_reason);
+                        message = format!("Compatibility policy block: {block_reason}");
+                        reason = format!("{block_reason:?}");
                         reason = reason.chars().filter(|c| c.is_alphanumeric()).collect();
                     }
                 }

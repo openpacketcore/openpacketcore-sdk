@@ -92,7 +92,7 @@ async fn test_server_admission_control_overload() {
         .unwrap();
     let consumer = MockConsumer::with_client(client);
 
-    let url = format!("http://{}", addr);
+    let url = format!("http://{addr}");
     let (status, headers, body) = consumer.send_get(&url, HashMap::new()).await.unwrap();
 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);

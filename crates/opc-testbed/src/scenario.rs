@@ -140,8 +140,7 @@ impl Scenario {
         for (idx, step) in self.steps.iter().enumerate() {
             if matches!(step, Step::Other) {
                 return Err(crate::TestbedError::Validation(format!(
-                    "step {} is an unsupported/unknown step kind",
-                    idx
+                    "step {idx} is an unsupported/unknown step kind"
                 )));
             }
         }

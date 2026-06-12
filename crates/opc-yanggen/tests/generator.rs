@@ -712,8 +712,7 @@ fn test_constraint_depth_limit_at_max_succeeds() {
     let result = lower_constraint(&raw, source);
     assert!(
         result.is_ok(),
-        "Lowering at depth {} should succeed",
-        MAX_CONSTRAINT_EXPR_DEPTH
+        "Lowering at depth {MAX_CONSTRAINT_EXPR_DEPTH} should succeed"
     );
 }
 
@@ -1066,8 +1065,7 @@ fn test_canonical_node_limit_wide_sibling_stack_bounded() {
     // A threshold of 800 cleanly separates the two implementations.
     assert!(
         max_stack < 800,
-        "max_canonical_scan_stack_len ({}) must be < 800 with the scan_stack.len() guard",
-        max_stack
+        "max_canonical_scan_stack_len ({max_stack}) must be < 800 with the scan_stack.len() guard"
     );
 }
 

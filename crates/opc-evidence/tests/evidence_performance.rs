@@ -21,10 +21,8 @@ fn test_gap_006_005_performance_baseline() {
     );
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/dummy".to_string());
-    let raw_cmd = format!(
-        "cargo run --release --config {}/secret_config.json --ip 192.168.1.50",
-        home
-    );
+    let raw_cmd =
+        format!("cargo run --release --config {home}/secret_config.json --ip 192.168.1.50");
     let redacted = redact_secrets_and_paths(&raw_cmd);
 
     assert!(redacted.contains("<home>"));

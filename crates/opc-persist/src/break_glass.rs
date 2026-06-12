@@ -106,8 +106,7 @@ impl BreakGlassApprovalTrait for DefaultBreakGlassApproval {
 
         if !app_roles.iter().any(|r| r == "security-admin") {
             return Err(SecurityPolicyError::Unauthorized(format!(
-                "Approver '{}' lacks 'security-admin' role",
-                app_spiffe
+                "Approver '{app_spiffe}' lacks 'security-admin' role"
             )));
         }
 

@@ -16,8 +16,7 @@ static TEST_MUTEX: TokioMutex<()> = TokioMutex::const_new(());
 
 fn get_admin_principal(name: &str) -> String {
     format!(
-        "spiffe://test-domain/tenant/test-tenant/ns/default/sa/security-admin/nf/amf/instance/{}",
-        name
+        "spiffe://test-domain/tenant/test-tenant/ns/default/sa/security-admin/nf/amf/instance/{name}"
     )
 }
 
@@ -71,10 +70,7 @@ pub struct TestAlarmNotifier {
 #[async_trait::async_trait]
 impl BreakGlassAlarmNotifier for TestAlarmNotifier {
     async fn raise_alarm(&self, tenant: &str, session_id: &str) -> Result<(), String> {
-        let text = format!(
-            "Active break-glass session {} for tenant {}",
-            session_id, tenant
-        );
+        let text = format!("Active break-glass session {session_id} for tenant {tenant}");
         let _ = self.manager.raise(
             opc_alarm::AlarmType::new("security.break-glass"),
             opc_alarm::Severity::Warning,
@@ -318,16 +314,16 @@ async fn test_concurrency_transitions() {
     for i in 0..num_concurrent {
         let service_clone = Arc::clone(&service);
         let requester_clone = requester.clone();
-        let approver = get_admin_principal(&format!("approver-{}", i));
+        let approver = get_admin_principal(&format!("approver-{i}"));
 
         let t = tokio::spawn(async move {
             let request = BreakGlassRequest {
                 principal: requester_clone.clone(),
                 tenant: "test-tenant".to_string(),
-                reason: format!("Concurrency test {}", i),
+                reason: format!("Concurrency test {i}"),
                 scope: "/security:break-glass".to_string(),
                 requested_duration: 60,
-                evidence_id: format!("CONC-{}", i),
+                evidence_id: format!("CONC-{i}"),
             };
 
             // 1. Request
@@ -541,16 +537,16 @@ async fn test_revocation_and_expiry_under_stress() {
 
     // Request, approve and activate 10 sessions to revoke and 10 to expire
     for i in 0..10 {
-        let approver = get_admin_principal(&format!("approver-{}", i));
+        let approver = get_admin_principal(&format!("approver-{i}"));
 
         // Revoke target
         let req_rev = BreakGlassRequest {
             principal: requester.clone(),
             tenant: tenant.to_string(),
-            reason: format!("Revoke target {}", i),
+            reason: format!("Revoke target {i}"),
             scope: "/security:break-glass".to_string(),
             requested_duration: 100,
-            evidence_id: format!("REV-{}", i),
+            evidence_id: format!("REV-{i}"),
         };
         let s_rev = service
             .request_break_glass(tenant, &requester, req_rev)
@@ -570,10 +566,10 @@ async fn test_revocation_and_expiry_under_stress() {
         let req_exp = BreakGlassRequest {
             principal: requester.clone(),
             tenant: tenant.to_string(),
-            reason: format!("Expire target {}", i),
+            reason: format!("Expire target {i}"),
             scope: "/security:break-glass".to_string(),
             requested_duration: 1, // 1 second
-            evidence_id: format!("EXP-{}", i),
+            evidence_id: format!("EXP-{i}"),
         };
         let s_exp = service
             .request_break_glass(tenant, &requester, req_exp)

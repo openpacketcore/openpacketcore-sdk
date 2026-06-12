@@ -114,7 +114,7 @@ pub fn find_free_port_block(size: u16) -> u16 {
         let mut success = true;
         for i in 0..size {
             let port = start_port + i;
-            match std::net::TcpListener::bind(format!("127.0.0.1:{}", port)) {
+            match std::net::TcpListener::bind(format!("127.0.0.1:{port}")) {
                 Ok(listener) => {
                     listeners.push(listener);
                 }
@@ -135,7 +135,7 @@ pub fn find_free_port_block(size: u16) -> u16 {
 }
 
 pub async fn wait_for_port(port: u16) {
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
     for _ in 0..300 {
         if let Ok(stream) = tokio::net::TcpStream::connect(&addr).await {
             drop(stream);
@@ -144,7 +144,7 @@ pub async fn wait_for_port(port: u16) {
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
-    panic!("Port {} did not become available in time", port);
+    panic!("Port {port} did not become available in time");
 }
 
 pub fn generate_test_identities(node_ids: &[usize]) -> HashMap<usize, NodeIdentity> {
@@ -164,8 +164,7 @@ pub fn generate_test_identities(node_ids: &[usize]) -> HashMap<usize, NodeIdenti
             .push(rcgen::DnType::CommonName, "localhost");
 
         let spiffe = format!(
-            "spiffe://test/trust-domain/tenant/test/ns/default/sa/svc/nf/test/instance/{}",
-            node_id
+            "spiffe://test/trust-domain/tenant/test/ns/default/sa/svc/nf/test/instance/{node_id}"
         );
 
         node_params.subject_alt_names = vec![
@@ -261,7 +260,7 @@ impl Proxy {
                                     if !enabled.load(Ordering::SeqCst) {
                                         return;
                                     }
-                                    let target_addr = format!("127.0.0.1:{}", target_port);
+                                    let target_addr = format!("127.0.0.1:{target_port}");
                                     let target_stream = match TcpStream::connect(&target_addr).await {
                                         Ok(s) => s,
                                         Err(_) => return,
@@ -351,9 +350,9 @@ impl TestNode {
         election_timeout_max: u64,
         rpc_timeout: u64,
     ) -> Self {
-        let ca_cert_path = certs_dir.join(format!("ca_{}.crt", node_id));
-        let cert_chain_path = certs_dir.join(format!("node_{}.crt", node_id));
-        let private_key_path = certs_dir.join(format!("node_{}.key", node_id));
+        let ca_cert_path = certs_dir.join(format!("ca_{node_id}.crt"));
+        let cert_chain_path = certs_dir.join(format!("node_{node_id}.crt"));
+        let private_key_path = certs_dir.join(format!("node_{node_id}.key"));
 
         std::fs::create_dir_all(&certs_dir).unwrap();
         std::fs::write(&ca_cert_path, &identity.ca_cert_pem).unwrap();
@@ -402,10 +401,10 @@ impl TestNode {
 
         for &(peer_id, peer_proxy_port) in peers {
             args.push("--peer".to_string());
-            args.push(format!("{}=127.0.0.1:{}", peer_id, peer_proxy_port));
+            args.push(format!("{peer_id}=127.0.0.1:{peer_proxy_port}"));
         }
 
-        let stderr_path = certs_dir.join(format!("node_{}.err", node_id));
+        let stderr_path = certs_dir.join(format!("node_{node_id}.err"));
         let stderr_file = std::fs::File::create(&stderr_path).unwrap();
 
         let mut child = Command::new(&binary_path)
@@ -415,9 +414,7 @@ impl TestNode {
             .stderr(stderr_file)
             .kill_on_drop(true)
             .spawn()
-            .unwrap_or_else(|e| {
-                panic!("failed to spawn daemon binary at {:?}: {}", binary_path, e)
-            });
+            .unwrap_or_else(|e| panic!("failed to spawn daemon binary at {binary_path:?}: {e}"));
 
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -465,31 +462,29 @@ impl TestNode {
             std::thread::sleep(std::time::Duration::from_millis(150));
             let status_str = if let Some(ref mut p) = process_ref {
                 match p.try_wait() {
-                    Ok(Some(status)) => format!(" (exited with status: {})", status),
+                    Ok(Some(status)) => format!(" (exited with status: {status})"),
                     Ok(None) => " (still running)".to_string(),
-                    Err(e) => format!(" (try_wait error: {})", e),
+                    Err(e) => format!(" (try_wait error: {e})"),
                 }
             } else {
                 " (no process)".to_string()
             };
-            let stderr_path = parent_path.join(format!("node_{}.err", node_id));
+            let stderr_path = parent_path.join(format!("node_{node_id}.err"));
             let err_content = std::fs::read_to_string(&stderr_path)
                 .unwrap_or_else(|_| "no stderr log".to_string());
-            format!("{} {}", err_content, status_str)
+            format!("{err_content} {status_str}")
         };
 
         if let Err(e) = self.stdin.write_all(line.as_bytes()).await {
             let stderr = get_stderr(self.node_id, parent_path);
             return Err(format!(
-                "failed to write to child stdin: {}, stderr: {}",
-                e, stderr
+                "failed to write to child stdin: {e}, stderr: {stderr}"
             ));
         }
         if let Err(e) = self.stdin.flush().await {
             let stderr = get_stderr(self.node_id, parent_path);
             return Err(format!(
-                "failed to flush child stdin: {}, stderr: {}",
-                e, stderr
+                "failed to flush child stdin: {e}, stderr: {stderr}"
             ));
         }
 
@@ -509,13 +504,12 @@ impl TestNode {
             }
             Ok(None) => {
                 let stderr = get_stderr(self.node_id, parent_path);
-                Err(format!("child process stdout closed, stderr: {}", stderr))
+                Err(format!("child process stdout closed, stderr: {stderr}"))
             }
             Err(_) => {
                 let stderr = get_stderr(self.node_id, parent_path);
                 Err(format!(
-                    "timeout waiting for command response, stderr: {}",
-                    stderr
+                    "timeout waiting for command response, stderr: {stderr}"
                 ))
             }
         }
@@ -618,12 +612,12 @@ impl TestCluster {
             proxy
                 .start()
                 .await
-                .map_err(|e| format!("failed to start proxy: {}", e))?;
+                .map_err(|e| format!("failed to start proxy: {e}"))?;
         }
 
         for node_id in 0..3 {
             let port = self.base_port + (node_id as u16 * 10);
-            let db_path = self.temp_dir.path().join(format!("node_{}.db", node_id));
+            let db_path = self.temp_dir.path().join(format!("node_{node_id}.db"));
             let identity = self.identities.get(&node_id).unwrap();
 
             let mut peers = Vec::new();
@@ -662,7 +656,7 @@ impl TestCluster {
 
         for node_id in 0..3 {
             let port = self.base_port + (node_id as u16 * 10);
-            let addr = format!("127.0.0.1:{}", port);
+            let addr = format!("127.0.0.1:{port}");
             let mut success = false;
             for _ in 0..300 {
                 if let Ok(stream) = tokio::net::TcpStream::connect(&addr).await {
@@ -675,14 +669,14 @@ impl TestCluster {
             }
             if !success {
                 for nid in 0..3 {
-                    let err_path = self.certs_dir.join(format!("node_{}.err", nid));
+                    let err_path = self.certs_dir.join(format!("node_{nid}.err"));
                     if let Ok(err_content) = std::fs::read_to_string(&err_path) {
-                        println!("--- NODE {} STDERR --- \n{}", nid, err_content);
+                        println!("--- NODE {nid} STDERR --- \n{err_content}");
                     } else {
-                        println!("--- NODE {} STDERR (not found/unread) ---", nid);
+                        println!("--- NODE {nid} STDERR (not found/unread) ---");
                     }
                 }
-                panic!("Port {} did not become available in time", port);
+                panic!("Port {port} did not become available in time");
             }
         }
 
@@ -776,7 +770,7 @@ impl TestCluster {
 
         for &(peer_id, peer_proxy_port) in &peers {
             args.push("--peer".to_string());
-            args.push(format!("{}=127.0.0.1:{}", peer_id, peer_proxy_port));
+            args.push(format!("{peer_id}=127.0.0.1:{peer_proxy_port}"));
         }
 
         let mut child = Command::new(&binary_path)
@@ -786,9 +780,7 @@ impl TestCluster {
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
-            .unwrap_or_else(|e| {
-                panic!("failed to spawn daemon binary at {:?}: {}", binary_path, e)
-            });
+            .unwrap_or_else(|e| panic!("failed to spawn daemon binary at {binary_path:?}: {e}"));
 
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -884,8 +876,7 @@ pub fn generate_test_ca_and_identities(
             .push(rcgen::DnType::CommonName, "localhost");
 
         let spiffe = format!(
-            "spiffe://test/trust-domain/tenant/test/ns/default/sa/svc/nf/test/instance/{}",
-            node_id
+            "spiffe://test/trust-domain/tenant/test/ns/default/sa/svc/nf/test/instance/{node_id}"
         );
 
         node_params.subject_alt_names = vec![
@@ -1062,12 +1053,12 @@ pub async fn bootstrap_4_nodes(_base_port: u16) -> Result<TestCluster, String> {
         proxy
             .start()
             .await
-            .map_err(|e| format!("failed to start proxy: {}", e))?;
+            .map_err(|e| format!("failed to start proxy: {e}"))?;
     }
 
     for node_id in 0..4 {
         let port = base_port + (node_id as u16 * 10);
-        let db_path = cluster.temp_dir.path().join(format!("node_{}.db", node_id));
+        let db_path = cluster.temp_dir.path().join(format!("node_{node_id}.db"));
         let identity = cluster.identities.get(&node_id).unwrap();
 
         let mut peers = Vec::new();

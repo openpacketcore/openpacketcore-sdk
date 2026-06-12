@@ -39,15 +39,15 @@ impl AlarmAuditSink for PersistAlarmAuditSink {
         };
 
         let scope_str = match &event.scope {
-            AlarmActionScope::Alarm { alarm_id } => format!("alarm:{}", alarm_id),
-            AlarmActionScope::Tenant { tenant } => format!("tenant:{}", tenant),
+            AlarmActionScope::Alarm { alarm_id } => format!("alarm:{alarm_id}"),
+            AlarmActionScope::Tenant { tenant } => format!("tenant:{tenant}"),
             AlarmActionScope::Global => "global".to_string(),
         };
 
         let occurred_at_str = event
             .occurred_at
             .format(&Rfc3339)
-            .map_err(|e| format!("Failed to format timestamp: {}", e))?;
+            .map_err(|e| format!("Failed to format timestamp: {e}"))?;
 
         // Redact principal, reason, and correlation_id to prevent leaking sensitive values
         let redacted_principal = redact_sensitive_string(&event.principal);
@@ -63,7 +63,7 @@ impl AlarmAuditSink for PersistAlarmAuditSink {
         let tenant_str = event.tenant.clone();
 
         let handle = tokio::runtime::Handle::try_current()
-            .map_err(|e| format!("No tokio runtime handle available: {}", e))?;
+            .map_err(|e| format!("No tokio runtime handle available: {e}"))?;
 
         let result = std::thread::spawn(move || {
             handle.block_on(async move {
@@ -82,11 +82,11 @@ impl AlarmAuditSink for PersistAlarmAuditSink {
                         &occurred_at_str,
                     )
                     .await
-                    .map_err(|e| format!("Database audit append failed: {}", e))
+                    .map_err(|e| format!("Database audit append failed: {e}"))
             })
         })
         .join()
-        .map_err(|e| format!("Thread join failed: {:?}", e))?;
+        .map_err(|e| format!("Thread join failed: {e:?}"))?;
 
         result
     }

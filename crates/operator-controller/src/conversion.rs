@@ -158,8 +158,7 @@ pub fn convert_v1alpha1_to_v1beta1(
         let target_api = "openpacketcore.org/v1beta1";
         if !m.is_crd_api_version_supported(target_api) {
             return Err(ConversionError::new_validation(&format!(
-                "unsupported target CRD API version: {}",
-                target_api
+                "unsupported target CRD API version: {target_api}"
             )));
         }
     }
@@ -172,8 +171,7 @@ pub fn convert_v1alpha1_to_v1beta1(
             let trimmed = token.trim();
             if trimmed.is_empty() || trimmed.len() < 16 || trimmed == "admin123" {
                 return Err(ConversionError::new_validation(&format!(
-                    "unsafe admin token token={} is rejected",
-                    token
+                    "unsafe admin token token={token} is rejected"
                 )));
             }
         } else {
@@ -251,8 +249,7 @@ pub fn convert_v1beta1_to_v1alpha1(
         let target_api = "openpacketcore.org/v1alpha1";
         if !m.is_crd_api_version_supported(target_api) {
             return Err(ConversionError::new_validation(&format!(
-                "unsupported target CRD API version: {}",
-                target_api
+                "unsupported target CRD API version: {target_api}"
             )));
         }
     }
@@ -262,8 +259,7 @@ pub fn convert_v1beta1_to_v1alpha1(
             let trimmed = token.trim();
             if trimmed.is_empty() || trimmed.len() < 16 || trimmed == "admin123" {
                 return Err(ConversionError::new_validation(&format!(
-                    "unsafe admin token token={} is rejected",
-                    token
+                    "unsafe admin token token={token} is rejected"
                 )));
             }
         } else {

@@ -327,7 +327,7 @@ async fn test_tcp_consensus_log_term_gap_recovery() {
         let res = group[0]
             .append_commit(
                 make_commit_record(tx_id, v),
-                vec![make_audit_record(tx_id, 0, &format!("/path/{}", v))],
+                vec![make_audit_record(tx_id, 0, &format!("/path/{v}"))],
             )
             .await;
         assert!(res.is_ok() || res.is_err()); // Ensure it returns a Result

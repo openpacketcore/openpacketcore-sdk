@@ -75,8 +75,7 @@ impl<'a> AlarmAsserter<'a> {
             .collect();
         assert!(
             matches.is_empty(),
-            "Expected no alarms with severity '{severity}' and cause '{cause:?}', but found: {:?}",
-            matches
+            "Expected no alarms with severity '{severity}' and cause '{cause:?}', but found: {matches:?}"
         );
     }
 
@@ -106,9 +105,7 @@ impl<'a> AlarmAsserter<'a> {
         assert_eq!(
             matching.len(),
             1,
-            "Expected exactly 1 alarm for dedup key '{:?}', but found: {:?}",
-            dedup_key,
-            matching
+            "Expected exactly 1 alarm for dedup key '{dedup_key:?}', but found: {matching:?}"
         );
         let alarm = matching[0];
         assert!(
@@ -251,10 +248,7 @@ pub async fn assert_eventually_deduplicated<F, Fut, S>(
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    panic!(
-        "Timed out waiting for alarm dedup key '{:?}' to be eventually deduplicated",
-        dedup_key
-    );
+    panic!("Timed out waiting for alarm dedup key '{dedup_key:?}' to be eventually deduplicated");
 }
 
 /// Scans all alarm fields to prove that raw subscriber identifiers and sensitive values

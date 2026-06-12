@@ -15,7 +15,7 @@ pub enum CompatibilityFeature {
 
 impl std::fmt::Display for CompatibilityFeature {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -247,7 +247,7 @@ impl CompatibilityMatrix {
                 return CompatibilityDecision::Blocked(
                     CompatibilityBlockReason::UnsupportedPersistenceProfile {
                         expected: rule.required_persistence_profiles.clone(),
-                        actual: format!("config={}, session={}", config_backend, session_backend),
+                        actual: format!("config={config_backend}, session={session_backend}"),
                     },
                 );
             }
@@ -349,18 +349,16 @@ impl CompatibilityMatrix {
                     }
                     break;
                 }
-            } else {
-                if src_req.matches(&src) && tgt_req.matches(&tgt) {
-                    path_found = true;
-                    if require_rollback && !mig.allowed_rollback {
-                        return CompatibilityDecision::Blocked(
-                            CompatibilityBlockReason::RollbackNotAllowed {
-                                target_version: target_version.to_string(),
-                            },
-                        );
-                    }
-                    break;
+            } else if src_req.matches(&src) && tgt_req.matches(&tgt) {
+                path_found = true;
+                if require_rollback && !mig.allowed_rollback {
+                    return CompatibilityDecision::Blocked(
+                        CompatibilityBlockReason::RollbackNotAllowed {
+                            target_version: target_version.to_string(),
+                        },
+                    );
                 }
+                break;
             }
         }
 

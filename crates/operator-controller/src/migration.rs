@@ -200,8 +200,7 @@ pub fn evaluate_migration_readiness(
             operator_lifecycle::CompatibilityDecision::Allowed => {}
             operator_lifecycle::CompatibilityDecision::Blocked(reason) => {
                 return Err(MigrationBlockReason::AdmissionFailed(format!(
-                    "Migration path not allowed by policy: {}",
-                    reason
+                    "Migration path not allowed by policy: {reason}"
                 )));
             }
         }
@@ -215,8 +214,7 @@ pub fn evaluate_migration_readiness(
                 operator_lifecycle::CompatibilityDecision::Allowed => {}
                 operator_lifecycle::CompatibilityDecision::Blocked(reason) => {
                     return Err(MigrationBlockReason::AdmissionFailed(format!(
-                        "Unsafe or high-risk migration steps require policy to explicitly permit rollback: {}",
-                        reason
+                        "Unsafe or high-risk migration steps require policy to explicitly permit rollback: {reason}"
                     )));
                 }
             }
@@ -249,14 +247,14 @@ pub fn execute_migration<D: MigrationDriver>(
     for step in &plan.steps {
         if let Err(e) = driver.execute_step(step) {
             let sanitized = operator_lifecycle::sanitize_denial_message(&e);
-            return Err(format!("Migration aborted during step: {}", sanitized));
+            return Err(format!("Migration aborted during step: {sanitized}"));
         }
     }
 
     // Finalize publish success
     if let Err(e) = driver.publish_success(plan.target_version) {
         let sanitized = operator_lifecycle::sanitize_denial_message(&e);
-        return Err(format!("Migration finalize failed: {}", sanitized));
+        return Err(format!("Migration finalize failed: {sanitized}"));
     }
 
     Ok(())

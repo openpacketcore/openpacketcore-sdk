@@ -225,12 +225,10 @@ impl ConsensusConfigStore {
                                 drop(s);
                             }
                             break;
+                        } else if next_idx > 1 {
+                            s.next_index.insert(peer_id, next_idx - 1);
                         } else {
-                            if next_idx > 1 {
-                                s.next_index.insert(peer_id, next_idx - 1);
-                            } else {
-                                break;
-                            }
+                            break;
                         }
                     }
                     Err(_) => break,
@@ -943,12 +941,10 @@ impl ConsensusConfigStore {
                                         .await;
                                     }
                                     break;
+                                } else if next_idx > 1 {
+                                    s.next_index.insert(peer_id, next_idx - 1);
                                 } else {
-                                    if next_idx > 1 {
-                                        s.next_index.insert(peer_id, next_idx - 1);
-                                    } else {
-                                        break;
-                                    }
+                                    break;
                                 }
                             }
                             Err(e) => {

@@ -80,8 +80,7 @@ fn nrf_integration_discovery_cache_ttl_and_stale_if_error() {
     let lookup = cache.lookup_at(&key, stale);
     assert!(
         matches!(lookup, CacheLookup::Stale(ref p) if p[0].nf_instance_id.as_str() == "amf-01"),
-        "expected stale fallback, got {:?}",
-        lookup
+        "expected stale fallback, got {lookup:?}"
     );
 
     // After TTL + stale-if-error: miss.
@@ -199,8 +198,7 @@ fn nrf_integration_token_fixture_structurally_valid() {
         assert!(
             s.bytes()
                 .all(|b| b.is_ascii_graphic() || b == b'.' || b == b'-'),
-            "token fixture contains invalid chars: {}",
-            s
+            "token fixture contains invalid chars: {s}"
         );
     }
 }
@@ -271,8 +269,7 @@ fn nrf_integration_stale_if_error_with_mock_nrf_down() {
     let lookup = cache.lookup_at(&query.to_cache_key(), after_ttl);
     assert!(
         matches!(lookup, CacheLookup::Stale(_)),
-        "expected stale fallback when NRF is down, got {:?}",
-        lookup
+        "expected stale fallback when NRF is down, got {lookup:?}"
     );
 
     // Caller can use the stale profile to keep routing.
@@ -309,7 +306,7 @@ fn nrf_integration_mock_register_discover_round_trip() {
             assert_eq!(profiles[0].nf_instance_id.as_str(), "amf-02");
             assert_eq!(profiles[1].nf_instance_id.as_str(), "amf-01");
         }
-        other => panic!("expected Found, got {:?}", other),
+        other => panic!("expected Found, got {other:?}"),
     }
 }
 
@@ -343,7 +340,7 @@ fn nrf_integration_discovery_filters_by_service_name() {
         DiscoveryResult::Found(profiles) => {
             assert_eq!(profiles.len(), 2);
         }
-        other => panic!("expected Found 2 AMFs, got {:?}", other),
+        other => panic!("expected Found 2 AMFs, got {other:?}"),
     }
 
     // Query for NAMF-MT should return only amf-01.
@@ -359,7 +356,7 @@ fn nrf_integration_discovery_filters_by_service_name() {
             assert_eq!(profiles.len(), 1);
             assert_eq!(profiles[0].nf_instance_id.as_str(), "amf-01");
         }
-        other => panic!("expected Found 1 AMF, got {:?}", other),
+        other => panic!("expected Found 1 AMF, got {other:?}"),
     }
 
     // Query for a non-existent service should return NotFound.

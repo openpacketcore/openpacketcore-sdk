@@ -402,8 +402,7 @@ impl ConfigAuthorizer for NacmConfigAuthorizer {
                     .nacm_eval_deny
                     .fetch_add(1, Ordering::Relaxed);
                 return Err(AuthorizationError::new(format!(
-                    "NACM policy denies action {:?} on path {}",
-                    nacm_action, path_str
+                    "NACM policy denies action {nacm_action:?} on path {path_str}"
                 )));
             }
         }
@@ -470,7 +469,7 @@ impl AmfLite {
             alarms.clone(),
         )
         .await
-        .map_err(|e| RuntimeError::Supervisor(format!("config bus init failed: {}", e)))?;
+        .map_err(|e| RuntimeError::Supervisor(format!("config bus init failed: {e}")))?;
 
         // 3. Quorum Session Store wrapped in mTLS/KMS encrypting envelope
         let mut wrapped_replicas = Vec::new();

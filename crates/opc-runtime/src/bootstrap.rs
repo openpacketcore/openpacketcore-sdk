@@ -256,7 +256,7 @@ fn redact_panic_payload(payload: &str) -> String {
     if payload_len == 0 {
         "panic payload redacted".to_string()
     } else {
-        format!("panic payload redacted ({} chars)", payload_len)
+        format!("panic payload redacted ({payload_len} chars)")
     }
 }
 

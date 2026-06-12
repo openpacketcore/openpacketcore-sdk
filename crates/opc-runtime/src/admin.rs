@@ -379,11 +379,11 @@ async fn handle_client(
             let uptime = handle.started_at.elapsed().as_secs();
 
             let runtime_data = RuntimeView {
-                mode: format!("{:?}", mode).to_lowercase(),
-                startup_phase: format!("{}", phase),
+                mode: format!("{mode:?}").to_lowercase(),
+                startup_phase: format!("{phase}"),
                 readiness: readiness_str,
                 liveness,
-                shutdown_phase: format!("{}", shutdown_phase),
+                shutdown_phase: format!("{shutdown_phase}"),
                 task_counts: TaskCountsView {
                     total,
                     fatal: TaskStateCounts {

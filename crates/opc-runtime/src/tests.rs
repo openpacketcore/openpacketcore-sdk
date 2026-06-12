@@ -513,8 +513,7 @@ async fn test_production_budget_enforcement_fail_closed() {
     let err = res.unwrap_err().to_string();
     assert!(
         err.contains("Production profile requires an explicit ResourceBudget"),
-        "Wrong error: {}",
-        err
+        "Wrong error: {err}"
     );
 
     let profile_invalid_budget = RuntimeProfile {
@@ -534,8 +533,7 @@ async fn test_production_budget_enforcement_fail_closed() {
     let err2 = res2.unwrap_err().to_string();
     assert!(
         err2.contains("max_tasks must be > 0 and <= 100,000"),
-        "Wrong error: {}",
-        err2
+        "Wrong error: {err2}"
     );
 }
 
@@ -598,8 +596,7 @@ async fn test_budget_limit_max_tasks_enforced() {
     let err = res.unwrap_err().to_string();
     assert!(
         err.contains("Resource budget limit exceeded"),
-        "Wrong error: {}",
-        err
+        "Wrong error: {err}"
     );
     assert_eq!(
         crate::metrics::METRICS

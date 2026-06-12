@@ -425,7 +425,7 @@ async fn worker_loop<C: OpcConfig>(
                 if let Err(err) = rollback_res {
                     crate::metrics::record_rollback_failure();
                     tracing::error!("expiry rollback failed: {:?}", err);
-                    recovery.fence(format!("commit-confirmed expiry rollback failed: {:?}", err));
+                    recovery.fence(format!("commit-confirmed expiry rollback failed: {err:?}"));
 
                     raise_config_error_alarm(
                         &alarm_manager,

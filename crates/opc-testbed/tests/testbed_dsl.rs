@@ -68,7 +68,7 @@ assertions:
             assert_eq!(to, "amf");
             assert_eq!(message, "InitialUEMessage.registration_request");
         }
-        other => panic!("expected SendNgap, got {:?}", other),
+        other => panic!("expected SendNgap, got {other:?}"),
     }
 
     match &scenario.steps[1] {
@@ -81,7 +81,7 @@ assertions:
             assert_eq!(to, "ausf");
             assert_eq!(operation, "Nausf_UEAuthentication.Authenticate");
         }
-        other => panic!("expected ExpectSbi, got {:?}", other),
+        other => panic!("expected ExpectSbi, got {other:?}"),
     }
 
     assert_eq!(scenario.assertions.len(), 1);
@@ -373,8 +373,7 @@ steps:
     let err_str = err.to_string();
     assert!(
         err_str.contains("image"),
-        "expected error to mention 'image', got: {}",
-        err_str
+        "expected error to mention 'image', got: {err_str}"
     );
 }
 
@@ -399,8 +398,7 @@ steps:
     let err_str = err.to_string();
     assert!(
         err_str.contains("simulator"),
-        "expected error to mention 'simulator', got: {}",
-        err_str
+        "expected error to mention 'simulator', got: {err_str}"
     );
 }
 
@@ -703,12 +701,10 @@ steps:
     let err_str = err.to_string();
     assert!(
         err_str.contains("image"),
-        "expected error to mention 'image', got: {}",
-        err_str
+        "expected error to mention 'image', got: {err_str}"
     );
     assert!(
         err_str.contains("string length"),
-        "expected error to mention 'string length', got: {}",
-        err_str
+        "expected error to mention 'string length', got: {err_str}"
     );
 }

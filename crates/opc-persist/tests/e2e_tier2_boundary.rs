@@ -54,7 +54,7 @@ async fn test_boundary_duplicate_rpc_frame() {
 
     let node_1_port = cluster.base_port + 10;
     let identity = cluster.identities.get(&0).unwrap().clone();
-    let mut tls_stream = connect_raw_tls(&format!("127.0.0.1:{}", node_1_port), &identity)
+    let mut tls_stream = connect_raw_tls(&format!("127.0.0.1:{node_1_port}"), &identity)
         .await
         .unwrap();
 
@@ -87,7 +87,7 @@ async fn test_boundary_connection_drop_mid_rpc() {
     sleep(Duration::from_millis(500)).await;
 
     let node_1_port = cluster.base_port + 10;
-    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", node_1_port))
+    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{node_1_port}"))
         .await
         .unwrap();
 
@@ -139,7 +139,7 @@ async fn test_boundary_slow_connection() {
 
     let node_1_port = cluster.base_port + 10;
     let identity = cluster.identities.get(&0).unwrap().clone();
-    let mut tls_stream = connect_raw_tls(&format!("127.0.0.1:{}", node_1_port), &identity)
+    let mut tls_stream = connect_raw_tls(&format!("127.0.0.1:{node_1_port}"), &identity)
         .await
         .unwrap();
 
@@ -166,7 +166,7 @@ async fn test_boundary_zero_byte_rpc() {
 
     let node_1_port = cluster.base_port + 10;
     let identity = cluster.identities.get(&0).unwrap().clone();
-    let tls_stream = connect_raw_tls(&format!("127.0.0.1:{}", node_1_port), &identity)
+    let tls_stream = connect_raw_tls(&format!("127.0.0.1:{node_1_port}"), &identity)
         .await
         .unwrap();
     drop(tls_stream);
@@ -195,7 +195,7 @@ async fn test_boundary_frame_size_exhaustion() {
 
     let node_1_port = cluster.base_port + 10;
     let identity = cluster.identities.get(&0).unwrap().clone();
-    let mut tls_stream = connect_raw_tls(&format!("127.0.0.1:{}", node_1_port), &identity)
+    let mut tls_stream = connect_raw_tls(&format!("127.0.0.1:{node_1_port}"), &identity)
         .await
         .unwrap();
 
@@ -207,9 +207,6 @@ async fn test_boundary_frame_size_exhaustion() {
     match read_res {
         Ok(0) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
-        other => panic!(
-            "Expected connection closed (EOF or UnexpectedEof), got {:?}",
-            other
-        ),
+        other => panic!("Expected connection closed (EOF or UnexpectedEof), got {other:?}"),
     }
 }

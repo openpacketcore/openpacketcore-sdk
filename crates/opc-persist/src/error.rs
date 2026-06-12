@@ -177,7 +177,7 @@ impl std::fmt::Display for PersistError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let raw = format!("{}", self.kind);
         let sanitized = sanitize_error_message(&raw);
-        write!(f, "persist error: {}", sanitized)
+        write!(f, "persist error: {sanitized}")
     }
 }
 

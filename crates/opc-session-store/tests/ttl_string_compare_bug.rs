@@ -209,7 +209,6 @@ async fn test_sqlite_lease_premature_millisecond_prune() {
 
     assert!(
         res.is_ok(),
-        "CAS should succeed because lease is still valid (100us < 900us), but got: {:?}",
-        res
+        "CAS should succeed because lease is still valid (100us < 900us), but got: {res:?}"
     );
 }

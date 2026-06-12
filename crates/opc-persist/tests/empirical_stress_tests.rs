@@ -36,8 +36,7 @@ fn generate_test_ca_and_identities(
             .push(rcgen::DnType::CommonName, "localhost");
 
         let spiffe = format!(
-            "spiffe://test/trust-domain/tenant/test/ns/default/sa/svc/nf/test/instance/{}",
-            node_id
+            "spiffe://test/trust-domain/tenant/test/ns/default/sa/svc/nf/test/instance/{node_id}"
         );
 
         node_params.subject_alt_names = vec![
@@ -145,7 +144,7 @@ async fn test_empirical_active_connections_desync_stress() {
     store.campaign().await.unwrap();
 
     let port = get_free_port();
-    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{}", port));
+    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{port}"));
     let handle = server.start().await.unwrap();
 
     // Spawn multiple tasks to cause connection spikes and disconnections.
@@ -153,7 +152,7 @@ async fn test_empirical_active_connections_desync_stress() {
 
     // 1. Spammer tasks: raw TCP stream, write garbage, close immediately.
     for _ in 0..50 {
-        let addr = format!("127.0.0.1:{}", port);
+        let addr = format!("127.0.0.1:{port}");
         tasks.push(tokio::spawn(async move {
             if let Ok(mut stream) = TcpStream::connect(&addr).await {
                 let _ = stream.write_all(b"GARBAGE").await;
@@ -165,7 +164,7 @@ async fn test_empirical_active_connections_desync_stress() {
 
     // 2. Hang tasks: raw TCP stream, connect, sleep, then close.
     for _ in 0..50 {
-        let addr = format!("127.0.0.1:{}", port);
+        let addr = format!("127.0.0.1:{port}");
         tasks.push(tokio::spawn(async move {
             if let Ok(_stream) = TcpStream::connect(&addr).await {
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -177,7 +176,7 @@ async fn test_empirical_active_connections_desync_stress() {
     // 3. Valid peer RPC tasks: correct handshake, do load_latest, close.
     let peer_identity = identities.get(&1).unwrap().clone();
     for _ in 0..50 {
-        let addr = format!("127.0.0.1:{}", port);
+        let addr = format!("127.0.0.1:{port}");
         let id_clone = peer_identity.clone();
         tasks.push(tokio::spawn(async move {
             let peer = TcpPeer::new(0, addr, std::time::Duration::from_millis(300));
@@ -242,12 +241,12 @@ async fn test_empirical_connection_rejections_no_listener_stall() {
     store.campaign().await.unwrap();
 
     let port = get_free_port();
-    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{}", port));
+    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{port}"));
     let handle = server.start().await.unwrap();
 
     // 1. Occupy all 100 connection slots.
     let mut persistent_connections = Vec::new();
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
     for _ in 0..100 {
         let stream = TcpStream::connect(&addr).await.unwrap();
         persistent_connections.push(stream);
@@ -350,9 +349,9 @@ async fn test_empirical_auth_failures_tracking() {
     store.campaign().await.unwrap();
 
     let port = get_free_port();
-    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{}", port));
+    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{port}"));
     let handle = server.start().await.unwrap();
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
 
     // Initial auth failures should be 0.
     let m0 = store.dump_metrics().await.unwrap();

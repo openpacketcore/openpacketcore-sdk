@@ -926,7 +926,7 @@ async fn test_refactored_zeroizing_decrypt_hygiene() {
             // The conflict record returned to caller must be properly decrypted
             assert_eq!(current_record.payload.as_bytes(), plaintext);
         }
-        other => panic!("expected conflict result, got {:?}", other),
+        other => panic!("expected conflict result, got {other:?}"),
     }
 }
 

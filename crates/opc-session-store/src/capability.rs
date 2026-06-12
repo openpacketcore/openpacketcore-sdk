@@ -109,7 +109,7 @@ impl std::str::FromStr for SessionStateProfile {
             "ephemeral-procedure" => Ok(Self::EphemeralProcedure),
             "read-through-cache" => Ok(Self::ReadThroughCache),
             "replicated-disaster-recovery" => Ok(Self::ReplicatedDisasterRecovery),
-            _ => Err(format!("unknown session state profile: {}", s)),
+            _ => Err(format!("unknown session state profile: {s}")),
         }
     }
 }

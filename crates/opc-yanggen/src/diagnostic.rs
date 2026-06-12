@@ -81,7 +81,7 @@ impl fmt::Display for Diagnostic {
             writeln!(f, "source: {:?}", src.to_string())?;
         }
         if let Some(ref h) = self.help {
-            writeln!(f, "help: {:?}", h)?;
+            writeln!(f, "help: {h:?}")?;
         }
         Ok(())
     }

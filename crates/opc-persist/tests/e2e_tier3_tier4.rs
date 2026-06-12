@@ -90,7 +90,7 @@ impl SnapshotPayload {
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 async fn setup_process_cluster(size: usize) -> TestCluster {
@@ -131,7 +131,7 @@ async fn setup_process_cluster(size: usize) -> TestCluster {
     let voting_members: Vec<usize> = (0..std::cmp::min(size, 3)).collect();
     for node_id in 0..size {
         let port = base_port + (node_id as u16 * 10);
-        let db_path = cluster.temp_dir.path().join(format!("node_{}.db", node_id));
+        let db_path = cluster.temp_dir.path().join(format!("node_{node_id}.db"));
         let identity = cluster.identities.get(&node_id).unwrap();
 
         let mut peers = Vec::new();
@@ -783,8 +783,7 @@ async fn test_realworld_long_running_workload() {
                     }
                 }
                 panic!(
-                    "Failed to campaign a surviving leader, last response was: {:?}, node metrics: {:?}",
-                    last_res, metrics_info
+                    "Failed to campaign a surviving leader, last response was: {last_res:?}, node metrics: {metrics_info:?}"
                 );
             };
             sleep(Duration::from_millis(1000)).await;
@@ -815,7 +814,7 @@ async fn test_realworld_long_running_workload() {
             }
             sleep(Duration::from_millis(200)).await;
         }
-        assert!(success, "failed to commit at iteration {}", v);
+        assert!(success, "failed to commit at iteration {v}");
     }
 
     // Bring all nodes back online and sync
@@ -1003,7 +1002,7 @@ async fn test_realworld_latency_starvation() {
         last_res = res;
         sleep(Duration::from_millis(200)).await;
     }
-    assert!(campaign_success, "node 1 Campaign failed: {:?}", last_res);
+    assert!(campaign_success, "node 1 Campaign failed: {last_res:?}");
     sleep(Duration::from_millis(500)).await;
 
     // Restore connections (heal partition)

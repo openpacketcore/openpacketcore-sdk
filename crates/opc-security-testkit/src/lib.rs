@@ -22,7 +22,7 @@ impl FakeCa {
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         params
             .distinguished_name
-            .push(DnType::CommonName, format!("CA for {}", trust_domain));
+            .push(DnType::CommonName, format!("CA for {trust_domain}"));
 
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&key_pair).unwrap();
@@ -175,7 +175,7 @@ pub struct FakeKms {
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
-        let _ = fmt::write(&mut s, format_args!("{:02x}", b));
+        let _ = fmt::write(&mut s, format_args!("{b:02x}"));
     }
     s
 }
@@ -307,7 +307,7 @@ async fn handle_kms_stream<S>(
                         .unwrap_or(0)
                         + 1;
 
-                    let next_kid = format!("{}-{}-r{}", purpose, tenant, next_counter);
+                    let next_kid = format!("{purpose}-{tenant}-r{next_counter}");
                     let next_bytes = vec![next_counter as u8; 32];
                     let next_hex = hex_encode(&next_bytes);
 

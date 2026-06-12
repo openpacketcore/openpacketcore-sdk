@@ -57,7 +57,7 @@ impl SbiClient {
             .host()
             .ok_or_else(|| "Missing host in URI".to_string())?;
         let port = uri.port_u16().unwrap_or(443);
-        let addr = format!("{}:{}", host, port);
+        let addr = format!("{host}:{port}");
 
         let path = uri.path();
         let service_name = safe_metric_label(path.split('/').nth(1).unwrap_or("unknown"));

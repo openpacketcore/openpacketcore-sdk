@@ -464,8 +464,7 @@ mod tests {
 
         assert!(
             matches!(event, IdentityReloadEvent::Failure { ref error } if error.contains("failed to parse") || error.contains("empty cert chain")),
-            "expected failure event with parse error, got {:?}",
-            event
+            "expected failure event with parse error, got {event:?}"
         );
 
         // Verify old identity is retained.

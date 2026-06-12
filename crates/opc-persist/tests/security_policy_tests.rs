@@ -81,8 +81,7 @@ async fn test_bootstrap_and_stage_policy() {
     let res = service.stage_policy(tenant, &principal, policy).await;
     assert!(
         res.is_ok(),
-        "Staging policy should succeed during bootstrap: {:?}",
-        res
+        "Staging policy should succeed during bootstrap: {res:?}"
     );
 }
 
@@ -102,8 +101,7 @@ async fn test_lockout_validation_fails_for_empty_policy() {
     let res = service.validate_policy(tenant, &principal).await;
     assert!(
         matches!(res, Err(SecurityPolicyError::ValidationFailed(_))),
-        "Validation must fail lockout check for policy that denies access: {:?}",
-        res
+        "Validation must fail lockout check for policy that denies access: {res:?}"
     );
 }
 
@@ -170,8 +168,7 @@ async fn test_apply_policy_rejects_stale_or_equal_version() {
     let res = service.apply_policy(tenant, &principal).await;
     assert!(
         matches!(res, Err(SecurityPolicyError::StaleVersion(_))),
-        "Apply must reject older version: {:?}",
-        res
+        "Apply must reject older version: {res:?}"
     );
 
     let policy_equal = make_valid_policy(2);
@@ -182,8 +179,7 @@ async fn test_apply_policy_rejects_stale_or_equal_version() {
     let res2 = service.apply_policy(tenant, &principal).await;
     assert!(
         matches!(res2, Err(SecurityPolicyError::StaleVersion(_))),
-        "Apply must reject equal version: {:?}",
-        res2
+        "Apply must reject equal version: {res2:?}"
     );
 }
 
@@ -318,8 +314,7 @@ async fn test_tenant_and_role_authorization_enforced() {
         .await;
     assert!(
         matches!(res_mismatch, Err(SecurityPolicyError::Unauthorized(_))),
-        "Stage policy must reject tenant mismatch: {:?}",
-        res_mismatch
+        "Stage policy must reject tenant mismatch: {res_mismatch:?}"
     );
 
     // Principal lacking role must be rejected
@@ -329,8 +324,7 @@ async fn test_tenant_and_role_authorization_enforced() {
         .await;
     assert!(
         matches!(res_unauth, Err(SecurityPolicyError::Unauthorized(_))),
-        "Stage policy must reject non-security-admin principal: {:?}",
-        res_unauth
+        "Stage policy must reject non-security-admin principal: {res_unauth:?}"
     );
 
     // inspect_active_policy and list_policy_history must enforce tenant scope and roles
@@ -342,8 +336,7 @@ async fn test_tenant_and_role_authorization_enforced() {
             res_inspect_mismatch,
             Err(SecurityPolicyError::Unauthorized(_))
         ),
-        "inspect_active_policy must reject tenant mismatch: {:?}",
-        res_inspect_mismatch
+        "inspect_active_policy must reject tenant mismatch: {res_inspect_mismatch:?}"
     );
 
     let res_history_mismatch = service
@@ -354,8 +347,7 @@ async fn test_tenant_and_role_authorization_enforced() {
             res_history_mismatch,
             Err(SecurityPolicyError::Unauthorized(_))
         ),
-        "list_policy_history must reject tenant mismatch: {:?}",
-        res_history_mismatch
+        "list_policy_history must reject tenant mismatch: {res_history_mismatch:?}"
     );
 
     let res_inspect_unauth = service
@@ -366,8 +358,7 @@ async fn test_tenant_and_role_authorization_enforced() {
             res_inspect_unauth,
             Err(SecurityPolicyError::Unauthorized(_))
         ),
-        "inspect_active_policy must reject non-security-admin principal: {:?}",
-        res_inspect_unauth
+        "inspect_active_policy must reject non-security-admin principal: {res_inspect_unauth:?}"
     );
 
     let res_history_unauth = service.list_policy_history(tenant, &normal_principal).await;
@@ -376,8 +367,7 @@ async fn test_tenant_and_role_authorization_enforced() {
             res_history_unauth,
             Err(SecurityPolicyError::Unauthorized(_))
         ),
-        "list_policy_history must reject non-security-admin principal: {:?}",
-        res_history_unauth
+        "list_policy_history must reject non-security-admin principal: {res_history_unauth:?}"
     );
 }
 
@@ -471,8 +461,7 @@ async fn test_additional_security_policy_verifications() {
         .await;
     assert!(
         matches!(res_stage, Err(SecurityPolicyError::Unauthorized(_))),
-        "Expected admin-read-only to be unauthorized to stage policy, got: {:?}",
-        res_stage
+        "Expected admin-read-only to be unauthorized to stage policy, got: {res_stage:?}"
     );
 
     // Other service accounts with similar names but not exactly "admin" or "security-admin"
@@ -482,8 +471,7 @@ async fn test_additional_security_policy_verifications() {
         .await;
     assert!(
         matches!(res_stage_lite, Err(SecurityPolicyError::Unauthorized(_))),
-        "Expected security-admin-lite to be unauthorized, got: {:?}",
-        res_stage_lite
+        "Expected security-admin-lite to be unauthorized, got: {res_stage_lite:?}"
     );
 
     // 2. Verify proper tenant isolation on read-only metadata endpoints
@@ -506,8 +494,7 @@ async fn test_additional_security_policy_verifications() {
         .await;
     assert!(
         matches!(res_inspect, Err(SecurityPolicyError::Unauthorized(_))),
-        "Expected inspect_active_policy to reject tenant mismatch, got: {:?}",
-        res_inspect
+        "Expected inspect_active_policy to reject tenant mismatch, got: {res_inspect:?}"
     );
 
     let res_history = service
@@ -515,8 +502,7 @@ async fn test_additional_security_policy_verifications() {
         .await;
     assert!(
         matches!(res_history, Err(SecurityPolicyError::Unauthorized(_))),
-        "Expected list_policy_history to reject tenant mismatch, got: {:?}",
-        res_history
+        "Expected list_policy_history to reject tenant mismatch, got: {res_history:?}"
     );
 
     // 3. Database transaction commit failures correctly trigger audit events
@@ -651,7 +637,6 @@ async fn test_security_policy_audit_corruption_fails_closed() {
         .await;
     assert!(
         matches!(res, Err(SecurityPolicyError::Internal)),
-        "corrupt audit HMAC length must fail closed, got: {:?}",
-        res
+        "corrupt audit HMAC length must fail closed, got: {res:?}"
     );
 }

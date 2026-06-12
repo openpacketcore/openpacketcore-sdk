@@ -123,7 +123,7 @@ pub fn redact_error<E: std::fmt::Display>(e: E) -> PersistError {
     {
         PersistError::io("RPC operation failed with redacted safety error")
     } else {
-        PersistError::io(format!("RPC operation failed: {}", err_str))
+        PersistError::io(format!("RPC operation failed: {err_str}"))
     }
 }
 
@@ -179,14 +179,14 @@ async fn send_rpc_once(
 
     let host = peer.addr.split(':').next().unwrap_or("127.0.0.1");
     let server_name = ServerName::try_from(host)
-        .map_err(|e| redact_error(PersistError::io(format!("invalid server name: {}", e))))?
+        .map_err(|e| redact_error(PersistError::io(format!("invalid server name: {e}"))))?
         .to_owned();
 
     let tls_stream_future = connector.connect(server_name, tcp_stream);
     let mut stream = tokio::time::timeout(timeout_dur, tls_stream_future)
         .await
         .map_err(|_| redact_error(PersistError::io("TLS handshake timeout")))?
-        .map_err(|e| redact_error(PersistError::io(format!("TLS handshake failed: {}", e))))?;
+        .map_err(|e| redact_error(PersistError::io(format!("TLS handshake failed: {e}"))))?;
 
     let auth_req = {
         let auth_guard = peer.auth_info.lock().await;
@@ -480,7 +480,7 @@ impl TcpRpcServer {
                                             tracing::debug!("server TLS handshake failed: {}", e);
                                             store.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
                                             store.metrics.server_rejected_connections.fetch_add(1, Ordering::Relaxed);
-                                            redact_error(PersistError::io(format!("TLS handshake failed: {}", e)))
+                                            redact_error(PersistError::io(format!("TLS handshake failed: {e}")))
                                         })?;
 
                                         Self::handle_connection(tls_stream, &store).await
@@ -708,7 +708,7 @@ impl TcpRpcServer {
                 .metrics
                 .server_rejected_connections
                 .fetch_add(1, Ordering::Relaxed);
-            PersistError::inconsistent_state(format!("failed to parse client certificate: {}", e))
+            PersistError::inconsistent_state(format!("failed to parse client certificate: {e}"))
         })?;
 
         let cert_valid = x509.validity().is_valid();

@@ -307,8 +307,7 @@ fn generate_unique_check(
             }
             let child = unique_node.ok_or_else(|| {
                 RustGenerationError::new(format!(
-                    "unique field '{}' not found in child paths",
-                    cleaned
+                    "unique field '{cleaned}' not found in child paths"
                 ))
             })?;
 
@@ -439,7 +438,7 @@ fn generate_leafref_check(
         .iter()
         .find(|n| n.path == target_path)
         .ok_or_else(|| {
-            RustGenerationError::new(format!("leafref target node '{}' not found", target_path))
+            RustGenerationError::new(format!("leafref target node '{target_path}' not found"))
         })?;
 
     let is_target_sensitive = super::types::is_sensitive_node(target_node);
@@ -678,7 +677,7 @@ fn resolve_path_node(
     let target_node = nodes
         .iter()
         .find(|n| n.path == target_path)
-        .ok_or_else(|| format!("target node '{}' not found", target_path))?;
+        .ok_or_else(|| format!("target node '{target_path}' not found"))?;
     match path.anchor {
         PathAnchor::Current => find_node_by_path_segments(target_node, &path.segments, nodes),
         PathAnchor::Root => {
@@ -703,7 +702,7 @@ fn resolve_path_node(
             let parent_node = nodes
                 .iter()
                 .find(|n| n.path == parent_path)
-                .ok_or_else(|| format!("parent of '{}' not found", target_path))?;
+                .ok_or_else(|| format!("parent of '{target_path}' not found"))?;
             find_node_by_path_segments(parent_node, &path.segments, nodes)
         }
     }
@@ -757,8 +756,7 @@ fn evaluate_expr(
             let resolved_node =
                 resolve_path_node(target_path, path, &input.nodes).map_err(|e| {
                     RustGenerationError::new(format!(
-                        "must/when constraints path resolution error: {}",
-                        e
+                        "must/when constraints path resolution error: {e}"
                     ))
                 })?;
             let access = generate_path_access(&resolved_node, context_path, input);
@@ -773,12 +771,10 @@ fn evaluate_expr(
                 } else {
                     Ok(quote! { #access.as_option() })
                 }
+            } else if is_custom_wrapper {
+                Ok(quote! { #access.as_ref().map(|x| x.0) })
             } else {
-                if is_custom_wrapper {
-                    Ok(quote! { #access.as_ref().map(|x| x.0) })
-                } else {
-                    Ok(quote! { #access.as_ref() })
-                }
+                Ok(quote! { #access.as_ref() })
             }
         }
         ConstraintExpr::Compare { op, left, right } => {
@@ -927,10 +923,7 @@ fn evaluate_expr(
                 if let ConstraintExpr::Path(path) = &func.args[0] {
                     let resolved_node = resolve_path_node(target_path, path, &input.nodes)
                         .map_err(|e| {
-                            RustGenerationError::new(format!(
-                                "count() path resolution error: {}",
-                                e
-                            ))
+                            RustGenerationError::new(format!("count() path resolution error: {e}"))
                         })?;
                     let field_name = clean_segment(last_segment(&resolved_node.path));
                     let field_ident = format_ident!("{}", to_snake_case(field_name));
@@ -968,7 +961,7 @@ fn evaluate_expr(
                     .iter()
                     .find(|n| n.path == target_path)
                     .ok_or_else(|| {
-                        RustGenerationError::new(format!("target node '{}' not found", target_path))
+                        RustGenerationError::new(format!("target node '{target_path}' not found"))
                     })?;
                 let access = generate_path_access(resolved_node, context_path, input);
                 let is_custom_wrapper = matches!(
@@ -981,12 +974,10 @@ fn evaluate_expr(
                     } else {
                         Ok(quote! { #access.as_option() })
                     }
+                } else if is_custom_wrapper {
+                    Ok(quote! { #access.as_ref().map(|x| x.0) })
                 } else {
-                    if is_custom_wrapper {
-                        Ok(quote! { #access.as_ref().map(|x| x.0) })
-                    } else {
-                        Ok(quote! { #access.as_ref() })
-                    }
+                    Ok(quote! { #access.as_ref() })
                 }
             }
             _ => Err(RustGenerationError::new(format!(

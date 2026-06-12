@@ -40,7 +40,7 @@ fn make_audit_record(tx_id: TxId, sequence: u32, path: &str) -> AuditRecord {
 async fn setup_replicas(temp_dir: &TempDir) -> Vec<FencedReplica> {
     let mut replicas = Vec::new();
     for i in 0..3 {
-        let db_path = temp_dir.path().join(format!("replica_{}.db", i));
+        let db_path = temp_dir.path().join(format!("replica_{i}.db"));
         let backend = SqliteBackend::open(&db_path, true, 0)
             .await
             .expect("open backend");
@@ -203,7 +203,7 @@ async fn test_restart_rejoin_monotonicity() {
 
     // 1. Initial run: create 3 replicas
     let db_paths: Vec<_> = (0..3)
-        .map(|i| temp_dir.path().join(format!("replica_{}.db", i)))
+        .map(|i| temp_dir.path().join(format!("replica_{i}.db")))
         .collect();
     let mut replicas = Vec::new();
     for (i, path) in db_paths.iter().enumerate() {

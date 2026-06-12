@@ -240,7 +240,7 @@ pub fn schema_digest_from_canonical(canonical: &CanonicalInput) -> String {
     let canonical_str = serde_json::to_string(&canonical_json)
         .expect("canonical JSON serialization of plain data types");
     let hash = fnv1a64(canonical_str.as_bytes());
-    format!("fnv1a64:{:016x}", hash)
+    format!("fnv1a64:{hash:016x}")
 }
 
 fn format_constraint_expr_inner(expr: &ConstraintExpr, depth: u16) -> String {
@@ -249,7 +249,7 @@ fn format_constraint_expr_inner(expr: &ConstraintExpr, depth: u16) -> String {
     }
     match expr {
         ConstraintExpr::Literal(lit) => match lit {
-            Literal::String(s) => format!("'{}'", s),
+            Literal::String(s) => format!("'{s}'"),
             Literal::Number(n) => n.to_string(),
             Literal::Bool(b) => b.to_string(),
         },
@@ -575,8 +575,7 @@ pub fn emit_fixture_from_canonical(canonical: &CanonicalInput) -> String {
     out.push_str(&format!("profile {}", canonical.profile.generation));
     if let Some(lockfile_profile) = &canonical.profile.lockfile_mismatch {
         out.push_str(&format!(
-            " lockfile-profile={} mismatch=true",
-            lockfile_profile
+            " lockfile-profile={lockfile_profile} mismatch=true"
         ));
     }
     out.push('\n');
@@ -630,23 +629,23 @@ pub fn emit_fixture_from_canonical(canonical: &CanonicalInput) -> String {
             Some(TypeRef::Int64) => "int64".to_string(),
             Some(TypeRef::Decimal64) => "decimal64".to_string(),
             Some(TypeRef::Empty) => "empty".to_string(),
-            Some(TypeRef::IdentityRef { base }) => format!("identityref(base={})", base),
-            Some(TypeRef::LeafRef { target_path }) => format!("leafref(target={})", target_path),
-            Some(TypeRef::Custom { name }) => format!("custom(name={})", name),
+            Some(TypeRef::IdentityRef { base }) => format!("identityref(base={base})"),
+            Some(TypeRef::LeafRef { target_path }) => format!("leafref(target={target_path})"),
+            Some(TypeRef::Custom { name }) => format!("custom(name={name})"),
         };
 
         let mut extra = String::new();
         if let Some(ref d) = node.default {
-            extra.push_str(&format!(" default={}", d));
+            extra.push_str(&format!(" default={d}"));
         }
         if let Some(ref p) = node.presence {
-            extra.push_str(&format!(" presence={}", p));
+            extra.push_str(&format!(" presence={p}"));
         }
         if let Some(ref o) = node.ordered_by {
-            extra.push_str(&format!(" ordered-by={}", o));
+            extra.push_str(&format!(" ordered-by={o}"));
         }
         if let Some(ref dc) = node.data_class {
-            extra.push_str(&format!(" data-class={}", dc));
+            extra.push_str(&format!(" data-class={dc}"));
         }
         if !node.unique_constraints.is_empty() {
             let unique_strs: Vec<String> = node

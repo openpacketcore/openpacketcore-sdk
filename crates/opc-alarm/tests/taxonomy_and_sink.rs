@@ -191,7 +191,7 @@ async fn test_bounded_alarm_sink_retry_exhaustion() {
     let err = bounded.send(make_dummy_alarm()).await.unwrap_err();
     match err {
         AlarmSinkError::RetryExhausted(msg) => assert!(msg.contains("mock failure")),
-        other => panic!("expected RetryExhausted, got {:?}", other),
+        other => panic!("expected RetryExhausted, got {other:?}"),
     }
 }
 
@@ -223,7 +223,7 @@ async fn test_bounded_alarm_sink_redacts_retry_error() {
             assert!(!msg.contains("/Users/alice"));
             assert!(!msg.contains("208950000000001"));
         }
-        other => panic!("expected RetryExhausted, got {:?}", other),
+        other => panic!("expected RetryExhausted, got {other:?}"),
     }
 }
 

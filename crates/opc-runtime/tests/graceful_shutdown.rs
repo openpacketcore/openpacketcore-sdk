@@ -339,8 +339,7 @@ async fn test_sigterm_triggers_graceful_shutdown_impl() {
     let elapsed = start_instant.elapsed();
     assert!(
         elapsed < Duration::from_millis(600),
-        "Full graceful shutdown from SIGTERM took {:?}, exceeding the configured drain deadline",
-        elapsed
+        "Full graceful shutdown from SIGTERM took {elapsed:?}, exceeding the configured drain deadline"
     );
 }
 
@@ -649,8 +648,7 @@ async fn test_phase_ready_timing_race_prevention() {
     // and since task-delayed is not ready, the runtime phase will remain at PeerWarmup.
     assert!(
         !phases_snapshot.contains(&RuntimePhase::Ready),
-        "BUG: Runtime phase transitioned to Ready before all caller tasks finished spawning and became ready! Phases seen: {:?}",
-        phases_snapshot
+        "BUG: Runtime phase transitioned to Ready before all caller tasks finished spawning and became ready! Phases seen: {phases_snapshot:?}"
     );
 }
 
@@ -745,8 +743,7 @@ async fn test_degrade_count_recovery() {
     let health = supervisor.health().await;
     assert_eq!(
         health.degrade_count, 0,
-        "degrade_count must be 0 after recovery. Health: {:?}",
-        health
+        "degrade_count must be 0 after recovery. Health: {health:?}"
     );
 }
 
@@ -852,7 +849,7 @@ async fn test_high_concurrency_stress() {
     for i in 0..num_tasks {
         let supervisor = supervisor.clone();
         let barrier = barrier.clone();
-        let name = opc_runtime::TaskName::new(format!("stress-task-{}", i));
+        let name = opc_runtime::TaskName::new(format!("stress-task-{i}"));
         let restart_policy = RestartPolicy {
             max_restarts: 10,
             window_secs: 5,
@@ -1304,13 +1301,11 @@ async fn test_multiple_failing_drain_hooks_aggregated_alarm_impl() {
     let alarm_text = active[0].text.as_str();
     assert!(
         alarm_text.contains("first hook failure"),
-        "Alarm text must contain the first hook failure: {}",
-        alarm_text
+        "Alarm text must contain the first hook failure: {alarm_text}"
     );
     assert!(
         alarm_text.contains("second hook failure"),
-        "Alarm text must contain the second hook failure: {}",
-        alarm_text
+        "Alarm text must contain the second hook failure: {alarm_text}"
     );
 
     // Confirm that the shutdown continues to Stopped phase
@@ -1378,8 +1373,7 @@ async fn test_mixed_drain_hooks_executes_all_and_raises_alarm_impl() {
     let alarm_text = active[0].text.as_str();
     assert!(
         alarm_text.contains("failed hook in mixed setup"),
-        "Alarm text must contain the failure details: {}",
-        alarm_text
+        "Alarm text must contain the failure details: {alarm_text}"
     );
 
     // Confirm that the shutdown continues to Stopped phase
@@ -1404,8 +1398,7 @@ async fn test_required_nrf_drain_hook_missing_fails_in_production_impl() {
     let err_str = err.to_string();
     assert!(
         err_str.contains("missing required drain hook: NrfDrainHook"),
-        "Error message should mention NrfDrainHook: {}",
-        err_str
+        "Error message should mention NrfDrainHook: {err_str}"
     );
 }
 

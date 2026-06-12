@@ -368,7 +368,7 @@ where
         };
         let meta: PersistedMetadata =
             serde_json::from_str(&stored.record.principal).map_err(|e| {
-                StoreError::internal(format!("failed to deserialize principal metadata: {}", e))
+                StoreError::internal(format!("failed to deserialize principal metadata: {e}"))
             })?;
 
         let mut recovery_required = meta.recovery_required;
@@ -443,7 +443,7 @@ where
             .map_err(|e| StoreError::internal(e.to_string()))?;
         let meta: PersistedMetadata =
             serde_json::from_str(&stored.record.principal).map_err(|e| {
-                StoreError::internal(format!("failed to deserialize principal metadata: {}", e))
+                StoreError::internal(format!("failed to deserialize principal metadata: {e}"))
             })?;
 
         let mut recovery_required = meta.recovery_required;
@@ -1177,8 +1177,7 @@ async fn test_fault_injection_task_never_completes_shutdown() {
         active_alarms
             .iter()
             .any(|alarm| { alarm.alarm_type.as_str() == "fault-inj-cnf.runtime.drain.incomplete" }),
-        "Expected drain incomplete alarm to be raised, active alarms: {:?}",
-        active_alarms
+        "Expected drain incomplete alarm to be raised, active alarms: {active_alarms:?}"
     );
 }
 
@@ -1250,8 +1249,7 @@ async fn test_fault_injection_task_stops_making_progress() {
                 && alarm.probable_cause
                     == ProbableCause::Other("opc-runtime.task-failure".to_string())
         }),
-        "Expected hung task critical alarm to be raised, active: {:?}",
-        active_alarms
+        "Expected hung task critical alarm to be raised, active: {active_alarms:?}"
     );
 
     // Verify task is marked failed in health (it is aborted/not running)
@@ -1399,8 +1397,7 @@ async fn test_fault_injection_memory_budget_pressure() {
                 && alarm.probable_cause
                     == ProbableCause::Other("opc-runtime.memory-budget-exceeded".to_string())
         }),
-        "Expected memory budget exhausted alarm to be raised, active: {:?}",
-        active_alarms
+        "Expected memory budget exhausted alarm to be raised, active: {active_alarms:?}"
     );
 
     // Assert that spawning a new task fails closed due to budget pressure
@@ -1421,8 +1418,7 @@ async fn test_fault_injection_memory_budget_pressure() {
     let err_str = spawn_res.unwrap_err().to_string();
     assert!(
         err_str.contains("Resource budget limit exceeded: memory pressure"),
-        "Wrong error: {}",
-        err_str
+        "Wrong error: {err_str}"
     );
     assert_eq!(
         METRICS.runtime_budget_exhausted.load(Ordering::Relaxed),

@@ -444,25 +444,21 @@ async fn test_consensus_metrics_leak_prevention() {
 
     assert!(
         !serialized.contains("spiffe://"),
-        "Metrics leak SPIFFE IDs: {}",
-        serialized
+        "Metrics leak SPIFFE IDs: {serialized}"
     );
 
     assert!(
         !serialized.contains("-----BEGIN"),
-        "Metrics leak certificates: {}",
-        serialized
+        "Metrics leak certificates: {serialized}"
     );
 
     assert!(
         !serialized.contains('/'),
-        "Metrics leak UNIX paths: {}",
-        serialized
+        "Metrics leak UNIX paths: {serialized}"
     );
     assert!(
         !serialized.contains('\\'),
-        "Metrics leak Windows paths: {}",
-        serialized
+        "Metrics leak Windows paths: {serialized}"
     );
 }
 
@@ -505,12 +501,12 @@ async fn test_consensus_active_connections_and_limit() {
         .unwrap();
 
     let port = get_free_port();
-    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{}", port));
+    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{port}"));
     let handle = server.start().await.unwrap();
 
     let mut connections = Vec::new();
     for _ in 0..100 {
-        let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await;
+        let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await;
         if let Ok(s) = stream {
             connections.push(s);
         }
@@ -522,7 +518,7 @@ async fn test_consensus_active_connections_and_limit() {
     assert_eq!(m.server_active_connections, connections.len() as u64);
     assert_eq!(m.server_rejected_connections, 0);
 
-    let extra_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+    let extra_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .unwrap();
 
@@ -574,12 +570,12 @@ async fn test_consensus_active_connections_handshake_timeout_recovery() {
         .unwrap();
 
     let port = get_free_port();
-    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{}", port));
+    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{port}"));
     let handle = server.start().await.unwrap();
 
     let mut connections = Vec::new();
     for _ in 0..100 {
-        let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await;
+        let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await;
         if let Ok(s) = stream {
             connections.push(s);
         }
@@ -591,7 +587,7 @@ async fn test_consensus_active_connections_handshake_timeout_recovery() {
     assert_eq!(m.server_active_connections, 100);
     assert_eq!(m.server_rejected_connections, 0);
 
-    let extra_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+    let extra_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .unwrap();
 
@@ -607,7 +603,7 @@ async fn test_consensus_active_connections_handshake_timeout_recovery() {
     assert_eq!(m3.server_rejected_connections, 101);
     assert!(m3.auth_failures >= 100);
 
-    let new_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+    let new_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -653,13 +649,13 @@ async fn test_consensus_active_connections_stress_concurrency() {
         .unwrap();
 
     let port = get_free_port();
-    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{}", port));
+    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{port}"));
     let handle = server.start().await.unwrap();
 
     let mut connections = Vec::new();
     let mut connect_errors = 0;
     for _ in 0..200 {
-        match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await {
+        match tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await {
             Ok(stream) => {
                 connections.push(stream);
             }

@@ -55,12 +55,10 @@ pub fn evaluate_threshold(
         } else {
             RegressionStatus::Regression
         }
+    } else if current_value >= threshold {
+        RegressionStatus::Pass
     } else {
-        if current_value >= threshold {
-            RegressionStatus::Pass
-        } else {
-            RegressionStatus::Regression
-        }
+        RegressionStatus::Regression
     }
 }
 

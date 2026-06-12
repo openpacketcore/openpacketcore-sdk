@@ -57,7 +57,7 @@ pub fn make_audit_record(tx_id: TxId, sequence: u32, path: &str) -> AuditRecord 
 pub async fn setup_consensus_group(temp_dir: &TempDir) -> Vec<Arc<ConsensusConfigStore>> {
     let mut backends = Vec::new();
     for i in 0..3 {
-        let db_path = temp_dir.path().join(format!("consensus_{}.db", i));
+        let db_path = temp_dir.path().join(format!("consensus_{i}.db"));
         let backend = SqliteBackend::open_with_audit_key(&db_path, true, 0, test_audit_key())
             .await
             .expect("open backend");
@@ -121,8 +121,7 @@ pub fn generate_test_ca_and_identities(
             .push(rcgen::DnType::CommonName, "localhost");
 
         let spiffe = format!(
-            "spiffe://test/trust-domain/tenant/test/ns/default/sa/svc/nf/test/instance/{}",
-            node_id
+            "spiffe://test/trust-domain/tenant/test/ns/default/sa/svc/nf/test/instance/{node_id}"
         );
 
         node_params.subject_alt_names = vec![
@@ -297,7 +296,7 @@ pub async fn send_tls_rpc(
 ) -> Result<serde_json::Value, String> {
     let mut tls_stream = connect_raw_tls(addr, client_identity)
         .await
-        .map_err(|e| format!("Failed to connect: {}", e))?;
+        .map_err(|e| format!("Failed to connect: {e}"))?;
     let auth_req = AuthenticatedRequest {
         sender_node_id: sender_id,
         target_node_id: target_id,
@@ -313,21 +312,21 @@ pub async fn send_tls_rpc(
     tls_stream
         .write_all(&payload)
         .await
-        .map_err(|e| format!("Failed to write: {}", e))?;
+        .map_err(|e| format!("Failed to write: {e}"))?;
 
     let mut len_buf = [0u8; 4];
     tls_stream
         .read_exact(&mut len_buf)
         .await
-        .map_err(|e| format!("Failed to read length: {}", e))?;
+        .map_err(|e| format!("Failed to read length: {e}"))?;
     let len = u32::from_be_bytes(len_buf) as usize;
     let mut resp_buf = vec![0u8; len];
     tls_stream
         .read_exact(&mut resp_buf)
         .await
-        .map_err(|e| format!("Failed to read body: {}", e))?;
-    let resp: serde_json::Value = serde_json::from_slice(&resp_buf)
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
+        .map_err(|e| format!("Failed to read body: {e}"))?;
+    let resp: serde_json::Value =
+        serde_json::from_slice(&resp_buf).map_err(|e| format!("Failed to parse response: {e}"))?;
     Ok(resp)
 }
 
@@ -366,7 +365,7 @@ impl SnapshotPayload {
 }
 
 pub fn encode_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub async fn setup_process_cluster(size: usize) -> TestCluster {
@@ -405,7 +404,7 @@ pub async fn setup_process_cluster(size: usize) -> TestCluster {
     let voting_members: Vec<usize> = (0..std::cmp::min(size, 3)).collect();
     for node_id in 0..size {
         let port = base_port + (node_id as u16 * 10);
-        let db_path = cluster.temp_dir.path().join(format!("node_{}.db", node_id));
+        let db_path = cluster.temp_dir.path().join(format!("node_{node_id}.db"));
         let identity = cluster.identities.get(&node_id).unwrap();
 
         let mut peers = Vec::new();

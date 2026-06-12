@@ -55,8 +55,7 @@ async fn test_virtual_time_lease_takeover_success() {
 
     assert!(
         takeover_result.is_ok(),
-        "Expected takeover to succeed, but got: {:?}",
-        takeover_result
+        "Expected takeover to succeed, but got: {takeover_result:?}"
     );
 }
 
@@ -217,8 +216,7 @@ async fn test_clock_skew_and_jumps_determinism() {
                 takeover_result,
                 Err(opc_session_store::LeaseError::AlreadyHeld)
             ),
-            "Expected AlreadyHeld, got: {:?}",
-            takeover_result
+            "Expected AlreadyHeld, got: {takeover_result:?}"
         );
 
         // 3. Simulate clock jump: time moves FORWARD by 20 seconds from base_time.
@@ -236,8 +234,7 @@ async fn test_clock_skew_and_jumps_determinism() {
 
         assert!(
             takeover_result.is_ok(),
-            "Expected takeover to succeed, but got: {:?}",
-            takeover_result
+            "Expected takeover to succeed, but got: {takeover_result:?}"
         );
         let fresh_lease = takeover_result.unwrap();
         assert_eq!(fresh_lease.owner().as_str(), "owner-b");
@@ -322,8 +319,7 @@ async fn test_expired_lease_cas_rejection_with_injected_clock() {
 
         assert!(
             matches!(cas_res, Err(opc_session_store::StoreError::LeaseExpired)),
-            "Expected StoreError::LeaseExpired, got: {:?}",
-            cas_res
+            "Expected StoreError::LeaseExpired, got: {cas_res:?}"
         );
     }
 
@@ -386,7 +382,7 @@ async fn test_concurrency_lease_takeover_race() {
                 backend_clone
                     .acquire(
                         &key_clone,
-                        OwnerId::new(format!("owner-{}", i)).unwrap(),
+                        OwnerId::new(format!("owner-{i}")).unwrap(),
                         Duration::from_secs(10),
                     )
                     .await
@@ -401,7 +397,7 @@ async fn test_concurrency_lease_takeover_race() {
             match res {
                 Ok(_) => success_count += 1,
                 Err(opc_session_store::LeaseError::AlreadyHeld) => held_count += 1,
-                Err(other) => panic!("Unexpected error during concurrent acquire: {:?}", other),
+                Err(other) => panic!("Unexpected error during concurrent acquire: {other:?}"),
             }
         }
 

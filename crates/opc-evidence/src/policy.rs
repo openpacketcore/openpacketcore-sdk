@@ -143,8 +143,7 @@ impl<'a> GateEvaluator<'a> {
             let report: crate::data_governance::DataGovernanceEvidenceReport =
                 serde_json::from_str(dg_str).map_err(|e| {
                     EvidenceError::GapGateFailed(format!(
-                        "malformed data governance report JSON: {}",
-                        e
+                        "malformed data governance report JSON: {e}"
                     ))
                 })?;
             report.validate().map_err(EvidenceError::GapGateFailed)?;
@@ -181,15 +180,14 @@ impl<'a> GateEvaluator<'a> {
         if let Some(prov_str) = provenance {
             let prov: crate::provenance::ProvenanceStatement = serde_json::from_str(prov_str)
                 .map_err(|e| {
-                    EvidenceError::GapGateFailed(format!("malformed provenance JSON: {}", e))
+                    EvidenceError::GapGateFailed(format!("malformed provenance JSON: {e}"))
                 })?;
             let prov_commit = &prov.predicate.invocation.environment.git_commit;
 
             if let Some(ref expected) = self.policy.expected_git_commit {
                 if prov_commit != expected {
                     return Err(EvidenceError::GapGateFailed(format!(
-                        "provenance git commit '{}' does not match expected '{}'",
-                        prov_commit, expected
+                        "provenance git commit '{prov_commit}' does not match expected '{expected}'"
                     )));
                 }
             }

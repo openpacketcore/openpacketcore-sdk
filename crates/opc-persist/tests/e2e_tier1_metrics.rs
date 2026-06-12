@@ -201,7 +201,7 @@ async fn test_metrics_error_redaction() {
     let expired_identity = generate_custom_identity(&ca_cert, &ca_key_pair, spiffe, true);
 
     let node_0_port = cluster.base_port;
-    let conn_res = connect_raw_tls(&format!("127.0.0.1:{}", node_0_port), &expired_identity).await;
+    let conn_res = connect_raw_tls(&format!("127.0.0.1:{node_0_port}"), &expired_identity).await;
 
     if let Ok(mut tls_stream) = conn_res {
         let req = json!({

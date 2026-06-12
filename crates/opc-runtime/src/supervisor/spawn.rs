@@ -51,8 +51,7 @@ pub(crate) fn check_budget_limits_impl(
             })),
         );
         return Err(RuntimeError::Supervisor(format!(
-            "Resource budget limit exceeded: max tasks limit reached (limit {})",
-            max_tasks
+            "Resource budget limit exceeded: max tasks limit reached (limit {max_tasks})"
         )));
     }
 
@@ -90,8 +89,7 @@ pub(crate) fn check_budget_limits_impl(
                     })),
                 );
                 return Err(RuntimeError::Supervisor(format!(
-                    "Resource budget limit exceeded: memory pressure (limit {} bytes)",
-                    max_heap
+                    "Resource budget limit exceeded: memory pressure (limit {max_heap} bytes)"
                 )));
             }
         }
@@ -177,8 +175,7 @@ pub(crate) async fn register_impl(
     let mut tasks = supervisor.tasks.write().await;
     if tasks.contains_key(&name) {
         return Err(RuntimeError::Supervisor(format!(
-            "task {} already registered",
-            name
+            "task {name} already registered"
         )));
     }
 
@@ -232,8 +229,7 @@ pub(crate) async fn register_spec_impl(
     let name = spec.name;
     if tasks.contains_key(&name) {
         return Err(RuntimeError::Supervisor(format!(
-            "task {} already registered",
-            name
+            "task {name} already registered"
         )));
     }
 
@@ -358,8 +354,7 @@ pub(crate) async fn spawn_internal_impl(
             if let Some(ref handle) = existing.handle {
                 if handle.is_running() {
                     return Err(RuntimeError::Supervisor(format!(
-                        "task {} already running",
-                        name
+                        "task {name} already running"
                     )));
                 }
             }

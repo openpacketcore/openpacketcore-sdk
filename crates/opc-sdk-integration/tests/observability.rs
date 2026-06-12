@@ -102,13 +102,11 @@ impl opc_alarm::AlarmAuditSink for SuccessAuditSink {
 async fn send_admin_request(addr: SocketAddr, path: &str, token: Option<&str>) -> String {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let auth_hdr = match token {
-        Some(tok) => format!("Authorization: Bearer {}\r\n", tok),
+        Some(tok) => format!("Authorization: Bearer {tok}\r\n"),
         None => String::new(),
     };
-    let req = format!(
-        "GET {} HTTP/1.1\r\n{}Host: localhost\r\nConnection: close\r\n\r\n",
-        path, auth_hdr
-    );
+    let req =
+        format!("GET {path} HTTP/1.1\r\n{auth_hdr}Host: localhost\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.unwrap();
 
     let mut resp = Vec::new();
@@ -377,10 +375,8 @@ async fn test_admin_http_routes() {
     // 8. Request header size bound (431 Request Header Fields Too Large)
     let mut stream_431 = tokio::net::TcpStream::connect(local_addr).await.unwrap();
     let long_headers = "A".repeat(9 * 1024);
-    let req_431 = format!(
-        "GET /livez HTTP/1.1\r\nHost: localhost\r\n{}: value\r\n\r\n",
-        long_headers
-    );
+    let req_431 =
+        format!("GET /livez HTTP/1.1\r\nHost: localhost\r\n{long_headers}: value\r\n\r\n");
     stream_431.write_all(req_431.as_bytes()).await.unwrap();
     let mut resp_431 = Vec::new();
     let _ = stream_431.read_to_end(&mut resp_431).await;

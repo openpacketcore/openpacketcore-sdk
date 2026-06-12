@@ -33,8 +33,7 @@ pub fn generate_test_ca_and_identities(
             .push(rcgen::DnType::CommonName, "localhost");
 
         let spiffe = format!(
-            "spiffe://test/trust-domain/tenant/test/ns/default/sa/svc/nf/test/instance/{}",
-            node_id
+            "spiffe://test/trust-domain/tenant/test/ns/default/sa/svc/nf/test/instance/{node_id}"
         );
 
         node_params.subject_alt_names = vec![
@@ -158,7 +157,7 @@ pub async fn setup_tcp_consensus_group(
 
     let mut backends = Vec::new();
     for i in 0..3 {
-        let db_path = temp_dir.path().join(format!("tcp_consensus_{}.db", i));
+        let db_path = temp_dir.path().join(format!("tcp_consensus_{i}.db"));
         let backend = SqliteBackend::open_with_audit_key(&db_path, true, 0, test_audit_key())
             .await
             .expect("open backend");
@@ -169,7 +168,7 @@ pub async fn setup_tcp_consensus_group(
     let free_ports = get_free_ports(3);
     let mut addrs = Vec::new();
     for port in free_ports {
-        addrs.push(format!("127.0.0.1:{}", port));
+        addrs.push(format!("127.0.0.1:{port}"));
     }
 
     for i in 0..3 {

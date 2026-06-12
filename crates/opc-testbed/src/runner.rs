@@ -242,7 +242,7 @@ impl KindRunner {
             self.config.namespace
         ));
         for line in scenario_yaml.lines() {
-            manifests.push_str(&format!("    {}\n", line));
+            manifests.push_str(&format!("    {line}\n"));
         }
         manifests.push_str("---\n");
 
@@ -347,8 +347,7 @@ impl HardwareLabRunner {
         plan.push_str("Nodes to Provision:\n");
         for name in scenario.topology.nfs.keys() {
             plan.push_str(&format!(
-                "- Provisioning hardware resources for NF: {}\n",
-                name
+                "- Provisioning hardware resources for NF: {name}\n"
             ));
         }
 

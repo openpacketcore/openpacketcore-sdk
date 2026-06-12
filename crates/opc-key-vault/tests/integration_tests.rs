@@ -76,7 +76,7 @@ impl MockVault {
         });
 
         Self {
-            url: url::Url::parse(&format!("http://127.0.0.1:{}/", port)).unwrap(),
+            url: url::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap(),
             requests,
         }
     }

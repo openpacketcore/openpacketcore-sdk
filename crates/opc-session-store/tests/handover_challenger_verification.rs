@@ -128,8 +128,7 @@ async fn test_target_stale_lease_rejection() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::Store(StoreError::StaleFence))),
-        "Expected StoreError::StaleFence, got {:?}",
-        res
+        "Expected StoreError::StaleFence, got {res:?}"
     );
 
     // Try to mark prepared using active lease_t2 -> should succeed
@@ -148,8 +147,7 @@ async fn test_target_stale_lease_rejection() {
             Err(HandoverError::FencingMismatch { .. })
                 | Err(HandoverError::Store(StoreError::StaleFence))
         ),
-        "Expected FencingMismatch or StaleFence, got {:?}",
-        res
+        "Expected FencingMismatch or StaleFence, got {res:?}"
     );
 
     // Try to activate using active lease_t2 -> should succeed
@@ -168,8 +166,7 @@ async fn test_target_stale_lease_rejection() {
             Err(HandoverError::FencingMismatch { .. })
                 | Err(HandoverError::Store(StoreError::StaleFence))
         ),
-        "Expected FencingMismatch or StaleFence, got {:?}",
-        res
+        "Expected FencingMismatch or StaleFence, got {res:?}"
     );
 
     // Try to complete using active lease_t2 -> should succeed
@@ -236,8 +233,7 @@ async fn test_source_stale_lease_rejection() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::Store(StoreError::StaleFence))),
-        "Expected StoreError::StaleFence, got {:?}",
-        res
+        "Expected StoreError::StaleFence, got {res:?}"
     );
 
     // Call prepare_handover using S2 -> should succeed
@@ -327,8 +323,7 @@ async fn test_lease_expiration_during_handover_operations() {
             .await;
         assert!(
             matches!(res, Err(HandoverError::Store(StoreError::LeaseExpired))),
-            "Expected StoreError::LeaseExpired, got {:?}",
-            res
+            "Expected StoreError::LeaseExpired, got {res:?}"
         );
     }
 }
@@ -395,8 +390,7 @@ async fn test_abort_and_finalize_stale_lease_rejection() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::Store(StoreError::StaleFence))),
-        "Expected StoreError::StaleFence, got {:?}",
-        res
+        "Expected StoreError::StaleFence, got {res:?}"
     );
 
     // S aborts using S2 -> should succeed (phase becomes Aborting)
@@ -420,8 +414,7 @@ async fn test_abort_and_finalize_stale_lease_rejection() {
         .await;
     assert!(
         matches!(res, Err(HandoverError::Store(StoreError::StaleFence))),
-        "Expected StoreError::StaleFence, got {:?}",
-        res
+        "Expected StoreError::StaleFence, got {res:?}"
     );
 
     // S finalizes abort using S3 -> should succeed (phase becomes Stable)

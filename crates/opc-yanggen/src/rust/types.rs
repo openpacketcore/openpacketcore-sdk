@@ -618,12 +618,10 @@ fn get_field_default_expr(
                     } else {
                         quote! { LeafPresence::Absent }
                     }
+                } else if is_sensitive {
+                    quote! { SecretLeaf::new(None) }
                 } else {
-                    if is_sensitive {
-                        quote! { SecretLeaf::new(None) }
-                    } else {
-                        quote! { None }
-                    }
+                    quote! { None }
                 }
             }
             _ => {

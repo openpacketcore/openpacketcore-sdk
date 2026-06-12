@@ -86,12 +86,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         } else {
                             quote! { self.#field_ident = LeafPresence::Explicit(parsed); }
                         }
+                    } else if is_sensitive {
+                        quote! { self.#field_ident = SecretLeaf::new(Some(parsed)); }
                     } else {
-                        if is_sensitive {
-                            quote! { self.#field_ident = SecretLeaf::new(Some(parsed)); }
-                        } else {
-                            quote! { self.#field_ident = Some(parsed); }
-                        }
+                        quote! { self.#field_ident = Some(parsed); }
                     };
 
                     let delete_stmt = if child.config {
@@ -100,12 +98,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         } else {
                             quote! { self.#field_ident = LeafPresence::Absent; }
                         }
+                    } else if is_sensitive {
+                        quote! { self.#field_ident = SecretLeaf::new(None); }
                     } else {
-                        if is_sensitive {
-                            quote! { self.#field_ident = SecretLeaf::new(None); }
-                        } else {
-                            quote! { self.#field_ident = None; }
-                        }
+                        quote! { self.#field_ident = None; }
                     };
 
                     let arm = match child.kind {
@@ -463,7 +459,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     let mut format_str = String::new();
                                     let mut format_args = Vec::new();
                                     for key_leaf in &child.key_leaves {
-                                        format_str.push_str(&format!("[{}='{{}}']", key_leaf));
+                                        format_str.push_str(&format!("[{key_leaf}='{{}}']"));
                                         let field_ident =
                                             format_ident!("{}", to_snake_case(key_leaf));
                                         format_args.push(quote! { k.#field_ident });

@@ -15,10 +15,7 @@ use opc_types::TenantId;
 static EMPIRICAL_TEST_MUTEX: Mutex<()> = Mutex::const_new(());
 
 fn get_tenant_principal(tenant: &str, role: &str) -> String {
-    format!(
-        "spiffe://test-domain/tenant/{}/ns/default/sa/{}/nf/amf/instance/0",
-        tenant, role
-    )
+    format!("spiffe://test-domain/tenant/{tenant}/ns/default/sa/{role}/nf/amf/instance/0")
 }
 
 fn make_valid_policy(version: u64) -> NacmPolicy {
@@ -66,7 +63,7 @@ async fn setup_stress_service(
         let tenant_id = TenantId::new(tenant).unwrap();
         key_provider
             .insert_active_key(
-                KeyId::new(format!("key-{}", tenant)).unwrap(),
+                KeyId::new(format!("key-{tenant}")).unwrap(),
                 KeyPurpose::ShadowSecurity,
                 tenant_id,
                 Zeroizing::new([0x99; 32]),
@@ -229,7 +226,7 @@ async fn test_concurrent_mutations_stress() {
                 .stage_policy("tenant-a", &admin_clone, policy)
                 .await;
             if let Err(ref e) = stage_res {
-                panic!("Stage policy failed unexpectedly: {:?}", e);
+                panic!("Stage policy failed unexpectedly: {e:?}");
             }
 
             let apply_res = service_clone.apply_policy("tenant-a", &admin_clone).await;
@@ -237,7 +234,7 @@ async fn test_concurrent_mutations_stress() {
                 Ok(_) => {}
                 Err(SecurityPolicyError::StaleVersion(_)) => {}
                 Err(e) => {
-                    panic!("Apply policy failed with unexpected error: {:?}", e);
+                    panic!("Apply policy failed with unexpected error: {e:?}");
                 }
             }
         }));

@@ -458,7 +458,7 @@ fn severity_transition_raises_alarm() {
             assert_eq!(alarm.severity, Severity::Warning);
             assert_eq!(alarm.state, AlarmState::Raised);
         }
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     }
 }
 
@@ -503,7 +503,7 @@ fn severity_transition_updates_existing_alarm() {
             assert_eq!(alarm.severity, Severity::Critical);
             assert_eq!(alarm.state, AlarmState::Updated);
         }
-        other => panic!("expected Updated, got {:?}", other),
+        other => panic!("expected Updated, got {other:?}"),
     }
 
     assert_eq!(mgr.active_count(), 1, "same dedup key must not duplicate");
@@ -535,7 +535,7 @@ fn history_preserves_raise_update_clear_lifecycle_and_scope_queries() {
         AlarmDetails::empty(),
     ) {
         AlarmOpResult::Raised { alarm } => alarm.alarm_id,
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     };
 
     let updated = mgr.raise(
@@ -844,7 +844,7 @@ fn clear_re_raise_creates_new_alarm_with_new_id() {
             assert_eq!(alarm.state, AlarmState::Raised);
             assert_eq!(alarm.severity, Severity::Major);
         }
-        other => panic!("expected Raised after clear, got {:?}", other),
+        other => panic!("expected Raised after clear, got {other:?}"),
     }
 }
 
@@ -897,10 +897,7 @@ fn clear_after_clear_returns_clear_without_active() {
     );
     match r2 {
         AlarmOpResult::ClearWithoutActive { .. } => {}
-        other => panic!(
-            "expected ClearWithoutActive on second clear, got {:?}",
-            other
-        ),
+        other => panic!("expected ClearWithoutActive on second clear, got {other:?}"),
     }
 }
 
@@ -923,7 +920,7 @@ fn acknowledge_cleared_alarm_returns_not_found() {
         AlarmDetails::empty(),
     ) {
         AlarmOpResult::Raised { alarm } => alarm.alarm_id,
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     };
 
     mgr.clear(
@@ -949,7 +946,7 @@ fn acknowledge_cleared_alarm_returns_not_found() {
 
     match result {
         AlarmOpResult::NotFound { .. } => {}
-        other => panic!("expected NotFound for cleared alarm, got {:?}", other),
+        other => panic!("expected NotFound for cleared alarm, got {other:?}"),
     }
 }
 
@@ -972,7 +969,7 @@ fn suppress_cleared_alarm_returns_not_found() {
         AlarmDetails::empty(),
     ) {
         AlarmOpResult::Raised { alarm } => alarm.alarm_id,
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     };
 
     mgr.clear(
@@ -998,7 +995,7 @@ fn suppress_cleared_alarm_returns_not_found() {
 
     match result {
         AlarmOpResult::NotFound { .. } => {}
-        other => panic!("expected NotFound for cleared alarm, got {:?}", other),
+        other => panic!("expected NotFound for cleared alarm, got {other:?}"),
     }
 }
 
@@ -1025,7 +1022,7 @@ fn clear_without_active_alarm_returns_no_op_metric() {
             assert_eq!(cause, ProbableCause::PeerUnreachable);
             let _ = dedup_key.as_str();
         }
-        other => panic!("expected ClearWithoutActive, got {:?}", other),
+        other => panic!("expected ClearWithoutActive, got {other:?}"),
     }
 }
 
@@ -1065,7 +1062,7 @@ fn clear_clears_active_alarm() {
             assert_eq!(mgr.active_count(), 0);
             let _ = alarm_id.as_str();
         }
-        other => panic!("expected Cleared, got {:?}", other),
+        other => panic!("expected Cleared, got {other:?}"),
     }
 }
 
@@ -1090,7 +1087,7 @@ fn suppress_requires_authorization() {
         AlarmDetails::empty(),
     ) {
         AlarmOpResult::Raised { alarm } => alarm.alarm_id,
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     };
 
     // Unauthorized suppress attempt
@@ -1106,7 +1103,7 @@ fn suppress_requires_authorization() {
         AlarmOpResult::Unauthorized { message } => {
             assert!(message.contains("not authorized"));
         }
-        other => panic!("expected Unauthorized, got {:?}", other),
+        other => panic!("expected Unauthorized, got {other:?}"),
     }
 }
 
@@ -1129,7 +1126,7 @@ fn acknowledge_requires_authorization() {
         AlarmDetails::empty(),
     ) {
         AlarmOpResult::Raised { alarm } => alarm.alarm_id,
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     };
 
     let result = mgr.acknowledge(
@@ -1144,7 +1141,7 @@ fn acknowledge_requires_authorization() {
         AlarmOpResult::Unauthorized { message } => {
             assert!(message.contains("not authorized"));
         }
-        other => panic!("expected Unauthorized, got {:?}", other),
+        other => panic!("expected Unauthorized, got {other:?}"),
     }
 }
 
@@ -1167,7 +1164,7 @@ fn policy_acknowledge_denied_records_denied_audit_event() {
         AlarmDetails::empty(),
     ) {
         AlarmOpResult::Raised { alarm } => alarm.alarm_id,
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     };
 
     let auth = TestAuthorizer {
@@ -1213,7 +1210,7 @@ fn policy_suppress_authorized_records_audit_event() {
         AlarmDetails::empty(),
     ) {
         AlarmOpResult::Raised { alarm } => alarm.alarm_id,
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     };
 
     let auth = TestAuthorizer {
@@ -1232,7 +1229,7 @@ fn policy_suppress_authorized_records_audit_event() {
         AlarmOpResult::Suppressed { alarm } => {
             assert_eq!(alarm.state, AlarmState::Suppressed);
         }
-        other => panic!("expected Suppressed, got {:?}", other),
+        other => panic!("expected Suppressed, got {other:?}"),
     }
     assert_eq!(audit.events.len(), 1);
     assert_eq!(audit.events[0].action, AlarmAction::Suppress);
@@ -1260,7 +1257,7 @@ fn policy_suppress_security_critical_denied_by_default() {
         AlarmDetails::empty(),
     ) {
         AlarmOpResult::Raised { alarm } => alarm.alarm_id,
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     };
 
     let auth = TestAuthorizer {
@@ -1300,7 +1297,7 @@ fn policy_suppress_security_critical_requires_explicit_override() {
         AlarmDetails::empty(),
     ) {
         AlarmOpResult::Raised { alarm } => alarm.alarm_id,
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     };
 
     let auth = TestAuthorizer {
@@ -1339,7 +1336,7 @@ fn policy_action_fails_closed_when_audit_fails() {
         AlarmDetails::empty(),
     ) {
         AlarmOpResult::Raised { alarm } => alarm.alarm_id,
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     };
 
     let auth = TestAuthorizer {
@@ -1385,7 +1382,7 @@ fn suppress_succeeds_with_authorization() {
         AlarmDetails::empty(),
     ) {
         AlarmOpResult::Raised { alarm } => alarm.alarm_id,
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     };
 
     let result = mgr.suppress(
@@ -1400,7 +1397,7 @@ fn suppress_succeeds_with_authorization() {
         AlarmOpResult::Suppressed { alarm } => {
             assert_eq!(alarm.state, AlarmState::Suppressed);
         }
-        other => panic!("expected Suppressed, got {:?}", other),
+        other => panic!("expected Suppressed, got {other:?}"),
     }
 }
 
@@ -1423,7 +1420,7 @@ fn repeated_raise_preserves_suppressed_state() {
         AlarmDetails::empty(),
     ) {
         AlarmOpResult::Raised { alarm } => alarm.alarm_id,
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     };
 
     let suppressed = mgr.suppress(
@@ -1464,7 +1461,7 @@ fn repeated_raise_preserves_suppressed_state() {
             assert_eq!(alarm.severity, Severity::Critical);
             assert_eq!(alarm.state, AlarmState::Suppressed);
         }
-        other => panic!("expected Updated with preserved state, got {:?}", other),
+        other => panic!("expected Updated with preserved state, got {other:?}"),
     }
 }
 
@@ -1489,7 +1486,7 @@ fn acknowledge_succeeds_with_authorization() {
         AlarmDetails::empty(),
     ) {
         AlarmOpResult::Raised { alarm } => alarm.alarm_id,
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     };
 
     let result = mgr.acknowledge(
@@ -1504,7 +1501,7 @@ fn acknowledge_succeeds_with_authorization() {
         AlarmOpResult::Acknowledged { alarm } => {
             assert_eq!(alarm.state, AlarmState::Acknowledged);
         }
-        other => panic!("expected Acknowledged, got {:?}", other),
+        other => panic!("expected Acknowledged, got {other:?}"),
     }
 }
 
@@ -1527,7 +1524,7 @@ fn repeated_raise_preserves_acknowledged_state() {
         AlarmDetails::empty(),
     ) {
         AlarmOpResult::Raised { alarm } => alarm.alarm_id,
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     };
 
     let acknowledged = mgr.acknowledge(
@@ -1568,7 +1565,7 @@ fn repeated_raise_preserves_acknowledged_state() {
             assert_eq!(alarm.severity, Severity::Critical);
             assert_eq!(alarm.state, AlarmState::Acknowledged);
         }
-        other => panic!("expected Updated with preserved state, got {:?}", other),
+        other => panic!("expected Updated with preserved state, got {other:?}"),
     }
 }
 
@@ -1588,7 +1585,7 @@ fn acknowledge_not_found_returns_not_found() {
         AlarmOpResult::NotFound { alarm_id } => {
             assert_eq!(alarm_id.as_str(), "nonexistent-id");
         }
-        other => panic!("expected NotFound, got {:?}", other),
+        other => panic!("expected NotFound, got {other:?}"),
     }
 }
 
@@ -1608,7 +1605,7 @@ fn suppress_not_found_returns_not_found() {
         AlarmOpResult::NotFound { alarm_id } => {
             assert_eq!(alarm_id.as_str(), "nonexistent-id");
         }
-        other => panic!("expected NotFound, got {:?}", other),
+        other => panic!("expected NotFound, got {other:?}"),
     }
 }
 
@@ -1647,7 +1644,7 @@ fn redacted_alarm_text_stored_as_provided() {
                 "raw identifier must not appear in stored alarm text"
             );
         }
-        other => panic!("expected Raised, got {:?}", other),
+        other => panic!("expected Raised, got {other:?}"),
     }
 }
 
@@ -1866,15 +1863,12 @@ fn probable_cause_round_trips_through_json() {
         let json = serde_json::to_string(&w).unwrap();
         assert!(
             json.contains(expected_str),
-            "JSON should contain '{}', got: {}",
-            expected_str,
-            json
+            "JSON should contain '{expected_str}', got: {json}"
         );
         let round_tripped: Wrapper = serde_json::from_str(&json).unwrap();
         assert_eq!(
             round_tripped.cause, cause,
-            "round-trip failed for {:?}",
-            cause
+            "round-trip failed for {cause:?}"
         );
     }
 }

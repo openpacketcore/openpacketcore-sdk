@@ -74,9 +74,9 @@ impl std::fmt::Display for StartupPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StartupPhase::Pending => write!(f, "Pending"),
-            StartupPhase::InProgress(s) => write!(f, "InProgress({})", s),
+            StartupPhase::InProgress(s) => write!(f, "InProgress({s})"),
             StartupPhase::Complete => write!(f, "Complete"),
-            StartupPhase::Failed(s) => write!(f, "Failed({})", s),
+            StartupPhase::Failed(s) => write!(f, "Failed({s})"),
         }
     }
 }

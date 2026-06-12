@@ -214,8 +214,7 @@ pub(crate) fn get_sync(
         "ephemeral-procedure" => StateClass::EphemeralProcedure,
         _ => {
             return Err(StoreError::Serialization(format!(
-                "unknown state class: {}",
-                state_class_str
+                "unknown state class: {state_class_str}"
             )))
         }
     };
@@ -246,8 +245,7 @@ pub(crate) fn get_sync(
         ),
         _ => {
             return Err(StoreError::Serialization(format!(
-                "unknown payload encoding: {}",
-                encoding
+                "unknown payload encoding: {encoding}"
             )))
         }
     };

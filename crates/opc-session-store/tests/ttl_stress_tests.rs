@@ -267,7 +267,7 @@ async fn test_lease_takeover_concurrency_race() {
     for i in 0..10 {
         let b_clone = backend.clone();
         let k_clone = key.clone();
-        let owner_id = OwnerId::new(format!("owner-{}", i)).unwrap();
+        let owner_id = OwnerId::new(format!("owner-{i}")).unwrap();
         tasks.push(tokio::spawn(async move {
             b_clone
                 .acquire(&k_clone, owner_id, Duration::from_secs(5))
@@ -294,7 +294,6 @@ async fn test_lease_takeover_concurrency_race() {
 
     assert_eq!(
         success_count, 1,
-        "Exactly one concurrent acquire must succeed, but got {}",
-        success_count
+        "Exactly one concurrent acquire must succeed, but got {success_count}"
     );
 }

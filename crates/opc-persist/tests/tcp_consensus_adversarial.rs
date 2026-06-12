@@ -47,13 +47,13 @@ async fn test_adversarial_active_connections_desync() {
         .unwrap();
 
     let port = get_free_port();
-    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{}", port));
+    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{port}"));
     let handle = server.start().await.unwrap();
 
     // 1. Parallel connection spikes with immediate/abnormal disconnections.
     let mut tasks = Vec::new();
     for _ in 0..80 {
-        let addr = format!("127.0.0.1:{}", port);
+        let addr = format!("127.0.0.1:{port}");
         tasks.push(tokio::spawn(async move {
             if let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await {
                 // Send some random bytes to start a handshake or handshake attempt
@@ -122,13 +122,13 @@ async fn test_adversarial_connection_limit_no_stall() {
         .unwrap();
 
     let port = get_free_port();
-    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{}", port));
+    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{port}"));
     let handle = server.start().await.unwrap();
 
     // 1. Establish 100 connections and leave them open
     let mut connections = Vec::new();
     for _ in 0..100 {
-        let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await;
+        let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await;
         if let Ok(s) = stream {
             connections.push(s);
         }
@@ -144,7 +144,7 @@ async fn test_adversarial_connection_limit_no_stall() {
     // As each connection is rejected and closed, its FD is released before the next connection is made.
     let mut rejected_count = 0;
     for _ in 0..150 {
-        let addr = format!("127.0.0.1:{}", port);
+        let addr = format!("127.0.0.1:{port}");
         match tokio::net::TcpStream::connect(&addr).await {
             Ok(mut stream) => {
                 // Try to read. Since the server drops the connection, this should return EOF (Ok(0))
@@ -154,7 +154,7 @@ async fn test_adversarial_connection_limit_no_stall() {
                 rejected_count += 1;
             }
             Err(e) => {
-                println!("Connect error: {:?}", e);
+                println!("Connect error: {e:?}");
             }
         }
     }
@@ -209,12 +209,12 @@ async fn test_adversarial_auth_failures_types() {
         .unwrap();
 
     let port = get_free_port();
-    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{}", port));
+    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{port}"));
     let handle = server.start().await.unwrap();
 
     // Mode A: Plain TCP handshake, send some garbage, and close.
     {
-        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .unwrap();
         let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, b"NOT A TLS CLIENT HELLO").await;
@@ -237,7 +237,7 @@ async fn test_adversarial_auth_failures_types() {
         );
         let peer = TcpPeer::new(
             0,
-            format!("127.0.0.1:{}", port),
+            format!("127.0.0.1:{port}"),
             std::time::Duration::from_millis(150),
         );
         peer.set_identity(expired_identity).await.unwrap();
@@ -267,7 +267,7 @@ async fn test_adversarial_auth_failures_types() {
         );
         let peer = TcpPeer::new(
             0,
-            format!("127.0.0.1:{}", port),
+            format!("127.0.0.1:{port}"),
             std::time::Duration::from_millis(150),
         );
         peer.set_identity(bad_spiffe_identity).await.unwrap();

@@ -27,10 +27,7 @@ fn lower_constraint_inner(
     if depth > MAX_CONSTRAINT_EXPR_DEPTH {
         return Err(Diagnostic::new(
             DiagnosticCode::ConstraintDepthExceeded,
-            format!(
-                "Constraint expression exceeds maximum depth of {}",
-                MAX_CONSTRAINT_EXPR_DEPTH
-            ),
+            format!("Constraint expression exceeds maximum depth of {MAX_CONSTRAINT_EXPR_DEPTH}"),
             Some(source.clone()),
             Some("Simplify the expression or split it into multiple constraints"),
         ));
@@ -43,7 +40,7 @@ fn lower_constraint_inner(
                 if seg.is_empty() || seg == "/" || seg == "." || seg == ".." {
                     return Err(Diagnostic::new(
                         DiagnosticCode::InvalidPathExpression,
-                        format!("Invalid path segment: '{}' (empty or invalid)", seg),
+                        format!("Invalid path segment: '{seg}' (empty or invalid)"),
                         Some(source.clone()),
                         Some(
                             "Paths must be well-formed without empty, '.', '..', or '//' segments",
@@ -56,7 +53,7 @@ fn lower_constraint_inner(
                 if seg.contains(['[', ']', '@', '*']) || seg.contains("::") {
                     return Err(Diagnostic::new(
                         DiagnosticCode::InvalidPathExpression,
-                        format!("Unsupported XPath construct in path segment: '{}'", seg),
+                        format!("Unsupported XPath construct in path segment: '{seg}'"),
                         Some(source.clone()),
                         Some(
                             "Predicates, axes, attribute selectors, and wildcards are not supported in the skeleton phase",
@@ -72,7 +69,7 @@ fn lower_constraint_inner(
                 _ => {
                     return Err(Diagnostic::new(
                         DiagnosticCode::InvalidPathExpression,
-                        format!("Unsupported or invalid path anchor: '{}'", anchor),
+                        format!("Unsupported or invalid path anchor: '{anchor}'"),
                         Some(source.clone()),
                         Some("Supported path anchors are: '/', 'current()', or '..'"),
                     ));
@@ -84,10 +81,7 @@ fn lower_constraint_inner(
             {
                 return Err(Diagnostic::new(
                     DiagnosticCode::InvalidPathExpression,
-                    format!(
-                        "Path with anchor '{}' must not have an empty segment list",
-                        anchor
-                    ),
+                    format!("Path with anchor '{anchor}' must not have an empty segment list"),
                     Some(source.clone()),
                     Some("Parent and root anchors must be followed by a path segment"),
                 ));
@@ -102,7 +96,7 @@ fn lower_constraint_inner(
             let _ = args;
             Err(Diagnostic::new(
                 DiagnosticCode::UnsupportedXPathFunction,
-                format!("Unsupported XPath function: '{}'", name),
+                format!("Unsupported XPath function: '{name}'"),
                 Some(source.clone()),
                 Some(
                     "XPath function lowering is intentionally disabled in the skeleton phase until reference-engine differential tests are available",
@@ -120,7 +114,7 @@ fn lower_constraint_inner(
                 _ => {
                     return Err(Diagnostic::new(
                         DiagnosticCode::InvalidPathExpression,
-                        format!("Unsupported comparison operator: '{}'", op),
+                        format!("Unsupported comparison operator: '{op}'"),
                         Some(source.clone()),
                         None::<String>,
                     ));
@@ -143,7 +137,7 @@ fn lower_constraint_inner(
                 _ => {
                     return Err(Diagnostic::new(
                         DiagnosticCode::InvalidPathExpression,
-                        format!("Unsupported boolean operator: '{}'", op),
+                        format!("Unsupported boolean operator: '{op}'"),
                         Some(source.clone()),
                         None::<String>,
                     ));

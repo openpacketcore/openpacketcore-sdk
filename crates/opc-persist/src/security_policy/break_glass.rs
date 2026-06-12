@@ -186,17 +186,13 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
         let decision = evaluator.evaluate(&active_policy, &path, action);
 
         if !decision.is_allowed() {
-            let details = format!(
-                "NACM check denied break-glass access for action {:?}",
-                action
-            );
+            let details = format!("NACM check denied break-glass access for action {action:?}");
             let _ = self
                 .break_glass_audit_event(tenant, &validated_spiffe, "EVALUATE_DENY", &details)
                 .await;
 
             return Err(SecurityPolicyError::Unauthorized(format!(
-                "Access denied by active security policy for action: {:?}",
-                action
+                "Access denied by active security policy for action: {action:?}"
             )));
         }
 
@@ -370,8 +366,7 @@ impl<P: KeyProvider + 'static> BreakGlassService for SqliteSecurityPolicyService
         }
 
         let details = format!(
-            "Break glass request approved: session_id={}, approver={}",
-            session_id, validated_approver
+            "Break glass request approved: session_id={session_id}, approver={validated_approver}"
         );
         self.break_glass_audit_event(tenant, &validated_approver, "APPROVE", &details)
             .await?;
@@ -434,8 +429,7 @@ impl<P: KeyProvider + 'static> BreakGlassService for SqliteSecurityPolicyService
         let _ = self.alarm_notifier.raise_alarm(tenant, session_id).await;
 
         let details = format!(
-            "Break glass session activated: session_id={}, expires_at={}",
-            session_id, expires_at_str
+            "Break glass session activated: session_id={session_id}, expires_at={expires_at_str}"
         );
         self.break_glass_audit_event(tenant, &validated_spiffe, "ACTIVATE", &details)
             .await?;
@@ -477,10 +471,8 @@ impl<P: KeyProvider + 'static> BreakGlassService for SqliteSecurityPolicyService
             })?;
         }
 
-        let details = format!(
-            "Break glass request denied: session_id={}, by={}",
-            session_id, validated_spiffe
-        );
+        let details =
+            format!("Break glass request denied: session_id={session_id}, by={validated_spiffe}");
         self.break_glass_audit_event(tenant, &validated_spiffe, "DENY", &details)
             .await?;
 
@@ -530,10 +522,8 @@ impl<P: KeyProvider + 'static> BreakGlassService for SqliteSecurityPolicyService
             let _ = self.alarm_notifier.resolve_alarm(tenant, session_id).await;
         }
 
-        let details = format!(
-            "Break glass session revoked: session_id={}, by={}",
-            session_id, validated_spiffe
-        );
+        let details =
+            format!("Break glass session revoked: session_id={session_id}, by={validated_spiffe}");
         self.break_glass_audit_event(tenant, &validated_spiffe, "REVOKE", &details)
             .await?;
 
@@ -559,8 +549,7 @@ impl<P: KeyProvider + 'static> BreakGlassService for SqliteSecurityPolicyService
             Ok(s) => Ok(s),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 Err(SecurityPolicyError::ValidationFailed(format!(
-                    "Break glass session not found: {}",
-                    session_id
+                    "Break glass session not found: {session_id}"
                 )))
             }
             Err(e) => {

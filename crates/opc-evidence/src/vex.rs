@@ -22,8 +22,7 @@ impl std::str::FromStr for VexDecision {
             "fixed" => Ok(VexDecision::Fixed),
             "under_investigation" | "under-investigation" => Ok(VexDecision::UnderInvestigation),
             _ => Err(EvidenceError::GapGateFailed(format!(
-                "malformed VEX status: {}",
-                s
+                "malformed VEX status: {s}"
             ))),
         }
     }
@@ -62,7 +61,7 @@ impl VexPolicyResult {
         let timestamp = OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| {
-                EvidenceError::GapGateFailed(format!("failed to format timestamp: {}", e))
+                EvidenceError::GapGateFailed(format!("failed to format timestamp: {e}"))
             })?;
 
         Ok(Self {

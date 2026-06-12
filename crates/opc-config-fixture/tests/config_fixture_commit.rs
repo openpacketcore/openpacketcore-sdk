@@ -73,8 +73,7 @@ impl opc_config_bus::ConfigAuthorizer for NacmAuthorizer {
             let decision = evaluator.evaluate(&self.policy, &nacm_path, action);
             if !decision.is_allowed() {
                 return Err(opc_config_bus::AuthorizationError::new(format!(
-                    "permission denied for {}",
-                    path_str
+                    "permission denied for {path_str}"
                 )));
             }
         }

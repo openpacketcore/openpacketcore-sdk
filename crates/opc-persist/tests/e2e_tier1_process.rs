@@ -77,8 +77,7 @@ async fn test_process_control_graceful_stop_restart() {
     }
     assert!(
         success,
-        "Node 1 failed to load latest config after restart. resp = {:?}",
-        resp_latest
+        "Node 1 failed to load latest config after restart. resp = {resp_latest:?}"
     );
 }
 
@@ -162,8 +161,7 @@ async fn test_process_control_hard_kill_failover() {
     }
     assert!(
         success,
-        "Follower failed to catch up / load latest. resp = {:?}",
-        resp_latest
+        "Follower failed to catch up / load latest. resp = {resp_latest:?}"
     );
 }
 

@@ -142,9 +142,9 @@ impl fmt::Display for RedactedValue {
         match self {
             Self::Dropped => f.write_str("<dropped>"),
             Self::Mask => f.write_str("<redacted>"),
-            Self::Class(class) => write!(f, "<{}>", class),
-            Self::LengthClass(class, bucket) => write!(f, "<{}:{}>", class, bucket),
-            Self::Digest(digest) => write!(f, "<digest:{}>", digest),
+            Self::Class(class) => write!(f, "<{class}>"),
+            Self::LengthClass(class, bucket) => write!(f, "<{class}:{bucket}>"),
+            Self::Digest(digest) => write!(f, "<digest:{digest}>"),
             Self::Cleartext(_) => f.write_str("<cleartext>"),
         }
     }
@@ -264,7 +264,7 @@ mod tests {
                 assert_eq!(d.len(), 64);
                 assert!(r.to_string().starts_with("<digest:"));
             }
-            other => panic!("expected Digest, got {:?}", other),
+            other => panic!("expected Digest, got {other:?}"),
         }
     }
 
@@ -353,14 +353,12 @@ mod tests {
             let display = r.to_string();
             assert!(
                 !display.contains(raw),
-                "level {:?} leaked raw value in display",
-                level
+                "level {level:?} leaked raw value in display"
             );
-            let debug = format!("{:?}", r);
+            let debug = format!("{r:?}");
             assert!(
                 !debug.contains(raw),
-                "level {:?} leaked raw value in debug",
-                level
+                "level {level:?} leaked raw value in debug"
             );
         }
     }

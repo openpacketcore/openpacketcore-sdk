@@ -374,7 +374,7 @@ fn parse_cargo_lock_dependency(raw: &str) -> Option<LockDependency> {
 pub fn generate_sbom(workspace_dir: &Path) -> Result<Sbom, EvidenceError> {
     let timestamp = OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
-        .map_err(|e| EvidenceError::GapGateFailed(format!("failed to format timestamp: {}", e)))?;
+        .map_err(|e| EvidenceError::GapGateFailed(format!("failed to format timestamp: {e}")))?;
     generate_sbom_at(workspace_dir, &timestamp)
 }
 
@@ -392,7 +392,7 @@ pub fn generate_sbom_at(workspace_dir: &Path, timestamp: &str) -> Result<Sbom, E
     // 1. Read and parse root Cargo.toml
     let root_toml_path = workspace_dir.join("Cargo.toml");
     let root_toml_content = fs::read_to_string(&root_toml_path).map_err(|e| {
-        EvidenceError::GapGateFailed(format!("failed to read root Cargo.toml: {}", e))
+        EvidenceError::GapGateFailed(format!("failed to read root Cargo.toml: {e}"))
     })?;
     let workspace_config = parse_root_cargo_toml(&root_toml_content);
     let workspace_members = parse_workspace_members(&root_toml_content);
@@ -405,7 +405,7 @@ pub fn generate_sbom_at(workspace_dir: &Path, timestamp: &str) -> Result<Sbom, E
             let member_toml_path = path.join("Cargo.toml");
             if member_toml_path.exists() {
                 let member_toml_content = fs::read_to_string(&member_toml_path).map_err(|e| {
-                    EvidenceError::GapGateFailed(format!("failed to read member Cargo.toml: {}", e))
+                    EvidenceError::GapGateFailed(format!("failed to read member Cargo.toml: {e}"))
                 })?;
                 if let Some(member) =
                     parse_member_cargo_toml(&member_toml_content, &workspace_config)
@@ -419,7 +419,7 @@ pub fn generate_sbom_at(workspace_dir: &Path, timestamp: &str) -> Result<Sbom, E
     // 3. Read and parse Cargo.lock
     let lock_path = workspace_dir.join("Cargo.lock");
     let lock_content = fs::read_to_string(&lock_path)
-        .map_err(|e| EvidenceError::GapGateFailed(format!("failed to read Cargo.lock: {}", e)))?;
+        .map_err(|e| EvidenceError::GapGateFailed(format!("failed to read Cargo.lock: {e}")))?;
     let lock_packages = parse_cargo_lock(&lock_content);
 
     // 4. Build components list
@@ -524,8 +524,7 @@ pub fn generate_sbom_at(workspace_dir: &Path, timestamp: &str) -> Result<Sbom, E
 
     let root_comp = workspace_root_pkg.ok_or_else(|| {
         EvidenceError::GapGateFailed(format!(
-            "root workspace component '{}' not found",
-            root_member_name
+            "root workspace component '{root_member_name}' not found"
         ))
     })?;
 

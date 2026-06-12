@@ -111,14 +111,12 @@ impl AlarmActionAuthorizer for NacmAlarmAuthorizer {
         if let (Some(context_tenant), Some(alarm_tenant)) = (&context.tenant, &alarm.tenant) {
             if context_tenant != alarm_tenant {
                 return Err(AlarmActionDenied::new(format!(
-                    "Tenant mismatch: context tenant '{}' does not match alarm tenant '{}'",
-                    context_tenant, alarm_tenant
+                    "Tenant mismatch: context tenant '{context_tenant}' does not match alarm tenant '{alarm_tenant}'"
                 )));
             }
         } else if let (Some(context_tenant), None) = (&context.tenant, &alarm.tenant) {
             return Err(AlarmActionDenied::new(format!(
-                "Tenant mismatch: tenant-scoped context '{}' cannot touch global alarm",
-                context_tenant
+                "Tenant mismatch: tenant-scoped context '{context_tenant}' cannot touch global alarm"
             )));
         }
 
@@ -129,7 +127,7 @@ impl AlarmActionAuthorizer for NacmAlarmAuthorizer {
         };
 
         let path = YangPath::parse(path_str, &self.registry)
-            .map_err(|e| AlarmActionDenied::new(format!("Failed to parse action path: {}", e)))?;
+            .map_err(|e| AlarmActionDenied::new(format!("Failed to parse action path: {e}")))?;
 
         // 5. Evaluate policy
         let mut eval = self.evaluator.lock().unwrap();

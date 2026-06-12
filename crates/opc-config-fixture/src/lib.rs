@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn redacted_secrets_never_leak_in_debug() {
         let config = ToyConfig::new("router-1").with_admin_password("hunter2");
-        let debug = format!("{:?}", config);
+        let debug = format!("{config:?}");
         assert!(debug.contains("router-1"));
         assert!(!debug.contains("hunter2"));
         assert!(debug.contains("<redacted>"));

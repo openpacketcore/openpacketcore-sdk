@@ -100,8 +100,7 @@ pub(crate) fn compile_serializable_policy(
             "deny" => NacmEffect::Deny,
             other => {
                 return Err(SecurityPolicyError::ValidationFailed(format!(
-                    "Invalid effect: {}",
-                    other
+                    "Invalid effect: {other}"
                 )))
             }
         };
@@ -172,8 +171,7 @@ pub(crate) fn validate_principal_tenant_and_roles(
 
     if parsed_tenant != target_tenant {
         return Err(SecurityPolicyError::Unauthorized(format!(
-            "Tenant mismatch: principal tenant '{}' does not match target tenant '{}'",
-            parsed_tenant, target_tenant
+            "Tenant mismatch: principal tenant '{parsed_tenant}' does not match target tenant '{target_tenant}'"
         )));
     }
 

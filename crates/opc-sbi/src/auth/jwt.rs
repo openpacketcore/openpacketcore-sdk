@@ -270,7 +270,7 @@ impl SbiAuth for SbiJwtValidator {
                 .get_decoding_key(&kid)
                 .await
                 .map_err(|e| SbiAuthError::Internal {
-                    reason: sanitize_error_message(format!("failed to get signature key: {}", e)),
+                    reason: sanitize_error_message(format!("failed to get signature key: {e}")),
                 })?;
 
         // 4. Validate signature, issuer, and expiry

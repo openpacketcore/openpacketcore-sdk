@@ -15,8 +15,7 @@ static TEST_MUTEX: TokioMutex<()> = TokioMutex::const_new(());
 
 fn get_admin_principal(name: &str) -> String {
     format!(
-        "spiffe://test-domain/tenant/test-tenant/ns/default/sa/security-admin/nf/amf/instance/{}",
-        name
+        "spiffe://test-domain/tenant/test-tenant/ns/default/sa/security-admin/nf/amf/instance/{name}"
     )
 }
 
@@ -75,10 +74,7 @@ pub struct TestAlarmNotifier {
 #[async_trait::async_trait]
 impl BreakGlassAlarmNotifier for TestAlarmNotifier {
     async fn raise_alarm(&self, tenant: &str, session_id: &str) -> Result<(), String> {
-        let text = format!(
-            "Active break-glass session {} for tenant {}",
-            session_id, tenant
-        );
+        let text = format!("Active break-glass session {session_id} for tenant {tenant}");
         let _ = self.manager.raise(
             opc_alarm::AlarmType::new("security.break-glass"),
             opc_alarm::Severity::Warning,
@@ -234,7 +230,7 @@ async fn test_break_glass_excessive_duration_rejected() {
         .await;
     assert!(res.is_err());
     let err = res.err().unwrap();
-    assert!(format!("{:?}", err).contains("duration"));
+    assert!(format!("{err:?}").contains("duration"));
 }
 
 #[tokio::test]
@@ -286,7 +282,7 @@ async fn test_break_glass_two_person_approval_requester_cannot_approve() {
         .await;
     assert!(res.is_err());
     let err = res.err().unwrap();
-    assert!(format!("{:?}", err).contains("different principal"));
+    assert!(format!("{err:?}").contains("different principal"));
 }
 
 #[tokio::test]
@@ -317,7 +313,7 @@ async fn test_break_glass_unauthorized_approver_role_rejected() {
         .await;
     assert!(res.is_err());
     let err = res.err().unwrap();
-    assert!(format!("{:?}", err).contains("lacks 'security-admin' role"));
+    assert!(format!("{err:?}").contains("lacks 'security-admin' role"));
 }
 
 #[tokio::test]
@@ -356,7 +352,7 @@ async fn test_break_glass_unauthorized_action_by_policy() {
         .await;
     assert!(res.is_err());
     let err = res.err().unwrap();
-    let err_msg = format!("{:?}", err);
+    let err_msg = format!("{err:?}");
     assert!(err_msg.contains("lacks permission") || err_msg.contains("Access denied"));
 }
 
@@ -432,8 +428,7 @@ async fn test_break_glass_audit_corruption_fails_closed() {
         .await;
     assert!(
         matches!(res, Err(opc_persist::SecurityPolicyError::Internal)),
-        "corrupt audit HMAC length must fail closed, got: {:?}",
-        res
+        "corrupt audit HMAC length must fail closed, got: {res:?}"
     );
 }
 

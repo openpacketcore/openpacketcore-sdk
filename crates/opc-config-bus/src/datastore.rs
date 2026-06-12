@@ -411,8 +411,7 @@ impl<C: OpcConfig> ManagedDatastore<C> for MockManagedDatastore<C> {
                 .cloned()
                 .ok_or_else(|| {
                     StoreError::not_found(format!(
-                        "rollback version {} not present in mock store",
-                        version
+                        "rollback version {version} not present in mock store"
                     ))
                 })?,
             RollbackTarget::TxId(tx_id) => state
@@ -423,8 +422,7 @@ impl<C: OpcConfig> ManagedDatastore<C> for MockManagedDatastore<C> {
                 .cloned()
                 .ok_or_else(|| {
                     StoreError::not_found(format!(
-                        "rollback transaction {} not present in mock store",
-                        tx_id
+                        "rollback transaction {tx_id} not present in mock store"
                     ))
                 })?,
             RollbackTarget::Label(label) => state
@@ -500,8 +498,7 @@ impl<C: OpcConfig> ManagedDatastore<C> for MockManagedDatastore<C> {
             .position(|record| record.tx_id == tx_id)
             .ok_or_else(|| {
                 StoreError::not_found(format!(
-                    "transaction {} not present in mock store for recovery update",
-                    tx_id
+                    "transaction {tx_id} not present in mock store for recovery update"
                 ))
             })?;
 
@@ -524,8 +521,7 @@ impl<C: OpcConfig> ManagedDatastore<C> for MockManagedDatastore<C> {
             .position(|record| record.tx_id == tx_id)
             .ok_or_else(|| {
                 StoreError::not_found(format!(
-                    "transaction {} not present in mock store for confirmation",
-                    tx_id
+                    "transaction {tx_id} not present in mock store for confirmation"
                 ))
             })?;
         state.history[index].confirmed_deadline = None;

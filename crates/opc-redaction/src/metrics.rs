@@ -555,8 +555,8 @@ fn write_metric(out: &mut String, name: &str, mtype: &str, help: &str, val: f64)
         name,
         escape_prometheus_help(help)
     ));
-    out.push_str(&format!("# TYPE {} {}\n", name, mtype));
-    out.push_str(&format!("{} {}\n", name, val));
+    out.push_str(&format!("# TYPE {name} {mtype}\n"));
+    out.push_str(&format!("{name} {val}\n"));
 }
 
 fn write_histogram_metadata(out: &mut String, name: &str, help: &str) {
@@ -565,7 +565,7 @@ fn write_histogram_metadata(out: &mut String, name: &str, help: &str) {
         name,
         escape_prometheus_help(help)
     ));
-    out.push_str(&format!("# TYPE {} histogram\n", name));
+    out.push_str(&format!("# TYPE {name} histogram\n"));
 }
 
 fn write_histogram_samples(
@@ -706,13 +706,11 @@ pub fn export_prometheus_text() -> String {
     out.push_str("# HELP opc_config_bus_rollback_total Total count of config rollbacks\n");
     out.push_str("# TYPE opc_config_bus_rollback_total counter\n");
     out.push_str(&format!(
-        "opc_config_bus_rollback_total{{status=\"success\"}} {}\n",
-        rollback_success
+        "opc_config_bus_rollback_total{{status=\"success\"}} {rollback_success}\n"
     ));
     let rollback_failure = METRICS.config_bus_rollback_failure.load(Ordering::Relaxed);
     out.push_str(&format!(
-        "opc_config_bus_rollback_total{{status=\"failure\"}} {}\n",
-        rollback_failure
+        "opc_config_bus_rollback_total{{status=\"failure\"}} {rollback_failure}\n"
     ));
 
     let fence = METRICS
@@ -787,23 +785,19 @@ pub fn export_prometheus_text() -> String {
     out.push_str("# HELP opc_persist_quorum_total Total count of consensus quorum actions\n");
     out.push_str("# TYPE opc_persist_quorum_total counter\n");
     out.push_str(&format!(
-        "opc_persist_quorum_total{{op=\"read\",status=\"success\"}} {}\n",
-        quorum_r_succ
+        "opc_persist_quorum_total{{op=\"read\",status=\"success\"}} {quorum_r_succ}\n"
     ));
     let quorum_r_fail = METRICS.persist_quorum_read_failure.load(Ordering::Relaxed);
     out.push_str(&format!(
-        "opc_persist_quorum_total{{op=\"read\",status=\"failure\"}} {}\n",
-        quorum_r_fail
+        "opc_persist_quorum_total{{op=\"read\",status=\"failure\"}} {quorum_r_fail}\n"
     ));
     let quorum_w_succ = METRICS.persist_quorum_write_success.load(Ordering::Relaxed);
     out.push_str(&format!(
-        "opc_persist_quorum_total{{op=\"write\",status=\"success\"}} {}\n",
-        quorum_w_succ
+        "opc_persist_quorum_total{{op=\"write\",status=\"success\"}} {quorum_w_succ}\n"
     ));
     let quorum_w_fail = METRICS.persist_quorum_write_failure.load(Ordering::Relaxed);
     out.push_str(&format!(
-        "opc_persist_quorum_total{{op=\"write\",status=\"failure\"}} {}\n",
-        quorum_w_fail
+        "opc_persist_quorum_total{{op=\"write\",status=\"failure\"}} {quorum_w_fail}\n"
     ));
 
     let stale_leader = METRICS
@@ -826,8 +820,7 @@ pub fn export_prometheus_text() -> String {
         sorted_lag.sort_by_key(|k| k.0);
         for (&peer, &lag) in sorted_lag {
             out.push_str(&format!(
-                "opc_persist_peer_replication_lag{{peer=\"{}\"}} {}\n",
-                peer, lag
+                "opc_persist_peer_replication_lag{{peer=\"{peer}\"}} {lag}\n"
             ));
         }
     }
@@ -869,15 +862,13 @@ pub fn export_prometheus_text() -> String {
     out.push_str("# HELP opc_persist_audit_chain_verification_total Total count of audit-chain verifications\n");
     out.push_str("# TYPE opc_persist_audit_chain_verification_total counter\n");
     out.push_str(&format!(
-        "opc_persist_audit_chain_verification_total{{status=\"success\"}} {}\n",
-        audit_chain_succ
+        "opc_persist_audit_chain_verification_total{{status=\"success\"}} {audit_chain_succ}\n"
     ));
     let audit_chain_fail = METRICS
         .persist_audit_chain_verification_failure
         .load(Ordering::Relaxed);
     out.push_str(&format!(
-        "opc_persist_audit_chain_verification_total{{status=\"failure\"}} {}\n",
-        audit_chain_fail
+        "opc_persist_audit_chain_verification_total{{status=\"failure\"}} {audit_chain_fail}\n"
     ));
 
     let p_write = METRICS.persist_write_success.load(Ordering::Relaxed);
@@ -912,23 +903,19 @@ pub fn export_prometheus_text() -> String {
     );
     out.push_str("# TYPE opc_session_store_quorum_total counter\n");
     out.push_str(&format!(
-        "opc_session_store_quorum_total{{op=\"read\",status=\"success\"}} {}\n",
-        s_quorum_r_succ
+        "opc_session_store_quorum_total{{op=\"read\",status=\"success\"}} {s_quorum_r_succ}\n"
     ));
     let s_quorum_r_fail = METRICS.session_quorum_read_failure.load(Ordering::Relaxed);
     out.push_str(&format!(
-        "opc_session_store_quorum_total{{op=\"read\",status=\"failure\"}} {}\n",
-        s_quorum_r_fail
+        "opc_session_store_quorum_total{{op=\"read\",status=\"failure\"}} {s_quorum_r_fail}\n"
     ));
     let s_quorum_w_succ = METRICS.session_quorum_write_success.load(Ordering::Relaxed);
     out.push_str(&format!(
-        "opc_session_store_quorum_total{{op=\"write\",status=\"success\"}} {}\n",
-        s_quorum_w_succ
+        "opc_session_store_quorum_total{{op=\"write\",status=\"success\"}} {s_quorum_w_succ}\n"
     ));
     let s_quorum_w_fail = METRICS.session_quorum_write_failure.load(Ordering::Relaxed);
     out.push_str(&format!(
-        "opc_session_store_quorum_total{{op=\"write\",status=\"failure\"}} {}\n",
-        s_quorum_w_fail
+        "opc_session_store_quorum_total{{op=\"write\",status=\"failure\"}} {s_quorum_w_fail}\n"
     ));
 
     let s_seq = METRICS
@@ -975,36 +962,30 @@ pub fn export_prometheus_text() -> String {
     );
     out.push_str("# TYPE opc_session_store_watch_resume_total counter\n");
     out.push_str(&format!(
-        "opc_session_store_watch_resume_total{{status=\"success\"}} {}\n",
-        s_watch_succ
+        "opc_session_store_watch_resume_total{{status=\"success\"}} {s_watch_succ}\n"
     ));
     let s_watch_fail = METRICS.session_watch_resume_failure.load(Ordering::Relaxed);
     out.push_str(&format!(
-        "opc_session_store_watch_resume_total{{status=\"failure\"}} {}\n",
-        s_watch_fail
+        "opc_session_store_watch_resume_total{{status=\"failure\"}} {s_watch_fail}\n"
     ));
 
     let s_lease_acq = METRICS.session_lease_acquire.load(Ordering::Relaxed);
     out.push_str("# HELP opc_session_store_lease_ops_total Total count of lease operations\n");
     out.push_str("# TYPE opc_session_store_lease_ops_total counter\n");
     out.push_str(&format!(
-        "opc_session_store_lease_ops_total{{op=\"acquire\"}} {}\n",
-        s_lease_acq
+        "opc_session_store_lease_ops_total{{op=\"acquire\"}} {s_lease_acq}\n"
     ));
     let s_lease_ren = METRICS.session_lease_renew.load(Ordering::Relaxed);
     out.push_str(&format!(
-        "opc_session_store_lease_ops_total{{op=\"renew\"}} {}\n",
-        s_lease_ren
+        "opc_session_store_lease_ops_total{{op=\"renew\"}} {s_lease_ren}\n"
     ));
     let s_lease_rel = METRICS.session_lease_release.load(Ordering::Relaxed);
     out.push_str(&format!(
-        "opc_session_store_lease_ops_total{{op=\"release\"}} {}\n",
-        s_lease_rel
+        "opc_session_store_lease_ops_total{{op=\"release\"}} {s_lease_rel}\n"
     ));
     let s_lease_del = METRICS.session_lease_delete.load(Ordering::Relaxed);
     out.push_str(&format!(
-        "opc_session_store_lease_ops_total{{op=\"delete\"}} {}\n",
-        s_lease_del
+        "opc_session_store_lease_ops_total{{op=\"delete\"}} {s_lease_del}\n"
     ));
 
     // --- NACM / Authz ---
@@ -1012,18 +993,15 @@ pub fn export_prometheus_text() -> String {
     out.push_str("# HELP opc_nacm_eval_total Total count of NACM policy evaluations\n");
     out.push_str("# TYPE opc_nacm_eval_total counter\n");
     out.push_str(&format!(
-        "opc_nacm_eval_total{{action=\"allow\"}} {}\n",
-        nacm_allow
+        "opc_nacm_eval_total{{action=\"allow\"}} {nacm_allow}\n"
     ));
     let nacm_deny = METRICS.nacm_eval_deny.load(Ordering::Relaxed);
     out.push_str(&format!(
-        "opc_nacm_eval_total{{action=\"deny\"}} {}\n",
-        nacm_deny
+        "opc_nacm_eval_total{{action=\"deny\"}} {nacm_deny}\n"
     ));
     let nacm_error = METRICS.nacm_eval_error.load(Ordering::Relaxed);
     out.push_str(&format!(
-        "opc_nacm_eval_total{{action=\"error\"}} {}\n",
-        nacm_error
+        "opc_nacm_eval_total{{action=\"error\"}} {nacm_error}\n"
     ));
 
     write_histogram_metadata(
@@ -1057,8 +1035,7 @@ pub fn export_prometheus_text() -> String {
             let safe_sev = metrics_label_safe(&key.0);
             let safe_cause = metrics_label_safe(&key.1);
             out.push_str(&format!(
-                "opc_alarm_active_count{{severity=\"{}\",cause=\"{}\"}} {}\n",
-                safe_sev, safe_cause, val
+                "opc_alarm_active_count{{severity=\"{safe_sev}\",cause=\"{safe_cause}\"}} {val}\n"
             ));
         }
     }
@@ -1067,13 +1044,11 @@ pub fn export_prometheus_text() -> String {
     out.push_str("# HELP opc_alarm_audit_total Total count of alarm audits\n");
     out.push_str("# TYPE opc_alarm_audit_total counter\n");
     out.push_str(&format!(
-        "opc_alarm_audit_total{{status=\"success\"}} {}\n",
-        alarm_aud_succ
+        "opc_alarm_audit_total{{status=\"success\"}} {alarm_aud_succ}\n"
     ));
     let alarm_aud_fail = METRICS.alarm_audit_failure.load(Ordering::Relaxed);
     out.push_str(&format!(
-        "opc_alarm_audit_total{{status=\"failure\"}} {}\n",
-        alarm_aud_fail
+        "opc_alarm_audit_total{{status=\"failure\"}} {alarm_aud_fail}\n"
     ));
 
     let hl = METRICS.runtime_health_live.load(Ordering::Relaxed);
@@ -1121,8 +1096,7 @@ pub fn export_prometheus_text() -> String {
             let safe_route = metrics_label_safe(&key.0);
             let safe_status = metrics_label_safe(&key.1);
             out.push_str(&format!(
-                "opc_admin_requests_total{{route=\"{}\",status=\"{}\"}} {}\n",
-                safe_route, safe_status, val
+                "opc_admin_requests_total{{route=\"{safe_route}\",status=\"{safe_status}\"}} {val}\n"
             ));
         }
     }
@@ -1216,8 +1190,7 @@ pub fn export_prometheus_text() -> String {
             let operation = metrics_label_safe(&k.2);
             let outcome = metrics_label_safe(&k.3);
             out.push_str(&format!(
-                "opc_sbi_requests_total{{nf=\"{}\",service=\"{}\",operation=\"{}\",outcome=\"{}\"}} {}\n",
-                nf, service, operation, outcome, v
+                "opc_sbi_requests_total{{nf=\"{nf}\",service=\"{service}\",operation=\"{operation}\",outcome=\"{outcome}\"}} {v}\n"
             ));
         }
     }
@@ -1252,8 +1225,7 @@ pub fn export_prometheus_text() -> String {
             let cause = metrics_label_safe(&k.1);
             let status = metrics_label_safe(&k.2);
             out.push_str(&format!(
-                "opc_sbi_problem_details_total{{service=\"{}\",cause=\"{}\",status=\"{}\"}} {}\n",
-                service, cause, status, v
+                "opc_sbi_problem_details_total{{service=\"{service}\",cause=\"{cause}\",status=\"{status}\"}} {v}\n"
             ));
         }
     }
@@ -1267,8 +1239,7 @@ pub fn export_prometheus_text() -> String {
             let outcome = metrics_label_safe(&k.0);
             let reason = metrics_label_safe(&k.1);
             out.push_str(&format!(
-                "opc_sbi_oauth_validation_total{{outcome=\"{}\",reason=\"{}\"}} {}\n",
-                outcome, reason, v
+                "opc_sbi_oauth_validation_total{{outcome=\"{outcome}\",reason=\"{reason}\"}} {v}\n"
             ));
         }
     }
@@ -1281,8 +1252,7 @@ pub fn export_prometheus_text() -> String {
         for (k, &v) in sorted {
             let outcome = metrics_label_safe(k);
             out.push_str(&format!(
-                "opc_sbi_nrf_discovery_total{{outcome=\"{}\"}} {}\n",
-                outcome, v
+                "opc_sbi_nrf_discovery_total{{outcome=\"{outcome}\"}} {v}\n"
             ));
         }
     }
@@ -1295,8 +1265,7 @@ pub fn export_prometheus_text() -> String {
         for (k, &v) in sorted {
             let service = metrics_label_safe(k);
             out.push_str(&format!(
-                "opc_sbi_nrf_cache_entries{{service=\"{}\"}} {}\n",
-                service, v
+                "opc_sbi_nrf_cache_entries{{service=\"{service}\"}} {v}\n"
             ));
         }
     }
@@ -1309,8 +1278,7 @@ pub fn export_prometheus_text() -> String {
         for (k, &v) in sorted {
             let outcome = metrics_label_safe(k);
             out.push_str(&format!(
-                "opc_sbi_nrf_heartbeat_total{{outcome=\"{}\"}} {}\n",
-                outcome, v
+                "opc_sbi_nrf_heartbeat_total{{outcome=\"{outcome}\"}} {v}\n"
             ));
         }
     }
@@ -1327,8 +1295,7 @@ pub fn export_prometheus_text() -> String {
             let service = metrics_label_safe(&k.1);
             let state = metrics_label_safe(&k.2);
             out.push_str(&format!(
-                "opc_sbi_circuit_state{{peer=\"{}\",service=\"{}\",state=\"{}\"}} {}\n",
-                peer, service, state, v
+                "opc_sbi_circuit_state{{peer=\"{peer}\",service=\"{service}\",state=\"{state}\"}} {v}\n"
             ));
         }
     }
@@ -1342,8 +1309,7 @@ pub fn export_prometheus_text() -> String {
             let service = metrics_label_safe(&k.0);
             let reason = metrics_label_safe(&k.1);
             out.push_str(&format!(
-                "opc_sbi_overload_rejections_total{{service=\"{}\",reason=\"{}\"}} {}\n",
-                service, reason, v
+                "opc_sbi_overload_rejections_total{{service=\"{service}\",reason=\"{reason}\"}} {v}\n"
             ));
         }
     }
@@ -1357,8 +1323,7 @@ pub fn export_prometheus_text() -> String {
             let target = metrics_label_safe(&k.0);
             let outcome = metrics_label_safe(&k.1);
             out.push_str(&format!(
-                "opc_sbi_callback_delivery_total{{target=\"{}\",outcome=\"{}\"}} {}\n",
-                target, outcome, v
+                "opc_sbi_callback_delivery_total{{target=\"{target}\",outcome=\"{outcome}\"}} {v}\n"
             ));
         }
     }

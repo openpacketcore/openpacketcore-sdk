@@ -29,7 +29,7 @@ async fn test_boundary_expired_client_cert() {
     let expired_identity = generate_custom_identity(&ca_cert, &ca_key_pair, spiffe, true);
 
     let node_0_port = cluster.base_port;
-    let conn_res = connect_raw_tls(&format!("127.0.0.1:{}", node_0_port), &expired_identity).await;
+    let conn_res = connect_raw_tls(&format!("127.0.0.1:{node_0_port}"), &expired_identity).await;
 
     if let Ok(mut tls_stream) = conn_res {
         let req = json!({
@@ -96,8 +96,7 @@ async fn test_boundary_untrusted_ca() {
         generate_custom_identity(&untrusted_ca_cert, &untrusted_ca_key_pair, spiffe, false);
 
     let node_0_port = cluster.base_port;
-    let conn_res =
-        connect_raw_tls(&format!("127.0.0.1:{}", node_0_port), &untrusted_identity).await;
+    let conn_res = connect_raw_tls(&format!("127.0.0.1:{node_0_port}"), &untrusted_identity).await;
     assert!(conn_res.is_err());
 }
 
@@ -114,8 +113,7 @@ async fn test_boundary_malformed_san_uri() {
     let malformed_identity = generate_malformed_san_identity(&ca_cert, &ca_key_pair, malformed_san);
 
     let node_0_port = cluster.base_port;
-    let conn_res =
-        connect_raw_tls(&format!("127.0.0.1:{}", node_0_port), &malformed_identity).await;
+    let conn_res = connect_raw_tls(&format!("127.0.0.1:{node_0_port}"), &malformed_identity).await;
 
     if let Ok(mut tls_stream) = conn_res {
         let req = json!({
@@ -171,7 +169,7 @@ async fn test_boundary_spiffe_node_id_mismatch() {
     let custom_identity = generate_custom_identity(&ca_cert, &ca_key_pair, spiffe, false);
 
     let node_0_port = cluster.base_port;
-    let mut tls_stream = connect_raw_tls(&format!("127.0.0.1:{}", node_0_port), &custom_identity)
+    let mut tls_stream = connect_raw_tls(&format!("127.0.0.1:{node_0_port}"), &custom_identity)
         .await
         .unwrap();
 
@@ -224,7 +222,7 @@ async fn test_boundary_cluster_id_mismatch() {
 
     let node_0_port = cluster.base_port;
     let identity = cluster.identities.get(&1).unwrap().clone();
-    let mut tls_stream = connect_raw_tls(&format!("127.0.0.1:{}", node_0_port), &identity)
+    let mut tls_stream = connect_raw_tls(&format!("127.0.0.1:{node_0_port}"), &identity)
         .await
         .unwrap();
 
@@ -273,8 +271,7 @@ async fn test_boundary_non_test_spiffe_profile_is_accepted() {
     let mut identities = HashMap::new();
     for node_id in 0..3 {
         let spiffe = format!(
-            "spiffe://prod.example.org/tenant/carrier/ns/core/sa/opc-consensus/nf/amf/instance/{}",
-            node_id
+            "spiffe://prod.example.org/tenant/carrier/ns/core/sa/opc-consensus/nf/amf/instance/{node_id}"
         );
         identities.insert(
             node_id,

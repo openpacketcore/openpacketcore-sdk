@@ -39,8 +39,7 @@ impl RequirementId {
             || section.contains('-')
         {
             return Err(EvidenceError::InvalidRequirementId(format!(
-                "REQ-{}-{}-{}-{}-{:03}",
-                source, document, release, section, ordinal
+                "REQ-{source}-{document}-{release}-{section}-{ordinal:03}"
             )));
         }
 

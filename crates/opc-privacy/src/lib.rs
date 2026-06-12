@@ -41,18 +41,15 @@ impl std::fmt::Display for MinimizationError {
             ),
             Self::CohortTooSmall(size, threshold) => write!(
                 f,
-                "Minimization error: cohort size {} is below k-anonymity threshold {}",
-                size, threshold
+                "Minimization error: cohort size {size} is below k-anonymity threshold {threshold}"
             ),
             Self::DirectIdentifierNotAllowed(class) => write!(
                 f,
-                "Minimization error: direct identifier class '{}' is not allowed in analytics",
-                class
+                "Minimization error: direct identifier class '{class}' is not allowed in analytics"
             ),
             Self::ClassNotAllowed(class) => write!(
                 f,
-                "Minimization error: class '{}' is not permitted by current analytics policy",
-                class
+                "Minimization error: class '{class}' is not permitted by current analytics policy"
             ),
         }
     }
@@ -121,7 +118,7 @@ pub fn try_bin_value(val: u64, bin_size: u64) -> Result<String, MinimizationErro
     }
     let lower = (val / bin_size) * bin_size;
     let upper = lower + bin_size;
-    Ok(format!("{}-{}", lower, upper))
+    Ok(format!("{lower}-{upper}"))
 }
 
 /// Helper to hash a subscriber ID if needed, using a keyed digest.
