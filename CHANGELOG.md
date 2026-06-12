@@ -88,6 +88,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manual strategies. Integrated into `workload.RenderDeployment`. Envtest
   coverage verifies strategy fields are persisted correctly on a real
   API server.
+- `opc-proto-ngap` (experimental v0): NGAP (3GPP TS 38.413) codec built on
+  `rasn` per ADR 0013 Option A. NGAP-PDU framing (initiating / successful /
+  unsuccessful outcomes), typed APER decoding of NGSetupRequest,
+  NGSetupResponse, NGSetupFailure, and InitialUEMessage, and raw-preserving
+  encode so decode->encode round-trips byte-exactly against spec and
+  independent `asn1c`/libngap fixtures. Offline generator
+  `scripts/generate-ngap.py` (Wireshark ASN.1 + `rasn-compiler`) and
+  `make generate-ngap`; fuzz target `decode_ngap` with seed corpus and
+  CI registration.
+
+### Changed
+- `opc-session-net` (experimental): `RemoteSessionBackend` now keeps a single
+  persistent TCP/TLS connection per backend instance (one in-flight request at
+  a time) instead of opening a fresh connection per request. Lost connections
+  are re-established with the existing backoff retry, still bounded by the
+  per-call deadline. `ServerHandle::abort()` now also aborts in-flight
+  connection handlers so tests can simulate server crashes. Added integration
+  tests for transparent reconnect after restart and for surfacing a
+  backend-unavailable error within deadline when a request is in flight during
+  disconnect.
 
 - ADR 0014 (dependency and toolchain policy) and ADR 0015 (protocol codec
   conformance policy); ADR 0013 amended with the outcome of the first NGAP
