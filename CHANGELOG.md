@@ -110,6 +110,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Offline generator `scripts/generate-ngap.py` (Wireshark ASN.1 +
   `rasn-compiler`) and `make generate-ngap`; fuzz target `decode_ngap`
   with seed corpus and CI registration.
+- `opc-sbi`: `NrfClient` now implements `NrfDeregNotifier` so consumers can
+  wire a real NRF client directly into `NrfDrainHook` without a wrapper.
 - `opc-api-nnrf` (experimental): expanded generated TS 29.510 types to cover
   the NRF NFManagement payloads used for registration, heartbeat, and
   subscription/notification exchanges: `SubscriptionData`, `NotificationData`,

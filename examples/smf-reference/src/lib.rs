@@ -24,9 +24,7 @@ use opc_runtime::{
     Criticality, Readiness, RuntimeError, RuntimeHandle, RuntimeProfile, Supervisor, TaskError,
     TaskKind, TaskSpec,
 };
-use opc_sbi::nrf::{
-    HeartbeatDriver, NfProfile, NfStatus, NrfClient, NrfDeregNotifier, NrfOperations,
-};
+use opc_sbi::nrf::{HeartbeatDriver, NfProfile, NfStatus, NrfClient, NrfOperations};
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, FakeSessionBackend, Generation,
     OwnerId, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, StateClass,
@@ -36,26 +34,6 @@ use opc_types::{NetworkFunctionKind, NfInstanceId, NfType, PlmnId, Snssai, Tenan
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::{watch, Mutex};
-
-/// Wrapper that implements [`NrfDeregNotifier`] for the concrete [`NrfClient`].
-///
-/// FRACTURE-JOURNAL: `NrfClient` implements `NrfOperations` but not
-/// `NrfDeregNotifier`, even though it has a `deregister` method with the same
-/// semantics. A reference consumer should not need this boilerplate to wire a
-/// real NRF client into the runtime drain sequence.
-pub struct NrfDeregWrapper(Arc<NrfClient>);
-
-#[async_trait::async_trait]
-impl NrfDeregNotifier for NrfDeregWrapper {
-    async fn deregister(
-        &self,
-        nf_instance_id: &NfInstanceId,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.0.deregister(nf_instance_id).await.map_err(|e| {
-            Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
-        })
-    }
-}
 
 /// Errors surfaced by the reference SMF.
 #[derive(Debug, Error)]
@@ -218,8 +196,8 @@ impl Smf {
             .build()
             .map_err(SmfError::Nrf)?;
         let nrf_client: Arc<NrfClient> = Arc::new(NrfClient::new(client, config.nrf_uri.clone()));
-        let nrf_dereg = Arc::new(NrfDeregWrapper(nrf_client.clone()));
-        let nrf_drain_hook = opc_sbi::nrf::NrfDrainHook::new(nrf_dereg, config.instance_id.clone());
+        let nrf_drain_hook =
+            opc_sbi::nrf::NrfDrainHook::new(nrf_client.clone(), config.instance_id.clone());
 
         let config_clone = config.clone();
         let store_clone = store.clone();
@@ -416,13 +394,6 @@ async fn spawn_nrf_task(
         shutdown_rx,
         degraded_tx,
     );
-
-    // FRACTURE-JOURNAL: NrfDrainHook requires the notifier to implement NrfDeregNotifier.
-    // MockNrf implements it, but NrfClient does not, so a real SMF cannot use the
-    // runtime-hooks feature with NrfClient directly. We register the hook manually below
-    // by constructing a notifier wrapper, which is extra boilerplate for a reference consumer.
-    // The hook is registered on the runtime builder before `build`; here we only run the
-    // heartbeat driver.
 
     supervisor
         .spawn_spec(TaskSpec::new(

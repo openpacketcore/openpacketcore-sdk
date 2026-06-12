@@ -2,7 +2,9 @@
 //! NFDiscovery), the periodic heartbeat driver, and the cache-fronted
 //! discovery client with stale-if-error and production fail-closed rules.
 
-use crate::nrf::{CacheLookup, DiscoveryCache, DiscoveryQuery, DiscoveryResult, NfProfile};
+use crate::nrf::{
+    CacheLookup, DiscoveryCache, DiscoveryQuery, DiscoveryResult, NfProfile, NrfDeregNotifier,
+};
 use crate::redact::{safe_metric_label, sanitize_error_message};
 use async_trait::async_trait;
 use opc_types::NfInstanceId;
@@ -50,6 +52,20 @@ impl NrfClient {
     /// from the supplied client.
     pub fn new(client: crate::client::SbiClient, nrf_uri: String) -> Self {
         Self { client, nrf_uri }
+    }
+}
+
+#[async_trait]
+impl NrfDeregNotifier for NrfClient {
+    async fn deregister(
+        &self,
+        nf_instance_id: &NfInstanceId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        <Self as NrfOperations>::deregister(self, nf_instance_id)
+            .await
+            .map_err(|e| {
+                Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
+            })
     }
 }
 
