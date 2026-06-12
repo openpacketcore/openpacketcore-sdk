@@ -180,6 +180,34 @@ impl GroupedIe for CreateQer {
 }
 
 // ---------------------------------------------------------------------------
+// Update QER (type 14)
+// ---------------------------------------------------------------------------
+
+/// Update QER grouped IE (type 14).
+///
+/// TS 29.244 §7.5.4.5: contains QER ID and the subset of QoS parameters
+/// that need to be modified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateQer {
+    /// Member IEs.
+    pub members: Vec<TypedIe>,
+}
+
+impl GroupedIe for UpdateQer {
+    fn decode_members(input: &[u8], ctx: DecodeContext, depth: usize) -> Result<Self, DecodeError> {
+        let members = decode_typed_ie_sequence(input, ctx, depth)?;
+        Ok(Self { members })
+    }
+
+    fn encode_members(&self, dst: &mut BytesMut, ctx: EncodeContext) -> Result<(), EncodeError> {
+        for member in &self.members {
+            member.encode(dst, ctx)?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Created PDR (type 8)
 // ---------------------------------------------------------------------------
 

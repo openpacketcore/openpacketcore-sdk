@@ -267,6 +267,8 @@ pub enum IeType {
     CreateQer = 7,
     /// Created PDR
     CreatedPdr = 8,
+    /// Update QER
+    UpdateQer = 14,
     /// Cause
     Cause = 19,
     /// Source Interface
@@ -279,6 +281,8 @@ pub enum IeType {
     GateStatus = 25,
     /// MBR
     Mbr = 26,
+    /// GBR
+    Gbr = 27,
     /// Precedence
     Precedence = 29,
     /// Reporting Triggers
@@ -311,6 +315,8 @@ pub enum IeType {
     FarId = 108,
     /// QER ID
     QerId = 109,
+    /// QoS Flow Identifier
+    Qfi = 124,
 }
 
 /// A generic PFCP IE with type/length framing and raw byte preservation.

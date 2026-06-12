@@ -71,6 +71,10 @@ arithmetic, truncation/overflow rejection, and negative tests.
 | Outer Header Creation | 84 | §8.2.56 | 16-bit description (octet 5 = high byte); TEID iff GTP-U (octet 5 bits 1-2), UDP port iff non-GTP UDP (bits 3-4), addresses per bits 1/3/5 and 2/4/6; C-TAG/S-TAG. |
 | Outer Header Removal | 95 | §8.2.57 | 1 octet description. |
 | Recovery Time Stamp | 96 | §8.2.69 | 4 octets, NTP short-format seconds (RFC 5905, 1900 era), carried opaquely. |
+| QoS Flow Identifier (QFI) | 124 | §8.2.89 | 1 octet; 6-bit QFI value, spare high bits emitted as zero. |
+| Gate Status | 25 | §8.2.7 | 1 octet; UL gate (bits 2-1), DL gate (bits 4-3). Open=0, Closed=1. |
+| Maximum Bit Rate (MBR) | 26 | §8.2.8 | 10 octets; UL/DL 40-bit rates in kbps (binary). |
+| Guaranteed Bit Rate (GBR) | 27 | §8.2.9 | 10 octets; UL/DL 40-bit rates in kbps (binary). |
 
 #### Canonicalizing re-encode
 
@@ -97,11 +101,12 @@ input. Byte-exact round-trip verified for all listed grouped IEs.
 | Forwarding Parameters | 4 | §7.5.2.2.1 | Typed members with depth limit. |
 | Create URR | 6 | §7.5.2.5 | Typed members with depth limit. |
 | Create QER | 7 | §7.5.2.4 | Typed members with depth limit. |
+| Update QER | 14 | §7.5.4.5 | Typed members with depth limit. |
 | Created PDR | 8 | §7.5.2.6 | Typed members with depth limit. |
 
 ## Out of Scope (v1+)
 
-- Remaining simple IEs not listed above (e.g., Gate Status, MBR, GBR,
-  Reporting Triggers, Report Type, Measurement Method, etc.).
+- Remaining simple IEs not listed above (e.g., Reporting Triggers,
+  Report Type, Measurement Method, Packet Rate, DL Flow Level Marking, etc.).
 - Full message-specific semantic validation (e.g., mandatory-IE presence).
 - PFD Management, Subscriber Management, and other non-SMF/UPF messages.

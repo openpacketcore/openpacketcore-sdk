@@ -975,3 +975,221 @@ fn test_create_urr_roundtrip() {
     }
     assert_typed_roundtrip(&bytes);
 }
+
+// ---------------------------------------------------------------------------
+// QoS IEs (§8.2.89, §8.2.7, §8.2.8, §8.2.9)
+// ---------------------------------------------------------------------------
+
+/// QoS Flow Identifier IE, value = 5 per §8.2.89.
+/// Octets: type=0x007C, length=0x0001, value=0x05 (spare bits 0).
+#[test]
+fn test_qfi_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x7C, // IE type 124 (QFI)
+        0x00, 0x01, // length 1
+        0x05, // QFI = 5, spare bits 0 (§8.2.89)
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::Qfi(q) => assert_eq!(q.value, 5),
+        other => panic!("expected Qfi, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Gate Status IE with both gates open per §8.2.7.
+/// Octets: type=0x0019, length=0x0001, value=0x00.
+#[test]
+fn test_gate_status_open_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x19, // IE type 25 (Gate Status)
+        0x00, 0x01, // length 1
+        0x00, // UL gate open (0), DL gate open (0) (§8.2.7)
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::GateStatus(g) => {
+            assert_eq!(g.ul, crate::ie::Gate::Open);
+            assert_eq!(g.dl, crate::ie::Gate::Open);
+        }
+        other => panic!("expected GateStatus, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Gate Status IE with both gates closed per §8.2.7.
+/// UL gate = 1 (closed), DL gate = 1 (closed) => value 0x05.
+#[test]
+fn test_gate_status_closed_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x19, // IE type 25 (Gate Status)
+        0x00, 0x01, // length 1
+        0x05, // UL closed (1), DL closed (1)
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::GateStatus(g) => {
+            assert_eq!(g.ul, crate::ie::Gate::Closed);
+            assert_eq!(g.dl, crate::ie::Gate::Closed);
+        }
+        other => panic!("expected GateStatus, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Maximum Bit Rate IE per §8.2.8.
+/// UL MBR = 0x0000000001 (1 kbps), DL MBR = 0x0000000002 (2 kbps).
+#[test]
+fn test_mbr_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x1A, // IE type 26 (MBR)
+        0x00, 0x0A, // length 10
+        // UL MBR (5 octets)
+        0x00, 0x00, 0x00, 0x00, 0x01, // DL MBR (5 octets)
+        0x00, 0x00, 0x00, 0x00, 0x02,
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::Mbr(m) => {
+            assert_eq!(m.ul_kbps, 1);
+            assert_eq!(m.dl_kbps, 2);
+        }
+        other => panic!("expected Mbr, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Guaranteed Bit Rate IE per §8.2.9.
+/// UL GBR = 0x00000003E8 (1000 kbps), DL GBR = 0x00000007D0 (2000 kbps).
+#[test]
+fn test_gbr_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x1B, // IE type 27 (GBR)
+        0x00, 0x0A, // length 10
+        // UL GBR (5 octets)
+        0x00, 0x00, 0x00, 0x03, 0xE8, // DL GBR (5 octets)
+        0x00, 0x00, 0x00, 0x07, 0xD0,
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::Gbr(g) => {
+            assert_eq!(g.ul_kbps, 1000);
+            assert_eq!(g.dl_kbps, 2000);
+        }
+        other => panic!("expected Gbr, got {:?}", other),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+#[test]
+fn test_mbr_truncated_rejected() {
+    let bytes: &[u8] = &[
+        0x00, 0x1A, // IE type 26 (MBR)
+        0x00, 0x0A, // length 10
+        // only 9 octets
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let result = TypedIe::decode(bytes, DecodeContext::default(), 0);
+    assert!(result.is_err(), "truncated MBR must be rejected");
+}
+
+#[test]
+fn test_gbr_truncated_rejected() {
+    let bytes: &[u8] = &[
+        0x00, 0x1B, // IE type 27 (GBR)
+        0x00, 0x0A, // length 10
+        // only 9 octets
+        0x00, 0x00, 0x00, 0x03, 0xE8, 0x00, 0x00, 0x00, 0x07,
+    ];
+    let result = TypedIe::decode(bytes, DecodeContext::default(), 0);
+    assert!(result.is_err(), "truncated GBR must be rejected");
+}
+
+/// Create QER containing QER ID, Gate Status, MBR, GBR and QFI per §7.5.2.5.
+#[test]
+fn test_create_qer_with_qos_members_roundtrip() {
+    let qer_id: &[u8] = &[
+        0x00, 0x6D, // IE type 109 (QER ID)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x01, // QER ID = 1
+    ];
+    let gate_status: &[u8] = &[
+        0x00, 0x19, // IE type 25 (Gate Status)
+        0x00, 0x01, // length 1
+        0x00, // both gates open
+    ];
+    let mbr: &[u8] = &[
+        0x00, 0x1A, // IE type 26 (MBR)
+        0x00, 0x0A, // length 10
+        0x00, 0x00, 0x00, 0x00, 0x01, // UL 1 kbps
+        0x00, 0x00, 0x00, 0x00, 0x02, // DL 2 kbps
+    ];
+    let gbr: &[u8] = &[
+        0x00, 0x1B, // IE type 27 (GBR)
+        0x00, 0x0A, // length 10
+        0x00, 0x00, 0x00, 0x00, 0x01, // UL 1 kbps
+        0x00, 0x00, 0x00, 0x00, 0x02, // DL 2 kbps
+    ];
+    let qfi: &[u8] = &[
+        0x00, 0x7C, // IE type 124 (QFI)
+        0x00, 0x01, // length 1
+        0x05, // QFI = 5
+    ];
+
+    let mut value = BytesMut::new();
+    value.put_slice(qer_id);
+    value.put_slice(gate_status);
+    value.put_slice(mbr);
+    value.put_slice(gbr);
+    value.put_slice(qfi);
+
+    let mut raw = BytesMut::new();
+    raw.put_u16(7); // Create QER type
+    raw.put_u16(value.len() as u16);
+    raw.put_slice(&value);
+
+    let bytes = raw.freeze();
+    let ie = decode_typed(&bytes);
+    match ie {
+        TypedIe::CreateQer(g) => {
+            assert_eq!(g.members.len(), 5);
+        }
+        other => panic!("expected CreateQer, got {:?}", other),
+    }
+    assert_typed_roundtrip(&bytes);
+}
+
+/// Update QER containing QER ID and a modified MBR per §7.5.4.5.
+#[test]
+fn test_update_qer_roundtrip() {
+    let qer_id: &[u8] = &[
+        0x00, 0x6D, // IE type 109 (QER ID)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x01, // QER ID = 1
+    ];
+    let mbr: &[u8] = &[
+        0x00, 0x1A, // IE type 26 (MBR)
+        0x00, 0x0A, // length 10
+        0x00, 0x00, 0x00, 0x00, 0x0A, // UL 10 kbps
+        0x00, 0x00, 0x00, 0x00, 0x14, // DL 20 kbps
+    ];
+
+    let mut value = BytesMut::new();
+    value.put_slice(qer_id);
+    value.put_slice(mbr);
+
+    let mut raw = BytesMut::new();
+    raw.put_u16(14); // Update QER type
+    raw.put_u16(value.len() as u16);
+    raw.put_slice(&value);
+
+    let bytes = raw.freeze();
+    let ie = decode_typed(&bytes);
+    match ie {
+        TypedIe::UpdateQer(g) => {
+            assert_eq!(g.members.len(), 2);
+        }
+        other => panic!("expected UpdateQer, got {:?}", other),
+    }
+    assert_typed_roundtrip(&bytes);
+}

@@ -14,9 +14,9 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use opc_alarm::SharedAlarmManager;
 use opc_proto_pfcp::ie::{
-    ApplyAction, CauseValue, CreateFar, CreatePdr, DestinationInterface, FSeid, FarId,
-    ForwardingParameters, NetworkInstance, NodeIdType, OuterHeaderCreation, Pdi, PdrId, Precedence,
-    SourceInterface, TypedIe,
+    ApplyAction, CauseValue, CreateFar, CreatePdr, CreateQer, DestinationInterface, FSeid, FarId,
+    ForwardingParameters, Gate, GateStatus, Gbr, Mbr, NetworkInstance, NodeIdType,
+    OuterHeaderCreation, Pdi, PdrId, Precedence, QerId, Qfi, SourceInterface, TypedIe,
 };
 use opc_proto_pfcp::{Header, InformationElement, MessageType, OwnedMessage};
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
@@ -851,38 +851,28 @@ pub fn build_create_far(
     Ok(TypedIe::CreateFar(CreateFar { members }))
 }
 
-/// Build a Create QER IE using raw member IEs when typed QoS IEs are not yet
-/// available in the SDK (P1 honest workaround; P2 replaces with typed IEs).
-pub fn build_create_qer_raw(qer_id: u32) -> Result<InformationElement, SmfError> {
-    let mut value = BytesMut::new();
-    // QER ID
-    value.extend_from_slice(&[
-        0x00, 0x6D, // QER ID IE type
-        0x00, 0x04, // length
-    ]);
-    value.extend_from_slice(&qer_id.to_be_bytes());
-    // Gate Status (open)
-    value.extend_from_slice(&[
-        0x00, 0x19, // Gate Status IE type
-        0x00, 0x01, // length
-        0x00, // both gates open
-    ]);
-    // MBR (UL+DL)
-    value.extend_from_slice(&[
-        0x00, 0x1A, // MBR IE type
-        0x00, 0x0A, // length
-    ]);
-    value.extend_from_slice(&[0u8; 10]);
-    // GBR (UL+DL)
-    value.extend_from_slice(&[
-        0x00, 0x1B, // GBR IE type
-        0x00, 0x0A, // length
-    ]);
-    value.extend_from_slice(&[0u8; 10]);
+/// Build a Create QER IE from a static QoS template.
+///
+/// This exercises the typed QoS IEs added in P2: Gate Status, MBR, GBR, QFI.
+pub fn build_create_qer(qer_id: u32, qfi: u8) -> Result<TypedIe, SmfError> {
+    let qer = CreateQer {
+        members: vec![
+            TypedIe::QerId(QerId { value: qer_id }),
+            TypedIe::GateStatus(GateStatus {
+                ul: Gate::Open,
+                dl: Gate::Open,
+            }),
+            TypedIe::Mbr(Mbr {
+                ul_kbps: 1_000_000,
+                dl_kbps: 2_000_000,
+            }),
+            TypedIe::Gbr(Gbr {
+                ul_kbps: 500_000,
+                dl_kbps: 1_000_000,
+            }),
+            TypedIe::Qfi(Qfi { value: qfi }),
+        ],
+    };
 
-    Ok(InformationElement {
-        ie_type: opc_proto_pfcp::IeType::CreateQer as u16,
-        enterprise_id: 0,
-        value: value.freeze(),
-    })
+    Ok(TypedIe::CreateQer(qer))
 }

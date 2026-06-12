@@ -8,7 +8,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use opc_proto_pfcp::ie::{CauseValue, TypedIe};
 use opc_proto_pfcp::{Header, InformationElement, MessageType, OwnedMessage};
 use opc_protocol::{DecodeContext, Encode, EncodeContext, OwnedDecode};
-use smf_reference::{build_create_far, build_create_pdr, build_create_qer_raw, Smf, SmfConfig};
+use smf_reference::{build_create_far, build_create_pdr, build_create_qer, Smf, SmfConfig};
 use tokio::net::UdpSocket;
 
 fn init_tracing() {
@@ -128,7 +128,7 @@ async fn pfcp_association_session_lifecycle() {
     // 2. Session Establishment Request with typed Create PDR/FAR and raw QER.
     let create_pdr = build_create_pdr(1, 100, 1).expect("create pdr");
     let create_far = build_create_far(1, false, true, Some(1)).expect("create far");
-    let create_qer = build_create_qer_raw(1).expect("create qer");
+    let create_qer = build_create_qer(1, 5).expect("create qer");
 
     let session_est = OwnedMessage {
         header: Header {
@@ -147,7 +147,7 @@ async fn pfcp_association_session_lifecycle() {
         ies: vec![
             encode_typed_ie(create_pdr),
             encode_typed_ie(create_far),
-            create_qer,
+            encode_typed_ie(create_qer),
         ],
     };
 

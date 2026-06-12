@@ -25,12 +25,12 @@ use simple::SimpleIe;
 mod tests;
 
 pub use grouped::{
-    CreateFar, CreatePdr, CreateQer, CreateUrr, CreatedPdr, ForwardingParameters, Pdi,
+    CreateFar, CreatePdr, CreateQer, CreateUrr, CreatedPdr, ForwardingParameters, Pdi, UpdateQer,
 };
 pub use simple::{
-    ApplyAction, Cause, CauseValue, DestinationInterface, FSeid, FTeid, FarId, NetworkInstance,
-    NodeId, NodeIdType, OuterHeaderCreation, OuterHeaderRemoval, PdrId, Precedence, QerId,
-    RecoveryTimeStamp, SourceInterface, UeIpAddress, UrrId,
+    ApplyAction, Cause, CauseValue, DestinationInterface, FSeid, FTeid, FarId, Gate, GateStatus,
+    Gbr, Mbr, NetworkInstance, NodeId, NodeIdType, OuterHeaderCreation, OuterHeaderRemoval, PdrId,
+    Precedence, QerId, Qfi, RecoveryTimeStamp, SourceInterface, UeIpAddress, UrrId,
 };
 
 /// A decoded PFCP IE — either a known typed IE or a raw-preserving fallback.
@@ -51,6 +51,8 @@ pub enum TypedIe {
     CreateUrr(CreateUrr),
     /// Create QER (grouped IE, type 7).
     CreateQer(CreateQer),
+    /// Update QER (grouped IE, type 14).
+    UpdateQer(UpdateQer),
     /// Created PDR (grouped IE, type 8).
     CreatedPdr(CreatedPdr),
     /// Cause (type 19).
@@ -61,6 +63,12 @@ pub enum TypedIe {
     FTeid(FTeid),
     /// Network Instance (type 22).
     NetworkInstance(NetworkInstance),
+    /// Gate Status (type 25).
+    GateStatus(GateStatus),
+    /// Maximum Bit Rate (type 26).
+    Mbr(Mbr),
+    /// Guaranteed Bit Rate (type 27).
+    Gbr(Gbr),
     /// Precedence (type 29).
     Precedence(Precedence),
     /// Apply Action (type 44).
@@ -87,6 +95,8 @@ pub enum TypedIe {
     FarId(FarId),
     /// QER ID (type 109).
     QerId(QerId),
+    /// QoS Flow Identifier (type 124).
+    Qfi(Qfi),
     /// Unknown or vendor IE preserved byte-exact.
     Raw(InformationElement),
 }
@@ -130,6 +140,7 @@ impl TypedIe {
             4 => Self::ForwardingParameters(decode_grouped(value, ctx, depth)?),
             6 => Self::CreateUrr(decode_grouped(value, ctx, depth)?),
             7 => Self::CreateQer(decode_grouped(value, ctx, depth)?),
+            14 => Self::UpdateQer(decode_grouped(value, ctx, depth)?),
             8 => Self::CreatedPdr(decode_grouped(value, ctx, depth)?),
             19 => Self::Cause(simple::Cause::decode_value(
                 value,
@@ -151,6 +162,13 @@ impl TypedIe {
                 offset,
                 spec_ref.clone(),
             )?),
+            25 => Self::GateStatus(simple::GateStatus::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            26 => Self::Mbr(simple::Mbr::decode_value(value, offset, spec_ref.clone())?),
+            27 => Self::Gbr(simple::Gbr::decode_value(value, offset, spec_ref.clone())?),
             29 => Self::Precedence(simple::Precedence::decode_value(
                 value,
                 offset,
@@ -216,6 +234,7 @@ impl TypedIe {
                 offset,
                 spec_ref.clone(),
             )?),
+            124 => Self::Qfi(simple::Qfi::decode_value(value, offset, spec_ref.clone())?),
             _ => Self::Raw(raw),
         };
 
@@ -271,6 +290,10 @@ impl TypedIe {
                 encode_grouped(v, &mut buf, ctx)?;
                 7
             }
+            Self::UpdateQer(v) => {
+                encode_grouped(v, &mut buf, ctx)?;
+                14
+            }
             Self::CreatedPdr(v) => {
                 encode_grouped(v, &mut buf, ctx)?;
                 8
@@ -290,6 +313,18 @@ impl TypedIe {
             Self::NetworkInstance(v) => {
                 v.encode_value(&mut buf)?;
                 22
+            }
+            Self::GateStatus(v) => {
+                v.encode_value(&mut buf)?;
+                25
+            }
+            Self::Mbr(v) => {
+                v.encode_value(&mut buf)?;
+                26
+            }
+            Self::Gbr(v) => {
+                v.encode_value(&mut buf)?;
+                27
             }
             Self::Precedence(v) => {
                 v.encode_value(&mut buf)?;
@@ -343,6 +378,10 @@ impl TypedIe {
                 v.encode_value(&mut buf)?;
                 109
             }
+            Self::Qfi(v) => {
+                v.encode_value(&mut buf)?;
+                124
+            }
             Self::Raw(_) => unreachable!("Raw handled in outer match"),
         };
         Ok((ie_type, buf.to_vec()))
@@ -357,11 +396,15 @@ impl TypedIe {
             Self::ForwardingParameters(_) => 4,
             Self::CreateUrr(_) => 6,
             Self::CreateQer(_) => 7,
+            Self::UpdateQer(_) => 14,
             Self::CreatedPdr(_) => 8,
             Self::Cause(_) => 19,
             Self::SourceInterface(_) => 20,
             Self::FTeid(_) => 21,
             Self::NetworkInstance(_) => 22,
+            Self::GateStatus(_) => 25,
+            Self::Mbr(_) => 26,
+            Self::Gbr(_) => 27,
             Self::Precedence(_) => 29,
             Self::ApplyAction(_) => 44,
             Self::DestinationInterface(_) => 42,
@@ -375,6 +418,7 @@ impl TypedIe {
             Self::OuterHeaderCreation(_) => 84,
             Self::FarId(_) => 108,
             Self::QerId(_) => 109,
+            Self::Qfi(_) => 124,
             Self::Raw(raw) => raw.ie_type,
         }
     }

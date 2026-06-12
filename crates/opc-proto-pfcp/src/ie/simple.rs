@@ -580,6 +580,188 @@ impl SimpleIe for QerId {
 }
 
 // ---------------------------------------------------------------------------
+// QoS Flow Identifier (§8.2.89)
+// ---------------------------------------------------------------------------
+
+/// QoS Flow Identifier IE (type 124).
+///
+/// TS 29.244 §8.2.89: one octet, bits 6-1 = QFI, bits 8-7 = spare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qfi {
+    /// QoS Flow Identifier (6 bits).
+    pub value: u8,
+}
+
+impl SimpleIe for Qfi {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.is_empty() {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        Ok(Self {
+            value: value[0] & 0x3F,
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        dst.put_u8(self.value & 0x3F);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gate Status (§8.2.7)
+// ---------------------------------------------------------------------------
+
+/// Gate state for a single direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// Gate is open (traffic forwarded).
+    Open,
+    /// Gate is closed (traffic discarded).
+    Closed,
+}
+
+impl From<u8> for Gate {
+    fn from(value: u8) -> Self {
+        match value & 0x03 {
+            0 => Self::Open,
+            _ => Self::Closed,
+        }
+    }
+}
+
+impl From<Gate> for u8 {
+    fn from(gate: Gate) -> Self {
+        match gate {
+            Gate::Open => 0,
+            Gate::Closed => 1,
+        }
+    }
+}
+
+/// Gate Status IE (type 25).
+///
+/// TS 29.244 §8.2.7: one octet, bits 4-3 = DL gate, bits 2-1 = UL gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateStatus {
+    /// Uplink gate state.
+    pub ul: Gate,
+    /// Downlink gate state.
+    pub dl: Gate,
+}
+
+impl SimpleIe for GateStatus {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.is_empty() {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        let b = value[0];
+        Ok(Self {
+            ul: Gate::from(b & 0x03),
+            dl: Gate::from((b >> 2) & 0x03),
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        let b = (u8::from(self.dl) << 2) | u8::from(self.ul);
+        dst.put_u8(b);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Maximum Bit Rate (§8.2.8)
+// ---------------------------------------------------------------------------
+
+/// Maximum Bit Rate IE (type 26).
+///
+/// TS 29.244 §8.2.8: ten octets. The first five octets encode the uplink
+/// MBR and the last five octets encode the downlink MBR, each as a 40-bit
+/// unsigned integer in kilobits per second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mbr {
+    /// Uplink maximum bitrate (kbps).
+    pub ul_kbps: u64,
+    /// Downlink maximum bitrate (kbps).
+    pub dl_kbps: u64,
+}
+
+impl SimpleIe for Mbr {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.len() < 10 {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        let ul = u64::from_be_bytes([0, 0, 0, value[0], value[1], value[2], value[3], value[4]]);
+        let dl = u64::from_be_bytes([0, 0, 0, value[5], value[6], value[7], value[8], value[9]]);
+        Ok(Self {
+            ul_kbps: ul,
+            dl_kbps: dl,
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        let mut write_rate = |rate: u64| {
+            for i in (0..5).rev() {
+                dst.put_u8(((rate >> (i * 8)) & 0xFF) as u8);
+            }
+        };
+        write_rate(self.ul_kbps);
+        write_rate(self.dl_kbps);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Guaranteed Bit Rate (§8.2.9)
+// ---------------------------------------------------------------------------
+
+/// Guaranteed Bit Rate IE (type 27).
+///
+/// TS 29.244 §8.2.9: ten octets. The first five octets encode the uplink
+/// GBR and the last five octets encode the downlink GBR, each as a 40-bit
+/// unsigned integer in kilobits per second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gbr {
+    /// Uplink guaranteed bitrate (kbps).
+    pub ul_kbps: u64,
+    /// Downlink guaranteed bitrate (kbps).
+    pub dl_kbps: u64,
+}
+
+impl SimpleIe for Gbr {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.len() < 10 {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        let ul = u64::from_be_bytes([0, 0, 0, value[0], value[1], value[2], value[3], value[4]]);
+        let dl = u64::from_be_bytes([0, 0, 0, value[5], value[6], value[7], value[8], value[9]]);
+        Ok(Self {
+            ul_kbps: ul,
+            dl_kbps: dl,
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        let mut write_rate = |rate: u64| {
+            for i in (0..5).rev() {
+                dst.put_u8(((rate >> (i * 8)) & 0xFF) as u8);
+            }
+        };
+        write_rate(self.ul_kbps);
+        write_rate(self.dl_kbps);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // URR ID (§8.2.71)
 // ---------------------------------------------------------------------------
 
