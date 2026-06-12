@@ -53,6 +53,26 @@ impl NrfClient {
     pub fn new(client: crate::client::SbiClient, nrf_uri: String) -> Self {
         Self { client, nrf_uri }
     }
+
+    /// Create an NRF client using the default plain-HTTP SBI client.
+    ///
+    /// For TLS or custom timeouts, use [`NrfClient::new`] with a configured
+    /// [`crate::client::SbiClientBuilder`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use opc_sbi::nrf::NrfClient;
+    ///
+    /// let client = NrfClient::with_default_client("http://127.0.0.1:8000".to_string())
+    ///     .expect("valid default client");
+    /// ```
+    pub fn with_default_client(nrf_uri: String) -> Result<Self, String> {
+        let client = crate::client::SbiClientBuilder::new()
+            .with_http2_only(false)
+            .build()?;
+        Ok(Self::new(client, nrf_uri))
+    }
 }
 
 #[async_trait]

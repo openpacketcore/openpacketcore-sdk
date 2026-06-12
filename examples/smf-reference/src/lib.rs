@@ -196,11 +196,9 @@ impl Smf {
         .await?;
         write_ownership_marker(&store, &ownership).await?;
 
-        let client = opc_sbi::client::SbiClientBuilder::new()
-            .with_http2_only(false)
-            .build()
-            .map_err(SmfError::Nrf)?;
-        let nrf_client: Arc<NrfClient> = Arc::new(NrfClient::new(client, config.nrf_uri.clone()));
+        let nrf_client: Arc<NrfClient> = Arc::new(
+            NrfClient::with_default_client(config.nrf_uri.clone()).map_err(SmfError::Nrf)?,
+        );
         let nrf_drain_hook =
             opc_sbi::nrf::NrfDrainHook::new(nrf_client.clone(), config.instance_id.clone());
 

@@ -133,6 +133,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`amf`, `smf`, `upf`, `nrf`, `ausf`, `udm`, `pcf`, `nssf`, `nef`, `smsf`)
   and a standard SBI service-name constants module so NRF profile building no
   longer relies on free strings.
+- `opc-sbi`: add `NrfClient::with_default_client()` convenience constructor
+  for plain-HTTP NRF clients.
+- `opc-protocol`: confirm `EncodeError::code()` and `DecodeError::code()`
+  accessors and re-export `EncodeErrorCode`/`DecodeErrorCode` from the crate
+  root; no consumer changes required.
 - `opc-api-nnrf` (experimental): expanded generated TS 29.510 types to cover
   the NRF NFManagement payloads used for registration, heartbeat, and
   subscription/notification exchanges: `SubscriptionData`, `NotificationData`,
