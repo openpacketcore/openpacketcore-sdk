@@ -180,7 +180,7 @@ async fn run_renewal_loop<B: SessionBackend + SessionLeaseManager + 'static>(
     loop {
         tokio::time::sleep(interval).await;
         let mut current = lease.lock().await;
-        match store.renew(&*current, ttl).await {
+        match store.renew(&current, ttl).await {
             Ok(new_lease) => {
                 *current = new_lease;
             }

@@ -1385,16 +1385,15 @@ mod from_typed_tests {
     }
 
     #[test]
-    fn information_element_from_typed_matches_typed_encode_for_every_variant() {
+    fn information_element_from_typed_matches_typed_encode_for_every_variant(
+    ) -> Result<(), crate::EncodeError> {
         for typed in all_typed_ie_variants() {
             let mut direct = BytesMut::new();
-            typed
-                .encode(&mut direct, EncodeContext::default())
-                .expect("typed encode");
+            typed.encode(&mut direct, EncodeContext::default())?;
 
-            let raw = InformationElement::from_typed(&typed).expect("from_typed");
+            let raw = InformationElement::from_typed(&typed)?;
             let mut via_raw = BytesMut::new();
-            raw.encode(&mut via_raw).expect("raw encode");
+            raw.encode(&mut via_raw)?;
 
             assert_eq!(
                 direct.freeze().as_ref(),
@@ -1402,17 +1401,19 @@ mod from_typed_tests {
                 "from_typed did not match typed encode for {typed:?}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn raw_variant_encode_value_returns_raw_value() {
+    fn raw_variant_encode_value_returns_raw_value() -> Result<(), crate::EncodeError> {
         let raw = InformationElement {
             ie_type: 0x8001,
             enterprise_id: 1,
             value: Bytes::from_static(b"vendor"),
         };
         let typed = TypedIe::Raw(raw.clone());
-        assert_eq!(typed.encode_value().unwrap(), raw.value);
+        assert_eq!(typed.encode_value()?, raw.value);
+        Ok(())
     }
 
     #[test]
