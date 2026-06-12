@@ -1,3 +1,5 @@
+mod common;
+
 use opc_yanggen::rust::generate_rust;
 use opc_yanggen::{
     BooleanOp, CanonicalInput, CompareOp, ConstraintBinding, ConstraintExpr, GenerationInput,
@@ -948,10 +950,12 @@ edition = "2021"
 [dependencies]
 serde = {{ version = "1.0", features = ["derive"] }}
 serde_json = "1.0"
+time = "={}"
 opc-config-model = {{ path = "{}" }}
 opc-types = {{ path = "{}" }}
 opc-data-governance = {{ path = "{}" }}
 "#,
+        common::locked_version(&workspace_dir, "time"),
         workspace_dir.join("crates/opc-config-model").display(),
         workspace_dir.join("crates/opc-types").display(),
         workspace_dir.join("crates/opc-data-governance").display()

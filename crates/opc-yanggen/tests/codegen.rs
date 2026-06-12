@@ -1,3 +1,5 @@
+mod common;
+
 use opc_yanggen::rust::generate_rust;
 use opc_yanggen::{
     CanonicalInput, GenerationInput, SchemaModule, SchemaNode, SchemaNodeKind, StackBudget,
@@ -102,6 +104,13 @@ fn test_generate_and_compile() {
     let types_path = workspace_dir.join("crates/opc-types");
     let data_gov_path = workspace_dir.join("crates/opc-data-governance");
 
+    // The scratch project resolves dependencies fresh (it has no lockfile),
+    // which makes this test hostage to upstream releases: a transitive crate
+    // published after the workspace lockfile can fail to build here while the
+    // workspace itself is green. Pin the floating transitive dependencies to
+    // the versions locked by the workspace so both resolve identically.
+    let time_version = common::locked_version(&workspace_dir, "time");
+
     let cargo_toml = format!(
         r#"
 [package]
@@ -112,10 +121,12 @@ edition = "2021"
 [dependencies]
 serde = {{ version = "1.0", features = ["derive"] }}
 serde_json = "1.0"
+time = "={}"
 opc-config-model = {{ path = "{}" }}
 opc-types = {{ path = "{}" }}
 opc-data-governance = {{ path = "{}" }}
 "#,
+        time_version,
         config_model_path.display(),
         types_path.display(),
         data_gov_path.display()
