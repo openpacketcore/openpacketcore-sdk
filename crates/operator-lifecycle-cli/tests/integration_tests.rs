@@ -1,10 +1,11 @@
 use std::process::{Command, Stdio};
 
 fn cli_path() -> String {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .unwrap_or_else(|_| format!("{manifest_dir}/../../target"));
-    format!("{target_dir}/debug/operator-lifecycle-cli")
+    // Cargo sets CARGO_BIN_EXE_<name> for integration tests and guarantees
+    // the binary is built for this test run, regardless of target-dir
+    // configuration. A hand-assembled target path can resolve to a stale
+    // binary when a target-dir override is in effect.
+    env!("CARGO_BIN_EXE_operator-lifecycle-cli").to_string()
 }
 
 fn run_json(subcommand: &str, input: &str) -> (String, i32) {
