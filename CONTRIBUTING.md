@@ -95,6 +95,24 @@ Before requesting review, please confirm:
 
 ## Releasing
 
+### Cutting a release
+
+1. Bump the workspace version in `Cargo.toml` (`[workspace.package]`) and the
+   intra-workspace `version` keys on path dependencies, including the
+   `examples/smf-reference` workspace; refresh both `Cargo.lock` files. The
+   `opc-yanggen` golden fixture
+   (`crates/opc-yanggen/tests/fixtures/deterministic-emitter.txt`) embeds the
+   generator version and must be updated to match.
+2. Roll the `[Unreleased]` section of `CHANGELOG.md` into a dated version
+   section and update the comparison links.
+3. Run the full validation gates, then tag `vX.Y.Z` and push the tag. The
+   `Release Validation` workflow re-runs the gates and uploads SBOMs and
+   release evidence.
+4. crates.io publishing is staged in `.github/workflows/release.yml` as a
+   commented-out `publish` job; enabling it requires a `CARGO_REGISTRY_TOKEN`
+   repository secret. Until it is enabled, releases are source releases
+   (git tag + GitHub release) only.
+
 ### Publish tiers
 
 The workspace is split into two publish tiers. `scripts/publish-order.py --check`

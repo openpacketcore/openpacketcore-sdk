@@ -7,6 +7,8 @@ verifies each crate's dependencies against the registry at publish time.
 
 Usage:
     scripts/publish-order.py            # print `cargo publish -p <crate>` order
+    scripts/publish-order.py --names    # print bare crate names, one per line
+                                        # (for scripting publish loops)
     scripts/publish-order.py --check    # validate graph only (CI mode):
                                         #   - dependency graph is acyclic
                                         #   - every intra-workspace [dependencies]
@@ -32,6 +34,7 @@ def cargo_metadata() -> dict:
 
 def main() -> int:
     check_only = "--check" in sys.argv[1:]
+    names_only = "--names" in sys.argv[1:]
     meta = cargo_metadata()
 
     packages = {p["name"]: p for p in meta["packages"]}
@@ -93,6 +96,11 @@ def main() -> int:
 
     if check_only:
         print(f"OK: {len(order)} publishable crates, graph acyclic, version keys present")
+        return 0
+
+    if names_only:
+        for name in order:
+            print(name)
         return 0
 
     print("# Publish in this order (each must be live on crates.io before the next):")
