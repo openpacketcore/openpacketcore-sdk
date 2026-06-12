@@ -37,7 +37,7 @@ fn test_config(n4: &str, instance: &str) -> SmfConfig {
         upf_addr: FAKE_UPF.parse().expect("valid address"),
         nrf_uri: "http://127.0.0.1:18800".to_string(),
         plmn: opc_types::PlmnId::new("001", "01").expect("valid plmn"),
-        s_nssai: opc_types::Snssai::new(1, Some("010203")).expect("valid snssai"),
+        s_nssai: opc_types::Snssai::with_sd(1, "010203").expect("valid snssai"),
         instance_id: opc_types::NfInstanceId::new(instance).expect("valid instance id"),
     }
 }

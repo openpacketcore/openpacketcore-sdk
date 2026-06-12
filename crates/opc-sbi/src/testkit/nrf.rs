@@ -580,7 +580,7 @@ mod tests {
 
         // Query for NSMF-PDUSESSION with target NF type SMF should return smf-01.
         let query_smf = DiscoveryQuery {
-            target_nf_type: NfType::new("smf").unwrap(),
+            target_nf_type: NfType::smf(),
             requester_nf_instance_id: None,
             plmn: Some(PlmnId::new("001", "01").unwrap()),
             s_nssai: None,

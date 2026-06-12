@@ -91,6 +91,17 @@ impl StateType {
         Ok(Self(value))
     }
 
+    /// Create from a known-valid `&'static str`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` is empty or longer than 128 characters. Intended for
+    /// deterministic literals in tests and reference code; use `new` for
+    /// runtime input.
+    pub fn from_static(value: &'static str) -> Self {
+        Self::new(value).unwrap_or_else(|e| panic!("invalid state type: {e}"))
+    }
+
     /// The validated string form, as persisted in backend rows and bound into
     /// the payload encryption AAD.
     pub fn as_str(&self) -> &str {
@@ -511,7 +522,7 @@ mod tests {
     fn test_key() -> SessionKey {
         SessionKey {
             tenant: TenantId::new("tenant-a").unwrap(),
-            nf_kind: NetworkFunctionKind::new("smf").unwrap(),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
             key_type: SessionKeyType::PduSession,
             stable_id: Bytes::from_static(b"same-id"),
         }
@@ -579,7 +590,7 @@ mod tests {
         let raw_stable_id = "imsi-001010000000001";
         let key = SessionKey {
             tenant: TenantId::new("tenant-a").unwrap(),
-            nf_kind: NetworkFunctionKind::new("smf").unwrap(),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
             key_type: SessionKeyType::PduSession,
             stable_id: Bytes::copy_from_slice(raw_stable_id.as_bytes()),
         };
@@ -596,7 +607,7 @@ mod tests {
         let raw_stable_id = "imsi-001010000000001";
         let key = SessionKey {
             tenant: TenantId::new("tenant-a").unwrap(),
-            nf_kind: NetworkFunctionKind::new("smf").unwrap(),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
             key_type: SessionKeyType::PduSession,
             stable_id: Bytes::copy_from_slice(raw_stable_id.as_bytes()),
         };

@@ -50,9 +50,22 @@ use crate::record::StoredSessionRecord;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
 pub struct SessionStore<B: SessionBackend + SessionLeaseManager> {
     backend: Arc<B>,
+}
+
+impl<B: SessionBackend + SessionLeaseManager> std::fmt::Debug for SessionStore<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionStore").finish_non_exhaustive()
+    }
+}
+
+impl<B: SessionBackend + SessionLeaseManager> Clone for SessionStore<B> {
+    fn clone(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+        }
+    }
 }
 
 impl<B: SessionBackend + SessionLeaseManager> SessionStore<B> {
@@ -176,8 +189,8 @@ mod tests {
         let store = SessionStore::new(FakeSessionBackend::new());
         let owner = OwnerId::new("smf-01").expect("valid owner");
         let key = SessionKey {
-            tenant: TenantId::new("ref-smf").expect("valid tenant"),
-            nf_kind: NetworkFunctionKind::new("smf").expect("valid nf kind"),
+            tenant: TenantId::from_static("ref-smf"),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
             key_type: SessionKeyType::PduSession,
             stable_id: Bytes::from_static(b"seid-1"),
         };
@@ -191,7 +204,7 @@ mod tests {
             owner: owner.clone(),
             fence: lease.fence(),
             state_class: StateClass::AuthoritativeSession,
-            state_type: StateType::new("pdu-session").expect("valid state type"),
+            state_type: StateType::from_static("pdu-session"),
             expires_at: None,
             payload: EncryptedSessionPayload::new(Bytes::from_static(b"payload")),
         };

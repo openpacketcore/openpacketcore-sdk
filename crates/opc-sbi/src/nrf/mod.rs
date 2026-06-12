@@ -9,6 +9,7 @@
 
 pub mod cache;
 pub mod client;
+pub mod services;
 
 pub use cache::{CacheLookup, DiscoveryCache};
 pub use client::{CachedDiscoveryClient, HeartbeatDriver, NrfClient, NrfOperations};
@@ -260,14 +261,14 @@ mod tests {
     #[test]
     fn nrf_cache_key_service_name_order_is_normalized() {
         let q1 = DiscoveryQuery {
-            target_nf_type: NfType::new("smf").unwrap(),
+            target_nf_type: NfType::smf(),
             requester_nf_instance_id: None,
             plmn: None,
             s_nssai: None,
             service_names: vec!["nsmf-pdusession".into(), "nsmf-eventexposure".into()],
         };
         let q2 = DiscoveryQuery {
-            target_nf_type: NfType::new("smf").unwrap(),
+            target_nf_type: NfType::smf(),
             requester_nf_instance_id: None,
             plmn: None,
             s_nssai: None,

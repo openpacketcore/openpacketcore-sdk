@@ -18,7 +18,7 @@ use opc_types::{NetworkFunctionKind, TenantId};
 fn test_key() -> SessionKey {
     SessionKey {
         tenant: TenantId::new("tenant-a").unwrap(),
-        nf_kind: NetworkFunctionKind::new("smf").unwrap(),
+        nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
         stable_id: Bytes::from_static(b"test-session"),
     }

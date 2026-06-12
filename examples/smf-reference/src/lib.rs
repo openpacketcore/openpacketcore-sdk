@@ -27,8 +27,8 @@ use opc_runtime::{
 use opc_sbi::nrf::{HeartbeatDriver, NfProfile, NfStatus, NrfClient, NrfOperations};
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, FakeSessionBackend, Generation,
-    OwnerId, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SessionStore,
-    StateClass, StateType, StoredSessionRecord,
+    OwnedSession, OwnerId, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager,
+    SessionStore, StateClass, StateType, StoredSessionRecord,
 };
 use opc_types::{NetworkFunctionKind, NfInstanceId, NfType, PlmnId, Snssai, TenantId};
 use thiserror::Error;
@@ -126,7 +126,7 @@ impl SmfConfig {
                 .map_err(|e: std::net::AddrParseError| SmfError::AddrParse(e.to_string()))?,
             nrf_uri: "http://127.0.0.1:8000".to_string(),
             plmn: PlmnId::new("001", "01")?,
-            s_nssai: Snssai::new(1, Some("010203"))?, // FRACTURE-JOURNAL: Snssai::new takes Option<impl Into<String>>, but the SD hex validation is strict; passing a &str works only because it impls Into<String>. A helper for literal SD would reduce friction.
+            s_nssai: Snssai::with_sd(1, "010203")?,
             instance_id: NfInstanceId::new("smf-ref-01")?,
         })
     }
@@ -163,6 +163,8 @@ pub struct Smf {
     next_seid: Arc<Mutex<u64>>,
     store: SessionStore<FakeSessionBackend>,
     owner: OwnerId,
+    #[allow(dead_code)]
+    ownership: OwnedSession<FakeSessionBackend>,
 }
 
 impl std::fmt::Debug for Smf {
@@ -184,6 +186,16 @@ impl Smf {
         let owner = OwnerId::new(config.instance_id.as_str().to_string())
             .map_err(SmfError::SessionStore)?;
 
+        let (ownership, _ownership_failures) = OwnedSession::acquire(
+            store.clone(),
+            ownership_key(&owner),
+            owner.clone(),
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        )
+        .await?;
+        write_ownership_marker(&store, &ownership).await?;
+
         let client = opc_sbi::client::SbiClientBuilder::new()
             .with_http2_only(false)
             .build()
@@ -193,8 +205,6 @@ impl Smf {
             opc_sbi::nrf::NrfDrainHook::new(nrf_client.clone(), config.instance_id.clone());
 
         let config_clone = config.clone();
-        let store_clone = store.clone();
-        let owner_clone = owner.clone();
         let nrf_client_clone: Arc<dyn NrfOperations> = nrf_client.clone();
 
         let runtime = opc_runtime::Builder::new(profile)
@@ -218,12 +228,6 @@ impl Smf {
                     {
                         tracing::error!(error = %e, "failed to spawn nrf task");
                     }
-                    if let Err(e) =
-                        spawn_store_maintenance_task(supervisor, shutdown, store_clone, owner_clone)
-                            .await
-                    {
-                        tracing::error!(error = %e, "failed to spawn store maintenance task");
-                    }
                 })
             })
             .build()
@@ -235,6 +239,7 @@ impl Smf {
             next_seid: Arc::new(Mutex::new(1)),
             store,
             owner,
+            ownership,
         })
     }
 
@@ -254,7 +259,7 @@ impl Smf {
     /// opc-session-store would remove this boilerplate.
     pub async fn create_session(&self) -> Result<u64, SmfError> {
         let seid = self.allocate_seid().await;
-        let key = session_key(&self.owner, seid)?;
+        let key = session_key(&self.owner, seid);
         let lease = self
             .store
             .acquire(&key, self.owner.clone(), Duration::from_secs(60))
@@ -272,7 +277,7 @@ impl Smf {
             owner: self.owner.clone(),
             fence: lease.fence(),
             state_class: StateClass::AuthoritativeSession,
-            state_type: StateType::new("pdu-session").map_err(SmfError::SessionStore)?,
+            state_type: StateType::from_static("pdu-session"),
             expires_at: None,
             payload: EncryptedSessionPayload::new(Bytes::from(
                 serde_json::to_vec(&record).map_err(|e| SmfError::SessionStore(e.to_string()))?,
@@ -297,7 +302,7 @@ impl Smf {
 
     /// Read a PDU session record from the session store.
     pub async fn get_session(&self, seid: u64) -> Result<Option<PduSessionRecord>, SmfError> {
-        let key = session_key(&self.owner, seid)?;
+        let key = session_key(&self.owner, seid);
         let maybe_record = self.store.get(&key).await?;
         match maybe_record {
             Some(record) => {
@@ -322,42 +327,39 @@ impl Smf {
     }
 }
 
-fn ownership_key(owner: &OwnerId) -> Result<SessionKey, SmfError> {
-    // FRACTURE-JOURNAL: TenantId::new and NetworkFunctionKind::new return Result, so even
-    // deterministic literal keys need error handling. A const-construction path for
-    // well-known tenant/NF-kind literals would remove noise in reference code.
-    Ok(SessionKey {
-        tenant: TenantId::new("ref-smf")?,
-        nf_kind: NetworkFunctionKind::new("smf")?,
+fn ownership_key(owner: &OwnerId) -> SessionKey {
+    SessionKey {
+        tenant: TenantId::from_static("ref-smf"),
+        nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::Other("smf-ownership".to_string()),
         stable_id: Bytes::copy_from_slice(owner.as_str().as_bytes()),
-    })
+    }
 }
 
-fn session_key(owner: &OwnerId, seid: u64) -> Result<SessionKey, SmfError> {
+fn session_key(owner: &OwnerId, seid: u64) -> SessionKey {
     let mut stable_id = owner.as_str().as_bytes().to_vec();
     stable_id.extend_from_slice(&seid.to_be_bytes());
-    Ok(SessionKey {
-        tenant: TenantId::new("ref-smf")?,
-        nf_kind: NetworkFunctionKind::new("smf")?,
+    SessionKey {
+        tenant: TenantId::from_static("ref-smf"),
+        nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
         stable_id: Bytes::from(stable_id),
-    })
+    }
 }
 
-fn build_smf_profile(config: &SmfConfig) -> Result<NfProfile, SmfError> {
-    Ok(NfProfile {
+fn build_smf_profile(config: &SmfConfig) -> NfProfile {
+    NfProfile {
         nf_instance_id: config.instance_id.clone(),
-        nf_type: NfType::new("smf")?,
+        nf_type: NfType::smf(),
         nf_status: NfStatus::Registered,
         ipv4_addresses: vec![config.n4_addr.ip().to_string()],
         fqdn: None,
         plmn_list: vec![config.plmn.clone()],
         s_nssais: vec![config.s_nssai.clone()],
-        nf_services: vec!["nsmf-pdusession".to_string()],
+        nf_services: vec![opc_sbi::nrf::services::NSMF_PDUSESSION.to_string()],
         priority: 10,
         capacity: 100,
-    })
+    }
 }
 
 /// Register the SMF profile with the NRF and start the heartbeat driver.
@@ -367,7 +369,7 @@ async fn spawn_nrf_task(
     config: SmfConfig,
     nrf_client: Arc<dyn NrfOperations>,
 ) -> Result<(), SmfError> {
-    let profile = build_smf_profile(&config)?;
+    let profile = build_smf_profile(&config);
     let interval = nrf_client.register(&profile).await.map_err(SmfError::Nrf)?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -420,26 +422,20 @@ async fn spawn_n4_task(
     Ok(())
 }
 
-/// Placeholder store-maintenance task: acquires and renews a lease for
-/// the SMF's own ownership key so the session-store integration is real.
-async fn spawn_store_maintenance_task(
-    supervisor: Supervisor,
-    _shutdown: opc_runtime::ShutdownToken,
-    store: SessionStore<FakeSessionBackend>,
-    owner: OwnerId,
+/// Write the SMF ownership marker using the owned-session lease.
+async fn write_ownership_marker(
+    store: &SessionStore<FakeSessionBackend>,
+    ownership: &OwnedSession<FakeSessionBackend>,
 ) -> Result<(), SmfError> {
-    let key = ownership_key(&owner)?;
-    let lease = store
-        .acquire(&key, owner.clone(), Duration::from_secs(60))
-        .await?;
-
+    let key = ownership.key().clone();
+    let lease = ownership.lease().lock().await;
     let record = StoredSessionRecord {
         key: key.clone(),
         generation: Generation::new(1),
-        owner: owner.clone(),
+        owner: ownership.owner().clone(),
         fence: lease.fence(),
         state_class: StateClass::EphemeralProcedure,
-        state_type: StateType::new("smf-ownership").map_err(SmfError::SessionStore)?,
+        state_type: StateType::from_static("smf-ownership"),
         expires_at: None,
         payload: EncryptedSessionPayload::new(Bytes::from_static(b"smf-ref-ok")),
     };
@@ -447,53 +443,16 @@ async fn spawn_store_maintenance_task(
     match store
         .compare_and_set(CompareAndSet {
             key,
-            lease,
+            lease: lease.clone(),
             expected_generation: None,
             new_record: record,
         })
         .await?
     {
-        CompareAndSetResult::Success => {}
+        CompareAndSetResult::Success => Ok(()),
         CompareAndSetResult::Conflict { .. } => {
             tracing::warn!("ownership marker already present in store");
-        }
-    }
-
-    supervisor
-        .spawn_spec(TaskSpec::new(
-            "store-lease",
-            TaskKind::BackgroundSync,
-            Criticality::Degrade,
-            store_lease_renewal_loop(store.clone(), owner),
-        ))
-        .await
-        .map_err(SmfError::Runtime)?;
-
-    Ok(())
-}
-
-async fn store_lease_renewal_loop(
-    store: SessionStore<FakeSessionBackend>,
-    owner: OwnerId,
-) -> Result<(), TaskError> {
-    let key = ownership_key(&owner)
-        .map_err(|e| TaskError::Failed("invalid ownership key".to_string(), Arc::new(e)))?;
-    let mut lease = store
-        .acquire(&key, owner, Duration::from_secs(60))
-        .await
-        .map_err(|e| TaskError::Failed("initial store lease failed".to_string(), Arc::new(e)))?;
-
-    loop {
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        match store.renew(&lease, Duration::from_secs(60)).await {
-            Ok(new_lease) => lease = new_lease,
-            Err(e) => {
-                tracing::warn!(error = %e, "store lease renewal failed");
-                return Err(TaskError::Failed(
-                    "lease renewal failed".to_string(),
-                    Arc::new(e),
-                ));
-            }
+            Ok(())
         }
     }
 }

@@ -429,7 +429,7 @@ fn nrf_integration_cache_max_entries_evicts_oldest() {
         service_names: vec![],
     };
     let key_b = CacheKey {
-        target_nf_type: NfType::new("smf").unwrap(),
+        target_nf_type: NfType::smf(),
         requester_nf_instance_id: None,
         plmn: None,
         s_nssai: None,

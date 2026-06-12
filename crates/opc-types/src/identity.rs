@@ -22,6 +22,17 @@ macro_rules! string_identifier {
                 Ok(Self(validate_slug($kind, &value, $max_len)?))
             }
 
+            /// Create from a known-valid `&'static str`.
+            ///
+            /// # Panics
+            ///
+            /// Panics if `value` fails validation. This is intended for
+            /// deterministic literals in tests and reference code; use `new`
+            /// for runtime input.
+            pub fn from_static(value: &'static str) -> Self {
+                Self::new(value).unwrap_or_else(|e| panic!("invalid {}: {e}", $kind))
+            }
+
             /// Return the identifier as a string slice.
             pub fn as_str(&self) -> &str {
                 &self.0
@@ -347,12 +358,44 @@ pub struct Snssai {
 impl Snssai {
     /// Create a new S-NSSAI from SST and optional SD.
     pub fn new(sst: u8, sd: Option<impl Into<String>>) -> Result<Self, ParseError> {
-        let sd = match sd {
-            Some(sd) => Some(validate_hex("snssai", &sd.into(), 6)?),
-            None => None,
-        };
+        match sd {
+            Some(sd) => Self::with_sd(sst, sd),
+            None => Ok(Self::without_sd(sst)),
+        }
+    }
 
-        Ok(Self { sst, sd })
+    /// Create an S-NSSAI with a slice differentiator.
+    ///
+    /// `sd` must be exactly six hexadecimal characters (0-9, a-f, A-F). It is
+    /// normalized to lowercase on success.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use opc_types::Snssai;
+    ///
+    /// let s = Snssai::with_sd(1, "010203").expect("valid sd");
+    /// assert_eq!(s.sst(), 1);
+    /// assert_eq!(s.sd(), Some("010203"));
+    /// ```
+    pub fn with_sd(sst: u8, sd: impl Into<String>) -> Result<Self, ParseError> {
+        let sd = validate_hex("snssai", &sd.into(), 6)?;
+        Ok(Self { sst, sd: Some(sd) })
+    }
+
+    /// Create an S-NSSAI without a slice differentiator.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use opc_types::Snssai;
+    ///
+    /// let s = Snssai::without_sd(1);
+    /// assert_eq!(s.sst(), 1);
+    /// assert_eq!(s.sd(), None);
+    /// ```
+    pub fn without_sd(sst: u8) -> Self {
+        Self { sst, sd: None }
     }
 
     /// Slice/Service Type.

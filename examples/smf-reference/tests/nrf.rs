@@ -12,12 +12,12 @@ use tokio::sync::watch;
 fn sample_profile(id: &str) -> NfProfile {
     NfProfile {
         nf_instance_id: NfInstanceId::new(id).expect("valid instance id"),
-        nf_type: NfType::new("smf").expect("valid nf type"),
+        nf_type: NfType::smf(),
         nf_status: NfStatus::Registered,
         ipv4_addresses: vec!["127.0.0.1".into()],
         fqdn: None,
         plmn_list: vec![PlmnId::new("001", "01").expect("valid plmn")],
-        s_nssais: vec![Snssai::new(1, Some("010203")).expect("valid snssai")],
+        s_nssais: vec![Snssai::with_sd(1, "010203").expect("valid snssai")],
         nf_services: vec!["nsmf-pdusession".into()],
         priority: 10,
         capacity: 100,

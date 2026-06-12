@@ -29,6 +29,7 @@ pub mod handover;
 mod hex;
 pub mod lease;
 pub mod model;
+pub mod owned_session;
 pub mod quorum;
 pub mod record;
 pub mod sqlite;
@@ -51,6 +52,7 @@ pub use model::{
     FenceToken, Generation, HandoverPhase, HandoverTxId, OwnerId, SessionKey, SessionKeyType,
     StateClass, StateType,
 };
+pub use owned_session::OwnedSession;
 pub use quorum::{FencedSessionReplica, QuorumSessionStore, SessionStoreBackend};
 pub use record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 pub use sqlite::SqliteSessionBackend;

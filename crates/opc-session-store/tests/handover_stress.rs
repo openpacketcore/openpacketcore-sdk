@@ -17,7 +17,7 @@ fn tenant() -> TenantId {
 fn test_key(stable_id: &[u8]) -> SessionKey {
     SessionKey {
         tenant: tenant(),
-        nf_kind: NetworkFunctionKind::new("smf").expect("nf kind"),
+        nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
         stable_id: Bytes::copy_from_slice(stable_id),
     }

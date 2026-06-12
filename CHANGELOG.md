@@ -120,6 +120,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `InformationElement::from_typed()` to build raw IEs directly from typed IEs.
   The reference SMF response path now uses typed IEs end-to-end instead of
   hand-building raw value bytes.
+- `opc-session-store`: add `OwnedSession` helper that bundles a key, lease, and
+  background renewal task for single-owner records, with renewal failures
+  surfaced through a `tokio::sync::watch` channel. The reference SMF ownership
+  marker no longer uses a hand-rolled renewal loop.
+- `opc-types`: add `from_static()` constructors for `TenantId`,
+  `NetworkFunctionKind`/`NfKind`/`NfType`, and `opc_session_store::StateType`
+  so deterministic literals no longer need `Result` plumbing.
+- `opc-types`: add `Snssai::with_sd()` and `Snssai::without_sd()` with strict
+  six-digit-hex SD validation and rustdoc examples.
+- `opc-types` and `opc-sbi`: add typed constructors for standard NF kinds
+  (`amf`, `smf`, `upf`, `nrf`, `ausf`, `udm`, `pcf`, `nssf`, `nef`, `smsf`)
+  and a standard SBI service-name constants module so NRF profile building no
+  longer relies on free strings.
 - `opc-api-nnrf` (experimental): expanded generated TS 29.510 types to cover
   the NRF NFManagement payloads used for registration, heartbeat, and
   subscription/notification exchanges: `SubscriptionData`, `NotificationData`,

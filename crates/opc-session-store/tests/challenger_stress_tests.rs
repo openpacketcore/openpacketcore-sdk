@@ -36,7 +36,7 @@ impl Clock for ManualClock {
 fn test_key(stable_id: &[u8]) -> SessionKey {
     SessionKey {
         tenant: TenantId::new("tenant-challenger").unwrap(),
-        nf_kind: NetworkFunctionKind::new("smf").unwrap(),
+        nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
         stable_id: Bytes::copy_from_slice(stable_id),
     }

@@ -20,6 +20,16 @@ impl NfKind {
         Ok(Self(validate_slug("nf kind", &value, 64)?))
     }
 
+    /// Create from a known-valid `&'static str`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` fails validation. Intended for deterministic literals
+    /// in tests and reference code; use `new` for runtime input.
+    pub fn from_static(value: &'static str) -> Self {
+        Self::new(value).unwrap_or_else(|e| panic!("invalid nf kind: {e}"))
+    }
+
     /// Return the NF kind as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -28,6 +38,56 @@ impl NfKind {
     /// Check if this NF kind is in the known 3GPP set.
     pub fn is_known(&self) -> bool {
         Self::KNOWN_VALUES.contains(&self.as_str())
+    }
+
+    /// Access and Mobility Management Function.
+    pub fn amf() -> Self {
+        Self::from_static("amf")
+    }
+
+    /// Session Management Function.
+    pub fn smf() -> Self {
+        Self::from_static("smf")
+    }
+
+    /// User Plane Function.
+    pub fn upf() -> Self {
+        Self::from_static("upf")
+    }
+
+    /// Network Repository Function.
+    pub fn nrf() -> Self {
+        Self::from_static("nrf")
+    }
+
+    /// Authentication Server Function.
+    pub fn ausf() -> Self {
+        Self::from_static("ausf")
+    }
+
+    /// Unified Data Management.
+    pub fn udm() -> Self {
+        Self::from_static("udm")
+    }
+
+    /// Policy Control Function.
+    pub fn pcf() -> Self {
+        Self::from_static("pcf")
+    }
+
+    /// Network Slice Selection Function.
+    pub fn nssf() -> Self {
+        Self::from_static("nssf")
+    }
+
+    /// Network Exposure Function.
+    pub fn nef() -> Self {
+        Self::from_static("nef")
+    }
+
+    /// Short Message Service Function.
+    pub fn smsf() -> Self {
+        Self::from_static("smsf")
     }
 }
 

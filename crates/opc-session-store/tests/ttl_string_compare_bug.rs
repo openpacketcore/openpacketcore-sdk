@@ -34,7 +34,7 @@ async fn test_sqlite_string_comparison_subsecond_bug() {
 
     let key = SessionKey {
         tenant: TenantId::new("tenant-a").unwrap(),
-        nf_kind: NetworkFunctionKind::new("smf").unwrap(),
+        nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
         stable_id: Bytes::from(vec![1, 2, 3]),
     };
@@ -99,7 +99,7 @@ async fn test_sqlite_string_comparison_subsecond_bug_not_pruning_expired() {
 
     let key = SessionKey {
         tenant: TenantId::new("tenant-a").unwrap(),
-        nf_kind: NetworkFunctionKind::new("smf").unwrap(),
+        nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
         stable_id: Bytes::from(vec![4, 5, 6]),
     };
@@ -171,7 +171,7 @@ async fn test_sqlite_lease_premature_millisecond_prune() {
 
     let key = SessionKey {
         tenant: TenantId::new("tenant-a").unwrap(),
-        nf_kind: NetworkFunctionKind::new("smf").unwrap(),
+        nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
         stable_id: Bytes::from(vec![7, 8, 9]),
     };
