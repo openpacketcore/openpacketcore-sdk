@@ -116,6 +116,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SessionBackend` and `SessionLeaseManager` into one handle, constructible
   from any backend implementing both traits. `FakeSessionBackend` and
   `opc_session_net::RemoteSessionBackend` both slot in.
+- `opc-proto-pfcp`: add `TypedIe::encode_value()` for value-only encoding and
+  `InformationElement::from_typed()` to build raw IEs directly from typed IEs.
+  The reference SMF response path now uses typed IEs end-to-end instead of
+  hand-building raw value bytes.
 - `opc-api-nnrf` (experimental): expanded generated TS 29.510 types to cover
   the NRF NFManagement payloads used for registration, heartbeat, and
   subscription/notification exchanges: `SubscriptionData`, `NotificationData`,

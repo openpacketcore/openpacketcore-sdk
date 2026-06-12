@@ -14,8 +14,8 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use opc_alarm::SharedAlarmManager;
 use opc_proto_pfcp::ie::{
-    ApplyAction, CauseValue, CreateFar, CreatePdr, CreateQer, DestinationInterface, FSeid, FarId,
-    ForwardingParameters, Gate, GateStatus, Gbr, Mbr, NetworkInstance, NodeIdType,
+    ApplyAction, Cause, CauseValue, CreateFar, CreatePdr, CreateQer, DestinationInterface, FSeid,
+    FarId, ForwardingParameters, Gate, GateStatus, Gbr, Mbr, NetworkInstance, NodeId, NodeIdType,
     OuterHeaderCreation, Pdi, PdrId, Precedence, QerId, Qfi, SourceInterface, TypedIe,
 };
 use opc_proto_pfcp::{Header, InformationElement, MessageType, OwnedMessage};
@@ -543,19 +543,19 @@ async fn handle_n4_message(
             None
         }
         t if t == MessageType::AssociationSetupRequest as u8 => {
-            Some(association_setup_response(msg.header.sequence_number))
+            Some(association_setup_response(msg.header.sequence_number)?)
         }
         t if t == MessageType::AssociationReleaseRequest as u8 => {
-            Some(association_release_response(msg.header.sequence_number))
+            Some(association_release_response(msg.header.sequence_number)?)
         }
         t if t == MessageType::SessionEstablishmentRequest as u8 => {
-            Some(session_establishment_response(msg.header.sequence_number))
+            Some(session_establishment_response(msg.header.sequence_number)?)
         }
         t if t == MessageType::SessionModificationRequest as u8 => {
-            Some(session_modification_response(msg.header.sequence_number))
+            Some(session_modification_response(msg.header.sequence_number)?)
         }
         t if t == MessageType::SessionDeletionRequest as u8 => {
-            Some(session_deletion_response(msg.header.sequence_number))
+            Some(session_deletion_response(msg.header.sequence_number)?)
         }
         other => {
             tracing::warn!(msg_type = other, "unhandled PFCP message type");
@@ -571,8 +571,8 @@ async fn handle_n4_message(
     Ok(())
 }
 
-fn association_setup_response(seq: u32) -> OwnedMessage {
-    OwnedMessage {
+fn association_setup_response(seq: u32) -> Result<OwnedMessage, SmfError> {
+    Ok(OwnedMessage {
         header: Header {
             version: 1,
             spare: 0,
@@ -587,22 +587,19 @@ fn association_setup_response(seq: u32) -> OwnedMessage {
             spare_octet: 0,
         },
         ies: vec![
-            InformationElement {
-                ie_type: opc_proto_pfcp::IeType::NodeId as u16,
-                enterprise_id: 0,
-                value: Bytes::from(vec![u8::from(NodeIdType::Fqdn), b'r', b'e', b'f']),
-            },
-            InformationElement {
-                ie_type: opc_proto_pfcp::IeType::Cause as u16,
-                enterprise_id: 0,
-                value: Bytes::from(vec![u8::from(CauseValue::RequestAccepted)]),
-            },
+            InformationElement::from_typed(&TypedIe::NodeId(NodeId {
+                node_id_type: NodeIdType::Fqdn,
+                value: b"ref".to_vec(),
+            }))?,
+            InformationElement::from_typed(&TypedIe::Cause(Cause {
+                value: CauseValue::RequestAccepted,
+            }))?,
         ],
-    }
+    })
 }
 
-fn association_release_response(seq: u32) -> OwnedMessage {
-    OwnedMessage {
+fn association_release_response(seq: u32) -> Result<OwnedMessage, SmfError> {
+    Ok(OwnedMessage {
         header: Header {
             version: 1,
             spare: 0,
@@ -616,16 +613,14 @@ fn association_release_response(seq: u32) -> OwnedMessage {
             message_priority: None,
             spare_octet: 0,
         },
-        ies: vec![InformationElement {
-            ie_type: opc_proto_pfcp::IeType::Cause as u16,
-            enterprise_id: 0,
-            value: Bytes::from(vec![u8::from(CauseValue::RequestAccepted)]),
-        }],
-    }
+        ies: vec![InformationElement::from_typed(&TypedIe::Cause(Cause {
+            value: CauseValue::RequestAccepted,
+        }))?],
+    })
 }
 
-fn session_establishment_response(seq: u32) -> OwnedMessage {
-    OwnedMessage {
+fn session_establishment_response(seq: u32) -> Result<OwnedMessage, SmfError> {
+    Ok(OwnedMessage {
         header: Header {
             version: 1,
             spare: 0,
@@ -640,27 +635,26 @@ fn session_establishment_response(seq: u32) -> OwnedMessage {
             spare_octet: 0,
         },
         ies: vec![
-            InformationElement {
-                ie_type: opc_proto_pfcp::IeType::NodeId as u16,
-                enterprise_id: 0,
-                value: Bytes::from(vec![u8::from(NodeIdType::Fqdn), b'r', b'e', b'f']),
-            },
-            InformationElement {
-                ie_type: opc_proto_pfcp::IeType::Cause as u16,
-                enterprise_id: 0,
-                value: Bytes::from(vec![u8::from(CauseValue::RequestAccepted)]),
-            },
-            InformationElement {
-                ie_type: opc_proto_pfcp::IeType::FSeid as u16,
-                enterprise_id: 0,
-                value: encode_fseid_value(),
-            },
+            InformationElement::from_typed(&TypedIe::NodeId(NodeId {
+                node_id_type: NodeIdType::Fqdn,
+                value: b"ref".to_vec(),
+            }))?,
+            InformationElement::from_typed(&TypedIe::Cause(Cause {
+                value: CauseValue::RequestAccepted,
+            }))?,
+            InformationElement::from_typed(&TypedIe::FSeid(FSeid {
+                v4: true,
+                v6: false,
+                seid: 1,
+                ipv4: Some([127, 0, 0, 1]),
+                ipv6: None,
+            }))?,
         ],
-    }
+    })
 }
 
-fn session_modification_response(seq: u32) -> OwnedMessage {
-    OwnedMessage {
+fn session_modification_response(seq: u32) -> Result<OwnedMessage, SmfError> {
+    Ok(OwnedMessage {
         header: Header {
             version: 1,
             spare: 0,
@@ -674,16 +668,14 @@ fn session_modification_response(seq: u32) -> OwnedMessage {
             message_priority: None,
             spare_octet: 0,
         },
-        ies: vec![InformationElement {
-            ie_type: opc_proto_pfcp::IeType::Cause as u16,
-            enterprise_id: 0,
-            value: Bytes::from(vec![u8::from(CauseValue::RequestAccepted)]),
-        }],
-    }
+        ies: vec![InformationElement::from_typed(&TypedIe::Cause(Cause {
+            value: CauseValue::RequestAccepted,
+        }))?],
+    })
 }
 
-fn session_deletion_response(seq: u32) -> OwnedMessage {
-    OwnedMessage {
+fn session_deletion_response(seq: u32) -> Result<OwnedMessage, SmfError> {
+    Ok(OwnedMessage {
         header: Header {
             version: 1,
             spare: 0,
@@ -697,34 +689,10 @@ fn session_deletion_response(seq: u32) -> OwnedMessage {
             message_priority: None,
             spare_octet: 0,
         },
-        ies: vec![InformationElement {
-            ie_type: opc_proto_pfcp::IeType::Cause as u16,
-            enterprise_id: 0,
-            value: Bytes::from(vec![u8::from(CauseValue::RequestAccepted)]),
-        }],
-    }
-}
-
-fn encode_fseid_value() -> Bytes {
-    let fseid = FSeid {
-        v4: true,
-        v6: false,
-        seid: 1,
-        ipv4: Some([127, 0, 0, 1]),
-        ipv6: None,
-    };
-    let typed = TypedIe::FSeid(fseid);
-    let mut ie_buf = BytesMut::new();
-    // FRACTURE-JOURNAL: TypedIe::encode returns Result but the error type does not impl
-    // Display in a way that lets us recover a value here. We decode the encoded IE to
-    // strip the TLV header and return just the value bytes for the raw response path.
-    match typed.encode(&mut ie_buf, EncodeContext::default()) {
-        Ok(()) => match opc_proto_pfcp::InformationElement::decode(&ie_buf) {
-            Ok((_, raw)) => raw.value,
-            Err(_) => Bytes::new(),
-        },
-        Err(_) => Bytes::new(),
-    }
+        ies: vec![InformationElement::from_typed(&TypedIe::Cause(Cause {
+            value: CauseValue::RequestAccepted,
+        }))?],
+    })
 }
 
 /// Build a Create PDR IE from a static rule template.

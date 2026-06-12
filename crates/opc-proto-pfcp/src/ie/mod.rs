@@ -251,19 +251,52 @@ impl TypedIe {
         match self {
             Self::Raw(raw) => raw.encode(dst),
             other => {
-                let (ie_type, value) = other.encode_value(ctx)?;
+                let (ie_type, value) = other.encode_value_parts(ctx)?;
                 let ie = InformationElement {
                     ie_type,
                     enterprise_id: 0,
-                    value: Bytes::from(value),
+                    value,
                 };
                 ie.encode(dst)
             }
         }
     }
 
-    /// Encode the inner value to a `Vec<u8>` and return the IE type code.
-    fn encode_value(&self, ctx: EncodeContext) -> Result<(u16, Vec<u8>), EncodeError> {
+    /// Encode only the value octets of this typed IE.
+    ///
+    /// The returned bytes are exactly the IE value field (no type or length
+    /// header). Grouped IEs are recursively encoded in place. This is the
+    /// building block for [`InformationElement::from_typed`].
+    ///
+    /// @spec 3GPP TS29244 R18 8.1.1, 8.2
+    /// @req REQ-3GPP-TS29244-R18-8.2-005
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use opc_proto_pfcp::ie::{FSeid, TypedIe};
+    ///
+    /// let fseid = FSeid {
+    ///     v4: true,
+    ///     v6: false,
+    ///     seid: 1,
+    ///     ipv4: Some([127, 0, 0, 1]),
+    ///     ipv6: None,
+    /// };
+    /// let value = TypedIe::FSeid(fseid).encode_value().expect("valid F-SEID");
+    /// assert!(!value.is_empty());
+    /// ```
+    pub fn encode_value(&self) -> Result<Bytes, EncodeError> {
+        match self {
+            Self::Raw(raw) => Ok(raw.value.clone()),
+            other => other
+                .encode_value_parts(EncodeContext::default())
+                .map(|(_, v)| v),
+        }
+    }
+
+    /// Encode the inner value and return the IE type code.
+    fn encode_value_parts(&self, ctx: EncodeContext) -> Result<(u16, Bytes), EncodeError> {
         let mut buf = BytesMut::new();
         let ie_type = match self {
             Self::CreatePdr(v) => {
@@ -384,7 +417,7 @@ impl TypedIe {
             }
             Self::Raw(_) => unreachable!("Raw handled in outer match"),
         };
-        Ok((ie_type, buf.to_vec()))
+        Ok((ie_type, buf.freeze()))
     }
 
     /// The IE type code for this IE.

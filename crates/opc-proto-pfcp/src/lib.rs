@@ -425,6 +425,42 @@ impl InformationElement {
         let header_len = if self.ie_type >= 0x8000 { 6 } else { 4 };
         header_len + self.value.len()
     }
+
+    /// Build a raw [`InformationElement`] from a typed IE.
+    ///
+    /// The typed value is encoded and wrapped with the correct type code and
+    /// zero enterprise id. This lets consumers compose responses directly from
+    /// the typed layer instead of hand-building raw value bytes.
+    ///
+    /// @spec 3GPP TS29244 R18 8.1.1
+    /// @req REQ-3GPP-TS29244-R18-8.1.1-004
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use opc_proto_pfcp::ie::{Cause, CauseValue, TypedIe};
+    /// use opc_proto_pfcp::InformationElement;
+    ///
+    /// let typed = TypedIe::Cause(Cause {
+    ///     value: CauseValue::RequestAccepted,
+    /// });
+    /// let raw = InformationElement::from_typed(&typed).expect("encodes");
+    /// assert_eq!(raw.ie_type, 19);
+    /// assert_eq!(raw.value.as_ref(), &[1]);
+    /// ```
+    pub fn from_typed(typed: &crate::ie::TypedIe) -> Result<Self, EncodeError> {
+        match typed {
+            crate::ie::TypedIe::Raw(raw) => Ok(raw.clone()),
+            other => {
+                let value = other.encode_value()?;
+                Ok(Self {
+                    ie_type: typed.ie_type(),
+                    enterprise_id: 0,
+                    value,
+                })
+            }
+        }
+    }
 }
 
 /// A borrowed PFCP message.

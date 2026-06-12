@@ -1192,3 +1192,242 @@ fn test_update_qer_roundtrip() {
     }
     assert_typed_roundtrip(&bytes);
 }
+
+// ---------------------------------------------------------------------------
+// Typed-to-raw helpers (friction-journal #3)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod from_typed_tests {
+    use bytes::{Bytes, BytesMut};
+    use opc_protocol::EncodeContext;
+
+    use crate::ie::{
+        ApplyAction, Cause, CauseValue, CreateFar, CreatePdr, CreateQer, CreateUrr, CreatedPdr,
+        DestinationInterface, FSeid, FTeid, FarId, Gate, GateStatus, Gbr, Mbr, NetworkInstance,
+        NodeId, NodeIdType, OuterHeaderCreation, OuterHeaderRemoval, Pdi, PdrId, Precedence, QerId,
+        Qfi, RecoveryTimeStamp, SourceInterface, TypedIe, UeIpAddress, UpdateQer, UrrId,
+    };
+    use crate::InformationElement;
+
+    fn all_typed_ie_variants() -> Vec<TypedIe> {
+        vec![
+            TypedIe::CreatePdr(CreatePdr {
+                members: vec![
+                    TypedIe::PdrId(PdrId { value: 1 }),
+                    TypedIe::Precedence(Precedence { value: 1 }),
+                ],
+            }),
+            TypedIe::Pdi(Pdi {
+                members: vec![
+                    TypedIe::SourceInterface(SourceInterface { value: 0, spare: 0 }),
+                    TypedIe::NetworkInstance(NetworkInstance {
+                        value: b"internet".to_vec(),
+                    }),
+                ],
+            }),
+            TypedIe::CreateFar(CreateFar {
+                members: vec![
+                    TypedIe::FarId(FarId { value: 1 }),
+                    TypedIe::ApplyAction(ApplyAction {
+                        drop: false,
+                        forward: true,
+                        buffer: false,
+                        notify_cp: false,
+                        duplicate: false,
+                        ip_masquerade: false,
+                        ip_masquerade_decap: false,
+                        dfrt: false,
+                        edrt: false,
+                        bdpn: false,
+                        ddpn: false,
+                        spare: 0,
+                    }),
+                ],
+            }),
+            TypedIe::ForwardingParameters(crate::ie::ForwardingParameters {
+                members: vec![TypedIe::DestinationInterface(DestinationInterface {
+                    value: 0,
+                    spare: 0,
+                })],
+            }),
+            TypedIe::CreateUrr(CreateUrr {
+                members: vec![TypedIe::UrrId(UrrId { value: 1 })],
+            }),
+            TypedIe::CreateQer(CreateQer {
+                members: vec![
+                    TypedIe::QerId(QerId { value: 1 }),
+                    TypedIe::GateStatus(GateStatus {
+                        ul: Gate::Open,
+                        dl: Gate::Open,
+                    }),
+                    TypedIe::Mbr(Mbr {
+                        ul_kbps: 1,
+                        dl_kbps: 1,
+                    }),
+                    TypedIe::Gbr(Gbr {
+                        ul_kbps: 1,
+                        dl_kbps: 1,
+                    }),
+                    TypedIe::Qfi(Qfi { value: 1 }),
+                ],
+            }),
+            TypedIe::UpdateQer(UpdateQer {
+                members: vec![TypedIe::QerId(QerId { value: 1 })],
+            }),
+            TypedIe::CreatedPdr(CreatedPdr {
+                members: vec![
+                    TypedIe::PdrId(PdrId { value: 1 }),
+                    TypedIe::FTeid(FTeid {
+                        v4: true,
+                        v6: false,
+                        ch: false,
+                        chid: false,
+                        choose_id: None,
+                        teid: Some(1),
+                        ipv4: Some([1, 2, 3, 4]),
+                        ipv6: None,
+                    }),
+                ],
+            }),
+            TypedIe::Cause(Cause {
+                value: CauseValue::RequestAccepted,
+            }),
+            TypedIe::SourceInterface(SourceInterface { value: 0, spare: 0 }),
+            TypedIe::FTeid(FTeid {
+                v4: true,
+                v6: false,
+                ch: false,
+                chid: false,
+                choose_id: None,
+                teid: Some(1),
+                ipv4: Some([1, 2, 3, 4]),
+                ipv6: None,
+            }),
+            TypedIe::NetworkInstance(NetworkInstance {
+                value: b"internet".to_vec(),
+            }),
+            TypedIe::GateStatus(GateStatus {
+                ul: Gate::Open,
+                dl: Gate::Open,
+            }),
+            TypedIe::Mbr(Mbr {
+                ul_kbps: 1,
+                dl_kbps: 1,
+            }),
+            TypedIe::Gbr(Gbr {
+                ul_kbps: 1,
+                dl_kbps: 1,
+            }),
+            TypedIe::Precedence(Precedence { value: 1 }),
+            TypedIe::ApplyAction(ApplyAction {
+                drop: false,
+                forward: true,
+                buffer: false,
+                notify_cp: false,
+                duplicate: false,
+                ip_masquerade: false,
+                ip_masquerade_decap: false,
+                dfrt: false,
+                edrt: false,
+                bdpn: false,
+                ddpn: false,
+                spare: 0,
+            }),
+            TypedIe::DestinationInterface(DestinationInterface { value: 0, spare: 0 }),
+            TypedIe::PdrId(PdrId { value: 1 }),
+            TypedIe::FSeid(FSeid {
+                v4: true,
+                v6: false,
+                seid: 1,
+                ipv4: Some([127, 0, 0, 1]),
+                ipv6: None,
+            }),
+            TypedIe::NodeId(NodeId {
+                node_id_type: NodeIdType::Fqdn,
+                value: b"ref".to_vec(),
+            }),
+            TypedIe::UrrId(UrrId { value: 1 }),
+            TypedIe::UeIpAddress(UeIpAddress {
+                v4: true,
+                v6: false,
+                sd: false,
+                ipv4d: false,
+                ipv6d: false,
+                chv4: false,
+                chv6: false,
+                ch: false,
+                ipv4: Some([1, 2, 3, 4]),
+                ipv6: None,
+                ipv4_prefix_length: None,
+                ipv6_prefix_length: None,
+            }),
+            TypedIe::OuterHeaderRemoval(OuterHeaderRemoval { description: 0 }),
+            TypedIe::RecoveryTimeStamp(RecoveryTimeStamp { seconds: 0 }),
+            TypedIe::OuterHeaderCreation(OuterHeaderCreation {
+                description: 0,
+                teid: None,
+                ipv4: None,
+                ipv6: None,
+                port: None,
+                c_tag: None,
+                s_tag: None,
+            }),
+            TypedIe::FarId(FarId { value: 1 }),
+            TypedIe::QerId(QerId { value: 1 }),
+            TypedIe::Qfi(Qfi { value: 1 }),
+            TypedIe::Raw(InformationElement {
+                ie_type: 0x8001,
+                enterprise_id: 1,
+                value: Bytes::from_static(b"vendor"),
+            }),
+        ]
+    }
+
+    #[test]
+    fn information_element_from_typed_matches_typed_encode_for_every_variant() {
+        for typed in all_typed_ie_variants() {
+            let mut direct = BytesMut::new();
+            typed
+                .encode(&mut direct, EncodeContext::default())
+                .expect("typed encode");
+
+            let raw = InformationElement::from_typed(&typed).expect("from_typed");
+            let mut via_raw = BytesMut::new();
+            raw.encode(&mut via_raw).expect("raw encode");
+
+            assert_eq!(
+                direct.freeze().as_ref(),
+                via_raw.freeze().as_ref(),
+                "from_typed did not match typed encode for {typed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_variant_encode_value_returns_raw_value() {
+        let raw = InformationElement {
+            ie_type: 0x8001,
+            enterprise_id: 1,
+            value: Bytes::from_static(b"vendor"),
+        };
+        let typed = TypedIe::Raw(raw.clone());
+        assert_eq!(typed.encode_value().unwrap(), raw.value);
+    }
+
+    #[test]
+    fn from_typed_propagates_encode_errors() {
+        // A vendor-specific raw IE whose value is too large to encode triggers
+        // length_overflow when the grouped IE tries to encode its member.
+        let oversized = InformationElement {
+            ie_type: 0x8001,
+            enterprise_id: 1,
+            value: Bytes::from(vec![0u8; (u16::MAX as usize) + 1]),
+        };
+        let grouped = TypedIe::CreatePdr(CreatePdr {
+            members: vec![TypedIe::Raw(oversized)],
+        });
+        assert!(grouped.encode_value().is_err());
+        assert!(InformationElement::from_typed(&grouped).is_err());
+    }
+}

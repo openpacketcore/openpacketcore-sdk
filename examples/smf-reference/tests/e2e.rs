@@ -25,13 +25,7 @@ fn decode_typed_ie(ie_type: u16, value: &[u8]) -> TypedIe {
 }
 
 fn encode_typed_ie(typed: TypedIe) -> InformationElement {
-    let mut ie_buf = BytesMut::new();
-    typed
-        .encode(&mut ie_buf, EncodeContext::default())
-        .expect("encode typed ie");
-    InformationElement::decode(&ie_buf)
-        .expect("decode raw ie")
-        .1
+    InformationElement::from_typed(&typed).expect("typed ie encodes to raw ie")
 }
 
 const SMF_N4: &str = "127.0.0.1:18805";
