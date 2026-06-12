@@ -129,7 +129,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: operators/sdk-reference-operator/go.mod
           cache-dependency-path: operators/sdk-reference-operator/go.sum
@@ -156,7 +156,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: operators/operator-sdk-go/go.mod
           cache-dependency-path: operators/operator-sdk-go/go.sum

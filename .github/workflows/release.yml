@@ -28,7 +28,7 @@ jobs:
           components: clippy,rustfmt
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: operators/sdk-reference-operator/go.mod
           cache-dependency-path: operators/sdk-reference-operator/go.sum
