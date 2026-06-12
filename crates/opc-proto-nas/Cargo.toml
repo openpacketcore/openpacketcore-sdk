@@ -11,7 +11,7 @@ readme = "README.md"
 documentation = "https://docs.rs/opc-proto-nas"
 keywords = ["5g", "nas", "packet-core", "codec", "telecom"]
 categories = ["network-programming", "encoding"]
-publish = true
+publish = false # experimental: not published until graduation
 
 [dependencies]
 opc-protocol = { path = "../opc-protocol", version = "0.1.0" }

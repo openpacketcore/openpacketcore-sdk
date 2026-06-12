@@ -11,6 +11,7 @@ readme = "README.md"
 documentation = "https://docs.rs/opc-api-nnrf"
 keywords = ["5g", "nrf", "sbi", "openapi", "telecom"]
 categories = ["network-programming", "api-bindings"]
+publish = false # experimental: not published until graduation
 
 [lints]
 workspace = true

@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - crates.io publishing metadata (description, keywords, categories,
   documentation, readme) and per-crate READMEs for all publishable crates;
   intra-workspace path dependencies now carry `version` keys.
+- Workspace publish tiering: six experimental crates (`opc-session-net`,
+  `opc-key-vault`, `opc-proto-pfcp`, `opc-proto-nas`, `opc-proto-ngap`,
+  `opc-api-nnrf`) are now marked `publish = false` and documented in
+  `CONTRIBUTING.md` with per-crate graduation requirements.
 - README claims corrected: the SDK is 5G-centric (GTP-U is the only EPC-shared
   component) and in-process quorum semantics are distinguished from the
   experimental networked replication in `opc-session-net`.

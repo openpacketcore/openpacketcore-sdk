@@ -11,7 +11,7 @@ readme = "README.md"
 documentation = "https://docs.rs/opc-session-net"
 keywords = ["5g", "cnf", "session", "replication", "packet-core"]
 categories = ["network-programming", "data-structures"]
-publish = true
+publish = false # experimental: not published until graduation
 
 [features]
 default = []

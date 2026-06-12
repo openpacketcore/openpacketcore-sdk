@@ -95,9 +95,37 @@ Before requesting review, please confirm:
 
 ## Releasing
 
-Publishable crates must reach crates.io in topological dependency order —
-cargo verifies each crate's dependencies against the registry at publish
-time. The order is computed from the workspace metadata:
+### Publish tiers
+
+The workspace is split into two publish tiers. `scripts/publish-order.py --check`
+verifies that every crate declares its tier consistently (`publish = true` or
+`publish = false`) and that the dependency graph has no cycles.
+
+- **Tier 1 — publish now.** These crates are produced by
+  `scripts/publish-order.py` and are published to crates.io in topological
+  dependency order. cargo verifies each crate's dependencies against the
+  registry at publish time, so every dependency must be live before the
+  dependent is published.
+- **Tier 2 — held/experimental.** These crates carry `publish = false` in their
+  `Cargo.toml`. They are built and tested with the workspace but are not
+  published until they graduate to Tier 1.
+
+The current held crates and their graduation requirements are:
+
+| Crate | Status | Graduation requirement |
+|:------|:-------|:-----------------------|
+| `opc-session-net` | experimental | A stable wire-format contract with a documented compatibility policy and soak evidence across at least one minor version bump. See `crates/opc-session-net/README.md`. |
+| `opc-key-vault` | experimental | A production-readiness review covering Vault policy scoping, secret-zero handling, lease rotation, and an integration test against a real or containerized Vault Transit instance. |
+| `opc-proto-pfcp` | experimental | Full typed IE coverage for the session-management subset with all gaps in `crates/opc-proto-pfcp/CONFORMANCE.md` closed and conformance fixtures for every structured IE. |
+| `opc-proto-nas` | experimental | Structured parsing of the remaining 5GMM and 5GSM message bodies listed as out-of-scope in `crates/opc-proto-nas/CONFORMANCE.md`, with spec-byte fixtures for each message. |
+| `opc-proto-ngap` | experimental | A working canonical (typed) APER encoder path, verified by external fixtures for `NGSetupResponse` and `NGSetupFailure`, after the upstream `rasn` APER encoder misalignment is resolved or replaced. See `crates/opc-proto-ngap/CONFORMANCE.md`. |
+| `opc-api-nnrf` | experimental | Client/server stub generation and expanded OpenAPI operation coverage, plus generator stability across regenerated `types.rs` from the same pinned 3GPP YAML. See `crates/opc-api-nnrf/CONFORMANCE.md`. |
+
+To change a crate's tier, update `publish` in its `Cargo.toml` and move its row
+from the held table to the publishable list; the next release section in
+`CHANGELOG.md` must note the graduation.
+
+### Publishing a release
 
 ```bash
 python3 scripts/publish-order.py            # prints the cargo publish sequence
