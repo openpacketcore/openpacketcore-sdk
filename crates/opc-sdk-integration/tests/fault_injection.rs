@@ -679,7 +679,8 @@ async fn setup_fault_injecting_bus(
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_fault_injection_disk_full_fails_closed() {
-    METRICS.reset_all();
+    let persist_errors_before = METRICS.persist_error.load(Ordering::Relaxed);
+
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("disk_full.db");
     let sqlite = SqliteBackend::open(&db_path, true, 0).await.unwrap();
@@ -703,13 +704,17 @@ async fn test_fault_injection_disk_full_fails_closed() {
     assert!(!err_str.contains("secret"));
     assert!(!err_str.contains(".db"));
 
-    // Metric check
-    assert!(METRICS.persist_error.load(Ordering::Relaxed) >= 1);
+    // Metric check: use a delta to stay safe under parallel test execution.
+    assert!(
+        METRICS.persist_error.load(Ordering::Relaxed) > persist_errors_before,
+        "persist_error metric did not increment"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_fault_injection_fsync_failure_fails_closed() {
-    METRICS.reset_all();
+    let persist_errors_before = METRICS.persist_error.load(Ordering::Relaxed);
+
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("fsync_fail.db");
     let sqlite = SqliteBackend::open(&db_path, true, 0).await.unwrap();
@@ -728,7 +733,10 @@ async fn test_fault_injection_fsync_failure_fails_closed() {
     let err_str = err.to_string();
     assert!(!err_str.contains("secret"));
     assert!(!err_str.contains(".db"));
-    assert!(METRICS.persist_error.load(Ordering::Relaxed) >= 1);
+    assert!(
+        METRICS.persist_error.load(Ordering::Relaxed) > persist_errors_before,
+        "persist_error metric did not increment"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -806,7 +814,10 @@ async fn test_fault_injection_corrupt_wal_on_startup() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_fault_injection_rollback_audit_chain_corruption() {
-    METRICS.reset_all();
+    let audit_failures_before = METRICS
+        .persist_audit_chain_verification_failure
+        .load(Ordering::Relaxed);
+
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("rollback_audit_corrupt.db");
     let sqlite = SqliteBackend::open(&db_path, true, 0).await.unwrap();
@@ -852,13 +863,15 @@ async fn test_fault_injection_rollback_audit_chain_corruption() {
         METRICS
             .persist_audit_chain_verification_failure
             .load(Ordering::Relaxed)
-            >= 1
+            > audit_failures_before,
+        "persist_audit_chain_verification_failure metric did not increment"
     );
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_fault_injection_failed_rollback_load() {
-    METRICS.reset_all();
+    let rollback_failures_before = METRICS.config_bus_rollback_failure.load(Ordering::Relaxed);
+
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("failed_rollback_load.db");
     let sqlite = SqliteBackend::open(&db_path, true, 0).await.unwrap();
@@ -895,12 +908,14 @@ async fn test_fault_injection_failed_rollback_load() {
     assert!(!err_str.contains("secret"));
     assert!(!err_str.contains(".db"));
 
-    assert!(METRICS.config_bus_rollback_failure.load(Ordering::Relaxed) >= 1);
+    assert!(
+        METRICS.config_bus_rollback_failure.load(Ordering::Relaxed) > rollback_failures_before,
+        "config_bus_rollback_failure metric did not increment"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_fault_injection_mark_confirmed_failure() {
-    METRICS.reset_all();
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("mark_confirmed.db");
     let sqlite = SqliteBackend::open(&db_path, true, 0).await.unwrap();
@@ -1320,7 +1335,7 @@ async fn test_fault_injection_restart_loop_exceeds_policy() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_fault_injection_memory_budget_pressure() {
-    METRICS.reset_all();
+    let budget_exhausted_before = METRICS.runtime_budget_exhausted.load(Ordering::Relaxed);
 
     let alarms = SharedAlarmManager::default();
     let budget = ResourceBudget {
@@ -1409,7 +1424,11 @@ async fn test_fault_injection_memory_budget_pressure() {
         "Wrong error: {}",
         err_str
     );
-    assert_eq!(METRICS.runtime_budget_exhausted.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        METRICS.runtime_budget_exhausted.load(Ordering::Relaxed),
+        budget_exhausted_before + 1,
+        "runtime_budget_exhausted metric did not increment exactly once"
+    );
 
     // Verify error is redacted and client-safe (no raw paths/secrets/database details)
     assert!(!err_str.contains("secret"));
