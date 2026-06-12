@@ -29,7 +29,7 @@ axum = { version = "0.8.9", features = ["http2"] }
 tower = "0.5.3"
 hyper = { version = "1.10.1", features = ["full", "client", "server", "http1", "http2"] }
 h2 = "0.4.14"
-jsonwebtoken = "9.3.1"
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 tower-http = { version = "0.6.11", features = ["limit", "timeout", "trace"] }
 opc-tls = { version = "0.2.0", path = "../opc-tls" }
 serde_json.workspace = true

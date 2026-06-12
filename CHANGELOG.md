@@ -10,11 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Behaviour-pinning tests for randomness usage in `opc-crypto`, `opc-sbi`, and
   `opc-persist` ahead of the rand 0.10 migration.
+- JWT-SVID validation verdict tests in `opc-sbi` covering valid tokens, expiry,
+  audience/issuer mismatch, future `nbf`, missing/unknown `kid`, and the dev
+  bypass path.
 
 ### Changed
 - Workspace dependency `rand` 0.8 → 0.10, with direct callers migrated to the
   new API. `opc-crypto` continues to source nonce entropy from the OS via
   `getrandom::SysRng`.
+- `opc-sbi` dependency `jsonwebtoken` 9.3.1 → 10.4.0, using the `rust_crypto`
+  backend with PEM support. No source changes were required because the JWT
+  validation API remained compatible.
 
 ## [0.2.0] — 2026-06-12
 
