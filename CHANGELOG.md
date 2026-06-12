@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-sbi` dependency `jsonwebtoken` 9.3.1 → 10.4.0, using the `rust_crypto`
   backend with PEM support. No source changes were required because the JWT
   validation API remained compatible.
+- Added an on-disk SQLite fixture database and compatibility test in
+  `opc-persist` to guard against rusqlite major-version regressions.
+
+### Blocked
+- The coordinated RustCrypto digest-0.11 line (sha2/hmac/hkdf 0.11) remains
+  blocked because `aes-gcm-siv` 0.12 is still at release-candidate status; a
+  stable release is required before the workspace can move off
+  `crypto-common` 0.1 / `digest` 0.10 without duplicate versions.
+- `rusqlite` 0.32 → 0.40 is blocked at MSRV 1.88: `rusqlite` 0.40 pulls in
+  `libsqlite3-sys` 0.38, whose build script uses the built-in `cfg_select!`
+  macro that is unavailable before Rust 1.91 (confirmed by the `rust:1.88`
+  container failing to compile `libsqlite3-sys` 0.38.1).
 
 ## [0.2.0] — 2026-06-12
 
