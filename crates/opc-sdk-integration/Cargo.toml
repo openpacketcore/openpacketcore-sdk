@@ -36,7 +36,7 @@ opc-redaction = { path = "../opc-redaction" }
 opc-data-governance = { path = "../opc-data-governance" }
 opc-privacy = { path = "../opc-privacy" }
 opc-export = { path = "../opc-export" }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
 
 [lints]
