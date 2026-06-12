@@ -15,6 +15,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex,
 };
+use std::time::Duration;
 use thiserror::Error;
 
 /// Errors returned by the mock NRF.
@@ -340,6 +341,29 @@ impl crate::nrf::NrfDeregNotifier for MockNrf {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.deregister(nf_instance_id)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::nrf::NrfOperations for MockNrf {
+    async fn register(&self, profile: &NfProfile) -> Result<Duration, String> {
+        self.register(profile.clone())
+            .map(|_| Duration::from_secs(5))
+            .map_err(|e| e.to_string())
+    }
+
+    async fn deregister(&self, instance_id: &opc_types::NfInstanceId) -> Result<(), String> {
+        self.deregister(instance_id).map_err(|e| e.to_string())
+    }
+
+    async fn heartbeat(&self, instance_id: &opc_types::NfInstanceId) -> Result<Duration, String> {
+        self.heartbeat(instance_id)
+            .map(|_| Duration::from_secs(5))
+            .map_err(|e| e.to_string())
+    }
+
+    async fn discover(&self, query: &DiscoveryQuery) -> Result<DiscoveryResult, String> {
+        Ok(self.discover(query))
     }
 }
 

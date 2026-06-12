@@ -1,0 +1,47 @@
+[package]
+name = "smf-reference"
+version = "0.1.0"
+authors = ["OpenPacketCore Contributors"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/openpacketcore/openpacketcore-sdk"
+rust-version = "1.88"
+description = "Reference SMF consumer example for the OpenPacketCore SDK"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+bytes = "1.8"
+uuid = { version = "1.11", features = ["v4"] }
+time = "0.3"
+async-trait = "0.1"
+
+opc-runtime = { path = "../../crates/opc-runtime", version = "0.1.0" }
+opc-config-bus = { path = "../../crates/opc-config-bus", version = "0.1.0" }
+opc-alarm = { path = "../../crates/opc-alarm", version = "0.1.0" }
+opc-sbi = { path = "../../crates/opc-sbi", version = "0.1.0", features = ["runtime-hooks"] }
+opc-proto-pfcp = { path = "../../crates/opc-proto-pfcp", version = "0.1.0" }
+opc-protocol = { path = "../../crates/opc-protocol", version = "0.1.0" }
+opc-session-store = { path = "../../crates/opc-session-store", version = "0.1.0" }
+opc-types = { path = "../../crates/opc-types", version = "0.1.0" }
+
+[dev-dependencies]
+opc-sbi = { path = "../../crates/opc-sbi", version = "0.1.0", features = ["testkit"] }
+
+[workspace]
+
+[[bin]]
+name = "smf-reference"
+path = "src/main.rs"
