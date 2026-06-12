@@ -86,10 +86,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with hand-authored spec-byte fixtures citing TS 29.244 section numbers;
   negative tests for truncation, wrong length, and depth exceedance. Fuzz
   target extended with typed-IE decode loop.
-- Upstream-ready repro and issue draft for the `rasn` 0.28 APER encoder
-  alignment bug that prevents `opc-proto-ngap` from re-encoding typed
-  NGSetupRequest values. The draft and self-contained Cargo repro live in
-  `.planning/rasn-aper-repro/` and `.planning/rasn-issue-draft.md`.
+- Diagnosed a `rasn` 0.28 APER encoder alignment bug that prevents
+  `opc-proto-ngap` from re-encoding typed NGSetupRequest values; a
+  self-contained repro has been prepared for an upstream issue. The
+  affected re-encode path is documented in the crate's CONFORMANCE notes.
 - `opc-api-nnrf` (experimental): generated Rust types for 3GPP TS 29.510
   `NfProfile` and `NfService` from official OpenAPI YAML. Python generator
   `scripts/generate-api-nnrf.py` resolves `$refs`, maps primitives to Rust,

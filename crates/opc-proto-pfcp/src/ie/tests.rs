@@ -1194,7 +1194,7 @@ fn test_update_qer_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
-// Typed-to-raw helpers (friction-journal #3)
+// Typed-to-raw helpers: encode_value and InformationElement::from_typed
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

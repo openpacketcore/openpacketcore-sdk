@@ -42,7 +42,11 @@ cargo fmt --check
   Create PDR/FAR/QER IEs, session modification, session deletion, and
   heartbeat handling.
 
-## Friction journal
+## Feedback loop
 
-API rough edges hit while building this consumer are recorded in
-`.planning/v0.5-report.md` at the repository root.
+API rough edges hit while building this consumer are fixed directly in the
+SDK: the consumer adopts the improved API in the same change, so this
+example always reflects the intended way to consume the SDK. Recent
+examples include the `SessionStore` facade with `OwnedSession` renewal,
+`InformationElement::from_typed`, and the typed NF identifiers used for
+NRF registration.
