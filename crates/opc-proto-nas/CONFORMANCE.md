@@ -38,7 +38,7 @@ Decodes IE *content* (caller strips IEI/length framing):
   AMF Pointer (6 bits), 5G-TMSI; exact 11-octet length enforced.
 - **IMEI (3) / IMEISV (5)**: length-checked, odd/even digit indicator
   exposed, raw content preserved; BCD unpacking available via
-  [`unpack_imei`](crate::unpack_imei).
+  ``unpack_imei``.
 - **5G-S-TMSI (4) / MAC (6) / EUI-64 (7) / no identity (0)**:
   length-validated, raw preservation only.
 
@@ -51,11 +51,11 @@ Decodes IE *content* (caller strips IEI/length framing):
   the raw code remains available on the header.
 
 ### 4. BCD Digit Unpacking (TS 24.008 / 24.501 digit packing)
-- [`unpack_plmn`](crate::unpack_plmn): three BCD octets into MCC and
+- ``unpack_plmn``: three BCD octets into MCC and
   MNC, including the 2-digit MNC case (`0xF` in octet 2 high nibble).
-- [`unpack_routing_indicator`](crate::unpack_routing_indicator): two
+- ``unpack_routing_indicator``: two
   BCD octets, stopping at the first `0xF` filler nibble.
-- [`unpack_imei`](crate::unpack_imei): IMEI or IMEISV content including
+- ``unpack_imei``: IMEI or IMEISV content including
   the type octet, honoring the odd/even indicator and stopping at `0xF`.
 - Filler-nibble, odd-count, and MNC-padding cases are covered by hand-
   authored spec-byte fixtures.
