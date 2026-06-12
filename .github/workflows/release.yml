@@ -34,7 +34,7 @@ jobs:
           cache-dependency-path: operators/sdk-reference-operator/go.sum
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v4
+        uses: azure/setup-kubectl@v5
 
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2
