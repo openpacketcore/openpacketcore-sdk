@@ -317,3 +317,82 @@ async fn test_replication_log_and_watch() {
     handle2.abort();
     handle3.abort();
 }
+
+/// A deadline that fires mid-exchange must poison the connection: the next
+/// request has to reconnect rather than reuse a connection whose pending
+/// (stale) response would otherwise be read as the new request's reply.
+#[tokio::test]
+async fn test_timeout_mid_exchange_forces_reconnect() {
+    use opc_session_net::protocol::{read_frame, write_frame, CONTRACT_VERSION};
+    use opc_session_net::{Request, Response};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let conn_count = connections.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let n = conn_count.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let (mut r, mut w) = stream.into_split();
+                // Speak the handshake on every connection.
+                let hello: Request = match read_frame(&mut r, 1 << 20).await {
+                    Ok(req) => req,
+                    Err(_) => return,
+                };
+                assert!(matches!(hello, Request::Hello { .. }));
+                write_frame(
+                    &mut w,
+                    &Response::HelloAck {
+                        contract_version: CONTRACT_VERSION,
+                    },
+                )
+                .await
+                .unwrap();
+
+                loop {
+                    let req: Request = match read_frame(&mut r, 1 << 20).await {
+                        Ok(req) => req,
+                        Err(_) => return,
+                    };
+                    if n == 0 {
+                        // First connection: swallow the request forever so the
+                        // client's deadline fires mid-exchange.
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                        return;
+                    }
+                    // Later connections answer promptly.
+                    if let Request::Get { .. } = req {
+                        write_frame(&mut w, &Response::Get(Ok(None))).await.unwrap();
+                    }
+                }
+            });
+        }
+    });
+
+    let remote = RemoteSessionBackend::new(addr, None, Some(Duration::from_millis(300)));
+    let key = test_key();
+
+    // First request hits the stalling connection and must fail at the
+    // deadline rather than hang.
+    let start = tokio::time::Instant::now();
+    let first = remote.get(&key).await;
+    assert!(first.is_err(), "stalled request must surface an error");
+    assert!(start.elapsed() < Duration::from_secs(2));
+
+    // Second request must succeed via a NEW connection - reusing the stalled
+    // one would read no (or the wrong) response.
+    let second = remote.get(&key).await;
+    assert_eq!(second.unwrap(), None);
+    assert!(
+        connections.load(Ordering::SeqCst) >= 2,
+        "client must reconnect after a timed-out exchange"
+    );
+}

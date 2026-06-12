@@ -69,14 +69,16 @@ pub enum PduKind {
 }
 
 /// Decoded NGAP message body for the v0 subset.
+///
+/// Typed decoding is only offered where conformance fixtures prove the
+/// mapping (see CONFORMANCE.md); every other procedure/outcome combination —
+/// including NGSetupResponse and NGSetupFailure until external fixtures
+/// exist for them — is surfaced as [`Message::Unknown`] with the body bytes
+/// preserved raw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
-    /// NG Setup Request (procedure code 21).
+    /// NG Setup Request (initiating message, procedure code 21).
     NgSetupRequest(generated::ngap_pdu_contents::NGSetupRequest),
-    /// NG Setup Response (procedure code 21).
-    NgSetupResponse(generated::ngap_pdu_contents::NGSetupResponse),
-    /// NG Setup Failure (procedure code 21).
-    NgSetupFailure(generated::ngap_pdu_contents::NGSetupFailure),
     /// Initial UE Message (procedure code 15).
     InitialUeMessage(generated::ngap_pdu_contents::InitialUEMessage),
     /// Message not in the v0 typed subset; raw bytes are preserved.
@@ -106,7 +108,12 @@ pub fn decode(buf: &[u8], ctx: DecodeContext) -> Result<Pdu, DecodeError> {
 
     match pdu {
         generated::ngap_pdu_descriptions::NGAPPDU::initiatingMessage(im) => {
-            let message = decode_message(im.procedure_code.0, im.value.as_bytes(), ctx)?;
+            let message = decode_message(
+                Outcome::Initiating,
+                im.procedure_code.0,
+                im.value.as_bytes(),
+                ctx,
+            )?;
             Ok(Pdu {
                 raw,
                 kind: PduKind::Initiating {
@@ -117,7 +124,12 @@ pub fn decode(buf: &[u8], ctx: DecodeContext) -> Result<Pdu, DecodeError> {
             })
         }
         generated::ngap_pdu_descriptions::NGAPPDU::successfulOutcome(so) => {
-            let message = decode_message(so.procedure_code.0, so.value.as_bytes(), ctx)?;
+            let message = decode_message(
+                Outcome::Successful,
+                so.procedure_code.0,
+                so.value.as_bytes(),
+                ctx,
+            )?;
             Ok(Pdu {
                 raw,
                 kind: PduKind::Successful {
@@ -128,7 +140,12 @@ pub fn decode(buf: &[u8], ctx: DecodeContext) -> Result<Pdu, DecodeError> {
             })
         }
         generated::ngap_pdu_descriptions::NGAPPDU::unsuccessfulOutcome(uo) => {
-            let message = decode_message(uo.procedure_code.0, uo.value.as_bytes(), ctx)?;
+            let message = decode_message(
+                Outcome::Unsuccessful,
+                uo.procedure_code.0,
+                uo.value.as_bytes(),
+                ctx,
+            )?;
             Ok(Pdu {
                 raw,
                 kind: PduKind::Unsuccessful {
@@ -141,7 +158,19 @@ pub fn decode(buf: &[u8], ctx: DecodeContext) -> Result<Pdu, DecodeError> {
     }
 }
 
+/// NGAP-PDU outcome class, used to dispatch message-body decoding: the same
+/// procedure code carries different message types per outcome (procedure 21
+/// is NGSetupRequest when initiating but NGSetupResponse/NGSetupFailure on
+/// the successful/unsuccessful outcomes).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Initiating,
+    Successful,
+    Unsuccessful,
+}
+
 fn decode_message(
+    outcome: Outcome,
     procedure_code: u8,
     value: &[u8],
     ctx: DecodeContext,
@@ -150,15 +179,15 @@ fn decode_message(
         return Err(length_error(value.len(), ctx.max_message_len));
     }
 
-    match procedure_code {
-        PROCEDURE_CODE_NG_SETUP => {
+    match (outcome, procedure_code) {
+        (Outcome::Initiating, PROCEDURE_CODE_NG_SETUP) => {
             let msg: generated::ngap_pdu_contents::NGSetupRequest = rasn::aper::decode(value)
                 .map_err(|_| {
                     DecodeError::new(DecodeErrorCode::Structural { reason: "ngsetup" }, 0)
                 })?;
             Ok(Message::NgSetupRequest(msg))
         }
-        PROCEDURE_CODE_INITIAL_UE => {
+        (Outcome::Initiating, PROCEDURE_CODE_INITIAL_UE) => {
             let msg: generated::ngap_pdu_contents::InitialUEMessage = rasn::aper::decode(value)
                 .map_err(|_| {
                     DecodeError::new(
@@ -170,6 +199,10 @@ fn decode_message(
                 })?;
             Ok(Message::InitialUeMessage(msg))
         }
+        // NGSetupResponse/NGSetupFailure (successful/unsuccessful outcome of
+        // procedure 21) intentionally remain raw until external conformance
+        // fixtures exist for them; decoding them with the request type would
+        // silently mislabel peer messages.
         _ => Ok(Message::Unknown(Bytes::copy_from_slice(value))),
     }
 }
@@ -252,14 +285,100 @@ mod tests {
             } => {
                 assert_eq!(*procedure_code, PROCEDURE_CODE_NG_SETUP);
                 assert_eq!(*criticality, Criticality::ignore);
+                let req = match message {
+                    Message::NgSetupRequest(req) => req,
+                    other => panic!("expected NGSetupRequest, got {other:?}"),
+                };
+
+                // Content assertions: the decoder must map the IEs to the
+                // values the independent implementation encoded, not merely
+                // produce *something* of the right type.
+                let ies = &req.protocol_ies.0;
+                assert_eq!(ies.len(), 4, "fixture carries exactly four IEs");
+                let ids: Vec<u16> = ies.iter().map(|ie| ie.id).collect();
+                // id-GlobalRANNodeID(27), id-RANNodeName(82),
+                // id-SupportedTAList(102), id-DefaultPagingDRX(21)
+                assert_eq!(ids, vec![27, 82, 102, 21]);
+                // RANNodeName open-type value carries the printable string.
+                let name_ie = &ies[1];
                 assert!(
-                    matches!(message, Message::NgSetupRequest(_)),
-                    "expected NGSetupRequest"
+                    name_ie.value.as_bytes().ends_with(b"My little gNB"),
+                    "RANNodeName value must contain the fixture's node name"
                 );
+                // DefaultPagingDRX open-type value: APER enumerated v64.
+                let drx_ie = &ies[3];
+                assert_eq!(drx_ie.value.as_bytes(), &[0x40], "DefaultPagingDRX v64");
             }
             _ => panic!("expected initiating message"),
         }
 
+        let encoded = encode(
+            &pdu,
+            EncodeContext {
+                raw_preserving: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(encoded, bytes);
+    }
+
+    /// Hand-authored successfulOutcome wrapper per TS 38.413 §9.2 / X.691:
+    /// octet 0 = 0x20 (extension bit 0, CHOICE index 01 = successfulOutcome,
+    /// then padding to the octet boundary), octet 1 = procedureCode 21,
+    /// octet 2 = criticality reject (00 in the top two bits), octet 3 =
+    /// open-type length 3, then an opaque 3-octet body. v0 has no external
+    /// NGSetupResponse fixture, so the body must surface as
+    /// `Message::Unknown` — never be mislabeled as an NGSetupRequest — and
+    /// re-encode byte-exactly.
+    #[test]
+    fn successful_outcome_framing_roundtrip() {
+        let bytes = vec![0x20, 0x15, 0x00, 0x03, 0xAA, 0xBB, 0xCC];
+        let pdu = decode(&bytes, DecodeContext::default()).unwrap();
+        match &pdu.kind {
+            PduKind::Successful {
+                procedure_code,
+                criticality,
+                message,
+            } => {
+                assert_eq!(*procedure_code, PROCEDURE_CODE_NG_SETUP);
+                assert_eq!(*criticality, Criticality::reject);
+                match message {
+                    Message::Unknown(body) => assert_eq!(&body[..], &[0xAA, 0xBB, 0xCC]),
+                    other => panic!("successful outcome must stay raw in v0, got {other:?}"),
+                }
+            }
+            other => panic!("expected successful outcome, got {other:?}"),
+        }
+        let encoded = encode(
+            &pdu,
+            EncodeContext {
+                raw_preserving: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(encoded, bytes);
+    }
+
+    /// Hand-authored unsuccessfulOutcome wrapper: octet 0 = 0x40 (CHOICE
+    /// index 10 = unsuccessfulOutcome), then as above. Must surface as
+    /// `Message::Unknown` and round-trip byte-exactly.
+    #[test]
+    fn unsuccessful_outcome_framing_roundtrip() {
+        let bytes = vec![0x40, 0x15, 0x00, 0x02, 0xDE, 0xAD];
+        let pdu = decode(&bytes, DecodeContext::default()).unwrap();
+        match &pdu.kind {
+            PduKind::Unsuccessful {
+                procedure_code,
+                message,
+                ..
+            } => {
+                assert_eq!(*procedure_code, PROCEDURE_CODE_NG_SETUP);
+                assert!(matches!(message, Message::Unknown(_)));
+            }
+            other => panic!("expected unsuccessful outcome, got {other:?}"),
+        }
         let encoded = encode(
             &pdu,
             EncodeContext {

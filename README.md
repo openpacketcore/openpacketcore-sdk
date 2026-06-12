@@ -31,7 +31,8 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | [`opc-protocol`](crates/opc-protocol/) | Zero-copy protocol codec framework: traits, context, errors, and fuzzing contracts. | [RFC 005](docs/rfc/005-protocol-framework.md) |
 | [`opc-proto-gtpu`](crates/opc-proto-gtpu/) | GTP-U protocol codec for the user-plane data path. | — |
 | [`opc-proto-pfcp`](crates/opc-proto-pfcp/) | PFCP codec (TS 29.244): message layer, raw TLV preservation, and typed session-management IEs *(experimental)*. | — |
-| [`opc-proto-nas`](crates/opc-proto-nas/) | NAS-5GS (TS 24.501) v0 codec: plain headers, security-envelope recognition, 5GS mobile identity *(experimental v0)*. | — |
+| [`opc-proto-nas`](crates/opc-proto-nas/) | NAS-5GS (TS 24.501) codec: headers, security-envelope recognition, mobile identity, BCD unpacking, Registration Request/Accept IEs *(experimental)*. | — |
+| [`opc-proto-ngap`](crates/opc-proto-ngap/) | NGAP (TS 38.413) v0 decoder via `rasn` APER: PDU framing, fixture-proven NGSetupRequest, raw-preserving re-encode *(experimental v0)*. | [ADR 0013](docs/adr/0013-ngap-asn1-strategy.md) |
 | [`opc-node-resources`](crates/opc-node-resources/) | Validates `ResourceProfile` compatibility against observed `NodeCapabilityReport`. | [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md) |
 
 ### Config & Management (`crates/`)

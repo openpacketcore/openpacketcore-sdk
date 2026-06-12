@@ -8,11 +8,11 @@ This crate provides the first NGAP codec in the SDK, built on the `rasn`
 ASN.1 / APER toolchain per ADR 0013. It currently covers:
 
 - NGAP-PDU framing: initiating message, successful outcome, unsuccessful outcome.
-- Typed decoding of the v0 message subset:
-  - `NGSetupRequest`
-  - `NGSetupResponse`
-  - `NGSetupFailure`
-  - `InitialUEMessage`
+- Typed decoding of the fixture-proven v0 subset: `NGSetupRequest`
+  (field-level conformance fixture) and `InitialUEMessage` (decode path,
+  fixture pending). `NGSetupResponse` and `NGSetupFailure` are intentionally
+  surfaced as raw `Message::Unknown` bodies until external fixtures exist —
+  decoding them without fixtures risks silently mislabeling peer messages.
 - Byte-exact raw-preserving round-trip at the NGAP-PDU level.
 
 ## Important caveat

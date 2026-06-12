@@ -89,14 +89,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   coverage verifies strategy fields are persisted correctly on a real
   API server.
 - `opc-proto-ngap` (experimental v0): NGAP (3GPP TS 38.413) codec built on
-  `rasn` per ADR 0013 Option A. NGAP-PDU framing (initiating / successful /
-  unsuccessful outcomes), typed APER decoding of NGSetupRequest,
-  NGSetupResponse, NGSetupFailure, and InitialUEMessage, and raw-preserving
-  encode so decode->encode round-trips byte-exactly against spec and
-  independent `asn1c`/libngap fixtures. Offline generator
-  `scripts/generate-ngap.py` (Wireshark ASN.1 + `rasn-compiler`) and
-  `make generate-ngap`; fuzz target `decode_ngap` with seed corpus and
-  CI registration.
+  `rasn` per ADR 0013 Option A. NGAP-PDU framing for all three outcome
+  classes with outcome-aware dispatch, typed APER decoding of
+  NGSetupRequest (field-level external `asn1c`/libngap fixture) and
+  InitialUEMessage, and raw-preserving encode so decode->encode
+  round-trips byte-exactly. NGSetupResponse/NGSetupFailure are surfaced
+  raw until external fixtures exist for them, and typed (canonical)
+  encoding is out of scope for v0 — see the crate's CONFORMANCE.md.
+  Offline generator `scripts/generate-ngap.py` (Wireshark ASN.1 +
+  `rasn-compiler`) and `make generate-ngap`; fuzz target `decode_ngap`
+  with seed corpus and CI registration.
 - `opc-api-nnrf` (experimental): expanded generated TS 29.510 types to cover
   the NRF NFManagement payloads used for registration, heartbeat, and
   subscription/notification exchanges: `SubscriptionData`, `NotificationData`,

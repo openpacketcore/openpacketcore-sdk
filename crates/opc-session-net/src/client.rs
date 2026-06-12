@@ -118,19 +118,24 @@ impl RemoteSessionBackend {
     async fn do_request(&self, req: &Request) -> Result<Response, ProtocolError> {
         let mut guard = self.conn.lock().await;
 
-        if guard.is_none() {
-            let conn = self.connect().await?;
-            *guard = Some(conn);
-        }
+        // Take the connection out of the slot for the duration of the
+        // exchange. If this future is cancelled mid-exchange (the per-call
+        // deadline can fire between writing a request and reading its
+        // response), a connection left in the slot would deliver the stale
+        // response of the cancelled request to the next caller; taking it
+        // means cancellation drops the connection and the next request
+        // reconnects cleanly. Errors drop it for the same reason.
+        let mut conn = match guard.take() {
+            Some(conn) => conn,
+            None => self.connect().await?,
+        };
 
-        let conn = guard.as_mut().unwrap();
-        match self.exchange(req, conn).await {
-            Ok(resp) => Ok(resp),
-            Err(e) => {
-                // Drop the connection on any error; the retry loop will reconnect.
-                *guard = None;
-                Err(e)
+        match self.exchange(req, &mut conn).await {
+            Ok(resp) => {
+                *guard = Some(conn);
+                Ok(resp)
             }
+            Err(e) => Err(e),
         }
     }
 
