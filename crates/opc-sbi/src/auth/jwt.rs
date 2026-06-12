@@ -400,6 +400,166 @@ fn parse_spiffe_id_segments(spiffe_id: &SpiffeId) -> Option<(String, String, Str
     Some((tenant, nf_kind, instance_id))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::headers::BearerToken;
+    use crate::testkit::fixtures::{
+        generate_test_token_with_nbf_offset, test_private_key_pem, MockJwksResolver,
+        TokenFixtures,
+    };
+    use std::sync::Arc;
+
+    const AUD: &str = "amf-audience";
+    const ISS: &str = "nrf-issuer";
+    const SUB: &str = "spiffe://example.com/tenant/default/ns/core/sa/default/nf/amf/instance/amf-01";
+
+    fn auth_request(token: &str) -> SbiAuthRequest {
+        SbiAuthRequest {
+            method: http::Method::GET,
+            path: "/nnrf-disc/v1/nf-instances".to_string(),
+            headers: crate::headers::SbiHeaders::default(),
+            bearer_token: Some(BearerToken::new(token).unwrap()),
+            peer: SbiPeer {
+                spiffe: None,
+                nf_instance_id: None,
+                nf_type: None,
+                tenant: TenantId::new("default").unwrap(),
+                plmn: None,
+                snssai: None,
+            },
+        }
+    }
+
+    fn production_validator() -> SbiJwtValidator {
+        SbiJwtValidator::new(
+            Arc::new(MockJwksResolver::new()),
+            Duration::from_secs(60),
+            AUD.to_string(),
+            ISS.to_string(),
+            true,
+            false,
+        )
+    }
+
+    #[tokio::test]
+    async fn valid_token_returns_expected_peer_and_scopes() {
+        let validator = production_validator();
+        let token = TokenFixtures::valid(SUB, AUD, ISS, "nnrf-disc nnrf-nfm");
+        let ctx = validator.authorize(&auth_request(&token)).await.unwrap();
+
+        assert_eq!(ctx.peer.tenant, TenantId::new("default").unwrap());
+        assert_eq!(
+            ctx.peer.nf_instance_id.as_ref().map(|id| id.as_str()),
+            Some("amf-01")
+        );
+        assert_eq!(ctx.peer.nf_type.as_ref().map(|t| t.as_str()), Some("amf"));
+        assert_eq!(
+            ctx.scopes,
+            vec!["nnrf-disc".to_string(), "nnrf-nfm".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_token_is_denied() {
+        let validator = production_validator();
+        let token = TokenFixtures::expired(SUB, AUD, ISS);
+        let err = validator.authorize(&auth_request(&token)).await.unwrap_err();
+        assert!(matches!(err, SbiAuthError::Denied { .. }));
+    }
+
+    #[tokio::test]
+    async fn wrong_audience_is_denied() {
+        let validator = production_validator();
+        let token = TokenFixtures::bad_audience(SUB, ISS);
+        let err = validator.authorize(&auth_request(&token)).await.unwrap_err();
+        assert!(matches!(err, SbiAuthError::Denied { .. }));
+    }
+
+    #[tokio::test]
+    async fn wrong_issuer_is_denied() {
+        let validator = production_validator();
+        let token = generate_test_token_with_nbf_offset(SUB, AUD, "evil-issuer", None, 3600, -10);
+        let err = validator.authorize(&auth_request(&token)).await.unwrap_err();
+        assert!(matches!(err, SbiAuthError::Denied { .. }));
+    }
+
+    #[tokio::test]
+    async fn future_nbf_is_denied() {
+        let validator = production_validator();
+        let token = generate_test_token_with_nbf_offset(SUB, AUD, ISS, None, 3600, 3600);
+        let err = validator.authorize(&auth_request(&token)).await.unwrap_err();
+        assert!(matches!(err, SbiAuthError::Denied { .. }));
+    }
+
+    #[tokio::test]
+    async fn missing_kid_is_denied() {
+        let validator = production_validator();
+        let private_key = test_private_key_pem();
+        let encoding_key =
+            jsonwebtoken::EncodingKey::from_rsa_pem(private_key.as_bytes()).unwrap();
+        let now = jsonwebtoken::get_current_timestamp();
+        let claims = SvidClaims {
+            iss: ISS.to_string(),
+            sub: SUB.to_string(),
+            aud: serde_json::Value::String(AUD.to_string()),
+            exp: now + 3600,
+            nbf: Some(now - 10),
+            scope: Some("nnrf-disc".to_string()),
+        };
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        let token = jsonwebtoken::encode(&header, &claims, &encoding_key).unwrap();
+
+        let err = validator.authorize(&auth_request(&token)).await.unwrap_err();
+        assert!(matches!(err, SbiAuthError::Denied { .. }));
+    }
+
+    #[tokio::test]
+    async fn unknown_kid_fails_closed_internal() {
+        let empty_resolver = crate::auth::Jwks { keys: vec![] };
+        struct EmptyResolver(crate::auth::Jwks);
+        #[async_trait::async_trait]
+        impl JwksResolver for EmptyResolver {
+            async fn fetch_jwks(&self) -> Result<Jwks, String> {
+                Ok(self.0.clone())
+            }
+        }
+        let validator = SbiJwtValidator::new(
+            Arc::new(EmptyResolver(empty_resolver)),
+            Duration::from_secs(60),
+            AUD.to_string(),
+            ISS.to_string(),
+            true,
+            false,
+        );
+        let token = TokenFixtures::valid(SUB, AUD, ISS, "nnrf-disc");
+        let err = validator.authorize(&auth_request(&token)).await.unwrap_err();
+        assert!(matches!(err, SbiAuthError::Internal { .. }));
+    }
+
+    #[tokio::test]
+    async fn dev_bypass_allows_mock_token_when_not_production() {
+        let validator = SbiJwtValidator::new(
+            Arc::new(MockJwksResolver::new()),
+            Duration::from_secs(60),
+            AUD.to_string(),
+            ISS.to_string(),
+            false, // not production
+            true,  // bypass enabled
+        );
+        let ctx = validator
+            .authorize(&auth_request("mock-token-test"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.peer.tenant, TenantId::new("default").unwrap());
+        assert_eq!(
+            ctx.peer.nf_instance_id.as_ref().map(|id| id.as_str()),
+            Some("mock-instance")
+        );
+        assert_eq!(ctx.peer.nf_type.as_ref().map(|t| t.as_str()), Some("amf"));
+    }
+}
+
 /// Token Provider trait for client token acquisition
 #[async_trait]
 pub trait TokenProvider: Send + Sync {
