@@ -18,9 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workspace dependency `rand` 0.8 → 0.10, with direct callers migrated to the
   new API. `opc-crypto` continues to source nonce entropy from the OS via
   `getrandom::SysRng`.
-- `opc-sbi` dependency `jsonwebtoken` 9.3.1 → 10.4.0, using the `rust_crypto`
+- `opc-sbi` dependency `jsonwebtoken` 9.3.1 → 10.4.0, using the `aws_lc_rs`
   backend with PEM support. No source changes were required because the JWT
-  validation API remained compatible.
+  validation API remained compatible; the `aws_lc_rs` backend avoids the
+  `rsa` crate and the RUSTSEC-2023-0071 advisory that the `rust_crypto`
+  backend would pull in.
 - Added an on-disk SQLite fixture database and compatibility test in
   `opc-persist` to guard against rusqlite major-version regressions.
 
