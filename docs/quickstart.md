@@ -12,7 +12,7 @@ This guide shows how to build a minimal 5G CNF using the `opc-sdk` facade crate 
 
 ```toml
 [dependencies]
-opc-sdk = { path = "../crates/opc-sdk", version = "0.1.0", features = ["runtime", "sbi", "alarm"] }
+opc-sdk = { path = "../crates/opc-sdk", version = "0.2.0", features = ["runtime", "sbi", "alarm"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

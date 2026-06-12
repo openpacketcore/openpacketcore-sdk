@@ -18,8 +18,8 @@ default = []
 insecure-test = []
 
 [dependencies]
-opc-session-store = { path = "../opc-session-store", version = "0.1.0" }
-opc-tls = { path = "../opc-tls", version = "0.1.0" }
+opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
+opc-tls = { path = "../opc-tls", version = "0.2.0" }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros"] }
 serde = { workspace = true, features = ["derive"] }

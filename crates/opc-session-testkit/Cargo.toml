@@ -1,6 +1,6 @@
 [package]
 name = "opc-session-testkit"
-version = "0.1.0"
+version = "0.2.0"
 publish = false
 edition = "2021"
 description = "Chaos and failure testing testkit for OpenPacketCore session replication (RFC 004)"

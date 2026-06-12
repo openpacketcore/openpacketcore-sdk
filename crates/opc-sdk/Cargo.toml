@@ -25,18 +25,18 @@ types = ["dep:opc-types"]
 testkit = ["opc-sbi?/testkit"]
 
 [dependencies]
-opc-types = { path = "../opc-types", version = "0.1.0", optional = true }
-opc-runtime = { path = "../opc-runtime", version = "0.1.0", optional = true }
-opc-config-bus = { path = "../opc-config-bus", version = "0.1.0", optional = true }
-opc-config-model = { path = "../opc-config-model", version = "0.1.0", optional = true }
-opc-session-store = { path = "../opc-session-store", version = "0.1.0", optional = true }
-opc-session-cache = { path = "../opc-session-cache", version = "0.1.0", optional = true }
-opc-sbi = { path = "../opc-sbi", version = "0.1.0", optional = true }
-opc-alarm = { path = "../opc-alarm", version = "0.1.0", optional = true }
-opc-identity = { path = "../opc-identity", version = "0.1.0", optional = true }
-opc-tls = { path = "../opc-tls", version = "0.1.0", optional = true }
-opc-key = { path = "../opc-key", version = "0.1.0", optional = true }
-opc-crypto = { path = "../opc-crypto", version = "0.1.0", optional = true }
+opc-types = { path = "../opc-types", version = "0.2.0", optional = true }
+opc-runtime = { path = "../opc-runtime", version = "0.2.0", optional = true }
+opc-config-bus = { path = "../opc-config-bus", version = "0.2.0", optional = true }
+opc-config-model = { path = "../opc-config-model", version = "0.2.0", optional = true }
+opc-session-store = { path = "../opc-session-store", version = "0.2.0", optional = true }
+opc-session-cache = { path = "../opc-session-cache", version = "0.2.0", optional = true }
+opc-sbi = { path = "../opc-sbi", version = "0.2.0", optional = true }
+opc-alarm = { path = "../opc-alarm", version = "0.2.0", optional = true }
+opc-identity = { path = "../opc-identity", version = "0.2.0", optional = true }
+opc-tls = { path = "../opc-tls", version = "0.2.0", optional = true }
+opc-key = { path = "../opc-key", version = "0.2.0", optional = true }
+opc-crypto = { path = "../opc-crypto", version = "0.2.0", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "signal"] }

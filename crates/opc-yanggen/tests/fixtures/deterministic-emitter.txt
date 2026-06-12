@@ -1,4 +1,4 @@
-generator-version 0.1.0
+generator-version 0.2.0
 profile carrier-default
 schema-digest fnv1a64:22bedbc321e5c931
 lockfile

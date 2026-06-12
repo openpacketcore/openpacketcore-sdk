@@ -23,8 +23,8 @@ x509-parser = { workspace = true }
 rustls-pki-types = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
-opc-types = { path = "../opc-types", version = "0.1.0" }
-opc-identity = { path = "../opc-identity", version = "0.1.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
+opc-identity = { path = "../opc-identity", version = "0.2.0" }
 
 [dev-dependencies]
 rcgen = { workspace = true }

@@ -14,12 +14,12 @@ documentation = "https://docs.rs/opc-crypto"
 keywords = ["5g", "cnf", "cryptography", "telecom", "packet-core"]
 categories = ["cryptography", "network-programming"]
 [dependencies]
-opc-key = { path = "../opc-key", version = "0.1.0" }
+opc-key = { path = "../opc-key", version = "0.2.0" }
 rand = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-opc-types = { path = "../opc-types", version = "0.1.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

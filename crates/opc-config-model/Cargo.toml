@@ -14,7 +14,7 @@ documentation = "https://docs.rs/opc-config-model"
 keywords = ["5g", "cnf", "config", "telecom", "packet-core"]
 categories = ["network-programming", "data-structures"]
 [dependencies]
-opc-types = { path = "../opc-types", version = "0.1.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 uuid = { workspace = true }

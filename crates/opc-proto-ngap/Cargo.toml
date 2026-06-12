@@ -18,7 +18,7 @@ workspace = true
 
 [dependencies]
 bytes = { workspace = true }
-opc-protocol = { path = "../opc-protocol", version = "0.1.0" }
+opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 rasn = "0.28.13"
 thiserror = { workspace = true }
 

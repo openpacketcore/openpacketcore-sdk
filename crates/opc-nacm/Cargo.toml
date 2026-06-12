@@ -15,7 +15,7 @@ keywords = ["5g", "cnf", "yang", "telecom", "packet-core"]
 categories = ["network-programming"]
 [dependencies]
 thiserror = { workspace = true }
-opc-redaction = { path = "../opc-redaction", version = "0.1.0" }
+opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 
 [lints]
 workspace = true

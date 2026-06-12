@@ -18,8 +18,8 @@ default = []
 k8s-auth = []
 
 [dependencies]
-opc-key = { path = "../opc-key", version = "0.1.0" }
-opc-types = { path = "../opc-types", version = "0.1.0" }
+opc-key = { path = "../opc-key", version = "0.2.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
 async-trait = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -33,7 +33,7 @@ base64 = "0.22"
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json = { workspace = true }
-opc-crypto = { path = "../opc-crypto", version = "0.1.0" }
+opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 
 [lints]
 workspace = true

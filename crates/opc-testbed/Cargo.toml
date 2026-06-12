@@ -24,11 +24,11 @@ thiserror = { workspace = true }
 serde_yaml = "0.9"
 serde_json = { workspace = true }
 time = { workspace = true, features = ["formatting", "parsing", "serde"] }
-opc-types = { path = "../opc-types", version = "0.1.0" }
-opc-evidence = { path = "../opc-evidence", version = "0.1.0" }
-opc-schema-validate = { path = "../opc-schema-validate", version = "0.1.0" }
-opc-redaction = { path = "../opc-redaction", version = "0.1.0" }
-opc-node-resources = { path = "../opc-node-resources", version = "0.1.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
+opc-evidence = { path = "../opc-evidence", version = "0.2.0" }
+opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
+opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
+opc-node-resources = { path = "../opc-node-resources", version = "0.2.0" }
 
 [lints]
 workspace = true

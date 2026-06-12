@@ -851,7 +851,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "opc-alarm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "opc-redaction",
@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "opc-config-bus"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -888,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "opc-config-model"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "opc-types",
  "serde",
@@ -898,7 +898,7 @@ dependencies = [
 
 [[package]]
 name = "opc-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "opc-key",
  "rand",
@@ -907,14 +907,14 @@ dependencies = [
 
 [[package]]
 name = "opc-data-governance"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "opc-identity"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "opc-types",
  "rustls",
@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "opc-key"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm-siv",
  "async-trait",
@@ -952,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "opc-proto-pfcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "opc-protocol",
@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "opc-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.18",
@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "opc-redaction"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hmac",
  "opc-data-governance",
@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "opc-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "opc-sbi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "opc-session-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1055,7 +1055,7 @@ dependencies = [
 
 [[package]]
 name = "opc-tls"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "opc-identity",
  "opc-types",
@@ -1072,7 +1072,7 @@ dependencies = [
 
 [[package]]
 name = "opc-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -1433,7 +1433,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "smf-reference"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",

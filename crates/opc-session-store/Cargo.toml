@@ -14,10 +14,10 @@ documentation = "https://docs.rs/opc-session-store"
 keywords = ["5g", "cnf", "session", "telecom", "packet-core"]
 categories = ["network-programming", "data-structures"]
 [dependencies]
-opc-crypto = { path = "../opc-crypto", version = "0.1.0" }
-opc-key = { path = "../opc-key", version = "0.1.0" }
-opc-types = { path = "../opc-types", version = "0.1.0" }
-opc-redaction = { path = "../opc-redaction", version = "0.1.0" }
+opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
+opc-key = { path = "../opc-key", version = "0.2.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
+opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

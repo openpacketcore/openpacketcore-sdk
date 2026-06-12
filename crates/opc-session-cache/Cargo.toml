@@ -14,7 +14,7 @@ documentation = "https://docs.rs/opc-session-cache"
 keywords = ["5g", "cnf", "session", "telecom", "packet-core"]
 categories = ["network-programming", "data-structures"]
 [dependencies]
-opc-session-store = { path = "../opc-session-store", version = "0.1.0" }
+opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
 tokio = { workspace = true, features = ["time", "sync", "macros", "rt"] }
 tracing = { workspace = true }
 futures-util = "0.3"
@@ -23,6 +23,6 @@ async-trait = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["time", "sync", "test-util"] }
 opc-session-testkit = { path = "../opc-session-testkit" }
-opc-types = { path = "../opc-types", version = "0.1.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
 bytes = { workspace = true }
 zeroize = { workspace = true }

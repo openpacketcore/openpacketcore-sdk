@@ -20,8 +20,8 @@ runtime-hooks = ["dep:opc-runtime"]
 [dependencies]
 async-trait = { workspace = true }
 http = "1"
-opc-types = { path = "../opc-types", version = "0.1.0" }
-opc-runtime = { path = "../opc-runtime", version = "0.1.0", optional = true }
+opc-types = { path = "../opc-types", version = "0.2.0" }
+opc-runtime = { path = "../opc-runtime", version = "0.2.0", optional = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
@@ -31,12 +31,12 @@ hyper = { version = "1.10.1", features = ["full", "client", "server", "http1", "
 h2 = "0.4.14"
 jsonwebtoken = "9.3.1"
 tower-http = { version = "0.6.11", features = ["limit", "timeout", "trace"] }
-opc-tls = { version = "0.1.0", path = "../opc-tls" }
+opc-tls = { version = "0.2.0", path = "../opc-tls" }
 serde_json.workspace = true
-opc-redaction = { version = "0.1.0", path = "../opc-redaction" }
+opc-redaction = { version = "0.2.0", path = "../opc-redaction" }
 tokio = { workspace = true, features = ["sync", "time"] }
 rustls.workspace = true
-opc-identity = { version = "0.1.0", path = "../opc-identity" }
+opc-identity = { version = "0.2.0", path = "../opc-identity" }
 hyper-util = { version = "0.1.20", features = ["client", "server", "tokio", "server-auto"] }
 futures-util = "0.3.32"
 tokio-rustls.workspace = true
@@ -49,7 +49,7 @@ rand.workspace = true
 [dev-dependencies]
 serde_json = { workspace = true }
 # Enable testkit for integration tests (self-referential dev-dep is valid in Cargo).
-opc-sbi = { path = ".", version = "0.1.0", features = ["testkit"] }
+opc-sbi = { path = ".", version = "0.2.0", features = ["testkit"] }
 
 [lints]
 workspace = true

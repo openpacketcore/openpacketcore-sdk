@@ -35,14 +35,14 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 rand = { workspace = true }
 
 # Shared types across the SDK
-opc-types = { path = "../opc-types", version = "0.1.0" }
-opc-redaction = { path = "../opc-redaction", version = "0.1.0" }
-opc-data-governance = { path = "../opc-data-governance", version = "0.1.0" }
-opc-identity = { path = "../opc-identity", version = "0.1.0" }
-opc-tls = { path = "../opc-tls", version = "0.1.0" }
-opc-nacm = { path = "../opc-nacm", version = "0.1.0" }
-opc-key = { path = "../opc-key", version = "0.1.0" }
-opc-crypto = { path = "../opc-crypto", version = "0.1.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
+opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
+opc-data-governance = { path = "../opc-data-governance", version = "0.2.0" }
+opc-identity = { path = "../opc-identity", version = "0.2.0" }
+opc-tls = { path = "../opc-tls", version = "0.2.0" }
+opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
+opc-key = { path = "../opc-key", version = "0.2.0" }
+opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 
 [features]
 default = []
@@ -55,4 +55,4 @@ workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process"] }
 rcgen = { workspace = true }
-opc-alarm = { path = "../opc-alarm", version = "0.1.0" }
+opc-alarm = { path = "../opc-alarm", version = "0.2.0" }

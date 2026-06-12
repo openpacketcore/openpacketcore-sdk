@@ -14,7 +14,7 @@ documentation = "https://docs.rs/opc-proto-gtpu"
 keywords = ["5g", "cnf", "gtp-u", "telecom", "packet-core"]
 categories = ["network-programming", "encoding"]
 [dependencies]
-opc-protocol = { path = "../opc-protocol", version = "0.1.0" }
+opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 

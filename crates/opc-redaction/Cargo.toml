@@ -14,7 +14,7 @@ documentation = "https://docs.rs/opc-redaction"
 keywords = ["5g", "cnf", "privacy", "telecom", "packet-core"]
 categories = ["network-programming"]
 [dependencies]
-opc-data-governance = { path = "../opc-data-governance", version = "0.1.0" }
+opc-data-governance = { path = "../opc-data-governance", version = "0.2.0" }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }

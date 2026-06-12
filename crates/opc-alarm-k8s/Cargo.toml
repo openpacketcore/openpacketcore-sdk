@@ -14,7 +14,7 @@ documentation = "https://docs.rs/opc-alarm-k8s"
 keywords = ["5g", "cnf", "alarm", "kubernetes", "telecom"]
 categories = ["network-programming"]
 [dependencies]
-opc-alarm = { path = "../opc-alarm", version = "0.1.0" }
+opc-alarm = { path = "../opc-alarm", version = "0.2.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 time = { workspace = true, features = ["formatting"] }
