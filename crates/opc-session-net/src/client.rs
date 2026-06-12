@@ -17,21 +17,45 @@ use opc_session_store::lease::{LeaseGuard, SessionLeaseManager};
 use opc_session_store::model::{OwnerId, SessionKey};
 
 use opc_session_store::record::StoredSessionRecord;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 
 use crate::error::ProtocolError;
 use crate::protocol::{
     read_frame, write_frame, Request, Response, CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE,
 };
 
+/// Persistent transport connection to a remote session backend.
+///
+/// The v0 client keeps a single connection and allows one in-flight request at
+/// a time; clones of [`RemoteSessionBackend`] share this connection.
+struct Connection {
+    reader: Box<dyn AsyncRead + Unpin + Send>,
+    writer: Box<dyn AsyncWrite + Unpin + Send>,
+}
+
 /// Remote session backend client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RemoteSessionBackend {
     addr: SocketAddr,
     tls_config: Option<Arc<opc_tls::ClientConfig>>,
     deadline: Duration,
     max_frame_size: usize,
     node_id: String,
+    conn: Arc<Mutex<Option<Connection>>>,
+}
+
+impl std::fmt::Debug for RemoteSessionBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteSessionBackend")
+            .field("addr", &self.addr)
+            .field("tls_config", &self.tls_config.is_some())
+            .field("deadline", &self.deadline)
+            .field("max_frame_size", &self.max_frame_size)
+            .field("node_id", &self.node_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RemoteSessionBackend {
@@ -52,6 +76,7 @@ impl RemoteSessionBackend {
             deadline: deadline.unwrap_or(Duration::from_secs(2)),
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             node_id: format!("opc-session-net/{}", std::process::id()),
+            conn: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -91,38 +116,49 @@ impl RemoteSessionBackend {
     }
 
     async fn do_request(&self, req: &Request) -> Result<Response, ProtocolError> {
+        let mut guard = self.conn.lock().await;
+
+        if guard.is_none() {
+            let conn = self.connect().await?;
+            *guard = Some(conn);
+        }
+
+        let conn = guard.as_mut().unwrap();
+        match self.exchange(req, conn).await {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                // Drop the connection on any error; the retry loop will reconnect.
+                *guard = None;
+                Err(e)
+            }
+        }
+    }
+
+    async fn connect(&self) -> Result<Connection, ProtocolError> {
         let tcp = TcpStream::connect(self.addr)
             .await
             .map_err(ProtocolError::Io)?;
 
-        if let Some(tls_config) = &self.tls_config {
+        let (mut reader, mut writer): (
+            Box<dyn AsyncRead + Unpin + Send>,
+            Box<dyn AsyncWrite + Unpin + Send>,
+        ) = if let Some(tls_config) = &self.tls_config {
             let connector = tokio_rustls::TlsConnector::from(tls_config.clone());
             let server_name = rustls_pki_types::ServerName::IpAddress(self.addr.ip().into());
             let tls_stream = connector
                 .connect(server_name, tcp)
                 .await
                 .map_err(ProtocolError::Io)?;
-            let (mut reader, mut writer) = tokio::io::split(tls_stream);
-            self.exchange(req, &mut reader, &mut writer).await
+            let (r, w) = tokio::io::split(tls_stream);
+            (Box::new(r), Box::new(w))
         } else {
-            let (mut reader, mut writer) = tokio::io::split(tcp);
-            self.exchange(req, &mut reader, &mut writer).await
-        }
-    }
+            let (r, w) = tokio::io::split(tcp);
+            (Box::new(r), Box::new(w))
+        };
 
-    async fn exchange<R, W>(
-        &self,
-        req: &Request,
-        reader: &mut R,
-        writer: &mut W,
-    ) -> Result<Response, ProtocolError>
-    where
-        R: tokio::io::AsyncRead + Unpin,
-        W: tokio::io::AsyncWrite + Unpin,
-    {
-        // Send hello
+        // Hello handshake
         write_frame(
-            writer,
+            &mut writer,
             &Request::Hello {
                 contract_version: CONTRACT_VERSION,
                 node_id: self.node_id.clone(),
@@ -130,8 +166,7 @@ impl RemoteSessionBackend {
         )
         .await?;
 
-        // Read hello ack
-        let ack: Response = read_frame(reader, self.max_frame_size).await?;
+        let ack: Response = read_frame(&mut reader, self.max_frame_size).await?;
         match ack {
             Response::HelloAck { contract_version } => {
                 if contract_version != CONTRACT_VERSION {
@@ -151,11 +186,16 @@ impl RemoteSessionBackend {
             }
         }
 
-        // Send request
-        write_frame(writer, req).await?;
+        Ok(Connection { reader, writer })
+    }
 
-        // Read response
-        read_frame(reader, self.max_frame_size).await
+    async fn exchange(
+        &self,
+        req: &Request,
+        conn: &mut Connection,
+    ) -> Result<Response, ProtocolError> {
+        write_frame(&mut conn.writer, req).await?;
+        read_frame(&mut conn.reader, self.max_frame_size).await
     }
 }
 

@@ -146,6 +146,62 @@ async fn test_three_node_quorum_kill_and_restart() {
 }
 
 #[tokio::test]
+async fn test_persistent_connection_reconnect_after_restart() {
+    let (addr, backend, handle) = start_server().await;
+    let remote = Arc::new(RemoteSessionBackend::new(addr, None, None));
+
+    // Warm up the persistent connection.
+    let key = test_key();
+    assert_eq!(remote.get(&key).await.unwrap(), None);
+
+    // Kill the server. The old TCP connection may linger until the next write.
+    handle.abort();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Restart a server on the same address with the same backend state.
+    let server = SessionReplicationServer::new(Arc::new(backend.clone()), None);
+    let (handle_new, _addr_new) = server.listen(addr).await.unwrap();
+
+    // The next request must transparently reconnect rather than fail.
+    assert_eq!(remote.get(&key).await.unwrap(), None);
+
+    handle_new.abort();
+}
+
+#[tokio::test]
+async fn test_in_flight_request_surfaces_error_on_disconnect() {
+    let (addr, _backend, handle) = start_server().await;
+
+    // Short deadline so reconnect attempts expire before any restart.
+    let remote = Arc::new(RemoteSessionBackend::new(
+        addr,
+        None,
+        Some(Duration::from_millis(300)),
+    ));
+
+    // Warm up the persistent connection.
+    let key = test_key();
+    assert_eq!(remote.get(&key).await.unwrap(), None);
+
+    // Kill the server while a request is about to be issued.
+    handle.abort();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let start = tokio::time::Instant::now();
+    let result = remote.get(&key).await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_err(),
+        "expected backend-unavailable error after disconnect, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "request hung instead of failing within deadline: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_batch_and_delete() {
     let (addr1, _backend1, handle1) = start_server().await;
     let (addr2, _backend2, handle2) = start_server().await;

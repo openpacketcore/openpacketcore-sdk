@@ -60,16 +60,18 @@ read-repair scenario.
 - **No stable wire format yet.** Frames are versioned via the `Hello`
   handshake (`CONTRACT_VERSION`); cross-version compatibility is not
   guaranteed while experimental.
-- **No connection pooling or multiplexing.** Each request opens a fresh
-  connection; the watch stream holds a dedicated long-lived connection.
+- **No connection pooling or full multiplexing.** Each `RemoteSessionBackend`
+  keeps one persistent connection with a single in-flight request; the watch
+  stream holds its own dedicated long-lived connection.
 
 ## Roadmap to non-experimental
 
 The crate keeps its experimental label until:
 
-1. **Connection pooling / multiplexing** — today every request opens a
-   fresh connection and the watch stream holds its own; a pooled transport
-   with in-flight pipelining is required before production traffic levels.
+1. **Connection pooling / multiplexing** — ✅ single persistent connection
+   per `RemoteSessionBackend` with one in-flight request at a time; full
+   pipelining is still out of scope and will be required before production
+   traffic levels.
 2. **Wire-format freeze** — the length-prefixed JSON framing is
    version-gated via the `Hello` handshake but not yet stable; a freeze
    requires a documented compatibility policy (and likely a binary

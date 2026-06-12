@@ -5,7 +5,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use opc_session_store::quorum::SessionStoreBackend;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tracing;
 
 use crate::error::ProtocolError;
@@ -18,12 +18,20 @@ use crate::protocol::{
 pub struct ServerHandle {
     abort_handle: tokio::task::AbortHandle,
     _shutdown_tx: tokio::sync::mpsc::Sender<()>,
+    connection_handles: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
 }
 
 impl ServerHandle {
-    /// Abort the server task immediately.
+    /// Abort the server task and all in-flight connection handlers immediately.
     pub fn abort(&self) {
         self.abort_handle.abort();
+        let handles = self.connection_handles.clone();
+        tokio::spawn(async move {
+            let mut guard = handles.lock().await;
+            for handle in guard.drain(..) {
+                handle.abort();
+            }
+        });
     }
 
     /// Request graceful shutdown.
@@ -99,6 +107,8 @@ impl SessionReplicationServer {
         let tls_config = self.tls_config.clone();
         let backend = self.backend.clone();
         let max_frame_size = self.max_frame_size;
+        let connection_handles = Arc::new(Mutex::new(Vec::new()));
+        let connection_handles_clone = connection_handles.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -115,8 +125,9 @@ impl SessionReplicationServer {
                             Ok((stream, peer)) => {
                                 let backend = backend.clone();
                                 let tls_config = tls_config.clone();
+                                let handles = connection_handles_clone.clone();
                                 tracing::debug!(%peer, "accepted connection");
-                                tokio::spawn(async move {
+                                let conn_handle = tokio::spawn(async move {
                                     let _permit = permit;
                                     if let Err(e) = handle_connection(
                                         backend,
@@ -129,6 +140,7 @@ impl SessionReplicationServer {
                                         tracing::debug!(%peer, error = ?e, "connection handler exited");
                                     }
                                 });
+                                handles.lock().await.push(conn_handle.abort_handle());
                             }
                             Err(e) => {
                                 tracing::warn!(error = ?e, "accept failed");
@@ -143,6 +155,7 @@ impl SessionReplicationServer {
             ServerHandle {
                 abort_handle: handle.abort_handle(),
                 _shutdown_tx: shutdown_tx,
+                connection_handles,
             },
             bound_addr,
         ))
