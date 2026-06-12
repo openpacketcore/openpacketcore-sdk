@@ -27,8 +27,8 @@ use opc_runtime::{
 use opc_sbi::nrf::{HeartbeatDriver, NfProfile, NfStatus, NrfClient, NrfOperations};
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, FakeSessionBackend, Generation,
-    OwnedSession, OwnerId, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager,
-    SessionStore, StateClass, StateType, StoredSessionRecord,
+    LeaseError, OwnedSession, OwnerId, SessionBackend, SessionKey, SessionKeyType,
+    SessionLeaseManager, SessionStore, StateClass, StateType, StoredSessionRecord,
 };
 use opc_types::{NetworkFunctionKind, NfInstanceId, NfType, PlmnId, Snssai, TenantId};
 use thiserror::Error;
@@ -163,6 +163,9 @@ pub struct Smf {
     next_seid: Arc<Mutex<u64>>,
     store: SessionStore<FakeSessionBackend>,
     owner: OwnerId,
+    // Held for the lifetime of the SMF: keeps the instance-ownership lease
+    // renewed in the background. Renewal failures surface through the
+    // supervised "store-lease" watch task.
     #[allow(dead_code)]
     ownership: OwnedSession<FakeSessionBackend>,
 }
@@ -186,7 +189,7 @@ impl Smf {
         let owner = OwnerId::new(config.instance_id.as_str().to_string())
             .map_err(SmfError::SessionStore)?;
 
-        let (ownership, _ownership_failures) = OwnedSession::acquire(
+        let (ownership, ownership_failures) = OwnedSession::acquire(
             store.clone(),
             ownership_key(&owner),
             owner.clone(),
@@ -226,6 +229,11 @@ impl Smf {
                     {
                         tracing::error!(error = %e, "failed to spawn nrf task");
                     }
+                    if let Err(e) =
+                        spawn_lease_watch_task(supervisor.clone(), ownership_failures).await
+                    {
+                        tracing::error!(error = %e, "failed to spawn lease watch task");
+                    }
                 })
             })
             .build()
@@ -251,10 +259,9 @@ impl Smf {
 
     /// Create a PDU session record in the session store.
     ///
-    /// FRACTURE-JOURNAL: Every session-store write needs a `LeaseGuard`, which
-    /// means a reference consumer must juggle lease acquisition/renewal per key
-    /// even for simple test records. A higher-level "owned session" helper in
-    /// opc-session-store would remove this boilerplate.
+    /// Each PDU session record is written under its own short-lived lease;
+    /// the long-lived [`OwnedSession`] covers only the instance-ownership
+    /// marker.
     pub async fn create_session(&self) -> Result<u64, SmfError> {
         let seid = self.allocate_seid().await;
         let key = session_key(&self.owner, seid);
@@ -399,6 +406,42 @@ async fn spawn_nrf_task(
         .await
         .map_err(SmfError::Runtime)?;
 
+    Ok(())
+}
+
+/// Watch the ownership lease's renewal channel under supervision.
+///
+/// [`OwnedSession`] renews the lease in the background; this task turns a
+/// renewal failure into a degrade-criticality task failure so the runtime
+/// sees the loss of write authority. A closed channel means the owned
+/// session was released or dropped during shutdown, which is a clean exit.
+async fn spawn_lease_watch_task(
+    supervisor: Supervisor,
+    mut failures: watch::Receiver<Result<(), LeaseError>>,
+) -> Result<(), SmfError> {
+    supervisor
+        .spawn_spec(TaskSpec::new(
+            "store-lease",
+            TaskKind::BackgroundSync,
+            Criticality::Degrade,
+            async move {
+                loop {
+                    if failures.changed().await.is_err() {
+                        return Ok(());
+                    }
+                    let failure = failures.borrow_and_update().as_ref().err().cloned();
+                    if let Some(e) = failure {
+                        tracing::warn!(error = %e, "store lease renewal failed");
+                        return Err(TaskError::Failed(
+                            "lease renewal failed".to_string(),
+                            Arc::new(e),
+                        ));
+                    }
+                }
+            },
+        ))
+        .await
+        .map_err(SmfError::Runtime)?;
     Ok(())
 }
 
