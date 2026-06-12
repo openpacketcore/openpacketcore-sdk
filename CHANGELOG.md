@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Behaviour-pinning tests for randomness usage in `opc-crypto`, `opc-sbi`, and
+  `opc-persist` ahead of the rand 0.10 migration.
+
+### Changed
+- Workspace dependency `rand` 0.8 → 0.10, with direct callers migrated to the
+  new API. `opc-crypto` continues to source nonce entropy from the OS via
+  `getrandom::SysRng`.
+
 ## [0.2.0] — 2026-06-12
 
 ### Added
