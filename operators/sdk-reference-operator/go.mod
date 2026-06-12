@@ -3,9 +3,9 @@ module openpacketcore.io/sdk-reference-operator
 go 1.26.4
 
 require (
-	k8s.io/api v0.36.1
-	k8s.io/apimachinery v0.36.1
-	k8s.io/client-go v0.36.0
+	k8s.io/api v0.36.2
+	k8s.io/apimachinery v0.36.2
+	k8s.io/client-go v0.36.2
 	openpacketcore.io/operator-sdk-go v0.0.0-00010101000000-000000000000
 	sigs.k8s.io/controller-runtime v0.24.1
 )
