@@ -603,3 +603,215 @@ pub fn check_fsync_available(dir: &Path) -> bool {
     let _ = fs::remove_file(&test_path);
     ok
 }
+
+#[cfg(test)]
+mod fixture_tests {
+    use super::{initialize_schema, SCHEMA_VERSION};
+    use rusqlite::{params, Connection};
+    use std::env;
+    use std::path::PathBuf;
+
+    const FIXTURE_NAME: &str = "opc_persist_v032.db";
+
+    fn fixture_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(FIXTURE_NAME)
+    }
+
+    fn known_tx_id() -> Vec<u8> {
+        vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+    }
+
+    fn write_fixture(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let parent = path.parent().unwrap();
+        std::fs::create_dir_all(parent).expect("create fixture dir");
+
+        let conn = Connection::open(path).expect("open fixture for writing");
+        initialize_schema(&conn).expect("initialize schema");
+
+        conn.execute(
+            "INSERT INTO schema_version (id, schema_digest, sdk_version, created_at) VALUES (1, ?1, ?2, ?3)",
+            params!["fixture-digest-abc123", SCHEMA_VERSION, "2026-06-12T00:00:00Z"],
+        )
+        .expect("insert schema_version");
+
+        conn.execute(
+            "INSERT INTO config_history (tx_id, parent_tx_id, version, committed_at, principal, source, schema_digest, plaintext_digest, encrypted_blob, rollback_point, rollback_label, confirmed_deadline, confirmed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                known_tx_id().as_slice(),
+                Option::<&[u8]>::None,
+                1_i64,
+                "2026-06-12T00:00:00Z",
+                "fixture-principal",
+                "fixture-source",
+                vec![0x11_u8].as_slice(),
+                vec![0x22_u8].as_slice(),
+                vec![0x33_u8].as_slice(),
+                0_i64,
+                Option::<&str>::None,
+                Option::<&str>::None,
+                Option::<&str>::None,
+            ],
+        )
+        .expect("insert config_history");
+
+        conn.execute(
+            "INSERT INTO audit_trail (tx_id, sequence, yang_path, op_type, previous_value, new_value, redaction_applied, previous_hash, entry_hmac) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                known_tx_id().as_slice(),
+                1_i64,
+                "/nf/profile",
+                "CREATE",
+                Option::<&str>::None,
+                "new-value",
+                0_i64,
+                vec![0x00_u8].as_slice(),
+                vec![0xAA_u8].as_slice(),
+            ],
+        )
+        .expect("insert audit_trail");
+
+        conn.execute(
+            "INSERT INTO alarm_audit (action, outcome, alarm_id, alarm_type, probable_cause, principal, tenant, reason, scope, correlation_id, occurred_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                "CREATE",
+                "success",
+                "alarm-1",
+                "COMMUNICATIONS_ALARM",
+                "fixture-cause",
+                "admin",
+                "default",
+                "fixture-reason",
+                "system",
+                "corr-1",
+                "2026-06-12T00:00:00Z",
+            ],
+        )
+        .expect("insert alarm_audit");
+
+        conn.execute(
+            "INSERT INTO consensus_state (node_id, current_term, voted_for) VALUES (?1, ?2, ?3)",
+            params![7_i64, 42_i64, 7_i64],
+        )
+        .expect("insert consensus_state");
+
+        conn.execute(
+            "INSERT INTO consensus_log (log_index, term, op_type, payload) VALUES (?1, ?2, ?3, ?4)",
+            params![1_i64, 42_i64, "NOOP", vec![0xAB_u8, 0xCD_u8].as_slice()],
+        )
+        .expect("insert consensus_log");
+
+        conn.execute(
+            "INSERT INTO consensus_membership (id, cluster_id, node_id, voting_members, non_voting_members, old_voting_members, removed_members, epoch) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                1_i64,
+                "cluster-a",
+                7_i64,
+                "[7]",
+                "[]",
+                Option::<&str>::None,
+                "[]",
+                5_i64,
+            ],
+        )
+        .expect("insert consensus_membership");
+
+        conn.close().expect("close fixture cleanly");
+    }
+
+    #[test]
+    fn sqlite_fixture_opens_and_returns_known_rows() {
+        let path = fixture_path();
+        if env::var("FIXTURE_REGEN").is_ok() {
+            write_fixture(&path);
+        }
+
+        assert!(
+            path.exists(),
+            "fixture {} is missing; run with FIXTURE_REGEN=1 to create it",
+            path.display()
+        );
+
+        let conn = Connection::open(&path).expect("open fixture");
+
+        let (digest, version, created_at): (String, String, String) = conn
+            .query_row(
+                "SELECT schema_digest, sdk_version, created_at FROM schema_version WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read schema_version");
+        assert_eq!(digest, "fixture-digest-abc123");
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(created_at, "2026-06-12T00:00:00Z");
+
+        let (tx_id, principal, source): (Vec<u8>, String, String) = conn
+            .query_row(
+                "SELECT tx_id, principal, source FROM config_history WHERE version = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read config_history");
+        assert_eq!(tx_id, known_tx_id());
+        assert_eq!(principal, "fixture-principal");
+        assert_eq!(source, "fixture-source");
+
+        let (seq, yang_path, op_type): (i64, String, String) = conn
+            .query_row(
+                "SELECT sequence, yang_path, op_type FROM audit_trail WHERE tx_id = ?1",
+                params![known_tx_id().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read audit_trail");
+        assert_eq!(seq, 1);
+        assert_eq!(yang_path, "/nf/profile");
+        assert_eq!(op_type, "CREATE");
+
+        let (action, outcome): (String, String) = conn
+            .query_row(
+                "SELECT action, outcome FROM alarm_audit WHERE alarm_id = 'alarm-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read alarm_audit");
+        assert_eq!(action, "CREATE");
+        assert_eq!(outcome, "success");
+
+        let (term, voted_for): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT current_term, voted_for FROM consensus_state WHERE node_id = 7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read consensus_state");
+        assert_eq!(term, 42);
+        assert_eq!(voted_for, Some(7));
+
+        let (index, payload): (i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT log_index, payload FROM consensus_log WHERE log_index = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read consensus_log");
+        assert_eq!(index, 1);
+        assert_eq!(payload, vec![0xAB, 0xCD]);
+
+        let (cluster_id, epoch): (String, i64) = conn
+            .query_row(
+                "SELECT cluster_id, epoch FROM consensus_membership WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read consensus_membership");
+        assert_eq!(cluster_id, "cluster-a");
+        assert_eq!(epoch, 5);
+    }
+}
