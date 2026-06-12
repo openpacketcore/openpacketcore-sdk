@@ -51,6 +51,34 @@ jobs:
       - name: Run consensus e2e tests (serial)
         run: cargo test --locked -p opc-persist --all-features --quiet -- --test-threads=1
 
+  smf-reference:
+    name: Reference SMF consumer
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: examples/smf-reference
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --all-features --quiet -- --test-threads=4
+
   msrv:
     name: MSRV check
     runs-on: ubuntu-latest
