@@ -8,11 +8,14 @@ OpenPacketCore SDK.
 
 Hand-writing the TS 29.5xx request/response models is repetitive and
 error-prone; this crate pilots generating them from the published 3GPP
-OpenAPI definitions instead. It currently covers `NfProfile`, `NfService`,
-their supporting structs, and the `NfType`/`NfStatus`/`NfServiceStatus`
-enumerations (each with a forward-compatible `Other(String)` catch-all),
-wired to `opc-types` identifiers (`NfInstanceId`, `PlmnId`, `Snssai`)
-rather than redundant string wrappers.
+OpenAPI definitions instead. It currently covers `NfProfile`, `NfService`, the NRF subscription and
+notification payloads (`SubscriptionData`, `NotificationData`),
+their supporting structs (`NotifCondition`, `NfServiceVersion`,
+`IpEndPoint`, `PlmnSnssai`), and the `NfType`/`NfStatus`/`NfServiceStatus`/
+`NotificationEventType`/`ConditionEventType` enumerations (each with a
+forward-compatible `Other(String)` catch-all), wired to `opc-types`
+identifiers (`NfInstanceId`, `PlmnId`, `Snssai`) rather than redundant
+string wrappers.
 
 ## Regenerating
 

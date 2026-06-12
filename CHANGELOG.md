@@ -97,6 +97,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/generate-ngap.py` (Wireshark ASN.1 + `rasn-compiler`) and
   `make generate-ngap`; fuzz target `decode_ngap` with seed corpus and
   CI registration.
+- `opc-api-nnrf` (experimental): expanded generated TS 29.510 types to cover
+  the NRF NFManagement payloads used for registration, heartbeat, and
+  subscription/notification exchanges: `SubscriptionData`, `NotificationData`,
+  `NotifCondition`, `NotificationEventType`, and `ConditionEventType`.
+  Added `tests/compat_sbi.rs` demonstrating that an `opc-sbi::nrf::NfProfile`
+  serializes into the generated `opc_api_nnrf::NfProfile` at the serde value
+  level after casing normalization.
 
 ### Changed
 - `opc-session-net` (experimental): `RemoteSessionBackend` now keeps a single

@@ -174,6 +174,38 @@ pub enum NfServiceStatus {
     Other(String),
 }
 
+/// Types of events sent in notifications from NRF to subscribed NF
+/// Instances
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NotificationEventType {
+    /// Wire value `NF_REGISTERED`.
+    NfRegistered,
+    /// Wire value `NF_DEREGISTERED`.
+    NfDeregistered,
+    /// Wire value `NF_PROFILE_CHANGED`.
+    NfProfileChanged,
+    /// Wire value `SHARED_DATA_CHANGED`.
+    SharedDataChanged,
+    /// Forward-compatibility catch-all for values not in this release.
+    #[serde(untagged)]
+    Other(String),
+}
+
+/// Indicates whether a notification is due to the NF Instance to start or
+/// stop being part of a condition for a subscription to a set of NFs
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ConditionEventType {
+    /// Wire value `NF_ADDED`.
+    NfAdded,
+    /// Wire value `NF_REMOVED`.
+    NfRemoved,
+    /// Forward-compatibility catch-all for values not in this release.
+    #[serde(untagged)]
+    Other(String),
+}
+
 /// Contains the version details of an NF service
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -213,6 +245,17 @@ pub struct PlmnSnssai {
     pub s_nssai_list: Vec<opc_types::Snssai>,
 }
 
+/// Condition (list of attributes in the NF Profile) to determine whether a
+/// notification must be sent by NRF
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotifCondition {
+    /// Optional `monitoredAttributes` attribute per TS 29.510.
+    pub monitored_attributes: Option<Vec<String>>,
+    /// Optional `unmonitoredAttributes` attribute per TS 29.510.
+    pub unmonitored_attributes: Option<Vec<String>>,
+}
+
 /// Information of an NF Instance registered in the NRF
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -237,7 +280,7 @@ pub struct NfProfile {
     /// key
     pub allowed_rule_set: Option<std::collections::HashMap<String, String>>,
     /// Optional `allowedSnpns` attribute per TS 29.510.
-    pub allowed_snpns: Option<Vec<serde_json::Value>>,
+    pub allowed_snpns: Option<Vec<String>>,
     /// Optional `amfInfo` attribute per TS 29.510.
     pub amf_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
@@ -414,7 +457,7 @@ pub struct NfProfile {
     /// Optional `smsfInfo` attribute per TS 29.510.
     pub smsf_info: Option<serde_json::Value>,
     /// Optional `snpnList` attribute per TS 29.510.
-    pub snpn_list: Option<Vec<serde_json::Value>>,
+    pub snpn_list: Option<Vec<String>>,
     /// The key of the map is the IANA-assigned SMI Network Management Private
     /// Enterprise Codes
     pub supported_vendor_specific_features: Option<std::collections::HashMap<String, Vec<String>>>,
@@ -471,7 +514,7 @@ pub struct NfService {
     /// key
     pub allowed_scopes_rule_set: Option<std::collections::HashMap<String, String>>,
     /// Optional `allowedSnpns` attribute per TS 29.510.
-    pub allowed_snpns: Option<Vec<serde_json::Value>>,
+    pub allowed_snpns: Option<Vec<String>>,
     /// Optional `apiPrefix` attribute per TS 29.510.
     pub api_prefix: Option<String>,
     /// Optional `callbackUriPrefixList` attribute per TS 29.510.
@@ -529,4 +572,86 @@ pub struct NfService {
     pub vendor_id: Option<u32>,
     /// Mandatory `versions` attribute per TS 29.510.
     pub versions: Vec<NfServiceVersion>,
+}
+
+/// Information of a subscription to notifications to NRF events, included
+/// in subscription requests and responses
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionData {
+    /// Optional `completeProfileSubscription` attribute per TS 29.510.
+    pub complete_profile_subscription: Option<bool>,
+    /// A map (list of key-value pairs) where the key of the map represents the
+    /// relative priority, for the requester, of each locality description among
+    /// the list of locality descriptions in this query parameter, encoded as
+    /// "1" (highest priority"), "2", "3", …, "n" (lowest priority)
+    pub ext_preferred_locality: Option<std::collections::HashMap<String, Vec<serde_json::Value>>>,
+    /// Optional `hnrfUri` attribute per TS 29.510.
+    pub hnrf_uri: Option<String>,
+    /// Mandatory `nfStatusNotificationUri` attribute per TS 29.510.
+    pub nf_status_notification_uri: String,
+    /// Optional `nid` attribute per TS 29.510.
+    pub nid: Option<String>,
+    /// Optional `notifCondition` attribute per TS 29.510.
+    pub notif_condition: Option<NotifCondition>,
+    /// Optional `nrfSupportedFeatures` attribute per TS 29.510.
+    pub nrf_supported_features: serde_json::Value,
+    /// Optional `onboardingCapability` attribute per TS 29.510.
+    pub onboarding_capability: Option<bool>,
+    /// Optional `plmnId` attribute per TS 29.510.
+    pub plmn_id: Option<opc_types::PlmnId>,
+    /// Optional `preferredLocality` attribute per TS 29.510.
+    pub preferred_locality: Option<String>,
+    /// Optional `reqNfFqdn` attribute per TS 29.510.
+    pub req_nf_fqdn: Option<String>,
+    /// Optional `reqNfInstanceId` attribute per TS 29.510.
+    pub req_nf_instance_id: Option<opc_types::NfInstanceId>,
+    /// Optional `reqNfType` attribute per TS 29.510.
+    pub req_nf_type: Option<NfType>,
+    /// Optional `reqNotifEvents` attribute per TS 29.510.
+    pub req_notif_events: Option<Vec<NotificationEventType>>,
+    /// Optional `reqPerPlmnSnssais` attribute per TS 29.510.
+    pub req_per_plmn_snssais: Option<Vec<PlmnSnssai>>,
+    /// Optional `reqPlmnList` attribute per TS 29.510.
+    pub req_plmn_list: Option<Vec<opc_types::PlmnId>>,
+    /// Optional `reqSnpnList` attribute per TS 29.510.
+    pub req_snpn_list: Option<Vec<String>>,
+    /// Optional `reqSnssais` attribute per TS 29.510.
+    pub req_snssais: Option<Vec<opc_types::Snssai>>,
+    /// Optional `requesterFeatures` attribute per TS 29.510.
+    pub requester_features: serde_json::Value,
+    /// Optional `servingScope` attribute per TS 29.510.
+    pub serving_scope: Option<Vec<String>>,
+    /// Optional `sharedDataIds` attribute per TS 29.510.
+    pub shared_data_ids: Option<Vec<String>>,
+    /// Optional `subscrCond` attribute per TS 29.510.
+    pub subscr_cond: Option<serde_json::Value>,
+    /// Optional `subscriptionId` attribute per TS 29.510.
+    pub subscription_id: Option<String>,
+    /// Optional `targetHni` attribute per TS 29.510.
+    pub target_hni: Option<String>,
+    /// Optional `validityTime` attribute per TS 29.510.
+    pub validity_time: Option<String>,
+}
+
+/// Data sent in notifications from NRF to subscribed NF Instances
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationData {
+    /// Optional `completeNfProfile` attribute per TS 29.510.
+    pub complete_nf_profile: Option<serde_json::Value>,
+    /// Optional `conditionEvent` attribute per TS 29.510.
+    pub condition_event: Option<ConditionEventType>,
+    /// Mandatory `event` attribute per TS 29.510.
+    pub event: NotificationEventType,
+    /// Mandatory `nfInstanceUri` attribute per TS 29.510.
+    pub nf_instance_uri: String,
+    /// Optional `nfProfile` attribute per TS 29.510.
+    pub nf_profile: serde_json::Value,
+    /// Optional `profileChanges` attribute per TS 29.510.
+    pub profile_changes: Option<Vec<serde_json::Value>>,
+    /// Optional `sharedDataChanges` attribute per TS 29.510.
+    pub shared_data_changes: Option<Vec<serde_json::Value>>,
+    /// Optional `subscriptionContext` attribute per TS 29.510.
+    pub subscription_context: Option<serde_json::Value>,
 }

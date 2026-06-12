@@ -3,8 +3,12 @@
 > **Status:** the pilot described here has shipped as
 > [`opc-api-nnrf`](https://github.com/openpacketcore/openpacketcore-sdk/tree/main/crates/opc-api-nnrf)
 > (generated `NfProfile`/`NfService` types from pinned TS 29.510 YAML, with a
-> deterministic `make generate-api` target). The remainder of this note —
-> extending generation to further TS 29.5xx interfaces — is future work.
+> deterministic `make generate-api` target). The v0.4 expansion added the
+> NFManagement subscription and notification payloads
+> (`SubscriptionData`, `NotificationData`, `NotifCondition`, and the
+> `NotificationEventType`/`ConditionEventType` enums). The remainder of this
+> note — extending generation to further TS 29.5xx interfaces beyond NRF — is
+> future work.
 
 ## Goal
 
@@ -78,14 +82,23 @@ Each crate:
 4. **Priority** — the PFCP and NAS codecs are higher-leverage for the first
    production NF vertical (SMF/UPF).
 
-## Acceptance criteria for v0.3.0
+## Acceptance criteria
 
-- [ ] `cargo check -p opc-api-nnrf` passes with generated types for
+### v0.3.0 (pilot)
+
+- [x] `cargo check -p opc-api-nnrf` passes with generated types for
   `NfProfile` and `NfService` matching the hand-written `opc-sbi` equivalents.
-- [ ] A `make generate-api` target exists that downloads pinned 3GPP YAML,
+- [x] A `make generate-api` target exists that downloads pinned 3GPP YAML,
   runs the generator, and produces deterministic output.
-- [ ] Generated crates carry `status: experimental` and a `CONFORMANCE.md`
+- [x] Generated crates carry `status: experimental` and a `CONFORMANCE.md`
   documenting which TS sections are covered.
+
+### v0.4 (NFManagement payload expansion)
+
+- [x] Generator extended to cover `SubscriptionData`, `NotificationData`,
+  `NotifCondition`, `NotificationEventType`, and `ConditionEventType`.
+- [x] Compatibility test shows an `opc-sbi::nf::NfProfile` round-tripping
+  through the generated `NfProfile` at the serde value level.
 
 ## Links
 

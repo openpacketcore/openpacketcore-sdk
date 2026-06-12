@@ -21,3 +21,5 @@ serde_json = { workspace = true }
 opc-types = { path = "../opc-types", version = "0.1.0" }
 
 [dev-dependencies]
+opc-sbi = { path = "../opc-sbi", version = "0.1.0", features = ["testkit"] }
+tokio = { workspace = true, features = ["macros", "rt"] }

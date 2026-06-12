@@ -54,7 +54,7 @@ EXPECTED_HASHES = {
     "TS29571_CommonData.yaml": "ada4343f25dd182400bf2fb5aa4c5563fbc50675dbe8618e11c4a0ed47f28b31",
 }
 
-# Map external $refs to opc-types re-exports.
+# Map external $refs to opc-types re-exports or plain Rust primitives.
 EXTERNAL_TYPE_MAP: dict[str, str] = {
     "TS29571_CommonData.yaml#/components/schemas/NfInstanceId": "opc_types::NfInstanceId",
     "TS29571_CommonData.yaml#/components/schemas/PlmnId": "opc_types::PlmnId",
@@ -66,6 +66,10 @@ EXTERNAL_TYPE_MAP: dict[str, str] = {
     "TS29571_CommonData.yaml#/components/schemas/UriScheme": "String",
     "TS29571_CommonData.yaml#/components/schemas/SupportedFeatures": "String",
     "TS29571_CommonData.yaml#/components/schemas/NfServiceSetId": "String",
+    "TS29571_CommonData.yaml#/components/schemas/Nid": "String",
+    "TS29571_CommonData.yaml#/components/schemas/Uri": "String",
+    "TS29571_CommonData.yaml#/components/schemas/PlmnIdNid": "String",
+    "TS29571_CommonData.yaml#/components/schemas/ChangeItem": "serde_json::Value",
 }
 
 # Local refs that we generate as primitive or local types.
@@ -90,6 +94,15 @@ LOCAL_PRIMITIVE_MAP: dict[str, str] = {
     "#/components/schemas/AmfInfo": "serde_json::Value",
     "#/components/schemas/SmfInfo": "serde_json::Value",
     "#/components/schemas/CollocatedNfInstance": "String",
+    # v0 expansion: NFManagement subscription/notification payloads.
+    "#/components/schemas/NotificationEventType": "NotificationEventType",
+    "#/components/schemas/ConditionEventType": "ConditionEventType",
+    "#/components/schemas/NotifCondition": "NotifCondition",
+    "#/components/schemas/SubscrCond": "serde_json::Value",
+    "#/components/schemas/LocalityDescription": "serde_json::Value",
+    "#/components/schemas/SubscriptionContext": "serde_json::Value",
+    "#/components/schemas/ProfileChange": "serde_json::Value",
+    "#/components/schemas/SharedData": "serde_json::Value",
 }
 
 
@@ -357,6 +370,9 @@ def generate_types(docs: dict[str, Any]) -> list[str]:
         "NfType": "#/components/schemas/NFType",
         "NfStatus": "#/components/schemas/NFStatus",
         "NfServiceStatus": "#/components/schemas/NFServiceStatus",
+        # v0 expansion: subscription/notification event types.
+        "NotificationEventType": "#/components/schemas/NotificationEventType",
+        "ConditionEventType": "#/components/schemas/ConditionEventType",
     }
     for rust_name, ref_path in enum_schemas.items():
         schema = resolve_ref(ref_path, docs)
@@ -368,6 +384,8 @@ def generate_types(docs: dict[str, Any]) -> list[str]:
         "NfServiceVersion": "#/components/schemas/NFServiceVersion",
         "IpEndPoint": "#/components/schemas/IpEndPoint",
         "PlmnSnssai": "#/components/schemas/PlmnSnssai",
+        # v0 expansion: notification condition.
+        "NotifCondition": "#/components/schemas/NotifCondition",
     }
     for rust_name, ref_path in support_structs.items():
         schema = resolve_ref(ref_path, docs)
@@ -376,8 +394,12 @@ def generate_types(docs: dict[str, Any]) -> list[str]:
     # Generate main target structs.
     nf_profile = resolve_ref("#/components/schemas/NFProfile", docs)
     nf_service = resolve_ref("#/components/schemas/NFService", docs)
+    subscription_data = resolve_ref("#/components/schemas/SubscriptionData", docs)
+    notification_data = resolve_ref("#/components/schemas/NotificationData", docs)
     lines.extend(emit_struct("NfProfile", nf_profile, docs))
     lines.extend(emit_struct("NfService", nf_service, docs))
+    lines.extend(emit_struct("SubscriptionData", subscription_data, docs))
+    lines.extend(emit_struct("NotificationData", notification_data, docs))
 
     return lines
 

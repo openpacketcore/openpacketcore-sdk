@@ -1188,9 +1188,11 @@ dependencies = [
 name = "opc-api-nnrf"
 version = "0.1.0"
 dependencies = [
+ "opc-sbi",
  "opc-types",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
