@@ -112,6 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with seed corpus and CI registration.
 - `opc-sbi`: `NrfClient` now implements `NrfDeregNotifier` so consumers can
   wire a real NRF client directly into `NrfDrainHook` without a wrapper.
+- `opc-session-store`: add `SessionStore<B>` facade that bundles a
+  `SessionBackend` and `SessionLeaseManager` into one handle, constructible
+  from any backend implementing both traits. `FakeSessionBackend` and
+  `opc_session_net::RemoteSessionBackend` both slot in.
 - `opc-api-nnrf` (experimental): expanded generated TS 29.510 types to cover
   the NRF NFManagement payloads used for registration, heartbeat, and
   subscription/notification exchanges: `SubscriptionData`, `NotificationData`,

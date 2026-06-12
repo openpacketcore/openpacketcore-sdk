@@ -32,6 +32,7 @@ pub mod model;
 pub mod quorum;
 pub mod record;
 pub mod sqlite;
+pub mod store;
 
 pub use backend::{
     CompareAndSet, CompareAndSetResult, EncryptingSessionBackend, ReplicationEntry, ReplicationOp,
@@ -53,3 +54,4 @@ pub use model::{
 pub use quorum::{FencedSessionReplica, QuorumSessionStore, SessionStoreBackend};
 pub use record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 pub use sqlite::SqliteSessionBackend;
+pub use store::SessionStore;

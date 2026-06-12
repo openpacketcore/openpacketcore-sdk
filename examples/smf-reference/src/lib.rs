@@ -27,8 +27,8 @@ use opc_runtime::{
 use opc_sbi::nrf::{HeartbeatDriver, NfProfile, NfStatus, NrfClient, NrfOperations};
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, FakeSessionBackend, Generation,
-    OwnerId, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, StateClass,
-    StateType, StoredSessionRecord,
+    OwnerId, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SessionStore,
+    StateClass, StateType, StoredSessionRecord,
 };
 use opc_types::{NetworkFunctionKind, NfInstanceId, NfType, PlmnId, Snssai, TenantId};
 use thiserror::Error;
@@ -161,8 +161,7 @@ pub struct Smf {
     config: SmfConfig,
     runtime: RuntimeHandle,
     next_seid: Arc<Mutex<u64>>,
-    store: Arc<dyn SessionBackend>,
-    lease_manager: Arc<dyn SessionLeaseManager>,
+    store: SessionStore<FakeSessionBackend>,
     owner: OwnerId,
 }
 
@@ -181,13 +180,7 @@ impl Smf {
         let profile = RuntimeProfile::conformance("smf");
         let alarm_manager = SharedAlarmManager::default();
 
-        // FRACTURE-JOURNAL: SessionBackend and SessionLeaseManager are separate
-        // traits, so a reference consumer must wrap the same backend twice. There
-        // is no single "session store" handle that owns both storage and leases,
-        // which makes it easy to accidentally split state across two backends.
-        let store_backend = Arc::new(FakeSessionBackend::new());
-        let store: Arc<dyn SessionBackend> = store_backend.clone();
-        let lease_manager: Arc<dyn SessionLeaseManager> = store_backend;
+        let store = SessionStore::new(FakeSessionBackend::new());
         let owner = OwnerId::new(config.instance_id.as_str().to_string())
             .map_err(SmfError::SessionStore)?;
 
@@ -201,7 +194,6 @@ impl Smf {
 
         let config_clone = config.clone();
         let store_clone = store.clone();
-        let lease_clone = lease_manager.clone();
         let owner_clone = owner.clone();
         let nrf_client_clone: Arc<dyn NrfOperations> = nrf_client.clone();
 
@@ -226,14 +218,9 @@ impl Smf {
                     {
                         tracing::error!(error = %e, "failed to spawn nrf task");
                     }
-                    if let Err(e) = spawn_store_maintenance_task(
-                        supervisor,
-                        shutdown,
-                        store_clone,
-                        lease_clone,
-                        owner_clone,
-                    )
-                    .await
+                    if let Err(e) =
+                        spawn_store_maintenance_task(supervisor, shutdown, store_clone, owner_clone)
+                            .await
                     {
                         tracing::error!(error = %e, "failed to spawn store maintenance task");
                     }
@@ -247,7 +234,6 @@ impl Smf {
             runtime,
             next_seid: Arc::new(Mutex::new(1)),
             store,
-            lease_manager,
             owner,
         })
     }
@@ -270,7 +256,7 @@ impl Smf {
         let seid = self.allocate_seid().await;
         let key = session_key(&self.owner, seid)?;
         let lease = self
-            .lease_manager
+            .store
             .acquire(&key, self.owner.clone(), Duration::from_secs(60))
             .await?;
         let record = PduSessionRecord {
@@ -439,12 +425,11 @@ async fn spawn_n4_task(
 async fn spawn_store_maintenance_task(
     supervisor: Supervisor,
     _shutdown: opc_runtime::ShutdownToken,
-    store: Arc<dyn SessionBackend>,
-    lease_manager: Arc<dyn SessionLeaseManager>,
+    store: SessionStore<FakeSessionBackend>,
     owner: OwnerId,
 ) -> Result<(), SmfError> {
     let key = ownership_key(&owner)?;
-    let lease = lease_manager
+    let lease = store
         .acquire(&key, owner.clone(), Duration::from_secs(60))
         .await?;
 
@@ -479,7 +464,7 @@ async fn spawn_store_maintenance_task(
             "store-lease",
             TaskKind::BackgroundSync,
             Criticality::Degrade,
-            store_lease_renewal_loop(lease_manager, owner),
+            store_lease_renewal_loop(store.clone(), owner),
         ))
         .await
         .map_err(SmfError::Runtime)?;
@@ -488,19 +473,19 @@ async fn spawn_store_maintenance_task(
 }
 
 async fn store_lease_renewal_loop(
-    lease_manager: Arc<dyn SessionLeaseManager>,
+    store: SessionStore<FakeSessionBackend>,
     owner: OwnerId,
 ) -> Result<(), TaskError> {
     let key = ownership_key(&owner)
         .map_err(|e| TaskError::Failed("invalid ownership key".to_string(), Arc::new(e)))?;
-    let mut lease = lease_manager
+    let mut lease = store
         .acquire(&key, owner, Duration::from_secs(60))
         .await
         .map_err(|e| TaskError::Failed("initial store lease failed".to_string(), Arc::new(e)))?;
 
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
-        match lease_manager.renew(&lease, Duration::from_secs(60)).await {
+        match store.renew(&lease, Duration::from_secs(60)).await {
             Ok(new_lease) => lease = new_lease,
             Err(e) => {
                 tracing::warn!(error = %e, "store lease renewal failed");
