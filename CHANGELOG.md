@@ -66,15 +66,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rustdoc for the entire public API of `opc-runtime`, `opc-sbi`,
   `opc-config-bus`, `opc-session-store`, and `opc-alarm`, now enforced with
   `#![deny(missing_docs)]` across all eight core crates.
+- `examples/smf-reference/`: first standalone, outside-the-workspace
+  reference consumer of the SDK — a deliberately bounded reference SMF
+  proving runtime startup, NRF registration/heartbeat/deregistration via
+  `opc-sbi`, real PFCP/N4 bytes over UDP via `opc-proto-pfcp`, and session
+  state in `opc-session-store`. Includes a fake UPF end-to-end test over
+  loopback UDP and its own CI job.
 - `opc-proto-pfcp` typed IE layer: decode/encode for Cause, Node ID, F-SEID,
   F-TEID, PDR/FAR/QER/URR ID, Precedence, Apply Action, Source/Destination
   Interface, Network Instance, UE IP Address, Outer Header Creation/Removal,
-  Recovery Time Stamp; grouped-IE recursion (Create/Created PDR, PDI, Create
-  FAR, Forwarding Parameters, Create QER, Create URR) with configurable
-  `max_depth` enforcement; unknown and vendor IEs preserved byte-exact via
-  `TypedIe::Raw`. 54 conformance tests with hand-authored spec-byte fixtures
-  citing TS 29.244 section numbers; negative tests for truncation, wrong
-  length, and depth exceedance. Fuzz target extended with typed-IE decode loop.
+  Recovery Time Stamp, QFI, Gate Status, MBR, and GBR; grouped-IE recursion
+  (Create/Created PDR, PDI, Create FAR, Forwarding Parameters, Create QER,
+  Update QER, Create URR) with configurable `max_depth` enforcement; unknown
+  and vendor IEs preserved byte-exact via `TypedIe::Raw`. Conformance tests
+  with hand-authored spec-byte fixtures citing TS 29.244 section numbers;
+  negative tests for truncation, wrong length, and depth exceedance. Fuzz
+  target extended with typed-IE decode loop.
+- Upstream-ready repro and issue draft for the `rasn` 0.28 APER encoder
+  alignment bug that prevents `opc-proto-ngap` from re-encoding typed
+  NGSetupRequest values. The draft and self-contained Cargo repro live in
+  `.planning/rasn-aper-repro/` and `.planning/rasn-issue-draft.md`.
 - `opc-api-nnrf` (experimental): generated Rust types for 3GPP TS 29.510
   `NfProfile` and `NfService` from official OpenAPI YAML. Python generator
   `scripts/generate-api-nnrf.py` resolves `$refs`, maps primitives to Rust,
