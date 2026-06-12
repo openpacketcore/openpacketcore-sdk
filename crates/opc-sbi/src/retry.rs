@@ -384,3 +384,67 @@ pub enum RetryPolicyParseError {
         max_delay_ms: String,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy_with_jitter(jitter: Jitter) -> RetryPolicy {
+        RetryPolicy::new(
+            3,
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+            jitter,
+        )
+    }
+
+    #[test]
+    fn no_jitter_is_deterministic() {
+        let policy = policy_with_jitter(Jitter::None);
+        assert_eq!(policy.backoff_delay(1), Duration::from_millis(10));
+        assert_eq!(policy.backoff_delay(2), Duration::from_millis(20));
+        assert_eq!(policy.backoff_delay(5), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn full_jitter_is_bounded_below_calculated_cap() {
+        let policy = policy_with_jitter(Jitter::Full);
+        let caps = [(1, 10), (2, 20), (5, 100)];
+        for (attempt, cap_ms) in caps {
+            for _ in 0..50 {
+                let delay = policy.backoff_delay(attempt);
+                assert!(
+                    delay < Duration::from_millis(cap_ms),
+                    "attempt {attempt} produced delay {delay:?} not below {cap_ms}ms cap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn equal_jitter_is_bounded_above_half_and_below_cap() {
+        let policy = policy_with_jitter(Jitter::Equal);
+        let caps = [(1, 10), (2, 20), (5, 100)];
+        for (attempt, cap_ms) in caps {
+            let half = Duration::from_millis(cap_ms / 2);
+            let cap = Duration::from_millis(cap_ms);
+            for _ in 0..50 {
+                let delay = policy.backoff_delay(attempt);
+                assert!(
+                    delay >= half,
+                    "attempt {attempt} produced delay {delay:?} below half {half:?}"
+                );
+                assert!(
+                    delay < cap,
+                    "attempt {attempt} produced delay {delay:?} not below cap {cap:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_attempt_yields_zero_delay() {
+        let policy = policy_with_jitter(Jitter::Full);
+        assert_eq!(policy.backoff_delay(0), Duration::ZERO);
+    }
+}

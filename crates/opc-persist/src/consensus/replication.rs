@@ -1053,3 +1053,33 @@ impl ConsensusConfigStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn random_election_timeout_stays_within_clock_bounds() {
+        let clock = ConsensusClock::default();
+        for _ in 0..100 {
+            let timeout = ConsensusConfigStore::get_random_timeout(&clock);
+            assert!(timeout >= clock.election_timeout_min);
+            assert!(timeout < clock.election_timeout_max);
+        }
+    }
+
+    #[test]
+    fn random_election_timeout_returns_min_when_bounds_equal() {
+        let clock = ConsensusClock {
+            election_timeout_min: Duration::from_millis(200),
+            election_timeout_max: Duration::from_millis(200),
+            heartbeat_interval: Duration::from_millis(50),
+            enable_timers: true,
+        };
+        assert_eq!(
+            ConsensusConfigStore::get_random_timeout(&clock),
+            Duration::from_millis(200)
+        );
+    }
+}

@@ -551,4 +551,33 @@ mod tests {
         let err = CryptoEnvelopeV1::decode(b"OPCE").expect_err("short buffer should fail");
         assert_eq!(err, CryptoError::InvalidEnvelope);
     }
+
+    #[tokio::test]
+    async fn random_nonce_has_full_entropy_and_is_unique() {
+        let provider = provider_with_active_key(KeyPurpose::Config, "config-key-2026-01", 0x41);
+        let plaintext = br#"{"hostname":"amf-01"}"#;
+        let aad = config_aad();
+
+        let encoded1 = encrypt_envelope(&provider, &aad, plaintext)
+            .await
+            .expect("encrypt");
+        let encoded2 = encrypt_envelope(&provider, &aad, plaintext)
+            .await
+            .expect("encrypt");
+
+        let envelope1 = CryptoEnvelopeV1::decode(&encoded1).expect("decode");
+        let envelope2 = CryptoEnvelopeV1::decode(&encoded2).expect("decode");
+
+        assert_eq!(envelope1.nonce.len(), AES_256_GCM_SIV_NONCE_LEN);
+        assert_eq!(envelope2.nonce.len(), AES_256_GCM_SIV_NONCE_LEN);
+        assert_ne!(
+            envelope1.nonce, envelope2.nonce,
+            "random nonces must differ"
+        );
+
+        let round_trip = decrypt_envelope(&provider, &aad, &encoded1)
+            .await
+            .expect("decrypt");
+        assert_eq!(round_trip.as_slice(), plaintext);
+    }
 }
