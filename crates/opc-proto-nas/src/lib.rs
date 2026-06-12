@@ -2,12 +2,13 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![deny(missing_docs)]
 
-//! NAS-5GS protocol codec (TS 24.501) for OpenPacketCore — v0.
+//! NAS-5GS protocol codec (TS 24.501) for OpenPacketCore — v1.
 //!
-//! v0 scope (see CONFORMANCE.md): plain 5GMM and 5GSM header parsing,
+//! v1 scope (see CONFORMANCE.md): plain 5GMM and 5GSM header parsing,
 //! security-protected envelope *recognition* (no integrity or ciphering),
-//! 5GS mobile identity decoding, and message-type registries. Message
-//! bodies beyond the header are preserved as raw bytes.
+//! 5GS mobile identity decoding, BCD digit unpacking for PLMN/routing
+//! indicator/IMEI/IMEISV, and IE-level decoding of Registration Request and
+//! Registration Accept. Other 5GMM/5GSM message bodies are preserved raw.
 //!
 //! NAS PDUs carry no internal length framing — the transport (NGAP, N1)
 //! delimits them — so decoding consumes the entire input slice.
@@ -16,7 +17,9 @@
 //! @req REQ-3GPP-TS24501-R18-001
 //! @conformance v0 — see CONFORMANCE.md
 
+pub mod bcd;
 pub mod identity;
+pub mod messages;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
@@ -24,7 +27,12 @@ use opc_protocol::{
     EncodeError, OwnedDecode, SpecRef, ValidationLevel,
 };
 
+pub use bcd::{unpack_imei, unpack_plmn, unpack_routing_indicator, BcdError, Plmn};
 pub use identity::{GutiView, IdentityType, IdentityView, MobileIdentity, SuciView};
+pub use messages::{
+    NasKeySetIdentifier, OptionalIe, RegistrationAccept, RegistrationRequest, RegistrationResult,
+    RegistrationType,
+};
 
 /// Extended protocol discriminator for 5GS mobility management (TS 24.007).
 pub const EPD_5GMM: u8 = 0x7E;

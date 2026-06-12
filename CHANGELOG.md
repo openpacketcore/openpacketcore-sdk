@@ -104,6 +104,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Added `tests/compat_sbi.rs` demonstrating that an `opc-sbi::nrf::NfProfile`
   serializes into the generated `opc_api_nnrf::NfProfile` at the serde value
   level after casing normalization.
+- `opc-proto-nas` (experimental v1): IE-level decoding for 5GMM
+  Registration Request (§8.2.6) and Registration Accept (§8.2.7), including
+  structured mandatory fields, ngKSI, 5GS mobile identity reuse, and
+  optional-IE iteration with raw preservation of unknown IEs. Added BCD
+  unpacking for PLMN (MCC/MNC with 2- and 3-digit MNC), routing indicator,
+  and IMEI/IMEISV with spec-byte fixtures for filler nibbles, odd digit
+  counts, and MNC padding. Integration tests, extended fuzz target, and
+  regenerated/added corpus seeds cover byte-exact round-trips.
 
 ### Changed
 - `opc-session-net` (experimental): `RemoteSessionBackend` now keeps a single

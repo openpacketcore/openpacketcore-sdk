@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opc_proto_nas::{MobileIdentity, NasMessage};
+use opc_proto_nas::{MobileIdentity, NasMessage, RegistrationAccept, RegistrationRequest};
 use opc_protocol::{BorrowDecode, DecodeContext, OwnedDecode, ValidationLevel};
 
 fuzz_target!(|data: &[u8]| {
@@ -21,4 +21,17 @@ fuzz_target!(|data: &[u8]| {
 
     // Mobile identity decoding on arbitrary content bytes.
     let _ = MobileIdentity::decode(data);
+
+    // v1 message body parsing (Registration Request/Accept).
+    let _ = RegistrationRequest::decode_body(data, DecodeContext::default());
+    let _ = RegistrationAccept::decode_body(data, DecodeContext::default());
+
+    // BCD helpers on fixed-size prefixes.
+    if data.len() >= 3 {
+        let _ = opc_proto_nas::unpack_plmn([data[0], data[1], data[2]]);
+    }
+    if data.len() >= 2 {
+        let _ = opc_proto_nas::unpack_routing_indicator([data[0], data[1]]);
+    }
+    let _ = opc_proto_nas::unpack_imei(data);
 });
