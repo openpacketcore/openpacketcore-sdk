@@ -323,7 +323,6 @@ impl FakeSessionBackend {
     }
 
     fn apply_replicated_op_with_state(
-        &self,
         state: &mut FakeBackendState,
         op: ReplicationOp,
         now: Timestamp,
@@ -501,7 +500,7 @@ impl FakeSessionBackend {
             }
             ReplicationOp::Batch { ops } => {
                 for op in ops {
-                    self.apply_replicated_op_with_state(state, op, now)?;
+                    Self::apply_replicated_op_with_state(state, op, now)?;
                 }
                 Ok(())
             }
@@ -526,7 +525,7 @@ impl FakeSessionBackend {
                     "replication log sequence gap".into(),
                 ));
             }
-            self.apply_replicated_op_with_state(state, entry.op.clone(), entry.timestamp)?;
+            Self::apply_replicated_op_with_state(state, entry.op.clone(), entry.timestamp)?;
             state.replication_log.push(entry);
         }
 
@@ -668,7 +667,7 @@ impl SessionBackend for FakeSessionBackend {
         }
 
         // Apply mutation
-        self.apply_replicated_op_with_state(&mut state, entry.op.clone(), now)?;
+        Self::apply_replicated_op_with_state(&mut state, entry.op.clone(), now)?;
 
         // Append to replication log
         state.replication_log.push(entry.clone());
