@@ -24,7 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend with PEM support. No source changes were required because the JWT
   validation API remained compatible; the `aws_lc_rs` backend avoids the
   `rsa` crate and the RUSTSEC-2023-0071 advisory that the `rust_crypto`
-  backend would pull in.
+  backend would pull in, keeping `cargo audit`/`cargo deny` clean without a
+  standing exception. The cost is the `aws-lc-sys`/`cmake` build dependency,
+  reconciled in ADR 0014 point 9; a future migration to `rust_crypto` is
+  planned once `rsa` ships a constant-time release.
 
 ## [0.2.0] — 2026-06-12
 

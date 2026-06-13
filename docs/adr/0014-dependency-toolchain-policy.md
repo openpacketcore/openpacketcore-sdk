@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted (amended 2026-06-12: crypto-provider scope and JWT backend, point 9)
 
 ## Date
 
@@ -29,8 +29,11 @@ implicit policy does not survive contact with routine maintenance:
 
 1. **TLS: rustls only.** No `openssl`/`native-tls` anywhere in the graph,
    including transitively via feature defaults (disable `default-features`
-   where needed). Rationale: a single auditable TLS stack, no C toolchain
-   coupling, reproducible cross-compilation.
+   where needed). Rationale: a single auditable TLS stack and reproducible
+   cross-compilation, with no coupling to a *system* OpenSSL/`native-tls`
+   library (dynamic linking, version skew). This rule targets system/dynamic
+   crypto; vendored crypto built statically from source as part of the graph
+   (e.g. `ring`, `aws-lc-sys`) is permitted — see point 9.
 2. **Async runtime: tokio only.** No second runtime, no runtime-agnostic
    abstraction layers.
 3. **No gRPC stack (`tonic`/`prost`) in SDK crates.** Internal transports
@@ -56,6 +59,22 @@ implicit policy does not survive contact with routine maintenance:
    replaces, why the existing stack cannot serve, license, MSRV impact).
 8. **`unsafe_code = "forbid"` is workspace-wide and non-negotiable**, which
    also rules out FFI-based protocol libraries (see ADR 0013).
+9. **Cryptographic providers.** rustls uses the `ring` provider for TLS;
+   `opc-sbi`'s `jsonwebtoken` uses the `aws_lc_rs` backend for JWT-SVID
+   signature verification. Both are vendored, statically-built crypto (no
+   system OpenSSL), consistent with point 1. `aws_lc_rs` is chosen over
+   `jsonwebtoken`'s pure-Rust `rust_crypto` backend because the latter pulls
+   the `rsa` crate, which carries RUSTSEC-2023-0071 (the "Marvin" timing
+   sidechannel) with no fixed release available upstream. That advisory is
+   unreachable for our verify-only (public-key) usage — the SDK never holds
+   or decrypts with an RSA private key — but `aws_lc_rs` is constant-time and
+   keeps both security gates (`cargo audit`, `cargo deny`) green without a
+   standing advisory exception, which matters for a security SDK whose
+   advisory surface is inherited by every downstream consumer. **Future
+   goal:** migrate JWT verification to the pure-Rust `rust_crypto` backend
+   once the `rsa` crate ships a constant-time release (its in-progress
+   `crypto-bigint` migration), dropping the `aws-lc-sys`/`cmake` build step
+   and fully satisfying the pure-Rust ideal.
 
 ## Consequences
 
