@@ -62,11 +62,19 @@ impl AlarmAuditSink for PersistAlarmAuditSink {
         let probable_cause_str = event.probable_cause.to_string();
         let tenant_str = event.tenant.clone();
 
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|e| format!("No tokio runtime handle available: {e}"))?;
-
-        let result = std::thread::spawn(move || {
-            handle.block_on(async move {
+        // The audit append is async but `record_alarm_action` is a synchronous
+        // trait method. Run the append on a worker thread that owns its OWN
+        // single-threaded runtime rather than driving the ambient runtime's
+        // handle: blocking the ambient runtime (especially a current-thread one,
+        // or one that is shutting down) from a spawned thread can deadlock.
+        // Decoupling keeps the fail-closed audit independent of the caller's
+        // runtime flavor and lifecycle.
+        let join = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to build audit runtime: {e}"))?;
+            runtime.block_on(async move {
                 backend
                     .record_alarm_audit(
                         &action_str,
@@ -85,10 +93,22 @@ impl AlarmAuditSink for PersistAlarmAuditSink {
                     .map_err(|e| format!("Database audit append failed: {e}"))
             })
         })
-        .join()
-        .map_err(|e| format!("Thread join failed: {e:?}"))?;
+        .join();
 
-        result
+        match join {
+            Ok(result) => result,
+            // A panic in the DB path must surface as a real audit failure with a
+            // usable reason, not an opaque join error — the manager fails closed
+            // on this, so the reason must be meaningful.
+            Err(panic) => {
+                let reason = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                Err(format!("Audit append panicked: {reason}"))
+            }
+        }
     }
 }
 

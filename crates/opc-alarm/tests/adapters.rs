@@ -378,6 +378,41 @@ async fn persist_audit_sink_records_authorized_ack() {
     assert_eq!(record.correlation_id.as_deref(), Some("corr-123"));
 }
 
+// The sink runs its async append on a worker thread that owns its own runtime,
+// so it must complete without deadlocking regardless of the caller's runtime
+// flavor. This covers the multi-thread case; the tests above (default
+// `#[tokio::test]`) cover the current-thread case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persist_audit_sink_records_under_multi_thread_runtime() {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("mt_audit.db");
+    let backend = SqliteBackend::open(&db_path, true, 0).await.unwrap();
+
+    let alarm = make_test_alarm("alarm-mt", Severity::Major);
+    let context = make_context(&alarm.alarm_id, "admin-user");
+    let event = AlarmAuditEvent {
+        action: AlarmAction::Suppress,
+        outcome: AlarmAuditOutcome::Authorized,
+        alarm_id: alarm.alarm_id.clone(),
+        alarm_type: alarm.alarm_type.clone(),
+        probable_cause: alarm.probable_cause.clone(),
+        principal: context.principal.clone(),
+        tenant: context.tenant.clone(),
+        reason: context.reason.clone(),
+        scope: context.scope.clone(),
+        correlation_id: context.correlation_id.clone(),
+        occurred_at: OffsetDateTime::now_utc(),
+    };
+
+    let mut sink = PersistAlarmAuditSink::new(backend.clone());
+    sink.record_alarm_action(event)
+        .expect("audit append must succeed under a multi-thread runtime");
+
+    let records = backend.query_alarm_audits().await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].action, "suppress");
+}
+
 #[tokio::test]
 async fn persist_audit_sink_records_authorized_suppress() {
     let temp_dir = tempdir().unwrap();
