@@ -24,10 +24,14 @@
 //!
 //! Before opening a database for writes, [`SqliteBackend::preflight`] verifies:
 //! - The database path is on a persistent volume when durability is required
-//! - WAL, SHM, and database files are on the same filesystem
+//! - WAL, SHM, and database files are on the same filesystem (device-id check)
 //! - The volume is not a known-unsafe network filesystem
 //! - `fsync` is available and not disabled by mount options
 //! - Free space exceeds the configured threshold
+//!
+//! POSIX byte-range locking compatibility is inferred from the filesystem-safety
+//! check rather than probed directly: the network filesystems that break SQLite
+//! locking are exactly those the safety check rejects.
 //!
 //! If preflight fails, the backend fails closed — it will not accept writes
 //! unless explicitly placed in ephemeral development mode.

@@ -401,12 +401,24 @@ impl SqliteBackend {
         // fsync availability
         let fsync_available = schema::check_fsync_available(dir);
 
+        // The database file and its WAL/SHM siblings must share one filesystem.
+        let same_filesystem = schema::is_same_filesystem(dir, path);
+        if !same_filesystem {
+            warn!(path = %dir.display(), "preflight: database file and its WAL/SHM directory are on different filesystems");
+        }
+
+        // POSIX byte-range locking is unreliable precisely on the network
+        // filesystems rejected by is_safe_filesystem; on a safe (local)
+        // filesystem it is available. Derive the flag from that real check
+        // rather than asserting it unconditionally.
+        let locking_compatible = safe_filesystem;
+
         Ok(PersistCapabilities {
             ephemeral_mode: false,
             storage_path,
             fsync_available,
-            locking_compatible: true,
-            same_filesystem: true,
+            locking_compatible,
+            same_filesystem,
             safe_filesystem,
             free_bytes,
             min_free_bytes,

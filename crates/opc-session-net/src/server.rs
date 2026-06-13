@@ -10,7 +10,7 @@ use tracing;
 
 use crate::error::ProtocolError;
 use crate::protocol::{
-    read_frame, write_frame, Request, Response, CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE,
+    read_frame_within, write_frame, Request, Response, CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE,
 };
 
 /// Handle to a running [`SessionReplicationServer`].
@@ -40,12 +40,16 @@ impl ServerHandle {
     }
 }
 
+/// Default per-frame read deadline for accepted connections.
+const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Networked session replication server.
 pub struct SessionReplicationServer {
     backend: Arc<dyn SessionStoreBackend>,
     tls_config: Option<Arc<opc_tls::ServerConfig>>,
     max_connections: usize,
     max_frame_size: usize,
+    idle_timeout: std::time::Duration,
 }
 
 impl fmt::Debug for SessionReplicationServer {
@@ -69,6 +73,7 @@ impl SessionReplicationServer {
             tls_config,
             max_connections: 128,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
     }
 
@@ -80,7 +85,16 @@ impl SessionReplicationServer {
             tls_config: None,
             max_connections: 128,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
+    }
+
+    /// Set the per-frame read deadline for accepted connections. A peer that
+    /// does not deliver a complete frame within this window is disconnected,
+    /// freeing its connection slot.
+    pub fn with_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.idle_timeout = timeout;
+        self
     }
 
     /// Set the maximum number of concurrent connections.
@@ -107,6 +121,7 @@ impl SessionReplicationServer {
         let tls_config = self.tls_config.clone();
         let backend = self.backend.clone();
         let max_frame_size = self.max_frame_size;
+        let idle_timeout = self.idle_timeout;
         let connection_handles = Arc::new(Mutex::new(Vec::new()));
         let connection_handles_clone = connection_handles.clone();
 
@@ -134,6 +149,7 @@ impl SessionReplicationServer {
                                         stream,
                                         tls_config,
                                         max_frame_size,
+                                        idle_timeout,
                                     )
                                     .await
                                     {
@@ -167,15 +183,16 @@ async fn handle_connection(
     stream: TcpStream,
     tls_config: Option<Arc<opc_tls::ServerConfig>>,
     max_frame_size: usize,
+    idle_timeout: std::time::Duration,
 ) -> Result<(), ProtocolError> {
     if let Some(tls_config) = tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
         let tls_stream = acceptor.accept(stream).await.map_err(ProtocolError::Io)?;
         let (mut r, mut w) = tokio::io::split(tls_stream);
-        dispatch(backend, &mut r, &mut w, max_frame_size).await
+        dispatch(backend, &mut r, &mut w, max_frame_size, idle_timeout).await
     } else {
         let (mut r, mut w) = tokio::io::split(stream);
-        dispatch(backend, &mut r, &mut w, max_frame_size).await
+        dispatch(backend, &mut r, &mut w, max_frame_size, idle_timeout).await
     }
 }
 
@@ -184,13 +201,14 @@ async fn dispatch<R, W>(
     reader: &mut R,
     writer: &mut W,
     max_frame_size: usize,
+    idle_timeout: std::time::Duration,
 ) -> Result<(), ProtocolError>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    // Hello handshake
-    let hello: Request = read_frame(reader, max_frame_size).await?;
+    // Hello handshake — bounded so a peer that connects and stalls is reaped.
+    let hello: Request = read_frame_within(reader, max_frame_size, idle_timeout).await?;
     match hello {
         Request::Hello {
             contract_version, ..
@@ -218,7 +236,7 @@ where
 
     // Dispatch loop
     loop {
-        let req: Request = match read_frame(reader, max_frame_size).await {
+        let req: Request = match read_frame_within(reader, max_frame_size, idle_timeout).await {
             Ok(r) => r,
             Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),

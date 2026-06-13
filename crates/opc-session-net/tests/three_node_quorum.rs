@@ -54,6 +54,34 @@ async fn start_server() -> (
 }
 
 #[tokio::test]
+async fn stalled_connection_is_reaped_after_idle_timeout() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let backend = FakeSessionBackend::new();
+    let server = SessionReplicationServer::new(Arc::new(backend), None)
+        .with_max_connections(1)
+        .with_idle_timeout(Duration::from_millis(150));
+    let (handle, addr) = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+    // Connect and send only a partial length prefix (2 of 4 bytes), then stall
+    // — the classic slowloris move.
+    let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stalled.write_all(&[0x00, 0x00]).await.unwrap();
+    stalled.flush().await.unwrap();
+
+    // The server must reap the idle connection rather than hold its slot
+    // forever: our read then returns EOF once the server closes it.
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(5), stalled.read(&mut buf))
+        .await
+        .expect("server should close the stalled connection within the timeout")
+        .expect("read from reaped connection");
+    assert_eq!(n, 0, "stalled connection should be closed by the server");
+
+    drop(handle);
+}
+
+#[tokio::test]
 async fn test_three_node_quorum_kill_and_restart() {
     // 1. Spin up 3 servers
     let (addr1, backend1, handle1) = start_server().await;

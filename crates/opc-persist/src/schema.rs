@@ -496,6 +496,35 @@ pub fn is_safe_filesystem(path: &Path) -> bool {
     }
 }
 
+/// Check that the database file and its directory live on the same filesystem.
+///
+/// SQLite creates the WAL and SHM files as siblings of the database in its
+/// directory. If the database file itself is on a different device than that
+/// directory (a symlink or bind mount crossing filesystems), the WAL/SHM and
+/// the database straddle two filesystems, which SQLite cannot keep consistent.
+/// When the database does not yet exist it will be created in `dir`, so the
+/// invariant holds by construction.
+pub fn is_same_filesystem(dir: &Path, db_path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dir_dev = std::fs::metadata(dir).map(|m| m.dev()).ok();
+        match dir_dev {
+            None => false, // cannot stat the directory: do not assume safe
+            Some(dir_dev) => match std::fs::metadata(db_path).map(|m| m.dev()).ok() {
+                // DB not yet created — it will be created inside `dir`.
+                None => true,
+                Some(db_dev) => dir_dev == db_dev,
+            },
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, db_path);
+        true
+    }
+}
+
 /// Check if the database directory permissions are safe.
 ///
 /// Verifies the directory is not world-writable (security concern).

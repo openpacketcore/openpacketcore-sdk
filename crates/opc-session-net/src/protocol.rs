@@ -134,3 +134,28 @@ where
         .map_err(ProtocolError::Io)?;
     serde_json::from_slice(&buf).map_err(ProtocolError::Serialization)
 }
+
+/// Read a frame, failing with a timed-out I/O error if the whole frame does not
+/// arrive within `timeout`.
+///
+/// Servers must use this rather than [`read_frame`] on accepted connections so
+/// that a peer which connects and then stalls (sending nothing, or a partial
+/// length prefix) is reaped instead of holding its connection slot forever
+/// (slowloris-style exhaustion).
+pub async fn read_frame_within<R, T>(
+    reader: &mut R,
+    max_frame_size: usize,
+    timeout: std::time::Duration,
+) -> Result<T, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
+    match tokio::time::timeout(timeout, read_frame(reader, max_frame_size)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(ProtocolError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out reading frame from peer",
+        ))),
+    }
+}
