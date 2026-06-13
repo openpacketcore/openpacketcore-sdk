@@ -391,14 +391,14 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     field_arms.extend(arm);
 
                     // Diff logic
-                    let child_path_str = &child.path;
+                    let child_segment_str = last_segment(&child.path);
                     let diff_arm = match child.kind {
                         SchemaNodeKind::Leaf => {
                             if child.config {
                                 if is_sensitive {
                                     quote! {
                                         if self.#field_ident.get().as_option() != previous.#field_ident.get().as_option() {
-                                            let p = YangPath::new(#child_path_str).expect("valid path");
+                                            let p = YangPath::new(format!("{}/{}", _path_prefix, #child_segment_str)).expect("valid path");
                                             if let Some(ref val) = self.#field_ident.get().as_option() {
                                                 let v_str = serde_json::to_string(val).unwrap().trim_matches('"').to_string();
                                                 deltas.push(ConfigDelta::Update(p, v_str));
@@ -410,7 +410,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 } else {
                                     quote! {
                                         if self.#field_ident.as_option() != previous.#field_ident.as_option() {
-                                            let p = YangPath::new(#child_path_str).expect("valid path");
+                                            let p = YangPath::new(format!("{}/{}", _path_prefix, #child_segment_str)).expect("valid path");
                                             if let Some(ref val) = self.#field_ident.as_option() {
                                                 let v_str = serde_json::to_string(val).unwrap().trim_matches('"').to_string();
                                                 deltas.push(ConfigDelta::Update(p, v_str));
@@ -426,15 +426,16 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         }
                         SchemaNodeKind::Container => {
                             quote! {
+                                let child_path = format!("{}/{}", _path_prefix, #child_segment_str);
                                 match (&self.#field_ident, &previous.#field_ident) {
                                     (Some(cur), Some(prev)) => {
-                                        cur.diff_segments(prev, #child_path_str, deltas)?;
+                                        cur.diff_segments(prev, &child_path, deltas)?;
                                     }
                                     (Some(cur), None) => {
-                                        cur.diff_segments(&Default::default(), #child_path_str, deltas)?;
+                                        cur.diff_segments(&Default::default(), &child_path, deltas)?;
                                     }
                                     (None, Some(_)) => {
-                                        deltas.push(ConfigDelta::Delete(YangPath::new(#child_path_str).expect("valid path")));
+                                        deltas.push(ConfigDelta::Delete(YangPath::new(child_path).expect("valid path")));
                                     }
                                     (None, None) => {}
                                 }
@@ -444,7 +445,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             if child.key_leaves.is_empty() {
                                 quote! {
                                     if self.#field_ident != previous.#field_ident {
-                                        let p = YangPath::new(#child_path_str).expect("valid path");
+                                        let p = YangPath::new(format!("{}/{}", _path_prefix, #child_segment_str)).expect("valid path");
                                         let v_str = serde_json::to_string(&self.#field_ident).unwrap();
                                         deltas.push(ConfigDelta::Update(p, v_str));
                                     }
@@ -453,28 +454,34 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 let key_bracket_construction = if child.key_leaves.len() == 1 {
                                     let key_leaf = &child.key_leaves[0];
                                     quote! {
-                                        let key_bracket_str = format!("[{}='{}']", #key_leaf, k);
+                                        let key_bracket_str = format!("[{}='{}']", #key_leaf, escape_key_value(&k.to_string()));
                                     }
                                 } else {
-                                    let mut format_str = String::new();
-                                    let mut format_args = Vec::new();
+                                    let mut key_bracket_parts = TokenStream::new();
                                     for key_leaf in &child.key_leaves {
-                                        format_str.push_str(&format!("[{key_leaf}='{{}}']"));
                                         let field_ident =
                                             format_ident!("{}", to_snake_case(key_leaf));
-                                        format_args.push(quote! { k.#field_ident });
+                                        key_bracket_parts.extend(quote! {
+                                            key_bracket_str.push_str(&format!(
+                                                "[{}='{}']",
+                                                #key_leaf,
+                                                escape_key_value(&k.#field_ident.to_string())
+                                            ));
+                                        });
                                     }
                                     quote! {
-                                        let key_bracket_str = format!(#format_str, #(#format_args),*);
+                                        let mut key_bracket_str = String::new();
+                                        #key_bracket_parts
                                     }
                                 };
                                 let key_bracket_construction_prev =
                                     key_bracket_construction.clone();
 
                                 quote! {
+                                    let list_path = format!("{}/{}", _path_prefix, #child_segment_str);
                                     for (k, cur_val) in &self.#field_ident {
                                         #key_bracket_construction
-                                        let entry_path = format!("{}{}", #child_path_str, key_bracket_str);
+                                        let entry_path = format!("{}{}", list_path, key_bracket_str);
                                         if let Some(prev_val) = previous.#field_ident.get(k) {
                                             cur_val.diff_segments(prev_val, &entry_path, deltas)?;
                                         } else {
@@ -484,7 +491,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     for (k, _) in &previous.#field_ident {
                                         if !self.#field_ident.contains_key(k) {
                                             #key_bracket_construction_prev
-                                            let entry_path = format!("{}{}", #child_path_str, key_bracket_str);
+                                            let entry_path = format!("{}{}", list_path, key_bracket_str);
                                             deltas.push(ConfigDelta::Delete(YangPath::new(&entry_path).expect("valid path")));
                                         }
                                     }
@@ -494,7 +501,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         SchemaNodeKind::LeafList => {
                             quote! {
                                 if self.#field_ident != previous.#field_ident {
-                                    let p = YangPath::new(#child_path_str).expect("valid path");
+                                    let p = YangPath::new(format!("{}/{}", _path_prefix, #child_segment_str)).expect("valid path");
                                     let v_str = serde_json::to_string(&self.#field_ident).unwrap();
                                     deltas.push(ConfigDelta::Update(p, v_str));
                                 }
@@ -577,6 +584,20 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             });
         }
     }
+
+    let escape_key_value_fn = if input
+        .nodes
+        .iter()
+        .any(|node| node.kind == SchemaNodeKind::List && !node.key_leaves.is_empty())
+    {
+        quote! {
+            fn escape_key_value(value: &str) -> String {
+                value.replace('\\', "\\\\").replace('\'', "\\'")
+            }
+        }
+    } else {
+        quote! {}
+    };
 
     let tokens = quote! {
         use opc_config_model::{ConfigError, YangPath};
@@ -703,11 +724,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             if let Some(eq_idx) = current_key.find('=') {
                                 let k = current_key[..eq_idx].trim();
                                 let clean_k = clean_segment(k).to_string();
-                                let mut v = current_key[eq_idx + 1..].trim()
+                                let v = current_key[eq_idx + 1..].trim()
                                     .trim_matches('\'')
                                     .trim_matches('"')
                                     .to_string();
-                                v = v.replace("\\'", "'").replace("\\\"", "\"");
+                                let v = unescape_quoted_value(&v);
                                 keys.insert(clean_k, v);
                             }
                             current_key.clear();
@@ -732,6 +753,26 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 seg
             }
         }
+
+        fn unescape_quoted_value(value: &str) -> String {
+            let mut out = String::with_capacity(value.len());
+            let mut chars = value.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    match chars.peek().copied() {
+                        Some('\\' | '\'' | '"') => {
+                            out.push(chars.next().expect("peeked next character"));
+                        }
+                        Some(_) | None => out.push(c),
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+
+        #escape_key_value_fn
 
         pub fn diff_root(current: &#root_type, previous: &#root_type) -> Result<Vec<ConfigDelta>, ConfigError> {
             let mut deltas = Vec::new();
