@@ -937,6 +937,134 @@ fn test_production_proof_codegen() {
         let path = "/proof:system/proof:interfaces/proof:interface[proof:name='eth[0]']/proof:enabled";
         assert!(is_valid_path(path));
     }
+
+    #[test]
+    fn test_schema_registry_rich() {
+        use generated_test::schema_registry::registry;
+        // Methods are called on the `&dyn SchemaRegistry` trait object, which does
+        // not require the trait itself to be in scope.
+        use opc_config_model::OpcConfig;
+        use opc_mgmt_schema::{DataClass, DefaultReport, LeafType, NacmAction, NodeKind};
+
+        let reg = registry();
+
+        // Two served modules (proof + other-module).
+        let names: Vec<&str> = reg.served_models().iter().map(|m| m.name).collect();
+        assert!(names.contains(&"proof"));
+        assert!(names.contains(&"other-module"));
+
+        // State (config=false) node: read-only NACM, leaf type preserved.
+        assert!(!reg.is_config_path("/proof:system/proof:state-leaf"));
+        assert_eq!(
+            reg.nacm_actions("/proof:system/proof:state-leaf"),
+            &[NacmAction::Read]
+        );
+        assert_eq!(
+            reg.leaf_type("/proof:system/proof:state-leaf"),
+            Some(LeafType::Uint32)
+        );
+        let typed_digest = System::default().schema_digest();
+        assert_eq!(typed_digest.to_hex().len(), 64);
+        assert_ne!(
+            typed_digest.to_hex(),
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
+
+        // Config node: full datastore action set.
+        let cfg = reg.nacm_actions("/proof:system/proof:config-leaf");
+        assert!(cfg.contains(&NacmAction::Create) && cfg.contains(&NacmAction::Replace));
+
+        // Default metadata drives with-defaults.
+        assert_eq!(
+            reg.leaf_type("/proof:system/proof:default-leaf"),
+            Some(LeafType::Uint16)
+        );
+        assert_eq!(
+            reg.default_for("/proof:system/proof:default-leaf", DefaultReport::ReportAll),
+            Some("42")
+        );
+        assert_eq!(
+            reg.default_for("/proof:system/proof:default-leaf", DefaultReport::Trim),
+            None
+        );
+
+        // Single-key and multi-key lists preserve key order verbatim.
+        assert_eq!(
+            reg.key_leaves("/proof:system/proof:interfaces/proof:interface"),
+            Some(&["name"][..])
+        );
+        assert_eq!(
+            reg.key_leaves("/proof:system/proof:subscribers/proof:subscriber"),
+            Some(&["imsi", "plmn-id"][..])
+        );
+
+        // Special leaf types round-trip through the registry.
+        assert_eq!(
+            reg.leaf_type("/proof:system/proof:empty-leaf"),
+            Some(LeafType::Empty)
+        );
+        assert_eq!(
+            reg.leaf_type("/proof:system/proof:decimal-leaf"),
+            Some(LeafType::Decimal64)
+        );
+        assert!(matches!(
+            reg.leaf_type("/proof:system/proof:algo-type"),
+            Some(LeafType::IdentityRef { .. })
+        ));
+        assert!(matches!(
+            reg.leaf_type("/proof:system/proof:default-interface"),
+            Some(LeafType::LeafRef { .. })
+        ));
+        assert_eq!(
+            reg.node("/proof:system/proof:dns-servers").map(|n| n.kind),
+            Some(NodeKind::LeafList)
+        );
+
+        // Data classes MUST agree with the generated metadata resolver.
+        for path in [
+            "/proof:system/proof:admin-password",
+            "/proof:system/proof:subscribers/proof:subscriber/proof:imsi",
+        ] {
+            let yp = opc_config_model::YangPath::new(path).unwrap();
+            assert_eq!(
+                reg.data_class(path),
+                generated_test::metadata::get_data_class_for_path(&yp)
+            );
+        }
+        assert_eq!(
+            reg.data_class("/proof:system/proof:admin-password"),
+            Some(DataClass::SecuritySecret)
+        );
+        assert_eq!(
+            reg.data_class("/proof:system/proof:subscribers/proof:subscriber/proof:imsi"),
+            Some(DataClass::SubscriberId)
+        );
+
+        // Origins: each served module, plus the default "" spanning all (sorted).
+        assert_eq!(reg.modules_for_origin("proof"), Some(&["proof"][..]));
+        assert_eq!(
+            reg.modules_for_origin("other-module"),
+            Some(&["other-module"][..])
+        );
+        assert_eq!(
+            reg.modules_for_origin(""),
+            Some(&["other-module", "proof"][..])
+        );
+        assert_eq!(reg.modules_for_origin("nope"), None);
+
+        // A node from the other module still resolves.
+        assert!(reg.is_valid_path("/proof:system/other-module:external-leaf"));
+        assert!(!reg.is_valid_path("/proof:system/bogus:external-leaf"));
+        assert!(!reg.is_valid_path(
+            "/proof:system/proof:interfaces/proof:interface[bogus:name='eth0']/proof:enabled"
+        ));
+        assert!(!reg.is_valid_path(
+            "/proof:system/proof:interfaces/proof:interface[proof:name='eth0'/proof:enabled"
+        ));
+
+        // Integrity holds on the full schema.
+        assert_eq!(reg.self_check(), Ok(()));
+    }
     "#;
     fs::write(tests_dir.join("production_proof_test.rs"), test_rs).unwrap();
 
@@ -954,11 +1082,13 @@ time = "={}"
 opc-config-model = {{ path = "{}" }}
 opc-types = {{ path = "{}" }}
 opc-data-governance = {{ path = "{}" }}
+opc-mgmt-schema = {{ path = "{}" }}
 "#,
         common::locked_version(&workspace_dir, "time"),
         workspace_dir.join("crates/opc-config-model").display(),
         workspace_dir.join("crates/opc-types").display(),
-        workspace_dir.join("crates/opc-data-governance").display()
+        workspace_dir.join("crates/opc-data-governance").display(),
+        workspace_dir.join("crates/opc-mgmt-schema").display()
     );
 
     fs::write(dir.path().join("Cargo.toml"), cargo_toml).unwrap();

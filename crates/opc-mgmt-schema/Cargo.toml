@@ -1,0 +1,19 @@
+[package]
+name = "opc-mgmt-schema"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Runtime YANG schema-registry contract for the OpenPacketCore management plane (gNMI/NETCONF), populated by opc-yanggen-generated code"
+readme = "README.md"
+documentation = "https://docs.rs/opc-mgmt-schema"
+keywords = ["5g", "cnf", "yang", "gnmi", "netconf"]
+categories = ["network-programming"]
+
+[dependencies]
+opc-data-governance = { path = "../opc-data-governance", version = "0.2.0" }
+
+[lints]
+workspace = true

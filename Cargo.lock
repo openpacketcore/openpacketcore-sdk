@@ -1434,6 +1434,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-mgmt-schema"
+version = "0.2.0"
+dependencies = [
+ "opc-data-governance",
+]
+
+[[package]]
 name = "opc-nacm"
 version = "0.2.0"
 dependencies = [
