@@ -11,7 +11,7 @@ readme = "README.md"
 documentation = "https://docs.rs/opc-proto-pfcp"
 keywords = ["5g", "cnf", "pfcp", "telecom", "packet-core"]
 categories = ["network-programming", "encoding"]
-publish = false # experimental: not published until graduation
+publish = true
 
 [dependencies]
 opc-protocol = { path = "../opc-protocol", version = "0.2.0" }

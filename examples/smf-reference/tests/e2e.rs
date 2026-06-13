@@ -8,7 +8,10 @@ use bytes::{BufMut, Bytes, BytesMut};
 use opc_proto_pfcp::ie::{CauseValue, TypedIe};
 use opc_proto_pfcp::{Header, InformationElement, MessageType, OwnedMessage};
 use opc_protocol::{DecodeContext, Encode, EncodeContext, OwnedDecode};
-use smf_reference::{build_create_far, build_create_pdr, build_create_qer, Smf, SmfConfig};
+use smf_reference::{
+    build_create_far, build_create_pdr, build_create_qer, build_remove_pdr,
+    build_session_report_request, build_update_far, Smf, SmfConfig,
+};
 use tokio::net::UdpSocket;
 
 fn init_tracing() {
@@ -61,6 +64,15 @@ async fn send_recv(
     peer: SocketAddr,
     msg: &OwnedMessage,
 ) -> (SocketAddr, OwnedMessage) {
+    let (from, _bytes, decoded) = send_recv_raw(socket, peer, msg).await;
+    (from, decoded)
+}
+
+async fn send_recv_raw(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    msg: &OwnedMessage,
+) -> (SocketAddr, Bytes, OwnedMessage) {
     let bytes = encode_message(msg);
     socket.send_to(&bytes, peer).await.expect("send");
 
@@ -70,12 +82,31 @@ async fn send_recv(
         .expect("recv timeout")
         .expect("recv");
 
-    let decoded = OwnedMessage::decode_owned(
-        Bytes::copy_from_slice(&buf[..len]),
-        DecodeContext::default(),
-    )
-    .expect("decode");
-    (from, decoded)
+    let raw = Bytes::copy_from_slice(&buf[..len]);
+    let decoded =
+        OwnedMessage::decode_owned(raw.clone(), DecodeContext::default()).expect("decode");
+    (from, raw, decoded)
+}
+
+async fn recv_message(socket: &UdpSocket) -> (SocketAddr, Bytes, OwnedMessage) {
+    let mut buf = vec![0u8; 65535];
+    let (len, from) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+        .await
+        .expect("recv timeout")
+        .expect("recv");
+    let raw = Bytes::copy_from_slice(&buf[..len]);
+    let decoded =
+        OwnedMessage::decode_owned(raw.clone(), DecodeContext::default()).expect("decode");
+    (from, raw, decoded)
+}
+
+fn expect_typed_ie(msg: &OwnedMessage, ie_type: u16) -> TypedIe {
+    let ie = msg
+        .ies
+        .iter()
+        .find(|ie| ie.ie_type == ie_type)
+        .unwrap_or_else(|| panic!("expected IE type {ie_type}"));
+    decode_typed_ie(ie.ie_type, &ie.value)
 }
 
 #[tokio::test]
@@ -171,31 +202,174 @@ async fn pfcp_association_session_lifecycle() {
         panic!("expected F-SEID typed IE");
     }
 
-    // 3. Session Modification Request
-    let mod_req = OwnedMessage {
-        header: Header {
-            version: 1,
-            spare: 0,
-            fo: false,
-            mp: false,
-            s: true,
-            message_type: MessageType::SessionModificationRequest as u8,
-            length: 0,
-            seid: Some(1),
-            sequence_number: 102,
-            message_priority: None,
-            spare_octet: 0,
-        },
-        ies: vec![],
-    };
-    let (_, mod_resp) = send_recv(&upf, smf_addr, &mod_req).await;
-    assert_eq!(
-        mod_resp.header.message_type,
-        MessageType::SessionModificationResponse as u8
-    );
-    assert!(find_cause(&mod_resp, CauseValue::RequestAccepted));
+    // 3. Session Modification Request (SMF-initiated with typed IEs).
+    let update_far = build_update_far(1, 1).expect("update far");
+    let remove_pdr = build_remove_pdr(1).expect("remove pdr");
+    let mut mod_req = opc_proto_pfcp::session_modification_request(102, 1);
+    mod_req.ies.push(encode_typed_ie(update_far));
+    mod_req.ies.push(encode_typed_ie(remove_pdr));
 
-    // 4. Session Deletion Request
+    smf.send_pfcp(mod_req.clone())
+        .expect("send modification request");
+    let (from, raw, decoded) = recv_message(&upf).await;
+    assert_eq!(from, smf_addr);
+    assert_eq!(
+        decoded.header.message_type,
+        MessageType::SessionModificationRequest as u8
+    );
+    assert_eq!(decoded.header.sequence_number, 102);
+    assert_eq!(decoded.header.seid, Some(1));
+    assert_eq!(
+        encode_message(&decoded),
+        raw,
+        "modification request round-trips byte-exact"
+    );
+
+    if let TypedIe::UpdateFar(u) =
+        expect_typed_ie(&decoded, opc_proto_pfcp::IeType::UpdateFar as u16)
+    {
+        let far_id = u
+            .members
+            .iter()
+            .find_map(|m| {
+                if let TypedIe::FarId(f) = m {
+                    Some(f.value)
+                } else {
+                    None
+                }
+            })
+            .expect("Update FAR contains FAR ID");
+        assert_eq!(far_id, 1);
+        let fwd = u
+            .members
+            .iter()
+            .find_map(|m| {
+                if let TypedIe::UpdateForwardingParameters(fp) = m {
+                    Some(fp)
+                } else {
+                    None
+                }
+            })
+            .expect("Update FAR contains Update Forwarding Parameters");
+        let dst_iface = fwd
+            .members
+            .iter()
+            .find_map(|m| {
+                if let TypedIe::DestinationInterface(di) = m {
+                    Some(di.value)
+                } else {
+                    None
+                }
+            })
+            .expect("Update Forwarding Parameters contains Destination Interface");
+        assert_eq!(dst_iface, 1);
+    } else {
+        panic!("expected Update FAR typed IE");
+    }
+
+    if let TypedIe::RemovePdr(r) =
+        expect_typed_ie(&decoded, opc_proto_pfcp::IeType::RemovePdr as u16)
+    {
+        assert_eq!(r.pdr_id.value, 1);
+    } else {
+        panic!("expected Remove PDR typed IE");
+    }
+
+    // 4. Session Report Request (fake UPF-initiated with typed Usage Report).
+    let report_req =
+        build_session_report_request(103, 1, 1, 7, 1_000_000, 60).expect("session report request");
+    let (_, report_raw, report_resp) = send_recv_raw(&upf, smf_addr, &report_req).await;
+    assert_eq!(
+        report_resp.header.message_type,
+        MessageType::SessionReportResponse as u8
+    );
+    assert_eq!(report_resp.header.sequence_number, 103);
+    assert_eq!(report_resp.header.seid, Some(1));
+    assert_eq!(
+        encode_message(&report_resp),
+        report_raw,
+        "session report response round-trips byte-exact"
+    );
+    assert!(find_cause(&report_resp, CauseValue::RequestAccepted));
+
+    // Verify the report request itself round-trips and contains the Usage Report.
+    let report_req_encoded = encode_message(&report_req);
+    let report_req_decoded =
+        OwnedMessage::decode_owned(report_req_encoded.clone(), DecodeContext::default())
+            .expect("decode report request");
+    assert_eq!(
+        encode_message(&report_req_decoded),
+        report_req_encoded,
+        "session report request round-trips byte-exact"
+    );
+
+    if let TypedIe::ReportType(rt) = expect_typed_ie(
+        &report_req_decoded,
+        opc_proto_pfcp::IeType::ReportType as u16,
+    ) {
+        assert!(rt.usage_report);
+        assert!(!rt.downlink_data_report);
+    } else {
+        panic!("expected Report Type typed IE");
+    }
+
+    if let TypedIe::UsageReport(ur) = expect_typed_ie(
+        &report_req_decoded,
+        opc_proto_pfcp::IeType::UsageReport as u16,
+    ) {
+        let urr_id = ur
+            .members
+            .iter()
+            .find_map(|m| {
+                if let TypedIe::UrrId(u) = m {
+                    Some(u.value)
+                } else {
+                    None
+                }
+            })
+            .expect("Usage Report contains URR ID");
+        assert_eq!(urr_id, 1);
+        let ur_seqn = ur
+            .members
+            .iter()
+            .find_map(|m| {
+                if let TypedIe::UrSeqn(s) = m {
+                    Some(s.value)
+                } else {
+                    None
+                }
+            })
+            .expect("Usage Report contains UR-SEQN");
+        assert_eq!(ur_seqn, 7);
+        let total_volume = ur
+            .members
+            .iter()
+            .find_map(|m| {
+                if let TypedIe::VolumeMeasurement(v) = m {
+                    v.total_volume
+                } else {
+                    None
+                }
+            })
+            .expect("Usage Report contains total volume");
+        assert_eq!(total_volume, 1_000_000);
+        let duration = ur
+            .members
+            .iter()
+            .find_map(|m| {
+                if let TypedIe::DurationMeasurement(d) = m {
+                    Some(d.seconds)
+                } else {
+                    None
+                }
+            })
+            .expect("Usage Report contains duration");
+        assert_eq!(duration, 60);
+    } else {
+        panic!("expected Usage Report typed IE");
+    }
+
+    // 5. Session Deletion Request
     let del_req = OwnedMessage {
         header: Header {
             version: 1,
@@ -206,7 +380,7 @@ async fn pfcp_association_session_lifecycle() {
             message_type: MessageType::SessionDeletionRequest as u8,
             length: 0,
             seid: Some(1),
-            sequence_number: 103,
+            sequence_number: 104,
             message_priority: None,
             spare_octet: 0,
         },
@@ -219,7 +393,7 @@ async fn pfcp_association_session_lifecycle() {
     );
     assert!(find_cause(&del_resp, CauseValue::RequestAccepted));
 
-    // 5. Heartbeat exchange and timeout handling.
+    // 6. Heartbeat exchange and timeout handling.
     let hb_req = opc_proto_pfcp::heartbeat_request(200);
     let (_, hb_resp) = send_recv(&upf, smf_addr, &hb_req).await;
     assert_eq!(

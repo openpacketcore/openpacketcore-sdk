@@ -14,9 +14,11 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use opc_alarm::SharedAlarmManager;
 use opc_proto_pfcp::ie::{
-    ApplyAction, Cause, CauseValue, CreateFar, CreatePdr, CreateQer, DestinationInterface, FSeid,
-    FarId, ForwardingParameters, Gate, GateStatus, Gbr, Mbr, NetworkInstance, NodeId, NodeIdType,
-    OuterHeaderCreation, Pdi, PdrId, Precedence, QerId, Qfi, SourceInterface, TypedIe,
+    ApplyAction, Cause, CauseValue, CreateFar, CreatePdr, CreateQer, DestinationInterface,
+    DurationMeasurement, FSeid, FarId, ForwardingParameters, Gate, GateStatus, Gbr, Mbr,
+    NetworkInstance, NodeId, NodeIdType, OuterHeaderCreation, Pdi, PdrId, Precedence, QerId, Qfi,
+    RemovePdr, ReportType, SourceInterface, TypedIe, UpdateFar, UpdateForwardingParameters, UrSeqn,
+    UrrId, UsageReport, UsageReportTrigger, VolumeMeasurement,
 };
 use opc_proto_pfcp::{Header, InformationElement, MessageType, OwnedMessage};
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
@@ -33,7 +35,7 @@ use opc_session_store::{
 use opc_types::{NetworkFunctionKind, NfInstanceId, NfType, PlmnId, Snssai, TenantId};
 use thiserror::Error;
 use tokio::net::UdpSocket;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 
 /// Errors surfaced by the reference SMF.
 #[derive(Debug, Error)]
@@ -168,6 +170,8 @@ pub struct Smf {
     // supervised "store-lease" watch task.
     #[allow(dead_code)]
     ownership: OwnedSession<FakeSessionBackend>,
+    // Outbound N4 message channel: consumed by the N4 worker task.
+    n4_out: mpsc::UnboundedSender<OwnedMessage>,
 }
 
 impl std::fmt::Debug for Smf {
@@ -205,6 +209,8 @@ impl Smf {
         let nrf_drain_hook =
             opc_sbi::nrf::NrfDrainHook::new(nrf_client.clone(), config.instance_id.clone());
 
+        let (n4_out_tx, n4_out_rx) = mpsc::unbounded_channel();
+
         let config_clone = config.clone();
         let nrf_client_clone: Arc<dyn NrfOperations> = nrf_client.clone();
 
@@ -213,9 +219,13 @@ impl Smf {
             .with_drain_hook(Arc::new(nrf_drain_hook))
             .with_init(move |supervisor: Supervisor, shutdown| {
                 Box::pin(async move {
-                    if let Err(e) =
-                        spawn_n4_task(supervisor.clone(), shutdown.clone(), config_clone.clone())
-                            .await
+                    if let Err(e) = spawn_n4_task(
+                        supervisor.clone(),
+                        shutdown.clone(),
+                        config_clone.clone(),
+                        n4_out_rx,
+                    )
+                    .await
                     {
                         tracing::error!(error = %e, "failed to spawn n4 task");
                     }
@@ -246,6 +256,7 @@ impl Smf {
             store,
             owner,
             ownership,
+            n4_out: n4_out_tx,
         })
     }
 
@@ -255,6 +266,17 @@ impl Smf {
         let seid = *guard;
         *guard = guard.saturating_add(1);
         seid
+    }
+
+    /// Send a PFCP message to the configured UPF over the N4 socket.
+    ///
+    /// The message is handed to the supervised N4 worker for encoding and
+    /// transmission, so the same local endpoint is used for outbound requests
+    /// and inbound responses.
+    pub fn send_pfcp(&self, msg: OwnedMessage) -> Result<(), SmfError> {
+        self.n4_out
+            .send(msg)
+            .map_err(|_| SmfError::PfcpEncode("N4 outbound channel closed".to_string()))
     }
 
     /// Create a PDU session record in the session store.
@@ -450,13 +472,14 @@ async fn spawn_n4_task(
     supervisor: Supervisor,
     shutdown: opc_runtime::ShutdownToken,
     config: SmfConfig,
+    n4_out_rx: mpsc::UnboundedReceiver<OwnedMessage>,
 ) -> Result<(), SmfError> {
     supervisor
         .spawn_spec(TaskSpec::new(
             "n4-udp",
             TaskKind::Listener,
             Criticality::Fatal,
-            n4_worker(config, shutdown),
+            n4_worker(config, shutdown, n4_out_rx),
         ))
         .await
         .map_err(SmfError::Runtime)?;
@@ -501,6 +524,7 @@ async fn write_ownership_marker(
 async fn n4_worker(
     config: SmfConfig,
     shutdown: opc_runtime::ShutdownToken,
+    mut n4_out_rx: mpsc::UnboundedReceiver<OwnedMessage>,
 ) -> Result<(), TaskError> {
     let socket = Arc::new(
         UdpSocket::bind(config.n4_addr)
@@ -516,6 +540,24 @@ async fn n4_worker(
                 let data = &buf[..len];
                 if let Err(e) = handle_n4_message(&socket, peer, data).await {
                     tracing::warn!(error = %e, peer = %peer, "n4 message handling failed");
+                }
+            }
+            maybe_msg = n4_out_rx.recv() => {
+                match maybe_msg {
+                    Some(msg) => {
+                        let mut out = BytesMut::new();
+                        if let Err(e) = msg.encode(&mut out, EncodeContext::default()) {
+                            tracing::warn!(error = %e, "failed to encode outbound N4 message");
+                            continue;
+                        }
+                        if let Err(e) = socket.send_to(&out, config.upf_addr).await {
+                            tracing::warn!(error = %e, "failed to send outbound N4 message");
+                        }
+                    }
+                    None => {
+                        tracing::info!("n4 outbound channel closed");
+                        break;
+                    }
                 }
             }
             _ = shutdown.shutdown_acknowledged() => {
@@ -557,6 +599,10 @@ async fn handle_n4_message(
         t if t == MessageType::SessionDeletionRequest as u8 => {
             Some(session_deletion_response(msg.header.sequence_number)?)
         }
+        t if t == MessageType::SessionReportRequest as u8 => Some(session_report_response(
+            msg.header.sequence_number,
+            msg.header.seid.unwrap_or(0),
+        )?),
         other => {
             tracing::warn!(msg_type = other, "unhandled PFCP message type");
             None
@@ -695,6 +741,27 @@ fn session_deletion_response(seq: u32) -> Result<OwnedMessage, SmfError> {
     })
 }
 
+fn session_report_response(seq: u32, seid: u64) -> Result<OwnedMessage, SmfError> {
+    Ok(OwnedMessage {
+        header: Header {
+            version: 1,
+            spare: 0,
+            fo: false,
+            mp: false,
+            s: true,
+            message_type: MessageType::SessionReportResponse as u8,
+            length: 0,
+            seid: Some(seid),
+            sequence_number: seq,
+            message_priority: None,
+            spare_octet: 0,
+        },
+        ies: vec![InformationElement::from_typed(&TypedIe::Cause(Cause {
+            value: CauseValue::RequestAccepted,
+        }))?],
+    })
+}
+
 /// Build a Create PDR IE from a static rule template.
 ///
 /// This is the primary SDK API exercised by the SMF: it composes typed IEs
@@ -799,4 +866,138 @@ pub fn build_create_qer(qer_id: u32, qfi: u8) -> Result<TypedIe, SmfError> {
     };
 
     Ok(TypedIe::CreateQer(qer))
+}
+
+/// Build an Update FAR IE that changes the destination interface and applies
+/// forwarding parameters.
+pub fn build_update_far(far_id: u32, dst_interface: u8) -> Result<TypedIe, SmfError> {
+    let update_fwd = UpdateForwardingParameters {
+        members: vec![
+            TypedIe::DestinationInterface(DestinationInterface {
+                value: dst_interface,
+                spare: 0,
+            }),
+            TypedIe::NetworkInstance(NetworkInstance {
+                value: b"internet".to_vec(),
+            }),
+            TypedIe::OuterHeaderCreation(OuterHeaderCreation {
+                description: 0x0100, // GTP-U/UDP/IPv4
+                teid: Some(0x1234_5678),
+                ipv4: Some([10, 0, 0, 1]),
+                ipv6: None,
+                port: None,
+                c_tag: None,
+                s_tag: None,
+            }),
+        ],
+    };
+
+    let update_far = UpdateFar {
+        members: vec![
+            TypedIe::FarId(FarId { value: far_id }),
+            TypedIe::ApplyAction(ApplyAction {
+                drop: false,
+                forward: true,
+                buffer: false,
+                notify_cp: false,
+                duplicate: false,
+                ip_masquerade: false,
+                ip_masquerade_decap: false,
+                dfrt: false,
+                edrt: false,
+                bdpn: false,
+                ddpn: false,
+                spare: 0,
+            }),
+            TypedIe::UpdateForwardingParameters(update_fwd),
+        ],
+    };
+
+    Ok(TypedIe::UpdateFar(update_far))
+}
+
+/// Build a Remove PDR IE that removes a single PDR by ID.
+pub fn build_remove_pdr(pdr_id: u16) -> Result<TypedIe, SmfError> {
+    Ok(TypedIe::RemovePdr(RemovePdr {
+        pdr_id: PdrId { value: pdr_id },
+    }))
+}
+
+/// Build a Usage Report grouped IE for the Session Report flow.
+pub fn build_usage_report(
+    urr_id: u32,
+    ur_seqn: u32,
+    total_volume: u64,
+    duration_seconds: u32,
+) -> Result<TypedIe, SmfError> {
+    let usage_report = UsageReport {
+        members: vec![
+            TypedIe::UrrId(UrrId { value: urr_id }),
+            TypedIe::UrSeqn(UrSeqn { value: ur_seqn }),
+            TypedIe::UsageReportTrigger(UsageReportTrigger {
+                periodic_reporting: false,
+                volume_threshold: false,
+                time_threshold: false,
+                quota_holding_time: false,
+                start_of_traffic: false,
+                stop_of_traffic: false,
+                dropped_dl_traffic_threshold: false,
+                immediate_report: true,
+                volume_quota: false,
+                time_quota: false,
+                linked_usage_reporting: false,
+                termination_report: false,
+                monitoring_time: false,
+                envelope_closure: false,
+                mac_addresses_reporting: false,
+                event_threshold: false,
+                event_quota: false,
+                termination_by_up_report: false,
+                ip_multicast_join_leave: false,
+                quota_validity_time: false,
+                end_marker_reception_report: false,
+                user_plane_inactivity_timer: false,
+            }),
+            TypedIe::VolumeMeasurement(VolumeMeasurement {
+                total_volume: Some(total_volume),
+                uplink_volume: None,
+                downlink_volume: None,
+                total_packets: None,
+                uplink_packets: None,
+                downlink_packets: None,
+            }),
+            TypedIe::DurationMeasurement(DurationMeasurement {
+                seconds: duration_seconds,
+            }),
+        ],
+    };
+
+    Ok(TypedIe::UsageReport(usage_report))
+}
+
+/// Build a Session Report Request message carrying a typed Usage Report.
+pub fn build_session_report_request(
+    seq: u32,
+    seid: u64,
+    urr_id: u32,
+    ur_seqn: u32,
+    total_volume: u64,
+    duration_seconds: u32,
+) -> Result<OwnedMessage, SmfError> {
+    let usage_report = build_usage_report(urr_id, ur_seqn, total_volume, duration_seconds)?;
+    let mut msg = opc_proto_pfcp::session_report_request(seq, seid);
+    msg.ies
+        .push(InformationElement::from_typed(&TypedIe::ReportType(
+            ReportType {
+                downlink_data_report: false,
+                usage_report: true,
+                error_indication_report: false,
+                user_plane_inactivity_report: false,
+                tsc_management_info_report: false,
+                session_report: false,
+                up_initiated_session_request: false,
+            },
+        ))?);
+    msg.ies.push(InformationElement::from_typed(&usage_report)?);
+    Ok(msg)
 }

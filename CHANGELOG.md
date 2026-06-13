@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `opc-proto-pfcp`: typed IE coverage for the Session Modification lifecycle
+  (Update PDR/FAR/URR/QER, Update Forwarding Parameters, Remove PDR/FAR/URR/QER)
+  and the Session Report / usage-reporting flow (Report Type, Measurement
+  Method, Reporting Triggers, Volume/Time Threshold, Volume/Time Quota,
+  Monitoring Time, Offending IE, Usage Report Trigger, Volume Measurement,
+  Duration Measurement, UR-SEQN, and grouped Usage Report).
+- `opc-proto-pfcp`: message builders for Session Modification Request, Session
+  Report Request, and Session Report Response.
+- `examples/smf-reference`: end-to-end N4 exercise that has the SMF send a
+  typed Session Modification Request (Update FAR + Remove PDR) and the fake UPF
+  send a typed Session Report Request (Usage Report with Report Type and
+  volume/duration measurements), with field and wire-byte assertions.
+
+### Changed
+- `opc-proto-pfcp` graduated from experimental to publishable
+  (`publish = true`); moved from the held-experimental tier to the publishable
+  tier in `CONTRIBUTING.md`.
+
 ## [0.2.0] — 2026-06-12
 
 ### Added

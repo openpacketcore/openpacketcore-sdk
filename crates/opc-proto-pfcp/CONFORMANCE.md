@@ -7,7 +7,7 @@ This document defines the conformance of the `opc-proto-pfcp` crate against
 
 - **Document**: 3GPP TS 29.244
 - **Release**: Release 18 (R18)
-- **Status**: v1 — typed IEs for session-management subset
+- **Status**: v2 — session-management subset complete and published
 
 ## Supported Features
 
