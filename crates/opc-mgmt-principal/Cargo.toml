@@ -1,0 +1,23 @@
+[package]
+name = "opc-mgmt-principal"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Maps a transport-authenticated SPIFFE workload identity to a config-bus TrustedPrincipal for the OpenPacketCore management plane"
+readme = "README.md"
+documentation = "https://docs.rs/opc-mgmt-principal"
+keywords = ["5g", "cnf", "spiffe", "nacm", "packet-core"]
+categories = ["network-programming", "authentication"]
+
+[dependencies]
+opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
+opc-identity = { path = "../opc-identity", version = "0.2.0" }
+
+[dev-dependencies]
+opc-types = { path = "../opc-types", version = "0.2.0" }
+
+[lints]
+workspace = true

@@ -1434,6 +1434,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-mgmt-principal"
+version = "0.2.0"
+dependencies = [
+ "opc-config-model",
+ "opc-identity",
+ "opc-types",
+]
+
+[[package]]
 name = "opc-mgmt-schema"
 version = "0.2.0"
 dependencies = [
