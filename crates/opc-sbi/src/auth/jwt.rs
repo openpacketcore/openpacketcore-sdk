@@ -374,12 +374,33 @@ impl SbiAuth for SbiJwtValidator {
             snssai: None,
         };
 
-        let scopes = claims
+        let scopes: Vec<String> = claims
             .scope
             .unwrap_or_default()
             .split_whitespace()
             .map(String::from)
             .collect();
+
+        // 8. Enforce OAuth2 scope against the requested service (least
+        //    privilege). SBI request paths are `/{service}/v{N}/...` and the
+        //    leading service-name segment is the OAuth2 scope (TS 29.510), so a
+        //    token must carry the scope for the service it invokes — a token
+        //    granted only `nnrf-disc` must not be accepted for an `nnrf-nfm`
+        //    operation just because the signature is valid.
+        if let Some(required) = required_scope_for_path(&request.path) {
+            if !scopes.iter().any(|s| s == required) {
+                opc_redaction::metrics::METRICS
+                    .sbi_oauth_validation_total
+                    .lock()
+                    .unwrap()
+                    .entry(("deny".to_string(), "insufficient_scope".to_string()))
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                return Err(SbiAuthError::Denied {
+                    reason: "insufficient scope for requested service".to_string(),
+                });
+            }
+        }
 
         // Increment allow metric
         opc_redaction::metrics::METRICS
@@ -396,6 +417,19 @@ impl SbiAuth for SbiJwtValidator {
             access_token: Some(token.clone()),
         })
     }
+}
+
+/// The OAuth2 scope required to invoke an SBI request `path`.
+///
+/// SBI paths are `/{service-name}/v{N}/...` and the leading service-name
+/// segment is the OAuth2 scope (TS 29.510). Returns `None` when the path has no
+/// leading segment, in which case scope is not enforced (non-service paths such
+/// as health/admin endpoints are gated elsewhere, not by service scope).
+fn required_scope_for_path(path: &str) -> Option<&str> {
+    path.trim_start_matches('/')
+        .split('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
 }
 
 fn validate_audience(aud_value: &serde_json::Value, expected_aud: &str) -> bool {
@@ -633,6 +667,46 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SbiAuthError::MissingPeerBinding));
+    }
+
+    fn request_for_path(token: &str, path: &str) -> SbiAuthRequest {
+        SbiAuthRequest {
+            method: http::Method::POST,
+            path: path.to_string(),
+            headers: crate::headers::SbiHeaders::default(),
+            bearer_token: Some(BearerToken::new(token).unwrap()),
+            peer: matching_peer(),
+        }
+    }
+
+    #[tokio::test]
+    async fn insufficient_scope_for_service_is_denied() {
+        // A token scoped only for nnrf-disc invoking an nnrf-nfm operation:
+        // the signature/claims/binding are all valid, but the scope does not
+        // cover the requested service.
+        let validator = production_validator();
+        let token = TokenFixtures::valid(SUB, AUD, ISS, "nnrf-disc");
+        let err = validator
+            .authorize(&request_for_path(
+                &token,
+                "/nnrf-nfm/v1/nf-instances/amf-01",
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SbiAuthError::Denied { .. }));
+    }
+
+    #[tokio::test]
+    async fn sufficient_scope_for_service_is_allowed() {
+        let validator = production_validator();
+        let token = TokenFixtures::valid(SUB, AUD, ISS, "nnrf-disc nnrf-nfm");
+        assert!(validator
+            .authorize(&request_for_path(
+                &token,
+                "/nnrf-nfm/v1/nf-instances/amf-01"
+            ))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

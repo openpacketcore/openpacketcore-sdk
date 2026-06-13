@@ -199,4 +199,67 @@ mod tests {
         assert_eq!(decision.effect(), NacmEffect::Allow);
         assert_eq!(decision.matched_rule_index(), Some(0));
     }
+
+    #[test]
+    fn module_wildcard_matches_same_module_child() {
+        let registry = registry();
+        let path = YangPath::parse("/if:interfaces/if:interface", &registry).expect("parse path");
+
+        // `if:*` matches any single segment in the ietf-interfaces module.
+        let policy = NacmPolicy::builder(PolicyVersion::new(1))
+            .add_rule(NacmRule::allow(
+                NacmAction::Read,
+                YangPathPattern::parse("/if:interfaces/if:*", &registry)
+                    .expect("module wildcard rule"),
+            ))
+            .build();
+
+        let decision = policy.evaluate(&path, NacmAction::Read);
+        assert_eq!(decision.effect(), NacmEffect::Allow);
+        assert_eq!(decision.matched_rule_index(), Some(0));
+    }
+
+    #[test]
+    fn module_wildcard_default_denies_unmatched_path() {
+        let registry = registry();
+        // A path in a different subtree than the module-wildcard rule covers.
+        let path = YangPath::parse("/sys:system", &registry).expect("parse path");
+
+        let policy = NacmPolicy::builder(PolicyVersion::new(1))
+            .add_rule(NacmRule::allow(
+                NacmAction::Read,
+                YangPathPattern::parse("/if:interfaces/if:*", &registry)
+                    .expect("module wildcard rule"),
+            ))
+            .build();
+
+        // No rule matches, so the default-deny posture applies.
+        let decision = policy.evaluate(&path, NacmAction::Read);
+        assert_eq!(decision.effect(), NacmEffect::Deny);
+        assert_eq!(decision.matched_rule_index(), None);
+    }
+
+    #[test]
+    fn earlier_exact_deny_beats_later_module_wildcard_allow() {
+        let registry = registry();
+        let path = YangPath::parse("/if:interfaces/if:interface", &registry).expect("parse path");
+
+        let policy = NacmPolicy::builder(PolicyVersion::new(1))
+            .add_rule(NacmRule::deny(
+                NacmAction::Read,
+                YangPathPattern::parse("/if:interfaces/if:interface", &registry)
+                    .expect("exact deny rule"),
+            ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Read,
+                YangPathPattern::parse("/if:interfaces/if:*", &registry)
+                    .expect("module wildcard allow rule"),
+            ))
+            .build();
+
+        // First-match ordering: the earlier exact deny wins over the wildcard.
+        let decision = policy.evaluate(&path, NacmAction::Read);
+        assert_eq!(decision.effect(), NacmEffect::Deny);
+        assert_eq!(decision.matched_rule_index(), Some(0));
+    }
 }
