@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-12
+
 ### Added
 - Behaviour-pinning tests for randomness usage in `opc-crypto`, `opc-sbi`, and
   `opc-persist` ahead of the rand 0.10 migration.
@@ -15,23 +17,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HS256/RS256 key-confusion rejection, and the dev bypass path.
 - An on-disk SQLite fixture database and compatibility test in `opc-persist`
   that guard the stored format across rusqlite version changes.
-
-### Changed
-- Workspace dependency `rand` 0.8 → 0.10, with direct callers migrated to the
-  new API. `opc-crypto` continues to source nonce entropy from the OS via
-  `getrandom::SysRng`.
-- `opc-sbi` dependency `jsonwebtoken` 9.3.1 → 10.4.0, using the `aws_lc_rs`
-  backend with PEM support. No source changes were required because the JWT
-  validation API remained compatible; the `aws_lc_rs` backend avoids the
-  `rsa` crate and the RUSTSEC-2023-0071 advisory that the `rust_crypto`
-  backend would pull in, keeping `cargo audit`/`cargo deny` clean without a
-  standing exception. The cost is the `aws-lc-sys`/`cmake` build dependency,
-  reconciled in ADR 0014 point 9; a future migration to `rust_crypto` is
-  planned once `rsa` ships a constant-time release.
-
-## [0.2.0] — 2026-06-12
-
-### Added
 - Community and governance files: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, `GOVERNANCE.md`, `MAINTAINERS.md`, `NOTICE`, and `.github/CODEOWNERS`.
 - GitHub issue and pull-request templates.
 - `CHANGELOG.md` tracking release changes.
@@ -54,6 +39,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/adr/0013-ngap-asn1-strategy.md` and `docs/design/openapi-codegen-plan.md`.
 
 ### Changed
+- Workspace dependency `rand` 0.8 → 0.10, with direct callers migrated to the
+  new API. `opc-crypto` continues to source nonce entropy from the OS via
+  `getrandom::SysRng`.
+- `opc-sbi` dependency `jsonwebtoken` 9.3.1 → 10.4.0, using the `aws_lc_rs`
+  backend with PEM support. No source changes were required because the JWT
+  validation API remained compatible; the `aws_lc_rs` backend avoids the
+  `rsa` crate and the RUSTSEC-2023-0071 advisory that the `rust_crypto`
+  backend would pull in, keeping `cargo audit`/`cargo deny` clean without a
+  standing exception. The cost is the `aws-lc-sys`/`cmake` build dependency,
+  reconciled in ADR 0014 point 9; a future migration to `rust_crypto` is
+  planned once `rsa` ships a constant-time release.
 - crates.io publishing metadata (description, keywords, categories,
   documentation, readme) and per-crate READMEs for all publishable crates;
   intra-workspace path dependencies now carry `version` keys.
