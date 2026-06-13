@@ -729,6 +729,84 @@ pub fn heartbeat_response(seq: u32) -> OwnedMessage {
     }
 }
 
+/// Build a Session Modification Request message.
+///
+/// The caller must populate the IEs (e.g., Update FAR, Remove PDR).
+///
+/// @spec 3GPP TS29244 R18 7.5.4
+/// @req REQ-3GPP-TS29244-R18-7.5.4-001
+/// @conformance v0
+pub fn session_modification_request(seq: u32, seid: u64) -> OwnedMessage {
+    OwnedMessage {
+        header: Header {
+            version: 1,
+            spare: 0,
+            fo: false,
+            mp: false,
+            s: true,
+            message_type: MessageType::SessionModificationRequest as u8,
+            length: 0,
+            seid: Some(seid),
+            sequence_number: seq,
+            message_priority: None,
+            spare_octet: 0,
+        },
+        ies: Vec::new(),
+    }
+}
+
+/// Build a Session Report Request message.
+///
+/// The caller must populate the IEs (e.g., Report Type, Usage Report).
+///
+/// @spec 3GPP TS29244 R18 7.5.8
+/// @req REQ-3GPP-TS29244-R18-7.5.8-001
+/// @conformance v0
+pub fn session_report_request(seq: u32, seid: u64) -> OwnedMessage {
+    OwnedMessage {
+        header: Header {
+            version: 1,
+            spare: 0,
+            fo: false,
+            mp: false,
+            s: true,
+            message_type: MessageType::SessionReportRequest as u8,
+            length: 0,
+            seid: Some(seid),
+            sequence_number: seq,
+            message_priority: None,
+            spare_octet: 0,
+        },
+        ies: Vec::new(),
+    }
+}
+
+/// Build a Session Report Response message.
+///
+/// The caller must populate the IEs (e.g., Cause).
+///
+/// @spec 3GPP TS29244 R18 7.5.8
+/// @req REQ-3GPP-TS29244-R18-7.5.8-002
+/// @conformance v0
+pub fn session_report_response(seq: u32, seid: u64) -> OwnedMessage {
+    OwnedMessage {
+        header: Header {
+            version: 1,
+            spare: 0,
+            fo: false,
+            mp: false,
+            s: true,
+            message_type: MessageType::SessionReportResponse as u8,
+            length: 0,
+            seid: Some(seid),
+            sequence_number: seq,
+            message_priority: None,
+            spare_octet: 0,
+        },
+        ies: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -776,6 +854,54 @@ mod tests {
             MessageType::HeartbeatResponse as u8
         );
         assert_eq!(decoded.header.sequence_number, 99);
+        assert!(decoded.ies.is_empty());
+        assert_eq!(encode_owned(&decoded), bytes);
+    }
+
+    #[test]
+    fn test_session_modification_request_builder_roundtrip() {
+        let msg = session_modification_request(102, 1);
+        let bytes = encode_owned(&msg);
+        let decoded = OwnedMessage::decode_owned(bytes.clone(), DecodeContext::default()).unwrap();
+        assert_eq!(
+            decoded.header.message_type,
+            MessageType::SessionModificationRequest as u8
+        );
+        assert!(decoded.header.s);
+        assert_eq!(decoded.header.seid, Some(1));
+        assert_eq!(decoded.header.sequence_number, 102);
+        assert!(decoded.ies.is_empty());
+        assert_eq!(encode_owned(&decoded), bytes);
+    }
+
+    #[test]
+    fn test_session_report_request_builder_roundtrip() {
+        let msg = session_report_request(200, 1);
+        let bytes = encode_owned(&msg);
+        let decoded = OwnedMessage::decode_owned(bytes.clone(), DecodeContext::default()).unwrap();
+        assert_eq!(
+            decoded.header.message_type,
+            MessageType::SessionReportRequest as u8
+        );
+        assert!(decoded.header.s);
+        assert_eq!(decoded.header.seid, Some(1));
+        assert_eq!(decoded.header.sequence_number, 200);
+        assert!(decoded.ies.is_empty());
+        assert_eq!(encode_owned(&decoded), bytes);
+    }
+
+    #[test]
+    fn test_session_report_response_builder_roundtrip() {
+        let msg = session_report_response(200, 1);
+        let bytes = encode_owned(&msg);
+        let decoded = OwnedMessage::decode_owned(bytes.clone(), DecodeContext::default()).unwrap();
+        assert_eq!(
+            decoded.header.message_type,
+            MessageType::SessionReportResponse as u8
+        );
+        assert!(decoded.header.s);
+        assert_eq!(decoded.header.seid, Some(1));
+        assert_eq!(decoded.header.sequence_number, 200);
         assert!(decoded.ies.is_empty());
         assert_eq!(encode_owned(&decoded), bytes);
     }
