@@ -7,6 +7,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+// Every test here builds a runtime, and `Builder::build` registers a
+// process-wide SIGTERM handler; the sequential wrapper actually delivers
+// SIGTERM to the whole process. If two runtimes are live at once, a SIGTERM
+// meant for one is also delivered to the other — a flaky cross-test race.
+// Serialize every test so only one runtime (and one signal handler) exists at
+// a time.
+static SIGNAL_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct SimpleHook {
     called: Arc<AtomicBool>,
 }
@@ -65,6 +73,7 @@ impl DrainHook for ConfigurableFailingHook {
 
 #[tokio::test]
 async fn run_all_graceful_shutdown_tests_sequentially() {
+    let _serial = SIGNAL_SERIAL.lock().await;
     println!("Starting sequential graceful shutdown tests...");
     println!("Running test_drain_hook_is_called_on_shutdown_impl...");
     test_drain_hook_is_called_on_shutdown_impl().await;
@@ -585,6 +594,7 @@ async fn test_drain_hooks_are_idempotent_and_run_once_impl() {
 
 #[tokio::test]
 async fn test_phase_ready_timing_race_prevention() {
+    let _serial = SIGNAL_SERIAL.lock().await;
     use opc_runtime::{Criticality, RestartPolicy, TaskKind};
     let profile = RuntimeProfile {
         mode: RuntimeMode::Dev,
@@ -654,6 +664,7 @@ async fn test_phase_ready_timing_race_prevention() {
 
 #[tokio::test]
 async fn test_fake_clock_monotonicity() {
+    let _serial = SIGNAL_SERIAL.lock().await;
     let clock = FakeClock::synchronized();
     let base = clock.monotonic();
     clock.advance(Duration::from_secs(10));
@@ -667,6 +678,7 @@ async fn test_fake_clock_monotonicity() {
 
 #[tokio::test]
 async fn test_degrade_count_recovery() {
+    let _serial = SIGNAL_SERIAL.lock().await;
     use opc_runtime::{Criticality, RestartPolicy, TaskKind};
 
     let profile = RuntimeProfile {
@@ -749,6 +761,7 @@ async fn test_degrade_count_recovery() {
 
 #[tokio::test]
 async fn test_single_task_shutdown_isolation() {
+    let _serial = SIGNAL_SERIAL.lock().await;
     use opc_runtime::{Criticality, RestartPolicy, ShutdownPolicy, TaskKind};
     let profile = RuntimeProfile {
         mode: RuntimeMode::Dev,
@@ -824,6 +837,7 @@ async fn test_single_task_shutdown_isolation() {
 
 #[tokio::test]
 async fn test_high_concurrency_stress() {
+    let _serial = SIGNAL_SERIAL.lock().await;
     use opc_runtime::{
         Criticality, RestartPolicy, RuntimeProfile, ShutdownPolicy, ShutdownToken, Supervisor,
         TaskKind,
