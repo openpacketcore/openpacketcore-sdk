@@ -502,6 +502,7 @@ mod tests {
     use crate::headers::BearerToken;
     use crate::testkit::fixtures::{
         generate_test_token_with_nbf_offset, test_private_key_pem, MockJwksResolver, TokenFixtures,
+        TEST_KID, TEST_MODULUS_N,
     };
     use std::sync::Arc;
 
@@ -616,6 +617,35 @@ mod tests {
         };
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
         let token = jsonwebtoken::encode(&header, &claims, &encoding_key).unwrap();
+
+        let err = validator
+            .authorize(&auth_request(&token))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SbiAuthError::Denied { .. }));
+    }
+
+    #[tokio::test]
+    async fn hs256_token_signed_with_public_key_material_is_denied() {
+        // Key-confusion attack: an attacker who knows the RS256 public key
+        // (it is published in the JWKS) signs a token with HS256 using that
+        // public material as the HMAC secret. A validator that honours the
+        // token's own alg header instead of pinning RS256 would verify the
+        // HMAC against the same bytes and accept the forgery.
+        let validator = production_validator();
+        let now = jsonwebtoken::get_current_timestamp();
+        let claims = SvidClaims {
+            iss: ISS.to_string(),
+            sub: SUB.to_string(),
+            aud: serde_json::Value::String(AUD.to_string()),
+            exp: now + 3600,
+            nbf: Some(now - 10),
+            scope: Some("nnrf-disc".to_string()),
+        };
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        header.kid = Some(TEST_KID.to_string());
+        let forged_secret = jsonwebtoken::EncodingKey::from_secret(TEST_MODULUS_N.as_bytes());
+        let token = jsonwebtoken::encode(&header, &claims, &forged_secret).unwrap();
 
         let err = validator
             .authorize(&auth_request(&token))
