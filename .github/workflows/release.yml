@@ -74,7 +74,9 @@ jobs:
       - name: Generate Go SBOM
         run: |
           go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
-          cyclonedx-gomod app -json -output release-artifacts/sdk-reference-operator.bom.json operators/sdk-reference-operator
+          # The operator's main package lives in cmd/manager, not the module
+          # root; -main points cyclonedx-gomod at it.
+          cyclonedx-gomod app -json -main cmd/manager -output release-artifacts/sdk-reference-operator.bom.json operators/sdk-reference-operator
 
       - name: Upload release evidence
         uses: actions/upload-artifact@v7
