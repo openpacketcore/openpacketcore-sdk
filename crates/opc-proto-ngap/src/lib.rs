@@ -102,9 +102,15 @@ pub fn decode(buf: &[u8], ctx: DecodeContext) -> Result<Pdu, DecodeError> {
         return Err(length_error(buf.len(), ctx.max_message_len));
     }
 
-    let raw = Bytes::copy_from_slice(buf);
-    let pdu: generated::ngap_pdu_descriptions::NGAPPDU = rasn::aper::decode(buf)
-        .map_err(|_| DecodeError::new(DecodeErrorCode::Structural { reason: "ngap pdu" }, 0))?;
+    // Decode a single PDU and capture the unconsumed remainder. `raw` must
+    // cover ONLY the bytes this PDU actually consumed: copying the whole input
+    // would make `encode` re-emit any trailing attacker-controlled bytes
+    // byte-for-byte, a parse-vs-forward (request-smuggling) discrepancy.
+    let (pdu, remainder): (generated::ngap_pdu_descriptions::NGAPPDU, &[u8]) =
+        rasn::aper::decode_with_remainder(buf)
+            .map_err(|_| DecodeError::new(DecodeErrorCode::Structural { reason: "ngap pdu" }, 0))?;
+    let consumed = buf.len() - remainder.len();
+    let raw = Bytes::copy_from_slice(&buf[..consumed]);
 
     match pdu {
         generated::ngap_pdu_descriptions::NGAPPDU::initiatingMessage(im) => {
@@ -230,13 +236,26 @@ pub fn encode(pdu: &Pdu, ctx: EncodeContext) -> Result<Vec<u8>, EncodeError> {
 impl<'a> BorrowDecode<'a> for Pdu {
     fn decode(input: &'a [u8], ctx: DecodeContext) -> DecodeResult<'a, Self> {
         let pdu = decode(input, ctx)?;
-        Ok((&[], pdu))
+        // Report the bytes this PDU did NOT consume rather than claiming the
+        // whole input was used. `pdu.raw` is exactly the consumed prefix.
+        let consumed = pdu.raw.len();
+        Ok((&input[consumed..], pdu))
     }
 }
 
 impl OwnedDecode for Pdu {
     fn decode_owned(input: Bytes, ctx: DecodeContext) -> Result<Self, DecodeError> {
-        let (_, pdu) = Self::decode(&input, ctx)?;
+        let (remainder, pdu) = Self::decode(&input, ctx)?;
+        // An owned decode consumes a single, self-contained NGAP message;
+        // trailing bytes after the PDU are rejected rather than discarded.
+        if !remainder.is_empty() {
+            return Err(DecodeError::new(
+                DecodeErrorCode::Structural {
+                    reason: "trailing bytes after ngap pdu",
+                },
+                input.len() - remainder.len(),
+            ));
+        }
         Ok(pdu)
     }
 }
@@ -271,6 +290,33 @@ mod tests {
             0x80, 0x00, 0x00, 0x01, 0x00, 0x02, 0xf8, 0x39, 0x00, 0x01, 0x00, 0x18, 0x81, 0xc0,
             0x00, 0x13, 0x88, 0x00, 0x15, 0x40, 0x01, 0x40,
         ]
+    }
+
+    #[test]
+    fn trailing_bytes_after_pdu_are_rejected_and_not_re_emitted() {
+        let mut bytes = ngsetup_request_fixture();
+        let valid_len = bytes.len();
+
+        // A clean PDU: raw covers exactly the consumed input.
+        let pdu = decode(&bytes, DecodeContext::default()).unwrap();
+        assert_eq!(pdu.raw.len(), valid_len);
+
+        // Append attacker-controlled trailing bytes.
+        bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+
+        // BorrowDecode reports the trailing bytes as the unconsumed remainder
+        // (not an empty slice), and raw still covers only the real PDU — so
+        // re-encoding cannot smuggle the trailing bytes back out.
+        let (remainder, pdu) = Pdu::decode(&bytes, DecodeContext::default()).unwrap();
+        assert_eq!(remainder, &[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(pdu.raw.len(), valid_len);
+
+        // Owned decode of a single message rejects the trailing bytes outright.
+        let err = Pdu::decode_owned(Bytes::from(bytes), DecodeContext::default()).unwrap_err();
+        assert!(matches!(
+            err.code(),
+            DecodeErrorCode::Structural { reason } if reason.contains("trailing")
+        ));
     }
 
     #[test]
