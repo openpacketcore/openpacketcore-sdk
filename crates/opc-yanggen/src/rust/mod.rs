@@ -2,11 +2,12 @@ pub mod metadata;
 pub mod patch;
 pub mod paths;
 pub mod redaction;
+pub mod schema_registry;
 pub mod serde;
 pub mod types;
 pub mod validate;
 
-use crate::emit::{schema_digest_from_canonical, CanonicalInput};
+use crate::emit::{fnv1a64, schema_digest_from_canonical, CanonicalInput};
 use crate::ir::{SchemaNode, SchemaNodeKind, TypeRef};
 use std::collections::HashMap;
 use std::fmt;
@@ -43,6 +44,7 @@ pub fn generate_rust(
     let root_name = clean_segment(last_segment(&root.path));
     let root_type = to_pascal_case(root_name);
     let schema_digest = schema_digest_from_canonical(input);
+    let opc_config_schema_digest = schema_digest_hex_for_opc_config(&schema_digest);
     let mut files = HashMap::new();
 
     let mod_rs_content = r#"
@@ -53,6 +55,7 @@ pub mod patch;
 pub mod validate;
 pub mod metadata;
 pub mod redaction;
+pub mod schema_registry;
 
 use opc_config_model::{OpcConfig, ConfigError, YangPath, ValidationError, ValidationContext};
 use opc_types::SchemaDigest;
@@ -62,7 +65,7 @@ impl OpcConfig for types::__ROOT_TYPE__ {
     type Delta = patch::ConfigDelta;
 
     fn schema_digest(&self) -> SchemaDigest {
-        SchemaDigest::from_str("__SCHEMA_DIGEST__")
+        SchemaDigest::from_str("__OPC_CONFIG_SCHEMA_DIGEST__")
             .expect("opc-yanggen emitted an invalid schema digest")
     }
 
@@ -104,7 +107,7 @@ impl OpcConfig for types::__ROOT_TYPE__ {
 }
 "#
     .replace("__ROOT_TYPE__", &root_type)
-    .replace("__SCHEMA_DIGEST__", &schema_digest);
+    .replace("__OPC_CONFIG_SCHEMA_DIGEST__", &opc_config_schema_digest);
 
     files.insert("mod.rs".to_string(), mod_rs_content);
     files.insert("types.rs".to_string(), types::generate(input)?);
@@ -114,8 +117,21 @@ impl OpcConfig for types::__ROOT_TYPE__ {
     files.insert("validate.rs".to_string(), validate::generate(input)?);
     files.insert("metadata.rs".to_string(), metadata::generate(input)?);
     files.insert("redaction.rs".to_string(), redaction::generate(input)?);
+    files.insert(
+        "schema_registry.rs".to_string(),
+        schema_registry::generate(input)?,
+    );
 
     Ok(files)
+}
+
+fn schema_digest_hex_for_opc_config(registry_digest: &str) -> String {
+    let mut out = String::with_capacity(64);
+    for lane in 0..4 {
+        let material = format!("opc-yanggen-opc-config-schema-digest-v1:{lane}:{registry_digest}");
+        out.push_str(&format!("{:016x}", fnv1a64(material.as_bytes())));
+    }
+    out
 }
 
 fn validate_supported_input(input: &CanonicalInput) -> Result<&SchemaNode, RustGenerationError> {
