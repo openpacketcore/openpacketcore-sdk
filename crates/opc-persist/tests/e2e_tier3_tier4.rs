@@ -14,7 +14,8 @@ use tokio::time::sleep;
 
 mod common;
 use common::{
-    find_free_port_block, generate_test_identities, wait_for_port, TestCluster, TestNode,
+    acquire_cluster_serial, find_free_port_block, generate_test_identities, wait_for_port,
+    TestCluster, TestNode,
 };
 
 const TEST_AUDIT_KEY_BYTES: [u8; 32] = [0xA5; 32];
@@ -94,6 +95,9 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 async fn setup_process_cluster(size: usize) -> TestCluster {
+    // Hold the cluster serializer for this cluster's lifetime so only one
+    // process cluster runs at a time per binary (deterministic under -j).
+    let serial_guard = Some(acquire_cluster_serial().await);
     let temp_dir = TempDir::new().unwrap();
     let certs_dir = temp_dir.path().join("certs");
     let node_ids: Vec<usize> = (0..size).collect();
@@ -112,6 +116,7 @@ async fn setup_process_cluster(size: usize) -> TestCluster {
         election_timeout_min: 1000,
         election_timeout_max: 2000,
         rpc_timeout: 500,
+        serial_guard,
     };
 
     // Configure proxies for all pairs of nodes

@@ -844,9 +844,11 @@ async fn test_consensus_automatic_transition_finalization() {
             epoch: 1,
         };
         let clock = ConsensusClock {
-            election_timeout_min: std::time::Duration::from_millis(50),
-            election_timeout_max: std::time::Duration::from_millis(100),
-            heartbeat_interval: std::time::Duration::from_millis(15),
+            // Timers loose enough to survive CI scheduler jitter under load;
+            // the test asserts that membership finalizes (logic), not how fast.
+            election_timeout_min: std::time::Duration::from_millis(250),
+            election_timeout_max: std::time::Duration::from_millis(500),
+            heartbeat_interval: std::time::Duration::from_millis(50),
             enable_timers: true,
         };
         let store = ConsensusConfigStore::new(i, backend.clone(), Some(membership), Some(clock))

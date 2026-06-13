@@ -136,7 +136,7 @@ pub fn find_free_port_block(size: u16) -> u16 {
 
 pub async fn wait_for_port(port: u16) {
     let addr = format!("127.0.0.1:{port}");
-    for _ in 0..300 {
+    for _ in 0..600 {
         if let Ok(stream) = tokio::net::TcpStream::connect(&addr).await {
             drop(stream);
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -145,6 +145,23 @@ pub async fn wait_for_port(port: u16) {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
     panic!("Port {port} did not become available in time");
+}
+
+/// Process-global serializer for multi-node cluster tests.
+///
+/// Spawning several 3–4 node clusters concurrently (the libtest default of
+/// `--test-threads = cores`) oversubscribes CPU on small CI runners: nodes are
+/// slow to bind their ports and tight election timers miss their deadlines,
+/// producing non-deterministic "port did not become available" failures. Each
+/// cluster test holds this guard for its lifetime so only one cluster is live
+/// at a time per test binary, which keeps the suite deterministic without
+/// changing what any test verifies.
+static CLUSTER_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Acquire the cluster serializer; hold the returned guard for the test's
+/// duration (store it in [`TestCluster`] or a local `let _g = ...`).
+pub async fn acquire_cluster_serial() -> tokio::sync::MutexGuard<'static, ()> {
+    CLUSTER_SERIAL.lock().await
 }
 
 pub fn generate_test_identities(node_ids: &[usize]) -> HashMap<usize, NodeIdentity> {
@@ -567,6 +584,11 @@ pub struct TestCluster {
     pub election_timeout_min: u64,
     pub election_timeout_max: u64,
     pub rpc_timeout: u64,
+    // Held for the cluster's lifetime so only one cluster runs at a time per
+    // test binary (see `acquire_cluster_serial`). Public so setups that build
+    // the struct directly can attach it; read only via Drop.
+    #[allow(dead_code)]
+    pub serial_guard: Option<tokio::sync::MutexGuard<'static, ()>>,
 }
 
 impl TestCluster {
@@ -588,10 +610,14 @@ impl TestCluster {
             election_timeout_min: 2500,
             election_timeout_max: 4000,
             rpc_timeout: 500,
+            serial_guard: None,
         }
     }
 
     pub async fn bootstrap(&mut self) -> Result<(), String> {
+        if self.serial_guard.is_none() {
+            self.serial_guard = Some(acquire_cluster_serial().await);
+        }
         let _lock = DirLock::acquire();
         self.base_port = find_free_port_block(50);
 
@@ -1012,6 +1038,7 @@ pub struct AuthenticatedResponse {
 }
 
 pub async fn bootstrap_4_nodes(_base_port: u16) -> Result<TestCluster, String> {
+    let serial_guard = Some(acquire_cluster_serial().await);
     let temp_dir = tempfile::TempDir::new().unwrap();
     let certs_dir = temp_dir.path().join("certs");
     let node_ids = vec![0, 1, 2, 3];
@@ -1031,6 +1058,7 @@ pub async fn bootstrap_4_nodes(_base_port: u16) -> Result<TestCluster, String> {
         election_timeout_min: 2500,
         election_timeout_max: 4000,
         rpc_timeout: 500,
+        serial_guard,
     };
 
     for a in 0..4 {
