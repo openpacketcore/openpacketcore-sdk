@@ -171,6 +171,13 @@ impl TrustedPrincipal {
 pub enum TransportType {
     Gnmi,
     NetconfSsh,
+    /// NETCONF over TLS (RFC 7589), distinct from [`TransportType::NetconfSsh`].
+    ///
+    /// A NETCONF-over-TLS session must record this transport so audit,
+    /// authorization, and idempotency-fingerprint matching attribute the request
+    /// to the transport it actually arrived on. Mapping TLS sessions onto
+    /// `NetconfSsh` is forbidden because it makes those records inaccurate.
+    NetconfTls,
     RestconfHttps,
     Internal,
 }

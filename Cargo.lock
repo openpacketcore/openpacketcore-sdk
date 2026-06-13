@@ -1420,6 +1420,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-mgmt-errors"
+version = "0.2.0"
+dependencies = [
+ "opc-config-model",
+]
+
+[[package]]
+name = "opc-mgmt-limits"
+version = "0.2.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "opc-nacm"
 version = "0.2.0"
 dependencies = [

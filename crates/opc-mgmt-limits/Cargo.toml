@@ -1,0 +1,19 @@
+[package]
+name = "opc-mgmt-limits"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared, fail-closed input-bound limits for the OpenPacketCore management plane (gNMI/NETCONF)"
+readme = "README.md"
+documentation = "https://docs.rs/opc-mgmt-limits"
+keywords = ["5g", "cnf", "gnmi", "netconf", "packet-core"]
+categories = ["network-programming"]
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

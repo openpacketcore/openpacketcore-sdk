@@ -1,0 +1,19 @@
+[package]
+name = "opc-mgmt-errors"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Transport-neutral status taxonomy and SDK-error→gNMI/NETCONF mappings for the OpenPacketCore management plane"
+readme = "README.md"
+documentation = "https://docs.rs/opc-mgmt-errors"
+keywords = ["5g", "cnf", "gnmi", "netconf", "packet-core"]
+categories = ["network-programming"]
+
+[dependencies]
+opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
+
+[lints]
+workspace = true
