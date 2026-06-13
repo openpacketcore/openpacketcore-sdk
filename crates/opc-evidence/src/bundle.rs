@@ -15,6 +15,39 @@ pub fn manifest_signing_bytes(manifest: &Manifest) -> Result<Vec<u8>, EvidenceEr
     })
 }
 
+/// Serializes the bytes that a bundle signature must cover: the manifest plus
+/// the digest of every embedded blob (SBOM, VEX, conformance report, ...).
+///
+/// Signing only the manifest leaves the embedded blobs unprotected — they could
+/// be swapped without invalidating the signature. Binding their digests here
+/// makes any tamper detectable. A bundle with no embedded blobs produces bytes
+/// identical to [`manifest_signing_bytes`], so blob-free signatures are
+/// unchanged.
+pub fn bundle_signing_bytes(bundle: &EvidenceBundle) -> Result<Vec<u8>, EvidenceError> {
+    let mut bytes = manifest_signing_bytes(&bundle.manifest)?;
+    let mut blobs: Vec<(&str, String)> = Vec::new();
+    for (name, blob) in [
+        ("conformance_report", &bundle.conformance_report),
+        ("sbom", &bundle.sbom),
+        ("vex", &bundle.vex),
+        ("provenance", &bundle.provenance),
+        ("performance_baseline", &bundle.performance_baseline),
+        ("data_governance_report", &bundle.data_governance_report),
+    ] {
+        if let Some(b) = blob {
+            blobs.push((name, crate::manifest::compute_digest(b.as_bytes())));
+        }
+    }
+    blobs.sort();
+    for (name, digest) in blobs {
+        bytes.extend_from_slice(b"\n");
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(b":");
+        bytes.extend_from_slice(digest.as_bytes());
+    }
+    Ok(bytes)
+}
+
 /// A signer trait for signing the bundle manifest.
 pub trait BundleSigner {
     fn sign(&self, data: &[u8]) -> Result<String, EvidenceError>;
@@ -113,8 +146,10 @@ pub fn verify_bundle(
             "missing signature".to_string(),
         ));
     }
-    let manifest_bytes = manifest_signing_bytes(&bundle.manifest)?;
-    verifier.verify(&manifest_bytes, &bundle.signature)?;
+    // The signature must cover the manifest AND every embedded blob, so a
+    // swapped SBOM/VEX/report is detected.
+    let signing_bytes = bundle_signing_bytes(bundle)?;
+    verifier.verify(&signing_bytes, &bundle.signature)?;
 
     // 3. Collect digests of files we have
     let mut expected_digests = std::collections::HashMap::new();

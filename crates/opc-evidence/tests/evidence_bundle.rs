@@ -76,3 +76,48 @@ fn test_gap_006_004_bundle_signing_and_verification() {
     tampered_files.insert("sbom.json".to_string(), b"tampered content".to_vec());
     assert!(verify_bundle(&bundle, &verifier, &tampered_files).is_err());
 }
+
+#[test]
+fn tampering_an_embedded_blob_invalidates_the_signature() {
+    let manifest = Manifest {
+        schema_version: "1.0.0".to_string(),
+        sdk_version: "0.1.0".to_string(),
+        git_commit: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+        artifact_digests: vec![],
+        file_digests: vec![],
+        signing_identity: "mock-identity-key123".to_string(),
+        generation_tool: "opc-evidence".to_string(),
+        generation_tool_version: "0.1.0".to_string(),
+        generation_timestamp: "2026-06-08T12:00:00Z".to_string(),
+        known_incomplete_sections: vec![],
+        metadata: std::collections::HashMap::new(),
+    };
+
+    let signer = MockSigner::new("key123");
+    let verifier = MockVerifier::new("key123");
+
+    // Build a bundle carrying an embedded SBOM and sign over manifest + blobs.
+    let mut bundle = EvidenceBundle {
+        manifest,
+        signature: String::new(),
+        conformance_report: None,
+        sbom: Some("{\"sbom\":\"original\"}".to_string()),
+        vex: None,
+        provenance: None,
+        performance_baseline: None,
+        data_governance_report: None,
+    };
+    bundle.signature = signer
+        .sign(&bundle_signing_bytes(&bundle).unwrap())
+        .unwrap();
+
+    let files = std::collections::HashMap::new();
+    assert!(verify_bundle(&bundle, &verifier, &files).is_ok());
+
+    // Swapping the embedded SBOM must now invalidate the signature.
+    bundle.sbom = Some("{\"sbom\":\"malicious\"}".to_string());
+    assert!(
+        verify_bundle(&bundle, &verifier, &files).is_err(),
+        "a tampered embedded blob must fail verification"
+    );
+}

@@ -20,8 +20,8 @@ pub mod tag;
 pub mod vex;
 
 pub use bundle::{
-    manifest_signing_bytes, verify_bundle, BundleSigner, BundleVerifier, EvidenceBundle,
-    MockSigner, MockVerifier,
+    bundle_signing_bytes, manifest_signing_bytes, verify_bundle, BundleSigner, BundleVerifier,
+    EvidenceBundle, MockSigner, MockVerifier,
 };
 pub use data_governance::DataGovernanceEvidenceReport;
 pub use error::EvidenceError;

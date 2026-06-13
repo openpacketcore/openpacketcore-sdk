@@ -65,12 +65,9 @@ fn test_gap_006_006_gate_policy() {
     };
     let signer = MockSigner::new("policy-key");
     let verifier = MockVerifier::new("policy-key");
-    let signature = signer
-        .sign(&manifest_signing_bytes(&manifest).unwrap())
-        .unwrap();
-    let bundle = EvidenceBundle {
+    let mut bundle = EvidenceBundle {
         manifest,
-        signature,
+        signature: String::new(),
         conformance_report: Some("{}".to_string()),
         sbom: Some(sbom_json.to_string()),
         vex: Some(vex_json.to_string()),
@@ -78,6 +75,10 @@ fn test_gap_006_006_gate_policy() {
         performance_baseline: Some(perf_json.to_string()),
         data_governance_report: None,
     };
+    // Sign over the manifest AND the embedded blobs.
+    bundle.signature = signer
+        .sign(&bundle_signing_bytes(&bundle).unwrap())
+        .unwrap();
     let mut bundle_files = std::collections::HashMap::new();
     bundle_files.insert("evidence/sbom.json".to_string(), b"{}".to_vec());
 
