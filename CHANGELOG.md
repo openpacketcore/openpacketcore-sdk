@@ -34,6 +34,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   derived solely from the token's `sub`, so a valid token obtained by another
   workload could be replayed over its own mTLS channel and accepted as the
   token's subject (confused-deputy / token replay).
+- `opc-sbi`: enforce the OAuth2 scope against the requested service. A token is
+  now denied when it lacks the scope for the SBI service it invokes, so a token
+  granted only `nnrf-disc` can no longer call `nnrf-nfm`.
+- `opc-tls`: document that an unconstrained `PeerPolicy` authorizes any trusted
+  peer (authentication without authorization) and add `is_unconstrained` so
+  configuration layers can fail closed.
+- `opc-evidence`: bind embedded bundle blobs (SBOM, VEX, conformance report,
+  provenance, ...) to the bundle signature; they could previously be swapped
+  without invalidating it.
+- `opc-node-resources`: run the structural BPF checks (program type, attach
+  point, capability bound) in every environment, gating only the strict
+  signing/digest provenance on Production.
+- `opc-privacy`/`opc-data-governance`: enforce an absolute singleton-cohort
+  floor even when k-anonymity enforcement is disabled, and block the
+  destructive `Anonymize` disposal action under a legal hold.
+- `opc-session-net`: bound server-side frame reads with a configurable idle
+  timeout so a stalled peer is reaped instead of exhausting connection slots
+  (slowloris).
 
 ### Fixed
 - `opc-persist`: a committed `MarkConfirmed`/`CreateRollbackPoint` whose target
@@ -41,6 +59,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot) no longer aborts the consensus apply transaction. Applying a
   committed entry is now a deterministic no-op in that case instead of freezing
   `applied_index` and wedging the node's state machine.
+- `opc-persist`: the durability preflight no longer reports `same_filesystem`
+  and `locking_compatible` as unconditionally true; they are derived from real
+  checks (device-id comparison and the network-filesystem safety check).
+- `opc-proto-ngap`: reject trailing bytes after a decoded NGAP PDU instead of
+  silently discarding them and re-emitting them on encode.
+- `opc-alarm`: the persist audit sink runs its append on a worker thread with
+  its own runtime, decoupling fail-closed audit from the caller's runtime
+  flavor and lifecycle, and maps a DB-path panic to a meaningful reason.
+- `sdk-reference-operator`: a failed drain during deletion now retains the
+  finalizer and requeues instead of removing it unconditionally; only a
+  completed or timed-out drain releases it, so sessions are not cut.
+- `opc-api-nnrf`: `PlmnId` and S-NSSAI are generated with TS 29.571 object-form
+  serde (`{mcc,mnc}` / `{sst,sd}`) so the types interoperate with conformant
+  NRF peers.
 
 ## [0.2.0] — 2026-06-12
 
