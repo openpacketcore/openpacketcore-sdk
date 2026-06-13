@@ -126,6 +126,22 @@ input. Byte-exact round-trip verified for all listed grouped IEs.
 | Created PDR | 8 | §7.5.2.6 | Typed members with depth limit. |
 | Usage Report (Session Report Request) | 80 | §7.5.8.3 | Typed members with depth limit. |
 
+## Robustness & Fuzzing
+
+Decode paths carry no `unsafe`, use checked length arithmetic, and never
+preallocate from a wire-declared length. Three layers guard them:
+
+- **Per-PR regression guard** — `tests/corpus_replay.rs` replays every committed
+  corpus entry, byte-truncations of each, and hostile constant inputs through the
+  decode entry points (`Message::decode`, `OwnedMessage::decode_owned`, and
+  depth-limited typed-IE decode) at the Structural and Strict validation levels,
+  under `catch_unwind`. Runs in ordinary `cargo test`; no nightly toolchain or
+  libFuzzer required.
+- **Scheduled fuzzing** — `fuzz/fuzz_targets/decode_message.rs` with a seeded
+  corpus, registered in `.github/workflows/fuzz.yml` and run weekly.
+- **Verification** — a deep `cargo-fuzz` pass over the decoder completed ~41M
+  executions with no crash, leak, or OOM.
+
 ## Out of Scope (v1+)
 
 - Remaining simple IEs not listed above (e.g., Packet Rate, DL Flow Level
