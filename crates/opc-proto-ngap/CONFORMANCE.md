@@ -42,10 +42,19 @@ procedure remain raw until fixtures exist for them.
 - Successful/unsuccessful outcome wrappers: hand-authored from
   TS 38.413 §9.2 and X.691 aligned-PER rules with octet-level comments.
 
-## Fuzzing
+## Robustness & Fuzzing
 
-`fuzz/fuzz_targets/decode_ngap.rs` with a seeded corpus, registered in
-`.github/workflows/fuzz.yml` and exercised by the scheduled fuzz workflow.
+The decode path carries no `unsafe`, uses checked length arithmetic, and never
+preallocates from a wire-declared length. Three layers guard it:
+
+- **Per-PR regression guard** — `tests/corpus_replay.rs` replays every committed
+  corpus entry, byte-truncations of each, and hostile constant inputs through
+  `Pdu::decode_owned` under `catch_unwind`. Runs in ordinary `cargo test`; no
+  nightly toolchain or libFuzzer required.
+- **Scheduled fuzzing** — `fuzz/fuzz_targets/decode_ngap.rs` with a seeded
+  corpus, registered in `.github/workflows/fuzz.yml` and run weekly.
+- **Verification** — a deep `cargo-fuzz` pass over the decoder completed ~26M
+  executions with no crash, leak, or OOM.
 
 ## Out of scope (v0)
 

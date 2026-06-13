@@ -98,3 +98,18 @@ Decodes IE *content* (caller strips IEI/length framing):
 - The Registration Result `SMS over NAS` flag (bit 4 of the result value)
   is not surfaced separately; the raw value is preserved for byte-exact
   re-encode.
+
+## Robustness & Fuzzing
+
+Decode paths carry no `unsafe`, use checked length arithmetic, and never
+preallocate from a wire-declared length. Three layers guard them:
+
+- **Per-PR regression guard** — `tests/corpus_replay.rs` replays every committed
+  corpus entry, byte-truncations of each, and hostile constant inputs through the
+  decode entry points (`NasMessage::decode`/`decode_owned`, the v1 message bodies,
+  `MobileIdentity::decode`, and the BCD digit helpers), under `catch_unwind`. Runs
+  in ordinary `cargo test`; no nightly toolchain or libFuzzer required.
+- **Scheduled fuzzing** — `fuzz/fuzz_targets/decode_nas.rs` with a seeded corpus,
+  registered in `.github/workflows/fuzz.yml` and run weekly.
+- **Verification** — a deep `cargo-fuzz` pass over the decoder completed ~32M
+  executions with no crash, leak, or OOM.

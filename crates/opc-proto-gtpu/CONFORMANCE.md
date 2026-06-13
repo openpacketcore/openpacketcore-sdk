@@ -38,3 +38,23 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
 
 ### 2. Control Plane GTP-C
 - **Description**: Crate is dedicated to the User Plane (GTP-U). GTP-C messages (TS 29.274) are out of scope.
+
+---
+
+## Robustness & Fuzzing
+
+Decode paths carry no `unsafe`, use checked length arithmetic, and never
+preallocate from a wire-declared length. Three layers guard them:
+
+- **Per-PR regression guard** — `tests/corpus_replay.rs` replays every committed
+  corpus entry, byte-truncations of each, and hostile constant inputs through
+  `GtpuMessage::decode` at every validation level (HeaderOnly, Structural, Strict,
+  ProcedureAware) and asserts the raw-preserving and canonical round-trip
+  invariants, under `catch_unwind`. Runs in ordinary `cargo test`; no nightly
+  toolchain or libFuzzer required.
+- **Scheduled fuzzing** — `fuzz/fuzz_targets/decode.rs` and
+  `fuzz/fuzz_targets/roundtrip.rs` with a seeded corpus, registered in
+  `.github/workflows/fuzz.yml` and run weekly.
+- **Verification** — a deep `cargo-fuzz` pass over the decode and round-trip
+  targets completed ~730M executions with no crash, leak, OOM, or round-trip
+  violation.
