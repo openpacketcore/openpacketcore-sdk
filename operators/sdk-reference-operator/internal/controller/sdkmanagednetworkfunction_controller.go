@@ -28,6 +28,10 @@ import (
 
 const drainFinalizer = "lifecycle.openpacketcore.io/drain"
 
+// drainRetryInterval is how long to wait before retrying a drain that has not
+// yet reached a terminal state during deletion.
+const drainRetryInterval = 10 * time.Second
+
 // SdkManagedNetworkFunctionReconciler reconciles SdkManagedNetworkFunction resources.
 type SdkManagedNetworkFunctionReconciler struct {
 	Client   client.Client
@@ -81,7 +85,17 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 	if !crd.DeletionTimestamp.IsZero() {
 		if r.Drainer != nil && containsString(crd.Finalizers, drainFinalizer) {
 			if err := r.runDrain(ctx, crd, cm); err != nil {
-				logger.Error(err, "Drain during deletion failed")
+				// Drain has not reached a terminal state (it failed to start,
+				// failed, or is still in progress). Keep the finalizer and
+				// requeue so active sessions are not cut; only a completed or
+				// timed-out drain removes the finalizer. Persist the
+				// DrainReady=False condition for observability.
+				logger.Error(err, "Drain during deletion not complete; requeuing without removing finalizer")
+				r.syncConditions(crd, cm)
+				if updateErr := r.Client.Status().Update(ctx, crd); updateErr != nil {
+					logger.Error(updateErr, "failed to persist drain condition")
+				}
+				return ctrl.Result{RequeueAfter: drainRetryInterval}, nil
 			}
 		}
 		crd.Finalizers = removeString(crd.Finalizers, drainFinalizer)
@@ -434,12 +448,22 @@ func (r *SdkManagedNetworkFunctionReconciler) runDrain(ctx context.Context, crd 
 		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainStatusFailed", err.Error(), crd.Generation)
 		return err
 	}
-	if status.Phase != drain.Complete {
+	switch status.Phase {
+	case drain.Complete:
+		_ = cm.Set(conditions.DrainReady, metav1.ConditionTrue, "DrainComplete", "Drain completed successfully", crd.Generation)
+		return nil
+	case drain.TimedOut:
+		// The drainer's own bounded timeout elapsed. Treat this as terminal so
+		// teardown is not blocked forever: deletion proceeds (bounded
+		// force-delete) rather than retrying indefinitely.
+		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainTimedOut", "Drain timed out; proceeding with deletion", crd.Generation)
+		return nil
+	default:
+		// Failed, in progress, or any other non-terminal phase: signal the
+		// caller to requeue rather than remove the finalizer.
 		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainIncomplete", fmt.Sprintf("drain phase: %s", status.Phase), crd.Generation)
 		return fmt.Errorf("drain incomplete: %s", status.Phase)
 	}
-	_ = cm.Set(conditions.DrainReady, metav1.ConditionTrue, "DrainComplete", "Drain completed successfully", crd.Generation)
-	return nil
 }
 
 func (r *SdkManagedNetworkFunctionReconciler) orchestrateDrain(ctx context.Context, crd *v1beta1.SdkManagedNetworkFunction, cm *conditions.ConditionManager) (ctrl.Result, error) {

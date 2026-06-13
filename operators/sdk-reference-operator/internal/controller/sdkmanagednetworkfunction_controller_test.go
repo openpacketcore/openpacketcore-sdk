@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -616,6 +617,86 @@ func TestReconcileDrainTimeoutReleasesFinalizer(t *testing.T) {
 	if containsString(finalizersAfterUpdate, drainFinalizer) {
 		t.Errorf("Expected finalizer %s to be removed even on drain timeout", drainFinalizer)
 	}
+}
+
+// reconcileDrainFailureKeepsFinalizer drives a deletion whose drain does not
+// reach a terminal state and asserts the finalizer is retained and the
+// reconcile requeues — the object must not be deleted while sessions drain.
+func reconcileDrainFailureKeepsFinalizer(t *testing.T, name string, drainer *drain.FakeOrchestrator) {
+	t.Helper()
+	testutil.BuildOperatorLifecycleCLI(t)
+
+	bridge, err := sdkbridge.NewBridge()
+	if err != nil {
+		t.Fatalf("Failed to create bridge: %v", err)
+	}
+
+	now := metav1.NewTime(time.Now())
+	crd := &apiv1beta1.SdkManagedNetworkFunction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         "default",
+			Generation:        1,
+			Finalizers:        []string{drainFinalizer},
+			DeletionTimestamp: &now,
+		},
+		Spec: apiv1beta1.SdkManagedNetworkFunctionSpec{
+			RuntimeMode: "dev",
+			Version:     "1.0.0",
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	_ = apiv1beta1.AddToScheme(scheme)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(crd).
+		WithStatusSubresource(&apiv1beta1.SdkManagedNetworkFunction{}).
+		Build()
+
+	reconciler := &SdkManagedNetworkFunctionReconciler{
+		Client:  fakeClient,
+		Scheme:  scheme,
+		Bridge:  bridge,
+		Drainer: drainer,
+	}
+
+	res, err := reconciler.Reconcile(context.TODO(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: name, Namespace: "default"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Errorf("expected a requeue while drain is incomplete, got %+v", res)
+	}
+
+	var got apiv1beta1.SdkManagedNetworkFunction
+	if err := fakeClient.Get(context.TODO(), types.NamespacedName{Name: name, Namespace: "default"}, &got); err != nil {
+		t.Fatalf("Failed to get object: %v", err)
+	}
+	if !containsString(got.Finalizers, drainFinalizer) {
+		t.Errorf("finalizer %s must be retained while drain is incomplete", drainFinalizer)
+	}
+}
+
+func TestReconcileDrainStartErrorKeepsFinalizer(t *testing.T) {
+	reconcileDrainFailureKeepsFinalizer(t, "drain-start-error-cnf", &drain.FakeOrchestrator{
+		StartFunc: func(ctx context.Context, target string) error {
+			return errors.New("drain agent unreachable")
+		},
+	})
+}
+
+func TestReconcileDrainFailedPhaseKeepsFinalizer(t *testing.T) {
+	reconcileDrainFailureKeepsFinalizer(t, "drain-failed-cnf", &drain.FakeOrchestrator{
+		StartFunc: func(ctx context.Context, target string) error {
+			return nil
+		},
+		StatusFunc: func(ctx context.Context, target string) (drain.DrainStatus, error) {
+			return drain.DrainStatus{Phase: drain.Failed}, nil
+		},
+	})
 }
 
 func TestReconcileWorkloadSynthesisOptInCreatesDeployment(t *testing.T) {
