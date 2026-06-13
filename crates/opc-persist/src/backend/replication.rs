@@ -314,7 +314,17 @@ impl SqliteBackend {
                         )
                         .map_err(|e| PersistError::sqlite(e.to_string()))?;
                     if rows == 0 {
-                        return Err(PersistError::rollback_not_found());
+                        // The target tx may have been compacted away or never
+                        // applied on this node (e.g. restored from an older
+                        // snapshot). A committed entry must apply
+                        // deterministically and must never wedge the state
+                        // machine, so a missing target is a no-op here, not an
+                        // error. (The user-facing confirm path still validates
+                        // and rejects unknown tx_ids before proposing.)
+                        tracing::warn!(
+                            log_index = idx,
+                            "consensus apply: MarkConfirmed for unknown tx_id; skipping"
+                        );
                     }
                 }
                 ConsensusOp::CreateRollbackPoint { tx_id, label } => {
@@ -326,10 +336,14 @@ impl SqliteBackend {
                         )
                         .map_err(|e| PersistError::sqlite(e.to_string()))?;
                     if rows == 0 {
-                        return Err(PersistError::rollback_not_found());
-                    }
-
-                    if let Some(lbl) = &label {
+                        // Missing target: deterministic no-op (see MarkConfirmed
+                        // above). Skip the label insert too so it never points
+                        // at a non-existent tx_id.
+                        tracing::warn!(
+                            log_index = idx,
+                            "consensus apply: CreateRollbackPoint for unknown tx_id; skipping"
+                        );
+                    } else if let Some(lbl) = &label {
                         tx.execute(
                             "INSERT OR REPLACE INTO rollback_labels (label, tx_id, created_at) VALUES (?1, ?2, ?3)",
                             params![lbl, &tx_id_bytes, Timestamp::now_utc().to_string()],

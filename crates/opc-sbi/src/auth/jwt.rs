@@ -326,6 +326,45 @@ impl SbiAuth for SbiJwtValidator {
                 reason: "invalid nf_instance_id".to_string(),
             })?;
 
+        // 7. Bind the token's workload identity to the transport (mTLS) peer.
+        //    A JWT-SVID is a bearer credential: without this check any NF that
+        //    obtains a valid token minted for workload A could present it over
+        //    its own mTLS channel and be authorized as A (the confused-deputy /
+        //    token-replay case in RFC 007 §3.1). `request.peer` is the only
+        //    identity we know came from this connection, so the token's claimed
+        //    identity must match it.
+        match request.peer.nf_instance_id.as_ref() {
+            Some(peer_instance) => {
+                let bound = request.peer.tenant.as_str() == tenant.as_str()
+                    && request.peer.nf_type.as_ref().map(|t| t.as_str()) == Some(nf_type.as_str())
+                    && peer_instance.as_str() == nf_instance_id.as_str();
+                if !bound {
+                    opc_redaction::metrics::METRICS
+                        .sbi_oauth_validation_total
+                        .lock()
+                        .unwrap()
+                        .entry(("deny".to_string(), "token_binding_mismatch".to_string()))
+                        .and_modify(|c| *c += 1)
+                        .or_insert(1);
+                    return Err(SbiAuthError::TokenBindingMismatch);
+                }
+            }
+            None => {
+                // No transport peer identity. In production the binding cannot
+                // be verified, so fail closed; in dev/test (no mTLS) allow it.
+                if self.production_mode {
+                    opc_redaction::metrics::METRICS
+                        .sbi_oauth_validation_total
+                        .lock()
+                        .unwrap()
+                        .entry(("deny".to_string(), "missing_peer_binding".to_string()))
+                        .and_modify(|c| *c += 1)
+                        .or_insert(1);
+                    return Err(SbiAuthError::MissingPeerBinding);
+                }
+            }
+        }
+
         let peer = SbiPeer {
             spiffe: Some(spiffe),
             nf_instance_id: Some(nf_instance_id),
@@ -511,20 +550,31 @@ mod tests {
     const SUB: &str =
         "spiffe://example.com/tenant/default/ns/core/sa/default/nf/amf/instance/amf-01";
 
+    // The mTLS peer matching the SUB token identity (tenant=default,
+    // nf_type=amf, instance=amf-01), so positive tests pass the token-binding
+    // check. Use `auth_request_with_peer` to exercise mismatch/missing cases.
+    fn matching_peer() -> SbiPeer {
+        SbiPeer {
+            spiffe: SpiffeId::new(SUB).ok(),
+            nf_instance_id: NfInstanceId::new("amf-01").ok(),
+            nf_type: NfType::new("amf").ok(),
+            tenant: TenantId::new("default").unwrap(),
+            plmn: None,
+            snssai: None,
+        }
+    }
+
     fn auth_request(token: &str) -> SbiAuthRequest {
+        auth_request_with_peer(token, matching_peer())
+    }
+
+    fn auth_request_with_peer(token: &str, peer: SbiPeer) -> SbiAuthRequest {
         SbiAuthRequest {
             method: http::Method::GET,
             path: "/nnrf-disc/v1/nf-instances".to_string(),
             headers: crate::headers::SbiHeaders::default(),
             bearer_token: Some(BearerToken::new(token).unwrap()),
-            peer: SbiPeer {
-                spiffe: None,
-                nf_instance_id: None,
-                nf_type: None,
-                tenant: TenantId::new("default").unwrap(),
-                plmn: None,
-                snssai: None,
-            },
+            peer,
         }
     }
 
@@ -537,6 +587,52 @@ mod tests {
             true,
             false,
         )
+    }
+
+    #[tokio::test]
+    async fn token_presented_by_wrong_peer_is_denied() {
+        // A valid token minted for amf-01, replayed over a different NF's mTLS
+        // channel (amf-99). The token signature/claims are all valid; only the
+        // transport binding differs. Must be denied (confused-deputy guard).
+        let validator = production_validator();
+        let token = TokenFixtures::valid(SUB, AUD, ISS, "nnrf-disc");
+        let wrong_peer = SbiPeer {
+            spiffe: SpiffeId::new(
+                "spiffe://example.com/tenant/default/ns/core/sa/default/nf/amf/instance/amf-99",
+            )
+            .ok(),
+            nf_instance_id: NfInstanceId::new("amf-99").ok(),
+            nf_type: NfType::new("amf").ok(),
+            tenant: TenantId::new("default").unwrap(),
+            plmn: None,
+            snssai: None,
+        };
+        let err = validator
+            .authorize(&auth_request_with_peer(&token, wrong_peer))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SbiAuthError::TokenBindingMismatch));
+    }
+
+    #[tokio::test]
+    async fn missing_peer_binding_in_production_is_denied() {
+        // No transport peer identity in production: the token cannot be bound
+        // to the connection, so it must fail closed.
+        let validator = production_validator();
+        let token = TokenFixtures::valid(SUB, AUD, ISS, "nnrf-disc");
+        let no_peer = SbiPeer {
+            spiffe: None,
+            nf_instance_id: None,
+            nf_type: None,
+            tenant: TenantId::new("default").unwrap(),
+            plmn: None,
+            snssai: None,
+        };
+        let err = validator
+            .authorize(&auth_request_with_peer(&token, no_peer))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SbiAuthError::MissingPeerBinding));
     }
 
     #[tokio::test]

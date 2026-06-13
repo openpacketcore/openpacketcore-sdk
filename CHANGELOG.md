@@ -26,6 +26,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`publish = true`); moved from the held-experimental tier to the publishable
   tier in `CONTRIBUTING.md`.
 
+### Security
+- `opc-sbi`: bind the validated JWT-SVID to the mTLS peer identity. The
+  validator now rejects a token whose subject does not match the transport
+  peer (`TokenBindingMismatch`) and, in production, a request that carries no
+  peer identity (`MissingPeerBinding`). Previously the authorized identity was
+  derived solely from the token's `sub`, so a valid token obtained by another
+  workload could be replayed over its own mTLS channel and accepted as the
+  token's subject (confused-deputy / token replay).
+
+### Fixed
+- `opc-persist`: a committed `MarkConfirmed`/`CreateRollbackPoint` whose target
+  `tx_id` is absent on a node (compacted away, or restored from an older
+  snapshot) no longer aborts the consensus apply transaction. Applying a
+  committed entry is now a deterministic no-op in that case instead of freezing
+  `applied_index` and wedging the node's state machine.
+
 ## [0.2.0] — 2026-06-12
 
 ### Added

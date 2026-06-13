@@ -5,7 +5,7 @@ use opc_sbi::{
     server::builder::SbiServerBuilder,
     testkit::{generate_test_token, MockConsumer, MockJwksResolver, MockProducer, TokenFixtures},
 };
-use opc_types::TenantId;
+use opc_types::{NfInstanceId, NfType, SpiffeId, TenantId};
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -164,10 +164,13 @@ async fn test_jwt_svid_validation_success_and_failures() {
         path: "/nnrf-disc/v1/nf-instances".to_string(),
         headers: opc_sbi::headers::SbiHeaders::default(),
         bearer_token: Some(bearer),
+        // mTLS peer identity matching the token subject, so the token-binding
+        // check passes (the failure cases below reuse this peer but are denied
+        // earlier, at signature/audience/nbf/layout validation).
         peer: opc_sbi::auth::SbiPeer {
-            spiffe: None,
-            nf_instance_id: None,
-            nf_type: None,
+            spiffe: SpiffeId::new(sub).ok(),
+            nf_instance_id: NfInstanceId::new("amf-01").ok(),
+            nf_type: NfType::new("amf").ok(),
             tenant: TenantId::new("default").unwrap(),
             plmn: None,
             snssai: None,

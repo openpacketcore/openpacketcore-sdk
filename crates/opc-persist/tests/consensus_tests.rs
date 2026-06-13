@@ -786,6 +786,42 @@ async fn test_consensus_epoch_monotonicity_enforcement() {
 }
 
 #[tokio::test]
+async fn test_consensus_apply_tolerates_missing_tx_id() {
+    // A committed MarkConfirmed / CreateRollbackPoint whose target tx_id is not
+    // present on this node (compacted away, or restored from an older snapshot)
+    // must apply as a deterministic no-op. Returning an error here would abort
+    // the apply transaction and freeze applied_index, wedging the node forever.
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("missing_tx.db");
+    let backend = SqliteBackend::open_with_audit_key(&db_path, true, 0, test_audit_key())
+        .await
+        .unwrap();
+
+    let entries = vec![
+        opc_persist::LogEntry {
+            index: 1,
+            term: 1,
+            op: opc_persist::ConsensusOp::MarkConfirmed { tx_id: TxId::new() },
+        },
+        opc_persist::LogEntry {
+            index: 2,
+            term: 1,
+            op: opc_persist::ConsensusOp::CreateRollbackPoint {
+                tx_id: TxId::new(),
+                label: Some("orphan".to_string()),
+            },
+        },
+    ];
+    backend.consensus_append_logs(0, entries).await.unwrap();
+
+    // Apply must succeed (previously returned rollback_not_found and wedged).
+    backend.consensus_apply_entries(2).await.unwrap();
+
+    // applied_index advanced past both entries: the state machine made progress.
+    assert_eq!(backend.consensus_get_applied_index().await.unwrap(), 2);
+}
+
+#[tokio::test]
 async fn test_consensus_leadership_transfer() {
     let temp_dir = TempDir::new().unwrap();
     let group = setup_consensus_group(&temp_dir).await;
