@@ -22,6 +22,18 @@ fn protocol_versions(compat_mode: bool) -> &'static [&'static rustls::SupportedP
     }
 }
 
+/// Authorization policy applied to an authenticated peer's SPIFFE workload
+/// identity, after the certificate chain has been verified against the trust
+/// bundles.
+///
+/// Each field is an optional allowlist; `None` means "no constraint on this
+/// dimension". **A policy with every field `None` — including the derived
+/// [`Default`] — authorizes any peer whose certificate chains to a trusted
+/// bundle: authentication without authorization.** Callers that need
+/// authorization must populate at least one allowlist; use
+/// [`PeerPolicy::is_unconstrained`] to detect the allow-all case and fail
+/// closed at configuration time (e.g. in production) rather than silently
+/// admitting every trusted peer.
 #[derive(Debug, Clone, Default)]
 pub struct PeerPolicy {
     pub allowed_trust_domains: Option<HashSet<TrustDomain>>,
@@ -31,6 +43,16 @@ pub struct PeerPolicy {
 }
 
 impl PeerPolicy {
+    /// Returns `true` when the policy imposes no constraints and will therefore
+    /// authorize any authenticated peer. Configuration layers should reject an
+    /// unconstrained policy where authorization is required (e.g. production).
+    pub fn is_unconstrained(&self) -> bool {
+        self.allowed_trust_domains.is_none()
+            && self.allowed_tenants.is_none()
+            && self.allowed_nf_kinds.is_none()
+            && self.allowed_instances.is_none()
+    }
+
     pub fn check(&self, id: &WorkloadIdentity) -> Result<(), String> {
         if let Some(ref tds) = self.allowed_trust_domains {
             if !tds.contains(&id.trust_domain) {
@@ -392,5 +414,84 @@ impl TlsConfigBuilder {
             .with_cert_resolver(resolver);
 
         Ok(server_config)
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use opc_identity::{Namespace, ServiceAccount};
+    use opc_types::{SpiffeId, Timestamp};
+
+    fn workload(td: &str, tenant: &str, nf: &str, inst: &str) -> WorkloadIdentity {
+        WorkloadIdentity {
+            trust_domain: TrustDomain::new(td).unwrap(),
+            tenant: TenantId::new(tenant).unwrap(),
+            namespace: Namespace::new("core").unwrap(),
+            service_account: ServiceAccount::new("default").unwrap(),
+            nf_kind: NfKind::new(nf).unwrap(),
+            instance: InstanceId::new(inst).unwrap(),
+            spiffe_id: SpiffeId::new(format!(
+                "spiffe://{td}/tenant/{tenant}/ns/core/sa/default/nf/{nf}/instance/{inst}"
+            ))
+            .unwrap(),
+            expires_at: Timestamp::now_utc(),
+        }
+    }
+
+    fn td_set(v: &str) -> HashSet<TrustDomain> {
+        HashSet::from([TrustDomain::new(v).unwrap()])
+    }
+
+    #[test]
+    fn unconstrained_policy_authorizes_any_peer() {
+        // Pins (and documents) the allow-all behavior of an unconfigured policy.
+        let policy = PeerPolicy::default();
+        assert!(policy.is_unconstrained());
+        assert!(policy
+            .check(&workload("example.test", "tenant-a", "amf", "amf-01"))
+            .is_ok());
+    }
+
+    #[test]
+    fn each_dimension_rejects_a_non_allowlisted_peer() {
+        let id = workload("example.test", "tenant-a", "amf", "amf-01");
+
+        let by_td = PeerPolicy {
+            allowed_trust_domains: Some(td_set("other.test")),
+            ..Default::default()
+        };
+        assert!(!by_td.is_unconstrained());
+        assert!(by_td.check(&id).is_err());
+
+        let by_tenant = PeerPolicy {
+            allowed_tenants: Some(HashSet::from([TenantId::new("tenant-b").unwrap()])),
+            ..Default::default()
+        };
+        assert!(by_tenant.check(&id).is_err());
+
+        let by_nf = PeerPolicy {
+            allowed_nf_kinds: Some(HashSet::from([NfKind::new("smf").unwrap()])),
+            ..Default::default()
+        };
+        assert!(by_nf.check(&id).is_err());
+
+        let by_instance = PeerPolicy {
+            allowed_instances: Some(HashSet::from([InstanceId::new("amf-99").unwrap()])),
+            ..Default::default()
+        };
+        assert!(by_instance.check(&id).is_err());
+    }
+
+    #[test]
+    fn matching_allowlists_authorize_the_peer() {
+        let id = workload("example.test", "tenant-a", "amf", "amf-01");
+        let policy = PeerPolicy {
+            allowed_trust_domains: Some(td_set("example.test")),
+            allowed_tenants: Some(HashSet::from([TenantId::new("tenant-a").unwrap()])),
+            allowed_nf_kinds: Some(HashSet::from([NfKind::new("amf").unwrap()])),
+            allowed_instances: Some(HashSet::from([InstanceId::new("amf-01").unwrap()])),
+        };
+        assert!(policy.check(&id).is_ok());
     }
 }

@@ -1668,6 +1668,42 @@ fn test_bpf_governance_capability_escalation() {
 }
 
 #[test]
+fn test_bpf_governance_structural_checks_apply_in_lab() {
+    // A lab profile may run unsigned artifacts, but the structural checks
+    // (capabilities, program type, attach point) must still fire — they guard
+    // against capability escalation and mis-attachment regardless of
+    // environment. Only the strict provenance checks are Production-gated.
+    let mut profile = production_af_xdp_profile();
+    profile.environment = Environment::Lab;
+    profile.af_xdp.as_mut().unwrap().bpf_artifacts = vec![BpfArtifact {
+        name: "lab-prog".to_string(),
+        digest: String::new(),        // unsigned: permitted in lab
+        signature_ref: String::new(), // unsigned: permitted in lab
+        signer_identity: String::new(),
+        program_type: "xdp".to_string(),
+        expected_attach_point: "ens5f0".to_string(),
+        allowed_capabilities: BTreeSet::from([LinuxCapability::CapSysAdmin]),
+        evidence_id: None,
+    }];
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+    // Capability escalation is rejected even in lab.
+    assert!(report
+        .errors
+        .iter()
+        .any(|e| matches!(e, ValidationError::BpfCapabilityEscalation { .. })));
+    // Provenance (missing digest / unsigned) is NOT enforced in lab.
+    assert!(!report.errors.iter().any(|e| matches!(
+        e,
+        ValidationError::BpfMissingDigest { .. } | ValidationError::BpfUnsignedArtifact { .. }
+    )));
+}
+
+#[test]
 fn test_pod_security_privileged_without_evidence() {
     let mut profile = production_af_xdp_profile();
     profile.pod_security.privileged = true;

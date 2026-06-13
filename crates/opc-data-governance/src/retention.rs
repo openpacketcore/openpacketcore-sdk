@@ -63,11 +63,16 @@ impl RetentionPolicy {
             }
         }
 
-        // legal hold prevents purge/export deletion decisions;
+        // Legal hold blocks every irreversible disposal action. Anonymization
+        // is destructive — it strips the identifiers a hold exists to preserve
+        // — so it must be blocked alongside purge/immediate-disposal. Only
+        // Archive (non-destructive) is permitted under a hold.
         if self.legal_hold
             && matches!(
                 self.disposal_action,
-                DisposalAction::Purge | DisposalAction::ImmediateDisposal
+                DisposalAction::Purge
+                    | DisposalAction::ImmediateDisposal
+                    | DisposalAction::Anonymize
             )
         {
             return Err(PolicyError::LegalHoldBlocked);
@@ -162,6 +167,29 @@ mod tests {
         };
         assert_eq!(p.validate(true), Err(PolicyError::LegalHoldBlocked));
         assert!(!p.can_delete());
+    }
+
+    #[test]
+    fn test_legal_hold_blocks_anonymize_but_allows_archive() {
+        let base = RetentionPolicy {
+            data_class: DataClass::SubscriberId,
+            retention_duration: Some(Duration::from_secs(3600)),
+            legal_hold: true,
+            disposal_action: DisposalAction::Anonymize,
+            policy_source_id: Some("policy-123".to_string()),
+            tenant_id: Some("tenant-a".to_string()),
+        };
+
+        // Anonymization is destructive (strips the identifiers a hold preserves)
+        // and must be blocked under a legal hold.
+        assert_eq!(base.validate(true), Err(PolicyError::LegalHoldBlocked));
+
+        // Archive is non-destructive and remains permitted under a hold.
+        let archived = RetentionPolicy {
+            disposal_action: DisposalAction::Archive,
+            ..base
+        };
+        assert_eq!(archived.validate(true), Ok(()));
     }
 
     #[test]

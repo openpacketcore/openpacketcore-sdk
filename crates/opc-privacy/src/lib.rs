@@ -79,16 +79,25 @@ impl MinimizationPolicy {
     }
 
     /// Validates an export of a list of cohorts against k-anonymity requirements.
+    ///
+    /// When `enforce_k_anonymity` is set, every cohort must meet
+    /// `min_cohort_size`. Even when it is not set, an absolute floor still
+    /// applies: a singleton cohort (count `< 2`) is directly re-identifying and
+    /// is never released. Disabling enforcement relaxes the configured `k`, not
+    /// the singleton floor.
     pub fn validate_cohorts(&self, cohorts: &[CohortRecord]) -> Result<(), MinimizationError> {
         self.validate()?;
-        if self.enforce_k_anonymity {
-            for cohort in cohorts {
-                if cohort.count < self.min_cohort_size {
-                    return Err(MinimizationError::CohortTooSmall(
-                        cohort.count,
-                        self.min_cohort_size,
-                    ));
-                }
+        /// No cohort smaller than this may be released, regardless of policy
+        /// flags — a cohort of one re-identifies its subject.
+        const ABSOLUTE_MIN_COHORT: usize = 2;
+        let floor = if self.enforce_k_anonymity {
+            self.min_cohort_size
+        } else {
+            ABSOLUTE_MIN_COHORT
+        };
+        for cohort in cohorts {
+            if cohort.count < floor {
+                return Err(MinimizationError::CohortTooSmall(cohort.count, floor));
             }
         }
         Ok(())
@@ -172,6 +181,35 @@ mod tests {
             policy.validate_cohorts(&bad_cohorts),
             Err(MinimizationError::CohortTooSmall(3, 5))
         );
+    }
+
+    #[test]
+    fn test_singleton_cohort_rejected_even_without_k_anonymity() {
+        // Disabling k-anonymity relaxes the configured `k`, not the absolute
+        // singleton floor: a cohort of one is directly re-identifying.
+        let policy = MinimizationPolicy {
+            policy_id: "analytics-v1".to_string(),
+            min_cohort_size: 5,
+            enforce_k_anonymity: false,
+            allowed_classes: vec![DataClass::AnalyticsSensitive, DataClass::Public],
+        };
+
+        // A singleton cohort is rejected against the floor of 2.
+        let singleton = vec![CohortRecord {
+            keys: vec!["imsi-bucket".to_string()],
+            count: 1,
+        }];
+        assert_eq!(
+            policy.validate_cohorts(&singleton),
+            Err(MinimizationError::CohortTooSmall(1, 2))
+        );
+
+        // A cohort of two or more is allowed once k-anonymity is not enforced.
+        let pair = vec![CohortRecord {
+            keys: vec!["age:20-30".to_string()],
+            count: 2,
+        }];
+        assert!(policy.validate_cohorts(&pair).is_ok());
     }
 
     #[test]
