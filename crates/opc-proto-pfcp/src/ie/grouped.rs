@@ -208,6 +208,118 @@ impl GroupedIe for UpdateQer {
 }
 
 // ---------------------------------------------------------------------------
+// Update PDR (type 9)
+// ---------------------------------------------------------------------------
+
+/// Update PDR grouped IE (type 9).
+///
+/// TS 29.244 §7.5.4.2: contains PDR ID and the subset of detection/action
+/// parameters that need to be modified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatePdr {
+    /// Member IEs.
+    pub members: Vec<TypedIe>,
+}
+
+impl GroupedIe for UpdatePdr {
+    fn decode_members(input: &[u8], ctx: DecodeContext, depth: usize) -> Result<Self, DecodeError> {
+        let members = decode_typed_ie_sequence(input, ctx, depth)?;
+        Ok(Self { members })
+    }
+
+    fn encode_members(&self, dst: &mut BytesMut, ctx: EncodeContext) -> Result<(), EncodeError> {
+        for member in &self.members {
+            member.encode(dst, ctx)?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Update FAR (type 10)
+// ---------------------------------------------------------------------------
+
+/// Update FAR grouped IE (type 10).
+///
+/// TS 29.244 §7.5.4.3: contains FAR ID, Apply Action, and Update Forwarding
+/// Parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateFar {
+    /// Member IEs.
+    pub members: Vec<TypedIe>,
+}
+
+impl GroupedIe for UpdateFar {
+    fn decode_members(input: &[u8], ctx: DecodeContext, depth: usize) -> Result<Self, DecodeError> {
+        let members = decode_typed_ie_sequence(input, ctx, depth)?;
+        Ok(Self { members })
+    }
+
+    fn encode_members(&self, dst: &mut BytesMut, ctx: EncodeContext) -> Result<(), EncodeError> {
+        for member in &self.members {
+            member.encode(dst, ctx)?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Update Forwarding Parameters (type 11)
+// ---------------------------------------------------------------------------
+
+/// Update Forwarding Parameters grouped IE (type 11).
+///
+/// TS 29.244 §7.5.4.3-2: contains Destination Interface, Network Instance,
+/// Outer Header Creation, and other forwarding parameters to be modified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateForwardingParameters {
+    /// Member IEs.
+    pub members: Vec<TypedIe>,
+}
+
+impl GroupedIe for UpdateForwardingParameters {
+    fn decode_members(input: &[u8], ctx: DecodeContext, depth: usize) -> Result<Self, DecodeError> {
+        let members = decode_typed_ie_sequence(input, ctx, depth)?;
+        Ok(Self { members })
+    }
+
+    fn encode_members(&self, dst: &mut BytesMut, ctx: EncodeContext) -> Result<(), EncodeError> {
+        for member in &self.members {
+            member.encode(dst, ctx)?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Update URR (type 13)
+// ---------------------------------------------------------------------------
+
+/// Update URR grouped IE (type 13).
+///
+/// TS 29.244 §7.5.4.4: contains URR ID and the subset of measurement/reporting
+/// parameters that need to be modified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateUrr {
+    /// Member IEs.
+    pub members: Vec<TypedIe>,
+}
+
+impl GroupedIe for UpdateUrr {
+    fn decode_members(input: &[u8], ctx: DecodeContext, depth: usize) -> Result<Self, DecodeError> {
+        let members = decode_typed_ie_sequence(input, ctx, depth)?;
+        Ok(Self { members })
+    }
+
+    fn encode_members(&self, dst: &mut BytesMut, ctx: EncodeContext) -> Result<(), EncodeError> {
+        for member in &self.members {
+            member.encode(dst, ctx)?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Created PDR (type 8)
 // ---------------------------------------------------------------------------
 

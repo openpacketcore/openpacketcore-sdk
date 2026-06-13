@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "opc-proto-pfcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "opc-protocol",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "opc-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "thiserror",

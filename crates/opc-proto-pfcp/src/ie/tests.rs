@@ -1194,6 +1194,185 @@ fn test_update_qer_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
+// Session Modification lifecycle IEs (§7.5.4)
+// ---------------------------------------------------------------------------
+
+/// Update PDR grouped IE (type 9) containing a PDR ID per TS 29.244 §7.5.4.2.
+#[test]
+fn test_update_pdr_spec_bytes() {
+    let pdr_id: &[u8] = &[
+        0x00, 0x38, // IE type 56 (PDR ID)
+        0x00, 0x02, // length 2
+        0x00, 0x01, // PDR ID = 1
+    ];
+    let mut value = BytesMut::new();
+    value.put_slice(pdr_id);
+
+    let mut raw = BytesMut::new();
+    raw.put_u16(9); // Update PDR type (TS 29.244 Table 8.1.2-1)
+    raw.put_u16(value.len() as u16);
+    raw.put_slice(&value);
+
+    let bytes = raw.freeze();
+    let ie = decode_typed(&bytes);
+    match ie {
+        TypedIe::UpdatePdr(g) => {
+            assert_eq!(g.members.len(), 1);
+        }
+        other => panic!("expected UpdatePdr, got {other:?}"),
+    }
+    assert_typed_roundtrip(&bytes);
+}
+
+/// Update FAR grouped IE (type 10) containing FAR ID and Update Forwarding
+/// Parameters per TS 29.244 §7.5.4.3.
+#[test]
+fn test_update_far_spec_bytes() {
+    let far_id: &[u8] = &[
+        0x00, 0x6C, // IE type 108 (FAR ID)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x01, // FAR ID = 1
+    ];
+    let dst_intf: &[u8] = &[
+        0x00, 0x2A, // IE type 42 (Destination Interface)
+        0x00, 0x01, // length 1
+        0x01, // Core (1)
+    ];
+    let mut update_fp_value = BytesMut::new();
+    update_fp_value.put_slice(dst_intf);
+    let update_fp: &[u8] = &[
+        0x00,
+        0x0B, // IE type 11 (Update Forwarding Parameters)
+        0x00,
+        (update_fp_value.len() as u8), // length
+    ];
+    let mut update_fp_ie = BytesMut::new();
+    update_fp_ie.put_slice(update_fp);
+    update_fp_ie.put_slice(&update_fp_value);
+
+    let mut value = BytesMut::new();
+    value.put_slice(far_id);
+    value.put_slice(&update_fp_ie);
+
+    let mut raw = BytesMut::new();
+    raw.put_u16(10); // Update FAR type (TS 29.244 Table 8.1.2-1)
+    raw.put_u16(value.len() as u16);
+    raw.put_slice(&value);
+
+    let bytes = raw.freeze();
+    let ie = decode_typed(&bytes);
+    match ie {
+        TypedIe::UpdateFar(g) => {
+            assert_eq!(g.members.len(), 2);
+        }
+        other => panic!("expected UpdateFar, got {other:?}"),
+    }
+    assert_typed_roundtrip(&bytes);
+}
+
+/// Update URR grouped IE (type 13) containing a URR ID per TS 29.244 §7.5.4.4.
+#[test]
+fn test_update_urr_spec_bytes() {
+    let urr_id: &[u8] = &[
+        0x00, 0x51, // IE type 81 (URR ID)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x02, // URR ID = 2
+    ];
+    let mut value = BytesMut::new();
+    value.put_slice(urr_id);
+
+    let mut raw = BytesMut::new();
+    raw.put_u16(13); // Update URR type (TS 29.244 Table 8.1.2-1)
+    raw.put_u16(value.len() as u16);
+    raw.put_slice(&value);
+
+    let bytes = raw.freeze();
+    let ie = decode_typed(&bytes);
+    match ie {
+        TypedIe::UpdateUrr(g) => {
+            assert_eq!(g.members.len(), 1);
+        }
+        other => panic!("expected UpdateUrr, got {other:?}"),
+    }
+    assert_typed_roundtrip(&bytes);
+}
+
+/// Remove PDR IE (type 15) carrying PDR ID 0x1234 per TS 29.244 §7.5.4.6.
+#[test]
+fn test_remove_pdr_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x0F, // IE type 15 (Remove PDR)
+        0x00, 0x02, // length 2
+        0x12, 0x34, // PDR ID
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::RemovePdr(r) => assert_eq!(r.pdr_id.value, 0x1234),
+        other => panic!("expected RemovePdr, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Remove FAR IE (type 16) carrying FAR ID 0x12345678 per TS 29.244 §7.5.4.7.
+#[test]
+fn test_remove_far_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x10, // IE type 16 (Remove FAR)
+        0x00, 0x04, // length 4
+        0x12, 0x34, 0x56, 0x78, // FAR ID
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::RemoveFar(r) => assert_eq!(r.far_id.value, 0x1234_5678),
+        other => panic!("expected RemoveFar, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Remove URR IE (type 17) carrying URR ID 2 per TS 29.244 §7.5.4.8.
+#[test]
+fn test_remove_urr_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x11, // IE type 17 (Remove URR)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x02, // URR ID
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::RemoveUrr(r) => assert_eq!(r.urr_id.value, 2),
+        other => panic!("expected RemoveUrr, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Remove QER IE (type 18) carrying QER ID 1 per TS 29.244 §7.5.4.9.
+#[test]
+fn test_remove_qer_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x12, // IE type 18 (Remove QER)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x01, // QER ID
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::RemoveQer(r) => assert_eq!(r.qer_id.value, 1),
+        other => panic!("expected RemoveQer, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+#[test]
+fn test_remove_pdr_truncated_rejected() {
+    let bytes: &[u8] = &[
+        0x00, 0x0F, // IE type 15 (Remove PDR)
+        0x00, 0x02, // length 2
+        0x00, // only 1 octet
+    ];
+    let result = TypedIe::decode(bytes, DecodeContext::default(), 0);
+    assert!(result.is_err(), "truncated Remove PDR must be rejected");
+}
+
+// ---------------------------------------------------------------------------
 // Typed-to-raw helpers: encode_value and InformationElement::from_typed
 // ---------------------------------------------------------------------------
 
@@ -1206,7 +1385,9 @@ mod from_typed_tests {
         ApplyAction, Cause, CauseValue, CreateFar, CreatePdr, CreateQer, CreateUrr, CreatedPdr,
         DestinationInterface, FSeid, FTeid, FarId, Gate, GateStatus, Gbr, Mbr, NetworkInstance,
         NodeId, NodeIdType, OuterHeaderCreation, OuterHeaderRemoval, Pdi, PdrId, Precedence, QerId,
-        Qfi, RecoveryTimeStamp, SourceInterface, TypedIe, UeIpAddress, UpdateQer, UrrId,
+        Qfi, RecoveryTimeStamp, RemoveFar, RemovePdr, RemoveQer, RemoveUrr, SourceInterface,
+        TypedIe, UeIpAddress, UpdateFar, UpdateForwardingParameters, UpdatePdr, UpdateQer,
+        UpdateUrr, UrrId,
     };
     use crate::InformationElement;
 
@@ -1274,6 +1455,21 @@ mod from_typed_tests {
             }),
             TypedIe::UpdateQer(UpdateQer {
                 members: vec![TypedIe::QerId(QerId { value: 1 })],
+            }),
+            TypedIe::UpdatePdr(UpdatePdr {
+                members: vec![TypedIe::PdrId(PdrId { value: 1 })],
+            }),
+            TypedIe::UpdateFar(UpdateFar {
+                members: vec![TypedIe::FarId(FarId { value: 1 })],
+            }),
+            TypedIe::UpdateForwardingParameters(UpdateForwardingParameters {
+                members: vec![TypedIe::DestinationInterface(DestinationInterface {
+                    value: 0,
+                    spare: 0,
+                })],
+            }),
+            TypedIe::UpdateUrr(UpdateUrr {
+                members: vec![TypedIe::UrrId(UrrId { value: 1 })],
             }),
             TypedIe::CreatedPdr(CreatedPdr {
                 members: vec![
@@ -1376,6 +1572,18 @@ mod from_typed_tests {
             TypedIe::FarId(FarId { value: 1 }),
             TypedIe::QerId(QerId { value: 1 }),
             TypedIe::Qfi(Qfi { value: 1 }),
+            TypedIe::RemovePdr(RemovePdr {
+                pdr_id: PdrId { value: 1 },
+            }),
+            TypedIe::RemoveFar(RemoveFar {
+                far_id: FarId { value: 1 },
+            }),
+            TypedIe::RemoveUrr(RemoveUrr {
+                urr_id: UrrId { value: 1 },
+            }),
+            TypedIe::RemoveQer(RemoveQer {
+                qer_id: QerId { value: 1 },
+            }),
             TypedIe::Raw(InformationElement {
                 ie_type: 0x8001,
                 enterprise_id: 1,

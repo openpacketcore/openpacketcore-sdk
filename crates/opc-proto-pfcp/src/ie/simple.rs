@@ -580,6 +580,102 @@ impl SimpleIe for QerId {
 }
 
 // ---------------------------------------------------------------------------
+// Remove PDR (§7.5.4.6)
+// ---------------------------------------------------------------------------
+
+/// Remove PDR IE (type 15).
+///
+/// TS 29.244 §7.5.4.6: contains the PDR ID of the rule to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemovePdr {
+    /// PDR ID to remove.
+    pub pdr_id: PdrId,
+}
+
+impl SimpleIe for RemovePdr {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        let pdr_id = PdrId::decode_value(value, offset, spec_ref)?;
+        Ok(Self { pdr_id })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        self.pdr_id.encode_value(dst)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remove FAR (§7.5.4.7)
+// ---------------------------------------------------------------------------
+
+/// Remove FAR IE (type 16).
+///
+/// TS 29.244 §7.5.4.7: contains the FAR ID of the rule to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoveFar {
+    /// FAR ID to remove.
+    pub far_id: FarId,
+}
+
+impl SimpleIe for RemoveFar {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        let far_id = FarId::decode_value(value, offset, spec_ref)?;
+        Ok(Self { far_id })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        self.far_id.encode_value(dst)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remove URR (§7.5.4.8)
+// ---------------------------------------------------------------------------
+
+/// Remove URR IE (type 17).
+///
+/// TS 29.244 §7.5.4.8: contains the URR ID of the rule to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoveUrr {
+    /// URR ID to remove.
+    pub urr_id: UrrId,
+}
+
+impl SimpleIe for RemoveUrr {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        let urr_id = UrrId::decode_value(value, offset, spec_ref)?;
+        Ok(Self { urr_id })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        self.urr_id.encode_value(dst)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remove QER (§7.5.4.9)
+// ---------------------------------------------------------------------------
+
+/// Remove QER IE (type 18).
+///
+/// TS 29.244 §7.5.4.9: contains the QER ID of the rule to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoveQer {
+    /// QER ID to remove.
+    pub qer_id: QerId,
+}
+
+impl SimpleIe for RemoveQer {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        let qer_id = QerId::decode_value(value, offset, spec_ref)?;
+        Ok(Self { qer_id })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        self.qer_id.encode_value(dst)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // QoS Flow Identifier (§8.2.89)
 // ---------------------------------------------------------------------------
 

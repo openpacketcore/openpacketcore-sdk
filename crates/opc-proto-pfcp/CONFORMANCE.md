@@ -72,6 +72,10 @@ arithmetic, truncation/overflow rejection, and negative tests.
 | Outer Header Removal | 95 | §8.2.57 | 1 octet description. |
 | Recovery Time Stamp | 96 | §8.2.69 | 4 octets, NTP short-format seconds (RFC 5905, 1900 era), carried opaquely. |
 | QoS Flow Identifier (QFI) | 124 | §8.2.89 | 1 octet; 6-bit QFI value, spare high bits emitted as zero. |
+| Remove PDR | 15 | §7.5.4.6 | 2 octets; wraps PDR ID. |
+| Remove FAR | 16 | §7.5.4.7 | 4 octets; wraps FAR ID. |
+| Remove URR | 17 | §7.5.4.8 | 4 octets; wraps URR ID. |
+| Remove QER | 18 | §7.5.4.9 | 4 octets; wraps QER ID. |
 | Gate Status | 25 | §8.2.7 | 1 octet; UL gate (bits 2-1), DL gate (bits 4-3). Open=0, Closed=1. |
 | Maximum Bit Rate (MBR) | 26 | §8.2.8 | 10 octets; UL/DL 40-bit rates in kbps (binary). |
 | Guaranteed Bit Rate (GBR) | 27 | §8.2.9 | 10 octets; UL/DL 40-bit rates in kbps (binary). |
@@ -101,12 +105,19 @@ input. Byte-exact round-trip verified for all listed grouped IEs.
 | Forwarding Parameters | 4 | §7.5.2.2.1 | Typed members with depth limit. |
 | Create URR | 6 | §7.5.2.5 | Typed members with depth limit. |
 | Create QER | 7 | §7.5.2.4 | Typed members with depth limit. |
+| Update PDR | 9 | §7.5.4.2 | Typed members with depth limit. |
+| Update FAR | 10 | §7.5.4.3 | Typed members with depth limit. |
+| Update Forwarding Parameters | 11 | §7.5.4.3-2 | Typed members with depth limit. |
+| Update URR | 13 | §7.5.4.4 | Typed members with depth limit. |
 | Update QER | 14 | §7.5.4.5 | Typed members with depth limit. |
 | Created PDR | 8 | §7.5.2.6 | Typed members with depth limit. |
 
 ## Out of Scope (v1+)
 
 - Remaining simple IEs not listed above (e.g., Reporting Triggers,
-  Report Type, Measurement Method, Packet Rate, DL Flow Level Marking, etc.).
+  Report Type, Measurement Method, Volume Threshold, Time Threshold, Volume
+  Quota, Time Quota, Monitoring Time, Offending IE, Usage Report Trigger,
+  Volume Measurement, Duration Measurement, UR-SEQN, Packet Rate, DL Flow Level
+  Marking, etc.).
 - Full message-specific semantic validation (e.g., mandatory-IE presence).
 - PFD Management, Subscriber Management, and other non-SMF/UPF messages.

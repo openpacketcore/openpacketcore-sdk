@@ -267,8 +267,24 @@ pub enum IeType {
     CreateQer = 7,
     /// Created PDR
     CreatedPdr = 8,
+    /// Update PDR
+    UpdatePdr = 9,
+    /// Update FAR
+    UpdateFar = 10,
+    /// Update Forwarding Parameters
+    UpdateForwardingParameters = 11,
+    /// Update URR
+    UpdateUrr = 13,
     /// Update QER
     UpdateQer = 14,
+    /// Remove PDR
+    RemovePdr = 15,
+    /// Remove FAR
+    RemoveFar = 16,
+    /// Remove URR
+    RemoveUrr = 17,
+    /// Remove QER
+    RemoveQer = 18,
     /// Cause
     Cause = 19,
     /// Source Interface

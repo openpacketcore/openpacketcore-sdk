@@ -25,12 +25,14 @@ use simple::SimpleIe;
 mod tests;
 
 pub use grouped::{
-    CreateFar, CreatePdr, CreateQer, CreateUrr, CreatedPdr, ForwardingParameters, Pdi, UpdateQer,
+    CreateFar, CreatePdr, CreateQer, CreateUrr, CreatedPdr, ForwardingParameters, Pdi, UpdateFar,
+    UpdateForwardingParameters, UpdatePdr, UpdateQer, UpdateUrr,
 };
 pub use simple::{
     ApplyAction, Cause, CauseValue, DestinationInterface, FSeid, FTeid, FarId, Gate, GateStatus,
     Gbr, Mbr, NetworkInstance, NodeId, NodeIdType, OuterHeaderCreation, OuterHeaderRemoval, PdrId,
-    Precedence, QerId, Qfi, RecoveryTimeStamp, SourceInterface, UeIpAddress, UrrId,
+    Precedence, QerId, Qfi, RecoveryTimeStamp, RemoveFar, RemovePdr, RemoveQer, RemoveUrr,
+    SourceInterface, UeIpAddress, UrrId,
 };
 
 /// A decoded PFCP IE — either a known typed IE or a raw-preserving fallback.
@@ -51,6 +53,14 @@ pub enum TypedIe {
     CreateUrr(CreateUrr),
     /// Create QER (grouped IE, type 7).
     CreateQer(CreateQer),
+    /// Update PDR (grouped IE, type 9).
+    UpdatePdr(UpdatePdr),
+    /// Update FAR (grouped IE, type 10).
+    UpdateFar(UpdateFar),
+    /// Update Forwarding Parameters (grouped IE, type 11).
+    UpdateForwardingParameters(UpdateForwardingParameters),
+    /// Update URR (grouped IE, type 13).
+    UpdateUrr(UpdateUrr),
     /// Update QER (grouped IE, type 14).
     UpdateQer(UpdateQer),
     /// Created PDR (grouped IE, type 8).
@@ -97,6 +107,14 @@ pub enum TypedIe {
     QerId(QerId),
     /// QoS Flow Identifier (type 124).
     Qfi(Qfi),
+    /// Remove PDR (type 15).
+    RemovePdr(RemovePdr),
+    /// Remove FAR (type 16).
+    RemoveFar(RemoveFar),
+    /// Remove URR (type 17).
+    RemoveUrr(RemoveUrr),
+    /// Remove QER (type 18).
+    RemoveQer(RemoveQer),
     /// Unknown or vendor IE preserved byte-exact.
     Raw(InformationElement),
 }
@@ -140,6 +158,10 @@ impl TypedIe {
             4 => Self::ForwardingParameters(decode_grouped(value, ctx, depth)?),
             6 => Self::CreateUrr(decode_grouped(value, ctx, depth)?),
             7 => Self::CreateQer(decode_grouped(value, ctx, depth)?),
+            9 => Self::UpdatePdr(decode_grouped(value, ctx, depth)?),
+            10 => Self::UpdateFar(decode_grouped(value, ctx, depth)?),
+            11 => Self::UpdateForwardingParameters(decode_grouped(value, ctx, depth)?),
+            13 => Self::UpdateUrr(decode_grouped(value, ctx, depth)?),
             14 => Self::UpdateQer(decode_grouped(value, ctx, depth)?),
             8 => Self::CreatedPdr(decode_grouped(value, ctx, depth)?),
             19 => Self::Cause(simple::Cause::decode_value(
@@ -235,6 +257,26 @@ impl TypedIe {
                 spec_ref.clone(),
             )?),
             124 => Self::Qfi(simple::Qfi::decode_value(value, offset, spec_ref.clone())?),
+            15 => Self::RemovePdr(simple::RemovePdr::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            16 => Self::RemoveFar(simple::RemoveFar::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            17 => Self::RemoveUrr(simple::RemoveUrr::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            18 => Self::RemoveQer(simple::RemoveQer::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
             _ => Self::Raw(raw),
         };
 
@@ -322,6 +364,22 @@ impl TypedIe {
             Self::CreateQer(v) => {
                 encode_grouped(v, &mut buf, ctx)?;
                 7
+            }
+            Self::UpdatePdr(v) => {
+                encode_grouped(v, &mut buf, ctx)?;
+                9
+            }
+            Self::UpdateFar(v) => {
+                encode_grouped(v, &mut buf, ctx)?;
+                10
+            }
+            Self::UpdateForwardingParameters(v) => {
+                encode_grouped(v, &mut buf, ctx)?;
+                11
+            }
+            Self::UpdateUrr(v) => {
+                encode_grouped(v, &mut buf, ctx)?;
+                13
             }
             Self::UpdateQer(v) => {
                 encode_grouped(v, &mut buf, ctx)?;
@@ -415,6 +473,22 @@ impl TypedIe {
                 v.encode_value(&mut buf)?;
                 124
             }
+            Self::RemovePdr(v) => {
+                v.encode_value(&mut buf)?;
+                15
+            }
+            Self::RemoveFar(v) => {
+                v.encode_value(&mut buf)?;
+                16
+            }
+            Self::RemoveUrr(v) => {
+                v.encode_value(&mut buf)?;
+                17
+            }
+            Self::RemoveQer(v) => {
+                v.encode_value(&mut buf)?;
+                18
+            }
             Self::Raw(_) => unreachable!("Raw handled in outer match"),
         };
         Ok((ie_type, buf.freeze()))
@@ -429,6 +503,10 @@ impl TypedIe {
             Self::ForwardingParameters(_) => 4,
             Self::CreateUrr(_) => 6,
             Self::CreateQer(_) => 7,
+            Self::UpdatePdr(_) => 9,
+            Self::UpdateFar(_) => 10,
+            Self::UpdateForwardingParameters(_) => 11,
+            Self::UpdateUrr(_) => 13,
             Self::UpdateQer(_) => 14,
             Self::CreatedPdr(_) => 8,
             Self::Cause(_) => 19,
@@ -452,6 +530,10 @@ impl TypedIe {
             Self::FarId(_) => 108,
             Self::QerId(_) => 109,
             Self::Qfi(_) => 124,
+            Self::RemovePdr(_) => 15,
+            Self::RemoveFar(_) => 16,
+            Self::RemoveUrr(_) => 17,
+            Self::RemoveQer(_) => 18,
             Self::Raw(raw) => raw.ie_type,
         }
     }
