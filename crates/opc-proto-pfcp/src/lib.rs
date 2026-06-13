@@ -301,10 +301,18 @@ pub enum IeType {
     Gbr = 27,
     /// Precedence
     Precedence = 29,
+    /// Volume Threshold
+    VolumeThreshold = 31,
+    /// Time Threshold
+    TimeThreshold = 32,
+    /// Monitoring Time
+    MonitoringTime = 33,
     /// Reporting Triggers
     ReportingTriggers = 37,
     /// Report Type
     ReportType = 39,
+    /// Offending IE
+    OffendingIe = 40,
     /// Destination Interface
     DestinationInterface = 42,
     /// Apply Action
@@ -317,6 +325,16 @@ pub enum IeType {
     NodeId = 60,
     /// Measurement Method
     MeasurementMethod = 62,
+    /// Usage Report Trigger
+    UsageReportTrigger = 63,
+    /// Volume Measurement
+    VolumeMeasurement = 66,
+    /// Duration Measurement
+    DurationMeasurement = 67,
+    /// Volume Quota
+    VolumeQuota = 73,
+    /// Time Quota
+    TimeQuota = 74,
     /// URR ID
     UrrId = 81,
     /// Outer Header Creation
@@ -331,6 +349,10 @@ pub enum IeType {
     FarId = 108,
     /// QER ID
     QerId = 109,
+    /// UR-SEQN
+    UrSeqn = 104,
+    /// Usage Report (Session Report Request)
+    UsageReport = 80,
     /// QoS Flow Identifier
     Qfi = 124,
 }

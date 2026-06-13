@@ -1373,6 +1373,331 @@ fn test_remove_pdr_truncated_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// Usage reporting / Session Report IEs
+// ---------------------------------------------------------------------------
+
+/// Report Type IE (type 39) with Usage Report flag set per TS 29.244 §8.2.21.
+#[test]
+fn test_report_type_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x27, // IE type 39 (Report Type)
+        0x00, 0x01, // length 1
+        0x02, // Usage Report bit (bit 2)
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::ReportType(r) => {
+            assert!(r.usage_report);
+            assert!(!r.downlink_data_report);
+        }
+        other => panic!("expected ReportType, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Measurement Method IE (type 62) with Duration + Volume per TS 29.244 §8.2.40.
+#[test]
+fn test_measurement_method_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x3E, // IE type 62 (Measurement Method)
+        0x00, 0x01, // length 1
+        0x03, // DURAT (bit 1) + VOLUM (bit 2)
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::MeasurementMethod(m) => {
+            assert!(m.duration);
+            assert!(m.volume);
+            assert!(!m.event);
+        }
+        other => panic!("expected MeasurementMethod, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Reporting Triggers IE (type 37) with Volume + Time Threshold per TS 29.244 §8.2.19.
+#[test]
+fn test_reporting_triggers_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x25, // IE type 37 (Reporting Triggers)
+        0x00, 0x03, // length 3
+        0x06, // VOLTH (bit 2) + TIMTH (bit 3)
+        0x00, // no octet 6 flags
+        0x00, // no octet 7 flags, spare bits zero
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::ReportingTriggers(r) => {
+            assert!(r.volume_threshold);
+            assert!(r.time_threshold);
+            assert!(!r.periodic_reporting);
+        }
+        other => panic!("expected ReportingTriggers, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Volume Threshold IE (type 31) with Total Volume present per TS 29.244 §8.2.13.
+#[test]
+fn test_volume_threshold_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x1F, // IE type 31 (Volume Threshold)
+        0x00, 0x09, // length 9 (1 flag octet + 8 octets total volume)
+        0x01, // TOVOL flag (bit 1)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, // total volume 10
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::VolumeThreshold(v) => {
+            assert_eq!(v.total_volume, Some(10));
+            assert_eq!(v.uplink_volume, None);
+            assert_eq!(v.downlink_volume, None);
+        }
+        other => panic!("expected VolumeThreshold, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Time Threshold IE (type 32) with 60 seconds per TS 29.244 §8.2.14.
+#[test]
+fn test_time_threshold_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x20, // IE type 32 (Time Threshold)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x3C, // 60 seconds
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::TimeThreshold(t) => assert_eq!(t.seconds, 60),
+        other => panic!("expected TimeThreshold, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Volume Quota IE (type 73) with Total Volume present per TS 29.244 §8.2.50.
+#[test]
+fn test_volume_quota_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x49, // IE type 73 (Volume Quota)
+        0x00, 0x09, // length 9
+        0x01, // TOVOL flag (bit 1)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, // total volume 100
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::VolumeQuota(v) => {
+            assert_eq!(v.total_volume, Some(100));
+            assert_eq!(v.uplink_volume, None);
+            assert_eq!(v.downlink_volume, None);
+        }
+        other => panic!("expected VolumeQuota, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Time Quota IE (type 74) with 300 seconds per TS 29.244 §8.2.51.
+#[test]
+fn test_time_quota_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x4A, // IE type 74 (Time Quota)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x01, 0x2C, // 300 seconds
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::TimeQuota(t) => assert_eq!(t.seconds, 300),
+        other => panic!("expected TimeQuota, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Monitoring Time IE (type 33) per TS 29.244 §8.2.15.
+#[test]
+fn test_monitoring_time_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x21, // IE type 33 (Monitoring Time)
+        0x00, 0x04, // length 4
+        0x66, 0x55, 0x5A, 0x00, // NTP short-format seconds
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::MonitoringTime(m) => assert_eq!(m.seconds, 0x6655_5A00),
+        other => panic!("expected MonitoringTime, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Offending IE (type 40) reporting IE type 56 per TS 29.244 §8.2.22.
+#[test]
+fn test_offending_ie_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x28, // IE type 40 (Offending IE)
+        0x00, 0x02, // length 2
+        0x00, 0x38, // offending IE type 56 (PDR ID)
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::OffendingIe(o) => assert_eq!(o.ie_type, 56),
+        other => panic!("expected OffendingIe, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Usage Report Trigger IE (type 63) for Volume Threshold per TS 29.244 §8.2.41.
+#[test]
+fn test_usage_report_trigger_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x3F, // IE type 63 (Usage Report Trigger)
+        0x00, 0x03, // length 3
+        0x02, // VOLTH (bit 2)
+        0x00, 0x00,
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::UsageReportTrigger(u) => {
+            assert!(u.volume_threshold);
+            assert!(!u.periodic_reporting);
+        }
+        other => panic!("expected UsageReportTrigger, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Volume Measurement IE (type 66) with Total Volume per TS 29.244 §8.2.44.
+#[test]
+fn test_volume_measurement_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x42, // IE type 66 (Volume Measurement)
+        0x00, 0x09, // length 9
+        0x01, // TOVOL flag (bit 1)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, // total volume 32 octets
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::VolumeMeasurement(v) => {
+            assert_eq!(v.total_volume, Some(32));
+            assert_eq!(v.total_packets, None);
+        }
+        other => panic!("expected VolumeMeasurement, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Duration Measurement IE (type 67) with 120 seconds per TS 29.244 §8.2.45.
+#[test]
+fn test_duration_measurement_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x43, // IE type 67 (Duration Measurement)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x78, // 120 seconds
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::DurationMeasurement(d) => assert_eq!(d.seconds, 120),
+        other => panic!("expected DurationMeasurement, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// UR-SEQN IE (type 104) with sequence 7 per TS 29.244 §8.2.71.
+#[test]
+fn test_ur_seqn_spec_bytes() {
+    let bytes: &[u8] = &[
+        0x00, 0x68, // IE type 104 (UR-SEQN)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x07, // UR-SEQN = 7
+    ];
+    let ie = decode_typed(bytes);
+    match ie {
+        TypedIe::UrSeqn(u) => assert_eq!(u.value, 7),
+        other => panic!("expected UrSeqn, got {other:?}"),
+    }
+    assert_typed_roundtrip(bytes);
+}
+
+/// Usage Report grouped IE (type 80) within Session Report Request per TS 29.244 §7.5.8.3.
+#[test]
+fn test_usage_report_spec_bytes() {
+    let urr_id: &[u8] = &[
+        0x00, 0x51, // IE type 81 (URR ID)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x02, // URR ID = 2
+    ];
+    let ur_seqn: &[u8] = &[
+        0x00, 0x68, // IE type 104 (UR-SEQN)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x01, // UR-SEQN = 1
+    ];
+    let trigger: &[u8] = &[
+        0x00, 0x3F, // IE type 63 (Usage Report Trigger)
+        0x00, 0x03, // length 3
+        0x02, 0x00, 0x00, // Volume Threshold trigger
+    ];
+    let volume: &[u8] = &[
+        0x00, 0x42, // IE type 66 (Volume Measurement)
+        0x00, 0x09, // length 9
+        0x01, // TOVOL
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, // total volume 128
+    ];
+    let duration: &[u8] = &[
+        0x00, 0x43, // IE type 67 (Duration Measurement)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, 0x3C, // 60 seconds
+    ];
+
+    let mut value = BytesMut::new();
+    value.put_slice(urr_id);
+    value.put_slice(ur_seqn);
+    value.put_slice(trigger);
+    value.put_slice(volume);
+    value.put_slice(duration);
+
+    let mut raw = BytesMut::new();
+    raw.put_u16(80); // Usage Report (Session Report Request)
+    raw.put_u16(value.len() as u16);
+    raw.put_slice(&value);
+
+    let bytes = raw.freeze();
+    let ie = decode_typed(&bytes);
+    match ie {
+        TypedIe::UsageReport(g) => {
+            assert_eq!(g.members.len(), 5);
+        }
+        other => panic!("expected UsageReport, got {other:?}"),
+    }
+    assert_typed_roundtrip(&bytes);
+}
+
+#[test]
+fn test_volume_threshold_truncated_rejected() {
+    let bytes: &[u8] = &[
+        0x00, 0x1F, // IE type 31 (Volume Threshold)
+        0x00, 0x09, // length 9
+        0x01, // TOVOL flag set
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // only 7 octets of total volume
+    ];
+    let result = TypedIe::decode(bytes, DecodeContext::default(), 0);
+    assert!(
+        result.is_err(),
+        "truncated Volume Threshold must be rejected"
+    );
+}
+
+#[test]
+fn test_duration_measurement_truncated_rejected() {
+    let bytes: &[u8] = &[
+        0x00, 0x43, // IE type 67 (Duration Measurement)
+        0x00, 0x04, // length 4
+        0x00, 0x00, 0x00, // only 3 octets
+    ];
+    let result = TypedIe::decode(bytes, DecodeContext::default(), 0);
+    assert!(
+        result.is_err(),
+        "truncated Duration Measurement must be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Typed-to-raw helpers: encode_value and InformationElement::from_typed
 // ---------------------------------------------------------------------------
 
@@ -1383,11 +1708,13 @@ mod from_typed_tests {
 
     use crate::ie::{
         ApplyAction, Cause, CauseValue, CreateFar, CreatePdr, CreateQer, CreateUrr, CreatedPdr,
-        DestinationInterface, FSeid, FTeid, FarId, Gate, GateStatus, Gbr, Mbr, NetworkInstance,
-        NodeId, NodeIdType, OuterHeaderCreation, OuterHeaderRemoval, Pdi, PdrId, Precedence, QerId,
-        Qfi, RecoveryTimeStamp, RemoveFar, RemovePdr, RemoveQer, RemoveUrr, SourceInterface,
-        TypedIe, UeIpAddress, UpdateFar, UpdateForwardingParameters, UpdatePdr, UpdateQer,
-        UpdateUrr, UrrId,
+        DestinationInterface, DurationMeasurement, FSeid, FTeid, FarId, Gate, GateStatus, Gbr, Mbr,
+        MeasurementMethod, MonitoringTime, NetworkInstance, NodeId, NodeIdType, OffendingIe,
+        OuterHeaderCreation, OuterHeaderRemoval, Pdi, PdrId, Precedence, QerId, Qfi,
+        RecoveryTimeStamp, RemoveFar, RemovePdr, RemoveQer, RemoveUrr, ReportType,
+        ReportingTriggers, SourceInterface, TimeQuota, TimeThreshold, TypedIe, UeIpAddress,
+        UpdateFar, UpdateForwardingParameters, UpdatePdr, UpdateQer, UpdateUrr, UrSeqn, UrrId,
+        UsageReport, UsageReportTrigger, VolumeMeasurement, VolumeQuota, VolumeThreshold,
     };
     use crate::InformationElement;
 
@@ -1483,6 +1810,36 @@ mod from_typed_tests {
                         teid: Some(1),
                         ipv4: Some([1, 2, 3, 4]),
                         ipv6: None,
+                    }),
+                ],
+            }),
+            TypedIe::UsageReport(UsageReport {
+                members: vec![
+                    TypedIe::UrrId(UrrId { value: 1 }),
+                    TypedIe::UrSeqn(UrSeqn { value: 1 }),
+                    TypedIe::UsageReportTrigger(UsageReportTrigger {
+                        periodic_reporting: true,
+                        volume_threshold: false,
+                        time_threshold: false,
+                        quota_holding_time: false,
+                        start_of_traffic: false,
+                        stop_of_traffic: false,
+                        dropped_dl_traffic_threshold: false,
+                        immediate_report: false,
+                        volume_quota: false,
+                        time_quota: false,
+                        linked_usage_reporting: false,
+                        termination_report: false,
+                        monitoring_time: false,
+                        envelope_closure: false,
+                        mac_addresses_reporting: false,
+                        event_threshold: false,
+                        event_quota: false,
+                        termination_by_up_report: false,
+                        ip_multicast_join_leave: false,
+                        quota_validity_time: false,
+                        end_marker_reception_report: false,
+                        user_plane_inactivity_timer: false,
                     }),
                 ],
             }),
@@ -1584,6 +1941,88 @@ mod from_typed_tests {
             TypedIe::RemoveQer(RemoveQer {
                 qer_id: QerId { value: 1 },
             }),
+            TypedIe::ReportType(ReportType {
+                downlink_data_report: false,
+                usage_report: true,
+                error_indication_report: false,
+                user_plane_inactivity_report: false,
+                tsc_management_info_report: false,
+                session_report: false,
+                up_initiated_session_request: false,
+            }),
+            TypedIe::MeasurementMethod(MeasurementMethod {
+                duration: true,
+                volume: true,
+                event: false,
+            }),
+            TypedIe::ReportingTriggers(ReportingTriggers {
+                periodic_reporting: false,
+                volume_threshold: true,
+                time_threshold: true,
+                quota_holding_time: false,
+                start_of_traffic: false,
+                stop_of_traffic: false,
+                dropped_dl_traffic_threshold: false,
+                linked_usage_reporting: false,
+                volume_quota: false,
+                time_quota: false,
+                envelope_closure: false,
+                mac_addresses_reporting: false,
+                event_threshold: false,
+                event_quota: false,
+                ip_multicast_join_leave: false,
+                quota_validity_time: false,
+                report_end_marker_reception: false,
+                user_plane_inactivity_timer: false,
+            }),
+            TypedIe::VolumeThreshold(VolumeThreshold {
+                total_volume: Some(1),
+                uplink_volume: None,
+                downlink_volume: None,
+            }),
+            TypedIe::TimeThreshold(TimeThreshold { seconds: 1 }),
+            TypedIe::VolumeQuota(VolumeQuota {
+                total_volume: Some(1),
+                uplink_volume: None,
+                downlink_volume: None,
+            }),
+            TypedIe::TimeQuota(TimeQuota { seconds: 1 }),
+            TypedIe::MonitoringTime(MonitoringTime { seconds: 1 }),
+            TypedIe::OffendingIe(OffendingIe { ie_type: 56 }),
+            TypedIe::UsageReportTrigger(UsageReportTrigger {
+                periodic_reporting: true,
+                volume_threshold: false,
+                time_threshold: false,
+                quota_holding_time: false,
+                start_of_traffic: false,
+                stop_of_traffic: false,
+                dropped_dl_traffic_threshold: false,
+                immediate_report: false,
+                volume_quota: false,
+                time_quota: false,
+                linked_usage_reporting: false,
+                termination_report: false,
+                monitoring_time: false,
+                envelope_closure: false,
+                mac_addresses_reporting: false,
+                event_threshold: false,
+                event_quota: false,
+                termination_by_up_report: false,
+                ip_multicast_join_leave: false,
+                quota_validity_time: false,
+                end_marker_reception_report: false,
+                user_plane_inactivity_timer: false,
+            }),
+            TypedIe::VolumeMeasurement(VolumeMeasurement {
+                total_volume: Some(1),
+                uplink_volume: None,
+                downlink_volume: None,
+                total_packets: None,
+                uplink_packets: None,
+                downlink_packets: None,
+            }),
+            TypedIe::DurationMeasurement(DurationMeasurement { seconds: 1 }),
+            TypedIe::UrSeqn(UrSeqn { value: 1 }),
             TypedIe::Raw(InformationElement {
                 ie_type: 0x8001,
                 enterprise_id: 1,

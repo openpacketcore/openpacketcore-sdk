@@ -76,9 +76,22 @@ arithmetic, truncation/overflow rejection, and negative tests.
 | Remove FAR | 16 | §7.5.4.7 | 4 octets; wraps FAR ID. |
 | Remove URR | 17 | §7.5.4.8 | 4 octets; wraps URR ID. |
 | Remove QER | 18 | §7.5.4.9 | 4 octets; wraps QER ID. |
+| Volume Threshold | 31 | §8.2.13 | 1 flag octet + optional Total/Uplink/Downlink 8-octet volumes. |
+| Time Threshold | 32 | §8.2.14 | 4 octets; duration in seconds. |
+| Monitoring Time | 33 | §8.2.15 | 4 octets; NTP short-format seconds. |
+| Reporting Triggers | 37 | §8.2.19 | 3 octets; bits 3-8 of octet 7 emitted as zero. |
+| Report Type | 39 | §8.2.21 | 1 octet; bit 8 spare emitted as zero. |
+| Offending IE | 40 | §8.2.22 | 2 octets; offending IE type. |
 | Gate Status | 25 | §8.2.7 | 1 octet; UL gate (bits 2-1), DL gate (bits 4-3). Open=0, Closed=1. |
 | Maximum Bit Rate (MBR) | 26 | §8.2.8 | 10 octets; UL/DL 40-bit rates in kbps (binary). |
 | Guaranteed Bit Rate (GBR) | 27 | §8.2.9 | 10 octets; UL/DL 40-bit rates in kbps (binary). |
+| Measurement Method | 62 | §8.2.40 | 1 octet; bits 8-4 spare emitted as zero. |
+| Usage Report Trigger | 63 | §8.2.41 | 3 octets; bits 7-8 of octet 7 emitted as zero. |
+| Volume Measurement | 66 | §8.2.44 | 1 flag octet + optional volume/packet 8-octet counters. |
+| Duration Measurement | 67 | §8.2.45 | 4 octets; duration in seconds. |
+| Volume Quota | 73 | §8.2.50 | 1 flag octet + optional Total/Uplink/Downlink 8-octet volumes. |
+| Time Quota | 74 | §8.2.51 | 4 octets; duration in seconds. |
+| UR-SEQN | 104 | §8.2.71 | 4 octets; usage report sequence number. |
 
 #### Canonicalizing re-encode
 
@@ -111,13 +124,14 @@ input. Byte-exact round-trip verified for all listed grouped IEs.
 | Update URR | 13 | §7.5.4.4 | Typed members with depth limit. |
 | Update QER | 14 | §7.5.4.5 | Typed members with depth limit. |
 | Created PDR | 8 | §7.5.2.6 | Typed members with depth limit. |
+| Usage Report (Session Report Request) | 80 | §7.5.8.3 | Typed members with depth limit. |
 
 ## Out of Scope (v1+)
 
-- Remaining simple IEs not listed above (e.g., Reporting Triggers,
-  Report Type, Measurement Method, Volume Threshold, Time Threshold, Volume
-  Quota, Time Quota, Monitoring Time, Offending IE, Usage Report Trigger,
-  Volume Measurement, Duration Measurement, UR-SEQN, Packet Rate, DL Flow Level
-  Marking, etc.).
+- Remaining simple IEs not listed above (e.g., Packet Rate, DL Flow Level
+  Marking, SDF Filter, Application ID, Traffic Endpoint, BAR, MAR,
+  Subsequent Volume/Time Threshold/Quota, Event Quota/Threshold, etc.).
+- Session-Report-specific Usage Report semantics beyond member decode
+  (e.g., Start/End Time, Application Detection Information).
 - Full message-specific semantic validation (e.g., mandatory-IE presence).
 - PFD Management, Subscriber Management, and other non-SMF/UPF messages.

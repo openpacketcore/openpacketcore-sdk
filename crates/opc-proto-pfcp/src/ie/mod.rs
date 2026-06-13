@@ -26,13 +26,15 @@ mod tests;
 
 pub use grouped::{
     CreateFar, CreatePdr, CreateQer, CreateUrr, CreatedPdr, ForwardingParameters, Pdi, UpdateFar,
-    UpdateForwardingParameters, UpdatePdr, UpdateQer, UpdateUrr,
+    UpdateForwardingParameters, UpdatePdr, UpdateQer, UpdateUrr, UsageReport,
 };
 pub use simple::{
-    ApplyAction, Cause, CauseValue, DestinationInterface, FSeid, FTeid, FarId, Gate, GateStatus,
-    Gbr, Mbr, NetworkInstance, NodeId, NodeIdType, OuterHeaderCreation, OuterHeaderRemoval, PdrId,
-    Precedence, QerId, Qfi, RecoveryTimeStamp, RemoveFar, RemovePdr, RemoveQer, RemoveUrr,
-    SourceInterface, UeIpAddress, UrrId,
+    ApplyAction, Cause, CauseValue, DestinationInterface, DurationMeasurement, FSeid, FTeid, FarId,
+    Gate, GateStatus, Gbr, Mbr, MeasurementMethod, MonitoringTime, NetworkInstance, NodeId,
+    NodeIdType, OffendingIe, OuterHeaderCreation, OuterHeaderRemoval, PdrId, Precedence, QerId,
+    Qfi, RecoveryTimeStamp, RemoveFar, RemovePdr, RemoveQer, RemoveUrr, ReportType,
+    ReportingTriggers, SourceInterface, TimeQuota, TimeThreshold, UeIpAddress, UrSeqn, UrrId,
+    UsageReportTrigger, VolumeMeasurement, VolumeQuota, VolumeThreshold,
 };
 
 /// A decoded PFCP IE — either a known typed IE or a raw-preserving fallback.
@@ -65,6 +67,8 @@ pub enum TypedIe {
     UpdateQer(UpdateQer),
     /// Created PDR (grouped IE, type 8).
     CreatedPdr(CreatedPdr),
+    /// Usage Report (grouped IE within Session Report Request, type 80).
+    UsageReport(UsageReport),
     /// Cause (type 19).
     Cause(Cause),
     /// Source Interface (type 20).
@@ -115,6 +119,32 @@ pub enum TypedIe {
     RemoveUrr(RemoveUrr),
     /// Remove QER (type 18).
     RemoveQer(RemoveQer),
+    /// Report Type (type 39).
+    ReportType(ReportType),
+    /// Measurement Method (type 62).
+    MeasurementMethod(MeasurementMethod),
+    /// Reporting Triggers (type 37).
+    ReportingTriggers(ReportingTriggers),
+    /// Volume Threshold (type 31).
+    VolumeThreshold(VolumeThreshold),
+    /// Time Threshold (type 32).
+    TimeThreshold(TimeThreshold),
+    /// Volume Quota (type 73).
+    VolumeQuota(VolumeQuota),
+    /// Time Quota (type 74).
+    TimeQuota(TimeQuota),
+    /// Monitoring Time (type 33).
+    MonitoringTime(MonitoringTime),
+    /// Offending IE (type 40).
+    OffendingIe(OffendingIe),
+    /// Usage Report Trigger (type 63).
+    UsageReportTrigger(UsageReportTrigger),
+    /// Volume Measurement (type 66).
+    VolumeMeasurement(VolumeMeasurement),
+    /// Duration Measurement (type 67).
+    DurationMeasurement(DurationMeasurement),
+    /// UR-SEQN (type 104).
+    UrSeqn(UrSeqn),
     /// Unknown or vendor IE preserved byte-exact.
     Raw(InformationElement),
 }
@@ -164,6 +194,7 @@ impl TypedIe {
             13 => Self::UpdateUrr(decode_grouped(value, ctx, depth)?),
             14 => Self::UpdateQer(decode_grouped(value, ctx, depth)?),
             8 => Self::CreatedPdr(decode_grouped(value, ctx, depth)?),
+            80 => Self::UsageReport(decode_grouped(value, ctx, depth)?),
             19 => Self::Cause(simple::Cause::decode_value(
                 value,
                 offset,
@@ -257,6 +288,71 @@ impl TypedIe {
                 spec_ref.clone(),
             )?),
             124 => Self::Qfi(simple::Qfi::decode_value(value, offset, spec_ref.clone())?),
+            39 => Self::ReportType(simple::ReportType::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            62 => Self::MeasurementMethod(simple::MeasurementMethod::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            37 => Self::ReportingTriggers(simple::ReportingTriggers::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            31 => Self::VolumeThreshold(simple::VolumeThreshold::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            32 => Self::TimeThreshold(simple::TimeThreshold::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            73 => Self::VolumeQuota(simple::VolumeQuota::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            74 => Self::TimeQuota(simple::TimeQuota::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            33 => Self::MonitoringTime(simple::MonitoringTime::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            40 => Self::OffendingIe(simple::OffendingIe::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            63 => Self::UsageReportTrigger(simple::UsageReportTrigger::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            66 => Self::VolumeMeasurement(simple::VolumeMeasurement::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            67 => Self::DurationMeasurement(simple::DurationMeasurement::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            104 => Self::UrSeqn(simple::UrSeqn::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
             15 => Self::RemovePdr(simple::RemovePdr::decode_value(
                 value,
                 offset,
@@ -389,6 +485,10 @@ impl TypedIe {
                 encode_grouped(v, &mut buf, ctx)?;
                 8
             }
+            Self::UsageReport(v) => {
+                encode_grouped(v, &mut buf, ctx)?;
+                80
+            }
             Self::Cause(v) => {
                 v.encode_value(&mut buf)?;
                 19
@@ -473,6 +573,58 @@ impl TypedIe {
                 v.encode_value(&mut buf)?;
                 124
             }
+            Self::ReportType(v) => {
+                v.encode_value(&mut buf)?;
+                39
+            }
+            Self::MeasurementMethod(v) => {
+                v.encode_value(&mut buf)?;
+                62
+            }
+            Self::ReportingTriggers(v) => {
+                v.encode_value(&mut buf)?;
+                37
+            }
+            Self::VolumeThreshold(v) => {
+                v.encode_value(&mut buf)?;
+                31
+            }
+            Self::TimeThreshold(v) => {
+                v.encode_value(&mut buf)?;
+                32
+            }
+            Self::VolumeQuota(v) => {
+                v.encode_value(&mut buf)?;
+                73
+            }
+            Self::TimeQuota(v) => {
+                v.encode_value(&mut buf)?;
+                74
+            }
+            Self::MonitoringTime(v) => {
+                v.encode_value(&mut buf)?;
+                33
+            }
+            Self::OffendingIe(v) => {
+                v.encode_value(&mut buf)?;
+                40
+            }
+            Self::UsageReportTrigger(v) => {
+                v.encode_value(&mut buf)?;
+                63
+            }
+            Self::VolumeMeasurement(v) => {
+                v.encode_value(&mut buf)?;
+                66
+            }
+            Self::DurationMeasurement(v) => {
+                v.encode_value(&mut buf)?;
+                67
+            }
+            Self::UrSeqn(v) => {
+                v.encode_value(&mut buf)?;
+                104
+            }
             Self::RemovePdr(v) => {
                 v.encode_value(&mut buf)?;
                 15
@@ -509,6 +661,7 @@ impl TypedIe {
             Self::UpdateUrr(_) => 13,
             Self::UpdateQer(_) => 14,
             Self::CreatedPdr(_) => 8,
+            Self::UsageReport(_) => 80,
             Self::Cause(_) => 19,
             Self::SourceInterface(_) => 20,
             Self::FTeid(_) => 21,
@@ -530,6 +683,19 @@ impl TypedIe {
             Self::FarId(_) => 108,
             Self::QerId(_) => 109,
             Self::Qfi(_) => 124,
+            Self::ReportType(_) => 39,
+            Self::MeasurementMethod(_) => 62,
+            Self::ReportingTriggers(_) => 37,
+            Self::VolumeThreshold(_) => 31,
+            Self::TimeThreshold(_) => 32,
+            Self::VolumeQuota(_) => 73,
+            Self::TimeQuota(_) => 74,
+            Self::MonitoringTime(_) => 33,
+            Self::OffendingIe(_) => 40,
+            Self::UsageReportTrigger(_) => 63,
+            Self::VolumeMeasurement(_) => 66,
+            Self::DurationMeasurement(_) => 67,
+            Self::UrSeqn(_) => 104,
             Self::RemovePdr(_) => 15,
             Self::RemoveFar(_) => 16,
             Self::RemoveUrr(_) => 17,

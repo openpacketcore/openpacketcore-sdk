@@ -676,6 +676,974 @@ impl SimpleIe for RemoveQer {
 }
 
 // ---------------------------------------------------------------------------
+// Report Type (§8.2.21)
+// ---------------------------------------------------------------------------
+
+/// Report Type IE (type 39).
+///
+/// TS 29.244 §8.2.21: one octet of flags indicating the report type.
+/// Spare bit 8 is encoded as zero (canonical).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportType {
+    /// Downlink Data Report (bit 1).
+    pub downlink_data_report: bool,
+    /// Usage Report (bit 2).
+    pub usage_report: bool,
+    /// Error Indication Report (bit 3).
+    pub error_indication_report: bool,
+    /// User Plane Inactivity Report (bit 4).
+    pub user_plane_inactivity_report: bool,
+    /// TSC Management Information Report (bit 5).
+    pub tsc_management_info_report: bool,
+    /// Session Report (bit 6).
+    pub session_report: bool,
+    /// UP Initiated Session Request (bit 7).
+    pub up_initiated_session_request: bool,
+}
+
+impl SimpleIe for ReportType {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.is_empty() {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        let b = value[0];
+        Ok(Self {
+            downlink_data_report: (b & 0x01) != 0,
+            usage_report: (b & 0x02) != 0,
+            error_indication_report: (b & 0x04) != 0,
+            user_plane_inactivity_report: (b & 0x08) != 0,
+            tsc_management_info_report: (b & 0x10) != 0,
+            session_report: (b & 0x20) != 0,
+            up_initiated_session_request: (b & 0x40) != 0,
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        let mut b: u8 = 0;
+        if self.downlink_data_report {
+            b |= 0x01;
+        }
+        if self.usage_report {
+            b |= 0x02;
+        }
+        if self.error_indication_report {
+            b |= 0x04;
+        }
+        if self.user_plane_inactivity_report {
+            b |= 0x08;
+        }
+        if self.tsc_management_info_report {
+            b |= 0x10;
+        }
+        if self.session_report {
+            b |= 0x20;
+        }
+        if self.up_initiated_session_request {
+            b |= 0x40;
+        }
+        dst.put_u8(b);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Measurement Method (§8.2.40)
+// ---------------------------------------------------------------------------
+
+/// Measurement Method IE (type 62).
+///
+/// TS 29.244 §8.2.40: one octet of flags indicating the measurement method.
+/// Spare bits 8-4 are encoded as zero (canonical).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeasurementMethod {
+    /// Duration (bit 1).
+    pub duration: bool,
+    /// Volume (bit 2).
+    pub volume: bool,
+    /// Event (bit 3).
+    pub event: bool,
+}
+
+impl SimpleIe for MeasurementMethod {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.is_empty() {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        let b = value[0];
+        Ok(Self {
+            duration: (b & 0x01) != 0,
+            volume: (b & 0x02) != 0,
+            event: (b & 0x04) != 0,
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        let mut b: u8 = 0;
+        if self.duration {
+            b |= 0x01;
+        }
+        if self.volume {
+            b |= 0x02;
+        }
+        if self.event {
+            b |= 0x04;
+        }
+        dst.put_u8(b);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reporting Triggers (§8.2.19)
+// ---------------------------------------------------------------------------
+
+/// Reporting Triggers IE (type 37).
+///
+/// TS 29.244 §8.2.19: two octets of flags (octets 5-6) and a third octet
+/// (octet 7) with bits 1-2 used and bits 3-8 spare (encoded as zero).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportingTriggers {
+    /// Periodic Reporting (octet 5 bit 1).
+    pub periodic_reporting: bool,
+    /// Volume Threshold (octet 5 bit 2).
+    pub volume_threshold: bool,
+    /// Time Threshold (octet 5 bit 3).
+    pub time_threshold: bool,
+    /// Quota Holding Time (octet 5 bit 4).
+    pub quota_holding_time: bool,
+    /// Start of Traffic (octet 5 bit 5).
+    pub start_of_traffic: bool,
+    /// Stop of Traffic (octet 5 bit 6).
+    pub stop_of_traffic: bool,
+    /// Dropped DL Traffic Threshold (octet 5 bit 7).
+    pub dropped_dl_traffic_threshold: bool,
+    /// Linked Usage Reporting (octet 5 bit 8).
+    pub linked_usage_reporting: bool,
+    /// Volume Quota (octet 6 bit 1).
+    pub volume_quota: bool,
+    /// Time Quota (octet 6 bit 2).
+    pub time_quota: bool,
+    /// Envelope Closure (octet 6 bit 3).
+    pub envelope_closure: bool,
+    /// MAC Addresses Reporting (octet 6 bit 4).
+    pub mac_addresses_reporting: bool,
+    /// Event Threshold (octet 6 bit 5).
+    pub event_threshold: bool,
+    /// Event Quota (octet 6 bit 6).
+    pub event_quota: bool,
+    /// IP Multicast Join/Leave (octet 6 bit 7).
+    pub ip_multicast_join_leave: bool,
+    /// Quota Validity Time (octet 6 bit 8).
+    pub quota_validity_time: bool,
+    /// Report End Marker Reception (octet 7 bit 1).
+    pub report_end_marker_reception: bool,
+    /// User Plane Inactivity Timer (octet 7 bit 2).
+    pub user_plane_inactivity_timer: bool,
+}
+
+impl SimpleIe for ReportingTriggers {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.len() < 2 {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        let b5 = value[0];
+        let b6 = value[1];
+        let b7 = value.get(2).copied().unwrap_or(0);
+        Ok(Self {
+            periodic_reporting: (b5 & 0x01) != 0,
+            volume_threshold: (b5 & 0x02) != 0,
+            time_threshold: (b5 & 0x04) != 0,
+            quota_holding_time: (b5 & 0x08) != 0,
+            start_of_traffic: (b5 & 0x10) != 0,
+            stop_of_traffic: (b5 & 0x20) != 0,
+            dropped_dl_traffic_threshold: (b5 & 0x40) != 0,
+            linked_usage_reporting: (b5 & 0x80) != 0,
+            volume_quota: (b6 & 0x01) != 0,
+            time_quota: (b6 & 0x02) != 0,
+            envelope_closure: (b6 & 0x04) != 0,
+            mac_addresses_reporting: (b6 & 0x08) != 0,
+            event_threshold: (b6 & 0x10) != 0,
+            event_quota: (b6 & 0x20) != 0,
+            ip_multicast_join_leave: (b6 & 0x40) != 0,
+            quota_validity_time: (b6 & 0x80) != 0,
+            report_end_marker_reception: (b7 & 0x01) != 0,
+            user_plane_inactivity_timer: (b7 & 0x02) != 0,
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        let mut b5: u8 = 0;
+        let mut b6: u8 = 0;
+        let mut b7: u8 = 0;
+        if self.periodic_reporting {
+            b5 |= 0x01;
+        }
+        if self.volume_threshold {
+            b5 |= 0x02;
+        }
+        if self.time_threshold {
+            b5 |= 0x04;
+        }
+        if self.quota_holding_time {
+            b5 |= 0x08;
+        }
+        if self.start_of_traffic {
+            b5 |= 0x10;
+        }
+        if self.stop_of_traffic {
+            b5 |= 0x20;
+        }
+        if self.dropped_dl_traffic_threshold {
+            b5 |= 0x40;
+        }
+        if self.linked_usage_reporting {
+            b5 |= 0x80;
+        }
+        if self.volume_quota {
+            b6 |= 0x01;
+        }
+        if self.time_quota {
+            b6 |= 0x02;
+        }
+        if self.envelope_closure {
+            b6 |= 0x04;
+        }
+        if self.mac_addresses_reporting {
+            b6 |= 0x08;
+        }
+        if self.event_threshold {
+            b6 |= 0x10;
+        }
+        if self.event_quota {
+            b6 |= 0x20;
+        }
+        if self.ip_multicast_join_leave {
+            b6 |= 0x40;
+        }
+        if self.quota_validity_time {
+            b6 |= 0x80;
+        }
+        if self.report_end_marker_reception {
+            b7 |= 0x01;
+        }
+        if self.user_plane_inactivity_timer {
+            b7 |= 0x02;
+        }
+        dst.put_u8(b5);
+        dst.put_u8(b6);
+        dst.put_u8(b7);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Volume Threshold (§8.2.13)
+// ---------------------------------------------------------------------------
+
+/// Volume Threshold IE (type 31).
+///
+/// TS 29.244 §8.2.13: octet 5 flags select which of Total/Uplink/Downlink
+/// Volume fields (each 8 octets) are present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeThreshold {
+    /// Total volume threshold (octets m to m+7) present if TOVOL flag set.
+    pub total_volume: Option<u64>,
+    /// Uplink volume threshold (octets p to p+7) present if ULVOL flag set.
+    pub uplink_volume: Option<u64>,
+    /// Downlink volume threshold (octets q to q+7) present if DLVOL flag set.
+    pub downlink_volume: Option<u64>,
+}
+
+impl SimpleIe for VolumeThreshold {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.is_empty() {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        let flags = value[0];
+        let has_total = (flags & 0x01) != 0;
+        let has_uplink = (flags & 0x02) != 0;
+        let has_downlink = (flags & 0x04) != 0;
+
+        let mut pos = 1usize;
+        let read_u64 = |value: &[u8],
+                        pos: &mut usize,
+                        offset: usize,
+                        spec_ref: &SpecRef|
+         -> Result<u64, DecodeError> {
+            if value.len() < *pos + 8 {
+                return Err(DecodeError::new(DecodeErrorCode::Truncated, offset + *pos)
+                    .with_spec_ref(spec_ref.clone()));
+            }
+            let v = u64::from_be_bytes([
+                value[*pos],
+                value[*pos + 1],
+                value[*pos + 2],
+                value[*pos + 3],
+                value[*pos + 4],
+                value[*pos + 5],
+                value[*pos + 6],
+                value[*pos + 7],
+            ]);
+            *pos += 8;
+            Ok(v)
+        };
+
+        let total_volume = if has_total {
+            Some(read_u64(value, &mut pos, offset, &spec_ref)?)
+        } else {
+            None
+        };
+        let uplink_volume = if has_uplink {
+            Some(read_u64(value, &mut pos, offset, &spec_ref)?)
+        } else {
+            None
+        };
+        let downlink_volume = if has_downlink {
+            Some(read_u64(value, &mut pos, offset, &spec_ref)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            total_volume,
+            uplink_volume,
+            downlink_volume,
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        let mut flags: u8 = 0;
+        if self.total_volume.is_some() {
+            flags |= 0x01;
+        }
+        if self.uplink_volume.is_some() {
+            flags |= 0x02;
+        }
+        if self.downlink_volume.is_some() {
+            flags |= 0x04;
+        }
+        dst.put_u8(flags);
+        if let Some(v) = self.total_volume {
+            dst.put_u64(v);
+        }
+        if let Some(v) = self.uplink_volume {
+            dst.put_u64(v);
+        }
+        if let Some(v) = self.downlink_volume {
+            dst.put_u64(v);
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Time Threshold (§8.2.14)
+// ---------------------------------------------------------------------------
+
+/// Time Threshold IE (type 32).
+///
+/// TS 29.244 §8.2.14: four octets containing the threshold duration in seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeThreshold {
+    /// Threshold duration in seconds.
+    pub seconds: u32,
+}
+
+impl SimpleIe for TimeThreshold {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.len() < 4 {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        Ok(Self {
+            seconds: u32::from_be_bytes([value[0], value[1], value[2], value[3]]),
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        dst.put_u32(self.seconds);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Monitoring Time (§8.2.15)
+// ---------------------------------------------------------------------------
+
+/// Monitoring Time IE (type 33).
+///
+/// TS 29.244 §8.2.15: four octets encoded as the first four octets of the
+/// 64-bit NTP timestamp (RFC 5905), i.e. seconds since the NTP era origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitoringTime {
+    /// Seconds since the NTP era origin (1900-01-01).
+    pub seconds: u32,
+}
+
+impl SimpleIe for MonitoringTime {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.len() < 4 {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        Ok(Self {
+            seconds: u32::from_be_bytes([value[0], value[1], value[2], value[3]]),
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        dst.put_u32(self.seconds);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Volume Quota (§8.2.50)
+// ---------------------------------------------------------------------------
+
+/// Volume Quota IE (type 73).
+///
+/// TS 29.244 §8.2.50: octet 5 flags select which of Total/Uplink/Downlink
+/// Volume fields (each 8 octets) are present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeQuota {
+    /// Total volume quota (octets m to m+7) present if TOVOL flag set.
+    pub total_volume: Option<u64>,
+    /// Uplink volume quota (octets p to p+7) present if ULVOL flag set.
+    pub uplink_volume: Option<u64>,
+    /// Downlink volume quota (octets q to q+7) present if DLVOL flag set.
+    pub downlink_volume: Option<u64>,
+}
+
+impl SimpleIe for VolumeQuota {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.is_empty() {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        let flags = value[0];
+        let has_total = (flags & 0x01) != 0;
+        let has_uplink = (flags & 0x02) != 0;
+        let has_downlink = (flags & 0x04) != 0;
+
+        let mut pos = 1usize;
+        let read_u64 = |value: &[u8],
+                        pos: &mut usize,
+                        offset: usize,
+                        spec_ref: &SpecRef|
+         -> Result<u64, DecodeError> {
+            if value.len() < *pos + 8 {
+                return Err(DecodeError::new(DecodeErrorCode::Truncated, offset + *pos)
+                    .with_spec_ref(spec_ref.clone()));
+            }
+            let v = u64::from_be_bytes([
+                value[*pos],
+                value[*pos + 1],
+                value[*pos + 2],
+                value[*pos + 3],
+                value[*pos + 4],
+                value[*pos + 5],
+                value[*pos + 6],
+                value[*pos + 7],
+            ]);
+            *pos += 8;
+            Ok(v)
+        };
+
+        let total_volume = if has_total {
+            Some(read_u64(value, &mut pos, offset, &spec_ref)?)
+        } else {
+            None
+        };
+        let uplink_volume = if has_uplink {
+            Some(read_u64(value, &mut pos, offset, &spec_ref)?)
+        } else {
+            None
+        };
+        let downlink_volume = if has_downlink {
+            Some(read_u64(value, &mut pos, offset, &spec_ref)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            total_volume,
+            uplink_volume,
+            downlink_volume,
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        let mut flags: u8 = 0;
+        if self.total_volume.is_some() {
+            flags |= 0x01;
+        }
+        if self.uplink_volume.is_some() {
+            flags |= 0x02;
+        }
+        if self.downlink_volume.is_some() {
+            flags |= 0x04;
+        }
+        dst.put_u8(flags);
+        if let Some(v) = self.total_volume {
+            dst.put_u64(v);
+        }
+        if let Some(v) = self.uplink_volume {
+            dst.put_u64(v);
+        }
+        if let Some(v) = self.downlink_volume {
+            dst.put_u64(v);
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Time Quota (§8.2.51)
+// ---------------------------------------------------------------------------
+
+/// Time Quota IE (type 74).
+///
+/// TS 29.244 §8.2.51: four octets containing the quota duration in seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeQuota {
+    /// Quota duration in seconds.
+    pub seconds: u32,
+}
+
+impl SimpleIe for TimeQuota {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.len() < 4 {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        Ok(Self {
+            seconds: u32::from_be_bytes([value[0], value[1], value[2], value[3]]),
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        dst.put_u32(self.seconds);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Offending IE (§8.2.22)
+// ---------------------------------------------------------------------------
+
+/// Offending IE (type 40).
+///
+/// TS 29.244 §8.2.22: two octets containing the type of the offending IE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OffendingIe {
+    /// Type of the offending IE.
+    pub ie_type: u16,
+}
+
+impl SimpleIe for OffendingIe {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.len() < 2 {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        Ok(Self {
+            ie_type: u16::from_be_bytes([value[0], value[1]]),
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        dst.put_u16(self.ie_type);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Usage Report Trigger (§8.2.41)
+// ---------------------------------------------------------------------------
+
+/// Usage Report Trigger IE (type 63).
+///
+/// TS 29.244 §8.2.41: three octets of flags; octet 7 bits 7-8 are spare
+/// (encoded as zero on canonical re-encode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageReportTrigger {
+    /// Periodic Reporting (octet 5 bit 1).
+    pub periodic_reporting: bool,
+    /// Volume Threshold (octet 5 bit 2).
+    pub volume_threshold: bool,
+    /// Time Threshold (octet 5 bit 3).
+    pub time_threshold: bool,
+    /// Quota Holding Time (octet 5 bit 4).
+    pub quota_holding_time: bool,
+    /// Start of Traffic (octet 5 bit 5).
+    pub start_of_traffic: bool,
+    /// Stop of Traffic (octet 5 bit 6).
+    pub stop_of_traffic: bool,
+    /// Dropped DL Traffic Threshold (octet 5 bit 7).
+    pub dropped_dl_traffic_threshold: bool,
+    /// Immediate Report (octet 5 bit 8).
+    pub immediate_report: bool,
+    /// Volume Quota (octet 6 bit 1).
+    pub volume_quota: bool,
+    /// Time Quota (octet 6 bit 2).
+    pub time_quota: bool,
+    /// Linked Usage Reporting (octet 6 bit 3).
+    pub linked_usage_reporting: bool,
+    /// Termination Report (octet 6 bit 4).
+    pub termination_report: bool,
+    /// Monitoring Time (octet 6 bit 5).
+    pub monitoring_time: bool,
+    /// Envelope Closure (octet 6 bit 6).
+    pub envelope_closure: bool,
+    /// MAC Addresses Reporting (octet 6 bit 7).
+    pub mac_addresses_reporting: bool,
+    /// Event Threshold (octet 6 bit 8).
+    pub event_threshold: bool,
+    /// Event Quota (octet 7 bit 1).
+    pub event_quota: bool,
+    /// Termination By UP function Report (octet 7 bit 2).
+    pub termination_by_up_report: bool,
+    /// IP Multicast Join/Leave (octet 7 bit 3).
+    pub ip_multicast_join_leave: bool,
+    /// Quota Validity Time (octet 7 bit 4).
+    pub quota_validity_time: bool,
+    /// End Marker Reception Report (octet 7 bit 5).
+    pub end_marker_reception_report: bool,
+    /// User Plane Inactivity Timer (octet 7 bit 6).
+    pub user_plane_inactivity_timer: bool,
+}
+
+impl SimpleIe for UsageReportTrigger {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.len() < 2 {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        let b5 = value[0];
+        let b6 = value[1];
+        let b7 = value.get(2).copied().unwrap_or(0);
+        Ok(Self {
+            periodic_reporting: (b5 & 0x01) != 0,
+            volume_threshold: (b5 & 0x02) != 0,
+            time_threshold: (b5 & 0x04) != 0,
+            quota_holding_time: (b5 & 0x08) != 0,
+            start_of_traffic: (b5 & 0x10) != 0,
+            stop_of_traffic: (b5 & 0x20) != 0,
+            dropped_dl_traffic_threshold: (b5 & 0x40) != 0,
+            immediate_report: (b5 & 0x80) != 0,
+            volume_quota: (b6 & 0x01) != 0,
+            time_quota: (b6 & 0x02) != 0,
+            linked_usage_reporting: (b6 & 0x04) != 0,
+            termination_report: (b6 & 0x08) != 0,
+            monitoring_time: (b6 & 0x10) != 0,
+            envelope_closure: (b6 & 0x20) != 0,
+            mac_addresses_reporting: (b6 & 0x40) != 0,
+            event_threshold: (b6 & 0x80) != 0,
+            event_quota: (b7 & 0x01) != 0,
+            termination_by_up_report: (b7 & 0x02) != 0,
+            ip_multicast_join_leave: (b7 & 0x04) != 0,
+            quota_validity_time: (b7 & 0x08) != 0,
+            end_marker_reception_report: (b7 & 0x10) != 0,
+            user_plane_inactivity_timer: (b7 & 0x20) != 0,
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        let mut b5: u8 = 0;
+        let mut b6: u8 = 0;
+        let mut b7: u8 = 0;
+        if self.periodic_reporting {
+            b5 |= 0x01;
+        }
+        if self.volume_threshold {
+            b5 |= 0x02;
+        }
+        if self.time_threshold {
+            b5 |= 0x04;
+        }
+        if self.quota_holding_time {
+            b5 |= 0x08;
+        }
+        if self.start_of_traffic {
+            b5 |= 0x10;
+        }
+        if self.stop_of_traffic {
+            b5 |= 0x20;
+        }
+        if self.dropped_dl_traffic_threshold {
+            b5 |= 0x40;
+        }
+        if self.immediate_report {
+            b5 |= 0x80;
+        }
+        if self.volume_quota {
+            b6 |= 0x01;
+        }
+        if self.time_quota {
+            b6 |= 0x02;
+        }
+        if self.linked_usage_reporting {
+            b6 |= 0x04;
+        }
+        if self.termination_report {
+            b6 |= 0x08;
+        }
+        if self.monitoring_time {
+            b6 |= 0x10;
+        }
+        if self.envelope_closure {
+            b6 |= 0x20;
+        }
+        if self.mac_addresses_reporting {
+            b6 |= 0x40;
+        }
+        if self.event_threshold {
+            b6 |= 0x80;
+        }
+        if self.event_quota {
+            b7 |= 0x01;
+        }
+        if self.termination_by_up_report {
+            b7 |= 0x02;
+        }
+        if self.ip_multicast_join_leave {
+            b7 |= 0x04;
+        }
+        if self.quota_validity_time {
+            b7 |= 0x08;
+        }
+        if self.end_marker_reception_report {
+            b7 |= 0x10;
+        }
+        if self.user_plane_inactivity_timer {
+            b7 |= 0x20;
+        }
+        dst.put_u8(b5);
+        dst.put_u8(b6);
+        dst.put_u8(b7);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Volume Measurement (§8.2.44)
+// ---------------------------------------------------------------------------
+
+/// Volume Measurement IE (type 66).
+///
+/// TS 29.244 §8.2.44: octet 5 flags select which of Total/Uplink/Downlink
+/// Volume and Total/Uplink/Downlink Number of Packets fields (each 8 octets)
+/// are present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeMeasurement {
+    /// Total volume (octets m to m+7) present if TOVOL flag set.
+    pub total_volume: Option<u64>,
+    /// Uplink volume (octets p to p+7) present if ULVOL flag set.
+    pub uplink_volume: Option<u64>,
+    /// Downlink volume (octets q to q+7) present if DLVOL flag set.
+    pub downlink_volume: Option<u64>,
+    /// Total number of packets (octets r to r+7) present if TONOP flag set.
+    pub total_packets: Option<u64>,
+    /// Uplink number of packets (octets s to s+7) present if ULNOP flag set.
+    pub uplink_packets: Option<u64>,
+    /// Downlink number of packets (octets t to t+7) present if DLNOP flag set.
+    pub downlink_packets: Option<u64>,
+}
+
+impl SimpleIe for VolumeMeasurement {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.is_empty() {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        let flags = value[0];
+        let has_total_volume = (flags & 0x01) != 0;
+        let has_uplink_volume = (flags & 0x02) != 0;
+        let has_downlink_volume = (flags & 0x04) != 0;
+        let has_total_packets = (flags & 0x08) != 0;
+        let has_uplink_packets = (flags & 0x10) != 0;
+        let has_downlink_packets = (flags & 0x20) != 0;
+
+        let mut pos = 1usize;
+        let read_u64 = |value: &[u8],
+                        pos: &mut usize,
+                        offset: usize,
+                        spec_ref: &SpecRef|
+         -> Result<u64, DecodeError> {
+            if value.len() < *pos + 8 {
+                return Err(DecodeError::new(DecodeErrorCode::Truncated, offset + *pos)
+                    .with_spec_ref(spec_ref.clone()));
+            }
+            let v = u64::from_be_bytes([
+                value[*pos],
+                value[*pos + 1],
+                value[*pos + 2],
+                value[*pos + 3],
+                value[*pos + 4],
+                value[*pos + 5],
+                value[*pos + 6],
+                value[*pos + 7],
+            ]);
+            *pos += 8;
+            Ok(v)
+        };
+
+        Ok(Self {
+            total_volume: if has_total_volume {
+                Some(read_u64(value, &mut pos, offset, &spec_ref)?)
+            } else {
+                None
+            },
+            uplink_volume: if has_uplink_volume {
+                Some(read_u64(value, &mut pos, offset, &spec_ref)?)
+            } else {
+                None
+            },
+            downlink_volume: if has_downlink_volume {
+                Some(read_u64(value, &mut pos, offset, &spec_ref)?)
+            } else {
+                None
+            },
+            total_packets: if has_total_packets {
+                Some(read_u64(value, &mut pos, offset, &spec_ref)?)
+            } else {
+                None
+            },
+            uplink_packets: if has_uplink_packets {
+                Some(read_u64(value, &mut pos, offset, &spec_ref)?)
+            } else {
+                None
+            },
+            downlink_packets: if has_downlink_packets {
+                Some(read_u64(value, &mut pos, offset, &spec_ref)?)
+            } else {
+                None
+            },
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        let mut flags: u8 = 0;
+        if self.total_volume.is_some() {
+            flags |= 0x01;
+        }
+        if self.uplink_volume.is_some() {
+            flags |= 0x02;
+        }
+        if self.downlink_volume.is_some() {
+            flags |= 0x04;
+        }
+        if self.total_packets.is_some() {
+            flags |= 0x08;
+        }
+        if self.uplink_packets.is_some() {
+            flags |= 0x10;
+        }
+        if self.downlink_packets.is_some() {
+            flags |= 0x20;
+        }
+        dst.put_u8(flags);
+        if let Some(v) = self.total_volume {
+            dst.put_u64(v);
+        }
+        if let Some(v) = self.uplink_volume {
+            dst.put_u64(v);
+        }
+        if let Some(v) = self.downlink_volume {
+            dst.put_u64(v);
+        }
+        if let Some(v) = self.total_packets {
+            dst.put_u64(v);
+        }
+        if let Some(v) = self.uplink_packets {
+            dst.put_u64(v);
+        }
+        if let Some(v) = self.downlink_packets {
+            dst.put_u64(v);
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Duration Measurement (§8.2.45)
+// ---------------------------------------------------------------------------
+
+/// Duration Measurement IE (type 67).
+///
+/// TS 29.244 §8.2.45: four octets containing the duration in seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurationMeasurement {
+    /// Duration in seconds.
+    pub seconds: u32,
+}
+
+impl SimpleIe for DurationMeasurement {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.len() < 4 {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        Ok(Self {
+            seconds: u32::from_be_bytes([value[0], value[1], value[2], value[3]]),
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        dst.put_u32(self.seconds);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UR-SEQN (§8.2.71)
+// ---------------------------------------------------------------------------
+
+/// UR-SEQN IE (type 104).
+///
+/// TS 29.244 §8.2.71: four octets containing the usage report sequence number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UrSeqn {
+    /// Usage report sequence number.
+    pub value: u32,
+}
+
+impl SimpleIe for UrSeqn {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.len() < 4 {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        Ok(Self {
+            value: u32::from_be_bytes([value[0], value[1], value[2], value[3]]),
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        dst.put_u32(self.value);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // QoS Flow Identifier (§8.2.89)
 // ---------------------------------------------------------------------------
 

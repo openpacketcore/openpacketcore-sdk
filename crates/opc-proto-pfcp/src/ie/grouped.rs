@@ -346,6 +346,34 @@ impl GroupedIe for CreatedPdr {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Usage Report (Session Report Request) (type 80)
+// ---------------------------------------------------------------------------
+
+/// Usage Report grouped IE within Session Report Request (type 80).
+///
+/// TS 29.244 §7.5.8.3: contains URR ID, UR-SEQN, Usage Report Trigger,
+/// Volume Measurement, Duration Measurement, Start Time, End Time, etc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageReport {
+    /// Member IEs.
+    pub members: Vec<TypedIe>,
+}
+
+impl GroupedIe for UsageReport {
+    fn decode_members(input: &[u8], ctx: DecodeContext, depth: usize) -> Result<Self, DecodeError> {
+        let members = decode_typed_ie_sequence(input, ctx, depth)?;
+        Ok(Self { members })
+    }
+
+    fn encode_members(&self, dst: &mut BytesMut, ctx: EncodeContext) -> Result<(), EncodeError> {
+        for member in &self.members {
+            member.encode(dst, ctx)?;
+        }
+        Ok(())
+    }
+}
+
 /// Decode a sequence of member IEs from a grouped IE value buffer,
 /// enforcing depth limits for nested grouped IEs.
 fn decode_typed_ie_sequence(
