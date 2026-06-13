@@ -62,7 +62,14 @@ jobs:
       - name: Generate Rust SBOM
         run: |
           cargo install cargo-cyclonedx --locked
-          cargo cyclonedx --format json --output release-artifacts/
+          # cargo-cyclonedx writes one <crate>.cdx.json next to each member's
+          # Cargo.toml (it has no --output flag); collect them into the
+          # evidence directory under uniquely-named files.
+          cargo cyclonedx --format json --all
+          mkdir -p release-artifacts/rust-sbom
+          find . -name '*.cdx.json' -not -path './target/*' \
+            -not -path './release-artifacts/*' \
+            -exec mv {} release-artifacts/rust-sbom/ \;
 
       - name: Generate Go SBOM
         run: |
