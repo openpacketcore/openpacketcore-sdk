@@ -894,6 +894,16 @@ fn test_production_proof_codegen() {
         assert_eq!(p.len(), 4);
         assert_eq!(p[2].keys.get("name").map(|s| s.as_str()), Some("eth'0"));
 
+        let path_backslash =
+            "/proof:system/proof:interfaces/proof:interface[proof:name='eth\\\\0']/proof:enabled";
+        let p = parse_path(path_backslash).unwrap();
+        assert_eq!(p[2].keys.get("name").map(|s| s.as_str()), Some("eth\\0"));
+
+        let path_trailing_backslash =
+            "/proof:system/proof:interfaces/proof:interface[proof:name='eth\\\\']/proof:enabled";
+        let p = parse_path(path_trailing_backslash).unwrap();
+        assert_eq!(p[2].keys.get("name").map(|s| s.as_str()), Some("eth\\"));
+
         // Additional adversarial inputs for safety and no-panic guarantee
         let adversarial = vec![
             "/proof:system/proof:interfaces/proof:interface[proof:name='eth[0][1][2]']/proof:enabled",
@@ -936,6 +946,34 @@ fn test_production_proof_codegen() {
         use generated_test::paths::is_valid_path;
         let path = "/proof:system/proof:interfaces/proof:interface[proof:name='eth[0]']/proof:enabled";
         assert!(is_valid_path(path));
+    }
+
+    #[test]
+    fn test_diff_root_escapes_key_values() {
+        use generated_test::patch::{diff_root, ConfigDelta};
+        use generated_test::types::{Interface, Interfaces, LeafPresence};
+
+        let mut current = System::default();
+        let mut interfaces = Interfaces::default();
+        let mut interface = Interface::default();
+        interface.enabled = LeafPresence::Explicit(true);
+        interfaces.interface.insert("eth\\'0".to_string(), interface);
+        current.interfaces = Some(interfaces);
+
+        let deltas = diff_root(&current, &System::default()).unwrap();
+        let paths: Vec<&str> = deltas
+            .iter()
+            .map(|delta| match delta {
+                ConfigDelta::Update(path, _)
+                | ConfigDelta::Replace(path, _)
+                | ConfigDelta::Delete(path)
+                | ConfigDelta::Merge(path, _)
+                | ConfigDelta::Remove(path) => path.as_str(),
+            })
+            .collect();
+        assert!(paths
+            .iter()
+            .any(|path| path.contains("interface[name='eth\\\\\\'0']")));
     }
 
     #[test]

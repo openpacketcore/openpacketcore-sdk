@@ -1434,6 +1434,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-mgmt-path"
+version = "0.2.0"
+dependencies = [
+ "opc-config-model",
+ "opc-mgmt-schema",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "opc-mgmt-principal"
 version = "0.2.0"
 dependencies = [

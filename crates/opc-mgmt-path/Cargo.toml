@@ -1,0 +1,21 @@
+[package]
+name = "opc-mgmt-path"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Registry-validated, instance-aware canonical YANG path construction for the OpenPacketCore management plane (gNMI/NETCONF)"
+readme = "README.md"
+documentation = "https://docs.rs/opc-mgmt-path"
+keywords = ["5g", "cnf", "yang", "gnmi", "netconf"]
+categories = ["network-programming"]
+
+[dependencies]
+opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
+opc-mgmt-schema = { path = "../opc-mgmt-schema", version = "0.2.0" }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
