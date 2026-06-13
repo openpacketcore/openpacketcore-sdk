@@ -2,8 +2,8 @@ mod common;
 mod tcp_consensus_common;
 
 use opc_persist::{
-    ClusterMembership, ConsensusClock, ConsensusConfigStore, ConsensusPeer, Role, TcpPeer,
-    TcpRpcServer,
+    ClusterMembership, ConsensusClock, ConsensusConfigStore, ConsensusMetricsDump, ConsensusPeer,
+    Role, TcpPeer, TcpRpcServer,
 };
 use std::sync::Arc;
 use tcp_consensus_common::{
@@ -11,9 +11,58 @@ use tcp_consensus_common::{
 };
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
+use tokio::time::{sleep, Duration, Instant};
+
+static HIGH_FD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn wait_for_metrics<F>(
+    store: &ConsensusConfigStore,
+    timeout: Duration,
+    mut predicate: F,
+) -> ConsensusMetricsDump
+where
+    F: FnMut(&ConsensusMetricsDump) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        let metrics = store.dump_metrics().await.unwrap();
+        if predicate(&metrics) || Instant::now() >= deadline {
+            return metrics;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn connect_raw_clients(addr: &str, target: usize, timeout: Duration) -> Vec<TcpStream> {
+    let deadline = Instant::now() + timeout;
+    let mut connections = Vec::with_capacity(target);
+    let mut last_error = None;
+
+    while connections.len() < target && Instant::now() < deadline {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => connections.push(stream),
+            Err(err) => {
+                last_error = Some(err);
+                sleep(Duration::from_millis(25)).await;
+            }
+        }
+        sleep(Duration::from_millis(2)).await;
+    }
+
+    assert_eq!(
+        connections.len(),
+        target,
+        "opened {} of {target} raw TCP connections before timeout; last error: {last_error:?}",
+        connections.len()
+    );
+
+    connections
+}
 
 #[tokio::test]
 async fn test_tcp_consensus_mtls_validation_and_failures() {
+    let _fd_guard = HIGH_FD_TEST_LOCK.lock().await;
     let temp_dir = TempDir::new().unwrap();
     let (ca_cert, ca_key_pair, identities) = generate_test_ca_and_identities(&[0, 1]);
 
@@ -472,6 +521,7 @@ fn get_free_port() -> u16 {
 
 #[tokio::test]
 async fn test_consensus_active_connections_and_limit() {
+    let _fd_guard = HIGH_FD_TEST_LOCK.lock().await;
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("conn_limit_test.db");
     let backend = Arc::new(
@@ -501,38 +551,34 @@ async fn test_consensus_active_connections_and_limit() {
         .unwrap();
 
     let port = get_free_port();
-    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{port}"));
+    let addr = format!("127.0.0.1:{port}");
+    let server = TcpRpcServer::new(store.clone(), addr.clone());
     let handle = server.start().await.unwrap();
 
-    let mut connections = Vec::new();
-    for _ in 0..100 {
-        let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await;
-        if let Ok(s) = stream {
-            connections.push(s);
-        }
-    }
+    let connections = connect_raw_clients(&addr, 100, Duration::from_secs(5)).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let m = store.dump_metrics().await.unwrap();
-    assert_eq!(m.server_active_connections, connections.len() as u64);
+    let m = wait_for_metrics(&store, Duration::from_secs(5), |m| {
+        m.server_active_connections == 100
+    })
+    .await;
+    assert_eq!(m.server_active_connections, 100);
     assert_eq!(m.server_rejected_connections, 0);
 
-    let extra_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
+    let extra_stream = TcpStream::connect(&addr).await.unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let m2 = store.dump_metrics().await.unwrap();
-    assert_eq!(m2.server_rejected_connections, 1);
+    let m2 = wait_for_metrics(&store, Duration::from_secs(2), |m| {
+        m.server_rejected_connections >= 1
+    })
+    .await;
+    assert!(m2.server_rejected_connections >= 1);
 
     drop(connections);
     drop(extra_stream);
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let m3 = store.dump_metrics().await.unwrap();
+    let m3 = wait_for_metrics(&store, Duration::from_secs(2), |m| {
+        m.server_active_connections == 0
+    })
+    .await;
     assert_eq!(m3.server_active_connections, 0);
 
     server.shutdown().await;
@@ -541,6 +587,7 @@ async fn test_consensus_active_connections_and_limit() {
 
 #[tokio::test]
 async fn test_consensus_active_connections_handshake_timeout_recovery() {
+    let _fd_guard = HIGH_FD_TEST_LOCK.lock().await;
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("conn_timeout_test.db");
     let backend = Arc::new(
@@ -570,44 +617,42 @@ async fn test_consensus_active_connections_handshake_timeout_recovery() {
         .unwrap();
 
     let port = get_free_port();
-    let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{port}"));
+    let addr = format!("127.0.0.1:{port}");
+    let server = TcpRpcServer::new(store.clone(), addr.clone());
     let handle = server.start().await.unwrap();
 
-    let mut connections = Vec::new();
-    for _ in 0..100 {
-        let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await;
-        if let Ok(s) = stream {
-            connections.push(s);
-        }
-    }
+    let connections = connect_raw_clients(&addr, 100, Duration::from_secs(5)).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let m = store.dump_metrics().await.unwrap();
+    let m = wait_for_metrics(&store, Duration::from_secs(5), |m| {
+        m.server_active_connections == 100
+    })
+    .await;
     assert_eq!(m.server_active_connections, 100);
     assert_eq!(m.server_rejected_connections, 0);
 
-    let extra_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
+    let extra_stream = TcpStream::connect(&addr).await.unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let m2 = wait_for_metrics(&store, Duration::from_secs(2), |m| {
+        m.server_rejected_connections >= 1
+    })
+    .await;
+    assert!(m2.server_rejected_connections >= 1);
 
-    let m2 = store.dump_metrics().await.unwrap();
-    assert_eq!(m2.server_rejected_connections, 1);
-
-    tokio::time::sleep(std::time::Duration::from_millis(5500)).await;
-
-    let m3 = store.dump_metrics().await.unwrap();
+    let m3 = wait_for_metrics(&store, Duration::from_secs(8), |m| {
+        m.server_active_connections == 0
+            && m.server_rejected_connections >= 101
+            && m.auth_failures >= 100
+    })
+    .await;
     assert_eq!(m3.server_active_connections, 0);
-    assert_eq!(m3.server_rejected_connections, 101);
+    assert!(m3.server_rejected_connections >= 101);
     assert!(m3.auth_failures >= 100);
 
-    let new_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let m4 = store.dump_metrics().await.unwrap();
+    let new_stream = TcpStream::connect(&addr).await.unwrap();
+    let m4 = wait_for_metrics(&store, Duration::from_secs(2), |m| {
+        m.server_active_connections == 1
+    })
+    .await;
     assert_eq!(m4.server_active_connections, 1);
 
     drop(new_stream);
@@ -620,6 +665,7 @@ async fn test_consensus_active_connections_handshake_timeout_recovery() {
 
 #[tokio::test]
 async fn test_consensus_active_connections_stress_concurrency() {
+    let _fd_guard = HIGH_FD_TEST_LOCK.lock().await;
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("conn_stress_test.db");
     let backend = Arc::new(
@@ -672,13 +718,17 @@ async fn test_consensus_active_connections_stress_concurrency() {
         connect_errors
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let m = store.dump_metrics().await.unwrap();
+    let expected = connections.len() as u64;
+    let m = wait_for_metrics(&store, Duration::from_secs(3), |m| {
+        let total_accounted = m.server_active_connections + m.server_rejected_connections;
+        m.server_active_connections <= 100
+            && total_accounted >= expected.saturating_sub(2)
+            && total_accounted <= expected
+    })
+    .await;
     assert!(m.server_active_connections <= 100);
 
     let total_accounted = m.server_active_connections + m.server_rejected_connections;
-    let expected = connections.len() as u64;
     assert!(
         total_accounted >= expected.saturating_sub(2) && total_accounted <= expected,
         "Expected total accounted around {}, got active={}, rejected={}",
@@ -688,9 +738,11 @@ async fn test_consensus_active_connections_stress_concurrency() {
     );
 
     drop(connections);
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    let m2 = store.dump_metrics().await.unwrap();
+    let m2 = wait_for_metrics(&store, Duration::from_secs(2), |m| {
+        m.server_active_connections == 0
+    })
+    .await;
     assert_eq!(m2.server_active_connections, 0);
 
     server.shutdown().await;

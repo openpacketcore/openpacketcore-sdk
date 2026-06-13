@@ -174,3 +174,41 @@ fn commit_errors_redact_client_visible_validation_and_diff_messages() {
     assert_eq!(diff.message, "candidate config diff generation failed");
     assert!(!diff.message.contains(secret));
 }
+
+#[test]
+fn transport_type_netconf_tls_is_distinct_and_serde_stable() {
+    // NETCONF over TLS must be a transport distinct from SSH so audit,
+    // authorization, and idempotency-fingerprint matching attribute a request to
+    // the transport it actually arrived on (the spec forbids mapping TLS onto SSH).
+    assert_ne!(TransportType::NetconfTls, TransportType::NetconfSsh);
+
+    // Every transport must serde round-trip: the variant is embedded in persisted
+    // commit/audit/idempotency records, so a serialization that did not round-trip
+    // would corrupt them or break idempotent-replay matching.
+    for transport in [
+        TransportType::Gnmi,
+        TransportType::NetconfSsh,
+        TransportType::NetconfTls,
+        TransportType::RestconfHttps,
+        TransportType::Internal,
+    ] {
+        let json = serde_json::to_string(&transport).expect("serialize transport");
+        let round: TransportType = serde_json::from_str(&json).expect("deserialize transport");
+        assert_eq!(round, transport);
+    }
+
+    // NetconfTls is usable as a CommitRequest transport and is preserved verbatim
+    // (the field the config bus copies into the authorization context and the
+    // stored request fingerprint).
+    let request = CommitRequest::commit(
+        RequestId::new(),
+        principal(),
+        TransportType::NetconfTls,
+        RequestSource::Northbound,
+        ConfigOperation::Replace,
+        ExampleConfig { revision: 1 },
+        vec![YangPath::new("/system/hostname").expect("path")],
+        Instant::now(),
+    );
+    assert_eq!(request.transport, TransportType::NetconfTls);
+}

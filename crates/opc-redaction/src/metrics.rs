@@ -315,6 +315,31 @@ pub struct SdkMetrics {
     pub sbi_circuit_state: Mutex<HashMap<(String, String, String), u64>>,
     pub sbi_overload_rejections_total: Mutex<HashMap<(String, String), u64>>,
     pub sbi_callback_delivery_total: Mutex<HashMap<(String, String), u64>>,
+
+    // === gNMI Server (opc-gnmi-server) ===
+    // These families are written by the gNMI server once it exists; until then
+    // they export as empty metric families (no rows), which is honest. Label
+    // values are sanitized via metrics_label_safe at export time.
+    pub gnmi_rpc_requests_total: Mutex<HashMap<(String, String), u64>>,
+    pub gnmi_rpc_errors_total: Mutex<HashMap<(String, String), u64>>,
+    pub gnmi_rpc_seconds: Mutex<HashMap<String, LatencyHistogram>>,
+    pub gnmi_set_commit_seconds: Mutex<HashMap<String, LatencyHistogram>>,
+    pub gnmi_active_streams: Mutex<HashMap<String, i64>>,
+    pub gnmi_subscription_events_total: Mutex<HashMap<(String, String), u64>>,
+    pub gnmi_subscription_lag_total: Mutex<HashMap<String, u64>>,
+    pub gnmi_nacm_denials_total: Mutex<HashMap<String, u64>>,
+    pub gnmi_extensions_total: Mutex<HashMap<(String, String), u64>>,
+    pub gnmi_arbitration_denials_total: Mutex<HashMap<String, u64>>,
+
+    // === NETCONF Server (opc-netconf-server) ===
+    pub netconf_sessions_active: Mutex<HashMap<String, i64>>,
+    pub netconf_rpc_requests_total: Mutex<HashMap<(String, String), u64>>,
+    pub netconf_rpc_errors_total: Mutex<HashMap<(String, String), u64>>,
+    pub netconf_rpc_seconds: Mutex<HashMap<String, LatencyHistogram>>,
+    pub netconf_commit_seconds: Mutex<HashMap<String, LatencyHistogram>>,
+    pub netconf_locks_active: Mutex<HashMap<String, i64>>,
+    pub netconf_notifications_total: Mutex<HashMap<(String, String), u64>>,
+    pub netconf_nacm_denials_total: Mutex<HashMap<String, u64>>,
 }
 
 impl SdkMetrics {
@@ -405,6 +430,26 @@ impl SdkMetrics {
             sbi_circuit_state: Mutex::new(HashMap::new()),
             sbi_overload_rejections_total: Mutex::new(HashMap::new()),
             sbi_callback_delivery_total: Mutex::new(HashMap::new()),
+
+            gnmi_rpc_requests_total: Mutex::new(HashMap::new()),
+            gnmi_rpc_errors_total: Mutex::new(HashMap::new()),
+            gnmi_rpc_seconds: Mutex::new(HashMap::new()),
+            gnmi_set_commit_seconds: Mutex::new(HashMap::new()),
+            gnmi_active_streams: Mutex::new(HashMap::new()),
+            gnmi_subscription_events_total: Mutex::new(HashMap::new()),
+            gnmi_subscription_lag_total: Mutex::new(HashMap::new()),
+            gnmi_nacm_denials_total: Mutex::new(HashMap::new()),
+            gnmi_extensions_total: Mutex::new(HashMap::new()),
+            gnmi_arbitration_denials_total: Mutex::new(HashMap::new()),
+
+            netconf_sessions_active: Mutex::new(HashMap::new()),
+            netconf_rpc_requests_total: Mutex::new(HashMap::new()),
+            netconf_rpc_errors_total: Mutex::new(HashMap::new()),
+            netconf_rpc_seconds: Mutex::new(HashMap::new()),
+            netconf_commit_seconds: Mutex::new(HashMap::new()),
+            netconf_locks_active: Mutex::new(HashMap::new()),
+            netconf_notifications_total: Mutex::new(HashMap::new()),
+            netconf_nacm_denials_total: Mutex::new(HashMap::new()),
         }
     }
 
@@ -537,6 +582,49 @@ impl SdkMetrics {
         if let Ok(mut m) = self.sbi_callback_delivery_total.lock() {
             m.clear();
         }
+
+        for map in [
+            &self.gnmi_rpc_requests_total,
+            &self.gnmi_rpc_errors_total,
+            &self.gnmi_subscription_events_total,
+            &self.gnmi_extensions_total,
+            &self.netconf_rpc_requests_total,
+            &self.netconf_rpc_errors_total,
+            &self.netconf_notifications_total,
+        ] {
+            if let Ok(mut m) = map.lock() {
+                m.clear();
+            }
+        }
+        for map in [
+            &self.gnmi_subscription_lag_total,
+            &self.gnmi_nacm_denials_total,
+            &self.gnmi_arbitration_denials_total,
+            &self.netconf_nacm_denials_total,
+        ] {
+            if let Ok(mut m) = map.lock() {
+                m.clear();
+            }
+        }
+        for map in [
+            &self.gnmi_active_streams,
+            &self.netconf_sessions_active,
+            &self.netconf_locks_active,
+        ] {
+            if let Ok(mut m) = map.lock() {
+                m.clear();
+            }
+        }
+        for map in [
+            &self.gnmi_rpc_seconds,
+            &self.gnmi_set_commit_seconds,
+            &self.netconf_rpc_seconds,
+            &self.netconf_commit_seconds,
+        ] {
+            if let Ok(mut m) = map.lock() {
+                m.clear();
+            }
+        }
     }
 }
 
@@ -636,6 +724,89 @@ fn escape_prometheus_label_value(value: &str) -> String {
 
 fn escape_prometheus_help(help: &str) -> String {
     help.replace('\\', r"\\").replace('\n', r"\n")
+}
+
+/// Render a single-label counter family from a locked map, sanitizing the label
+/// value with [`metrics_label_safe`] and emitting rows in deterministic order.
+fn write_labeled_counter_1(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    map: &Mutex<HashMap<String, u64>>,
+    label: &str,
+) {
+    out.push_str(&format!("# HELP {name} {}\n", escape_prometheus_help(help)));
+    out.push_str(&format!("# TYPE {name} counter\n"));
+    if let Ok(m) = map.lock() {
+        let mut sorted: Vec<_> = m.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, &v) in sorted {
+            let safe = metrics_label_safe(k);
+            out.push_str(&format!("{name}{{{label}=\"{safe}\"}} {v}\n"));
+        }
+    }
+}
+
+/// Render a two-label counter family from a locked map, sanitizing both labels.
+fn write_labeled_counter_2(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    map: &Mutex<HashMap<(String, String), u64>>,
+    l1: &str,
+    l2: &str,
+) {
+    out.push_str(&format!("# HELP {name} {}\n", escape_prometheus_help(help)));
+    out.push_str(&format!("# TYPE {name} counter\n"));
+    if let Ok(m) = map.lock() {
+        let mut sorted: Vec<_> = m.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, &v) in sorted {
+            let s1 = metrics_label_safe(&k.0);
+            let s2 = metrics_label_safe(&k.1);
+            out.push_str(&format!("{name}{{{l1}=\"{s1}\",{l2}=\"{s2}\"}} {v}\n"));
+        }
+    }
+}
+
+/// Render a single-label gauge family from a locked map, sanitizing the label.
+fn write_labeled_gauge_1(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    map: &Mutex<HashMap<String, i64>>,
+    label: &str,
+) {
+    out.push_str(&format!("# HELP {name} {}\n", escape_prometheus_help(help)));
+    out.push_str(&format!("# TYPE {name} gauge\n"));
+    if let Ok(m) = map.lock() {
+        let mut sorted: Vec<_> = m.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, &v) in sorted {
+            let safe = metrics_label_safe(k);
+            out.push_str(&format!("{name}{{{label}=\"{safe}\"}} {v}\n"));
+        }
+    }
+}
+
+/// Render a single-label histogram family from a locked map of histograms,
+/// sanitizing the label and reusing [`write_histogram_samples`] per series.
+fn write_labeled_histogram_1(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    map: &Mutex<HashMap<String, LatencyHistogram>>,
+    label: &str,
+) {
+    write_histogram_metadata(out, name, help);
+    if let Ok(m) = map.lock() {
+        let mut sorted: Vec<_> = m.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, hist) in sorted {
+            let safe = metrics_label_safe(k);
+            write_histogram_samples(out, name, hist, &[(label, &safe)]);
+        }
+    }
 }
 
 /// Export all SDK metrics in standard Prometheus text exposition format.
@@ -1328,6 +1499,143 @@ pub fn export_prometheus_text() -> String {
         }
     }
 
+    // === gNMI Server ===
+    write_labeled_counter_2(
+        &mut out,
+        "opc_gnmi_rpc_requests_total",
+        "Total gNMI RPC requests by RPC and outcome",
+        &METRICS.gnmi_rpc_requests_total,
+        "rpc",
+        "outcome",
+    );
+    write_labeled_counter_2(
+        &mut out,
+        "opc_gnmi_rpc_errors_total",
+        "Total gNMI RPC errors by RPC and status code",
+        &METRICS.gnmi_rpc_errors_total,
+        "rpc",
+        "code",
+    );
+    write_labeled_histogram_1(
+        &mut out,
+        "opc_gnmi_rpc_seconds",
+        "gNMI RPC latency in seconds by RPC",
+        &METRICS.gnmi_rpc_seconds,
+        "rpc",
+    );
+    write_labeled_histogram_1(
+        &mut out,
+        "opc_gnmi_set_commit_seconds",
+        "gNMI Set commit latency in seconds by operation",
+        &METRICS.gnmi_set_commit_seconds,
+        "operation",
+    );
+    write_labeled_gauge_1(
+        &mut out,
+        "opc_gnmi_active_streams",
+        "Active gNMI subscription streams by mode",
+        &METRICS.gnmi_active_streams,
+        "mode",
+    );
+    write_labeled_counter_2(
+        &mut out,
+        "opc_gnmi_subscription_events_total",
+        "Total gNMI subscription events by mode and event",
+        &METRICS.gnmi_subscription_events_total,
+        "mode",
+        "event",
+    );
+    write_labeled_counter_1(
+        &mut out,
+        "opc_gnmi_subscription_lag_total",
+        "Total gNMI subscription lag events by lag policy",
+        &METRICS.gnmi_subscription_lag_total,
+        "policy",
+    );
+    write_labeled_counter_1(
+        &mut out,
+        "opc_gnmi_nacm_denials_total",
+        "Total gNMI NACM denials by action",
+        &METRICS.gnmi_nacm_denials_total,
+        "action",
+    );
+    write_labeled_counter_2(
+        &mut out,
+        "opc_gnmi_extensions_total",
+        "Total gNMI extension outcomes by extension and outcome",
+        &METRICS.gnmi_extensions_total,
+        "extension",
+        "outcome",
+    );
+    write_labeled_counter_1(
+        &mut out,
+        "opc_gnmi_arbitration_denials_total",
+        "Total gNMI arbitration write denials by reason",
+        &METRICS.gnmi_arbitration_denials_total,
+        "reason",
+    );
+
+    // === NETCONF Server ===
+    write_labeled_gauge_1(
+        &mut out,
+        "opc_netconf_sessions_active",
+        "Active NETCONF sessions by transport",
+        &METRICS.netconf_sessions_active,
+        "transport",
+    );
+    write_labeled_counter_2(
+        &mut out,
+        "opc_netconf_rpc_requests_total",
+        "Total NETCONF RPC requests by operation and outcome",
+        &METRICS.netconf_rpc_requests_total,
+        "operation",
+        "outcome",
+    );
+    write_labeled_counter_2(
+        &mut out,
+        "opc_netconf_rpc_errors_total",
+        "Total NETCONF RPC errors by operation and error tag",
+        &METRICS.netconf_rpc_errors_total,
+        "operation",
+        "error_tag",
+    );
+    write_labeled_histogram_1(
+        &mut out,
+        "opc_netconf_rpc_seconds",
+        "NETCONF RPC latency in seconds by operation",
+        &METRICS.netconf_rpc_seconds,
+        "operation",
+    );
+    write_labeled_histogram_1(
+        &mut out,
+        "opc_netconf_commit_seconds",
+        "NETCONF commit latency in seconds by target datastore",
+        &METRICS.netconf_commit_seconds,
+        "target",
+    );
+    write_labeled_gauge_1(
+        &mut out,
+        "opc_netconf_locks_active",
+        "Active NETCONF datastore locks by datastore",
+        &METRICS.netconf_locks_active,
+        "datastore",
+    );
+    write_labeled_counter_2(
+        &mut out,
+        "opc_netconf_notifications_total",
+        "Total NETCONF notifications by stream and outcome",
+        &METRICS.netconf_notifications_total,
+        "stream",
+        "outcome",
+    );
+    write_labeled_counter_1(
+        &mut out,
+        "opc_netconf_nacm_denials_total",
+        "Total NETCONF NACM denials by action",
+        &METRICS.netconf_nacm_denials_total,
+        "action",
+    );
+
     out
 }
 
@@ -1421,6 +1729,30 @@ mod tests {
             alarms.insert(("warning".to_string(), "spiffe://test/leak".to_string()), 2);
         }
 
+        // --- Management-plane (gNMI / NETCONF) families ---
+        if let Ok(mut m) = METRICS.gnmi_rpc_requests_total.lock() {
+            m.insert(("Get".to_string(), "ok".to_string()), 5);
+        }
+        if let Ok(mut m) = METRICS.gnmi_active_streams.lock() {
+            m.insert("stream".to_string(), 2);
+        }
+        if let Ok(mut m) = METRICS.gnmi_nacm_denials_total.lock() {
+            m.insert("read".to_string(), 1);
+            // A path-shaped label value must be sanitized, not leaked, in export.
+            m.insert("/secret/path".to_string(), 9);
+        }
+        if let Ok(mut m) = METRICS.gnmi_rpc_seconds.lock() {
+            let hist = LatencyHistogram::new();
+            hist.observe(0.025);
+            m.insert("Set".to_string(), hist);
+        }
+        if let Ok(mut m) = METRICS.netconf_sessions_active.lock() {
+            m.insert("netconf-tls".to_string(), 3);
+        }
+        if let Ok(mut m) = METRICS.netconf_rpc_errors_total.lock() {
+            m.insert(("edit-config".to_string(), "access-denied".to_string()), 4);
+        }
+
         let exported = export_prometheus_text();
         assert!(exported.contains("opc_config_bus_pending_commits 3\n"));
         assert!(exported.contains("opc_break_glass_sessions_active 1\n"));
@@ -1437,5 +1769,27 @@ mod tests {
             .contains("opc_alarm_active_count{severity=\"critical\",cause=\"cpu_high\"} 1\n"));
         assert!(exported
             .contains("opc_alarm_active_count{severity=\"warning\",cause=\"redacted\"} 2\n"));
+
+        // Management-plane families export with sanitized labels.
+        assert!(exported.contains("opc_gnmi_rpc_requests_total{rpc=\"Get\",outcome=\"ok\"} 5\n"));
+        assert!(exported.contains("opc_gnmi_active_streams{mode=\"stream\"} 2\n"));
+        assert!(exported.contains("opc_gnmi_nacm_denials_total{action=\"read\"} 1\n"));
+        // Path-shaped label value must be redacted, never leaked verbatim.
+        assert!(exported.contains("opc_gnmi_nacm_denials_total{action=\"redacted\"} 9\n"));
+        assert!(!exported.contains("/secret/path"));
+        assert!(exported.contains("# TYPE opc_gnmi_rpc_seconds histogram\n"));
+        assert!(exported.contains("opc_gnmi_rpc_seconds_bucket{rpc=\"Set\",le=\"0.025\"} 1\n"));
+        // Histogram families with no observations still emit TYPE metadata.
+        assert!(exported.contains("# TYPE opc_gnmi_set_commit_seconds histogram\n"));
+        assert!(exported.contains("opc_netconf_sessions_active{transport=\"netconf-tls\"} 3\n"));
+        assert!(exported.contains(
+            "opc_netconf_rpc_errors_total{operation=\"edit-config\",error_tag=\"access-denied\"} 4\n"
+        ));
+
+        // reset_all clears the management-plane families too.
+        METRICS.reset_all();
+        let after = export_prometheus_text();
+        assert!(!after.contains("opc_gnmi_rpc_requests_total{rpc=\"Get\""));
+        assert!(!after.contains("opc_netconf_sessions_active{transport=\"netconf-tls\""));
     }
 }

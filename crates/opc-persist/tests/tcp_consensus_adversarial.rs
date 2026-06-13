@@ -1,12 +1,16 @@
 mod common;
 mod tcp_consensus_common;
 
-use opc_persist::{ClusterMembership, ConsensusConfigStore, ConsensusPeer, TcpPeer, TcpRpcServer};
+use opc_persist::{
+    ClusterMembership, ConsensusConfigStore, ConsensusMetricsDump, ConsensusPeer, TcpPeer,
+    TcpRpcServer,
+};
 use std::sync::Arc;
 use tcp_consensus_common::{
     generate_custom_identity, generate_test_ca_and_identities, test_audit_key, SqliteBackend,
 };
 use tempfile::TempDir;
+use tokio::time::{sleep, Duration, Instant};
 
 fn get_free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -14,6 +18,24 @@ fn get_free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+async fn wait_for_metrics<F>(
+    store: &ConsensusConfigStore,
+    timeout: Duration,
+    mut predicate: F,
+) -> ConsensusMetricsDump
+where
+    F: FnMut(&ConsensusMetricsDump) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        let metrics = store.dump_metrics().await.unwrap();
+        if predicate(&metrics) || Instant::now() >= deadline {
+            return metrics;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
 }
 
 #[tokio::test]
@@ -63,7 +85,7 @@ async fn test_adversarial_active_connections_desync() {
                 )
                 .await;
                 // Sleep tiny amount and close abruptly
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                sleep(Duration::from_millis(5)).await;
             }
         }));
     }
@@ -73,7 +95,7 @@ async fn test_adversarial_active_connections_desync() {
     }
 
     // Give the server time to process disconnections and timeout/error cleanup
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
     // Verify active connections return to 0 and did not leak/desync
     let m = store.dump_metrics().await.unwrap();
@@ -125,18 +147,26 @@ async fn test_adversarial_connection_limit_no_stall() {
     let server = TcpRpcServer::new(store.clone(), format!("127.0.0.1:{port}"));
     let handle = server.start().await.unwrap();
 
-    // 1. Establish 100 connections and leave them open
+    // 1. Establish 100 connections and leave them open.
+    //
+    // Under full-workspace test load the accept loop may take longer than a
+    // fixed 200 ms to account for every connection. Poll the metric instead of
+    // racing the listener; this test is about the connection limit, not accept
+    // loop scheduling jitter.
     let mut connections = Vec::new();
+    let addr = format!("127.0.0.1:{port}");
     for _ in 0..100 {
-        let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await;
-        if let Ok(s) = stream {
-            connections.push(s);
-        }
+        let stream = tokio::net::TcpStream::connect(&addr)
+            .await
+            .expect("initial connection should be accepted by the OS");
+        connections.push(stream);
+        sleep(Duration::from_millis(2)).await;
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let m1 = store.dump_metrics().await.unwrap();
+    let m1 = wait_for_metrics(&store, Duration::from_secs(3), |m| {
+        m.server_active_connections == 100
+    })
+    .await;
     assert_eq!(m1.server_active_connections, 100);
     assert_eq!(m1.server_rejected_connections, 0);
 
@@ -144,7 +174,6 @@ async fn test_adversarial_connection_limit_no_stall() {
     // As each connection is rejected and closed, its FD is released before the next connection is made.
     let mut rejected_count = 0;
     for _ in 0..150 {
-        let addr = format!("127.0.0.1:{port}");
         match tokio::net::TcpStream::connect(&addr).await {
             Ok(mut stream) => {
                 // Try to read. Since the server drops the connection, this should return EOF (Ok(0))
@@ -159,19 +188,23 @@ async fn test_adversarial_connection_limit_no_stall() {
         }
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let m2 = wait_for_metrics(&store, Duration::from_secs(3), |m| {
+        m.server_active_connections == 100 && m.server_rejected_connections >= 150
+    })
+    .await;
 
     // Check that we rejected exactly 150 connections and didn't stall
-    let m2 = store.dump_metrics().await.unwrap();
     assert_eq!(m2.server_active_connections, 100);
     assert_eq!(rejected_count, 150);
     assert_eq!(m2.server_rejected_connections, 150);
 
     // Drop the original 100 connections
     drop(connections);
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let m3 = store.dump_metrics().await.unwrap();
+    let m3 = wait_for_metrics(&store, Duration::from_secs(3), |m| {
+        m.server_active_connections == 0
+    })
+    .await;
     assert_eq!(m3.server_active_connections, 0);
 
     server.shutdown().await;
