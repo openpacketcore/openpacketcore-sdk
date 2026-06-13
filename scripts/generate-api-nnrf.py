@@ -57,8 +57,11 @@ EXPECTED_HASHES = {
 # Map external $refs to opc-types re-exports or plain Rust primitives.
 EXTERNAL_TYPE_MAP: dict[str, str] = {
     "TS29571_CommonData.yaml#/components/schemas/NfInstanceId": "opc_types::NfInstanceId",
-    "TS29571_CommonData.yaml#/components/schemas/PlmnId": "opc_types::PlmnId",
-    "TS29571_CommonData.yaml#/components/schemas/ExtSnssai": "opc_types::Snssai",
+    # PlmnId and ExtSnssai use object-form serde wrappers (TS 29.571
+    # {mcc,mnc} and {sst,sd}) so generated types interoperate with conformant
+    # NRF peers instead of emitting OpenPacketCore's compact string form.
+    "TS29571_CommonData.yaml#/components/schemas/PlmnId": "crate::serde_3gpp::NnrfPlmnId",
+    "TS29571_CommonData.yaml#/components/schemas/ExtSnssai": "crate::serde_3gpp::NnrfSnssai",
     "TS29571_CommonData.yaml#/components/schemas/Ipv4Addr": "String",
     "TS29571_CommonData.yaml#/components/schemas/Ipv6Addr": "String",
     "TS29571_CommonData.yaml#/components/schemas/Fqdn": "String",

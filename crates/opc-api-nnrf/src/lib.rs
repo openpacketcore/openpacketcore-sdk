@@ -10,8 +10,10 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod serde_3gpp;
 mod types;
 
+pub use serde_3gpp::{NnrfPlmnId, NnrfSnssai};
 pub use types::*;
 
 #[cfg(test)]
