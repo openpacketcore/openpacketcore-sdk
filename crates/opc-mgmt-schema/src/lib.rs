@@ -112,7 +112,12 @@ pub enum DefaultReport {
     Trim,
     /// Report only values explicitly set by a client.
     Explicit,
+    /// Report all data and tag schema-defaulted values with `wd:default="true"`.
+    ReportAllTagged,
 }
+
+/// RFC 6243 `ietf-netconf-with-defaults` XML namespace URI.
+pub const WITH_DEFAULTS_NS: &str = "urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults";
 
 /// A served YANG module: a gNMI Capabilities `ModelData` row and a NETCONF
 /// YANG-Library module entry.
@@ -579,11 +584,14 @@ pub trait SchemaRegistry: Send + Sync {
     }
 
     /// The schema default literal to report for a path under a with-defaults
-    /// mode. `ReportAll` yields the default when one exists; `Trim`/`Explicit`
-    /// yield `None` (the server omits defaulted/non-explicit values).
+    /// mode. `ReportAll` and `ReportAllTagged` yield the default when one
+    /// exists; `Trim`/`Explicit` yield `None` (the server omits
+    /// defaulted/non-explicit values).
     fn default_for(&self, schema_path: &str, report: DefaultReport) -> Option<&'static str> {
         match report {
-            DefaultReport::ReportAll => self.node(schema_path).and_then(|n| n.default),
+            DefaultReport::ReportAll | DefaultReport::ReportAllTagged => {
+                self.node(schema_path).and_then(|n| n.default)
+            }
             DefaultReport::Trim | DefaultReport::Explicit => None,
         }
     }
@@ -772,8 +780,15 @@ impl<'a> NetconfXmlRenderContext<'a> {
 
     /// All `(prefix, namespace)` pairs referenced by the selection, sorted by
     /// prefix so root namespace declarations are deterministic.
+    ///
+    /// When the report mode is [`DefaultReport::ReportAllTagged`], the RFC 6243
+    /// `wd` namespace is included so the root element can declare it once for
+    /// all `wd:default="true"` attributes emitted by leaf renderers.
     pub fn module_namespaces(&self) -> Vec<(&'static str, &'static str)> {
         let mut by_prefix = std::collections::BTreeMap::<&'static str, &'static str>::new();
+        if self.report == DefaultReport::ReportAllTagged {
+            by_prefix.insert("wd", WITH_DEFAULTS_NS);
+        }
         for path in self.selection {
             for seg in path.split('/') {
                 if seg.is_empty() {
@@ -799,6 +814,22 @@ impl<'a> NetconfXmlRenderContext<'a> {
         path: &'static str,
         raw_value: &str,
     ) -> Result<String, NetconfProjectionError> {
+        self.format_leaf_with_default(path, raw_value, false)
+    }
+
+    /// Format one leaf element, optionally tagging it as schema-defaulted.
+    ///
+    /// When `is_defaulted` is `true` and the report mode is
+    /// [`DefaultReport::ReportAllTagged`], the element carries the RFC 6243
+    /// `wd:default="true"` attribute. The caller must ensure the `wd` prefix
+    /// is declared by the outermost rendered element (see
+    /// [`Self::module_namespaces`]).
+    pub fn format_leaf_with_default(
+        &self,
+        path: &'static str,
+        raw_value: &str,
+        is_defaulted: bool,
+    ) -> Result<String, NetconfProjectionError> {
         let name = self.qualified_name(path)?;
         let data_class = self.registry.data_class(path).unwrap_or(DataClass::Public);
         let value = if data_class.allows_cleartext() {
@@ -806,11 +837,16 @@ impl<'a> NetconfXmlRenderContext<'a> {
         } else {
             redact(raw_value, data_class, RedactionLevel::Mask, None, None).to_string()
         };
+        let default_attr = if is_defaulted && self.report == DefaultReport::ReportAllTagged {
+            r#" wd:default="true""#
+        } else {
+            ""
+        };
         if value.is_empty() {
-            Ok(format!("<{name}/>"))
+            Ok(format!("<{name}{default_attr}/>"))
         } else {
             Ok(format!(
-                "<{name}>{value}</{name}>",
+                "<{name}{default_attr}>{value}</{name}>",
                 value = xml_escape_text(&value)
             ))
         }

@@ -77,10 +77,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 report: DefaultReport,
             ) -> Result<String, NetconfProjectionError> {
                 match report {
-                    DefaultReport::Trim | DefaultReport::ReportAll => {}
-                    _ => {
-                        return Err(NetconfProjectionError::UnsupportedDefaultReport { report });
-                    }
+                    DefaultReport::Trim
+                    | DefaultReport::ReportAll
+                    | DefaultReport::Explicit
+                    | DefaultReport::ReportAllTagged => {}
                 }
                 let ctx = NetconfXmlRenderContext::new(
                     super::schema_registry::registry(),
@@ -92,7 +92,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             }
 
             fn supported_default_reports(&self) -> &'static [DefaultReport] {
-                &[DefaultReport::Trim, DefaultReport::ReportAll]
+                &[
+                    DefaultReport::Trim,
+                    DefaultReport::ReportAll,
+                    DefaultReport::Explicit,
+                    DefaultReport::ReportAllTagged,
+                ]
             }
         }
 
@@ -442,6 +447,9 @@ fn render_leaf_fn(
                 Some(v) => v,
                 None => return Ok(None),
             };
+            if ctx.report() == DefaultReport::Explicit && is_defaulted {
+                return Ok(None);
+            }
             if is_defaulted && ctx.report() == DefaultReport::Trim {
                 if let Some(def) = ctx.schema_default(path) {
                     if raw == def {
@@ -449,7 +457,7 @@ fn render_leaf_fn(
                     }
                 }
             }
-            ctx.format_leaf(path, &raw).map(Some)
+            ctx.format_leaf_with_default(path, &raw, is_defaulted).map(Some)
         }
     })
 }

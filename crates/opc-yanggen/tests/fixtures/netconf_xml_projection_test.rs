@@ -455,3 +455,162 @@ fn sensitive_leaf_list_is_redacted() {
     assert!(!xml.contains("alpha"));
     assert!(!xml.contains("beta"));
 }
+
+#[test]
+fn explicit_emits_explicit_values_omits_defaulted_and_absent() {
+    let mut system = System::default();
+    system.hostname = LeafPresence::Explicit("router1".to_string());
+    system.enabled = LeafPresence::Explicit(true);
+    system.dns = Some(Dns::default());
+
+    let xml = renderer()
+        .render_running_config(
+            &system,
+            &[
+                "/ex:system/ex:hostname",
+                "/ex:system/ex:enabled",
+                "/ex:system/ex:dns/ex:server",
+            ],
+            DefaultReport::Explicit,
+        )
+        .unwrap();
+
+    assert!(xml.contains("<ex:hostname>router1</ex:hostname>"));
+    assert!(xml.contains("<ex:enabled>true</ex:enabled>"));
+    // Defaulted value is omitted in explicit mode.
+    assert!(!xml.contains("<ex:server>"));
+}
+
+#[test]
+fn explicit_omits_defaulted_leaf_even_when_same_value_explicit_exists() {
+    let mut system = System::default();
+    system.enabled = LeafPresence::Defaulted(true);
+
+    let xml = renderer()
+        .render_running_config(&system, &["/ex:system/ex:enabled"], DefaultReport::Explicit)
+        .unwrap();
+
+    assert!(!xml.contains("<ex:enabled>"));
+}
+
+#[test]
+fn report_all_tagged_emits_defaulted_values_with_tag() {
+    let mut system = System::default();
+    system.hostname = LeafPresence::Explicit("router1".to_string());
+    system.enabled = LeafPresence::Defaulted(true);
+    let mut dns = Dns::default();
+    dns.server = LeafPresence::Defaulted("8.8.8.8".to_string());
+    system.dns = Some(dns);
+
+    let xml = renderer()
+        .render_running_config(
+            &system,
+            &[
+                "/ex:system/ex:hostname",
+                "/ex:system/ex:enabled",
+                "/ex:system/ex:dns/ex:server",
+            ],
+            DefaultReport::ReportAllTagged,
+        )
+        .unwrap();
+
+    assert!(xml.contains("xmlns:wd=\"urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults\""));
+    assert!(xml.contains("<ex:hostname>router1</ex:hostname>"));
+    assert!(xml.contains("<ex:enabled wd:default=\"true\">true</ex:enabled>"));
+    assert!(xml.contains("<ex:server wd:default=\"true\">8.8.8.8</ex:server>"));
+}
+
+#[test]
+fn report_all_tagged_explicit_same_value_leaf_emits_without_tag() {
+    let mut system = System::default();
+    system.enabled = LeafPresence::Explicit(true);
+
+    let xml = renderer()
+        .render_running_config(&system, &["/ex:system/ex:enabled"], DefaultReport::ReportAllTagged)
+        .unwrap();
+
+    assert!(xml.contains("<ex:enabled>true</ex:enabled>"));
+    assert!(!xml.contains("wd:default"));
+}
+
+#[test]
+fn report_all_tagged_nested_container_and_keyed_list() {
+    let mut system = System::default();
+    let mut dns = Dns::default();
+    dns.server = LeafPresence::Defaulted("8.8.8.8".to_string());
+    system.dns = Some(dns);
+
+    let mut iface = Interfaces::default();
+    iface.name = LeafPresence::Explicit("eth0".to_string());
+    iface.mtu = LeafPresence::Defaulted(1500);
+    system.interfaces.insert("eth0".to_string(), iface);
+
+    let xml = renderer()
+        .render_running_config(
+            &system,
+            &[
+                "/ex:system/ex:dns",
+                "/ex:system/ex:dns/ex:server",
+                "/ex:system/ex:interfaces",
+                "/ex:system/ex:interfaces/ex:name",
+                "/ex:system/ex:interfaces/ex:mtu",
+            ],
+            DefaultReport::ReportAllTagged,
+        )
+        .unwrap();
+
+    assert!(xml.contains("xmlns:wd=\"urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults\""));
+    assert!(xml.contains("<ex:server wd:default=\"true\">8.8.8.8</ex:server>"));
+    assert!(xml.contains("<ex:interfaces><ex:name>eth0</ex:name><ex:mtu wd:default=\"true\">1500</ex:mtu></ex:interfaces>"));
+}
+
+#[test]
+fn report_all_tagged_secret_defaulted_leaf_redacts_value_and_still_tags() {
+    let mut system = System::default();
+    system.secret = SecretLeaf::new(LeafPresence::Defaulted("hunter2".to_string()));
+
+    let xml = renderer()
+        .render_running_config(&system, &["/ex:system/ex:secret"], DefaultReport::ReportAllTagged)
+        .unwrap();
+
+    assert!(xml.contains("<ex:secret wd:default=\"true\">"));
+    assert!(!xml.contains("hunter2"));
+}
+
+#[test]
+fn explicit_secret_defaulted_leaf_omits() {
+    let mut system = System::default();
+    system.secret = SecretLeaf::new(LeafPresence::Defaulted("hunter2".to_string()));
+
+    let xml = renderer()
+        .render_running_config(&system, &["/ex:system/ex:secret"], DefaultReport::Explicit)
+        .unwrap();
+
+    assert!(!xml.contains("<ex:secret>"));
+    assert!(!xml.contains("hunter2"));
+}
+
+#[test]
+fn report_all_tagged_no_duplicate_wd_declaration() {
+    let mut system = System::default();
+    system.enabled = LeafPresence::Defaulted(true);
+    system.hostname = LeafPresence::Explicit("router1".to_string());
+
+    let xml = renderer()
+        .render_running_config(
+            &system,
+            &[
+                "/ex:system/ex:hostname",
+                "/ex:system/ex:enabled",
+            ],
+            DefaultReport::ReportAllTagged,
+        )
+        .unwrap();
+
+    let mut found = 0usize;
+    for m in xml.match_indices("xmlns:wd=\"urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults\"") {
+        let _ = m;
+        found += 1;
+    }
+    assert_eq!(found, 1, "wd namespace should be declared exactly once");
+}
