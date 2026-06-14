@@ -2,9 +2,14 @@
 
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::Arc;
 use std::time::Instant;
 
-use opc_config_model::{OpcConfig, RequestId, TransportType, TrustedPrincipal};
+use opc_config_model::{
+    CommitMode, ConfigOperation, OpcConfig, RequestId, RequestSource, TransportType,
+    TrustedPrincipal, ValidationContext,
+};
 use opc_mgmt_audit::{
     AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink, SchemaNodePath,
 };
@@ -31,6 +36,7 @@ use crate::xml::{
     parse_rpc_with_context, GetSchemaRequest as XmlGetSchemaRequest,
     KillSessionRequest as XmlKillSessionRequest, LockRequest as XmlLockRequest, RpcOperation,
     RpcOperationHint, RpcParseError, UnlockRequest as XmlUnlockRequest, UnsupportedOperation,
+    ValidateRequest as XmlValidateRequest,
 };
 
 const NETCONF_BASE_MODEL: &[ModelData] = &[ModelData {
@@ -44,6 +50,7 @@ const NETCONF_CLOSE_SESSION_PATH: &str = "/nc:close-session";
 const NETCONF_LOCK_PATH: &str = "/nc:lock";
 const NETCONF_UNLOCK_PATH: &str = "/nc:unlock";
 const NETCONF_KILL_SESSION_PATH: &str = "/nc:kill-session";
+const NETCONF_VALIDATE_PATH: &str = "/nc:validate";
 
 /// Server construction error.
 #[derive(Debug, Error)]
@@ -334,6 +341,16 @@ where
                     started,
                 },
                 session_context,
+            ),
+            RpcOperation::Validate(request) => self.handle_validate(
+                request,
+                RpcExecContext {
+                    request_id,
+                    principal,
+                    message_id: &parsed.message_id,
+                    reply_attrs: &parsed.reply_attrs,
+                    started,
+                },
             ),
             RpcOperation::KillSession(request) => self.handle_kill_session(
                 request,
@@ -1344,6 +1361,232 @@ where
         ))
     }
 
+    fn handle_validate(
+        &self,
+        request: &XmlValidateRequest,
+        context: RpcExecContext<'_>,
+    ) -> RpcHandlingResult {
+        let validate_path = schema_node_path(NETCONF_VALIDATE_PATH);
+        if request.source != crate::xml::Datastore::Running {
+            if self
+                .audit
+                .record(
+                    &AuditEvent::new(
+                        context.request_id,
+                        context.principal,
+                        self.transport,
+                        AuditOperation::Validate,
+                        audit_failed("operation-not-supported"),
+                    )
+                    .with_paths([validate_path]),
+                )
+                .is_err()
+            {
+                record_rpc_error(
+                    NetconfOperation::Validate,
+                    NetconfErrorTag::OperationFailed,
+                    context.started.elapsed(),
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(context.message_id),
+                    context.reply_attrs,
+                    RpcError::operation_failed(),
+                ));
+            }
+            record_rpc_error(
+                NetconfOperation::Validate,
+                NetconfErrorTag::OperationNotSupported,
+                context.started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_not_supported(),
+            ));
+        }
+
+        match self.authorize_exec(context.principal, NETCONF_VALIDATE_PATH) {
+            Ok(true) => {}
+            Ok(false) => {
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            context.request_id,
+                            context.principal,
+                            self.transport,
+                            AuditOperation::Validate,
+                            audit_denied("access-denied"),
+                        )
+                        .with_paths([validate_path]),
+                    )
+                    .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::Validate,
+                        NetconfErrorTag::OperationFailed,
+                        context.started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(context.message_id),
+                        context.reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                record_rpc_error(
+                    NetconfOperation::Validate,
+                    NetconfErrorTag::AccessDenied,
+                    context.started.elapsed(),
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(context.message_id),
+                    context.reply_attrs,
+                    RpcError::access_denied(),
+                ));
+            }
+            Err(_) => {
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            context.request_id,
+                            context.principal,
+                            self.transport,
+                            AuditOperation::Validate,
+                            audit_failed("resource-denied"),
+                        )
+                        .with_paths([validate_path]),
+                    )
+                    .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::Validate,
+                        NetconfErrorTag::OperationFailed,
+                        context.started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(context.message_id),
+                        context.reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                record_rpc_error(
+                    NetconfOperation::Validate,
+                    NetconfErrorTag::ResourceDenied,
+                    context.started.elapsed(),
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(context.message_id),
+                    context.reply_attrs,
+                    RpcError::resource_denied(),
+                ));
+            }
+        }
+
+        let snapshot = self.binding.config_bus().current_snapshot();
+        let validation_context = ValidationContext {
+            request_id: context.request_id,
+            principal: context.principal.clone(),
+            transport: self.transport,
+            source: RequestSource::Northbound,
+            operation: ConfigOperation::Replace,
+            mode: CommitMode::ValidateOnly,
+            base_version: snapshot.version,
+            previous: Some(Arc::clone(&snapshot.config)),
+        };
+        let validation = panic::catch_unwind(AssertUnwindSafe(|| {
+            snapshot
+                .config
+                .validate_syntax()
+                .map_err(|_| "syntax-validation-failed")?;
+            snapshot
+                .config
+                .validate_semantics(&validation_context)
+                .map_err(|_| "semantic-validation-failed")?;
+            Ok::<_, &'static str>(())
+        }));
+
+        match validation {
+            Ok(Ok(())) => {
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            context.request_id,
+                            context.principal,
+                            self.transport,
+                            AuditOperation::Validate,
+                            AuditOutcome::Success,
+                        )
+                        .with_paths([validate_path]),
+                    )
+                    .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::Validate,
+                        NetconfErrorTag::OperationFailed,
+                        context.started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(context.message_id),
+                        context.reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                record_rpc_success(NetconfOperation::Validate, context.started.elapsed());
+                RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
+                    context.message_id,
+                    context.reply_attrs,
+                ))
+            }
+            Ok(Err(reason)) => self.validate_failed_reply(context, validate_path, reason),
+            Err(_) => self.validate_failed_reply(context, validate_path, "operation-failed"),
+        }
+    }
+
+    fn validate_failed_reply(
+        &self,
+        context: RpcExecContext<'_>,
+        validate_path: SchemaNodePath,
+        reason: &'static str,
+    ) -> RpcHandlingResult {
+        if self
+            .audit
+            .record(
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Validate,
+                    audit_failed(reason),
+                )
+                .with_paths([validate_path]),
+            )
+            .is_err()
+        {
+            record_rpc_error(
+                NetconfOperation::Validate,
+                NetconfErrorTag::OperationFailed,
+                context.started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
+        record_rpc_error(
+            NetconfOperation::Validate,
+            NetconfErrorTag::OperationFailed,
+            context.started.elapsed(),
+        );
+        RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+            Some(context.message_id),
+            context.reply_attrs,
+            RpcError::operation_failed(),
+        ))
+    }
+
     fn handle_get_schema(
         &self,
         request: &XmlGetSchemaRequest,
@@ -1619,6 +1862,9 @@ where
             Some(RpcOperationHint::KillSession) => {
                 event.with_paths([schema_node_path(NETCONF_KILL_SESSION_PATH)])
             }
+            Some(RpcOperationHint::Validate) => {
+                event.with_paths([schema_node_path(NETCONF_VALIDATE_PATH)])
+            }
             Some(RpcOperationHint::Get | RpcOperationHint::GetConfig) | None => event,
         };
         self.audit.record(&event)
@@ -1629,6 +1875,7 @@ fn audit_operation_for_parse_failure(err: &RpcParseError) -> AuditOperation {
     match err.operation_hint {
         Some(RpcOperationHint::Lock | RpcOperationHint::Unlock) => AuditOperation::Exec,
         Some(RpcOperationHint::KillSession) => AuditOperation::Exec,
+        Some(RpcOperationHint::Validate) => AuditOperation::Validate,
         Some(RpcOperationHint::Get | RpcOperationHint::GetConfig) | None => AuditOperation::Read,
     }
 }
@@ -1640,6 +1887,7 @@ fn netconf_operation_for_parse_failure(err: &RpcParseError) -> NetconfOperation 
         Some(RpcOperationHint::Lock) => NetconfOperation::Lock,
         Some(RpcOperationHint::Unlock) => NetconfOperation::Unlock,
         Some(RpcOperationHint::KillSession) => NetconfOperation::KillSession,
+        Some(RpcOperationHint::Validate) => NetconfOperation::Validate,
         None => NetconfOperation::Unknown,
     }
 }
@@ -1673,6 +1921,7 @@ fn audit_failed(reason: &'static str) -> AuditOutcome {
 mod tests {
     use std::collections::HashSet;
     use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1763,6 +2012,78 @@ mod tests {
             &self,
             _ctx: &ValidationContext<Self>,
         ) -> Result<(), ValidationError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct ValidationConfig {
+        mode: Arc<AtomicU8>,
+        saw_previous: Arc<AtomicBool>,
+    }
+
+    impl ValidationConfig {
+        fn new() -> Self {
+            Self {
+                mode: Arc::new(AtomicU8::new(0)),
+                saw_previous: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn set_syntax_failure(&self) {
+            self.mode.store(1, Ordering::SeqCst);
+        }
+
+        fn set_semantic_failure(&self) {
+            self.mode.store(2, Ordering::SeqCst);
+        }
+
+        fn saw_previous(&self) -> bool {
+            self.saw_previous.load(Ordering::SeqCst)
+        }
+    }
+
+    impl OpcConfig for ValidationConfig {
+        type Delta = ();
+
+        fn schema_digest(&self) -> SchemaDigest {
+            SchemaDigest::from_bytes([2u8; 32])
+        }
+
+        fn diff(&self, _previous: &Self) -> Result<Vec<Self::Delta>, ConfigError> {
+            Ok(Vec::new())
+        }
+
+        fn changed_paths(
+            &self,
+            _previous: &Self,
+            _deltas: &[Self::Delta],
+        ) -> Result<Vec<YangPath>, ConfigError> {
+            Ok(Vec::new())
+        }
+
+        fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), ConfigError> {
+            Ok(())
+        }
+
+        fn validate_syntax(&self) -> Result<(), ValidationError> {
+            if self.mode.load(Ordering::SeqCst) == 1 {
+                return Err(ValidationError::syntax(
+                    "syntax failure contains /sys:system/sys:secret",
+                ));
+            }
+            Ok(())
+        }
+
+        fn validate_semantics(&self, ctx: &ValidationContext<Self>) -> Result<(), ValidationError> {
+            if ctx.previous.is_some() {
+                self.saw_previous.store(true, Ordering::SeqCst);
+            }
+            if self.mode.load(Ordering::SeqCst) == 2 {
+                return Err(ValidationError::semantics(
+                    "semantic failure contains /sys:system/sys:secret",
+                ));
+            }
             Ok(())
         }
     }
@@ -1888,6 +2209,28 @@ mod tests {
 
         fn observed_with_defaults(&self) -> Arc<Mutex<Vec<WithDefaultsMode>>> {
             Arc::clone(&self.observed_with_defaults)
+        }
+    }
+
+    struct ValidationBinding {
+        bus: Arc<ConfigBus<ValidationConfig>>,
+    }
+
+    impl NetconfConfigBinding<ValidationConfig> for ValidationBinding {
+        fn config_bus(&self) -> Arc<ConfigBus<ValidationConfig>> {
+            Arc::clone(&self.bus)
+        }
+
+        fn schema_registry(&self) -> &'static dyn SchemaRegistry {
+            &REGISTRY
+        }
+
+        fn render_running_config(
+            &self,
+            _config: &ValidationConfig,
+            _selection: ReadSelection<'_>,
+        ) -> Result<String, BindingError> {
+            Ok(String::new())
         }
     }
 
@@ -2464,6 +2807,13 @@ mod tests {
         )
     }
 
+    fn allow_validate_rule(modules: &ModuleRegistry) -> NacmRule {
+        NacmRule::allow(
+            NacmAction::Exec,
+            YangPathPattern::parse(NETCONF_VALIDATE_PATH, modules).expect("allow validate path"),
+        )
+    }
+
     fn policy_allow_system_but_deny_secret() -> NacmPolicy {
         let mut modules = ModuleRegistry::new();
         modules
@@ -2482,6 +2832,7 @@ mod tests {
             .add_rule(allow_close_session_rule(&modules))
             .add_rule(allow_lock_rule(&modules))
             .add_rule(allow_unlock_rule(&modules))
+            .add_rule(allow_validate_rule(&modules))
             .add_rule(allow_kill_session_rule(&modules))
             .build()
     }
@@ -2576,6 +2927,29 @@ mod tests {
         )
         .expect("server");
         (server, observed, audit)
+    }
+
+    async fn validation_server_fixture() -> (
+        ReadOnlyNetconfServer<ValidationConfig, ValidationBinding, FixedPolicy, CapturingAudit>,
+        ValidationConfig,
+        CapturingAudit,
+    ) {
+        let config = ValidationConfig::new();
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(config.clone(), MockManagedDatastore::new())
+                .await
+                .expect("bus"),
+        );
+        let binding = ValidationBinding { bus };
+        let audit = CapturingAudit::default();
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            audit.clone(),
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+        (server, config, audit)
     }
 
     async fn server_fixture_with_policy_source_and_audit<P, A>(
@@ -2870,6 +3244,12 @@ mod tests {
     fn unlock_rpc(target: &str) -> String {
         format!(
             r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="304"><unlock><target><{target}/></target></unlock></rpc>"#
+        )
+    }
+
+    fn validate_rpc(source: &str) -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="305"><validate><source><{source}/></source></validate></rpc>"#
         )
     }
 
@@ -3928,6 +4308,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_running_returns_ok_and_audits_validate() {
+        let (server, _observed, audit) = server_fixture().await;
+        let success_before = netconf_rpc_requests("validate", "success");
+
+        let result = server.handle_rpc(
+            RequestId::new(),
+            &principal(),
+            &validate_rpc("running"),
+            &MgmtLimits::default(),
+        );
+
+        assert!(!result.close_session);
+        assert!(result.reply_xml.contains(r#"message-id="305""#));
+        assert!(result.reply_xml.contains("<ok/>"));
+        assert!(!result.reply_xml.contains("do-not-leak"));
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Validate);
+        assert_eq!(events[0].outcome, AuditOutcome::Success);
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_VALIDATE_PATH)]
+        );
+        assert!(netconf_rpc_requests("validate", "success") > success_before);
+    }
+
+    #[tokio::test]
+    async fn validate_running_requires_exec_grant() {
+        let audit = CapturingAudit::default();
+        let server = server_fixture_with_policy_source_and_audit(
+            FixedPolicy(NacmPolicy::empty(PolicyVersion::new(505))),
+            audit.clone(),
+        )
+        .await;
+        let errors_before = netconf_rpc_errors("validate", "access-denied");
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &validate_rpc("running"),
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains("<error-tag>access-denied</error-tag>"));
+        assert!(!reply.contains("do-not-leak"));
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Validate);
+        assert_eq!(events[0].outcome, audit_denied("access-denied"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_VALIDATE_PATH)]
+        );
+        assert!(netconf_rpc_errors("validate", "access-denied") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn validate_candidate_is_not_supported_or_advertised() {
+        let (server, _observed, audit) = server_fixture().await;
+        let errors_before = netconf_rpc_errors("validate", "operation-not-supported");
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &validate_rpc("candidate"),
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains("<error-tag>operation-not-supported</error-tag>"));
+        assert!(!reply.contains("candidate config"));
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Validate);
+        assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_VALIDATE_PATH)]
+        );
+        assert!(netconf_rpc_errors("validate", "operation-not-supported") > errors_before);
+
+        let hello = server.server_hello(NonZeroU32::new(42));
+        assert!(!hello.contains(":validate"));
+    }
+
+    #[tokio::test]
+    async fn validate_running_failure_is_payload_free() {
+        let (server, config, audit) = validation_server_fixture().await;
+        config.set_syntax_failure();
+        let errors_before = netconf_rpc_errors("validate", "operation-failed");
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &validate_rpc("running"),
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains("<error-tag>operation-failed</error-tag>"));
+        assert!(!reply.contains("/sys:system/sys:secret"));
+        assert!(!reply.contains("syntax failure"));
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Validate);
+        assert_eq!(events[0].outcome, audit_failed("syntax-validation-failed"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_VALIDATE_PATH)]
+        );
+        assert!(netconf_rpc_errors("validate", "operation-failed") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn validate_running_semantic_failure_is_payload_free() {
+        let (server, config, audit) = validation_server_fixture().await;
+        config.set_semantic_failure();
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &validate_rpc("running"),
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains("<error-tag>operation-failed</error-tag>"));
+        assert!(!reply.contains("/sys:system/sys:secret"));
+        assert!(!reply.contains("semantic failure"));
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Validate);
+        assert_eq!(
+            events[0].outcome,
+            audit_failed("semantic-validation-failed")
+        );
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_VALIDATE_PATH)]
+        );
+        assert!(config.saw_previous());
+    }
+
+    #[tokio::test]
     async fn lock_without_registry_is_operation_not_supported() {
         let (server, _observed, audit) = server_fixture().await;
         let errors_before = netconf_rpc_errors("lock", "operation-not-supported");
@@ -4142,6 +4664,7 @@ mod tests {
         let (server, observed, audit) = server_fixture().await;
         let lock_errors_before = netconf_rpc_errors("lock", "missing-element");
         let unlock_errors_before = netconf_rpc_errors("unlock", "bad-element");
+        let validate_errors_before = netconf_rpc_errors("validate", "bad-element");
 
         let lock =
             format!(r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="lock-missing"><lock/></rpc>"#);
@@ -4165,10 +4688,22 @@ mod tests {
         );
         assert!(reply.contains(r#"message-id="unlock-bad""#));
         assert!(reply.contains("<error-tag>bad-element</error-tag>"));
+
+        let validate = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="validate-bad"><validate><source><running/><candidate/></source></validate></rpc>"#
+        );
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &validate,
+            &MgmtLimits::default(),
+        );
+        assert!(reply.contains(r#"message-id="validate-bad""#));
+        assert!(reply.contains("<error-tag>bad-element</error-tag>"));
         assert!(observed.lock().expect("observed paths mutex").is_empty());
 
         let events = audit.events.lock().expect("audit mutex");
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert_eq!(events[0].operation, AuditOperation::Exec);
         assert_eq!(events[0].outcome, audit_failed("missing-element"));
         assert_eq!(
@@ -4181,8 +4716,15 @@ mod tests {
             events[1].schema_paths,
             vec![schema_node_path(NETCONF_UNLOCK_PATH)]
         );
+        assert_eq!(events[2].operation, AuditOperation::Validate);
+        assert_eq!(events[2].outcome, audit_failed("bad-element"));
+        assert_eq!(
+            events[2].schema_paths,
+            vec![schema_node_path(NETCONF_VALIDATE_PATH)]
+        );
         assert!(netconf_rpc_errors("lock", "missing-element") > lock_errors_before);
         assert!(netconf_rpc_errors("unlock", "bad-element") > unlock_errors_before);
+        assert!(netconf_rpc_errors("validate", "bad-element") > validate_errors_before);
     }
 
     #[tokio::test]
