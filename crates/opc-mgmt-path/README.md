@@ -27,8 +27,8 @@ This crate does that conversion **once**, against the generated
   the order the client supplied them, preserving a prefix-qualified key leaf's
   prefix when the registry provides one;
 - rejects key predicates on non-list segments;
-- rejects malformed segment names before lookup, so malformed input is never
-  echoed as an unknown path;
+- rejects malformed segment and key names before lookup/rendering, so malformed
+  input is never echoed as an unknown path;
 - escapes key values once (`\` and `'`), so callers never hand-concatenate paths.
 
 It returns both the predicate-free schema path (for registry / NACM lookup) and

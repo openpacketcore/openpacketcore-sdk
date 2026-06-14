@@ -19,8 +19,8 @@
 //!   order the client supplied, preserving a prefix-qualified key leaf's prefix
 //!   when the registry provides one;
 //! - rejects key predicates on non-list segments;
-//! - rejects malformed segment names before lookup, so malformed input is never
-//!   echoed as an unknown path;
+//! - rejects malformed segment and key names before lookup/rendering, so
+//!   malformed input is never echoed as an unknown path;
 //! - escapes key values once, so callers never hand-concatenate paths.
 //!
 //! It returns the predicate-free schema path (for registry / NACM lookup) and the
@@ -420,14 +420,29 @@ fn parse_qualified_name(name: &str) -> Option<(Option<&str>, &str)> {
 
     match name.split_once(':') {
         Some((prefix, bare)) => {
-            if prefix.is_empty() || bare.is_empty() || bare.contains(':') {
+            if prefix.is_empty()
+                || bare.is_empty()
+                || bare.contains(':')
+                || !is_yang_identifier(prefix)
+                || !is_yang_identifier(bare)
+            {
                 None
             } else {
                 Some((Some(prefix), bare))
             }
         }
-        None => Some((None, name)),
+        None if is_yang_identifier(name) => Some((None, name)),
+        None => None,
     }
+}
+
+fn is_yang_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    matches!(first, 'a'..='z' | 'A'..='Z' | '_')
+        && chars.all(|ch| matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.'))
 }
 
 fn key_prefix_matches(
@@ -834,6 +849,19 @@ mod tests {
     }
 
     #[test]
+    fn malformed_yang_identifier_segment_fails_before_lookup() {
+        let req = RequestPath::from_elems([PathSegment::new("9system")]);
+        let err = resolve(&TestReg, &req).unwrap_err();
+        assert!(matches!(err, PathError::Malformed(_)));
+        assert!(!matches!(err, PathError::UnknownPath(_)));
+
+        let req = RequestPath::from_elems([PathSegment::new("sys:host*name")]);
+        let err = resolve(&TestReg, &req).unwrap_err();
+        assert!(matches!(err, PathError::Malformed(_)));
+        assert!(!matches!(err, PathError::UnknownPath(_)));
+    }
+
+    #[test]
     fn malformed_key_name_fails_without_echoing_values() {
         let req = RequestPath::from_elems([
             PathSegment::new("system"),
@@ -842,6 +870,25 @@ mod tests {
         let err = resolve(&TestReg, &req).unwrap_err();
         assert!(matches!(err, PathError::Malformed(_)));
         assert!(!err.to_string().contains("super-secret-supi"));
+        assert!(!err.to_string().contains("also-secret"));
+    }
+
+    #[test]
+    fn malformed_yang_identifier_key_name_fails_without_echoing_value() {
+        let req = RequestPath::from_elems([
+            PathSegment::new("system"),
+            PathSegment::with_keys("user", [("9name", "super-secret-supi")]),
+        ]);
+        let err = resolve(&TestReg, &req).unwrap_err();
+        assert!(matches!(err, PathError::Malformed(_)));
+        assert!(!err.to_string().contains("super-secret-supi"));
+
+        let req = RequestPath::from_elems([
+            PathSegment::new("system"),
+            PathSegment::with_keys("user", [("sys:na*me", "also-secret")]),
+        ]);
+        let err = resolve(&TestReg, &req).unwrap_err();
+        assert!(matches!(err, PathError::Malformed(_)));
         assert!(!err.to_string().contains("also-secret"));
     }
 
