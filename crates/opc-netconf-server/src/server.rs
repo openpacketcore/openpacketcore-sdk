@@ -2488,7 +2488,9 @@ mod tests {
         OperationalError, OperationalRequest, OperationalResponse, OperationalValue,
     };
     use opc_mgmt_schema::{
-        DataClass, LeafType, ModelData, NodeKind, NodeMeta, OriginEntry, SchemaRegistry,
+        DataClass, DefaultReport, LeafType, ModelData, NetconfProjectionError,
+        NetconfXmlRenderContext, NetconfXmlRenderer, NodeKind, NodeMeta, OriginEntry,
+        SchemaRegistry,
     };
     use opc_mgmt_transport::TlsBootstrap;
     use opc_nacm::{
@@ -2913,6 +2915,138 @@ mod tests {
         NotUnique,
         Failed,
         TooBig,
+    }
+
+    /// A test NETCONF XML renderer that uses the shared `TestRegistry` to
+    /// produce XML from `DemoConfig`. It exercises the default binding wiring
+    /// without requiring a full `opc-yanggen` generated crate in this unit test
+    /// module.
+    struct DemoRenderer;
+
+    impl NetconfXmlRenderer<DemoConfig> for DemoRenderer {
+        fn render_running_config(
+            &self,
+            config: &DemoConfig,
+            selection: &[&str],
+            report: DefaultReport,
+        ) -> Result<String, NetconfProjectionError> {
+            if !matches!(report, DefaultReport::Trim | DefaultReport::ReportAll) {
+                return Err(NetconfProjectionError::UnsupportedDefaultReport { report });
+            }
+            let ctx = NetconfXmlRenderContext::new(&REGISTRY, selection, report);
+            if !ctx.is_subtree_selected("/sys:system") {
+                return Ok(String::new());
+            }
+            let mut out = String::from(r#"<sys:system xmlns:sys="urn:opc:demo">"#);
+            if ctx.is_selected("/sys:system/sys:hostname") {
+                out.push_str(&ctx.format_leaf("/sys:system/sys:hostname", &config.hostname)?);
+            }
+            if ctx.is_selected("/sys:system/sys:secret") {
+                out.push_str(&ctx.format_leaf("/sys:system/sys:secret", &config.secret)?);
+            }
+            out.push_str("</sys:system>");
+            Ok(out)
+        }
+
+        fn supported_default_reports(&self) -> &'static [DefaultReport] {
+            &[DefaultReport::Trim, DefaultReport::ReportAll]
+        }
+    }
+
+    static DEMO_RENDERER: DemoRenderer = DemoRenderer;
+
+    /// A binding that opts into the generated-renderer default hooks.
+    struct GeneratedRendererBinding {
+        bus: Arc<ConfigBus<DemoConfig>>,
+        operational_mode: OperationalMode,
+    }
+
+    impl NetconfConfigBinding<DemoConfig> for GeneratedRendererBinding {
+        fn config_bus(&self) -> Arc<ConfigBus<DemoConfig>> {
+            Arc::clone(&self.bus)
+        }
+
+        fn schema_registry(&self) -> &'static dyn SchemaRegistry {
+            &REGISTRY
+        }
+
+        fn generated_xml_renderer(&self) -> Option<&dyn NetconfXmlRenderer<DemoConfig>> {
+            Some(&DEMO_RENDERER)
+        }
+
+        fn with_defaults_capability(&self) -> Option<WithDefaultsCapability> {
+            Some(
+                WithDefaultsCapability::new(WithDefaultsMode::ReportAll, [WithDefaultsMode::Trim])
+                    .expect("with-defaults capability"),
+            )
+        }
+
+        fn get_operational_state(
+            &self,
+            request: &OperationalRequest,
+        ) -> Result<OperationalResponse, OperationalError> {
+            match self.operational_mode {
+                OperationalMode::Normal => {}
+                OperationalMode::NoValues => return Ok(OperationalResponse::default()),
+                OperationalMode::Error => {
+                    return Err(OperationalError::internal("backend leaked secret"));
+                }
+                _ => return Ok(OperationalResponse::default()),
+            }
+
+            let mut values = Vec::new();
+            for path in request.paths() {
+                if path.as_str() == "/sys:system/sys:uptime" {
+                    values.push(
+                        OperationalValue::new(path.clone(), "12345")
+                            .expect("valid operational json"),
+                    );
+                }
+            }
+            Ok(OperationalResponse::new(values))
+        }
+    }
+
+    /// A renderer that always fails, used to verify fail-closed behavior.
+    struct FailingRenderer;
+
+    impl NetconfXmlRenderer<DemoConfig> for FailingRenderer {
+        fn render_running_config(
+            &self,
+            _config: &DemoConfig,
+            _selection: &[&str],
+            _report: DefaultReport,
+        ) -> Result<String, NetconfProjectionError> {
+            Err(NetconfProjectionError::UnsupportedShape {
+                path: "/sys:system",
+                kind: NodeKind::Container,
+            })
+        }
+
+        fn supported_default_reports(&self) -> &'static [DefaultReport] {
+            &[DefaultReport::Trim]
+        }
+    }
+
+    static FAILING_RENDERER: FailingRenderer = FailingRenderer;
+
+    /// A binding that opts into a generated renderer which always fails.
+    struct FailingRendererBinding {
+        bus: Arc<ConfigBus<DemoConfig>>,
+    }
+
+    impl NetconfConfigBinding<DemoConfig> for FailingRendererBinding {
+        fn config_bus(&self) -> Arc<ConfigBus<DemoConfig>> {
+            Arc::clone(&self.bus)
+        }
+
+        fn schema_registry(&self) -> &'static dyn SchemaRegistry {
+            &REGISTRY
+        }
+
+        fn generated_xml_renderer(&self) -> Option<&dyn NetconfXmlRenderer<DemoConfig>> {
+            Some(&FAILING_RENDERER)
+        }
     }
 
     impl NetconfConfigBinding<DemoConfig> for TestBinding {
@@ -3712,6 +3846,60 @@ mod tests {
         };
         ReadOnlyNetconfServer::new(binding, policy_source, audit, TransportType::NetconfTls)
             .expect("server")
+    }
+
+    async fn generated_renderer_server_fixture(
+        operational_mode: OperationalMode,
+    ) -> ReadOnlyNetconfServer<DemoConfig, GeneratedRendererBinding, FixedPolicy, CapturingAudit>
+    {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = GeneratedRendererBinding {
+            bus,
+            operational_mode,
+        };
+        let audit = CapturingAudit::default();
+        ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            audit,
+            TransportType::NetconfTls,
+        )
+        .expect("server")
+    }
+
+    async fn failing_renderer_server_fixture(
+    ) -> ReadOnlyNetconfServer<DemoConfig, FailingRendererBinding, FixedPolicy, CapturingAudit>
+    {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = FailingRendererBinding { bus };
+        let audit = CapturingAudit::default();
+        ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            audit,
+            TransportType::NetconfTls,
+        )
+        .expect("server")
     }
 
     async fn server_fixture_with_yang_library() -> (
@@ -6656,6 +6844,128 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].outcome, AuditOutcome::Success);
         assert!(netconf_rpc_requests("get", "success") > success_before);
+    }
+
+    #[tokio::test]
+    async fn get_config_uses_generated_renderer_when_bound() {
+        let server = generated_renderer_server_fixture(OperationalMode::Normal).await;
+        let success_before = netconf_rpc_requests("get-config", "success");
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &get_config_rpc("running"),
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains(r#"message-id="101""#));
+        assert!(reply.contains("<sys:hostname>amf-1</sys:hostname>"));
+        assert!(reply.contains("xmlns:sys=\"urn:opc:demo\""));
+        assert!(!reply.contains("<sys:secret>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(!reply.contains("<rpc-error>"));
+        assert!(netconf_rpc_requests("get-config", "success") > success_before);
+    }
+
+    #[tokio::test]
+    async fn get_config_with_defaults_rejects_unsupported_report_all_tagged_when_renderer_bound() {
+        let server = generated_renderer_server_fixture(OperationalMode::Normal).await;
+        let failures_before = netconf_rpc_requests("get-config", "failure");
+        let errors_before = netconf_rpc_errors("get-config", "operation-not-supported");
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &get_config_with_defaults_rpc("report-all-tagged"),
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains(r#"message-id="111""#));
+        assert!(reply.contains("<error-tag>operation-not-supported</error-tag>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(netconf_rpc_requests("get-config", "failure") > failures_before);
+        assert!(netconf_rpc_errors("get-config", "operation-not-supported") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn get_combines_generated_config_and_operational_state() {
+        let server = generated_renderer_server_fixture(OperationalMode::Normal).await;
+        let success_before = netconf_rpc_requests("get", "success");
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &get_rpc(),
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains(r#"message-id="201""#));
+        assert!(reply.contains("<sys:hostname>amf-1</sys:hostname>"));
+        assert!(reply.contains("<sys:uptime>12345</sys:uptime>"));
+        assert!(!reply.contains("<sys:secret>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(!reply.contains("<rpc-error>"));
+        assert!(netconf_rpc_requests("get", "success") > success_before);
+    }
+
+    #[tokio::test]
+    async fn generated_renderer_projection_failure_is_payload_free_operation_failed() {
+        let server = failing_renderer_server_fixture().await;
+        let failures_before = netconf_rpc_requests("get-config", "failure");
+        let errors_before = netconf_rpc_errors("get-config", "operation-failed");
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &get_config_rpc("running"),
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains(r#"message-id="101""#));
+        assert!(reply.contains("<error-tag>operation-failed</error-tag>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(netconf_rpc_requests("get-config", "failure") > failures_before);
+        assert!(netconf_rpc_errors("get-config", "operation-failed") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn get_config_all_denied_returns_empty_without_calling_renderer() {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = GeneratedRendererBinding {
+            bus,
+            operational_mode: OperationalMode::Normal,
+        };
+        let audit = CapturingAudit::default();
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(NacmPolicy::empty(PolicyVersion::new(701))),
+            audit.clone(),
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &get_config_rpc("running"),
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains(r#"message-id="101""#));
+        assert!(reply.contains("<data/>"));
+        assert!(!reply.contains("<sys:hostname>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(!reply.contains("<rpc-error>"));
     }
 
     #[tokio::test]

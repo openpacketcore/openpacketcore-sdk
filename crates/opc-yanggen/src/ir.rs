@@ -46,17 +46,12 @@ pub struct SchemaModule {
     pub conformance: ModuleConformance,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ModuleConformance {
+    #[default]
     Implement,
     Import,
-}
-
-impl Default for ModuleConformance {
-    fn default() -> Self {
-        Self::Implement
-    }
 }
 
 impl Default for SchemaModule {
