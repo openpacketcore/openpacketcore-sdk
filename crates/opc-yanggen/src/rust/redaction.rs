@@ -25,33 +25,48 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     let is_sensitive = super::types::is_sensitive_node(child);
 
                     if is_sensitive {
-                        let is_key = node.kind == SchemaNodeKind::List
-                            && node.key_leaves.iter().any(|k| k == child_name);
-                        if is_key {
-                            if child.config {
-                                redactions.extend(quote! {
-                                    if let Some(val) = self.#field_ident.get().as_option() {
-                                        let hashed = val.deterministic_hash();
-                                        self.#field_ident = SecretLeaf::new(LeafPresence::Explicit(hashed));
+                        match child.kind {
+                            SchemaNodeKind::Leaf => {
+                                let is_key = node.kind == SchemaNodeKind::List
+                                    && node.key_leaves.iter().any(|k| k == child_name);
+                                if is_key {
+                                    if child.config {
+                                        redactions.extend(quote! {
+                                            if let Some(val) = self.#field_ident.get().as_option() {
+                                                let hashed = val.deterministic_hash();
+                                                self.#field_ident = SecretLeaf::new(LeafPresence::Explicit(hashed));
+                                            }
+                                        });
+                                    } else {
+                                        redactions.extend(quote! {
+                                            if let Some(val) = self.#field_ident.get().as_ref() {
+                                                let hashed = val.deterministic_hash();
+                                                self.#field_ident = SecretLeaf::new(Some(hashed));
+                                            }
+                                        });
                                     }
-                                });
-                            } else {
+                                } else {
+                                    let redact_val = if child.config {
+                                        quote! { LeafPresence::Absent }
+                                    } else {
+                                        quote! { None }
+                                    };
+                                    redactions.extend(quote! {
+                                        self.#field_ident = SecretLeaf::new(#redact_val);
+                                    });
+                                }
+                            }
+                            SchemaNodeKind::Container => {
                                 redactions.extend(quote! {
-                                    if let Some(val) = self.#field_ident.get().as_ref() {
-                                        let hashed = val.deterministic_hash();
-                                        self.#field_ident = SecretLeaf::new(Some(hashed));
-                                    }
+                                    self.#field_ident = SecretLeaf::new(None);
                                 });
                             }
-                        } else {
-                            let redact_val = if child.config {
-                                quote! { LeafPresence::Absent }
-                            } else {
-                                quote! { None }
-                            };
-                            redactions.extend(quote! {
-                                self.#field_ident = SecretLeaf::new(#redact_val);
-                            });
+                            SchemaNodeKind::List | SchemaNodeKind::LeafList => {
+                                redactions.extend(quote! {
+                                    self.#field_ident = SecretLeaf::new(Default::default());
+                                });
+                            }
+                            SchemaNodeKind::Choice | SchemaNodeKind::Case => {}
                         }
                     } else {
                         match child.kind {

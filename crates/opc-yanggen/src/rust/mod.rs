@@ -194,6 +194,12 @@ fn validate_supported_node(
                     node.path
                 )));
             }
+            if types::is_sensitive_node(node) {
+                return Err(RustGenerationError::new(format!(
+                    "container {} must not be classified as sensitive; classify sensitive leaves instead",
+                    node.path
+                )));
+            }
         }
         SchemaNodeKind::Leaf => match &node.type_ref {
             Some(
@@ -215,7 +221,15 @@ fn validate_supported_node(
                 )));
             }
         },
-        SchemaNodeKind::List | SchemaNodeKind::LeafList => {}
+        SchemaNodeKind::List => {
+            if types::is_sensitive_node(node) {
+                return Err(RustGenerationError::new(format!(
+                    "list {} must not be classified as sensitive; classify sensitive leaves instead",
+                    node.path
+                )));
+            }
+        }
+        SchemaNodeKind::LeafList => {}
         SchemaNodeKind::Choice | SchemaNodeKind::Case => {
             return Err(RustGenerationError::new(format!(
                 "node {} has unsupported kind {:?}",

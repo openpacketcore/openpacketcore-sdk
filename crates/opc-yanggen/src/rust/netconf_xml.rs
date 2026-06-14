@@ -177,7 +177,7 @@ fn render_container_fn(
     let local = clean_segment(last_segment(&node.path));
     let type_ident = format_ident!("{}", to_pascal_case(local));
 
-    let child_stmts = child_render_stmts(node, nodes_by_path)?;
+    let child_stmts = child_render_stmts(node, nodes_by_path, false, &format_ident!("children"))?;
 
     Ok(quote! {
         fn #fn_ident(
@@ -224,6 +224,24 @@ fn render_list_fn(
     let entry_type_ident = format_ident!("{}", to_pascal_case(local));
     let field_type = sequence_field_type(node, nodes_by_path);
 
+    if super::types::is_sensitive_node(node) {
+        return Ok(quote! {
+            fn #fn_ident(
+                _value: &#field_type,
+                ctx: &NetconfXmlRenderContext<'_>,
+                path: &'static str,
+            ) -> Result<Option<String>, NetconfProjectionError> {
+                if !ctx.is_subtree_selected(path) {
+                    return Ok(None);
+                }
+                Err(NetconfProjectionError::UnsupportedShape {
+                    path,
+                    kind: opc_mgmt_schema::NodeKind::List,
+                })
+            }
+        });
+    }
+
     let entry_fn = render_list_entry_fn(node, nodes_by_path, &entry_fn_ident, &entry_type_ident)?;
 
     let iter_expr = if node.key_leaves.is_empty() {
@@ -263,7 +281,14 @@ fn render_list_entry_fn(
     fn_ident: &proc_macro2::Ident,
     type_ident: &proc_macro2::Ident,
 ) -> Result<TokenStream, RustGenerationError> {
-    let child_stmts = child_render_stmts(node, nodes_by_path)?;
+    let key_stmts = list_key_render_stmts(node, nodes_by_path)?;
+    let non_key_stmts = child_render_stmts(
+        node,
+        nodes_by_path,
+        true,
+        &format_ident!("non_key_children"),
+    )?;
+    let required_key_count = key_stmts.len();
 
     Ok(quote! {
         fn #fn_ident(
@@ -276,8 +301,24 @@ fn render_list_entry_fn(
                 return Ok(None);
             }
             let qname = ctx.qualified_name(path)?;
-            let mut children = String::new();
-            #(#child_stmts)*
+            #[allow(unused_mut)]
+            let mut key_children = String::new();
+            #[allow(unused_mut)]
+            let mut rendered_key_count = 0usize;
+            #(#key_stmts)*
+            #[allow(unused_mut)]
+            let mut non_key_children = String::new();
+            #(#non_key_stmts)*
+            if (!key_children.is_empty() || !non_key_children.is_empty())
+                && rendered_key_count != #required_key_count
+            {
+                return Err(NetconfProjectionError::UnsupportedShape {
+                    path,
+                    kind: opc_mgmt_schema::NodeKind::List,
+                });
+            }
+            let mut children = key_children;
+            children.push_str(&non_key_children);
             if children.is_empty() {
                 return Ok(None);
             }
@@ -306,6 +347,11 @@ fn render_leaf_list_fn(
 ) -> Result<TokenStream, RustGenerationError> {
     let fn_ident = format_ident!("render_{}", path_to_snake(&node.path));
     let field_type = sequence_field_type(node, nodes_by_path);
+    let value_expr = if super::types::is_sensitive_node(node) {
+        quote! { value.get() }
+    } else {
+        quote! { value }
+    };
 
     let is_custom =
         resolved_type(node, nodes_by_path).is_some_and(|t| matches!(t, TypeRef::Custom { .. }));
@@ -339,11 +385,12 @@ fn render_leaf_list_fn(
             if !ctx.is_selected(path) {
                 return Ok(None);
             }
-            if value.is_empty() {
+            let values = #value_expr;
+            if values.is_empty() {
                 return Ok(None);
             }
             let mut fragments = String::new();
-            for v in value {
+            for v in values {
                 let raw = #scalar;
                 fragments.push_str(&ctx.format_leaf(path, &raw)?);
             }
@@ -411,6 +458,8 @@ fn render_leaf_fn(
 fn child_render_stmts(
     node: &SchemaNode,
     nodes_by_path: &HashMap<String, &SchemaNode>,
+    skip_key_leaves: bool,
+    target: &proc_macro2::Ident,
 ) -> Result<Vec<TokenStream>, RustGenerationError> {
     let mut child_stmts = Vec::new();
     for child_path in ordered_child_paths(node) {
@@ -419,6 +468,14 @@ fn child_render_stmts(
         };
         let child_fn = format_ident!("render_{}", path_to_snake(&child.path));
         let child_local = clean_segment(last_segment(&child.path));
+        if skip_key_leaves
+            && node
+                .key_leaves
+                .iter()
+                .any(|key| clean_segment(key) == child_local)
+        {
+            continue;
+        }
         let field_ident = format_ident!("{}", to_snake_case(child_local));
 
         let access_expr = match child.kind {
@@ -426,7 +483,7 @@ fn child_render_stmts(
                 quote! {
                     if let Some(v) = value.#field_ident.as_ref() {
                         if let Some(fragment) = #child_fn(v, ctx, #child_path, false)? {
-                            children.push_str(&fragment);
+                            #target.push_str(&fragment);
                         }
                     }
                 }
@@ -434,7 +491,7 @@ fn child_render_stmts(
             SchemaNodeKind::Leaf | SchemaNodeKind::List | SchemaNodeKind::LeafList => {
                 quote! {
                     if let Some(fragment) = #child_fn(&value.#field_ident, ctx, #child_path)? {
-                        children.push_str(&fragment);
+                        #target.push_str(&fragment);
                     }
                 }
             }
@@ -443,6 +500,38 @@ fn child_render_stmts(
         child_stmts.push(access_expr);
     }
     Ok(child_stmts)
+}
+
+fn list_key_render_stmts(
+    node: &SchemaNode,
+    nodes_by_path: &HashMap<String, &SchemaNode>,
+) -> Result<Vec<TokenStream>, RustGenerationError> {
+    let mut stmts = Vec::new();
+    for child_path in ordered_child_paths(node) {
+        let Some(child) = nodes_by_path.get(child_path) else {
+            continue;
+        };
+        let child_local = clean_segment(last_segment(&child.path));
+        if !node
+            .key_leaves
+            .iter()
+            .any(|key| clean_segment(key) == child_local)
+        {
+            continue;
+        }
+        if !matches!(child.kind, SchemaNodeKind::Leaf) {
+            continue;
+        }
+        let child_fn = format_ident!("render_{}", path_to_snake(&child.path));
+        let field_ident = format_ident!("{}", to_snake_case(child_local));
+        stmts.push(quote! {
+            if let Some(fragment) = #child_fn(&value.#field_ident, ctx, #child_path)? {
+                key_children.push_str(&fragment);
+                rendered_key_count += 1;
+            }
+        });
+    }
+    Ok(stmts)
 }
 
 fn leaf_field_type(node: &SchemaNode, nodes_by_path: &HashMap<String, &SchemaNode>) -> TokenStream {
@@ -537,7 +626,7 @@ fn sequence_field_type(
     node: &SchemaNode,
     nodes_by_path: &HashMap<String, &SchemaNode>,
 ) -> TokenStream {
-    match node.kind {
+    let inner = match node.kind {
         SchemaNodeKind::List => {
             let local = clean_segment(last_segment(&node.path));
             let type_ident = format_ident!("{}", to_pascal_case(local));
@@ -553,6 +642,11 @@ fn sequence_field_type(
             quote! { Vec<#elem_type> }
         }
         _ => unreachable!(),
+    };
+    if super::types::is_sensitive_node(node) {
+        quote! { super::types::SecretLeaf<#inner> }
+    } else {
+        inner
     }
 }
 

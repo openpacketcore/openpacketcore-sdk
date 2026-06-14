@@ -276,15 +276,42 @@ fn selected_child_under_list_does_not_leak_siblings() {
     let xml = renderer()
         .render_running_config(
             &system,
-            &["/ex:system/ex:interfaces/ex:mtu"],
+            &[
+                "/ex:system/ex:interfaces/ex:name",
+                "/ex:system/ex:interfaces/ex:mtu",
+            ],
             DefaultReport::Trim,
         )
         .unwrap();
 
+    assert!(xml.contains("<ex:name>eth0</ex:name>"));
     assert!(xml.contains("<ex:mtu>1500</ex:mtu>"));
-    assert!(!xml.contains("<ex:name>"));
     assert!(!xml.contains("<ex:admin>"));
     assert!(!xml.contains("auth-secret"));
+}
+
+#[test]
+fn selected_list_child_without_key_fails_closed() {
+    let mut system = sample_config();
+    system
+        .interfaces
+        .insert("eth0".to_string(), interface_eth0());
+
+    let err = renderer()
+        .render_running_config(
+            &system,
+            &["/ex:system/ex:interfaces/ex:mtu"],
+            DefaultReport::Trim,
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        err,
+        NetconfProjectionError::UnsupportedShape {
+            path: "/ex:system/ex:interfaces",
+            kind: opc_mgmt_schema::NodeKind::List,
+        }
+    );
 }
 
 #[test]
@@ -413,4 +440,18 @@ fn leaf_list_numeric_render() {
 
     assert!(xml.contains("<ex:tags>10</ex:tags>"));
     assert!(xml.contains("<ex:tags>20</ex:tags>"));
+}
+
+#[test]
+fn sensitive_leaf_list_is_redacted() {
+    let mut system = sample_config();
+    system.secret_codes = SecretLeaf::new(vec!["alpha".to_string(), "beta".to_string()]);
+
+    let xml = renderer()
+        .render_running_config(&system, &["/ex:system/ex:secret-codes"], DefaultReport::Trim)
+        .unwrap();
+
+    assert!(xml.contains("<ex:secret-codes>"));
+    assert!(!xml.contains("alpha"));
+    assert!(!xml.contains("beta"));
 }
