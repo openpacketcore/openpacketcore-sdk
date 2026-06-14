@@ -197,6 +197,6 @@ pub use transport::{
 pub use xml::{
     parse_client_hello, parse_rpc, ClientHello, Datastore, Filter, FilterElement, FilterKind,
     GetConfigRequest, GetRequest, KillSessionRequest, LockRequest, ParsedRpc, RpcOperation,
-    SubtreeFilter, SubtreeSelection, UnlockRequest, UnsupportedOperation, WithDefaultsMode,
-    XmlError,
+    SubtreeFilter, SubtreeSelection, UnlockRequest, UnsupportedOperation, ValidateRequest,
+    WithDefaultsMode, XmlError,
 };

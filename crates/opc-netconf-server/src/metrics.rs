@@ -16,6 +16,8 @@ pub(crate) enum NetconfOperation {
     Unlock,
     /// `<kill-session>`.
     KillSession,
+    /// `<validate>`.
+    Validate,
     /// `<get>`.
     Get,
     /// `<get-config>`.
@@ -35,6 +37,7 @@ impl NetconfOperation {
             Self::Lock => "lock",
             Self::Unlock => "unlock",
             Self::KillSession => "kill-session",
+            Self::Validate => "validate",
             Self::Get => "get",
             Self::GetConfig => "get-config",
             Self::GetSchema => "get-schema",
