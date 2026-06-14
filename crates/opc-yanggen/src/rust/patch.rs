@@ -330,6 +330,12 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             }
                         }
                         SchemaNodeKind::LeafList => {
+                            let is_sensitive = is_sensitive_node(child);
+                            let list_access = if is_sensitive {
+                                quote! { self.#field_ident.get_mut() }
+                            } else {
+                                quote! { &mut self.#field_ident }
+                            };
                             let parse_elem = match &child.type_ref {
                                 Some(TypeRef::Boolean) => quote! {
                                     let parsed_elem = match v {
@@ -362,20 +368,22 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     if segments.len() == 1 {
                                         match op {
                                             ConfigOp::Delete | ConfigOp::Remove => {
+                                                let values = #list_access;
                                                 if let Some(v) = value {
                                                     #parse_elem
-                                                    self.#field_ident.retain(|x| x != &parsed_elem);
+                                                    values.retain(|x| x != &parsed_elem);
                                                 } else {
-                                                    self.#field_ident.clear();
+                                                    values.clear();
                                                 }
                                             }
                                             ConfigOp::Replace | ConfigOp::Update | ConfigOp::Merge => {
+                                                let values = #list_access;
                                                 let v = value.ok_or_else(|| config_error("missing-value", "Value is required"))?;
                                                 if v.starts_with('[') {
-                                                    self.#field_ident = serde_json::from_str(v).map_err(|e| config_error("invalid-value", e.to_string()))?;
+                                                    *values = serde_json::from_str(v).map_err(|e| config_error("invalid-value", e.to_string()))?;
                                                 } else {
                                                     #parse_elem
-                                                    self.#field_ident.push(parsed_elem);
+                                                    values.push(parsed_elem);
                                                 }
                                             }
                                         }

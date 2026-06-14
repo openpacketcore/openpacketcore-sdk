@@ -36,6 +36,7 @@ fn build_input() -> CanonicalInput {
                 "/ex:system/ex:routes".to_string(),
                 "/ex:system/ex:servers".to_string(),
                 "/ex:system/ex:tags".to_string(),
+                "/ex:system/ex:secret-codes".to_string(),
                 "/ex:system/ex:custom-tags".to_string(),
             ],
             source: source.clone(),
@@ -238,6 +239,16 @@ fn build_input() -> CanonicalInput {
             kind: SchemaNodeKind::LeafList,
             config: true,
             type_ref: Some(TypeRef::Uint16),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:secret-codes".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::LeafList,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            data_class: Some("security-secret".to_string()),
             source: source.clone(),
             ..Default::default()
         },

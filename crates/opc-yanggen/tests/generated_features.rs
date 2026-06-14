@@ -362,6 +362,46 @@ fn test_rust_generation_rejects_missing_children() {
 }
 
 #[test]
+fn test_rust_generation_rejects_sensitive_structural_nodes() {
+    let mut input = create_test_input();
+    let src = YangSourceLocation::new("test.yang", 30, 1);
+    input
+        .nodes
+        .get_mut(0)
+        .expect("root")
+        .child_paths
+        .push("/test:system/secret-list".to_string());
+    input.nodes.push(SchemaNode {
+        path: "/test:system/secret-list".to_string(),
+        module: "test".to_string(),
+        kind: SchemaNodeKind::List,
+        config: true,
+        data_class: Some("security-secret".to_string()),
+        key_leaves: vec!["name".to_string()],
+        child_paths: vec!["/test:system/secret-list/name".to_string()],
+        source: src.clone(),
+        ..Default::default()
+    });
+    input.nodes.push(SchemaNode {
+        path: "/test:system/secret-list/name".to_string(),
+        module: "test".to_string(),
+        kind: SchemaNodeKind::Leaf,
+        config: true,
+        type_ref: Some(TypeRef::String),
+        source: src,
+        ..Default::default()
+    });
+
+    let err = generate_rust(&input).unwrap_err();
+    assert!(
+        err.message()
+            .contains("must not be classified as sensitive"),
+        "got: {}",
+        err.message()
+    );
+}
+
+#[test]
 fn test_schema_registry_rejects_unknown_data_class() {
     let mut input = create_test_input();
     // A data_class outside the known DataClass set. metadata.rs would silently
