@@ -3417,6 +3417,119 @@ mod tests {
         }
     }
 
+    /// A generated-renderer-style renderer that supports every RFC 6243
+    /// with-defaults mode. Used to verify that the default binding dispatches
+    /// modes only when both capability and renderer advertise support.
+    struct FullDefaultsRenderer;
+
+    impl NetconfXmlRenderer<DemoConfig> for FullDefaultsRenderer {
+        fn render_running_config(
+            &self,
+            config: &DemoConfig,
+            selection: &[&str],
+            report: DefaultReport,
+        ) -> Result<String, NetconfProjectionError> {
+            let ctx = NetconfXmlRenderContext::new(&REGISTRY, selection, report);
+            if !ctx.is_subtree_selected("/sys:system") {
+                return Ok(String::new());
+            }
+            let ns_decls = ctx
+                .module_namespaces()
+                .into_iter()
+                .map(|(prefix, ns)| format!(r#" xmlns:{prefix}="{ns}""#))
+                .collect::<String>();
+            let mut out = format!(r#"<sys:system{ns_decls}>"#);
+            if ctx.is_selected("/sys:system/sys:hostname") {
+                // Treat the fixture value as schema-defaulted so that
+                // report-all-tagged exercises the wd:default attribute path.
+                let is_default = report == DefaultReport::ReportAllTagged;
+                out.push_str(&ctx.format_leaf_with_default(
+                    "/sys:system/sys:hostname",
+                    &config.hostname,
+                    is_default,
+                )?);
+            }
+            out.push_str("</sys:system>");
+            Ok(out)
+        }
+
+        fn supported_default_reports(&self) -> &'static [DefaultReport] {
+            &[
+                DefaultReport::Trim,
+                DefaultReport::ReportAll,
+                DefaultReport::Explicit,
+                DefaultReport::ReportAllTagged,
+            ]
+        }
+    }
+
+    static FULL_DEFAULTS_RENDERER: FullDefaultsRenderer = FullDefaultsRenderer;
+
+    /// A generated-renderer binding that advertises and supports all
+    /// with-defaults modes.
+    struct FullDefaultsGeneratedRendererBinding {
+        bus: Arc<ConfigBus<DemoConfig>>,
+    }
+
+    impl NetconfConfigBinding<DemoConfig> for FullDefaultsGeneratedRendererBinding {
+        fn config_bus(&self) -> Arc<ConfigBus<DemoConfig>> {
+            Arc::clone(&self.bus)
+        }
+
+        fn schema_registry(&self) -> &'static dyn SchemaRegistry {
+            &REGISTRY
+        }
+
+        fn generated_xml_renderer(&self) -> Option<&dyn NetconfXmlRenderer<DemoConfig>> {
+            Some(&FULL_DEFAULTS_RENDERER)
+        }
+
+        fn with_defaults_capability(&self) -> Option<WithDefaultsCapability> {
+            Some(
+                WithDefaultsCapability::new(
+                    WithDefaultsMode::ReportAll,
+                    [
+                        WithDefaultsMode::Trim,
+                        WithDefaultsMode::Explicit,
+                        WithDefaultsMode::ReportAllTagged,
+                    ],
+                )
+                .expect("with-defaults capability"),
+            )
+        }
+    }
+
+    /// A generated-renderer binding that advertises report-all-tagged but uses
+    /// the limited `DemoRenderer`, which does not support it. Exercises the
+    /// fail-closed path for a capability that overshoots renderer support.
+    struct OverdeclaredDefaultsGeneratedRendererBinding {
+        bus: Arc<ConfigBus<DemoConfig>>,
+    }
+
+    impl NetconfConfigBinding<DemoConfig> for OverdeclaredDefaultsGeneratedRendererBinding {
+        fn config_bus(&self) -> Arc<ConfigBus<DemoConfig>> {
+            Arc::clone(&self.bus)
+        }
+
+        fn schema_registry(&self) -> &'static dyn SchemaRegistry {
+            &REGISTRY
+        }
+
+        fn generated_xml_renderer(&self) -> Option<&dyn NetconfXmlRenderer<DemoConfig>> {
+            Some(&DEMO_RENDERER)
+        }
+
+        fn with_defaults_capability(&self) -> Option<WithDefaultsCapability> {
+            Some(
+                WithDefaultsCapability::new(
+                    WithDefaultsMode::Trim,
+                    [WithDefaultsMode::ReportAllTagged],
+                )
+                .expect("with-defaults capability"),
+            )
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum AdvertisedDiscovery {
         YangLibrary,
@@ -3867,6 +3980,62 @@ mod tests {
             bus,
             operational_mode,
         };
+        let audit = CapturingAudit::default();
+        ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            audit,
+            TransportType::NetconfTls,
+        )
+        .expect("server")
+    }
+
+    async fn full_defaults_renderer_server_fixture() -> ReadOnlyNetconfServer<
+        DemoConfig,
+        FullDefaultsGeneratedRendererBinding,
+        FixedPolicy,
+        CapturingAudit,
+    > {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = FullDefaultsGeneratedRendererBinding { bus };
+        let audit = CapturingAudit::default();
+        ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            audit,
+            TransportType::NetconfTls,
+        )
+        .expect("server")
+    }
+
+    async fn overdeclared_defaults_renderer_server_fixture() -> ReadOnlyNetconfServer<
+        DemoConfig,
+        OverdeclaredDefaultsGeneratedRendererBinding,
+        FixedPolicy,
+        CapturingAudit,
+    > {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = OverdeclaredDefaultsGeneratedRendererBinding { bus };
         let audit = CapturingAudit::default();
         ReadOnlyNetconfServer::new(
             binding,
@@ -6885,6 +7054,65 @@ mod tests {
         assert!(!reply.contains("do-not-leak"));
         assert!(netconf_rpc_requests("get-config", "failure") > failures_before);
         assert!(netconf_rpc_errors("get-config", "operation-not-supported") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn get_config_with_defaults_generated_renderer_supports_explicit() {
+        let server = full_defaults_renderer_server_fixture().await;
+        let success_before = netconf_rpc_requests("get-config", "success");
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &get_config_with_defaults_rpc("explicit"),
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains(r#"message-id="111""#));
+        assert!(reply.contains("<sys:hostname>amf-1</sys:hostname>"));
+        assert!(!reply.contains("<rpc-error>"));
+        assert!(netconf_rpc_requests("get-config", "success") > success_before);
+    }
+
+    #[tokio::test]
+    async fn get_config_with_defaults_generated_renderer_supports_report_all_tagged() {
+        let server = full_defaults_renderer_server_fixture().await;
+        let success_before = netconf_rpc_requests("get-config", "success");
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &get_config_with_defaults_rpc("report-all-tagged"),
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains(r#"message-id="111""#));
+        assert!(
+            reply.contains("xmlns:wd=\"urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults\"")
+        );
+        assert!(reply.contains("<sys:hostname wd:default=\"true\">amf-1</sys:hostname>"));
+        assert!(!reply.contains("<rpc-error>"));
+        assert!(netconf_rpc_requests("get-config", "success") > success_before);
+    }
+
+    #[tokio::test]
+    async fn get_config_with_defaults_over_declared_mode_fails_closed() {
+        let server = overdeclared_defaults_renderer_server_fixture().await;
+        let failures_before = netconf_rpc_requests("get-config", "failure");
+        let errors_before = netconf_rpc_errors("get-config", "operation-failed");
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &get_config_with_defaults_rpc("report-all-tagged"),
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains(r#"message-id="111""#));
+        assert!(reply.contains("<error-tag>operation-failed</error-tag>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(netconf_rpc_requests("get-config", "failure") > failures_before);
+        assert!(netconf_rpc_errors("get-config", "operation-failed") > errors_before);
     }
 
     #[tokio::test]

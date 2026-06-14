@@ -563,9 +563,7 @@ fn with_defaults_mode_to_report(mode: WithDefaultsMode) -> Result<DefaultReport,
         WithDefaultsMode::ReportAll => Ok(DefaultReport::ReportAll),
         WithDefaultsMode::Trim => Ok(DefaultReport::Trim),
         WithDefaultsMode::Explicit => Ok(DefaultReport::Explicit),
-        WithDefaultsMode::ReportAllTagged => Err(BindingError::projection(
-            "NETCONF with-defaults report-all-tagged is not supported",
-        )),
+        WithDefaultsMode::ReportAllTagged => Ok(DefaultReport::ReportAllTagged),
         WithDefaultsMode::Unrecognized => Err(BindingError::projection(
             "NETCONF with-defaults mode is unrecognized",
         )),
