@@ -76,6 +76,10 @@ impl RpcParseError {
 /// RPC operation context available before the full RPC can be parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RpcOperationHint {
+    /// Base NETCONF `<get>`.
+    Get,
+    /// Base NETCONF `<get-config>`.
+    GetConfig,
     /// Base NETCONF `<kill-session>`.
     KillSession,
 }
@@ -699,12 +703,14 @@ impl ParserState {
                     if self.has_rpc_operation() {
                         return Err(XmlError::DuplicateElement);
                     }
+                    self.operation_hint = Some(RpcOperationHint::Get);
                     self.get = Some(PartialGet::default());
                 }
                 "get-config" => {
                     if self.has_rpc_operation() {
                         return Err(XmlError::DuplicateElement);
                     }
+                    self.operation_hint = Some(RpcOperationHint::GetConfig);
                     self.get_config = Some(PartialGetConfig::default());
                 }
                 "close-session" => {
@@ -1433,7 +1439,17 @@ fn attr_value<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> 
         .map(|(_, value)| value.as_str())
 }
 
+fn attr_occurrences(attrs: &[(String, String)], name: &str) -> usize {
+    attrs
+        .iter()
+        .filter(|(attr_name, _)| attr_name == name)
+        .count()
+}
+
 fn filter_kind(attrs: &[(String, String)]) -> Result<FilterKind, XmlError> {
+    if attr_occurrences(attrs, "type") > 1 {
+        return Err(XmlError::InvalidFilterType);
+    }
     match attr_value(attrs, "type").unwrap_or("subtree") {
         "subtree" => {
             if attrs.iter().any(|(name, _)| name != "type") {
@@ -1446,6 +1462,13 @@ fn filter_kind(attrs: &[(String, String)]) -> Result<FilterKind, XmlError> {
                 .iter()
                 .any(|(name, _)| name != "type" && name != "select")
             {
+                return Err(XmlError::InvalidFilterType);
+            }
+            if attr_occurrences(attrs, "select") > 1 {
+                return Err(XmlError::InvalidFilterType);
+            }
+            let select = attr_value(attrs, "select").ok_or(XmlError::MissingAttribute)?;
+            if select.trim().is_empty() {
                 return Err(XmlError::InvalidFilterType);
             }
             Ok(FilterKind::XPath)
@@ -1737,6 +1760,36 @@ mod tests {
     }
 
     #[test]
+    fn operation_hints_require_namespace_accepted_reads_but_preserve_kill_context() {
+        let wrong_get = parse_rpc_with_context(
+            r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" xmlns:bad="urn:example:bad" message-id="wrong-get"><bad:get/></rpc>"#,
+            &MgmtLimits::default(),
+        )
+        .expect_err("wrong namespace get");
+        assert_eq!(wrong_get.error, XmlError::UnknownNamespace);
+        assert_eq!(wrong_get.operation_hint, None);
+
+        let wrong_get_config = parse_rpc_with_context(
+            r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" xmlns:bad="urn:example:bad" message-id="wrong-get-config"><bad:get-config/></rpc>"#,
+            &MgmtLimits::default(),
+        )
+        .expect_err("wrong namespace get-config");
+        assert_eq!(wrong_get_config.error, XmlError::UnknownNamespace);
+        assert_eq!(wrong_get_config.operation_hint, None);
+
+        let wrong_kill = parse_rpc_with_context(
+            r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" xmlns:bad="urn:example:bad" message-id="wrong-kill"><bad:kill-session><session-id>42</session-id></bad:kill-session></rpc>"#,
+            &MgmtLimits::default(),
+        )
+        .expect_err("wrong namespace kill-session");
+        assert_eq!(wrong_kill.error, XmlError::UnknownNamespace);
+        assert_eq!(
+            wrong_kill.operation_hint,
+            Some(RpcOperationHint::KillSession)
+        );
+    }
+
+    #[test]
     fn parses_get_schema_in_monitoring_namespace() {
         let parsed = parse_rpc(
             r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="501"><ncm:get-schema xmlns:ncm="urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring"><ncm:identifier>demo-system</ncm:identifier><ncm:version>2026-06-13</ncm:version><ncm:format>yang</ncm:format></ncm:get-schema></rpc>"#,
@@ -1980,6 +2033,131 @@ mod tests {
         assert_eq!(filter.selections().len(), 2);
         assert_eq!(filter.selections()[0].elements()[0].namespace, "");
         assert_eq!(filter.selections()[0].elements()[1].namespace, "");
+    }
+
+    #[test]
+    fn parses_well_shaped_xpath_filter_for_unsupported_evaluator() {
+        let get_config = parse_rpc(
+            &rpc(r#"<get-config><source><running/></source><filter type="xpath" select="/sys:system/sys:hostname"/></get-config>"#),
+            &MgmtLimits::default(),
+        )
+        .expect("parse get-config xpath filter envelope");
+        let RpcOperation::GetConfig(request) = get_config.operation else {
+            panic!("expected get-config operation");
+        };
+        assert_eq!(request.filter, Some(Filter::XPath));
+
+        let get = parse_rpc(
+            &rpc(r#"<get><filter type="xpath" select="/sys:system/sys:hostname"/></get>"#),
+            &MgmtLimits::default(),
+        )
+        .expect("parse get xpath filter envelope");
+        let RpcOperation::Get(request) = get.operation else {
+            panic!("expected get operation");
+        };
+        assert_eq!(request.filter, Some(Filter::XPath));
+
+        let namespaced_select = parse_rpc(
+            &rpc(r#"<get><filter xmlns:sys="urn:opc:test" type="xpath" select="/sys:system/sys:hostname"/></get>"#),
+            &MgmtLimits::default(),
+        )
+        .expect("parse xpath filter envelope with namespace declaration");
+        let RpcOperation::Get(request) = namespaced_select.operation else {
+            panic!("expected get operation");
+        };
+        assert_eq!(request.filter, Some(Filter::XPath));
+    }
+
+    #[test]
+    fn xpath_filter_namespace_declarations_obey_namespace_limit() {
+        let limits = MgmtLimits {
+            max_xml_namespace_decls: 1,
+            ..MgmtLimits::default()
+        };
+        let err = parse_rpc(
+            &rpc(r#"<get><filter xmlns:sys="urn:opc:test" xmlns:if="urn:opc:if" type="xpath" select="/sys:system/if:interfaces"/></get>"#),
+            &limits,
+        )
+        .expect_err("xpath namespace declarations over limit");
+        assert_eq!(
+            err,
+            XmlError::Limit(opc_mgmt_limits::LimitsError::Exceeded {
+                limit: "xml_namespace_decls",
+                max: 1,
+                actual: 2
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_xpath_filter_shape_before_operation_dispatch() {
+        let missing_select = parse_rpc(
+            &rpc(r#"<get-config><source><running/></source><filter type="xpath"/></get-config>"#),
+            &MgmtLimits::default(),
+        )
+        .expect_err("missing xpath select");
+        assert_eq!(missing_select, XmlError::MissingAttribute);
+
+        let empty_select = parse_rpc(
+            &rpc(r#"<get-config><source><running/></source><filter type="xpath" select=" "/></get-config>"#),
+            &MgmtLimits::default(),
+        )
+        .expect_err("empty xpath select");
+        assert_eq!(empty_select, XmlError::InvalidFilterType);
+
+        let extra_attr = parse_rpc(
+            &rpc(r#"<get-config><source><running/></source><filter type="xpath" select="/sys:system" mode="all"/></get-config>"#),
+            &MgmtLimits::default(),
+        )
+        .expect_err("extra xpath attribute");
+        assert_eq!(extra_attr, XmlError::InvalidFilterType);
+
+        let get_missing_select = parse_rpc(
+            &rpc(r#"<get><filter type="xpath"/></get>"#),
+            &MgmtLimits::default(),
+        )
+        .expect_err("get missing xpath select");
+        assert_eq!(get_missing_select, XmlError::MissingAttribute);
+
+        let child_content = parse_rpc(
+            &rpc(r#"<get-config><source><running/></source><filter type="xpath" select="/sys:system"><sys:system xmlns:sys="urn:opc:test"/></filter></get-config>"#),
+            &MgmtLimits::default(),
+        )
+        .expect_err("xpath filter content");
+        assert_eq!(child_content, XmlError::UnsupportedFilterContent);
+
+        let duplicate_wire_type = parse_rpc(
+            &rpc(r#"<get-config><source><running/></source><filter type="xpath" type="subtree" select="/sys:system"/></get-config>"#),
+            &MgmtLimits::default(),
+        )
+        .expect_err("duplicate xpath type attribute");
+        assert_eq!(duplicate_wire_type, XmlError::Malformed);
+
+        let duplicate_wire_select = parse_rpc(
+            &rpc(r#"<get-config><source><running/></source><filter type="xpath" select="/sys:system" select="/sys:interfaces"/></get-config>"#),
+            &MgmtLimits::default(),
+        )
+        .expect_err("duplicate xpath select attribute");
+        assert_eq!(duplicate_wire_select, XmlError::Malformed);
+
+        assert_eq!(
+            filter_kind(&[
+                ("type".to_string(), "xpath".to_string()),
+                ("type".to_string(), "xpath".to_string()),
+                ("select".to_string(), "/sys:system".to_string()),
+            ])
+            .expect_err("duplicate xpath type"),
+            XmlError::InvalidFilterType
+        );
+        assert_eq!(
+            filter_kind(&[
+                ("type".to_string(), "xpath".to_string()),
+                ("select".to_string(), "/sys:system".to_string()),
+                ("select".to_string(), "/sys:interfaces".to_string()),
+            ])
+            .expect_err("duplicate xpath select"),
+            XmlError::InvalidFilterType
+        );
     }
 
     #[test]
