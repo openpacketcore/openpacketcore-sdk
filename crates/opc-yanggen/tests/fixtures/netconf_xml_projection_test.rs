@@ -18,9 +18,14 @@ fn sample_config() -> System {
 fn selected_leaf_only() {
     let system = sample_config();
     let xml = renderer()
-        .render_running_config(&system, &["/ex:system/ex:hostname"], DefaultReport::Trim)
+        .render_running_config(
+            &system,
+            &["/ex:system", "/ex:system/ex:hostname"],
+            DefaultReport::Trim,
+        )
         .unwrap();
     assert!(xml.contains("<ex:hostname>router1</ex:hostname>"));
+    assert!(!xml.contains("<ex:enabled>"));
     assert!(!xml.contains("<ex:secret>"));
     assert!(!xml.contains("hunter2"));
 }
@@ -29,11 +34,27 @@ fn selected_leaf_only() {
 fn selected_container_and_descendants() {
     let system = sample_config();
     let xml = renderer()
-        .render_running_config(&system, &["/ex:system/ex:dns"], DefaultReport::Trim)
+        .render_running_config(
+            &system,
+            &["/ex:system/ex:dns", "/ex:system/ex:dns/ex:server"],
+            DefaultReport::Trim,
+        )
         .unwrap();
     assert!(xml.contains("<ex:dns>"));
     assert!(xml.contains("<ex:server>1.1.1.1</ex:server>"));
     assert!(xml.contains("</ex:dns>"));
+}
+
+#[test]
+fn selected_container_without_leaf_descendant_does_not_emit_siblings() {
+    let system = sample_config();
+    let xml = renderer()
+        .render_running_config(&system, &["/ex:system/ex:dns"], DefaultReport::Trim)
+        .unwrap();
+    assert!(xml.contains("<ex:dns>"));
+    assert!(!xml.contains("<ex:server>"));
+    assert!(!xml.contains("<ex:hostname>"));
+    assert!(!xml.contains("<ex:secret>"));
 }
 
 #[test]
@@ -42,7 +63,11 @@ fn denied_leaf_omitted() {
     let xml = renderer()
         .render_running_config(
             &system,
-            &["/ex:system/ex:hostname", "/ex:system/ex:enabled"],
+            &[
+                "/ex:system",
+                "/ex:system/ex:hostname",
+                "/ex:system/ex:enabled",
+            ],
             DefaultReport::Trim,
         )
         .unwrap();
