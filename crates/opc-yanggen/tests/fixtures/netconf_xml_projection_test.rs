@@ -14,6 +14,24 @@ fn sample_config() -> System {
     system
 }
 
+fn interface_eth0() -> Interfaces {
+    let mut iface = Interfaces::default();
+    iface.name = LeafPresence::Explicit("eth0".to_string());
+    iface.mtu = LeafPresence::Explicit(1500);
+    iface.admin = LeafPresence::Explicit(true);
+    iface.auth_key = SecretLeaf::new(LeafPresence::Explicit("auth-secret".to_string()));
+    iface
+}
+
+fn interface_eth1() -> Interfaces {
+    let mut iface = Interfaces::default();
+    iface.name = LeafPresence::Explicit("eth1".to_string());
+    iface.mtu = LeafPresence::Explicit(9000);
+    iface.admin = LeafPresence::Explicit(false);
+    iface.auth_key = SecretLeaf::new(LeafPresence::Explicit("auth-secret-2".to_string()));
+    iface
+}
+
 #[test]
 fn selected_leaf_only() {
     let system = sample_config();
@@ -109,16 +127,16 @@ fn namespace_and_prefix_declared() {
 }
 
 #[test]
-fn unsupported_list_fails_closed() {
+fn unsupported_custom_leaf_list_fails_closed() {
     let system = sample_config();
     let err = renderer()
-        .render_running_config(&system, &["/ex:system/ex:interfaces"], DefaultReport::Trim)
+        .render_running_config(&system, &["/ex:system/ex:custom-tags"], DefaultReport::Trim)
         .unwrap_err();
     assert_eq!(
         err,
         NetconfProjectionError::UnsupportedShape {
-            path: "/ex:system/ex:interfaces",
-            kind: opc_mgmt_schema::NodeKind::List,
+            path: "/ex:system/ex:custom-tags",
+            kind: opc_mgmt_schema::NodeKind::LeafList,
         }
     );
 }
@@ -201,4 +219,198 @@ fn state_leaf_rendered_when_selected() {
         .render_running_config(&system, &["/ex:system/ex:uptime"], DefaultReport::Trim)
         .unwrap();
     assert!(xml.contains("<ex:uptime>123</ex:uptime>"));
+}
+
+#[test]
+fn keyed_list_renders_selected_children() {
+    let mut system = sample_config();
+    system
+        .interfaces
+        .insert("eth0".to_string(), interface_eth0());
+    system
+        .interfaces
+        .insert("eth1".to_string(), interface_eth1());
+
+    let xml = renderer()
+        .render_running_config(
+            &system,
+            &[
+                "/ex:system/ex:interfaces",
+                "/ex:system/ex:interfaces/ex:name",
+                "/ex:system/ex:interfaces/ex:mtu",
+            ],
+            DefaultReport::Trim,
+        )
+        .unwrap();
+
+    assert!(xml.contains("<ex:interfaces><ex:name>eth0</ex:name><ex:mtu>1500</ex:mtu></ex:interfaces>"));
+    assert!(xml.contains("<ex:interfaces><ex:name>eth1</ex:name><ex:mtu>9000</ex:mtu></ex:interfaces>"));
+    assert!(!xml.contains("<ex:admin>"));
+    assert!(!xml.contains("auth-secret"));
+}
+
+#[test]
+fn selected_list_container_without_child_does_not_emit_unauthorized_children() {
+    let mut system = sample_config();
+    system
+        .interfaces
+        .insert("eth0".to_string(), interface_eth0());
+
+    let xml = renderer()
+        .render_running_config(&system, &["/ex:system/ex:interfaces"], DefaultReport::Trim)
+        .unwrap();
+
+    assert!(!xml.contains("<ex:name>"));
+    assert!(!xml.contains("<ex:mtu>"));
+    assert!(!xml.contains("<ex:admin>"));
+    assert!(!xml.contains("auth-secret"));
+}
+
+#[test]
+fn selected_child_under_list_does_not_leak_siblings() {
+    let mut system = sample_config();
+    system
+        .interfaces
+        .insert("eth0".to_string(), interface_eth0());
+
+    let xml = renderer()
+        .render_running_config(
+            &system,
+            &["/ex:system/ex:interfaces/ex:mtu"],
+            DefaultReport::Trim,
+        )
+        .unwrap();
+
+    assert!(xml.contains("<ex:mtu>1500</ex:mtu>"));
+    assert!(!xml.contains("<ex:name>"));
+    assert!(!xml.contains("<ex:admin>"));
+    assert!(!xml.contains("auth-secret"));
+}
+
+#[test]
+fn list_with_secret_leaf_redaction() {
+    let mut system = sample_config();
+    system
+        .interfaces
+        .insert("eth0".to_string(), interface_eth0());
+
+    let xml = renderer()
+        .render_running_config(
+            &system,
+            &[
+                "/ex:system/ex:interfaces",
+                "/ex:system/ex:interfaces/ex:name",
+                "/ex:system/ex:interfaces/ex:auth-key",
+            ],
+            DefaultReport::Trim,
+        )
+        .unwrap();
+
+    assert!(xml.contains("<ex:name>eth0</ex:name>"));
+    assert!(xml.contains("<ex:auth-key>"));
+    assert!(!xml.contains("auth-secret"));
+}
+
+#[test]
+fn multi_key_list_renders_keys_in_schema_order() {
+    let mut system = sample_config();
+    let mut route = Routes::default();
+    route.dest = LeafPresence::Explicit("0.0.0.0/0".to_string());
+    route.next_hop = LeafPresence::Explicit("10.0.0.1".to_string());
+    route.metric = LeafPresence::Explicit(1);
+    system.routes.insert(
+        RoutesKey {
+            dest: "0.0.0.0/0".to_string(),
+            next_hop: "10.0.0.1".to_string(),
+        },
+        route,
+    );
+
+    let xml = renderer()
+        .render_running_config(
+            &system,
+            &[
+                "/ex:system/ex:routes",
+                "/ex:system/ex:routes/ex:dest",
+                "/ex:system/ex:routes/ex:next-hop",
+                "/ex:system/ex:routes/ex:metric",
+            ],
+            DefaultReport::Trim,
+        )
+        .unwrap();
+
+    let dest_pos = xml.find("<ex:dest>").unwrap();
+    let next_hop_pos = xml.find("<ex:next-hop>").unwrap();
+    let metric_pos = xml.find("<ex:metric>").unwrap();
+    assert!(dest_pos < next_hop_pos);
+    assert!(next_hop_pos < metric_pos);
+    assert!(xml.contains("<ex:dest>0.0.0.0/0</ex:dest>"));
+    assert!(xml.contains("<ex:next-hop>10.0.0.1</ex:next-hop>"));
+    assert!(xml.contains("<ex:metric>1</ex:metric>"));
+}
+
+#[test]
+fn nested_list_renders_selected_children() {
+    let mut system = sample_config();
+    let mut iface = interface_eth0();
+    let mut sub = SubInterfaces::default();
+    sub.id = LeafPresence::Explicit(100);
+    sub.description = LeafPresence::Explicit("vlan100".to_string());
+    iface.sub_interfaces.insert(100, sub);
+    system.interfaces.insert("eth0".to_string(), iface);
+
+    let xml = renderer()
+        .render_running_config(
+            &system,
+            &[
+                "/ex:system/ex:interfaces",
+                "/ex:system/ex:interfaces/ex:name",
+                "/ex:system/ex:interfaces/ex:sub-interfaces",
+                "/ex:system/ex:interfaces/ex:sub-interfaces/ex:id",
+                "/ex:system/ex:interfaces/ex:sub-interfaces/ex:description",
+            ],
+            DefaultReport::Trim,
+        )
+        .unwrap();
+
+    assert!(xml.contains("<ex:name>eth0</ex:name>"));
+    assert!(xml.contains("<ex:sub-interfaces><ex:id>100</ex:id><ex:description>vlan100</ex:description></ex:sub-interfaces>"));
+}
+
+#[test]
+fn leaf_list_scalar_render() {
+    let mut system = sample_config();
+    system.servers = vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()];
+
+    let xml = renderer()
+        .render_running_config(&system, &["/ex:system/ex:servers"], DefaultReport::Trim)
+        .unwrap();
+
+    assert!(xml.contains("<ex:servers>8.8.8.8</ex:servers>"));
+    assert!(xml.contains("<ex:servers>1.1.1.1</ex:servers>"));
+}
+
+#[test]
+fn leaf_list_xml_escaped() {
+    let mut system = sample_config();
+    system.servers = vec!["a & b".to_string()];
+
+    let xml = renderer()
+        .render_running_config(&system, &["/ex:system/ex:servers"], DefaultReport::Trim)
+        .unwrap();
+
+    assert!(xml.contains("<ex:servers>a &amp; b</ex:servers>"));
+}
+
+#[test]
+fn leaf_list_numeric_render() {
+    let mut system = sample_config();
+    system.tags = vec![10, 20];
+
+    let xml = renderer()
+        .render_running_config(&system, &["/ex:system/ex:tags"], DefaultReport::Trim)
+        .unwrap();
+
+    assert!(xml.contains("<ex:tags>10</ex:tags>"));
+    assert!(xml.contains("<ex:tags>20</ex:tags>"));
 }
