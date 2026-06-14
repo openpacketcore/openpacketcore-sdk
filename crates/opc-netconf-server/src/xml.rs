@@ -5,8 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use opc_mgmt_errors::{NetconfError, NetconfErrorTag, NetconfErrorType};
 use opc_mgmt_limits::{LimitsError, MgmtLimits};
 use quick_xml::encoding::Decoder;
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::{BytesEnd, BytesStart, Event};
+use quick_xml::name::QName;
 use quick_xml::reader::Reader;
+use quick_xml::writer::Writer;
 use quick_xml::XmlVersion;
 use thiserror::Error;
 
@@ -76,6 +78,8 @@ impl RpcParseError {
 /// RPC operation context available before the full RPC can be parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RpcOperationHint {
+    /// Base NETCONF `<edit-config>`.
+    EditConfig,
     /// Base NETCONF `<get>`.
     Get,
     /// Base NETCONF `<get-config>`.
@@ -93,6 +97,8 @@ pub(crate) enum RpcOperationHint {
 /// Supported parsed RPC operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcOperation {
+    /// `<edit-config>`.
+    EditConfig(EditConfigRequest),
     /// `<get-config>`.
     GetConfig(GetConfigRequest),
     /// `<get>`.
@@ -256,6 +262,98 @@ pub struct GetConfigRequest {
     /// RFC 6243 `<with-defaults>` parameter. The handler accepts it only when
     /// the binding advertises a matching `WithDefaultsCapability`.
     pub with_defaults: Option<WithDefaultsMode>,
+}
+
+/// `<edit-config>` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditConfigRequest {
+    /// Requested target datastore.
+    pub target: Datastore,
+    /// RFC 6241 default operation.
+    pub default_operation: EditDefaultOperation,
+    /// RFC 6241 test option.
+    pub test_option: EditTestOption,
+    /// Whether the client explicitly supplied `<test-option>`.
+    ///
+    /// RFC 6241 gates this leaf behind `:validate:1.1`. The parser records
+    /// presence separately so the server can reject explicit use while
+    /// `:validate` remains unadvertised.
+    pub test_option_explicit: bool,
+    /// RFC 6241 error option.
+    pub error_option: EditErrorOption,
+    /// Namespace-preserving XML for the complete `<config>` element. The
+    /// generic server treats this as opaque; the CNF binding translates the
+    /// bounded element payload into a full candidate config.
+    pub config_xml: String,
+}
+
+/// RFC 6241 `<default-operation>` value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EditDefaultOperation {
+    /// `merge` (RFC default).
+    #[default]
+    Merge,
+    /// `replace`.
+    Replace,
+    /// `none`.
+    None,
+}
+
+impl EditDefaultOperation {
+    fn parse(value: &str) -> Result<Self, XmlError> {
+        match value.trim() {
+            "merge" => Ok(Self::Merge),
+            "replace" => Ok(Self::Replace),
+            "none" => Ok(Self::None),
+            _ => Err(XmlError::InvalidValue),
+        }
+    }
+}
+
+/// RFC 6241 `<test-option>` value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EditTestOption {
+    /// `test-then-set` (RFC default when `:validate` is supported).
+    #[default]
+    TestThenSet,
+    /// `set`.
+    Set,
+    /// `test-only`.
+    TestOnly,
+}
+
+impl EditTestOption {
+    fn parse(value: &str) -> Result<Self, XmlError> {
+        match value.trim() {
+            "test-then-set" => Ok(Self::TestThenSet),
+            "set" => Ok(Self::Set),
+            "test-only" => Ok(Self::TestOnly),
+            _ => Err(XmlError::InvalidValue),
+        }
+    }
+}
+
+/// RFC 6241 `<error-option>` value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EditErrorOption {
+    /// `stop-on-error` (RFC default).
+    #[default]
+    StopOnError,
+    /// `continue-on-error`.
+    ContinueOnError,
+    /// `rollback-on-error`.
+    RollbackOnError,
+}
+
+impl EditErrorOption {
+    fn parse(value: &str) -> Result<Self, XmlError> {
+        match value.trim() {
+            "stop-on-error" => Ok(Self::StopOnError),
+            "continue-on-error" => Ok(Self::ContinueOnError),
+            "rollback-on-error" => Ok(Self::RollbackOnError),
+            _ => Err(XmlError::InvalidValue),
+        }
+    }
 }
 
 /// NETCONF datastores recognized by the parser.
@@ -486,6 +584,18 @@ struct PartialGetConfig {
 }
 
 #[derive(Debug, Clone, Default)]
+struct PartialEditConfig {
+    target: Option<Datastore>,
+    default_operation_seen: bool,
+    default_operation: Option<EditDefaultOperation>,
+    test_option_seen: bool,
+    test_option: Option<EditTestOption>,
+    error_option_seen: bool,
+    error_option: Option<EditErrorOption>,
+    config_xml: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 struct PartialGetSchema {
     identifier: Option<String>,
     version: Option<String>,
@@ -519,7 +629,7 @@ enum GetSchemaField {
     Format,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 struct ParserState {
     root: Option<RootKind>,
     stack: Vec<Element>,
@@ -528,6 +638,7 @@ struct ParserState {
     reply_attrs: RpcReplyAttributes,
     capabilities: Vec<String>,
     hello_capabilities_seen: bool,
+    edit_config: Option<PartialEditConfig>,
     get: Option<PartialGet>,
     get_config: Option<PartialGetConfig>,
     get_schema: Option<PartialGetSchema>,
@@ -540,6 +651,8 @@ struct ParserState {
     unsupported_operation: Option<UnsupportedOperation>,
     filter_depth: usize,
     filter_stack: Vec<FilterFrame>,
+    edit_config_capture: Option<Writer<Vec<u8>>>,
+    edit_config_capture_depth: usize,
     root_closed: bool,
     xml_decl_seen: bool,
     pre_decl_misc_seen: bool,
@@ -574,8 +687,14 @@ impl ParserState {
         };
 
         limits.check_depth(self.stack.len() + 1)?;
+        let capture_start =
+            self.edit_config_capture.is_some() || self.is_edit_config_config_start(&element);
         self.validate_protocol_namespace(&element)?;
         self.process_start(&element, &scoped.attrs, &scoped.reply_attrs)?;
+        if capture_start {
+            self.capture_event(Event::Start(start.borrow()))?;
+            self.edit_config_capture_depth = self.edit_config_capture_depth.saturating_add(1);
+        }
         self.stack.push(element);
         self.scopes.push(scoped.scope);
         Ok(())
@@ -595,11 +714,25 @@ impl ParserState {
         let scope = self.scopes.last().ok_or(XmlError::Malformed)?;
         let (prefix, local) = split_qname(raw_name)?;
         let namespace = resolve_namespace(prefix, scope)?;
+        let closing_edit_config_root = self.local_path_is(&["rpc", "edit-config", "config"]);
         let Some(current) = self.stack.pop() else {
             return Err(XmlError::Malformed);
         };
         if current.local != local || current.namespace != namespace {
             return Err(XmlError::Malformed);
+        }
+        if self.edit_config_capture.is_some() {
+            self.capture_event(Event::End(BytesEnd::from(QName(raw_name))))?;
+            self.edit_config_capture_depth = self
+                .edit_config_capture_depth
+                .checked_sub(1)
+                .ok_or(XmlError::Malformed)?;
+            if closing_edit_config_root {
+                if self.edit_config_capture_depth != 0 {
+                    return Err(XmlError::Malformed);
+                }
+                self.finish_edit_config_capture()?;
+            }
         }
         self.scopes.pop();
         if self.filter_depth > 1 {
@@ -651,6 +784,12 @@ impl ParserState {
             self.set_get_with_defaults_text(text)?;
         } else if self.local_path_is(&["rpc", "get-config", "with-defaults"]) {
             self.set_get_config_with_defaults_text(text)?;
+        } else if self.local_path_is(&["rpc", "edit-config", "default-operation"]) {
+            self.set_edit_default_operation_text(text)?;
+        } else if self.local_path_is(&["rpc", "edit-config", "test-option"]) {
+            self.set_edit_test_option_text(text)?;
+        } else if self.local_path_is(&["rpc", "edit-config", "error-option"]) {
+            self.set_edit_error_option_text(text)?;
         } else if text.trim().is_empty() || self.inside_unsupported_operation() {
             return Ok(());
         } else {
@@ -680,7 +819,10 @@ impl ParserState {
     }
 
     fn validate_protocol_namespace(&self, element: &Element) -> Result<(), XmlError> {
-        if self.filter_depth > 0 || self.inside_unsupported_operation() {
+        if self.filter_depth > 0
+            || self.edit_config_capture.is_some()
+            || self.inside_unsupported_operation()
+        {
             return Ok(());
         }
         if element.namespace == NETCONF_BASE_NS
@@ -702,6 +844,10 @@ impl ParserState {
         if self.filter_depth > 0 {
             self.process_filter_content_start(element, attrs)?;
             self.filter_depth += 1;
+            return Ok(());
+        }
+
+        if self.edit_config_capture.is_some() {
             return Ok(());
         }
 
@@ -764,6 +910,16 @@ impl ParserState {
                     self.operation_hint = Some(RpcOperationHint::GetConfig);
                     self.get_config = Some(PartialGetConfig::default());
                 }
+                "edit-config" => {
+                    if self.has_rpc_operation() {
+                        return Err(XmlError::DuplicateElement);
+                    }
+                    self.operation_hint = Some(RpcOperationHint::EditConfig);
+                    self.edit_config = Some(PartialEditConfig::default());
+                    if !attrs.is_empty() {
+                        return Err(XmlError::Malformed);
+                    }
+                }
                 "close-session" => {
                     if self.has_rpc_operation() {
                         return Err(XmlError::DuplicateElement);
@@ -806,7 +962,6 @@ impl ParserState {
                     }
                     self.get_schema = Some(PartialGetSchema::default());
                 }
-                "edit-config" => self.set_unsupported(UnsupportedOperation::EditConfig)?,
                 "copy-config" => self.set_unsupported(UnsupportedOperation::CopyConfig)?,
                 "delete-config" => self.set_unsupported(UnsupportedOperation::DeleteConfig)?,
                 "kill-session" => {
@@ -842,6 +997,23 @@ impl ParserState {
                 }
                 _ => Err(XmlError::Malformed),
             }
+        } else if self.local_path_is(&["rpc", "edit-config"]) {
+            match element.local.as_str() {
+                "target" if element.namespace == NETCONF_BASE_NS && attrs.is_empty() => Ok(()),
+                "default-operation" if element.namespace == NETCONF_BASE_NS && attrs.is_empty() => {
+                    self.install_edit_default_operation()
+                }
+                "test-option" if element.namespace == NETCONF_BASE_NS && attrs.is_empty() => {
+                    self.install_edit_test_option()
+                }
+                "error-option" if element.namespace == NETCONF_BASE_NS && attrs.is_empty() => {
+                    self.install_edit_error_option()
+                }
+                "config" if element.namespace == NETCONF_BASE_NS && attrs.is_empty() => {
+                    self.install_edit_config_capture()
+                }
+                _ => Err(XmlError::Malformed),
+            }
         } else if self.local_path_is(&["rpc", "close-session"]) {
             Err(XmlError::Malformed)
         } else if self.local_path_is(&["rpc", "lock"]) || self.local_path_is(&["rpc", "unlock"]) {
@@ -857,6 +1029,7 @@ impl ParserState {
         } else if self.local_path_is(&["rpc", "lock", "target"])
             || self.local_path_is(&["rpc", "unlock", "target"])
             || self.local_path_is(&["rpc", "validate", "source"])
+            || self.local_path_is(&["rpc", "edit-config", "target"])
         {
             if element.namespace != NETCONF_BASE_NS || !attrs.is_empty() {
                 return Err(XmlError::Malformed);
@@ -870,6 +1043,14 @@ impl ParserState {
             } else if self.local_path_is(&["rpc", "unlock", "target"]) {
                 let unlock = self.unlock.as_mut().ok_or(XmlError::UnsupportedOperation)?;
                 if unlock.target.replace(datastore).is_some() {
+                    return Err(XmlError::DuplicateElement);
+                }
+            } else if self.local_path_is(&["rpc", "edit-config", "target"]) {
+                let edit_config = self
+                    .edit_config
+                    .as_mut()
+                    .ok_or(XmlError::UnsupportedOperation)?;
+                if edit_config.target.replace(datastore).is_some() {
                     return Err(XmlError::DuplicateElement);
                 }
             } else {
@@ -909,6 +1090,12 @@ impl ParserState {
             || self.local_path_is(&["rpc", "validate", "source", "running"])
             || self.local_path_is(&["rpc", "validate", "source", "candidate"])
             || self.local_path_is(&["rpc", "validate", "source", "startup"])
+            || self.local_path_is(&["rpc", "edit-config", "target", "running"])
+            || self.local_path_is(&["rpc", "edit-config", "target", "candidate"])
+            || self.local_path_is(&["rpc", "edit-config", "target", "startup"])
+            || self.local_path_is(&["rpc", "edit-config", "default-operation"])
+            || self.local_path_is(&["rpc", "edit-config", "test-option"])
+            || self.local_path_is(&["rpc", "edit-config", "error-option"])
             || self.local_path_is(&["rpc", "get", "with-defaults"])
             || self.local_path_is(&["rpc", "get-config", "with-defaults"])
         {
@@ -929,7 +1116,8 @@ impl ParserState {
     }
 
     fn has_rpc_operation(&self) -> bool {
-        self.get.is_some()
+        self.edit_config.is_some()
+            || self.get.is_some()
             || self.get_config.is_some()
             || self.get_schema.is_some()
             || self.kill_session.is_some()
@@ -951,8 +1139,10 @@ impl ParserState {
         {
             return;
         }
-        if local == "kill-session" {
-            self.operation_hint = Some(RpcOperationHint::KillSession);
+        match local {
+            "edit-config" => self.operation_hint = Some(RpcOperationHint::EditConfig),
+            "kill-session" => self.operation_hint = Some(RpcOperationHint::KillSession),
+            _ => {}
         }
     }
 
@@ -1066,6 +1256,134 @@ impl ParserState {
             .replace(WithDefaultsMode::parse(text))
             .is_some()
         {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn install_edit_default_operation(&mut self) -> Result<(), XmlError> {
+        let edit_config = self
+            .edit_config
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if edit_config.default_operation_seen {
+            return Err(XmlError::DuplicateElement);
+        }
+        edit_config.default_operation_seen = true;
+        Ok(())
+    }
+
+    fn install_edit_test_option(&mut self) -> Result<(), XmlError> {
+        let edit_config = self
+            .edit_config
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if edit_config.test_option_seen {
+            return Err(XmlError::DuplicateElement);
+        }
+        edit_config.test_option_seen = true;
+        Ok(())
+    }
+
+    fn install_edit_error_option(&mut self) -> Result<(), XmlError> {
+        let edit_config = self
+            .edit_config
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if edit_config.error_option_seen {
+            return Err(XmlError::DuplicateElement);
+        }
+        edit_config.error_option_seen = true;
+        Ok(())
+    }
+
+    fn install_edit_config_capture(&mut self) -> Result<(), XmlError> {
+        let edit_config = self
+            .edit_config
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if edit_config.config_xml.is_some() || self.edit_config_capture.is_some() {
+            return Err(XmlError::DuplicateElement);
+        }
+        self.edit_config_capture = Some(Writer::new(Vec::new()));
+        self.edit_config_capture_depth = 0;
+        Ok(())
+    }
+
+    fn set_edit_default_operation_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let edit_config = self
+            .edit_config
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if edit_config
+            .default_operation
+            .replace(EditDefaultOperation::parse(text)?)
+            .is_some()
+        {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn set_edit_test_option_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let edit_config = self
+            .edit_config
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if edit_config
+            .test_option
+            .replace(EditTestOption::parse(text)?)
+            .is_some()
+        {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn set_edit_error_option_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let edit_config = self
+            .edit_config
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if edit_config
+            .error_option
+            .replace(EditErrorOption::parse(text)?)
+            .is_some()
+        {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn is_edit_config_config_start(&self, element: &Element) -> bool {
+        self.local_path_is(&["rpc", "edit-config"])
+            && element.namespace == NETCONF_BASE_NS
+            && element.local == "config"
+    }
+
+    fn edit_config_capture_is_active(&self) -> bool {
+        self.edit_config_capture.is_some()
+    }
+
+    fn capture_event<'a, E>(&mut self, event: E) -> Result<(), XmlError>
+    where
+        E: Into<Event<'a>>,
+    {
+        let Some(writer) = self.edit_config_capture.as_mut() else {
+            return Err(XmlError::Malformed);
+        };
+        writer.write_event(event).map_err(|_| XmlError::Malformed)
+    }
+
+    fn finish_edit_config_capture(&mut self) -> Result<(), XmlError> {
+        let writer = self.edit_config_capture.take().ok_or(XmlError::Malformed)?;
+        let bytes = writer.into_inner();
+        let config_xml = String::from_utf8(bytes).map_err(|_| XmlError::Malformed)?;
+        let edit_config = self
+            .edit_config
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if edit_config.config_xml.replace(config_xml).is_some() {
             return Err(XmlError::DuplicateElement);
         }
         Ok(())
@@ -1195,6 +1513,29 @@ impl ParserState {
             RootKind::Rpc => {
                 let message_id = self.message_id.ok_or(XmlError::MissingAttribute)?;
                 let reply_attrs = self.reply_attrs;
+                if let Some(edit_config) = self.edit_config {
+                    return Ok(ParsedMessage::Rpc(ParsedRpc {
+                        message_id,
+                        reply_attrs,
+                        operation: RpcOperation::EditConfig(EditConfigRequest {
+                            target: edit_config.target.ok_or(XmlError::MissingElement)?,
+                            default_operation: finish_edit_option(
+                                edit_config.default_operation_seen,
+                                edit_config.default_operation,
+                            )?,
+                            test_option: finish_edit_option(
+                                edit_config.test_option_seen,
+                                edit_config.test_option,
+                            )?,
+                            test_option_explicit: edit_config.test_option_seen,
+                            error_option: finish_edit_option(
+                                edit_config.error_option_seen,
+                                edit_config.error_option,
+                            )?,
+                            config_xml: edit_config.config_xml.ok_or(XmlError::MissingElement)?,
+                        }),
+                    }));
+                }
                 if let Some(get) = self.get {
                     let with_defaults =
                         finish_with_defaults(get.with_defaults_seen, get.with_defaults);
@@ -1348,7 +1689,7 @@ fn parse_message_with_context(
     validate_xml_decl_start(xml).map_err(RpcParseError::without_message_id)?;
 
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
     let mut state = ParserState::new();
 
     loop {
@@ -1375,6 +1716,12 @@ fn parse_message_with_context(
                 limits
                     .check_value_bytes(text.as_ref().len())
                     .map_err(|err| parse_error(&state, err.into()))?;
+                if state.edit_config_capture_is_active() {
+                    state
+                        .capture_event(Event::Text(text.borrow()))
+                        .map_err(|err| parse_error(&state, err))?;
+                    continue;
+                }
                 let decoded = text
                     .decode()
                     .map_err(|_| parse_error(&state, XmlError::Malformed))?;
@@ -1386,6 +1733,12 @@ fn parse_message_with_context(
                 limits
                     .check_value_bytes(cdata.as_ref().len())
                     .map_err(|err| parse_error(&state, err.into()))?;
+                if state.edit_config_capture_is_active() {
+                    state
+                        .capture_event(Event::CData(cdata.borrow()))
+                        .map_err(|err| parse_error(&state, err))?;
+                    continue;
+                }
                 if state.inside_unsupported_operation() {
                     continue;
                 }
@@ -1413,6 +1766,12 @@ fn parse_message_with_context(
                 limits
                     .check_value_bytes(comment.len())
                     .map_err(|err| parse_error(&state, err.into()))?;
+                if state.edit_config_capture_is_active() {
+                    state
+                        .capture_event(Event::Comment(comment.borrow()))
+                        .map_err(|err| parse_error(&state, err))?;
+                    continue;
+                }
                 state.comment();
             }
             Event::PI(pi) => {
@@ -1671,6 +2030,15 @@ fn finish_with_defaults(seen: bool, mode: Option<WithDefaultsMode>) -> Option<Wi
         Some(mode.unwrap_or(WithDefaultsMode::Unrecognized))
     } else {
         None
+    }
+}
+
+fn finish_edit_option<T: Default>(seen: bool, value: Option<T>) -> Result<T, XmlError> {
+    match (seen, value) {
+        (false, None) => Ok(T::default()),
+        (true, Some(value)) => Ok(value),
+        (true, None) => Err(XmlError::InvalidValue),
+        (false, Some(_)) => Err(XmlError::Malformed),
     }
 }
 
@@ -2111,33 +2479,133 @@ mod tests {
     }
 
     #[test]
-    fn parses_known_unsupported_base_operation_with_bounded_ignored_payload() {
+    fn parses_edit_config_with_bounded_config_payload() {
         let parsed = parse_rpc(
             &rpc(
                 r#"<edit-config><target><running/></target><config><sys:secret xmlns:sys="urn:opc:test">do-not-leak</sys:secret></config></edit-config>"#,
             ),
             &MgmtLimits::default(),
         )
-        .expect("parse unsupported edit-config");
+        .expect("parse edit-config");
         assert_eq!(parsed.message_id, "101");
         assert_eq!(
             parsed.operation,
-            RpcOperation::Unsupported(UnsupportedOperation::EditConfig)
+            RpcOperation::EditConfig(EditConfigRequest {
+                target: Datastore::Running,
+                default_operation: EditDefaultOperation::Merge,
+                test_option: EditTestOption::TestThenSet,
+                test_option_explicit: false,
+                error_option: EditErrorOption::StopOnError,
+                config_xml: r#"<config><sys:secret xmlns:sys="urn:opc:test">do-not-leak</sys:secret></config>"#.to_string(),
+            })
         );
     }
 
     #[test]
-    fn parses_known_unsupported_base_operation_with_bounded_ignored_cdata_payload() {
+    fn parses_edit_config_with_bounded_cdata_payload() {
         let parsed = parse_rpc(
-            &rpc("<edit-config><config><![CDATA[do-not-leak]]></config></edit-config>"),
+            &rpc(
+                "<edit-config><target><running/></target><config><![CDATA[do-not-leak]]></config></edit-config>",
+            ),
             &MgmtLimits::default(),
         )
-        .expect("parse unsupported edit-config with CDATA");
+        .expect("parse edit-config with CDATA");
         assert_eq!(parsed.message_id, "101");
         assert_eq!(
             parsed.operation,
-            RpcOperation::Unsupported(UnsupportedOperation::EditConfig)
+            RpcOperation::EditConfig(EditConfigRequest {
+                target: Datastore::Running,
+                default_operation: EditDefaultOperation::Merge,
+                test_option: EditTestOption::TestThenSet,
+                test_option_explicit: false,
+                error_option: EditErrorOption::StopOnError,
+                config_xml: "<config><![CDATA[do-not-leak]]></config>".to_string(),
+            })
         );
+    }
+
+    #[test]
+    fn parses_edit_config_options_and_preserves_config_namespace_context() {
+        let parsed = parse_rpc(
+            &rpc(
+                r#"<edit-config><target><running/></target><default-operation>replace</default-operation><test-option>set</test-option><error-option>continue-on-error</error-option><config xmlns:sys="urn:opc:test"><sys:system/></config></edit-config>"#,
+            ),
+            &MgmtLimits::default(),
+        )
+        .expect("parse edit-config options");
+
+        assert_eq!(
+            parsed.operation,
+            RpcOperation::EditConfig(EditConfigRequest {
+                target: Datastore::Running,
+                default_operation: EditDefaultOperation::Replace,
+                test_option: EditTestOption::Set,
+                test_option_explicit: true,
+                error_option: EditErrorOption::ContinueOnError,
+                config_xml:
+                    r#"<config xmlns:sys="urn:opc:test"><sys:system></sys:system></config>"#
+                        .to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_edit_config_shape() {
+        let missing_target = parse_rpc(
+            &rpc("<edit-config><config><sys:system xmlns:sys=\"urn:opc:test\"/></config></edit-config>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("missing edit target");
+        assert_eq!(missing_target, XmlError::MissingElement);
+
+        let missing_config = parse_rpc(
+            &rpc("<edit-config><target><running/></target></edit-config>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("missing edit config");
+        assert_eq!(missing_config, XmlError::MissingElement);
+
+        let duplicate_target = parse_rpc(
+            &rpc("<edit-config><target><running/><candidate/></target><config/></edit-config>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("duplicate edit target");
+        assert_eq!(duplicate_target, XmlError::DuplicateElement);
+
+        let duplicate_config = parse_rpc(
+            &rpc("<edit-config><target><running/></target><config/><config/></edit-config>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("duplicate edit config");
+        assert_eq!(duplicate_config, XmlError::DuplicateElement);
+
+        let invalid_option = parse_rpc(
+            &rpc("<edit-config><target><running/></target><error-option>do-not-leak</error-option><config/></edit-config>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("invalid edit option");
+        assert_eq!(invalid_option, XmlError::InvalidValue);
+
+        let empty_default_operation = parse_rpc(
+            &rpc("<edit-config><target><running/></target><default-operation/><config/></edit-config>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("empty default-operation");
+        assert_eq!(empty_default_operation, XmlError::InvalidValue);
+
+        let empty_test_option = parse_rpc(
+            &rpc("<edit-config><target><running/></target><test-option/><config/></edit-config>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("empty test-option");
+        assert_eq!(empty_test_option, XmlError::InvalidValue);
+
+        let empty_error_option = parse_rpc(
+            &rpc("<edit-config><target><running/></target><error-option/><config/></edit-config>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("empty error-option");
+        assert_eq!(empty_error_option, XmlError::InvalidValue);
     }
 
     #[test]

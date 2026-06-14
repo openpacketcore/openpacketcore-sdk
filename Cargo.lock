@@ -1512,6 +1512,7 @@ dependencies = [
 name = "opc-netconf-server"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "opc-config-bus",
  "opc-config-model",
  "opc-identity",

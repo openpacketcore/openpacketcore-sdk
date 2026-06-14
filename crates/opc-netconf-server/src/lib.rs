@@ -1,8 +1,8 @@
 //! NETCONF server core for the OpenPacketCore management plane.
 //!
 //! This crate is deliberately capability-honest. The current implementation
-//! provides the read-only protocol core needed to start integrating a NETCONF
-//! northbound path:
+//! provides the protocol core needed to start integrating a NETCONF northbound
+//! path:
 //!
 //! - NETCONF 1.0 and 1.1 message framing, including fail-closed rejection of
 //!   malformed base 1.1 chunk lengths, truncated chunk bodies, and too many
@@ -35,6 +35,16 @@
 //!   session-id enforcement with exhausted-range rejection, audit-before-signal
 //!   in-process session-registry termination for live target sessions, and
 //!   audit-before-state-change lock ownership.
+//! - Optional running datastore `<edit-config>` through registry-aware session
+//!   runners when the CNF binding explicitly advertises `:writable-running` and
+//!   implements the candidate builder hook. The server owns the NETCONF envelope
+//!   parser, bounded namespace-preserving `<config>` capture, NACM `exec`
+//!   authorization, running lock/write serialization, config-bus submission,
+//!   commit-error mapping, metrics, and audit. The CNF owns schema-aware XML to
+//!   config translation. This slice supports running target with
+//!   `stop-on-error`; explicit `<test-option>` is rejected until `:validate`
+//!   is advertised. `candidate`, `startup`, `test-only`,
+//!   `continue-on-error`, and `rollback-on-error` fail closed.
 //! - Known-but-unimplemented NETCONF base operations are parsed only far
 //!   enough to preserve `message-id`, audit the failed attempt, and return
 //!   payload-free `operation-not-supported`; bounded text and CDATA payloads
@@ -71,9 +81,10 @@
 //! public [`ReadOnlyNetconfServer::handle_rpc`] and
 //! [`ReadOnlyNetconfServer::handle_rpc_xml`] helpers are registry-free,
 //! low-level dispatch helpers: they preserve parser/audit/metrics/reply
-//! behavior for one RPC, but `<kill-session>`, `<lock>`, and `<unlock>` return
-//! `operation-not-supported` without a live [`SessionRegistry`], and
-//! `handle_rpc_xml` discards the `<close-session>` close signal. The raw hello
+//! behavior for one RPC, but `<kill-session>`, `<lock>`, `<unlock>`, and
+//! `<edit-config>` return `operation-not-supported` without a live
+//! [`SessionRegistry`], and `handle_rpc_xml` discards the `<close-session>`
+//! close signal. The raw hello
 //! renderers require
 //! `NonZeroU32` for a supplied session id, so direct helper callers cannot
 //! render `0` or an out-of-range `<session-id>`. Custom transports that
@@ -161,14 +172,15 @@ pub mod transport;
 pub mod xml;
 
 pub use binding::{
-    BindingError, GetSchemaError, GetSchemaRequest as NetconfGetSchemaRequest,
-    NetconfConfigBinding, NetconfMonitoringCapability, ReadSelection, WithDefaultsCapability,
-    YangLibraryCapability,
+    BindingError, EditConfigCandidate, EditConfigError, GetSchemaError,
+    GetSchemaRequest as NetconfGetSchemaRequest, NetconfConfigBinding, NetconfMonitoringCapability,
+    ReadSelection, WithDefaultsCapability, YangLibraryCapability,
 };
 pub use capabilities::{
     read_only_base_capabilities, read_only_capabilities, render_server_hello, NETCONF_BASE_1_0,
     NETCONF_BASE_1_1, NETCONF_BASE_NS, NETCONF_MONITORING_NS, NETCONF_MONITORING_REVISION,
-    WITH_DEFAULTS_1_0_BASE, WITH_DEFAULTS_NS, YANG_LIBRARY_1_1_BASE, YANG_LIBRARY_REVISION,
+    WITH_DEFAULTS_1_0_BASE, WITH_DEFAULTS_NS, WRITABLE_RUNNING_1_0, YANG_LIBRARY_1_1_BASE,
+    YANG_LIBRARY_REVISION,
 };
 pub use error::{
     rpc_error_reply, rpc_get_schema_reply, rpc_ok_empty_reply, rpc_ok_reply, xml_escape, RpcError,
@@ -195,8 +207,9 @@ pub use transport::{
     TlsSessionError,
 };
 pub use xml::{
-    parse_client_hello, parse_rpc, ClientHello, Datastore, Filter, FilterElement, FilterKind,
-    GetConfigRequest, GetRequest, KillSessionRequest, LockRequest, ParsedRpc, RpcOperation,
-    SubtreeFilter, SubtreeSelection, UnlockRequest, UnsupportedOperation, ValidateRequest,
-    WithDefaultsMode, XmlError,
+    parse_client_hello, parse_rpc, ClientHello, Datastore, EditConfigRequest, EditDefaultOperation,
+    EditErrorOption, EditTestOption, Filter, FilterElement, FilterKind, GetConfigRequest,
+    GetRequest, KillSessionRequest, LockRequest, ParsedRpc, RpcOperation, SubtreeFilter,
+    SubtreeSelection, UnlockRequest, UnsupportedOperation, ValidateRequest, WithDefaultsMode,
+    XmlError,
 };

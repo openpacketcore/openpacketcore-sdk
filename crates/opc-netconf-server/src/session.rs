@@ -204,14 +204,16 @@ where
             });
         };
         let rpc_xml = str::from_utf8(&message).map_err(|_| SessionError::InvalidUtf8)?;
-        let result = server.handle_rpc_for_session(
-            RequestId::new(),
-            principal,
-            rpc_xml,
-            &config.limits,
-            registration.session_id(),
-            sessions,
-        );
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                principal,
+                rpc_xml,
+                &config.limits,
+                registration.session_id(),
+                sessions,
+            )
+            .await;
         tokio::select! {
             _ = registration.terminated() => {
                 return Ok(SessionResult {

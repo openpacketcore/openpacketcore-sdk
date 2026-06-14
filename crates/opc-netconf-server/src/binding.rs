@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use opc_config_bus::ConfigBus;
-use opc_config_model::OpcConfig;
+use opc_config_model::{OpcConfig, YangPath};
 use opc_mgmt_opstate::{OperationalError, OperationalRequest, OperationalResponse};
 use opc_mgmt_schema::SchemaRegistry;
 use thiserror::Error;
 
-use crate::xml::WithDefaultsMode;
+use crate::xml::{EditConfigRequest, WithDefaultsMode};
 
 /// RFC 8525 YANG Library advertisement data supplied by the embedding CNF.
 ///
@@ -155,6 +155,70 @@ impl GetSchemaError {
     }
 }
 
+/// Candidate returned by a CNF after translating NETCONF `<edit-config>` XML.
+///
+/// The generic server owns NETCONF protocol handling and `ConfigBus`
+/// submission. It deliberately does not infer model-specific edits from XML:
+/// generated CNF code translates the bounded `<config>` element into a full
+/// candidate `C` and may provide changed-path hints. The config bus still
+/// derives authoritative changed paths from `OpcConfig::changed_paths`.
+#[derive(Debug, Clone)]
+pub struct EditConfigCandidate<C: OpcConfig> {
+    /// Complete candidate config to submit.
+    pub candidate: C,
+    /// Optional changed-path hint for request logging and idempotency
+    /// fingerprinting; the bus recomputes authoritative paths.
+    pub changed_paths: Vec<YangPath>,
+}
+
+impl<C: OpcConfig> EditConfigCandidate<C> {
+    /// Builds an edit-config candidate with optional changed-path hints.
+    pub fn new(candidate: C, changed_paths: impl Into<Vec<YangPath>>) -> Self {
+        Self {
+            candidate,
+            changed_paths: changed_paths.into(),
+        }
+    }
+}
+
+/// CNF-supplied `<edit-config>` translation failure.
+///
+/// Display text is payload-free. Detailed parser/model diagnostics stay inside
+/// the embedding CNF's logs and must not be returned to clients by the generic
+/// NETCONF server.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum EditConfigError {
+    /// This binding does not implement the requested edit semantics.
+    #[error("NETCONF edit-config operation is not supported")]
+    Unsupported,
+    /// The client-supplied config fragment is invalid for the served model.
+    #[error("NETCONF edit-config value is invalid")]
+    InvalidValue,
+    /// Translation failed for an internal reason.
+    #[error("NETCONF edit-config translation failed")]
+    Failed {
+        /// Server-side diagnostic detail. Do not surface directly to clients.
+        detail: String,
+    },
+}
+
+impl EditConfigError {
+    /// Constructs an internal translation failure with local diagnostic detail.
+    pub fn failed(detail: impl Into<String>) -> Self {
+        Self::Failed {
+            detail: detail.into(),
+        }
+    }
+
+    /// Server-side diagnostic detail, if present.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Failed { detail } => Some(detail),
+            Self::Unsupported | Self::InvalidValue => None,
+        }
+    }
+}
+
 /// Authorized schema-node selection passed to the CNF XML renderer.
 #[derive(Debug, Clone, Copy)]
 pub struct ReadSelection<'a> {
@@ -221,6 +285,17 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         config: &C,
         selection: ReadSelection<'_>,
     ) -> Result<String, BindingError>;
+
+    /// Returns true when this binding supports RFC 6241 running datastore
+    /// writes through `<edit-config>` and [`Self::build_edit_config_candidate`].
+    ///
+    /// The default is `false`: no `:writable-running` capability is advertised
+    /// and registry-free dispatch rejects `<edit-config>` with
+    /// `operation-not-supported`. A binding that returns `true` must translate
+    /// the bounded `<config>` element into a full candidate config.
+    fn writable_running_capability(&self) -> bool {
+        false
+    }
 
     /// Returns the advertised RFC 6243 with-defaults capability, if this
     /// binding can render every advertised mode.
@@ -382,5 +457,20 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         Err(GetSchemaError::failed(
             "NETCONF get-schema retrieval is not implemented",
         ))
+    }
+
+    /// Builds a full candidate config for a running `<edit-config>` request.
+    ///
+    /// The request's `config_xml` is a bounded, namespace-preserving NETCONF
+    /// `<config>` element. Bindings typically decode it with generated
+    /// schema-aware XML/YANG helpers or translate it into the generated
+    /// `ConfigDelta` patch applicator. The default fails closed, so adding
+    /// server-side edit support does not imply every CNF can accept writes.
+    fn build_edit_config_candidate(
+        &self,
+        _running: &C,
+        _request: &EditConfigRequest,
+    ) -> Result<EditConfigCandidate<C>, EditConfigError> {
+        Err(EditConfigError::Unsupported)
     }
 }
