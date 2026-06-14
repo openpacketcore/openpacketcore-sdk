@@ -3220,9 +3220,7 @@ mod tests {
                         && request.version.as_deref() == Some("2026-06-13")
                         && request.format == "yang"
                     {
-                        Ok(crate::xml_escape(
-                            r#"module demo-system { namespace "urn:opc:demo"; prefix sys; }"#,
-                        ))
+                        Ok(r#"module demo-system { namespace "urn:opc:demo"; prefix sys; description "a < b & c"; }"#.to_string())
                     } else {
                         Err(GetSchemaError::NotFound)
                     }
@@ -4520,6 +4518,8 @@ mod tests {
         assert!(reply.contains(&format!(r#"<data xmlns="{NETCONF_MONITORING_NS}">"#)));
         assert!(reply.contains("module demo-system"));
         assert!(reply.contains("&quot;urn:opc:demo&quot;"));
+        assert!(reply.contains("a &lt; b &amp; c"));
+        assert!(!reply.contains("a < b & c"));
         assert!(!reply.contains("<rpc-error>"));
         assert!(!reply.contains("do-not-leak"));
         assert!(observed.lock().expect("observed paths mutex").is_empty());
