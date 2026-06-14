@@ -51,6 +51,9 @@ pub fn decode_message(frame: &[u8], limits: &MgmtLimits) -> Result<Vec<u8>, Fram
         if len_start == cursor || cursor >= frame.len() || frame[cursor] != b'\n' {
             return Err(FramingError::InvalidChunkHeader);
         }
+        if frame[len_start] == b'0' {
+            return Err(FramingError::InvalidChunkLength);
+        }
 
         let len_str = std::str::from_utf8(&frame[len_start..cursor])
             .map_err(|_| FramingError::InvalidChunkLength)?;
@@ -61,6 +64,11 @@ pub fn decode_message(frame: &[u8], limits: &MgmtLimits) -> Result<Vec<u8>, Fram
             return Err(FramingError::InvalidChunkLength);
         }
         cursor += 1;
+
+        let next_chunks = chunks
+            .checked_add(1)
+            .ok_or(FramingError::InvalidChunkLength)?;
+        limits.check_frame_chunks(next_chunks)?;
 
         let next_len = out
             .len()
@@ -73,7 +81,7 @@ pub fn decode_message(frame: &[u8], limits: &MgmtLimits) -> Result<Vec<u8>, Fram
 
         out.extend_from_slice(&frame[cursor..cursor + chunk_len]);
         cursor += chunk_len;
-        chunks += 1;
+        chunks = next_chunks;
     }
 }
 
@@ -110,6 +118,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_leading_zero_chunk_length() {
+        let err =
+            decode_message(b"\n#03\nabc\n##\n", &MgmtLimits::default()).expect_err("leading zero");
+        assert_eq!(err, FramingError::InvalidChunkLength);
+    }
+
+    #[test]
     fn enforces_accumulated_size_limit() {
         let limits = MgmtLimits {
             max_request_bytes: 5,
@@ -117,5 +132,22 @@ mod tests {
         };
         let err = decode_message(b"\n#3\nabc\n#3\ndef\n##\n", &limits).expect_err("too large");
         assert!(matches!(err, FramingError::Limit(_)));
+    }
+
+    #[test]
+    fn enforces_chunk_count_limit() {
+        let limits = MgmtLimits {
+            max_frame_chunks_per_message: 1,
+            ..MgmtLimits::default()
+        };
+        let err = decode_message(b"\n#1\na\n#1\nb\n##\n", &limits).expect_err("too many chunks");
+        assert_eq!(
+            err,
+            FramingError::Limit(opc_mgmt_limits::LimitsError::Exceeded {
+                limit: "frame_chunks_per_message",
+                max: 1,
+                actual: 2,
+            })
+        );
     }
 }

@@ -7,23 +7,36 @@ use opc_config_model::{OpcConfig, RequestId, TransportType, TrustedPrincipal};
 use opc_mgmt_audit::{
     AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink, SchemaNodePath,
 };
-use opc_mgmt_authz::{AuthzError, PolicySource, ReadAuthorizer};
+use opc_mgmt_authz::{AuthzError, ExecAuthorizer, PolicySource, ReadAuthorizer};
 use opc_mgmt_errors::{NetconfErrorTag, NetconfErrorType};
 use opc_mgmt_limits::MgmtLimits;
+use opc_mgmt_schema::ModelData;
 use thiserror::Error;
 
 use crate::binding::{
     GetSchemaError, GetSchemaRequest as BindingGetSchemaRequest, NetconfConfigBinding,
 };
 use crate::capabilities::render_server_hello;
-use crate::error::{rpc_error_reply, rpc_get_schema_reply, rpc_ok_empty_reply, RpcError};
+use crate::error::{
+    rpc_error_reply_with_attrs, rpc_get_schema_reply_with_attrs, rpc_ok_empty_reply_with_attrs,
+    RpcError, RpcReplyAttributes,
+};
 use crate::metrics::{record_rpc_error, record_rpc_success, NetconfOperation};
 use crate::operations::get::{handle_get, GetContext};
 use crate::operations::get_config::{handle_get_config, GetConfigContext};
 use crate::xml::{
-    parse_rpc, GetSchemaRequest as XmlGetSchemaRequest, RpcOperation, UnsupportedOperation,
-    XmlError,
+    parse_rpc_with_context, GetSchemaRequest as XmlGetSchemaRequest, RpcOperation,
+    UnsupportedOperation, XmlError,
 };
+
+const NETCONF_BASE_MODEL: &[ModelData] = &[ModelData {
+    name: "ietf-netconf",
+    revision: "2011-06-01",
+    namespace: "urn:ietf:params:xml:ns:netconf:base:1.0",
+    prefix: "nc",
+}];
+
+const NETCONF_CLOSE_SESSION_PATH: &str = "/nc:close-session";
 
 /// Server construction error.
 #[derive(Debug, Error)]
@@ -143,11 +156,12 @@ where
         limits: &MgmtLimits,
     ) -> RpcHandlingResult {
         let started = Instant::now();
-        let parsed = match parse_rpc(xml, limits) {
+        let parsed = match parse_rpc_with_context(xml, limits) {
             Ok(parsed) => parsed,
             Err(err) => {
+                let message_id = err.message_id.as_deref();
                 if self
-                    .audit_parse_failure(request_id, principal, &err)
+                    .audit_parse_failure(request_id, principal, &err.error)
                     .is_err()
                 {
                     record_rpc_error(
@@ -160,12 +174,13 @@ where
                         error_tag = NetconfErrorTag::OperationFailed.as_str(),
                         "NETCONF RPC rejected after audit failure"
                     );
-                    return RpcHandlingResult::keep_open(rpc_error_reply(
-                        None,
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        message_id,
+                        &err.reply_attrs,
                         RpcError::operation_failed(),
                     ));
                 }
-                let classification = err.classification();
+                let classification = err.error.classification();
                 record_rpc_error(
                     NetconfOperation::Unknown,
                     classification.tag,
@@ -177,8 +192,12 @@ where
                     error_tag = classification.tag.as_str(),
                     "NETCONF RPC rejected during parse"
                 );
-                let rpc_error = RpcError::new(classification, err.client_message());
-                return RpcHandlingResult::keep_open(rpc_error_reply(None, rpc_error));
+                let rpc_error = RpcError::new(classification, err.error.client_message());
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    message_id,
+                    &err.reply_attrs,
+                    rpc_error,
+                ));
             }
         };
 
@@ -192,7 +211,9 @@ where
                     request_id,
                     principal,
                     message_id: &parsed.message_id,
+                    reply_attrs: &parsed.reply_attrs,
                     started,
+                    limits,
                 },
                 request,
             )),
@@ -206,22 +227,34 @@ where
                         request_id,
                         principal,
                         message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
                         started,
+                        limits,
                     },
                     request,
                 ))
             }
-            RpcOperation::CloseSession => {
-                self.handle_close_session(request_id, principal, &parsed.message_id, started)
-            }
-            RpcOperation::GetSchema(request) => {
-                self.handle_get_schema(request, request_id, principal, &parsed.message_id, started)
-            }
+            RpcOperation::CloseSession => self.handle_close_session(
+                request_id,
+                principal,
+                &parsed.message_id,
+                &parsed.reply_attrs,
+                started,
+            ),
+            RpcOperation::GetSchema(request) => self.handle_get_schema(
+                request,
+                request_id,
+                principal,
+                &parsed.message_id,
+                &parsed.reply_attrs,
+                started,
+            ),
             RpcOperation::Unsupported(operation) => self.handle_unsupported_operation(
                 *operation,
                 request_id,
                 principal,
                 &parsed.message_id,
+                &parsed.reply_attrs,
                 started,
             ),
         }
@@ -233,6 +266,7 @@ where
         request_id: RequestId,
         principal: &TrustedPrincipal,
         message_id: &str,
+        reply_attrs: &RpcReplyAttributes,
         started: Instant,
     ) -> RpcHandlingResult {
         let metric_operation = NetconfOperation::Unsupported(operation.as_str());
@@ -257,8 +291,9 @@ where
                 error_tag = NetconfErrorTag::OperationFailed.as_str(),
                 "NETCONF unsupported operation rejected after audit failure"
             );
-            return RpcHandlingResult::keep_open(rpc_error_reply(
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
                 Some(message_id),
+                reply_attrs,
                 RpcError::operation_failed(),
             ));
         }
@@ -273,8 +308,9 @@ where
             error_tag = NetconfErrorTag::OperationNotSupported.as_str(),
             "NETCONF operation is recognized but not implemented in this slice"
         );
-        RpcHandlingResult::keep_open(rpc_error_reply(
+        RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
             Some(message_id),
+            reply_attrs,
             RpcError::operation_not_supported(),
         ))
     }
@@ -284,17 +320,110 @@ where
         request_id: RequestId,
         principal: &TrustedPrincipal,
         message_id: &str,
+        reply_attrs: &RpcReplyAttributes,
         started: Instant,
     ) -> RpcHandlingResult {
+        let close_path = schema_node_path(NETCONF_CLOSE_SESSION_PATH);
+        match self.authorize_exec(principal, NETCONF_CLOSE_SESSION_PATH) {
+            Ok(true) => {}
+            Ok(false) => {
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            request_id,
+                            principal,
+                            self.transport,
+                            AuditOperation::Exec,
+                            audit_denied("access-denied"),
+                        )
+                        .with_paths([close_path]),
+                    )
+                    .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::CloseSession,
+                        NetconfErrorTag::OperationFailed,
+                        started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(message_id),
+                        reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                record_rpc_error(
+                    NetconfOperation::CloseSession,
+                    NetconfErrorTag::AccessDenied,
+                    started.elapsed(),
+                );
+                tracing::debug!(
+                    operation = "close-session",
+                    error_tag = NetconfErrorTag::AccessDenied.as_str(),
+                    "NETCONF close-session denied by exec NACM"
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::access_denied(),
+                ));
+            }
+            Err(()) => {
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            request_id,
+                            principal,
+                            self.transport,
+                            AuditOperation::Exec,
+                            audit_failed("resource-denied"),
+                        )
+                        .with_paths([close_path]),
+                    )
+                    .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::CloseSession,
+                        NetconfErrorTag::OperationFailed,
+                        started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(message_id),
+                        reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                record_rpc_error(
+                    NetconfOperation::CloseSession,
+                    NetconfErrorTag::ResourceDenied,
+                    started.elapsed(),
+                );
+                tracing::debug!(
+                    operation = "close-session",
+                    error_tag = NetconfErrorTag::ResourceDenied.as_str(),
+                    "NETCONF close-session failed closed on exec policy source error"
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::resource_denied(),
+                ));
+            }
+        }
+
         if self
             .audit
-            .record(&AuditEvent::new(
-                request_id,
-                principal,
-                self.transport,
-                AuditOperation::Exec,
-                AuditOutcome::Success,
-            ))
+            .record(
+                &AuditEvent::new(
+                    request_id,
+                    principal,
+                    self.transport,
+                    AuditOperation::Exec,
+                    AuditOutcome::Success,
+                )
+                .with_paths([close_path]),
+            )
             .is_err()
         {
             record_rpc_error(
@@ -307,8 +436,9 @@ where
                 error_tag = NetconfErrorTag::OperationFailed.as_str(),
                 "NETCONF close-session rejected after audit failure"
             );
-            return RpcHandlingResult::keep_open(rpc_error_reply(
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
                 Some(message_id),
+                reply_attrs,
                 RpcError::operation_failed(),
             ));
         }
@@ -318,7 +448,7 @@ where
             operation = "close-session",
             "NETCONF close-session succeeded"
         );
-        RpcHandlingResult::close(rpc_ok_empty_reply(message_id))
+        RpcHandlingResult::close(rpc_ok_empty_reply_with_attrs(message_id, reply_attrs))
     }
 
     fn handle_get_schema(
@@ -327,6 +457,7 @@ where
         request_id: RequestId,
         principal: &TrustedPrincipal,
         message_id: &str,
+        reply_attrs: &RpcReplyAttributes,
         started: Instant,
     ) -> RpcHandlingResult {
         let schema_path = schema_node_path("/ncm:netconf-state/ncm:schemas/ncm:schema");
@@ -350,8 +481,9 @@ where
                     NetconfErrorTag::OperationFailed,
                     started.elapsed(),
                 );
-                return RpcHandlingResult::keep_open(rpc_error_reply(
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
                     Some(message_id),
+                    reply_attrs,
                     RpcError::operation_failed(),
                 ));
             }
@@ -360,8 +492,9 @@ where
                 NetconfErrorTag::OperationNotSupported,
                 started.elapsed(),
             );
-            return RpcHandlingResult::keep_open(rpc_error_reply(
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
                 Some(message_id),
+                reply_attrs,
                 RpcError::operation_not_supported(),
             ));
         }
@@ -388,8 +521,9 @@ where
                         NetconfErrorTag::OperationFailed,
                         started.elapsed(),
                     );
-                    return RpcHandlingResult::keep_open(rpc_error_reply(
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
                         Some(message_id),
+                        reply_attrs,
                         RpcError::operation_failed(),
                     ));
                 }
@@ -398,8 +532,9 @@ where
                     NetconfErrorTag::AccessDenied,
                     started.elapsed(),
                 );
-                return RpcHandlingResult::keep_open(rpc_error_reply(
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
                     Some(message_id),
+                    reply_attrs,
                     RpcError::access_denied(),
                 ));
             }
@@ -423,8 +558,9 @@ where
                         NetconfErrorTag::OperationFailed,
                         started.elapsed(),
                     );
-                    return RpcHandlingResult::keep_open(rpc_error_reply(
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
                         Some(message_id),
+                        reply_attrs,
                         RpcError::operation_failed(),
                     ));
                 }
@@ -433,8 +569,9 @@ where
                     NetconfErrorTag::ResourceDenied,
                     started.elapsed(),
                 );
-                return RpcHandlingResult::keep_open(rpc_error_reply(
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
                     Some(message_id),
+                    reply_attrs,
                     RpcError::resource_denied(),
                 ));
             }
@@ -467,13 +604,18 @@ where
                         NetconfErrorTag::OperationFailed,
                         started.elapsed(),
                     );
-                    return RpcHandlingResult::keep_open(rpc_error_reply(
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
                         Some(message_id),
+                        reply_attrs,
                         RpcError::operation_failed(),
                     ));
                 }
                 record_rpc_success(NetconfOperation::GetSchema, started.elapsed());
-                RpcHandlingResult::keep_open(rpc_get_schema_reply(message_id, &data_xml))
+                RpcHandlingResult::keep_open(rpc_get_schema_reply_with_attrs(
+                    message_id,
+                    reply_attrs,
+                    &data_xml,
+                ))
             }
             Err(error) => {
                 let (rpc_error, tag, reason) = match error {
@@ -512,13 +654,18 @@ where
                         NetconfErrorTag::OperationFailed,
                         started.elapsed(),
                     );
-                    return RpcHandlingResult::keep_open(rpc_error_reply(
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
                         Some(message_id),
+                        reply_attrs,
                         RpcError::operation_failed(),
                     ));
                 }
                 record_rpc_error(NetconfOperation::GetSchema, tag, started.elapsed());
-                RpcHandlingResult::keep_open(rpc_error_reply(Some(message_id), rpc_error))
+                RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    rpc_error,
+                ))
             }
         }
     }
@@ -536,6 +683,12 @@ where
                 "/ncm:netconf-state/ncm:schemas/ncm:schema",
             )
             .map_err(|_| ())
+    }
+
+    fn authorize_exec(&self, principal: &TrustedPrincipal, path: &str) -> Result<bool, ()> {
+        let authz =
+            ExecAuthorizer::new(NETCONF_BASE_MODEL, self.authz.policy_source()).map_err(|_| ())?;
+        authz.may_exec(principal, path).map_err(|_| ())
     }
 
     fn audit_parse_failure(
@@ -578,7 +731,7 @@ fn audit_operation_for_unsupported(operation: UnsupportedOperation) -> AuditOper
 }
 
 fn schema_node_path(path: &'static str) -> SchemaNodePath {
-    SchemaNodePath::new(path).expect("static NETCONF monitoring schema path")
+    SchemaNodePath::new(path).expect("static NETCONF schema path")
 }
 
 fn audit_denied(reason: &'static str) -> AuditOutcome {
@@ -1253,6 +1406,14 @@ mod tests {
         }
     }
 
+    struct BrokenPolicySource;
+
+    impl PolicySource for BrokenPolicySource {
+        fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
+            Err(AuthzError::PolicyUnavailable)
+        }
+    }
+
     fn principal() -> TrustedPrincipal {
         TrustedPrincipal::new(
             WorkloadIdentity::User("operator".to_string()),
@@ -1335,11 +1496,26 @@ mod tests {
         }
     }
 
+    fn register_netconf_module(modules: &mut ModuleRegistry) {
+        modules
+            .register_module("ietf-netconf", "nc")
+            .expect("NETCONF module");
+    }
+
+    fn allow_close_session_rule(modules: &ModuleRegistry) -> NacmRule {
+        NacmRule::allow(
+            NacmAction::Exec,
+            YangPathPattern::parse(NETCONF_CLOSE_SESSION_PATH, modules)
+                .expect("allow close-session path"),
+        )
+    }
+
     fn policy_allow_system_but_deny_secret() -> NacmPolicy {
         let mut modules = ModuleRegistry::new();
         modules
             .register_module("demo-system", "sys")
             .expect("module");
+        register_netconf_module(&mut modules);
         NacmPolicy::builder(PolicyVersion::new(1))
             .add_rule(NacmRule::deny(
                 NacmAction::Read,
@@ -1349,6 +1525,7 @@ mod tests {
                 NacmAction::Read,
                 YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
             ))
+            .add_rule(allow_close_session_rule(&modules))
             .build()
     }
 
@@ -1357,6 +1534,7 @@ mod tests {
         modules
             .register_module("demo-system", "sys")
             .expect("demo module");
+        register_netconf_module(&mut modules);
         modules
             .register_module(
                 crate::filter::YANG_LIBRARY_MODULE,
@@ -1388,6 +1566,7 @@ mod tests {
                 YangPathPattern::parse("/ncm:netconf-state/**", &modules)
                     .expect("allow monitoring path"),
             ))
+            .add_rule(allow_close_session_rule(&modules))
             .build()
     }
 
@@ -1695,6 +1874,12 @@ mod tests {
         )
     }
 
+    fn unsupported_edit_config_cdata_rpc() -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="402"><edit-config><config><![CDATA[do-not-leak]]></config></edit-config></rpc>"#
+        )
+    }
+
     #[tokio::test]
     async fn get_config_running_reads_bus_authorizes_and_audits() {
         let (server, observed, audit) = server_fixture().await;
@@ -1724,6 +1909,92 @@ mod tests {
         assert_eq!(events[0].transport, TransportType::NetconfTls);
         assert!(netconf_rpc_requests("get-config", "success") > success_before);
         assert!(netconf_nacm_denials("read") > nacm_before);
+    }
+
+    #[tokio::test]
+    async fn rpc_reply_copies_extra_rpc_attributes_on_success_and_parse_error() {
+        let (server, observed, _audit) = server_fixture().await;
+        let success_rpc = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" xmlns:trace="urn:trace" trace:id="req&amp;1" client-tag="cli" message-id="109"><get-config><source><running/></source></get-config></rpc>"#
+        );
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &success_rpc,
+            &MgmtLimits::default(),
+        );
+        assert!(reply.contains(r#"message-id="109""#));
+        assert!(reply.contains(r#"xmlns:trace="urn:trace""#));
+        assert!(reply.contains(r#"trace:id="req&amp;1""#));
+        assert!(reply.contains(r#"client-tag="cli""#));
+        assert!(reply.contains("<sys:hostname>amf-1</sys:hostname>"));
+        assert!(!reply.contains("do-not-leak"));
+
+        observed.lock().expect("observed paths mutex").clear();
+        let error_rpc = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" xmlns:trace="urn:trace" trace:id="err&amp;1" message-id="110"><get>do-not-leak</get></rpc>"#
+        );
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &error_rpc,
+            &MgmtLimits::default(),
+        );
+        assert!(reply.contains(r#"message-id="110""#));
+        assert!(reply.contains(r#"xmlns:trace="urn:trace""#));
+        assert!(reply.contains(r#"trace:id="err&amp;1""#));
+        assert!(reply.contains("<error-tag>malformed-message</error-tag>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+    }
+
+    #[tokio::test]
+    async fn rpc_reply_with_copied_default_namespace_uses_prefixed_netconf_elements() {
+        let (server, _observed, _audit) = server_fixture().await;
+        let rpc = format!(
+            r#"<nc:rpc xmlns:nc="{NETCONF_BASE_NS}" xmlns="urn:client:default" message-id="112"><nc:get-config><nc:source><nc:running/></nc:source></nc:get-config></nc:rpc>"#
+        );
+
+        let reply =
+            server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &MgmtLimits::default());
+
+        assert!(reply.starts_with(&format!(
+            r#"<nc1:rpc-reply xmlns:nc1="{NETCONF_BASE_NS}" message-id="112""#
+        )));
+        assert!(reply.contains(r#" xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0""#));
+        assert!(reply.contains(r#" xmlns="urn:client:default""#));
+        assert!(reply.contains("<nc1:data>"));
+        assert!(reply.contains("</nc1:data></nc1:rpc-reply>"));
+        assert!(reply.contains("<sys:hostname>amf-1</sys:hostname>"));
+        assert!(!reply.contains(r#"<rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="112" xmlns="urn:client:default""#));
+    }
+
+    #[tokio::test]
+    async fn get_config_expanded_selection_over_path_limit_is_too_big_without_projection() {
+        let (server, observed, audit) = server_fixture().await;
+        let limits = MgmtLimits {
+            max_paths_per_request: 2,
+            ..MgmtLimits::default()
+        };
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &get_config_rpc("running"),
+            &limits,
+        );
+
+        assert!(reply.contains(r#"message-id="101""#));
+        assert!(reply.contains("<error-tag>too-big</error-tag>"));
+        assert!(!reply.contains("<sys:hostname>"));
+        assert!(!reply.contains("<sys:secret>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, audit_failed("too-big"));
+        assert!(events[0].schema_paths.is_empty());
     }
 
     #[tokio::test]
@@ -1808,6 +2079,30 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].outcome, AuditOutcome::Success);
         assert!(netconf_rpc_requests("get", "success") > success_before);
+    }
+
+    #[tokio::test]
+    async fn get_expanded_selection_over_path_limit_is_too_big_without_projection() {
+        let (server, observed, audit) = server_fixture().await;
+        let limits = MgmtLimits {
+            max_paths_per_request: 3,
+            ..MgmtLimits::default()
+        };
+
+        let reply = server.handle_rpc_xml(RequestId::new(), &principal(), &get_rpc(), &limits);
+
+        assert!(reply.contains(r#"message-id="201""#));
+        assert!(reply.contains("<error-tag>too-big</error-tag>"));
+        assert!(!reply.contains("<sys:hostname>"));
+        assert!(!reply.contains("<sys:secret>"));
+        assert!(!reply.contains("<sys:uptime>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, audit_failed("too-big"));
+        assert!(events[0].schema_paths.is_empty());
     }
 
     #[tokio::test]
@@ -2614,8 +2909,130 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].operation, AuditOperation::Exec);
         assert_eq!(events[0].outcome, AuditOutcome::Success);
-        assert!(events[0].schema_paths.is_empty());
+        assert!(events[0]
+            .schema_paths
+            .iter()
+            .any(|path| path.as_str() == NETCONF_CLOSE_SESSION_PATH));
         assert!(netconf_rpc_requests("close-session", "success") > success_before);
+    }
+
+    #[tokio::test]
+    async fn close_session_without_exec_grant_is_access_denied_and_keeps_session_open() {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = TestBinding {
+            bus,
+            observed_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_yang_library_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_monitoring_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_with_defaults: Arc::new(Mutex::new(Vec::new())),
+            operational_mode: OperationalMode::Normal,
+            yang_library: false,
+            monitoring: false,
+            with_defaults: false,
+            get_schema_mode: GetSchemaMode::Ok,
+        };
+        let audit = CapturingAudit::default();
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(NacmPolicy::empty(PolicyVersion::new(404))),
+            audit.clone(),
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+
+        let result = server.handle_rpc(
+            RequestId::new(),
+            &principal(),
+            &close_session_rpc(),
+            &MgmtLimits::default(),
+        );
+
+        assert!(!result.close_session);
+        assert!(result.reply_xml.contains(r#"message-id="301""#));
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>access-denied</error-tag>"));
+        assert!(!result.reply_xml.contains("<ok/>"));
+        assert!(!result.reply_xml.contains("do-not-leak"));
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Exec);
+        assert_eq!(events[0].outcome, audit_denied("access-denied"));
+        assert!(events[0]
+            .schema_paths
+            .iter()
+            .any(|path| path.as_str() == NETCONF_CLOSE_SESSION_PATH));
+    }
+
+    #[tokio::test]
+    async fn close_session_policy_error_is_resource_denied_and_keeps_session_open() {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = TestBinding {
+            bus,
+            observed_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_yang_library_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_monitoring_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_with_defaults: Arc::new(Mutex::new(Vec::new())),
+            operational_mode: OperationalMode::Normal,
+            yang_library: false,
+            monitoring: false,
+            with_defaults: false,
+            get_schema_mode: GetSchemaMode::Ok,
+        };
+        let audit = CapturingAudit::default();
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            BrokenPolicySource,
+            audit.clone(),
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+
+        let result = server.handle_rpc(
+            RequestId::new(),
+            &principal(),
+            &close_session_rpc(),
+            &MgmtLimits::default(),
+        );
+
+        assert!(!result.close_session);
+        assert!(result.reply_xml.contains(r#"message-id="301""#));
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>resource-denied</error-tag>"));
+        assert!(!result.reply_xml.contains("<ok/>"));
+        assert!(!result.reply_xml.contains("policy"));
+        assert!(!result.reply_xml.contains("do-not-leak"));
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Exec);
+        assert_eq!(events[0].outcome, audit_failed("resource-denied"));
+        assert!(events[0]
+            .schema_paths
+            .iter()
+            .any(|path| path.as_str() == NETCONF_CLOSE_SESSION_PATH));
     }
 
     #[tokio::test]
@@ -2681,6 +3098,36 @@ mod tests {
 
         assert!(!result.close_session);
         assert!(result.reply_xml.contains(r#"message-id="401""#));
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>operation-not-supported</error-tag>"));
+        assert!(!result.reply_xml.contains("do-not-leak"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
+        assert!(events[0].schema_paths.is_empty());
+        assert!(netconf_rpc_requests("edit-config", "failure") > failures_before);
+        assert!(netconf_rpc_errors("edit-config", "operation-not-supported") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn unsupported_base_operation_cdata_payload_is_bounded_ignored_and_not_echoed() {
+        let (server, observed, audit) = server_fixture().await;
+        let failures_before = netconf_rpc_requests("edit-config", "failure");
+        let errors_before = netconf_rpc_errors("edit-config", "operation-not-supported");
+
+        let result = server.handle_rpc(
+            RequestId::new(),
+            &principal(),
+            &unsupported_edit_config_cdata_rpc(),
+            &MgmtLimits::default(),
+        );
+
+        assert!(!result.close_session);
+        assert!(result.reply_xml.contains(r#"message-id="402""#));
         assert!(result
             .reply_xml
             .contains("<error-tag>operation-not-supported</error-tag>"));
@@ -3171,7 +3618,32 @@ mod tests {
         );
         let reply =
             server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &MgmtLimits::default());
+        assert!(reply.contains(r#"message-id="106""#));
         assert!(reply.contains("<error-tag>bad-element</error-tag>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+    }
+
+    #[tokio::test]
+    async fn unexpected_protocol_text_fails_closed_without_payload() {
+        let (server, observed, _audit) = server_fixture().await;
+        let rpc = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="107"><get>do-not-leak</get></rpc>"#
+        );
+        let reply =
+            server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &MgmtLimits::default());
+        assert!(reply.contains(r#"message-id="107""#));
+        assert!(reply.contains("<error-tag>malformed-message</error-tag>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+
+        let rpc = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="108"><get><![CDATA[do-not-leak]]></get></rpc>"#
+        );
+        let reply =
+            server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &MgmtLimits::default());
+        assert!(reply.contains(r#"message-id="108""#));
+        assert!(reply.contains("<error-tag>malformed-message</error-tag>"));
         assert!(!reply.contains("do-not-leak"));
         assert!(observed.lock().expect("observed paths mutex").is_empty());
     }
@@ -3187,6 +3659,7 @@ mod tests {
         let reply =
             server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &MgmtLimits::default());
         assert!(reply.contains("<error-tag>malformed-message</error-tag>"));
+        assert!(!reply.contains("message-id="));
         assert!(!reply.contains("do-not-leak"));
         assert!(netconf_rpc_requests("unknown", "failure") > failures_before);
         assert!(netconf_rpc_errors("unknown", "malformed-message") > errors_before);

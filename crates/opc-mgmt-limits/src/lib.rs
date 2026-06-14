@@ -73,6 +73,11 @@ pub struct MgmtLimits {
     /// Maximum size of a single decoded inbound request/message
     /// (gNMI request message; NETCONF RPC XML document).
     pub max_request_bytes: usize,
+    /// Maximum number of chunks/frames that may compose one decoded inbound
+    /// message. This bounds protocol framing overhead separately from payload
+    /// bytes, so a valid-size message cannot be split into unbounded tiny
+    /// chunks.
+    pub max_frame_chunks_per_message: usize,
     /// Maximum number of paths (gNMI) or addressed nodes (NETCONF edit) in one
     /// request.
     pub max_paths_per_request: usize,
@@ -106,6 +111,7 @@ impl Default for MgmtLimits {
     fn default() -> Self {
         Self {
             max_request_bytes: 4 * 1024 * 1024,
+            max_frame_chunks_per_message: 4096,
             max_paths_per_request: 1024,
             max_value_bytes: 1024 * 1024,
             max_xml_depth: 64,
@@ -123,8 +129,12 @@ impl MgmtLimits {
     /// is never "unbounded"), and a single value/queue may not be larger than a
     /// whole message would allow, which would make the per-value bound dead.
     pub fn validate(&self) -> Result<(), LimitsError> {
-        let fields: [(&'static str, usize); 9] = [
+        let fields: [(&'static str, usize); 10] = [
             ("request_bytes", self.max_request_bytes),
+            (
+                "frame_chunks_per_message",
+                self.max_frame_chunks_per_message,
+            ),
             ("paths_per_request", self.max_paths_per_request),
             ("value_bytes", self.max_value_bytes),
             ("xml_depth", self.max_xml_depth),
@@ -158,6 +168,16 @@ impl MgmtLimits {
     /// Rejects an inbound message larger than [`Self::max_request_bytes`].
     pub fn check_request_bytes(&self, actual: usize) -> Result<(), LimitsError> {
         Self::check("request_bytes", self.max_request_bytes, actual)
+    }
+
+    /// Rejects an inbound message composed from more than
+    /// [`Self::max_frame_chunks_per_message`] chunks/frames.
+    pub fn check_frame_chunks(&self, actual: usize) -> Result<(), LimitsError> {
+        Self::check(
+            "frame_chunks_per_message",
+            self.max_frame_chunks_per_message,
+            actual,
+        )
     }
 
     /// Rejects a request addressing more than [`Self::max_paths_per_request`].
@@ -219,6 +239,7 @@ mod tests {
         let limits = MgmtLimits::default();
         limits.validate().expect("defaults valid");
         assert!(limits.max_request_bytes > 0);
+        assert!(limits.max_frame_chunks_per_message > 0);
         assert!(limits.max_value_bytes <= limits.max_request_bytes);
     }
 
@@ -228,6 +249,10 @@ mod tests {
         let zeroed = [
             MgmtLimits {
                 max_request_bytes: 0,
+                ..base
+            },
+            MgmtLimits {
+                max_frame_chunks_per_message: 0,
                 ..base
             },
             MgmtLimits {
@@ -288,6 +313,7 @@ mod tests {
     fn checks_accept_at_limit_and_reject_above() {
         let limits = MgmtLimits {
             max_request_bytes: 100,
+            max_frame_chunks_per_message: 2,
             max_paths_per_request: 4,
             max_value_bytes: 50,
             max_xml_depth: 8,
@@ -307,6 +333,8 @@ mod tests {
                 actual: 101,
             })
         );
+        assert!(limits.check_frame_chunks(2).is_ok());
+        assert!(limits.check_frame_chunks(3).is_err());
         assert!(limits.check_paths(4).is_ok());
         assert!(limits.check_paths(5).is_err());
         assert!(limits.check_value_bytes(50).is_ok());
