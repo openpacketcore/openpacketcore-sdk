@@ -7765,4 +7765,475 @@ mod tests {
             .and_then(|map| map.get(action).copied())
             .unwrap_or(0)
     }
+
+    // -------------------------------------------------------------------------
+    // Generated edit-config applicator wiring tests
+    // -------------------------------------------------------------------------
+
+    use crate::session_registry::{RunningWriteResult, SessionRegistry};
+    use opc_mgmt_schema::{
+        EditConfigNode, EditOperation, NetconfEditError, NetconfXmlEditApplicator,
+    };
+
+    /// A hand-written stand-in for an `opc-yanggen`-emitted edit applicator. It
+    /// proves that the server wires `NetconfConfigBinding::generated_xml_edit_applicator`
+    /// through to the running `<edit-config>` path without a CNF-authored candidate
+    /// builder.
+    struct DemoEditApplicator;
+
+    static DEMO_EDIT_APPLICATOR: DemoEditApplicator = DemoEditApplicator;
+
+    impl NetconfXmlEditApplicator<DemoConfig> for DemoEditApplicator {
+        fn apply_edit_config(
+            &self,
+            running: &DemoConfig,
+            edit: &EditConfigNode,
+        ) -> Result<DemoConfig, NetconfEditError> {
+            let mut candidate = running.clone();
+            apply_edit_node(&mut candidate, edit)?;
+            Ok(candidate)
+        }
+    }
+
+    fn apply_edit_node(
+        config: &mut DemoConfig,
+        node: &EditConfigNode,
+    ) -> Result<(), NetconfEditError> {
+        match node.schema_path {
+            "/sys:system" => {
+                for child in &node.children {
+                    apply_edit_node(config, child)?;
+                }
+            }
+            "/sys:system/sys:hostname" => {
+                config.hostname = leaf_edit_value(node)?;
+            }
+            "/sys:system/sys:secret" => {
+                config.secret = leaf_edit_value(node)?;
+            }
+            _ => {
+                return Err(NetconfEditError::UnknownPath(node.schema_path.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    fn leaf_edit_value(node: &EditConfigNode) -> Result<String, NetconfEditError> {
+        match node.operation {
+            EditOperation::Delete | EditOperation::Remove => Ok(String::new()),
+            _ => node.value.clone().ok_or(NetconfEditError::InvalidValue {
+                path: node.schema_path,
+            }),
+        }
+    }
+
+    /// A binding that opts into the generated edit applicator default hook.
+    struct GeneratedEditBinding {
+        bus: Arc<ConfigBus<DemoConfig>>,
+    }
+
+    impl NetconfConfigBinding<DemoConfig> for GeneratedEditBinding {
+        fn config_bus(&self) -> Arc<ConfigBus<DemoConfig>> {
+            Arc::clone(&self.bus)
+        }
+
+        fn schema_registry(&self) -> &'static dyn SchemaRegistry {
+            &REGISTRY
+        }
+
+        fn generated_xml_edit_applicator(
+            &self,
+        ) -> Option<&dyn NetconfXmlEditApplicator<DemoConfig>> {
+            Some(&DEMO_EDIT_APPLICATOR)
+        }
+
+        fn writable_running_capability(&self) -> bool {
+            true
+        }
+
+        fn render_running_config(
+            &self,
+            _config: &DemoConfig,
+            _selection: ReadSelection<'_>,
+        ) -> Result<String, BindingError> {
+            Ok(String::new())
+        }
+    }
+
+    /// A writable binding that exposes no edit applicator; the default builder
+    /// must return `Unsupported` rather than falling back to a generic translator.
+    struct WritableNoHookBinding {
+        bus: Arc<ConfigBus<DemoConfig>>,
+    }
+
+    impl NetconfConfigBinding<DemoConfig> for WritableNoHookBinding {
+        fn config_bus(&self) -> Arc<ConfigBus<DemoConfig>> {
+            Arc::clone(&self.bus)
+        }
+
+        fn schema_registry(&self) -> &'static dyn SchemaRegistry {
+            &REGISTRY
+        }
+
+        fn writable_running_capability(&self) -> bool {
+            true
+        }
+
+        fn render_running_config(
+            &self,
+            _config: &DemoConfig,
+            _selection: ReadSelection<'_>,
+        ) -> Result<String, BindingError> {
+            Ok(String::new())
+        }
+    }
+
+    /// An applicator that must never be invoked; used to prove NACM exec denial
+    /// happens before candidate construction.
+    struct PanicEditApplicator;
+
+    static PANIC_EDIT_APPLICATOR: PanicEditApplicator = PanicEditApplicator;
+
+    impl NetconfXmlEditApplicator<DemoConfig> for PanicEditApplicator {
+        fn apply_edit_config(
+            &self,
+            _running: &DemoConfig,
+            _edit: &EditConfigNode,
+        ) -> Result<DemoConfig, NetconfEditError> {
+            panic!("candidate builder must not be called when exec NACM denies the request")
+        }
+    }
+
+    struct PanicEditBinding {
+        bus: Arc<ConfigBus<DemoConfig>>,
+    }
+
+    impl NetconfConfigBinding<DemoConfig> for PanicEditBinding {
+        fn config_bus(&self) -> Arc<ConfigBus<DemoConfig>> {
+            Arc::clone(&self.bus)
+        }
+
+        fn schema_registry(&self) -> &'static dyn SchemaRegistry {
+            &REGISTRY
+        }
+
+        fn generated_xml_edit_applicator(
+            &self,
+        ) -> Option<&dyn NetconfXmlEditApplicator<DemoConfig>> {
+            Some(&PANIC_EDIT_APPLICATOR)
+        }
+
+        fn writable_running_capability(&self) -> bool {
+            true
+        }
+
+        fn render_running_config(
+            &self,
+            _config: &DemoConfig,
+            _selection: ReadSelection<'_>,
+        ) -> Result<String, BindingError> {
+            Ok(String::new())
+        }
+    }
+
+    fn edit_config_rpc(config_xml: &str, default_operation: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><rpc xmlns="{NETCONF_BASE_NS}" message-id="1"><edit-config><target><running/></target><default-operation>{default_operation}</default-operation><config>{config_xml}</config></edit-config></rpc>"#
+        )
+    }
+
+    async fn generated_edit_server_fixture() -> (
+        ReadOnlyNetconfServer<DemoConfig, GeneratedEditBinding, FixedPolicy, CapturingAudit>,
+        Arc<ConfigBus<DemoConfig>>,
+        CapturingAudit,
+    ) {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = GeneratedEditBinding {
+            bus: Arc::clone(&bus),
+        };
+        let audit = CapturingAudit::default();
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            audit.clone(),
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+        (server, bus, audit)
+    }
+
+    #[tokio::test]
+    async fn generated_edit_applicator_wires_through_running_edit_config() {
+        let (server, bus, audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_config_rpc(
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(!result.close_session);
+        assert!(
+            result.reply_xml.contains("<ok/>"),
+            "expected success reply, got: {}",
+            result.reply_xml
+        );
+
+        let snapshot = bus.current_snapshot();
+        assert_eq!(snapshot.config.hostname, "amf-2");
+        assert_eq!(snapshot.config.secret, "do-not-leak");
+
+        let events = audit.events.lock().expect("audit mutex");
+        let updates: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.operation, AuditOperation::Update))
+            .collect();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].outcome, AuditOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn generated_edit_secret_value_never_leaks() {
+        let (server, bus, audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_config_rpc(
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:secret>new-secret</sys:secret></sys:system>"#,
+            "merge",
+        );
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(
+            result.reply_xml.contains("<ok/>"),
+            "expected success reply, got: {}",
+            result.reply_xml
+        );
+        assert!(
+            !result.reply_xml.contains("new-secret"),
+            "reply leaked secret: {}",
+            result.reply_xml
+        );
+
+        let snapshot = bus.current_snapshot();
+        assert_eq!(snapshot.config.secret, "new-secret");
+
+        let events = audit.events.lock().expect("audit mutex");
+        let audit_debug = format!("{:?}", events);
+        assert!(
+            !audit_debug.contains("new-secret"),
+            "audit leaked secret: {}",
+            audit_debug
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_edit_config_returns_invalid_value_without_mutating_running() {
+        let (server, bus, _audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_config_rpc(
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:unknown>value</sys:unknown></sys:system>"#,
+            "merge",
+        );
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(
+            result
+                .reply_xml
+                .contains("<error-tag>invalid-value</error-tag>"),
+            "expected invalid-value, got: {}",
+            result.reply_xml
+        );
+
+        let snapshot = bus.current_snapshot();
+        assert_eq!(snapshot.config.hostname, "amf-1");
+    }
+
+    #[tokio::test]
+    async fn writable_binding_without_applicator_has_no_fallback() {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: String::new(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = WritableNoHookBinding {
+            bus: Arc::clone(&bus),
+        };
+        let audit = CapturingAudit::default();
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            audit,
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_config_rpc(
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(
+            result
+                .reply_xml
+                .contains("<error-tag>operation-not-supported</error-tag>"),
+            "expected operation-not-supported, got: {}",
+            result.reply_xml
+        );
+    }
+
+    #[tokio::test]
+    async fn nacm_exec_denial_happens_before_candidate_build() {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: String::new(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = PanicEditBinding {
+            bus: Arc::clone(&bus),
+        };
+        let audit = CapturingAudit::default();
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_edit_config()),
+            audit,
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_config_rpc(
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(
+            result
+                .reply_xml
+                .contains("<error-tag>access-denied</error-tag>"),
+            "expected access-denied, got: {}",
+            result.reply_xml
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_config_respects_running_write_guard() {
+        let (server, _bus, _audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _reg1 = registry.register(1).expect("register session 1");
+        let _reg2 = registry.register(2).expect("register session 2");
+
+        let guard = match registry.begin_running_write(1) {
+            RunningWriteResult::Acquired(g) => g,
+            _ => panic!("expected running write guard"),
+        };
+
+        let rpc = edit_config_rpc(
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                2,
+                &registry,
+            )
+            .await;
+
+        assert!(
+            result
+                .reply_xml
+                .contains("<error-tag>lock-denied</error-tag>"),
+            "expected lock-denied, got: {}",
+            result.reply_xml
+        );
+        assert!(
+            result.reply_xml.contains("<session-id>1</session-id>"),
+            "expected lock owner session id, got: {}",
+            result.reply_xml
+        );
+
+        drop(guard);
+    }
 }

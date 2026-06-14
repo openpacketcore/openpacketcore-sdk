@@ -1,5 +1,6 @@
 pub mod metadata;
 pub mod netconf_xml;
+pub mod netconf_xml_edit;
 pub mod patch;
 pub mod paths;
 pub mod redaction;
@@ -56,6 +57,7 @@ pub mod patch;
 pub mod validate;
 pub mod metadata;
 pub mod netconf_xml;
+pub mod netconf_xml_edit;
 pub mod redaction;
 pub mod schema_registry;
 
@@ -119,6 +121,10 @@ impl OpcConfig for types::__ROOT_TYPE__ {
     files.insert("validate.rs".to_string(), validate::generate(input)?);
     files.insert("metadata.rs".to_string(), metadata::generate(input)?);
     files.insert("netconf_xml.rs".to_string(), netconf_xml::generate(input)?);
+    files.insert(
+        "netconf_xml_edit.rs".to_string(),
+        netconf_xml_edit::generate(input)?,
+    );
     files.insert("redaction.rs".to_string(), redaction::generate(input)?);
     files.insert(
         "schema_registry.rs".to_string(),
