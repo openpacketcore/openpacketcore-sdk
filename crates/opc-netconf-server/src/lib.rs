@@ -159,6 +159,7 @@
 pub mod binding;
 pub mod capabilities;
 mod discovery;
+mod edit_xml;
 pub mod error;
 pub mod filter;
 pub mod framing;

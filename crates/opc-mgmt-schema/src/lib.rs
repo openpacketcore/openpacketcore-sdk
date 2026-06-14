@@ -278,7 +278,7 @@ struct ParsedSchemaPath {
 }
 
 /// Strips a leading module prefix (`prefix:name` -> `name`) from one path segment.
-fn bare_segment(seg: &str) -> &str {
+pub fn bare_segment(seg: &str) -> &str {
     match seg.find(':') {
         Some(i) => &seg[i + 1..],
         None => seg,
@@ -584,6 +584,35 @@ pub trait SchemaRegistry: Send + Sync {
             .any(|model| model.prefix == prefix || model.name == prefix)
     }
 
+    /// The served module whose XML namespace matches `namespace`, if any.
+    fn module_for_namespace(&self, namespace: &str) -> Option<&'static str> {
+        self.served_models()
+            .iter()
+            .find(|model| model.namespace == namespace)
+            .map(|model| model.name)
+    }
+
+    /// Resolves a child schema-node path by parent path, element local name, and
+    /// owning module. This is the only supported way for a NETCONF XML parser to
+    /// map an incoming element to a schema path without ad hoc string surgery.
+    fn child_schema_path(
+        &self,
+        parent_path: &str,
+        local_name: &str,
+        module: &str,
+    ) -> Option<&'static str> {
+        let parent = self.node(parent_path)?;
+        parent
+            .child_paths
+            .iter()
+            .find(|&&cp| {
+                self.node(cp).is_some_and(|child| {
+                    child.module == module && bare_segment(last_segment(child.path)) == local_name
+                })
+            })
+            .copied()
+    }
+
     /// The schema default literal to report for a path under a with-defaults
     /// mode. `ReportAll` and `ReportAllTagged` yield the default when one
     /// exists; `Trim`/`Explicit` yield `None` (the server omits
@@ -682,6 +711,175 @@ pub trait NetconfXmlRenderer<C: OpcConfig>: Send + Sync {
 
     /// Reports which with-defaults modes this renderer implements.
     fn supported_default_reports(&self) -> &'static [DefaultReport];
+}
+
+// ---------------------------------------------------------------------------
+// NETCONF XML edit-config contract
+// ---------------------------------------------------------------------------
+
+/// RFC 6241 edit operation, normalized from the request default or a per-node
+/// `nc:operation` attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditOperation {
+    /// No operation (used when `default-operation` is `none` and no per-node
+    /// operation attribute is present).
+    None,
+    /// `merge`.
+    Merge,
+    /// `replace`.
+    Replace,
+    /// `create`.
+    Create,
+    /// `delete`.
+    Delete,
+    /// `remove`.
+    Remove,
+}
+
+/// Failure modes for schema-backed NETCONF `<edit-config>` application.
+///
+/// These variants deliberately carry schema paths and key *names*, never raw
+/// key values or leaf values, so they can be logged without leaking secrets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetconfEditError {
+    /// A schema shape the current generated edit applicator cannot mutate
+    /// correctly (e.g. leaf-list, keyless list, custom typedef, choice/case).
+    UnsupportedShape {
+        /// Schema-node path that triggered the rejection.
+        path: &'static str,
+        /// Kind of node that is not supported.
+        kind: NodeKind,
+    },
+    /// The supplied config element does not resolve to a known schema node.
+    UnknownPath(String),
+    /// The supplied value cannot be parsed as the leaf's declared type.
+    InvalidValue {
+        /// Schema-node path of the leaf.
+        path: &'static str,
+    },
+    /// A keyed list entry was missing one of its key leaves.
+    MissingKey {
+        /// List node path.
+        path: &'static str,
+        /// Key leaf name that was missing.
+        key: &'static str,
+    },
+    /// A keyed list entry was given a key name that is not one of its key
+    /// leaves.
+    ExtraKey {
+        /// List node path.
+        path: &'static str,
+        /// Unexpected key leaf name.
+        key: String,
+    },
+    /// Key predicates were supplied for a non-list node.
+    KeyOnNonList {
+        /// Schema-node path of the offending node.
+        path: &'static str,
+    },
+    /// The XML config fragment is structurally malformed.
+    MalformedXml,
+    /// The requested operation is not semantically valid for this node kind or
+    /// state.
+    OperationNotSupported {
+        /// Schema-node path.
+        path: &'static str,
+        /// Operation that cannot be applied.
+        operation: EditOperation,
+        /// Kind of node.
+        kind: NodeKind,
+    },
+    /// The target node is read-only and cannot be edited.
+    ReadOnly {
+        /// Schema-node path.
+        path: &'static str,
+    },
+}
+
+impl std::fmt::Display for NetconfEditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedShape { path, kind } => {
+                write!(f, "NETCONF edit does not support {kind:?} at {path}")
+            }
+            Self::UnknownPath(path) => write!(f, "NETCONF edit unknown path: {path}"),
+            Self::InvalidValue { path } => {
+                write!(f, "NETCONF edit invalid value at {path}")
+            }
+            Self::MissingKey { path, key } => {
+                write!(f, "NETCONF edit missing key '{key}' for list {path}")
+            }
+            Self::ExtraKey { path, key } => {
+                write!(f, "NETCONF edit unexpected key '{key}' for list {path}")
+            }
+            Self::KeyOnNonList { path } => {
+                write!(f, "NETCONF edit keys supplied on non-list {path}")
+            }
+            Self::MalformedXml => f.write_str("NETCONF edit config XML is malformed"),
+            Self::OperationNotSupported {
+                path,
+                operation,
+                kind,
+            } => {
+                write!(
+                    f,
+                    "NETCONF edit operation {operation:?} is not supported for {kind:?} at {path}"
+                )
+            }
+            Self::ReadOnly { path } => write!(f, "NETCONF edit path is read-only: {path}"),
+        }
+    }
+}
+
+impl std::error::Error for NetconfEditError {}
+
+/// Schema-backed NETCONF `<edit-config>` applicator for a generated config root
+/// `C`.
+///
+/// `opc-yanggen` emits an implementation of this trait for the generated root
+/// type. A CNF binding returns the applicator through
+/// [`opc_netconf_server::binding::NetconfConfigBinding::generated_xml_edit_applicator`]
+/// so the server can apply running `<edit-config>` requests without a hand-written
+/// candidate builder.
+pub trait NetconfXmlEditApplicator<C: OpcConfig>: Send + Sync {
+    /// Apply one normalized `<config>` subtree to a clone of `running` and
+    /// return the full candidate config.
+    fn apply_edit_config(&self, running: &C, edit: &EditConfigNode) -> Result<C, NetconfEditError>;
+}
+
+/// Normalized, schema-bound `<edit-config>` config subtree.
+///
+/// This tree is produced by the server-side XML parser and consumed by the
+/// generated applicator. It contains no raw XML, no prefixes, and no namespace
+/// declarations. Values are kept in `String` form because they are required to
+/// build the candidate config, but the type deliberately implements a custom
+/// [`std::fmt::Debug`] that does **not** print values or key values, so a
+/// secret can travel into the candidate without being exposed in logs or test
+/// helper output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EditConfigNode {
+    /// Canonical prefix-qualified schema path of this node.
+    pub schema_path: &'static str,
+    /// Edit operation to apply to this node.
+    pub operation: EditOperation,
+    /// Leaf value, if this is a leaf node.
+    pub value: Option<String>,
+    /// Child nodes (containers, list entries, non-key leaf children).
+    pub children: Vec<EditConfigNode>,
+    /// Key leaf values for a list entry, keyed by bare key leaf name.
+    pub list_keys: std::collections::BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for EditConfigNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EditConfigNode")
+            .field("schema_path", &self.schema_path)
+            .field("operation", &self.operation)
+            .field("leaf", &self.value.is_some())
+            .field("children", &self.children.len())
+            .field("keys", &self.list_keys.len())
+            .finish()
+    }
 }
 
 /// Context shared by generated NETCONF XML renderers.

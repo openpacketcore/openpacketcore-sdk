@@ -6,8 +6,8 @@ use opc_config_bus::ConfigBus;
 use opc_config_model::{OpcConfig, YangPath};
 use opc_mgmt_opstate::{OperationalError, OperationalRequest, OperationalResponse};
 use opc_mgmt_schema::{
-    DefaultReport, NetconfProjectionError, NetconfXmlRenderContext, NetconfXmlRenderer,
-    SchemaRegistry,
+    DefaultReport, NetconfEditError, NetconfProjectionError, NetconfXmlEditApplicator,
+    NetconfXmlRenderContext, NetconfXmlRenderer, SchemaRegistry,
 };
 use thiserror::Error;
 
@@ -294,6 +294,17 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         None
     }
 
+    /// Optional generated NETCONF XML edit applicator for this binding.
+    ///
+    /// When a CNF returns `Some`, the default
+    /// [`Self::build_edit_config_candidate`] parses the bounded `<config>` XML
+    /// and applies it through the generated schema-aware applicator. A binding
+    /// may return `None` to keep full ownership of edit translation, or to
+    /// decline running writes even when `:writable-running` is advertised.
+    fn generated_xml_edit_applicator(&self) -> Option<&dyn NetconfXmlEditApplicator<C>> {
+        None
+    }
+
     /// Renders the currently published running config for the authorized paths.
     ///
     /// The default delegates to [`Self::generated_xml_renderer`] if present. A
@@ -543,14 +554,45 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
     /// The request's `config_xml` is a bounded, namespace-preserving NETCONF
     /// `<config>` element. Bindings typically decode it with generated
     /// schema-aware XML/YANG helpers or translate it into the generated
-    /// `ConfigDelta` patch applicator. The default fails closed, so adding
-    /// server-side edit support does not imply every CNF can accept writes.
+    /// `ConfigDelta` patch applicator.
+    ///
+    /// The default implementation delegates to
+    /// [`Self::generated_xml_edit_applicator`] when the binding exposes one.
+    /// This is an explicit opt-in: there is no hidden fallback to a generic
+    /// translator, so adding server-side edit support does not imply every CNF
+    /// can accept writes.
     fn build_edit_config_candidate(
         &self,
-        _running: &C,
-        _request: &EditConfigRequest,
+        running: &C,
+        request: &EditConfigRequest,
     ) -> Result<EditConfigCandidate<C>, EditConfigError> {
-        Err(EditConfigError::Unsupported)
+        let applicator = self
+            .generated_xml_edit_applicator()
+            .ok_or(EditConfigError::Unsupported)?;
+        let edit = crate::edit_xml::parse_edit_config_xml(
+            &request.config_xml,
+            self.schema_registry(),
+            request.default_operation,
+        )
+        .map_err(netconf_edit_error_to_binding_error)?;
+        let candidate = applicator
+            .apply_edit_config(running, &edit)
+            .map_err(netconf_edit_error_to_binding_error)?;
+        Ok(EditConfigCandidate::new(candidate, Vec::new()))
+    }
+}
+
+fn netconf_edit_error_to_binding_error(err: NetconfEditError) -> EditConfigError {
+    match err {
+        NetconfEditError::UnsupportedShape { .. } => EditConfigError::InvalidValue,
+        NetconfEditError::OperationNotSupported { .. } => EditConfigError::InvalidValue,
+        NetconfEditError::ReadOnly { .. } => EditConfigError::InvalidValue,
+        NetconfEditError::UnknownPath(_) => EditConfigError::InvalidValue,
+        NetconfEditError::InvalidValue { .. } => EditConfigError::InvalidValue,
+        NetconfEditError::MissingKey { .. } => EditConfigError::InvalidValue,
+        NetconfEditError::ExtraKey { .. } => EditConfigError::InvalidValue,
+        NetconfEditError::KeyOnNonList { .. } => EditConfigError::InvalidValue,
+        NetconfEditError::MalformedXml => EditConfigError::InvalidValue,
     }
 }
 
