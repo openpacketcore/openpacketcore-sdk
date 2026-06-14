@@ -23,6 +23,7 @@ use crate::binding::NetconfConfigBinding;
 use crate::capabilities::{NETCONF_BASE_1_0, NETCONF_BASE_1_1};
 use crate::framing::{base10, base11, FramingError};
 use crate::server::ReadOnlyNetconfServer;
+use crate::session_registry::{session_id_for_hello, SessionRegistry, SessionRegistryError};
 use crate::xml::{parse_client_hello, ClientHello, XmlError};
 
 /// Negotiated NETCONF message framing after hello exchange.
@@ -58,8 +59,11 @@ pub struct SessionResult {
     /// Capabilities advertised by the client hello.
     pub client_capabilities: Vec<String>,
     /// Negotiated framing for post-hello RPCs.
+    ///
+    /// If the session is terminated before the client hello arrives, this is
+    /// `Base10`, the only framing valid during hello exchange.
     pub framing: SessionFraming,
-    /// Number of RPCs dispatched before EOF.
+    /// Number of RPC replies written before the session exited.
     pub rpc_count: u64,
 }
 
@@ -87,9 +91,19 @@ pub enum SessionError {
     /// The peer closed the stream before the client hello was received.
     #[error("NETCONF session closed before client hello")]
     MissingClientHello,
+    /// The session id is already registered.
+    #[error("NETCONF session id is already registered")]
+    DuplicateSessionId,
+    /// The session id is outside the NETCONF session-id range.
+    #[error("NETCONF session id is invalid")]
+    InvalidSessionId,
 }
 
 /// Runs one read-only NETCONF session over an authenticated stream.
+///
+/// This convenience helper creates an isolated [`SessionRegistry`] for the
+/// session. Use [`run_read_only_session_with_registry`] when multiple sessions
+/// must be addressable by RFC 6241 `<kill-session>`.
 pub async fn run_read_only_session<C, B, P, A, S>(
     server: &ReadOnlyNetconfServer<C, B, P, A>,
     principal: &TrustedPrincipal,
@@ -104,18 +118,64 @@ where
     A: AuditSink,
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let registry = SessionRegistry::new();
+    run_read_only_session_with_registry(server, principal, stream, config, session_id, &registry)
+        .await
+}
+
+/// Runs one read-only NETCONF session registered for cross-session
+/// `<kill-session>` control.
+pub async fn run_read_only_session_with_registry<C, B, P, A, S>(
+    server: &ReadOnlyNetconfServer<C, B, P, A>,
+    principal: &TrustedPrincipal,
+    stream: &mut S,
+    config: SessionConfig,
+    session_id: u64,
+    sessions: &SessionRegistry,
+) -> Result<SessionResult, SessionError>
+where
+    C: OpcConfig,
+    B: NetconfConfigBinding<C>,
+    P: PolicySource,
+    A: AuditSink,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     config.limits.validate()?;
+    let Some(hello_session_id) = session_id_for_hello(session_id) else {
+        return Err(SessionError::InvalidSessionId);
+    };
+    let mut registration = sessions.register(session_id).map_err(|err| match err {
+        SessionRegistryError::InvalidSessionId => SessionError::InvalidSessionId,
+        SessionRegistryError::DuplicateSessionId => SessionError::DuplicateSessionId,
+    })?;
 
-    let server_hello = server.server_hello(Some(session_id));
-    write_message(
-        stream,
-        SessionFraming::Base10,
-        server_hello.as_bytes(),
-        &config.limits,
-    )
-    .await?;
+    let server_hello = server.server_hello(Some(hello_session_id));
+    tokio::select! {
+        _ = registration.terminated() => {
+            return Ok(SessionResult {
+                client_capabilities: Vec::new(),
+                framing: SessionFraming::Base10,
+                rpc_count: 0,
+            });
+        }
+        result = write_message(
+            stream,
+            SessionFraming::Base10,
+            server_hello.as_bytes(),
+            &config.limits,
+        ) => result?,
+    }
 
-    let client_hello_bytes = read_message(stream, SessionFraming::Base10, &config).await?;
+    let client_hello_bytes = tokio::select! {
+        _ = registration.terminated() => {
+            return Ok(SessionResult {
+                client_capabilities: Vec::new(),
+                framing: SessionFraming::Base10,
+                rpc_count: 0,
+            });
+        }
+        result = read_message(stream, SessionFraming::Base10, &config) => result?,
+    };
     let Some(client_hello_bytes) = client_hello_bytes else {
         return Err(SessionError::MissingClientHello);
     };
@@ -126,7 +186,17 @@ where
 
     let mut rpc_count = 0u64;
     loop {
-        let Some(message) = read_message(stream, framing, &config).await? else {
+        let message = tokio::select! {
+            _ = registration.terminated() => {
+                return Ok(SessionResult {
+                    client_capabilities: client_hello.capabilities,
+                    framing,
+                    rpc_count,
+                });
+            }
+            result = read_message(stream, framing, &config) => result?,
+        };
+        let Some(message) = message else {
             return Ok(SessionResult {
                 client_capabilities: client_hello.capabilities,
                 framing,
@@ -134,8 +204,26 @@ where
             });
         };
         let rpc_xml = str::from_utf8(&message).map_err(|_| SessionError::InvalidUtf8)?;
-        let result = server.handle_rpc(RequestId::new(), principal, rpc_xml, &config.limits);
-        write_message(stream, framing, result.reply_xml.as_bytes(), &config.limits).await?;
+        let result = server.handle_rpc_for_session(
+            RequestId::new(),
+            principal,
+            rpc_xml,
+            &config.limits,
+            registration.session_id(),
+            sessions,
+        );
+        tokio::select! {
+            _ = registration.terminated() => {
+                return Ok(SessionResult {
+                    client_capabilities: client_hello.capabilities,
+                    framing,
+                    rpc_count,
+                });
+            }
+            write_result = write_message(stream, framing, result.reply_xml.as_bytes(), &config.limits) => {
+                write_result?;
+            }
+        }
         rpc_count = rpc_count.saturating_add(1);
         if result.close_session {
             return Ok(SessionResult {
@@ -554,20 +642,25 @@ mod tests {
                 NacmAction::Exec,
                 YangPathPattern::parse("/nc:close-session", &modules).expect("close-session path"),
             ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Exec,
+                YangPathPattern::parse("/nc:kill-session", &modules).expect("kill-session path"),
+            ))
             .build()
     }
 
     async fn server_fixture(
     ) -> ReadOnlyNetconfServer<DemoConfig, TestBinding, FixedPolicy, CapturingAudit> {
+        server_fixture_with_hostname("amf-1".to_string()).await
+    }
+
+    async fn server_fixture_with_hostname(
+        hostname: String,
+    ) -> ReadOnlyNetconfServer<DemoConfig, TestBinding, FixedPolicy, CapturingAudit> {
         let bus = Arc::new(
-            ConfigBus::new_dev_only(
-                DemoConfig {
-                    hostname: "amf-1".to_string(),
-                },
-                MockManagedDatastore::new(),
-            )
-            .await
-            .expect("bus"),
+            ConfigBus::new_dev_only(DemoConfig { hostname }, MockManagedDatastore::new())
+                .await
+                .expect("bus"),
         );
         ReadOnlyNetconfServer::new(
             TestBinding { bus },
@@ -601,6 +694,12 @@ mod tests {
         )
     }
 
+    fn kill_session_rpc(message_id: &str, target_session_id: u64) -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="{message_id}"><kill-session><session-id>{target_session_id}</session-id></kill-session></rpc>"#
+        )
+    }
+
     async fn client_write_message<S>(
         stream: &mut S,
         framing: SessionFraming,
@@ -610,6 +709,35 @@ mod tests {
         S: AsyncWrite + Unpin,
     {
         write_message(stream, framing, xml.as_bytes(), &MgmtLimits::default()).await
+    }
+
+    async fn wait_until_registered(sessions: &SessionRegistry, session_id: u64) {
+        for _ in 0..100 {
+            if sessions.contains_session_for_test(session_id) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("session {session_id} was not registered");
+    }
+
+    #[tokio::test]
+    async fn invalid_local_session_id_is_rejected_before_hello() {
+        let server = server_fixture().await;
+        let principal = principal();
+        let (_client, mut server_io) = tokio::io::duplex(1024);
+
+        let err = run_read_only_session(
+            &server,
+            &principal,
+            &mut server_io,
+            SessionConfig::default(),
+            crate::session_registry::NETCONF_MAX_SESSION_ID + 1,
+        )
+        .await
+        .expect_err("invalid session id");
+
+        assert!(matches!(err, SessionError::InvalidSessionId));
     }
 
     #[tokio::test]
@@ -761,6 +889,365 @@ mod tests {
             .await
             .expect("read eof");
         assert!(eof.is_none());
+    }
+
+    #[tokio::test]
+    async fn kill_session_from_peer_terminates_target_session() {
+        let target_server = server_fixture().await;
+        let controller_server = server_fixture().await;
+        let target_principal = principal();
+        let controller_principal = principal();
+        let sessions = SessionRegistry::new();
+        let target_sessions = sessions.clone();
+        let controller_sessions = sessions.clone();
+        let (mut target_client, mut target_io) = tokio::io::duplex(64 * 1024);
+        let (mut controller_client, mut controller_io) = tokio::io::duplex(64 * 1024);
+
+        let target_task = tokio::spawn(async move {
+            run_read_only_session_with_registry(
+                &target_server,
+                &target_principal,
+                &mut target_io,
+                SessionConfig::default(),
+                401,
+                &target_sessions,
+            )
+            .await
+        });
+        let controller_task = tokio::spawn(async move {
+            run_read_only_session_with_registry(
+                &controller_server,
+                &controller_principal,
+                &mut controller_io,
+                SessionConfig::default(),
+                402,
+                &controller_sessions,
+            )
+            .await
+        });
+
+        read_base10_message(&mut target_client, &MgmtLimits::default())
+            .await
+            .expect("target hello frame")
+            .expect("target hello");
+        client_write_message(
+            &mut target_client,
+            SessionFraming::Base10,
+            &client_hello(&[NETCONF_BASE_1_0]),
+        )
+        .await
+        .expect("target client hello");
+
+        read_base10_message(&mut controller_client, &MgmtLimits::default())
+            .await
+            .expect("controller hello frame")
+            .expect("controller hello");
+        client_write_message(
+            &mut controller_client,
+            SessionFraming::Base10,
+            &client_hello(&[NETCONF_BASE_1_0]),
+        )
+        .await
+        .expect("controller client hello");
+
+        client_write_message(
+            &mut controller_client,
+            SessionFraming::Base10,
+            &kill_session_rpc("303", 401),
+        )
+        .await
+        .expect("kill-session rpc");
+
+        let reply = read_base10_message(&mut controller_client, &MgmtLimits::default())
+            .await
+            .expect("kill reply frame")
+            .expect("kill reply");
+        let reply = str::from_utf8(&reply).expect("reply utf8");
+        assert!(reply.contains(r#"message-id="303""#));
+        assert!(reply.contains("<ok/>"));
+
+        let target_result = tokio::time::timeout(Duration::from_secs(5), target_task)
+            .await
+            .expect("target termination timeout")
+            .expect("target join")
+            .expect("target result");
+        assert_eq!(target_result.framing, SessionFraming::Base10);
+        assert_eq!(target_result.rpc_count, 0);
+
+        drop(controller_client);
+        let controller_result = controller_task
+            .await
+            .expect("controller join")
+            .expect("controller result");
+        assert_eq!(controller_result.rpc_count, 1);
+    }
+
+    #[tokio::test]
+    async fn kill_session_interrupts_target_blocked_writing_server_hello() {
+        let target_server = server_fixture().await;
+        let controller_server = server_fixture().await;
+        let target_principal = principal();
+        let controller_principal = principal();
+        let sessions = SessionRegistry::new();
+        let target_sessions = sessions.clone();
+        let controller_sessions = sessions.clone();
+        let (_target_client, mut target_io) = tokio::io::duplex(1);
+        let (mut controller_client, mut controller_io) = tokio::io::duplex(64 * 1024);
+
+        let target_task = tokio::spawn(async move {
+            run_read_only_session_with_registry(
+                &target_server,
+                &target_principal,
+                &mut target_io,
+                SessionConfig::default(),
+                431,
+                &target_sessions,
+            )
+            .await
+        });
+        wait_until_registered(&sessions, 431).await;
+
+        let controller_task = tokio::spawn(async move {
+            run_read_only_session_with_registry(
+                &controller_server,
+                &controller_principal,
+                &mut controller_io,
+                SessionConfig::default(),
+                432,
+                &controller_sessions,
+            )
+            .await
+        });
+
+        read_base10_message(&mut controller_client, &MgmtLimits::default())
+            .await
+            .expect("controller hello frame")
+            .expect("controller hello");
+        client_write_message(
+            &mut controller_client,
+            SessionFraming::Base10,
+            &client_hello(&[NETCONF_BASE_1_0]),
+        )
+        .await
+        .expect("controller client hello");
+
+        client_write_message(
+            &mut controller_client,
+            SessionFraming::Base10,
+            &kill_session_rpc("304", 431),
+        )
+        .await
+        .expect("kill-session rpc");
+
+        let reply = read_base10_message(&mut controller_client, &MgmtLimits::default())
+            .await
+            .expect("kill reply frame")
+            .expect("kill reply");
+        let reply = str::from_utf8(&reply).expect("reply utf8");
+        assert!(reply.contains(r#"message-id="304""#));
+        assert!(reply.contains("<ok/>"));
+
+        let target_result = tokio::time::timeout(Duration::from_secs(5), target_task)
+            .await
+            .expect("target server-hello write termination timeout")
+            .expect("target join")
+            .expect("target result");
+        assert_eq!(target_result.client_capabilities, Vec::<String>::new());
+        assert_eq!(target_result.framing, SessionFraming::Base10);
+        assert_eq!(target_result.rpc_count, 0);
+
+        drop(controller_client);
+        let controller_result = controller_task
+            .await
+            .expect("controller join")
+            .expect("controller result");
+        assert_eq!(controller_result.rpc_count, 1);
+    }
+
+    #[tokio::test]
+    async fn kill_session_interrupts_target_waiting_for_client_hello() {
+        let target_server = server_fixture().await;
+        let controller_server = server_fixture().await;
+        let target_principal = principal();
+        let controller_principal = principal();
+        let sessions = SessionRegistry::new();
+        let target_sessions = sessions.clone();
+        let controller_sessions = sessions.clone();
+        let (mut target_client, mut target_io) = tokio::io::duplex(64 * 1024);
+        let (mut controller_client, mut controller_io) = tokio::io::duplex(64 * 1024);
+
+        let target_task = tokio::spawn(async move {
+            run_read_only_session_with_registry(
+                &target_server,
+                &target_principal,
+                &mut target_io,
+                SessionConfig::default(),
+                411,
+                &target_sessions,
+            )
+            .await
+        });
+        let controller_task = tokio::spawn(async move {
+            run_read_only_session_with_registry(
+                &controller_server,
+                &controller_principal,
+                &mut controller_io,
+                SessionConfig::default(),
+                412,
+                &controller_sessions,
+            )
+            .await
+        });
+
+        read_base10_message(&mut target_client, &MgmtLimits::default())
+            .await
+            .expect("target hello frame")
+            .expect("target hello");
+
+        read_base10_message(&mut controller_client, &MgmtLimits::default())
+            .await
+            .expect("controller hello frame")
+            .expect("controller hello");
+        client_write_message(
+            &mut controller_client,
+            SessionFraming::Base10,
+            &client_hello(&[NETCONF_BASE_1_0]),
+        )
+        .await
+        .expect("controller client hello");
+
+        client_write_message(
+            &mut controller_client,
+            SessionFraming::Base10,
+            &kill_session_rpc("304", 411),
+        )
+        .await
+        .expect("kill-session rpc");
+
+        let reply = read_base10_message(&mut controller_client, &MgmtLimits::default())
+            .await
+            .expect("kill reply frame")
+            .expect("kill reply");
+        let reply = str::from_utf8(&reply).expect("reply utf8");
+        assert!(reply.contains(r#"message-id="304""#));
+        assert!(reply.contains("<ok/>"));
+
+        let target_result = tokio::time::timeout(Duration::from_secs(5), target_task)
+            .await
+            .expect("target pre-hello termination timeout")
+            .expect("target join")
+            .expect("target result");
+        assert_eq!(target_result.client_capabilities, Vec::<String>::new());
+        assert_eq!(target_result.framing, SessionFraming::Base10);
+        assert_eq!(target_result.rpc_count, 0);
+
+        drop(controller_client);
+        let controller_result = controller_task
+            .await
+            .expect("controller join")
+            .expect("controller result");
+        assert_eq!(controller_result.rpc_count, 1);
+    }
+
+    #[tokio::test]
+    async fn kill_session_interrupts_target_blocked_writing_reply() {
+        let target_server = server_fixture_with_hostname("x".repeat(512 * 1024)).await;
+        let controller_server = server_fixture().await;
+        let target_principal = principal();
+        let controller_principal = principal();
+        let sessions = SessionRegistry::new();
+        let target_sessions = sessions.clone();
+        let controller_sessions = sessions.clone();
+        let (mut target_client, mut target_io) = tokio::io::duplex(1024);
+        let (mut controller_client, mut controller_io) = tokio::io::duplex(64 * 1024);
+
+        let target_task = tokio::spawn(async move {
+            run_read_only_session_with_registry(
+                &target_server,
+                &target_principal,
+                &mut target_io,
+                SessionConfig::default(),
+                421,
+                &target_sessions,
+            )
+            .await
+        });
+        let controller_task = tokio::spawn(async move {
+            run_read_only_session_with_registry(
+                &controller_server,
+                &controller_principal,
+                &mut controller_io,
+                SessionConfig::default(),
+                422,
+                &controller_sessions,
+            )
+            .await
+        });
+
+        read_base10_message(&mut target_client, &MgmtLimits::default())
+            .await
+            .expect("target hello frame")
+            .expect("target hello");
+        client_write_message(
+            &mut target_client,
+            SessionFraming::Base10,
+            &client_hello(&[NETCONF_BASE_1_0]),
+        )
+        .await
+        .expect("target client hello");
+
+        read_base10_message(&mut controller_client, &MgmtLimits::default())
+            .await
+            .expect("controller hello frame")
+            .expect("controller hello");
+        client_write_message(
+            &mut controller_client,
+            SessionFraming::Base10,
+            &client_hello(&[NETCONF_BASE_1_0]),
+        )
+        .await
+        .expect("controller client hello");
+
+        client_write_message(
+            &mut target_client,
+            SessionFraming::Base10,
+            &get_config_rpc("305"),
+        )
+        .await
+        .expect("target get-config rpc");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        client_write_message(
+            &mut controller_client,
+            SessionFraming::Base10,
+            &kill_session_rpc("306", 421),
+        )
+        .await
+        .expect("kill-session rpc");
+
+        let reply = read_base10_message(&mut controller_client, &MgmtLimits::default())
+            .await
+            .expect("kill reply frame")
+            .expect("kill reply");
+        let reply = str::from_utf8(&reply).expect("reply utf8");
+        assert!(reply.contains(r#"message-id="306""#));
+        assert!(reply.contains("<ok/>"));
+
+        let target_result = tokio::time::timeout(Duration::from_secs(5), target_task)
+            .await
+            .expect("target blocked-write termination timeout")
+            .expect("target join")
+            .expect("target result");
+        assert_eq!(target_result.framing, SessionFraming::Base10);
+        assert_eq!(target_result.rpc_count, 0);
+
+        drop(controller_client);
+        let controller_result = controller_task
+            .await
+            .expect("controller join")
+            .expect("controller result");
+        assert_eq!(controller_result.rpc_count, 1);
     }
 
     #[tokio::test]

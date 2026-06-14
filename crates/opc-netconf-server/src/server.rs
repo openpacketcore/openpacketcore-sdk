@@ -1,6 +1,7 @@
 //! Read-only NETCONF server core.
 
 use std::marker::PhantomData;
+use std::num::NonZeroU32;
 use std::time::Instant;
 
 use opc_config_model::{OpcConfig, RequestId, TransportType, TrustedPrincipal};
@@ -24,9 +25,11 @@ use crate::error::{
 use crate::metrics::{record_rpc_error, record_rpc_success, NetconfOperation};
 use crate::operations::get::{handle_get, GetContext};
 use crate::operations::get_config::{handle_get_config, GetConfigContext};
+use crate::session_registry::{KillSessionResult, SessionRegistry};
 use crate::xml::{
-    parse_rpc_with_context, GetSchemaRequest as XmlGetSchemaRequest, RpcOperation,
-    UnsupportedOperation, XmlError,
+    parse_rpc_with_context, GetSchemaRequest as XmlGetSchemaRequest,
+    KillSessionRequest as XmlKillSessionRequest, RpcOperation, RpcOperationHint, RpcParseError,
+    UnsupportedOperation,
 };
 
 const NETCONF_BASE_MODEL: &[ModelData] = &[ModelData {
@@ -37,6 +40,7 @@ const NETCONF_BASE_MODEL: &[ModelData] = &[ModelData {
 }];
 
 const NETCONF_CLOSE_SESSION_PATH: &str = "/nc:close-session";
+const NETCONF_KILL_SESSION_PATH: &str = "/nc:kill-session";
 
 /// Server construction error.
 #[derive(Debug, Error)]
@@ -74,11 +78,30 @@ impl RpcHandlingResult {
     }
 }
 
+struct RpcExecContext<'a> {
+    request_id: RequestId,
+    principal: &'a TrustedPrincipal,
+    message_id: &'a str,
+    reply_attrs: &'a RpcReplyAttributes,
+    started: Instant,
+}
+
 /// Read-only NETCONF server core.
 ///
 /// This type handles parsed XML RPC documents. It does not bind sockets or
 /// perform the NETCONF `<hello>` handshake; transport/session code composes
 /// those pieces around this core.
+///
+/// The public [`Self::handle_rpc`] and [`Self::handle_rpc_xml`] helpers are
+/// registry-free, low-level dispatch helpers. They preserve parser, NACM,
+/// audit, metrics, and reply behavior for one RPC, but they are not a complete
+/// advertised NETCONF base session: `<kill-session>` returns
+/// `operation-not-supported` without a live [`SessionRegistry`], and
+/// [`Self::handle_rpc_xml`] also discards the `<close-session>` close signal.
+/// Use [`crate::session::run_read_only_session_with_registry`] or
+/// [`crate::transport::run_read_only_tls_session_with_registry`] when custom
+/// transports need full base-session behavior backed by the audited shared
+/// session registry.
 pub struct ReadOnlyNetconfServer<C, B, P, A>
 where
     C: OpcConfig,
@@ -122,6 +145,10 @@ where
     }
 
     /// Handles one complete XML RPC document and returns an XML `<rpc-reply>`.
+    ///
+    /// This is a low-level helper for request/response harnesses. It does not
+    /// enact session-control side effects: `<kill-session>` has no shared
+    /// registry context and `<close-session>`'s close signal is discarded.
     pub fn handle_rpc_xml(
         &self,
         request_id: RequestId,
@@ -134,7 +161,12 @@ where
     }
 
     /// Renders this server instance's `<hello>` capabilities.
-    pub fn server_hello(&self, session_id: Option<u64>) -> String {
+    ///
+    /// The base capabilities are intended to be paired with the session runners
+    /// in [`crate::session`] or [`crate::transport`]. Direct callers that pair a
+    /// rendered `<hello>` with [`Self::handle_rpc`] do not get cross-session
+    /// `<kill-session>` semantics.
+    pub fn server_hello(&self, session_id: Option<NonZeroU32>) -> String {
         let yang_library = self.binding.yang_library_capability();
         let monitoring = self.binding.netconf_monitoring_capability();
         let with_defaults = self.binding.with_defaults_capability();
@@ -147,7 +179,13 @@ where
     }
 
     /// Handles one complete XML RPC document and returns the reply plus any
-    /// session-control action.
+    /// registry-free session-control action.
+    ///
+    /// This helper can report `<close-session>` via
+    /// [`RpcHandlingResult::close_session`], but it cannot address other live
+    /// sessions. `<kill-session>` therefore returns `operation-not-supported`.
+    /// Use the registry-aware session runners for complete base
+    /// `<kill-session>` behavior.
     pub fn handle_rpc(
         &self,
         request_id: RequestId,
@@ -155,22 +193,54 @@ where
         xml: &str,
         limits: &MgmtLimits,
     ) -> RpcHandlingResult {
+        self.handle_rpc_inner(request_id, principal, xml, limits, None)
+    }
+
+    /// Handles one XML RPC with access to live NETCONF session controls.
+    pub(crate) fn handle_rpc_for_session(
+        &self,
+        request_id: RequestId,
+        principal: &TrustedPrincipal,
+        xml: &str,
+        limits: &MgmtLimits,
+        current_session_id: u64,
+        sessions: &SessionRegistry,
+    ) -> RpcHandlingResult {
+        self.handle_rpc_inner(
+            request_id,
+            principal,
+            xml,
+            limits,
+            Some((current_session_id, sessions)),
+        )
+    }
+
+    fn handle_rpc_inner(
+        &self,
+        request_id: RequestId,
+        principal: &TrustedPrincipal,
+        xml: &str,
+        limits: &MgmtLimits,
+        session_context: Option<(u64, &SessionRegistry)>,
+    ) -> RpcHandlingResult {
         let started = Instant::now();
         let parsed = match parse_rpc_with_context(xml, limits) {
             Ok(parsed) => parsed,
             Err(err) => {
                 let message_id = err.message_id.as_deref();
+                let operation = netconf_operation_for_parse_failure(&err);
+                let operation_label = operation.as_str();
                 if self
-                    .audit_parse_failure(request_id, principal, &err.error)
+                    .audit_parse_failure(request_id, principal, &err)
                     .is_err()
                 {
                     record_rpc_error(
-                        NetconfOperation::Unknown,
+                        operation,
                         NetconfErrorTag::OperationFailed,
                         started.elapsed(),
                     );
                     tracing::debug!(
-                        operation = "unknown",
+                        operation = operation_label,
                         error_tag = NetconfErrorTag::OperationFailed.as_str(),
                         "NETCONF RPC rejected after audit failure"
                     );
@@ -181,13 +251,9 @@ where
                     ));
                 }
                 let classification = err.error.classification();
-                record_rpc_error(
-                    NetconfOperation::Unknown,
-                    classification.tag,
-                    started.elapsed(),
-                );
+                record_rpc_error(operation, classification.tag, started.elapsed());
                 tracing::debug!(
-                    operation = "unknown",
+                    operation = operation_label,
                     error_type = classification.error_type.as_str(),
                     error_tag = classification.tag.as_str(),
                     "NETCONF RPC rejected during parse"
@@ -240,6 +306,17 @@ where
                 &parsed.message_id,
                 &parsed.reply_attrs,
                 started,
+            ),
+            RpcOperation::KillSession(request) => self.handle_kill_session(
+                request,
+                RpcExecContext {
+                    request_id,
+                    principal,
+                    message_id: &parsed.message_id,
+                    reply_attrs: &parsed.reply_attrs,
+                    started,
+                },
+                session_context,
             ),
             RpcOperation::GetSchema(request) => self.handle_get_schema(
                 request,
@@ -449,6 +526,265 @@ where
             "NETCONF close-session succeeded"
         );
         RpcHandlingResult::close(rpc_ok_empty_reply_with_attrs(message_id, reply_attrs))
+    }
+
+    fn handle_kill_session(
+        &self,
+        request: &XmlKillSessionRequest,
+        context: RpcExecContext<'_>,
+        session_context: Option<(u64, &SessionRegistry)>,
+    ) -> RpcHandlingResult {
+        let RpcExecContext {
+            request_id,
+            principal,
+            message_id,
+            reply_attrs,
+            started,
+        } = context;
+        let kill_path = schema_node_path(NETCONF_KILL_SESSION_PATH);
+        match self.authorize_exec(principal, NETCONF_KILL_SESSION_PATH) {
+            Ok(true) => {}
+            Ok(false) => {
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            request_id,
+                            principal,
+                            self.transport,
+                            AuditOperation::Exec,
+                            audit_denied("access-denied"),
+                        )
+                        .with_paths([kill_path]),
+                    )
+                    .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::KillSession,
+                        NetconfErrorTag::OperationFailed,
+                        started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(message_id),
+                        reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                record_rpc_error(
+                    NetconfOperation::KillSession,
+                    NetconfErrorTag::AccessDenied,
+                    started.elapsed(),
+                );
+                tracing::debug!(
+                    operation = "kill-session",
+                    error_tag = NetconfErrorTag::AccessDenied.as_str(),
+                    "NETCONF kill-session denied by exec NACM"
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::access_denied(),
+                ));
+            }
+            Err(()) => {
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            request_id,
+                            principal,
+                            self.transport,
+                            AuditOperation::Exec,
+                            audit_failed("resource-denied"),
+                        )
+                        .with_paths([kill_path]),
+                    )
+                    .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::KillSession,
+                        NetconfErrorTag::OperationFailed,
+                        started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(message_id),
+                        reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                record_rpc_error(
+                    NetconfOperation::KillSession,
+                    NetconfErrorTag::ResourceDenied,
+                    started.elapsed(),
+                );
+                tracing::debug!(
+                    operation = "kill-session",
+                    error_tag = NetconfErrorTag::ResourceDenied.as_str(),
+                    "NETCONF kill-session failed closed on exec policy source error"
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::resource_denied(),
+                ));
+            }
+        }
+
+        let Some((current_session_id, sessions)) = session_context else {
+            if self
+                .audit
+                .record(
+                    &AuditEvent::new(
+                        request_id,
+                        principal,
+                        self.transport,
+                        AuditOperation::Exec,
+                        audit_failed("operation-not-supported"),
+                    )
+                    .with_paths([kill_path]),
+                )
+                .is_err()
+            {
+                record_rpc_error(
+                    NetconfOperation::KillSession,
+                    NetconfErrorTag::OperationFailed,
+                    started.elapsed(),
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::operation_failed(),
+                ));
+            }
+            record_rpc_error(
+                NetconfOperation::KillSession,
+                NetconfErrorTag::OperationNotSupported,
+                started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(message_id),
+                reply_attrs,
+                RpcError::operation_not_supported(),
+            ));
+        };
+
+        if request.session_id == current_session_id {
+            if self
+                .audit
+                .record(
+                    &AuditEvent::new(
+                        request_id,
+                        principal,
+                        self.transport,
+                        AuditOperation::Exec,
+                        audit_failed("invalid-value"),
+                    )
+                    .with_paths([kill_path]),
+                )
+                .is_err()
+            {
+                record_rpc_error(
+                    NetconfOperation::KillSession,
+                    NetconfErrorTag::OperationFailed,
+                    started.elapsed(),
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::operation_failed(),
+                ));
+            }
+            record_rpc_error(
+                NetconfOperation::KillSession,
+                NetconfErrorTag::InvalidValue,
+                started.elapsed(),
+            );
+            tracing::debug!(
+                operation = "kill-session",
+                error_tag = NetconfErrorTag::InvalidValue.as_str(),
+                "NETCONF kill-session rejected self-kill"
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(message_id),
+                reply_attrs,
+                RpcError::invalid_value(),
+            ));
+        }
+
+        match sessions.terminate_after(request.session_id, || {
+            self.audit
+                .record(
+                    &AuditEvent::new(
+                        request_id,
+                        principal,
+                        self.transport,
+                        AuditOperation::Exec,
+                        AuditOutcome::Success,
+                    )
+                    .with_paths([kill_path.clone()]),
+                )
+                .map_err(|_| ())
+        }) {
+            Err(()) => {
+                record_rpc_error(
+                    NetconfOperation::KillSession,
+                    NetconfErrorTag::OperationFailed,
+                    started.elapsed(),
+                );
+                RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::operation_failed(),
+                ))
+            }
+            Ok(KillSessionResult::Terminated) => {
+                record_rpc_success(NetconfOperation::KillSession, started.elapsed());
+                tracing::debug!(operation = "kill-session", "NETCONF kill-session succeeded");
+                RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(message_id, reply_attrs))
+            }
+            Ok(KillSessionResult::NotFound) => {
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            request_id,
+                            principal,
+                            self.transport,
+                            AuditOperation::Exec,
+                            audit_failed("data-missing"),
+                        )
+                        .with_paths([kill_path]),
+                    )
+                    .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::KillSession,
+                        NetconfErrorTag::OperationFailed,
+                        started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(message_id),
+                        reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                record_rpc_error(
+                    NetconfOperation::KillSession,
+                    NetconfErrorTag::DataMissing,
+                    started.elapsed(),
+                );
+                tracing::debug!(
+                    operation = "kill-session",
+                    error_tag = NetconfErrorTag::DataMissing.as_str(),
+                    "NETCONF kill-session target not found"
+                );
+                RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::data_missing(),
+                ))
+            }
+        }
     }
 
     fn handle_get_schema(
@@ -695,24 +1031,49 @@ where
         &self,
         request_id: RequestId,
         principal: &TrustedPrincipal,
-        err: &XmlError,
+        err: &RpcParseError,
     ) -> Result<(), AuditError> {
-        let reason = match (err.classification().error_type, err.classification().tag) {
+        let reason = match (
+            err.error.classification().error_type,
+            err.error.classification().tag,
+        ) {
             (NetconfErrorType::Rpc, NetconfErrorTag::MalformedMessage) => "malformed-message",
             (_, NetconfErrorTag::UnknownNamespace) => "unknown-namespace",
             (_, NetconfErrorTag::MissingAttribute) => "missing-attribute",
             (_, NetconfErrorTag::MissingElement) => "missing-element",
+            (_, NetconfErrorTag::InvalidValue) => "invalid-value",
             (_, NetconfErrorTag::TooBig) => "too-big",
             (_, NetconfErrorTag::OperationNotSupported) => "operation-not-supported",
             _ => "operation-failed",
         };
-        self.audit.record(&AuditEvent::new(
+        let event = AuditEvent::new(
             request_id,
             principal,
             self.transport,
-            AuditOperation::Read,
+            audit_operation_for_parse_failure(err),
             audit_failed(reason),
-        ))
+        );
+        let event = match err.operation_hint {
+            Some(RpcOperationHint::KillSession) => {
+                event.with_paths([schema_node_path(NETCONF_KILL_SESSION_PATH)])
+            }
+            None => event,
+        };
+        self.audit.record(&event)
+    }
+}
+
+fn audit_operation_for_parse_failure(err: &RpcParseError) -> AuditOperation {
+    match err.operation_hint {
+        Some(RpcOperationHint::KillSession) => AuditOperation::Exec,
+        None => AuditOperation::Read,
+    }
+}
+
+fn netconf_operation_for_parse_failure(err: &RpcParseError) -> NetconfOperation {
+    match err.operation_hint {
+        Some(RpcOperationHint::KillSession) => NetconfOperation::KillSession,
+        None => NetconfOperation::Unknown,
     }
 }
 
@@ -724,7 +1085,6 @@ fn audit_operation_for_unsupported(operation: UnsupportedOperation) -> AuditOper
         UnsupportedOperation::Validate => AuditOperation::Validate,
         UnsupportedOperation::Lock
         | UnsupportedOperation::Unlock
-        | UnsupportedOperation::KillSession
         | UnsupportedOperation::Commit
         | UnsupportedOperation::DiscardChanges => AuditOperation::Exec,
     }
@@ -745,6 +1105,7 @@ fn audit_failed(reason: &'static str) -> AuditOutcome {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::num::NonZeroU32;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1422,6 +1783,10 @@ mod tests {
         .with_auth_strength(AuthStrength::MutualTls)
     }
 
+    fn session_id(id: u32) -> NonZeroU32 {
+        NonZeroU32::new(id).expect("nonzero test session id")
+    }
+
     fn peer_policy() -> PeerPolicy {
         PeerPolicy {
             allowed_trust_domains: Some(HashSet::from([
@@ -1510,6 +1875,14 @@ mod tests {
         )
     }
 
+    fn allow_kill_session_rule(modules: &ModuleRegistry) -> NacmRule {
+        NacmRule::allow(
+            NacmAction::Exec,
+            YangPathPattern::parse(NETCONF_KILL_SESSION_PATH, modules)
+                .expect("allow kill-session path"),
+        )
+    }
+
     fn policy_allow_system_but_deny_secret() -> NacmPolicy {
         let mut modules = ModuleRegistry::new();
         modules
@@ -1526,6 +1899,7 @@ mod tests {
                 YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
             ))
             .add_rule(allow_close_session_rule(&modules))
+            .add_rule(allow_kill_session_rule(&modules))
             .build()
     }
 
@@ -1567,6 +1941,7 @@ mod tests {
                     .expect("allow monitoring path"),
             ))
             .add_rule(allow_close_session_rule(&modules))
+            .add_rule(allow_kill_session_rule(&modules))
             .build()
     }
 
@@ -1618,6 +1993,41 @@ mod tests {
         )
         .expect("server");
         (server, observed, audit)
+    }
+
+    async fn server_fixture_with_policy_source_and_audit<P, A>(
+        policy_source: P,
+        audit: A,
+    ) -> ReadOnlyNetconfServer<DemoConfig, TestBinding, P, A>
+    where
+        P: PolicySource,
+        A: AuditSink,
+    {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = TestBinding {
+            bus,
+            observed_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_yang_library_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_monitoring_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_with_defaults: Arc::new(Mutex::new(Vec::new())),
+            operational_mode: OperationalMode::Normal,
+            yang_library: false,
+            monitoring: false,
+            with_defaults: false,
+            get_schema_mode: GetSchemaMode::Ok,
+        };
+        ReadOnlyNetconfServer::new(binding, policy_source, audit, TransportType::NetconfTls)
+            .expect("server")
     }
 
     async fn server_fixture_with_yang_library() -> (
@@ -1866,6 +2276,12 @@ mod tests {
 
     fn close_session_rpc() -> String {
         format!(r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="301"><close-session/></rpc>"#)
+    }
+
+    fn kill_session_rpc(session_id: u64) -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="302"><kill-session><session-id>{session_id}</session-id></kill-session></rpc>"#
+        )
     }
 
     fn unsupported_edit_config_rpc() -> String {
@@ -2164,7 +2580,7 @@ mod tests {
     #[tokio::test]
     async fn default_server_does_not_advertise_yang_library() {
         let (server, _observed, _audit) = server_fixture().await;
-        let hello = server.server_hello(Some(77));
+        let hello = server.server_hello(Some(session_id(77)));
 
         assert!(hello.contains(NETCONF_BASE_1_0));
         assert!(hello.contains(NETCONF_BASE_1_1));
@@ -2199,7 +2615,7 @@ mod tests {
     async fn yang_library_binding_advertises_and_serves_registry_discovery() {
         let (server, observed, observed_yang_library, audit) =
             server_fixture_with_yang_library().await;
-        let hello = server.server_hello(Some(88));
+        let hello = server.server_hello(Some(session_id(88)));
 
         assert!(hello.contains(
             "urn:ietf:params:netconf:capability:yang-library:1.1?revision=2019-01-04&amp;content-id=fnv1a64%3Atest-schema"
@@ -2290,7 +2706,7 @@ mod tests {
             GetSchemaMode::Ok,
         )
         .await;
-        let hello = server.server_hello(Some(89));
+        let hello = server.server_hello(Some(session_id(89)));
 
         assert!(hello.contains(
             "urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring?module=ietf-netconf-monitoring&amp;revision=2010-10-04"
@@ -2917,6 +3333,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kill_session_without_registry_is_operation_not_supported() {
+        let (server, _observed, audit) = server_fixture().await;
+        let errors_before = netconf_rpc_errors("kill-session", "operation-not-supported");
+
+        let result = server.handle_rpc(
+            RequestId::new(),
+            &principal(),
+            &kill_session_rpc(99),
+            &MgmtLimits::default(),
+        );
+
+        assert!(!result.close_session);
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>operation-not-supported</error-tag>"));
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events[0].operation, AuditOperation::Exec);
+        assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_KILL_SESSION_PATH)]
+        );
+        assert!(netconf_rpc_errors("kill-session", "operation-not-supported") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn kill_session_rejects_self_kill_with_invalid_value() {
+        let (server, _observed, audit) = server_fixture().await;
+        let sessions = SessionRegistry::new();
+        let _current = sessions.register(80).expect("current session");
+        let errors_before = netconf_rpc_errors("kill-session", "invalid-value");
+
+        let result = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &kill_session_rpc(80),
+            &MgmtLimits::default(),
+            80,
+            &sessions,
+        );
+
+        assert!(!result.close_session);
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>invalid-value</error-tag>"));
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events[0].operation, AuditOperation::Exec);
+        assert_eq!(events[0].outcome, audit_failed("invalid-value"));
+        assert!(netconf_rpc_errors("kill-session", "invalid-value") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn kill_session_missing_target_returns_data_missing_without_value_leak() {
+        let (server, _observed, audit) = server_fixture().await;
+        let sessions = SessionRegistry::new();
+        let _current = sessions.register(80).expect("current session");
+        let errors_before = netconf_rpc_errors("kill-session", "data-missing");
+
+        let result = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &kill_session_rpc(99),
+            &MgmtLimits::default(),
+            80,
+            &sessions,
+        );
+
+        assert!(!result.close_session);
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>data-missing</error-tag>"));
+        assert!(!result.reply_xml.contains("99"));
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events[0].operation, AuditOperation::Exec);
+        assert_eq!(events[0].outcome, audit_failed("data-missing"));
+        assert!(netconf_rpc_errors("kill-session", "data-missing") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn kill_session_terminates_registered_target_and_audits_success() {
+        let (server, _observed, audit) = server_fixture().await;
+        let sessions = SessionRegistry::new();
+        let _current = sessions.register(80).expect("current session");
+        let mut target = sessions.register(81).expect("target session");
+        let success_before = netconf_rpc_requests("kill-session", "success");
+
+        let result = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &kill_session_rpc(81),
+            &MgmtLimits::default(),
+            80,
+            &sessions,
+        );
+
+        assert!(!result.close_session);
+        assert!(result.reply_xml.contains("<ok/>"));
+        target.terminated().await;
+        assert!(target.is_terminated());
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events[0].operation, AuditOperation::Exec);
+        assert_eq!(events[0].outcome, AuditOutcome::Success);
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_KILL_SESSION_PATH)]
+        );
+        assert!(netconf_rpc_requests("kill-session", "success") > success_before);
+    }
+
+    #[tokio::test]
+    async fn kill_session_without_exec_grant_is_access_denied_and_does_not_kill() {
+        let audit = CapturingAudit::default();
+        let server = server_fixture_with_policy_source_and_audit(
+            FixedPolicy(NacmPolicy::empty(PolicyVersion::new(404))),
+            audit.clone(),
+        )
+        .await;
+        let sessions = SessionRegistry::new();
+        let _current = sessions.register(80).expect("current session");
+        let target = sessions.register(81).expect("target session");
+
+        let result = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &kill_session_rpc(81),
+            &MgmtLimits::default(),
+            80,
+            &sessions,
+        );
+
+        assert!(!result.close_session);
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>access-denied</error-tag>"));
+        assert!(!result.reply_xml.contains("<ok/>"));
+        assert!(!result.reply_xml.contains("81"));
+        assert!(!target.is_terminated());
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Exec);
+        assert_eq!(events[0].outcome, audit_denied("access-denied"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_KILL_SESSION_PATH)]
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_session_policy_error_is_resource_denied_and_does_not_kill() {
+        let audit = CapturingAudit::default();
+        let server =
+            server_fixture_with_policy_source_and_audit(BrokenPolicySource, audit.clone()).await;
+        let sessions = SessionRegistry::new();
+        let _current = sessions.register(80).expect("current session");
+        let target = sessions.register(81).expect("target session");
+
+        let result = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &kill_session_rpc(81),
+            &MgmtLimits::default(),
+            80,
+            &sessions,
+        );
+
+        assert!(!result.close_session);
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>resource-denied</error-tag>"));
+        assert!(!result.reply_xml.contains("<ok/>"));
+        assert!(!result.reply_xml.contains("policy"));
+        assert!(!result.reply_xml.contains("81"));
+        assert!(!target.is_terminated());
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Exec);
+        assert_eq!(events[0].outcome, audit_failed("resource-denied"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_KILL_SESSION_PATH)]
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_session_audit_failure_prevents_target_termination() {
+        let server = server_fixture_with_policy_source_and_audit(
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            FailingAudit,
+        )
+        .await;
+        let sessions = SessionRegistry::new();
+        let _current = sessions.register(80).expect("current session");
+        let target = sessions.register(81).expect("target session");
+
+        let result = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &kill_session_rpc(81),
+            &MgmtLimits::default(),
+            80,
+            &sessions,
+        );
+
+        assert!(!result.close_session);
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>operation-failed</error-tag>"));
+        assert!(!result.reply_xml.contains("<ok/>"));
+        assert!(!result.reply_xml.contains("secret-admin"));
+        assert!(!result.reply_xml.contains("81"));
+        assert!(!target.is_terminated());
+    }
+
+    #[tokio::test]
     async fn close_session_without_exec_grant_is_access_denied_and_keeps_session_open() {
         let bus = Arc::new(
             ConfigBus::new_dev_only(
@@ -3218,7 +3848,7 @@ mod tests {
         let failures_before = netconf_rpc_requests("get-config", "failure");
         let errors_before = netconf_rpc_errors("get-config", "operation-not-supported");
 
-        let hello = server.server_hello(Some(78));
+        let hello = server.server_hello(Some(session_id(78)));
         assert!(!hello.contains("with-defaults"));
 
         let reply = server.handle_rpc_xml(
@@ -3246,7 +3876,7 @@ mod tests {
         let failures_before = netconf_rpc_requests("get", "failure");
         let errors_before = netconf_rpc_errors("get", "operation-not-supported");
 
-        let hello = server.server_hello(Some(79));
+        let hello = server.server_hello(Some(session_id(79)));
         assert!(!hello.contains("with-defaults"));
 
         let reply = server.handle_rpc_xml(
@@ -3273,7 +3903,7 @@ mod tests {
         let (server, observed, observed_defaults, audit) = server_fixture_with_defaults().await;
         let success_before = netconf_rpc_requests("get-config", "success");
 
-        let hello = server.server_hello(Some(80));
+        let hello = server.server_hello(Some(session_id(80)));
         assert!(hello.contains(
             "urn:ietf:params:netconf:capability:with-defaults:1.0?basic-mode=report-all&amp;also-supported=trim,explicit,report-all-tagged"
         ));
@@ -3381,7 +4011,7 @@ mod tests {
             server_fixture_with_advertised_defaults_but_no_projection().await;
         let failures_before = netconf_rpc_requests("get-config", "failure");
 
-        let hello = server.server_hello(Some(81));
+        let hello = server.server_hello(Some(session_id(81)));
         assert!(
             hello.contains("urn:ietf:params:netconf:capability:with-defaults:1.0?basic-mode=trim")
         );
@@ -3426,7 +4056,7 @@ mod tests {
         )
         .await;
 
-        let hello = server.server_hello(Some(82));
+        let hello = server.server_hello(Some(session_id(82)));
         assert!(hello.contains(
             "urn:ietf:params:netconf:capability:yang-library:1.1?revision=2019-01-04&amp;content-id=fnv1a64%3Atest-schema"
         ));
@@ -3460,7 +4090,7 @@ mod tests {
         )
         .await;
 
-        let hello = server.server_hello(Some(83));
+        let hello = server.server_hello(Some(session_id(83)));
         assert!(hello.contains(
             "urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring?module=ietf-netconf-monitoring&amp;revision=2010-10-04"
         ));
@@ -3663,6 +4293,55 @@ mod tests {
         assert!(!reply.contains("do-not-leak"));
         assert!(netconf_rpc_requests("unknown", "failure") > failures_before);
         assert!(netconf_rpc_errors("unknown", "malformed-message") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn invalid_kill_session_value_audits_invalid_value_without_payload() {
+        let (server, _observed, audit) = server_fixture().await;
+        let errors_before = netconf_rpc_errors("kill-session", "invalid-value");
+        let rpc = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="bad-kill"><kill-session><session-id>4294967296</session-id></kill-session></rpc>"#
+        );
+
+        let reply =
+            server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &MgmtLimits::default());
+
+        assert!(reply.contains(r#"message-id="bad-kill""#));
+        assert!(reply.contains("<error-type>application</error-type>"));
+        assert!(reply.contains("<error-tag>invalid-value</error-tag>"));
+        assert!(!reply.contains("4294967296"));
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events[0].operation, AuditOperation::Exec);
+        assert_eq!(events[0].outcome, audit_failed("invalid-value"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_KILL_SESSION_PATH)]
+        );
+        assert!(netconf_rpc_errors("kill-session", "invalid-value") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn wrong_namespace_kill_session_audits_as_exec_without_accepting_it() {
+        let (server, _observed, audit) = server_fixture().await;
+        let errors_before = netconf_rpc_errors("kill-session", "unknown-namespace");
+        let rpc = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" xmlns:bad="urn:example:bad" message-id="bad-ns"><bad:kill-session><session-id>42</session-id></bad:kill-session></rpc>"#
+        );
+
+        let reply =
+            server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &MgmtLimits::default());
+
+        assert!(reply.contains(r#"message-id="bad-ns""#));
+        assert!(reply.contains("<error-tag>unknown-namespace</error-tag>"));
+        assert!(!reply.contains("42"));
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events[0].operation, AuditOperation::Exec);
+        assert_eq!(events[0].outcome, audit_failed("unknown-namespace"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_KILL_SESSION_PATH)]
+        );
+        assert!(netconf_rpc_errors("kill-session", "unknown-namespace") > errors_before);
     }
 
     fn netconf_rpc_requests(operation: &str, outcome: &str) -> u64 {

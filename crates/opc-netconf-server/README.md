@@ -29,11 +29,15 @@ The current slice is intentionally read-only and capability-honest:
   elements when a copied default namespace would otherwise collide with the
   reply namespace. XML text/CDATA plus non-text event payloads (comments,
   processing instructions, declarations, doctypes, and entity references) are
-  value-bounded before handling. Reserved XML/XMLNS namespace binding misuse, XML declarations
-  that are not the first parsed event, and unexpected protocol-container text
-  are rejected.
-- `<close-session>` with NACM `exec` authorization, `<ok/>` reply, and clean
-  session teardown.
+  value-bounded before handling. Reserved XML/XMLNS namespace binding misuse,
+  XML declarations that are not the first parsed event, and unexpected
+  protocol-container text are rejected.
+- `<close-session>` and `<kill-session>` with NACM `exec` authorization,
+  payload-free denial/failure errors, audited outcomes, self-kill rejection,
+  valid local session-id enforcement with exhausted-range rejection, and
+  audit-before-signal in-process session-registry termination for live target
+  sessions, including registered targets still waiting for client `<hello>` or
+  blocked writing server hello / RPC replies.
 - Known-but-unimplemented NETCONF base operations are bounded, audited, and
   rejected with `operation-not-supported` while preserving `message-id`;
   bounded text and CDATA payloads inside those RPCs are ignored and never
@@ -72,6 +76,18 @@ The current slice is intentionally read-only and capability-honest:
 - Read audit through `opc-mgmt-audit`.
 - NETCONF RPC/session/NACM-denial metrics emitted through the shared
   `opc-redaction` registry with low-cardinality sanitized labels.
+
+Complete base-session behavior is provided by the session runners. Direct
+`ReadOnlyNetconfServer::handle_rpc` and `handle_rpc_xml` calls are low-level,
+registry-free dispatch helpers: they preserve parser/audit/metrics/reply
+behavior for one RPC, but `<kill-session>` returns `operation-not-supported`
+without a live `SessionRegistry`, and `handle_rpc_xml` discards the
+`<close-session>` close signal. The raw hello renderers require `NonZeroU32`
+for a supplied session id, so direct helper callers cannot render `0` or an
+out-of-range `<session-id>`. Custom transports that advertise a server
+`<hello>` should use `run_read_only_session_with_registry` or
+`run_read_only_tls_session_with_registry` for audited cross-session
+`<kill-session>` semantics.
 
 It does not implement SSH, Call Home, candidate/startup datastores, XPath
 filters, subtree content-match/attribute-match forms, `:with-defaults` default

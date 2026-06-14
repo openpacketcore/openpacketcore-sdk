@@ -96,6 +96,14 @@ impl RpcError {
         )
     }
 
+    /// `(application, data-missing)`.
+    pub const fn data_missing() -> Self {
+        Self::new(
+            NetconfError::new(NetconfErrorType::Application, NetconfErrorTag::DataMissing),
+            "data missing",
+        )
+    }
+
     /// `(application, operation-failed)`.
     pub const fn operation_failed() -> Self {
         Self::new(

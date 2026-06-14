@@ -12,6 +12,7 @@ use thiserror::Error;
 
 use crate::capabilities::{NETCONF_BASE_NS, NETCONF_MONITORING_NS, WITH_DEFAULTS_NS};
 use crate::error::RpcReplyAttributes;
+use crate::session_registry::is_valid_session_id;
 
 const XML_NAMESPACE_URI: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NAMESPACE_URI: &str = "http://www.w3.org/2000/xmlns/";
@@ -42,23 +43,27 @@ pub(crate) struct RpcParseError {
     pub message_id: Option<String>,
     /// Extra request `<rpc>` attributes parsed before this failure.
     pub reply_attrs: RpcReplyAttributes,
+    /// Recognized RPC operation context at the point parsing failed.
+    pub operation_hint: Option<RpcOperationHint>,
     /// Payload-free parse error.
     pub error: XmlError,
 }
 
 impl RpcParseError {
     fn new(message_id: Option<String>, error: XmlError) -> Self {
-        Self::with_reply_attrs(message_id, RpcReplyAttributes::default(), error)
+        Self::with_context(message_id, RpcReplyAttributes::default(), None, error)
     }
 
-    fn with_reply_attrs(
+    fn with_context(
         message_id: Option<String>,
         reply_attrs: RpcReplyAttributes,
+        operation_hint: Option<RpcOperationHint>,
         error: XmlError,
     ) -> Self {
         Self {
             message_id,
             reply_attrs,
+            operation_hint,
             error,
         }
     }
@@ -66,6 +71,13 @@ impl RpcParseError {
     fn without_message_id(error: XmlError) -> Self {
         Self::new(None, error)
     }
+}
+
+/// RPC operation context available before the full RPC can be parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RpcOperationHint {
+    /// Base NETCONF `<kill-session>`.
+    KillSession,
 }
 
 /// Supported parsed RPC operations.
@@ -77,6 +89,8 @@ pub enum RpcOperation {
     Get(GetRequest),
     /// `<close-session>`.
     CloseSession,
+    /// `<kill-session>`.
+    KillSession(KillSessionRequest),
     /// RFC 6022 `<get-schema>`.
     GetSchema(GetSchemaRequest),
     /// A known NETCONF operation that this read-only slice deliberately does
@@ -95,6 +109,13 @@ pub struct GetSchemaRequest {
     pub format: String,
 }
 
+/// RFC 6241 `<kill-session>` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KillSessionRequest {
+    /// Target NETCONF session id.
+    pub session_id: u64,
+}
+
 /// Known NETCONF operations that are parsed only to reject safely with the
 /// request `message-id` preserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,8 +130,6 @@ pub enum UnsupportedOperation {
     Lock,
     /// `<unlock>`.
     Unlock,
-    /// `<kill-session>`.
-    KillSession,
     /// `<commit>`.
     Commit,
     /// `<discard-changes>`.
@@ -128,7 +147,6 @@ impl UnsupportedOperation {
             Self::DeleteConfig => "delete-config",
             Self::Lock => "lock",
             Self::Unlock => "unlock",
-            Self::KillSession => "kill-session",
             Self::Commit => "commit",
             Self::DiscardChanges => "discard-changes",
             Self::Validate => "validate",
@@ -327,6 +345,9 @@ pub enum XmlError {
     /// The operation is not recognized by this parser.
     #[error("NETCONF RPC operation is not supported")]
     UnsupportedOperation,
+    /// A protocol value failed validation.
+    #[error("NETCONF RPC value is invalid")]
+    InvalidValue,
     /// A filter type is not valid for this server core.
     #[error("NETCONF filter type is invalid")]
     InvalidFilterType,
@@ -353,6 +374,7 @@ impl XmlError {
             Self::DuplicateElement | Self::InvalidFilterType | Self::UnsupportedFilterContent => {
                 NetconfError::new(Ty::Protocol, Tag::BadElement)
             }
+            Self::InvalidValue => NetconfError::new(Ty::Application, Tag::InvalidValue),
             Self::UnsupportedOperation => {
                 NetconfError::new(Ty::Protocol, Tag::OperationNotSupported)
             }
@@ -368,6 +390,7 @@ impl XmlError {
             Self::MissingElement => "missing element",
             Self::DuplicateElement => "duplicate element",
             Self::UnsupportedOperation => "operation not supported",
+            Self::InvalidValue => "invalid value",
             Self::InvalidFilterType => "invalid filter type",
             Self::UnsupportedFilterContent => "unsupported filter content",
             Self::Malformed
@@ -432,6 +455,11 @@ struct PartialGetSchema {
     format: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PartialKillSession {
+    session_id: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum GetSchemaField {
     Identifier,
@@ -451,6 +479,8 @@ struct ParserState {
     get: Option<PartialGet>,
     get_config: Option<PartialGetConfig>,
     get_schema: Option<PartialGetSchema>,
+    kill_session: Option<PartialKillSession>,
+    operation_hint: Option<RpcOperationHint>,
     close_session: bool,
     unsupported_operation: Option<UnsupportedOperation>,
     filter_depth: usize,
@@ -481,6 +511,7 @@ impl ParserState {
         let scoped = scoped_attributes(start, decoder, limits, self.scopes.last())?;
         let raw_name = start.name();
         let (prefix, local) = split_qname(raw_name.as_ref())?;
+        self.note_rpc_operation_hint(local);
         let namespace = resolve_namespace(prefix, &scoped.scope)?;
         let element = Element {
             local: local.to_string(),
@@ -559,6 +590,8 @@ impl ParserState {
             self.set_get_schema_text(GetSchemaField::Version, text)?;
         } else if self.local_path_is(&["rpc", "get-schema", "format"]) {
             self.set_get_schema_text(GetSchemaField::Format, text)?;
+        } else if self.local_path_is(&["rpc", "kill-session", "session-id"]) {
+            self.set_kill_session_id(text)?;
         } else if self.local_path_is(&["rpc", "get", "with-defaults"]) {
             self.set_get_with_defaults_text(text)?;
         } else if self.local_path_is(&["rpc", "get-config", "with-defaults"]) {
@@ -691,7 +724,15 @@ impl ParserState {
                 "delete-config" => self.set_unsupported(UnsupportedOperation::DeleteConfig)?,
                 "lock" => self.set_unsupported(UnsupportedOperation::Lock)?,
                 "unlock" => self.set_unsupported(UnsupportedOperation::Unlock)?,
-                "kill-session" => self.set_unsupported(UnsupportedOperation::KillSession)?,
+                "kill-session" => {
+                    if self.has_rpc_operation() {
+                        return Err(XmlError::DuplicateElement);
+                    }
+                    self.kill_session = Some(PartialKillSession::default());
+                    if !attrs.is_empty() {
+                        return Err(XmlError::Malformed);
+                    }
+                }
                 "commit" => self.set_unsupported(UnsupportedOperation::Commit)?,
                 "discard-changes" => self.set_unsupported(UnsupportedOperation::DiscardChanges)?,
                 "validate" => self.set_unsupported(UnsupportedOperation::Validate)?,
@@ -719,6 +760,11 @@ impl ParserState {
             }
         } else if self.local_path_is(&["rpc", "close-session"]) {
             Err(XmlError::Malformed)
+        } else if self.local_path_is(&["rpc", "kill-session"]) {
+            match element.local.as_str() {
+                "session-id" if element.namespace == NETCONF_BASE_NS && attrs.is_empty() => Ok(()),
+                _ => Err(XmlError::Malformed),
+            }
         } else if self.local_path_is(&["rpc", "get-schema"]) {
             match element.local.as_str() {
                 "identifier" | "version" | "format"
@@ -731,6 +777,7 @@ impl ParserState {
         } else if self.local_path_is(&["rpc", "get-schema", "identifier"])
             || self.local_path_is(&["rpc", "get-schema", "version"])
             || self.local_path_is(&["rpc", "get-schema", "format"])
+            || self.local_path_is(&["rpc", "kill-session", "session-id"])
             || self.local_path_is(&["rpc", "get", "with-defaults"])
             || self.local_path_is(&["rpc", "get-config", "with-defaults"])
         {
@@ -759,14 +806,32 @@ impl ParserState {
         self.get.is_some()
             || self.get_config.is_some()
             || self.get_schema.is_some()
+            || self.kill_session.is_some()
             || self.close_session
             || self.unsupported_operation.is_some()
     }
 
+    fn operation_hint(&self) -> Option<RpcOperationHint> {
+        self.operation_hint
+    }
+
+    fn note_rpc_operation_hint(&mut self, local: &str) {
+        if self.operation_hint.is_some()
+            || self.has_rpc_operation()
+            || !self.local_path_is(&["rpc"])
+        {
+            return;
+        }
+        if local == "kill-session" {
+            self.operation_hint = Some(RpcOperationHint::KillSession);
+        }
+    }
+
     fn get_schema_namespace_is_allowed(&self, element: &Element) -> bool {
         element.namespace == NETCONF_MONITORING_NS
-            && (self.local_path_is(&["rpc"])
-                || self.local_path_is(&["rpc", "get-schema"])
+            && ((self.local_path_is(&["rpc"]) && element.local == "get-schema")
+                || (self.local_path_is(&["rpc", "get-schema"])
+                    && matches!(element.local.as_str(), "identifier" | "version" | "format"))
                 || self.local_path_is(&["rpc", "get-schema", "identifier"])
                 || self.local_path_is(&["rpc", "get-schema", "version"])
                 || self.local_path_is(&["rpc", "get-schema", "format"]))
@@ -774,9 +839,10 @@ impl ParserState {
 
     fn with_defaults_namespace_is_allowed(&self, element: &Element) -> bool {
         element.namespace == WITH_DEFAULTS_NS
-            && (self.local_path_is(&["rpc", "get"])
+            && (((self.local_path_is(&["rpc", "get"])
+                || self.local_path_is(&["rpc", "get-config"]))
+                && element.local == "with-defaults")
                 || self.local_path_is(&["rpc", "get", "with-defaults"])
-                || self.local_path_is(&["rpc", "get-config"])
                 || self.local_path_is(&["rpc", "get-config", "with-defaults"]))
     }
 
@@ -795,6 +861,25 @@ impl ParserState {
             GetSchemaField::Format => &mut get_schema.format,
         };
         if slot.replace(value.to_string()).is_some() {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn set_kill_session_id(&mut self, text: &str) -> Result<(), XmlError> {
+        let kill_session = self
+            .kill_session
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        let value = text.trim();
+        if value.is_empty() {
+            return Err(XmlError::InvalidValue);
+        }
+        let session_id = value.parse::<u64>().map_err(|_| XmlError::InvalidValue)?;
+        if !is_valid_session_id(session_id) {
+            return Err(XmlError::InvalidValue);
+        }
+        if kill_session.session_id.replace(session_id).is_some() {
             return Err(XmlError::DuplicateElement);
         }
         Ok(())
@@ -1016,6 +1101,15 @@ impl ParserState {
                         operation: RpcOperation::CloseSession,
                     }));
                 }
+                if let Some(kill_session) = self.kill_session {
+                    return Ok(ParsedMessage::Rpc(ParsedRpc {
+                        message_id,
+                        reply_attrs,
+                        operation: RpcOperation::KillSession(KillSessionRequest {
+                            session_id: kill_session.session_id.ok_or(XmlError::MissingElement)?,
+                        }),
+                    }));
+                }
                 if let Some(get_schema) = self.get_schema {
                     return Ok(ParsedMessage::Rpc(ParsedRpc {
                         message_id,
@@ -1177,8 +1271,9 @@ fn parse_message_with_context(
 
     let message_id = state.message_id.clone();
     let reply_attrs = state.reply_attrs.clone();
+    let operation_hint = state.operation_hint();
     let parsed = state.finish().map_err(|err| {
-        RpcParseError::with_reply_attrs(message_id.clone(), reply_attrs.clone(), err)
+        RpcParseError::with_context(message_id.clone(), reply_attrs.clone(), operation_hint, err)
     })?;
     if let ParsedMessage::Rpc(ParsedRpc {
         operation:
@@ -1192,9 +1287,10 @@ fn parse_message_with_context(
             limits
                 .check_paths(filter.selections().len())
                 .map_err(|err| {
-                    RpcParseError::with_reply_attrs(
+                    RpcParseError::with_context(
                         Some(message_id.clone()),
                         reply_attrs.clone(),
+                        None,
                         err.into(),
                     )
                 })?;
@@ -1204,7 +1300,12 @@ fn parse_message_with_context(
 }
 
 fn parse_error(state: &ParserState, error: XmlError) -> RpcParseError {
-    RpcParseError::with_reply_attrs(state.message_id.clone(), state.reply_attrs.clone(), error)
+    RpcParseError::with_context(
+        state.message_id.clone(),
+        state.reply_attrs.clone(),
+        state.operation_hint(),
+        error,
+    )
 }
 
 fn validate_xml_decl_start(xml: &str) -> Result<(), XmlError> {
@@ -1531,6 +1632,108 @@ mod tests {
             .expect("parse close-session");
         assert_eq!(parsed.message_id, "101");
         assert_eq!(parsed.operation, RpcOperation::CloseSession);
+    }
+
+    #[test]
+    fn parses_kill_session() {
+        let parsed = parse_rpc(
+            &rpc("<kill-session><session-id>42</session-id></kill-session>"),
+            &MgmtLimits::default(),
+        )
+        .expect("parse kill-session");
+        assert_eq!(parsed.message_id, "101");
+        assert_eq!(
+            parsed.operation,
+            RpcOperation::KillSession(KillSessionRequest { session_id: 42 })
+        );
+    }
+
+    #[test]
+    fn parses_kill_session_yang_integer_lexical_forms() {
+        let with_plus = parse_rpc(
+            &rpc("<kill-session><session-id>+42</session-id></kill-session>"),
+            &MgmtLimits::default(),
+        )
+        .expect("parse signed lexical form");
+        assert_eq!(
+            with_plus.operation,
+            RpcOperation::KillSession(KillSessionRequest { session_id: 42 })
+        );
+
+        let leading_zeros = parse_rpc(
+            &rpc("<kill-session><session-id>00042</session-id></kill-session>"),
+            &MgmtLimits::default(),
+        )
+        .expect("parse leading-zero XML lexical form");
+        assert_eq!(
+            leading_zeros.operation,
+            RpcOperation::KillSession(KillSessionRequest { session_id: 42 })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_kill_session_shape_or_value() {
+        let missing = parse_rpc(&rpc("<kill-session/>"), &MgmtLimits::default())
+            .expect_err("missing session-id");
+        assert_eq!(missing, XmlError::MissingElement);
+
+        let duplicate = parse_rpc(
+            &rpc(
+                "<kill-session><session-id>42</session-id><session-id>43</session-id></kill-session>",
+            ),
+            &MgmtLimits::default(),
+        )
+        .expect_err("duplicate session-id");
+        assert_eq!(duplicate, XmlError::DuplicateElement);
+
+        let operation_attr = parse_rpc(
+            &rpc(r#"<kill-session unexpected="value"><session-id>42</session-id></kill-session>"#),
+            &MgmtLimits::default(),
+        )
+        .expect_err("unexpected kill-session attribute");
+        assert_eq!(operation_attr, XmlError::Malformed);
+
+        let session_id_attr = parse_rpc(
+            &rpc(r#"<kill-session><session-id unexpected="value">42</session-id></kill-session>"#),
+            &MgmtLimits::default(),
+        )
+        .expect_err("unexpected session-id attribute");
+        assert_eq!(session_id_attr, XmlError::Malformed);
+
+        let wrong_namespace = parse_rpc(
+            r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" xmlns:ncm="urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring" message-id="101"><ncm:kill-session><session-id>42</session-id></ncm:kill-session></rpc>"#,
+            &MgmtLimits::default(),
+        )
+        .expect_err("wrong kill-session namespace");
+        assert_eq!(wrong_namespace, XmlError::UnknownNamespace);
+
+        let zero = parse_rpc(
+            &rpc("<kill-session><session-id>0</session-id></kill-session>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("zero session-id");
+        assert_eq!(zero, XmlError::InvalidValue);
+
+        let negative = parse_rpc(
+            &rpc("<kill-session><session-id>-1</session-id></kill-session>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("negative session-id");
+        assert_eq!(negative, XmlError::InvalidValue);
+
+        let too_large = parse_rpc(
+            &rpc("<kill-session><session-id>4294967296</session-id></kill-session>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("session-id exceeds uint32");
+        assert_eq!(too_large, XmlError::InvalidValue);
+
+        let child = parse_rpc(
+            &rpc("<kill-session><session-id><nested/></session-id></kill-session>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("child under session-id");
+        assert_eq!(child, XmlError::Malformed);
     }
 
     #[test]
@@ -1952,5 +2155,9 @@ mod tests {
         let nc = XmlError::UnknownNamespace.classification();
         assert_eq!(nc.error_type, NetconfErrorType::Protocol);
         assert_eq!(nc.tag, NetconfErrorTag::UnknownNamespace);
+
+        let nc = XmlError::InvalidValue.classification();
+        assert_eq!(nc.error_type, NetconfErrorType::Application);
+        assert_eq!(nc.tag, NetconfErrorTag::InvalidValue);
     }
 }

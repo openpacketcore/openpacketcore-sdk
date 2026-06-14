@@ -1,5 +1,7 @@
 //! NETCONF capability constants and `<hello>` rendering.
 
+use std::num::NonZeroU32;
+
 use crate::binding::{NetconfMonitoringCapability, WithDefaultsCapability, YangLibraryCapability};
 use crate::error::xml_escape;
 
@@ -66,8 +68,12 @@ pub fn read_only_capabilities(
 }
 
 /// Renders a server `<hello>` document.
+///
+/// A NETCONF session id is optional in the raw renderer, but when present it is
+/// represented as [`NonZeroU32`] so callers cannot render an unaddressable
+/// `<session-id>`.
 pub fn render_server_hello(
-    session_id: Option<u64>,
+    session_id: Option<NonZeroU32>,
     yang_library: Option<&YangLibraryCapability>,
     monitoring: Option<&NetconfMonitoringCapability>,
     with_defaults: Option<&WithDefaultsCapability>,
@@ -127,7 +133,7 @@ const fn hex(nibble: u8) -> char {
     }
 }
 
-fn render_hello(capabilities: &[String], session_id: Option<u64>) -> String {
+fn render_hello(capabilities: &[String], session_id: Option<NonZeroU32>) -> String {
     let mut out = String::from(r#"<hello xmlns=""#);
     out.push_str(NETCONF_BASE_NS);
     out.push_str(r#""><capabilities>"#);
@@ -139,7 +145,7 @@ fn render_hello(capabilities: &[String], session_id: Option<u64>) -> String {
     out.push_str("</capabilities>");
     if let Some(session_id) = session_id {
         out.push_str("<session-id>");
-        out.push_str(&session_id.to_string());
+        out.push_str(&session_id.get().to_string());
         out.push_str("</session-id>");
     }
     out.push_str("</hello>");
@@ -179,7 +185,12 @@ mod tests {
             "urn:ietf:params:netconf:capability:yang-library:1.1?revision=2019-01-04&content-id=fnv1a64%3Aabc%26def"
         );
 
-        let hello = render_server_hello(Some(42), Some(&yang_library), None, None);
+        let hello = render_server_hello(
+            std::num::NonZeroU32::new(42),
+            Some(&yang_library),
+            None,
+            None,
+        );
         assert!(hello.contains("yang-library:1.1?revision=2019-01-04"));
         assert!(hello.contains("content-id=fnv1a64%3Aabc%26def"));
     }
@@ -220,7 +231,7 @@ mod tests {
 
     #[test]
     fn hello_contains_session_id_when_requested() {
-        let hello = render_server_hello(Some(42), None, None, None);
+        let hello = render_server_hello(std::num::NonZeroU32::new(42), None, None, None);
         assert!(hello.contains(NETCONF_BASE_1_0));
         assert!(hello.contains(NETCONF_BASE_1_1));
         assert!(hello.contains("<session-id>42</session-id>"));
