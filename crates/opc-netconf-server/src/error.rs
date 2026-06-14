@@ -51,6 +51,18 @@ pub struct RpcError {
     pub message: &'static str,
     /// Optional stable application error tag.
     pub app_tag: Option<&'static str>,
+    /// Optional RFC-defined error-info payload.
+    pub info: Option<RpcErrorInfo>,
+}
+
+/// Structured RFC-defined `<error-info>` payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcErrorInfo {
+    /// `lock-denied` owner session id.
+    LockDenied {
+        /// NETCONF session id of the lock owner, or zero for non-NETCONF owner.
+        session_id: u64,
+    },
 }
 
 impl RpcError {
@@ -60,6 +72,7 @@ impl RpcError {
             classification,
             message,
             app_tag: None,
+            info: None,
         }
     }
 
@@ -67,6 +80,19 @@ impl RpcError {
     pub const fn with_app_tag(mut self, app_tag: &'static str) -> Self {
         self.app_tag = Some(app_tag);
         self
+    }
+
+    /// `(protocol, lock-denied)` with RFC 6241 owner `session-id`.
+    pub const fn lock_denied(session_id: u64) -> Self {
+        Self {
+            classification: NetconfError::new(
+                NetconfErrorType::Protocol,
+                NetconfErrorTag::LockDenied,
+            ),
+            message: "lock denied",
+            app_tag: None,
+            info: Some(RpcErrorInfo::LockDenied { session_id }),
+        }
     }
 
     /// `(protocol, operation-not-supported)`.
@@ -241,6 +267,8 @@ pub fn rpc_error_reply_with_attrs(
     let error_severity_tag = netconf_tag(prefix.as_deref(), "error-severity");
     let error_message_tag = netconf_tag(prefix.as_deref(), "error-message");
     let error_app_tag = netconf_tag(prefix.as_deref(), "error-app-tag");
+    let error_info_tag = netconf_tag(prefix.as_deref(), "error-info");
+    let session_id_tag = netconf_tag(prefix.as_deref(), "session-id");
     out.push_str("><");
     out.push_str(&rpc_error_tag);
     out.push_str("><");
@@ -274,6 +302,23 @@ pub fn rpc_error_reply_with_attrs(
         out.push_str("</");
         out.push_str(&error_app_tag);
         out.push('>');
+    }
+    if let Some(info) = error.info {
+        match info {
+            RpcErrorInfo::LockDenied { session_id } => {
+                out.push('<');
+                out.push_str(&error_info_tag);
+                out.push_str("><");
+                out.push_str(&session_id_tag);
+                out.push('>');
+                out.push_str(&session_id.to_string());
+                out.push_str("</");
+                out.push_str(&session_id_tag);
+                out.push_str("></");
+                out.push_str(&error_info_tag);
+                out.push('>');
+            }
+        }
     }
     out.push_str("</");
     out.push_str(&rpc_error_tag);
@@ -405,5 +450,19 @@ mod tests {
         let error = rpc_error_reply_with_attrs(Some("m1"), &attrs, RpcError::operation_failed());
         assert!(error.contains("<nc1:rpc-error><nc1:error-type>"));
         assert!(error.contains("</nc1:rpc-error></nc1:rpc-reply>"));
+    }
+
+    #[test]
+    fn lock_denied_error_includes_prefixed_owner_session_id() {
+        let attrs = RpcReplyAttributes::from_pairs(vec![(
+            "xmlns".to_string(),
+            "urn:client:default".to_string(),
+        )]);
+
+        let reply = rpc_error_reply_with_attrs(Some("m1"), &attrs, RpcError::lock_denied(454));
+
+        assert!(reply.contains("<nc:rpc-error><nc:error-type>protocol</nc:error-type>"));
+        assert!(reply.contains("<nc:error-tag>lock-denied</nc:error-tag>"));
+        assert!(reply.contains("<nc:error-info><nc:session-id>454</nc:session-id></nc:error-info>"));
     }
 }

@@ -29,11 +29,12 @@
 //!   payloads (comments, processing instructions,
 //!   declarations, doctypes, and entity references) are value-bounded before
 //!   handling.
-//! - `<close-session>` and `<kill-session>` with NACM `exec` authorization,
-//!   payload-free denial/failure errors, audited outcomes, self-kill rejection,
-//!   valid local session-id enforcement with exhausted-range rejection, and
-//!   audit-before-signal in-process session-registry termination for live target
-//!   sessions, including targets blocked on session writes.
+//! - `<close-session>`, `<kill-session>`, and running datastore
+//!   `<lock>`/`<unlock>` with NACM `exec` authorization, payload-free
+//!   denial/failure errors, audited outcomes, self-kill rejection, valid local
+//!   session-id enforcement with exhausted-range rejection, audit-before-signal
+//!   in-process session-registry termination for live target sessions, and
+//!   audit-before-state-change lock ownership.
 //! - Known-but-unimplemented NETCONF base operations are parsed only far
 //!   enough to preserve `message-id`, audit the failed attempt, and return
 //!   payload-free `operation-not-supported`; bounded text and CDATA payloads
@@ -70,14 +71,16 @@
 //! public [`ReadOnlyNetconfServer::handle_rpc`] and
 //! [`ReadOnlyNetconfServer::handle_rpc_xml`] helpers are registry-free,
 //! low-level dispatch helpers: they preserve parser/audit/metrics/reply
-//! behavior for one RPC, but `<kill-session>` returns `operation-not-supported`
-//! without a live [`SessionRegistry`], and `handle_rpc_xml` discards the
-//! `<close-session>` close signal. The raw hello renderers require
+//! behavior for one RPC, but `<kill-session>`, `<lock>`, and `<unlock>` return
+//! `operation-not-supported` without a live [`SessionRegistry`], and
+//! `handle_rpc_xml` discards the `<close-session>` close signal. The raw hello
+//! renderers require
 //! `NonZeroU32` for a supplied session id, so direct helper callers cannot
 //! render `0` or an out-of-range `<session-id>`. Custom transports that
-//! advertise a server `<hello>` should use [`run_read_only_session_with_registry`] or
+//! advertise a server `<hello>` should use
+//! [`run_read_only_session_with_registry`] or
 //! [`run_read_only_tls_session_with_registry`] to get audited cross-session
-//! `<kill-session>` semantics.
+//! `<kill-session>` and running datastore lock semantics.
 //!
 //! The raw session-registry controls are intentionally not part of the public
 //! API. Custom transports share a [`SessionRegistry`] by passing it into
@@ -193,6 +196,7 @@ pub use transport::{
 };
 pub use xml::{
     parse_client_hello, parse_rpc, ClientHello, Datastore, Filter, FilterElement, FilterKind,
-    GetConfigRequest, GetRequest, KillSessionRequest, ParsedRpc, RpcOperation, SubtreeFilter,
-    SubtreeSelection, UnsupportedOperation, WithDefaultsMode, XmlError,
+    GetConfigRequest, GetRequest, KillSessionRequest, LockRequest, ParsedRpc, RpcOperation,
+    SubtreeFilter, SubtreeSelection, UnlockRequest, UnsupportedOperation, WithDefaultsMode,
+    XmlError,
 };
