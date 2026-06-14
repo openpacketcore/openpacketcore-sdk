@@ -210,22 +210,22 @@ pub fn rpc_ok_reply_with_attrs(
 }
 
 /// Renders a successful RFC 6022 `<get-schema>` `<rpc-reply>`.
-pub fn rpc_get_schema_reply(message_id: &str, schema_xml: &str) -> String {
-    rpc_get_schema_reply_with_attrs(message_id, &RpcReplyAttributes::default(), schema_xml)
+pub fn rpc_get_schema_reply(message_id: &str, schema_text: &str) -> String {
+    rpc_get_schema_reply_with_attrs(message_id, &RpcReplyAttributes::default(), schema_text)
 }
 
 /// Renders a successful RFC 6022 `<get-schema>` reply with copied attributes.
 pub fn rpc_get_schema_reply_with_attrs(
     message_id: &str,
     reply_attrs: &RpcReplyAttributes,
-    schema_xml: &str,
+    schema_text: &str,
 ) -> String {
     let mut out = String::new();
     let prefix = append_rpc_reply_start(&mut out, Some(message_id), reply_attrs);
     out.push_str(r#"><data xmlns=""#);
     out.push_str(NETCONF_MONITORING_NS);
     out.push_str(r#"">"#);
-    out.push_str(schema_xml);
+    out.push_str(&xml_escape(schema_text));
     out.push_str("</data>");
     append_rpc_reply_end(&mut out, prefix.as_deref());
     out
@@ -422,6 +422,18 @@ mod tests {
 
         let error = rpc_error_reply_with_attrs(Some("m1"), &attrs, RpcError::operation_failed());
         assert!(error.contains(r#"trace:id="a&amp;b&quot;c""#));
+    }
+
+    #[test]
+    fn get_schema_reply_escapes_raw_yang_source_text() {
+        let reply = rpc_get_schema_reply_with_attrs(
+            "m1",
+            &RpcReplyAttributes::default(),
+            r#"module demo { description "a < b & c"; }"#,
+        );
+        assert!(reply.contains("module demo"));
+        assert!(reply.contains("&quot;a &lt; b &amp; c&quot;"));
+        assert!(!reply.contains("\"a < b & c\""));
     }
 
     #[test]
