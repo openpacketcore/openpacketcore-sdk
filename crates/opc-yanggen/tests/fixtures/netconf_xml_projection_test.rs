@@ -614,3 +614,28 @@ fn report_all_tagged_no_duplicate_wd_declaration() {
     }
     assert_eq!(found, 1, "wd namespace should be declared exactly once");
 }
+
+#[test]
+fn report_all_tagged_avoids_served_module_prefix_collision() {
+    let mut system = System::default();
+    system.colliding_default = LeafPresence::Defaulted("collision".to_string());
+
+    let xml = renderer()
+        .render_running_config(
+            &system,
+            &["/ex:system/wd:colliding-default"],
+            DefaultReport::ReportAllTagged,
+        )
+        .unwrap();
+
+    assert!(xml.contains("xmlns:wd=\"urn:wd-prefix-module\""));
+    assert!(xml.contains(
+        "xmlns:wd1=\"urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults\""
+    ));
+    assert!(xml.contains(
+        "<wd:colliding-default wd1:default=\"true\">collision</wd:colliding-default>"
+    ));
+    assert!(!xml.contains(
+        "xmlns:wd=\"urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults\""
+    ));
+}

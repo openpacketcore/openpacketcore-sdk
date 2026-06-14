@@ -206,7 +206,7 @@ fn render_container_fn(
                     .map(|(prefix, ns)| {
                         format!(
                             " xmlns:{}=\"{}\"",
-                            opc_mgmt_schema::xml_escape_attr(prefix),
+                            opc_mgmt_schema::xml_escape_attr(&prefix),
                             opc_mgmt_schema::xml_escape_attr(ns)
                         )
                     })
@@ -333,7 +333,7 @@ fn render_list_entry_fn(
                     .map(|(prefix, ns)| {
                         format!(
                             " xmlns:{}=\"{}\"",
-                            opc_mgmt_schema::xml_escape_attr(prefix),
+                            opc_mgmt_schema::xml_escape_attr(&prefix),
                             opc_mgmt_schema::xml_escape_attr(ns)
                         )
                     })

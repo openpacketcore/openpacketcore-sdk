@@ -112,7 +112,8 @@ pub enum DefaultReport {
     Trim,
     /// Report only values explicitly set by a client.
     Explicit,
-    /// Report all data and tag schema-defaulted values with `wd:default="true"`.
+    /// Report all data and tag schema-defaulted values with a
+    /// with-defaults `default="true"` attribute.
     ReportAllTagged,
 }
 
@@ -782,13 +783,10 @@ impl<'a> NetconfXmlRenderContext<'a> {
     /// prefix so root namespace declarations are deterministic.
     ///
     /// When the report mode is [`DefaultReport::ReportAllTagged`], the RFC 6243
-    /// `wd` namespace is included so the root element can declare it once for
-    /// all `wd:default="true"` attributes emitted by leaf renderers.
-    pub fn module_namespaces(&self) -> Vec<(&'static str, &'static str)> {
-        let mut by_prefix = std::collections::BTreeMap::<&'static str, &'static str>::new();
-        if self.report == DefaultReport::ReportAllTagged {
-            by_prefix.insert("wd", WITH_DEFAULTS_NS);
-        }
+    /// with-defaults namespace is included under a deterministic collision-free
+    /// prefix (`wd`, or `wdN` if selected data already uses `wd`).
+    pub fn module_namespaces(&self) -> Vec<(String, &'static str)> {
+        let mut by_prefix = std::collections::BTreeMap::<String, &'static str>::new();
         for path in self.selection {
             for seg in path.split('/') {
                 if seg.is_empty() {
@@ -801,9 +799,13 @@ impl<'a> NetconfXmlRenderContext<'a> {
                     .iter()
                     .find(|m| m.name == module_or_prefix || m.prefix == module_or_prefix)
                 {
-                    by_prefix.insert(model.prefix, model.namespace);
+                    by_prefix.insert(model.prefix.to_string(), model.namespace);
                 }
             }
+        }
+        if self.report == DefaultReport::ReportAllTagged {
+            let prefix = with_defaults_prefix(by_prefix.keys().map(String::as_str));
+            by_prefix.insert(prefix, WITH_DEFAULTS_NS);
         }
         by_prefix.into_iter().collect()
     }
@@ -821,8 +823,9 @@ impl<'a> NetconfXmlRenderContext<'a> {
     ///
     /// When `is_defaulted` is `true` and the report mode is
     /// [`DefaultReport::ReportAllTagged`], the element carries the RFC 6243
-    /// `wd:default="true"` attribute. The caller must ensure the `wd` prefix
-    /// is declared by the outermost rendered element (see
+    /// `default="true"` attribute in the with-defaults namespace. The caller
+    /// must ensure the selected with-defaults prefix is declared by the
+    /// outermost rendered element (see
     /// [`Self::module_namespaces`]).
     pub fn format_leaf_with_default(
         &self,
@@ -838,9 +841,15 @@ impl<'a> NetconfXmlRenderContext<'a> {
             redact(raw_value, data_class, RedactionLevel::Mask, None, None).to_string()
         };
         let default_attr = if is_defaulted && self.report == DefaultReport::ReportAllTagged {
-            r#" wd:default="true""#
+            let used_prefixes = self
+                .module_namespaces()
+                .into_iter()
+                .filter_map(|(prefix, ns)| (ns != WITH_DEFAULTS_NS).then_some(prefix))
+                .collect::<Vec<_>>();
+            let prefix = with_defaults_prefix(used_prefixes.iter().map(String::as_str));
+            format!(r#" {prefix}:default="true""#)
         } else {
-            ""
+            String::new()
         };
         if value.is_empty() {
             Ok(format!("<{name}{default_attr}/>"))
@@ -851,6 +860,22 @@ impl<'a> NetconfXmlRenderContext<'a> {
             ))
         }
     }
+}
+
+fn with_defaults_prefix<'a>(used_prefixes: impl IntoIterator<Item = &'a str>) -> String {
+    let used = used_prefixes
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if !used.contains("wd") {
+        return "wd".to_string();
+    }
+    for idx in 1usize.. {
+        let candidate = format!("wd{idx}");
+        if !used.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded prefix search must find a free with-defaults prefix")
 }
 
 /// XML-escape text content.
@@ -1481,7 +1506,93 @@ mod tests {
         );
 
         let ns = ctx.module_namespaces();
-        assert_eq!(ns, vec![("ex", "urn:example"), ("ot", "urn:other")]);
+        assert_eq!(
+            ns,
+            vec![
+                ("ex".to_string(), "urn:example"),
+                ("ot".to_string(), "urn:other")
+            ]
+        );
+    }
+
+    #[test]
+    fn report_all_tagged_namespace_avoids_selected_module_prefix_collision() {
+        static MODELS: &[ModelData] = &[
+            ModelData {
+                name: "example",
+                revision: "",
+                namespace: "urn:example",
+                prefix: "ex",
+            },
+            ModelData {
+                name: "with-default-prefix",
+                revision: "",
+                namespace: "urn:with-default-prefix",
+                prefix: "wd",
+            },
+        ];
+        static NODES: &[NodeMeta] = &[
+            NodeMeta {
+                path: "/ex:system",
+                module: "example",
+                kind: NodeKind::Container,
+                config: true,
+                leaf_type: None,
+                key_leaves: &[],
+                data_class: DataClass::Public,
+                default: None,
+                has_default: false,
+                presence: false,
+                child_paths: &["/ex:system/wd:colliding-default"],
+            },
+            NodeMeta {
+                path: "/ex:system/wd:colliding-default",
+                module: "with-default-prefix",
+                kind: NodeKind::Leaf,
+                config: true,
+                leaf_type: Some(LeafType::String),
+                key_leaves: &[],
+                data_class: DataClass::Public,
+                default: Some("collision"),
+                has_default: true,
+                presence: false,
+                child_paths: &[],
+            },
+        ];
+
+        struct TestRegistry;
+        impl SchemaRegistry for TestRegistry {
+            fn schema_digest(&self) -> &'static str {
+                "digest"
+            }
+            fn served_models(&self) -> &'static [ModelData] {
+                MODELS
+            }
+            fn nodes(&self) -> &'static [NodeMeta] {
+                NODES
+            }
+            fn origins(&self) -> &'static [OriginEntry] {
+                &[]
+            }
+        }
+
+        let reg = TestRegistry;
+        let selection: &[&str] = &["/ex:system/wd:colliding-default"];
+        let ctx = NetconfXmlRenderContext::new(&reg, selection, DefaultReport::ReportAllTagged);
+
+        assert_eq!(
+            ctx.module_namespaces(),
+            vec![
+                ("ex".to_string(), "urn:example"),
+                ("wd".to_string(), "urn:with-default-prefix"),
+                ("wd1".to_string(), WITH_DEFAULTS_NS),
+            ]
+        );
+        assert_eq!(
+            ctx.format_leaf_with_default("/ex:system/wd:colliding-default", "collision", true)
+                .unwrap(),
+            r#"<wd:colliding-default wd1:default="true">collision</wd:colliding-default>"#
+        );
     }
 
     #[test]
