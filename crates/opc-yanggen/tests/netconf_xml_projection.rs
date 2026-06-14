@@ -33,6 +33,10 @@ fn build_input() -> CanonicalInput {
                 "/ex:system/ex:uptime".to_string(),
                 "/ex:system/ex:dns".to_string(),
                 "/ex:system/ex:interfaces".to_string(),
+                "/ex:system/ex:routes".to_string(),
+                "/ex:system/ex:servers".to_string(),
+                "/ex:system/ex:tags".to_string(),
+                "/ex:system/ex:custom-tags".to_string(),
             ],
             source: source.clone(),
             ..Default::default()
@@ -100,7 +104,13 @@ fn build_input() -> CanonicalInput {
             kind: SchemaNodeKind::List,
             config: true,
             key_leaves: vec!["name".to_string()],
-            child_paths: vec!["/ex:system/ex:interfaces/ex:name".to_string()],
+            child_paths: vec![
+                "/ex:system/ex:interfaces/ex:name".to_string(),
+                "/ex:system/ex:interfaces/ex:mtu".to_string(),
+                "/ex:system/ex:interfaces/ex:admin".to_string(),
+                "/ex:system/ex:interfaces/ex:auth-key".to_string(),
+                "/ex:system/ex:interfaces/ex:sub-interfaces".to_string(),
+            ],
             source: source.clone(),
             ..Default::default()
         },
@@ -110,6 +120,135 @@ fn build_input() -> CanonicalInput {
             kind: SchemaNodeKind::Leaf,
             config: true,
             type_ref: Some(TypeRef::String),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:interfaces/ex:mtu".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::Uint16),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:interfaces/ex:admin".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::Boolean),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:interfaces/ex:auth-key".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            data_class: Some("security-secret".to_string()),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:interfaces/ex:sub-interfaces".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::List,
+            config: true,
+            key_leaves: vec!["id".to_string()],
+            child_paths: vec![
+                "/ex:system/ex:interfaces/ex:sub-interfaces/ex:id".to_string(),
+                "/ex:system/ex:interfaces/ex:sub-interfaces/ex:description".to_string(),
+            ],
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:interfaces/ex:sub-interfaces/ex:id".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::Uint16),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:interfaces/ex:sub-interfaces/ex:description".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:routes".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::List,
+            config: true,
+            key_leaves: vec!["dest".to_string(), "next-hop".to_string()],
+            child_paths: vec![
+                "/ex:system/ex:routes/ex:dest".to_string(),
+                "/ex:system/ex:routes/ex:next-hop".to_string(),
+                "/ex:system/ex:routes/ex:metric".to_string(),
+            ],
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:routes/ex:dest".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:routes/ex:next-hop".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:routes/ex:metric".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::Uint32),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:servers".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::LeafList,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:tags".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::LeafList,
+            config: true,
+            type_ref: Some(TypeRef::Uint16),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:custom-tags".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::LeafList,
+            config: true,
+            type_ref: Some(TypeRef::Custom {
+                name: "CustomTag".to_string(),
+            }),
             source: source.clone(),
             ..Default::default()
         },
@@ -161,7 +300,20 @@ fn generated_netconf_xml_projection() {
         } else {
             name
         };
-        fs::write(src_dir.join(name), content).unwrap();
+        fs::write(src_dir.join(&name), content).unwrap();
+        if name == "types.rs" {
+            // The schema intentionally contains a custom-typed leaf-list so that
+            // the projection can exercise runtime fail-closed for unsupported
+            // custom types. Provide a minimal placeholder type that satisfies
+            // the generated struct's trait bounds without claiming a real codec.
+            let placeholder = r#"
+
+/// Placeholder for the intentionally-unsupported custom leaf-list element type.
+pub type CustomTag = String;
+"#;
+            let augmented = fs::read_to_string(src_dir.join("types.rs")).unwrap() + placeholder;
+            fs::write(src_dir.join("types.rs"), augmented).unwrap();
+        }
     }
 
     let workspace_dir = std::env::current_dir()
