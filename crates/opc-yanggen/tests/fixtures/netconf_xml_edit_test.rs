@@ -64,6 +64,42 @@ fn scalar_leaf_merge_creates_value() {
 }
 
 #[test]
+fn default_operation_none_leaf_is_noop() {
+    let mut running = empty_system();
+    running.hostname = LeafPresence::Explicit("old".to_string());
+    let edit = container(
+        "/ex:system",
+        EditOperation::None,
+        vec![leaf("/ex:system/ex:hostname", EditOperation::None, "new")],
+    );
+
+    let candidate = applicator().apply_edit_config(&running, &edit).unwrap();
+
+    assert_eq!(candidate.hostname, LeafPresence::Explicit("old".to_string()));
+}
+
+#[test]
+fn string_leaf_edit_preserves_leading_and_trailing_whitespace() {
+    let running = empty_system();
+    let edit = container(
+        "/ex:system",
+        EditOperation::Merge,
+        vec![leaf(
+            "/ex:system/ex:hostname",
+            EditOperation::Merge,
+            "  router1  ",
+        )],
+    );
+
+    let candidate = applicator().apply_edit_config(&running, &edit).unwrap();
+
+    assert_eq!(
+        candidate.hostname,
+        LeafPresence::Explicit("  router1  ".to_string())
+    );
+}
+
+#[test]
 fn scalar_leaf_replace_overwrites_existing() {
     let mut running = empty_system();
     running.hostname = LeafPresence::Explicit("old".to_string());
@@ -185,6 +221,54 @@ fn nested_container_merge_creates_container_and_leaf() {
 }
 
 #[test]
+fn default_operation_none_container_does_not_materialize_empty_frame() {
+    let running = empty_system();
+    let edit = container(
+        "/ex:system",
+        EditOperation::None,
+        vec![container(
+            "/ex:system/ex:dns",
+            EditOperation::None,
+            vec![leaf(
+                "/ex:system/ex:dns/ex:server",
+                EditOperation::None,
+                "8.8.8.8",
+            )],
+        )],
+    );
+
+    let candidate = applicator().apply_edit_config(&running, &edit).unwrap();
+
+    assert!(candidate.dns.is_none());
+}
+
+#[test]
+fn default_operation_none_container_can_frame_explicit_child_op() {
+    let running = empty_system();
+    let edit = container(
+        "/ex:system",
+        EditOperation::None,
+        vec![container(
+            "/ex:system/ex:dns",
+            EditOperation::None,
+            vec![leaf(
+                "/ex:system/ex:dns/ex:server",
+                EditOperation::Merge,
+                "8.8.8.8",
+            )],
+        )],
+    );
+
+    let candidate = applicator().apply_edit_config(&running, &edit).unwrap();
+    let dns = candidate.dns.expect("explicit child op should create frame");
+
+    assert_eq!(
+        dns.server,
+        LeafPresence::Explicit("8.8.8.8".to_string())
+    );
+}
+
+#[test]
 fn nested_container_replace_resets_subtree() {
     let mut running = empty_system();
     let mut dns = Dns::default();
@@ -261,6 +345,86 @@ fn keyed_list_create_and_merge() {
     let eth0 = candidate2.interfaces.get("eth0").unwrap();
     assert_eq!(eth0.mtu, LeafPresence::Explicit(9000));
     assert_eq!(eth0.admin, LeafPresence::Explicit(true));
+}
+
+#[test]
+fn default_operation_none_list_does_not_create_entry() {
+    let running = empty_system();
+    let edit = container(
+        "/ex:system",
+        EditOperation::None,
+        vec![list_entry(
+            "/ex:system/ex:interfaces",
+            EditOperation::None,
+            &[("name", "eth0")],
+            vec![leaf(
+                "/ex:system/ex:interfaces/ex:mtu",
+                EditOperation::None,
+                "1500",
+            )],
+        )],
+    );
+
+    let candidate = applicator().apply_edit_config(&running, &edit).unwrap();
+
+    assert!(candidate.interfaces.is_empty());
+}
+
+#[test]
+fn default_operation_none_list_traverses_existing_entry_for_explicit_child_op() {
+    let mut running = empty_system();
+    let mut iface = Interfaces::default();
+    iface.name = LeafPresence::Explicit("eth0".to_string());
+    iface.mtu = LeafPresence::Explicit(1500);
+    iface.admin = LeafPresence::Explicit(true);
+    running.interfaces.insert("eth0".to_string(), iface);
+
+    let edit = container(
+        "/ex:system",
+        EditOperation::None,
+        vec![list_entry(
+            "/ex:system/ex:interfaces",
+            EditOperation::None,
+            &[("name", "eth0")],
+            vec![leaf(
+                "/ex:system/ex:interfaces/ex:mtu",
+                EditOperation::Replace,
+                "9000",
+            )],
+        )],
+    );
+
+    let candidate = applicator().apply_edit_config(&running, &edit).unwrap();
+    let eth0 = candidate.interfaces.get("eth0").unwrap();
+
+    assert_eq!(eth0.mtu, LeafPresence::Explicit(9000));
+    assert_eq!(eth0.admin, LeafPresence::Explicit(true));
+}
+
+#[test]
+fn default_operation_none_list_explicit_child_can_create_needed_entry() {
+    let running = empty_system();
+    let edit = container(
+        "/ex:system",
+        EditOperation::None,
+        vec![list_entry(
+            "/ex:system/ex:interfaces",
+            EditOperation::None,
+            &[("name", "eth0")],
+            vec![leaf(
+                "/ex:system/ex:interfaces/ex:mtu",
+                EditOperation::Merge,
+                "1500",
+            )],
+        )],
+    );
+
+    let candidate = applicator().apply_edit_config(&running, &edit).unwrap();
+    let eth0 = candidate.interfaces.get("eth0").unwrap();
+
+    assert_eq!(eth0.name, LeafPresence::Explicit("eth0".to_string()));
+    assert_eq!(eth0.mtu, LeafPresence::Explicit(1500));
+    assert!(eth0.admin.is_absent());
 }
 
 #[test]

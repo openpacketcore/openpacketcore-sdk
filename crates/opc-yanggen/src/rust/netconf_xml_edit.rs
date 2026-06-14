@@ -205,11 +205,12 @@ fn apply_children_fn(
                                     #parse_expr
                                     value.#field_ident = SecretLeaf::new(LeafPresence::Explicit(parsed));
                                 }
-                                EditOperation::Replace | EditOperation::Merge | EditOperation::None => {
+                                EditOperation::Replace | EditOperation::Merge => {
                                     let _v = child.value.as_deref().unwrap_or("");
                                     #parse_expr
                                     value.#field_ident = SecretLeaf::new(LeafPresence::Explicit(parsed));
                                 }
+                                EditOperation::None => {}
                             }
                         }
                     } else {
@@ -242,11 +243,12 @@ fn apply_children_fn(
                                     #parse_expr
                                     value.#field_ident = LeafPresence::Explicit(parsed);
                                 }
-                                EditOperation::Replace | EditOperation::Merge | EditOperation::None => {
+                                EditOperation::Replace | EditOperation::Merge => {
                                     let _v = child.value.as_deref().unwrap_or("");
                                     #parse_expr
                                     value.#field_ident = LeafPresence::Explicit(parsed);
                                 }
+                                EditOperation::None => {}
                             }
                         }
                     }
@@ -299,9 +301,21 @@ fn apply_children_fn(
                                 #children_fn_ident(&child.children, &mut new_container)?;
                                 value.#field_ident = Some(new_container);
                             }
-                            EditOperation::Merge | EditOperation::None => {
+                            EditOperation::Merge => {
                                 let container = value.#field_ident.get_or_insert_with(|| #new_expr);
                                 #children_fn_ident(&child.children, container)?;
+                            }
+                            EditOperation::None => {
+                                if let Some(container) = value.#field_ident.as_mut() {
+                                    #children_fn_ident(&child.children, container)?;
+                                } else if child.children.iter().any(|nested| nested.operation != EditOperation::None) {
+                                    let mut new_container = #new_expr;
+                                    #children_fn_ident(&child.children, &mut new_container)?;
+                                    let baseline = #new_expr;
+                                    if new_container != baseline {
+                                        value.#field_ident = Some(new_container);
+                                    }
+                                }
                             }
                         }
                     }
@@ -511,10 +525,23 @@ fn apply_list_fn(
                     #children_fn_ident(&node.children, &mut entry)?;
                     map.insert(parsed_key, entry);
                 }
-                EditOperation::Merge | EditOperation::None => {
+                EditOperation::Merge => {
                     let entry = map.entry(parsed_key.clone()).or_default();
                     #(#key_assigns)*
                     #children_fn_ident(&node.children, entry)?;
+                }
+                EditOperation::None => {
+                    if let Some(entry) = map.get_mut(&parsed_key) {
+                        #children_fn_ident(&node.children, entry)?;
+                    } else if node.children.iter().any(|child| child.operation != EditOperation::None) {
+                        let mut entry = #entry_type_ident::default();
+                        #(#key_assigns)*
+                        let baseline = entry.clone();
+                        #children_fn_ident(&node.children, &mut entry)?;
+                        if entry != baseline {
+                            map.insert(parsed_key, entry);
+                        }
+                    }
                 }
             }
             Ok(())
@@ -530,25 +557,28 @@ fn parse_leaf_value_expr(
     let resolved = resolved_type(node, nodes_by_path);
     let expr = match resolved {
         Some(TypeRef::Boolean) => quote! {
-            let parsed = match _v {
+            let parsed = match _v.trim() {
                 "true" => true,
                 "false" => false,
                 _ => return Err(NetconfEditError::InvalidValue { path: #path }),
             };
         },
         Some(TypeRef::Uint16) => quote! {
-            let parsed = _v.parse::<u16>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
+            let parsed = _v.trim().parse::<u16>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
         },
         Some(TypeRef::Uint32) => quote! {
-            let parsed = _v.parse::<u32>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
+            let parsed = _v.trim().parse::<u32>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
         },
         Some(TypeRef::Int64) => quote! {
-            let parsed = YangInt64(_v.parse::<i64>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?);
+            let parsed = YangInt64(_v.trim().parse::<i64>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?);
         },
         Some(TypeRef::Decimal64) => quote! {
-            let parsed = YangDecimal64(_v.parse::<f64>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?);
+            let parsed = YangDecimal64(_v.trim().parse::<f64>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?);
         },
         Some(TypeRef::Empty) => quote! {
+            if !_v.trim().is_empty() {
+                return Err(NetconfEditError::InvalidValue { path: #path });
+            }
             let parsed = YangEmpty;
         },
         Some(TypeRef::String)
