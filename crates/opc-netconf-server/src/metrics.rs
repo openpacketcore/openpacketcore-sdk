@@ -8,6 +8,8 @@ use opc_redaction::metrics::{metrics_label_safe, LatencyHistogram, METRICS};
 /// Low-cardinality NETCONF operation labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NetconfOperation {
+    /// `<edit-config>`.
+    EditConfig,
     /// `<close-session>`.
     CloseSession,
     /// `<lock>`.
@@ -33,6 +35,7 @@ pub(crate) enum NetconfOperation {
 impl NetconfOperation {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::EditConfig => "edit-config",
             Self::CloseSession => "close-session",
             Self::Lock => "lock",
             Self::Unlock => "unlock",

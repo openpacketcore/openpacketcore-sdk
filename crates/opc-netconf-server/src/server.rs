@@ -1,26 +1,27 @@
-//! Read-only NETCONF server core.
+//! NETCONF server core.
 
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use opc_config_model::{
-    CommitMode, ConfigOperation, OpcConfig, RequestId, RequestSource, TransportType,
+    CommitMode, CommitRequest, ConfigOperation, OpcConfig, RequestId, RequestSource, TransportType,
     TrustedPrincipal, ValidationContext,
 };
 use opc_mgmt_audit::{
     AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink, SchemaNodePath,
 };
 use opc_mgmt_authz::{AuthzError, ExecAuthorizer, PolicySource, ReadAuthorizer};
-use opc_mgmt_errors::{NetconfErrorTag, NetconfErrorType};
+use opc_mgmt_errors::{commit_error_to_netconf, NetconfError, NetconfErrorTag, NetconfErrorType};
 use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_schema::ModelData;
 use thiserror::Error;
 
 use crate::binding::{
-    GetSchemaError, GetSchemaRequest as BindingGetSchemaRequest, NetconfConfigBinding,
+    EditConfigError, GetSchemaError, GetSchemaRequest as BindingGetSchemaRequest,
+    NetconfConfigBinding,
 };
 use crate::capabilities::render_server_hello;
 use crate::error::{
@@ -30,10 +31,11 @@ use crate::error::{
 use crate::metrics::{record_rpc_error, record_rpc_success, NetconfOperation};
 use crate::operations::get::{handle_get, GetContext};
 use crate::operations::get_config::{handle_get_config, GetConfigContext};
-use crate::session_registry::{KillSessionResult, SessionRegistry};
+use crate::session_registry::{KillSessionResult, RunningWriteResult, SessionRegistry};
 use crate::session_registry::{LockRunningResult, UnlockRunningResult};
 use crate::xml::{
-    parse_rpc_with_context, GetSchemaRequest as XmlGetSchemaRequest,
+    parse_rpc_with_context, Datastore as XmlDatastore, EditConfigRequest as XmlEditConfigRequest,
+    EditErrorOption, EditTestOption, GetSchemaRequest as XmlGetSchemaRequest,
     KillSessionRequest as XmlKillSessionRequest, LockRequest as XmlLockRequest, RpcOperation,
     RpcOperationHint, RpcParseError, UnlockRequest as XmlUnlockRequest, UnsupportedOperation,
     ValidateRequest as XmlValidateRequest,
@@ -47,6 +49,7 @@ const NETCONF_BASE_MODEL: &[ModelData] = &[ModelData {
 }];
 
 const NETCONF_CLOSE_SESSION_PATH: &str = "/nc:close-session";
+const NETCONF_EDIT_CONFIG_PATH: &str = "/nc:edit-config";
 const NETCONF_LOCK_PATH: &str = "/nc:lock";
 const NETCONF_UNLOCK_PATH: &str = "/nc:unlock";
 const NETCONF_KILL_SESSION_PATH: &str = "/nc:kill-session";
@@ -96,7 +99,7 @@ struct RpcExecContext<'a> {
     started: Instant,
 }
 
-/// Read-only NETCONF server core.
+/// NETCONF server core.
 ///
 /// This type handles parsed XML RPC documents. It does not bind sockets or
 /// perform the NETCONF `<hello>` handshake; transport/session code composes
@@ -108,7 +111,9 @@ struct RpcExecContext<'a> {
 /// advertised NETCONF base session: `<kill-session>`, `<lock>`, and
 /// `<unlock>` return `operation-not-supported` without a live
 /// [`SessionRegistry`], and [`Self::handle_rpc_xml`] also discards the
-/// `<close-session>` close signal.
+/// `<close-session>` close signal. `<edit-config>` also returns
+/// `operation-not-supported` from these registry-free helpers; running writes
+/// require the registry-aware async session path.
 /// Use [`crate::session::run_read_only_session_with_registry`] or
 /// [`crate::transport::run_read_only_tls_session_with_registry`] when custom
 /// transports need full base-session behavior backed by the audited shared
@@ -182,11 +187,13 @@ where
         let yang_library = self.binding.yang_library_capability();
         let monitoring = self.binding.netconf_monitoring_capability();
         let with_defaults = self.binding.with_defaults_capability();
+        let writable_running = self.binding.writable_running_capability();
         render_server_hello(
             session_id,
             yang_library.as_ref(),
             monitoring.as_ref(),
             with_defaults.as_ref(),
+            writable_running,
         )
     }
 
@@ -210,6 +217,7 @@ where
     }
 
     /// Handles one XML RPC with access to live NETCONF session controls.
+    #[allow(dead_code)]
     pub(crate) fn handle_rpc_for_session(
         &self,
         request_id: RequestId,
@@ -226,6 +234,27 @@ where
             limits,
             Some((current_session_id, sessions)),
         )
+    }
+
+    /// Handles one XML RPC with access to live NETCONF session controls and
+    /// async config-bus writes.
+    pub(crate) async fn handle_rpc_for_session_async(
+        &self,
+        request_id: RequestId,
+        principal: &TrustedPrincipal,
+        xml: &str,
+        limits: &MgmtLimits,
+        current_session_id: u64,
+        sessions: &SessionRegistry,
+    ) -> RpcHandlingResult {
+        self.handle_rpc_inner_async(
+            request_id,
+            principal,
+            xml,
+            limits,
+            Some((current_session_id, sessions)),
+        )
+        .await
     }
 
     fn handle_rpc_inner(
@@ -281,6 +310,182 @@ where
         };
 
         match &parsed.operation {
+            RpcOperation::EditConfig(_) => self.handle_unsupported_operation(
+                UnsupportedOperation::EditConfig,
+                request_id,
+                principal,
+                &parsed.message_id,
+                &parsed.reply_attrs,
+                started,
+            ),
+            RpcOperation::Get(request) => RpcHandlingResult::keep_open(handle_get::<C, B, P, A>(
+                &self.binding,
+                GetContext {
+                    authz: &self.authz,
+                    audit: &self.audit,
+                    transport: self.transport,
+                    request_id,
+                    principal,
+                    message_id: &parsed.message_id,
+                    reply_attrs: &parsed.reply_attrs,
+                    started,
+                    limits,
+                },
+                request,
+            )),
+            RpcOperation::GetConfig(request) => {
+                RpcHandlingResult::keep_open(handle_get_config::<C, B, P, A>(
+                    &self.binding,
+                    GetConfigContext {
+                        authz: &self.authz,
+                        audit: &self.audit,
+                        transport: self.transport,
+                        request_id,
+                        principal,
+                        message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
+                        started,
+                        limits,
+                    },
+                    request,
+                ))
+            }
+            RpcOperation::CloseSession => self.handle_close_session(
+                request_id,
+                principal,
+                &parsed.message_id,
+                &parsed.reply_attrs,
+                started,
+            ),
+            RpcOperation::Lock(request) => self.handle_lock(
+                request,
+                RpcExecContext {
+                    request_id,
+                    principal,
+                    message_id: &parsed.message_id,
+                    reply_attrs: &parsed.reply_attrs,
+                    started,
+                },
+                session_context,
+            ),
+            RpcOperation::Unlock(request) => self.handle_unlock(
+                request,
+                RpcExecContext {
+                    request_id,
+                    principal,
+                    message_id: &parsed.message_id,
+                    reply_attrs: &parsed.reply_attrs,
+                    started,
+                },
+                session_context,
+            ),
+            RpcOperation::Validate(request) => self.handle_validate(
+                request,
+                RpcExecContext {
+                    request_id,
+                    principal,
+                    message_id: &parsed.message_id,
+                    reply_attrs: &parsed.reply_attrs,
+                    started,
+                },
+            ),
+            RpcOperation::KillSession(request) => self.handle_kill_session(
+                request,
+                RpcExecContext {
+                    request_id,
+                    principal,
+                    message_id: &parsed.message_id,
+                    reply_attrs: &parsed.reply_attrs,
+                    started,
+                },
+                session_context,
+            ),
+            RpcOperation::GetSchema(request) => self.handle_get_schema(
+                request,
+                request_id,
+                principal,
+                &parsed.message_id,
+                &parsed.reply_attrs,
+                started,
+            ),
+            RpcOperation::Unsupported(operation) => self.handle_unsupported_operation(
+                *operation,
+                request_id,
+                principal,
+                &parsed.message_id,
+                &parsed.reply_attrs,
+                started,
+            ),
+        }
+    }
+
+    async fn handle_rpc_inner_async(
+        &self,
+        request_id: RequestId,
+        principal: &TrustedPrincipal,
+        xml: &str,
+        limits: &MgmtLimits,
+        session_context: Option<(u64, &SessionRegistry)>,
+    ) -> RpcHandlingResult {
+        let started = Instant::now();
+        let parsed = match parse_rpc_with_context(xml, limits) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                let message_id = err.message_id.as_deref();
+                let operation = netconf_operation_for_parse_failure(&err);
+                let operation_label = operation.as_str();
+                if self
+                    .audit_parse_failure(request_id, principal, &err)
+                    .is_err()
+                {
+                    record_rpc_error(
+                        operation,
+                        NetconfErrorTag::OperationFailed,
+                        started.elapsed(),
+                    );
+                    tracing::debug!(
+                        operation = operation_label,
+                        error_tag = NetconfErrorTag::OperationFailed.as_str(),
+                        "NETCONF RPC rejected after audit failure"
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        message_id,
+                        &err.reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                let classification = err.error.classification();
+                record_rpc_error(operation, classification.tag, started.elapsed());
+                tracing::debug!(
+                    operation = operation_label,
+                    error_type = classification.error_type.as_str(),
+                    error_tag = classification.tag.as_str(),
+                    "NETCONF RPC rejected during parse"
+                );
+                let rpc_error = RpcError::new(classification, err.error.client_message());
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    message_id,
+                    &err.reply_attrs,
+                    rpc_error,
+                ));
+            }
+        };
+
+        match &parsed.operation {
+            RpcOperation::EditConfig(request) => {
+                self.handle_edit_config(
+                    request,
+                    RpcExecContext {
+                        request_id,
+                        principal,
+                        message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
+                        started,
+                    },
+                    session_context,
+                )
+                .await
+            }
             RpcOperation::Get(request) => RpcHandlingResult::keep_open(handle_get::<C, B, P, A>(
                 &self.binding,
                 GetContext {
@@ -1361,6 +1566,272 @@ where
         ))
     }
 
+    async fn handle_edit_config(
+        &self,
+        request: &XmlEditConfigRequest,
+        context: RpcExecContext<'_>,
+        session_context: Option<(u64, &SessionRegistry)>,
+    ) -> RpcHandlingResult {
+        if !self.binding.writable_running_capability() {
+            return self.edit_config_failure_reply(
+                &context,
+                audit_failed("operation-not-supported"),
+                RpcError::operation_not_supported(),
+            );
+        }
+
+        if request.target != XmlDatastore::Running
+            || request.error_option != EditErrorOption::StopOnError
+            || request.test_option_explicit
+            || request.test_option == EditTestOption::TestOnly
+        {
+            return self.edit_config_failure_reply(
+                &context,
+                audit_failed("operation-not-supported"),
+                RpcError::operation_not_supported(),
+            );
+        }
+
+        match self.authorize_exec(context.principal, NETCONF_EDIT_CONFIG_PATH) {
+            Ok(true) => {}
+            Ok(false) => {
+                return self.edit_config_failure_reply(
+                    &context,
+                    audit_denied("access-denied"),
+                    RpcError::access_denied(),
+                );
+            }
+            Err(()) => {
+                return self.edit_config_failure_reply(
+                    &context,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        }
+
+        let Some((current_session_id, sessions)) = session_context else {
+            return self.edit_config_failure_reply(
+                &context,
+                audit_failed("operation-not-supported"),
+                RpcError::operation_not_supported(),
+            );
+        };
+
+        let _write_guard = match sessions.begin_running_write(current_session_id) {
+            RunningWriteResult::Acquired(guard) => guard,
+            RunningWriteResult::Denied { owner_session_id } => {
+                return self.edit_config_lock_denied_reply(&context, owner_session_id);
+            }
+            RunningWriteResult::SessionNotRegistered => {
+                return self.edit_config_failure_reply(
+                    &context,
+                    audit_failed("operation-failed"),
+                    RpcError::operation_failed(),
+                );
+            }
+        };
+
+        let bus = self.binding.config_bus();
+        let snapshot = bus.current_snapshot();
+        let candidate = match self
+            .binding
+            .build_edit_config_candidate(snapshot.config.as_ref(), request)
+        {
+            Ok(candidate) => candidate,
+            Err(EditConfigError::Unsupported) => {
+                return self.edit_config_failure_reply(
+                    &context,
+                    audit_failed("operation-not-supported"),
+                    RpcError::operation_not_supported(),
+                );
+            }
+            Err(EditConfigError::InvalidValue) => {
+                return self.edit_config_failure_reply(
+                    &context,
+                    audit_failed("invalid-value"),
+                    RpcError::invalid_value(),
+                );
+            }
+            Err(EditConfigError::Failed { .. }) => {
+                return self.edit_config_failure_reply(
+                    &context,
+                    audit_failed("operation-failed"),
+                    RpcError::operation_failed(),
+                );
+            }
+        };
+
+        let commit_request = CommitRequest::commit(
+            context.request_id,
+            context.principal.clone(),
+            self.transport,
+            RequestSource::Northbound,
+            ConfigOperation::Patch,
+            candidate.candidate,
+            candidate.changed_paths,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .with_base_version(snapshot.version);
+
+        match bus.submit(commit_request).await {
+            Ok(result) => {
+                let paths = self.schema_paths_for_changed_paths(&result.changed_paths);
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            context.request_id,
+                            context.principal,
+                            self.transport,
+                            AuditOperation::Update,
+                            AuditOutcome::Success,
+                        )
+                        .with_paths(paths),
+                    )
+                    .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::EditConfig,
+                        NetconfErrorTag::OperationFailed,
+                        context.started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(context.message_id),
+                        context.reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                record_rpc_success(NetconfOperation::EditConfig, context.started.elapsed());
+                RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
+                    context.message_id,
+                    context.reply_attrs,
+                ))
+            }
+            Err(error) => {
+                let classification = commit_error_to_netconf(error.code);
+                self.edit_config_failure_reply(
+                    &context,
+                    audit_failed(error.code.as_str()),
+                    rpc_error_for_netconf(classification),
+                )
+            }
+        }
+    }
+
+    fn edit_config_failure_reply(
+        &self,
+        context: &RpcExecContext<'_>,
+        outcome: AuditOutcome,
+        rpc_error: RpcError,
+    ) -> RpcHandlingResult {
+        if self
+            .audit
+            .record(
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Update,
+                    outcome,
+                )
+                .with_paths([schema_node_path(NETCONF_EDIT_CONFIG_PATH)]),
+            )
+            .is_err()
+        {
+            record_rpc_error(
+                NetconfOperation::EditConfig,
+                NetconfErrorTag::OperationFailed,
+                context.started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
+
+        record_rpc_error(
+            NetconfOperation::EditConfig,
+            rpc_error.classification.tag,
+            context.started.elapsed(),
+        );
+        RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+            Some(context.message_id),
+            context.reply_attrs,
+            rpc_error,
+        ))
+    }
+
+    fn edit_config_lock_denied_reply(
+        &self,
+        context: &RpcExecContext<'_>,
+        owner_session_id: u64,
+    ) -> RpcHandlingResult {
+        if self
+            .audit
+            .record(
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Update,
+                    audit_failed("lock-denied"),
+                )
+                .with_paths([schema_node_path(NETCONF_EDIT_CONFIG_PATH)]),
+            )
+            .is_err()
+        {
+            record_rpc_error(
+                NetconfOperation::EditConfig,
+                NetconfErrorTag::OperationFailed,
+                context.started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
+
+        record_rpc_error(
+            NetconfOperation::EditConfig,
+            NetconfErrorTag::LockDenied,
+            context.started.elapsed(),
+        );
+        RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+            Some(context.message_id),
+            context.reply_attrs,
+            RpcError::lock_denied(owner_session_id),
+        ))
+    }
+
+    fn schema_paths_for_changed_paths(
+        &self,
+        changed_paths: &[opc_config_model::YangPath],
+    ) -> Vec<SchemaNodePath> {
+        let registry = self.binding.schema_registry();
+        let mut paths = Vec::new();
+        let mut saw_unknown = false;
+        for path in changed_paths {
+            let Some(node) = registry.node(path.as_str()) else {
+                saw_unknown = true;
+                continue;
+            };
+            let schema_path = schema_node_path(node.path);
+            if !paths.contains(&schema_path) {
+                paths.push(schema_path);
+            }
+        }
+        if paths.is_empty() || saw_unknown {
+            let edit_path = schema_node_path(NETCONF_EDIT_CONFIG_PATH);
+            if !paths.contains(&edit_path) {
+                paths.push(edit_path);
+            }
+        }
+        paths
+    }
+
     fn handle_validate(
         &self,
         request: &XmlValidateRequest,
@@ -1855,6 +2326,9 @@ where
             audit_failed(reason),
         );
         let event = match err.operation_hint {
+            Some(RpcOperationHint::EditConfig) => {
+                event.with_paths([schema_node_path(NETCONF_EDIT_CONFIG_PATH)])
+            }
             Some(RpcOperationHint::Lock) => event.with_paths([schema_node_path(NETCONF_LOCK_PATH)]),
             Some(RpcOperationHint::Unlock) => {
                 event.with_paths([schema_node_path(NETCONF_UNLOCK_PATH)])
@@ -1873,6 +2347,7 @@ where
 
 fn audit_operation_for_parse_failure(err: &RpcParseError) -> AuditOperation {
     match err.operation_hint {
+        Some(RpcOperationHint::EditConfig) => AuditOperation::Update,
         Some(RpcOperationHint::Lock | RpcOperationHint::Unlock) => AuditOperation::Exec,
         Some(RpcOperationHint::KillSession) => AuditOperation::Exec,
         Some(RpcOperationHint::Validate) => AuditOperation::Validate,
@@ -1882,6 +2357,7 @@ fn audit_operation_for_parse_failure(err: &RpcParseError) -> AuditOperation {
 
 fn netconf_operation_for_parse_failure(err: &RpcParseError) -> NetconfOperation {
     match err.operation_hint {
+        Some(RpcOperationHint::EditConfig) => NetconfOperation::EditConfig,
         Some(RpcOperationHint::Get) => NetconfOperation::Get,
         Some(RpcOperationHint::GetConfig) => NetconfOperation::GetConfig,
         Some(RpcOperationHint::Lock) => NetconfOperation::Lock,
@@ -1889,6 +2365,34 @@ fn netconf_operation_for_parse_failure(err: &RpcParseError) -> NetconfOperation 
         Some(RpcOperationHint::KillSession) => NetconfOperation::KillSession,
         Some(RpcOperationHint::Validate) => NetconfOperation::Validate,
         None => NetconfOperation::Unknown,
+    }
+}
+
+fn rpc_error_for_netconf(classification: NetconfError) -> RpcError {
+    RpcError::new(classification, netconf_error_message(classification.tag))
+}
+
+fn netconf_error_message(tag: NetconfErrorTag) -> &'static str {
+    match tag {
+        NetconfErrorTag::InUse => "in use",
+        NetconfErrorTag::InvalidValue => "invalid value",
+        NetconfErrorTag::TooBig => "request is too large",
+        NetconfErrorTag::MissingAttribute => "missing attribute",
+        NetconfErrorTag::BadAttribute => "bad attribute",
+        NetconfErrorTag::UnknownAttribute => "unknown attribute",
+        NetconfErrorTag::MissingElement => "missing element",
+        NetconfErrorTag::BadElement => "bad element",
+        NetconfErrorTag::UnknownElement => "unknown element",
+        NetconfErrorTag::UnknownNamespace => "unknown namespace",
+        NetconfErrorTag::AccessDenied => "access denied",
+        NetconfErrorTag::LockDenied => "lock denied",
+        NetconfErrorTag::ResourceDenied => "resource denied",
+        NetconfErrorTag::DataExists => "data exists",
+        NetconfErrorTag::DataMissing => "data missing",
+        NetconfErrorTag::OperationNotSupported => "operation not supported",
+        NetconfErrorTag::OperationFailed => "operation failed",
+        NetconfErrorTag::MalformedMessage => "malformed message",
+        _ => "operation failed",
     }
 }
 
@@ -1925,10 +2429,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use opc_config_bus::{ConfigBus, MockManagedDatastore};
+    use opc_config_bus::{
+        AuthorizationContext, AuthorizationError, ConfigAuthorizer, ConfigBus, MockManagedDatastore,
+    };
     use opc_config_model::{
-        AuthStrength, ConfigError, OpcConfig, TransportType, TrustedPrincipal, ValidationContext,
-        ValidationError, WorkloadIdentity, YangPath,
+        AuthStrength, ConfigError, ConfigOperation, OpcConfig, RequestSource, TransportType,
+        TrustedPrincipal, ValidationContext, ValidationError, WorkloadIdentity, YangPath,
     };
     use opc_identity::{
         parse_certs_pem, parse_key_pem, IdentityState, SvidDocument, TrustBundle, TrustBundleSet,
@@ -1962,12 +2468,12 @@ mod tests {
 
     use super::*;
     use crate::binding::{
-        BindingError, NetconfMonitoringCapability, ReadSelection, WithDefaultsCapability,
-        YangLibraryCapability,
+        BindingError, EditConfigCandidate, EditConfigError, NetconfMonitoringCapability,
+        ReadSelection, WithDefaultsCapability, YangLibraryCapability,
     };
     use crate::capabilities::{
         NETCONF_BASE_1_0, NETCONF_BASE_1_1, NETCONF_BASE_NS, NETCONF_MONITORING_NS,
-        WITH_DEFAULTS_NS,
+        WITH_DEFAULTS_NS, WRITABLE_RUNNING_1_0,
     };
     use crate::framing::base10;
     use crate::listener::{run_read_only_tls_listener, TlsListenerConfig};
@@ -1994,10 +2500,17 @@ mod tests {
 
         fn changed_paths(
             &self,
-            _previous: &Self,
+            previous: &Self,
             _deltas: &[Self::Delta],
         ) -> Result<Vec<YangPath>, ConfigError> {
-            Ok(Vec::new())
+            let mut paths = Vec::new();
+            if self.hostname != previous.hostname {
+                paths.push(YangPath::new("/sys:system/sys:hostname").expect("hostname path"));
+            }
+            if self.secret != previous.secret {
+                paths.push(YangPath::new("/sys:system/sys:secret").expect("secret path"));
+            }
+            Ok(paths)
         }
 
         fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), ConfigError> {
@@ -2234,6 +2747,113 @@ mod tests {
         }
     }
 
+    struct NonWritableEditBinding {
+        bus: Arc<ConfigBus<DemoConfig>>,
+        candidate_builder_called: Arc<AtomicBool>,
+    }
+
+    impl NetconfConfigBinding<DemoConfig> for NonWritableEditBinding {
+        fn config_bus(&self) -> Arc<ConfigBus<DemoConfig>> {
+            Arc::clone(&self.bus)
+        }
+
+        fn schema_registry(&self) -> &'static dyn SchemaRegistry {
+            &REGISTRY
+        }
+
+        fn render_running_config(
+            &self,
+            _config: &DemoConfig,
+            _selection: ReadSelection<'_>,
+        ) -> Result<String, BindingError> {
+            Ok(String::new())
+        }
+
+        fn build_edit_config_candidate(
+            &self,
+            running: &DemoConfig,
+            _request: &crate::xml::EditConfigRequest,
+        ) -> Result<EditConfigCandidate<DemoConfig>, EditConfigError> {
+            self.candidate_builder_called.store(true, Ordering::SeqCst);
+            let mut candidate = running.clone();
+            candidate.hostname = "amf-2".to_string();
+            Ok(EditConfigCandidate::new(
+                candidate,
+                [YangPath::new("/sys:system/sys:hostname").expect("hostname path")],
+            ))
+        }
+    }
+
+    struct WritableCountingEditBinding {
+        bus: Arc<ConfigBus<DemoConfig>>,
+        candidate_builder_called: Arc<AtomicBool>,
+    }
+
+    impl NetconfConfigBinding<DemoConfig> for WritableCountingEditBinding {
+        fn config_bus(&self) -> Arc<ConfigBus<DemoConfig>> {
+            Arc::clone(&self.bus)
+        }
+
+        fn schema_registry(&self) -> &'static dyn SchemaRegistry {
+            &REGISTRY
+        }
+
+        fn render_running_config(
+            &self,
+            _config: &DemoConfig,
+            _selection: ReadSelection<'_>,
+        ) -> Result<String, BindingError> {
+            Ok(String::new())
+        }
+
+        fn writable_running_capability(&self) -> bool {
+            true
+        }
+
+        fn build_edit_config_candidate(
+            &self,
+            running: &DemoConfig,
+            _request: &crate::xml::EditConfigRequest,
+        ) -> Result<EditConfigCandidate<DemoConfig>, EditConfigError> {
+            self.candidate_builder_called.store(true, Ordering::SeqCst);
+            let mut candidate = running.clone();
+            candidate.hostname = "amf-2".to_string();
+            Ok(EditConfigCandidate::new(
+                candidate,
+                [YangPath::new("/sys:system/sys:hostname").expect("hostname path")],
+            ))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ObservedAuthorization {
+        transport: TransportType,
+        source: RequestSource,
+        operation: ConfigOperation,
+        changed_paths: Vec<YangPath>,
+    }
+
+    #[derive(Debug)]
+    struct DenyingConfigAuthorizer {
+        called: Arc<AtomicBool>,
+        observed: Arc<Mutex<Option<ObservedAuthorization>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ConfigAuthorizer for DenyingConfigAuthorizer {
+        async fn authorize(&self, ctx: &AuthorizationContext) -> Result<(), AuthorizationError> {
+            self.called.store(true, Ordering::SeqCst);
+            *self.observed.lock().expect("authorizer observation mutex") =
+                Some(ObservedAuthorization {
+                    transport: ctx.transport,
+                    source: ctx.source,
+                    operation: ctx.operation,
+                    changed_paths: ctx.changed_paths.clone(),
+                });
+            Err(AuthorizationError::new("do-not-leak-authorizer-detail"))
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum OperationalMode {
         Normal,
@@ -2284,6 +2904,39 @@ mod tests {
             }
             out.push_str("</sys:system>");
             Ok(out)
+        }
+
+        fn writable_running_capability(&self) -> bool {
+            true
+        }
+
+        fn build_edit_config_candidate(
+            &self,
+            running: &DemoConfig,
+            request: &crate::xml::EditConfigRequest,
+        ) -> Result<EditConfigCandidate<DemoConfig>, EditConfigError> {
+            if request.config_xml.contains("invalid-edit-value") {
+                return Err(EditConfigError::InvalidValue);
+            }
+            if request.config_xml.contains("failed-edit-value") {
+                return Err(EditConfigError::failed("do-not-leak"));
+            }
+            if request.config_xml.contains("unsupported-edit-shape") {
+                return Err(EditConfigError::Unsupported);
+            }
+            if !request
+                .config_xml
+                .contains("<sys:hostname>amf-2</sys:hostname>")
+            {
+                return Err(EditConfigError::Unsupported);
+            }
+
+            let mut candidate = running.clone();
+            candidate.hostname = "amf-2".to_string();
+            Ok(EditConfigCandidate::new(
+                candidate,
+                [YangPath::new("/sys:system/sys:hostname").expect("hostname path")],
+            ))
         }
 
         fn with_defaults_capability(&self) -> Option<WithDefaultsCapability> {
@@ -2785,6 +3438,14 @@ mod tests {
         )
     }
 
+    fn allow_edit_config_rule(modules: &ModuleRegistry) -> NacmRule {
+        NacmRule::allow(
+            NacmAction::Exec,
+            YangPathPattern::parse(NETCONF_EDIT_CONFIG_PATH, modules)
+                .expect("allow edit-config path"),
+        )
+    }
+
     fn allow_kill_session_rule(modules: &ModuleRegistry) -> NacmRule {
         NacmRule::allow(
             NacmAction::Exec,
@@ -2815,6 +3476,30 @@ mod tests {
     }
 
     fn policy_allow_system_but_deny_secret() -> NacmPolicy {
+        let mut modules = ModuleRegistry::new();
+        modules
+            .register_module("demo-system", "sys")
+            .expect("module");
+        register_netconf_module(&mut modules);
+        NacmPolicy::builder(PolicyVersion::new(1))
+            .add_rule(NacmRule::deny(
+                NacmAction::Read,
+                YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
+            ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Read,
+                YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
+            ))
+            .add_rule(allow_close_session_rule(&modules))
+            .add_rule(allow_lock_rule(&modules))
+            .add_rule(allow_unlock_rule(&modules))
+            .add_rule(allow_validate_rule(&modules))
+            .add_rule(allow_edit_config_rule(&modules))
+            .add_rule(allow_kill_session_rule(&modules))
+            .build()
+    }
+
+    fn policy_allow_system_but_deny_edit_config() -> NacmPolicy {
         let mut modules = ModuleRegistry::new();
         modules
             .register_module("demo-system", "sys")
@@ -3265,9 +3950,39 @@ mod tests {
         )
     }
 
+    fn edit_config_hostname_rpc(message_id: &str) -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="{message_id}"><edit-config><target><running/></target><config><sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system></config></edit-config></rpc>"#
+        )
+    }
+
+    fn edit_config_continue_on_error_rpc() -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="411"><edit-config><target><running/></target><error-option>continue-on-error</error-option><config><sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system></config></edit-config></rpc>"#
+        )
+    }
+
+    fn edit_config_test_option_set_rpc() -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="414"><edit-config><target><running/></target><test-option>set</test-option><config><sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system></config></edit-config></rpc>"#
+        )
+    }
+
+    fn edit_config_invalid_value_rpc() -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="412"><edit-config><target><running/></target><config><sys:system xmlns:sys="urn:opc:demo"><sys:hostname>invalid-edit-value</sys:hostname></sys:system></config></edit-config></rpc>"#
+        )
+    }
+
+    fn edit_config_failed_rpc() -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="418"><edit-config><target><running/></target><config><sys:system xmlns:sys="urn:opc:demo"><sys:hostname>failed-edit-value</sys:hostname></sys:system></config></edit-config></rpc>"#
+        )
+    }
+
     fn unsupported_edit_config_cdata_rpc() -> String {
         format!(
-            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="402"><edit-config><config><![CDATA[do-not-leak]]></config></edit-config></rpc>"#
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="402"><edit-config><target><running/></target><config><![CDATA[do-not-leak]]></config></edit-config></rpc>"#
         )
     }
 
@@ -3559,6 +4274,7 @@ mod tests {
 
         assert!(hello.contains(NETCONF_BASE_1_0));
         assert!(hello.contains(NETCONF_BASE_1_1));
+        assert!(hello.contains(WRITABLE_RUNNING_1_0));
         assert!(!hello.contains("yang-library"));
         assert!(!hello.contains("ietf-netconf-monitoring"));
     }
@@ -5106,6 +5822,506 @@ mod tests {
             .contains("<error-tag>operation-failed</error-tag>"));
         assert!(!result.reply_xml.contains("secret-admin"));
         assert!(!result.reply_xml.contains("do-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn edit_config_requires_writable_running_opt_in_before_binding_or_commit() {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let candidate_builder_called = Arc::new(AtomicBool::new(false));
+        let binding = NonWritableEditBinding {
+            bus: Arc::clone(&bus),
+            candidate_builder_called: Arc::clone(&candidate_builder_called),
+        };
+        let audit = CapturingAudit::default();
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            audit.clone(),
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+        let sessions = SessionRegistry::new();
+        let _registration = sessions.register(89).expect("register session");
+
+        let hello = server.server_hello(NonZeroU32::new(89));
+        assert!(!hello.contains(WRITABLE_RUNNING_1_0));
+
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &edit_config_hostname_rpc("409"),
+                &MgmtLimits::default(),
+                89,
+                &sessions,
+            )
+            .await;
+
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>operation-not-supported</error-tag>"));
+        assert!(!candidate_builder_called.load(Ordering::SeqCst));
+        let snapshot = bus.current_snapshot();
+        assert_eq!(snapshot.config.hostname, "amf-1");
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_EDIT_CONFIG_PATH)]
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_config_requires_exec_nacm_before_candidate_builder_or_commit() {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let candidate_builder_called = Arc::new(AtomicBool::new(false));
+        let binding = WritableCountingEditBinding {
+            bus: Arc::clone(&bus),
+            candidate_builder_called: Arc::clone(&candidate_builder_called),
+        };
+        let audit = CapturingAudit::default();
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_edit_config()),
+            audit.clone(),
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+        let sessions = SessionRegistry::new();
+        let _registration = sessions.register(97).expect("register session");
+
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &edit_config_hostname_rpc("416"),
+                &MgmtLimits::default(),
+                97,
+                &sessions,
+            )
+            .await;
+
+        assert!(result.reply_xml.contains(r#"message-id="416""#));
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>access-denied</error-tag>"));
+        assert!(!candidate_builder_called.load(Ordering::SeqCst));
+        assert!(!result.reply_xml.contains("amf-2"));
+        assert!(!result.reply_xml.contains("do-not-leak"));
+
+        let snapshot = bus.current_snapshot();
+        assert_eq!(snapshot.config.hostname, "amf-1");
+        assert_eq!(sessions.running_write_owner_for_test(), None);
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, audit_denied("access-denied"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_EDIT_CONFIG_PATH)]
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_config_running_commits_candidate_and_audits_schema_path() {
+        let (server, _observed, audit) = server_fixture().await;
+        let sessions = SessionRegistry::new();
+        let _registration = sessions.register(90).expect("register session");
+        let successes_before = netconf_rpc_requests("edit-config", "success");
+
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &edit_config_hostname_rpc("410"),
+                &MgmtLimits::default(),
+                90,
+                &sessions,
+            )
+            .await;
+
+        assert!(!result.close_session);
+        assert!(result.reply_xml.contains(r#"message-id="410""#));
+        assert!(result.reply_xml.contains("<ok/>"));
+        assert!(!result.reply_xml.contains("amf-2"));
+
+        let snapshot = server.binding.config_bus().current_snapshot();
+        assert_eq!(snapshot.config.hostname, "amf-2");
+        assert_eq!(sessions.running_write_owner_for_test(), None);
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, AuditOutcome::Success);
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path("/sys:system/sys:hostname")]
+        );
+        assert!(netconf_rpc_requests("edit-config", "success") > successes_before);
+    }
+
+    #[tokio::test]
+    async fn edit_config_success_audit_failure_is_payload_free_after_durable_commit() {
+        let store = Arc::new(MockManagedDatastore::new());
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                Arc::clone(&store),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = TestBinding {
+            bus: Arc::clone(&bus),
+            observed_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_yang_library_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_monitoring_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_with_defaults: Arc::new(Mutex::new(Vec::new())),
+            operational_mode: OperationalMode::Normal,
+            yang_library: false,
+            monitoring: false,
+            with_defaults: false,
+            get_schema_mode: GetSchemaMode::Ok,
+        };
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            FailingAudit,
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+        let sessions = SessionRegistry::new();
+        let _registration = sessions.register(98).expect("register session");
+        let request_id = RequestId::new();
+
+        let result = server
+            .handle_rpc_for_session_async(
+                request_id,
+                &principal(),
+                &edit_config_hostname_rpc("417"),
+                &MgmtLimits::default(),
+                98,
+                &sessions,
+            )
+            .await;
+
+        assert!(result.reply_xml.contains(r#"message-id="417""#));
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>operation-failed</error-tag>"));
+        assert!(!result.reply_xml.contains("amf-2"));
+        assert!(!result.reply_xml.contains("do-not-leak"));
+        assert!(!result.reply_xml.contains("secret-admin"));
+        assert_eq!(sessions.running_write_owner_for_test(), None);
+
+        let snapshot = bus.current_snapshot();
+        assert_eq!(snapshot.config.hostname, "amf-2");
+
+        let latest = store.latest().await.expect("durable commit record");
+        assert_eq!(latest.config.hostname, "amf-2");
+        assert_eq!(latest.source, RequestSource::Northbound);
+        assert_eq!(latest.request_id, Some(request_id));
+        let fingerprint = latest
+            .request_fingerprint
+            .expect("commit request fingerprint");
+        assert_eq!(fingerprint.operation, ConfigOperation::Patch);
+        assert_eq!(fingerprint.transport, TransportType::NetconfTls);
+        assert_eq!(
+            fingerprint.changed_paths,
+            vec![YangPath::new("/sys:system/sys:hostname").expect("hostname path")]
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_config_bus_authorizer_denial_is_payload_free_and_does_not_commit() {
+        let authorizer_called = Arc::new(AtomicBool::new(false));
+        let observed_authorization = Arc::new(Mutex::new(None));
+        let authorizer: Arc<dyn ConfigAuthorizer> = Arc::new(DenyingConfigAuthorizer {
+            called: Arc::clone(&authorizer_called),
+            observed: Arc::clone(&observed_authorization),
+        });
+        let bus = Arc::new(
+            ConfigBus::new(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+                authorizer,
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = TestBinding {
+            bus: Arc::clone(&bus),
+            observed_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_yang_library_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_monitoring_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_with_defaults: Arc::new(Mutex::new(Vec::new())),
+            operational_mode: OperationalMode::Normal,
+            yang_library: false,
+            monitoring: false,
+            with_defaults: false,
+            get_schema_mode: GetSchemaMode::Ok,
+        };
+        let audit = CapturingAudit::default();
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            audit.clone(),
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+        let sessions = SessionRegistry::new();
+        let _registration = sessions.register(96).expect("register session");
+
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &edit_config_hostname_rpc("415"),
+                &MgmtLimits::default(),
+                96,
+                &sessions,
+            )
+            .await;
+
+        assert!(result.reply_xml.contains(r#"message-id="415""#));
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>access-denied</error-tag>"));
+        assert!(!result.reply_xml.contains("do-not-leak-authorizer-detail"));
+        assert!(!result.reply_xml.contains("amf-2"));
+        assert!(authorizer_called.load(Ordering::SeqCst));
+        let observed = observed_authorization
+            .lock()
+            .expect("authorizer observation mutex")
+            .clone()
+            .expect("authorizer observed context");
+        assert_eq!(observed.transport, TransportType::NetconfTls);
+        assert_eq!(observed.source, RequestSource::Northbound);
+        assert_eq!(observed.operation, ConfigOperation::Patch);
+        assert_eq!(
+            observed.changed_paths,
+            vec![YangPath::new("/sys:system/sys:hostname").expect("hostname path")]
+        );
+
+        let snapshot = bus.current_snapshot();
+        assert_eq!(snapshot.config.hostname, "amf-1");
+        assert_eq!(sessions.running_write_owner_for_test(), None);
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, audit_failed("authorization_denied"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_EDIT_CONFIG_PATH)]
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_config_unsupported_error_option_does_not_call_binding_or_commit() {
+        let (server, _observed, audit) = server_fixture().await;
+        let sessions = SessionRegistry::new();
+        let _registration = sessions.register(91).expect("register session");
+
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &edit_config_continue_on_error_rpc(),
+                &MgmtLimits::default(),
+                91,
+                &sessions,
+            )
+            .await;
+
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>operation-not-supported</error-tag>"));
+        let snapshot = server.binding.config_bus().current_snapshot();
+        assert_eq!(snapshot.config.hostname, "amf-1");
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_EDIT_CONFIG_PATH)]
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_config_explicit_test_option_requires_validate_capability() {
+        let (server, _observed, audit) = server_fixture().await;
+        let sessions = SessionRegistry::new();
+        let _registration = sessions.register(95).expect("register session");
+
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &edit_config_test_option_set_rpc(),
+                &MgmtLimits::default(),
+                95,
+                &sessions,
+            )
+            .await;
+
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>operation-not-supported</error-tag>"));
+        let snapshot = server.binding.config_bus().current_snapshot();
+        assert_eq!(snapshot.config.hostname, "amf-1");
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_EDIT_CONFIG_PATH)]
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_config_binding_invalid_value_is_payload_free_and_does_not_commit() {
+        let (server, _observed, audit) = server_fixture().await;
+        let sessions = SessionRegistry::new();
+        let _registration = sessions.register(92).expect("register session");
+
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &edit_config_invalid_value_rpc(),
+                &MgmtLimits::default(),
+                92,
+                &sessions,
+            )
+            .await;
+
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>invalid-value</error-tag>"));
+        assert!(!result.reply_xml.contains("invalid-edit-value"));
+        let snapshot = server.binding.config_bus().current_snapshot();
+        assert_eq!(snapshot.config.hostname, "amf-1");
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, audit_failed("invalid-value"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_EDIT_CONFIG_PATH)]
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_config_binding_failed_is_payload_free_and_releases_write_guard() {
+        let (server, _observed, audit) = server_fixture().await;
+        let sessions = SessionRegistry::new();
+        let _registration = sessions.register(99).expect("register session");
+
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &edit_config_failed_rpc(),
+                &MgmtLimits::default(),
+                99,
+                &sessions,
+            )
+            .await;
+
+        assert!(result.reply_xml.contains(r#"message-id="418""#));
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>operation-failed</error-tag>"));
+        assert!(!result.reply_xml.contains("do-not-leak"));
+        assert!(!result.reply_xml.contains("failed-edit-value"));
+
+        let snapshot = server.binding.config_bus().current_snapshot();
+        assert_eq!(snapshot.config.hostname, "amf-1");
+        assert_eq!(sessions.running_write_owner_for_test(), None);
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, audit_failed("operation-failed"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_EDIT_CONFIG_PATH)]
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_config_running_lock_denied_uses_update_audit_and_does_not_commit() {
+        let (server, _observed, audit) = server_fixture().await;
+        let sessions = SessionRegistry::new();
+        let _owner = sessions.register(93).expect("register owner");
+        let _writer = sessions.register(94).expect("register writer");
+        assert_eq!(
+            sessions.lock_running_after(93, || Ok::<(), ()>(())),
+            Ok(LockRunningResult::Acquired)
+        );
+
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &edit_config_hostname_rpc("413"),
+                &MgmtLimits::default(),
+                94,
+                &sessions,
+            )
+            .await;
+
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>lock-denied</error-tag>"));
+        assert!(result.reply_xml.contains("<session-id>93</session-id>"));
+        let snapshot = server.binding.config_bus().current_snapshot();
+        assert_eq!(snapshot.config.hostname, "amf-1");
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, audit_failed("lock-denied"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_EDIT_CONFIG_PATH)]
+        );
     }
 
     #[tokio::test]

@@ -33,6 +33,7 @@ tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
 opc-tls = { path = "../opc-tls", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }

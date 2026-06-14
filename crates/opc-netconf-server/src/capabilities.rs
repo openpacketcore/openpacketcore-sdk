@@ -26,6 +26,8 @@ pub const NETCONF_MONITORING_REVISION: &str = "2010-10-04";
 pub const WITH_DEFAULTS_NS: &str = "urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults";
 /// RFC 6243 NETCONF with-defaults capability base URI.
 pub const WITH_DEFAULTS_1_0_BASE: &str = "urn:ietf:params:netconf:capability:with-defaults:1.0";
+/// RFC 6241 writable-running capability.
+pub const WRITABLE_RUNNING_1_0: &str = "urn:ietf:params:netconf:capability:writable-running:1.0";
 
 const NETCONF_MONITORING_MODULE: &str = "ietf-netconf-monitoring";
 
@@ -33,10 +35,10 @@ const READ_ONLY_CAPABILITIES: [&str; 2] = [NETCONF_BASE_1_0, NETCONF_BASE_1_1];
 
 /// Returns the base capabilities implemented by the current read-only server core.
 ///
-/// Candidate, startup, writable-running, validate, confirmed-commit,
-/// with-defaults, XPath, and notifications are intentionally absent until those
-/// behaviors exist and are tested. Optional binding-backed capabilities are
-/// appended by [`read_only_capabilities`] only when their hooks are present.
+/// Candidate, startup, validate, confirmed-commit, XPath, and notifications are
+/// intentionally absent until those behaviors exist and are tested. Optional
+/// binding-backed capabilities are appended by [`read_only_capabilities`] only
+/// when their hooks are present.
 pub const fn read_only_base_capabilities() -> &'static [&'static str] {
     &READ_ONLY_CAPABILITIES
 }
@@ -50,11 +52,15 @@ pub fn read_only_capabilities(
     yang_library: Option<&YangLibraryCapability>,
     monitoring: Option<&NetconfMonitoringCapability>,
     with_defaults: Option<&WithDefaultsCapability>,
+    writable_running: bool,
 ) -> Vec<String> {
     let mut capabilities = read_only_base_capabilities()
         .iter()
         .map(|capability| (*capability).to_string())
         .collect::<Vec<_>>();
+    if writable_running {
+        capabilities.push(WRITABLE_RUNNING_1_0.to_string());
+    }
     if let Some(yang_library) = yang_library {
         capabilities.push(yang_library_capability(yang_library.content_id()));
     }
@@ -77,8 +83,10 @@ pub fn render_server_hello(
     yang_library: Option<&YangLibraryCapability>,
     monitoring: Option<&NetconfMonitoringCapability>,
     with_defaults: Option<&WithDefaultsCapability>,
+    writable_running: bool,
 ) -> String {
-    let capabilities = read_only_capabilities(yang_library, monitoring, with_defaults);
+    let capabilities =
+        read_only_capabilities(yang_library, monitoring, with_defaults, writable_running);
     render_hello(&capabilities, session_id)
 }
 
@@ -158,7 +166,7 @@ mod tests {
 
     #[test]
     fn read_only_capabilities_are_base_only_without_yang_library() {
-        let capabilities = read_only_capabilities(None, None, None);
+        let capabilities = read_only_capabilities(None, None, None, false);
         assert_eq!(capabilities, [NETCONF_BASE_1_0, NETCONF_BASE_1_1]);
         assert!(!capabilities.iter().any(|cap| cap.contains("candidate")));
         assert!(!capabilities.iter().any(|cap| cap.contains("startup")));
@@ -177,7 +185,7 @@ mod tests {
     fn yang_library_capability_includes_revision_and_escaped_content_id() {
         let yang_library =
             YangLibraryCapability::new("fnv1a64:abc&def").expect("capability content id");
-        let capabilities = read_only_capabilities(Some(&yang_library), None, None);
+        let capabilities = read_only_capabilities(Some(&yang_library), None, None, false);
 
         assert_eq!(capabilities.len(), 3);
         assert_eq!(
@@ -190,6 +198,7 @@ mod tests {
             Some(&yang_library),
             None,
             None,
+            false,
         );
         assert!(hello.contains("yang-library:1.1?revision=2019-01-04"));
         assert!(hello.contains("content-id=fnv1a64%3Aabc%26def"));
@@ -198,7 +207,7 @@ mod tests {
     #[test]
     fn monitoring_capability_is_opt_in() {
         let monitoring = NetconfMonitoringCapability;
-        let capabilities = read_only_capabilities(None, Some(&monitoring), None);
+        let capabilities = read_only_capabilities(None, Some(&monitoring), None, false);
 
         assert_eq!(capabilities.len(), 3);
         assert_eq!(capabilities[0], NETCONF_BASE_1_0);
@@ -220,7 +229,7 @@ mod tests {
             ],
         )
         .expect("with-defaults capability");
-        let capabilities = read_only_capabilities(None, None, Some(&with_defaults));
+        let capabilities = read_only_capabilities(None, None, Some(&with_defaults), false);
 
         assert_eq!(capabilities.len(), 3);
         assert_eq!(
@@ -231,9 +240,19 @@ mod tests {
 
     #[test]
     fn hello_contains_session_id_when_requested() {
-        let hello = render_server_hello(std::num::NonZeroU32::new(42), None, None, None);
+        let hello = render_server_hello(std::num::NonZeroU32::new(42), None, None, None, false);
         assert!(hello.contains(NETCONF_BASE_1_0));
         assert!(hello.contains(NETCONF_BASE_1_1));
         assert!(hello.contains("<session-id>42</session-id>"));
+    }
+
+    #[test]
+    fn writable_running_capability_is_opt_in() {
+        let capabilities = read_only_capabilities(None, None, None, true);
+
+        assert_eq!(capabilities.len(), 3);
+        assert_eq!(capabilities[0], NETCONF_BASE_1_0);
+        assert_eq!(capabilities[1], NETCONF_BASE_1_1);
+        assert_eq!(capabilities[2], WRITABLE_RUNNING_1_0);
     }
 }

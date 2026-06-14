@@ -83,6 +83,7 @@ impl SessionRegistry {
         if entry.kill_tx.receiver_count() == 0 {
             state.sessions.remove(&session_id);
             state.release_running_lock(session_id);
+            state.release_running_write(session_id);
             return Ok(KillSessionResult::NotFound);
         }
         before_signal()?;
@@ -91,6 +92,7 @@ impl SessionRegistry {
         } else {
             state.sessions.remove(&session_id);
             state.release_running_lock(session_id);
+            state.release_running_write(session_id);
             Ok(KillSessionResult::NotFound)
         }
     }
@@ -113,9 +115,39 @@ impl SessionRegistry {
                 owner_session_id: owner.session_id,
             });
         }
+        if let Some(owner) = state.running_write {
+            return Ok(LockRunningResult::Denied {
+                owner_session_id: owner.session_id,
+            });
+        }
         before_lock()?;
         state.running_lock = Some(RunningLock { session_id });
         Ok(LockRunningResult::Acquired)
+    }
+
+    /// Acquires a short-lived running datastore write guard.
+    pub(crate) fn begin_running_write(&self, session_id: u64) -> RunningWriteResult {
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if !state.sessions.contains_key(&session_id) {
+            return RunningWriteResult::SessionNotRegistered;
+        }
+        if let Some(owner) = state.running_lock {
+            if owner.session_id != session_id {
+                return RunningWriteResult::Denied {
+                    owner_session_id: owner.session_id,
+                };
+            }
+        }
+        if let Some(owner) = state.running_write {
+            return RunningWriteResult::Denied {
+                owner_session_id: owner.session_id,
+            };
+        }
+        state.running_write = Some(RunningWrite { session_id });
+        RunningWriteResult::Acquired(RunningWriteGuard {
+            registry: self.clone(),
+            session_id,
+        })
     }
 
     /// Releases the global running datastore lock after `before_unlock`
@@ -154,6 +186,7 @@ impl SessionRegistry {
         {
             state.sessions.remove(&session_id);
             state.release_running_lock(session_id);
+            state.release_running_write(session_id);
         }
     }
 
@@ -174,12 +207,22 @@ impl SessionRegistry {
             .running_lock
             .map(|lock| lock.session_id)
     }
+
+    #[cfg(test)]
+    pub(crate) fn running_write_owner_for_test(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .running_write
+            .map(|write| write.session_id)
+    }
 }
 
 #[derive(Debug, Default)]
 struct RegistryState {
     sessions: HashMap<u64, Arc<SessionEntry>>,
     running_lock: Option<RunningLock>,
+    running_write: Option<RunningWrite>,
 }
 
 impl RegistryState {
@@ -189,6 +232,15 @@ impl RegistryState {
             .is_some_and(|lock| lock.session_id == session_id)
         {
             self.running_lock = None;
+        }
+    }
+
+    fn release_running_write(&mut self, session_id: u64) {
+        if self
+            .running_write
+            .is_some_and(|write| write.session_id == session_id)
+        {
+            self.running_write = None;
         }
     }
 }
@@ -201,6 +253,28 @@ struct SessionEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RunningLock {
     session_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunningWrite {
+    session_id: u64,
+}
+
+/// Drop guard for an in-flight running datastore write.
+pub(crate) struct RunningWriteGuard {
+    registry: SessionRegistry,
+    session_id: u64,
+}
+
+impl Drop for RunningWriteGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .registry
+            .inner
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        state.release_running_write(self.session_id);
+    }
 }
 
 /// Live-session registration handle.
@@ -283,6 +357,19 @@ pub(crate) enum UnlockRunningResult {
     /// A different NETCONF session owns the running lock.
     NotOwner {
         /// NETCONF session id that owns the lock.
+        owner_session_id: u64,
+    },
+    /// The current session id is not registered in this registry.
+    SessionNotRegistered,
+}
+
+/// Result of acquiring a short-lived running write guard.
+pub(crate) enum RunningWriteResult {
+    /// The calling session may write running until the guard is dropped.
+    Acquired(RunningWriteGuard),
+    /// The running datastore is locked or being written by another session.
+    Denied {
+        /// NETCONF session id that currently owns running.
         owner_session_id: u64,
     },
     /// The current session id is not registered in this registry.
@@ -432,5 +519,60 @@ mod tests {
         drop(owner);
 
         assert_eq!(registry.running_lock_owner_for_test(), None);
+    }
+
+    #[test]
+    fn running_write_guard_denies_parallel_writes_and_releases_on_drop() {
+        let registry = SessionRegistry::new();
+        let _first = registry.register(10).expect("register first");
+        let _second = registry.register(11).expect("register second");
+
+        let guard = match registry.begin_running_write(10) {
+            RunningWriteResult::Acquired(guard) => guard,
+            _ => panic!("first writer should acquire"),
+        };
+        assert_eq!(registry.running_write_owner_for_test(), Some(10));
+
+        assert!(matches!(
+            registry.begin_running_write(11),
+            RunningWriteResult::Denied {
+                owner_session_id: 10
+            }
+        ));
+        assert!(matches!(
+            registry.lock_running_after(11, || Ok::<(), ()>(())),
+            Ok(LockRunningResult::Denied {
+                owner_session_id: 10
+            })
+        ));
+
+        drop(guard);
+        assert_eq!(registry.running_write_owner_for_test(), None);
+        assert!(matches!(
+            registry.begin_running_write(11),
+            RunningWriteResult::Acquired(_)
+        ));
+    }
+
+    #[test]
+    fn running_write_respects_existing_running_lock_owner() {
+        let registry = SessionRegistry::new();
+        let _first = registry.register(10).expect("register first");
+        let _second = registry.register(11).expect("register second");
+
+        assert_eq!(
+            registry.lock_running_after(10, || Ok::<(), ()>(())),
+            Ok(LockRunningResult::Acquired)
+        );
+        assert!(matches!(
+            registry.begin_running_write(11),
+            RunningWriteResult::Denied {
+                owner_session_id: 10
+            }
+        ));
+        assert!(matches!(
+            registry.begin_running_write(10),
+            RunningWriteResult::Acquired(_)
+        ));
     }
 }
