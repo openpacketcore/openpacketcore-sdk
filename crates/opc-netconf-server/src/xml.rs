@@ -797,6 +797,15 @@ impl ParserState {
         Ok(())
     }
 
+    fn record_filter_attribute_match(&mut self) -> Result<(), XmlError> {
+        self.filter_attribute_match_count += 1;
+        self.limits
+            .check_subtree_filter_attribute_match_nodes(self.filter_attribute_match_count)?;
+        self.filter_unsupported_subtree_error =
+            Some(XmlError::SubtreeFilterAttributeMatchNotSupported);
+        Ok(())
+    }
+
     fn text(&mut self, text: &str) -> Result<(), XmlError> {
         if self.root.is_none() && self.stack.is_empty() && !self.root_closed {
             if text.trim().is_empty() {
@@ -1485,27 +1494,32 @@ impl ParserState {
             return Err(XmlError::UnsupportedFilterContent);
         }
 
-        if let Some(parent) = self.filter_stack.last_mut() {
-            if parent.suppress_subtree {
-                let mut path = parent.path.clone();
-                path.push(FilterElement {
-                    namespace: element.namespace.clone(),
-                    local: element.local.clone(),
-                });
-                self.filter_stack.push(FilterFrame {
-                    path,
-                    child_count: 0,
-                    suppress_subtree: true,
-                });
-                return Ok(());
+        if let Some(mut path) = self
+            .filter_stack
+            .last()
+            .and_then(|parent| parent.suppress_subtree.then(|| parent.path.clone()))
+        {
+            if !attrs.is_empty() {
+                self.record_filter_attribute_match()?;
             }
+            path.push(FilterElement {
+                namespace: element.namespace.clone(),
+                local: element.local.clone(),
+            });
+            self.filter_stack.push(FilterFrame {
+                path,
+                child_count: 0,
+                suppress_subtree: true,
+            });
+            return Ok(());
+        }
+
+        if let Some(parent) = self.filter_stack.last_mut() {
             parent.child_count += 1;
         }
 
         if !attrs.is_empty() {
-            self.filter_attribute_match_count += 1;
-            self.limits
-                .check_subtree_filter_attribute_match_nodes(self.filter_attribute_match_count)?;
+            self.record_filter_attribute_match()?;
             let mut path = self
                 .filter_stack
                 .last()
@@ -1520,8 +1534,6 @@ impl ParserState {
                 child_count: 0,
                 suppress_subtree: true,
             });
-            self.filter_unsupported_subtree_error =
-                Some(XmlError::SubtreeFilterAttributeMatchNotSupported);
             return Ok(());
         }
 
@@ -3171,6 +3183,20 @@ mod tests {
             &limits,
         )
         .expect_err("attribute match over limit");
+        assert!(matches!(err, XmlError::Limit(_)));
+    }
+
+    #[test]
+    fn subtree_filter_attribute_match_is_bounded_inside_suppressed_content_match() {
+        let limits = MgmtLimits {
+            max_subtree_filter_attribute_match_nodes: 1,
+            ..MgmtLimits::default()
+        };
+        let err = parse_rpc(
+            &rpc(r#"<get-config><source><running/></source><filter><sys:system xmlns:sys="urn:opc:test"><sys:hostname>content<sys:alt a="first"/><sys:alt b="second"/></sys:hostname></sys:system></filter></get-config>"#),
+            &limits,
+        )
+        .expect_err("nested attribute match over limit");
         assert!(matches!(err, XmlError::Limit(_)));
     }
 
