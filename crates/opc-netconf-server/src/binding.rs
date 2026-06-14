@@ -5,7 +5,10 @@ use std::sync::Arc;
 use opc_config_bus::ConfigBus;
 use opc_config_model::{OpcConfig, YangPath};
 use opc_mgmt_opstate::{OperationalError, OperationalRequest, OperationalResponse};
-use opc_mgmt_schema::SchemaRegistry;
+use opc_mgmt_schema::{
+    DefaultReport, NetconfProjectionError, NetconfXmlRenderContext, NetconfXmlRenderer,
+    SchemaRegistry,
+};
 use thiserror::Error;
 
 use crate::discovery;
@@ -280,12 +283,34 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
     /// Generated schema registry for the served model set.
     fn schema_registry(&self) -> &'static dyn SchemaRegistry;
 
+    /// Optional generated NETCONF XML renderer for this binding.
+    ///
+    /// When a CNF returns `Some`, the default read-path hooks render through the
+    /// generated projection. A binding may return `None` to keep full ownership
+    /// of XML rendering, in which case the default hooks fail closed. This is an
+    /// explicit opt-in: the server never falls back to generated projection
+    /// without the binding's knowledge.
+    fn generated_xml_renderer(&self) -> Option<&dyn NetconfXmlRenderer<C>> {
+        None
+    }
+
     /// Renders the currently published running config for the authorized paths.
+    ///
+    /// The default delegates to [`Self::generated_xml_renderer`] if present. A
+    /// binding that overrides this method is responsible for honoring
+    /// `ReadSelection`, redacting secrets, escaping values, and failing closed.
     fn render_running_config(
         &self,
         config: &C,
         selection: ReadSelection<'_>,
-    ) -> Result<String, BindingError>;
+    ) -> Result<String, BindingError> {
+        let renderer = self.generated_xml_renderer().ok_or_else(|| {
+            BindingError::projection("NETCONF running XML projection is not implemented")
+        })?;
+        renderer
+            .render_running_config(config, selection.schema_paths(), DefaultReport::Trim)
+            .map_err(projection_error)
+    }
 
     /// Returns true when this binding supports RFC 6241 running datastore
     /// writes through `<edit-config>` and [`Self::build_edit_config_candidate`].
@@ -311,18 +336,28 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
     /// Renders running config for an RFC 6243 with-defaults request.
     ///
     /// A binding that advertises [`Self::with_defaults_capability`] must
-    /// implement this hook for every advertised mode. The default fails closed
-    /// so a capability declaration without projection support cannot
+    /// implement this hook for every advertised mode. The default delegates to
+    /// the generated renderer for `report-all` and `trim`; other modes fail
+    /// closed so a capability declaration without projection support cannot
     /// accidentally return non-default-aware XML.
     fn render_running_config_with_defaults(
         &self,
-        _config: &C,
-        _selection: ReadSelection<'_>,
-        _mode: WithDefaultsMode,
+        config: &C,
+        selection: ReadSelection<'_>,
+        mode: WithDefaultsMode,
     ) -> Result<String, BindingError> {
-        Err(BindingError::projection(
-            "NETCONF with-defaults running projection is not implemented",
-        ))
+        let renderer = self.generated_xml_renderer().ok_or_else(|| {
+            BindingError::projection("NETCONF with-defaults running projection is not implemented")
+        })?;
+        let report = with_defaults_mode_to_report(mode)?;
+        if !renderer.supported_default_reports().contains(&report) {
+            return Err(BindingError::projection(
+                "NETCONF with-defaults report mode is not supported by the generated renderer",
+            ));
+        }
+        renderer
+            .render_running_config(config, selection.schema_paths(), report)
+            .map_err(projection_error)
     }
 
     /// Reads NF-supplied operational state for NETCONF `<get>`.
@@ -339,39 +374,75 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
 
     /// Renders NETCONF `<get>` data after server-side filtering and NACM.
     ///
-    /// The server owns path resolution, authorization, and operational-state
-    /// request validation. The CNF owns schema-aware XML projection until
-    /// `opc-yanggen` grows a generated NETCONF XML renderer.
+    /// The default renders the config portion through
+    /// [`Self::generated_xml_renderer`] when present, and renders the
+    /// operational portion through the generic helper
+    /// [`render_operational_xml`]. When no renderer is present and no
+    /// operational values are requested, it falls back to the legacy fail-closed
+    /// behavior for bindings that have not yet opted into generated projection.
     fn render_get_data(
         &self,
         config: &C,
         config_selection: ReadSelection<'_>,
         operational: &OperationalResponse,
-        _operational_selection: ReadSelection<'_>,
+        operational_selection: ReadSelection<'_>,
     ) -> Result<String, BindingError> {
-        if !operational.values.is_empty() {
+        let mut out = String::new();
+        if let Some(renderer) = self.generated_xml_renderer() {
+            out.push_str(
+                &renderer
+                    .render_running_config(
+                        config,
+                        config_selection.schema_paths(),
+                        DefaultReport::Trim,
+                    )
+                    .map_err(projection_error)?,
+            );
+        } else if !operational.values.is_empty() {
             return Err(BindingError::projection(
                 "NETCONF operational XML projection is not implemented",
             ));
         }
-        self.render_running_config(config, config_selection)
+        out.push_str(&render_operational_xml(
+            self.schema_registry(),
+            operational_selection.schema_paths(),
+            operational,
+        )?);
+        Ok(out)
     }
 
     /// Renders NETCONF `<get>` data for an RFC 6243 with-defaults request.
     ///
     /// A binding that advertises [`Self::with_defaults_capability`] must
-    /// implement this hook for every advertised mode. The default fails closed.
+    /// implement this hook for every advertised mode. The default delegates to
+    /// the generated renderer for the config portion and the generic helper for
+    /// the operational portion; unsupported modes fail closed.
     fn render_get_data_with_defaults(
         &self,
-        _config: &C,
-        _config_selection: ReadSelection<'_>,
-        _operational: &OperationalResponse,
-        _operational_selection: ReadSelection<'_>,
-        _mode: WithDefaultsMode,
+        config: &C,
+        config_selection: ReadSelection<'_>,
+        operational: &OperationalResponse,
+        operational_selection: ReadSelection<'_>,
+        mode: WithDefaultsMode,
     ) -> Result<String, BindingError> {
-        Err(BindingError::projection(
-            "NETCONF with-defaults data projection is not implemented",
-        ))
+        let renderer = self.generated_xml_renderer().ok_or_else(|| {
+            BindingError::projection("NETCONF with-defaults data projection is not implemented")
+        })?;
+        let report = with_defaults_mode_to_report(mode)?;
+        if !renderer.supported_default_reports().contains(&report) {
+            return Err(BindingError::projection(
+                "NETCONF with-defaults report mode is not supported by the generated renderer",
+            ));
+        }
+        let mut out = renderer
+            .render_running_config(config, config_selection.schema_paths(), report)
+            .map_err(projection_error)?;
+        out.push_str(&render_operational_xml(
+            self.schema_registry(),
+            operational_selection.schema_paths(),
+            operational,
+        )?);
+        Ok(out)
     }
 
     /// Returns the advertised RFC 8525 YANG Library capability, if this binding
@@ -481,4 +552,75 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
     ) -> Result<EditConfigCandidate<C>, EditConfigError> {
         Err(EditConfigError::Unsupported)
     }
+}
+
+fn projection_error(err: NetconfProjectionError) -> BindingError {
+    BindingError::projection(err.to_string())
+}
+
+fn with_defaults_mode_to_report(mode: WithDefaultsMode) -> Result<DefaultReport, BindingError> {
+    match mode {
+        WithDefaultsMode::ReportAll => Ok(DefaultReport::ReportAll),
+        WithDefaultsMode::Trim => Ok(DefaultReport::Trim),
+        WithDefaultsMode::Explicit => Ok(DefaultReport::Explicit),
+        WithDefaultsMode::ReportAllTagged => Err(BindingError::projection(
+            "NETCONF with-defaults report-all-tagged is not supported",
+        )),
+        WithDefaultsMode::Unrecognized => Err(BindingError::projection(
+            "NETCONF with-defaults mode is unrecognized",
+        )),
+    }
+}
+
+/// Renders operational-state values as NETCONF XML for the authorized state paths.
+///
+/// This helper is anti-fabrication: paths the provider did not report are
+/// omitted, non-leaf values are skipped, and JSON payloads that are not scalar
+/// fail closed rather than being silently flattened.
+pub fn render_operational_xml(
+    registry: &'static dyn SchemaRegistry,
+    paths: &[&'static str],
+    operational: &OperationalResponse,
+) -> Result<String, BindingError> {
+    if paths.is_empty() || operational.values.is_empty() {
+        return Ok(String::new());
+    }
+
+    let ctx = NetconfXmlRenderContext::new(registry, paths, DefaultReport::Trim);
+    let mut out = String::new();
+
+    for path in paths {
+        let Some(node) = registry.node(path) else {
+            continue;
+        };
+        if node.config || node.kind != opc_mgmt_schema::NodeKind::Leaf {
+            continue;
+        }
+
+        let yang_path = YangPath::new(*path).map_err(|_| {
+            BindingError::projection("NETCONF operational path is not a valid YangPath")
+        })?;
+        let Some(value) = operational.value_for(&yang_path) else {
+            continue;
+        };
+
+        let json_value: serde_json::Value = serde_json::from_str(value.value_json())
+            .map_err(|_| BindingError::projection("NETCONF operational value is not valid JSON"))?;
+
+        let raw = match json_value {
+            serde_json::Value::Null => continue,
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                return Err(BindingError::projection(
+                    "NETCONF operational value is not a scalar and cannot be rendered as XML",
+                ));
+            }
+        };
+
+        out.push_str(&ctx.format_leaf(path, &raw).map_err(projection_error)?);
+    }
+
+    Ok(out)
 }

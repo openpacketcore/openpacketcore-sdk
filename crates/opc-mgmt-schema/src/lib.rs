@@ -594,6 +594,261 @@ pub trait SchemaRegistry: Send + Sync {
     }
 }
 
+// ---------------------------------------------------------------------------
+// NETCONF XML projection contract
+// ---------------------------------------------------------------------------
+
+use opc_config_model::OpcConfig;
+use opc_redaction::{redact, RedactionLevel};
+
+/// Failure modes for schema-backed NETCONF XML projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetconfProjectionError {
+    /// A schema shape the current generated projection cannot render correctly.
+    UnsupportedShape {
+        /// Schema-node path that triggered the rejection.
+        path: &'static str,
+        /// Kind of node that is not supported.
+        kind: NodeKind,
+    },
+    /// A requested with-defaults report mode is not implemented.
+    UnsupportedDefaultReport {
+        /// The requested report mode.
+        report: DefaultReport,
+    },
+    /// A schema path references a module that is not in the served-model set.
+    MissingModule {
+        /// Schema-node path that references the missing module.
+        path: &'static str,
+        /// Module name that has no served-model entry.
+        module: &'static str,
+    },
+    /// Writing the XML fragment failed (e.g. invalid UTF-8).
+    WriteError,
+}
+
+impl std::fmt::Display for NetconfProjectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedShape { path, kind } => {
+                write!(
+                    f,
+                    "NETCONF XML projection does not support {kind:?} at {path}"
+                )
+            }
+            Self::UnsupportedDefaultReport { report } => {
+                write!(
+                    f,
+                    "NETCONF XML projection does not support default report {report:?}"
+                )
+            }
+            Self::MissingModule { path, module } => {
+                write!(
+                    f,
+                    "NETCONF XML projection cannot resolve module {module} for {path}"
+                )
+            }
+            Self::WriteError => f.write_str("NETCONF XML projection write failed"),
+        }
+    }
+}
+
+impl std::error::Error for NetconfProjectionError {}
+
+/// Schema-backed NETCONF XML renderer for a generated config root `C`.
+///
+/// `opc-yanggen` emits an implementation of this trait for the generated root
+/// type. A CNF binding returns the renderer through
+/// [`opc_netconf_server::binding::NetconfConfigBinding::generated_xml_renderer`]
+/// so the server can render running config (and the config part of `<get>`)
+/// without hand-written XML projection.
+pub trait NetconfXmlRenderer<C: OpcConfig>: Send + Sync {
+    /// Render the running-config XML fragment for the authorized `selection`.
+    fn render_running_config(
+        &self,
+        config: &C,
+        selection: &[&str],
+        report: DefaultReport,
+    ) -> Result<String, NetconfProjectionError>;
+
+    /// Reports which with-defaults modes this renderer implements.
+    fn supported_default_reports(&self) -> &'static [DefaultReport];
+}
+
+/// Context shared by generated NETCONF XML renderers.
+///
+/// The context is intentionally immutable: generated container renderers build
+/// their subtree strings locally and return them, so empty containers can be
+/// omitted without buffering an entire document.
+#[derive(Clone, Copy)]
+pub struct NetconfXmlRenderContext<'a> {
+    registry: &'a dyn SchemaRegistry,
+    selection: &'a [&'a str],
+    report: DefaultReport,
+}
+
+impl<'a> NetconfXmlRenderContext<'a> {
+    /// Build a render context for the given selection and report mode.
+    pub fn new(
+        registry: &'a dyn SchemaRegistry,
+        selection: &'a [&'a str],
+        report: DefaultReport,
+    ) -> Self {
+        Self {
+            registry,
+            selection,
+            report,
+        }
+    }
+
+    /// The report mode in effect for this render.
+    pub const fn report(&self) -> DefaultReport {
+        self.report
+    }
+
+    /// Returns whether `path` itself is in the authorized selection.
+    pub fn is_selected(&self, path: &str) -> bool {
+        self.selection.contains(&path)
+    }
+
+    /// Returns whether `path` lies inside the selected subtree.
+    ///
+    /// This is true when `path` itself is selected, when any descendant of
+    /// `path` is selected, or when any ancestor of `path` is selected. In other
+    /// words, the selected paths form a subtree mask and this method reports
+    /// whether `path` is covered by that mask.
+    pub fn is_subtree_selected(&self, path: &str) -> bool {
+        self.selection.iter().any(|p| {
+            *p == path
+                || p.strip_prefix(path)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+                || path
+                    .strip_prefix(p)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    }
+
+    /// Schema default literal for `path` under the current report mode.
+    pub fn default_for(&self, path: &str) -> Option<&'static str> {
+        self.registry.default_for(path, self.report)
+    }
+
+    /// Schema default literal for `path`, independent of report mode.
+    ///
+    /// Generated renderers need this to implement `trim`: a `Defaulted` value
+    /// equals the schema default regardless of whether the request asked for
+    /// `report-all` or `trim`.
+    pub fn schema_default(&self, path: &str) -> Option<&'static str> {
+        self.registry.node(path).and_then(|n| n.default)
+    }
+
+    /// Node metadata lookup.
+    pub fn node(&self, path: &str) -> Option<&'static NodeMeta> {
+        self.registry.node(path)
+    }
+
+    /// The XML-qualified name (`prefix:local`) for a schema-node path.
+    pub fn qualified_name(&self, path: &'static str) -> Result<String, NetconfProjectionError> {
+        let node = self
+            .registry
+            .node(path)
+            .ok_or(NetconfProjectionError::UnsupportedShape {
+                path,
+                kind: NodeKind::Container,
+            })?;
+        let prefix = self
+            .registry
+            .served_models()
+            .iter()
+            .find(|m| m.name == node.module)
+            .map(|m| m.prefix)
+            .ok_or(NetconfProjectionError::MissingModule {
+                path,
+                module: node.module,
+            })?;
+        let local = last_segment(path)
+            .split_once(':')
+            .map(|(_, name)| name)
+            .unwrap_or_else(|| last_segment(path));
+        Ok(format!("{prefix}:{local}"))
+    }
+
+    /// All `(prefix, namespace)` pairs referenced by the selection, sorted by
+    /// prefix so root namespace declarations are deterministic.
+    pub fn module_namespaces(&self) -> Vec<(&'static str, &'static str)> {
+        let mut by_prefix = std::collections::BTreeMap::<&'static str, &'static str>::new();
+        for path in self.selection {
+            for seg in path.split('/') {
+                if seg.is_empty() {
+                    continue;
+                }
+                let module_or_prefix = seg.split_once(':').map(|(pfx, _)| pfx).unwrap_or(seg);
+                if let Some(model) = self
+                    .registry
+                    .served_models()
+                    .iter()
+                    .find(|m| m.name == module_or_prefix || m.prefix == module_or_prefix)
+                {
+                    by_prefix.insert(model.prefix, model.namespace);
+                }
+            }
+        }
+        by_prefix.into_iter().collect()
+    }
+
+    /// Format one leaf element with redaction and XML escaping.
+    pub fn format_leaf(
+        &self,
+        path: &'static str,
+        raw_value: &str,
+    ) -> Result<String, NetconfProjectionError> {
+        let name = self.qualified_name(path)?;
+        let data_class = self.registry.data_class(path).unwrap_or(DataClass::Public);
+        let value = if data_class.allows_cleartext() {
+            raw_value.to_string()
+        } else {
+            redact(raw_value, data_class, RedactionLevel::Mask, None, None).to_string()
+        };
+        if value.is_empty() {
+            Ok(format!("<{name}/>"))
+        } else {
+            Ok(format!(
+                "<{name}>{value}</{name}>",
+                value = xml_escape_text(&value)
+            ))
+        }
+    }
+}
+
+/// XML-escape text content.
+pub fn xml_escape_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// XML-escape an attribute value.
+pub fn xml_escape_attr(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1024,5 +1279,239 @@ mod tests {
         assert_eq!(reg.node("/root/leaf"), None);
         assert_eq!(reg.node("/a:root/a:leaf").map(|n| n.module), Some("a"));
         assert_eq!(reg.node("/b:root/b:leaf").map(|n| n.module), Some("b"));
+    }
+
+    #[test]
+    fn xml_escaping_obeys_basic_rules() {
+        assert_eq!(xml_escape_text("a & b < c > d"), "a &amp; b &lt; c &gt; d");
+        assert_eq!(
+            xml_escape_attr(r#"value "quoted""#),
+            "value &quot;quoted&quot;"
+        );
+    }
+
+    #[test]
+    fn render_context_selection_predicates() {
+        static MODELS: &[ModelData] = &[ModelData {
+            name: "example",
+            revision: "",
+            namespace: "urn:example",
+            prefix: "ex",
+        }];
+        static NODES: &[NodeMeta] = &[
+            NodeMeta {
+                path: "/ex:system",
+                module: "example",
+                kind: NodeKind::Container,
+                config: true,
+                leaf_type: None,
+                key_leaves: &[],
+                data_class: DataClass::Public,
+                default: None,
+                has_default: false,
+                presence: false,
+                child_paths: &["/ex:system/ex:hostname"],
+            },
+            NodeMeta {
+                path: "/ex:system/ex:hostname",
+                module: "example",
+                kind: NodeKind::Leaf,
+                config: true,
+                leaf_type: Some(LeafType::String),
+                key_leaves: &[],
+                data_class: DataClass::Public,
+                default: None,
+                has_default: false,
+                presence: false,
+                child_paths: &[],
+            },
+        ];
+
+        struct TestRegistry;
+        impl SchemaRegistry for TestRegistry {
+            fn schema_digest(&self) -> &'static str {
+                "digest"
+            }
+            fn served_models(&self) -> &'static [ModelData] {
+                MODELS
+            }
+            fn nodes(&self) -> &'static [NodeMeta] {
+                NODES
+            }
+            fn origins(&self) -> &'static [OriginEntry] {
+                &[]
+            }
+        }
+
+        let reg = TestRegistry;
+        let selection: &[&str] = &["/ex:system", "/ex:system/ex:hostname"];
+        let ctx = NetconfXmlRenderContext::new(&reg, selection, DefaultReport::Trim);
+
+        assert!(ctx.is_selected("/ex:system/ex:hostname"));
+        assert!(!ctx.is_selected("/ex:system/ex:missing"));
+        assert!(ctx.is_subtree_selected("/ex:system"));
+        assert!(!ctx.is_subtree_selected("/ex:other"));
+
+        // A selected ancestor covers its descendants.
+        let root_ctx = NetconfXmlRenderContext::new(&reg, &["/ex:system"], DefaultReport::Trim);
+        assert!(root_ctx.is_subtree_selected("/ex:system/ex:hostname"));
+        assert!(root_ctx.is_subtree_selected("/ex:system"));
+        assert!(!root_ctx.is_subtree_selected("/ex:other"));
+    }
+
+    #[test]
+    fn render_context_qualified_name_and_namespaces() {
+        static MODELS: &[ModelData] = &[
+            ModelData {
+                name: "example",
+                revision: "",
+                namespace: "urn:example",
+                prefix: "ex",
+            },
+            ModelData {
+                name: "other",
+                revision: "",
+                namespace: "urn:other",
+                prefix: "ot",
+            },
+        ];
+        static NODES: &[NodeMeta] = &[
+            NodeMeta {
+                path: "/ex:system",
+                module: "example",
+                kind: NodeKind::Container,
+                config: true,
+                leaf_type: None,
+                key_leaves: &[],
+                data_class: DataClass::Public,
+                default: None,
+                has_default: false,
+                presence: false,
+                child_paths: &["/ex:system/ex:hostname", "/ex:system/ot:neighbor"],
+            },
+            NodeMeta {
+                path: "/ex:system/ex:hostname",
+                module: "example",
+                kind: NodeKind::Leaf,
+                config: true,
+                leaf_type: Some(LeafType::String),
+                key_leaves: &[],
+                data_class: DataClass::Public,
+                default: None,
+                has_default: false,
+                presence: false,
+                child_paths: &[],
+            },
+            NodeMeta {
+                path: "/ex:system/ot:neighbor",
+                module: "other",
+                kind: NodeKind::Leaf,
+                config: true,
+                leaf_type: Some(LeafType::String),
+                key_leaves: &[],
+                data_class: DataClass::Public,
+                default: None,
+                has_default: false,
+                presence: false,
+                child_paths: &[],
+            },
+        ];
+
+        struct TestRegistry;
+        impl SchemaRegistry for TestRegistry {
+            fn schema_digest(&self) -> &'static str {
+                "digest"
+            }
+            fn served_models(&self) -> &'static [ModelData] {
+                MODELS
+            }
+            fn nodes(&self) -> &'static [NodeMeta] {
+                NODES
+            }
+            fn origins(&self) -> &'static [OriginEntry] {
+                &[]
+            }
+        }
+
+        let reg = TestRegistry;
+        let selection: &[&str] = &["/ex:system/ex:hostname", "/ex:system/ot:neighbor"];
+        let ctx = NetconfXmlRenderContext::new(&reg, selection, DefaultReport::Trim);
+
+        assert_eq!(
+            ctx.qualified_name("/ex:system/ex:hostname").unwrap(),
+            "ex:hostname"
+        );
+        assert_eq!(
+            ctx.qualified_name("/ex:system/ot:neighbor").unwrap(),
+            "ot:neighbor"
+        );
+
+        let ns = ctx.module_namespaces();
+        assert_eq!(ns, vec![("ex", "urn:example"), ("ot", "urn:other")]);
+    }
+
+    #[test]
+    fn format_leaf_redacts_security_secret() {
+        static MODELS: &[ModelData] = &[ModelData {
+            name: "example",
+            revision: "",
+            namespace: "urn:example",
+            prefix: "ex",
+        }];
+        static NODES: &[NodeMeta] = &[
+            NodeMeta {
+                path: "/ex:secret",
+                module: "example",
+                kind: NodeKind::Leaf,
+                config: true,
+                leaf_type: Some(LeafType::String),
+                key_leaves: &[],
+                data_class: DataClass::SecuritySecret,
+                default: None,
+                has_default: false,
+                presence: false,
+                child_paths: &[],
+            },
+            NodeMeta {
+                path: "/ex:hostname",
+                module: "example",
+                kind: NodeKind::Leaf,
+                config: true,
+                leaf_type: Some(LeafType::String),
+                key_leaves: &[],
+                data_class: DataClass::Public,
+                default: None,
+                has_default: false,
+                presence: false,
+                child_paths: &[],
+            },
+        ];
+
+        struct TestRegistry;
+        impl SchemaRegistry for TestRegistry {
+            fn schema_digest(&self) -> &'static str {
+                "digest"
+            }
+            fn served_models(&self) -> &'static [ModelData] {
+                MODELS
+            }
+            fn nodes(&self) -> &'static [NodeMeta] {
+                NODES
+            }
+            fn origins(&self) -> &'static [OriginEntry] {
+                &[]
+            }
+        }
+
+        let reg = TestRegistry;
+        let ctx = NetconfXmlRenderContext::new(&reg, &[], DefaultReport::Trim);
+
+        let public = ctx.format_leaf("/ex:hostname", "router1").unwrap();
+        assert_eq!(public, "<ex:hostname>router1</ex:hostname>");
+
+        let secret = ctx.format_leaf("/ex:secret", "hunter2").unwrap();
+        assert!(!secret.contains("hunter2"));
+        assert!(secret.starts_with("<ex:secret>"));
+        assert!(secret.ends_with("</ex:secret>"));
     }
 }

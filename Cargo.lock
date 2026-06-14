@@ -1486,7 +1486,9 @@ dependencies = [
 name = "opc-mgmt-schema"
 version = "0.2.0"
 dependencies = [
+ "opc-config-model",
  "opc-data-governance",
+ "opc-redaction",
 ]
 
 [[package]]
@@ -1531,6 +1533,7 @@ dependencies = [
  "opc-types",
  "quick-xml",
  "rcgen",
+ "serde_json",
  "thiserror 2.0.18",
  "time",
  "tokio",
