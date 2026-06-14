@@ -1043,6 +1043,7 @@ where
             (_, NetconfErrorTag::MissingElement) => "missing-element",
             (_, NetconfErrorTag::InvalidValue) => "invalid-value",
             (_, NetconfErrorTag::TooBig) => "too-big",
+            (_, NetconfErrorTag::BadElement) => "bad-element",
             (_, NetconfErrorTag::OperationNotSupported) => "operation-not-supported",
             _ => "operation-failed",
         };
@@ -1057,7 +1058,7 @@ where
             Some(RpcOperationHint::KillSession) => {
                 event.with_paths([schema_node_path(NETCONF_KILL_SESSION_PATH)])
             }
-            None => event,
+            Some(RpcOperationHint::Get | RpcOperationHint::GetConfig) | None => event,
         };
         self.audit.record(&event)
     }
@@ -1066,12 +1067,14 @@ where
 fn audit_operation_for_parse_failure(err: &RpcParseError) -> AuditOperation {
     match err.operation_hint {
         Some(RpcOperationHint::KillSession) => AuditOperation::Exec,
-        None => AuditOperation::Read,
+        Some(RpcOperationHint::Get | RpcOperationHint::GetConfig) | None => AuditOperation::Read,
     }
 }
 
 fn netconf_operation_for_parse_failure(err: &RpcParseError) -> NetconfOperation {
     match err.operation_hint {
+        Some(RpcOperationHint::Get) => NetconfOperation::Get,
+        Some(RpcOperationHint::GetConfig) => NetconfOperation::GetConfig,
         Some(RpcOperationHint::KillSession) => NetconfOperation::KillSession,
         None => NetconfOperation::Unknown,
     }
@@ -4214,17 +4217,76 @@ mod tests {
     #[tokio::test]
     async fn xpath_filter_remains_rejected_until_bounded_evaluator_exists() {
         let (server, observed, audit) = server_fixture().await;
-        let rpc = format!(
+        let get_config = format!(
             r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="104"><get-config><source><running/></source><filter type="xpath" select="/sys:system/sys:hostname"/></get-config></rpc>"#
         );
-        let reply =
-            server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &MgmtLimits::default());
-        assert!(reply.contains("<error-tag>operation-not-supported</error-tag>"));
-        assert!(!reply.contains("sys:hostname"));
+        let get_config_reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &get_config,
+            &MgmtLimits::default(),
+        );
+        assert!(get_config_reply.contains("<error-tag>operation-not-supported</error-tag>"));
+        assert!(!get_config_reply.contains("sys:hostname"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+
+        let get = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="105"><get><filter type="xpath" select="/sys:system/sys:hostname"/></get></rpc>"#
+        );
+        let get_reply =
+            server.handle_rpc_xml(RequestId::new(), &principal(), &get, &MgmtLimits::default());
+        assert!(get_reply.contains("<error-tag>operation-not-supported</error-tag>"));
+        assert!(!get_reply.contains("sys:hostname"));
         assert!(observed.lock().expect("observed paths mutex").is_empty());
 
         let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
+        assert_eq!(events[1].outcome, audit_failed("operation-not-supported"));
+    }
+
+    #[tokio::test]
+    async fn malformed_xpath_filter_envelope_fails_before_projection_without_payload() {
+        let (server, observed, audit) = server_fixture().await;
+        let get_errors_before = netconf_rpc_errors("get", "bad-element");
+        let get = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="115"><get><filter type="xpath" select="/sys:system/sys:hostname[.='do-not-leak']" mode="all"/></get></rpc>"#
+        );
+        let reply =
+            server.handle_rpc_xml(RequestId::new(), &principal(), &get, &MgmtLimits::default());
+
+        assert!(reply.contains(r#"message-id="115""#));
+        assert!(reply.contains("<error-tag>bad-element</error-tag>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(!reply.contains("sys:hostname"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+        assert!(netconf_rpc_errors("get", "bad-element") > get_errors_before);
+
+        let get_config_errors_before = netconf_rpc_errors("get-config", "missing-attribute");
+        let get_config = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="116"><get-config><source><running/></source><filter type="xpath"/></get-config></rpc>"#
+        );
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &get_config,
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains(r#"message-id="116""#));
+        assert!(reply.contains("<error-tag>missing-attribute</error-tag>"));
+        assert!(!reply.contains("sys:hostname"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+        assert!(netconf_rpc_errors("get-config", "missing-attribute") > get_config_errors_before);
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].operation, AuditOperation::Read);
+        assert_eq!(events[0].outcome, audit_failed("bad-element"));
+        assert!(events[0].schema_paths.is_empty());
+        assert_eq!(events[1].operation, AuditOperation::Read);
+        assert_eq!(events[1].outcome, audit_failed("missing-attribute"));
+        assert!(events[1].schema_paths.is_empty());
     }
 
     #[tokio::test]
@@ -4342,6 +4404,46 @@ mod tests {
             vec![schema_node_path(NETCONF_KILL_SESSION_PATH)]
         );
         assert!(netconf_rpc_errors("kill-session", "unknown-namespace") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn wrong_namespace_read_operations_stay_unknown_until_base_namespace_matches() {
+        let (server, _observed, audit) = server_fixture().await;
+        let unknown_errors_before = netconf_rpc_errors("unknown", "unknown-namespace");
+
+        let bad_get = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" xmlns:bad="urn:example:bad" message-id="bad-get"><bad:get/></rpc>"#
+        );
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &bad_get,
+            &MgmtLimits::default(),
+        );
+        assert!(reply.contains(r#"message-id="bad-get""#));
+        assert!(reply.contains("<error-tag>unknown-namespace</error-tag>"));
+
+        let bad_get_config = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" xmlns:bad="urn:example:bad" message-id="bad-get-config"><bad:get-config/></rpc>"#
+        );
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &bad_get_config,
+            &MgmtLimits::default(),
+        );
+        assert!(reply.contains(r#"message-id="bad-get-config""#));
+        assert!(reply.contains("<error-tag>unknown-namespace</error-tag>"));
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].operation, AuditOperation::Read);
+        assert_eq!(events[0].outcome, audit_failed("unknown-namespace"));
+        assert!(events[0].schema_paths.is_empty());
+        assert_eq!(events[1].operation, AuditOperation::Read);
+        assert_eq!(events[1].outcome, audit_failed("unknown-namespace"));
+        assert!(events[1].schema_paths.is_empty());
+        assert!(netconf_rpc_errors("unknown", "unknown-namespace") >= unknown_errors_before + 2);
     }
 
     fn netconf_rpc_requests(operation: &str, outcome: &str) -> u64 {
