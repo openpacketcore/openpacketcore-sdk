@@ -6,9 +6,12 @@ use opc_mgmt_audit::{
 };
 use opc_mgmt_authz::{PolicySource, ReadAction, ReadAuthorizer};
 use opc_mgmt_errors::NetconfErrorTag;
+use opc_mgmt_limits::MgmtLimits;
 
 use crate::binding::{NetconfConfigBinding, ReadSelection};
-use crate::error::{rpc_error_reply, rpc_ok_reply, RpcError};
+use crate::error::{
+    rpc_error_reply_with_attrs, rpc_ok_reply_with_attrs, RpcError, RpcReplyAttributes,
+};
 use crate::filter::get_config_paths;
 use crate::metrics::{
     record_nacm_denials, record_rpc_error, record_rpc_success, NetconfNacmAction, NetconfOperation,
@@ -33,8 +36,12 @@ where
     pub principal: &'a TrustedPrincipal,
     /// NETCONF message id.
     pub message_id: &'a str,
+    /// Extra request `<rpc>` attributes to copy onto `<rpc-reply>`.
+    pub reply_attrs: &'a RpcReplyAttributes,
     /// RPC receive timestamp for latency metrics.
     pub started: std::time::Instant,
+    /// Shared management-plane input and fanout limits.
+    pub limits: &'a MgmtLimits,
 }
 
 /// Handles a parsed `<get-config>` request.
@@ -65,7 +72,7 @@ where
                 NetconfErrorTag::OperationFailed,
                 ctx.started.elapsed(),
             );
-            return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+            return error_reply(&ctx, RpcError::operation_failed());
         }
         record_rpc_error(
             NetconfOperation::GetConfig,
@@ -77,7 +84,7 @@ where
             error_tag = NetconfErrorTag::OperationNotSupported.as_str(),
             "NETCONF get-config rejected unsupported source datastore"
         );
-        return rpc_error_reply(Some(ctx.message_id), RpcError::operation_not_supported());
+        return error_reply(&ctx, RpcError::operation_not_supported());
     }
 
     let with_defaults_mode: Option<WithDefaultsMode> = match request.with_defaults {
@@ -104,7 +111,7 @@ where
                     NetconfErrorTag::OperationFailed,
                     ctx.started.elapsed(),
                 );
-                return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+                return error_reply(&ctx, RpcError::operation_failed());
             }
             record_rpc_error(
                 NetconfOperation::GetConfig,
@@ -116,7 +123,7 @@ where
                 error_tag = NetconfErrorTag::OperationNotSupported.as_str(),
                 "NETCONF get-config rejected unsupported with-defaults parameter"
             );
-            return rpc_error_reply(Some(ctx.message_id), RpcError::operation_not_supported());
+            return error_reply(&ctx, RpcError::operation_not_supported());
         }
         None => None,
     };
@@ -142,7 +149,7 @@ where
                     NetconfErrorTag::OperationFailed,
                     ctx.started.elapsed(),
                 );
-                return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+                return error_reply(&ctx, RpcError::operation_failed());
             }
             record_rpc_error(
                 NetconfOperation::GetConfig,
@@ -154,9 +161,39 @@ where
                 error_tag = error_tag.as_str(),
                 "NETCONF get-config rejected unsupported or invalid filter"
             );
-            return rpc_error_reply(Some(ctx.message_id), rpc_error);
+            return error_reply(&ctx, rpc_error);
         }
     };
+    if ctx.limits.check_paths(config_paths.len()).is_err() {
+        if audit_failure(
+            ctx.audit,
+            ctx.request_id,
+            ctx.principal,
+            ctx.transport,
+            "too-big",
+            Vec::new(),
+        )
+        .is_err()
+        {
+            record_rpc_error(
+                NetconfOperation::GetConfig,
+                NetconfErrorTag::OperationFailed,
+                ctx.started.elapsed(),
+            );
+            return error_reply(&ctx, RpcError::operation_failed());
+        }
+        record_rpc_error(
+            NetconfOperation::GetConfig,
+            NetconfErrorTag::TooBig,
+            ctx.started.elapsed(),
+        );
+        tracing::debug!(
+            operation = "get-config",
+            error_tag = NetconfErrorTag::TooBig.as_str(),
+            "NETCONF get-config rejected expanded path selection over limit"
+        );
+        return error_reply(&ctx, RpcError::too_big());
+    }
 
     if config_paths.is_empty() {
         if audit_success(
@@ -173,14 +210,14 @@ where
                 NetconfErrorTag::OperationFailed,
                 ctx.started.elapsed(),
             );
-            return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+            return error_reply(&ctx, RpcError::operation_failed());
         }
         record_rpc_success(NetconfOperation::GetConfig, ctx.started.elapsed());
         tracing::debug!(
             operation = "get-config",
             "NETCONF get-config returned empty selection"
         );
-        return rpc_ok_reply(ctx.message_id, "");
+        return ok_reply(&ctx, "");
     }
 
     let decisions = match ctx
@@ -204,7 +241,7 @@ where
                     NetconfErrorTag::OperationFailed,
                     ctx.started.elapsed(),
                 );
-                return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+                return error_reply(&ctx, RpcError::operation_failed());
             }
             record_rpc_error(
                 NetconfOperation::GetConfig,
@@ -216,7 +253,7 @@ where
                 error_tag = NetconfErrorTag::ResourceDenied.as_str(),
                 "NETCONF get-config failed closed on policy source error"
             );
-            return rpc_error_reply(Some(ctx.message_id), RpcError::resource_denied());
+            return error_reply(&ctx, RpcError::resource_denied());
         }
     };
 
@@ -247,14 +284,14 @@ where
                 NetconfErrorTag::OperationFailed,
                 ctx.started.elapsed(),
             );
-            return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+            return error_reply(&ctx, RpcError::operation_failed());
         }
         record_rpc_success(NetconfOperation::GetConfig, ctx.started.elapsed());
         tracing::debug!(
             operation = "get-config",
             "NETCONF get-config returned empty NACM-authorized selection"
         );
-        return rpc_ok_reply(ctx.message_id, "");
+        return ok_reply(&ctx, "");
     }
 
     let snapshot = binding.config_bus().current_snapshot();
@@ -282,11 +319,11 @@ where
                     NetconfErrorTag::OperationFailed,
                     ctx.started.elapsed(),
                 );
-                return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+                return error_reply(&ctx, RpcError::operation_failed());
             }
             record_rpc_success(NetconfOperation::GetConfig, ctx.started.elapsed());
             tracing::debug!(operation = "get-config", "NETCONF get-config succeeded");
-            rpc_ok_reply(ctx.message_id, &data_xml)
+            ok_reply(&ctx, &data_xml)
         }
         Err(_) => {
             if audit_failure(
@@ -304,7 +341,7 @@ where
                     NetconfErrorTag::OperationFailed,
                     ctx.started.elapsed(),
                 );
-                return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+                return error_reply(&ctx, RpcError::operation_failed());
             }
             record_rpc_error(
                 NetconfOperation::GetConfig,
@@ -316,9 +353,25 @@ where
                 error_tag = NetconfErrorTag::OperationFailed.as_str(),
                 "NETCONF get-config XML projection failed"
             );
-            rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed())
+            error_reply(&ctx, RpcError::operation_failed())
         }
     }
+}
+
+fn error_reply<P, A>(ctx: &GetConfigContext<'_, P, A>, error: RpcError) -> String
+where
+    P: PolicySource,
+    A: AuditSink,
+{
+    rpc_error_reply_with_attrs(Some(ctx.message_id), ctx.reply_attrs, error)
+}
+
+fn ok_reply<P, A>(ctx: &GetConfigContext<'_, P, A>, data_xml: &str) -> String
+where
+    P: PolicySource,
+    A: AuditSink,
+{
+    rpc_ok_reply_with_attrs(ctx.message_id, ctx.reply_attrs, data_xml)
 }
 
 fn audit_success<A: AuditSink>(

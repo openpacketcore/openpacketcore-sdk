@@ -9,12 +9,18 @@
 //!
 //! - applies the request prefix before the per-request elements;
 //! - validates the gNMI origin against served modules (unknown origin and a path
-//!   outside the origin's modules both fail closed);
+//!   outside the origin's modules both fail closed) and uses that origin to
+//!   disambiguate otherwise-ambiguous bare paths inside the origin's module set;
 //! - resolves the whole path to a real schema node (unknown paths fail closed);
+//! - requires schema prefixes to resolve to served models before accepting a
+//!   match, so malformed registry/input prefix pairs fail closed;
 //! - requires keyed lists to carry exactly their `key` leaves (missing/extra keys
 //!   fail closed) and emits them in the schema's `key` order regardless of the
-//!   order the client supplied;
+//!   order the client supplied, preserving a prefix-qualified key leaf's prefix
+//!   when the registry provides one;
 //! - rejects key predicates on non-list segments;
+//! - rejects malformed segment names before lookup, so malformed input is never
+//!   echoed as an unknown path;
 //! - escapes key values once, so callers never hand-concatenate paths.
 //!
 //! It returns the predicate-free schema path (for registry / NACM lookup) and the
@@ -158,15 +164,22 @@ pub fn resolve(
     registry: &dyn SchemaRegistry,
     request: &RequestPath,
 ) -> Result<ResolvedPath, PathError> {
-    if let Some(origin) = &request.origin {
-        if registry.modules_for_origin(origin).is_none() {
-            return Err(PathError::UnknownOrigin(origin.clone()));
-        }
-    }
+    let origin_modules = match &request.origin {
+        Some(origin) => Some(
+            registry
+                .modules_for_origin(origin)
+                .ok_or_else(|| PathError::UnknownOrigin(origin.clone()))?,
+        ),
+        None => None,
+    };
 
     let segments: Vec<&PathSegment> = request.prefix.iter().chain(request.elems.iter()).collect();
     if segments.is_empty() {
         return Err(PathError::Empty);
+    }
+
+    for seg in &segments {
+        validate_segment_name(&seg.name)?;
     }
 
     let mut lookup = String::new();
@@ -175,9 +188,20 @@ pub fn resolve(
         lookup.push_str(&seg.name);
     }
 
-    let node = registry
-        .node(&lookup)
-        .ok_or_else(|| PathError::UnknownPath(lookup.clone()))?;
+    let node = match resolve_node(registry, &segments, None) {
+        NodeLookup::Found(node) => node,
+        NodeLookup::NotFound | NodeLookup::Ambiguous => {
+            match origin_modules.and_then(|modules| {
+                match resolve_node(registry, &segments, Some(modules)) {
+                    NodeLookup::Found(node) => Some(node),
+                    NodeLookup::NotFound | NodeLookup::Ambiguous => None,
+                }
+            }) {
+                Some(node) => node,
+                None => return Err(PathError::UnknownPath(lookup.clone())),
+            }
+        }
+    };
 
     // The resolved node's canonical path has one segment per input element (path
     // normalization preserves segment count), so we can align by index.
@@ -186,10 +210,7 @@ pub fn resolve(
         return Err(PathError::UnknownPath(lookup.clone()));
     }
 
-    if let Some(origin) = &request.origin {
-        let modules = registry
-            .modules_for_origin(origin)
-            .ok_or_else(|| PathError::UnknownOrigin(origin.clone()))?;
+    if let (Some(origin), Some(modules)) = (&request.origin, origin_modules) {
         if !modules.contains(&node.module) {
             return Err(PathError::OriginModuleMismatch {
                 origin: origin.clone(),
@@ -230,6 +251,77 @@ pub fn resolve(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeLookup {
+    Found(&'static NodeMeta),
+    NotFound,
+    Ambiguous,
+}
+
+fn resolve_node(
+    registry: &dyn SchemaRegistry,
+    segments: &[&PathSegment],
+    allowed_modules: Option<&[&str]>,
+) -> NodeLookup {
+    let mut matches = registry.nodes().iter().filter(|node| {
+        allowed_modules.is_none_or(|modules| modules.contains(&node.module))
+            && path_segments_match(registry, node.path, segments)
+    });
+
+    let Some(first) = matches.next() else {
+        return NodeLookup::NotFound;
+    };
+    if matches.next().is_some() {
+        return NodeLookup::Ambiguous;
+    }
+    NodeLookup::Found(first)
+}
+
+fn path_segments_match(
+    registry: &dyn SchemaRegistry,
+    schema_path: &str,
+    input_segments: &[&PathSegment],
+) -> bool {
+    let schema_segments: Vec<&str> = schema_path.trim_start_matches('/').split('/').collect();
+    schema_segments.len() == input_segments.len()
+        && schema_segments
+            .iter()
+            .zip(input_segments)
+            .all(|(schema_seg, input_seg)| segment_matches(registry, schema_seg, &input_seg.name))
+}
+
+fn segment_matches(registry: &dyn SchemaRegistry, schema_seg: &str, input_name: &str) -> bool {
+    let Some((input_prefix, input_bare)) = parse_qualified_name(input_name) else {
+        return false;
+    };
+
+    if input_bare != bare_segment(schema_seg) {
+        return false;
+    }
+
+    let schema_module = match prefix_of(schema_seg) {
+        Some(schema_prefix) => match module_for_prefix(registry, schema_prefix) {
+            Some(module) => Some(module),
+            None => return false,
+        },
+        None => None,
+    };
+
+    let Some(input_prefix) = input_prefix else {
+        return true;
+    };
+
+    module_for_prefix(registry, input_prefix).is_some_and(|input_module| {
+        schema_module.is_some_and(|schema_module| input_module == schema_module)
+    })
+}
+
+fn validate_segment_name(name: &str) -> Result<(), PathError> {
+    parse_qualified_name(name)
+        .map(|_| ())
+        .ok_or_else(|| PathError::Malformed("invalid path segment".to_string()))
+}
+
 /// Validates and renders a list segment's key predicates in `key` order.
 fn render_keys(
     registry: &dyn SchemaRegistry,
@@ -242,7 +334,7 @@ fn render_keys(
     let mut provided: BTreeMap<&str, &str> = BTreeMap::new();
     for (k, v) in &input.keys {
         let (prefix, bare) = parse_qualified_name(k).ok_or_else(|| {
-            PathError::Malformed(format!("invalid key '{}' for list '{}'", k, list.path))
+            PathError::Malformed(format!("invalid key name for list '{}'", list.path))
         })?;
         if !key_prefix_matches(registry, list, prefix, bare) {
             return Err(PathError::UnexpectedKeys {
@@ -284,13 +376,16 @@ fn render_keys(
         });
     }
 
-    // Emit in schema `key` order, prefixing each key with the list's prefix.
+    // Emit in schema `key` order. Today's generator emits bare key names from
+    // the YANG key statement, so fall back to the list prefix; if a future
+    // registry carries prefix-qualified key leaves, preserve the key leaf's own
+    // prefix in the predicate.
     let key_prefix = prefix_of(seg_name);
     for kl in list.key_leaves {
         let bare = bare_segment(kl);
         let value = provided.get(bare).expect("validated present above");
         let escaped = escape_key_value(value);
-        match key_prefix {
+        match prefix_of(kl).or(key_prefix) {
             Some(prefix) => out.push_str(&format!("[{prefix}:{bare}='{escaped}']")),
             None => out.push_str(&format!("[{bare}='{escaped}']")),
         }
@@ -307,13 +402,17 @@ fn bare_segment(seg: &str) -> &str {
     }
 }
 
-/// Parses a bare or `prefix:name` identifier used as a key predicate name.
+/// Parses a bare or `prefix:name` identifier used as a path segment or key name.
 fn parse_qualified_name(name: &str) -> Option<(Option<&str>, &str)> {
     if name.is_empty()
         || name.trim() != name
         || name.contains('/')
         || name.contains('[')
         || name.contains(']')
+        || name.contains('=')
+        || name.contains('\'')
+        || name.contains('"')
+        || name.chars().any(char::is_whitespace)
         || name.chars().any(char::is_control)
     {
         return None;
@@ -447,6 +546,19 @@ mod tests {
             child_paths: &[],
         },
         NodeMeta {
+            path: "/oth:system",
+            module: "other-system",
+            kind: NodeKind::Container,
+            config: true,
+            leaf_type: None,
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[],
+        },
+        NodeMeta {
             path: "/sys:system",
             module: "demo-system",
             kind: NodeKind::Container,
@@ -460,6 +572,7 @@ mod tests {
             child_paths: &[
                 "/sys:system/sys:flow",
                 "/sys:system/sys:hostname",
+                "/sys:system/sys:prefixed-key",
                 "/sys:system/sys:user",
             ],
         },
@@ -484,6 +597,32 @@ mod tests {
         leaf("/sys:system/sys:flow/sys:dst"),
         leaf("/sys:system/sys:flow/sys:src"),
         leaf("/sys:system/sys:hostname"),
+        NodeMeta {
+            path: "/sys:system/sys:prefixed-key",
+            module: "demo-system",
+            kind: NodeKind::List,
+            config: true,
+            leaf_type: None,
+            key_leaves: &["oth:id"],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &["/sys:system/sys:prefixed-key/oth:id"],
+        },
+        NodeMeta {
+            path: "/sys:system/sys:prefixed-key/oth:id",
+            module: "other-system",
+            kind: NodeKind::Leaf,
+            config: true,
+            leaf_type: Some(LeafType::String),
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[],
+        },
         NodeMeta {
             path: "/sys:system/sys:user",
             module: "demo-system",
@@ -513,6 +652,37 @@ mod tests {
         }
         fn nodes(&self) -> &'static [NodeMeta] {
             NODES
+        }
+        fn origins(&self) -> &'static [OriginEntry] {
+            ORIGINS
+        }
+    }
+
+    struct UnknownPrefixReg;
+
+    static UNKNOWN_PREFIX_NODES: &[NodeMeta] = &[NodeMeta {
+        path: "/bad:system",
+        module: "demo-system",
+        kind: NodeKind::Container,
+        config: true,
+        leaf_type: None,
+        key_leaves: &[],
+        data_class: DataClass::Public,
+        default: None,
+        has_default: false,
+        presence: false,
+        child_paths: &[],
+    }];
+
+    impl SchemaRegistry for UnknownPrefixReg {
+        fn schema_digest(&self) -> &'static str {
+            "fnv1a64:bad"
+        }
+        fn served_models(&self) -> &'static [ModelData] {
+            MODELS
+        }
+        fn nodes(&self) -> &'static [NodeMeta] {
+            UNKNOWN_PREFIX_NODES
         }
         fn origins(&self) -> &'static [OriginEntry] {
             ORIGINS
@@ -590,6 +760,19 @@ mod tests {
     }
 
     #[test]
+    fn prefix_qualified_key_leaf_prefix_is_preserved() {
+        let req = RequestPath::from_elems([
+            PathSegment::new("system"),
+            PathSegment::with_keys("prefixed-key", [("id", "remote")]),
+        ]);
+        let resolved = resolve(&TestReg, &req).expect("resolve");
+        assert_eq!(
+            resolved.canonical.as_str(),
+            "/sys:system/sys:prefixed-key[oth:id='remote']"
+        );
+    }
+
+    #[test]
     fn missing_key_fails_closed() {
         let req = RequestPath::from_elems([
             PathSegment::new("system"),
@@ -640,6 +823,29 @@ mod tests {
     }
 
     #[test]
+    fn malformed_segment_fails_without_echoing_values() {
+        let req = RequestPath::from_elems([
+            PathSegment::new("system"),
+            PathSegment::new("user[name='super-secret-supi']"),
+        ]);
+        let err = resolve(&TestReg, &req).unwrap_err();
+        assert!(matches!(err, PathError::Malformed(_)));
+        assert!(!err.to_string().contains("super-secret-supi"));
+    }
+
+    #[test]
+    fn malformed_key_name_fails_without_echoing_values() {
+        let req = RequestPath::from_elems([
+            PathSegment::new("system"),
+            PathSegment::with_keys("user", [("name='super-secret-supi'", "also-secret")]),
+        ]);
+        let err = resolve(&TestReg, &req).unwrap_err();
+        assert!(matches!(err, PathError::Malformed(_)));
+        assert!(!err.to_string().contains("super-secret-supi"));
+        assert!(!err.to_string().contains("also-secret"));
+    }
+
+    #[test]
     fn empty_path_fails_closed() {
         assert_eq!(
             resolve(&TestReg, &RequestPath::default()),
@@ -655,6 +861,42 @@ mod tests {
             elems: vec![PathSegment::new("system"), PathSegment::new("hostname")],
         };
         assert!(resolve(&TestReg, &req).is_ok());
+    }
+
+    #[test]
+    fn origin_disambiguates_bare_path_within_its_modules() {
+        let req = RequestPath {
+            origin: Some("demo-system".to_string()),
+            prefix: vec![],
+            elems: vec![PathSegment::new("system")],
+        };
+        let resolved = resolve(&TestReg, &req).expect("resolve");
+        assert_eq!(resolved.schema_path, "/sys:system");
+        assert_eq!(resolved.canonical.as_str(), "/sys:system");
+    }
+
+    #[test]
+    fn ambiguous_bare_path_without_origin_fails_closed() {
+        let req = RequestPath::from_elems([PathSegment::new("system")]);
+        assert!(matches!(
+            resolve(&TestReg, &req),
+            Err(PathError::UnknownPath(_))
+        ));
+    }
+
+    #[test]
+    fn unserved_schema_prefix_fails_closed() {
+        let prefixed = RequestPath::from_elems([PathSegment::new("evil:system")]);
+        assert!(matches!(
+            resolve(&UnknownPrefixReg, &prefixed),
+            Err(PathError::UnknownPath(_))
+        ));
+
+        let bare = RequestPath::from_elems([PathSegment::new("system")]);
+        assert!(matches!(
+            resolve(&UnknownPrefixReg, &bare),
+            Err(PathError::UnknownPath(_))
+        ));
     }
 
     #[test]

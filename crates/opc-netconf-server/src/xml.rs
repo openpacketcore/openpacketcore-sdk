@@ -1,6 +1,6 @@
 //! Bounded NETCONF XML envelope parsing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use opc_mgmt_errors::{NetconfError, NetconfErrorTag, NetconfErrorType};
 use opc_mgmt_limits::{LimitsError, MgmtLimits};
@@ -11,6 +11,10 @@ use quick_xml::XmlVersion;
 use thiserror::Error;
 
 use crate::capabilities::{NETCONF_BASE_NS, NETCONF_MONITORING_NS, WITH_DEFAULTS_NS};
+use crate::error::RpcReplyAttributes;
+
+const XML_NAMESPACE_URI: &str = "http://www.w3.org/XML/1998/namespace";
+const XMLNS_NAMESPACE_URI: &str = "http://www.w3.org/2000/xmlns/";
 
 /// Parsed NETCONF client `<hello>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +30,42 @@ pub struct ParsedRpc {
     pub message_id: String,
     /// RPC operation.
     pub operation: RpcOperation,
+    /// Extra request `<rpc>` attributes that must be copied onto `<rpc-reply>`.
+    pub(crate) reply_attrs: RpcReplyAttributes,
+}
+
+/// RPC parse failure plus any message-id already validated from the envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RpcParseError {
+    /// Parsed RFC 6241 message id, when the root RPC envelope was valid enough
+    /// to read it before the error occurred.
+    pub message_id: Option<String>,
+    /// Extra request `<rpc>` attributes parsed before this failure.
+    pub reply_attrs: RpcReplyAttributes,
+    /// Payload-free parse error.
+    pub error: XmlError,
+}
+
+impl RpcParseError {
+    fn new(message_id: Option<String>, error: XmlError) -> Self {
+        Self::with_reply_attrs(message_id, RpcReplyAttributes::default(), error)
+    }
+
+    fn with_reply_attrs(
+        message_id: Option<String>,
+        reply_attrs: RpcReplyAttributes,
+        error: XmlError,
+    ) -> Self {
+        Self {
+            message_id,
+            reply_attrs,
+            error,
+        }
+    }
+
+    fn without_message_id(error: XmlError) -> Self {
+        Self::new(None, error)
+    }
 }
 
 /// Supported parsed RPC operations.
@@ -364,6 +404,13 @@ struct NamespaceScope {
 }
 
 #[derive(Debug, Clone, Default)]
+struct ScopedAttributes {
+    scope: NamespaceScope,
+    attrs: Vec<(String, String)>,
+    reply_attrs: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Default)]
 struct PartialGet {
     filter: Option<Filter>,
     with_defaults_seen: bool,
@@ -398,7 +445,9 @@ struct ParserState {
     stack: Vec<Element>,
     scopes: Vec<NamespaceScope>,
     message_id: Option<String>,
+    reply_attrs: RpcReplyAttributes,
     capabilities: Vec<String>,
+    hello_capabilities_seen: bool,
     get: Option<PartialGet>,
     get_config: Option<PartialGetConfig>,
     get_schema: Option<PartialGetSchema>,
@@ -407,6 +456,8 @@ struct ParserState {
     filter_depth: usize,
     filter_stack: Vec<FilterFrame>,
     root_closed: bool,
+    xml_decl_seen: bool,
+    pre_decl_misc_seen: bool,
 }
 
 impl ParserState {
@@ -427,10 +478,10 @@ impl ParserState {
             return Err(XmlError::MultipleRoots);
         }
 
-        let (scope, attrs) = scoped_attributes(start, decoder, limits, self.scopes.last())?;
+        let scoped = scoped_attributes(start, decoder, limits, self.scopes.last())?;
         let raw_name = start.name();
         let (prefix, local) = split_qname(raw_name.as_ref())?;
-        let namespace = resolve_namespace(prefix, &scope)?;
+        let namespace = resolve_namespace(prefix, &scoped.scope)?;
         let element = Element {
             local: local.to_string(),
             namespace,
@@ -438,9 +489,9 @@ impl ParserState {
 
         limits.check_depth(self.stack.len() + 1)?;
         self.validate_protocol_namespace(&element)?;
-        self.process_start(&element, &attrs)?;
+        self.process_start(&element, &scoped.attrs, &scoped.reply_attrs)?;
         self.stack.push(element);
-        self.scopes.push(scope);
+        self.scopes.push(scoped.scope);
         Ok(())
     }
 
@@ -481,6 +532,16 @@ impl ParserState {
     }
 
     fn text(&mut self, text: &str) -> Result<(), XmlError> {
+        if self.root.is_none() && self.stack.is_empty() && !self.root_closed {
+            if text.trim().is_empty() {
+                if !self.xml_decl_seen {
+                    self.pre_decl_misc_seen = true;
+                }
+                return Ok(());
+            }
+            return Err(XmlError::Malformed);
+        }
+
         if self.filter_depth > 0 {
             if text.trim().is_empty() {
                 return Ok(());
@@ -488,7 +549,10 @@ impl ParserState {
             return Err(XmlError::UnsupportedFilterContent);
         }
         if self.local_path_is(&["hello", "capabilities", "capability"]) {
-            self.capabilities.push(text.to_string());
+            let capability = text.trim();
+            if !capability.is_empty() {
+                self.capabilities.push(capability.to_string());
+            }
         } else if self.local_path_is(&["rpc", "get-schema", "identifier"]) {
             self.set_get_schema_text(GetSchemaField::Identifier, text)?;
         } else if self.local_path_is(&["rpc", "get-schema", "version"]) {
@@ -499,8 +563,32 @@ impl ParserState {
             self.set_get_with_defaults_text(text)?;
         } else if self.local_path_is(&["rpc", "get-config", "with-defaults"]) {
             self.set_get_config_with_defaults_text(text)?;
+        } else if text.trim().is_empty() || self.inside_unsupported_operation() {
+            return Ok(());
+        } else {
+            return Err(XmlError::Malformed);
         }
         Ok(())
+    }
+
+    fn xml_decl(&mut self) -> Result<(), XmlError> {
+        if self.xml_decl_seen
+            || self.pre_decl_misc_seen
+            || self.root.is_some()
+            || self.root_closed
+            || !self.stack.is_empty()
+        {
+            return Err(XmlError::Malformed);
+        }
+        self.xml_decl_seen = true;
+        Ok(())
+    }
+
+    fn comment(&mut self) {
+        if !self.xml_decl_seen && self.root.is_none() && !self.root_closed && self.stack.is_empty()
+        {
+            self.pre_decl_misc_seen = true;
+        }
     }
 
     fn validate_protocol_namespace(&self, element: &Element) -> Result<(), XmlError> {
@@ -521,6 +609,7 @@ impl ParserState {
         &mut self,
         element: &Element,
         attrs: &[(String, String)],
+        reply_attrs: &[(String, String)],
     ) -> Result<(), XmlError> {
         if self.filter_depth > 0 {
             self.process_filter_content_start(element, attrs)?;
@@ -533,6 +622,7 @@ impl ParserState {
                 "hello" => Some(RootKind::Hello),
                 "rpc" => {
                     self.message_id = attr_value(attrs, "message-id").map(ToOwned::to_owned);
+                    self.reply_attrs = RpcReplyAttributes::from_pairs(rpc_reply_attrs(reply_attrs));
                     Some(RootKind::Rpc)
                 }
                 _ => return Err(XmlError::UnsupportedOperation),
@@ -547,10 +637,14 @@ impl ParserState {
         }
     }
 
-    fn process_hello_start(&self, element: &Element) -> Result<(), XmlError> {
-        if self.local_path_is(&["hello"]) && element.local == "capabilities"
-            || self.local_path_is(&["hello", "capabilities"]) && element.local == "capability"
-        {
+    fn process_hello_start(&mut self, element: &Element) -> Result<(), XmlError> {
+        if self.local_path_is(&["hello"]) && element.local == "capabilities" {
+            if self.hello_capabilities_seen {
+                return Err(XmlError::DuplicateElement);
+            }
+            self.hello_capabilities_seen = true;
+            Ok(())
+        } else if self.local_path_is(&["hello", "capabilities"]) && element.local == "capability" {
             Ok(())
         } else {
             Err(XmlError::Malformed)
@@ -876,16 +970,23 @@ impl ParserState {
         }
 
         match self.root.expect("checked root") {
-            RootKind::Hello => Ok(ParsedMessage::Hello(ClientHello {
-                capabilities: self.capabilities,
-            })),
+            RootKind::Hello => {
+                if !self.hello_capabilities_seen || self.capabilities.is_empty() {
+                    return Err(XmlError::MissingElement);
+                }
+                Ok(ParsedMessage::Hello(ClientHello {
+                    capabilities: self.capabilities,
+                }))
+            }
             RootKind::Rpc => {
                 let message_id = self.message_id.ok_or(XmlError::MissingAttribute)?;
+                let reply_attrs = self.reply_attrs;
                 if let Some(get) = self.get {
                     let with_defaults =
                         finish_with_defaults(get.with_defaults_seen, get.with_defaults);
                     return Ok(ParsedMessage::Rpc(ParsedRpc {
                         message_id,
+                        reply_attrs,
                         operation: RpcOperation::Get(GetRequest {
                             filter: get.filter,
                             with_defaults,
@@ -900,6 +1001,7 @@ impl ParserState {
                     );
                     return Ok(ParsedMessage::Rpc(ParsedRpc {
                         message_id,
+                        reply_attrs,
                         operation: RpcOperation::GetConfig(GetConfigRequest {
                             source,
                             filter: get_config.filter,
@@ -910,12 +1012,14 @@ impl ParserState {
                 if self.close_session {
                     return Ok(ParsedMessage::Rpc(ParsedRpc {
                         message_id,
+                        reply_attrs,
                         operation: RpcOperation::CloseSession,
                     }));
                 }
                 if let Some(get_schema) = self.get_schema {
                     return Ok(ParsedMessage::Rpc(ParsedRpc {
                         message_id,
+                        reply_attrs,
                         operation: RpcOperation::GetSchema(GetSchemaRequest {
                             identifier: get_schema.identifier.ok_or(XmlError::MissingElement)?,
                             version: get_schema.version,
@@ -926,6 +1030,7 @@ impl ParserState {
                 if let Some(operation) = self.unsupported_operation {
                     return Ok(ParsedMessage::Rpc(ParsedRpc {
                         message_id,
+                        reply_attrs,
                         operation: RpcOperation::Unsupported(operation),
                     }));
                 }
@@ -960,61 +1065,153 @@ pub fn parse_client_hello(xml: &str, limits: &MgmtLimits) -> Result<ClientHello,
 
 /// Parses a NETCONF RPC envelope.
 pub fn parse_rpc(xml: &str, limits: &MgmtLimits) -> Result<ParsedRpc, XmlError> {
-    match parse_message(xml, limits)? {
+    parse_rpc_with_context(xml, limits).map_err(|err| err.error)
+}
+
+/// Parses a NETCONF RPC envelope, preserving a parsed `message-id` on failure.
+pub(crate) fn parse_rpc_with_context(
+    xml: &str,
+    limits: &MgmtLimits,
+) -> Result<ParsedRpc, RpcParseError> {
+    match parse_message_with_context(xml, limits)? {
         ParsedMessage::Rpc(rpc) => Ok(rpc),
-        ParsedMessage::Hello(_) => Err(XmlError::UnsupportedOperation),
+        ParsedMessage::Hello(_) => Err(RpcParseError::without_message_id(
+            XmlError::UnsupportedOperation,
+        )),
     }
 }
 
 fn parse_message(xml: &str, limits: &MgmtLimits) -> Result<ParsedMessage, XmlError> {
-    limits.validate()?;
-    limits.check_request_bytes(xml.len())?;
+    parse_message_with_context(xml, limits).map_err(|err| err.error)
+}
+
+fn parse_message_with_context(
+    xml: &str,
+    limits: &MgmtLimits,
+) -> Result<ParsedMessage, RpcParseError> {
+    limits
+        .validate()
+        .map_err(|err| RpcParseError::without_message_id(err.into()))?;
+    limits
+        .check_request_bytes(xml.len())
+        .map_err(|err| RpcParseError::without_message_id(err.into()))?;
+    validate_xml_decl_start(xml).map_err(RpcParseError::without_message_id)?;
 
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     let mut state = ParserState::new();
 
     loop {
-        match reader.read_event().map_err(|_| XmlError::Malformed)? {
+        match reader
+            .read_event()
+            .map_err(|_| parse_error(&state, XmlError::Malformed))?
+        {
             Event::Start(start) => {
-                state.push_start(&start, reader.decoder(), limits)?;
+                state
+                    .push_start(&start, reader.decoder(), limits)
+                    .map_err(|err| parse_error(&state, err))?;
             }
             Event::Empty(start) => {
-                state.push_empty(&start, reader.decoder(), limits)?;
+                state
+                    .push_empty(&start, reader.decoder(), limits)
+                    .map_err(|err| parse_error(&state, err))?;
             }
             Event::End(end) => {
-                state.pop_end(end.name().as_ref())?;
+                state
+                    .pop_end(end.name().as_ref())
+                    .map_err(|err| parse_error(&state, err))?;
             }
             Event::Text(text) => {
-                limits.check_value_bytes(text.as_ref().len())?;
-                let decoded = text.decode().map_err(|_| XmlError::Malformed)?;
-                state.text(decoded.as_ref())?;
+                limits
+                    .check_value_bytes(text.as_ref().len())
+                    .map_err(|err| parse_error(&state, err.into()))?;
+                let decoded = text
+                    .decode()
+                    .map_err(|_| parse_error(&state, XmlError::Malformed))?;
+                state
+                    .text(decoded.as_ref())
+                    .map_err(|err| parse_error(&state, err))?;
             }
             Event::CData(cdata) => {
-                limits.check_value_bytes(cdata.as_ref().len())?;
-                return Err(XmlError::Malformed);
+                limits
+                    .check_value_bytes(cdata.as_ref().len())
+                    .map_err(|err| parse_error(&state, err.into()))?;
+                if state.inside_unsupported_operation() {
+                    continue;
+                }
+                return Err(parse_error(&state, XmlError::Malformed));
             }
-            Event::DocType(_) => return Err(XmlError::DtdForbidden),
-            Event::GeneralRef(_) => return Err(XmlError::EntityForbidden),
-            Event::Decl(_) | Event::Comment(_) => {}
-            Event::PI(_) => return Err(XmlError::Malformed),
+            Event::DocType(doctype) => {
+                limits
+                    .check_value_bytes(doctype.len())
+                    .map_err(|err| parse_error(&state, err.into()))?;
+                return Err(parse_error(&state, XmlError::DtdForbidden));
+            }
+            Event::GeneralRef(reference) => {
+                limits
+                    .check_value_bytes(reference.len())
+                    .map_err(|err| parse_error(&state, err.into()))?;
+                return Err(parse_error(&state, XmlError::EntityForbidden));
+            }
+            Event::Decl(decl) => {
+                limits
+                    .check_value_bytes(decl.len())
+                    .map_err(|err| parse_error(&state, err.into()))?;
+                state.xml_decl().map_err(|err| parse_error(&state, err))?;
+            }
+            Event::Comment(comment) => {
+                limits
+                    .check_value_bytes(comment.len())
+                    .map_err(|err| parse_error(&state, err.into()))?;
+                state.comment();
+            }
+            Event::PI(pi) => {
+                limits
+                    .check_value_bytes(pi.len())
+                    .map_err(|err| parse_error(&state, err.into()))?;
+                return Err(parse_error(&state, XmlError::Malformed));
+            }
             Event::Eof => break,
         }
     }
 
-    let parsed = state.finish()?;
+    let message_id = state.message_id.clone();
+    let reply_attrs = state.reply_attrs.clone();
+    let parsed = state.finish().map_err(|err| {
+        RpcParseError::with_reply_attrs(message_id.clone(), reply_attrs.clone(), err)
+    })?;
     if let ParsedMessage::Rpc(ParsedRpc {
         operation:
             RpcOperation::GetConfig(GetConfigRequest { filter, .. })
             | RpcOperation::Get(GetRequest { filter, .. }),
+        message_id,
         ..
     }) = &parsed
     {
         if let Some(Filter::Subtree(filter)) = filter {
-            limits.check_paths(filter.selections().len())?;
+            limits
+                .check_paths(filter.selections().len())
+                .map_err(|err| {
+                    RpcParseError::with_reply_attrs(
+                        Some(message_id.clone()),
+                        reply_attrs.clone(),
+                        err.into(),
+                    )
+                })?;
         }
     }
     Ok(parsed)
+}
+
+fn parse_error(state: &ParserState, error: XmlError) -> RpcParseError {
+    RpcParseError::with_reply_attrs(state.message_id.clone(), state.reply_attrs.clone(), error)
+}
+
+fn validate_xml_decl_start(xml: &str) -> Result<(), XmlError> {
+    if !xml.starts_with("<?xml") && xml.trim_start().starts_with("<?xml") {
+        return Err(XmlError::Malformed);
+    }
+    Ok(())
 }
 
 fn scoped_attributes(
@@ -1022,11 +1219,14 @@ fn scoped_attributes(
     decoder: Decoder,
     limits: &MgmtLimits,
     parent: Option<&NamespaceScope>,
-) -> Result<(NamespaceScope, Vec<(String, String)>), XmlError> {
+) -> Result<ScopedAttributes, XmlError> {
     let mut scope = parent.cloned().unwrap_or_default();
     let mut attrs = Vec::new();
+    let mut reply_attrs = Vec::new();
     let mut attr_count = 0usize;
     let mut ns_count = 0usize;
+    let mut default_declared = false;
+    let mut declared_prefixes = BTreeSet::new();
 
     for attr in start.attributes().with_checks(true) {
         let attr = attr.map_err(|_| XmlError::Malformed)?;
@@ -1037,15 +1237,25 @@ fn scoped_attributes(
             .map_err(|_| XmlError::Malformed)?
             .into_owned();
         limits.check_value_bytes(value.len())?;
+        reply_attrs.push((key.to_string(), value.clone()));
 
         if key == "xmlns" {
             ns_count += 1;
+            if default_declared {
+                return Err(XmlError::Malformed);
+            }
+            default_declared = true;
+            validate_namespace_binding(None, &value)?;
             scope.default = Some(value);
         } else if let Some(prefix) = key.strip_prefix("xmlns:") {
             ns_count += 1;
             if prefix.is_empty() {
                 return Err(XmlError::Malformed);
             }
+            if !declared_prefixes.insert(prefix.to_string()) {
+                return Err(XmlError::Malformed);
+            }
+            validate_namespace_binding(Some(prefix), &value)?;
             scope.bindings.insert(prefix.to_string(), value);
         } else {
             attrs.push((key.to_string(), value));
@@ -1068,8 +1278,51 @@ fn scoped_attributes(
         }
         .into());
     }
+    validate_attribute_names(&attrs, &scope)?;
 
-    Ok((scope, attrs))
+    Ok(ScopedAttributes {
+        scope,
+        attrs,
+        reply_attrs,
+    })
+}
+
+fn validate_namespace_binding(prefix: Option<&str>, uri: &str) -> Result<(), XmlError> {
+    match prefix {
+        None if uri == XML_NAMESPACE_URI || uri == XMLNS_NAMESPACE_URI => Err(XmlError::Malformed),
+        None => Ok(()),
+        Some("xml") if uri == XML_NAMESPACE_URI => Ok(()),
+        Some("xml") | Some("xmlns") => Err(XmlError::Malformed),
+        Some(_) if uri.is_empty() || uri == XML_NAMESPACE_URI || uri == XMLNS_NAMESPACE_URI => {
+            Err(XmlError::Malformed)
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+fn validate_attribute_names(
+    attrs: &[(String, String)],
+    scope: &NamespaceScope,
+) -> Result<(), XmlError> {
+    for (name, _) in attrs {
+        let (prefix, _) = split_qname(name.as_bytes())?;
+        if let Some(prefix) = prefix {
+            if prefix != "xml" && !scope.bindings.contains_key(prefix) {
+                return Err(XmlError::UnknownNamespace);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rpc_reply_attrs(attrs: &[(String, String)]) -> Vec<(String, String)> {
+    attrs
+        .iter()
+        .filter(|(name, value)| {
+            name != "message-id" && !(name == "xmlns" && value == NETCONF_BASE_NS)
+        })
+        .cloned()
+        .collect()
 }
 
 fn attr_value<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -1361,6 +1614,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_known_unsupported_base_operation_with_bounded_ignored_cdata_payload() {
+        let parsed = parse_rpc(
+            &rpc("<edit-config><config><![CDATA[do-not-leak]]></config></edit-config>"),
+            &MgmtLimits::default(),
+        )
+        .expect("parse unsupported edit-config with CDATA");
+        assert_eq!(parsed.message_id, "101");
+        assert_eq!(
+            parsed.operation,
+            RpcOperation::Unsupported(UnsupportedOperation::EditConfig)
+        );
+    }
+
+    #[test]
     fn duplicate_known_unsupported_operation_is_rejected() {
         let err = parse_rpc(&rpc("<edit-config/><get/>"), &MgmtLimits::default())
             .expect_err("duplicate operation");
@@ -1377,13 +1644,58 @@ mod tests {
     }
 
     #[test]
+    fn preserves_extra_rpc_reply_attributes_and_rejects_undeclared_attr_prefix() {
+        let xml = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" xmlns:trace="urn:trace" trace:id="req&amp;1" client-tag="cli" message-id="7"><get/></rpc>"#
+        );
+        let parsed = parse_rpc(&xml, &MgmtLimits::default()).expect("parse rpc attributes");
+        assert_eq!(parsed.message_id, "7");
+        assert!(!parsed.reply_attrs.is_empty());
+
+        let err = parse_rpc(
+            &format!(
+                r#"<rpc xmlns="{NETCONF_BASE_NS}" trace:id="req" message-id="7"><get/></rpc>"#
+            ),
+            &MgmtLimits::default(),
+        )
+        .expect_err("undeclared attribute prefix");
+        assert_eq!(err, XmlError::UnknownNamespace);
+    }
+
+    #[test]
     fn parses_client_hello_capabilities() {
         let xml = format!(
-            r#"<hello xmlns="{NETCONF_BASE_NS}"><capabilities><capability>{}</capability></capabilities></hello>"#,
+            r#"<hello xmlns="{NETCONF_BASE_NS}"><capabilities><capability> {} </capability></capabilities></hello>"#,
             crate::capabilities::NETCONF_BASE_1_1
         );
         let hello = parse_client_hello(&xml, &MgmtLimits::default()).expect("parse hello");
         assert_eq!(hello.capabilities, [crate::capabilities::NETCONF_BASE_1_1]);
+    }
+
+    #[test]
+    fn rejects_structurally_invalid_client_hello_capabilities() {
+        let missing = format!(r#"<hello xmlns="{NETCONF_BASE_NS}"/>"#);
+        assert_eq!(
+            parse_client_hello(&missing, &MgmtLimits::default()).expect_err("missing capabilities"),
+            XmlError::MissingElement
+        );
+
+        let empty = format!(r#"<hello xmlns="{NETCONF_BASE_NS}"><capabilities/></hello>"#);
+        assert_eq!(
+            parse_client_hello(&empty, &MgmtLimits::default()).expect_err("empty capabilities"),
+            XmlError::MissingElement
+        );
+
+        let duplicate = format!(
+            r#"<hello xmlns="{NETCONF_BASE_NS}"><capabilities><capability>{}</capability></capabilities><capabilities><capability>{}</capability></capabilities></hello>"#,
+            crate::capabilities::NETCONF_BASE_1_0,
+            crate::capabilities::NETCONF_BASE_1_1
+        );
+        assert_eq!(
+            parse_client_hello(&duplicate, &MgmtLimits::default())
+                .expect_err("duplicate capabilities"),
+            XmlError::DuplicateElement
+        );
     }
 
     #[test]
@@ -1468,6 +1780,132 @@ mod tests {
     }
 
     #[test]
+    fn rejects_reserved_namespace_binding_misuse() {
+        let xml_prefix = parse_rpc(
+            &format!(
+                r#"<rpc xmlns="{NETCONF_BASE_NS}" xmlns:xml="urn:opc:test" message-id="101"><get/></rpc>"#
+            ),
+            &MgmtLimits::default(),
+        )
+        .expect_err("xml prefix rebound");
+        assert_eq!(xml_prefix, XmlError::Malformed);
+
+        let xmlns_prefix = parse_rpc(
+            &format!(
+                r#"<rpc xmlns="{NETCONF_BASE_NS}" xmlns:xmlns="urn:opc:test" message-id="101"><get/></rpc>"#
+            ),
+            &MgmtLimits::default(),
+        )
+        .expect_err("xmlns prefix declared");
+        assert_eq!(xmlns_prefix, XmlError::Malformed);
+
+        let xml_namespace = parse_rpc(
+            &format!(
+                r#"<rpc xmlns="{NETCONF_BASE_NS}" xmlns:p="{XML_NAMESPACE_URI}" message-id="101"><get/></rpc>"#
+            ),
+            &MgmtLimits::default(),
+        )
+        .expect_err("xml namespace on non-xml prefix");
+        assert_eq!(xml_namespace, XmlError::Malformed);
+    }
+
+    #[test]
+    fn rejects_unexpected_protocol_text() {
+        let get_text = parse_rpc(&rpc("<get>do-not-leak</get>"), &MgmtLimits::default())
+            .expect_err("unexpected get text");
+        assert_eq!(get_text, XmlError::Malformed);
+
+        let get_cdata = parse_rpc(
+            &rpc("<get><![CDATA[do-not-leak]]></get>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("unexpected get CDATA");
+        assert_eq!(get_cdata, XmlError::Malformed);
+
+        let source_text = parse_rpc(
+            &rpc("<get-config><source>do-not-leak<running/></source></get-config>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("unexpected source text");
+        assert_eq!(source_text, XmlError::Malformed);
+
+        let hello_text = parse_client_hello(
+            &format!(
+                r#"<hello xmlns="{NETCONF_BASE_NS}">do-not-leak<capabilities><capability>{}</capability></capabilities></hello>"#,
+                crate::capabilities::NETCONF_BASE_1_1
+            ),
+            &MgmtLimits::default(),
+        )
+        .expect_err("unexpected hello text");
+        assert_eq!(hello_text, XmlError::Malformed);
+    }
+
+    #[test]
+    fn xml_declaration_must_be_the_first_parsed_event() {
+        let valid = parse_rpc(
+            &format!(
+                r#"<?xml version="1.0"?><rpc xmlns="{NETCONF_BASE_NS}" message-id="101"><get/></rpc>"#
+            ),
+            &MgmtLimits::default(),
+        )
+        .expect("xml declaration before root");
+        assert_eq!(valid.message_id, "101");
+
+        let err = parse_rpc_with_context(
+            &rpc(r#"<get><?xml version="1.0"?></get>"#),
+            &MgmtLimits::default(),
+        )
+        .expect_err("xml declaration inside rpc");
+        assert_eq!(err.message_id.as_deref(), Some("101"));
+        assert_eq!(err.error, XmlError::Malformed);
+
+        let comment_before_decl = parse_rpc(
+            &format!(
+                r#"<!--not-first--><?xml version="1.0"?><rpc xmlns="{NETCONF_BASE_NS}" message-id="101"><get/></rpc>"#
+            ),
+            &MgmtLimits::default(),
+        )
+        .expect_err("xml declaration after comment");
+        assert_eq!(comment_before_decl, XmlError::Malformed);
+
+        let whitespace_before_decl = parse_rpc(
+            &format!(
+                "\n<?xml version=\"1.0\"?><rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"101\"><get/></rpc>"
+            ),
+            &MgmtLimits::default(),
+        )
+        .expect_err("xml declaration after whitespace");
+        assert_eq!(whitespace_before_decl, XmlError::Malformed);
+    }
+
+    #[test]
+    fn enforces_value_limit_on_non_text_xml_events() {
+        let limits = MgmtLimits {
+            max_request_bytes: 1024,
+            max_value_bytes: 64,
+            ..MgmtLimits::default()
+        };
+        let oversized = "x".repeat(65);
+
+        let comment = parse_rpc(&rpc(&format!("<get/><!--{oversized}-->")), &limits)
+            .expect_err("oversized comment");
+        assert!(matches!(comment, XmlError::Limit(_)));
+
+        let pi = parse_rpc(&rpc(&format!(r#"<get/><?audit {oversized}?>"#)), &limits)
+            .expect_err("oversized PI");
+        assert!(matches!(pi, XmlError::Limit(_)));
+
+        let decl = parse_rpc(
+            &format!(
+                r#"<?xml version="1.0" encoding="{oversized}"?><rpc xmlns="{NETCONF_BASE_NS}" message-id="101"><get/></rpc>"#
+            ),
+            &limits,
+        )
+        .expect_err("oversized XML declaration");
+        assert!(matches!(decl, XmlError::Limit(_)));
+    }
+
+    #[test]
     fn rejects_subtree_filter_content_match_until_supported() {
         let err = parse_rpc(
             &rpc(r#"<get-config><source><running/></source><filter><sys:system xmlns:sys="urn:opc:test"><sys:hostname>amf-1</sys:hostname></sys:system></filter></get-config>"#),
@@ -1475,6 +1913,24 @@ mod tests {
         )
         .expect_err("content match not supported yet");
         assert_eq!(err, XmlError::UnsupportedFilterContent);
+    }
+
+    #[test]
+    fn parse_context_preserves_message_id_after_rpc_envelope() {
+        let err = parse_rpc_with_context(
+            &rpc(r#"<get-config><source><running/></source><filter><sys:system xmlns:sys="urn:opc:test"><sys:hostname>amf-1</sys:hostname></sys:system></filter></get-config>"#),
+            &MgmtLimits::default(),
+        )
+        .expect_err("content match not supported yet");
+        assert_eq!(err.message_id.as_deref(), Some("101"));
+        assert_eq!(err.error, XmlError::UnsupportedFilterContent);
+
+        let legacy = parse_rpc(
+            &rpc(r#"<get-config><source><running/></source><filter><sys:system xmlns:sys="urn:opc:test"><sys:hostname>amf-1</sys:hostname></sys:system></filter></get-config>"#),
+            &MgmtLimits::default(),
+        )
+        .expect_err("legacy parse error");
+        assert_eq!(legacy, XmlError::UnsupportedFilterContent);
     }
 
     #[test]

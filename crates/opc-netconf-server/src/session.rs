@@ -283,6 +283,9 @@ where
         if !next.is_ascii_digit() {
             return Err(FramingError::InvalidChunkHeader.into());
         }
+        if next == b'0' {
+            return Err(FramingError::InvalidChunkLength.into());
+        }
         let mut len_bytes = vec![next];
         loop {
             let b = read_required_one(reader).await?;
@@ -301,6 +304,11 @@ where
         if chunk_len == 0 {
             return Err(FramingError::InvalidChunkLength.into());
         }
+        let next_chunks = chunks
+            .checked_add(1)
+            .ok_or(FramingError::InvalidChunkLength)?;
+        limits.check_frame_chunks(next_chunks)?;
+
         let next_len = out
             .len()
             .checked_add(chunk_len)
@@ -308,8 +316,21 @@ where
         limits.check_request_bytes(next_len)?;
         let start = out.len();
         out.resize(next_len, 0);
-        reader.read_exact(&mut out[start..next_len]).await?;
-        chunks += 1;
+        read_chunk_data(reader, &mut out[start..next_len]).await?;
+        chunks = next_chunks;
+    }
+}
+
+async fn read_chunk_data<R>(reader: &mut R, buf: &mut [u8]) -> Result<(), SessionError>
+where
+    R: AsyncRead + Unpin,
+{
+    match reader.read_exact(buf).await {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(FramingError::MissingChunkData.into())
+        }
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -521,10 +542,17 @@ mod tests {
         modules
             .register_module("demo-system", "sys")
             .expect("module");
+        modules
+            .register_module("ietf-netconf", "nc")
+            .expect("NETCONF module");
         NacmPolicy::builder(PolicyVersion::new(1))
             .add_rule(NacmRule::allow(
                 NacmAction::Read,
                 YangPathPattern::parse("/sys:system/**", &modules).expect("path"),
+            ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Exec,
+                YangPathPattern::parse("/nc:close-session", &modules).expect("close-session path"),
             ))
             .build()
     }
@@ -771,6 +799,135 @@ mod tests {
         assert!(matches!(
             err,
             SessionError::Framing(FramingError::InvalidChunkHeader)
+        ));
+    }
+
+    #[tokio::test]
+    async fn base11_leading_zero_chunk_length_fails_closed() {
+        let server = server_fixture().await;
+        let principal = principal();
+        let (mut client, mut server_io) = tokio::io::duplex(64 * 1024);
+
+        let task = tokio::spawn(async move {
+            run_read_only_session(
+                &server,
+                &principal,
+                &mut server_io,
+                SessionConfig::default(),
+                82,
+            )
+            .await
+        });
+
+        read_base10_message(&mut client, &MgmtLimits::default())
+            .await
+            .expect("read server hello")
+            .expect("server hello");
+        client_write_message(
+            &mut client,
+            SessionFraming::Base10,
+            &client_hello(&[NETCONF_BASE_1_0, NETCONF_BASE_1_1]),
+        )
+        .await
+        .expect("client hello");
+
+        let rpc = get_config_rpc("204");
+        client
+            .write_all(format!("\n#0{}\n{}", rpc.len(), rpc).as_bytes())
+            .await
+            .expect("write bad base11 chunk");
+
+        let err = task.await.expect("join").expect_err("framing error");
+        assert!(matches!(
+            err,
+            SessionError::Framing(FramingError::InvalidChunkLength)
+        ));
+    }
+
+    #[tokio::test]
+    async fn base11_short_chunk_data_fails_as_framing_error() {
+        let server = server_fixture().await;
+        let principal = principal();
+        let (mut client, mut server_io) = tokio::io::duplex(64 * 1024);
+
+        let task = tokio::spawn(async move {
+            run_read_only_session(
+                &server,
+                &principal,
+                &mut server_io,
+                SessionConfig::default(),
+                84,
+            )
+            .await
+        });
+
+        read_base10_message(&mut client, &MgmtLimits::default())
+            .await
+            .expect("read server hello")
+            .expect("server hello");
+        client_write_message(
+            &mut client,
+            SessionFraming::Base10,
+            &client_hello(&[NETCONF_BASE_1_0, NETCONF_BASE_1_1]),
+        )
+        .await
+        .expect("client hello");
+
+        client
+            .write_all(b"\n#10\nshort")
+            .await
+            .expect("write truncated base11 chunk");
+        drop(client);
+
+        let err = task.await.expect("join").expect_err("framing error");
+        assert!(matches!(
+            err,
+            SessionError::Framing(FramingError::MissingChunkData)
+        ));
+    }
+
+    #[tokio::test]
+    async fn base11_chunk_count_limit_fails_closed() {
+        let server = server_fixture().await;
+        let principal = principal();
+        let (mut client, mut server_io) = tokio::io::duplex(64 * 1024);
+        let config = SessionConfig {
+            limits: MgmtLimits {
+                max_frame_chunks_per_message: 1,
+                ..MgmtLimits::default()
+            },
+            ..SessionConfig::default()
+        };
+
+        let task = tokio::spawn(async move {
+            run_read_only_session(&server, &principal, &mut server_io, config, 83).await
+        });
+
+        read_base10_message(&mut client, &MgmtLimits::default())
+            .await
+            .expect("read server hello")
+            .expect("server hello");
+        client_write_message(
+            &mut client,
+            SessionFraming::Base10,
+            &client_hello(&[NETCONF_BASE_1_0, NETCONF_BASE_1_1]),
+        )
+        .await
+        .expect("client hello");
+
+        client
+            .write_all(b"\n#1\n<\n#1\nr\n##\n")
+            .await
+            .expect("write too many base11 chunks");
+
+        let err = task.await.expect("join").expect_err("chunk limit error");
+        assert!(matches!(
+            err,
+            SessionError::Limit(LimitsError::Exceeded {
+                limit: "frame_chunks_per_message",
+                max: 1,
+                actual: 2,
+            })
         ));
     }
 

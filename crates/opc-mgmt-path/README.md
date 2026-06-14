@@ -16,12 +16,19 @@ This crate does that conversion **once**, against the generated
 
 - applies a request prefix before the per-request elements;
 - validates the gNMI origin against the registry's served modules (unknown
-  origin and paths outside that origin's module set fail closed);
+  origin and paths outside that origin's module set fail closed) and uses a
+  known origin to disambiguate otherwise-ambiguous bare paths inside that
+  origin's module set;
 - resolves the whole path to a real schema node (unknown paths fail closed);
+- requires schema prefixes to resolve to served models before accepting a match,
+  so malformed registry/input prefix pairs fail closed;
 - requires keyed lists to carry exactly their `key` leaves; missing or extra
   keys fail closed, and it **emits them in the schema's `key` order** regardless of
-  the order the client supplied them;
+  the order the client supplied them, preserving a prefix-qualified key leaf's
+  prefix when the registry provides one;
 - rejects key predicates on non-list segments;
+- rejects malformed segment names before lookup, so malformed input is never
+  echoed as an unknown path;
 - escapes key values once (`\` and `'`), so callers never hand-concatenate paths.
 
 It returns both the predicate-free schema path (for registry / NACM lookup) and

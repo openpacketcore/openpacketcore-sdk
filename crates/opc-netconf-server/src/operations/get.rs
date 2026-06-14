@@ -6,11 +6,14 @@ use opc_mgmt_audit::{
 };
 use opc_mgmt_authz::{PolicySource, ReadAction, ReadAuthorizer};
 use opc_mgmt_errors::NetconfErrorTag;
+use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_opstate::{OperationalRequest, OperationalResponse};
 use opc_mgmt_schema::{NodeKind, SchemaRegistry};
 
 use crate::binding::{NetconfConfigBinding, ReadSelection};
-use crate::error::{rpc_error_reply, rpc_ok_reply, RpcError};
+use crate::error::{
+    rpc_error_reply_with_attrs, rpc_ok_reply_with_attrs, RpcError, RpcReplyAttributes,
+};
 use crate::filter::{get_paths_with_discovery, netconf_monitoring_registry, yang_library_registry};
 use crate::metrics::{
     record_nacm_denials, record_rpc_error, record_rpc_success, NetconfNacmAction, NetconfOperation,
@@ -35,8 +38,12 @@ where
     pub principal: &'a TrustedPrincipal,
     /// NETCONF message id.
     pub message_id: &'a str,
+    /// Extra request `<rpc>` attributes to copy onto `<rpc-reply>`.
+    pub reply_attrs: &'a RpcReplyAttributes,
     /// RPC receive timestamp for latency metrics.
     pub started: std::time::Instant,
+    /// Shared management-plane input and fanout limits.
+    pub limits: &'a MgmtLimits,
 }
 
 /// Handles a parsed `<get>` request.
@@ -78,7 +85,7 @@ where
                     NetconfErrorTag::OperationFailed,
                     ctx.started.elapsed(),
                 );
-                return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+                return error_reply(&ctx, RpcError::operation_failed());
             }
             record_rpc_error(
                 NetconfOperation::Get,
@@ -90,7 +97,7 @@ where
                 error_tag = NetconfErrorTag::OperationNotSupported.as_str(),
                 "NETCONF get rejected unsupported with-defaults parameter"
             );
-            return rpc_error_reply(Some(ctx.message_id), RpcError::operation_not_supported());
+            return error_reply(&ctx, RpcError::operation_not_supported());
         }
         None => None,
     };
@@ -119,7 +126,7 @@ where
                     NetconfErrorTag::OperationFailed,
                     ctx.started.elapsed(),
                 );
-                return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+                return error_reply(&ctx, RpcError::operation_failed());
             }
             record_rpc_error(NetconfOperation::Get, error_tag, ctx.started.elapsed());
             tracing::debug!(
@@ -127,9 +134,44 @@ where
                 error_tag = error_tag.as_str(),
                 "NETCONF get rejected unsupported or invalid filter"
             );
-            return rpc_error_reply(Some(ctx.message_id), rpc_error);
+            return error_reply(&ctx, rpc_error);
         }
     };
+    let selected_path_count = selected_paths
+        .data_paths
+        .len()
+        .saturating_add(selected_paths.yang_library_paths.len())
+        .saturating_add(selected_paths.netconf_monitoring_paths.len());
+    if ctx.limits.check_paths(selected_path_count).is_err() {
+        if audit_failure(
+            ctx.audit,
+            ctx.request_id,
+            ctx.principal,
+            ctx.transport,
+            "too-big",
+            Vec::new(),
+        )
+        .is_err()
+        {
+            record_rpc_error(
+                NetconfOperation::Get,
+                NetconfErrorTag::OperationFailed,
+                ctx.started.elapsed(),
+            );
+            return error_reply(&ctx, RpcError::operation_failed());
+        }
+        record_rpc_error(
+            NetconfOperation::Get,
+            NetconfErrorTag::TooBig,
+            ctx.started.elapsed(),
+        );
+        tracing::debug!(
+            operation = "get",
+            error_tag = NetconfErrorTag::TooBig.as_str(),
+            "NETCONF get rejected expanded path selection over limit"
+        );
+        return error_reply(&ctx, RpcError::too_big());
+    }
 
     if selected_paths.data_paths.is_empty()
         && selected_paths.yang_library_paths.is_empty()
@@ -149,11 +191,11 @@ where
                 NetconfErrorTag::OperationFailed,
                 ctx.started.elapsed(),
             );
-            return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+            return error_reply(&ctx, RpcError::operation_failed());
         }
         record_rpc_success(NetconfOperation::Get, ctx.started.elapsed());
         tracing::debug!(operation = "get", "NETCONF get returned empty selection");
-        return rpc_ok_reply(ctx.message_id, "");
+        return ok_reply(&ctx, "");
     }
 
     let decisions =
@@ -178,7 +220,7 @@ where
                         NetconfErrorTag::OperationFailed,
                         ctx.started.elapsed(),
                     );
-                    return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+                    return error_reply(&ctx, RpcError::operation_failed());
                 }
                 record_rpc_error(
                     NetconfOperation::Get,
@@ -190,7 +232,7 @@ where
                     error_tag = NetconfErrorTag::ResourceDenied.as_str(),
                     "NETCONF get failed closed on policy source error"
                 );
-                return rpc_error_reply(Some(ctx.message_id), RpcError::resource_denied());
+                return error_reply(&ctx, RpcError::resource_denied());
             }
         };
 
@@ -227,7 +269,7 @@ where
                     NetconfErrorTag::OperationFailed,
                     ctx.started.elapsed(),
                 );
-                return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+                return error_reply(&ctx, RpcError::operation_failed());
             }
             record_rpc_error(
                 NetconfOperation::Get,
@@ -239,7 +281,7 @@ where
                 error_tag = NetconfErrorTag::ResourceDenied.as_str(),
                 "NETCONF get failed closed on YANG Library authz setup"
             );
-            return rpc_error_reply(Some(ctx.message_id), RpcError::resource_denied());
+            return error_reply(&ctx, RpcError::resource_denied());
         }
     };
 
@@ -270,7 +312,7 @@ where
                     NetconfErrorTag::OperationFailed,
                     ctx.started.elapsed(),
                 );
-                return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+                return error_reply(&ctx, RpcError::operation_failed());
             }
             record_rpc_error(
                 NetconfOperation::Get,
@@ -282,7 +324,7 @@ where
                 error_tag = NetconfErrorTag::ResourceDenied.as_str(),
                 "NETCONF get failed closed on monitoring authz setup"
             );
-            return rpc_error_reply(Some(ctx.message_id), RpcError::resource_denied());
+            return error_reply(&ctx, RpcError::resource_denied());
         }
     };
 
@@ -338,7 +380,7 @@ where
                     NetconfErrorTag::OperationFailed,
                     ctx.started.elapsed(),
                 );
-                return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+                return error_reply(&ctx, RpcError::operation_failed());
             }
             record_rpc_error(
                 NetconfOperation::Get,
@@ -350,7 +392,7 @@ where
                 error_tag = NetconfErrorTag::OperationFailed.as_str(),
                 "NETCONF get operational provider failed or returned unexpected paths"
             );
-            return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+            return error_reply(&ctx, RpcError::operation_failed());
         }
     };
 
@@ -415,11 +457,11 @@ where
                     NetconfErrorTag::OperationFailed,
                     ctx.started.elapsed(),
                 );
-                return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+                return error_reply(&ctx, RpcError::operation_failed());
             }
             record_rpc_success(NetconfOperation::Get, ctx.started.elapsed());
             tracing::debug!(operation = "get", "NETCONF get succeeded");
-            rpc_ok_reply(ctx.message_id, &data_xml)
+            ok_reply(&ctx, &data_xml)
         }
         Err(_) => {
             if audit_failure(
@@ -441,7 +483,7 @@ where
                     NetconfErrorTag::OperationFailed,
                     ctx.started.elapsed(),
                 );
-                return rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed());
+                return error_reply(&ctx, RpcError::operation_failed());
             }
             record_rpc_error(
                 NetconfOperation::Get,
@@ -453,9 +495,25 @@ where
                 error_tag = NetconfErrorTag::OperationFailed.as_str(),
                 "NETCONF get XML projection failed"
             );
-            rpc_error_reply(Some(ctx.message_id), RpcError::operation_failed())
+            error_reply(&ctx, RpcError::operation_failed())
         }
     }
+}
+
+fn error_reply<P, A>(ctx: &GetContext<'_, P, A>, error: RpcError) -> String
+where
+    P: PolicySource,
+    A: AuditSink,
+{
+    rpc_error_reply_with_attrs(Some(ctx.message_id), ctx.reply_attrs, error)
+}
+
+fn ok_reply<P, A>(ctx: &GetContext<'_, P, A>, data_xml: &str) -> String
+where
+    P: PolicySource,
+    A: AuditSink,
+{
+    rpc_ok_reply_with_attrs(ctx.message_id, ctx.reply_attrs, data_xml)
 }
 
 fn authorize_yang_library<P: PolicySource>(
