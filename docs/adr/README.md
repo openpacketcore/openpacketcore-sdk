@@ -1,11 +1,13 @@
 # Architecture Decision Records
 
-This directory contains accepted architecture decisions for the OpenPacketCore
-SDK hardening work completed through June 8, 2026.
+This directory contains accepted and proposed architecture decisions for the
+OpenPacketCore SDK hardening and management-plane work.
 
 ADRs are the durable record of architectural intent. The audit completion
 reports and implementation status matrix record what was validated; these ADRs
-record why the shape of the SDK is what it is.
+record why the shape of the SDK is what it is. Proposed ADRs are included here
+when they gate in-progress work, but they do not authorize implementation until
+accepted.
 
 ## Index
 
@@ -26,3 +28,5 @@ record why the shape of the SDK is what it is.
 | [0013](0013-ngap-asn1-strategy.md) | NGAP requires generated ASN.1 APER code; hand-written and FFI codecs are rejected. |
 | [0014](0014-dependency-toolchain-policy.md) | rustls/tokio-only dependency policy, no gRPC stack in SDK crates, and a measured (not aspirational) MSRV. |
 | [0015](0015-protocol-codec-conformance-policy.md) | Protocol codecs are proven against spec-authored byte fixtures, never only their own encoder output. |
+| [0016](0016-northbound-grpc-stack-exception.md) | _(proposed)_ `tonic`/`prost` are permitted only for `opc-gnmi-server` as the ADR 0014 §3 exception; core SDK crates stay gRPC-free. |
+| [0017](0017-sctp-transport-ffi-boundary.md) | _(proposed)_ Kernel SCTP is reached through a single `opc-libsctp-sys` crate that holds all `unsafe` SCTP UAPI/`libsctp` helper FFI; this OS-transport exception to ADR 0014 §8 does not reopen ADR 0013's rejection of foreign C codec FFI. |

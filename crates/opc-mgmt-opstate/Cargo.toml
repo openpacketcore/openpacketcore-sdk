@@ -1,0 +1,21 @@
+[package]
+name = "opc-mgmt-opstate"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "NF-supplied operational-state provider contract for the OpenPacketCore management plane (gNMI/NETCONF state reads)"
+readme = "README.md"
+documentation = "https://docs.rs/opc-mgmt-opstate"
+keywords = ["5g", "cnf", "gnmi", "netconf", "nmda"]
+categories = ["network-programming"]
+
+[dependencies]
+opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

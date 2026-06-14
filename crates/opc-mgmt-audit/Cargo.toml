@@ -1,0 +1,25 @@
+[package]
+name = "opc-mgmt-audit"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Management-plane audit event model and sink for the OpenPacketCore gNMI/NETCONF servers (successful and failed/denied operations)"
+readme = "README.md"
+documentation = "https://docs.rs/opc-mgmt-audit"
+keywords = ["5g", "cnf", "audit", "gnmi", "netconf"]
+categories = ["network-programming"]
+
+[dependencies]
+opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
+opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+opc-types = { path = "../opc-types", version = "0.2.0" }
+
+[lints]
+workspace = true

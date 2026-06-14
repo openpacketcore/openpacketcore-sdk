@@ -1,0 +1,25 @@
+[package]
+name = "opc-mgmt-authz"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Read-side NACM authorization facade for the OpenPacketCore management plane (gNMI/NETCONF Get/Subscribe)"
+readme = "README.md"
+documentation = "https://docs.rs/opc-mgmt-authz"
+keywords = ["5g", "cnf", "nacm", "gnmi", "netconf"]
+categories = ["network-programming", "authentication"]
+
+[dependencies]
+opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
+opc-mgmt-schema = { path = "../opc-mgmt-schema", version = "0.2.0" }
+opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+opc-types = { path = "../opc-types", version = "0.2.0" }
+
+[lints]
+workspace = true
