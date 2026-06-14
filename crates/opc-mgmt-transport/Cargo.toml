@@ -1,0 +1,23 @@
+[package]
+name = "opc-mgmt-transport"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Fail-closed mTLS bootstrap for the OpenPacketCore management plane (gNMI/NETCONF) over opc-tls"
+readme = "README.md"
+documentation = "https://docs.rs/opc-mgmt-transport"
+keywords = ["5g", "cnf", "tls", "spiffe", "packet-core"]
+categories = ["network-programming", "authentication"]
+
+[dependencies]
+opc-tls = { path = "../opc-tls", version = "0.2.0" }
+opc-identity = { path = "../opc-identity", version = "0.2.0" }
+opc-runtime = { path = "../opc-runtime", version = "0.2.0" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -101,22 +101,27 @@ async fn test_process_control_hard_kill_failover() {
 
     cluster.kill_node(0).await;
     let mut new_leader = None;
+    let mut last_campaign_resp = serde_json::Value::Null;
     for _attempt in 0..35 {
         for &node_id in &[1, 2] {
-            if let Ok(resp) = cluster
+            match cluster
                 .nodes
                 .get_mut(&node_id)
                 .unwrap()
                 .send_command(json!({
-                    "command": "DumpMetrics"
+                    "command": "Campaign"
                 }))
                 .await
             {
-                if resp["success"].as_bool().unwrap_or(false)
-                    && resp["data"]["role"].as_str() == Some("Leader")
-                {
+                Ok(resp) if resp["success"].as_bool().unwrap_or(false) => {
                     new_leader = Some(node_id);
                     break;
+                }
+                Ok(resp) => {
+                    last_campaign_resp = resp;
+                }
+                Err(err) => {
+                    last_campaign_resp = json!({ "error": err.to_string() });
                 }
             }
         }
@@ -125,7 +130,9 @@ async fn test_process_control_hard_kill_failover() {
         }
         sleep(Duration::from_millis(200)).await;
     }
-    let leader_id = new_leader.expect("A new leader should be elected");
+    let leader_id = new_leader.unwrap_or_else(|| {
+        panic!("A surviving node should campaign and become leader: {last_campaign_resp:?}")
+    });
 
     let tx_id = TxId::new();
     let resp = cluster.nodes.get_mut(&leader_id).unwrap().send_command(json!({

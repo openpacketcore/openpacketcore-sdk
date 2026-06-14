@@ -1420,6 +1420,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-mgmt-audit"
+version = "0.2.0"
+dependencies = [
+ "opc-config-model",
+ "opc-redaction",
+ "opc-types",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "opc-mgmt-authz"
+version = "0.2.0"
+dependencies = [
+ "opc-config-model",
+ "opc-mgmt-schema",
+ "opc-nacm",
+ "opc-types",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "opc-mgmt-errors"
 version = "0.2.0"
 dependencies = [
@@ -1430,6 +1452,15 @@ dependencies = [
 name = "opc-mgmt-limits"
 version = "0.2.0"
 dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "opc-mgmt-opstate"
+version = "0.2.0"
+dependencies = [
+ "opc-config-model",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -1459,11 +1490,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-mgmt-transport"
+version = "0.2.0"
+dependencies = [
+ "opc-identity",
+ "opc-runtime",
+ "opc-tls",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "opc-nacm"
 version = "0.2.0"
 dependencies = [
  "opc-redaction",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "opc-netconf-server"
+version = "0.2.0"
+dependencies = [
+ "opc-config-bus",
+ "opc-config-model",
+ "opc-identity",
+ "opc-mgmt-audit",
+ "opc-mgmt-authz",
+ "opc-mgmt-errors",
+ "opc-mgmt-limits",
+ "opc-mgmt-opstate",
+ "opc-mgmt-principal",
+ "opc-mgmt-schema",
+ "opc-mgmt-transport",
+ "opc-nacm",
+ "opc-redaction",
+ "opc-runtime",
+ "opc-tls",
+ "opc-types",
+ "quick-xml",
+ "rcgen",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]
@@ -1980,6 +2051,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.40.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2474bd2e5029e7ccb6abb2ba48cf2383a333851dedf495901544281590c7da7f"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
