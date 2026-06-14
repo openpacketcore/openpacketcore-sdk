@@ -711,19 +711,16 @@ impl<'a> NetconfXmlRenderContext<'a> {
         self.selection.contains(&path)
     }
 
-    /// Returns whether `path` lies inside the selected subtree.
+    /// Returns whether `path` itself or one of its descendants is selected.
     ///
-    /// This is true when `path` itself is selected, when any descendant of
-    /// `path` is selected, or when any ancestor of `path` is selected. In other
-    /// words, the selected paths form a subtree mask and this method reports
-    /// whether `path` is covered by that mask.
+    /// Generated container renderers use this to decide whether they need to
+    /// render a structural parent for an authorized descendant. A selected
+    /// ancestor does **not** cover all descendants here: `ReadSelection` is
+    /// post-NACM, and structural containers must not authorize sibling leaves.
     pub fn is_subtree_selected(&self, path: &str) -> bool {
         self.selection.iter().any(|p| {
             *p == path
                 || p.strip_prefix(path)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-                || path
-                    .strip_prefix(p)
                     .is_some_and(|suffix| suffix.starts_with('/'))
         })
     }
@@ -1352,9 +1349,10 @@ mod tests {
         assert!(ctx.is_subtree_selected("/ex:system"));
         assert!(!ctx.is_subtree_selected("/ex:other"));
 
-        // A selected ancestor covers its descendants.
+        // A selected ancestor is only structural; it must not authorize every
+        // descendant under the same container.
         let root_ctx = NetconfXmlRenderContext::new(&reg, &["/ex:system"], DefaultReport::Trim);
-        assert!(root_ctx.is_subtree_selected("/ex:system/ex:hostname"));
+        assert!(!root_ctx.is_subtree_selected("/ex:system/ex:hostname"));
         assert!(root_ctx.is_subtree_selected("/ex:system"));
         assert!(!root_ctx.is_subtree_selected("/ex:other"));
     }

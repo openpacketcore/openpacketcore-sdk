@@ -244,7 +244,7 @@ fn render_leaf_fn(
             ctx: &NetconfXmlRenderContext<'_>,
             path: &'static str,
         ) -> Result<Option<String>, NetconfProjectionError> {
-            if !ctx.is_subtree_selected(path) {
+            if !ctx.is_selected(path) {
                 return Ok(None);
             }
             #custom_check
