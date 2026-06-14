@@ -17,7 +17,11 @@ use tokio_rustls::rustls::pki_types::CertificateDer;
 
 use crate::binding::NetconfConfigBinding;
 use crate::server::ReadOnlyNetconfServer;
-use crate::session::{run_read_only_session, SessionConfig, SessionError, SessionResult};
+use crate::session::{
+    run_read_only_session, run_read_only_session_with_registry, SessionConfig, SessionError,
+    SessionResult,
+};
+use crate::session_registry::SessionRegistry;
 
 /// Error deriving a NETCONF principal from a verified TLS peer.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -85,6 +89,10 @@ pub fn principal_from_identity_state(
 }
 
 /// Runs a read-only NETCONF session over an already-accepted TLS stream.
+///
+/// This convenience helper creates an isolated session registry after principal
+/// extraction. Use [`run_read_only_tls_session_with_registry`] when multiple TLS
+/// sessions must be addressable by RFC 6241 `<kill-session>`.
 pub async fn run_read_only_tls_session<C, B, P, A, IO>(
     server: &ReadOnlyNetconfServer<C, B, P, A>,
     stream: &mut tokio_rustls::server::TlsStream<IO>,
@@ -101,6 +109,30 @@ where
 {
     let principal = principal_from_tls_stream(stream, identity_rx)?;
     Ok(run_read_only_session(server, &principal, stream, config, session_id).await?)
+}
+
+/// Runs a read-only NETCONF TLS session registered for cross-session
+/// `<kill-session>` control.
+pub async fn run_read_only_tls_session_with_registry<C, B, P, A, IO>(
+    server: &ReadOnlyNetconfServer<C, B, P, A>,
+    stream: &mut tokio_rustls::server::TlsStream<IO>,
+    identity_rx: &watch::Receiver<Option<IdentityState>>,
+    config: SessionConfig,
+    session_id: u64,
+    sessions: &SessionRegistry,
+) -> Result<SessionResult, TlsSessionError>
+where
+    C: OpcConfig,
+    B: NetconfConfigBinding<C>,
+    P: PolicySource,
+    A: AuditSink,
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let principal = principal_from_tls_stream(stream, identity_rx)?;
+    Ok(run_read_only_session_with_registry(
+        server, &principal, stream, config, session_id, sessions,
+    )
+    .await?)
 }
 
 #[cfg(test)]

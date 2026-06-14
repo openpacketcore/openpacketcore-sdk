@@ -10,6 +10,8 @@ use opc_redaction::metrics::{metrics_label_safe, LatencyHistogram, METRICS};
 pub(crate) enum NetconfOperation {
     /// `<close-session>`.
     CloseSession,
+    /// `<kill-session>`.
+    KillSession,
     /// `<get>`.
     Get,
     /// `<get-config>`.
@@ -23,9 +25,10 @@ pub(crate) enum NetconfOperation {
 }
 
 impl NetconfOperation {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::CloseSession => "close-session",
+            Self::KillSession => "kill-session",
             Self::Get => "get",
             Self::GetConfig => "get-config",
             Self::GetSchema => "get-schema",

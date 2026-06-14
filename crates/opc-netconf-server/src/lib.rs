@@ -29,8 +29,11 @@
 //!   payloads (comments, processing instructions,
 //!   declarations, doctypes, and entity references) are value-bounded before
 //!   handling.
-//! - `<close-session>` with NACM `exec` authorization, `<ok/>` reply, and clean
-//!   session teardown.
+//! - `<close-session>` and `<kill-session>` with NACM `exec` authorization,
+//!   payload-free denial/failure errors, audited outcomes, self-kill rejection,
+//!   valid local session-id enforcement with exhausted-range rejection, and
+//!   audit-before-signal in-process session-registry termination for live target
+//!   sessions, including targets blocked on session writes.
 //! - Known-but-unimplemented NETCONF base operations are parsed only far
 //!   enough to preserve `message-id`, audit the failed attempt, and return
 //!   payload-free `operation-not-supported`; bounded text and CDATA payloads
@@ -63,6 +66,75 @@
 //!   provider responses with unrequested paths, duplicate paths, or unrequested
 //!   origin metadata fail closed before XML projection.
 //!
+//! Complete base-session semantics are provided by the session runners. The
+//! public [`ReadOnlyNetconfServer::handle_rpc`] and
+//! [`ReadOnlyNetconfServer::handle_rpc_xml`] helpers are registry-free,
+//! low-level dispatch helpers: they preserve parser/audit/metrics/reply
+//! behavior for one RPC, but `<kill-session>` returns `operation-not-supported`
+//! without a live [`SessionRegistry`], and `handle_rpc_xml` discards the
+//! `<close-session>` close signal. The raw hello renderers require
+//! `NonZeroU32` for a supplied session id, so direct helper callers cannot
+//! render `0` or an out-of-range `<session-id>`. Custom transports that
+//! advertise a server `<hello>` should use [`run_read_only_session_with_registry`] or
+//! [`run_read_only_tls_session_with_registry`] to get audited cross-session
+//! `<kill-session>` semantics.
+//!
+//! The raw session-registry controls are intentionally not part of the public
+//! API. Custom transports share a [`SessionRegistry`] by passing it into
+//! [`run_read_only_session_with_registry`] or
+//! [`run_read_only_tls_session_with_registry`]; they cannot register or
+//! terminate sessions outside the audited RPC path:
+//!
+//! ```compile_fail
+//! let registry = opc_netconf_server::SessionRegistry::new();
+//! let _registration = registry.register(1);
+//! ```
+//!
+//! ```compile_fail
+//! let registry = opc_netconf_server::SessionRegistry::new();
+//! let _ = registry.terminate_after(1, || Ok::<(), ()>(()));
+//! ```
+//!
+//! The public registry handle is also deliberately not `Debug`, so accidentally
+//! formatting the handle cannot dump live session ids from the private map:
+//!
+//! ```compile_fail
+//! let registry = opc_netconf_server::SessionRegistry::new();
+//! let _ = format!("{registry:?}");
+//! ```
+//!
+//! The session-context RPC entry point is also crate-private. Custom transports
+//! cannot inject arbitrary current-session ids; they must use the
+//! registry-aware session runners:
+//!
+//! ```compile_fail
+//! use opc_config_model::{OpcConfig, RequestId, TrustedPrincipal};
+//! use opc_mgmt_audit::AuditSink;
+//! use opc_mgmt_authz::PolicySource;
+//! use opc_mgmt_limits::MgmtLimits;
+//! use opc_netconf_server::{NetconfConfigBinding, ReadOnlyNetconfServer, SessionRegistry};
+//!
+//! fn cannot_inject_session_context<C, B, P, A>(
+//!     server: &ReadOnlyNetconfServer<C, B, P, A>,
+//!     principal: &TrustedPrincipal,
+//!     sessions: &SessionRegistry,
+//! ) where
+//!     C: OpcConfig,
+//!     B: NetconfConfigBinding<C>,
+//!     P: PolicySource,
+//!     A: AuditSink,
+//! {
+//!     let _ = server.handle_rpc_for_session(
+//!         RequestId::new(),
+//!         principal,
+//!         "<rpc/>",
+//!         &MgmtLimits::default(),
+//!         1,
+//!         sessions,
+//!     );
+//! }
+//! ```
+//!
 //! It does not claim generic YANG XML projection. Generated config models are
 //! RFC 7951 JSON-capable today; a CNF must supply the XML projection binding for
 //! the models, discovery trees, and schema sources it serves until the
@@ -80,6 +152,7 @@ mod metrics;
 pub mod operations;
 pub mod server;
 pub mod session;
+mod session_registry;
 pub mod supervision;
 pub mod transport;
 pub mod xml;
@@ -108,15 +181,18 @@ pub use listener::{
 };
 pub use server::{ReadOnlyNetconfServer, RpcHandlingResult, ServerInitError};
 pub use session::{
-    run_read_only_session, SessionConfig, SessionError, SessionFraming, SessionResult,
+    run_read_only_session, run_read_only_session_with_registry, SessionConfig, SessionError,
+    SessionFraming, SessionResult,
 };
+pub use session_registry::SessionRegistry;
 pub use supervision::{spawn_read_only_tls_listener, SupervisedTlsListenerConfig};
 pub use transport::{
     principal_from_identity_state, principal_from_identity_watch, principal_from_tls_stream,
-    run_read_only_tls_session, TlsPrincipalError, TlsSessionError,
+    run_read_only_tls_session, run_read_only_tls_session_with_registry, TlsPrincipalError,
+    TlsSessionError,
 };
 pub use xml::{
     parse_client_hello, parse_rpc, ClientHello, Datastore, Filter, FilterElement, FilterKind,
-    GetConfigRequest, GetRequest, ParsedRpc, RpcOperation, SubtreeFilter, SubtreeSelection,
-    UnsupportedOperation, WithDefaultsMode, XmlError,
+    GetConfigRequest, GetRequest, KillSessionRequest, ParsedRpc, RpcOperation, SubtreeFilter,
+    SubtreeSelection, UnsupportedOperation, WithDefaultsMode, XmlError,
 };
