@@ -49,8 +49,15 @@ pub(crate) fn parse_edit_config_xml(
                 let node = finalize_frame(frame, registry)?;
                 attach_child(&mut stack, node)?;
             }
-            quick_xml::events::Event::End(_) => {
-                let frame = stack.pop().ok_or(NetconfEditError::MalformedXml)?;
+            quick_xml::events::Event::End(end) => {
+                let frame = stack.last().ok_or(NetconfEditError::MalformedXml)?;
+                validate_end(
+                    end.name().as_ref(),
+                    &frame.ns_scope,
+                    &frame.local_name,
+                    &frame.namespace,
+                )?;
+                let frame = stack.pop().expect("validated stack has a frame");
                 let node = finalize_frame(frame, registry)?;
                 if stack.is_empty() {
                     // Closing the `<config>` wrapper: return its single data child.
@@ -64,6 +71,12 @@ pub(crate) fn parse_edit_config_xml(
             }
             quick_xml::events::Event::Text(text) => {
                 let decoded = text.decode().map_err(|_| NetconfEditError::MalformedXml)?;
+                if let Some(frame) = stack.last_mut() {
+                    frame.text.push_str(&decoded);
+                }
+            }
+            quick_xml::events::Event::CData(cdata) => {
+                let decoded = cdata.decode().map_err(|_| NetconfEditError::MalformedXml)?;
                 if let Some(frame) = stack.last_mut() {
                     frame.text.push_str(&decoded);
                 }
@@ -103,6 +116,8 @@ struct NsScope {
 }
 
 struct Frame {
+    local_name: String,
+    namespace: String,
     schema_path: &'static str,
     node_kind: NodeKind,
     operation: EditOperation,
@@ -126,11 +141,13 @@ fn push_element(
         // The first element must be the NETCONF `<config>` wrapper. The bounded
         // capture loses ancestor namespace declarations, so a bare `<config>`
         // (no explicit namespace) is accepted as the base NETCONF namespace.
-        let (local, ns_scope) = resolve_config_start(start, decoder)?;
+        let (local, namespace, ns_scope) = resolve_config_start(start, decoder)?;
         if local != "config" {
             return Err(NetconfEditError::MalformedXml);
         }
         return Ok(Frame {
+            local_name: local.to_string(),
+            namespace,
             schema_path: "",
             node_kind: NodeKind::Container,
             operation: map_default_operation(default_operation),
@@ -174,6 +191,8 @@ fn push_element(
     let operation = op_attr.unwrap_or(parent.operation);
 
     Ok(Frame {
+        local_name: local,
+        namespace,
         schema_path,
         node_kind: node.kind,
         operation,
@@ -243,7 +262,7 @@ fn resolve_start(
 fn resolve_config_start(
     start: &BytesStart<'_>,
     decoder: quick_xml::encoding::Decoder,
-) -> Result<(String, NsScope), NetconfEditError> {
+) -> Result<(String, String, NsScope), NetconfEditError> {
     let raw_name = start.name();
     let (prefix, local) = split_qname(raw_name.as_ref())?;
     let mut scope = NsScope::default();
@@ -279,7 +298,7 @@ fn resolve_config_start(
             .bindings
             .get(p)
             .cloned()
-            .unwrap_or_else(|| NETCONF_BASE_NS.to_string()),
+            .ok_or(NetconfEditError::MalformedXml)?,
         None => scope.default.clone().expect("default set above"),
     };
 
@@ -287,7 +306,36 @@ fn resolve_config_start(
         return Err(NetconfEditError::MalformedXml);
     }
 
-    Ok((local.to_string(), scope))
+    Ok((local.to_string(), namespace, scope))
+}
+
+fn validate_end(
+    raw_name: &[u8],
+    scope: &NsScope,
+    expected_local: &str,
+    expected_namespace: &str,
+) -> Result<(), NetconfEditError> {
+    let (prefix, local) = split_qname(raw_name)?;
+    if local != expected_local {
+        return Err(NetconfEditError::MalformedXml);
+    }
+
+    let namespace = match prefix {
+        Some(p) => scope
+            .bindings
+            .get(p)
+            .map(String::as_str)
+            .ok_or(NetconfEditError::MalformedXml)?,
+        None => scope
+            .default
+            .as_deref()
+            .ok_or(NetconfEditError::MalformedXml)?,
+    };
+
+    if namespace != expected_namespace {
+        return Err(NetconfEditError::MalformedXml);
+    }
+    Ok(())
 }
 
 fn finalize_frame(
@@ -298,7 +346,7 @@ fn finalize_frame(
         NodeKind::Leaf => Ok(EditConfigNode {
             schema_path: frame.schema_path,
             operation: frame.operation,
-            value: Some(frame.text.trim().to_string()),
+            value: Some(frame.text),
             children: Vec::new(),
             list_keys: BTreeMap::new(),
         }),
@@ -408,4 +456,136 @@ fn decode_utf8(raw: &[u8]) -> Result<&str, NetconfEditError> {
 
 fn last_segment(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opc_mgmt_schema::{DataClass, LeafType, ModelData, NodeMeta, OriginEntry, SchemaRegistry};
+
+    struct TestRegistry;
+
+    static MODELS: &[ModelData] = &[ModelData {
+        name: "example",
+        revision: "2026-06-14",
+        namespace: "urn:example",
+        prefix: "ex",
+    }];
+
+    static ORIGINS: &[OriginEntry] = &[OriginEntry {
+        origin: "",
+        modules: &["example"],
+    }];
+
+    static NODES: &[NodeMeta] = &[
+        NodeMeta {
+            path: "/ex:system",
+            module: "example",
+            kind: NodeKind::Container,
+            config: true,
+            leaf_type: None,
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &["/ex:system/ex:hostname"],
+        },
+        NodeMeta {
+            path: "/ex:system/ex:hostname",
+            module: "example",
+            kind: NodeKind::Leaf,
+            config: true,
+            leaf_type: Some(LeafType::String),
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[],
+        },
+    ];
+
+    impl SchemaRegistry for TestRegistry {
+        fn schema_digest(&self) -> &'static str {
+            "fnv1a64:test"
+        }
+
+        fn served_models(&self) -> &'static [ModelData] {
+            MODELS
+        }
+
+        fn nodes(&self) -> &'static [NodeMeta] {
+            NODES
+        }
+
+        fn origins(&self) -> &'static [OriginEntry] {
+            ORIGINS
+        }
+    }
+
+    static REGISTRY: TestRegistry = TestRegistry;
+
+    #[test]
+    fn parser_preserves_string_leaf_whitespace() {
+        let edit = parse_edit_config_xml(
+            r#"<config><ex:system xmlns:ex="urn:example"><ex:hostname>  router1  </ex:hostname></ex:system></config>"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+        )
+        .expect("edit");
+
+        let value = edit.children[0].value.as_deref();
+        assert_eq!(value, Some("  router1  "));
+    }
+
+    #[test]
+    fn parser_preserves_cdata_leaf_text() {
+        let edit = parse_edit_config_xml(
+            r#"<config><ex:system xmlns:ex="urn:example"><ex:hostname><![CDATA[  router1  ]]></ex:hostname></ex:system></config>"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+        )
+        .expect("edit");
+
+        let value = edit.children[0].value.as_deref();
+        assert_eq!(value, Some("  router1  "));
+    }
+
+    #[test]
+    fn default_operation_none_propagates_to_unannotated_nodes() {
+        let edit = parse_edit_config_xml(
+            r#"<config><ex:system xmlns:ex="urn:example"><ex:hostname>router1</ex:hostname></ex:system></config>"#,
+            &REGISTRY,
+            EditDefaultOperation::None,
+        )
+        .expect("edit");
+
+        assert_eq!(edit.operation, EditOperation::None);
+        assert_eq!(edit.children[0].operation, EditOperation::None);
+    }
+
+    #[test]
+    fn prefixed_config_requires_declared_prefix() {
+        let err = parse_edit_config_xml(
+            r#"<nc:config><ex:system xmlns:ex="urn:example"><ex:hostname>router1</ex:hostname></ex:system></nc:config>"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+        )
+        .expect_err("undeclared config prefix must fail");
+
+        assert!(matches!(err, NetconfEditError::MalformedXml));
+    }
+
+    #[test]
+    fn mismatched_end_tag_fails_closed() {
+        let err = parse_edit_config_xml(
+            r#"<config><ex:system xmlns:ex="urn:example"><ex:hostname>router1</ex:host></ex:system></config>"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+        )
+        .expect_err("mismatched tag must fail");
+
+        assert!(matches!(err, NetconfEditError::MalformedXml));
+    }
 }
