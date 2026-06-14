@@ -101,6 +101,16 @@ pub struct MgmtLimits {
     /// Maximum number of concurrent northbound sessions/connections the server
     /// will accept.
     pub max_sessions: usize,
+    /// Maximum number of subtree-filter content-match nodes (leaf text values)
+    /// permitted in one `<filter>`. The server does not implement content-match
+    /// semantics, but the bound still limits how many rejected nodes a client can
+    /// force the parser to classify before failing closed.
+    pub max_subtree_filter_content_match_nodes: usize,
+    /// Maximum number of subtree-filter attribute-match nodes (element attributes)
+    /// permitted in one `<filter>`. The server does not implement attribute-match
+    /// semantics, but the bound still limits how many rejected nodes a client can
+    /// force the parser to classify before failing closed.
+    pub max_subtree_filter_attribute_match_nodes: usize,
 }
 
 impl Default for MgmtLimits {
@@ -120,6 +130,8 @@ impl Default for MgmtLimits {
             max_subscriber_queue_bytes: 8 * 1024 * 1024,
             max_subscriptions_per_session: 256,
             max_sessions: 1024,
+            max_subtree_filter_content_match_nodes: 16,
+            max_subtree_filter_attribute_match_nodes: 16,
         }
     }
 }
@@ -129,7 +141,7 @@ impl MgmtLimits {
     /// is never "unbounded"), and a single value/queue may not be larger than a
     /// whole message would allow, which would make the per-value bound dead.
     pub fn validate(&self) -> Result<(), LimitsError> {
-        let fields: [(&'static str, usize); 10] = [
+        let fields: [(&'static str, usize); 12] = [
             ("request_bytes", self.max_request_bytes),
             (
                 "frame_chunks_per_message",
@@ -149,6 +161,14 @@ impl MgmtLimits {
                 self.max_subscriptions_per_session,
             ),
             ("sessions", self.max_sessions),
+            (
+                "subtree_filter_content_match_nodes",
+                self.max_subtree_filter_content_match_nodes,
+            ),
+            (
+                "subtree_filter_attribute_match_nodes",
+                self.max_subtree_filter_attribute_match_nodes,
+            ),
         ];
         for (name, value) in fields {
             if value == 0 {
@@ -220,6 +240,32 @@ impl MgmtLimits {
         Self::check("sessions", self.max_sessions, actual)
     }
 
+    /// Rejects a subtree filter containing more than
+    /// [`Self::max_subtree_filter_content_match_nodes`] content-match nodes.
+    pub fn check_subtree_filter_content_match_nodes(
+        &self,
+        actual: usize,
+    ) -> Result<(), LimitsError> {
+        Self::check(
+            "subtree_filter_content_match_nodes",
+            self.max_subtree_filter_content_match_nodes,
+            actual,
+        )
+    }
+
+    /// Rejects a subtree filter containing more than
+    /// [`Self::max_subtree_filter_attribute_match_nodes`] attribute-match nodes.
+    pub fn check_subtree_filter_attribute_match_nodes(
+        &self,
+        actual: usize,
+    ) -> Result<(), LimitsError> {
+        Self::check(
+            "subtree_filter_attribute_match_nodes",
+            self.max_subtree_filter_attribute_match_nodes,
+            actual,
+        )
+    }
+
     #[inline]
     fn check(limit: &'static str, max: usize, actual: usize) -> Result<(), LimitsError> {
         if actual > max {
@@ -287,6 +333,14 @@ mod tests {
                 max_sessions: 0,
                 ..base
             },
+            MgmtLimits {
+                max_subtree_filter_content_match_nodes: 0,
+                ..base
+            },
+            MgmtLimits {
+                max_subtree_filter_attribute_match_nodes: 0,
+                ..base
+            },
         ];
         for limits in zeroed {
             assert!(
@@ -317,10 +371,13 @@ mod tests {
             max_paths_per_request: 4,
             max_value_bytes: 50,
             max_xml_depth: 8,
+            max_xml_attributes_per_element: 8,
+            max_xml_namespace_decls: 8,
             max_subscriber_queue_bytes: 200,
             max_subscriptions_per_session: 2,
             max_sessions: 3,
-            ..MgmtLimits::default()
+            max_subtree_filter_content_match_nodes: 1,
+            max_subtree_filter_attribute_match_nodes: 1,
         };
 
         // At the limit is allowed; one past is rejected with the named limit.
@@ -347,6 +404,12 @@ mod tests {
         assert!(limits.check_subscriptions(3).is_err());
         assert!(limits.check_sessions(3).is_ok());
         assert!(limits.check_sessions(4).is_err());
+        assert!(limits.check_subtree_filter_content_match_nodes(1).is_ok());
+        assert!(limits.check_subtree_filter_content_match_nodes(2).is_err());
+        assert!(limits.check_subtree_filter_attribute_match_nodes(1).is_ok());
+        assert!(limits
+            .check_subtree_filter_attribute_match_nodes(2)
+            .is_err());
     }
 
     #[test]
