@@ -407,6 +407,7 @@ where
                 &parsed.message_id,
                 &parsed.reply_attrs,
                 started,
+                limits,
             ),
             RpcOperation::Unsupported(operation) => self.handle_unsupported_operation(
                 *operation,
@@ -575,6 +576,7 @@ where
                 &parsed.message_id,
                 &parsed.reply_attrs,
                 started,
+                limits,
             ),
             RpcOperation::Unsupported(operation) => self.handle_unsupported_operation(
                 *operation,
@@ -2058,6 +2060,7 @@ where
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_get_schema(
         &self,
         request: &XmlGetSchemaRequest,
@@ -2066,6 +2069,7 @@ where
         message_id: &str,
         reply_attrs: &RpcReplyAttributes,
         started: Instant,
+        limits: &MgmtLimits,
     ) -> RpcHandlingResult {
         let schema_path = schema_node_path("/ncm:netconf-state/ncm:schemas/ncm:schema");
         if self.binding.netconf_monitoring_capability().is_none() {
@@ -2192,6 +2196,44 @@ where
 
         match self.binding.get_schema(&binding_request) {
             Ok(data_xml) => {
+                if limits.check_value_bytes(data_xml.len()).is_err() {
+                    if self
+                        .audit
+                        .record(
+                            &AuditEvent::new(
+                                request_id,
+                                principal,
+                                self.transport,
+                                AuditOperation::Read,
+                                audit_failed("too-big"),
+                            )
+                            .with_paths([schema_path]),
+                        )
+                        .is_err()
+                    {
+                        record_rpc_error(
+                            NetconfOperation::GetSchema,
+                            NetconfErrorTag::OperationFailed,
+                            started.elapsed(),
+                        );
+                        return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                            Some(message_id),
+                            reply_attrs,
+                            RpcError::operation_failed(),
+                        ));
+                    }
+                    record_rpc_error(
+                        NetconfOperation::GetSchema,
+                        NetconfErrorTag::TooBig,
+                        started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(message_id),
+                        reply_attrs,
+                        RpcError::too_big(),
+                    ));
+                }
+
                 if self
                     .audit
                     .record(
@@ -2870,6 +2912,7 @@ mod tests {
         NotFound,
         NotUnique,
         Failed,
+        TooBig,
     }
 
     impl NetconfConfigBinding<DemoConfig> for TestBinding {
@@ -3189,6 +3232,7 @@ mod tests {
                 GetSchemaMode::Failed => Err(GetSchemaError::failed(
                     "schema backend leaked /sys:system/sys:secret",
                 )),
+                GetSchemaMode::TooBig => Ok("x".repeat(2 * 1024 * 1024)),
             }
         }
     }
@@ -4575,6 +4619,31 @@ mod tests {
 
         let events = audit.events.lock().expect("audit mutex");
         assert_eq!(events[0].outcome, audit_failed("operation-failed"));
+    }
+
+    #[tokio::test]
+    async fn get_schema_rejects_oversized_source_with_too_big_error() {
+        let (server, _observed, _observed_monitoring, audit) = server_fixture_with_monitoring(
+            policy_allow_system_and_yang_library_but_deny_secret(),
+            GetSchemaMode::TooBig,
+        )
+        .await;
+        let limits = MgmtLimits {
+            max_value_bytes: 1024,
+            ..MgmtLimits::default()
+        };
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &get_schema_rpc("demo-system", Some("2026-06-13")),
+            &limits,
+        );
+
+        assert!(reply.contains("<error-tag>too-big</error-tag>"));
+        assert!(!reply.contains("xxxx"));
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events[0].outcome, audit_failed("too-big"));
     }
 
     #[tokio::test]

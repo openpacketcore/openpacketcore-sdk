@@ -169,6 +169,68 @@ pub struct OriginEntry {
     pub modules: &'static [&'static str],
 }
 
+/// Conformance of a module entry in a YANG Library module-set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleConformance {
+    /// The module is implemented by the server.
+    Implement,
+    /// The module is imported only (not implemented).
+    Import,
+}
+
+/// An imported module referenced by a YANG module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleImport {
+    /// Imported module name.
+    pub name: &'static str,
+    /// Imported module revision, if known.
+    pub revision: Option<&'static str>,
+}
+
+/// Extended discovery/source metadata for one served YANG module.
+///
+/// This is separate from [`ModelData`] so that lightweight registries can keep
+/// the small identity row while registries that carry generated discovery data
+/// can expose imports/features/deviations/source text through a second table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryMetadata {
+    /// Module name (must match a row in [`SchemaRegistry::served_models`]).
+    pub name: &'static str,
+    /// Module revision (must match the corresponding [`ModelData::revision`]).
+    pub revision: &'static str,
+    /// Whether the module is implemented or import-only.
+    pub conformance: ModuleConformance,
+    /// Modules imported by this module.
+    pub imports: &'static [ModuleImport],
+    /// Features advertised by this module.
+    pub features: &'static [&'static str],
+    /// Deviation module names applied to this module.
+    pub deviations: &'static [&'static str],
+    /// Raw YANG source text, available for `<get-schema>` retrieval.
+    pub source: Option<&'static str>,
+}
+
+/// Failure to retrieve a YANG module source via [`SchemaRegistry::schema_source`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaSourceError {
+    /// No module source matches the identifier/version/format.
+    NotFound,
+    /// More than one module matches the request without a version disambiguator.
+    NotUnique,
+    /// The requested source format is not supported.
+    UnsupportedFormat,
+}
+
+impl std::fmt::Display for SchemaSourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "schema source not found"),
+            Self::NotUnique => write!(f, "schema identifier is ambiguous"),
+            Self::UnsupportedFormat => write!(f, "schema source format is not supported"),
+        }
+    }
+}
+
 /// An integrity failure detected by [`SchemaRegistry::self_check`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
@@ -410,6 +472,29 @@ pub trait SchemaRegistry: Send + Sync {
 
     /// The gNMI origin map.
     fn origins(&self) -> &'static [OriginEntry];
+
+    /// Extended discovery/source metadata for the served modules.
+    ///
+    /// The default empty table means the registry does not carry generated
+    /// discovery artifacts; NETCONF YANG Library / monitoring rendering and
+    /// `<get-schema>` must then come from a CNF-specific binding hook.
+    fn discovery_metadata(&self) -> &'static [DiscoveryMetadata] {
+        &[]
+    }
+
+    /// Retrieves raw YANG source text for a module identified by name and optional
+    /// revision. Only the `yang` format is required; other formats may be rejected
+    /// as unsupported.
+    ///
+    /// The default implementation returns [`SchemaSourceError::NotFound`].
+    fn schema_source(
+        &self,
+        _identifier: &str,
+        _version: Option<&str>,
+        _format: &str,
+    ) -> Result<&'static str, SchemaSourceError> {
+        Err(SchemaSourceError::NotFound)
+    }
 
     /// Resolves a (possibly prefixed, possibly keyed) path to its node metadata.
     fn node(&self, schema_path: &str) -> Option<&'static NodeMeta> {
