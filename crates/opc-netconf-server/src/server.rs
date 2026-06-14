@@ -6974,6 +6974,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subtree_filter_nested_attribute_match_over_limit_is_too_big_without_leak() {
+        let (server, observed, audit) = server_fixture().await;
+        let limits = MgmtLimits {
+            max_subtree_filter_attribute_match_nodes: 1,
+            ..MgmtLimits::default()
+        };
+        let rpc = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="106c"><get-config><source><running/></source><filter><sys:system xmlns:sys="urn:opc:demo"><sys:hostname>content<sys:alt first="do-not-leak"/><sys:alt second="also-secret"/></sys:hostname></sys:system></filter></get-config></rpc>"#
+        );
+        let reply = server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &limits);
+        assert!(reply.contains(r#"message-id="106c""#));
+        assert!(reply.contains("<error-tag>too-big</error-tag>"));
+        assert!(!reply.contains("content"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(!reply.contains("also-secret"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, audit_failed("too-big"));
+    }
+
+    #[tokio::test]
     async fn unexpected_protocol_text_fails_closed_without_payload() {
         let (server, observed, _audit) = server_fixture().await;
         let rpc = format!(
