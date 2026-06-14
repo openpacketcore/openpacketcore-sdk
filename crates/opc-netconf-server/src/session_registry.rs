@@ -30,7 +30,7 @@ pub(crate) fn session_id_for_hello(session_id: u64) -> Option<NonZeroU32> {
 /// does not store principals, peer addresses, or request payloads.
 #[derive(Clone, Default)]
 pub struct SessionRegistry {
-    inner: Arc<Mutex<HashMap<u64, Arc<SessionEntry>>>>,
+    inner: Arc<Mutex<RegistryState>>,
 }
 
 impl SessionRegistry {
@@ -49,11 +49,11 @@ impl SessionRegistry {
         }
         let (kill_tx, kill_rx) = watch::channel(false);
         let entry = Arc::new(SessionEntry { kill_tx });
-        let mut sessions = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        if sessions.contains_key(&session_id) {
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if state.sessions.contains_key(&session_id) {
             return Err(SessionRegistryError::DuplicateSessionId);
         }
-        sessions.insert(session_id, Arc::clone(&entry));
+        state.sessions.insert(session_id, Arc::clone(&entry));
         Ok(SessionRegistration {
             registry: self.clone(),
             session_id,
@@ -76,30 +76,84 @@ impl SessionRegistry {
     where
         F: FnOnce() -> Result<(), E>,
     {
-        let mut sessions = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        let Some(entry) = sessions.get(&session_id).cloned() else {
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        let Some(entry) = state.sessions.get(&session_id).cloned() else {
             return Ok(KillSessionResult::NotFound);
         };
         if entry.kill_tx.receiver_count() == 0 {
-            sessions.remove(&session_id);
+            state.sessions.remove(&session_id);
+            state.release_running_lock(session_id);
             return Ok(KillSessionResult::NotFound);
         }
         before_signal()?;
         if entry.kill_tx.send(true).is_ok() {
             Ok(KillSessionResult::Terminated)
         } else {
-            sessions.remove(&session_id);
+            state.sessions.remove(&session_id);
+            state.release_running_lock(session_id);
             Ok(KillSessionResult::NotFound)
         }
     }
 
+    /// Acquires the global running datastore lock after `before_lock` succeeds.
+    pub(crate) fn lock_running_after<F, E>(
+        &self,
+        session_id: u64,
+        before_lock: F,
+    ) -> Result<LockRunningResult, E>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if !state.sessions.contains_key(&session_id) {
+            return Ok(LockRunningResult::SessionNotRegistered);
+        }
+        if let Some(owner) = state.running_lock {
+            return Ok(LockRunningResult::Denied {
+                owner_session_id: owner.session_id,
+            });
+        }
+        before_lock()?;
+        state.running_lock = Some(RunningLock { session_id });
+        Ok(LockRunningResult::Acquired)
+    }
+
+    /// Releases the global running datastore lock after `before_unlock`
+    /// succeeds.
+    pub(crate) fn unlock_running_after<F, E>(
+        &self,
+        session_id: u64,
+        before_unlock: F,
+    ) -> Result<UnlockRunningResult, E>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if !state.sessions.contains_key(&session_id) {
+            return Ok(UnlockRunningResult::SessionNotRegistered);
+        }
+        match state.running_lock {
+            Some(owner) if owner.session_id == session_id => {
+                before_unlock()?;
+                state.running_lock = None;
+                Ok(UnlockRunningResult::Unlocked)
+            }
+            Some(owner) => Ok(UnlockRunningResult::NotOwner {
+                owner_session_id: owner.session_id,
+            }),
+            None => Ok(UnlockRunningResult::NotLocked),
+        }
+    }
+
     fn deregister(&self, session_id: u64, entry: &Arc<SessionEntry>) {
-        let mut sessions = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        if sessions
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if state
+            .sessions
             .get(&session_id)
             .is_some_and(|current| Arc::ptr_eq(current, entry))
         {
-            sessions.remove(&session_id);
+            state.sessions.remove(&session_id);
+            state.release_running_lock(session_id);
         }
     }
 
@@ -108,13 +162,45 @@ impl SessionRegistry {
         self.inner
             .lock()
             .unwrap_or_else(|err| err.into_inner())
+            .sessions
             .contains_key(&session_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn running_lock_owner_for_test(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .running_lock
+            .map(|lock| lock.session_id)
+    }
+}
+
+#[derive(Debug, Default)]
+struct RegistryState {
+    sessions: HashMap<u64, Arc<SessionEntry>>,
+    running_lock: Option<RunningLock>,
+}
+
+impl RegistryState {
+    fn release_running_lock(&mut self, session_id: u64) {
+        if self
+            .running_lock
+            .is_some_and(|lock| lock.session_id == session_id)
+        {
+            self.running_lock = None;
+        }
     }
 }
 
 #[derive(Debug)]
 struct SessionEntry {
     kill_tx: watch::Sender<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunningLock {
+    session_id: u64,
 }
 
 /// Live-session registration handle.
@@ -171,6 +257,36 @@ pub(crate) enum KillSessionResult {
     Terminated,
     /// No live target session exists.
     NotFound,
+}
+
+/// Result of a running datastore lock request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockRunningResult {
+    /// The calling session now owns the running lock.
+    Acquired,
+    /// The running lock is already owned by a NETCONF session.
+    Denied {
+        /// NETCONF session id that owns the lock.
+        owner_session_id: u64,
+    },
+    /// The current session id is not registered in this registry.
+    SessionNotRegistered,
+}
+
+/// Result of a running datastore unlock request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnlockRunningResult {
+    /// The calling session's running lock was released.
+    Unlocked,
+    /// No running lock is currently active.
+    NotLocked,
+    /// A different NETCONF session owns the running lock.
+    NotOwner {
+        /// NETCONF session id that owns the lock.
+        owner_session_id: u64,
+    },
+    /// The current session id is not registered in this registry.
+    SessionNotRegistered,
 }
 
 #[cfg(test)]
@@ -245,16 +361,76 @@ mod tests {
             .inner
             .lock()
             .expect("registry mutex")
+            .sessions
             .insert(42, Arc::new(SessionEntry { kill_tx }));
 
         let result = registry.terminate_after(42, || panic!("hook must not run"));
 
         assert_eq!(result, Ok::<_, ()>(KillSessionResult::NotFound));
-        assert!(registry
+        assert!(!registry
             .inner
             .lock()
             .expect("registry mutex")
-            .get(&42)
-            .is_none());
+            .sessions
+            .contains_key(&42));
+    }
+
+    #[test]
+    fn running_lock_is_acquired_denied_and_released_by_owner() {
+        let registry = SessionRegistry::new();
+        let _owner = registry.register(10).expect("owner");
+        let _other = registry.register(11).expect("other");
+
+        assert_eq!(
+            registry.lock_running_after(10, || Ok::<(), ()>(())),
+            Ok(LockRunningResult::Acquired)
+        );
+        assert_eq!(registry.running_lock_owner_for_test(), Some(10));
+        assert_eq!(
+            registry.lock_running_after(11, || Ok::<(), ()>(())),
+            Ok(LockRunningResult::Denied {
+                owner_session_id: 10
+            })
+        );
+        assert_eq!(
+            registry.unlock_running_after(11, || Ok::<(), ()>(())),
+            Ok(UnlockRunningResult::NotOwner {
+                owner_session_id: 10
+            })
+        );
+        assert_eq!(
+            registry.unlock_running_after(10, || Ok::<(), ()>(())),
+            Ok(UnlockRunningResult::Unlocked)
+        );
+        assert_eq!(registry.running_lock_owner_for_test(), None);
+        assert_eq!(
+            registry.unlock_running_after(10, || Ok::<(), ()>(())),
+            Ok(UnlockRunningResult::NotLocked)
+        );
+    }
+
+    #[test]
+    fn running_lock_audit_failure_prevents_state_change() {
+        let registry = SessionRegistry::new();
+        let _owner = registry.register(10).expect("owner");
+
+        let result = registry.lock_running_after(10, || Err("audit failed"));
+
+        assert_eq!(result, Err("audit failed"));
+        assert_eq!(registry.running_lock_owner_for_test(), None);
+    }
+
+    #[test]
+    fn running_lock_released_when_session_deregisters() {
+        let registry = SessionRegistry::new();
+        let owner = registry.register(10).expect("owner");
+        assert_eq!(
+            registry.lock_running_after(10, || Ok::<(), ()>(())),
+            Ok(LockRunningResult::Acquired)
+        );
+
+        drop(owner);
+
+        assert_eq!(registry.running_lock_owner_for_test(), None);
     }
 }

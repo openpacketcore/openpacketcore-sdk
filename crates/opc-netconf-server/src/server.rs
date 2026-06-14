@@ -26,10 +26,11 @@ use crate::metrics::{record_rpc_error, record_rpc_success, NetconfOperation};
 use crate::operations::get::{handle_get, GetContext};
 use crate::operations::get_config::{handle_get_config, GetConfigContext};
 use crate::session_registry::{KillSessionResult, SessionRegistry};
+use crate::session_registry::{LockRunningResult, UnlockRunningResult};
 use crate::xml::{
     parse_rpc_with_context, GetSchemaRequest as XmlGetSchemaRequest,
-    KillSessionRequest as XmlKillSessionRequest, RpcOperation, RpcOperationHint, RpcParseError,
-    UnsupportedOperation,
+    KillSessionRequest as XmlKillSessionRequest, LockRequest as XmlLockRequest, RpcOperation,
+    RpcOperationHint, RpcParseError, UnlockRequest as XmlUnlockRequest, UnsupportedOperation,
 };
 
 const NETCONF_BASE_MODEL: &[ModelData] = &[ModelData {
@@ -40,6 +41,8 @@ const NETCONF_BASE_MODEL: &[ModelData] = &[ModelData {
 }];
 
 const NETCONF_CLOSE_SESSION_PATH: &str = "/nc:close-session";
+const NETCONF_LOCK_PATH: &str = "/nc:lock";
+const NETCONF_UNLOCK_PATH: &str = "/nc:unlock";
 const NETCONF_KILL_SESSION_PATH: &str = "/nc:kill-session";
 
 /// Server construction error.
@@ -95,9 +98,10 @@ struct RpcExecContext<'a> {
 /// The public [`Self::handle_rpc`] and [`Self::handle_rpc_xml`] helpers are
 /// registry-free, low-level dispatch helpers. They preserve parser, NACM,
 /// audit, metrics, and reply behavior for one RPC, but they are not a complete
-/// advertised NETCONF base session: `<kill-session>` returns
-/// `operation-not-supported` without a live [`SessionRegistry`], and
-/// [`Self::handle_rpc_xml`] also discards the `<close-session>` close signal.
+/// advertised NETCONF base session: `<kill-session>`, `<lock>`, and
+/// `<unlock>` return `operation-not-supported` without a live
+/// [`SessionRegistry`], and [`Self::handle_rpc_xml`] also discards the
+/// `<close-session>` close signal.
 /// Use [`crate::session::run_read_only_session_with_registry`] or
 /// [`crate::transport::run_read_only_tls_session_with_registry`] when custom
 /// transports need full base-session behavior backed by the audited shared
@@ -147,8 +151,9 @@ where
     /// Handles one complete XML RPC document and returns an XML `<rpc-reply>`.
     ///
     /// This is a low-level helper for request/response harnesses. It does not
-    /// enact session-control side effects: `<kill-session>` has no shared
-    /// registry context and `<close-session>`'s close signal is discarded.
+    /// enact session-control side effects: `<kill-session>`, `<lock>`, and
+    /// `<unlock>` have no shared registry context, and `<close-session>`'s
+    /// close signal is discarded.
     pub fn handle_rpc_xml(
         &self,
         request_id: RequestId,
@@ -165,7 +170,7 @@ where
     /// The base capabilities are intended to be paired with the session runners
     /// in [`crate::session`] or [`crate::transport`]. Direct callers that pair a
     /// rendered `<hello>` with [`Self::handle_rpc`] do not get cross-session
-    /// `<kill-session>` semantics.
+    /// `<kill-session>` or running datastore lock semantics.
     pub fn server_hello(&self, session_id: Option<NonZeroU32>) -> String {
         let yang_library = self.binding.yang_library_capability();
         let monitoring = self.binding.netconf_monitoring_capability();
@@ -183,9 +188,10 @@ where
     ///
     /// This helper can report `<close-session>` via
     /// [`RpcHandlingResult::close_session`], but it cannot address other live
-    /// sessions. `<kill-session>` therefore returns `operation-not-supported`.
-    /// Use the registry-aware session runners for complete base
-    /// `<kill-session>` behavior.
+    /// sessions or hold running datastore lock ownership. `<kill-session>`,
+    /// `<lock>`, and `<unlock>` therefore return `operation-not-supported`.
+    /// Use the registry-aware session runners for complete base session-control
+    /// behavior.
     pub fn handle_rpc(
         &self,
         request_id: RequestId,
@@ -306,6 +312,28 @@ where
                 &parsed.message_id,
                 &parsed.reply_attrs,
                 started,
+            ),
+            RpcOperation::Lock(request) => self.handle_lock(
+                request,
+                RpcExecContext {
+                    request_id,
+                    principal,
+                    message_id: &parsed.message_id,
+                    reply_attrs: &parsed.reply_attrs,
+                    started,
+                },
+                session_context,
+            ),
+            RpcOperation::Unlock(request) => self.handle_unlock(
+                request,
+                RpcExecContext {
+                    request_id,
+                    principal,
+                    message_id: &parsed.message_id,
+                    reply_attrs: &parsed.reply_attrs,
+                    started,
+                },
+                session_context,
             ),
             RpcOperation::KillSession(request) => self.handle_kill_session(
                 request,
@@ -787,6 +815,535 @@ where
         }
     }
 
+    fn handle_lock(
+        &self,
+        request: &XmlLockRequest,
+        context: RpcExecContext<'_>,
+        session_context: Option<(u64, &SessionRegistry)>,
+    ) -> RpcHandlingResult {
+        let RpcExecContext {
+            request_id,
+            principal,
+            message_id,
+            reply_attrs,
+            started,
+        } = context;
+        let lock_path = schema_node_path(NETCONF_LOCK_PATH);
+        if request.target != crate::xml::Datastore::Running {
+            if self
+                .audit
+                .record(
+                    &AuditEvent::new(
+                        request_id,
+                        principal,
+                        self.transport,
+                        AuditOperation::Exec,
+                        audit_failed("operation-not-supported"),
+                    )
+                    .with_paths([lock_path]),
+                )
+                .is_err()
+            {
+                record_rpc_error(
+                    NetconfOperation::Lock,
+                    NetconfErrorTag::OperationFailed,
+                    started.elapsed(),
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::operation_failed(),
+                ));
+            }
+            record_rpc_error(
+                NetconfOperation::Lock,
+                NetconfErrorTag::OperationNotSupported,
+                started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(message_id),
+                reply_attrs,
+                RpcError::operation_not_supported(),
+            ));
+        }
+
+        match self.authorize_exec(principal, NETCONF_LOCK_PATH) {
+            Ok(true) => {}
+            Ok(false) => {
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            request_id,
+                            principal,
+                            self.transport,
+                            AuditOperation::Exec,
+                            audit_denied("access-denied"),
+                        )
+                        .with_paths([lock_path]),
+                    )
+                    .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::Lock,
+                        NetconfErrorTag::OperationFailed,
+                        started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(message_id),
+                        reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                record_rpc_error(
+                    NetconfOperation::Lock,
+                    NetconfErrorTag::AccessDenied,
+                    started.elapsed(),
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::access_denied(),
+                ));
+            }
+            Err(()) => {
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            request_id,
+                            principal,
+                            self.transport,
+                            AuditOperation::Exec,
+                            audit_failed("resource-denied"),
+                        )
+                        .with_paths([lock_path]),
+                    )
+                    .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::Lock,
+                        NetconfErrorTag::OperationFailed,
+                        started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(message_id),
+                        reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                record_rpc_error(
+                    NetconfOperation::Lock,
+                    NetconfErrorTag::ResourceDenied,
+                    started.elapsed(),
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::resource_denied(),
+                ));
+            }
+        }
+
+        let Some((current_session_id, sessions)) = session_context else {
+            if self
+                .audit
+                .record(
+                    &AuditEvent::new(
+                        request_id,
+                        principal,
+                        self.transport,
+                        AuditOperation::Exec,
+                        audit_failed("operation-not-supported"),
+                    )
+                    .with_paths([lock_path]),
+                )
+                .is_err()
+            {
+                record_rpc_error(
+                    NetconfOperation::Lock,
+                    NetconfErrorTag::OperationFailed,
+                    started.elapsed(),
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::operation_failed(),
+                ));
+            }
+            record_rpc_error(
+                NetconfOperation::Lock,
+                NetconfErrorTag::OperationNotSupported,
+                started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(message_id),
+                reply_attrs,
+                RpcError::operation_not_supported(),
+            ));
+        };
+
+        match sessions.lock_running_after(current_session_id, || {
+            self.audit
+                .record(
+                    &AuditEvent::new(
+                        request_id,
+                        principal,
+                        self.transport,
+                        AuditOperation::Exec,
+                        AuditOutcome::Success,
+                    )
+                    .with_paths([lock_path.clone()]),
+                )
+                .map_err(|_| ())
+        }) {
+            Ok(LockRunningResult::Acquired) => {
+                record_rpc_success(NetconfOperation::Lock, started.elapsed());
+                RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(message_id, reply_attrs))
+            }
+            Ok(LockRunningResult::Denied { owner_session_id }) => self.lock_denied_reply(
+                &RpcExecContext {
+                    request_id,
+                    principal,
+                    message_id,
+                    reply_attrs,
+                    started,
+                },
+                NETCONF_LOCK_PATH,
+                owner_session_id,
+                NetconfOperation::Lock,
+            ),
+            Ok(LockRunningResult::SessionNotRegistered) => {
+                let _ = self.audit.record(
+                    &AuditEvent::new(
+                        request_id,
+                        principal,
+                        self.transport,
+                        AuditOperation::Exec,
+                        audit_failed("operation-failed"),
+                    )
+                    .with_paths([lock_path]),
+                );
+                record_rpc_error(
+                    NetconfOperation::Lock,
+                    NetconfErrorTag::OperationFailed,
+                    started.elapsed(),
+                );
+                RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::operation_failed(),
+                ))
+            }
+            Err(()) => {
+                record_rpc_error(
+                    NetconfOperation::Lock,
+                    NetconfErrorTag::OperationFailed,
+                    started.elapsed(),
+                );
+                RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::operation_failed(),
+                ))
+            }
+        }
+    }
+
+    fn handle_unlock(
+        &self,
+        request: &XmlUnlockRequest,
+        context: RpcExecContext<'_>,
+        session_context: Option<(u64, &SessionRegistry)>,
+    ) -> RpcHandlingResult {
+        let RpcExecContext {
+            request_id,
+            principal,
+            message_id,
+            reply_attrs,
+            started,
+        } = context;
+        let unlock_path = schema_node_path(NETCONF_UNLOCK_PATH);
+        if request.target != crate::xml::Datastore::Running {
+            if self
+                .audit
+                .record(
+                    &AuditEvent::new(
+                        request_id,
+                        principal,
+                        self.transport,
+                        AuditOperation::Exec,
+                        audit_failed("operation-not-supported"),
+                    )
+                    .with_paths([unlock_path]),
+                )
+                .is_err()
+            {
+                record_rpc_error(
+                    NetconfOperation::Unlock,
+                    NetconfErrorTag::OperationFailed,
+                    started.elapsed(),
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::operation_failed(),
+                ));
+            }
+            record_rpc_error(
+                NetconfOperation::Unlock,
+                NetconfErrorTag::OperationNotSupported,
+                started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(message_id),
+                reply_attrs,
+                RpcError::operation_not_supported(),
+            ));
+        }
+
+        match self.authorize_exec(principal, NETCONF_UNLOCK_PATH) {
+            Ok(true) => {}
+            Ok(false) => {
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            request_id,
+                            principal,
+                            self.transport,
+                            AuditOperation::Exec,
+                            audit_denied("access-denied"),
+                        )
+                        .with_paths([unlock_path]),
+                    )
+                    .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::Unlock,
+                        NetconfErrorTag::OperationFailed,
+                        started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(message_id),
+                        reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                record_rpc_error(
+                    NetconfOperation::Unlock,
+                    NetconfErrorTag::AccessDenied,
+                    started.elapsed(),
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::access_denied(),
+                ));
+            }
+            Err(()) => {
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            request_id,
+                            principal,
+                            self.transport,
+                            AuditOperation::Exec,
+                            audit_failed("resource-denied"),
+                        )
+                        .with_paths([unlock_path]),
+                    )
+                    .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::Unlock,
+                        NetconfErrorTag::OperationFailed,
+                        started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(message_id),
+                        reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                record_rpc_error(
+                    NetconfOperation::Unlock,
+                    NetconfErrorTag::ResourceDenied,
+                    started.elapsed(),
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::resource_denied(),
+                ));
+            }
+        }
+
+        let Some((current_session_id, sessions)) = session_context else {
+            if self
+                .audit
+                .record(
+                    &AuditEvent::new(
+                        request_id,
+                        principal,
+                        self.transport,
+                        AuditOperation::Exec,
+                        audit_failed("operation-not-supported"),
+                    )
+                    .with_paths([unlock_path]),
+                )
+                .is_err()
+            {
+                record_rpc_error(
+                    NetconfOperation::Unlock,
+                    NetconfErrorTag::OperationFailed,
+                    started.elapsed(),
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::operation_failed(),
+                ));
+            }
+            record_rpc_error(
+                NetconfOperation::Unlock,
+                NetconfErrorTag::OperationNotSupported,
+                started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(message_id),
+                reply_attrs,
+                RpcError::operation_not_supported(),
+            ));
+        };
+
+        match sessions.unlock_running_after(current_session_id, || {
+            self.audit
+                .record(
+                    &AuditEvent::new(
+                        request_id,
+                        principal,
+                        self.transport,
+                        AuditOperation::Exec,
+                        AuditOutcome::Success,
+                    )
+                    .with_paths([unlock_path.clone()]),
+                )
+                .map_err(|_| ())
+        }) {
+            Ok(UnlockRunningResult::Unlocked) => {
+                record_rpc_success(NetconfOperation::Unlock, started.elapsed());
+                RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(message_id, reply_attrs))
+            }
+            Ok(UnlockRunningResult::NotOwner { owner_session_id }) => self.lock_denied_reply(
+                &RpcExecContext {
+                    request_id,
+                    principal,
+                    message_id,
+                    reply_attrs,
+                    started,
+                },
+                NETCONF_UNLOCK_PATH,
+                owner_session_id,
+                NetconfOperation::Unlock,
+            ),
+            Ok(UnlockRunningResult::NotLocked | UnlockRunningResult::SessionNotRegistered) => {
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            request_id,
+                            principal,
+                            self.transport,
+                            AuditOperation::Exec,
+                            audit_failed("operation-failed"),
+                        )
+                        .with_paths([unlock_path]),
+                    )
+                    .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::Unlock,
+                        NetconfErrorTag::OperationFailed,
+                        started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(message_id),
+                        reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                record_rpc_error(
+                    NetconfOperation::Unlock,
+                    NetconfErrorTag::OperationFailed,
+                    started.elapsed(),
+                );
+                RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::operation_failed(),
+                ))
+            }
+            Err(()) => {
+                record_rpc_error(
+                    NetconfOperation::Unlock,
+                    NetconfErrorTag::OperationFailed,
+                    started.elapsed(),
+                );
+                RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(message_id),
+                    reply_attrs,
+                    RpcError::operation_failed(),
+                ))
+            }
+        }
+    }
+
+    fn lock_denied_reply(
+        &self,
+        context: &RpcExecContext<'_>,
+        path: &'static str,
+        owner_session_id: u64,
+        operation: NetconfOperation,
+    ) -> RpcHandlingResult {
+        if self
+            .audit
+            .record(
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Exec,
+                    audit_failed("lock-denied"),
+                )
+                .with_paths([schema_node_path(path)]),
+            )
+            .is_err()
+        {
+            record_rpc_error(
+                operation,
+                NetconfErrorTag::OperationFailed,
+                context.started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
+        record_rpc_error(
+            operation,
+            NetconfErrorTag::LockDenied,
+            context.started.elapsed(),
+        );
+        RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+            Some(context.message_id),
+            context.reply_attrs,
+            RpcError::lock_denied(owner_session_id),
+        ))
+    }
+
     fn handle_get_schema(
         &self,
         request: &XmlGetSchemaRequest,
@@ -1055,6 +1612,10 @@ where
             audit_failed(reason),
         );
         let event = match err.operation_hint {
+            Some(RpcOperationHint::Lock) => event.with_paths([schema_node_path(NETCONF_LOCK_PATH)]),
+            Some(RpcOperationHint::Unlock) => {
+                event.with_paths([schema_node_path(NETCONF_UNLOCK_PATH)])
+            }
             Some(RpcOperationHint::KillSession) => {
                 event.with_paths([schema_node_path(NETCONF_KILL_SESSION_PATH)])
             }
@@ -1066,6 +1627,7 @@ where
 
 fn audit_operation_for_parse_failure(err: &RpcParseError) -> AuditOperation {
     match err.operation_hint {
+        Some(RpcOperationHint::Lock | RpcOperationHint::Unlock) => AuditOperation::Exec,
         Some(RpcOperationHint::KillSession) => AuditOperation::Exec,
         Some(RpcOperationHint::Get | RpcOperationHint::GetConfig) | None => AuditOperation::Read,
     }
@@ -1075,6 +1637,8 @@ fn netconf_operation_for_parse_failure(err: &RpcParseError) -> NetconfOperation 
     match err.operation_hint {
         Some(RpcOperationHint::Get) => NetconfOperation::Get,
         Some(RpcOperationHint::GetConfig) => NetconfOperation::GetConfig,
+        Some(RpcOperationHint::Lock) => NetconfOperation::Lock,
+        Some(RpcOperationHint::Unlock) => NetconfOperation::Unlock,
         Some(RpcOperationHint::KillSession) => NetconfOperation::KillSession,
         None => NetconfOperation::Unknown,
     }
@@ -1886,6 +2450,20 @@ mod tests {
         )
     }
 
+    fn allow_lock_rule(modules: &ModuleRegistry) -> NacmRule {
+        NacmRule::allow(
+            NacmAction::Exec,
+            YangPathPattern::parse(NETCONF_LOCK_PATH, modules).expect("allow lock path"),
+        )
+    }
+
+    fn allow_unlock_rule(modules: &ModuleRegistry) -> NacmRule {
+        NacmRule::allow(
+            NacmAction::Exec,
+            YangPathPattern::parse(NETCONF_UNLOCK_PATH, modules).expect("allow unlock path"),
+        )
+    }
+
     fn policy_allow_system_but_deny_secret() -> NacmPolicy {
         let mut modules = ModuleRegistry::new();
         modules
@@ -1902,6 +2480,8 @@ mod tests {
                 YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
             ))
             .add_rule(allow_close_session_rule(&modules))
+            .add_rule(allow_lock_rule(&modules))
+            .add_rule(allow_unlock_rule(&modules))
             .add_rule(allow_kill_session_rule(&modules))
             .build()
     }
@@ -2279,6 +2859,18 @@ mod tests {
 
     fn close_session_rpc() -> String {
         format!(r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="301"><close-session/></rpc>"#)
+    }
+
+    fn lock_rpc(target: &str) -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="303"><lock><target><{target}/></target></lock></rpc>"#
+        )
+    }
+
+    fn unlock_rpc(target: &str) -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="304"><unlock><target><{target}/></target></unlock></rpc>"#
+        )
     }
 
     fn kill_session_rpc(session_id: u64) -> String {
@@ -3333,6 +3925,264 @@ mod tests {
             .iter()
             .any(|path| path.as_str() == NETCONF_CLOSE_SESSION_PATH));
         assert!(netconf_rpc_requests("close-session", "success") > success_before);
+    }
+
+    #[tokio::test]
+    async fn lock_without_registry_is_operation_not_supported() {
+        let (server, _observed, audit) = server_fixture().await;
+        let errors_before = netconf_rpc_errors("lock", "operation-not-supported");
+
+        let result = server.handle_rpc(
+            RequestId::new(),
+            &principal(),
+            &lock_rpc("running"),
+            &MgmtLimits::default(),
+        );
+
+        assert!(!result.close_session);
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>operation-not-supported</error-tag>"));
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Exec);
+        assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_LOCK_PATH)]
+        );
+        assert!(netconf_rpc_errors("lock", "operation-not-supported") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn lock_unlock_running_tracks_owner_and_lock_denied_info() {
+        let (server, _observed, audit) = server_fixture().await;
+        let sessions = SessionRegistry::new();
+        let _owner = sessions.register(80).expect("owner");
+        let _other = sessions.register(81).expect("other");
+        let success_before = netconf_rpc_requests("lock", "success");
+        let denied_before = netconf_rpc_errors("lock", "lock-denied");
+
+        let locked = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &lock_rpc("running"),
+            &MgmtLimits::default(),
+            80,
+            &sessions,
+        );
+        assert!(locked.reply_xml.contains("<ok/>"));
+        assert_eq!(sessions.running_lock_owner_for_test(), Some(80));
+        assert!(netconf_rpc_requests("lock", "success") > success_before);
+
+        let denied = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &lock_rpc("running"),
+            &MgmtLimits::default(),
+            81,
+            &sessions,
+        );
+        assert!(denied
+            .reply_xml
+            .contains("<error-tag>lock-denied</error-tag>"));
+        assert!(denied.reply_xml.contains("<session-id>80</session-id>"));
+        assert_eq!(sessions.running_lock_owner_for_test(), Some(80));
+        assert!(netconf_rpc_errors("lock", "lock-denied") > denied_before);
+
+        let not_owner = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &unlock_rpc("running"),
+            &MgmtLimits::default(),
+            81,
+            &sessions,
+        );
+        assert!(not_owner
+            .reply_xml
+            .contains("<error-tag>lock-denied</error-tag>"));
+        assert!(not_owner.reply_xml.contains("<session-id>80</session-id>"));
+        assert_eq!(sessions.running_lock_owner_for_test(), Some(80));
+
+        let unlocked = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &unlock_rpc("running"),
+            &MgmtLimits::default(),
+            80,
+            &sessions,
+        );
+        assert!(unlocked.reply_xml.contains("<ok/>"));
+        assert_eq!(sessions.running_lock_owner_for_test(), None);
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].operation, AuditOperation::Exec);
+        assert_eq!(events[0].outcome, AuditOutcome::Success);
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_LOCK_PATH)]
+        );
+        assert_eq!(events[1].outcome, audit_failed("lock-denied"));
+        assert_eq!(
+            events[1].schema_paths,
+            vec![schema_node_path(NETCONF_LOCK_PATH)]
+        );
+        assert_eq!(events[2].outcome, audit_failed("lock-denied"));
+        assert_eq!(
+            events[2].schema_paths,
+            vec![schema_node_path(NETCONF_UNLOCK_PATH)]
+        );
+        assert_eq!(events[3].outcome, AuditOutcome::Success);
+        assert_eq!(
+            events[3].schema_paths,
+            vec![schema_node_path(NETCONF_UNLOCK_PATH)]
+        );
+    }
+
+    #[tokio::test]
+    async fn lock_running_without_exec_grant_is_access_denied_and_does_not_lock() {
+        let audit = CapturingAudit::default();
+        let server = server_fixture_with_policy_source_and_audit(
+            FixedPolicy(NacmPolicy::empty(PolicyVersion::new(405))),
+            audit.clone(),
+        )
+        .await;
+        let sessions = SessionRegistry::new();
+        let _current = sessions.register(80).expect("current session");
+
+        let result = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &lock_rpc("running"),
+            &MgmtLimits::default(),
+            80,
+            &sessions,
+        );
+
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>access-denied</error-tag>"));
+        assert_eq!(sessions.running_lock_owner_for_test(), None);
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, audit_denied("access-denied"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_LOCK_PATH)]
+        );
+    }
+
+    #[tokio::test]
+    async fn lock_audit_failure_prevents_lock_state_change() {
+        let server = server_fixture_with_policy_source_and_audit(
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            FailingAudit,
+        )
+        .await;
+        let sessions = SessionRegistry::new();
+        let _current = sessions.register(80).expect("current session");
+
+        let result = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &lock_rpc("running"),
+            &MgmtLimits::default(),
+            80,
+            &sessions,
+        );
+
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>operation-failed</error-tag>"));
+        assert!(!result.reply_xml.contains("secret-admin"));
+        assert_eq!(sessions.running_lock_owner_for_test(), None);
+    }
+
+    #[tokio::test]
+    async fn lock_candidate_and_unlock_without_lock_fail_closed() {
+        let (server, _observed, audit) = server_fixture().await;
+        let sessions = SessionRegistry::new();
+        let _current = sessions.register(80).expect("current session");
+
+        let candidate = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &lock_rpc("candidate"),
+            &MgmtLimits::default(),
+            80,
+            &sessions,
+        );
+        assert!(candidate
+            .reply_xml
+            .contains("<error-tag>operation-not-supported</error-tag>"));
+        assert_eq!(sessions.running_lock_owner_for_test(), None);
+
+        let unlocked = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &unlock_rpc("running"),
+            &MgmtLimits::default(),
+            80,
+            &sessions,
+        );
+        assert!(unlocked
+            .reply_xml
+            .contains("<error-tag>operation-failed</error-tag>"));
+        assert!(!unlocked.reply_xml.contains("<session-id>"));
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
+        assert_eq!(events[1].outcome, audit_failed("operation-failed"));
+    }
+
+    #[tokio::test]
+    async fn malformed_lock_unlock_parse_failures_are_exec_audited() {
+        let (server, observed, audit) = server_fixture().await;
+        let lock_errors_before = netconf_rpc_errors("lock", "missing-element");
+        let unlock_errors_before = netconf_rpc_errors("unlock", "bad-element");
+
+        let lock =
+            format!(r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="lock-missing"><lock/></rpc>"#);
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &lock,
+            &MgmtLimits::default(),
+        );
+        assert!(reply.contains(r#"message-id="lock-missing""#));
+        assert!(reply.contains("<error-tag>missing-element</error-tag>"));
+
+        let unlock = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="unlock-bad"><unlock><target><running/><candidate/></target></unlock></rpc>"#
+        );
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &unlock,
+            &MgmtLimits::default(),
+        );
+        assert!(reply.contains(r#"message-id="unlock-bad""#));
+        assert!(reply.contains("<error-tag>bad-element</error-tag>"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].operation, AuditOperation::Exec);
+        assert_eq!(events[0].outcome, audit_failed("missing-element"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_LOCK_PATH)]
+        );
+        assert_eq!(events[1].operation, AuditOperation::Exec);
+        assert_eq!(events[1].outcome, audit_failed("bad-element"));
+        assert_eq!(
+            events[1].schema_paths,
+            vec![schema_node_path(NETCONF_UNLOCK_PATH)]
+        );
+        assert!(netconf_rpc_errors("lock", "missing-element") > lock_errors_before);
+        assert!(netconf_rpc_errors("unlock", "bad-element") > unlock_errors_before);
     }
 
     #[tokio::test]

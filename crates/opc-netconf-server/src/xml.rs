@@ -80,6 +80,10 @@ pub(crate) enum RpcOperationHint {
     Get,
     /// Base NETCONF `<get-config>`.
     GetConfig,
+    /// Base NETCONF `<lock>`.
+    Lock,
+    /// Base NETCONF `<unlock>`.
+    Unlock,
     /// Base NETCONF `<kill-session>`.
     KillSession,
 }
@@ -93,6 +97,10 @@ pub enum RpcOperation {
     Get(GetRequest),
     /// `<close-session>`.
     CloseSession,
+    /// `<lock>`.
+    Lock(LockRequest),
+    /// `<unlock>`.
+    Unlock(UnlockRequest),
     /// `<kill-session>`.
     KillSession(KillSessionRequest),
     /// RFC 6022 `<get-schema>`.
@@ -118,6 +126,20 @@ pub struct GetSchemaRequest {
 pub struct KillSessionRequest {
     /// Target NETCONF session id.
     pub session_id: u64,
+}
+
+/// RFC 6241 `<lock>` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockRequest {
+    /// Target datastore.
+    pub target: Datastore,
+}
+
+/// RFC 6241 `<unlock>` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlockRequest {
+    /// Target datastore.
+    pub target: Datastore,
 }
 
 /// Known NETCONF operations that are parsed only to reject safely with the
@@ -464,6 +486,16 @@ struct PartialKillSession {
     session_id: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PartialLock {
+    target: Option<Datastore>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PartialUnlock {
+    target: Option<Datastore>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum GetSchemaField {
     Identifier,
@@ -484,6 +516,8 @@ struct ParserState {
     get_config: Option<PartialGetConfig>,
     get_schema: Option<PartialGetSchema>,
     kill_session: Option<PartialKillSession>,
+    lock: Option<PartialLock>,
+    unlock: Option<PartialUnlock>,
     operation_hint: Option<RpcOperationHint>,
     close_session: bool,
     unsupported_operation: Option<UnsupportedOperation>,
@@ -719,6 +753,26 @@ impl ParserState {
                     }
                     self.close_session = true;
                 }
+                "lock" => {
+                    if self.has_rpc_operation() {
+                        return Err(XmlError::DuplicateElement);
+                    }
+                    self.operation_hint = Some(RpcOperationHint::Lock);
+                    self.lock = Some(PartialLock::default());
+                    if !attrs.is_empty() {
+                        return Err(XmlError::Malformed);
+                    }
+                }
+                "unlock" => {
+                    if self.has_rpc_operation() {
+                        return Err(XmlError::DuplicateElement);
+                    }
+                    self.operation_hint = Some(RpcOperationHint::Unlock);
+                    self.unlock = Some(PartialUnlock::default());
+                    if !attrs.is_empty() {
+                        return Err(XmlError::Malformed);
+                    }
+                }
                 "get-schema" if element.namespace == NETCONF_MONITORING_NS => {
                     if self.has_rpc_operation() {
                         return Err(XmlError::DuplicateElement);
@@ -728,8 +782,6 @@ impl ParserState {
                 "edit-config" => self.set_unsupported(UnsupportedOperation::EditConfig)?,
                 "copy-config" => self.set_unsupported(UnsupportedOperation::CopyConfig)?,
                 "delete-config" => self.set_unsupported(UnsupportedOperation::DeleteConfig)?,
-                "lock" => self.set_unsupported(UnsupportedOperation::Lock)?,
-                "unlock" => self.set_unsupported(UnsupportedOperation::Unlock)?,
                 "kill-session" => {
                     if self.has_rpc_operation() {
                         return Err(XmlError::DuplicateElement);
@@ -766,6 +818,30 @@ impl ParserState {
             }
         } else if self.local_path_is(&["rpc", "close-session"]) {
             Err(XmlError::Malformed)
+        } else if self.local_path_is(&["rpc", "lock"]) || self.local_path_is(&["rpc", "unlock"]) {
+            match element.local.as_str() {
+                "target" if element.namespace == NETCONF_BASE_NS && attrs.is_empty() => Ok(()),
+                _ => Err(XmlError::Malformed),
+            }
+        } else if self.local_path_is(&["rpc", "lock", "target"])
+            || self.local_path_is(&["rpc", "unlock", "target"])
+        {
+            if element.namespace != NETCONF_BASE_NS || !attrs.is_empty() {
+                return Err(XmlError::Malformed);
+            }
+            let datastore = datastore_from_local(&element.local)?;
+            if self.local_path_is(&["rpc", "lock", "target"]) {
+                let lock = self.lock.as_mut().ok_or(XmlError::UnsupportedOperation)?;
+                if lock.target.replace(datastore).is_some() {
+                    return Err(XmlError::DuplicateElement);
+                }
+            } else {
+                let unlock = self.unlock.as_mut().ok_or(XmlError::UnsupportedOperation)?;
+                if unlock.target.replace(datastore).is_some() {
+                    return Err(XmlError::DuplicateElement);
+                }
+            }
+            Ok(())
         } else if self.local_path_is(&["rpc", "kill-session"]) {
             match element.local.as_str() {
                 "session-id" if element.namespace == NETCONF_BASE_NS && attrs.is_empty() => Ok(()),
@@ -784,17 +860,18 @@ impl ParserState {
             || self.local_path_is(&["rpc", "get-schema", "version"])
             || self.local_path_is(&["rpc", "get-schema", "format"])
             || self.local_path_is(&["rpc", "kill-session", "session-id"])
+            || self.local_path_is(&["rpc", "lock", "target", "running"])
+            || self.local_path_is(&["rpc", "lock", "target", "candidate"])
+            || self.local_path_is(&["rpc", "lock", "target", "startup"])
+            || self.local_path_is(&["rpc", "unlock", "target", "running"])
+            || self.local_path_is(&["rpc", "unlock", "target", "candidate"])
+            || self.local_path_is(&["rpc", "unlock", "target", "startup"])
             || self.local_path_is(&["rpc", "get", "with-defaults"])
             || self.local_path_is(&["rpc", "get-config", "with-defaults"])
         {
             Err(XmlError::Malformed)
         } else if self.local_path_is(&["rpc", "get-config", "source"]) {
-            let datastore = match element.local.as_str() {
-                "running" => Datastore::Running,
-                "candidate" => Datastore::Candidate,
-                "startup" => Datastore::Startup,
-                _ => return Err(XmlError::Malformed),
-            };
+            let datastore = datastore_from_local(&element.local)?;
             let get_config = self
                 .get_config
                 .as_mut()
@@ -813,6 +890,8 @@ impl ParserState {
             || self.get_config.is_some()
             || self.get_schema.is_some()
             || self.kill_session.is_some()
+            || self.lock.is_some()
+            || self.unlock.is_some()
             || self.close_session
             || self.unsupported_operation.is_some()
     }
@@ -1105,6 +1184,24 @@ impl ParserState {
                         message_id,
                         reply_attrs,
                         operation: RpcOperation::CloseSession,
+                    }));
+                }
+                if let Some(lock) = self.lock {
+                    return Ok(ParsedMessage::Rpc(ParsedRpc {
+                        message_id,
+                        reply_attrs,
+                        operation: RpcOperation::Lock(LockRequest {
+                            target: lock.target.ok_or(XmlError::MissingElement)?,
+                        }),
+                    }));
+                }
+                if let Some(unlock) = self.unlock {
+                    return Ok(ParsedMessage::Rpc(ParsedRpc {
+                        message_id,
+                        reply_attrs,
+                        operation: RpcOperation::Unlock(UnlockRequest {
+                            target: unlock.target.ok_or(XmlError::MissingElement)?,
+                        }),
                     }));
                 }
                 if let Some(kill_session) = self.kill_session {
@@ -1446,6 +1543,15 @@ fn attr_occurrences(attrs: &[(String, String)], name: &str) -> usize {
         .count()
 }
 
+fn datastore_from_local(local: &str) -> Result<Datastore, XmlError> {
+    match local {
+        "running" => Ok(Datastore::Running),
+        "candidate" => Ok(Datastore::Candidate),
+        "startup" => Ok(Datastore::Startup),
+        _ => Err(XmlError::Malformed),
+    }
+}
+
 fn filter_kind(attrs: &[(String, String)]) -> Result<FilterKind, XmlError> {
     if attr_occurrences(attrs, "type") > 1 {
         return Err(XmlError::InvalidFilterType);
@@ -1655,6 +1761,61 @@ mod tests {
             .expect("parse close-session");
         assert_eq!(parsed.message_id, "101");
         assert_eq!(parsed.operation, RpcOperation::CloseSession);
+    }
+
+    #[test]
+    fn parses_lock_and_unlock_running() {
+        let lock = parse_rpc(
+            &rpc("<lock><target><running/></target></lock>"),
+            &MgmtLimits::default(),
+        )
+        .expect("parse lock");
+        assert_eq!(
+            lock.operation,
+            RpcOperation::Lock(LockRequest {
+                target: Datastore::Running
+            })
+        );
+
+        let unlock = parse_rpc(
+            &rpc("<unlock><target><running/></target></unlock>"),
+            &MgmtLimits::default(),
+        )
+        .expect("parse unlock");
+        assert_eq!(
+            unlock.operation,
+            RpcOperation::Unlock(UnlockRequest {
+                target: Datastore::Running
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_lock_unlock_shape() {
+        let missing_target =
+            parse_rpc(&rpc("<lock/>"), &MgmtLimits::default()).expect_err("missing lock target");
+        assert_eq!(missing_target, XmlError::MissingElement);
+
+        let unexpected_attr = parse_rpc(
+            &rpc(r#"<lock xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0" nc:operation="merge"><target><running/></target></lock>"#),
+            &MgmtLimits::default(),
+        )
+        .expect_err("lock attr");
+        assert_eq!(unexpected_attr, XmlError::Malformed);
+
+        let duplicate_target = parse_rpc(
+            &rpc("<unlock><target><running/><candidate/></target></unlock>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("duplicate unlock target");
+        assert_eq!(duplicate_target, XmlError::DuplicateElement);
+
+        let nested_target = parse_rpc(
+            &rpc("<lock><target><running><extra/></running></target></lock>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("nested datastore target");
+        assert_eq!(nested_target, XmlError::Malformed);
     }
 
     #[test]
