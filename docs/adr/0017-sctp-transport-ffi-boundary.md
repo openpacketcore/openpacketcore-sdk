@@ -69,7 +69,8 @@ scope:
    force for every other crate); it sets its own local crate policy
    (`unsafe_code = "allow"` plus `unsafe_op_in_unsafe_fn = "deny"`, or
    equivalent crate attributes) that allows `unsafe` *only there*, with a
-   `// SAFETY:` comment required on every `unsafe` block.
+   `// SAFETY:` comment required on every allowed `unsafe` token (`unsafe`
+   block, `unsafe fn`, `unsafe impl`, `unsafe trait`, or unsafe extern block).
 2. **`opc-sctp`** (the public crate) is `#![forbid(unsafe_code)]` and exposes
    only safe async abstractions (associations, messages, events) over the sys
    crate, integrated with `tokio::io::unix::AsyncFd` (the spec's async model).

@@ -41,12 +41,14 @@ update to the mechanical allow-list; this exception is not a blanket
    `opc-identity`, `opc-tls`, `opc-nacm`, `opc-yanggen`, the `opc-proto-*`
    codecs, `opc-sbi`, the `opc-mgmt-*` foundation crates, etc.). They live only
    in `opc-gnmi-server` unless this ADR is amended. ADR 0014 §3 remains in force
-   everywhere else.
+   everywhere else. Inside this SDK workspace, no other crate may depend on or
+   re-export `opc-gnmi-server`; downstream CNFs outside the workspace opt in to
+   gNMI by depending on the server crate directly.
 2. **Boundary is enforced mechanically.**
    `scripts/check-management-plane-policy.py --check` asserts that no crate
    outside the explicit allowed set directly or transitively depends on
-   `tonic`/`prost`/`tonic-build`. The CI job runs this gate. The initial allowed
-   set is exactly `opc-gnmi-server`.
+   `tonic`/`prost`/`tonic-build`, or on `opc-gnmi-server` itself. The CI job
+   runs this gate. The initial allowed set is exactly `opc-gnmi-server`.
 3. **One TLS stack only (ADR 0014 §1 preserved).** `opc-gnmi-server` serves
    tonic over the `rustls::ServerConfig` produced by `opc-mgmt-transport`
    (`ring` provider), not tonic's own/native TLS. No `openssl`/`native-tls`
@@ -74,8 +76,9 @@ update to the mechanical allow-list; this exception is not a blanket
 
 ## Consequences
 
-- A CNF that embeds `opc-gnmi-server` inherits `tonic`/`prost`. That is an
-  explicit opt-in to gNMI; CNFs that do not expose gNMI never pull the stack.
+- A downstream CNF outside this workspace that embeds `opc-gnmi-server` inherits
+  `tonic`/`prost`. That is an explicit opt-in to gNMI; CNFs that do not expose
+  gNMI never pull the stack.
 - The core SDK graph stays gRPC-free and auditable, exactly as ADR 0014 §3
   intends; only the optional northbound server adds gRPC.
 - The mechanical gate from point 2 exists and runs in CI, so this exception's

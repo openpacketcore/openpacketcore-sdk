@@ -476,7 +476,124 @@ def dedupe_violations(violations: list[Violation]) -> list[Violation]:
     return deduped
 
 
+def grpc_policy_fixture(
+    workspace_members: list[str],
+    package_deps: dict[str, list[tuple[str, str | None]]],
+    resolve_deps: dict[str, list[str]],
+) -> dict:
+    package_names = set(workspace_members) | set(package_deps) | set(resolve_deps)
+    for deps in package_deps.values():
+        package_names.update(dep_name for dep_name, _kind in deps)
+    for deps in resolve_deps.values():
+        package_names.update(deps)
+
+    packages = []
+    for name in sorted(package_names):
+        packages.append(
+            {
+                "id": name,
+                "name": name,
+                "manifest_path": f"/fixture/{name}/Cargo.toml",
+                "dependencies": [
+                    {"name": dep_name, "kind": kind}
+                    for dep_name, kind in package_deps.get(name, [])
+                ],
+            }
+        )
+
+    return {
+        "packages": packages,
+        "workspace_members": workspace_members,
+        "resolve": {
+            "nodes": [
+                {
+                    "id": name,
+                    "deps": [{"pkg": dep_name} for dep_name in resolve_deps.get(name, [])],
+                }
+                for name in sorted(package_names)
+            ]
+        },
+    }
+
+
+def assert_grpc_policy_fragments(
+    case_name: str, metadata: dict, expected_fragments: list[str]
+) -> None:
+    rendered = [violation.render() for violation in check_grpc_boundary(metadata)]
+    if not expected_fragments and rendered:
+        raise SystemExit(
+            f"gRPC boundary self-test failed for {case_name}: expected no "
+            f"violations, got {rendered}"
+        )
+
+    missing = [
+        fragment
+        for fragment in expected_fragments
+        if not any(fragment in violation for violation in rendered)
+    ]
+    if missing:
+        raise SystemExit(
+            f"gRPC boundary self-test failed for {case_name}: missing {missing}; "
+            f"got {rendered}"
+        )
+
+
 def run_self_test() -> None:
+    assert_grpc_policy_fragments(
+        "opc-gnmi-server direct gRPC deps allowed",
+        grpc_policy_fixture(
+            ["opc-gnmi-server"],
+            {
+                "opc-gnmi-server": [
+                    ("prost", None),
+                    ("tonic", None),
+                    ("tonic-build", "build"),
+                ]
+            },
+            {"opc-gnmi-server": ["prost", "tonic", "tonic-build"]},
+        ),
+        [],
+    )
+    assert_grpc_policy_fragments(
+        "tonic-build is build-only",
+        grpc_policy_fixture(
+            ["opc-gnmi-server"],
+            {"opc-gnmi-server": [("tonic-build", None)]},
+            {"opc-gnmi-server": ["tonic-build"]},
+        ),
+        ["`tonic-build` is allowed only as a build dependency"],
+    )
+    assert_grpc_policy_fragments(
+        "workspace crate cannot directly depend on tonic",
+        grpc_policy_fixture(
+            ["opc-core"],
+            {"opc-core": [("tonic", None)]},
+            {"opc-core": ["tonic"]},
+        ),
+        ["`tonic` normal dependency is outside the ADR 0016"],
+    )
+    assert_grpc_policy_fragments(
+        "workspace crate cannot transitively reach tonic",
+        grpc_policy_fixture(
+            ["opc-core"],
+            {"opc-core": [("third-party-helper", None)]},
+            {
+                "opc-core": ["third-party-helper"],
+                "third-party-helper": ["tonic"],
+            },
+        ),
+        ["transitively reaches `tonic`"],
+    )
+    assert_grpc_policy_fragments(
+        "workspace crate cannot re-export opc-gnmi-server",
+        grpc_policy_fixture(
+            ["opc-core", "opc-gnmi-server"],
+            {"opc-core": [("opc-gnmi-server", None)]},
+            {"opc-core": ["opc-gnmi-server"]},
+        ),
+        ["transitively reaches `opc-gnmi-server`"],
+    )
+
     unsafe_cases = {
         "unsafe { call(); }": [(1, 1)],
         "fn unsafe_name() {}\nlet x = unsafe { y };": [(2, 9)],
