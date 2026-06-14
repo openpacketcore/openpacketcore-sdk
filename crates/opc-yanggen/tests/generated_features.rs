@@ -63,6 +63,7 @@ fn create_test_input() -> CanonicalInput {
             namespace: "urn:opc:test".to_string(),
             prefix: "test".to_string(),
             source: source.clone(),
+            ..Default::default()
         }],
         nodes: nodes.clone(),
         constraints: vec![],

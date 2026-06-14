@@ -385,6 +385,7 @@ fn create_proof_input() -> CanonicalInput {
                 namespace: "urn:opc:proof".to_string(),
                 prefix: "proof".to_string(),
                 source: source.clone(),
+                ..Default::default()
             },
             SchemaModule {
                 name: "other-module".to_string(),
@@ -392,6 +393,7 @@ fn create_proof_input() -> CanonicalInput {
                 namespace: "urn:opc:other-module".to_string(),
                 prefix: "other-module".to_string(),
                 source: source.clone(),
+                ..Default::default()
             },
         ],
         nodes,

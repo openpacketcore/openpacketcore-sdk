@@ -48,6 +48,7 @@ fn create_base_input() -> CanonicalInput {
             namespace: "urn:opc:upf-slice".to_string(),
             prefix: "upf".to_string(),
             source: source.clone(),
+            ..Default::default()
         }],
         nodes,
         constraints: vec![],

@@ -38,6 +38,7 @@ fn create_base_input() -> GenerationInput {
         namespace: "urn:ietf:params:xml:ns:yang:ietf-interfaces".to_string(),
         prefix: "if".to_string(),
         source: YangSourceLocation::new("ietf-interfaces.yang", 1, 1),
+        ..Default::default()
     };
 
     let node1 = SchemaNode {

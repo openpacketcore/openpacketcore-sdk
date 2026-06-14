@@ -8,6 +8,7 @@ use opc_mgmt_opstate::{OperationalError, OperationalRequest, OperationalResponse
 use opc_mgmt_schema::SchemaRegistry;
 use thiserror::Error;
 
+use crate::discovery;
 use crate::xml::{EditConfigRequest, WithDefaultsMode};
 
 /// RFC 8525 YANG Library advertisement data supplied by the embedding CNF.
@@ -376,87 +377,94 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
     /// Returns the advertised RFC 8525 YANG Library capability, if this binding
     /// can also render the `/yang-library` operational tree.
     ///
-    /// The default is `None`: no capability is advertised and `/yang-library`
-    /// filters are rejected as an unknown namespace. A binding that returns
-    /// `Some` must implement [`Self::render_yang_library`].
+    /// The default is `None` when the schema registry does not carry generated
+    /// discovery metadata. When it does, the default advertises
+    /// `:yang-library:1.1` with the registry's schema digest as the content-id
+    /// and dispatches to the generic renderer in [`Self::render_yang_library`].
     fn yang_library_capability(&self) -> Option<YangLibraryCapability> {
-        None
+        let registry = self.schema_registry();
+        if registry.discovery_metadata().is_empty() {
+            return None;
+        }
+        YangLibraryCapability::new(registry.schema_digest()).ok()
     }
 
     /// Renders the RFC 8525 `/yang-library` operational tree for the authorized
     /// schema-node paths in `selection`.
     ///
-    /// This is CNF-supplied because the generic schema registry intentionally
-    /// does not yet carry all discovery data required for a complete YANG
-    /// Library instance: imports, features, deviations, datastore schema
-    /// partitioning, and raw YANG source locations.
-    fn render_yang_library(&self, _selection: ReadSelection<'_>) -> Result<String, BindingError> {
-        Err(BindingError::projection(
-            "NETCONF YANG Library projection is not implemented",
-        ))
+    /// When the schema registry carries generated discovery metadata, the
+    /// default renders a bounded module-set from that metadata. Otherwise it
+    /// fails closed so a capability declaration without data cannot fabricate
+    /// discovery XML.
+    fn render_yang_library(&self, selection: ReadSelection<'_>) -> Result<String, BindingError> {
+        discovery::render_yang_library(self.schema_registry(), selection)
     }
 
     /// Renders the RFC 8525 `/yang-library` tree for a with-defaults request.
     ///
-    /// The default fails closed. Bindings that advertise with-defaults and
-    /// YANG Library together must implement this hook.
+    /// Discovery trees do not carry defaults, so the default ignores the mode
+    /// and renders the ordinary tree. Bindings that need different behavior may
+    /// override this hook.
     fn render_yang_library_with_defaults(
         &self,
-        _selection: ReadSelection<'_>,
+        selection: ReadSelection<'_>,
         _mode: WithDefaultsMode,
     ) -> Result<String, BindingError> {
-        Err(BindingError::projection(
-            "NETCONF YANG Library with-defaults projection is not implemented",
-        ))
+        discovery::render_yang_library(self.schema_registry(), selection)
     }
 
     /// Returns whether the CNF implements RFC 6022 NETCONF monitoring.
     ///
-    /// A binding that returns `Some` must also implement
-    /// [`Self::render_netconf_monitoring`] and [`Self::get_schema`]. The default
-    /// is `None`: no monitoring capability is advertised, `/netconf-state`
-    /// filters fail closed as an unknown namespace, and `<get-schema>` returns
-    /// `operation-not-supported`.
+    /// The default is `None` when the schema registry does not carry generated
+    /// discovery metadata. When it does, the default advertises monitoring and
+    /// dispatches `/netconf-state/schemas` rendering and `<get-schema>` lookups
+    /// to the generic helpers.
     fn netconf_monitoring_capability(&self) -> Option<NetconfMonitoringCapability> {
-        None
+        if self.schema_registry().discovery_metadata().is_empty() {
+            None
+        } else {
+            Some(NetconfMonitoringCapability)
+        }
     }
 
     /// Renders the RFC 6022 `/netconf-state` operational tree for the
     /// authorized schema-node paths in `selection`.
+    ///
+    /// The default renders only the `schemas` inventory from generated
+    /// discovery metadata; other `/netconf-state` containers are not fabricated.
     fn render_netconf_monitoring(
         &self,
-        _selection: ReadSelection<'_>,
+        selection: ReadSelection<'_>,
     ) -> Result<String, BindingError> {
-        Err(BindingError::projection(
-            "NETCONF monitoring projection is not implemented",
-        ))
+        discovery::render_netconf_monitoring(self.schema_registry(), selection)
     }
 
     /// Renders the RFC 6022 `/netconf-state` tree for a with-defaults request.
     ///
-    /// The default fails closed. Bindings that advertise with-defaults and
-    /// NETCONF monitoring together must implement this hook.
+    /// Discovery trees do not carry defaults, so the default ignores the mode.
     fn render_netconf_monitoring_with_defaults(
         &self,
-        _selection: ReadSelection<'_>,
+        selection: ReadSelection<'_>,
         _mode: WithDefaultsMode,
     ) -> Result<String, BindingError> {
-        Err(BindingError::projection(
-            "NETCONF monitoring with-defaults projection is not implemented",
-        ))
+        discovery::render_netconf_monitoring(self.schema_registry(), selection)
     }
 
     /// Retrieves a schema source for RFC 6022 `<get-schema>`.
     ///
-    /// The returned string is placed inside the `<data>` response element. YANG
-    /// source text must be XML-escaped by the binding because it is not an XML
-    /// element fragment. The default fails closed so an advertised monitoring
+    /// When the schema registry carries generated discovery metadata with raw
+    /// YANG source text, the default looks up the source by identifier and
+    /// version. Otherwise it fails closed so an advertised monitoring
     /// capability without a source hook cannot be mistaken for an empty schema
     /// inventory.
-    fn get_schema(&self, _request: &GetSchemaRequest) -> Result<String, GetSchemaError> {
-        Err(GetSchemaError::failed(
-            "NETCONF get-schema retrieval is not implemented",
-        ))
+    fn get_schema(&self, request: &GetSchemaRequest) -> Result<String, GetSchemaError> {
+        let registry = self.schema_registry();
+        if registry.discovery_metadata().is_empty() {
+            return Err(GetSchemaError::failed(
+                "NETCONF get-schema source provider is not configured",
+            ));
+        }
+        discovery::schema_source(registry, request)
     }
 
     /// Builds a full candidate config for a running `<edit-config>` request.

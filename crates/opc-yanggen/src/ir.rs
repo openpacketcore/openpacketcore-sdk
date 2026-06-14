@@ -29,6 +29,51 @@ pub struct SchemaModule {
     pub namespace: String,
     pub prefix: String,
     pub source: YangSourceLocation,
+    /// Raw YANG source text, if available for `<get-schema>` retrieval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_text: Option<String>,
+    /// Modules imported by this module.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<ModuleImport>,
+    /// Features advertised by this module.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+    /// Deviation module names applied to this module.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deviations: Vec<String>,
+    /// Whether the module is implemented or import-only.
+    #[serde(default)]
+    pub conformance: ModuleConformance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModuleConformance {
+    Implement,
+    Import,
+}
+
+impl Default for ModuleConformance {
+    fn default() -> Self {
+        Self::Implement
+    }
+}
+
+impl Default for SchemaModule {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            revision: String::new(),
+            namespace: String::new(),
+            prefix: String::new(),
+            source: YangSourceLocation::default(),
+            source_text: None,
+            imports: Vec::new(),
+            features: Vec::new(),
+            deviations: Vec::new(),
+            conformance: ModuleConformance::Implement,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

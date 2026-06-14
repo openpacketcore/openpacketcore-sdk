@@ -20,7 +20,7 @@
 
 use super::{clean_segment, last_segment, RustGenerationError};
 use crate::emit::{schema_digest_from_canonical, CanonicalInput};
-use crate::ir::{SchemaNode, SchemaNodeKind, TypeRef};
+use crate::ir::{ModuleConformance as IrModuleConformance, SchemaNode, SchemaNodeKind, TypeRef};
 use proc_macro2::TokenStream;
 use quote::quote;
 use std::collections::HashMap;
@@ -104,17 +104,28 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         });
     }
 
+    // Discovery/source metadata -> DiscoveryMetadata literals.
+    let discovery_inits: Vec<TokenStream> = input
+        .schema_modules
+        .iter()
+        .map(discovery_meta_tokens)
+        .collect::<Result<Vec<_>, _>>()?;
+
     let digest = schema_digest_from_canonical(input);
 
     let tokens = quote! {
         // `LeafType` is intentionally not imported: it is referenced fully
         // qualified in leaf-type tokens so a schema with no typed leaves does not
         // leave an unused import (the generated crate compiles with -Dwarnings).
-        use opc_mgmt_schema::{DataClass, ModelData, NodeKind, NodeMeta, OriginEntry, SchemaRegistry};
+        use opc_mgmt_schema::{
+            DataClass, DiscoveryMetadata, ModelData, ModuleConformance, NodeKind, NodeMeta,
+            OriginEntry, SchemaRegistry, SchemaSourceError,
+        };
 
         static NODES: &[NodeMeta] = &[ #(#node_inits),* ];
         static MODELS: &[ModelData] = &[ #(#model_inits),* ];
         static ORIGINS: &[OriginEntry] = &[ #(#origin_inits),* ];
+        static DISCOVERY: &[DiscoveryMetadata] = &[ #(#discovery_inits),* ];
         const DIGEST: &str = #digest;
 
         /// The generated, const-constructible schema registry for this model.
@@ -134,6 +145,36 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             }
             fn origins(&self) -> &'static [OriginEntry] {
                 ORIGINS
+            }
+            fn discovery_metadata(&self) -> &'static [DiscoveryMetadata] {
+                DISCOVERY
+            }
+            fn schema_source(
+                &self,
+                identifier: &str,
+                version: Option<&str>,
+                format: &str,
+            ) -> Result<&'static str, SchemaSourceError> {
+                if format != "yang" {
+                    return Err(SchemaSourceError::UnsupportedFormat);
+                }
+                let mut matched: Option<&DiscoveryMetadata> = None;
+                for d in DISCOVERY {
+                    if d.name != identifier {
+                        continue;
+                    }
+                    if let Some(v) = version {
+                        if d.revision != v {
+                            continue;
+                        }
+                    }
+                    if matched.is_some() {
+                        return Err(SchemaSourceError::NotUnique);
+                    }
+                    matched = Some(d);
+                }
+                let d = matched.ok_or(SchemaSourceError::NotFound)?;
+                d.source.ok_or(SchemaSourceError::NotFound)
             }
         }
 
@@ -203,6 +244,55 @@ fn node_meta_tokens(node: &SchemaNode) -> Result<TokenStream, RustGenerationErro
             has_default: #has_default,
             presence: #presence,
             child_paths: &[ #(#child_paths),* ],
+        }
+    })
+}
+
+fn discovery_meta_tokens(m: &crate::ir::SchemaModule) -> Result<TokenStream, RustGenerationError> {
+    let name = &m.name;
+    let revision = &m.revision;
+    let conformance_tok = match m.conformance {
+        IrModuleConformance::Implement => quote! { ModuleConformance::Implement },
+        IrModuleConformance::Import => quote! { ModuleConformance::Import },
+    };
+
+    let import_inits: Vec<TokenStream> = m
+        .imports
+        .iter()
+        .map(|imp| {
+            let imp_name = &imp.name;
+            let rev_tok = if imp.revision.is_empty() {
+                quote! { None }
+            } else {
+                let rev = &imp.revision;
+                quote! { Some(#rev) }
+            };
+            quote! {
+                opc_mgmt_schema::ModuleImport {
+                    name: #imp_name,
+                    revision: #rev_tok,
+                }
+            }
+        })
+        .collect();
+
+    let feature_inits: Vec<&String> = m.features.iter().collect();
+    let deviation_inits: Vec<&String> = m.deviations.iter().collect();
+
+    let source_tok = match &m.source_text {
+        Some(text) => quote! { Some(#text) },
+        None => quote! { None },
+    };
+
+    Ok(quote! {
+        DiscoveryMetadata {
+            name: #name,
+            revision: #revision,
+            conformance: #conformance_tok,
+            imports: &[ #(#import_inits),* ],
+            features: &[ #(#feature_inits),* ],
+            deviations: &[ #(#deviation_inits),* ],
+            source: #source_tok,
         }
     })
 }
