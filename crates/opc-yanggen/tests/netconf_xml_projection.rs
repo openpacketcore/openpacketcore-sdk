@@ -19,6 +19,14 @@ fn build_input() -> CanonicalInput {
         source: source.clone(),
         ..Default::default()
     };
+    let wd_prefix_module = SchemaModule {
+        name: "wd-prefix-module".to_string(),
+        revision: "2026-06-01".to_string(),
+        namespace: "urn:wd-prefix-module".to_string(),
+        prefix: "wd".to_string(),
+        source: source.clone(),
+        ..Default::default()
+    };
 
     let nodes = vec![
         SchemaNode {
@@ -38,6 +46,7 @@ fn build_input() -> CanonicalInput {
                 "/ex:system/ex:tags".to_string(),
                 "/ex:system/ex:secret-codes".to_string(),
                 "/ex:system/ex:custom-tags".to_string(),
+                "/ex:system/wd:colliding-default".to_string(),
             ],
             source: source.clone(),
             ..Default::default()
@@ -263,6 +272,16 @@ fn build_input() -> CanonicalInput {
             source: source.clone(),
             ..Default::default()
         },
+        SchemaNode {
+            path: "/ex:system/wd:colliding-default".to_string(),
+            module: "wd-prefix-module".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            default: Some("collision".to_string()),
+            source: source.clone(),
+            ..Default::default()
+        },
     ];
 
     let input = GenerationInput {
@@ -271,7 +290,7 @@ fn build_input() -> CanonicalInput {
             profile: "test".to_string(),
             modules: vec![],
         },
-        schema_modules: vec![module],
+        schema_modules: vec![module, wd_prefix_module],
         nodes,
         constraints: vec![],
         unsupported_features: vec![],
