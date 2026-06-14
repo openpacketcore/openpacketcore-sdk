@@ -6912,16 +6912,65 @@ mod tests {
 
     #[tokio::test]
     async fn subtree_filter_content_match_fails_closed_until_supported() {
-        let (server, observed, _audit) = server_fixture().await;
+        let (server, observed, audit) = server_fixture().await;
+        let errors_before = netconf_rpc_errors("get-config", "operation-not-supported");
         let rpc = format!(
             r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="106"><get-config><source><running/></source><filter><sys:system xmlns:sys="urn:opc:demo"><sys:hostname>do-not-leak</sys:hostname></sys:system></filter></get-config></rpc>"#
         );
         let reply =
             server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &MgmtLimits::default());
         assert!(reply.contains(r#"message-id="106""#));
-        assert!(reply.contains("<error-tag>bad-element</error-tag>"));
+        assert!(reply.contains("<error-tag>operation-not-supported</error-tag>"));
         assert!(!reply.contains("do-not-leak"));
         assert!(observed.lock().expect("observed paths mutex").is_empty());
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
+        assert!(netconf_rpc_errors("get-config", "operation-not-supported") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn subtree_filter_attribute_match_fails_closed_until_supported() {
+        let (server, observed, audit) = server_fixture().await;
+        let errors_before = netconf_rpc_errors("get", "operation-not-supported");
+        let rpc = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="106a"><get><filter><sys:system xmlns:sys="urn:opc:demo" name="do-not-leak"/></filter></get></rpc>"#
+        );
+        let reply =
+            server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &MgmtLimits::default());
+        assert!(reply.contains(r#"message-id="106a""#));
+        assert!(reply.contains("<error-tag>operation-not-supported</error-tag>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
+        assert!(netconf_rpc_errors("get", "operation-not-supported") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn subtree_filter_content_match_over_limit_is_too_big_without_leak() {
+        let (server, observed, audit) = server_fixture().await;
+        let limits = MgmtLimits {
+            max_subtree_filter_content_match_nodes: 1,
+            ..MgmtLimits::default()
+        };
+        let rpc = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="106b"><get-config><source><running/></source><filter><sys:system xmlns:sys="urn:opc:demo"><sys:hostname>first</sys:hostname><sys:uptime>second</sys:uptime></sys:system></filter></get-config></rpc>"#
+        );
+        let reply = server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &limits);
+        assert!(reply.contains(r#"message-id="106b""#));
+        assert!(reply.contains("<error-tag>too-big</error-tag>"));
+        assert!(!reply.contains("first"));
+        assert!(!reply.contains("second"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, audit_failed("too-big"));
     }
 
     #[tokio::test]
