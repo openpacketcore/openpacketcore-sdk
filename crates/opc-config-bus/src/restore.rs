@@ -542,7 +542,18 @@ impl<C: OpcConfig> ConfigBus<C> {
                 )
                 .await
                 .map_err(|err| preserve_startup_error(&alarm_manager, err))?;
-                (config, version, None, None)
+                let tx_id = TxId::new();
+                store
+                    .append_commit(StoredConfig::new(
+                        tx_id,
+                        version,
+                        startup_bootstrap_principal(),
+                        RequestSource::StartupRecovery,
+                        config.clone(),
+                    ))
+                    .await
+                    .map_err(|err| preserve_startup_error(&alarm_manager, err))?;
+                (config, version, Some(tx_id), None)
             }
         };
         clear_config_alarm_type(

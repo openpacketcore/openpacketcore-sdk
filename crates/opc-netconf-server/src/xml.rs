@@ -82,6 +82,8 @@ pub(crate) enum RpcOperationHint {
     EditConfig,
     /// Base NETCONF `<commit>`.
     Commit,
+    /// Base NETCONF `<cancel-commit>`.
+    CancelCommit,
     /// Base NETCONF `<discard-changes>`.
     DiscardChanges,
     /// Base NETCONF `<copy-config>`.
@@ -120,7 +122,9 @@ pub enum RpcOperation {
     /// `<validate>`.
     Validate(ValidateRequest),
     /// `<commit>`.
-    Commit,
+    Commit(CommitRequest),
+    /// `<cancel-commit>`.
+    CancelCommit(CancelCommitRequest),
     /// `<discard-changes>`.
     DiscardChanges,
     /// `<copy-config>`.
@@ -175,6 +179,36 @@ pub struct ValidateRequest {
     pub source: Datastore,
 }
 
+/// RFC 6241 `<commit>` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRequest {
+    /// Whether this is a confirmed commit.
+    pub confirmed: bool,
+    /// Confirmed commit timeout in seconds.
+    pub confirm_timeout: Option<u32>,
+    /// Persistent confirmed commit token for the new pending commit.
+    pub persist: Option<String>,
+    /// Token used to confirm or update an existing persistent confirmed commit.
+    pub persist_id: Option<String>,
+}
+
+impl CommitRequest {
+    /// Returns true for the plain `<commit/>` form.
+    pub const fn is_plain(&self) -> bool {
+        !self.confirmed
+            && self.confirm_timeout.is_none()
+            && self.persist.is_none()
+            && self.persist_id.is_none()
+    }
+}
+
+/// RFC 6241 `<cancel-commit>` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelCommitRequest {
+    /// Token used to cancel a persistent confirmed commit.
+    pub persist_id: Option<String>,
+}
+
 /// RFC 6241 `<copy-config>` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyConfigRequest {
@@ -207,6 +241,8 @@ pub enum UnsupportedOperation {
     Unlock,
     /// `<commit>`.
     Commit,
+    /// `<cancel-commit>`.
+    CancelCommit,
     /// `<discard-changes>`.
     DiscardChanges,
     /// `<validate>`.
@@ -223,6 +259,7 @@ impl UnsupportedOperation {
             Self::Lock => "lock",
             Self::Unlock => "unlock",
             Self::Commit => "commit",
+            Self::CancelCommit => "cancel-commit",
             Self::DiscardChanges => "discard-changes",
             Self::Validate => "validate",
         }
@@ -675,6 +712,23 @@ struct PartialValidate {
 }
 
 #[derive(Debug, Clone, Default)]
+struct PartialCommit {
+    confirmed: bool,
+    confirm_timeout_seen: bool,
+    confirm_timeout: Option<u32>,
+    persist_seen: bool,
+    persist: Option<String>,
+    persist_id_seen: bool,
+    persist_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PartialCancelCommit {
+    persist_id_seen: bool,
+    persist_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 struct PartialCopyConfig {
     target: Option<Datastore>,
     source: Option<Datastore>,
@@ -709,11 +763,12 @@ struct ParserState {
     lock: Option<PartialLock>,
     unlock: Option<PartialUnlock>,
     validate: Option<PartialValidate>,
+    commit: Option<PartialCommit>,
+    cancel_commit: Option<PartialCancelCommit>,
     copy_config: Option<PartialCopyConfig>,
     delete_config: Option<PartialDeleteConfig>,
     operation_hint: Option<RpcOperationHint>,
     close_session: bool,
-    commit: bool,
     discard_changes: bool,
     filter_depth: usize,
     filter_stack: Vec<FilterFrame>,
@@ -882,6 +937,14 @@ impl ParserState {
             self.set_get_schema_text(GetSchemaField::Format, text)?;
         } else if self.local_path_is(&["rpc", "kill-session", "session-id"]) {
             self.set_kill_session_id(text)?;
+        } else if self.local_path_is(&["rpc", "commit", "confirm-timeout"]) {
+            self.set_commit_confirm_timeout_text(text)?;
+        } else if self.local_path_is(&["rpc", "commit", "persist"]) {
+            self.set_commit_persist_text(text)?;
+        } else if self.local_path_is(&["rpc", "commit", "persist-id"]) {
+            self.set_commit_persist_id_text(text)?;
+        } else if self.local_path_is(&["rpc", "cancel-commit", "persist-id"]) {
+            self.set_cancel_commit_persist_id_text(text)?;
         } else if self.local_path_is(&["rpc", "get", "with-defaults"]) {
             self.set_get_with_defaults_text(text)?;
         } else if self.local_path_is(&["rpc", "get-config", "with-defaults"]) {
@@ -1094,7 +1157,17 @@ impl ParserState {
                         return Err(XmlError::DuplicateElement);
                     }
                     self.operation_hint = Some(RpcOperationHint::Commit);
-                    self.commit = true;
+                    self.commit = Some(PartialCommit::default());
+                    if !attrs.is_empty() {
+                        return Err(XmlError::Malformed);
+                    }
+                }
+                "cancel-commit" => {
+                    if self.has_rpc_operation() {
+                        return Err(XmlError::DuplicateElement);
+                    }
+                    self.operation_hint = Some(RpcOperationHint::CancelCommit);
+                    self.cancel_commit = Some(PartialCancelCommit::default());
                     if !attrs.is_empty() {
                         return Err(XmlError::Malformed);
                     }
@@ -1149,10 +1222,25 @@ impl ParserState {
                 _ => Err(XmlError::Malformed),
             }
         } else if self.local_path_is(&["rpc", "close-session"])
-            || self.local_path_is(&["rpc", "commit"])
             || self.local_path_is(&["rpc", "discard-changes"])
         {
             Err(XmlError::Malformed)
+        } else if self.local_path_is(&["rpc", "commit"]) {
+            match element.local.as_str() {
+                "confirmed" | "confirm-timeout" | "persist" | "persist-id"
+                    if element.namespace == NETCONF_BASE_NS && attrs.is_empty() =>
+                {
+                    self.install_commit_parameter(element.local.as_str())
+                }
+                _ => Err(XmlError::Malformed),
+            }
+        } else if self.local_path_is(&["rpc", "cancel-commit"]) {
+            match element.local.as_str() {
+                "persist-id" if element.namespace == NETCONF_BASE_NS && attrs.is_empty() => {
+                    self.install_cancel_commit_persist_id()
+                }
+                _ => Err(XmlError::Malformed),
+            }
         } else if self.local_path_is(&["rpc", "lock"]) || self.local_path_is(&["rpc", "unlock"]) {
             match element.local.as_str() {
                 "target" if element.namespace == NETCONF_BASE_NS && attrs.is_empty() => Ok(()),
@@ -1281,6 +1369,11 @@ impl ParserState {
             || self.local_path_is(&["rpc", "edit-config", "default-operation"])
             || self.local_path_is(&["rpc", "edit-config", "test-option"])
             || self.local_path_is(&["rpc", "edit-config", "error-option"])
+            || self.local_path_is(&["rpc", "commit", "confirmed"])
+            || self.local_path_is(&["rpc", "commit", "confirm-timeout"])
+            || self.local_path_is(&["rpc", "commit", "persist"])
+            || self.local_path_is(&["rpc", "commit", "persist-id"])
+            || self.local_path_is(&["rpc", "cancel-commit", "persist-id"])
             || self.local_path_is(&["rpc", "get", "with-defaults"])
             || self.local_path_is(&["rpc", "get-config", "with-defaults"])
         {
@@ -1311,8 +1404,9 @@ impl ParserState {
             || self.validate.is_some()
             || self.copy_config.is_some()
             || self.delete_config.is_some()
+            || self.commit.is_some()
+            || self.cancel_commit.is_some()
             || self.close_session
-            || self.commit
             || self.discard_changes
     }
 
@@ -1330,6 +1424,7 @@ impl ParserState {
         match local {
             "edit-config" => self.operation_hint = Some(RpcOperationHint::EditConfig),
             "commit" => self.operation_hint = Some(RpcOperationHint::Commit),
+            "cancel-commit" => self.operation_hint = Some(RpcOperationHint::CancelCommit),
             "discard-changes" => self.operation_hint = Some(RpcOperationHint::DiscardChanges),
             "copy-config" => self.operation_hint = Some(RpcOperationHint::CopyConfig),
             "delete-config" => self.operation_hint = Some(RpcOperationHint::DeleteConfig),
@@ -1391,6 +1486,105 @@ impl ParserState {
             return Err(XmlError::InvalidValue);
         }
         if kill_session.session_id.replace(session_id).is_some() {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn install_commit_parameter(&mut self, local: &str) -> Result<(), XmlError> {
+        let commit = self.commit.as_mut().ok_or(XmlError::UnsupportedOperation)?;
+        match local {
+            "confirmed" => {
+                if commit.confirmed {
+                    return Err(XmlError::DuplicateElement);
+                }
+                commit.confirmed = true;
+            }
+            "confirm-timeout" => {
+                if commit.confirm_timeout_seen {
+                    return Err(XmlError::DuplicateElement);
+                }
+                commit.confirm_timeout_seen = true;
+            }
+            "persist" => {
+                if commit.persist_seen {
+                    return Err(XmlError::DuplicateElement);
+                }
+                commit.persist_seen = true;
+            }
+            "persist-id" => {
+                if commit.persist_id_seen {
+                    return Err(XmlError::DuplicateElement);
+                }
+                commit.persist_id_seen = true;
+            }
+            _ => return Err(XmlError::Malformed),
+        }
+        Ok(())
+    }
+
+    fn install_cancel_commit_persist_id(&mut self) -> Result<(), XmlError> {
+        let cancel = self
+            .cancel_commit
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if cancel.persist_id_seen {
+            return Err(XmlError::DuplicateElement);
+        }
+        cancel.persist_id_seen = true;
+        Ok(())
+    }
+
+    fn set_commit_confirm_timeout_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let commit = self.commit.as_mut().ok_or(XmlError::UnsupportedOperation)?;
+        let value = text.trim();
+        if value.is_empty() {
+            return Err(XmlError::InvalidValue);
+        }
+        let seconds = value.parse::<u32>().map_err(|_| XmlError::InvalidValue)?;
+        if seconds == 0 {
+            return Err(XmlError::InvalidValue);
+        }
+        if commit.confirm_timeout.replace(seconds).is_some() {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn set_commit_persist_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let commit = self.commit.as_mut().ok_or(XmlError::UnsupportedOperation)?;
+        let value = text.trim();
+        if value.is_empty() {
+            return Err(XmlError::InvalidValue);
+        }
+        if commit.persist.replace(value.to_string()).is_some() {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn set_commit_persist_id_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let commit = self.commit.as_mut().ok_or(XmlError::UnsupportedOperation)?;
+        let value = text.trim();
+        if value.is_empty() {
+            return Err(XmlError::InvalidValue);
+        }
+        if commit.persist_id.replace(value.to_string()).is_some() {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn set_cancel_commit_persist_id_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let cancel = self
+            .cancel_commit
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        let value = text.trim();
+        if value.is_empty() {
+            return Err(XmlError::InvalidValue);
+        }
+        if cancel.persist_id.replace(value.to_string()).is_some() {
             return Err(XmlError::DuplicateElement);
         }
         Ok(())
@@ -1793,11 +1987,18 @@ impl ParserState {
                         operation: RpcOperation::CloseSession,
                     }));
                 }
-                if self.commit {
+                if let Some(commit) = self.commit {
                     return Ok(ParsedMessage::Rpc(ParsedRpc {
                         message_id,
                         reply_attrs,
-                        operation: RpcOperation::Commit,
+                        operation: RpcOperation::Commit(finish_commit(commit)?),
+                    }));
+                }
+                if let Some(cancel_commit) = self.cancel_commit {
+                    return Ok(ParsedMessage::Rpc(ParsedRpc {
+                        message_id,
+                        reply_attrs,
+                        operation: RpcOperation::CancelCommit(finish_cancel_commit(cancel_commit)?),
                     }));
                 }
                 if self.discard_changes {
@@ -2287,6 +2488,33 @@ fn finish_edit_option<T: Default>(seen: bool, value: Option<T>) -> Result<T, Xml
     }
 }
 
+fn finish_commit(commit: PartialCommit) -> Result<CommitRequest, XmlError> {
+    if commit.confirm_timeout_seen && commit.confirm_timeout.is_none() {
+        return Err(XmlError::InvalidValue);
+    }
+    if commit.persist_seen && commit.persist.is_none() {
+        return Err(XmlError::InvalidValue);
+    }
+    if commit.persist_id_seen && commit.persist_id.is_none() {
+        return Err(XmlError::InvalidValue);
+    }
+    Ok(CommitRequest {
+        confirmed: commit.confirmed,
+        confirm_timeout: commit.confirm_timeout,
+        persist: commit.persist,
+        persist_id: commit.persist_id,
+    })
+}
+
+fn finish_cancel_commit(cancel: PartialCancelCommit) -> Result<CancelCommitRequest, XmlError> {
+    if cancel.persist_id_seen && cancel.persist_id.is_none() {
+        return Err(XmlError::InvalidValue);
+    }
+    Ok(CancelCommitRequest {
+        persist_id: cancel.persist_id,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use opc_mgmt_errors::{NetconfErrorTag, NetconfErrorType};
@@ -2433,11 +2661,66 @@ mod tests {
     fn parses_commit_and_discard_changes() {
         let commit = parse_rpc(&rpc("<commit/>"), &MgmtLimits::default()).expect("parse commit");
         assert_eq!(commit.message_id, "101");
-        assert_eq!(commit.operation, RpcOperation::Commit);
+        assert_eq!(
+            commit.operation,
+            RpcOperation::Commit(CommitRequest {
+                confirmed: false,
+                confirm_timeout: None,
+                persist: None,
+                persist_id: None,
+            })
+        );
 
         let discard = parse_rpc(&rpc("<discard-changes/>"), &MgmtLimits::default())
             .expect("parse discard-changes");
         assert_eq!(discard.operation, RpcOperation::DiscardChanges);
+    }
+
+    #[test]
+    fn parses_confirmed_commit_and_cancel_commit() {
+        let confirmed = parse_rpc(
+            &rpc(
+                "<commit><confirmed/><confirm-timeout>30</confirm-timeout><persist>token</persist></commit>",
+            ),
+            &MgmtLimits::default(),
+        )
+        .expect("parse confirmed commit");
+        assert_eq!(
+            confirmed.operation,
+            RpcOperation::Commit(CommitRequest {
+                confirmed: true,
+                confirm_timeout: Some(30),
+                persist: Some("token".to_string()),
+                persist_id: None,
+            })
+        );
+
+        let confirm_persistent = parse_rpc(
+            &rpc("<commit><persist-id>token</persist-id></commit>"),
+            &MgmtLimits::default(),
+        )
+        .expect("parse persistent confirm");
+        assert_eq!(
+            confirm_persistent.operation,
+            RpcOperation::Commit(CommitRequest {
+                confirmed: false,
+                confirm_timeout: None,
+                persist: None,
+                persist_id: Some("token".to_string()),
+            })
+        );
+
+        let cancel = parse_rpc(
+            &rpc("<cancel-commit><persist-id>token</persist-id></cancel-commit>"),
+            &MgmtLimits::default(),
+        )
+        .expect("parse cancel-commit");
+        assert_eq!(
+            cancel.operation,
+            RpcOperation::CancelCommit(CancelCommitRequest {
+                persist_id: Some("token".to_string())
+            })
+        );
     }
 
     #[test]
@@ -2481,13 +2764,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_empty_commit_and_discard_changes() {
+    fn rejects_malformed_commit_and_discard_changes() {
         let commit = parse_rpc(
-            &rpc("<commit><persist>id</persist></commit>"),
+            &rpc("<commit><unsupported/></commit>"),
             &MgmtLimits::default(),
         )
-        .expect_err("commit child content");
+        .expect_err("unsupported commit child");
         assert_eq!(commit, XmlError::Malformed);
+
+        let empty_timeout = parse_rpc(
+            &rpc("<commit><confirmed/><confirm-timeout/></commit>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("empty confirm-timeout");
+        assert_eq!(empty_timeout, XmlError::InvalidValue);
 
         let discard = parse_rpc(
             &rpc(r#"<discard-changes unexpected="value"/>"#),

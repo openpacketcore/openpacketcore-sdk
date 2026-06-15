@@ -406,6 +406,16 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         false
     }
 
+    /// Returns true when this binding supports RFC 6241 confirmed commit.
+    ///
+    /// Confirmed commit depends on the server-owned candidate datastore and the
+    /// SDK config bus commit-confirmed state machine. Bindings that enable
+    /// candidate support get confirmed commit by default; override to `false`
+    /// only if the CNF cannot safely tolerate tentative running changes.
+    fn confirmed_commit_capability(&self) -> bool {
+        self.candidate_datastore_capability()
+    }
+
     /// Optional RFC 6241 startup datastore facade.
     ///
     /// The default is `None`: no `:startup` capability is advertised, startup

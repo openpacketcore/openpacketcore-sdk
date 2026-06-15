@@ -30,17 +30,39 @@ pub const WITH_DEFAULTS_1_0_BASE: &str = "urn:ietf:params:netconf:capability:wit
 pub const WRITABLE_RUNNING_1_0: &str = "urn:ietf:params:netconf:capability:writable-running:1.0";
 /// RFC 6241 candidate datastore capability.
 pub const CANDIDATE_1_0: &str = "urn:ietf:params:netconf:capability:candidate:1.0";
+/// RFC 6241 confirmed-commit 1.1 capability.
+pub const CONFIRMED_COMMIT_1_1: &str = "urn:ietf:params:netconf:capability:confirmed-commit:1.1";
 /// RFC 6241 startup datastore capability.
 pub const STARTUP_1_0: &str = "urn:ietf:params:netconf:capability:startup:1.0";
 
 const NETCONF_MONITORING_MODULE: &str = "ietf-netconf-monitoring";
 
+/// Capability inputs used to render one server `<hello>`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServerHelloCapabilities<'a> {
+    /// Optional RFC 8526 YANG Library capability.
+    pub yang_library: Option<&'a YangLibraryCapability>,
+    /// Optional RFC 6022 NETCONF monitoring capability.
+    pub monitoring: Option<&'a NetconfMonitoringCapability>,
+    /// Optional RFC 6243 with-defaults capability.
+    pub with_defaults: Option<&'a WithDefaultsCapability>,
+    /// Whether `:writable-running` is backed by an edit implementation.
+    pub writable_running: bool,
+    /// Whether `:candidate` is backed by a server-owned candidate datastore.
+    pub candidate: bool,
+    /// Whether `:confirmed-commit:1.1` is backed by candidate + config bus state.
+    pub confirmed_commit: bool,
+    /// Whether `:startup` is backed by a CNF startup datastore facade.
+    pub startup: bool,
+}
+
 const READ_ONLY_CAPABILITIES: [&str; 2] = [NETCONF_BASE_1_0, NETCONF_BASE_1_1];
 
 /// Returns the base capabilities implemented by the current read-only server core.
 ///
-/// Candidate, startup, validate, confirmed-commit, XPath, and notifications are
-/// intentionally absent until those behaviors exist and are tested. Optional
+/// Startup, validate, XPath, and notifications are intentionally absent until
+/// those behaviors exist and are tested. Candidate and confirmed-commit are
+/// advertised only when the binding exposes their backing datastore behavior. Optional
 /// binding-backed capabilities are appended by [`read_only_capabilities`] only
 /// when their hooks are present.
 pub const fn read_only_base_capabilities() -> &'static [&'static str] {
@@ -58,6 +80,7 @@ pub fn read_only_capabilities(
     with_defaults: Option<&WithDefaultsCapability>,
     writable_running: bool,
     candidate: bool,
+    confirmed_commit: bool,
     startup: bool,
 ) -> Vec<String> {
     let mut capabilities = read_only_base_capabilities()
@@ -69,6 +92,9 @@ pub fn read_only_capabilities(
     }
     if candidate {
         capabilities.push(CANDIDATE_1_0.to_string());
+    }
+    if confirmed_commit && candidate {
+        capabilities.push(CONFIRMED_COMMIT_1_1.to_string());
     }
     if startup {
         capabilities.push(STARTUP_1_0.to_string());
@@ -92,20 +118,16 @@ pub fn read_only_capabilities(
 /// `<session-id>`.
 pub fn render_server_hello(
     session_id: Option<NonZeroU32>,
-    yang_library: Option<&YangLibraryCapability>,
-    monitoring: Option<&NetconfMonitoringCapability>,
-    with_defaults: Option<&WithDefaultsCapability>,
-    writable_running: bool,
-    candidate: bool,
-    startup: bool,
+    capabilities: ServerHelloCapabilities<'_>,
 ) -> String {
     let capabilities = read_only_capabilities(
-        yang_library,
-        monitoring,
-        with_defaults,
-        writable_running,
-        candidate,
-        startup,
+        capabilities.yang_library,
+        capabilities.monitoring,
+        capabilities.with_defaults,
+        capabilities.writable_running,
+        capabilities.candidate,
+        capabilities.confirmed_commit,
+        capabilities.startup,
     );
     render_hello(&capabilities, session_id)
 }
@@ -186,9 +208,10 @@ mod tests {
 
     #[test]
     fn read_only_capabilities_are_base_only_without_yang_library() {
-        let capabilities = read_only_capabilities(None, None, None, false, false, false);
+        let capabilities = read_only_capabilities(None, None, None, false, false, false, false);
         assert_eq!(capabilities, [NETCONF_BASE_1_0, NETCONF_BASE_1_1]);
         assert!(!capabilities.iter().any(|cap| cap.contains("candidate")));
+        assert!(!capabilities.iter().any(|cap| cap.contains("confirmed")));
         assert!(!capabilities.iter().any(|cap| cap.contains("startup")));
         assert!(!capabilities
             .iter()
@@ -206,7 +229,7 @@ mod tests {
         let yang_library =
             YangLibraryCapability::new("fnv1a64:abc&def").expect("capability content id");
         let capabilities =
-            read_only_capabilities(Some(&yang_library), None, None, false, false, false);
+            read_only_capabilities(Some(&yang_library), None, None, false, false, false, false);
 
         assert_eq!(capabilities.len(), 3);
         assert_eq!(
@@ -216,12 +239,10 @@ mod tests {
 
         let hello = render_server_hello(
             std::num::NonZeroU32::new(42),
-            Some(&yang_library),
-            None,
-            None,
-            false,
-            false,
-            false,
+            ServerHelloCapabilities {
+                yang_library: Some(&yang_library),
+                ..ServerHelloCapabilities::default()
+            },
         );
         assert!(hello.contains("yang-library:1.1?revision=2019-01-04"));
         assert!(hello.contains("content-id=fnv1a64%3Aabc%26def"));
@@ -231,7 +252,7 @@ mod tests {
     fn monitoring_capability_is_opt_in() {
         let monitoring = NetconfMonitoringCapability;
         let capabilities =
-            read_only_capabilities(None, Some(&monitoring), None, false, false, false);
+            read_only_capabilities(None, Some(&monitoring), None, false, false, false, false);
 
         assert_eq!(capabilities.len(), 3);
         assert_eq!(capabilities[0], NETCONF_BASE_1_0);
@@ -254,7 +275,7 @@ mod tests {
         )
         .expect("with-defaults capability");
         let capabilities =
-            read_only_capabilities(None, None, Some(&with_defaults), false, false, false);
+            read_only_capabilities(None, None, Some(&with_defaults), false, false, false, false);
 
         assert_eq!(capabilities.len(), 3);
         assert_eq!(
@@ -267,12 +288,7 @@ mod tests {
     fn hello_contains_session_id_when_requested() {
         let hello = render_server_hello(
             std::num::NonZeroU32::new(42),
-            None,
-            None,
-            None,
-            false,
-            false,
-            false,
+            ServerHelloCapabilities::default(),
         );
         assert!(hello.contains(NETCONF_BASE_1_0));
         assert!(hello.contains(NETCONF_BASE_1_1));
@@ -281,7 +297,7 @@ mod tests {
 
     #[test]
     fn writable_running_capability_is_opt_in() {
-        let capabilities = read_only_capabilities(None, None, None, true, false, false);
+        let capabilities = read_only_capabilities(None, None, None, true, false, false, false);
 
         assert_eq!(capabilities.len(), 3);
         assert_eq!(capabilities[0], NETCONF_BASE_1_0);
@@ -291,7 +307,7 @@ mod tests {
 
     #[test]
     fn candidate_capability_is_opt_in() {
-        let capabilities = read_only_capabilities(None, None, None, false, true, false);
+        let capabilities = read_only_capabilities(None, None, None, false, true, false, false);
 
         assert_eq!(capabilities.len(), 3);
         assert_eq!(capabilities[0], NETCONF_BASE_1_0);
@@ -300,8 +316,24 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_commit_capability_depends_on_candidate() {
+        let without_candidate = read_only_capabilities(None, None, None, false, false, true, false);
+        assert!(!without_candidate
+            .iter()
+            .any(|capability| capability == CONFIRMED_COMMIT_1_1));
+
+        let capabilities = read_only_capabilities(None, None, None, false, true, true, false);
+
+        assert_eq!(capabilities.len(), 4);
+        assert_eq!(capabilities[0], NETCONF_BASE_1_0);
+        assert_eq!(capabilities[1], NETCONF_BASE_1_1);
+        assert_eq!(capabilities[2], CANDIDATE_1_0);
+        assert_eq!(capabilities[3], CONFIRMED_COMMIT_1_1);
+    }
+
+    #[test]
     fn startup_capability_is_opt_in() {
-        let capabilities = read_only_capabilities(None, None, None, false, false, true);
+        let capabilities = read_only_capabilities(None, None, None, false, false, false, true);
 
         assert_eq!(capabilities.len(), 3);
         assert_eq!(capabilities[0], NETCONF_BASE_1_0);

@@ -12,6 +12,8 @@ pub(crate) enum NetconfOperation {
     EditConfig,
     /// `<commit>`.
     Commit,
+    /// `<cancel-commit>`.
+    CancelCommit,
     /// `<discard-changes>`.
     DiscardChanges,
     /// `<copy-config>`.
@@ -45,6 +47,7 @@ impl NetconfOperation {
         match self {
             Self::EditConfig => "edit-config",
             Self::Commit => "commit",
+            Self::CancelCommit => "cancel-commit",
             Self::DiscardChanges => "discard-changes",
             Self::CopyConfig => "copy-config",
             Self::DeleteConfig => "delete-config",

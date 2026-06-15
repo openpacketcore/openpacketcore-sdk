@@ -345,6 +345,7 @@ pub enum CommitMode {
     Commit,
     ValidateOnly,
     CommitConfirmed { timeout: Duration },
+    CancelConfirmed,
     Rollback { target: RollbackTarget },
 }
 
@@ -743,6 +744,27 @@ impl<C: OpcConfig> CommitRequest<C> {
             source,
             ConfigOperation::Rollback,
             CommitMode::Rollback { target },
+            deadline,
+            None,
+            changed_paths,
+        )
+    }
+
+    pub fn cancel_confirmed(
+        request_id: RequestId,
+        principal: TrustedPrincipal,
+        transport: TransportType,
+        source: RequestSource,
+        changed_paths: Vec<YangPath>,
+        deadline: Instant,
+    ) -> Self {
+        Self::new(
+            request_id,
+            principal,
+            transport,
+            source,
+            ConfigOperation::Rollback,
+            CommitMode::CancelConfirmed,
             deadline,
             None,
             changed_paths,
