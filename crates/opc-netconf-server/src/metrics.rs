@@ -36,6 +36,8 @@ pub(crate) enum NetconfOperation {
     GetConfig,
     /// RFC 6022 `<get-schema>`.
     GetSchema,
+    /// RFC 5277 `<create-subscription>`.
+    CreateSubscription,
     /// A known operation parsed only to reject as unsupported.
     Unsupported(&'static str),
     /// Operation was not known because envelope parsing failed.
@@ -59,8 +61,27 @@ impl NetconfOperation {
             Self::Get => "get",
             Self::GetConfig => "get-config",
             Self::GetSchema => "get-schema",
+            Self::CreateSubscription => "create-subscription",
             Self::Unsupported(operation) => operation,
             Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Low-cardinality notification delivery outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetconfNotificationOutcome {
+    /// Notification frame was written to the session.
+    Success,
+    /// Notification could not be rendered or delivered.
+    Failure,
+}
+
+impl NetconfNotificationOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => OUTCOME_SUCCESS,
+            Self::Failure => OUTCOME_FAILURE,
         }
     }
 }
@@ -111,6 +132,16 @@ pub(crate) fn record_nacm_denials(action: NetconfNacmAction, count: usize) {
     if let Ok(mut map) = METRICS.netconf_nacm_denials_total.lock() {
         let entry = map.entry(safe_label(action.as_str())).or_insert(0);
         *entry = entry.saturating_add(count.try_into().unwrap_or(u64::MAX));
+    }
+}
+
+/// Records a NETCONF notification delivery outcome.
+pub(crate) fn record_notification(stream: &str, outcome: NetconfNotificationOutcome) {
+    if let Ok(mut map) = METRICS.netconf_notifications_total.lock() {
+        let entry = map
+            .entry((safe_label(stream), safe_label(outcome.as_str())))
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
     }
 }
 
@@ -203,6 +234,13 @@ mod tests {
         record_rpc_success(NetconfOperation::GetSchema, Duration::from_millis(1));
         assert!(rpc_request_count(NetconfOperation::GetSchema, OUTCOME_SUCCESS) > before);
 
+        let before = rpc_request_count(NetconfOperation::CreateSubscription, OUTCOME_SUCCESS);
+        record_rpc_success(
+            NetconfOperation::CreateSubscription,
+            Duration::from_millis(1),
+        );
+        assert!(rpc_request_count(NetconfOperation::CreateSubscription, OUTCOME_SUCCESS) > before);
+
         let before = rpc_error_count(NetconfOperation::GetConfig, NetconfErrorTag::ResourceDenied);
         record_rpc_error(
             NetconfOperation::GetConfig,
@@ -226,9 +264,23 @@ mod tests {
             "opc_netconf_rpc_requests_total{operation=\"get-schema\",outcome=\"success\"}"
         ));
         assert!(exported.contains(
+            "opc_netconf_rpc_requests_total{operation=\"create-subscription\",outcome=\"success\"}"
+        ));
+        assert!(exported.contains(
             "opc_netconf_rpc_errors_total{operation=\"get-config\",error_tag=\"resource-denied\"}"
         ));
         assert!(exported.contains("opc_netconf_rpc_seconds_bucket{operation=\"get-config\""));
+    }
+
+    #[test]
+    fn records_notification_metrics() {
+        let before = notification_count("NETCONF", OUTCOME_SUCCESS);
+        record_notification("NETCONF", NetconfNotificationOutcome::Success);
+        assert!(notification_count("NETCONF", OUTCOME_SUCCESS) > before);
+
+        let exported = export_prometheus_text();
+        assert!(exported
+            .contains("opc_netconf_notifications_total{stream=\"NETCONF\",outcome=\"success\"}"));
     }
 
     #[test]
@@ -276,6 +328,15 @@ mod tests {
             .lock()
             .ok()
             .and_then(|map| map.get(&safe_label(transport)).copied())
+            .unwrap_or(0)
+    }
+
+    fn notification_count(stream: &str, outcome: &'static str) -> u64 {
+        METRICS
+            .netconf_notifications_total
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&(safe_label(stream), safe_label(outcome))).copied())
             .unwrap_or(0)
     }
 }
