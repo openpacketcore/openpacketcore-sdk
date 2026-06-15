@@ -94,9 +94,9 @@ enum HandshakeError {
 ///
 /// The listener uses [`TlsBootstrap`] to stamp HTTP/2 ALPN and enforce
 /// production peer-policy rules, then injects an
-/// [`AuthenticatedGnmiPrincipal`] into every tonic request. `Capabilities` is
-/// `Capabilities` and authenticated read-only `Get` are implemented at this
-/// phase; `Set` and `Subscribe` remain explicit `UNIMPLEMENTED` responses.
+/// [`AuthenticatedGnmiPrincipal`] into every tonic request. RPC behavior is
+/// implemented by [`GnmiService`]; the listener owns transport/authentication
+/// only.
 pub async fn run_gnmi_tls_listener<C, B>(
     server: GnmiServer<C, B>,
     listener: TcpListener,
@@ -674,6 +674,58 @@ mod tests {
             .expect("get")
             .into_inner();
         assert!(get.notification.is_empty());
+
+        let (subscribe_tx, subscribe_rx) = mpsc::channel(1);
+        subscribe_tx
+            .send(gnmi::SubscribeRequest {
+                request: Some(gnmi::subscribe_request::Request::Subscribe(
+                    gnmi::SubscriptionList {
+                        prefix: None,
+                        subscription: vec![gnmi::Subscription {
+                            path: Some(gnmi::Path::default()),
+                            mode: gnmi::SubscriptionMode::Sample as i32,
+                            sample_interval: 1_000_000,
+                            suppress_redundant: false,
+                            heartbeat_interval: 0,
+                        }],
+                        qos: None,
+                        mode: gnmi::subscription_list::Mode::Once as i32,
+                        allow_aggregation: false,
+                        use_models: Vec::new(),
+                        encoding: gnmi::Encoding::JsonIetf as i32,
+                        updates_only: false,
+                    },
+                )),
+                extension: Vec::new(),
+            })
+            .await
+            .expect("send subscribe request");
+        drop(subscribe_tx);
+
+        grpc.ready().await.expect("subscribe ready");
+        let mut subscribe = grpc
+            .streaming(
+                Request::new(ReceiverStream::new(subscribe_rx)),
+                PathAndQuery::from_static("/gnmi.gNMI/Subscribe"),
+                ProstCodec::<gnmi::SubscribeRequest, gnmi::SubscribeResponse>::default(),
+            )
+            .await
+            .expect("subscribe")
+            .into_inner();
+        let sync = subscribe
+            .message()
+            .await
+            .expect("subscribe message")
+            .expect("sync response");
+        assert_eq!(
+            sync.response,
+            Some(gnmi::subscribe_response::Response::SyncResponse(true))
+        );
+        assert!(subscribe
+            .message()
+            .await
+            .expect("subscribe close")
+            .is_none());
 
         drop(grpc);
         shutdown.request_shutdown();

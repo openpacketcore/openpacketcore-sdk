@@ -8,7 +8,7 @@
 //! - CNF binding traits over `C: OpcConfig`;
 //! - capability data derived from the generated schema registry;
 //! - gNMI-shaped path normalization through `opc-mgmt-path`;
-//! - bounded JSON value normalization for future `TypedValue` adapters;
+//! - bounded JSON value normalization for `TypedValue` adapters;
 //! - fail-safe registered-extension handling;
 //! - low-cardinality gNMI metrics helpers.
 //!
@@ -16,8 +16,9 @@
 //! [`Capabilities`](proto::gnmi::g_nmi_server::GNmi::capabilities) is served from
 //! the generated schema registry, authenticated `Get` supports read-only
 //! JSON/JSON_IETF config and operational data through explicit binding hooks,
-//! while `Set` and `Subscribe` return `UNIMPLEMENTED` until those behaviors are
-//! backed by code and tests.
+//! authenticated `Set` applies generated patches through `opc-config-bus`, and
+//! authenticated `Subscribe` supports ONCE/POLL snapshots plus STREAM sample and
+//! config on-change delivery.
 
 #![forbid(unsafe_code)]
 
@@ -34,6 +35,7 @@ pub mod proto;
 pub mod proto_adapter;
 pub mod service;
 pub mod set;
+pub mod subscribe;
 pub mod transport;
 pub mod value;
 

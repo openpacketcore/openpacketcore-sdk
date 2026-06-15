@@ -12,6 +12,7 @@ use crate::{
     proto::{gnmi, gnmi_ext},
     proto_adapter::extension_from_proto,
     set::handle_set,
+    subscribe::{send_subscribe_error, serve_subscribe_stream},
     GnmiConfigBinding, GnmiError, GnmiServer,
 };
 
@@ -223,18 +224,40 @@ where
         &self,
         request: Request<tonic::Streaming<gnmi::SubscribeRequest>>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        let start = std::time::Instant::now();
         if let Err(err) = self.validate_authenticated_request(&request) {
+            record_rpc_error(GnmiOperation::Subscribe, err.status(), start.elapsed());
             return Err(status_from_error(err));
         }
-        Err(unsupported_rpc_status(GnmiOperation::Subscribe))
+        let principal = match request_principal(&request) {
+            Ok(principal) => principal.principal().clone(),
+            Err(err) => {
+                record_rpc_error(GnmiOperation::Subscribe, err.status(), start.elapsed());
+                return Err(status_from_error(err));
+            }
+        };
+        let capacity = subscribe_response_queue_capacity(self.server.limits());
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        let server = Arc::clone(&self.server);
+        tokio::spawn(async move {
+            if let Err(err) =
+                serve_subscribe_stream(server, principal, request.into_inner(), tx.clone()).await
+            {
+                send_subscribe_error(&tx, err).await;
+            }
+        });
+        record_rpc_success(GnmiOperation::Subscribe, start.elapsed());
+        Ok(Response::new(Box::pin(
+            tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
 }
 
-fn unsupported_rpc_status(operation: GnmiOperation) -> Status {
-    Status::unimplemented(format!("gNMI {} is not implemented", operation.as_str()))
+fn subscribe_response_queue_capacity(limits: &opc_mgmt_limits::MgmtLimits) -> usize {
+    (limits.max_subscriber_queue_bytes / 4096).clamp(1, 1024)
 }
 
-fn validate_extensions(
+pub(crate) fn validate_extensions(
     registry: &crate::ExtensionRegistry,
     extensions: &[gnmi_ext::Extension],
 ) -> Result<(), GnmiError> {
@@ -300,6 +323,7 @@ mod tests {
 
     use super::*;
     use crate::proto::gnmi::g_nmi_server::GNmi;
+    use crate::subscribe::{render_snapshot_responses, SubscribePlan};
     use crate::{
         CapabilityProfile, ExtensionRegistry, GnmiJsonProjectionError, GnmiJsonUpdate,
         GnmiPatchApplicator, GnmiVersion, ReadSelection, GNMI_VERSION,
@@ -814,6 +838,43 @@ mod tests {
             .build()
     }
 
+    fn allow_all_subscribe_policy() -> NacmPolicy {
+        let modules = module_registry();
+        NacmPolicy::builder(opc_nacm::PolicyVersion::new(1))
+            .add_rule(NacmRule::allow(
+                NacmAction::Subscribe,
+                YangPathPattern::parse("/sys:system", &modules).expect("root pattern"),
+            ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Subscribe,
+                YangPathPattern::parse("/sys:system/**", &modules).expect("subtree pattern"),
+            ))
+            .build()
+    }
+
+    fn allow_all_read_and_subscribe_policy() -> NacmPolicy {
+        let modules = module_registry();
+        NacmPolicy::builder(opc_nacm::PolicyVersion::new(1))
+            .add_rule(NacmRule::allow(
+                NacmAction::Read,
+                YangPathPattern::parse("/sys:system", &modules).expect("root read pattern"),
+            ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Read,
+                YangPathPattern::parse("/sys:system/**", &modules).expect("subtree read pattern"),
+            ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Subscribe,
+                YangPathPattern::parse("/sys:system", &modules).expect("root subscribe pattern"),
+            ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Subscribe,
+                YangPathPattern::parse("/sys:system/**", &modules)
+                    .expect("subtree subscribe pattern"),
+            ))
+            .build()
+    }
+
     fn deny_hostname_policy() -> NacmPolicy {
         let modules = module_registry();
         NacmPolicy::builder(opc_nacm::PolicyVersion::new(1))
@@ -981,6 +1042,29 @@ mod tests {
             .get(operation)
             .map(|hist| hist.count.load(Ordering::Relaxed))
             .unwrap_or_default()
+    }
+
+    fn subscribe_list(
+        mode: gnmi::subscription_list::Mode,
+        path: gnmi::Path,
+        subscription_mode: gnmi::SubscriptionMode,
+    ) -> gnmi::SubscriptionList {
+        gnmi::SubscriptionList {
+            prefix: None,
+            subscription: vec![gnmi::Subscription {
+                path: Some(path),
+                mode: subscription_mode as i32,
+                sample_interval: 1_000_000,
+                suppress_redundant: false,
+                heartbeat_interval: 0,
+            }],
+            qos: None,
+            mode: mode as i32,
+            allow_aggregation: false,
+            use_models: Vec::new(),
+            encoding: gnmi::Encoding::JsonIetf as i32,
+            updates_only: false,
+        }
     }
 
     #[tokio::test]
@@ -1697,7 +1781,147 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthenticated_get_and_set_are_rejected_and_subscribe_is_unimplemented() {
+    async fn subscribe_once_snapshot_uses_subscribe_nacm_and_renders_config() {
+        let service =
+            authenticated_service_with_policy(allow_all_read_and_subscribe_policy()).await;
+        let plan = SubscribePlan::from_subscription_list(
+            service.server(),
+            subscribe_list(
+                gnmi::subscription_list::Mode::Once,
+                hostname_path(),
+                gnmi::SubscriptionMode::Sample,
+            ),
+        )
+        .expect("subscribe plan");
+        let principal = authenticated_principal();
+
+        let responses = render_snapshot_responses(service.server(), principal.principal(), &plan)
+            .expect("snapshot");
+
+        assert_eq!(responses.len(), 1);
+        let notification = match responses[0].response.as_ref().expect("response") {
+            gnmi::subscribe_response::Response::Update(notification) => notification,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(notification.update.len(), 1);
+        assert_eq!(
+            notification.update[0]
+                .val
+                .as_ref()
+                .and_then(|value| value.value.as_ref()),
+            Some(&gnmi::typed_value::Value::JsonIetfVal(
+                br#""amf-1""#.to_vec()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_action_is_distinct_from_read_nacm() {
+        let service = authenticated_service_with_policy(allow_all_read_policy()).await;
+        let plan = SubscribePlan::from_subscription_list(
+            service.server(),
+            subscribe_list(
+                gnmi::subscription_list::Mode::Once,
+                hostname_path(),
+                gnmi::SubscriptionMode::Sample,
+            ),
+        )
+        .expect("subscribe plan");
+        let principal = authenticated_principal();
+
+        let responses = render_snapshot_responses(service.server(), principal.principal(), &plan)
+            .expect("snapshot");
+
+        assert!(responses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscribe_sample_can_read_operational_state() {
+        let service = authenticated_service_with_policy(allow_all_subscribe_policy()).await;
+        let plan = SubscribePlan::from_subscription_list(
+            service.server(),
+            subscribe_list(
+                gnmi::subscription_list::Mode::Stream,
+                uptime_path(),
+                gnmi::SubscriptionMode::Sample,
+            ),
+        )
+        .expect("subscribe plan");
+        let principal = authenticated_principal();
+
+        let responses = render_snapshot_responses(service.server(), principal.principal(), &plan)
+            .expect("snapshot");
+
+        assert_eq!(responses.len(), 1);
+        let notification = match responses[0].response.as_ref().expect("response") {
+            gnmi::subscribe_response::Response::Update(notification) => notification,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(
+            notification.update[0]
+                .val
+                .as_ref()
+                .and_then(|value| value.value.as_ref()),
+            Some(&gnmi::typed_value::Value::JsonIetfVal(b"123".to_vec()))
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_on_change_rejects_operational_paths_without_event_source() {
+        let service = authenticated_service_with_policy(allow_all_subscribe_policy()).await;
+        let err = SubscribePlan::from_subscription_list(
+            service.server(),
+            subscribe_list(
+                gnmi::subscription_list::Mode::Stream,
+                uptime_path(),
+                gnmi::SubscriptionMode::OnChange,
+            ),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.status().as_str(), "UNIMPLEMENTED");
+        assert_eq!(err.to_string(), "gNMI operation is not supported");
+    }
+
+    #[tokio::test]
+    async fn subscribe_plan_rejects_unsupported_shapes_without_payload_leak() {
+        let service =
+            authenticated_service_with_policy(allow_all_read_and_subscribe_policy()).await;
+
+        let target_defined = SubscribePlan::from_subscription_list(
+            service.server(),
+            subscribe_list(
+                gnmi::subscription_list::Mode::Stream,
+                hostname_path(),
+                gnmi::SubscriptionMode::TargetDefined,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(target_defined.status().as_str(), "UNIMPLEMENTED");
+
+        let mut qos = subscribe_list(
+            gnmi::subscription_list::Mode::Once,
+            hostname_path(),
+            gnmi::SubscriptionMode::Sample,
+        );
+        qos.qos = Some(gnmi::QosMarking { marking: 46 });
+        let qos_err = SubscribePlan::from_subscription_list(service.server(), qos).unwrap_err();
+        assert_eq!(qos_err.status().as_str(), "UNIMPLEMENTED");
+
+        let mut aggregation = subscribe_list(
+            gnmi::subscription_list::Mode::Once,
+            user_role_path("secret-admin"),
+            gnmi::SubscriptionMode::Sample,
+        );
+        aggregation.allow_aggregation = true;
+        let aggregation_err =
+            SubscribePlan::from_subscription_list(service.server(), aggregation).unwrap_err();
+        assert_eq!(aggregation_err.status().as_str(), "UNIMPLEMENTED");
+        assert!(!aggregation_err.to_string().contains("secret-admin"));
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_get_set_and_subscribe_are_rejected() {
         let service = service().await;
 
         let get = service
@@ -1731,10 +1955,10 @@ mod tests {
         let subscribe_stream =
             tonic::Streaming::new_empty(codec.decoder(), tonic::body::Body::empty());
         let subscribe = match service.subscribe(Request::new(subscribe_stream)).await {
-            Ok(_) => panic!("subscribe should be unimplemented"),
+            Ok(_) => panic!("subscribe should require authentication"),
             Err(status) => status,
         };
-        assert_eq!(subscribe.code(), Code::Unimplemented);
+        assert_eq!(subscribe.code(), Code::Unauthenticated);
     }
 
     #[test]
