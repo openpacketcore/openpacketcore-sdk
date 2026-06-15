@@ -84,6 +84,10 @@ pub(crate) enum RpcOperationHint {
     Commit,
     /// Base NETCONF `<discard-changes>`.
     DiscardChanges,
+    /// Base NETCONF `<copy-config>`.
+    CopyConfig,
+    /// Base NETCONF `<delete-config>`.
+    DeleteConfig,
     /// Base NETCONF `<get>`.
     Get,
     /// Base NETCONF `<get-config>`.
@@ -119,6 +123,10 @@ pub enum RpcOperation {
     Commit,
     /// `<discard-changes>`.
     DiscardChanges,
+    /// `<copy-config>`.
+    CopyConfig(CopyConfigRequest),
+    /// `<delete-config>`.
+    DeleteConfig(DeleteConfigRequest),
     /// `<kill-session>`.
     KillSession(KillSessionRequest),
     /// RFC 6022 `<get-schema>`.
@@ -165,6 +173,22 @@ pub struct UnlockRequest {
 pub struct ValidateRequest {
     /// Source datastore.
     pub source: Datastore,
+}
+
+/// RFC 6241 `<copy-config>` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyConfigRequest {
+    /// Target datastore.
+    pub target: Datastore,
+    /// Source datastore.
+    pub source: Datastore,
+}
+
+/// RFC 6241 `<delete-config>` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteConfigRequest {
+    /// Target datastore.
+    pub target: Datastore,
 }
 
 /// Known NETCONF operations that are parsed only to reject safely with the
@@ -650,6 +674,17 @@ struct PartialValidate {
     source: Option<Datastore>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PartialCopyConfig {
+    target: Option<Datastore>,
+    source: Option<Datastore>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PartialDeleteConfig {
+    target: Option<Datastore>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum GetSchemaField {
     Identifier,
@@ -674,11 +709,12 @@ struct ParserState {
     lock: Option<PartialLock>,
     unlock: Option<PartialUnlock>,
     validate: Option<PartialValidate>,
+    copy_config: Option<PartialCopyConfig>,
+    delete_config: Option<PartialDeleteConfig>,
     operation_hint: Option<RpcOperationHint>,
     close_session: bool,
     commit: bool,
     discard_changes: bool,
-    unsupported_operation: Option<UnsupportedOperation>,
     filter_depth: usize,
     filter_stack: Vec<FilterFrame>,
     edit_config_capture: Option<Writer<Vec<u8>>>,
@@ -856,7 +892,7 @@ impl ParserState {
             self.set_edit_test_option_text(text)?;
         } else if self.local_path_is(&["rpc", "edit-config", "error-option"]) {
             self.set_edit_error_option_text(text)?;
-        } else if text.trim().is_empty() || self.inside_unsupported_operation() {
+        } else if text.trim().is_empty() {
             return Ok(());
         } else {
             return Err(XmlError::Malformed);
@@ -885,10 +921,7 @@ impl ParserState {
     }
 
     fn validate_protocol_namespace(&self, element: &Element) -> Result<(), XmlError> {
-        if self.filter_depth > 0
-            || self.edit_config_capture.is_some()
-            || self.inside_unsupported_operation()
-        {
+        if self.filter_depth > 0 || self.edit_config_capture.is_some() {
             return Ok(());
         }
         if element.namespace == NETCONF_BASE_NS
@@ -956,10 +989,6 @@ impl ParserState {
         element: &Element,
         attrs: &[(String, String)],
     ) -> Result<(), XmlError> {
-        if self.inside_unsupported_operation() {
-            return Ok(());
-        }
-
         if self.local_path_is(&["rpc"]) {
             match element.local.as_str() {
                 "get" => {
@@ -1031,8 +1060,26 @@ impl ParserState {
                     }
                     self.get_schema = Some(PartialGetSchema::default());
                 }
-                "copy-config" => self.set_unsupported(UnsupportedOperation::CopyConfig)?,
-                "delete-config" => self.set_unsupported(UnsupportedOperation::DeleteConfig)?,
+                "copy-config" => {
+                    if self.has_rpc_operation() {
+                        return Err(XmlError::DuplicateElement);
+                    }
+                    self.operation_hint = Some(RpcOperationHint::CopyConfig);
+                    self.copy_config = Some(PartialCopyConfig::default());
+                    if !attrs.is_empty() {
+                        return Err(XmlError::Malformed);
+                    }
+                }
+                "delete-config" => {
+                    if self.has_rpc_operation() {
+                        return Err(XmlError::DuplicateElement);
+                    }
+                    self.operation_hint = Some(RpcOperationHint::DeleteConfig);
+                    self.delete_config = Some(PartialDeleteConfig::default());
+                    if !attrs.is_empty() {
+                        return Err(XmlError::Malformed);
+                    }
+                }
                 "kill-session" => {
                     if self.has_rpc_operation() {
                         return Err(XmlError::DuplicateElement);
@@ -1116,10 +1163,25 @@ impl ParserState {
                 "source" if element.namespace == NETCONF_BASE_NS && attrs.is_empty() => Ok(()),
                 _ => Err(XmlError::Malformed),
             }
+        } else if self.local_path_is(&["rpc", "copy-config"]) {
+            match element.local.as_str() {
+                "target" | "source" if element.namespace == NETCONF_BASE_NS && attrs.is_empty() => {
+                    Ok(())
+                }
+                _ => Err(XmlError::Malformed),
+            }
+        } else if self.local_path_is(&["rpc", "delete-config"]) {
+            match element.local.as_str() {
+                "target" if element.namespace == NETCONF_BASE_NS && attrs.is_empty() => Ok(()),
+                _ => Err(XmlError::Malformed),
+            }
         } else if self.local_path_is(&["rpc", "lock", "target"])
             || self.local_path_is(&["rpc", "unlock", "target"])
             || self.local_path_is(&["rpc", "validate", "source"])
             || self.local_path_is(&["rpc", "edit-config", "target"])
+            || self.local_path_is(&["rpc", "copy-config", "target"])
+            || self.local_path_is(&["rpc", "copy-config", "source"])
+            || self.local_path_is(&["rpc", "delete-config", "target"])
         {
             if element.namespace != NETCONF_BASE_NS || !attrs.is_empty() {
                 return Err(XmlError::Malformed);
@@ -1141,6 +1203,30 @@ impl ParserState {
                     .as_mut()
                     .ok_or(XmlError::UnsupportedOperation)?;
                 if edit_config.target.replace(datastore).is_some() {
+                    return Err(XmlError::DuplicateElement);
+                }
+            } else if self.local_path_is(&["rpc", "copy-config", "target"]) {
+                let copy_config = self
+                    .copy_config
+                    .as_mut()
+                    .ok_or(XmlError::UnsupportedOperation)?;
+                if copy_config.target.replace(datastore).is_some() {
+                    return Err(XmlError::DuplicateElement);
+                }
+            } else if self.local_path_is(&["rpc", "copy-config", "source"]) {
+                let copy_config = self
+                    .copy_config
+                    .as_mut()
+                    .ok_or(XmlError::UnsupportedOperation)?;
+                if copy_config.source.replace(datastore).is_some() {
+                    return Err(XmlError::DuplicateElement);
+                }
+            } else if self.local_path_is(&["rpc", "delete-config", "target"]) {
+                let delete_config = self
+                    .delete_config
+                    .as_mut()
+                    .ok_or(XmlError::UnsupportedOperation)?;
+                if delete_config.target.replace(datastore).is_some() {
                     return Err(XmlError::DuplicateElement);
                 }
             } else {
@@ -1180,6 +1266,15 @@ impl ParserState {
             || self.local_path_is(&["rpc", "validate", "source", "running"])
             || self.local_path_is(&["rpc", "validate", "source", "candidate"])
             || self.local_path_is(&["rpc", "validate", "source", "startup"])
+            || self.local_path_is(&["rpc", "copy-config", "target", "running"])
+            || self.local_path_is(&["rpc", "copy-config", "target", "candidate"])
+            || self.local_path_is(&["rpc", "copy-config", "target", "startup"])
+            || self.local_path_is(&["rpc", "copy-config", "source", "running"])
+            || self.local_path_is(&["rpc", "copy-config", "source", "candidate"])
+            || self.local_path_is(&["rpc", "copy-config", "source", "startup"])
+            || self.local_path_is(&["rpc", "delete-config", "target", "running"])
+            || self.local_path_is(&["rpc", "delete-config", "target", "candidate"])
+            || self.local_path_is(&["rpc", "delete-config", "target", "startup"])
             || self.local_path_is(&["rpc", "edit-config", "target", "running"])
             || self.local_path_is(&["rpc", "edit-config", "target", "candidate"])
             || self.local_path_is(&["rpc", "edit-config", "target", "startup"])
@@ -1214,10 +1309,11 @@ impl ParserState {
             || self.lock.is_some()
             || self.unlock.is_some()
             || self.validate.is_some()
+            || self.copy_config.is_some()
+            || self.delete_config.is_some()
             || self.close_session
             || self.commit
             || self.discard_changes
-            || self.unsupported_operation.is_some()
     }
 
     fn operation_hint(&self) -> Option<RpcOperationHint> {
@@ -1235,6 +1331,8 @@ impl ParserState {
             "edit-config" => self.operation_hint = Some(RpcOperationHint::EditConfig),
             "commit" => self.operation_hint = Some(RpcOperationHint::Commit),
             "discard-changes" => self.operation_hint = Some(RpcOperationHint::DiscardChanges),
+            "copy-config" => self.operation_hint = Some(RpcOperationHint::CopyConfig),
+            "delete-config" => self.operation_hint = Some(RpcOperationHint::DeleteConfig),
             "kill-session" => self.operation_hint = Some(RpcOperationHint::KillSession),
             _ => {}
         }
@@ -1483,18 +1581,6 @@ impl ParserState {
         Ok(())
     }
 
-    fn set_unsupported(&mut self, operation: UnsupportedOperation) -> Result<(), XmlError> {
-        if self.has_rpc_operation() {
-            return Err(XmlError::DuplicateElement);
-        }
-        self.unsupported_operation = Some(operation);
-        Ok(())
-    }
-
-    fn inside_unsupported_operation(&self) -> bool {
-        self.unsupported_operation.is_some() && self.stack.len() >= 2
-    }
-
     fn install_filter(&mut self, attrs: &[(String, String)]) -> Result<(), XmlError> {
         let filter = filter_kind(attrs)?;
         let parsed_filter = match filter {
@@ -1721,6 +1807,25 @@ impl ParserState {
                         operation: RpcOperation::DiscardChanges,
                     }));
                 }
+                if let Some(copy_config) = self.copy_config {
+                    return Ok(ParsedMessage::Rpc(ParsedRpc {
+                        message_id,
+                        reply_attrs,
+                        operation: RpcOperation::CopyConfig(CopyConfigRequest {
+                            target: copy_config.target.ok_or(XmlError::MissingElement)?,
+                            source: copy_config.source.ok_or(XmlError::MissingElement)?,
+                        }),
+                    }));
+                }
+                if let Some(delete_config) = self.delete_config {
+                    return Ok(ParsedMessage::Rpc(ParsedRpc {
+                        message_id,
+                        reply_attrs,
+                        operation: RpcOperation::DeleteConfig(DeleteConfigRequest {
+                            target: delete_config.target.ok_or(XmlError::MissingElement)?,
+                        }),
+                    }));
+                }
                 if let Some(lock) = self.lock {
                     return Ok(ParsedMessage::Rpc(ParsedRpc {
                         message_id,
@@ -1766,13 +1871,6 @@ impl ParserState {
                             version: get_schema.version,
                             format: get_schema.format.unwrap_or_else(|| "yang".to_string()),
                         }),
-                    }));
-                }
-                if let Some(operation) = self.unsupported_operation {
-                    return Ok(ParsedMessage::Rpc(ParsedRpc {
-                        message_id,
-                        reply_attrs,
-                        operation: RpcOperation::Unsupported(operation),
                     }));
                 }
                 Err(XmlError::UnsupportedOperation)
@@ -1887,9 +1985,6 @@ fn parse_message_with_context(
                     state
                         .capture_event(Event::CData(cdata.borrow()))
                         .map_err(|err| parse_error(&state, err))?;
-                    continue;
-                }
-                if state.inside_unsupported_operation() {
                     continue;
                 }
                 return Err(parse_error(&state, XmlError::Malformed));
@@ -2343,6 +2438,46 @@ mod tests {
         let discard = parse_rpc(&rpc("<discard-changes/>"), &MgmtLimits::default())
             .expect("parse discard-changes");
         assert_eq!(discard.operation, RpcOperation::DiscardChanges);
+    }
+
+    #[test]
+    fn parses_copy_config_and_delete_config_datastore_forms() {
+        let copy = parse_rpc(
+            &rpc(
+                "<copy-config><target><startup/></target><source><running/></source></copy-config>",
+            ),
+            &MgmtLimits::default(),
+        )
+        .expect("parse copy-config");
+        assert_eq!(
+            copy.operation,
+            RpcOperation::CopyConfig(CopyConfigRequest {
+                target: Datastore::Startup,
+                source: Datastore::Running,
+            })
+        );
+
+        let delete = parse_rpc(
+            &rpc("<delete-config><target><startup/></target></delete-config>"),
+            &MgmtLimits::default(),
+        )
+        .expect("parse delete-config");
+        assert_eq!(
+            delete.operation,
+            RpcOperation::DeleteConfig(DeleteConfigRequest {
+                target: Datastore::Startup,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_inline_copy_config_source_until_inline_config_is_supported() {
+        let err = parse_rpc(
+            &rpc("<copy-config><target><startup/></target><source><config><sys:system xmlns:sys=\"urn:opc:demo\"/></config></source></copy-config>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("inline source is unsupported");
+        assert_eq!(err, XmlError::Malformed);
     }
 
     #[test]

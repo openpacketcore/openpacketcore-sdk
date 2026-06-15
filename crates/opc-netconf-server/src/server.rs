@@ -22,7 +22,7 @@ use thiserror::Error;
 
 use crate::binding::{
     EditConfigError, GetSchemaError, GetSchemaRequest as BindingGetSchemaRequest,
-    NetconfConfigBinding,
+    NetconfConfigBinding, StartupDatastoreError,
 };
 use crate::capabilities::render_server_hello;
 use crate::error::{
@@ -34,15 +34,17 @@ use crate::operations::get::{handle_get, GetContext};
 use crate::operations::get_config::{handle_get_config, GetConfigContext};
 use crate::session_registry::{
     CandidateWriteResult, KillSessionResult, LockCandidateResult, RunningWriteResult,
-    SessionRegistry, UnlockCandidateResult,
+    SessionRegistry, StartupWriteResult, UnlockCandidateResult,
 };
-use crate::session_registry::{LockRunningResult, UnlockRunningResult};
+use crate::session_registry::{
+    LockRunningResult, LockStartupResult, UnlockRunningResult, UnlockStartupResult,
+};
 use crate::xml::{
-    parse_rpc_with_context, Datastore as XmlDatastore, EditConfigRequest as XmlEditConfigRequest,
-    EditErrorOption, EditTestOption, GetSchemaRequest as XmlGetSchemaRequest,
-    KillSessionRequest as XmlKillSessionRequest, LockRequest as XmlLockRequest, RpcOperation,
-    RpcOperationHint, RpcParseError, UnlockRequest as XmlUnlockRequest, UnsupportedOperation,
-    ValidateRequest as XmlValidateRequest,
+    parse_rpc_with_context, CopyConfigRequest as XmlCopyConfigRequest, Datastore as XmlDatastore,
+    EditConfigRequest as XmlEditConfigRequest, EditErrorOption, EditTestOption,
+    GetSchemaRequest as XmlGetSchemaRequest, KillSessionRequest as XmlKillSessionRequest,
+    LockRequest as XmlLockRequest, RpcOperation, RpcOperationHint, RpcParseError,
+    UnlockRequest as XmlUnlockRequest, UnsupportedOperation, ValidateRequest as XmlValidateRequest,
 };
 
 const NETCONF_BASE_MODEL: &[ModelData] = &[ModelData {
@@ -60,6 +62,8 @@ const NETCONF_KILL_SESSION_PATH: &str = "/nc:kill-session";
 const NETCONF_VALIDATE_PATH: &str = "/nc:validate";
 const NETCONF_COMMIT_PATH: &str = "/nc:commit";
 const NETCONF_DISCARD_CHANGES_PATH: &str = "/nc:discard-changes";
+const NETCONF_COPY_CONFIG_PATH: &str = "/nc:copy-config";
+const NETCONF_DELETE_CONFIG_PATH: &str = "/nc:delete-config";
 
 /// Server construction error.
 #[derive(Debug, Error)]
@@ -114,6 +118,41 @@ struct CandidateDatastore<C> {
 struct CandidateSnapshot<C> {
     config: C,
     base_version: ConfigVersion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatastoreFailure {
+    Unsupported,
+    Missing,
+    Failed,
+}
+
+impl DatastoreFailure {
+    const fn audit_reason(self) -> &'static str {
+        match self {
+            Self::Unsupported => "operation-not-supported",
+            Self::Missing => "data-missing",
+            Self::Failed => "operation-failed",
+        }
+    }
+
+    fn rpc_error(self) -> RpcError {
+        match self {
+            Self::Unsupported => RpcError::operation_not_supported(),
+            Self::Missing => RpcError::data_missing(),
+            Self::Failed => RpcError::operation_failed(),
+        }
+    }
+}
+
+impl From<StartupDatastoreError> for DatastoreFailure {
+    fn from(value: StartupDatastoreError) -> Self {
+        match value {
+            StartupDatastoreError::NotFound => Self::Missing,
+            StartupDatastoreError::Unsupported => Self::Unsupported,
+            StartupDatastoreError::Failed { .. } => Self::Failed,
+        }
+    }
 }
 
 impl<C: Clone> CandidateDatastore<C> {
@@ -238,6 +277,7 @@ where
         let with_defaults = self.binding.with_defaults_capability();
         let writable_running = self.binding.writable_running_capability();
         let candidate = self.binding.candidate_datastore_capability();
+        let startup = self.binding.startup_datastore_capability();
         render_server_hello(
             session_id,
             yang_library.as_ref(),
@@ -245,6 +285,7 @@ where
             with_defaults.as_ref(),
             writable_running,
             candidate,
+            startup,
         )
     }
 
@@ -386,6 +427,19 @@ where
             )),
             RpcOperation::GetConfig(request) => {
                 let candidate_config = self.candidate_config_for_get_config(request);
+                let startup_config = match self.startup_config_for_get_config(request) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        return self.startup_get_config_failure_reply(
+                            error,
+                            request_id,
+                            principal,
+                            &parsed.message_id,
+                            &parsed.reply_attrs,
+                            started,
+                        );
+                    }
+                };
                 RpcHandlingResult::keep_open(handle_get_config::<C, B, P, A>(
                     &self.binding,
                     GetConfigContext {
@@ -400,6 +454,8 @@ where
                         limits,
                         candidate_config: candidate_config.as_ref(),
                         candidate_supported: self.binding.candidate_datastore_capability(),
+                        startup_config: startup_config.as_ref(),
+                        startup_supported: self.binding.startup_datastore_capability(),
                     },
                     request,
                 ))
@@ -453,6 +509,22 @@ where
             ),
             RpcOperation::DiscardChanges => self.handle_unsupported_operation(
                 UnsupportedOperation::DiscardChanges,
+                request_id,
+                principal,
+                &parsed.message_id,
+                &parsed.reply_attrs,
+                started,
+            ),
+            RpcOperation::CopyConfig(_) => self.handle_unsupported_operation(
+                UnsupportedOperation::CopyConfig,
+                request_id,
+                principal,
+                &parsed.message_id,
+                &parsed.reply_attrs,
+                started,
+            ),
+            RpcOperation::DeleteConfig(_) => self.handle_unsupported_operation(
+                UnsupportedOperation::DeleteConfig,
                 request_id,
                 principal,
                 &parsed.message_id,
@@ -574,6 +646,19 @@ where
             )),
             RpcOperation::GetConfig(request) => {
                 let candidate_config = self.candidate_config_for_get_config(request);
+                let startup_config = match self.startup_config_for_get_config(request) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        return self.startup_get_config_failure_reply(
+                            error,
+                            request_id,
+                            principal,
+                            &parsed.message_id,
+                            &parsed.reply_attrs,
+                            started,
+                        );
+                    }
+                };
                 RpcHandlingResult::keep_open(handle_get_config::<C, B, P, A>(
                     &self.binding,
                     GetConfigContext {
@@ -588,6 +673,8 @@ where
                         limits,
                         candidate_config: candidate_config.as_ref(),
                         candidate_supported: self.binding.candidate_datastore_capability(),
+                        startup_config: startup_config.as_ref(),
+                        startup_supported: self.binding.startup_datastore_capability(),
                     },
                     request,
                 ))
@@ -645,6 +732,31 @@ where
                 .await
             }
             RpcOperation::DiscardChanges => self.handle_discard_changes(
+                RpcExecContext {
+                    request_id,
+                    principal,
+                    message_id: &parsed.message_id,
+                    reply_attrs: &parsed.reply_attrs,
+                    started,
+                },
+                session_context,
+            ),
+            RpcOperation::CopyConfig(request) => {
+                self.handle_copy_config(
+                    request,
+                    RpcExecContext {
+                        request_id,
+                        principal,
+                        message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
+                        started,
+                    },
+                    session_context,
+                )
+                .await
+            }
+            RpcOperation::DeleteConfig(request) => self.handle_delete_config(
+                request,
                 RpcExecContext {
                     request_id,
                     principal,
@@ -750,6 +862,74 @@ where
         let candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
         let candidate = candidate.snapshot_or(running.config.as_ref(), running.version);
         (candidate.base_version == running.version).then_some(candidate.config)
+    }
+
+    fn startup_config_for_get_config(
+        &self,
+        request: &crate::xml::GetConfigRequest,
+    ) -> Result<Option<C>, StartupDatastoreError> {
+        if request.source != XmlDatastore::Startup || !self.binding.startup_datastore_capability() {
+            return Ok(None);
+        }
+        let startup = self
+            .binding
+            .startup_datastore()
+            .ok_or(StartupDatastoreError::Unsupported)?;
+        startup.load_startup_config()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn startup_get_config_failure_reply(
+        &self,
+        error: StartupDatastoreError,
+        request_id: RequestId,
+        principal: &TrustedPrincipal,
+        message_id: &str,
+        reply_attrs: &RpcReplyAttributes,
+        started: Instant,
+    ) -> RpcHandlingResult {
+        let (reason, rpc_error) = match error {
+            StartupDatastoreError::NotFound => ("data-missing", RpcError::data_missing()),
+            StartupDatastoreError::Unsupported => (
+                "operation-not-supported",
+                RpcError::operation_not_supported(),
+            ),
+            StartupDatastoreError::Failed { .. } => {
+                ("operation-failed", RpcError::operation_failed())
+            }
+        };
+        if self
+            .audit
+            .record(&AuditEvent::new(
+                request_id,
+                principal,
+                self.transport,
+                AuditOperation::Read,
+                audit_failed(reason),
+            ))
+            .is_err()
+        {
+            record_rpc_error(
+                NetconfOperation::GetConfig,
+                NetconfErrorTag::OperationFailed,
+                started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(message_id),
+                reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
+        record_rpc_error(
+            NetconfOperation::GetConfig,
+            rpc_error.classification.tag,
+            started.elapsed(),
+        );
+        RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+            Some(message_id),
+            reply_attrs,
+            rpc_error,
+        ))
     }
 
     fn handle_close_session(
@@ -1164,6 +1344,8 @@ where
         if request.target != XmlDatastore::Running
             && !(request.target == XmlDatastore::Candidate
                 && self.binding.candidate_datastore_capability())
+            && !(request.target == XmlDatastore::Startup
+                && self.binding.startup_datastore_capability())
         {
             if self
                 .audit
@@ -1389,6 +1571,77 @@ where
             };
         }
 
+        if request.target == XmlDatastore::Startup {
+            return match sessions.lock_startup_after(current_session_id, || {
+                self.audit
+                    .record(
+                        &AuditEvent::new(
+                            request_id,
+                            principal,
+                            self.transport,
+                            AuditOperation::Exec,
+                            AuditOutcome::Success,
+                        )
+                        .with_paths([lock_path.clone()]),
+                    )
+                    .map_err(|_| ())
+            }) {
+                Ok(LockStartupResult::Acquired) => {
+                    record_rpc_success(NetconfOperation::Lock, started.elapsed());
+                    RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
+                        message_id,
+                        reply_attrs,
+                    ))
+                }
+                Ok(LockStartupResult::Denied { owner_session_id }) => self.lock_denied_reply(
+                    &RpcExecContext {
+                        request_id,
+                        principal,
+                        message_id,
+                        reply_attrs,
+                        started,
+                    },
+                    NETCONF_LOCK_PATH,
+                    owner_session_id,
+                    NetconfOperation::Lock,
+                ),
+                Ok(LockStartupResult::SessionNotRegistered) => {
+                    let _ = self.audit.record(
+                        &AuditEvent::new(
+                            request_id,
+                            principal,
+                            self.transport,
+                            AuditOperation::Exec,
+                            audit_failed("operation-failed"),
+                        )
+                        .with_paths([lock_path]),
+                    );
+                    record_rpc_error(
+                        NetconfOperation::Lock,
+                        NetconfErrorTag::OperationFailed,
+                        started.elapsed(),
+                    );
+                    RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(message_id),
+                        reply_attrs,
+                        RpcError::operation_failed(),
+                    ))
+                }
+                Err(()) => {
+                    record_rpc_error(
+                        NetconfOperation::Lock,
+                        NetconfErrorTag::OperationFailed,
+                        started.elapsed(),
+                    );
+                    RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(message_id),
+                        reply_attrs,
+                        RpcError::operation_failed(),
+                    ))
+                }
+            };
+        }
+
         match sessions.lock_running_after(current_session_id, || {
             self.audit
                 .record(
@@ -1473,6 +1726,8 @@ where
         if request.target != XmlDatastore::Running
             && !(request.target == XmlDatastore::Candidate
                 && self.binding.candidate_datastore_capability())
+            && !(request.target == XmlDatastore::Startup
+                && self.binding.startup_datastore_capability())
         {
             if self
                 .audit
@@ -1664,6 +1919,92 @@ where
                 Ok(
                     UnlockCandidateResult::NotLocked | UnlockCandidateResult::SessionNotRegistered,
                 ) => {
+                    if self
+                        .audit
+                        .record(
+                            &AuditEvent::new(
+                                request_id,
+                                principal,
+                                self.transport,
+                                AuditOperation::Exec,
+                                audit_failed("operation-failed"),
+                            )
+                            .with_paths([unlock_path]),
+                        )
+                        .is_err()
+                    {
+                        record_rpc_error(
+                            NetconfOperation::Unlock,
+                            NetconfErrorTag::OperationFailed,
+                            started.elapsed(),
+                        );
+                        return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                            Some(message_id),
+                            reply_attrs,
+                            RpcError::operation_failed(),
+                        ));
+                    }
+                    record_rpc_error(
+                        NetconfOperation::Unlock,
+                        NetconfErrorTag::OperationFailed,
+                        started.elapsed(),
+                    );
+                    RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(message_id),
+                        reply_attrs,
+                        RpcError::operation_failed(),
+                    ))
+                }
+                Err(()) => {
+                    record_rpc_error(
+                        NetconfOperation::Unlock,
+                        NetconfErrorTag::OperationFailed,
+                        started.elapsed(),
+                    );
+                    RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(message_id),
+                        reply_attrs,
+                        RpcError::operation_failed(),
+                    ))
+                }
+            };
+        }
+
+        if request.target == XmlDatastore::Startup {
+            return match sessions.unlock_startup_after(current_session_id, || {
+                self.audit
+                    .record(
+                        &AuditEvent::new(
+                            request_id,
+                            principal,
+                            self.transport,
+                            AuditOperation::Exec,
+                            AuditOutcome::Success,
+                        )
+                        .with_paths([unlock_path.clone()]),
+                    )
+                    .map_err(|_| ())
+            }) {
+                Ok(UnlockStartupResult::Unlocked) => {
+                    record_rpc_success(NetconfOperation::Unlock, started.elapsed());
+                    RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
+                        message_id,
+                        reply_attrs,
+                    ))
+                }
+                Ok(UnlockStartupResult::NotOwner { owner_session_id }) => self.lock_denied_reply(
+                    &RpcExecContext {
+                        request_id,
+                        principal,
+                        message_id,
+                        reply_attrs,
+                        started,
+                    },
+                    NETCONF_UNLOCK_PATH,
+                    owner_session_id,
+                    NetconfOperation::Unlock,
+                ),
+                Ok(UnlockStartupResult::NotLocked | UnlockStartupResult::SessionNotRegistered) => {
                     if self
                         .audit
                         .record(
@@ -2097,6 +2438,478 @@ where
         )
     }
 
+    async fn handle_copy_config(
+        &self,
+        request: &XmlCopyConfigRequest,
+        context: RpcExecContext<'_>,
+        session_context: Option<(u64, &SessionRegistry)>,
+    ) -> RpcHandlingResult {
+        if !self.datastore_available(request.source) || !self.datastore_available(request.target) {
+            return self.copy_config_failure_reply(&context, DatastoreFailure::Unsupported);
+        }
+
+        match self.authorize_exec(context.principal, NETCONF_COPY_CONFIG_PATH) {
+            Ok(true) => {}
+            Ok(false) => {
+                return self.copy_config_failure_reply_for_rpc(
+                    &context,
+                    audit_denied("access-denied"),
+                    RpcError::access_denied(),
+                );
+            }
+            Err(()) => {
+                return self.copy_config_failure_reply_for_rpc(
+                    &context,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        }
+
+        let Some((current_session_id, sessions)) = session_context else {
+            return self.copy_config_failure_reply(&context, DatastoreFailure::Unsupported);
+        };
+
+        let source = match self.load_datastore_config(request.source) {
+            Ok(config) => config,
+            Err(failure) => return self.copy_config_failure_reply(&context, failure),
+        };
+
+        match request.target {
+            XmlDatastore::Running => {
+                self.copy_config_to_running(source, &context, current_session_id, sessions)
+                    .await
+            }
+            XmlDatastore::Candidate => {
+                self.copy_config_to_candidate(source, &context, current_session_id, sessions)
+            }
+            XmlDatastore::Startup => {
+                self.copy_config_to_startup(source, &context, current_session_id, sessions)
+            }
+        }
+    }
+
+    fn handle_delete_config(
+        &self,
+        request: &crate::xml::DeleteConfigRequest,
+        context: RpcExecContext<'_>,
+        session_context: Option<(u64, &SessionRegistry)>,
+    ) -> RpcHandlingResult {
+        if request.target != XmlDatastore::Startup || !self.binding.startup_datastore_capability() {
+            return self.delete_config_failure_reply(&context, DatastoreFailure::Unsupported);
+        }
+
+        let Some(startup) = self.binding.startup_datastore() else {
+            return self.delete_config_failure_reply(&context, DatastoreFailure::Unsupported);
+        };
+        if !startup.delete_startup_supported() {
+            return self.delete_config_failure_reply(&context, DatastoreFailure::Unsupported);
+        }
+
+        match self.authorize_exec(context.principal, NETCONF_DELETE_CONFIG_PATH) {
+            Ok(true) => {}
+            Ok(false) => {
+                return self.delete_config_failure_reply_for_rpc(
+                    &context,
+                    audit_denied("access-denied"),
+                    RpcError::access_denied(),
+                );
+            }
+            Err(()) => {
+                return self.delete_config_failure_reply_for_rpc(
+                    &context,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        }
+
+        let Some((current_session_id, sessions)) = session_context else {
+            return self.delete_config_failure_reply(&context, DatastoreFailure::Unsupported);
+        };
+
+        let _startup_guard = match sessions.begin_startup_write(current_session_id) {
+            StartupWriteResult::Acquired(guard) => guard,
+            StartupWriteResult::Denied { owner_session_id } => {
+                return self.lock_denied_reply(
+                    &context,
+                    NETCONF_DELETE_CONFIG_PATH,
+                    owner_session_id,
+                    NetconfOperation::DeleteConfig,
+                );
+            }
+            StartupWriteResult::SessionNotRegistered => {
+                return self.delete_config_failure_reply(&context, DatastoreFailure::Failed);
+            }
+        };
+
+        match startup.delete_startup_config() {
+            Ok(()) => self.delete_config_success_reply(&context),
+            Err(error) => self.delete_config_failure_reply(&context, error.into()),
+        }
+    }
+
+    fn datastore_available(&self, datastore: XmlDatastore) -> bool {
+        match datastore {
+            XmlDatastore::Running => true,
+            XmlDatastore::Candidate => self.binding.candidate_datastore_capability(),
+            XmlDatastore::Startup => self.binding.startup_datastore_capability(),
+        }
+    }
+
+    fn load_datastore_config(&self, datastore: XmlDatastore) -> Result<C, DatastoreFailure> {
+        match datastore {
+            XmlDatastore::Running => Ok(self
+                .binding
+                .config_bus()
+                .current_snapshot()
+                .config
+                .as_ref()
+                .clone()),
+            XmlDatastore::Candidate => {
+                if !self.binding.candidate_datastore_capability() {
+                    return Err(DatastoreFailure::Unsupported);
+                }
+                let running = self.binding.config_bus().current_snapshot();
+                let candidate = self
+                    .candidate
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .snapshot_or(running.config.as_ref(), running.version);
+                if candidate.base_version != running.version {
+                    return Err(DatastoreFailure::Failed);
+                }
+                Ok(candidate.config)
+            }
+            XmlDatastore::Startup => {
+                if !self.binding.startup_datastore_capability() {
+                    return Err(DatastoreFailure::Unsupported);
+                }
+                let startup = self
+                    .binding
+                    .startup_datastore()
+                    .ok_or(DatastoreFailure::Unsupported)?;
+                match startup.load_startup_config() {
+                    Ok(Some(config)) => Ok(config),
+                    Ok(None) => Err(DatastoreFailure::Missing),
+                    Err(error) => Err(error.into()),
+                }
+            }
+        }
+    }
+
+    async fn copy_config_to_running(
+        &self,
+        source: C,
+        context: &RpcExecContext<'_>,
+        current_session_id: u64,
+        sessions: &SessionRegistry,
+    ) -> RpcHandlingResult {
+        let _running_guard = match sessions.begin_running_write(current_session_id) {
+            RunningWriteResult::Acquired(guard) => guard,
+            RunningWriteResult::Denied { owner_session_id } => {
+                return self.lock_denied_reply(
+                    context,
+                    NETCONF_COPY_CONFIG_PATH,
+                    owner_session_id,
+                    NetconfOperation::CopyConfig,
+                );
+            }
+            RunningWriteResult::SessionNotRegistered => {
+                return self.copy_config_failure_reply(context, DatastoreFailure::Failed);
+            }
+        };
+        let bus = self.binding.config_bus();
+        let snapshot = bus.current_snapshot();
+        let request = CommitRequest::commit(
+            context.request_id,
+            context.principal.clone(),
+            self.transport,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            source,
+            Vec::new(),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .with_base_version(snapshot.version);
+
+        match bus.submit(request).await {
+            Ok(result) => {
+                let paths = self.schema_paths_for_changed_paths(
+                    &result.changed_paths,
+                    NETCONF_COPY_CONFIG_PATH,
+                );
+                self.copy_config_success_reply(context, paths)
+            }
+            Err(error) => {
+                let classification = commit_error_to_netconf(error.code);
+                self.copy_config_failure_reply_for_rpc(
+                    context,
+                    audit_failed(error.code.as_str()),
+                    rpc_error_for_netconf(classification),
+                )
+            }
+        }
+    }
+
+    fn copy_config_to_candidate(
+        &self,
+        source: C,
+        context: &RpcExecContext<'_>,
+        current_session_id: u64,
+        sessions: &SessionRegistry,
+    ) -> RpcHandlingResult {
+        let _candidate_guard = match sessions.begin_candidate_write(current_session_id) {
+            CandidateWriteResult::Acquired(guard) => guard,
+            CandidateWriteResult::Denied { owner_session_id } => {
+                return self.lock_denied_reply(
+                    context,
+                    NETCONF_COPY_CONFIG_PATH,
+                    owner_session_id,
+                    NetconfOperation::CopyConfig,
+                );
+            }
+            CandidateWriteResult::SessionNotRegistered => {
+                return self.copy_config_failure_reply(context, DatastoreFailure::Failed);
+            }
+        };
+        let running = self.binding.config_bus().current_snapshot();
+        self.candidate
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .replace(source, running.version);
+        self.copy_config_success_reply(context, vec![schema_node_path(NETCONF_COPY_CONFIG_PATH)])
+    }
+
+    fn copy_config_to_startup(
+        &self,
+        source: C,
+        context: &RpcExecContext<'_>,
+        current_session_id: u64,
+        sessions: &SessionRegistry,
+    ) -> RpcHandlingResult {
+        let _startup_guard = match sessions.begin_startup_write(current_session_id) {
+            StartupWriteResult::Acquired(guard) => guard,
+            StartupWriteResult::Denied { owner_session_id } => {
+                return self.lock_denied_reply(
+                    context,
+                    NETCONF_COPY_CONFIG_PATH,
+                    owner_session_id,
+                    NetconfOperation::CopyConfig,
+                );
+            }
+            StartupWriteResult::SessionNotRegistered => {
+                return self.copy_config_failure_reply(context, DatastoreFailure::Failed);
+            }
+        };
+        let Some(startup) = self.binding.startup_datastore() else {
+            return self.copy_config_failure_reply(context, DatastoreFailure::Unsupported);
+        };
+        let previous = match startup.load_startup_config() {
+            Ok(Some(config)) => Some(Arc::new(config)),
+            Ok(None) | Err(StartupDatastoreError::NotFound) => None,
+            Err(StartupDatastoreError::Unsupported) => {
+                return self.copy_config_failure_reply(context, DatastoreFailure::Unsupported);
+            }
+            Err(StartupDatastoreError::Failed { .. }) => {
+                return self.copy_config_failure_reply(context, DatastoreFailure::Failed);
+            }
+        };
+        if self
+            .validate_config_for_datastore(&source, context, ConfigOperation::Replace, previous)
+            .is_err()
+        {
+            return self.copy_config_failure_reply(context, DatastoreFailure::Failed);
+        }
+        match startup.store_startup_config(&source) {
+            Ok(()) => self.copy_config_success_reply(
+                context,
+                vec![schema_node_path(NETCONF_COPY_CONFIG_PATH)],
+            ),
+            Err(error) => self.copy_config_failure_reply(context, error.into()),
+        }
+    }
+
+    fn copy_config_success_reply(
+        &self,
+        context: &RpcExecContext<'_>,
+        paths: Vec<SchemaNodePath>,
+    ) -> RpcHandlingResult {
+        if self
+            .audit
+            .record(
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Replace,
+                    AuditOutcome::Success,
+                )
+                .with_paths(paths),
+            )
+            .is_err()
+        {
+            record_rpc_error(
+                NetconfOperation::CopyConfig,
+                NetconfErrorTag::OperationFailed,
+                context.started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
+        record_rpc_success(NetconfOperation::CopyConfig, context.started.elapsed());
+        RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
+            context.message_id,
+            context.reply_attrs,
+        ))
+    }
+
+    fn copy_config_failure_reply(
+        &self,
+        context: &RpcExecContext<'_>,
+        failure: DatastoreFailure,
+    ) -> RpcHandlingResult {
+        self.copy_config_failure_reply_for_rpc(
+            context,
+            audit_failed(failure.audit_reason()),
+            failure.rpc_error(),
+        )
+    }
+
+    fn copy_config_failure_reply_for_rpc(
+        &self,
+        context: &RpcExecContext<'_>,
+        outcome: AuditOutcome,
+        rpc_error: RpcError,
+    ) -> RpcHandlingResult {
+        if self
+            .audit
+            .record(
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Replace,
+                    outcome,
+                )
+                .with_paths([schema_node_path(NETCONF_COPY_CONFIG_PATH)]),
+            )
+            .is_err()
+        {
+            record_rpc_error(
+                NetconfOperation::CopyConfig,
+                NetconfErrorTag::OperationFailed,
+                context.started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
+        record_rpc_error(
+            NetconfOperation::CopyConfig,
+            rpc_error.classification.tag,
+            context.started.elapsed(),
+        );
+        RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+            Some(context.message_id),
+            context.reply_attrs,
+            rpc_error,
+        ))
+    }
+
+    fn delete_config_success_reply(&self, context: &RpcExecContext<'_>) -> RpcHandlingResult {
+        if self
+            .audit
+            .record(
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Delete,
+                    AuditOutcome::Success,
+                )
+                .with_paths([schema_node_path(NETCONF_DELETE_CONFIG_PATH)]),
+            )
+            .is_err()
+        {
+            record_rpc_error(
+                NetconfOperation::DeleteConfig,
+                NetconfErrorTag::OperationFailed,
+                context.started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
+        record_rpc_success(NetconfOperation::DeleteConfig, context.started.elapsed());
+        RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
+            context.message_id,
+            context.reply_attrs,
+        ))
+    }
+
+    fn delete_config_failure_reply(
+        &self,
+        context: &RpcExecContext<'_>,
+        failure: DatastoreFailure,
+    ) -> RpcHandlingResult {
+        self.delete_config_failure_reply_for_rpc(
+            context,
+            audit_failed(failure.audit_reason()),
+            failure.rpc_error(),
+        )
+    }
+
+    fn delete_config_failure_reply_for_rpc(
+        &self,
+        context: &RpcExecContext<'_>,
+        outcome: AuditOutcome,
+        rpc_error: RpcError,
+    ) -> RpcHandlingResult {
+        if self
+            .audit
+            .record(
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Delete,
+                    outcome,
+                )
+                .with_paths([schema_node_path(NETCONF_DELETE_CONFIG_PATH)]),
+            )
+            .is_err()
+        {
+            record_rpc_error(
+                NetconfOperation::DeleteConfig,
+                NetconfErrorTag::OperationFailed,
+                context.started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
+        record_rpc_error(
+            NetconfOperation::DeleteConfig,
+            rpc_error.classification.tag,
+            context.started.elapsed(),
+        );
+        RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+            Some(context.message_id),
+            context.reply_attrs,
+            rpc_error,
+        ))
+    }
+
     fn exec_success_reply(
         &self,
         context: &RpcExecContext<'_>,
@@ -2189,7 +3002,7 @@ where
         let target_supported = match request.target {
             XmlDatastore::Running => self.binding.writable_running_capability(),
             XmlDatastore::Candidate => self.binding.candidate_datastore_capability(),
-            XmlDatastore::Startup => false,
+            XmlDatastore::Startup => self.binding.startup_datastore_capability(),
         };
         if !target_supported {
             return self.edit_config_failure_reply(
@@ -2238,6 +3051,15 @@ where
 
         if request.target == XmlDatastore::Candidate {
             return self.handle_candidate_edit_config(
+                request,
+                &context,
+                current_session_id,
+                sessions,
+            );
+        }
+
+        if request.target == XmlDatastore::Startup {
+            return self.handle_startup_edit_config(
                 request,
                 &context,
                 current_session_id,
@@ -2536,6 +3358,177 @@ where
         ))
     }
 
+    fn handle_startup_edit_config(
+        &self,
+        request: &XmlEditConfigRequest,
+        context: &RpcExecContext<'_>,
+        current_session_id: u64,
+        sessions: &SessionRegistry,
+    ) -> RpcHandlingResult {
+        let _write_guard = match sessions.begin_startup_write(current_session_id) {
+            StartupWriteResult::Acquired(guard) => guard,
+            StartupWriteResult::Denied { owner_session_id } => {
+                return self.edit_config_lock_denied_reply(context, owner_session_id);
+            }
+            StartupWriteResult::SessionNotRegistered => {
+                return self.edit_config_failure_reply(
+                    context,
+                    audit_failed("operation-failed"),
+                    RpcError::operation_failed(),
+                );
+            }
+        };
+
+        let Some(startup) = self.binding.startup_datastore() else {
+            return self.edit_config_failure_reply(
+                context,
+                audit_failed("operation-not-supported"),
+                RpcError::operation_not_supported(),
+            );
+        };
+        let base = match startup.load_startup_config() {
+            Ok(Some(config)) => config,
+            Ok(None) | Err(StartupDatastoreError::NotFound) => {
+                return self.edit_config_failure_reply(
+                    context,
+                    audit_failed("data-missing"),
+                    RpcError::data_missing(),
+                );
+            }
+            Err(StartupDatastoreError::Unsupported) => {
+                return self.edit_config_failure_reply(
+                    context,
+                    audit_failed("operation-not-supported"),
+                    RpcError::operation_not_supported(),
+                );
+            }
+            Err(StartupDatastoreError::Failed { .. }) => {
+                return self.edit_config_failure_reply(
+                    context,
+                    audit_failed("operation-failed"),
+                    RpcError::operation_failed(),
+                );
+            }
+        };
+        let candidate = match self.binding.build_edit_config_candidate(&base, request) {
+            Ok(candidate) => candidate,
+            Err(EditConfigError::Unsupported) => {
+                return self.edit_config_failure_reply(
+                    context,
+                    audit_failed("operation-not-supported"),
+                    RpcError::operation_not_supported(),
+                );
+            }
+            Err(EditConfigError::InvalidValue) => {
+                return self.edit_config_failure_reply(
+                    context,
+                    audit_failed("invalid-value"),
+                    RpcError::invalid_value(),
+                );
+            }
+            Err(EditConfigError::Failed { .. }) => {
+                return self.edit_config_failure_reply(
+                    context,
+                    audit_failed("operation-failed"),
+                    RpcError::operation_failed(),
+                );
+            }
+        };
+        let previous = Some(Arc::new(base));
+        if self
+            .validate_config_for_datastore(
+                &candidate.candidate,
+                context,
+                ConfigOperation::Patch,
+                previous,
+            )
+            .is_err()
+        {
+            return self.edit_config_failure_reply(
+                context,
+                audit_failed("operation-failed"),
+                RpcError::operation_failed(),
+            );
+        }
+        match startup.store_startup_config(&candidate.candidate) {
+            Ok(()) => {}
+            Err(StartupDatastoreError::Unsupported) => {
+                return self.edit_config_failure_reply(
+                    context,
+                    audit_failed("operation-not-supported"),
+                    RpcError::operation_not_supported(),
+                );
+            }
+            Err(StartupDatastoreError::NotFound | StartupDatastoreError::Failed { .. }) => {
+                return self.edit_config_failure_reply(
+                    context,
+                    audit_failed("operation-failed"),
+                    RpcError::operation_failed(),
+                );
+            }
+        }
+
+        let paths =
+            self.schema_paths_for_changed_paths(&candidate.changed_paths, NETCONF_EDIT_CONFIG_PATH);
+        if self
+            .audit
+            .record(
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Update,
+                    AuditOutcome::Success,
+                )
+                .with_paths(paths),
+            )
+            .is_err()
+        {
+            record_rpc_error(
+                NetconfOperation::EditConfig,
+                NetconfErrorTag::OperationFailed,
+                context.started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
+        record_rpc_success(NetconfOperation::EditConfig, context.started.elapsed());
+        RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
+            context.message_id,
+            context.reply_attrs,
+        ))
+    }
+
+    fn validate_config_for_datastore(
+        &self,
+        config: &C,
+        context: &RpcExecContext<'_>,
+        operation: ConfigOperation,
+        previous: Option<Arc<C>>,
+    ) -> Result<(), ()> {
+        let running = self.binding.config_bus().current_snapshot();
+        let validation_context = ValidationContext {
+            request_id: context.request_id,
+            principal: context.principal.clone(),
+            transport: self.transport,
+            source: RequestSource::Northbound,
+            operation,
+            mode: CommitMode::ValidateOnly,
+            base_version: running.version,
+            previous,
+        };
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            config.validate_syntax().map_err(|_| ())?;
+            config
+                .validate_semantics(&validation_context)
+                .map_err(|_| ())
+        }))
+        .map_err(|_| ())?
+    }
+
     fn schema_paths_for_changed_paths(
         &self,
         changed_paths: &[opc_config_model::YangPath],
@@ -2572,7 +3565,7 @@ where
         let source_supported = match request.source {
             XmlDatastore::Running => true,
             XmlDatastore::Candidate => self.binding.candidate_datastore_capability(),
-            XmlDatastore::Startup => false,
+            XmlDatastore::Startup => self.binding.startup_datastore_capability(),
         };
         if !source_supported {
             if self
@@ -2691,18 +3684,52 @@ where
         }
 
         let snapshot = self.binding.config_bus().current_snapshot();
-        let config = if request.source == XmlDatastore::Candidate {
-            let candidate = self
-                .candidate
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .snapshot_or(snapshot.config.as_ref(), snapshot.version);
-            if candidate.base_version != snapshot.version {
-                return self.validate_failed_reply(context, validate_path, "operation-failed");
+        let config = match request.source {
+            XmlDatastore::Candidate => {
+                let candidate = self
+                    .candidate
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .snapshot_or(snapshot.config.as_ref(), snapshot.version);
+                if candidate.base_version != snapshot.version {
+                    return self.validate_failed_reply(context, validate_path, "operation-failed");
+                }
+                Arc::new(candidate.config)
             }
-            Arc::new(candidate.config)
-        } else {
-            Arc::clone(&snapshot.config)
+            XmlDatastore::Startup => {
+                let Some(startup) = self.binding.startup_datastore() else {
+                    return self.validate_failed_reply(
+                        context,
+                        validate_path,
+                        "operation-not-supported",
+                    );
+                };
+                match startup.load_startup_config() {
+                    Ok(Some(config)) => Arc::new(config),
+                    Ok(None) | Err(StartupDatastoreError::NotFound) => {
+                        return self.validate_failed_reply(context, validate_path, "data-missing");
+                    }
+                    Err(StartupDatastoreError::Unsupported) => {
+                        return self.validate_failed_reply(
+                            context,
+                            validate_path,
+                            "operation-not-supported",
+                        );
+                    }
+                    Err(StartupDatastoreError::Failed { .. }) => {
+                        return self.validate_failed_reply(
+                            context,
+                            validate_path,
+                            "operation-failed",
+                        );
+                    }
+                }
+            }
+            XmlDatastore::Running => Arc::clone(&snapshot.config),
+        };
+        let previous = match request.source {
+            XmlDatastore::Startup => None,
+            XmlDatastore::Running | XmlDatastore::Candidate => Some(Arc::clone(&snapshot.config)),
         };
         let validation_context = ValidationContext {
             request_id: context.request_id,
@@ -2712,7 +3739,7 @@ where
             operation: ConfigOperation::Replace,
             mode: CommitMode::ValidateOnly,
             base_version: snapshot.version,
-            previous: Some(Arc::clone(&snapshot.config)),
+            previous,
         };
         let validation = panic::catch_unwind(AssertUnwindSafe(|| {
             config
@@ -2768,6 +3795,13 @@ where
         validate_path: SchemaNodePath,
         reason: &'static str,
     ) -> RpcHandlingResult {
+        let rpc_error = match reason {
+            "data-missing" => RpcError::data_missing(),
+            "operation-not-supported" => RpcError::operation_not_supported(),
+            "access-denied" => RpcError::access_denied(),
+            "resource-denied" => RpcError::resource_denied(),
+            _ => RpcError::operation_failed(),
+        };
         if self
             .audit
             .record(
@@ -2795,13 +3829,13 @@ where
         }
         record_rpc_error(
             NetconfOperation::Validate,
-            NetconfErrorTag::OperationFailed,
+            rpc_error.classification.tag,
             context.started.elapsed(),
         );
         RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
             Some(context.message_id),
             context.reply_attrs,
-            RpcError::operation_failed(),
+            rpc_error,
         ))
     }
 
@@ -3122,6 +4156,12 @@ where
             Some(RpcOperationHint::DiscardChanges) => {
                 event.with_paths([schema_node_path(NETCONF_DISCARD_CHANGES_PATH)])
             }
+            Some(RpcOperationHint::CopyConfig) => {
+                event.with_paths([schema_node_path(NETCONF_COPY_CONFIG_PATH)])
+            }
+            Some(RpcOperationHint::DeleteConfig) => {
+                event.with_paths([schema_node_path(NETCONF_DELETE_CONFIG_PATH)])
+            }
             Some(RpcOperationHint::Lock) => event.with_paths([schema_node_path(NETCONF_LOCK_PATH)]),
             Some(RpcOperationHint::Unlock) => {
                 event.with_paths([schema_node_path(NETCONF_UNLOCK_PATH)])
@@ -3142,6 +4182,8 @@ fn audit_operation_for_parse_failure(err: &RpcParseError) -> AuditOperation {
     match err.operation_hint {
         Some(RpcOperationHint::EditConfig) => AuditOperation::Update,
         Some(RpcOperationHint::Commit | RpcOperationHint::DiscardChanges) => AuditOperation::Exec,
+        Some(RpcOperationHint::CopyConfig) => AuditOperation::Replace,
+        Some(RpcOperationHint::DeleteConfig) => AuditOperation::Delete,
         Some(RpcOperationHint::Lock | RpcOperationHint::Unlock) => AuditOperation::Exec,
         Some(RpcOperationHint::KillSession) => AuditOperation::Exec,
         Some(RpcOperationHint::Validate) => AuditOperation::Validate,
@@ -3154,6 +4196,8 @@ fn netconf_operation_for_parse_failure(err: &RpcParseError) -> NetconfOperation 
         Some(RpcOperationHint::EditConfig) => NetconfOperation::EditConfig,
         Some(RpcOperationHint::Commit) => NetconfOperation::Commit,
         Some(RpcOperationHint::DiscardChanges) => NetconfOperation::DiscardChanges,
+        Some(RpcOperationHint::CopyConfig) => NetconfOperation::CopyConfig,
+        Some(RpcOperationHint::DeleteConfig) => NetconfOperation::DeleteConfig,
         Some(RpcOperationHint::Get) => NetconfOperation::Get,
         Some(RpcOperationHint::GetConfig) => NetconfOperation::GetConfig,
         Some(RpcOperationHint::Lock) => NetconfOperation::Lock,
@@ -3267,11 +4311,12 @@ mod tests {
     use super::*;
     use crate::binding::{
         BindingError, EditConfigCandidate, EditConfigError, NetconfMonitoringCapability,
-        ReadSelection, WithDefaultsCapability, YangLibraryCapability,
+        ReadSelection, StartupDatastore, StartupDatastoreError, WithDefaultsCapability,
+        YangLibraryCapability,
     };
     use crate::capabilities::{
         CANDIDATE_1_0, NETCONF_BASE_1_0, NETCONF_BASE_1_1, NETCONF_BASE_NS, NETCONF_MONITORING_NS,
-        WITH_DEFAULTS_NS, WRITABLE_RUNNING_1_0,
+        STARTUP_1_0, WITH_DEFAULTS_NS, WRITABLE_RUNNING_1_0,
     };
     use crate::framing::base10;
     use crate::listener::{run_read_only_tls_listener, TlsListenerConfig};
@@ -3525,6 +4570,25 @@ mod tests {
 
     struct ValidationBinding {
         bus: Arc<ConfigBus<ValidationConfig>>,
+        startup: Option<Arc<ValidationStartupDatastore>>,
+    }
+
+    struct ValidationStartupDatastore {
+        config: Mutex<Option<ValidationConfig>>,
+    }
+
+    impl StartupDatastore<ValidationConfig> for ValidationStartupDatastore {
+        fn load_startup_config(&self) -> Result<Option<ValidationConfig>, StartupDatastoreError> {
+            Ok(self.config.lock().expect("startup mutex").clone())
+        }
+
+        fn store_startup_config(
+            &self,
+            config: &ValidationConfig,
+        ) -> Result<(), StartupDatastoreError> {
+            *self.config.lock().expect("startup mutex") = Some(config.clone());
+            Ok(())
+        }
     }
 
     impl NetconfConfigBinding<ValidationConfig> for ValidationBinding {
@@ -3534,6 +4598,12 @@ mod tests {
 
         fn schema_registry(&self) -> &'static dyn SchemaRegistry {
             &REGISTRY
+        }
+
+        fn startup_datastore(&self) -> Option<&dyn StartupDatastore<ValidationConfig>> {
+            self.startup
+                .as_deref()
+                .map(|startup| startup as &dyn StartupDatastore<ValidationConfig>)
         }
 
         fn render_running_config(
@@ -4533,6 +5603,22 @@ mod tests {
         )
     }
 
+    fn allow_copy_config_rule(modules: &ModuleRegistry) -> NacmRule {
+        NacmRule::allow(
+            NacmAction::Exec,
+            YangPathPattern::parse(NETCONF_COPY_CONFIG_PATH, modules)
+                .expect("allow copy-config path"),
+        )
+    }
+
+    fn allow_delete_config_rule(modules: &ModuleRegistry) -> NacmRule {
+        NacmRule::allow(
+            NacmAction::Exec,
+            YangPathPattern::parse(NETCONF_DELETE_CONFIG_PATH, modules)
+                .expect("allow delete-config path"),
+        )
+    }
+
     fn policy_allow_system_but_deny_secret() -> NacmPolicy {
         let mut modules = ModuleRegistry::new();
         modules
@@ -4554,6 +5640,8 @@ mod tests {
             .add_rule(allow_validate_rule(&modules))
             .add_rule(allow_commit_rule(&modules))
             .add_rule(allow_discard_changes_rule(&modules))
+            .add_rule(allow_copy_config_rule(&modules))
+            .add_rule(allow_delete_config_rule(&modules))
             .add_rule(allow_edit_config_rule(&modules))
             .add_rule(allow_kill_session_rule(&modules))
             .build()
@@ -4687,7 +5775,7 @@ mod tests {
                 .await
                 .expect("bus"),
         );
-        let binding = ValidationBinding { bus };
+        let binding = ValidationBinding { bus, startup: None };
         let audit = CapturingAudit::default();
         let server = ReadOnlyNetconfServer::new(
             binding,
@@ -8600,9 +9688,53 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct MemoryStartupDatastore {
+        config: Mutex<Option<DemoConfig>>,
+        delete_supported: bool,
+    }
+
+    impl MemoryStartupDatastore {
+        fn new(config: Option<DemoConfig>, delete_supported: bool) -> Self {
+            Self {
+                config: Mutex::new(config),
+                delete_supported,
+            }
+        }
+
+        fn current(&self) -> Option<DemoConfig> {
+            self.config.lock().expect("startup mutex").clone()
+        }
+    }
+
+    impl StartupDatastore<DemoConfig> for MemoryStartupDatastore {
+        fn load_startup_config(&self) -> Result<Option<DemoConfig>, StartupDatastoreError> {
+            Ok(self.current())
+        }
+
+        fn store_startup_config(&self, config: &DemoConfig) -> Result<(), StartupDatastoreError> {
+            *self.config.lock().expect("startup mutex") = Some(config.clone());
+            Ok(())
+        }
+
+        fn delete_startup_supported(&self) -> bool {
+            self.delete_supported
+        }
+
+        fn delete_startup_config(&self) -> Result<(), StartupDatastoreError> {
+            let mut guard = self.config.lock().expect("startup mutex");
+            if guard.take().is_some() {
+                Ok(())
+            } else {
+                Err(StartupDatastoreError::NotFound)
+            }
+        }
+    }
+
     /// A binding that opts into the generated edit applicator default hook.
     struct GeneratedEditBinding {
         bus: Arc<ConfigBus<DemoConfig>>,
+        startup: Option<Arc<MemoryStartupDatastore>>,
     }
 
     impl NetconfConfigBinding<DemoConfig> for GeneratedEditBinding {
@@ -8626,6 +9758,12 @@ mod tests {
 
         fn candidate_datastore_capability(&self) -> bool {
             true
+        }
+
+        fn startup_datastore(&self) -> Option<&dyn StartupDatastore<DemoConfig>> {
+            self.startup
+                .as_deref()
+                .map(|startup| startup as &dyn StartupDatastore<DemoConfig>)
         }
 
         fn render_running_config(
@@ -8733,6 +9871,18 @@ mod tests {
         format!(r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="3"><discard-changes/></rpc>"#)
     }
 
+    fn copy_config_rpc(target: &str, source: &str) -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="4"><copy-config><target><{target}/></target><source><{source}/></source></copy-config></rpc>"#
+        )
+    }
+
+    fn delete_config_rpc(target: &str) -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="5"><delete-config><target><{target}/></target></delete-config></rpc>"#
+        )
+    }
+
     async fn generated_edit_server_fixture() -> (
         ReadOnlyNetconfServer<DemoConfig, GeneratedEditBinding, FixedPolicy, CapturingAudit>,
         Arc<ConfigBus<DemoConfig>>,
@@ -8751,6 +9901,7 @@ mod tests {
         );
         let binding = GeneratedEditBinding {
             bus: Arc::clone(&bus),
+            startup: None,
         };
         let audit = CapturingAudit::default();
         let server = ReadOnlyNetconfServer::new(
@@ -8761,6 +9912,45 @@ mod tests {
         )
         .expect("server");
         (server, bus, audit)
+    }
+
+    async fn generated_edit_server_with_startup_fixture() -> (
+        ReadOnlyNetconfServer<DemoConfig, GeneratedEditBinding, FixedPolicy, CapturingAudit>,
+        Arc<ConfigBus<DemoConfig>>,
+        Arc<MemoryStartupDatastore>,
+        CapturingAudit,
+    ) {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let startup = Arc::new(MemoryStartupDatastore::new(
+            Some(DemoConfig {
+                hostname: "boot-1".to_string(),
+                secret: "startup-secret".to_string(),
+            }),
+            true,
+        ));
+        let binding = GeneratedEditBinding {
+            bus: Arc::clone(&bus),
+            startup: Some(Arc::clone(&startup)),
+        };
+        let audit = CapturingAudit::default();
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            audit.clone(),
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+        (server, bus, startup, audit)
     }
 
     #[tokio::test]
@@ -8802,6 +9992,303 @@ mod tests {
             .collect();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].outcome, AuditOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn startup_capability_is_advertised_only_when_facade_is_present() {
+        let (server, _bus, _audit) = generated_edit_server_fixture().await;
+        assert!(!server.server_hello(None).contains(STARTUP_1_0));
+
+        let (server, _bus, _startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        assert!(server.server_hello(None).contains(STARTUP_1_0));
+    }
+
+    #[tokio::test]
+    async fn get_config_startup_reads_startup_without_leaking_secrets() {
+        let (server, _bus, _startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let reply = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &get_config_rpc("startup"),
+            &MgmtLimits::default(),
+            1,
+            &registry,
+        );
+
+        assert!(
+            reply
+                .reply_xml
+                .contains("<sys:hostname>boot-1</sys:hostname>"),
+            "startup reply: {}",
+            reply.reply_xml
+        );
+        assert!(!reply.reply_xml.contains("startup-secret"));
+    }
+
+    #[tokio::test]
+    async fn edit_config_startup_mutates_only_startup() {
+        let (server, bus, startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_config_rpc_to(
+            "startup",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>boot-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let edited = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(edited.reply_xml.contains("<ok/>"), "{}", edited.reply_xml);
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+        assert_eq!(
+            startup.current().expect("startup config").hostname,
+            "boot-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_config_running_to_startup_and_startup_to_running() {
+        let (server, bus, startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let copied_to_startup = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &copy_config_rpc("startup", "running"),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            copied_to_startup.reply_xml.contains("<ok/>"),
+            "{}",
+            copied_to_startup.reply_xml
+        );
+        assert_eq!(startup.current().expect("startup config").hostname, "amf-1");
+
+        startup
+            .store_startup_config(&DemoConfig {
+                hostname: "boot-3".to_string(),
+                secret: "startup-secret".to_string(),
+            })
+            .expect("store startup");
+
+        let copied_to_running = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &copy_config_rpc("running", "startup"),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            copied_to_running.reply_xml.contains("<ok/>"),
+            "{}",
+            copied_to_running.reply_xml
+        );
+        assert_eq!(bus.current_snapshot().config.hostname, "boot-3");
+    }
+
+    #[tokio::test]
+    async fn delete_config_startup_removes_startup_only_when_delete_supported() {
+        let (server, bus, startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let deleted = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &delete_config_rpc("startup"),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(deleted.reply_xml.contains("<ok/>"), "{}", deleted.reply_xml);
+        assert!(startup.current().is_none());
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+
+        let missing = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &get_config_rpc("startup"),
+            &MgmtLimits::default(),
+            1,
+            &registry,
+        );
+        assert!(
+            missing
+                .reply_xml
+                .contains("<error-tag>data-missing</error-tag>"),
+            "missing startup reply: {}",
+            missing.reply_xml
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_startup_uses_startup_snapshot() {
+        let (server, _bus, _startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let validated = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &validate_rpc("startup"),
+            &MgmtLimits::default(),
+            1,
+            &registry,
+        );
+
+        assert!(
+            validated.reply_xml.contains("<ok/>"),
+            "validate startup reply: {}",
+            validated.reply_xml
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_startup_does_not_use_running_as_previous_config() {
+        let running = ValidationConfig::new();
+        let startup = ValidationConfig::new();
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(running.clone(), MockManagedDatastore::new())
+                .await
+                .expect("bus"),
+        );
+        let binding = ValidationBinding {
+            bus,
+            startup: Some(Arc::new(ValidationStartupDatastore {
+                config: Mutex::new(Some(startup.clone())),
+            })),
+        };
+        let audit = CapturingAudit::default();
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            audit,
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &validate_rpc("startup"),
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains("<ok/>"), "{reply}");
+        assert!(
+            !startup.saw_previous(),
+            "startup validation must not receive running as ctx.previous"
+        );
+        assert!(
+            !running.saw_previous(),
+            "running config should not be validated for startup source"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_operations_fail_closed_without_facade() {
+        let (server, _bus, _audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let copy = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &copy_config_rpc("startup", "running"),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            copy.reply_xml
+                .contains("<error-tag>operation-not-supported</error-tag>"),
+            "copy reply: {}",
+            copy.reply_xml
+        );
+
+        let delete = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &delete_config_rpc("startup"),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            delete
+                .reply_xml
+                .contains("<error-tag>operation-not-supported</error-tag>"),
+            "delete reply: {}",
+            delete.reply_xml
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_lock_denies_other_session_startup_writes() {
+        let (server, _bus, startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        let registry = SessionRegistry::new();
+        let _owner = registry.register(1).expect("register owner");
+        let _other = registry.register(2).expect("register other");
+
+        let locked = server.handle_rpc_for_session(
+            RequestId::new(),
+            &principal(),
+            &lock_rpc("startup"),
+            &MgmtLimits::default(),
+            1,
+            &registry,
+        );
+        assert!(locked.reply_xml.contains("<ok/>"), "{}", locked.reply_xml);
+        assert_eq!(registry.startup_lock_owner_for_test(), Some(1));
+
+        let denied = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &copy_config_rpc("startup", "running"),
+                &MgmtLimits::default(),
+                2,
+                &registry,
+            )
+            .await;
+        assert!(
+            denied
+                .reply_xml
+                .contains("<error-tag>lock-denied</error-tag>"),
+            "denied reply: {}",
+            denied.reply_xml
+        );
+        assert!(denied.reply_xml.contains("<session-id>1</session-id>"));
+        assert_eq!(
+            startup.current().expect("startup config").hostname,
+            "boot-1"
+        );
     }
 
     #[tokio::test]

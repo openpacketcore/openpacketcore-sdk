@@ -47,6 +47,10 @@ where
     pub candidate_config: Option<&'a C>,
     /// Whether this binding explicitly advertised RFC 6241 `:candidate`.
     pub candidate_supported: bool,
+    /// Snapshot loaded from the binding-owned startup datastore.
+    pub startup_config: Option<&'a C>,
+    /// Whether this binding explicitly advertised RFC 6241 `:startup`.
+    pub startup_supported: bool,
 }
 
 /// Handles a parsed `<get-config>` request.
@@ -90,8 +94,36 @@ where
         return error_reply(&ctx, RpcError::operation_failed());
     }
 
+    if request.source == Datastore::Startup && ctx.startup_supported && ctx.startup_config.is_none()
+    {
+        if audit_failure(
+            ctx.audit,
+            ctx.request_id,
+            ctx.principal,
+            ctx.transport,
+            "data-missing",
+            Vec::new(),
+        )
+        .is_err()
+        {
+            record_rpc_error(
+                NetconfOperation::GetConfig,
+                NetconfErrorTag::OperationFailed,
+                ctx.started.elapsed(),
+            );
+            return error_reply(&ctx, RpcError::operation_failed());
+        }
+        record_rpc_error(
+            NetconfOperation::GetConfig,
+            NetconfErrorTag::DataMissing,
+            ctx.started.elapsed(),
+        );
+        return error_reply(&ctx, RpcError::data_missing());
+    }
+
     if request.source != Datastore::Running
         && !(request.source == Datastore::Candidate && ctx.candidate_supported)
+        && !(request.source == Datastore::Startup && ctx.startup_supported)
     {
         if audit_failure(
             ctx.audit,
@@ -332,14 +364,18 @@ where
 
     let snapshot =
         (request.source == Datastore::Running).then(|| binding.config_bus().current_snapshot());
-    let config = if let Some(candidate) = ctx.candidate_config {
-        candidate
-    } else {
-        snapshot
+    let config = match request.source {
+        Datastore::Running => snapshot
             .as_ref()
             .expect("running get-config snapshot is present")
             .config
-            .as_ref()
+            .as_ref(),
+        Datastore::Candidate => ctx
+            .candidate_config
+            .expect("candidate support checked before rendering"),
+        Datastore::Startup => ctx
+            .startup_config
+            .expect("startup support checked before rendering"),
     };
     let selection = ReadSelection::new(&allowed_paths);
     let rendered = match with_defaults_mode {
