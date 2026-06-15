@@ -1,0 +1,1 @@
+<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="402"><commit><confirmed/><confirm-timeout>30</confirm-timeout></commit></rpc>

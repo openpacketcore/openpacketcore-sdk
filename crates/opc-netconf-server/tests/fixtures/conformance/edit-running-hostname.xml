@@ -1,0 +1,1 @@
+<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="201"><edit-config><target><running/></target><default-operation>merge</default-operation><config><sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-running</sys:hostname></sys:system></config></edit-config></rpc>
