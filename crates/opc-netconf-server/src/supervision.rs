@@ -17,6 +17,7 @@ use tokio::sync::watch;
 use crate::binding::NetconfConfigBinding;
 use crate::listener::{run_read_only_tls_listener_shared, TlsListenerConfig};
 use crate::server::ReadOnlyNetconfServer;
+use crate::ssh::{run_read_only_ssh_listener_shared, SshListenerConfig};
 
 /// Supervisor metadata and protocol bounds for a NETCONF-over-TLS listener task.
 #[derive(Debug, Clone)]
@@ -40,6 +41,75 @@ impl Default for SupervisedTlsListenerConfig {
             listener: TlsListenerConfig::default(),
         }
     }
+}
+
+/// Supervisor metadata and protocol bounds for a NETCONF-over-SSH listener task.
+#[derive(Debug, Clone)]
+pub struct SupervisedSshListenerConfig {
+    /// Supervisor task name.
+    pub task_name: TaskName,
+    /// Runtime health impact if the listener fails.
+    pub criticality: Criticality,
+    /// Restart policy used by `opc-runtime`.
+    pub restart: RestartPolicy,
+    /// NETCONF-over-SSH listener/session configuration.
+    pub listener: SshListenerConfig,
+}
+
+/// Spawns the NETCONF-over-SSH listener under `opc-runtime`.
+///
+/// Host keys, authorized client keys, tenancy, SSH authentication policy, and
+/// NETCONF session bounds are all supplied by the caller through
+/// [`SshListenerConfig`]. The listener is registered as [`TaskKind::Listener`]
+/// and uses the same fail-closed NETCONF session, NACM, audit, metrics, and
+/// drain paths as [`crate::run_read_only_ssh_listener`].
+pub async fn spawn_read_only_ssh_listener<C, B, P, A>(
+    supervisor: &Supervisor,
+    server: Arc<ReadOnlyNetconfServer<C, B, P, A>>,
+    listener: TcpListener,
+    shutdown: ShutdownToken,
+    config: SupervisedSshListenerConfig,
+) -> Result<TaskHandle, RuntimeError>
+where
+    C: OpcConfig,
+    B: NetconfConfigBinding<C> + 'static,
+    P: PolicySource + 'static,
+    A: AuditSink + 'static,
+{
+    let listener = Arc::new(listener);
+    let task_name = config.task_name.clone();
+    let failure_label = task_name.to_string();
+    let listener_config = config.listener;
+
+    supervisor
+        .spawn(
+            task_name,
+            TaskKind::Listener,
+            config.criticality,
+            config.restart,
+            move || {
+                let server = Arc::clone(&server);
+                let listener = Arc::clone(&listener);
+                let shutdown = shutdown.clone();
+                let listener_config = listener_config.clone();
+                let failure_label = failure_label.clone();
+                Box::pin(async move {
+                    run_read_only_ssh_listener_shared(server, listener, shutdown, listener_config)
+                        .await
+                        .map(|result| {
+                            tracing::debug!(
+                                accepted_sessions = result.accepted_sessions,
+                                completed_sessions = result.completed_sessions,
+                                failed_sessions = result.failed_sessions,
+                                rejected_sessions = result.rejected_sessions,
+                                "supervised NETCONF SSH listener stopped"
+                            );
+                        })
+                        .map_err(|err| TaskError::Failed(failure_label, Arc::new(err)))
+                })
+            },
+        )
+        .await
 }
 
 /// Spawns the read-only NETCONF-over-TLS listener under `opc-runtime`.

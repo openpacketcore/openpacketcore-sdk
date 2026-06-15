@@ -17,14 +17,17 @@ The current slice is capability-gated and capability-honest:
   stream.
 - NETCONF-over-TLS TCP listener accept loop over `opc-mgmt-transport` TLS
   bootstrap, with shutdown-aware accept stop and `max_sessions` enforcement.
-- Optional `opc-runtime::Supervisor` task wrapper for the TLS listener.
+- Optional `opc-runtime::Supervisor` task wrappers for the TLS and SSH
+  listeners.
 - NETCONF-over-TLS principal extraction from verified rustls peer
   certificates, mapped through `opc-mgmt-principal` with no transport-derived
   grants.
-- NETCONF-over-SSH authenticated-channel session helpers. These require a
-  server constructed with `TransportType::NetconfSsh` and a
-  `TrustedPrincipal` stamped `AuthStrength::SshPublicKey`, so a future SSH
-  handshake layer cannot accidentally audit TLS/local principals as SSH.
+- NETCONF-over-SSH TCP listener with caller-provisioned host keys, exact
+  authorized public keys, public-key authentication only, `subsystem "netconf"`
+  admission, `max_sessions` enforcement, shutdown drain, and shared
+  registry-aware NETCONF session execution. Verified SSH usernames are mapped
+  through `opc-mgmt-principal` into grant-free `TrustedPrincipal` values stamped
+  `AuthStrength::SshPublicKey`.
 - Bounded XML parsing for client `<hello>` and RPC envelopes, including
   fail-closed rejection of missing, empty, or duplicate client hello capability
   containers, plus `MgmtLimits::max_paths_per_request` enforcement after subtree
@@ -131,12 +134,12 @@ out-of-range `<session-id>`. Custom transports that advertise a server
 `run_read_only_ssh_session_with_registry` for audited cross-session
 `<kill-session>` and datastore lock/write semantics.
 
-It still does not implement a NETCONF-over-SSH listener, SSH host-key
-generation/rotation, SSH client-key or certificate verification, Call Home,
-notification replay or notification filters, NMDA `<get-data>` / `<edit-data>`,
-a full RFC XPath instance evaluator or advertised `:xpath`, URL and
-inline-config copy/validate forms, `:rollback-on-error`, or external interop
-against `netopeer2-cli`, `ncclient`, or a target NMS. CNFs may use generated
-NETCONF XML projection/edit support for supported shapes, but unsupported YANG
-shapes remain fail-closed and model-specific bindings still own any
-projection/edit behavior outside the generated support matrix.
+It still does not implement SSH host-key generation/storage/rotation, SSH
+certificate CA authorization, password authentication, Call Home, notification
+replay or notification filters, NMDA `<get-data>` / `<edit-data>`, a full RFC
+XPath instance evaluator or advertised `:xpath`, URL and inline-config
+copy/validate forms, `:rollback-on-error`, or external interop against
+`netopeer2-cli`, `ncclient`, or a target NMS. CNFs may use generated NETCONF XML
+projection/edit support for supported shapes, but unsupported YANG shapes remain
+fail-closed and model-specific bindings still own any projection/edit behavior
+outside the generated support matrix.

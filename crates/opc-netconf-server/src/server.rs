@@ -5147,6 +5147,9 @@ mod tests {
     use opc_tls::{PeerPolicy, TlsConfigBuilder};
     use opc_types::{ConfigVersion, SchemaDigest, TenantId, Timestamp};
     use rcgen::{CertificateParams, DnType, KeyPair, SanType};
+    use russh::client;
+    use russh::keys::{PrivateKey as SshPrivateKey, PrivateKeyWithHashAlg};
+    use russh::{ChannelId, Disconnect};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::watch;
@@ -5167,7 +5170,11 @@ mod tests {
     use crate::framing::base10;
     use crate::listener::{run_read_only_tls_listener, TlsListenerConfig};
     use crate::session::SessionConfig;
-    use crate::supervision::{spawn_read_only_tls_listener, SupervisedTlsListenerConfig};
+    use crate::ssh::{run_read_only_ssh_listener, SshListenerConfig, SshListenerError};
+    use crate::supervision::{
+        spawn_read_only_ssh_listener, spawn_read_only_tls_listener, SupervisedSshListenerConfig,
+        SupervisedTlsListenerConfig,
+    };
     use crate::xml::WithDefaultsMode;
 
     #[derive(Clone)]
@@ -6389,6 +6396,71 @@ mod tests {
                 return base10::decode_message(&frame, &MgmtLimits::default()).expect("decode");
             }
         }
+    }
+
+    #[derive(Clone)]
+    struct TestSshClient {
+        channel_failed: Arc<AtomicBool>,
+    }
+
+    impl TestSshClient {
+        fn new() -> (Self, Arc<AtomicBool>) {
+            let channel_failed = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    channel_failed: Arc::clone(&channel_failed),
+                },
+                channel_failed,
+            )
+        }
+    }
+
+    impl client::Handler for TestSshClient {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &russh::keys::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn channel_failure(
+            &mut self,
+            _channel: ChannelId,
+            _session: &mut client::Session,
+        ) -> Result<(), Self::Error> {
+            self.channel_failed.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    fn ssh_private_key() -> SshPrivateKey {
+        SshPrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+            .expect("SSH private key")
+    }
+
+    fn ssh_signing_key(key: SshPrivateKey) -> PrivateKeyWithHashAlg {
+        PrivateKeyWithHashAlg::new(Arc::new(key), None)
+    }
+
+    fn ssh_listener_test_config(
+        host_key: SshPrivateKey,
+        user_key: &SshPrivateKey,
+    ) -> SshListenerConfig {
+        let mut config = SshListenerConfig::new(
+            TenantId::from_static("tenant-a"),
+            vec![host_key],
+            vec![user_key.public_key().clone()],
+        );
+        config.session = SessionConfig {
+            limits: MgmtLimits::default(),
+            frame_timeout: Duration::from_secs(5),
+        };
+        config.drain_timeout = Duration::from_secs(5);
+        config.auth_rejection_time = Duration::from_millis(1);
+        config.auth_rejection_time_initial = Some(Duration::from_millis(1));
+        config
     }
 
     fn register_netconf_module(modules: &mut ModuleRegistry) {
@@ -8438,6 +8510,344 @@ mod tests {
         let state = health
             .task_states
             .get("netconf-tls-supervised-test")
+            .expect("task state after shutdown");
+        assert!(!state.running);
+        assert!(!health.degraded);
+        assert!(!health.fatal_failure);
+    }
+
+    #[tokio::test]
+    async fn ssh_listener_validates_transport_keys_and_session_bounds() {
+        let host_key = ssh_private_key();
+        let user_key = ssh_private_key();
+
+        let (tls_server, _observed, _audit) = server_fixture().await;
+        let wrong_transport = run_read_only_ssh_listener(
+            Arc::new(tls_server),
+            TcpListener::bind("127.0.0.1:0").await.expect("bind"),
+            ShutdownToken::new(),
+            ssh_listener_test_config(host_key.clone(), &user_key),
+        )
+        .await;
+        assert!(matches!(
+            wrong_transport,
+            Err(SshListenerError::WrongServerTransport {
+                actual: TransportType::NetconfTls
+            })
+        ));
+
+        let (ssh_server, _observed, _audit) = server_fixture_with_operational_mode_and_transport(
+            OperationalMode::Normal,
+            TransportType::NetconfSsh,
+        )
+        .await;
+        let ssh_server = Arc::new(ssh_server);
+
+        let mut missing_host = ssh_listener_test_config(host_key.clone(), &user_key);
+        missing_host.host_keys.clear();
+        let result = run_read_only_ssh_listener(
+            Arc::clone(&ssh_server),
+            TcpListener::bind("127.0.0.1:0").await.expect("bind"),
+            ShutdownToken::new(),
+            missing_host,
+        )
+        .await;
+        assert!(matches!(result, Err(SshListenerError::MissingHostKey)));
+
+        let mut missing_authorized_key = ssh_listener_test_config(host_key.clone(), &user_key);
+        missing_authorized_key.authorized_keys.clear();
+        let result = run_read_only_ssh_listener(
+            Arc::clone(&ssh_server),
+            TcpListener::bind("127.0.0.1:0").await.expect("bind"),
+            ShutdownToken::new(),
+            missing_authorized_key,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(SshListenerError::MissingAuthorizedKey)
+        ));
+
+        let mut invalid_auth_attempt_limit = ssh_listener_test_config(host_key.clone(), &user_key);
+        invalid_auth_attempt_limit.max_auth_attempts = 0;
+        let result = run_read_only_ssh_listener(
+            Arc::clone(&ssh_server),
+            TcpListener::bind("127.0.0.1:0").await.expect("bind"),
+            ShutdownToken::new(),
+            invalid_auth_attempt_limit,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(SshListenerError::InvalidAuthAttemptLimit)
+        ));
+
+        let mut invalid_session_id = ssh_listener_test_config(host_key, &user_key);
+        invalid_session_id.first_session_id = 0;
+        let result = run_read_only_ssh_listener(
+            ssh_server,
+            TcpListener::bind("127.0.0.1:0").await.expect("bind"),
+            ShutdownToken::new(),
+            invalid_session_id,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(SshListenerError::InvalidFirstSessionId)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ssh_listener_serves_hello_and_get_config_over_real_public_key_auth() {
+        let (server, _observed, audit) = server_fixture_with_operational_mode_and_transport(
+            OperationalMode::Normal,
+            TransportType::NetconfSsh,
+        )
+        .await;
+        let host_key = ssh_private_key();
+        let user_key = ssh_private_key();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = ShutdownToken::new();
+        let limits = MgmtLimits::default();
+        let listener_config = ssh_listener_test_config(host_key, &user_key);
+        let listener_task = tokio::spawn(run_read_only_ssh_listener(
+            Arc::new(server),
+            listener,
+            shutdown.clone(),
+            listener_config,
+        ));
+
+        let (client_handler, _channel_failed) = TestSshClient::new();
+        let mut session =
+            client::connect(Arc::new(client::Config::default()), addr, client_handler)
+                .await
+                .expect("SSH connect");
+        let auth = session
+            .authenticate_publickey("operator", ssh_signing_key(user_key))
+            .await
+            .expect("SSH public-key auth");
+        assert!(auth.success());
+        let channel = session.channel_open_session().await.expect("open session");
+        channel
+            .request_subsystem(true, "netconf")
+            .await
+            .expect("request netconf subsystem");
+        let mut stream = channel.into_stream();
+
+        let server_hello =
+            String::from_utf8(read_base10_frame(&mut stream).await).expect("hello utf8");
+        assert!(server_hello.contains(NETCONF_BASE_1_0));
+
+        let client_hello = format!(
+            r#"<hello xmlns="{NETCONF_BASE_NS}"><capabilities><capability>{NETCONF_BASE_1_0}</capability></capabilities></hello>"#
+        );
+        stream
+            .write_all(
+                &base10::encode_message(client_hello.as_bytes(), &limits).expect("hello frame"),
+            )
+            .await
+            .expect("write client hello");
+
+        stream
+            .write_all(
+                &base10::encode_message(get_config_rpc("running").as_bytes(), &limits)
+                    .expect("rpc frame"),
+            )
+            .await
+            .expect("write rpc");
+        let reply = String::from_utf8(read_base10_frame(&mut stream).await).expect("reply utf8");
+        assert!(reply.contains("<sys:hostname>amf-1</sys:hostname>"));
+        assert!(!reply.contains("do-not-leak"));
+
+        stream
+            .write_all(
+                &base10::encode_message(close_session_rpc().as_bytes(), &limits).expect("close"),
+            )
+            .await
+            .expect("write close-session");
+        let reply = String::from_utf8(read_base10_frame(&mut stream).await).expect("close utf8");
+        assert!(reply.contains("<ok/>"), "{reply}");
+        drop(stream);
+        let _ = session
+            .disconnect(Disconnect::ByApplication, "test complete", "en")
+            .await;
+
+        shutdown.request_shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(5), listener_task)
+            .await
+            .expect("listener timeout")
+            .expect("listener join")
+            .expect("listener result");
+
+        assert_eq!(result.accepted_sessions, 1);
+        assert_eq!(result.completed_sessions, 1);
+        assert_eq!(result.failed_sessions, 0);
+        assert_eq!(result.rejected_sessions, 0);
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert!(events.iter().any(|event| {
+            event.outcome == AuditOutcome::Success && event.transport == TransportType::NetconfSsh
+        }));
+    }
+
+    #[tokio::test]
+    async fn ssh_listener_rejects_unprovisioned_public_key() {
+        let (server, _observed, audit) = server_fixture_with_operational_mode_and_transport(
+            OperationalMode::Normal,
+            TransportType::NetconfSsh,
+        )
+        .await;
+        let host_key = ssh_private_key();
+        let allowed_user_key = ssh_private_key();
+        let denied_user_key = ssh_private_key();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = ShutdownToken::new();
+        let listener_task = tokio::spawn(run_read_only_ssh_listener(
+            Arc::new(server),
+            listener,
+            shutdown.clone(),
+            ssh_listener_test_config(host_key, &allowed_user_key),
+        ));
+
+        let (client_handler, _channel_failed) = TestSshClient::new();
+        let mut session =
+            client::connect(Arc::new(client::Config::default()), addr, client_handler)
+                .await
+                .expect("SSH connect");
+        let auth = session
+            .authenticate_publickey("operator", ssh_signing_key(denied_user_key))
+            .await
+            .expect("SSH public-key auth rejection");
+        assert!(!auth.success());
+        let _ = session
+            .disconnect(Disconnect::ByApplication, "test complete", "en")
+            .await;
+
+        shutdown.request_shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(5), listener_task)
+            .await
+            .expect("listener timeout")
+            .expect("listener join")
+            .expect("listener result");
+
+        assert_eq!(result.accepted_sessions, 1);
+        assert_eq!(result.completed_sessions, 0);
+        assert_eq!(result.failed_sessions, 1);
+        assert_eq!(result.rejected_sessions, 0);
+        assert!(audit.events.lock().expect("audit mutex").is_empty());
+    }
+
+    #[tokio::test]
+    async fn ssh_listener_rejects_non_netconf_subsystem() {
+        let (server, _observed, audit) = server_fixture_with_operational_mode_and_transport(
+            OperationalMode::Normal,
+            TransportType::NetconfSsh,
+        )
+        .await;
+        let host_key = ssh_private_key();
+        let user_key = ssh_private_key();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = ShutdownToken::new();
+        let listener_task = tokio::spawn(run_read_only_ssh_listener(
+            Arc::new(server),
+            listener,
+            shutdown.clone(),
+            ssh_listener_test_config(host_key, &user_key),
+        ));
+
+        let (client_handler, channel_failed) = TestSshClient::new();
+        let mut session =
+            client::connect(Arc::new(client::Config::default()), addr, client_handler)
+                .await
+                .expect("SSH connect");
+        let auth = session
+            .authenticate_publickey("operator", ssh_signing_key(user_key))
+            .await
+            .expect("SSH public-key auth");
+        assert!(auth.success());
+        let channel = session.channel_open_session().await.expect("open session");
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .expect("request unsupported subsystem");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !channel_failed.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("subsystem failure notification");
+
+        let _ = session
+            .disconnect(Disconnect::ByApplication, "test complete", "en")
+            .await;
+        shutdown.request_shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(5), listener_task)
+            .await
+            .expect("listener timeout")
+            .expect("listener join")
+            .expect("listener result");
+
+        assert_eq!(result.accepted_sessions, 1);
+        assert_eq!(result.completed_sessions, 0);
+        assert_eq!(result.failed_sessions, 1);
+        assert_eq!(result.rejected_sessions, 0);
+        assert!(audit.events.lock().expect("audit mutex").is_empty());
+    }
+
+    #[tokio::test]
+    async fn supervised_ssh_listener_registers_as_runtime_listener_and_drains() {
+        let (server, _observed, _audit) = server_fixture_with_operational_mode_and_transport(
+            OperationalMode::Normal,
+            TransportType::NetconfSsh,
+        )
+        .await;
+        let host_key = ssh_private_key();
+        let user_key = ssh_private_key();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let shutdown = ShutdownToken::new();
+        let supervisor = Supervisor::new(RuntimeProfile::dev("amf"), shutdown.clone());
+        let task_name = TaskName::new("netconf-ssh-supervised-test");
+
+        let handle = spawn_read_only_ssh_listener(
+            &supervisor,
+            Arc::new(server),
+            listener,
+            shutdown,
+            SupervisedSshListenerConfig {
+                task_name: task_name.clone(),
+                criticality: Criticality::Degrade,
+                restart: RestartPolicy::no_restart(),
+                listener: ssh_listener_test_config(host_key, &user_key),
+            },
+        )
+        .await
+        .expect("spawn supervised SSH listener");
+
+        assert_eq!(handle.name, task_name);
+        tokio::task::yield_now().await;
+
+        let health = supervisor.health().await;
+        let state = health
+            .task_states
+            .get("netconf-ssh-supervised-test")
+            .expect("task state");
+        assert_eq!(state.kind, "listener");
+        assert_eq!(state.criticality, "degrade");
+        assert!(state.running);
+
+        supervisor
+            .shutdown_all(ShutdownPolicy::DrainWithTimeout(Duration::from_secs(2)))
+            .await;
+
+        let health = supervisor.health().await;
+        let state = health
+            .task_states
+            .get("netconf-ssh-supervised-test")
             .expect("task state after shutdown");
         assert!(!state.running);
         assert!(!health.degraded);

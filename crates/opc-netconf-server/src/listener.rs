@@ -210,7 +210,7 @@ where
     Ok(result)
 }
 
-fn allocate_session_id(next_session_id: &AtomicU64) -> Option<u64> {
+pub(crate) fn allocate_session_id(next_session_id: &AtomicU64) -> Option<u64> {
     loop {
         let session_id = next_session_id.load(Ordering::Relaxed);
         if !is_valid_session_id(session_id) {

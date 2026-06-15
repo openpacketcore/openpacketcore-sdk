@@ -13,13 +13,16 @@
 //! - Transport-neutral session handshake and RPC dispatch over an already
 //!   authenticated stream.
 //! - NETCONF-over-TLS TCP listener accept loop over `opc-mgmt-transport`.
-//! - Optional `opc-runtime::Supervisor` task wrapper for the TLS listener.
+//! - NETCONF-over-SSH TCP listener accept loop with caller-provisioned host
+//!   keys, exact public-key authorization, and `subsystem "netconf"` admission.
+//! - Optional `opc-runtime::Supervisor` task wrappers for the TLS and SSH
+//!   listeners.
 //! - NETCONF-over-TLS principal extraction from verified rustls peer
 //!   certificates.
 //! - NETCONF-over-SSH authenticated-channel helpers that require
 //!   `TransportType::NetconfSsh` and an `AuthStrength::SshPublicKey` principal.
-//!   Full SSH listener, host-key policy, client-key/certificate verification,
-//!   and Call Home remain future work.
+//!   Host-key generation/storage/rotation, SSH certificate CA policy, and Call
+//!   Home remain future work.
 //! - Bounded XML parsing for client `<hello>` and RPC envelopes, including
 //!   fail-closed rejection of missing, empty, or duplicate client hello
 //!   capability containers, bounded XPath filter `select` expressions, plus
@@ -189,6 +192,7 @@ pub mod operations;
 pub mod server;
 pub mod session;
 mod session_registry;
+pub mod ssh;
 pub mod supervision;
 pub mod transport;
 pub mod xml;
@@ -222,7 +226,14 @@ pub use session::{
     SessionFraming, SessionResult,
 };
 pub use session_registry::SessionRegistry;
-pub use supervision::{spawn_read_only_tls_listener, SupervisedTlsListenerConfig};
+pub use ssh::{
+    run_read_only_ssh_listener, SshAuthorizedKey, SshHostKey, SshListenerConfig, SshListenerError,
+    SshListenerResult,
+};
+pub use supervision::{
+    spawn_read_only_ssh_listener, spawn_read_only_tls_listener, SupervisedSshListenerConfig,
+    SupervisedTlsListenerConfig,
+};
 pub use transport::{
     principal_from_identity_state, principal_from_identity_watch, principal_from_tls_stream,
     run_read_only_ssh_session, run_read_only_ssh_session_with_registry, run_read_only_tls_session,
