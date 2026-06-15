@@ -8,8 +8,8 @@
 //!   malformed base 1.1 chunk lengths, truncated chunk bodies, and too many
 //!   base 1.1 chunks per message.
 //! - Server `<hello>` rendering with base capabilities plus optional discovery,
-//!   defaults, writable-running, candidate, confirmed-commit, and startup
-//!   capabilities only when their CNF binding hooks are present.
+//!   defaults, writable-running, candidate, confirmed-commit, startup, and
+//!   notification capabilities only when their CNF binding hooks are present.
 //! - Transport-neutral session handshake and RPC dispatch over an already
 //!   authenticated stream.
 //! - NETCONF-over-TLS TCP listener accept loop over `opc-mgmt-transport`.
@@ -74,6 +74,15 @@
 //!   Over-declared discovery capabilities fail closed with `operation-failed`
 //!   instead of falling back to ordinary rendering or pretending the data is
 //!   absent.
+//! - Optional RFC 5277 live `NETCONF` stream notifications backed by
+//!   `opc-config-bus` subscribers. The server accepts bounded
+//!   `<create-subscription>` only when the binding opts into
+//!   `:notification:1.0`, authorizes subscription through NACM `subscribe`,
+//!   allows one active live subscription per session, emits schema-path-only
+//!   RFC 6470-style config-change events, and never includes config values.
+//!   Replay, stop-time, and notification filters are recognized but rejected
+//!   with payload-free `operation-not-supported` until bounded replay/filter
+//!   support exists.
 //! - Read NACM and audit integration through the shared management crates; an
 //!   all-denied `<get-config>` or `<get>` returns empty `<data/>` without
 //!   invoking the CNF config projection hook or operational-state provider, and
@@ -85,17 +94,18 @@
 //! public [`ReadOnlyNetconfServer::handle_rpc`] and
 //! [`ReadOnlyNetconfServer::handle_rpc_xml`] helpers are registry-free,
 //! low-level dispatch helpers: they preserve parser/audit/metrics/reply
-//! behavior for one RPC, but `<kill-session>`, `<lock>`, `<unlock>`, and
-//! `<edit-config>` return `operation-not-supported` without a live
-//! [`SessionRegistry`], and `handle_rpc_xml` discards the `<close-session>`
-//! close signal. The raw hello
+//! behavior for one RPC, but `<kill-session>`, `<lock>`, `<unlock>`,
+//! `<edit-config>`, and `<create-subscription>` return
+//! `operation-not-supported` without a live [`SessionRegistry`] and session
+//! loop, and `handle_rpc_xml` discards the `<close-session>` close signal. The
+//! raw hello
 //! renderers require
 //! `NonZeroU32` for a supplied session id, so direct helper callers cannot
 //! render `0` or an out-of-range `<session-id>`. Custom transports that
 //! advertise a server `<hello>` should use
 //! [`run_read_only_session_with_registry`] or
 //! [`run_read_only_tls_session_with_registry`] to get audited cross-session
-//! `<kill-session>` and running datastore lock semantics.
+//! `<kill-session>`, datastore lock/write semantics, and notification delivery.
 //!
 //! The raw session-registry controls are intentionally not part of the public
 //! API. Custom transports share a [`SessionRegistry`] by passing it into
@@ -180,13 +190,13 @@ pub mod xml;
 pub use binding::{
     BindingError, EditConfigCandidate, EditConfigError, GetSchemaError,
     GetSchemaRequest as NetconfGetSchemaRequest, NetconfConfigBinding, NetconfMonitoringCapability,
-    ReadSelection, WithDefaultsCapability, YangLibraryCapability,
+    NetconfNotificationCapability, ReadSelection, WithDefaultsCapability, YangLibraryCapability,
 };
 pub use capabilities::{
     read_only_base_capabilities, read_only_capabilities, render_server_hello, NETCONF_BASE_1_0,
     NETCONF_BASE_1_1, NETCONF_BASE_NS, NETCONF_MONITORING_NS, NETCONF_MONITORING_REVISION,
-    WITH_DEFAULTS_1_0_BASE, WITH_DEFAULTS_NS, WRITABLE_RUNNING_1_0, YANG_LIBRARY_1_1_BASE,
-    YANG_LIBRARY_REVISION,
+    NETCONF_NOTIFICATION_NS, NOTIFICATION_1_0, WITH_DEFAULTS_1_0_BASE, WITH_DEFAULTS_NS,
+    WRITABLE_RUNNING_1_0, YANG_LIBRARY_1_1_BASE, YANG_LIBRARY_REVISION,
 };
 pub use error::{
     rpc_error_reply, rpc_get_schema_reply, rpc_ok_empty_reply, rpc_ok_reply, xml_escape, RpcError,
@@ -213,9 +223,9 @@ pub use transport::{
     TlsSessionError,
 };
 pub use xml::{
-    parse_client_hello, parse_rpc, ClientHello, Datastore, EditConfigRequest, EditDefaultOperation,
-    EditErrorOption, EditTestOption, Filter, FilterElement, FilterKind, GetConfigRequest,
-    GetRequest, KillSessionRequest, LockRequest, ParsedRpc, RpcOperation, SubtreeFilter,
-    SubtreeSelection, UnlockRequest, UnsupportedOperation, ValidateRequest, WithDefaultsMode,
-    XmlError,
+    parse_client_hello, parse_rpc, ClientHello, CreateSubscriptionRequest, Datastore,
+    EditConfigRequest, EditDefaultOperation, EditErrorOption, EditTestOption, Filter,
+    FilterElement, FilterKind, GetConfigRequest, GetRequest, KillSessionRequest, LockRequest,
+    ParsedRpc, RpcOperation, SubtreeFilter, SubtreeSelection, UnlockRequest, UnsupportedOperation,
+    ValidateRequest, WithDefaultsMode, XmlError,
 };

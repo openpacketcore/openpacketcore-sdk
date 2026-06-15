@@ -13,6 +13,7 @@ use std::num::NonZeroU32;
 use std::str;
 use std::time::Duration;
 
+use opc_config_bus::{ConfigEvent, ConfigReceiver};
 use opc_config_model::{OpcConfig, RequestId, TrustedPrincipal};
 use opc_mgmt_audit::AuditSink;
 use opc_mgmt_authz::PolicySource;
@@ -23,7 +24,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::binding::NetconfConfigBinding;
 use crate::capabilities::{NETCONF_BASE_1_0, NETCONF_BASE_1_1};
 use crate::framing::{base10, base11, FramingError};
-use crate::server::ReadOnlyNetconfServer;
+use crate::metrics::{record_notification, NetconfNotificationOutcome};
+use crate::server::{ReadOnlyNetconfServer, RpcSessionAction};
 use crate::session_registry::{
     session_id_for_hello, SessionRegistration, SessionRegistry, SessionRegistryError,
 };
@@ -220,6 +222,7 @@ where
     let framing = negotiate_framing(&client_hello)?;
 
     let mut rpc_count = 0u64;
+    let mut notification_receiver: Option<ConfigReceiver<C>> = None;
     loop {
         let message = tokio::select! {
             _ = registration.terminated() => {
@@ -228,6 +231,50 @@ where
                     framing,
                     rpc_count,
                 });
+            }
+            event = recv_notification(&mut notification_receiver), if notification_receiver.is_some() => {
+                match event {
+                    Some(event) => {
+                        if let Some(notification_xml) =
+                            server.notification_xml_for_event(principal, event)
+                        {
+                            let write_result = tokio::select! {
+                                _ = registration.terminated() => {
+                                    return Ok(SessionResult {
+                                        client_capabilities: client_hello.capabilities,
+                                        framing,
+                                        rpc_count,
+                                    });
+                                }
+                                result = write_message(
+                                    stream,
+                                    framing,
+                                    notification_xml.as_bytes(),
+                                    &config.limits,
+                                ) => result,
+                            };
+                            match write_result {
+                                Ok(()) => record_notification(
+                                    "NETCONF",
+                                    NetconfNotificationOutcome::Success,
+                                ),
+                                Err(err) => {
+                                    record_notification(
+                                        "NETCONF",
+                                        NetconfNotificationOutcome::Failure,
+                                    );
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    None => {
+                        notification_receiver = None;
+                        record_notification("NETCONF", NetconfNotificationOutcome::Failure);
+                        continue;
+                    }
+                }
             }
             result = read_message(stream, framing, &config) => result?,
         };
@@ -240,15 +287,17 @@ where
         };
         let rpc_xml = str::from_utf8(&message).map_err(|_| SessionError::InvalidUtf8)?;
         let result = server
-            .handle_rpc_for_session_async(
+            .handle_rpc_for_session_with_action_async(
                 RequestId::new(),
                 principal,
                 rpc_xml,
                 &config.limits,
                 registration.session_id(),
                 sessions,
+                usize::from(notification_receiver.is_some()),
             )
             .await;
+        let reply = result.reply;
         tokio::select! {
             _ = registration.terminated() => {
                 return Ok(SessionResult {
@@ -257,18 +306,35 @@ where
                     rpc_count,
                 });
             }
-            write_result = write_message(stream, framing, result.reply_xml.as_bytes(), &config.limits) => {
+            write_result = write_message(stream, framing, reply.reply_xml.as_bytes(), &config.limits) => {
                 write_result?;
             }
         }
+        if let Some(action) = result.action {
+            match action {
+                RpcSessionAction::StartNetconfNotifications(receiver) => {
+                    notification_receiver = Some(receiver);
+                }
+            }
+        }
         rpc_count = rpc_count.saturating_add(1);
-        if result.close_session {
+        if reply.close_session {
             return Ok(SessionResult {
                 client_capabilities: client_hello.capabilities,
                 framing,
                 rpc_count,
             });
         }
+    }
+}
+
+async fn recv_notification<C>(receiver: &mut Option<ConfigReceiver<C>>) -> Option<ConfigEvent<C>>
+where
+    C: OpcConfig,
+{
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
     }
 }
 

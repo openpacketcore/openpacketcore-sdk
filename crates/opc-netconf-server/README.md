@@ -11,7 +11,8 @@ The current slice is capability-gated and capability-honest:
   excesses rejected.
 - Server `<hello>` rendering with base capabilities plus optional discovery,
   defaults, writable-running, candidate, confirmed-commit, and startup
-  capabilities only when their CNF binding hooks are present.
+  capabilities, plus notifications only when their CNF binding hooks are
+  present.
 - Transport-neutral session handshake and RPC loop over an already-authenticated
   stream.
 - NETCONF-over-TLS TCP listener accept loop over `opc-mgmt-transport` TLS
@@ -90,6 +91,14 @@ The current slice is capability-gated and capability-honest:
   `<get-schema>` returns `operation-not-supported`. If the capability is
   over-declared without a renderer or schema-source hook, discovery reads and
   `<get-schema>` fail closed with `operation-failed`.
+- Optional RFC 5277 live `NETCONF` stream notifications: advertised only when
+  the CNF binding opts into `NetconfNotificationCapability`. The session runner
+  accepts bounded `<create-subscription>`, authorizes through NACM `subscribe`,
+  allows one active live subscription per session, subscribes to
+  `opc-config-bus`, and emits schema-path-only RFC 6470-style config-change
+  events without config values. Replay, `stopTime`, and
+  notification filters are parsed within limits but rejected with
+  `operation-not-supported` until bounded replay/filter semantics exist.
 - Read authorization through `opc-mgmt-authz`; if NACM denies every selected
   `<get-config>` or `<get>` data path, the server returns empty `<data/>`
   without calling the CNF config projection hook or operational-state provider.
@@ -117,10 +126,11 @@ out-of-range `<session-id>`. Custom transports that advertise a server
 `run_read_only_tls_session_with_registry` for audited cross-session
 `<kill-session>` and datastore lock/write semantics.
 
-It still does not implement NETCONF over SSH, Call Home, notifications, NMDA
-`<get-data>` / `<edit-data>`, a full RFC XPath instance evaluator or advertised
-`:xpath`, URL and inline-config copy/validate forms, `:rollback-on-error`, or
-external interop against `netopeer2-cli`, `ncclient`, or a target NMS. CNFs may
-use generated NETCONF XML projection/edit support for supported shapes, but
-unsupported YANG shapes remain fail-closed and model-specific bindings still
-own any projection/edit behavior outside the generated support matrix.
+It still does not implement NETCONF over SSH, Call Home, notification replay or
+notification filters, NMDA `<get-data>` / `<edit-data>`, a full RFC XPath
+instance evaluator or advertised `:xpath`, URL and inline-config copy/validate
+forms, `:rollback-on-error`, or external interop against `netopeer2-cli`,
+`ncclient`, or a target NMS. CNFs may use generated NETCONF XML projection/edit
+support for supported shapes, but unsupported YANG shapes remain fail-closed
+and model-specific bindings still own any projection/edit behavior outside the
+generated support matrix.

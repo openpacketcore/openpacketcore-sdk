@@ -12,7 +12,9 @@ use quick_xml::writer::Writer;
 use quick_xml::XmlVersion;
 use thiserror::Error;
 
-use crate::capabilities::{NETCONF_BASE_NS, NETCONF_MONITORING_NS, WITH_DEFAULTS_NS};
+use crate::capabilities::{
+    NETCONF_BASE_NS, NETCONF_MONITORING_NS, NETCONF_NOTIFICATION_NS, WITH_DEFAULTS_NS,
+};
 use crate::error::RpcReplyAttributes;
 use crate::session_registry::is_valid_session_id;
 
@@ -102,6 +104,8 @@ pub(crate) enum RpcOperationHint {
     Validate,
     /// Base NETCONF `<kill-session>`.
     KillSession,
+    /// RFC 5277 `<create-subscription>`.
+    CreateSubscription,
 }
 
 /// Supported parsed RPC operations.
@@ -135,9 +139,24 @@ pub enum RpcOperation {
     KillSession(KillSessionRequest),
     /// RFC 6022 `<get-schema>`.
     GetSchema(GetSchemaRequest),
+    /// RFC 5277 `<create-subscription>`.
+    CreateSubscription(CreateSubscriptionRequest),
     /// A known NETCONF operation that this read-only slice deliberately does
     /// not implement yet.
     Unsupported(UnsupportedOperation),
+}
+
+/// RFC 5277 `<create-subscription>` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSubscriptionRequest {
+    /// Optional stream name. Omitted means the default `NETCONF` stream.
+    pub stream: Option<String>,
+    /// Whether a notification filter element was supplied.
+    pub filter_present: bool,
+    /// Optional replay start time. Unsupported until replay storage exists.
+    pub start_time: Option<String>,
+    /// Optional replay stop time. Unsupported until replay storage exists.
+    pub stop_time: Option<String>,
 }
 
 /// RFC 6022 `<get-schema>` request.
@@ -247,6 +266,8 @@ pub enum UnsupportedOperation {
     DiscardChanges,
     /// `<validate>`.
     Validate,
+    /// RFC 5277 `<create-subscription>`.
+    CreateSubscription,
 }
 
 impl UnsupportedOperation {
@@ -262,6 +283,7 @@ impl UnsupportedOperation {
             Self::CancelCommit => "cancel-commit",
             Self::DiscardChanges => "discard-changes",
             Self::Validate => "validate",
+            Self::CreateSubscription => "create-subscription",
         }
     }
 }
@@ -717,6 +739,17 @@ struct PartialGetSchema {
 }
 
 #[derive(Debug, Clone, Default)]
+struct PartialCreateSubscription {
+    stream_seen: bool,
+    stream: Option<String>,
+    filter_seen: bool,
+    start_time_seen: bool,
+    start_time: Option<String>,
+    stop_time_seen: bool,
+    stop_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 struct PartialKillSession {
     session_id: Option<u64>,
 }
@@ -784,6 +817,7 @@ struct ParserState {
     get: Option<PartialGet>,
     get_config: Option<PartialGetConfig>,
     get_schema: Option<PartialGetSchema>,
+    create_subscription: Option<PartialCreateSubscription>,
     kill_session: Option<PartialKillSession>,
     lock: Option<PartialLock>,
     unlock: Option<PartialUnlock>,
@@ -796,6 +830,7 @@ struct ParserState {
     close_session: bool,
     discard_changes: bool,
     filter_depth: usize,
+    notification_filter_depth: usize,
     filter_stack: Vec<FilterFrame>,
     edit_config_capture: Option<Writer<Vec<u8>>>,
     edit_config_capture_depth: usize,
@@ -895,6 +930,9 @@ impl ParserState {
                 return Err(XmlError::Malformed);
             }
         }
+        if self.notification_filter_depth > 0 {
+            self.notification_filter_depth -= 1;
+        }
         if self.stack.is_empty() {
             self.root_closed = true;
         }
@@ -949,6 +987,9 @@ impl ParserState {
             }
             return self.reject_filter_text();
         }
+        if self.notification_filter_depth > 0 {
+            return Ok(());
+        }
         if self.local_path_is(&["hello", "capabilities", "capability"]) {
             let capability = text.trim();
             if !capability.is_empty() {
@@ -970,6 +1011,12 @@ impl ParserState {
             self.set_commit_persist_id_text(text)?;
         } else if self.local_path_is(&["rpc", "cancel-commit", "persist-id"]) {
             self.set_cancel_commit_persist_id_text(text)?;
+        } else if self.local_path_is(&["rpc", "create-subscription", "stream"]) {
+            self.set_create_subscription_stream_text(text)?;
+        } else if self.local_path_is(&["rpc", "create-subscription", "startTime"]) {
+            self.set_create_subscription_start_time_text(text)?;
+        } else if self.local_path_is(&["rpc", "create-subscription", "stopTime"]) {
+            self.set_create_subscription_stop_time_text(text)?;
         } else if self.local_path_is(&["rpc", "get", "with-defaults"]) {
             self.set_get_with_defaults_text(text)?;
         } else if self.local_path_is(&["rpc", "get-config", "with-defaults"]) {
@@ -1009,12 +1056,16 @@ impl ParserState {
     }
 
     fn validate_protocol_namespace(&self, element: &Element) -> Result<(), XmlError> {
-        if self.filter_depth > 0 || self.edit_config_capture.is_some() {
+        if self.filter_depth > 0
+            || self.notification_filter_depth > 0
+            || self.edit_config_capture.is_some()
+        {
             return Ok(());
         }
         if element.namespace == NETCONF_BASE_NS
             || self.get_schema_namespace_is_allowed(element)
             || self.with_defaults_namespace_is_allowed(element)
+            || self.notification_namespace_is_allowed(element)
         {
             Ok(())
         } else {
@@ -1032,6 +1083,11 @@ impl ParserState {
         if self.filter_depth > 0 {
             self.process_filter_content_start(element, attrs)?;
             self.filter_depth += 1;
+            return Ok(());
+        }
+
+        if self.notification_filter_depth > 0 {
+            self.notification_filter_depth += 1;
             return Ok(());
         }
 
@@ -1149,6 +1205,16 @@ impl ParserState {
                         return Err(XmlError::DuplicateElement);
                     }
                     self.get_schema = Some(PartialGetSchema::default());
+                }
+                "create-subscription" if element.namespace == NETCONF_NOTIFICATION_NS => {
+                    if self.has_rpc_operation() {
+                        return Err(XmlError::DuplicateElement);
+                    }
+                    self.operation_hint = Some(RpcOperationHint::CreateSubscription);
+                    self.create_subscription = Some(PartialCreateSubscription::default());
+                    if !attrs.is_empty() {
+                        return Err(XmlError::Malformed);
+                    }
                 }
                 "copy-config" => {
                     if self.has_rpc_operation() {
@@ -1372,9 +1438,24 @@ impl ParserState {
                 }
                 _ => Err(XmlError::Malformed),
             }
+        } else if self.local_path_is(&["rpc", "create-subscription"]) {
+            match element.local.as_str() {
+                "stream" | "startTime" | "stopTime"
+                    if element.namespace == NETCONF_NOTIFICATION_NS && attrs.is_empty() =>
+                {
+                    self.install_create_subscription_scalar(element.local.as_str())
+                }
+                "filter" if element.namespace == NETCONF_NOTIFICATION_NS => {
+                    self.install_create_subscription_filter()
+                }
+                _ => Err(XmlError::Malformed),
+            }
         } else if self.local_path_is(&["rpc", "get-schema", "identifier"])
             || self.local_path_is(&["rpc", "get-schema", "version"])
             || self.local_path_is(&["rpc", "get-schema", "format"])
+            || self.local_path_is(&["rpc", "create-subscription", "stream"])
+            || self.local_path_is(&["rpc", "create-subscription", "startTime"])
+            || self.local_path_is(&["rpc", "create-subscription", "stopTime"])
             || self.local_path_is(&["rpc", "kill-session", "session-id"])
             || self.local_path_is(&["rpc", "lock", "target", "running"])
             || self.local_path_is(&["rpc", "lock", "target", "candidate"])
@@ -1429,6 +1510,7 @@ impl ParserState {
             || self.get.is_some()
             || self.get_config.is_some()
             || self.get_schema.is_some()
+            || self.create_subscription.is_some()
             || self.kill_session.is_some()
             || self.lock.is_some()
             || self.unlock.is_some()
@@ -1460,6 +1542,9 @@ impl ParserState {
             "copy-config" => self.operation_hint = Some(RpcOperationHint::CopyConfig),
             "delete-config" => self.operation_hint = Some(RpcOperationHint::DeleteConfig),
             "kill-session" => self.operation_hint = Some(RpcOperationHint::KillSession),
+            "create-subscription" => {
+                self.operation_hint = Some(RpcOperationHint::CreateSubscription)
+            }
             _ => {}
         }
     }
@@ -1481,6 +1566,19 @@ impl ParserState {
                 && element.local == "with-defaults")
                 || self.local_path_is(&["rpc", "get", "with-defaults"])
                 || self.local_path_is(&["rpc", "get-config", "with-defaults"]))
+    }
+
+    fn notification_namespace_is_allowed(&self, element: &Element) -> bool {
+        element.namespace == NETCONF_NOTIFICATION_NS
+            && ((self.local_path_is(&["rpc"]) && element.local == "create-subscription")
+                || (self.local_path_is(&["rpc", "create-subscription"])
+                    && matches!(
+                        element.local.as_str(),
+                        "stream" | "filter" | "startTime" | "stopTime"
+                    ))
+                || self.local_path_is(&["rpc", "create-subscription", "stream"])
+                || self.local_path_is(&["rpc", "create-subscription", "startTime"])
+                || self.local_path_is(&["rpc", "create-subscription", "stopTime"]))
     }
 
     fn set_get_schema_text(&mut self, field: GetSchemaField, text: &str) -> Result<(), XmlError> {
@@ -1517,6 +1615,82 @@ impl ParserState {
             return Err(XmlError::InvalidValue);
         }
         if kill_session.session_id.replace(session_id).is_some() {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn install_create_subscription_scalar(&mut self, local: &str) -> Result<(), XmlError> {
+        let request = self
+            .create_subscription
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        let seen = match local {
+            "stream" => &mut request.stream_seen,
+            "startTime" => &mut request.start_time_seen,
+            "stopTime" => &mut request.stop_time_seen,
+            _ => return Err(XmlError::Malformed),
+        };
+        if *seen {
+            return Err(XmlError::DuplicateElement);
+        }
+        *seen = true;
+        Ok(())
+    }
+
+    fn install_create_subscription_filter(&mut self) -> Result<(), XmlError> {
+        let request = self
+            .create_subscription
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if request.filter_seen || self.notification_filter_depth > 0 {
+            return Err(XmlError::DuplicateElement);
+        }
+        request.filter_seen = true;
+        self.notification_filter_depth = 1;
+        Ok(())
+    }
+
+    fn set_create_subscription_stream_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let request = self
+            .create_subscription
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        let value = text.trim();
+        if value.is_empty() {
+            return Err(XmlError::InvalidValue);
+        }
+        if request.stream.replace(value.to_string()).is_some() {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn set_create_subscription_start_time_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let request = self
+            .create_subscription
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        let value = text.trim();
+        if value.is_empty() {
+            return Err(XmlError::InvalidValue);
+        }
+        if request.start_time.replace(value.to_string()).is_some() {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn set_create_subscription_stop_time_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let request = self
+            .create_subscription
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        let value = text.trim();
+        if value.is_empty() {
+            return Err(XmlError::InvalidValue);
+        }
+        if request.stop_time.replace(value.to_string()).is_some() {
             return Err(XmlError::DuplicateElement);
         }
         Ok(())
@@ -1780,6 +1954,10 @@ impl ParserState {
 
     fn edit_config_capture_is_active(&self) -> bool {
         self.edit_config_capture.is_some()
+    }
+
+    fn notification_filter_is_active(&self) -> bool {
+        self.notification_filter_depth > 0
     }
 
     fn capture_event<'a, E>(&mut self, event: E) -> Result<(), XmlError>
@@ -2113,6 +2291,27 @@ impl ParserState {
                         }),
                     }));
                 }
+                if let Some(create_subscription) = self.create_subscription {
+                    return Ok(ParsedMessage::Rpc(ParsedRpc {
+                        message_id,
+                        reply_attrs,
+                        operation: RpcOperation::CreateSubscription(CreateSubscriptionRequest {
+                            stream: finish_subscription_scalar(
+                                create_subscription.stream_seen,
+                                create_subscription.stream,
+                            )?,
+                            filter_present: create_subscription.filter_seen,
+                            start_time: finish_subscription_scalar(
+                                create_subscription.start_time_seen,
+                                create_subscription.start_time,
+                            )?,
+                            stop_time: finish_subscription_scalar(
+                                create_subscription.stop_time_seen,
+                                create_subscription.stop_time,
+                            )?,
+                        }),
+                    }));
+                }
                 Err(XmlError::UnsupportedOperation)
             }
         }
@@ -2225,6 +2424,9 @@ fn parse_message_with_context(
                     state
                         .capture_event(Event::CData(cdata.borrow()))
                         .map_err(|err| parse_error(&state, err))?;
+                    continue;
+                }
+                if state.notification_filter_is_active() {
                     continue;
                 }
                 return Err(parse_error(&state, XmlError::Malformed));
@@ -2522,6 +2724,18 @@ fn finish_edit_option<T: Default>(seen: bool, value: Option<T>) -> Result<T, Xml
     match (seen, value) {
         (false, None) => Ok(T::default()),
         (true, Some(value)) => Ok(value),
+        (true, None) => Err(XmlError::InvalidValue),
+        (false, Some(_)) => Err(XmlError::Malformed),
+    }
+}
+
+fn finish_subscription_scalar(
+    seen: bool,
+    value: Option<String>,
+) -> Result<Option<String>, XmlError> {
+    match (seen, value) {
+        (false, None) => Ok(None),
+        (true, Some(value)) => Ok(Some(value)),
         (true, None) => Err(XmlError::InvalidValue),
         (false, Some(_)) => Err(XmlError::Malformed),
     }
@@ -3091,6 +3305,75 @@ mod tests {
                 format: "yang".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn parses_create_subscription_default_and_explicit_stream() {
+        let default_stream = parse_rpc(
+            r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="601"><ncn:create-subscription xmlns:ncn="urn:ietf:params:xml:ns:netconf:notification:1.0"/></rpc>"#,
+            &MgmtLimits::default(),
+        )
+        .expect("parse default create-subscription");
+        assert_eq!(
+            default_stream.operation,
+            RpcOperation::CreateSubscription(CreateSubscriptionRequest {
+                stream: None,
+                filter_present: false,
+                start_time: None,
+                stop_time: None,
+            })
+        );
+
+        let explicit_stream = parse_rpc(
+            r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="602"><create-subscription xmlns="urn:ietf:params:xml:ns:netconf:notification:1.0"><stream>NETCONF</stream></create-subscription></rpc>"#,
+            &MgmtLimits::default(),
+        )
+        .expect("parse explicit create-subscription");
+        assert_eq!(
+            explicit_stream.operation,
+            RpcOperation::CreateSubscription(CreateSubscriptionRequest {
+                stream: Some("NETCONF".to_string()),
+                filter_present: false,
+                start_time: None,
+                stop_time: None,
+            })
+        );
+    }
+
+    #[test]
+    fn create_subscription_records_unsupported_filter_and_replay_fields() {
+        let parsed = parse_rpc(
+            r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="603"><ncn:create-subscription xmlns:ncn="urn:ietf:params:xml:ns:netconf:notification:1.0"><ncn:filter><sys:system xmlns:sys="urn:opc:demo"><sys:hostname><![CDATA[amf-1]]></sys:hostname></sys:system></ncn:filter><ncn:startTime>2026-06-14T00:00:00Z</ncn:startTime><ncn:stopTime>2026-06-14T01:00:00Z</ncn:stopTime></ncn:create-subscription></rpc>"#,
+            &MgmtLimits::default(),
+        )
+        .expect("parse create-subscription with unsupported optional fields");
+
+        assert_eq!(
+            parsed.operation,
+            RpcOperation::CreateSubscription(CreateSubscriptionRequest {
+                stream: None,
+                filter_present: true,
+                start_time: Some("2026-06-14T00:00:00Z".to_string()),
+                stop_time: Some("2026-06-14T01:00:00Z".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn create_subscription_rejects_empty_or_duplicate_scalars() {
+        let empty_stream = parse_rpc(
+            r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="604"><create-subscription xmlns="urn:ietf:params:xml:ns:netconf:notification:1.0"><stream/></create-subscription></rpc>"#,
+            &MgmtLimits::default(),
+        )
+        .expect_err("empty stream");
+        assert_eq!(empty_stream, XmlError::InvalidValue);
+
+        let duplicate_stream = parse_rpc(
+            r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="605"><create-subscription xmlns="urn:ietf:params:xml:ns:netconf:notification:1.0"><stream>NETCONF</stream><stream>NETCONF</stream></create-subscription></rpc>"#,
+            &MgmtLimits::default(),
+        )
+        .expect_err("duplicate stream");
+        assert_eq!(duplicate_stream, XmlError::DuplicateElement);
     }
 
     #[test]

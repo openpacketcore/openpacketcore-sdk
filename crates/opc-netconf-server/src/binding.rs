@@ -53,6 +53,15 @@ impl YangLibraryCapability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetconfMonitoringCapability;
 
+/// RFC 5277 notification capability supplied by the embedding CNF.
+///
+/// The generic server currently implements a live, config-bus-backed
+/// `NETCONF` stream for schema-path-only config-change notifications. Replay,
+/// stop-time, and notification filters are deliberately not advertised or
+/// accepted until a bounded historical/event-filter implementation exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetconfNotificationCapability;
+
 /// RFC 6243 with-defaults capability supplied by the embedding CNF.
 ///
 /// This server core owns parsing, capability advertisement, NACM, audit, and
@@ -604,6 +613,17 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         } else {
             Some(NetconfMonitoringCapability)
         }
+    }
+
+    /// Returns whether the CNF enables RFC 5277 live notifications.
+    ///
+    /// The default is `None`: no `:notification:1.0` capability is advertised
+    /// and `<create-subscription>` fails closed with `operation-not-supported`.
+    /// A binding that opts in uses the SDK config bus as the event source; the
+    /// server still owns parsing, NACM subscribe authorization, audit, metrics,
+    /// queue bounds, and XML event rendering.
+    fn netconf_notification_capability(&self) -> Option<NetconfNotificationCapability> {
+        None
     }
 
     /// Renders the RFC 6022 `/netconf-state` operational tree for the

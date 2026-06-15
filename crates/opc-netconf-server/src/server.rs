@@ -6,6 +6,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use opc_config_bus::{ConfigChange, ConfigEvent, ConfigReceiver, SubscriberLagPolicy};
 use opc_config_model::{
     CommitMode, CommitRequest, ConfigOperation, OpcConfig, RequestId, RequestSource, TransportType,
     TrustedPrincipal, ValidationContext,
@@ -13,11 +14,11 @@ use opc_config_model::{
 use opc_mgmt_audit::{
     AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink, SchemaNodePath,
 };
-use opc_mgmt_authz::{AuthzError, ExecAuthorizer, PolicySource, ReadAuthorizer};
+use opc_mgmt_authz::{AuthzError, ExecAuthorizer, PolicySource, ReadAction, ReadAuthorizer};
 use opc_mgmt_errors::{commit_error_to_netconf, NetconfError, NetconfErrorTag, NetconfErrorType};
 use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_schema::ModelData;
-use opc_types::ConfigVersion;
+use opc_types::{ConfigVersion, Timestamp};
 use thiserror::Error;
 
 use crate::binding::{
@@ -27,9 +28,12 @@ use crate::binding::{
 use crate::capabilities::{render_server_hello, ServerHelloCapabilities};
 use crate::error::{
     rpc_error_reply_with_attrs, rpc_get_schema_reply_with_attrs, rpc_ok_empty_reply_with_attrs,
-    RpcError, RpcReplyAttributes,
+    xml_escape, RpcError, RpcReplyAttributes,
 };
-use crate::metrics::{record_rpc_error, record_rpc_success, NetconfOperation};
+use crate::metrics::{
+    record_notification, record_rpc_error, record_rpc_success, NetconfNotificationOutcome,
+    NetconfOperation,
+};
 use crate::operations::get::{handle_get, GetContext};
 use crate::operations::get_config::{handle_get_config, GetConfigContext};
 use crate::session_registry::{
@@ -42,11 +46,11 @@ use crate::session_registry::{
 use crate::xml::{
     parse_rpc_with_context, CancelCommitRequest as XmlCancelCommitRequest,
     CommitRequest as XmlCommitRequest, CopyConfigRequest as XmlCopyConfigRequest,
-    Datastore as XmlDatastore, EditConfigRequest as XmlEditConfigRequest, EditErrorOption,
-    EditTestOption, GetSchemaRequest as XmlGetSchemaRequest,
-    KillSessionRequest as XmlKillSessionRequest, LockRequest as XmlLockRequest, RpcOperation,
-    RpcOperationHint, RpcParseError, UnlockRequest as XmlUnlockRequest, UnsupportedOperation,
-    ValidateRequest as XmlValidateRequest,
+    CreateSubscriptionRequest as XmlCreateSubscriptionRequest, Datastore as XmlDatastore,
+    EditConfigRequest as XmlEditConfigRequest, EditErrorOption, EditTestOption,
+    GetSchemaRequest as XmlGetSchemaRequest, KillSessionRequest as XmlKillSessionRequest,
+    LockRequest as XmlLockRequest, RpcOperation, RpcOperationHint, RpcParseError,
+    UnlockRequest as XmlUnlockRequest, UnsupportedOperation, ValidateRequest as XmlValidateRequest,
 };
 
 const NETCONF_BASE_MODEL: &[ModelData] = &[ModelData {
@@ -67,6 +71,12 @@ const NETCONF_CANCEL_COMMIT_PATH: &str = "/nc:cancel-commit";
 const NETCONF_DISCARD_CHANGES_PATH: &str = "/nc:discard-changes";
 const NETCONF_COPY_CONFIG_PATH: &str = "/nc:copy-config";
 const NETCONF_DELETE_CONFIG_PATH: &str = "/nc:delete-config";
+const NETCONF_CREATE_SUBSCRIPTION_PATH: &str = "/ncn:create-subscription";
+const NETCONF_NOTIFICATION_STREAM: &str = "NETCONF";
+const NETCONF_NOTIFICATION_NS: &str = "urn:ietf:params:xml:ns:netconf:notification:1.0";
+const NETCONF_CONFIG_CHANGE_NS: &str = "urn:ietf:params:xml:ns:yang:ietf-netconf-notifications";
+const NOTIFICATION_EVENT_BYTES_ESTIMATE: usize = 4096;
+const MAX_NOTIFICATION_EVENT_CAPACITY: usize = 4096;
 const DEFAULT_CONFIRMED_COMMIT_TIMEOUT_SECS: u32 = 600;
 
 /// Server construction error.
@@ -103,6 +113,40 @@ impl RpcHandlingResult {
             close_session: true,
         }
     }
+}
+
+pub(crate) struct RpcSessionHandlingResult<C: OpcConfig> {
+    pub(crate) reply: RpcHandlingResult,
+    pub(crate) action: Option<RpcSessionAction<C>>,
+}
+
+impl<C: OpcConfig> RpcSessionHandlingResult<C> {
+    fn keep_open(reply_xml: String) -> Self {
+        Self {
+            reply: RpcHandlingResult::keep_open(reply_xml),
+            action: None,
+        }
+    }
+
+    fn with_action(reply_xml: String, action: RpcSessionAction<C>) -> Self {
+        Self {
+            reply: RpcHandlingResult::keep_open(reply_xml),
+            action: Some(action),
+        }
+    }
+}
+
+impl<C: OpcConfig> From<RpcHandlingResult> for RpcSessionHandlingResult<C> {
+    fn from(reply: RpcHandlingResult) -> Self {
+        Self {
+            reply,
+            action: None,
+        }
+    }
+}
+
+pub(crate) enum RpcSessionAction<C: OpcConfig> {
+    StartNetconfNotifications(ConfigReceiver<C>),
 }
 
 struct RpcExecContext<'a> {
@@ -318,6 +362,7 @@ where
         let candidate = self.binding.candidate_datastore_capability();
         let confirmed_commit = self.binding.confirmed_commit_capability();
         let startup = self.binding.startup_datastore_capability();
+        let notifications = self.binding.netconf_notification_capability();
         render_server_hello(
             session_id,
             ServerHelloCapabilities {
@@ -328,6 +373,7 @@ where
                 candidate,
                 confirmed_commit,
                 startup,
+                notifications: notifications.as_ref(),
             },
         )
     }
@@ -371,8 +417,8 @@ where
         )
     }
 
-    /// Handles one XML RPC with access to live NETCONF session controls and
-    /// async config-bus writes.
+    /// Test helper that preserves the pre-notification async RPC shape.
+    #[cfg(test)]
     pub(crate) async fn handle_rpc_for_session_async(
         &self,
         request_id: RequestId,
@@ -382,12 +428,39 @@ where
         current_session_id: u64,
         sessions: &SessionRegistry,
     ) -> RpcHandlingResult {
-        self.handle_rpc_inner_async(
+        self.handle_rpc_inner_async_with_action(
             request_id,
             principal,
             xml,
             limits,
             Some((current_session_id, sessions)),
+            0,
+        )
+        .await
+        .reply
+    }
+
+    /// Handles one XML RPC with access to live NETCONF session controls,
+    /// async config-bus writes, and session-local side effects such as starting
+    /// a notification stream.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn handle_rpc_for_session_with_action_async(
+        &self,
+        request_id: RequestId,
+        principal: &TrustedPrincipal,
+        xml: &str,
+        limits: &MgmtLimits,
+        current_session_id: u64,
+        sessions: &SessionRegistry,
+        active_subscription_count: usize,
+    ) -> RpcSessionHandlingResult<C> {
+        self.handle_rpc_inner_async_with_action(
+            request_id,
+            principal,
+            xml,
+            limits,
+            Some((current_session_id, sessions)),
+            active_subscription_count,
         )
         .await
     }
@@ -602,6 +675,14 @@ where
                 started,
                 limits,
             ),
+            RpcOperation::CreateSubscription(_) => self.handle_unsupported_operation(
+                UnsupportedOperation::CreateSubscription,
+                request_id,
+                principal,
+                &parsed.message_id,
+                &parsed.reply_attrs,
+                started,
+            ),
             RpcOperation::Unsupported(operation) => self.handle_unsupported_operation(
                 *operation,
                 request_id,
@@ -613,14 +694,15 @@ where
         }
     }
 
-    async fn handle_rpc_inner_async(
+    async fn handle_rpc_inner_async_with_action(
         &self,
         request_id: RequestId,
         principal: &TrustedPrincipal,
         xml: &str,
         limits: &MgmtLimits,
         session_context: Option<(u64, &SessionRegistry)>,
-    ) -> RpcHandlingResult {
+        active_subscription_count: usize,
+    ) -> RpcSessionHandlingResult<C> {
         let started = Instant::now();
         let parsed = match parse_rpc_with_context(xml, limits) {
             Ok(parsed) => parsed,
@@ -646,7 +728,8 @@ where
                         message_id,
                         &err.reply_attrs,
                         RpcError::operation_failed(),
-                    ));
+                    ))
+                    .into();
                 }
                 let classification = err.error.classification();
                 record_rpc_error(operation, classification.tag, started.elapsed());
@@ -661,11 +744,12 @@ where
                     message_id,
                     &err.reply_attrs,
                     rpc_error,
-                ));
+                ))
+                .into();
             }
         };
 
-        match &parsed.operation {
+        let reply = match &parsed.operation {
             RpcOperation::EditConfig(request) => {
                 self.handle_edit_config(
                     request,
@@ -700,14 +784,16 @@ where
                 let startup_config = match self.startup_config_for_get_config(request) {
                     Ok(config) => config,
                     Err(error) => {
-                        return self.startup_get_config_failure_reply(
-                            error,
-                            request_id,
-                            principal,
-                            &parsed.message_id,
-                            &parsed.reply_attrs,
-                            started,
-                        );
+                        return self
+                            .startup_get_config_failure_reply(
+                                error,
+                                request_id,
+                                principal,
+                                &parsed.message_id,
+                                &parsed.reply_attrs,
+                                started,
+                            )
+                            .into();
                     }
                 };
                 RpcHandlingResult::keep_open(handle_get_config::<C, B, P, A>(
@@ -852,6 +938,20 @@ where
                 started,
                 limits,
             ),
+            RpcOperation::CreateSubscription(request) => {
+                return self.handle_create_subscription(
+                    request,
+                    RpcExecContext {
+                        request_id,
+                        principal,
+                        message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
+                        started,
+                    },
+                    limits,
+                    active_subscription_count,
+                );
+            }
             RpcOperation::Unsupported(operation) => self.handle_unsupported_operation(
                 *operation,
                 request_id,
@@ -860,7 +960,8 @@ where
                 &parsed.reply_attrs,
                 started,
             ),
-        }
+        };
+        reply.into()
     }
 
     fn handle_unsupported_operation(
@@ -916,6 +1017,201 @@ where
             reply_attrs,
             RpcError::operation_not_supported(),
         ))
+    }
+
+    fn handle_create_subscription(
+        &self,
+        request: &XmlCreateSubscriptionRequest,
+        context: RpcExecContext<'_>,
+        limits: &MgmtLimits,
+        active_subscription_count: usize,
+    ) -> RpcSessionHandlingResult<C> {
+        let metric_operation = NetconfOperation::CreateSubscription;
+        let subscribe_paths = self.subscribable_config_paths();
+        let audit_paths = schema_node_paths(&subscribe_paths);
+
+        if self.binding.netconf_notification_capability().is_none() {
+            return self.create_subscription_error(
+                context,
+                metric_operation,
+                AuditOutcome::failed("operation-not-supported")
+                    .expect("static NETCONF audit reason"),
+                audit_paths,
+                RpcError::operation_not_supported(),
+            );
+        }
+
+        if request
+            .stream
+            .as_deref()
+            .unwrap_or(NETCONF_NOTIFICATION_STREAM)
+            != NETCONF_NOTIFICATION_STREAM
+        {
+            return self.create_subscription_error(
+                context,
+                metric_operation,
+                audit_failed("invalid-value"),
+                audit_paths,
+                RpcError::invalid_value(),
+            );
+        }
+
+        if request.filter_present || request.start_time.is_some() || request.stop_time.is_some() {
+            return self.create_subscription_error(
+                context,
+                metric_operation,
+                audit_failed("operation-not-supported"),
+                audit_paths,
+                RpcError::operation_not_supported(),
+            );
+        }
+
+        if active_subscription_count > 0
+            || limits
+                .check_subscriptions(active_subscription_count.saturating_add(1))
+                .is_err()
+        {
+            return self.create_subscription_error(
+                context,
+                metric_operation,
+                audit_failed("resource-denied"),
+                audit_paths,
+                RpcError::resource_denied(),
+            );
+        }
+
+        if subscribe_paths.is_empty() {
+            return self.create_subscription_error(
+                context,
+                metric_operation,
+                audit_denied("access-denied"),
+                audit_paths,
+                RpcError::access_denied(),
+            );
+        }
+
+        let decisions =
+            match self
+                .authz
+                .authorize(context.principal, ReadAction::Subscribe, &subscribe_paths)
+            {
+                Ok(decisions) => decisions,
+                Err(_) => {
+                    return self.create_subscription_error(
+                        context,
+                        metric_operation,
+                        audit_failed("resource-denied"),
+                        audit_paths,
+                        RpcError::resource_denied(),
+                    );
+                }
+            };
+        let allowed_paths = subscribe_paths
+            .iter()
+            .zip(decisions.iter())
+            .filter_map(|(path, decision)| decision.allowed.then_some(*path))
+            .collect::<Vec<_>>();
+        if allowed_paths.is_empty() {
+            return self.create_subscription_error(
+                context,
+                metric_operation,
+                audit_denied("access-denied"),
+                audit_paths,
+                RpcError::access_denied(),
+            );
+        }
+
+        if self
+            .audit
+            .record(
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Subscribe,
+                    AuditOutcome::Success,
+                )
+                .with_paths(schema_node_paths(&allowed_paths)),
+            )
+            .is_err()
+        {
+            record_rpc_error(
+                metric_operation,
+                NetconfErrorTag::OperationFailed,
+                context.started.elapsed(),
+            );
+            return RpcSessionHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
+
+        let receiver = self.binding.config_bus().subscribe(
+            SubscriberLagPolicy::DisconnectOnLag,
+            notification_capacity(limits),
+        );
+        record_rpc_success(metric_operation, context.started.elapsed());
+        RpcSessionHandlingResult::with_action(
+            rpc_ok_empty_reply_with_attrs(context.message_id, context.reply_attrs),
+            RpcSessionAction::StartNetconfNotifications(receiver),
+        )
+    }
+
+    fn create_subscription_error(
+        &self,
+        context: RpcExecContext<'_>,
+        metric_operation: NetconfOperation,
+        outcome: AuditOutcome,
+        paths: Vec<SchemaNodePath>,
+        rpc_error: RpcError,
+    ) -> RpcSessionHandlingResult<C> {
+        if self
+            .audit
+            .record(
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Subscribe,
+                    outcome,
+                )
+                .with_paths(paths),
+            )
+            .is_err()
+        {
+            record_rpc_error(
+                metric_operation,
+                NetconfErrorTag::OperationFailed,
+                context.started.elapsed(),
+            );
+            return RpcSessionHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
+
+        record_rpc_error(
+            metric_operation,
+            rpc_error.classification.tag,
+            context.started.elapsed(),
+        );
+        RpcSessionHandlingResult::keep_open(rpc_error_reply_with_attrs(
+            Some(context.message_id),
+            context.reply_attrs,
+            rpc_error,
+        ))
+    }
+
+    fn subscribable_config_paths(&self) -> Vec<&'static str> {
+        self.binding
+            .schema_registry()
+            .nodes()
+            .iter()
+            .filter(|node| node.config)
+            .map(|node| node.path)
+            .collect()
     }
 
     fn candidate_config_for_get_config(&self, request: &crate::xml::GetConfigRequest) -> Option<C> {
@@ -3974,6 +4270,81 @@ where
         paths
     }
 
+    pub(crate) fn notification_xml_for_event(
+        &self,
+        principal: &TrustedPrincipal,
+        event: ConfigEvent<C>,
+    ) -> Option<String> {
+        match event {
+            ConfigEvent::Change(change) => self.config_change_notification_xml(principal, &change),
+            ConfigEvent::ResyncRequired { .. } => {
+                record_notification(
+                    NETCONF_NOTIFICATION_STREAM,
+                    NetconfNotificationOutcome::Failure,
+                );
+                None
+            }
+        }
+    }
+
+    fn config_change_notification_xml(
+        &self,
+        principal: &TrustedPrincipal,
+        change: &ConfigChange<C>,
+    ) -> Option<String> {
+        let registry = self.binding.schema_registry();
+        let mut candidate_paths = Vec::new();
+        for path in change.changed_paths.iter() {
+            let Some(node) = registry.node(path.as_str()) else {
+                continue;
+            };
+            if node.config && !candidate_paths.contains(&node.path) {
+                candidate_paths.push(node.path);
+            }
+        }
+        if candidate_paths.is_empty() {
+            return None;
+        }
+
+        let decisions =
+            match self
+                .authz
+                .authorize(principal, ReadAction::Subscribe, &candidate_paths)
+            {
+                Ok(decisions) => decisions,
+                Err(_) => {
+                    record_notification(
+                        NETCONF_NOTIFICATION_STREAM,
+                        NetconfNotificationOutcome::Failure,
+                    );
+                    return None;
+                }
+            };
+        let allowed_paths = candidate_paths
+            .iter()
+            .zip(decisions.iter())
+            .filter_map(|(path, decision)| decision.allowed.then_some(*path))
+            .collect::<Vec<_>>();
+        if allowed_paths.is_empty() {
+            return None;
+        }
+
+        let mut out = String::from(r#"<notification xmlns=""#);
+        out.push_str(NETCONF_NOTIFICATION_NS);
+        out.push_str(r#""><eventTime>"#);
+        out.push_str(&xml_escape(&Timestamp::now_utc().to_string()));
+        out.push_str("</eventTime><ncn:netconf-config-change xmlns:ncn=\"");
+        out.push_str(NETCONF_CONFIG_CHANGE_NS);
+        out.push_str("\"><ncn:changed-by><ncn:server/></ncn:changed-by>");
+        for path in allowed_paths {
+            out.push_str("<ncn:edit><ncn:target>");
+            out.push_str(&xml_escape(path));
+            out.push_str("</ncn:target><ncn:operation>merge</ncn:operation></ncn:edit>");
+        }
+        out.push_str("</ncn:netconf-config-change></notification>");
+        Some(out)
+    }
+
     fn handle_validate(
         &self,
         request: &XmlValidateRequest,
@@ -4590,6 +4961,9 @@ where
             Some(RpcOperationHint::KillSession) => {
                 event.with_paths([schema_node_path(NETCONF_KILL_SESSION_PATH)])
             }
+            Some(RpcOperationHint::CreateSubscription) => {
+                event.with_paths([schema_node_path(NETCONF_CREATE_SUBSCRIPTION_PATH)])
+            }
             Some(RpcOperationHint::Validate) => {
                 event.with_paths([schema_node_path(NETCONF_VALIDATE_PATH)])
             }
@@ -4633,6 +5007,7 @@ fn audit_operation_for_parse_failure(err: &RpcParseError) -> AuditOperation {
         Some(RpcOperationHint::DeleteConfig) => AuditOperation::Delete,
         Some(RpcOperationHint::Lock | RpcOperationHint::Unlock) => AuditOperation::Exec,
         Some(RpcOperationHint::KillSession) => AuditOperation::Exec,
+        Some(RpcOperationHint::CreateSubscription) => AuditOperation::Subscribe,
         Some(RpcOperationHint::Validate) => AuditOperation::Validate,
         Some(RpcOperationHint::Get | RpcOperationHint::GetConfig) | None => AuditOperation::Read,
     }
@@ -4651,6 +5026,7 @@ fn netconf_operation_for_parse_failure(err: &RpcParseError) -> NetconfOperation 
         Some(RpcOperationHint::Lock) => NetconfOperation::Lock,
         Some(RpcOperationHint::Unlock) => NetconfOperation::Unlock,
         Some(RpcOperationHint::KillSession) => NetconfOperation::KillSession,
+        Some(RpcOperationHint::CreateSubscription) => NetconfOperation::CreateSubscription,
         Some(RpcOperationHint::Validate) => NetconfOperation::Validate,
         None => NetconfOperation::Unknown,
     }
@@ -4689,6 +5065,7 @@ fn audit_operation_for_unsupported(operation: UnsupportedOperation) -> AuditOper
         UnsupportedOperation::EditConfig => AuditOperation::Update,
         UnsupportedOperation::CopyConfig => AuditOperation::Replace,
         UnsupportedOperation::DeleteConfig => AuditOperation::Delete,
+        UnsupportedOperation::CreateSubscription => AuditOperation::Subscribe,
         UnsupportedOperation::Validate => AuditOperation::Validate,
         UnsupportedOperation::Lock
         | UnsupportedOperation::Unlock
@@ -4700,6 +5077,18 @@ fn audit_operation_for_unsupported(operation: UnsupportedOperation) -> AuditOper
 
 fn schema_node_path(path: &'static str) -> SchemaNodePath {
     SchemaNodePath::new(path).expect("static NETCONF schema path")
+}
+
+fn schema_node_paths(paths: &[&'static str]) -> Vec<SchemaNodePath> {
+    paths
+        .iter()
+        .map(|path| schema_node_path(path))
+        .collect::<Vec<_>>()
+}
+
+fn notification_capacity(limits: &MgmtLimits) -> usize {
+    (limits.max_subscriber_queue_bytes / NOTIFICATION_EVENT_BYTES_ESTIMATE)
+        .clamp(1, MAX_NOTIFICATION_EVENT_CAPACITY)
 }
 
 fn audit_denied(reason: &'static str) -> AuditOutcome {
@@ -4766,7 +5155,8 @@ mod tests {
     };
     use crate::capabilities::{
         CANDIDATE_1_0, CONFIRMED_COMMIT_1_1, NETCONF_BASE_1_0, NETCONF_BASE_1_1, NETCONF_BASE_NS,
-        NETCONF_MONITORING_NS, STARTUP_1_0, WITH_DEFAULTS_NS, WRITABLE_RUNNING_1_0,
+        NETCONF_MONITORING_NS, NOTIFICATION_1_0, STARTUP_1_0, WITH_DEFAULTS_NS,
+        WRITABLE_RUNNING_1_0,
     };
     use crate::framing::base10;
     use crate::listener::{run_read_only_tls_listener, TlsListenerConfig};
@@ -4996,6 +5386,7 @@ mod tests {
         operational_mode: OperationalMode,
         yang_library: bool,
         monitoring: bool,
+        notifications: bool,
         with_defaults: bool,
         get_schema_mode: GetSchemaMode,
     }
@@ -5566,6 +5957,13 @@ mod tests {
             self.monitoring.then_some(NetconfMonitoringCapability)
         }
 
+        fn netconf_notification_capability(
+            &self,
+        ) -> Option<crate::binding::NetconfNotificationCapability> {
+            self.notifications
+                .then_some(crate::binding::NetconfNotificationCapability)
+        }
+
         fn render_netconf_monitoring(
             &self,
             selection: ReadSelection<'_>,
@@ -6088,8 +6486,16 @@ mod tests {
                 NacmAction::Read,
                 YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
             ))
+            .add_rule(NacmRule::deny(
+                NacmAction::Subscribe,
+                YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
+            ))
             .add_rule(NacmRule::allow(
                 NacmAction::Read,
+                YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
+            ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Subscribe,
                 YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
             ))
             .add_rule(allow_close_session_rule(&modules))
@@ -6155,8 +6561,16 @@ mod tests {
                 NacmAction::Read,
                 YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
             ))
+            .add_rule(NacmRule::deny(
+                NacmAction::Subscribe,
+                YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
+            ))
             .add_rule(NacmRule::allow(
                 NacmAction::Read,
+                YangPathPattern::parse("/sys:system/**", &modules).expect("allow system path"),
+            ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Subscribe,
                 YangPathPattern::parse("/sys:system/**", &modules).expect("allow system path"),
             ))
             .add_rule(NacmRule::allow(
@@ -6209,6 +6623,7 @@ mod tests {
             operational_mode,
             yang_library: false,
             monitoring: false,
+            notifications: false,
             with_defaults: false,
             get_schema_mode: GetSchemaMode::Ok,
         };
@@ -6222,6 +6637,46 @@ mod tests {
         )
         .expect("server");
         (server, observed, audit)
+    }
+
+    async fn server_fixture_with_notifications() -> (
+        ReadOnlyNetconfServer<DemoConfig, TestBinding, FixedPolicy, CapturingAudit>,
+        Arc<ConfigBus<DemoConfig>>,
+        CapturingAudit,
+    ) {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = TestBinding {
+            bus: Arc::clone(&bus),
+            observed_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_yang_library_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_monitoring_paths: Arc::new(Mutex::new(Vec::new())),
+            observed_with_defaults: Arc::new(Mutex::new(Vec::new())),
+            operational_mode: OperationalMode::Normal,
+            yang_library: false,
+            monitoring: false,
+            notifications: true,
+            with_defaults: false,
+            get_schema_mode: GetSchemaMode::Ok,
+        };
+        let audit = CapturingAudit::default();
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            audit.clone(),
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+        (server, bus, audit)
     }
 
     async fn validation_server_fixture() -> (
@@ -6275,6 +6730,7 @@ mod tests {
             operational_mode: OperationalMode::Normal,
             yang_library: false,
             monitoring: false,
+            notifications: false,
             with_defaults: false,
             get_schema_mode: GetSchemaMode::Ok,
         };
@@ -6418,6 +6874,7 @@ mod tests {
             operational_mode: OperationalMode::Normal,
             yang_library: true,
             monitoring: false,
+            notifications: false,
             with_defaults: false,
             get_schema_mode: GetSchemaMode::Ok,
         };
@@ -6463,6 +6920,7 @@ mod tests {
             operational_mode: OperationalMode::Normal,
             yang_library: false,
             monitoring: true,
+            notifications: false,
             with_defaults: false,
             get_schema_mode,
         };
@@ -6505,6 +6963,7 @@ mod tests {
             operational_mode: OperationalMode::Normal,
             yang_library: false,
             monitoring: false,
+            notifications: false,
             with_defaults: true,
             get_schema_mode: GetSchemaMode::Ok,
         };
@@ -6608,6 +7067,18 @@ mod tests {
         format!(r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="201"><get/></rpc>"#)
     }
 
+    fn create_subscription_rpc(message_id: &str) -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="{message_id}"><ncn:create-subscription xmlns:ncn="urn:ietf:params:xml:ns:netconf:notification:1.0"/></rpc>"#
+        )
+    }
+
+    fn create_subscription_with_inner_rpc(message_id: &str, inner: &str) -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="{message_id}"><ncn:create-subscription xmlns:ncn="urn:ietf:params:xml:ns:netconf:notification:1.0">{inner}</ncn:create-subscription></rpc>"#
+        )
+    }
+
     fn get_config_with_defaults_rpc(mode: &str) -> String {
         format!(
             r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="111"><get-config><source><running/></source><with-defaults xmlns="{WITH_DEFAULTS_NS}">{}</with-defaults></get-config></rpc>"#,
@@ -6656,6 +7127,24 @@ mod tests {
         format!(
             r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="305"><validate><source><{source}/></source></validate></rpc>"#
         )
+    }
+
+    async fn publish_demo_config(bus: &ConfigBus<DemoConfig>, hostname: &str, secret: &str) {
+        bus.submit(CommitRequest::commit(
+            RequestId::new(),
+            principal(),
+            TransportType::NetconfTls,
+            RequestSource::Northbound,
+            ConfigOperation::Patch,
+            DemoConfig {
+                hostname: hostname.to_string(),
+                secret: secret.to_string(),
+            },
+            Vec::new(),
+            Instant::now() + Duration::from_secs(30),
+        ))
+        .await
+        .expect("publish config change");
     }
 
     fn kill_session_rpc(session_id: u64) -> String {
@@ -6845,6 +7334,7 @@ mod tests {
             operational_mode: OperationalMode::Normal,
             yang_library: false,
             monitoring: false,
+            notifications: false,
             with_defaults: false,
             get_schema_mode: GetSchemaMode::Ok,
         };
@@ -6953,6 +7443,7 @@ mod tests {
             operational_mode: OperationalMode::Error,
             yang_library: false,
             monitoring: false,
+            notifications: false,
             with_defaults: false,
             get_schema_mode: GetSchemaMode::Ok,
         };
@@ -7176,6 +7667,243 @@ mod tests {
         assert!(reply.contains("<error-tag>unknown-namespace</error-tag>"));
         assert!(!reply.contains("demo-system"));
         assert!(observed.lock().expect("observed paths mutex").is_empty());
+    }
+
+    #[tokio::test]
+    async fn notification_capability_is_opt_in() {
+        let (server, _observed, _audit) = server_fixture().await;
+        assert!(!server.server_hello(None).contains(NOTIFICATION_1_0));
+
+        let (server, _bus, _audit) = server_fixture_with_notifications().await;
+        assert!(server.server_hello(None).contains(NOTIFICATION_1_0));
+    }
+
+    #[tokio::test]
+    async fn create_subscription_starts_live_config_change_notifications() {
+        let (server, bus, audit) = server_fixture_with_notifications().await;
+        let principal = principal();
+        let sessions = SessionRegistry::new();
+        let limits = MgmtLimits::default();
+        let (mut client, mut server_io) = tokio::io::duplex(64 * 1024);
+
+        let task = tokio::spawn(async move {
+            crate::session::run_read_only_session_with_registry(
+                &server,
+                &principal,
+                &mut server_io,
+                SessionConfig::default(),
+                771,
+                &sessions,
+            )
+            .await
+        });
+
+        let hello = String::from_utf8(read_base10_frame(&mut client).await).expect("hello utf8");
+        assert!(hello.contains(NOTIFICATION_1_0));
+        let client_hello = format!(
+            r#"<hello xmlns="{NETCONF_BASE_NS}"><capabilities><capability>{NETCONF_BASE_1_0}</capability></capabilities></hello>"#
+        );
+        client
+            .write_all(&base10::encode_message(client_hello.as_bytes(), &limits).expect("hello"))
+            .await
+            .expect("write hello");
+        client
+            .write_all(
+                &base10::encode_message(create_subscription_rpc("701").as_bytes(), &limits)
+                    .expect("create-subscription"),
+            )
+            .await
+            .expect("write create-subscription");
+
+        let reply =
+            String::from_utf8(read_base10_frame(&mut client).await).expect("subscription utf8");
+        assert!(reply.contains(r#"message-id="701""#));
+        assert!(reply.contains("<ok/>"));
+
+        publish_demo_config(&bus, "amf-2", "do-not-leak").await;
+        let notification = tokio::time::timeout(Duration::from_secs(2), async {
+            String::from_utf8(read_base10_frame(&mut client).await).expect("utf8")
+        })
+        .await
+        .expect("notification frame");
+        assert!(notification.contains("<notification"));
+        assert!(notification.contains("netconf-config-change"));
+        assert!(notification.contains("/sys:system/sys:hostname"));
+        assert!(!notification.contains("/sys:system/sys:secret"));
+        assert!(!notification.contains("amf-2"));
+        assert!(!notification.contains("do-not-leak"));
+
+        client
+            .write_all(
+                &base10::encode_message(close_session_rpc().as_bytes(), &limits).expect("close"),
+            )
+            .await
+            .expect("write close");
+        let close = String::from_utf8(read_base10_frame(&mut client).await).expect("close utf8");
+        assert!(close.contains(r#"message-id="301""#));
+        assert!(close.contains("<ok/>"));
+
+        let result = task.await.expect("join").expect("session result");
+        assert_eq!(result.rpc_count, 2);
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert!(events
+            .iter()
+            .any(|event| event.operation == AuditOperation::Subscribe
+                && event.outcome == AuditOutcome::Success
+                && event
+                    .schema_paths
+                    .iter()
+                    .any(|path| path.as_str() == "/sys:system/sys:hostname")));
+    }
+
+    #[tokio::test]
+    async fn notification_stream_does_not_emit_denied_secret_only_changes() {
+        let (server, bus, _audit) = server_fixture_with_notifications().await;
+        let principal = principal();
+        let sessions = SessionRegistry::new();
+        let limits = MgmtLimits::default();
+        let (mut client, mut server_io) = tokio::io::duplex(64 * 1024);
+
+        let task = tokio::spawn(async move {
+            crate::session::run_read_only_session_with_registry(
+                &server,
+                &principal,
+                &mut server_io,
+                SessionConfig::default(),
+                772,
+                &sessions,
+            )
+            .await
+        });
+
+        let _hello = read_base10_frame(&mut client).await;
+        let client_hello = format!(
+            r#"<hello xmlns="{NETCONF_BASE_NS}"><capabilities><capability>{NETCONF_BASE_1_0}</capability></capabilities></hello>"#
+        );
+        client
+            .write_all(&base10::encode_message(client_hello.as_bytes(), &limits).expect("hello"))
+            .await
+            .expect("write hello");
+        client
+            .write_all(
+                &base10::encode_message(create_subscription_rpc("702").as_bytes(), &limits)
+                    .expect("create-subscription"),
+            )
+            .await
+            .expect("write create-subscription");
+        let reply =
+            String::from_utf8(read_base10_frame(&mut client).await).expect("subscription utf8");
+        assert!(reply.contains("<ok/>"));
+
+        publish_demo_config(&bus, "amf-1", "changed-secret").await;
+        client
+            .write_all(
+                &base10::encode_message(close_session_rpc().as_bytes(), &limits).expect("close"),
+            )
+            .await
+            .expect("write close");
+        let next = String::from_utf8(read_base10_frame(&mut client).await).expect("next utf8");
+        assert!(next.contains(r#"message-id="301""#), "{next}");
+        assert!(next.contains("<ok/>"));
+        assert!(!next.contains("changed-secret"));
+        assert!(!next.contains("netconf-config-change"));
+
+        let result = task.await.expect("join").expect("session result");
+        assert_eq!(result.rpc_count, 2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_create_subscription_fails_closed() {
+        let (server, _bus, _audit) = server_fixture_with_notifications().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session");
+
+        let first = server
+            .handle_rpc_for_session_with_action_async(
+                RequestId::new(),
+                &principal(),
+                &create_subscription_rpc("705"),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+                0,
+            )
+            .await;
+        assert!(first.action.is_some());
+        assert!(first.reply.reply_xml.contains("<ok/>"));
+
+        let duplicate = server
+            .handle_rpc_for_session_with_action_async(
+                RequestId::new(),
+                &principal(),
+                &create_subscription_rpc("706"),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+                1,
+            )
+            .await;
+        assert!(duplicate.action.is_none());
+        assert!(duplicate
+            .reply
+            .reply_xml
+            .contains("<error-tag>resource-denied</error-tag>"));
+    }
+
+    #[tokio::test]
+    async fn create_subscription_replay_and_filter_options_fail_closed() {
+        let (server, _bus, audit) = server_fixture_with_notifications().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session");
+        let replay = create_subscription_with_inner_rpc(
+            "703",
+            "<ncn:startTime>2026-06-14T00:00:00Z</ncn:startTime>",
+        );
+        let replay_reply = server
+            .handle_rpc_for_session_with_action_async(
+                RequestId::new(),
+                &principal(),
+                &replay,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+                0,
+            )
+            .await;
+        assert!(replay_reply.action.is_none());
+        assert!(replay_reply
+            .reply
+            .reply_xml
+            .contains("<error-tag>operation-not-supported</error-tag>"));
+
+        let filter = create_subscription_with_inner_rpc(
+            "704",
+            r#"<ncn:filter><sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-1</sys:hostname></sys:system></ncn:filter>"#,
+        );
+        let filter_reply = server
+            .handle_rpc_for_session_with_action_async(
+                RequestId::new(),
+                &principal(),
+                &filter,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+                0,
+            )
+            .await;
+        assert!(filter_reply.action.is_none());
+        assert!(filter_reply
+            .reply
+            .reply_xml
+            .contains("<error-tag>operation-not-supported</error-tag>"));
+        assert!(!filter_reply.reply.reply_xml.contains("amf-1"));
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert!(events.iter().any(|event| {
+            event.operation == AuditOperation::Subscribe
+                && event.outcome == audit_failed("operation-not-supported")
+        }));
     }
 
     #[tokio::test]
@@ -7717,6 +8445,7 @@ mod tests {
             operational_mode: OperationalMode::Normal,
             yang_library: false,
             monitoring: false,
+            notifications: false,
             with_defaults: false,
             get_schema_mode: GetSchemaMode::Ok,
         };
@@ -8426,6 +9155,7 @@ mod tests {
             operational_mode: OperationalMode::Normal,
             yang_library: false,
             monitoring: false,
+            notifications: false,
             with_defaults: false,
             get_schema_mode: GetSchemaMode::Ok,
         };
@@ -8485,6 +9215,7 @@ mod tests {
             operational_mode: OperationalMode::Normal,
             yang_library: false,
             monitoring: false,
+            notifications: false,
             with_defaults: false,
             get_schema_mode: GetSchemaMode::Ok,
         };
@@ -8545,6 +9276,7 @@ mod tests {
             operational_mode: OperationalMode::Normal,
             yang_library: false,
             monitoring: false,
+            notifications: false,
             with_defaults: false,
             get_schema_mode: GetSchemaMode::Ok,
         };
@@ -8754,6 +9486,7 @@ mod tests {
             operational_mode: OperationalMode::Normal,
             yang_library: false,
             monitoring: false,
+            notifications: false,
             with_defaults: false,
             get_schema_mode: GetSchemaMode::Ok,
         };
@@ -8835,6 +9568,7 @@ mod tests {
             operational_mode: OperationalMode::Normal,
             yang_library: false,
             monitoring: false,
+            notifications: false,
             with_defaults: false,
             get_schema_mode: GetSchemaMode::Ok,
         };
@@ -9153,6 +9887,7 @@ mod tests {
             operational_mode: OperationalMode::Normal,
             yang_library: false,
             monitoring: false,
+            notifications: false,
             with_defaults: false,
             get_schema_mode: GetSchemaMode::Ok,
         };
