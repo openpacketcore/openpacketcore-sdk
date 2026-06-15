@@ -5,11 +5,13 @@
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use opc_config_model::{OpcConfig, TrustedPrincipal, YangPath};
+use opc_config_model::{OpcConfig, RequestId, TrustedPrincipal, YangPath};
+use opc_mgmt_audit::{AuditOperation, AuditOutcome, SchemaNodePath};
 use opc_mgmt_authz::{ReadAction, ReadAuthorizer};
 use opc_mgmt_opstate::{OperationalError, OperationalRequest, OperationalResponse};
 use opc_mgmt_schema::{NodeKind, SchemaRegistry};
 
+use crate::audit::{outcome_for_error, record_audit, schema_paths_for_schema};
 use crate::binding::{ReadSelection, ReadSelectionEntry};
 use crate::metrics::{record_nacm_denials, GnmiNacmAction};
 use crate::proto::gnmi;
@@ -28,13 +30,36 @@ where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
 {
-    handle_read_request(
+    let request_id = RequestId::new();
+    match execute_read_request(
         server,
         principal,
         request,
         ReadAction::Read,
         GnmiNacmAction::Read,
-    )
+    ) {
+        Ok(result) => {
+            record_read_audit(
+                server,
+                request_id,
+                principal,
+                AuditOutcome::Success,
+                result.audit_paths,
+            )?;
+            Ok(result.response)
+        }
+        Err(err) => {
+            let audit_error = record_read_audit(
+                server,
+                request_id,
+                principal,
+                outcome_for_error(&err.error),
+                err.audit_paths,
+            )
+            .err();
+            Err(audit_error.unwrap_or(err.error))
+        }
+    }
 }
 
 /// Executes a schema-backed read request for Get or Subscribe.
@@ -49,9 +74,25 @@ where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
 {
+    execute_read_request(server, principal, request, read_action, metric_action)
+        .map(|result| result.response)
+        .map_err(|err| err.error)
+}
+
+fn execute_read_request<C, B>(
+    server: &GnmiServer<C, B>,
+    principal: &TrustedPrincipal,
+    request: &gnmi::GetRequest,
+    read_action: ReadAction,
+    metric_action: GnmiNacmAction,
+) -> Result<ReadResult, ReadFailure>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
     let encoding = encoding_from_proto(request.encoding)?;
     if !server.profile().encodings().supports(encoding) {
-        return Err(GnmiError::from(encoding));
+        return Err(GnmiError::from(encoding).into());
     }
 
     let data_type = GetDataType::from_proto(request.r#type)?;
@@ -63,9 +104,7 @@ where
         .map(path_from_proto)
         .collect::<Result<Vec<_>, _>>()?;
     if prefix.as_ref().is_some_and(path_has_target) || request_paths.iter().any(path_has_target) {
-        return Err(GnmiError::unimplemented(
-            "non-empty gNMI target is not supported",
-        ));
+        return Err(GnmiError::unimplemented("non-empty gNMI target is not supported").into());
     }
     let selected_entries = select_paths(
         server.binding().schema(),
@@ -75,12 +114,12 @@ where
         data_type,
         &model_filter,
     )?;
+    let selected_audit_paths = audit_paths_for_entries(&selected_entries)?;
 
     if selected_entries.is_empty() {
-        return Ok(gnmi::GetResponse {
-            notification: Vec::new(),
-            error: None,
-            extension: Vec::new(),
+        return Ok(ReadResult {
+            response: empty_get_response(),
+            audit_paths: Vec::new(),
         });
     }
 
@@ -93,7 +132,12 @@ where
         .collect::<Vec<_>>();
     let decisions = authz
         .authorize(principal, read_action, &decision_input)
-        .map_err(|_| GnmiError::unavailable("gNMI read policy source unavailable"))?;
+        .map_err(|_| {
+            ReadFailure::new(
+                GnmiError::unavailable("gNMI read policy source unavailable"),
+                selected_audit_paths.clone(),
+            )
+        })?;
 
     let denied_count = decisions
         .iter()
@@ -130,21 +174,28 @@ where
         .cloned()
         .collect::<Vec<_>>();
 
-    let operational = read_operational(server.binding(), &state_entries)?;
+    let state_audit_paths = audit_paths_for_entries(&state_entries)?;
+    let operational = read_operational(server.binding(), &state_entries)
+        .map_err(|error| ReadFailure::new(error, state_audit_paths))?;
     let state_entries_with_values = state_entries_with_values(&state_entries, &operational);
     let config_entries = config_entries_for_render(server.binding().schema(), &config_entries);
 
     if config_entries.is_empty() && state_entries_with_values.is_empty() {
-        return Ok(gnmi::GetResponse {
-            notification: Vec::new(),
-            error: None,
-            extension: Vec::new(),
+        return Ok(ReadResult {
+            response: empty_get_response(),
+            audit_paths: Vec::new(),
         });
     }
 
     let snapshot = server.binding().config_bus().current_snapshot();
     let config_paths = schema_paths_for_entries(&config_entries);
     let state_paths = schema_paths_for_entries(&state_entries_with_values);
+    let render_audit_paths = audit_paths_for_schema_paths(
+        config_paths
+            .iter()
+            .copied()
+            .chain(state_paths.iter().copied()),
+    )?;
     let updates = server
         .binding()
         .render_get_json(
@@ -153,12 +204,18 @@ where
             &operational,
             ReadSelection::with_entries(&state_paths, &state_entries_with_values),
         )
-        .map_err(|err| GnmiError::schema(err.detail().to_string()))?;
+        .map_err(|err| {
+            ReadFailure::new(
+                GnmiError::schema(err.detail().to_string()),
+                render_audit_paths.clone(),
+            )
+        })?;
 
     let updates = updates
         .iter()
         .map(|update| update_to_proto(update, encoding, server.limits()))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ReadFailure::new(error, render_audit_paths.clone()))?;
 
     let notification = if updates.is_empty() {
         Vec::new()
@@ -172,11 +229,77 @@ where
         }]
     };
 
-    Ok(gnmi::GetResponse {
-        notification,
+    Ok(ReadResult {
+        response: gnmi::GetResponse {
+            notification,
+            error: None,
+            extension: Vec::new(),
+        },
+        audit_paths: render_audit_paths,
+    })
+}
+
+struct ReadResult {
+    response: gnmi::GetResponse,
+    audit_paths: Vec<SchemaNodePath>,
+}
+
+struct ReadFailure {
+    error: GnmiError,
+    audit_paths: Vec<SchemaNodePath>,
+}
+
+impl ReadFailure {
+    fn new(error: GnmiError, audit_paths: Vec<SchemaNodePath>) -> Self {
+        Self { error, audit_paths }
+    }
+}
+
+impl From<GnmiError> for ReadFailure {
+    fn from(error: GnmiError) -> Self {
+        Self::new(error, Vec::new())
+    }
+}
+
+fn empty_get_response() -> gnmi::GetResponse {
+    gnmi::GetResponse {
+        notification: Vec::new(),
         error: None,
         extension: Vec::new(),
-    })
+    }
+}
+
+fn record_read_audit<C, B>(
+    server: &GnmiServer<C, B>,
+    request_id: RequestId,
+    principal: &TrustedPrincipal,
+    outcome: AuditOutcome,
+    paths: Vec<SchemaNodePath>,
+) -> Result<(), GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    record_audit(
+        server.audit(),
+        request_id,
+        principal,
+        AuditOperation::Read,
+        outcome,
+        paths,
+    )
+}
+
+fn audit_paths_for_entries(
+    entries: &[ReadSelectionEntry],
+) -> Result<Vec<SchemaNodePath>, GnmiError> {
+    audit_paths_for_schema_paths(schema_paths_for_entries(entries))
+}
+
+fn audit_paths_for_schema_paths(
+    paths: impl IntoIterator<Item = &'static str>,
+) -> Result<Vec<SchemaNodePath>, GnmiError> {
+    schema_paths_for_schema(paths)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
