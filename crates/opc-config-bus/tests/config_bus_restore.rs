@@ -97,6 +97,28 @@ async fn restore_or_new_rejects_semantically_invalid_initial_config_when_store_i
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_or_new_empty_store_persists_bootstrap_rollback_parent() {
+    let store = Arc::new(MockManagedDatastore::new());
+
+    let bus = ConfigBus::restore_or_new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
+        .await
+        .expect("restore with empty store should seed bootstrap");
+
+    let snapshot = bus.current_snapshot();
+    assert_eq!(snapshot.version, ConfigVersion::INITIAL);
+    assert!(snapshot.tx_id.is_some());
+    assert_eq!(snapshot.config.name, "initial");
+
+    let history = store.history().await;
+    assert_eq!(history.len(), 1);
+    assert_eq!(Some(history[0].tx_id), snapshot.tx_id);
+    assert_eq!(history[0].version, ConfigVersion::INITIAL);
+    assert_eq!(history[0].config.name, "initial");
+    assert!(history[0].parent_tx_id.is_none());
+    assert!(history[0].confirmed_deadline.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_surfaces_startup_validation_task_panics() {
     let store = Arc::new(MockManagedDatastore::new());
 

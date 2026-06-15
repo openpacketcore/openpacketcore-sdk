@@ -48,6 +48,8 @@ const CONFIRM_RECONCILIATION_FAILED_MESSAGE: &str =
     "commit was persisted but the pending commit-confirmed marker could not be cleared durably";
 const RECOVERY_RECONCILIATION_FAILED_MESSAGE: &str =
     "commit was published but the recovery marker could not be cleared durably";
+const PENDING_CONFIRMED_UPDATE_UNSUPPORTED_MESSAGE: &str =
+    "commit-confirmed update while another confirmed commit is pending is not supported";
 
 pub(crate) struct Submission<C: OpcConfig> {
     pub(crate) request: CommitRequest<C>,
@@ -323,7 +325,9 @@ async fn worker_loop<C: OpcConfig>(
                             let deadline = Timestamp::from_offset_datetime(time::OffsetDateTime::now_utc() + timeout);
                             pending_deadline = Some(deadline);
                         }
-                        CommitMode::Commit | CommitMode::Rollback { .. } => {
+                        CommitMode::Commit
+                        | CommitMode::CancelConfirmed
+                        | CommitMode::Rollback { .. } => {
                             pending_deadline = None;
                         }
                         _ => {}
@@ -459,6 +463,17 @@ async fn process_commit<C: OpcConfig>(
     ensure_deadline(request.deadline)?;
 
     let current = snapshot.current_snapshot();
+    if matches!(request.mode, CommitMode::CommitConfirmed { .. }) && current.tx_id.is_none() {
+        return Err(CommitError::rollback_unavailable(
+            "commit-confirmed requires a durable rollback parent",
+        ));
+    }
+    if matches!(request.mode, CommitMode::CommitConfirmed { .. }) && has_pending {
+        return Err(CommitError::new(
+            CommitErrorCode::AdmissionRejected,
+            PENDING_CONFIRMED_UPDATE_UNSUPPORTED_MESSAGE,
+        ));
+    }
 
     let tx_id = TxId::new();
     let validation_context = ValidationContext {
@@ -497,8 +512,14 @@ async fn process_commit<C: OpcConfig>(
                 changed_paths,
             })
         }
-        CommitMode::CommitConfirmed { .. } | CommitMode::Commit | CommitMode::Rollback { .. } => {
-            let preauthorized_rollback = matches!(request.mode, CommitMode::Rollback { .. });
+        CommitMode::CommitConfirmed { .. }
+        | CommitMode::Commit
+        | CommitMode::CancelConfirmed
+        | CommitMode::Rollback { .. } => {
+            let preauthorized_rollback = matches!(
+                request.mode,
+                CommitMode::CancelConfirmed | CommitMode::Rollback { .. }
+            );
             if preauthorized_rollback {
                 authorize_request(
                     &request,
@@ -641,7 +662,9 @@ async fn process_commit<C: OpcConfig>(
             let status = match request.mode {
                 CommitMode::Commit => CommitStatus::Committed,
                 CommitMode::CommitConfirmed { .. } => CommitStatus::CommitConfirmedPending,
-                CommitMode::Rollback { .. } => CommitStatus::RollbackApplied,
+                CommitMode::CancelConfirmed | CommitMode::Rollback { .. } => {
+                    CommitStatus::RollbackApplied
+                }
                 CommitMode::ValidateOnly => {
                     unreachable!("handled above")
                 }
@@ -729,7 +752,11 @@ fn persisted_request_fingerprint<C: OpcConfig>(
         CommitMode::Rollback { target } => StoredRequestMode::Rollback {
             target: target.clone(),
         },
-        CommitMode::ValidateOnly | CommitMode::CommitConfirmed { .. } => return None,
+        CommitMode::ValidateOnly
+        | CommitMode::CommitConfirmed { .. }
+        | CommitMode::CancelConfirmed => {
+            return None;
+        }
     };
 
     Some(StoredRequestFingerprint {

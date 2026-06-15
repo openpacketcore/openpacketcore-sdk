@@ -24,7 +24,7 @@ use crate::binding::{
     EditConfigError, GetSchemaError, GetSchemaRequest as BindingGetSchemaRequest,
     NetconfConfigBinding, StartupDatastoreError,
 };
-use crate::capabilities::render_server_hello;
+use crate::capabilities::{render_server_hello, ServerHelloCapabilities};
 use crate::error::{
     rpc_error_reply_with_attrs, rpc_get_schema_reply_with_attrs, rpc_ok_empty_reply_with_attrs,
     RpcError, RpcReplyAttributes,
@@ -40,11 +40,13 @@ use crate::session_registry::{
     LockRunningResult, LockStartupResult, UnlockRunningResult, UnlockStartupResult,
 };
 use crate::xml::{
-    parse_rpc_with_context, CopyConfigRequest as XmlCopyConfigRequest, Datastore as XmlDatastore,
-    EditConfigRequest as XmlEditConfigRequest, EditErrorOption, EditTestOption,
-    GetSchemaRequest as XmlGetSchemaRequest, KillSessionRequest as XmlKillSessionRequest,
-    LockRequest as XmlLockRequest, RpcOperation, RpcOperationHint, RpcParseError,
-    UnlockRequest as XmlUnlockRequest, UnsupportedOperation, ValidateRequest as XmlValidateRequest,
+    parse_rpc_with_context, CancelCommitRequest as XmlCancelCommitRequest,
+    CommitRequest as XmlCommitRequest, CopyConfigRequest as XmlCopyConfigRequest,
+    Datastore as XmlDatastore, EditConfigRequest as XmlEditConfigRequest, EditErrorOption,
+    EditTestOption, GetSchemaRequest as XmlGetSchemaRequest,
+    KillSessionRequest as XmlKillSessionRequest, LockRequest as XmlLockRequest, RpcOperation,
+    RpcOperationHint, RpcParseError, UnlockRequest as XmlUnlockRequest, UnsupportedOperation,
+    ValidateRequest as XmlValidateRequest,
 };
 
 const NETCONF_BASE_MODEL: &[ModelData] = &[ModelData {
@@ -61,9 +63,11 @@ const NETCONF_UNLOCK_PATH: &str = "/nc:unlock";
 const NETCONF_KILL_SESSION_PATH: &str = "/nc:kill-session";
 const NETCONF_VALIDATE_PATH: &str = "/nc:validate";
 const NETCONF_COMMIT_PATH: &str = "/nc:commit";
+const NETCONF_CANCEL_COMMIT_PATH: &str = "/nc:cancel-commit";
 const NETCONF_DISCARD_CHANGES_PATH: &str = "/nc:discard-changes";
 const NETCONF_COPY_CONFIG_PATH: &str = "/nc:copy-config";
 const NETCONF_DELETE_CONFIG_PATH: &str = "/nc:delete-config";
+const DEFAULT_CONFIRMED_COMMIT_TIMEOUT_SECS: u32 = 600;
 
 /// Server construction error.
 #[derive(Debug, Error)]
@@ -112,6 +116,39 @@ struct RpcExecContext<'a> {
 #[derive(Debug)]
 struct CandidateDatastore<C> {
     snapshot: Option<CandidateSnapshot<C>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingConfirmedCommit {
+    owner_session_id: u64,
+    persist: Option<String>,
+    deadline: Instant,
+}
+
+#[derive(Debug, Default)]
+struct ConfirmedCommitState {
+    pending: Option<PendingConfirmedCommit>,
+}
+
+impl ConfirmedCommitState {
+    fn active(&mut self, now: Instant) -> Option<&PendingConfirmedCommit> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.deadline <= now)
+        {
+            self.pending = None;
+        }
+        self.pending.as_ref()
+    }
+
+    fn replace(&mut self, pending: PendingConfirmedCommit) {
+        self.pending = Some(pending);
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +253,7 @@ where
     audit: A,
     transport: TransportType,
     candidate: Arc<Mutex<CandidateDatastore<C>>>,
+    confirmed_commit: Arc<Mutex<ConfirmedCommitState>>,
     _config: PhantomData<C>,
 }
 
@@ -244,6 +282,7 @@ where
             audit,
             transport,
             candidate: Arc::new(Mutex::new(CandidateDatastore::default())),
+            confirmed_commit: Arc::new(Mutex::new(ConfirmedCommitState::default())),
             _config: PhantomData,
         })
     }
@@ -277,15 +316,19 @@ where
         let with_defaults = self.binding.with_defaults_capability();
         let writable_running = self.binding.writable_running_capability();
         let candidate = self.binding.candidate_datastore_capability();
+        let confirmed_commit = self.binding.confirmed_commit_capability();
         let startup = self.binding.startup_datastore_capability();
         render_server_hello(
             session_id,
-            yang_library.as_ref(),
-            monitoring.as_ref(),
-            with_defaults.as_ref(),
-            writable_running,
-            candidate,
-            startup,
+            ServerHelloCapabilities {
+                yang_library: yang_library.as_ref(),
+                monitoring: monitoring.as_ref(),
+                with_defaults: with_defaults.as_ref(),
+                writable_running,
+                candidate,
+                confirmed_commit,
+                startup,
+            },
         )
     }
 
@@ -499,8 +542,16 @@ where
                     started,
                 },
             ),
-            RpcOperation::Commit => self.handle_unsupported_operation(
+            RpcOperation::Commit(_) => self.handle_unsupported_operation(
                 UnsupportedOperation::Commit,
+                request_id,
+                principal,
+                &parsed.message_id,
+                &parsed.reply_attrs,
+                started,
+            ),
+            RpcOperation::CancelCommit(_) => self.handle_unsupported_operation(
+                UnsupportedOperation::CancelCommit,
                 request_id,
                 principal,
                 &parsed.message_id,
@@ -718,8 +769,23 @@ where
                     started,
                 },
             ),
-            RpcOperation::Commit => {
+            RpcOperation::Commit(request) => {
                 self.handle_commit(
+                    request,
+                    RpcExecContext {
+                        request_id,
+                        principal,
+                        message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
+                        started,
+                    },
+                    session_context,
+                )
+                .await
+            }
+            RpcOperation::CancelCommit(request) => {
+                self.handle_cancel_commit(
+                    request,
                     RpcExecContext {
                         request_id,
                         principal,
@@ -2184,6 +2250,7 @@ where
 
     async fn handle_commit(
         &self,
+        request: &XmlCommitRequest,
         context: RpcExecContext<'_>,
         session_context: Option<(u64, &SessionRegistry)>,
     ) -> RpcHandlingResult {
@@ -2194,6 +2261,24 @@ where
                 NETCONF_COMMIT_PATH,
                 audit_failed("operation-not-supported"),
                 RpcError::operation_not_supported(),
+            );
+        }
+        if !request.is_plain() && !self.binding.confirmed_commit_capability() {
+            return self.exec_failure_reply(
+                &context,
+                NetconfOperation::Commit,
+                NETCONF_COMMIT_PATH,
+                audit_failed("operation-not-supported"),
+                RpcError::operation_not_supported(),
+            );
+        }
+        if !request.confirmed && (request.confirm_timeout.is_some() || request.persist.is_some()) {
+            return self.exec_failure_reply(
+                &context,
+                NetconfOperation::Commit,
+                NETCONF_COMMIT_PATH,
+                audit_failed("invalid-value"),
+                RpcError::invalid_value(),
             );
         }
 
@@ -2229,6 +2314,46 @@ where
             );
         };
 
+        let now = Instant::now();
+        let pending = self
+            .confirmed_commit
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .active(now)
+            .cloned();
+        if let Some(pending) = pending.as_ref() {
+            if let Err(error) = validate_confirmed_commit_access(
+                pending,
+                request.persist_id.as_deref(),
+                current_session_id,
+            ) {
+                return self.exec_failure_reply(
+                    &context,
+                    NetconfOperation::Commit,
+                    NETCONF_COMMIT_PATH,
+                    audit_failed(error.classification.tag.as_str()),
+                    error,
+                );
+            }
+            if request.confirmed {
+                return self.exec_failure_reply(
+                    &context,
+                    NetconfOperation::Commit,
+                    NETCONF_COMMIT_PATH,
+                    audit_failed("operation-not-supported"),
+                    RpcError::operation_not_supported(),
+                );
+            }
+        } else if request.persist_id.is_some() {
+            return self.exec_failure_reply(
+                &context,
+                NetconfOperation::Commit,
+                NETCONF_COMMIT_PATH,
+                audit_failed("invalid-value"),
+                RpcError::invalid_value(),
+            );
+        }
+
         let _candidate_guard = match sessions.begin_candidate_write(current_session_id) {
             CandidateWriteResult::Acquired(guard) => guard,
             CandidateWriteResult::Denied { owner_session_id } => {
@@ -2255,13 +2380,22 @@ where
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .snapshot();
-        let Some(candidate) = candidate else {
+        if candidate.is_none() && pending.is_none() && request.is_plain() {
             return self.exec_success_reply(
                 &context,
                 NetconfOperation::Commit,
                 NETCONF_COMMIT_PATH,
             );
-        };
+        }
+        if candidate.is_none() && pending.is_none() {
+            return self.exec_failure_reply(
+                &context,
+                NetconfOperation::Commit,
+                NETCONF_COMMIT_PATH,
+                audit_failed("operation-failed"),
+                RpcError::operation_failed(),
+            );
+        }
 
         let _running_guard = match sessions.begin_running_write(current_session_id) {
             RunningWriteResult::Acquired(guard) => guard,
@@ -2286,26 +2420,40 @@ where
 
         let bus = self.binding.config_bus();
         let snapshot = bus.current_snapshot();
-        if candidate.base_version != snapshot.version {
-            return self.exec_failure_reply(
-                &context,
-                NetconfOperation::Commit,
-                NETCONF_COMMIT_PATH,
-                audit_failed("operation-failed"),
-                RpcError::operation_failed(),
-            );
+        if let Some(candidate) = candidate.as_ref() {
+            if candidate.base_version != snapshot.version {
+                return self.exec_failure_reply(
+                    &context,
+                    NetconfOperation::Commit,
+                    NETCONF_COMMIT_PATH,
+                    audit_failed("operation-failed"),
+                    RpcError::operation_failed(),
+                );
+            }
         }
-        let commit_request = CommitRequest::commit(
+        let timeout = confirmed_commit_timeout(request);
+        let mode = if request.confirmed {
+            CommitMode::CommitConfirmed { timeout }
+        } else {
+            CommitMode::Commit
+        };
+        let base_version = candidate
+            .as_ref()
+            .map(|candidate| candidate.base_version)
+            .unwrap_or(snapshot.version);
+        let candidate_config = candidate.map(|candidate| candidate.config);
+        let commit_request = CommitRequest::new(
             context.request_id,
             context.principal.clone(),
             self.transport,
             RequestSource::Northbound,
             ConfigOperation::Replace,
-            candidate.config,
+            mode,
+            now + Duration::from_secs(30),
+            candidate_config,
             Vec::new(),
-            Instant::now() + Duration::from_secs(30),
         )
-        .with_base_version(candidate.base_version);
+        .with_base_version(base_version);
 
         match bus.submit(commit_request).await {
             Ok(result) => {
@@ -2313,6 +2461,25 @@ where
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
                     .discard();
+                if request.confirmed {
+                    let persist = request
+                        .persist
+                        .clone()
+                        .or_else(|| pending.and_then(|pending| pending.persist));
+                    self.confirmed_commit
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .replace(PendingConfirmedCommit {
+                            owner_session_id: current_session_id,
+                            persist,
+                            deadline: now + timeout,
+                        });
+                } else if result.status == opc_config_model::CommitStatus::Committed {
+                    self.confirmed_commit
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .clear();
+                }
                 let paths =
                     self.schema_paths_for_changed_paths(&result.changed_paths, NETCONF_COMMIT_PATH);
                 if self
@@ -2352,6 +2519,173 @@ where
                     &context,
                     NetconfOperation::Commit,
                     NETCONF_COMMIT_PATH,
+                    audit_failed(error.code.as_str()),
+                    rpc_error_for_netconf(classification),
+                )
+            }
+        }
+    }
+
+    async fn handle_cancel_commit(
+        &self,
+        request: &XmlCancelCommitRequest,
+        context: RpcExecContext<'_>,
+        session_context: Option<(u64, &SessionRegistry)>,
+    ) -> RpcHandlingResult {
+        if !self.binding.candidate_datastore_capability()
+            || !self.binding.confirmed_commit_capability()
+        {
+            return self.exec_failure_reply(
+                &context,
+                NetconfOperation::CancelCommit,
+                NETCONF_CANCEL_COMMIT_PATH,
+                audit_failed("operation-not-supported"),
+                RpcError::operation_not_supported(),
+            );
+        }
+
+        match self.authorize_exec(context.principal, NETCONF_CANCEL_COMMIT_PATH) {
+            Ok(true) => {}
+            Ok(false) => {
+                return self.exec_failure_reply(
+                    &context,
+                    NetconfOperation::CancelCommit,
+                    NETCONF_CANCEL_COMMIT_PATH,
+                    audit_denied("access-denied"),
+                    RpcError::access_denied(),
+                );
+            }
+            Err(()) => {
+                return self.exec_failure_reply(
+                    &context,
+                    NetconfOperation::CancelCommit,
+                    NETCONF_CANCEL_COMMIT_PATH,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        }
+
+        let Some((current_session_id, sessions)) = session_context else {
+            return self.exec_failure_reply(
+                &context,
+                NetconfOperation::CancelCommit,
+                NETCONF_CANCEL_COMMIT_PATH,
+                audit_failed("operation-not-supported"),
+                RpcError::operation_not_supported(),
+            );
+        };
+
+        let now = Instant::now();
+        let pending = self
+            .confirmed_commit
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .active(now)
+            .cloned();
+        let Some(pending) = pending.as_ref() else {
+            return self.exec_failure_reply(
+                &context,
+                NetconfOperation::CancelCommit,
+                NETCONF_CANCEL_COMMIT_PATH,
+                audit_failed("operation-failed"),
+                RpcError::operation_failed(),
+            );
+        };
+        if let Err(error) = validate_confirmed_commit_access(
+            pending,
+            request.persist_id.as_deref(),
+            current_session_id,
+        ) {
+            return self.exec_failure_reply(
+                &context,
+                NetconfOperation::CancelCommit,
+                NETCONF_CANCEL_COMMIT_PATH,
+                audit_failed(error.classification.tag.as_str()),
+                error,
+            );
+        }
+
+        let _running_guard = match sessions.begin_running_write(current_session_id) {
+            RunningWriteResult::Acquired(guard) => guard,
+            RunningWriteResult::Denied { owner_session_id } => {
+                return self.lock_denied_reply(
+                    &context,
+                    NETCONF_CANCEL_COMMIT_PATH,
+                    owner_session_id,
+                    NetconfOperation::CancelCommit,
+                );
+            }
+            RunningWriteResult::SessionNotRegistered => {
+                return self.exec_failure_reply(
+                    &context,
+                    NetconfOperation::CancelCommit,
+                    NETCONF_CANCEL_COMMIT_PATH,
+                    audit_failed("operation-failed"),
+                    RpcError::operation_failed(),
+                );
+            }
+        };
+
+        let bus = self.binding.config_bus();
+        let snapshot = bus.current_snapshot();
+        let commit_request = CommitRequest::cancel_confirmed(
+            context.request_id,
+            context.principal.clone(),
+            self.transport,
+            RequestSource::Northbound,
+            Vec::new(),
+            now + Duration::from_secs(30),
+        )
+        .with_base_version(snapshot.version);
+
+        match bus.submit(commit_request).await {
+            Ok(result) => {
+                self.confirmed_commit
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .clear();
+                let paths = self.schema_paths_for_changed_paths(
+                    &result.changed_paths,
+                    NETCONF_CANCEL_COMMIT_PATH,
+                );
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            context.request_id,
+                            context.principal,
+                            self.transport,
+                            AuditOperation::Update,
+                            AuditOutcome::Success,
+                        )
+                        .with_paths(paths),
+                    )
+                    .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::CancelCommit,
+                        NetconfErrorTag::OperationFailed,
+                        context.started.elapsed(),
+                    );
+                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                        Some(context.message_id),
+                        context.reply_attrs,
+                        RpcError::operation_failed(),
+                    ));
+                }
+                record_rpc_success(NetconfOperation::CancelCommit, context.started.elapsed());
+                RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
+                    context.message_id,
+                    context.reply_attrs,
+                ))
+            }
+            Err(error) => {
+                let classification = commit_error_to_netconf(error.code);
+                self.exec_failure_reply(
+                    &context,
+                    NetconfOperation::CancelCommit,
+                    NETCONF_CANCEL_COMMIT_PATH,
                     audit_failed(error.code.as_str()),
                     rpc_error_for_netconf(classification),
                 )
@@ -4153,6 +4487,9 @@ where
             Some(RpcOperationHint::Commit) => {
                 event.with_paths([schema_node_path(NETCONF_COMMIT_PATH)])
             }
+            Some(RpcOperationHint::CancelCommit) => {
+                event.with_paths([schema_node_path(NETCONF_CANCEL_COMMIT_PATH)])
+            }
             Some(RpcOperationHint::DiscardChanges) => {
                 event.with_paths([schema_node_path(NETCONF_DISCARD_CHANGES_PATH)])
             }
@@ -4178,10 +4515,36 @@ where
     }
 }
 
+fn confirmed_commit_timeout(request: &XmlCommitRequest) -> Duration {
+    Duration::from_secs(u64::from(
+        request
+            .confirm_timeout
+            .unwrap_or(DEFAULT_CONFIRMED_COMMIT_TIMEOUT_SECS),
+    ))
+}
+
+fn validate_confirmed_commit_access(
+    pending: &PendingConfirmedCommit,
+    persist_id: Option<&str>,
+    current_session_id: u64,
+) -> Result<(), RpcError> {
+    match pending.persist.as_deref() {
+        Some(token) if persist_id == Some(token) => Ok(()),
+        Some(_) => Err(RpcError::invalid_value()),
+        None if persist_id.is_some() => Err(RpcError::invalid_value()),
+        None if pending.owner_session_id == current_session_id => Ok(()),
+        None => Err(RpcError::operation_failed()),
+    }
+}
+
 fn audit_operation_for_parse_failure(err: &RpcParseError) -> AuditOperation {
     match err.operation_hint {
         Some(RpcOperationHint::EditConfig) => AuditOperation::Update,
-        Some(RpcOperationHint::Commit | RpcOperationHint::DiscardChanges) => AuditOperation::Exec,
+        Some(
+            RpcOperationHint::Commit
+            | RpcOperationHint::CancelCommit
+            | RpcOperationHint::DiscardChanges,
+        ) => AuditOperation::Exec,
         Some(RpcOperationHint::CopyConfig) => AuditOperation::Replace,
         Some(RpcOperationHint::DeleteConfig) => AuditOperation::Delete,
         Some(RpcOperationHint::Lock | RpcOperationHint::Unlock) => AuditOperation::Exec,
@@ -4195,6 +4558,7 @@ fn netconf_operation_for_parse_failure(err: &RpcParseError) -> NetconfOperation 
     match err.operation_hint {
         Some(RpcOperationHint::EditConfig) => NetconfOperation::EditConfig,
         Some(RpcOperationHint::Commit) => NetconfOperation::Commit,
+        Some(RpcOperationHint::CancelCommit) => NetconfOperation::CancelCommit,
         Some(RpcOperationHint::DiscardChanges) => NetconfOperation::DiscardChanges,
         Some(RpcOperationHint::CopyConfig) => NetconfOperation::CopyConfig,
         Some(RpcOperationHint::DeleteConfig) => NetconfOperation::DeleteConfig,
@@ -4245,6 +4609,7 @@ fn audit_operation_for_unsupported(operation: UnsupportedOperation) -> AuditOper
         UnsupportedOperation::Lock
         | UnsupportedOperation::Unlock
         | UnsupportedOperation::Commit
+        | UnsupportedOperation::CancelCommit
         | UnsupportedOperation::DiscardChanges => AuditOperation::Exec,
     }
 }
@@ -4270,7 +4635,8 @@ mod tests {
     use std::time::Duration;
 
     use opc_config_bus::{
-        AuthorizationContext, AuthorizationError, ConfigAuthorizer, ConfigBus, MockManagedDatastore,
+        AuthorizationContext, AuthorizationError, ConfigAuthorizer, ConfigBus,
+        MockManagedDatastore, StoredConfig,
     };
     use opc_config_model::{
         AuthStrength, ConfigError, ConfigOperation, OpcConfig, RequestSource, TransportType,
@@ -4300,7 +4666,7 @@ mod tests {
         Supervisor, TaskName,
     };
     use opc_tls::{PeerPolicy, TlsConfigBuilder};
-    use opc_types::{SchemaDigest, TenantId, Timestamp};
+    use opc_types::{ConfigVersion, SchemaDigest, TenantId, Timestamp};
     use rcgen::{CertificateParams, DnType, KeyPair, SanType};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -4315,8 +4681,8 @@ mod tests {
         YangLibraryCapability,
     };
     use crate::capabilities::{
-        CANDIDATE_1_0, NETCONF_BASE_1_0, NETCONF_BASE_1_1, NETCONF_BASE_NS, NETCONF_MONITORING_NS,
-        STARTUP_1_0, WITH_DEFAULTS_NS, WRITABLE_RUNNING_1_0,
+        CANDIDATE_1_0, CONFIRMED_COMMIT_1_1, NETCONF_BASE_1_0, NETCONF_BASE_1_1, NETCONF_BASE_NS,
+        NETCONF_MONITORING_NS, STARTUP_1_0, WITH_DEFAULTS_NS, WRITABLE_RUNNING_1_0,
     };
     use crate::framing::base10;
     use crate::listener::{run_read_only_tls_listener, TlsListenerConfig};
@@ -5595,6 +5961,14 @@ mod tests {
         )
     }
 
+    fn allow_cancel_commit_rule(modules: &ModuleRegistry) -> NacmRule {
+        NacmRule::allow(
+            NacmAction::Exec,
+            YangPathPattern::parse(NETCONF_CANCEL_COMMIT_PATH, modules)
+                .expect("allow cancel-commit path"),
+        )
+    }
+
     fn allow_discard_changes_rule(modules: &ModuleRegistry) -> NacmRule {
         NacmRule::allow(
             NacmAction::Exec,
@@ -5639,6 +6013,7 @@ mod tests {
             .add_rule(allow_unlock_rule(&modules))
             .add_rule(allow_validate_rule(&modules))
             .add_rule(allow_commit_rule(&modules))
+            .add_rule(allow_cancel_commit_rule(&modules))
             .add_rule(allow_discard_changes_rule(&modules))
             .add_rule(allow_copy_config_rule(&modules))
             .add_rule(allow_delete_config_rule(&modules))
@@ -5667,6 +6042,7 @@ mod tests {
             .add_rule(allow_unlock_rule(&modules))
             .add_rule(allow_validate_rule(&modules))
             .add_rule(allow_commit_rule(&modules))
+            .add_rule(allow_cancel_commit_rule(&modules))
             .add_rule(allow_discard_changes_rule(&modules))
             .add_rule(allow_kill_session_rule(&modules))
             .build()
@@ -9867,6 +10243,44 @@ mod tests {
         format!(r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="2"><commit/></rpc>"#)
     }
 
+    fn confirmed_commit_rpc(timeout_secs: u32) -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="2"><commit><confirmed/><confirm-timeout>{timeout_secs}</confirm-timeout></commit></rpc>"#
+        )
+    }
+
+    fn persistent_confirmed_commit_rpc(timeout_secs: u32, persist: &str) -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="2"><commit><confirmed/><confirm-timeout>{timeout_secs}</confirm-timeout><persist>{persist}</persist></commit></rpc>"#
+        )
+    }
+
+    fn commit_persist_id_rpc(persist_id: &str) -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="2"><commit><persist-id>{persist_id}</persist-id></commit></rpc>"#
+        )
+    }
+
+    fn cancel_commit_rpc() -> String {
+        format!(r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="2"><cancel-commit/></rpc>"#)
+    }
+
+    fn cancel_commit_persist_id_rpc(persist_id: &str) -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="2"><cancel-commit><persist-id>{persist_id}</persist-id></cancel-commit></rpc>"#
+        )
+    }
+
+    async fn wait_for_hostname(bus: &ConfigBus<DemoConfig>, expected: &str) {
+        for _ in 0..30 {
+            if bus.current_snapshot().config.hostname == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(bus.current_snapshot().config.hostname, expected);
+    }
+
     fn discard_changes_rpc() -> String {
         format!(r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="3"><discard-changes/></rpc>"#)
     }
@@ -9888,13 +10302,26 @@ mod tests {
         Arc<ConfigBus<DemoConfig>>,
         CapturingAudit,
     ) {
-        let bus = Arc::new(
-            ConfigBus::new_dev_only(
+        let store = Arc::new(MockManagedDatastore::new());
+        store
+            .seed(StoredConfig::new(
+                opc_types::TxId::new(),
+                ConfigVersion::new(1),
+                principal(),
+                RequestSource::Northbound,
                 DemoConfig {
                     hostname: "amf-1".to_string(),
                     secret: "do-not-leak".to_string(),
                 },
-                MockManagedDatastore::new(),
+            ))
+            .await;
+        let bus = Arc::new(
+            ConfigBus::restore_or_new_dev_only(
+                DemoConfig {
+                    hostname: "fallback".to_string(),
+                    secret: "fallback-secret".to_string(),
+                },
+                Arc::clone(&store),
             )
             .await
             .expect("bus"),
@@ -9920,13 +10347,26 @@ mod tests {
         Arc<MemoryStartupDatastore>,
         CapturingAudit,
     ) {
-        let bus = Arc::new(
-            ConfigBus::new_dev_only(
+        let store = Arc::new(MockManagedDatastore::new());
+        store
+            .seed(StoredConfig::new(
+                opc_types::TxId::new(),
+                ConfigVersion::new(1),
+                principal(),
+                RequestSource::Northbound,
                 DemoConfig {
                     hostname: "amf-1".to_string(),
                     secret: "do-not-leak".to_string(),
                 },
-                MockManagedDatastore::new(),
+            ))
+            .await;
+        let bus = Arc::new(
+            ConfigBus::restore_or_new_dev_only(
+                DemoConfig {
+                    hostname: "fallback".to_string(),
+                    secret: "fallback-secret".to_string(),
+                },
+                Arc::clone(&store),
             )
             .await
             .expect("bus"),
@@ -10001,6 +10441,14 @@ mod tests {
 
         let (server, _bus, _startup, _audit) = generated_edit_server_with_startup_fixture().await;
         assert!(server.server_hello(None).contains(STARTUP_1_0));
+    }
+
+    #[tokio::test]
+    async fn confirmed_commit_capability_is_advertised_with_candidate() {
+        let (server, _bus, _audit) = generated_edit_server_fixture().await;
+        let hello = server.server_hello(None);
+        assert!(hello.contains(CANDIDATE_1_0));
+        assert!(hello.contains(CONFIRMED_COMMIT_1_1));
     }
 
     #[tokio::test]
@@ -10371,6 +10819,481 @@ mod tests {
             .iter()
             .any(|event| event.operation == AuditOperation::Update
                 && event.outcome == AuditOutcome::Success));
+    }
+
+    #[tokio::test]
+    async fn confirmed_commit_timeout_rolls_back_running() {
+        let (server, bus, _audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_config_rpc_to(
+            "candidate",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let edited = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(edited.reply_xml.contains("<ok/>"), "{}", edited.reply_xml);
+
+        let committed = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &confirmed_commit_rpc(1),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            committed.reply_xml.contains("<ok/>"),
+            "confirmed commit reply: {}",
+            committed.reply_xml
+        );
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+
+        wait_for_hostname(&bus, "amf-1").await;
+    }
+
+    #[tokio::test]
+    async fn confirmed_commit_can_be_confirmed_before_timeout() {
+        let (server, bus, _audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_config_rpc_to(
+            "candidate",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let edited = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(edited.reply_xml.contains("<ok/>"), "{}", edited.reply_xml);
+
+        let confirmed = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &confirmed_commit_rpc(1),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            confirmed.reply_xml.contains("<ok/>"),
+            "{}",
+            confirmed.reply_xml
+        );
+
+        let final_commit = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &commit_rpc(),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            final_commit.reply_xml.contains("<ok/>"),
+            "confirm reply: {}",
+            final_commit.reply_xml
+        );
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+    }
+
+    #[tokio::test]
+    async fn confirmed_commit_update_while_pending_fails_closed() {
+        let (server, bus, _audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let first_edit = edit_config_rpc_to(
+            "candidate",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let edited = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &first_edit,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(edited.reply_xml.contains("<ok/>"), "{}", edited.reply_xml);
+
+        let confirmed = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &confirmed_commit_rpc(1),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            confirmed.reply_xml.contains("<ok/>"),
+            "{}",
+            confirmed.reply_xml
+        );
+
+        let second_edit = edit_config_rpc_to(
+            "candidate",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-3</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let edited = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &second_edit,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(edited.reply_xml.contains("<ok/>"), "{}", edited.reply_xml);
+
+        let rejected = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &confirmed_commit_rpc(1),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            rejected
+                .reply_xml
+                .contains("<error-tag>operation-not-supported</error-tag>"),
+            "stacked confirmed commit reply: {}",
+            rejected.reply_xml
+        );
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+
+        wait_for_hostname(&bus, "amf-1").await;
+    }
+
+    #[tokio::test]
+    async fn cancel_commit_rolls_back_confirmed_commit_without_waiting() {
+        let (server, bus, _audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_config_rpc_to(
+            "candidate",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let edited = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(edited.reply_xml.contains("<ok/>"), "{}", edited.reply_xml);
+
+        let confirmed = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &confirmed_commit_rpc(30),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            confirmed.reply_xml.contains("<ok/>"),
+            "{}",
+            confirmed.reply_xml
+        );
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+
+        let canceled = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &cancel_commit_rpc(),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            canceled.reply_xml.contains("<ok/>"),
+            "cancel reply: {}",
+            canceled.reply_xml
+        );
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+    }
+
+    #[tokio::test]
+    async fn persistent_confirmed_commit_requires_matching_persist_id() {
+        let (server, bus, _audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _owner = registry.register(1).expect("register owner");
+        let _other = registry.register(2).expect("register other");
+
+        let rpc = edit_config_rpc_to(
+            "candidate",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let edited = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(edited.reply_xml.contains("<ok/>"), "{}", edited.reply_xml);
+
+        let confirmed = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &persistent_confirmed_commit_rpc(30, "persist-secret"),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            confirmed.reply_xml.contains("<ok/>"),
+            "{}",
+            confirmed.reply_xml
+        );
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+
+        let missing_token = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &commit_rpc(),
+                &MgmtLimits::default(),
+                2,
+                &registry,
+            )
+            .await;
+        assert!(
+            missing_token
+                .reply_xml
+                .contains("<error-tag>invalid-value</error-tag>"),
+            "missing-token reply: {}",
+            missing_token.reply_xml
+        );
+        assert!(!missing_token.reply_xml.contains("persist-secret"));
+
+        let wrong_token = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &commit_persist_id_rpc("wrong-secret"),
+                &MgmtLimits::default(),
+                2,
+                &registry,
+            )
+            .await;
+        assert!(
+            wrong_token
+                .reply_xml
+                .contains("<error-tag>invalid-value</error-tag>"),
+            "wrong-token reply: {}",
+            wrong_token.reply_xml
+        );
+        assert!(!wrong_token.reply_xml.contains("persist-secret"));
+        assert!(!wrong_token.reply_xml.contains("wrong-secret"));
+
+        let accepted = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &commit_persist_id_rpc("persist-secret"),
+                &MgmtLimits::default(),
+                2,
+                &registry,
+            )
+            .await;
+        assert!(
+            accepted.reply_xml.contains("<ok/>"),
+            "accepted reply: {}",
+            accepted.reply_xml
+        );
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+    }
+
+    #[tokio::test]
+    async fn persistent_cancel_commit_requires_matching_persist_id() {
+        let (server, bus, _audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _owner = registry.register(1).expect("register owner");
+        let _other = registry.register(2).expect("register other");
+
+        let rpc = edit_config_rpc_to(
+            "candidate",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let edited = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(edited.reply_xml.contains("<ok/>"), "{}", edited.reply_xml);
+
+        let confirmed = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &persistent_confirmed_commit_rpc(30, "cancel-secret"),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            confirmed.reply_xml.contains("<ok/>"),
+            "{}",
+            confirmed.reply_xml
+        );
+
+        let wrong_token = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &cancel_commit_persist_id_rpc("wrong-secret"),
+                &MgmtLimits::default(),
+                2,
+                &registry,
+            )
+            .await;
+        assert!(
+            wrong_token
+                .reply_xml
+                .contains("<error-tag>invalid-value</error-tag>"),
+            "wrong cancel reply: {}",
+            wrong_token.reply_xml
+        );
+        assert!(!wrong_token.reply_xml.contains("cancel-secret"));
+        assert!(!wrong_token.reply_xml.contains("wrong-secret"));
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+
+        let canceled = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &cancel_commit_persist_id_rpc("cancel-secret"),
+                &MgmtLimits::default(),
+                2,
+                &registry,
+            )
+            .await;
+        assert!(
+            canceled.reply_xml.contains("<ok/>"),
+            "cancel reply: {}",
+            canceled.reply_xml
+        );
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+    }
+
+    #[tokio::test]
+    async fn nonpersistent_confirmed_commit_rejects_other_session_confirm() {
+        let (server, bus, _audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _owner = registry.register(1).expect("register owner");
+        let _other = registry.register(2).expect("register other");
+
+        let rpc = edit_config_rpc_to(
+            "candidate",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let edited = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(edited.reply_xml.contains("<ok/>"), "{}", edited.reply_xml);
+
+        let confirmed = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &confirmed_commit_rpc(30),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            confirmed.reply_xml.contains("<ok/>"),
+            "{}",
+            confirmed.reply_xml
+        );
+
+        let denied = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &commit_rpc(),
+                &MgmtLimits::default(),
+                2,
+                &registry,
+            )
+            .await;
+        assert!(
+            denied
+                .reply_xml
+                .contains("<error-tag>operation-failed</error-tag>"),
+            "denied reply: {}",
+            denied.reply_xml
+        );
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
     }
 
     #[tokio::test]

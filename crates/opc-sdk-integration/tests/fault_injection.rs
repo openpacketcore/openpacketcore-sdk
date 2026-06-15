@@ -50,6 +50,14 @@ fn provider_with_active_key() -> MemoryKeyProvider {
         )
         .expect("insert active key");
     provider
+        .insert_active_key(
+            KeyId::new("config-key-system-2026-01").expect("system key id"),
+            KeyPurpose::Config,
+            TenantId::new("system").expect("system tenant"),
+            Zeroizing::new([0x22; 32]),
+        )
+        .expect("insert system active key");
+    provider
 }
 
 fn module_registry() -> ModuleRegistry {
@@ -925,6 +933,10 @@ async fn test_fault_injection_mark_confirmed_failure() {
     let bus = setup_fault_injecting_bus(db_path.clone(), fault_store.clone(), alarms).await;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let _baseline = bus
+        .submit(test_commit_request("commit-0", deadline))
+        .await
+        .unwrap();
     let _commit = bus
         .submit(test_commit_confirmed_request(
             "commit-1",

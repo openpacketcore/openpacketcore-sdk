@@ -81,6 +81,90 @@ async fn commit_confirmed_stores_deadline_and_publishes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_confirmed_requires_durable_rollback_parent() {
+    let store = Arc::new(MockManagedDatastore::new());
+    let bus = ConfigBus::new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
+        .await
+        .expect("startup succeeds");
+
+    let error = bus
+        .submit(CommitRequest::new(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            CommitMode::CommitConfirmed {
+                timeout: Duration::from_secs(60),
+            },
+            Instant::now() + Duration::from_secs(1),
+            Some(TestConfig::new("tentative")),
+            vec![changed_path()],
+        ))
+        .await
+        .expect_err("commit-confirmed without rollback parent must fail closed");
+
+    assert_eq!(error.code, CommitErrorCode::RollbackUnavailable);
+    assert_eq!(bus.load().name, "initial");
+    assert!(store.history().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_confirmed_update_while_pending_fails_closed() {
+    let store = Arc::new(MockManagedDatastore::new());
+    store
+        .seed(StoredConfig::new(
+            opc_types::TxId::new(),
+            ConfigVersion::new(1),
+            principal(),
+            RequestSource::Northbound,
+            TestConfig::new("initial"),
+        ))
+        .await;
+
+    let bus = ConfigBus::restore_or_new_dev_only(TestConfig::new("fallback"), Arc::clone(&store))
+        .await
+        .expect("startup succeeds");
+
+    bus.submit(CommitRequest::new(
+        RequestId::new(),
+        principal(),
+        TransportType::Internal,
+        RequestSource::Northbound,
+        ConfigOperation::Replace,
+        CommitMode::CommitConfirmed {
+            timeout: Duration::from_secs(60),
+        },
+        Instant::now() + Duration::from_secs(1),
+        Some(TestConfig::new("tentative")),
+        vec![changed_path()],
+    ))
+    .await
+    .expect("first commit-confirmed succeeds");
+
+    let error = bus
+        .submit(CommitRequest::new(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            CommitMode::CommitConfirmed {
+                timeout: Duration::from_secs(60),
+            },
+            Instant::now() + Duration::from_secs(1),
+            Some(TestConfig::new("stacked")),
+            vec![changed_path()],
+        ))
+        .await
+        .expect_err("second commit-confirmed must fail closed while pending");
+
+    assert_eq!(error.code, CommitErrorCode::AdmissionRejected);
+    assert_eq!(bus.load().name, "tentative");
+    assert_eq!(store.history().await.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_confirmed_explicit_confirm_prevents_rollback() {
     let store = Arc::new(MockManagedDatastore::new());
     store
@@ -144,6 +228,75 @@ async fn commit_confirmed_explicit_confirm_prevents_rollback() {
 
     let history = store.history().await;
     assert!(history.iter().all(|r| r.confirmed_deadline.is_none()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_confirmed_cancel_rolls_back_immediately() {
+    let store = Arc::new(MockManagedDatastore::new());
+    store
+        .seed(StoredConfig::new(
+            opc_types::TxId::new(),
+            ConfigVersion::new(1),
+            principal(),
+            RequestSource::Northbound,
+            TestConfig::new("initial"),
+        ))
+        .await;
+
+    let bus = ConfigBus::restore_or_new_dev_only(TestConfig::new("fallback"), Arc::clone(&store))
+        .await
+        .expect("startup succeeds");
+    let subscriber = bus.subscribe(SubscriberLagPolicy::DropOldest, 5);
+
+    bus.submit(CommitRequest::new(
+        RequestId::new(),
+        principal(),
+        TransportType::Internal,
+        RequestSource::Northbound,
+        ConfigOperation::Replace,
+        CommitMode::CommitConfirmed {
+            timeout: Duration::from_secs(60),
+        },
+        Instant::now() + Duration::from_secs(1),
+        Some(TestConfig::new("tentative")),
+        vec![changed_path()],
+    ))
+    .await
+    .expect("commit-confirmed succeeds");
+    let _ = subscriber.recv().await.expect("tentative event");
+    assert_eq!(bus.load().name, "tentative");
+
+    let cancel = bus
+        .submit(CommitRequest::cancel_confirmed(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            vec![changed_path()],
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .await
+        .expect("cancel-confirmed succeeds");
+
+    assert_eq!(
+        cancel.status,
+        opc_config_model::CommitStatus::RollbackApplied
+    );
+    assert_eq!(bus.load().name, "initial");
+    assert_eq!(bus.version(), ConfigVersion::new(3));
+
+    match subscriber.recv().await.expect("rollback event published") {
+        ConfigEvent::Change(change) => {
+            assert_eq!(change.version, ConfigVersion::new(3));
+            assert_eq!(change.current.name, "initial");
+        }
+        _ => panic!("expected change event"),
+    }
+
+    let history = store.history().await;
+    assert!(history
+        .last()
+        .is_some_and(|record| record.confirmed_deadline.is_none()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

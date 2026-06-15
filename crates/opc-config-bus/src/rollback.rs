@@ -36,6 +36,52 @@ pub(crate) async fn resolve_candidate<C: OpcConfig>(
             })?;
             Ok(stored.config)
         }
+        CommitMode::CancelConfirmed => {
+            if !has_pending {
+                return Err(CommitError::rollback_not_found(
+                    "pending confirmed commit was not found",
+                ));
+            }
+            let latest = store
+                .load_latest()
+                .await
+                .map_err(|err| {
+                    log_store_error("load_latest confirmed commit failed", request_id, &err);
+                    crate::metrics::record_rollback_failure();
+                    CommitError::rollback_unavailable(ROLLBACK_UNAVAILABLE_MESSAGE)
+                })?
+                .ok_or_else(|| CommitError::rollback_not_found(ROLLBACK_NOT_FOUND_MESSAGE))?;
+            if latest.confirmed_deadline.is_none() {
+                return Err(CommitError::rollback_not_found(
+                    "pending confirmed commit was not found",
+                ));
+            }
+            let parent_tx = latest
+                .parent_tx_id
+                .ok_or_else(|| CommitError::rollback_unavailable(ROLLBACK_UNAVAILABLE_MESSAGE))?;
+            let stored = store
+                .load_rollback(opc_config_model::RollbackTarget::TxId(parent_tx))
+                .await
+                .map_err(|err| {
+                    log_store_error("load_rollback confirmed parent failed", request_id, &err);
+                    crate::metrics::record_rollback_failure();
+                    if err.code == StoreErrorCode::NotFound {
+                        CommitError::rollback_not_found(ROLLBACK_NOT_FOUND_MESSAGE)
+                    } else {
+                        CommitError::rollback_unavailable(ROLLBACK_UNAVAILABLE_MESSAGE)
+                    }
+                })?;
+            validate_publishable_stored_config(&stored).map_err(|err| {
+                log_store_error(
+                    "confirmed commit rollback target validation failed",
+                    request_id,
+                    &err,
+                );
+                crate::metrics::record_rollback_failure();
+                CommitError::rollback_unavailable(ROLLBACK_UNAVAILABLE_MESSAGE)
+            })?;
+            Ok(stored.config)
+        }
         CommitMode::Commit | CommitMode::CommitConfirmed { .. } => {
             if let Some(cand) = candidate {
                 Ok(cand)
