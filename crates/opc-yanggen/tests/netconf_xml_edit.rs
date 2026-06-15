@@ -354,6 +354,7 @@ pub type CustomTag = String;
     let data_gov_path = workspace_dir.join("crates/opc-data-governance");
     let mgmt_schema_path = workspace_dir.join("crates/opc-mgmt-schema");
     let redaction_path = workspace_dir.join("crates/opc-redaction");
+    let gnmi_server_path = workspace_dir.join("crates/opc-gnmi-server");
 
     let time_version = common::locked_version(&workspace_dir, "time");
 
@@ -373,6 +374,7 @@ opc-types = {{ path = "{}" }}
 opc-data-governance = {{ path = "{}" }}
 opc-mgmt-schema = {{ path = "{}" }}
 opc-redaction = {{ path = "{}" }}
+opc-gnmi-server = {{ path = "{}" }}
 "#,
         time_version,
         config_model_path.display(),
@@ -380,6 +382,7 @@ opc-redaction = {{ path = "{}" }}
         data_gov_path.display(),
         mgmt_schema_path.display(),
         redaction_path.display(),
+        gnmi_server_path.display(),
     );
     fs::write(dir.path().join("Cargo.toml"), cargo_toml).unwrap();
 

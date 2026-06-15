@@ -2,7 +2,7 @@
 
 #![allow(deprecated)]
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use opc_config_model::{OpcConfig, TrustedPrincipal, YangPath};
@@ -10,7 +10,7 @@ use opc_mgmt_authz::{ReadAction, ReadAuthorizer};
 use opc_mgmt_opstate::{OperationalError, OperationalRequest, OperationalResponse};
 use opc_mgmt_schema::{NodeKind, SchemaRegistry};
 
-use crate::binding::ReadSelection;
+use crate::binding::{ReadSelection, ReadSelectionEntry};
 use crate::metrics::{record_nacm_denials, GnmiNacmAction};
 use crate::proto::gnmi;
 use crate::proto_adapter::path_from_proto;
@@ -46,18 +46,7 @@ where
             "non-empty gNMI target is not supported",
         ));
     }
-    if prefix.as_ref().is_some_and(path_has_keys) {
-        return Err(GnmiError::unimplemented(
-            "gNMI Get list instance predicates are not implemented",
-        ));
-    }
-    if request_paths.iter().any(path_has_keys) {
-        return Err(GnmiError::unimplemented(
-            "gNMI Get list instance predicates are not implemented",
-        ));
-    }
-
-    let selected_paths = select_schema_paths(
+    let selected_entries = select_paths(
         server.binding().schema(),
         server.limits(),
         prefix.as_ref(),
@@ -66,7 +55,7 @@ where
         &model_filter,
     )?;
 
-    if selected_paths.is_empty() {
+    if selected_entries.is_empty() {
         return Ok(gnmi::GetResponse {
             notification: Vec::new(),
             error: None,
@@ -77,7 +66,10 @@ where
     let authz_source = server.binding().policy_source();
     let authz = ReadAuthorizer::new(server.binding().schema(), authz_source.as_ref())
         .map_err(|_| GnmiError::schema("gNMI read authorizer setup failed"))?;
-    let decision_input = selected_paths.to_vec();
+    let decision_input = selected_entries
+        .iter()
+        .map(ReadSelectionEntry::schema_path)
+        .collect::<Vec<_>>();
     let decisions = authz
         .authorize(principal, ReadAction::Read, &decision_input)
         .map_err(|_| GnmiError::unavailable("gNMI read policy source unavailable"))?;
@@ -88,40 +80,40 @@ where
         .count();
     record_nacm_denials(GnmiNacmAction::Read, denied_count);
 
-    let allowed_paths = decisions
+    let allowed_entries = decisions
         .iter()
-        .zip(selected_paths.iter().copied())
-        .filter_map(|(decision, path)| decision.allowed.then_some(path))
+        .zip(selected_entries.iter())
+        .filter_map(|(decision, entry)| decision.allowed.then_some(entry.clone()))
         .collect::<Vec<_>>();
 
-    let config_paths = allowed_paths
+    let config_entries = allowed_entries
         .iter()
-        .copied()
-        .filter(|path| {
+        .filter(|entry| {
             server
                 .binding()
                 .schema()
-                .node(path)
+                .node(entry.schema_path())
                 .is_some_and(|node| node.config)
         })
+        .cloned()
         .collect::<Vec<_>>();
-    let state_paths = allowed_paths
+    let state_entries = allowed_entries
         .iter()
-        .copied()
-        .filter(|path| {
+        .filter(|entry| {
             server
                 .binding()
                 .schema()
-                .node(path)
+                .node(entry.schema_path())
                 .is_some_and(|node| !node.config)
         })
+        .cloned()
         .collect::<Vec<_>>();
 
-    let operational = read_operational(server.binding(), &state_paths)?;
-    let state_paths_with_values = state_paths_with_values(&state_paths, &operational);
-    let config_paths = config_paths_for_render(server.binding().schema(), &config_paths);
+    let operational = read_operational(server.binding(), &state_entries)?;
+    let state_entries_with_values = state_entries_with_values(&state_entries, &operational);
+    let config_entries = config_entries_for_render(server.binding().schema(), &config_entries);
 
-    if config_paths.is_empty() && state_paths_with_values.is_empty() {
+    if config_entries.is_empty() && state_entries_with_values.is_empty() {
         return Ok(gnmi::GetResponse {
             notification: Vec::new(),
             error: None,
@@ -130,13 +122,15 @@ where
     }
 
     let snapshot = server.binding().config_bus().current_snapshot();
+    let config_paths = schema_paths_for_entries(&config_entries);
+    let state_paths = schema_paths_for_entries(&state_entries_with_values);
     let updates = server
         .binding()
         .render_get_json(
             snapshot.config.as_ref(),
-            ReadSelection::new(&config_paths),
+            ReadSelection::with_entries(&config_paths, &config_entries),
             &operational,
-            ReadSelection::new(&state_paths_with_values),
+            ReadSelection::with_entries(&state_paths, &state_entries_with_values),
         )
         .map_err(|err| GnmiError::schema(err.detail().to_string()))?;
 
@@ -227,15 +221,15 @@ impl ModelFilter {
     }
 }
 
-fn select_schema_paths(
+fn select_paths(
     registry: &'static dyn SchemaRegistry,
     limits: &opc_mgmt_limits::MgmtLimits,
     prefix: Option<&GnmiPath>,
     request_paths: &[GnmiPath],
     data_type: GetDataType,
     model_filter: &ModelFilter,
-) -> Result<Vec<&'static str>, GnmiError> {
-    let mut selected = BTreeSet::new();
+) -> Result<Vec<ReadSelectionEntry>, GnmiError> {
+    let mut selected = Vec::new();
 
     if request_paths.is_empty() {
         if let Some(prefix) = prefix.filter(|prefix| !prefix.elems.is_empty()) {
@@ -249,7 +243,7 @@ fn select_schema_paths(
                 model_filter,
                 origin_modules.as_ref(),
                 &mut selected,
-            );
+            )?;
         }
     } else {
         limits
@@ -266,7 +260,7 @@ fn select_schema_paths(
                             model_filter,
                             origin_modules.as_ref(),
                             &mut selected,
-                        );
+                        )?;
                     } else {
                         let resolved = crate::resolve_path(registry, None, prefix)?;
                         expand_from_resolved(
@@ -284,7 +278,7 @@ fn select_schema_paths(
                         model_filter,
                         origin_modules.as_ref(),
                         &mut selected,
-                    );
+                    )?;
                 }
                 continue;
             }
@@ -296,8 +290,16 @@ fn select_schema_paths(
     limits
         .check_paths(selected.len())
         .map_err(GnmiError::from_limits)?;
-    reject_unsupported_selected_shapes(registry, &selected)?;
-    Ok(selected.into_iter().collect())
+    selected.sort_by(|a, b| {
+        a.schema_path()
+            .cmp(b.schema_path())
+            .then_with(|| a.canonical_path().as_str().cmp(b.canonical_path().as_str()))
+    });
+    selected.dedup_by(|a, b| {
+        a.schema_path() == b.schema_path()
+            && a.canonical_path().as_str() == b.canonical_path().as_str()
+    });
+    Ok(selected)
 }
 
 fn select_all_matching(
@@ -305,16 +307,20 @@ fn select_all_matching(
     data_type: GetDataType,
     model_filter: &ModelFilter,
     origin_modules: Option<&HashSet<&'static str>>,
-    selected: &mut BTreeSet<&'static str>,
-) {
+    selected: &mut Vec<ReadSelectionEntry>,
+) -> Result<(), GnmiError> {
     for node in registry.nodes() {
         if data_type.allows(node.config)
             && model_filter.allows(node.module)
             && origin_modules.is_none_or(|modules| modules.contains(node.module))
         {
-            selected.insert(node.path);
+            selected.push(ReadSelectionEntry::new(
+                node.path,
+                YangPath::new(node.path).map_err(|_| GnmiError::schema("invalid schema path"))?,
+            ));
         }
     }
+    Ok(())
 }
 
 fn root_origin_modules(
@@ -342,37 +348,16 @@ fn root_origin_modules(
     Ok(Some(modules.iter().copied().collect()))
 }
 
-fn reject_unsupported_selected_shapes(
-    registry: &'static dyn SchemaRegistry,
-    selected: &BTreeSet<&'static str>,
-) -> Result<(), GnmiError> {
-    if selected.iter().any(|path| {
-        registry
-            .node(path)
-            .is_some_and(|node| matches!(node.kind, NodeKind::List))
-    }) {
-        return Err(GnmiError::unimplemented(
-            "gNMI Get list projection is not implemented",
-        ));
-    }
-    Ok(())
-}
-
 fn expand_from_resolved(
     registry: &'static dyn SchemaRegistry,
     resolved: &ResolvedGnmiPath,
     data_type: GetDataType,
     model_filter: &ModelFilter,
-    selected: &mut BTreeSet<&'static str>,
+    selected: &mut Vec<ReadSelectionEntry>,
 ) -> Result<(), GnmiError> {
     if !model_filter.allows(resolved.node.module) {
         return Err(GnmiError::invalid(
             "gNMI Get path is outside the requested model set",
-        ));
-    }
-    if matches!(resolved.node.kind, NodeKind::List) {
-        return Err(GnmiError::unimplemented(
-            "gNMI Get list projection is not implemented",
         ));
     }
 
@@ -384,56 +369,74 @@ fn expand_from_resolved(
                 .strip_prefix(root)
                 .is_some_and(|suffix| suffix.starts_with('/'));
         if under_root && data_type.allows(node.config) && model_filter.allows(node.module) {
-            if matches!(node.kind, NodeKind::List) {
-                return Err(GnmiError::unimplemented(
-                    "gNMI Get list projection is not implemented",
-                ));
-            }
-            selected.insert(node.path);
+            selected.push(ReadSelectionEntry::new(
+                node.path,
+                canonical_descendant_path(resolved, node.path)?,
+            ));
         }
     }
     Ok(())
 }
 
-fn path_has_keys(path: &GnmiPath) -> bool {
-    path.elems.iter().any(|elem| !elem.keys.is_empty())
+fn canonical_descendant_path(
+    resolved: &ResolvedGnmiPath,
+    schema_path: &'static str,
+) -> Result<YangPath, GnmiError> {
+    if schema_path == resolved.schema_path {
+        return Ok(resolved.canonical.clone());
+    }
+    let suffix = schema_path
+        .strip_prefix(resolved.schema_path.as_str())
+        .ok_or_else(|| GnmiError::schema("invalid selected schema descendant"))?;
+    YangPath::new(format!("{}{}", resolved.canonical.as_str(), suffix))
+        .map_err(|_| GnmiError::schema("invalid selected canonical path"))
 }
 
 fn path_has_target(path: &GnmiPath) -> bool {
     path.target.is_some()
 }
 
-fn config_paths_for_render(
+fn config_entries_for_render(
     registry: &'static dyn SchemaRegistry,
-    paths: &[&'static str],
-) -> Vec<&'static str> {
-    if paths.iter().any(|path| {
-        registry.node(path).is_some_and(|node| {
+    entries: &[ReadSelectionEntry],
+) -> Vec<ReadSelectionEntry> {
+    if entries.iter().any(|entry| {
+        registry.node(entry.schema_path()).is_some_and(|node| {
             node.config
                 && (node.presence || matches!(node.kind, NodeKind::Leaf | NodeKind::LeafList))
         })
     }) {
-        paths.to_vec()
+        entries.to_vec()
     } else {
         Vec::new()
     }
 }
 
+fn schema_paths_for_entries(entries: &[ReadSelectionEntry]) -> Vec<&'static str> {
+    let mut paths = entries
+        .iter()
+        .map(ReadSelectionEntry::schema_path)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 fn read_operational<C, B>(
     binding: &B,
-    state_paths: &[&'static str],
+    state_entries: &[ReadSelectionEntry],
 ) -> Result<OperationalResponse, GnmiError>
 where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
 {
-    if state_paths.is_empty() {
+    if state_entries.is_empty() {
         return Ok(OperationalResponse::default());
     }
-    let requested = state_paths
+    let requested = state_entries
         .iter()
-        .map(|path| YangPath::new(*path).map_err(|_| GnmiError::schema("invalid schema path")))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|entry| entry.canonical_path().clone())
+        .collect::<Vec<_>>();
     let request = OperationalRequest::new(requested);
     let response = binding
         .operational_state()
@@ -456,18 +459,14 @@ fn operational_error(err: OperationalError) -> GnmiError {
     }
 }
 
-fn state_paths_with_values(
-    state_paths: &[&'static str],
+fn state_entries_with_values(
+    state_entries: &[ReadSelectionEntry],
     operational: &OperationalResponse,
-) -> Vec<&'static str> {
-    state_paths
+) -> Vec<ReadSelectionEntry> {
+    state_entries
         .iter()
-        .copied()
-        .filter(|path| {
-            YangPath::new(*path)
-                .ok()
-                .is_some_and(|path| operational.value_for(&path).is_some())
-        })
+        .filter(|entry| operational.value_for(entry.canonical_path()).is_some())
+        .cloned()
         .collect()
 }
 

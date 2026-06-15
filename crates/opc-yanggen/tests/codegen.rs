@@ -105,6 +105,8 @@ fn test_generate_and_compile() {
     let types_path = workspace_dir.join("crates/opc-types");
     let data_gov_path = workspace_dir.join("crates/opc-data-governance");
     let mgmt_schema_path = workspace_dir.join("crates/opc-mgmt-schema");
+    let gnmi_server_path = workspace_dir.join("crates/opc-gnmi-server");
+    let redaction_path = workspace_dir.join("crates/opc-redaction");
 
     // The scratch project resolves dependencies fresh (it has no lockfile),
     // which makes this test hostage to upstream releases: a transitive crate
@@ -128,12 +130,16 @@ opc-config-model = {{ path = "{}" }}
 opc-types = {{ path = "{}" }}
 opc-data-governance = {{ path = "{}" }}
 opc-mgmt-schema = {{ path = "{}" }}
+opc-gnmi-server = {{ path = "{}" }}
+opc-redaction = {{ path = "{}" }}
 "#,
         time_version,
         config_model_path.display(),
         types_path.display(),
         data_gov_path.display(),
-        mgmt_schema_path.display()
+        mgmt_schema_path.display(),
+        gnmi_server_path.display(),
+        redaction_path.display()
     );
 
     fs::write(dir.path().join("Cargo.toml"), cargo_toml).unwrap();
