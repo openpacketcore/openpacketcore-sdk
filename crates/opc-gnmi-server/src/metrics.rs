@@ -1,0 +1,275 @@
+//! gNMI metrics recorders backed by the shared SDK registry.
+
+use std::time::Duration;
+
+use opc_mgmt_errors::MgmtStatus;
+use opc_redaction::metrics::{metrics_label_safe, LatencyHistogram, METRICS};
+
+/// Low-cardinality gNMI RPC labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GnmiOperation {
+    /// `Capabilities`.
+    Capabilities,
+    /// `Get`.
+    Get,
+    /// `Set`.
+    Set,
+    /// `Subscribe`.
+    Subscribe,
+}
+
+impl GnmiOperation {
+    /// Stable RPC label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Capabilities => "Capabilities",
+            Self::Get => "Get",
+            Self::Set => "Set",
+            Self::Subscribe => "Subscribe",
+        }
+    }
+}
+
+/// gNMI read/write authorization action label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GnmiNacmAction {
+    /// Read authorization.
+    Read,
+    /// Subscribe authorization.
+    Subscribe,
+    /// Write authorization.
+    Write,
+}
+
+impl GnmiNacmAction {
+    /// Stable action label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Subscribe => "subscribe",
+            Self::Write => "write",
+        }
+    }
+}
+
+const OUTCOME_SUCCESS: &str = "success";
+const OUTCOME_FAILURE: &str = "failure";
+
+/// Records a successful gNMI RPC.
+pub fn record_rpc_success(operation: GnmiOperation, elapsed: Duration) {
+    increment_rpc_request(operation, OUTCOME_SUCCESS);
+    observe_rpc_latency(operation, elapsed);
+}
+
+/// Records a failed gNMI RPC.
+pub fn record_rpc_error(operation: GnmiOperation, status: MgmtStatus, elapsed: Duration) {
+    increment_rpc_request(operation, OUTCOME_FAILURE);
+    increment_rpc_error(operation, status);
+    observe_rpc_latency(operation, elapsed);
+}
+
+/// Records gNMI Set commit latency.
+pub fn record_set_commit_latency(operation: SetCommitMetric, elapsed: Duration) {
+    if let Ok(mut map) = METRICS.gnmi_set_commit_seconds.lock() {
+        map.entry(safe_label(operation.as_str()))
+            .or_insert_with(LatencyHistogram::new)
+            .observe(elapsed.as_secs_f64());
+    }
+}
+
+/// Low-cardinality Set commit shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetCommitMetric {
+    /// Pure delete.
+    Delete,
+    /// Pure replace.
+    Replace,
+    /// Patch/mixed update.
+    Patch,
+}
+
+impl SetCommitMetric {
+    /// Stable label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delete => "delete",
+            Self::Replace => "replace",
+            Self::Patch => "patch",
+        }
+    }
+}
+
+/// Records NACM denials filtered from gNMI handling.
+pub fn record_nacm_denials(action: GnmiNacmAction, count: usize) {
+    if count == 0 {
+        return;
+    }
+    if let Ok(mut map) = METRICS.gnmi_nacm_denials_total.lock() {
+        let entry = map.entry(safe_label(action.as_str())).or_insert(0);
+        *entry = entry.saturating_add(count.try_into().unwrap_or(u64::MAX));
+    }
+}
+
+/// Records extension validation/handling outcomes.
+pub fn record_extension(extension: &str, outcome: ExtensionMetricOutcome) {
+    if let Ok(mut map) = METRICS.gnmi_extensions_total.lock() {
+        let entry = map
+            .entry((safe_label(extension), safe_label(outcome.as_str())))
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+}
+
+/// Extension metric outcome labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionMetricOutcome {
+    /// Accepted/handled.
+    Accepted,
+    /// Ignored because it was unknown and non-critical.
+    Ignored,
+    /// Rejected because it was critical and unsupported.
+    Rejected,
+}
+
+impl ExtensionMetricOutcome {
+    /// Stable label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Ignored => "ignored",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// Increments active Subscribe streams and returns a guard that decrements on
+/// drop.
+pub fn active_stream(mode: SubscribeModeMetric) -> ActiveStreamGuard {
+    adjust_active_streams(mode.as_str(), 1);
+    ActiveStreamGuard { mode }
+}
+
+/// Subscribe mode labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscribeModeMetric {
+    /// ONCE mode.
+    Once,
+    /// POLL mode.
+    Poll,
+    /// STREAM mode.
+    Stream,
+}
+
+impl SubscribeModeMetric {
+    /// Stable label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Poll => "poll",
+            Self::Stream => "stream",
+        }
+    }
+}
+
+/// Active-stream gauge guard.
+#[derive(Debug)]
+pub struct ActiveStreamGuard {
+    mode: SubscribeModeMetric,
+}
+
+impl Drop for ActiveStreamGuard {
+    fn drop(&mut self) {
+        adjust_active_streams(self.mode.as_str(), -1);
+    }
+}
+
+fn increment_rpc_request(operation: GnmiOperation, outcome: &'static str) {
+    if let Ok(mut map) = METRICS.gnmi_rpc_requests_total.lock() {
+        let entry = map
+            .entry((safe_label(operation.as_str()), safe_label(outcome)))
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+}
+
+fn increment_rpc_error(operation: GnmiOperation, status: MgmtStatus) {
+    if let Ok(mut map) = METRICS.gnmi_rpc_errors_total.lock() {
+        let entry = map
+            .entry((safe_label(operation.as_str()), safe_label(status.as_str())))
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+}
+
+fn observe_rpc_latency(operation: GnmiOperation, elapsed: Duration) {
+    if let Ok(mut map) = METRICS.gnmi_rpc_seconds.lock() {
+        map.entry(safe_label(operation.as_str()))
+            .or_insert_with(LatencyHistogram::new)
+            .observe(elapsed.as_secs_f64());
+    }
+}
+
+fn adjust_active_streams(mode: &'static str, delta: i64) {
+    if let Ok(mut map) = METRICS.gnmi_active_streams.lock() {
+        let entry = map.entry(safe_label(mode)).or_insert(0);
+        if delta >= 0 {
+            *entry = entry.saturating_add(delta);
+        } else {
+            *entry = entry.saturating_sub(delta.saturating_abs());
+        }
+    }
+}
+
+fn safe_label(label: &str) -> String {
+    metrics_label_safe(label)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_low_cardinality_metrics() {
+        METRICS.reset_all();
+
+        record_rpc_success(GnmiOperation::Capabilities, Duration::from_millis(10));
+        record_rpc_error(
+            GnmiOperation::Get,
+            MgmtStatus::InvalidArgument,
+            Duration::from_millis(5),
+        );
+        record_nacm_denials(GnmiNacmAction::Read, 2);
+        record_extension("unknown", ExtensionMetricOutcome::Rejected);
+        record_set_commit_latency(SetCommitMetric::Patch, Duration::from_millis(20));
+        {
+            let _guard = active_stream(SubscribeModeMetric::Stream);
+            let active = METRICS.gnmi_active_streams.lock().expect("metrics");
+            assert_eq!(active.get("stream").copied(), Some(1));
+        }
+
+        let requests = METRICS.gnmi_rpc_requests_total.lock().expect("metrics");
+        assert_eq!(
+            requests.get(&("Capabilities".to_string(), "success".to_string())),
+            Some(&1)
+        );
+        assert_eq!(
+            requests.get(&("Get".to_string(), "failure".to_string())),
+            Some(&1)
+        );
+        drop(requests);
+
+        let errors = METRICS.gnmi_rpc_errors_total.lock().expect("metrics");
+        assert_eq!(
+            errors.get(&("Get".to_string(), "INVALID_ARGUMENT".to_string())),
+            Some(&1)
+        );
+        drop(errors);
+
+        let denials = METRICS.gnmi_nacm_denials_total.lock().expect("metrics");
+        assert_eq!(denials.get("read"), Some(&2));
+        drop(denials);
+
+        let active = METRICS.gnmi_active_streams.lock().expect("metrics");
+        assert_eq!(active.get("stream"), Some(&0));
+    }
+}
