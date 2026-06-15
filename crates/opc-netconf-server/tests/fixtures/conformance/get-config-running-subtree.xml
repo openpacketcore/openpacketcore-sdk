@@ -1,0 +1,1 @@
+<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="101"><get-config><source><running/></source><filter type="subtree"><sys:system xmlns:sys="urn:opc:demo"><sys:hostname/></sys:system></filter></get-config></rpc>

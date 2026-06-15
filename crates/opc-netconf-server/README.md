@@ -3,13 +3,14 @@
 `opc-netconf-server` is the NETCONF server core for OpenPacketCore management
 plane integrations.
 
-The current slice is intentionally read-only and capability-honest:
+The current slice is capability-gated and capability-honest:
 
 - NETCONF base 1.0 end-marker framing.
 - NETCONF base 1.1 chunked framing with malformed chunk lengths, including
   leading-zero lengths, truncated chunk bodies, and per-message chunk-count
   excesses rejected.
-- Server `<hello>` rendering with base capabilities plus optional discovery
+- Server `<hello>` rendering with base capabilities plus optional discovery,
+  defaults, writable-running, candidate, confirmed-commit, and startup
   capabilities only when their CNF binding hooks are present.
 - Transport-neutral session handshake and RPC loop over an already-authenticated
   stream.
@@ -38,16 +39,39 @@ The current slice is intentionally read-only and capability-honest:
   audit-before-signal in-process session-registry termination for live target
   sessions, including registered targets still waiting for client `<hello>` or
   blocked writing server hello / RPC replies.
+- Running, candidate, and startup datastore `<lock>` / `<unlock>` with
+  session-owned lock admission through the shared session registry.
+- Optional running datastore `<edit-config>` when the CNF binding explicitly
+  advertises `:writable-running` and supplies an edit candidate builder.
+- Optional server-owned `:candidate` datastore support when the CNF binding opts
+  in, including candidate `<edit-config>`, `<get-config>`, `<validate>`,
+  `<commit>`, `<discard-changes>`, stale-running-version failure, and candidate
+  lock/write guards.
+- Optional `:startup` support through an explicit CNF `StartupDatastore`
+  facade, including startup `<get-config>`, `<validate>`, `<edit-config>`,
+  datastore-to-datastore `<copy-config>`, safe opt-in `<delete-config>`, and
+  startup lock/write guards. SDK boot recovery is not treated as NETCONF
+  startup.
+- Optional `:confirmed-commit:1.1` support with candidate, including parsed
+  `<confirmed>`, `<confirm-timeout>`, `<persist>`, `<persist-id>`,
+  `<cancel-commit>`, timeout rollback through the config bus, explicit
+  confirm/cancel, token-safe errors, durable rollback-parent checks, and
+  non-persistent owner-session-exit rollback.
 - Known-but-unimplemented NETCONF base operations are bounded, audited, and
   rejected with `operation-not-supported` while preserving `message-id`;
   bounded text and CDATA payloads inside those RPCs are ignored and never
   echoed.
-- `<get-config>` for the `running` datastore only.
+- `<get-config>` for every advertised running/candidate/startup datastore.
 - `<get>` for running config plus CNF-supplied operational state.
 - Namespace/schema-aware structural subtree filters, including RFC 6241
-  namespace wildcards, for `<get-config running>` and `<get>`; expanded
-  schema-node fanout is rejected fail-closed before NACM or CNF projection when
-  it exceeds the configured path limit.
+  namespace wildcards, for `<get-config>` and `<get>`. Bounded subtree
+  content-match and attribute-match forms are classified and rejected
+  payload-free as unsupported within configured limits.
+- A bounded XPath schema-selection subset for `<get-config>` and `<get>`:
+  absolute prefixed child paths, `*` / `prefix:*` wildcards, and `|` union.
+  Expanded schema-node fanout is rejected fail-closed before NACM or CNF
+  projection when it exceeds the configured path limit. Full instance-aware
+  XPath predicates, functions, axes, and the `:xpath` capability remain absent.
 - RFC 6243 `<with-defaults>` request parameters are recognized. The
   `:with-defaults` capability is advertised only when the CNF binding supplies
   a `WithDefaultsCapability` and default-aware XML projection hooks; otherwise
@@ -76,6 +100,10 @@ The current slice is intentionally read-only and capability-honest:
 - Read audit through `opc-mgmt-audit`.
 - NETCONF RPC/session/NACM-denial metrics emitted through the shared
   `opc-redaction` registry with low-cardinality sanitized labels.
+- An in-repo conformance fixture harness exercises the real session runner over
+  base 1.0 and base 1.1 framing with running/candidate/startup, confirmed
+  commit rollback, bounded XPath selection, `<get-schema>`, and with-defaults
+  dispatch.
 
 Complete base-session behavior is provided by the session runners. Direct
 `ReadOnlyNetconfServer::handle_rpc` and `handle_rpc_xml` calls are low-level,
@@ -87,11 +115,12 @@ for a supplied session id, so direct helper callers cannot render `0` or an
 out-of-range `<session-id>`. Custom transports that advertise a server
 `<hello>` should use `run_read_only_session_with_registry` or
 `run_read_only_tls_session_with_registry` for audited cross-session
-`<kill-session>` semantics.
+`<kill-session>` and datastore lock/write semantics.
 
-It does not implement SSH, Call Home, candidate/startup datastores, XPath
-filters, subtree content-match/attribute-match forms, `:with-defaults` default
-projection, writes, notifications, or generic YANG XML projection yet. A CNF
-supplies NETCONF XML projection for config, operational state, YANG Library,
-NETCONF monitoring, and schema source data through `NetconfConfigBinding` until
-`opc-yanggen` grows schema-aware XML output and raw YANG source metadata.
+It still does not implement NETCONF over SSH, Call Home, notifications, NMDA
+`<get-data>` / `<edit-data>`, a full RFC XPath instance evaluator or advertised
+`:xpath`, URL and inline-config copy/validate forms, `:rollback-on-error`, or
+external interop against `netopeer2-cli`, `ncclient`, or a target NMS. CNFs may
+use generated NETCONF XML projection/edit support for supported shapes, but
+unsupported YANG shapes remain fail-closed and model-specific bindings still
+own any projection/edit behavior outside the generated support matrix.

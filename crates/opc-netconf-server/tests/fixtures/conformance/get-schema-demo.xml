@@ -1,0 +1,1 @@
+<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="601"><get-schema xmlns="urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring"><identifier>demo-system</identifier><version>2026-06-13</version><format>yang</format></get-schema></rpc>
