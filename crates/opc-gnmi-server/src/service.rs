@@ -7,6 +7,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     encoding_to_proto,
+    get::handle_get,
     metrics::{record_rpc_error, record_rpc_success, GnmiOperation},
     proto::{gnmi, gnmi_ext},
     proto_adapter::extension_from_proto,
@@ -83,10 +84,7 @@ where
         if !self.require_principal {
             return Ok(());
         }
-        let principal = request
-            .extensions()
-            .get::<AuthenticatedGnmiPrincipal>()
-            .ok_or(GnmiError::Unauthenticated)?;
+        let principal = request_principal(request)?;
         if principal.principal().auth_strength != AuthStrength::MutualTls {
             return Err(GnmiError::PermissionDenied);
         }
@@ -95,6 +93,13 @@ where
         }
         Ok(())
     }
+}
+
+fn request_principal<T>(request: &Request<T>) -> Result<&AuthenticatedGnmiPrincipal, GnmiError> {
+    request
+        .extensions()
+        .get::<AuthenticatedGnmiPrincipal>()
+        .ok_or(GnmiError::Unauthenticated)
 }
 
 #[tonic::async_trait]
@@ -149,10 +154,34 @@ where
         &self,
         request: Request<gnmi::GetRequest>,
     ) -> Result<Response<gnmi::GetResponse>, Status> {
+        let start = std::time::Instant::now();
         if let Err(err) = self.validate_authenticated_request(&request) {
+            record_rpc_error(GnmiOperation::Get, err.status(), start.elapsed());
             return Err(status_from_error(err));
         }
-        Err(unsupported_rpc_status(GnmiOperation::Get))
+        let principal = match request_principal(&request) {
+            Ok(principal) => principal,
+            Err(err) => {
+                record_rpc_error(GnmiOperation::Get, err.status(), start.elapsed());
+                return Err(status_from_error(err));
+            }
+        };
+        if let Err(err) =
+            validate_extensions(self.server.extensions(), &request.get_ref().extension)
+        {
+            record_rpc_error(GnmiOperation::Get, err.status(), start.elapsed());
+            return Err(status_from_error(err));
+        }
+        match handle_get(&self.server, principal.principal(), request.get_ref()) {
+            Ok(response) => {
+                record_rpc_success(GnmiOperation::Get, start.elapsed());
+                Ok(Response::new(response))
+            }
+            Err(err) => {
+                record_rpc_error(GnmiOperation::Get, err.status(), start.elapsed());
+                Err(status_from_error(err))
+            }
+        }
     }
 
     async fn set(
@@ -217,28 +246,35 @@ pub const fn code_from_status(status: opc_mgmt_errors::MgmtStatus) -> tonic::Cod
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::sync::Arc;
 
     use opc_config_bus::{ConfigBus, MockManagedDatastore};
     use opc_config_model::{
-        AuthStrength, TrustedPrincipal, WorkloadIdentity as ConfigWorkloadIdentity,
+        AuthStrength, ConfigError, TrustedPrincipal, ValidationContext, ValidationError,
+        WorkloadIdentity as ConfigWorkloadIdentity, YangPath,
     };
     use opc_mgmt_authz::{AuthzError, PolicySource};
     use opc_mgmt_limits::MgmtLimits;
     use opc_mgmt_opstate::{
         OperationalError, OperationalRequest, OperationalResponse, OperationalStateProvider,
+        OperationalValue,
     };
-    use opc_mgmt_schema::{DataClass, ModelData, NodeKind, NodeMeta, OriginEntry, SchemaRegistry};
+    use opc_mgmt_schema::{
+        DataClass, LeafType, ModelData, NodeKind, NodeMeta, OriginEntry, SchemaRegistry,
+    };
+    use opc_nacm::{ModuleRegistry, NacmAction, NacmPolicy, NacmRule, YangPathPattern};
     use tonic::codec::Codec;
     use tonic::Code;
 
     use super::*;
     use crate::proto::gnmi::g_nmi_server::GNmi;
     use crate::{
-        CapabilityProfile, ExtensionRegistry, GnmiPatchApplicator, GnmiVersion, GNMI_VERSION,
+        CapabilityProfile, ExtensionRegistry, GnmiJsonProjectionError, GnmiJsonUpdate,
+        GnmiPatchApplicator, GnmiVersion, ReadSelection, GNMI_VERSION,
     };
-    use opc_types::TenantId;
+    use opc_types::{SchemaDigest, TenantId};
 
     struct TestRegistry;
 
@@ -262,19 +298,64 @@ mod tests {
         modules: &["demo-if", "demo-system"],
     }];
 
-    static NODES: &[NodeMeta] = &[NodeMeta {
-        path: "/sys:system",
-        module: "demo-system",
-        kind: NodeKind::Container,
-        config: true,
-        leaf_type: None,
-        key_leaves: &[],
-        data_class: DataClass::Public,
-        default: None,
-        has_default: false,
-        presence: false,
-        child_paths: &[],
-    }];
+    static NODES: &[NodeMeta] = &[
+        NodeMeta {
+            path: "/sys:system",
+            module: "demo-system",
+            kind: NodeKind::Container,
+            config: true,
+            leaf_type: None,
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[
+                "/sys:system/sys:contact",
+                "/sys:system/sys:hostname",
+                "/sys:system/sys:uptime",
+            ],
+        },
+        NodeMeta {
+            path: "/sys:system/sys:contact",
+            module: "demo-system",
+            kind: NodeKind::Leaf,
+            config: true,
+            leaf_type: Some(LeafType::String),
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[],
+        },
+        NodeMeta {
+            path: "/sys:system/sys:hostname",
+            module: "demo-system",
+            kind: NodeKind::Leaf,
+            config: true,
+            leaf_type: Some(LeafType::String),
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[],
+        },
+        NodeMeta {
+            path: "/sys:system/sys:uptime",
+            module: "demo-system",
+            kind: NodeKind::Leaf,
+            config: false,
+            leaf_type: Some(LeafType::Uint32),
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[],
+        },
+    ];
 
     impl SchemaRegistry for TestRegistry {
         fn schema_digest(&self) -> &'static str {
@@ -294,40 +375,105 @@ mod tests {
         }
     }
 
-    struct EmptyPolicy;
+    struct FixedPolicy(NacmPolicy);
 
-    impl PolicySource for EmptyPolicy {
+    impl PolicySource for FixedPolicy {
         fn active_policy(&self, _tenant: &str) -> Result<opc_nacm::NacmPolicy, AuthzError> {
-            Ok(opc_nacm::NacmPolicy::empty(opc_nacm::PolicyVersion::new(1)))
+            Ok(self.0.clone())
         }
     }
 
-    struct EmptyOperationalState;
+    struct TestOperationalState;
 
-    impl OperationalStateProvider for EmptyOperationalState {
+    impl OperationalStateProvider for TestOperationalState {
         fn get(
             &self,
-            _request: &OperationalRequest,
+            request: &OperationalRequest,
         ) -> Result<OperationalResponse, OperationalError> {
-            Ok(OperationalResponse::default())
+            let path = opc_config_model::YangPath::new("/sys:system/sys:uptime")
+                .expect("static state path");
+            if request.paths().contains(&path) {
+                Ok(OperationalResponse::new([OperationalValue::new(
+                    path, "123",
+                )
+                .expect("state json")]))
+            } else {
+                Ok(OperationalResponse::default())
+            }
         }
     }
 
     struct UnitPatcher;
 
-    impl GnmiPatchApplicator<()> for UnitPatcher {
-        fn apply_set(&self, _running: &(), _set: &crate::NormalizedSet) -> Result<(), GnmiError> {
+    #[derive(Clone)]
+    struct DemoConfig {
+        hostname: String,
+    }
+
+    impl OpcConfig for DemoConfig {
+        type Delta = ();
+
+        fn schema_digest(&self) -> SchemaDigest {
+            SchemaDigest::from_bytes([2u8; 32])
+        }
+
+        fn diff(&self, _previous: &Self) -> Result<Vec<Self::Delta>, ConfigError> {
+            Ok(Vec::new())
+        }
+
+        fn changed_paths(
+            &self,
+            _previous: &Self,
+            _deltas: &[Self::Delta],
+        ) -> Result<Vec<YangPath>, ConfigError> {
+            Ok(vec![
+                YangPath::new("/sys:system/sys:hostname").expect("static path")
+            ])
+        }
+
+        fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), ConfigError> {
             Ok(())
+        }
+
+        fn validate_syntax(&self) -> Result<(), ValidationError> {
+            Ok(())
+        }
+
+        fn validate_semantics(
+            &self,
+            _ctx: &ValidationContext<Self>,
+        ) -> Result<(), ValidationError> {
+            Ok(())
+        }
+    }
+
+    impl GnmiPatchApplicator<DemoConfig> for UnitPatcher {
+        fn apply_set(
+            &self,
+            _running: &DemoConfig,
+            _set: &crate::NormalizedSet,
+        ) -> Result<DemoConfig, GnmiError> {
+            Ok(DemoConfig {
+                hostname: "amf-1".to_string(),
+            })
+        }
+    }
+
+    fn initial_config() -> DemoConfig {
+        DemoConfig {
+            hostname: "amf-1".to_string(),
         }
     }
 
     #[derive(Clone)]
     struct TestBinding {
-        bus: Arc<ConfigBus<()>>,
+        bus: Arc<ConfigBus<DemoConfig>>,
+        policy: Arc<dyn PolicySource>,
+        operational: Arc<dyn OperationalStateProvider>,
     }
 
-    impl GnmiConfigBinding<()> for TestBinding {
-        fn config_bus(&self) -> Arc<ConfigBus<()>> {
+    impl GnmiConfigBinding<DemoConfig> for TestBinding {
+        fn config_bus(&self) -> Arc<ConfigBus<DemoConfig>> {
             Arc::clone(&self.bus)
         }
 
@@ -335,37 +481,67 @@ mod tests {
             &TestRegistry
         }
 
-        fn patcher(&self) -> Arc<dyn GnmiPatchApplicator<()>> {
+        fn patcher(&self) -> Arc<dyn GnmiPatchApplicator<DemoConfig>> {
             Arc::new(UnitPatcher)
         }
 
         fn operational_state(&self) -> Arc<dyn OperationalStateProvider> {
-            Arc::new(EmptyOperationalState)
+            Arc::clone(&self.operational)
         }
 
         fn policy_source(&self) -> Arc<dyn PolicySource> {
-            Arc::new(EmptyPolicy)
+            Arc::clone(&self.policy)
+        }
+
+        fn render_running_json(
+            &self,
+            config: &DemoConfig,
+            selection: ReadSelection<'_>,
+        ) -> Result<Vec<GnmiJsonUpdate>, GnmiJsonProjectionError> {
+            let mut updates = Vec::new();
+            if selection.contains("/sys:system/sys:hostname") {
+                updates.push(GnmiJsonUpdate::new(
+                    opc_config_model::YangPath::new("/sys:system/sys:hostname")
+                        .expect("static config path"),
+                    serde_json::to_string(&config.hostname)
+                        .map_err(|_| GnmiJsonProjectionError::projection("hostname JSON"))?,
+                )?);
+            }
+            if selection.contains("/sys:system/sys:contact") {
+                updates.push(GnmiJsonUpdate::new(
+                    opc_config_model::YangPath::new("/sys:system/sys:contact")
+                        .expect("static config path"),
+                    r#""ops""#,
+                )?);
+            }
+            Ok(updates)
         }
     }
 
-    async fn service() -> GnmiService<(), TestBinding> {
+    async fn service() -> GnmiService<DemoConfig, TestBinding> {
         service_with_authentication(false).await
     }
 
-    async fn authenticated_service() -> GnmiService<(), TestBinding> {
+    async fn authenticated_service() -> GnmiService<DemoConfig, TestBinding> {
         service_with_authentication(true).await
     }
 
-    async fn service_with_authentication(authenticated: bool) -> GnmiService<(), TestBinding> {
+    async fn service_with_authentication(
+        authenticated: bool,
+    ) -> GnmiService<DemoConfig, TestBinding> {
         let bus = Arc::new(
-            ConfigBus::new_dev_only((), MockManagedDatastore::new())
+            ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
                 .await
                 .expect("bus"),
         );
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
         let server = GnmiServer::new(
-            TestBinding { bus },
+            TestBinding {
+                bus,
+                policy: Arc::new(FixedPolicy(allow_all_read_policy())),
+                operational: Arc::new(TestOperationalState),
+            },
             MgmtLimits::default(),
             profile,
             ExtensionRegistry::default(),
@@ -386,6 +562,70 @@ mod tests {
             )
             .with_auth_strength(AuthStrength::MutualTls),
         )
+    }
+
+    fn module_registry() -> ModuleRegistry {
+        let mut modules = ModuleRegistry::new();
+        modules
+            .register_module("demo-system", "sys")
+            .expect("demo-system module");
+        modules
+            .register_module("demo-if", "if")
+            .expect("demo-if module");
+        modules
+    }
+
+    fn allow_all_read_policy() -> NacmPolicy {
+        let modules = module_registry();
+        NacmPolicy::builder(opc_nacm::PolicyVersion::new(1))
+            .add_rule(NacmRule::allow(
+                NacmAction::Read,
+                YangPathPattern::parse("/sys:system", &modules).expect("root pattern"),
+            ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Read,
+                YangPathPattern::parse("/sys:system/**", &modules).expect("subtree pattern"),
+            ))
+            .build()
+    }
+
+    fn deny_hostname_policy() -> NacmPolicy {
+        let modules = module_registry();
+        NacmPolicy::builder(opc_nacm::PolicyVersion::new(1))
+            .add_rule(NacmRule::deny(
+                NacmAction::Read,
+                YangPathPattern::parse("/sys:system/sys:hostname", &modules)
+                    .expect("deny hostname"),
+            ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Read,
+                YangPathPattern::parse("/sys:system/**", &modules).expect("allow subtree"),
+            ))
+            .build()
+    }
+
+    async fn authenticated_service_with_policy(
+        policy: NacmPolicy,
+    ) -> GnmiService<DemoConfig, TestBinding> {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
+                .await
+                .expect("bus"),
+        );
+        let profile =
+            CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
+        let server = GnmiServer::new(
+            TestBinding {
+                bus,
+                policy: Arc::new(FixedPolicy(policy)),
+                operational: Arc::new(TestOperationalState),
+            },
+            MgmtLimits::default(),
+            profile,
+            ExtensionRegistry::default(),
+        )
+        .expect("server");
+        GnmiService::new_authenticated(server)
     }
 
     #[tokio::test]
@@ -507,7 +747,231 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_set_and_subscribe_are_explicitly_unimplemented() {
+    async fn authenticated_get_config_reads_authorized_running_json() {
+        let service = authenticated_service().await;
+        let mut request = Request::new(gnmi::GetRequest {
+            prefix: None,
+            path: vec![gnmi::Path {
+                element: Vec::new(),
+                origin: String::new(),
+                elem: vec![
+                    gnmi::PathElem {
+                        name: "system".to_string(),
+                        key: Default::default(),
+                    },
+                    gnmi::PathElem {
+                        name: "hostname".to_string(),
+                        key: Default::default(),
+                    },
+                ],
+                target: String::new(),
+            }],
+            r#type: gnmi::get_request::DataType::Config as i32,
+            encoding: gnmi::Encoding::JsonIetf as i32,
+            use_models: Vec::new(),
+            extension: Vec::new(),
+        });
+        request.extensions_mut().insert(authenticated_principal());
+
+        let response = service.get(request).await.expect("get").into_inner();
+
+        let update = &response.notification[0].update[0];
+        assert_eq!(
+            update.path.as_ref().expect("path").elem[1].name,
+            "sys:hostname"
+        );
+        assert_eq!(
+            update.val.as_ref().and_then(|value| value.value.as_ref()),
+            Some(&gnmi::typed_value::Value::JsonIetfVal(
+                br#""amf-1""#.to_vec()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_get_state_reads_operational_provider() {
+        let service = authenticated_service().await;
+        let mut request = Request::new(gnmi::GetRequest {
+            prefix: None,
+            path: vec![gnmi::Path {
+                element: Vec::new(),
+                origin: String::new(),
+                elem: vec![
+                    gnmi::PathElem {
+                        name: "system".to_string(),
+                        key: Default::default(),
+                    },
+                    gnmi::PathElem {
+                        name: "uptime".to_string(),
+                        key: Default::default(),
+                    },
+                ],
+                target: String::new(),
+            }],
+            r#type: gnmi::get_request::DataType::State as i32,
+            encoding: gnmi::Encoding::Json as i32,
+            use_models: Vec::new(),
+            extension: Vec::new(),
+        });
+        request.extensions_mut().insert(authenticated_principal());
+
+        let response = service.get(request).await.expect("get").into_inner();
+
+        let update = &response.notification[0].update[0];
+        assert_eq!(
+            update.val.as_ref().and_then(|value| value.value.as_ref()),
+            Some(&gnmi::typed_value::Value::JsonVal(b"123".to_vec()))
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_get_prefix_only_reads_prefix_subtree_not_whole_datastore() {
+        let service = authenticated_service().await;
+        let mut request = Request::new(gnmi::GetRequest {
+            prefix: Some(gnmi::Path {
+                element: Vec::new(),
+                origin: String::new(),
+                elem: vec![
+                    gnmi::PathElem {
+                        name: "system".to_string(),
+                        key: Default::default(),
+                    },
+                    gnmi::PathElem {
+                        name: "hostname".to_string(),
+                        key: Default::default(),
+                    },
+                ],
+                target: String::new(),
+            }),
+            path: Vec::new(),
+            r#type: gnmi::get_request::DataType::Config as i32,
+            encoding: gnmi::Encoding::JsonIetf as i32,
+            use_models: Vec::new(),
+            extension: Vec::new(),
+        });
+        request.extensions_mut().insert(authenticated_principal());
+
+        let response = service.get(request).await.expect("get").into_inner();
+        let updates = &response.notification[0].update;
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].path.as_ref().expect("path").elem[1].name,
+            "sys:hostname"
+        );
+        assert_eq!(
+            updates[0]
+                .val
+                .as_ref()
+                .and_then(|value| value.value.as_ref()),
+            Some(&gnmi::typed_value::Value::JsonIetfVal(
+                br#""amf-1""#.to_vec()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_get_all_merges_config_and_state() {
+        let service = authenticated_service().await;
+        let mut request = Request::new(gnmi::GetRequest {
+            prefix: None,
+            path: Vec::new(),
+            r#type: gnmi::get_request::DataType::All as i32,
+            encoding: gnmi::Encoding::JsonIetf as i32,
+            use_models: Vec::new(),
+            extension: Vec::new(),
+        });
+        request.extensions_mut().insert(authenticated_principal());
+
+        let response = service.get(request).await.expect("get").into_inner();
+        let values = response.notification[0]
+            .update
+            .iter()
+            .filter_map(|update| update.val.as_ref())
+            .filter_map(|value| value.value.as_ref())
+            .collect::<Vec<_>>();
+
+        assert!(values.contains(&&gnmi::typed_value::Value::JsonIetfVal(
+            br#""amf-1""#.to_vec()
+        )));
+        assert!(values.contains(&&gnmi::typed_value::Value::JsonIetfVal(b"123".to_vec())));
+    }
+
+    #[tokio::test]
+    async fn authenticated_get_omits_nacm_denied_paths() {
+        let service = authenticated_service_with_policy(deny_hostname_policy()).await;
+        let mut request = Request::new(gnmi::GetRequest {
+            prefix: None,
+            path: vec![gnmi::Path {
+                element: Vec::new(),
+                origin: String::new(),
+                elem: vec![
+                    gnmi::PathElem {
+                        name: "system".to_string(),
+                        key: Default::default(),
+                    },
+                    gnmi::PathElem {
+                        name: "hostname".to_string(),
+                        key: Default::default(),
+                    },
+                ],
+                target: String::new(),
+            }],
+            r#type: gnmi::get_request::DataType::Config as i32,
+            encoding: gnmi::Encoding::JsonIetf as i32,
+            use_models: Vec::new(),
+            extension: Vec::new(),
+        });
+        request.extensions_mut().insert(authenticated_principal());
+
+        let response = service.get(request).await.expect("get").into_inner();
+
+        assert!(response.notification.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticated_get_rejects_unsupported_encoding_and_list_predicates_without_leak() {
+        let service = authenticated_service().await;
+        let mut unsupported_encoding = Request::new(gnmi::GetRequest {
+            prefix: None,
+            path: Vec::new(),
+            r#type: gnmi::get_request::DataType::All as i32,
+            encoding: gnmi::Encoding::Proto as i32,
+            use_models: Vec::new(),
+            extension: Vec::new(),
+        });
+        unsupported_encoding
+            .extensions_mut()
+            .insert(authenticated_principal());
+        let status = service.get(unsupported_encoding).await.unwrap_err();
+        assert_eq!(status.code(), Code::Unimplemented);
+
+        let mut keyed = Request::new(gnmi::GetRequest {
+            prefix: None,
+            path: vec![gnmi::Path {
+                element: Vec::new(),
+                origin: String::new(),
+                elem: vec![gnmi::PathElem {
+                    name: "user".to_string(),
+                    key: [("name".to_string(), "secret-admin".to_string())]
+                        .into_iter()
+                        .collect(),
+                }],
+                target: String::new(),
+            }],
+            r#type: gnmi::get_request::DataType::All as i32,
+            encoding: gnmi::Encoding::JsonIetf as i32,
+            use_models: Vec::new(),
+            extension: Vec::new(),
+        });
+        keyed.extensions_mut().insert(authenticated_principal());
+        let status = service.get(keyed).await.unwrap_err();
+        assert_eq!(status.code(), Code::Unimplemented);
+        assert!(!status.message().contains("secret-admin"));
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_get_is_rejected_and_set_subscribe_are_unimplemented() {
         let service = service().await;
 
         let get = service
@@ -521,7 +985,7 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert_eq!(get.code(), Code::Unimplemented);
+        assert_eq!(get.code(), Code::Unauthenticated);
 
         let set = service
             .set(Request::new(gnmi::SetRequest {

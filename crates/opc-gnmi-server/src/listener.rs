@@ -95,8 +95,8 @@ enum HandshakeError {
 /// The listener uses [`TlsBootstrap`] to stamp HTTP/2 ALPN and enforce
 /// production peer-policy rules, then injects an
 /// [`AuthenticatedGnmiPrincipal`] into every tonic request. `Capabilities` is
-/// the only implemented RPC at this phase; `Get`, `Set`, and `Subscribe` remain
-/// explicit `UNIMPLEMENTED` responses.
+/// `Capabilities` and authenticated read-only `Get` are implemented at this
+/// phase; `Set` and `Subscribe` remain explicit `UNIMPLEMENTED` responses.
 pub async fn run_gnmi_tls_listener<C, B>(
     server: GnmiServer<C, B>,
     listener: TcpListener,
@@ -671,8 +671,9 @@ mod tests {
                 ProstCodec::<gnmi::GetRequest, gnmi::GetResponse>::default(),
             )
             .await
-            .expect_err("get unimplemented");
-        assert_eq!(get.code(), tonic::Code::Unimplemented);
+            .expect("get")
+            .into_inner();
+        assert!(get.notification.is_empty());
 
         drop(grpc);
         shutdown.request_shutdown();
