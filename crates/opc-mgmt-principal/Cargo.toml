@@ -15,9 +15,9 @@ categories = ["network-programming", "authentication"]
 [dependencies]
 opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
 
 [dev-dependencies]
-opc-types = { path = "../opc-types", version = "0.2.0" }
 
 [lints]
 workspace = true

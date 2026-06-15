@@ -16,6 +16,10 @@
 //! - Optional `opc-runtime::Supervisor` task wrapper for the TLS listener.
 //! - NETCONF-over-TLS principal extraction from verified rustls peer
 //!   certificates.
+//! - NETCONF-over-SSH authenticated-channel helpers that require
+//!   `TransportType::NetconfSsh` and an `AuthStrength::SshPublicKey` principal.
+//!   Full SSH listener, host-key policy, client-key/certificate verification,
+//!   and Call Home remain future work.
 //! - Bounded XML parsing for client `<hello>` and RPC envelopes, including
 //!   fail-closed rejection of missing, empty, or duplicate client hello
 //!   capability containers, bounded XPath filter `select` expressions, plus
@@ -104,13 +108,15 @@
 //! render `0` or an out-of-range `<session-id>`. Custom transports that
 //! advertise a server `<hello>` should use
 //! [`run_read_only_session_with_registry`] or
-//! [`run_read_only_tls_session_with_registry`] to get audited cross-session
+//! [`run_read_only_tls_session_with_registry`] or
+//! [`run_read_only_ssh_session_with_registry`] to get audited cross-session
 //! `<kill-session>`, datastore lock/write semantics, and notification delivery.
 //!
 //! The raw session-registry controls are intentionally not part of the public
 //! API. Custom transports share a [`SessionRegistry`] by passing it into
 //! [`run_read_only_session_with_registry`] or
-//! [`run_read_only_tls_session_with_registry`]; they cannot register or
+//! [`run_read_only_tls_session_with_registry`] or
+//! [`run_read_only_ssh_session_with_registry`]; they cannot register or
 //! terminate sessions outside the audited RPC path:
 //!
 //! ```compile_fail
@@ -219,8 +225,8 @@ pub use session_registry::SessionRegistry;
 pub use supervision::{spawn_read_only_tls_listener, SupervisedTlsListenerConfig};
 pub use transport::{
     principal_from_identity_state, principal_from_identity_watch, principal_from_tls_stream,
-    run_read_only_tls_session, run_read_only_tls_session_with_registry, TlsPrincipalError,
-    TlsSessionError,
+    run_read_only_ssh_session, run_read_only_ssh_session_with_registry, run_read_only_tls_session,
+    run_read_only_tls_session_with_registry, SshSessionError, TlsPrincipalError, TlsSessionError,
 };
 pub use xml::{
     parse_client_hello, parse_rpc, ClientHello, CreateSubscriptionRequest, Datastore,

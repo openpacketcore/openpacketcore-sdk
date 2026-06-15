@@ -331,6 +331,12 @@ where
         })
     }
 
+    /// Returns the transport identity this server records in audit,
+    /// authorization context, and config-bus commit fingerprints.
+    pub const fn transport_type(&self) -> TransportType {
+        self.transport
+    }
+
     /// Handles one complete XML RPC document and returns an XML `<rpc-reply>`.
     ///
     /// This is a low-level helper for request/response harnesses. It does not
@@ -6603,6 +6609,21 @@ mod tests {
         Arc<Mutex<Vec<Vec<&'static str>>>>,
         CapturingAudit,
     ) {
+        server_fixture_with_operational_mode_and_transport(
+            operational_mode,
+            TransportType::NetconfTls,
+        )
+        .await
+    }
+
+    async fn server_fixture_with_operational_mode_and_transport(
+        operational_mode: OperationalMode,
+        transport: TransportType,
+    ) -> (
+        ReadOnlyNetconfServer<DemoConfig, TestBinding, FixedPolicy, CapturingAudit>,
+        Arc<Mutex<Vec<Vec<&'static str>>>>,
+        CapturingAudit,
+    ) {
         let bus = Arc::new(
             ConfigBus::new_dev_only(
                 DemoConfig {
@@ -6633,7 +6654,7 @@ mod tests {
             binding,
             FixedPolicy(policy_allow_system_but_deny_secret()),
             audit.clone(),
-            TransportType::NetconfTls,
+            transport,
         )
         .expect("server");
         (server, observed, audit)
@@ -12633,5 +12654,124 @@ mod tests {
         );
 
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn ssh_session_rejects_non_ssh_server_transport() {
+        let (server, _observed, _audit) = server_fixture().await;
+        let principal = opc_mgmt_principal::principal_for_ssh_user(
+            "operator",
+            TenantId::from_static("tenant-a"),
+        )
+        .expect("ssh principal");
+        let registry = SessionRegistry::new();
+        let (_client, mut server_io) = tokio::io::duplex(1024);
+
+        let result = crate::transport::run_read_only_ssh_session_with_registry(
+            &server,
+            &principal,
+            &mut server_io,
+            SessionConfig::default(),
+            901,
+            &registry,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::transport::SshSessionError::WrongServerTransport {
+                actual: TransportType::NetconfTls
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn ssh_session_rejects_non_ssh_principal() {
+        let (server, _observed, _audit) = server_fixture_with_operational_mode_and_transport(
+            OperationalMode::Normal,
+            TransportType::NetconfSsh,
+        )
+        .await;
+        let registry = SessionRegistry::new();
+        let (_client, mut server_io) = tokio::io::duplex(1024);
+
+        let result = crate::transport::run_read_only_ssh_session_with_registry(
+            &server,
+            &principal(),
+            &mut server_io,
+            SessionConfig::default(),
+            902,
+            &registry,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(
+                crate::transport::SshSessionError::WrongPrincipalAuthStrength {
+                    actual: AuthStrength::MutualTls
+                }
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn ssh_authenticated_channel_runs_session_and_audits_netconf_ssh() {
+        let (server, _observed, audit) = server_fixture_with_operational_mode_and_transport(
+            OperationalMode::Normal,
+            TransportType::NetconfSsh,
+        )
+        .await;
+        let principal = opc_mgmt_principal::principal_for_ssh_user(
+            "operator",
+            TenantId::from_static("tenant-a"),
+        )
+        .expect("ssh principal");
+        let registry = SessionRegistry::new();
+        let limits = MgmtLimits::default();
+        let (mut client, mut server_io) = tokio::io::duplex(64 * 1024);
+
+        let task = tokio::spawn(async move {
+            crate::transport::run_read_only_ssh_session_with_registry(
+                &server,
+                &principal,
+                &mut server_io,
+                SessionConfig::default(),
+                903,
+                &registry,
+            )
+            .await
+        });
+
+        let hello = String::from_utf8(read_base10_frame(&mut client).await).expect("hello utf8");
+        assert!(hello.contains(NETCONF_BASE_1_0));
+        let client_hello = format!(
+            r#"<hello xmlns="{NETCONF_BASE_NS}"><capabilities><capability>{NETCONF_BASE_1_0}</capability></capabilities></hello>"#
+        );
+        client
+            .write_all(&base10::encode_message(client_hello.as_bytes(), &limits).expect("hello"))
+            .await
+            .expect("write client hello");
+        client
+            .write_all(
+                &base10::encode_message(close_session_rpc().as_bytes(), &limits).expect("close"),
+            )
+            .await
+            .expect("write close-session");
+
+        let reply = String::from_utf8(read_base10_frame(&mut client).await).expect("reply utf8");
+        assert!(reply.contains("<ok/>"), "{reply}");
+        let result = task
+            .await
+            .expect("join")
+            .expect("ssh authenticated session");
+        assert_eq!(result.rpc_count, 1);
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert!(events.iter().any(|event| {
+            event.operation == AuditOperation::Exec
+                && event.transport == TransportType::NetconfSsh
+                && event.outcome == AuditOutcome::Success
+        }));
     }
 }

@@ -124,8 +124,13 @@ pub enum WorkloadIdentity {
 /// Authentication strength presented by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthStrength {
+    /// Mutual TLS with a verified peer certificate/SPIFFE identity.
     MutualTls,
+    /// Bearer-token/JWT authentication.
     Jwt,
+    /// SSH public-key or SSH-certificate authentication.
+    SshPublicKey,
+    /// Trusted local process boundary.
     LocalProcess,
 }
 

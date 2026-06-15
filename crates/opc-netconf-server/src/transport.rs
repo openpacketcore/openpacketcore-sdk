@@ -1,12 +1,17 @@
-//! NETCONF-over-TLS principal extraction.
+//! NETCONF transport principal extraction and authenticated-session helpers.
 //!
 //! `opc-tls`/rustls performs mTLS chain verification and peer-policy checks
 //! during the handshake. The verifier intentionally does not attach an
 //! application principal to the stream, so the server re-derives the peer
 //! [`opc_identity::WorkloadIdentity`] from the verified peer leaf certificate
 //! and maps it through `opc-mgmt-principal`.
+//!
+//! NETCONF-over-SSH uses the same transport-neutral session runner after an SSH
+//! layer has authenticated a public key or SSH certificate. This module exposes
+//! a narrow SSH entry point that validates the already-authenticated principal
+//! and server transport before handing the byte stream to NETCONF.
 
-use opc_config_model::{OpcConfig, TrustedPrincipal};
+use opc_config_model::{AuthStrength, OpcConfig, TransportType, TrustedPrincipal};
 use opc_identity::{IdentityReloadError, IdentityState, WorkloadIdentity};
 use opc_mgmt_audit::AuditSink;
 use opc_mgmt_authz::PolicySource;
@@ -44,6 +49,26 @@ pub enum TlsSessionError {
     /// Principal extraction failed before the NETCONF hello exchange.
     #[error(transparent)]
     Principal(#[from] TlsPrincipalError),
+    /// NETCONF session handling failed.
+    #[error(transparent)]
+    Session(#[from] SessionError),
+}
+
+/// Error running a NETCONF session over an already-authenticated SSH channel.
+#[derive(Debug, Error)]
+pub enum SshSessionError {
+    /// The server core was not constructed for `TransportType::NetconfSsh`.
+    #[error("NETCONF SSH session requires a NetconfSsh server transport")]
+    WrongServerTransport {
+        /// Transport currently recorded by the server.
+        actual: TransportType,
+    },
+    /// The supplied principal did not come from SSH public-key/certificate auth.
+    #[error("NETCONF SSH session requires an SshPublicKey principal")]
+    WrongPrincipalAuthStrength {
+        /// Auth strength currently carried by the principal.
+        actual: AuthStrength,
+    },
     /// NETCONF session handling failed.
     #[error(transparent)]
     Session(#[from] SessionError),
@@ -133,6 +158,80 @@ where
         server, &principal, stream, config, session_id, sessions,
     )
     .await?)
+}
+
+/// Runs a NETCONF session over an already-authenticated SSH channel.
+///
+/// This helper intentionally does not perform the SSH handshake or host/client
+/// key validation. It is the safe boundary that an SSH implementation calls
+/// *after* public-key or SSH-certificate authentication maps the peer to a
+/// `TrustedPrincipal` through `opc-mgmt-principal`.
+pub async fn run_read_only_ssh_session<C, B, P, A, IO>(
+    server: &ReadOnlyNetconfServer<C, B, P, A>,
+    principal: &TrustedPrincipal,
+    stream: &mut IO,
+    config: SessionConfig,
+    session_id: u64,
+) -> Result<SessionResult, SshSessionError>
+where
+    C: OpcConfig,
+    B: NetconfConfigBinding<C>,
+    P: PolicySource,
+    A: AuditSink,
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    validate_ssh_session_context(server, principal)?;
+    Ok(run_read_only_session(server, principal, stream, config, session_id).await?)
+}
+
+/// Runs an authenticated SSH NETCONF session registered for cross-session
+/// `<kill-session>` control.
+pub async fn run_read_only_ssh_session_with_registry<C, B, P, A, IO>(
+    server: &ReadOnlyNetconfServer<C, B, P, A>,
+    principal: &TrustedPrincipal,
+    stream: &mut IO,
+    config: SessionConfig,
+    session_id: u64,
+    sessions: &SessionRegistry,
+) -> Result<SessionResult, SshSessionError>
+where
+    C: OpcConfig,
+    B: NetconfConfigBinding<C>,
+    P: PolicySource,
+    A: AuditSink,
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    validate_ssh_session_context(server, principal)?;
+    Ok(
+        run_read_only_session_with_registry(
+            server, principal, stream, config, session_id, sessions,
+        )
+        .await?,
+    )
+}
+
+fn validate_ssh_session_context<C, B, P, A>(
+    server: &ReadOnlyNetconfServer<C, B, P, A>,
+    principal: &TrustedPrincipal,
+) -> Result<(), SshSessionError>
+where
+    C: OpcConfig,
+    B: NetconfConfigBinding<C>,
+    P: PolicySource,
+    A: AuditSink,
+{
+    let actual_transport = server.transport_type();
+    if actual_transport != TransportType::NetconfSsh {
+        return Err(SshSessionError::WrongServerTransport {
+            actual: actual_transport,
+        });
+    }
+    if principal.auth_strength != AuthStrength::SshPublicKey {
+        return Err(SshSessionError::WrongPrincipalAuthStrength {
+            actual: principal.auth_strength,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -21,6 +21,10 @@ The current slice is capability-gated and capability-honest:
 - NETCONF-over-TLS principal extraction from verified rustls peer
   certificates, mapped through `opc-mgmt-principal` with no transport-derived
   grants.
+- NETCONF-over-SSH authenticated-channel session helpers. These require a
+  server constructed with `TransportType::NetconfSsh` and a
+  `TrustedPrincipal` stamped `AuthStrength::SshPublicKey`, so a future SSH
+  handshake layer cannot accidentally audit TLS/local principals as SSH.
 - Bounded XML parsing for client `<hello>` and RPC envelopes, including
   fail-closed rejection of missing, empty, or duplicate client hello capability
   containers, plus `MgmtLimits::max_paths_per_request` enforcement after subtree
@@ -123,14 +127,16 @@ without a live `SessionRegistry`, and `handle_rpc_xml` discards the
 for a supplied session id, so direct helper callers cannot render `0` or an
 out-of-range `<session-id>`. Custom transports that advertise a server
 `<hello>` should use `run_read_only_session_with_registry` or
-`run_read_only_tls_session_with_registry` for audited cross-session
+`run_read_only_tls_session_with_registry` /
+`run_read_only_ssh_session_with_registry` for audited cross-session
 `<kill-session>` and datastore lock/write semantics.
 
-It still does not implement NETCONF over SSH, Call Home, notification replay or
-notification filters, NMDA `<get-data>` / `<edit-data>`, a full RFC XPath
-instance evaluator or advertised `:xpath`, URL and inline-config copy/validate
-forms, `:rollback-on-error`, or external interop against `netopeer2-cli`,
-`ncclient`, or a target NMS. CNFs may use generated NETCONF XML projection/edit
-support for supported shapes, but unsupported YANG shapes remain fail-closed
-and model-specific bindings still own any projection/edit behavior outside the
-generated support matrix.
+It still does not implement a NETCONF-over-SSH listener, SSH host-key
+generation/rotation, SSH client-key or certificate verification, Call Home,
+notification replay or notification filters, NMDA `<get-data>` / `<edit-data>`,
+a full RFC XPath instance evaluator or advertised `:xpath`, URL and
+inline-config copy/validate forms, `:rollback-on-error`, or external interop
+against `netopeer2-cli`, `ncclient`, or a target NMS. CNFs may use generated
+NETCONF XML projection/edit support for supported shapes, but unsupported YANG
+shapes remain fail-closed and model-specific bindings still own any
+projection/edit behavior outside the generated support matrix.

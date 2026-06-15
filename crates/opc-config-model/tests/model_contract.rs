@@ -212,3 +212,18 @@ fn transport_type_netconf_tls_is_distinct_and_serde_stable() {
     );
     assert_eq!(request.transport, TransportType::NetconfTls);
 }
+
+#[test]
+fn auth_strength_serde_round_trips_all_variants() {
+    for strength in [
+        opc_config_model::AuthStrength::MutualTls,
+        opc_config_model::AuthStrength::Jwt,
+        opc_config_model::AuthStrength::SshPublicKey,
+        opc_config_model::AuthStrength::LocalProcess,
+    ] {
+        let json = serde_json::to_string(&strength).expect("serialize auth strength");
+        let round: opc_config_model::AuthStrength =
+            serde_json::from_str(&json).expect("deserialize auth strength");
+        assert_eq!(round, strength);
+    }
+}
