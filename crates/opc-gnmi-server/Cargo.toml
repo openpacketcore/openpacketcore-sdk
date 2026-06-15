@@ -22,8 +22,18 @@ opc-mgmt-opstate = { path = "../opc-mgmt-opstate", version = "0.2.0" }
 opc-mgmt-path = { path = "../opc-mgmt-path", version = "0.2.0" }
 opc-mgmt-schema = { path = "../opc-mgmt-schema", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
+prost = { version = "0.13.5", default-features = true }
+prost-types = { version = "0.13.5", default-features = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tonic = { version = "0.13.1", default-features = false, features = ["codegen", "prost", "server"] }
+
+[build-dependencies]
+tonic-build = { version = "0.13.1", default-features = false, features = ["prost", "transport"] }
+
+[dev-dependencies]
+opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

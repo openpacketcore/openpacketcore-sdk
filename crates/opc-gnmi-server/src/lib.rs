@@ -1,10 +1,9 @@
 //! gNMI server foundation for the OpenPacketCore management plane.
 //!
-//! This crate is intentionally proto-free for the first gNMI slice. ADR 0016,
-//! which permits `tonic`/`prost` only inside `opc-gnmi-server`, still has status
-//! `Proposed`, so this crate does **not** add the gRPC stack or claim a working
-//! OpenConfig service. It provides the protocol-neutral contracts that the
-//! future generated protobuf service must use:
+//! ADR 0016 permits `tonic`/`prost` only inside `opc-gnmi-server`; this crate is
+//! the only workspace crate that may carry the OpenConfig gNMI protobuf service.
+//! It provides the protocol-neutral contracts that generated protobuf handlers
+//! must use:
 //!
 //! - CNF binding traits over `C: OpcConfig`;
 //! - capability data derived from the generated schema registry;
@@ -13,9 +12,10 @@
 //! - fail-safe registered-extension handling;
 //! - low-cardinality gNMI metrics helpers.
 //!
-//! The public [`GnmiServer`] type is a foundation handle, not a transport
-//! listener. It validates the binding's schema and management limits up front
-//! and exposes only operations that are backed by current SDK code.
+//! The current protobuf service is intentionally capability-honest:
+//! [`Capabilities`](proto::gnmi::g_nmi_server::GNmi::capabilities) is served from
+//! the generated schema registry, while `Get`, `Set`, and `Subscribe` return
+//! `UNIMPLEMENTED` until those behaviors are backed by code and tests.
 
 #![forbid(unsafe_code)]
 
@@ -26,6 +26,9 @@ pub mod error;
 pub mod extension;
 pub mod metrics;
 pub mod path;
+pub mod proto;
+pub mod proto_adapter;
+pub mod service;
 pub mod set;
 pub mod value;
 
@@ -42,6 +45,11 @@ pub use extension::{
     AcceptedExtension, Extension, ExtensionDisposition, ExtensionRegistry, RegisteredExtension,
 };
 pub use path::{resolve_path, resolve_paths, GnmiPath, GnmiPathElem, ResolvedGnmiPath};
+pub use proto::GNMI_VERSION;
+pub use proto_adapter::{
+    encoding_to_proto, extension_from_proto, path_from_proto, typed_value_from_proto,
+};
+pub use service::GnmiService;
 pub use set::{NormalizedSet, SetOperation};
 pub use value::{normalize_typed_value, NormalizedValue, TypedValue};
 
