@@ -103,6 +103,8 @@ impl NetconfNacmAction {
 
 /// Listener transport label for NETCONF over TLS.
 pub(crate) const TRANSPORT_NETCONF_TLS: &str = "netconf-tls";
+/// Listener transport label for NETCONF over SSH.
+pub(crate) const TRANSPORT_NETCONF_SSH: &str = "netconf-ssh";
 
 const OUTCOME_SUCCESS: &str = "success";
 const OUTCOME_FAILURE: &str = "failure";
