@@ -80,6 +80,10 @@ impl RpcParseError {
 pub(crate) enum RpcOperationHint {
     /// Base NETCONF `<edit-config>`.
     EditConfig,
+    /// Base NETCONF `<commit>`.
+    Commit,
+    /// Base NETCONF `<discard-changes>`.
+    DiscardChanges,
     /// Base NETCONF `<get>`.
     Get,
     /// Base NETCONF `<get-config>`.
@@ -111,6 +115,10 @@ pub enum RpcOperation {
     Unlock(UnlockRequest),
     /// `<validate>`.
     Validate(ValidateRequest),
+    /// `<commit>`.
+    Commit,
+    /// `<discard-changes>`.
+    DiscardChanges,
     /// `<kill-session>`.
     KillSession(KillSessionRequest),
     /// RFC 6022 `<get-schema>`.
@@ -668,6 +676,8 @@ struct ParserState {
     validate: Option<PartialValidate>,
     operation_hint: Option<RpcOperationHint>,
     close_session: bool,
+    commit: bool,
+    discard_changes: bool,
     unsupported_operation: Option<UnsupportedOperation>,
     filter_depth: usize,
     filter_stack: Vec<FilterFrame>,
@@ -981,6 +991,9 @@ impl ParserState {
                         return Err(XmlError::DuplicateElement);
                     }
                     self.close_session = true;
+                    if !attrs.is_empty() {
+                        return Err(XmlError::Malformed);
+                    }
                 }
                 "lock" => {
                     if self.has_rpc_operation() {
@@ -1029,8 +1042,26 @@ impl ParserState {
                         return Err(XmlError::Malformed);
                     }
                 }
-                "commit" => self.set_unsupported(UnsupportedOperation::Commit)?,
-                "discard-changes" => self.set_unsupported(UnsupportedOperation::DiscardChanges)?,
+                "commit" => {
+                    if self.has_rpc_operation() {
+                        return Err(XmlError::DuplicateElement);
+                    }
+                    self.operation_hint = Some(RpcOperationHint::Commit);
+                    self.commit = true;
+                    if !attrs.is_empty() {
+                        return Err(XmlError::Malformed);
+                    }
+                }
+                "discard-changes" => {
+                    if self.has_rpc_operation() {
+                        return Err(XmlError::DuplicateElement);
+                    }
+                    self.operation_hint = Some(RpcOperationHint::DiscardChanges);
+                    self.discard_changes = true;
+                    if !attrs.is_empty() {
+                        return Err(XmlError::Malformed);
+                    }
+                }
                 _ => return Err(XmlError::UnsupportedOperation),
             }
             return Ok(());
@@ -1070,7 +1101,10 @@ impl ParserState {
                 }
                 _ => Err(XmlError::Malformed),
             }
-        } else if self.local_path_is(&["rpc", "close-session"]) {
+        } else if self.local_path_is(&["rpc", "close-session"])
+            || self.local_path_is(&["rpc", "commit"])
+            || self.local_path_is(&["rpc", "discard-changes"])
+        {
             Err(XmlError::Malformed)
         } else if self.local_path_is(&["rpc", "lock"]) || self.local_path_is(&["rpc", "unlock"]) {
             match element.local.as_str() {
@@ -1181,6 +1215,8 @@ impl ParserState {
             || self.unlock.is_some()
             || self.validate.is_some()
             || self.close_session
+            || self.commit
+            || self.discard_changes
             || self.unsupported_operation.is_some()
     }
 
@@ -1197,6 +1233,8 @@ impl ParserState {
         }
         match local {
             "edit-config" => self.operation_hint = Some(RpcOperationHint::EditConfig),
+            "commit" => self.operation_hint = Some(RpcOperationHint::Commit),
+            "discard-changes" => self.operation_hint = Some(RpcOperationHint::DiscardChanges),
             "kill-session" => self.operation_hint = Some(RpcOperationHint::KillSession),
             _ => {}
         }
@@ -1667,6 +1705,20 @@ impl ParserState {
                         message_id,
                         reply_attrs,
                         operation: RpcOperation::CloseSession,
+                    }));
+                }
+                if self.commit {
+                    return Ok(ParsedMessage::Rpc(ParsedRpc {
+                        message_id,
+                        reply_attrs,
+                        operation: RpcOperation::Commit,
+                    }));
+                }
+                if self.discard_changes {
+                    return Ok(ParsedMessage::Rpc(ParsedRpc {
+                        message_id,
+                        reply_attrs,
+                        operation: RpcOperation::DiscardChanges,
                     }));
                 }
                 if let Some(lock) = self.lock {
@@ -2280,6 +2332,34 @@ mod tests {
             .expect("parse close-session");
         assert_eq!(parsed.message_id, "101");
         assert_eq!(parsed.operation, RpcOperation::CloseSession);
+    }
+
+    #[test]
+    fn parses_commit_and_discard_changes() {
+        let commit = parse_rpc(&rpc("<commit/>"), &MgmtLimits::default()).expect("parse commit");
+        assert_eq!(commit.message_id, "101");
+        assert_eq!(commit.operation, RpcOperation::Commit);
+
+        let discard = parse_rpc(&rpc("<discard-changes/>"), &MgmtLimits::default())
+            .expect("parse discard-changes");
+        assert_eq!(discard.operation, RpcOperation::DiscardChanges);
+    }
+
+    #[test]
+    fn rejects_non_empty_commit_and_discard_changes() {
+        let commit = parse_rpc(
+            &rpc("<commit><persist>id</persist></commit>"),
+            &MgmtLimits::default(),
+        )
+        .expect_err("commit child content");
+        assert_eq!(commit, XmlError::Malformed);
+
+        let discard = parse_rpc(
+            &rpc(r#"<discard-changes unexpected="value"/>"#),
+            &MgmtLimits::default(),
+        )
+        .expect_err("discard attr");
+        assert_eq!(discard, XmlError::Malformed);
     }
 
     #[test]

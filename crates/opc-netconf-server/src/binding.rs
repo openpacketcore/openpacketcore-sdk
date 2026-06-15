@@ -334,6 +334,17 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         false
     }
 
+    /// Returns true when this binding supports the RFC 6241 candidate datastore
+    /// through the server-owned candidate buffer and generated edit applicator.
+    ///
+    /// The default is `false`: no `:candidate` capability is advertised and
+    /// candidate-target operations fail closed. A binding that enables this must
+    /// also be able to translate edits via [`Self::build_edit_config_candidate`]
+    /// for the generated config root.
+    fn candidate_datastore_capability(&self) -> bool {
+        false
+    }
+
     /// Returns the advertised RFC 6243 with-defaults capability, if this
     /// binding can render every advertised mode.
     ///
