@@ -14,8 +14,10 @@
 //!
 //! The current protobuf service is intentionally capability-honest:
 //! [`Capabilities`](proto::gnmi::g_nmi_server::GNmi::capabilities) is served from
-//! the generated schema registry, while `Get`, `Set`, and `Subscribe` return
-//! `UNIMPLEMENTED` until those behaviors are backed by code and tests.
+//! the generated schema registry, authenticated `Get` supports read-only
+//! JSON/JSON_IETF config and operational data through explicit binding hooks,
+//! while `Set` and `Subscribe` return `UNIMPLEMENTED` until those behaviors are
+//! backed by code and tests.
 
 #![forbid(unsafe_code)]
 
@@ -24,6 +26,7 @@ pub mod capabilities;
 pub mod encoding;
 pub mod error;
 pub mod extension;
+pub mod get;
 pub mod listener;
 pub mod metrics;
 pub mod path;
@@ -39,7 +42,9 @@ use std::marker::PhantomData;
 use opc_config_model::OpcConfig;
 use opc_mgmt_limits::MgmtLimits;
 
-pub use binding::{GnmiConfigBinding, GnmiPatchApplicator};
+pub use binding::{
+    GnmiConfigBinding, GnmiJsonProjectionError, GnmiJsonUpdate, GnmiPatchApplicator, ReadSelection,
+};
 pub use capabilities::{CapabilityProfile, GnmiCapabilities, GnmiModelData, GnmiVersion};
 pub use encoding::{Encoding, EncodingRegistry};
 pub use error::GnmiError;
