@@ -7,7 +7,8 @@
 //! - NETCONF 1.0 and 1.1 message framing, including fail-closed rejection of
 //!   malformed base 1.1 chunk lengths, truncated chunk bodies, and too many
 //!   base 1.1 chunks per message.
-//! - Server `<hello>` rendering with base capabilities plus optional discovery
+//! - Server `<hello>` rendering with base capabilities plus optional discovery,
+//!   defaults, writable-running, candidate, confirmed-commit, and startup
 //!   capabilities only when their CNF binding hooks are present.
 //! - Transport-neutral session handshake and RPC dispatch over an already
 //!   authenticated stream.
@@ -17,8 +18,9 @@
 //!   certificates.
 //! - Bounded XML parsing for client `<hello>` and RPC envelopes, including
 //!   fail-closed rejection of missing, empty, or duplicate client hello
-//!   capability containers, plus `MgmtLimits::max_paths_per_request`
-//!   enforcement after subtree filters expand into schema-node selections;
+//!   capability containers, bounded XPath filter `select` expressions, plus
+//!   `MgmtLimits::max_paths_per_request` enforcement after subtree/XPath
+//!   filters expand into schema-node selections;
 //!   parser errors after a valid `<rpc>` envelope preserve `message-id` without
 //!   echoing payload text, bounded extra `<rpc>` attributes are copied onto all
 //!   `<rpc-reply>` forms per RFC 6241 with prefixed NETCONF reply elements when
@@ -41,10 +43,9 @@
 //!   parser, bounded namespace-preserving `<config>` capture, NACM `exec`
 //!   authorization, running lock/write serialization, config-bus submission,
 //!   commit-error mapping, metrics, and audit. The CNF owns schema-aware XML to
-//!   config translation. This slice supports running target with
-//!   `stop-on-error`; explicit `<test-option>` is rejected until `:validate`
-//!   is advertised. `candidate`, `startup`, `test-only`,
-//!   `continue-on-error`, and `rollback-on-error` fail closed.
+//!   config translation. This path supports running, candidate, and startup
+//!   targets only when their capabilities/backing facades are present;
+//!   `test-only`, `continue-on-error`, and `rollback-on-error` fail closed.
 //! - Known-but-unimplemented NETCONF base operations are parsed only far
 //!   enough to preserve `message-id`, audit the failed attempt, and return
 //!   payload-free `operation-not-supported`; bounded text and CDATA payloads
@@ -53,9 +54,12 @@
 //!   `opc-config-bus`.
 //! - `<get>` against running config plus CNF-supplied operational state.
 //! - Namespace/schema-aware structural subtree filters, including RFC 6241
-//!   namespace wildcards, for `<get-config running>` and `<get>`; expanded
-//!   schema-node fanout is rejected fail-closed before NACM or CNF projection
-//!   when it exceeds the configured path limit.
+//!   namespace wildcards, plus a bounded XPath schema-selection subset
+//!   (absolute prefixed child paths, wildcards, and union) for `<get-config>`
+//!   and `<get>`; expanded schema-node fanout is rejected fail-closed before
+//!   NACM or CNF projection when it exceeds the configured path limit. Full RFC
+//!   XPath predicates, functions, axes, and the `:xpath` capability remain
+//!   intentionally absent until an instance-aware evaluator exists.
 //! - RFC 6243 `<with-defaults>` request parameters are recognized. The
 //!   `:with-defaults` capability is advertised only when the CNF binding
 //!   supplies a `WithDefaultsCapability` and default-aware XML projection hooks;

@@ -106,6 +106,7 @@ where
         request.filter.as_ref(),
         yang_library_capability.is_some(),
         monitoring_capability.is_some(),
+        ctx.limits,
     ) {
         Ok(paths) => paths,
         Err(err) => {

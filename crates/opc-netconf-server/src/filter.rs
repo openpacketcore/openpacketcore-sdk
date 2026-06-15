@@ -1,6 +1,7 @@
 //! Schema-aware NETCONF filter projection.
 
 use opc_mgmt_errors::{NetconfError, NetconfErrorTag, NetconfErrorType};
+use opc_mgmt_limits::{LimitsError, MgmtLimits};
 use opc_mgmt_schema::{
     DataClass, LeafType, ModelData, NodeKind, NodeMeta, OriginEntry, SchemaRegistry,
 };
@@ -8,7 +9,7 @@ use thiserror::Error;
 
 use crate::capabilities::NETCONF_MONITORING_NS;
 use crate::error::RpcError;
-use crate::xml::{Filter, SubtreeFilter, SubtreeSelection};
+use crate::xml::{Filter, SubtreeFilter, SubtreeSelection, XPathFilter};
 
 /// RFC 8525 `ietf-yang-library` XML namespace.
 pub const YANG_LIBRARY_NS: &str = "urn:ietf:params:xml:ns:yang:ietf-yang-library";
@@ -755,11 +756,18 @@ pub struct GetPathSelection {
 }
 
 /// Filter projection failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum FilterError {
-    /// XPath filters require a bounded evaluator, which is not implemented yet.
+    /// The XPath filter used a valid XPath construct outside the currently
+    /// supported bounded schema-selection subset.
     #[error("NETCONF XPath filter is not supported")]
     UnsupportedXPath,
+    /// The XPath filter expression was malformed for the supported subset.
+    #[error("NETCONF XPath filter is malformed")]
+    InvalidXPath,
+    /// The filter exceeded a configured management-plane bound.
+    #[error(transparent)]
+    Limit(#[from] LimitsError),
     /// A subtree filter element used a namespace that is not in the served
     /// module set.
     #[error("NETCONF subtree filter used an unknown namespace")]
@@ -771,9 +779,14 @@ pub enum FilterError {
 
 impl FilterError {
     /// Client-facing NETCONF error classification.
-    pub const fn rpc_error(self) -> RpcError {
+    pub const fn rpc_error(&self) -> RpcError {
         match self {
             Self::UnsupportedXPath => RpcError::operation_not_supported(),
+            Self::InvalidXPath => RpcError::new(
+                NetconfError::new(NetconfErrorType::Protocol, NetconfErrorTag::BadElement),
+                "bad element",
+            ),
+            Self::Limit(_) => RpcError::too_big(),
             Self::UnknownNamespace => RpcError::new(
                 NetconfError::new(
                     NetconfErrorType::Protocol,
@@ -789,9 +802,11 @@ impl FilterError {
     }
 
     /// Stable audit reason.
-    pub const fn audit_reason(self) -> &'static str {
+    pub const fn audit_reason(&self) -> &'static str {
         match self {
             Self::UnsupportedXPath => "operation-not-supported",
+            Self::InvalidXPath => "bad-element",
+            Self::Limit(_) => "too-big",
             Self::UnknownNamespace => "unknown-namespace",
             Self::UnknownNode => "bad-element",
         }
@@ -802,12 +817,22 @@ impl FilterError {
 ///
 /// `None` selects every config node in the registry. Structural subtree filters
 /// are resolved through the served module namespaces and schema paths. XPath is
-/// recognized but rejected until a bounded evaluator exists.
+/// limited to the bounded schema-selection subset implemented below.
 pub fn get_config_paths(
     registry: &'static dyn SchemaRegistry,
     filter: Option<&Filter>,
 ) -> Result<Vec<&'static str>, FilterError> {
-    data_paths(registry, filter, DataPathScope::ConfigOnly)
+    get_config_paths_with_limits(registry, filter, &MgmtLimits::default())
+}
+
+/// Computes the config schema-node paths addressed by a `<get-config>` filter
+/// using explicit management-plane limits.
+pub fn get_config_paths_with_limits(
+    registry: &'static dyn SchemaRegistry,
+    filter: Option<&Filter>,
+    limits: &MgmtLimits,
+) -> Result<Vec<&'static str>, FilterError> {
+    data_paths(registry, filter, DataPathScope::ConfigOnly, limits)
 }
 
 /// Computes every schema-node path addressed by a NETCONF `<get>` filter.
@@ -815,7 +840,7 @@ pub fn get_paths(
     registry: &'static dyn SchemaRegistry,
     filter: Option<&Filter>,
 ) -> Result<Vec<&'static str>, FilterError> {
-    data_paths(registry, filter, DataPathScope::All)
+    data_paths(registry, filter, DataPathScope::All, &MgmtLimits::default())
 }
 
 /// Computes schema-node paths addressed by a NETCONF `<get>` filter, including
@@ -825,7 +850,13 @@ pub fn get_paths_with_yang_library(
     filter: Option<&Filter>,
     include_yang_library: bool,
 ) -> Result<GetPathSelection, FilterError> {
-    get_paths_with_discovery(registry, filter, include_yang_library, false)
+    get_paths_with_discovery(
+        registry,
+        filter,
+        include_yang_library,
+        false,
+        &MgmtLimits::default(),
+    )
 }
 
 /// Computes schema-node paths addressed by a NETCONF `<get>` filter, including
@@ -835,6 +866,7 @@ pub fn get_paths_with_discovery(
     filter: Option<&Filter>,
     include_yang_library: bool,
     include_netconf_monitoring: bool,
+    limits: &MgmtLimits,
 ) -> Result<GetPathSelection, FilterError> {
     match filter {
         None => {
@@ -853,7 +885,13 @@ pub fn get_paths_with_discovery(
                 netconf_monitoring_paths,
             })
         }
-        Some(Filter::XPath) => Err(FilterError::UnsupportedXPath),
+        Some(Filter::XPath(filter)) => xpath_paths_with_discovery(
+            registry,
+            filter,
+            include_yang_library,
+            include_netconf_monitoring,
+            limits,
+        ),
         Some(Filter::Subtree(filter)) => {
             let mut data_paths = Vec::new();
             let mut yang_library_paths = Vec::new();
@@ -914,7 +952,7 @@ struct SelectionOutcome {
 impl SelectionOutcome {
     fn observe_error(&mut self, error: FilterError) {
         match error {
-            FilterError::UnsupportedXPath => {}
+            FilterError::UnsupportedXPath | FilterError::InvalidXPath | FilterError::Limit(_) => {}
             FilterError::UnknownNamespace => self.unknown_namespace = true,
             FilterError::UnknownNode => self.unknown_node = true,
         }
@@ -953,10 +991,11 @@ fn data_paths(
     registry: &'static dyn SchemaRegistry,
     filter: Option<&Filter>,
     scope: DataPathScope,
+    limits: &MgmtLimits,
 ) -> Result<Vec<&'static str>, FilterError> {
     match filter {
         None => Ok(all_paths(registry, scope)),
-        Some(Filter::XPath) => Err(FilterError::UnsupportedXPath),
+        Some(Filter::XPath(filter)) => xpath_paths(registry, filter, scope, limits),
         Some(Filter::Subtree(filter)) => subtree_paths(registry, filter, scope),
     }
 }
@@ -986,6 +1025,314 @@ fn subtree_paths(
     }
 
     Ok(sort_dedupe_by_registry(registry, &selected, scope))
+}
+
+fn xpath_paths_with_discovery(
+    registry: &'static dyn SchemaRegistry,
+    filter: &XPathFilter,
+    include_yang_library: bool,
+    include_netconf_monitoring: bool,
+    limits: &MgmtLimits,
+) -> Result<GetPathSelection, FilterError> {
+    let selections = parse_xpath_filter(filter, limits)?;
+    let mut data_paths = Vec::new();
+    let mut yang_library_paths = Vec::new();
+    let mut netconf_monitoring_paths = Vec::new();
+
+    for selection in &selections {
+        let mut outcome = SelectionOutcome::default();
+        collect_xpath_selection_paths(
+            selection,
+            registry,
+            DataPathScope::All,
+            &mut data_paths,
+            &mut outcome,
+        );
+        if include_yang_library {
+            collect_xpath_selection_paths(
+                selection,
+                yang_library_registry(),
+                DataPathScope::All,
+                &mut yang_library_paths,
+                &mut outcome,
+            );
+        }
+        if include_netconf_monitoring {
+            collect_xpath_selection_paths(
+                selection,
+                netconf_monitoring_registry(),
+                DataPathScope::All,
+                &mut netconf_monitoring_paths,
+                &mut outcome,
+            );
+        }
+        outcome.finish()?;
+    }
+
+    Ok(GetPathSelection {
+        data_paths: sort_dedupe_by_registry(registry, &data_paths, DataPathScope::All),
+        yang_library_paths: sort_dedupe_by_registry(
+            yang_library_registry(),
+            &yang_library_paths,
+            DataPathScope::All,
+        ),
+        netconf_monitoring_paths: sort_dedupe_by_registry(
+            netconf_monitoring_registry(),
+            &netconf_monitoring_paths,
+            DataPathScope::All,
+        ),
+    })
+}
+
+fn xpath_paths(
+    registry: &'static dyn SchemaRegistry,
+    filter: &XPathFilter,
+    scope: DataPathScope,
+    limits: &MgmtLimits,
+) -> Result<Vec<&'static str>, FilterError> {
+    let selections = parse_xpath_filter(filter, limits)?;
+    let mut selected = Vec::new();
+    for selection in &selections {
+        let paths = resolve_xpath_selection_paths(registry, selection)?;
+        for path in paths {
+            add_ancestors(registry, path, scope, &mut selected);
+            add_path(registry, path, scope, &mut selected);
+            add_descendants(registry, path, scope, &mut selected);
+        }
+    }
+
+    Ok(sort_dedupe_by_registry(registry, &selected, scope))
+}
+
+fn collect_xpath_selection_paths(
+    selection: &XPathSelection,
+    registry: &'static dyn SchemaRegistry,
+    scope: DataPathScope,
+    selected: &mut Vec<&'static str>,
+    outcome: &mut SelectionOutcome,
+) {
+    match resolve_xpath_selection_paths(registry, selection) {
+        Ok(paths) => {
+            outcome.matched = true;
+            for path in paths {
+                add_ancestors(registry, path, scope, selected);
+                add_path(registry, path, scope, selected);
+                add_descendants(registry, path, scope, selected);
+            }
+        }
+        Err(error) => outcome.observe_error(error),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct XPathSelection {
+    steps: Vec<XPathStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum XPathStep {
+    Name { namespace: String, local: String },
+    NamespaceWildcard { namespace: String },
+    Any,
+}
+
+fn parse_xpath_filter(
+    filter: &XPathFilter,
+    limits: &MgmtLimits,
+) -> Result<Vec<XPathSelection>, FilterError> {
+    limits.check_xpath_filter_bytes(filter.select().len())?;
+    reject_unsupported_xpath_constructs(filter.select())?;
+
+    let mut selections = Vec::new();
+    let mut total_segments = 0usize;
+    for arm in filter.select().split('|') {
+        let arm = arm.trim();
+        if arm.is_empty() {
+            return Err(FilterError::InvalidXPath);
+        }
+        selections.push(parse_xpath_location_path(
+            arm,
+            filter,
+            &mut total_segments,
+            limits,
+        )?);
+    }
+    limits.check_xpath_filter_unions(selections.len())?;
+    Ok(selections)
+}
+
+fn reject_unsupported_xpath_constructs(select: &str) -> Result<(), FilterError> {
+    if select.contains("//")
+        || select.contains('[')
+        || select.contains(']')
+        || select.contains('(')
+        || select.contains(')')
+        || select.contains('@')
+        || select.contains("::")
+    {
+        return Err(FilterError::UnsupportedXPath);
+    }
+    Ok(())
+}
+
+fn parse_xpath_location_path(
+    path: &str,
+    filter: &XPathFilter,
+    total_segments: &mut usize,
+    limits: &MgmtLimits,
+) -> Result<XPathSelection, FilterError> {
+    let Some(stripped) = path.strip_prefix('/') else {
+        return Err(FilterError::InvalidXPath);
+    };
+    if stripped.is_empty() {
+        return Err(FilterError::UnsupportedXPath);
+    }
+
+    let mut steps = Vec::new();
+    for raw_step in stripped.split('/') {
+        if raw_step.is_empty() {
+            return Err(FilterError::InvalidXPath);
+        }
+        *total_segments = total_segments.saturating_add(1);
+        limits.check_xpath_filter_segments(*total_segments)?;
+        steps.push(parse_xpath_step(raw_step, filter)?);
+    }
+
+    Ok(XPathSelection { steps })
+}
+
+fn parse_xpath_step(step: &str, filter: &XPathFilter) -> Result<XPathStep, FilterError> {
+    if step == "*" {
+        return Ok(XPathStep::Any);
+    }
+    if matches!(step, "." | "..") {
+        return Err(FilterError::UnsupportedXPath);
+    }
+    let (prefix, local) = step.split_once(':').ok_or(FilterError::UnknownNamespace)?;
+    if prefix.is_empty() || local.is_empty() || local.contains(':') {
+        return Err(FilterError::InvalidXPath);
+    }
+    if !is_xml_name(prefix) || (local != "*" && !is_xml_name(local)) {
+        return Err(FilterError::InvalidXPath);
+    }
+    let namespace = filter
+        .namespaces()
+        .get(prefix)
+        .cloned()
+        .ok_or(FilterError::UnknownNamespace)?;
+    if local == "*" {
+        Ok(XPathStep::NamespaceWildcard { namespace })
+    } else {
+        Ok(XPathStep::Name {
+            namespace,
+            local: local.to_string(),
+        })
+    }
+}
+
+fn is_xml_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch == '-' || ch == '.' || ch.is_ascii_alphanumeric())
+}
+
+fn resolve_xpath_selection_paths(
+    registry: &'static dyn SchemaRegistry,
+    selection: &XPathSelection,
+) -> Result<Vec<&'static str>, FilterError> {
+    let mut candidates = vec![String::new()];
+    for step in &selection.steps {
+        let mut next = Vec::new();
+        for candidate in &candidates {
+            extend_xpath_step_candidates(registry, candidate, step, &mut next)?;
+        }
+        if next.is_empty() {
+            return Err(FilterError::UnknownNode);
+        }
+        candidates = next;
+    }
+
+    let mut paths = Vec::new();
+    for candidate in candidates {
+        let path = registry
+            .node(&candidate)
+            .map(|node| node.path)
+            .ok_or(FilterError::UnknownNode)?;
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn extend_xpath_step_candidates(
+    registry: &'static dyn SchemaRegistry,
+    parent: &str,
+    step: &XPathStep,
+    next: &mut Vec<String>,
+) -> Result<(), FilterError> {
+    match step {
+        XPathStep::Name { namespace, local } => {
+            for prefix in prefixes_for_namespace(registry, namespace)? {
+                let path = format!("{parent}/{prefix}:{local}");
+                if registry.node(&path).is_some() && !next.contains(&path) {
+                    next.push(path);
+                }
+            }
+        }
+        XPathStep::NamespaceWildcard { namespace } => {
+            let prefixes = prefixes_for_namespace(registry, namespace)?;
+            for child in direct_child_paths(registry, parent) {
+                if path_prefix(child).is_some_and(|prefix| prefixes.contains(&prefix)) {
+                    let child = child.to_string();
+                    if !next.contains(&child) {
+                        next.push(child);
+                    }
+                }
+            }
+        }
+        XPathStep::Any => {
+            for child in direct_child_paths(registry, parent) {
+                let child = child.to_string();
+                if !next.contains(&child) {
+                    next.push(child);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn direct_child_paths(registry: &'static dyn SchemaRegistry, parent: &str) -> Vec<&'static str> {
+    if parent.is_empty() {
+        return registry
+            .nodes()
+            .iter()
+            .filter_map(|node| (path_depth(node.path) == 1).then_some(node.path))
+            .collect();
+    }
+    registry
+        .node(parent)
+        .map(|node| node.child_paths.to_vec())
+        .unwrap_or_default()
+}
+
+fn path_depth(path: &str) -> usize {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .count()
+}
+
+fn path_prefix(path: &str) -> Option<&str> {
+    path.rsplit('/')
+        .next()?
+        .split_once(':')
+        .map(|(prefix, _)| prefix)
 }
 
 fn collect_selection_paths(
@@ -1139,9 +1486,11 @@ fn is_descendant_or_self(candidate: &str, ancestor: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use opc_mgmt_schema::{DataClass, LeafType, ModelData, NodeKind, NodeMeta, OriginEntry};
 
-    use crate::xml::{FilterElement, SubtreeFilter};
+    use crate::xml::{FilterElement, SubtreeFilter, XPathFilter};
 
     use super::*;
 
@@ -1241,6 +1590,11 @@ mod tests {
         Filter::Subtree(filter)
     }
 
+    fn xpath(select: &str) -> Filter {
+        let namespaces = BTreeMap::from([("sys".to_string(), "urn:opc:demo".to_string())]);
+        Filter::XPath(XPathFilter::new(select.to_string(), namespaces))
+    }
+
     #[test]
     fn no_filter_selects_all_config_nodes() {
         assert_eq!(
@@ -1319,11 +1673,105 @@ mod tests {
     }
 
     #[test]
-    fn xpath_fails_closed_until_bounded_evaluator_exists() {
+    fn xpath_absolute_leaf_selects_ancestors() {
+        let filter = xpath("/sys:system/sys:hostname");
+
         assert_eq!(
-            get_config_paths(&REGISTRY, Some(&Filter::XPath)).expect_err("xpath"),
+            get_config_paths(&REGISTRY, Some(&filter)).expect("config xpath"),
+            ["/sys:system", "/sys:system/sys:hostname"]
+        );
+        assert_eq!(
+            get_paths(&REGISTRY, Some(&filter)).expect("get xpath"),
+            ["/sys:system", "/sys:system/sys:hostname"]
+        );
+    }
+
+    #[test]
+    fn xpath_container_selects_descendants_in_scope() {
+        let filter = xpath("/sys:system");
+
+        assert_eq!(
+            get_config_paths(&REGISTRY, Some(&filter)).expect("config xpath"),
+            ["/sys:system", "/sys:system/sys:hostname"]
+        );
+        assert_eq!(
+            get_paths(&REGISTRY, Some(&filter)).expect("get xpath"),
+            [
+                "/sys:system",
+                "/sys:system/sys:hostname",
+                "/sys:system/sys:uptime"
+            ]
+        );
+    }
+
+    #[test]
+    fn xpath_union_dedupes_in_registry_order() {
+        let filter = xpath("/sys:system/sys:uptime | /sys:system/sys:hostname");
+
+        assert_eq!(
+            get_paths(&REGISTRY, Some(&filter)).expect("get xpath union"),
+            [
+                "/sys:system",
+                "/sys:system/sys:hostname",
+                "/sys:system/sys:uptime"
+            ]
+        );
+    }
+
+    #[test]
+    fn xpath_wildcard_selects_direct_children() {
+        let filter = xpath("/sys:system/*");
+
+        assert_eq!(
+            get_config_paths(&REGISTRY, Some(&filter)).expect("config xpath wildcard"),
+            ["/sys:system", "/sys:system/sys:hostname"]
+        );
+        assert_eq!(
+            get_paths(&REGISTRY, Some(&filter)).expect("get xpath wildcard"),
+            [
+                "/sys:system",
+                "/sys:system/sys:hostname",
+                "/sys:system/sys:uptime"
+            ]
+        );
+    }
+
+    #[test]
+    fn xpath_unknown_prefix_fails_closed() {
+        let filter = xpath("/bad:system");
+
+        assert_eq!(
+            get_config_paths(&REGISTRY, Some(&filter)).expect_err("unknown prefix"),
+            FilterError::UnknownNamespace
+        );
+    }
+
+    #[test]
+    fn xpath_predicate_fails_unsupported() {
+        let filter = xpath("/sys:system[sys:hostname='router-1']");
+
+        assert_eq!(
+            get_config_paths(&REGISTRY, Some(&filter)).expect_err("predicate"),
             FilterError::UnsupportedXPath
         );
+    }
+
+    #[test]
+    fn xpath_segment_limit_fails_too_big() {
+        let filter = xpath("/sys:system/sys:hostname");
+        let limits = MgmtLimits {
+            max_xpath_filter_segments: 1,
+            ..MgmtLimits::default()
+        };
+
+        assert!(matches!(
+            get_config_paths_with_limits(&REGISTRY, Some(&filter), &limits),
+            Err(FilterError::Limit(opc_mgmt_limits::LimitsError::Exceeded {
+                limit: "xpath_filter_segments",
+                max: 1,
+                actual: 2
+            }))
+        ));
     }
 
     #[test]
@@ -1413,8 +1861,14 @@ mod tests {
         );
 
         assert_eq!(
-            get_paths_with_discovery(&REGISTRY, Some(&filter), false, false)
-                .expect_err("not advertised"),
+            get_paths_with_discovery(
+                &REGISTRY,
+                Some(&filter),
+                false,
+                false,
+                &MgmtLimits::default()
+            )
+            .expect_err("not advertised"),
             FilterError::UnknownNamespace
         );
     }
@@ -1435,8 +1889,14 @@ mod tests {
             true,
         );
 
-        let selected = get_paths_with_discovery(&REGISTRY, Some(&filter), false, true)
-            .expect("monitoring filter");
+        let selected = get_paths_with_discovery(
+            &REGISTRY,
+            Some(&filter),
+            false,
+            true,
+            &MgmtLimits::default(),
+        )
+        .expect("monitoring filter");
         assert!(selected.data_paths.is_empty());
         assert!(selected.yang_library_paths.is_empty());
         assert_eq!(
@@ -1458,8 +1918,14 @@ mod tests {
     fn namespace_wildcard_can_select_advertised_discovery_tree() {
         let filter = subtree(vec![wildcard_element("netconf-state")], true);
 
-        let selected = get_paths_with_discovery(&REGISTRY, Some(&filter), false, true)
-            .expect("monitoring wildcard filter");
+        let selected = get_paths_with_discovery(
+            &REGISTRY,
+            Some(&filter),
+            false,
+            true,
+            &MgmtLimits::default(),
+        )
+        .expect("monitoring wildcard filter");
         assert!(selected.data_paths.is_empty());
         assert!(selected.yang_library_paths.is_empty());
         assert!(selected
