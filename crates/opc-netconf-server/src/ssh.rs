@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,9 +20,9 @@ use russh::keys::{Certificate, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Session};
 use russh::{Channel, ChannelId, Disconnect, MethodKind, MethodSet, SshId};
 use thiserror::Error;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, TryAcquireError};
-use tokio::task::{JoinError, JoinSet};
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 
 use crate::binding::NetconfConfigBinding;
 use crate::listener::allocate_session_id;
@@ -37,6 +38,7 @@ pub type SshHostKey = PrivateKey;
 pub type SshAuthorizedKey = PublicKey;
 
 const NETCONF_SUBSYSTEM: &str = "netconf";
+const CALL_HOME_BACKOFF_JITTER_DIVISOR: u128 = 4;
 
 /// Runtime configuration for the NETCONF-over-SSH listener.
 #[derive(Clone)]
@@ -119,6 +121,34 @@ impl std::fmt::Debug for SshListenerConfig {
     }
 }
 
+/// Runtime configuration for NETCONF-over-SSH Call Home.
+#[derive(Debug, Clone)]
+pub struct SshCallHomeConfig {
+    /// SSH/NETCONF server-side policy used after the outbound TCP connection is established.
+    pub ssh: SshListenerConfig,
+    /// NMS endpoints to dial. The runner tries them round-robin.
+    pub endpoints: Vec<SocketAddr>,
+    /// Maximum time allowed for one outbound TCP connect attempt.
+    pub connect_timeout: Duration,
+    /// Initial reconnect backoff after a failed connect/session attempt.
+    pub retry_initial: Duration,
+    /// Maximum reconnect backoff.
+    pub retry_max: Duration,
+}
+
+impl SshCallHomeConfig {
+    /// Builds a Call Home config from an SSH server policy and NMS endpoints.
+    pub fn new(ssh: SshListenerConfig, endpoints: Vec<SocketAddr>) -> Self {
+        Self {
+            ssh,
+            endpoints,
+            connect_timeout: Duration::from_secs(10),
+            retry_initial: Duration::from_secs(1),
+            retry_max: Duration::from_secs(60),
+        }
+    }
+}
+
 /// Summary returned when the SSH listener stops.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SshListenerResult {
@@ -129,6 +159,23 @@ pub struct SshListenerResult {
     /// Connections whose SSH auth, subsystem, NETCONF loop, join, or drain failed.
     pub failed_sessions: u64,
     /// Connections rejected because `MgmtLimits::max_sessions` or the session-id range was exhausted.
+    pub rejected_sessions: u64,
+}
+
+/// Summary returned when the SSH Call Home runner stops.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SshCallHomeResult {
+    /// Outbound TCP connection attempts.
+    pub connection_attempts: u64,
+    /// Outbound TCP connections handed to SSH/session handling.
+    pub connected_sessions: u64,
+    /// Connections that authenticated, started `subsystem "netconf"`, and exited cleanly.
+    pub completed_sessions: u64,
+    /// TCP connect attempts that failed or timed out before SSH started.
+    pub connection_failures: u64,
+    /// Connections whose SSH auth, subsystem, NETCONF loop, join, or drain failed.
+    pub failed_sessions: u64,
+    /// Connections rejected because the session-id range was exhausted.
     pub rejected_sessions: u64,
 }
 
@@ -159,6 +206,23 @@ pub enum SshListenerError {
     /// TCP accept failed.
     #[error("NETCONF SSH listener I/O error")]
     Io(#[from] std::io::Error),
+}
+
+/// Call Home configuration failure before the outbound connection loop can run.
+#[derive(Debug, Error)]
+pub enum SshCallHomeError {
+    /// Shared SSH server-side policy was invalid.
+    #[error(transparent)]
+    Listener(#[from] SshListenerError),
+    /// No NMS endpoint was configured.
+    #[error("NETCONF SSH Call Home requires at least one endpoint")]
+    MissingEndpoint,
+    /// Outbound TCP connect timeout must be non-zero.
+    #[error("NETCONF SSH Call Home connect_timeout must be non-zero")]
+    InvalidConnectTimeout,
+    /// Retry backoff bounds must be non-zero and ordered.
+    #[error("NETCONF SSH Call Home retry backoff must be non-zero and retry_max >= retry_initial")]
+    InvalidRetryBackoff,
 }
 
 #[derive(Debug, Error)]
@@ -279,6 +343,139 @@ where
     Ok(result)
 }
 
+/// Runs NETCONF-over-SSH Call Home until shutdown is requested.
+///
+/// The TCP connection is initiated outbound to one of the configured NMS
+/// endpoints, but this side still runs the SSH server role and accepts only
+/// public-key authentication plus `subsystem "netconf"`. Reconnect attempts are
+/// bounded by exponential backoff with deterministic jitter so a broken NMS
+/// cannot create a tight loop.
+pub async fn run_read_only_ssh_call_home<C, B, P, A>(
+    server: Arc<ReadOnlyNetconfServer<C, B, P, A>>,
+    shutdown: ShutdownToken,
+    config: SshCallHomeConfig,
+) -> Result<SshCallHomeResult, SshCallHomeError>
+where
+    C: OpcConfig,
+    B: NetconfConfigBinding<C> + 'static,
+    P: PolicySource + 'static,
+    A: AuditSink + 'static,
+{
+    validate_call_home_config(server.as_ref(), &config)?;
+    let ssh_config = Arc::new(build_russh_config(&config.ssh));
+    let auth_policy = Arc::new(SshAuthPolicy {
+        tenant: config.ssh.tenant.clone(),
+        authorized_keys: config.ssh.authorized_keys.clone(),
+    });
+    let next_session_id = Arc::new(AtomicU64::new(config.ssh.first_session_id));
+    let session_registry = SessionRegistry::new();
+    let mut result = SshCallHomeResult::default();
+    let mut endpoint_index = 0usize;
+    let mut attempt = 0u64;
+    let mut retry = config.retry_initial;
+
+    loop {
+        let endpoint = config.endpoints[endpoint_index];
+        endpoint_index = (endpoint_index + 1) % config.endpoints.len();
+        result.connection_attempts = result.connection_attempts.saturating_add(1);
+
+        let connect = tokio::time::timeout(config.connect_timeout, TcpStream::connect(endpoint));
+        let stream = tokio::select! {
+            _ = shutdown.shutdown_acknowledged() => break,
+            connected = connect => connected,
+        };
+
+        let stream = match stream {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(err)) => {
+                result.connection_failures = result.connection_failures.saturating_add(1);
+                tracing::debug!(
+                    transport = TRANSPORT_NETCONF_SSH,
+                    endpoint = %endpoint,
+                    error = %err,
+                    "NETCONF SSH Call Home connect failed"
+                );
+                let wait = deterministic_jitter(retry, attempt, endpoint_index);
+                if sleep_or_shutdown(wait, &shutdown).await {
+                    break;
+                }
+                retry = next_backoff(retry, config.retry_max);
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+            Err(_) => {
+                result.connection_failures = result.connection_failures.saturating_add(1);
+                tracing::debug!(
+                    transport = TRANSPORT_NETCONF_SSH,
+                    endpoint = %endpoint,
+                    "NETCONF SSH Call Home connect timed out"
+                );
+                let wait = deterministic_jitter(retry, attempt, endpoint_index);
+                if sleep_or_shutdown(wait, &shutdown).await {
+                    break;
+                }
+                retry = next_backoff(retry, config.retry_max);
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+        };
+
+        let Some(session_id) = allocate_session_id(&next_session_id) else {
+            result.rejected_sessions = result.rejected_sessions.saturating_add(1);
+            tracing::debug!(
+                transport = TRANSPORT_NETCONF_SSH,
+                "NETCONF SSH Call Home session rejected because the session id range is exhausted"
+            );
+            let wait = deterministic_jitter(retry, attempt, endpoint_index);
+            if sleep_or_shutdown(wait, &shutdown).await {
+                break;
+            }
+            retry = next_backoff(retry, config.retry_max);
+            attempt = attempt.saturating_add(1);
+            continue;
+        };
+
+        result.connected_sessions = result.connected_sessions.saturating_add(1);
+        let worker = tokio::spawn({
+            let server = Arc::clone(&server);
+            let ssh_config = Arc::clone(&ssh_config);
+            let auth_policy = Arc::clone(&auth_policy);
+            let session_config = config.ssh.session;
+            let session_registry = session_registry.clone();
+            async move {
+                let _active_session = active_session(TRANSPORT_NETCONF_SSH);
+                run_ssh_worker(
+                    server,
+                    ssh_config,
+                    auth_policy,
+                    stream,
+                    session_config,
+                    session_id,
+                    session_registry,
+                )
+                .await
+            }
+        });
+
+        let clean = wait_for_call_home_worker(worker, &shutdown, config.ssh.drain_timeout).await;
+        if clean {
+            result.completed_sessions = result.completed_sessions.saturating_add(1);
+            retry = config.retry_initial;
+            attempt = 0;
+        } else {
+            result.failed_sessions = result.failed_sessions.saturating_add(1);
+            retry = next_backoff(retry, config.retry_max);
+            attempt = attempt.saturating_add(1);
+        }
+
+        if shutdown.is_shutdown_requested() {
+            break;
+        }
+    }
+
+    Ok(result)
+}
+
 fn build_russh_config(config: &SshListenerConfig) -> server::Config {
     server::Config {
         server_id: SshId::Standard(Cow::Borrowed("SSH-2.0-openpacketcore-netconf")),
@@ -298,7 +495,7 @@ async fn run_ssh_worker<C, B, P, A>(
     server: Arc<ReadOnlyNetconfServer<C, B, P, A>>,
     ssh_config: Arc<server::Config>,
     auth_policy: Arc<SshAuthPolicy>,
-    stream: tokio::net::TcpStream,
+    stream: TcpStream,
     session_config: SessionConfig,
     session_id: u64,
     session_registry: SessionRegistry,
@@ -332,6 +529,28 @@ where
     Ok(())
 }
 
+async fn wait_for_call_home_worker(
+    mut worker: JoinHandle<Result<(), SshWorkerError>>,
+    shutdown: &ShutdownToken,
+    drain_timeout: Duration,
+) -> bool {
+    tokio::select! {
+        joined = &mut worker => matches!(joined, Ok(Ok(()))),
+        _ = shutdown.shutdown_acknowledged() => {
+            if matches!(
+                tokio::time::timeout(drain_timeout, &mut worker).await,
+                Ok(Ok(Ok(())))
+            ) {
+                true
+            } else {
+                worker.abort();
+                let _ = worker.await;
+                false
+            }
+        }
+    }
+}
+
 fn validate_listener_config<C, B, P, A>(
     server: &ReadOnlyNetconfServer<C, B, P, A>,
     config: &SshListenerConfig,
@@ -362,6 +581,53 @@ where
         return Err(SshListenerError::InvalidAuthAttemptLimit);
     }
     Ok(())
+}
+
+fn validate_call_home_config<C, B, P, A>(
+    server: &ReadOnlyNetconfServer<C, B, P, A>,
+    config: &SshCallHomeConfig,
+) -> Result<(), SshCallHomeError>
+where
+    C: OpcConfig,
+    B: NetconfConfigBinding<C>,
+    P: PolicySource,
+    A: AuditSink,
+{
+    validate_listener_config(server, &config.ssh)?;
+    if config.endpoints.is_empty() {
+        return Err(SshCallHomeError::MissingEndpoint);
+    }
+    if config.connect_timeout.is_zero() {
+        return Err(SshCallHomeError::InvalidConnectTimeout);
+    }
+    if config.retry_initial.is_zero() || config.retry_max < config.retry_initial {
+        return Err(SshCallHomeError::InvalidRetryBackoff);
+    }
+    Ok(())
+}
+
+async fn sleep_or_shutdown(duration: Duration, shutdown: &ShutdownToken) -> bool {
+    tokio::select! {
+        _ = shutdown.shutdown_acknowledged() => true,
+        _ = tokio::time::sleep(duration) => false,
+    }
+}
+
+fn next_backoff(current: Duration, max: Duration) -> Duration {
+    current.saturating_mul(2).min(max)
+}
+
+fn deterministic_jitter(base: Duration, attempt: u64, endpoint_index: usize) -> Duration {
+    let base_millis = base.as_millis();
+    if base_millis == 0 {
+        return base;
+    }
+    let spread = (base_millis / CALL_HOME_BACKOFF_JITTER_DIVISOR).max(1);
+    let salt = attempt
+        .wrapping_mul(1_103_515_245)
+        .wrapping_add(endpoint_index as u64);
+    let jitter = u128::from(salt) % (spread + 1);
+    base.saturating_add(Duration::from_millis(jitter.try_into().unwrap_or(u64::MAX)))
 }
 
 async fn drain_workers(

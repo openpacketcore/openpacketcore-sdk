@@ -5108,6 +5108,7 @@ fn audit_failed(reason: &'static str) -> AuditOutcome {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::net::SocketAddr;
     use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::sync::{Arc, Mutex};
@@ -5170,10 +5171,13 @@ mod tests {
     use crate::framing::base10;
     use crate::listener::{run_read_only_tls_listener, TlsListenerConfig};
     use crate::session::SessionConfig;
-    use crate::ssh::{run_read_only_ssh_listener, SshListenerConfig, SshListenerError};
+    use crate::ssh::{
+        run_read_only_ssh_call_home, run_read_only_ssh_listener, SshCallHomeConfig,
+        SshCallHomeError, SshListenerConfig, SshListenerError,
+    };
     use crate::supervision::{
-        spawn_read_only_ssh_listener, spawn_read_only_tls_listener, SupervisedSshListenerConfig,
-        SupervisedTlsListenerConfig,
+        spawn_read_only_ssh_call_home, spawn_read_only_ssh_listener, spawn_read_only_tls_listener,
+        SupervisedSshCallHomeConfig, SupervisedSshListenerConfig, SupervisedTlsListenerConfig,
     };
     use crate::xml::WithDefaultsMode;
 
@@ -6460,6 +6464,19 @@ mod tests {
         config.drain_timeout = Duration::from_secs(5);
         config.auth_rejection_time = Duration::from_millis(1);
         config.auth_rejection_time_initial = Some(Duration::from_millis(1));
+        config
+    }
+
+    fn ssh_call_home_test_config(
+        endpoint: SocketAddr,
+        host_key: SshPrivateKey,
+        user_key: &SshPrivateKey,
+    ) -> SshCallHomeConfig {
+        let mut config =
+            SshCallHomeConfig::new(ssh_listener_test_config(host_key, user_key), vec![endpoint]);
+        config.connect_timeout = Duration::from_secs(5);
+        config.retry_initial = Duration::from_millis(5);
+        config.retry_max = Duration::from_millis(20);
         config
     }
 
@@ -8848,6 +8865,225 @@ mod tests {
         let state = health
             .task_states
             .get("netconf-ssh-supervised-test")
+            .expect("task state after shutdown");
+        assert!(!state.running);
+        assert!(!health.degraded);
+        assert!(!health.fatal_failure);
+    }
+
+    #[tokio::test]
+    async fn ssh_call_home_validates_transport_endpoints_and_backoff() {
+        let endpoint = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind")
+            .local_addr()
+            .expect("local addr");
+        let host_key = ssh_private_key();
+        let user_key = ssh_private_key();
+
+        let (tls_server, _observed, _audit) = server_fixture().await;
+        let wrong_transport = run_read_only_ssh_call_home(
+            Arc::new(tls_server),
+            ShutdownToken::new(),
+            ssh_call_home_test_config(endpoint, host_key.clone(), &user_key),
+        )
+        .await;
+        assert!(matches!(
+            wrong_transport,
+            Err(SshCallHomeError::Listener(
+                SshListenerError::WrongServerTransport {
+                    actual: TransportType::NetconfTls
+                }
+            ))
+        ));
+
+        let (ssh_server, _observed, _audit) = server_fixture_with_operational_mode_and_transport(
+            OperationalMode::Normal,
+            TransportType::NetconfSsh,
+        )
+        .await;
+        let ssh_server = Arc::new(ssh_server);
+
+        let missing_endpoint = SshCallHomeConfig::new(
+            ssh_listener_test_config(host_key.clone(), &user_key),
+            Vec::new(),
+        );
+        let result = run_read_only_ssh_call_home(
+            Arc::clone(&ssh_server),
+            ShutdownToken::new(),
+            missing_endpoint,
+        )
+        .await;
+        assert!(matches!(result, Err(SshCallHomeError::MissingEndpoint)));
+
+        let mut zero_timeout = ssh_call_home_test_config(endpoint, host_key.clone(), &user_key);
+        zero_timeout.connect_timeout = Duration::ZERO;
+        let result = run_read_only_ssh_call_home(
+            Arc::clone(&ssh_server),
+            ShutdownToken::new(),
+            zero_timeout,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(SshCallHomeError::InvalidConnectTimeout)
+        ));
+
+        let mut invalid_backoff = ssh_call_home_test_config(endpoint, host_key, &user_key);
+        invalid_backoff.retry_initial = Duration::from_millis(10);
+        invalid_backoff.retry_max = Duration::from_millis(1);
+        let result =
+            run_read_only_ssh_call_home(ssh_server, ShutdownToken::new(), invalid_backoff).await;
+        assert!(matches!(result, Err(SshCallHomeError::InvalidRetryBackoff)));
+    }
+
+    #[tokio::test]
+    async fn ssh_call_home_dials_nms_and_serves_netconf_over_outbound_tcp() {
+        let (server, _observed, audit) = server_fixture_with_operational_mode_and_transport(
+            OperationalMode::Normal,
+            TransportType::NetconfSsh,
+        )
+        .await;
+        let host_key = ssh_private_key();
+        let user_key = ssh_private_key();
+        let nms_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = nms_listener.local_addr().expect("local addr");
+        let shutdown = ShutdownToken::new();
+        let limits = MgmtLimits::default();
+        let call_home_task = tokio::spawn(run_read_only_ssh_call_home(
+            Arc::new(server),
+            shutdown.clone(),
+            ssh_call_home_test_config(endpoint, host_key, &user_key),
+        ));
+
+        let (socket, _peer) = tokio::time::timeout(Duration::from_secs(5), nms_listener.accept())
+            .await
+            .expect("NMS accept timeout")
+            .expect("NMS accept");
+        let (client_handler, _channel_failed) = TestSshClient::new();
+        let mut session =
+            client::connect_stream(Arc::new(client::Config::default()), socket, client_handler)
+                .await
+                .expect("SSH Call Home connect stream");
+        let auth = session
+            .authenticate_publickey("operator", ssh_signing_key(user_key))
+            .await
+            .expect("SSH public-key auth");
+        assert!(auth.success());
+        let channel = session.channel_open_session().await.expect("open session");
+        channel
+            .request_subsystem(true, "netconf")
+            .await
+            .expect("request netconf subsystem");
+        let mut stream = channel.into_stream();
+
+        let server_hello =
+            String::from_utf8(read_base10_frame(&mut stream).await).expect("hello utf8");
+        assert!(server_hello.contains(NETCONF_BASE_1_0));
+
+        let client_hello = format!(
+            r#"<hello xmlns="{NETCONF_BASE_NS}"><capabilities><capability>{NETCONF_BASE_1_0}</capability></capabilities></hello>"#
+        );
+        stream
+            .write_all(
+                &base10::encode_message(client_hello.as_bytes(), &limits).expect("hello frame"),
+            )
+            .await
+            .expect("write client hello");
+        stream
+            .write_all(
+                &base10::encode_message(get_config_rpc("running").as_bytes(), &limits)
+                    .expect("rpc frame"),
+            )
+            .await
+            .expect("write rpc");
+        let reply = String::from_utf8(read_base10_frame(&mut stream).await).expect("reply utf8");
+        assert!(reply.contains("<sys:hostname>amf-1</sys:hostname>"));
+        assert!(!reply.contains("do-not-leak"));
+
+        stream
+            .write_all(
+                &base10::encode_message(close_session_rpc().as_bytes(), &limits).expect("close"),
+            )
+            .await
+            .expect("write close-session");
+        let reply = String::from_utf8(read_base10_frame(&mut stream).await).expect("close utf8");
+        assert!(reply.contains("<ok/>"), "{reply}");
+        shutdown.request_shutdown();
+        drop(stream);
+        let _ = session
+            .disconnect(Disconnect::ByApplication, "test complete", "en")
+            .await;
+
+        let result = tokio::time::timeout(Duration::from_secs(5), call_home_task)
+            .await
+            .expect("Call Home timeout")
+            .expect("Call Home join")
+            .expect("Call Home result");
+
+        assert_eq!(result.connection_attempts, 1);
+        assert_eq!(result.connected_sessions, 1);
+        assert_eq!(result.completed_sessions, 1);
+        assert_eq!(result.connection_failures, 0);
+        assert_eq!(result.failed_sessions, 0);
+        assert_eq!(result.rejected_sessions, 0);
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert!(events.iter().any(|event| {
+            event.outcome == AuditOutcome::Success && event.transport == TransportType::NetconfSsh
+        }));
+    }
+
+    #[tokio::test]
+    async fn supervised_ssh_call_home_registers_as_runtime_listener_and_drains() {
+        let (server, _observed, _audit) = server_fixture_with_operational_mode_and_transport(
+            OperationalMode::Normal,
+            TransportType::NetconfSsh,
+        )
+        .await;
+        let unused_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = unused_listener.local_addr().expect("local addr");
+        drop(unused_listener);
+        let host_key = ssh_private_key();
+        let user_key = ssh_private_key();
+        let shutdown = ShutdownToken::new();
+        let supervisor = Supervisor::new(RuntimeProfile::dev("amf"), shutdown.clone());
+        let task_name = TaskName::new("netconf-ssh-call-home-supervised-test");
+
+        let handle = spawn_read_only_ssh_call_home(
+            &supervisor,
+            Arc::new(server),
+            shutdown,
+            SupervisedSshCallHomeConfig {
+                task_name: task_name.clone(),
+                criticality: Criticality::Degrade,
+                restart: RestartPolicy::no_restart(),
+                call_home: ssh_call_home_test_config(endpoint, host_key, &user_key),
+            },
+        )
+        .await
+        .expect("spawn supervised SSH Call Home");
+
+        assert_eq!(handle.name, task_name);
+        tokio::task::yield_now().await;
+
+        let health = supervisor.health().await;
+        let state = health
+            .task_states
+            .get("netconf-ssh-call-home-supervised-test")
+            .expect("task state");
+        assert_eq!(state.kind, "listener");
+        assert_eq!(state.criticality, "degrade");
+        assert!(state.running);
+
+        supervisor
+            .shutdown_all(ShutdownPolicy::DrainWithTimeout(Duration::from_secs(2)))
+            .await;
+
+        let health = supervisor.health().await;
+        let state = health
+            .task_states
+            .get("netconf-ssh-call-home-supervised-test")
             .expect("task state after shutdown");
         assert!(!state.running);
         assert!(!health.degraded);

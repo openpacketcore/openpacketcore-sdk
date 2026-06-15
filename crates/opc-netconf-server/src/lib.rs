@@ -15,14 +15,17 @@
 //! - NETCONF-over-TLS TCP listener accept loop over `opc-mgmt-transport`.
 //! - NETCONF-over-SSH TCP listener accept loop with caller-provisioned host
 //!   keys, exact public-key authorization, and `subsystem "netconf"` admission.
+//! - NETCONF-over-SSH Call Home loop that dials configured NMS endpoints with
+//!   bounded reconnect backoff, then runs the same SSH server/auth/subsystem
+//!   path over the outbound TCP stream.
 //! - Optional `opc-runtime::Supervisor` task wrappers for the TLS and SSH
-//!   listeners.
+//!   listeners and SSH Call Home.
 //! - NETCONF-over-TLS principal extraction from verified rustls peer
 //!   certificates.
 //! - NETCONF-over-SSH authenticated-channel helpers that require
 //!   `TransportType::NetconfSsh` and an `AuthStrength::SshPublicKey` principal.
-//!   Host-key generation/storage/rotation, SSH certificate CA policy, and Call
-//!   Home remain future work.
+//!   Host-key generation/storage/rotation and SSH certificate CA policy remain
+//!   future work.
 //! - Bounded XML parsing for client `<hello>` and RPC envelopes, including
 //!   fail-closed rejection of missing, empty, or duplicate client hello
 //!   capability containers, bounded XPath filter `select` expressions, plus
@@ -227,12 +230,13 @@ pub use session::{
 };
 pub use session_registry::SessionRegistry;
 pub use ssh::{
-    run_read_only_ssh_listener, SshAuthorizedKey, SshHostKey, SshListenerConfig, SshListenerError,
+    run_read_only_ssh_call_home, run_read_only_ssh_listener, SshAuthorizedKey, SshCallHomeConfig,
+    SshCallHomeError, SshCallHomeResult, SshHostKey, SshListenerConfig, SshListenerError,
     SshListenerResult,
 };
 pub use supervision::{
-    spawn_read_only_ssh_listener, spawn_read_only_tls_listener, SupervisedSshListenerConfig,
-    SupervisedTlsListenerConfig,
+    spawn_read_only_ssh_call_home, spawn_read_only_ssh_listener, spawn_read_only_tls_listener,
+    SupervisedSshCallHomeConfig, SupervisedSshListenerConfig, SupervisedTlsListenerConfig,
 };
 pub use transport::{
     principal_from_identity_state, principal_from_identity_watch, principal_from_tls_stream,
