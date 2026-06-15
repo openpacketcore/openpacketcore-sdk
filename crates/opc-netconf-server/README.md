@@ -74,6 +74,15 @@ The current slice is capability-gated and capability-honest:
   echoed.
 - `<get-config>` for every advertised running/candidate/startup datastore.
 - `<get>` for running config plus CNF-supplied operational state.
+- Optional RFC 8526 `<get-data>` Phase 1 support when the CNF binding opts in:
+  `ds:running`, `ds:candidate`, and `ds:startup` read the same advertised
+  config datastores as `<get-config>`; `ds:operational` combines running config
+  with CNF-supplied operational state through the existing `<get>` projection
+  path. `config-filter`, subtree filters, the bounded schema-selection XPath
+  subset, NACM, audit, path limits, metrics, and the NMDA `<data>` namespace are
+  enforced. Unsupported NMDA origin filters, `with-origin`, limited
+  `max-depth`, full intended datastore semantics, and `<edit-data>` fail
+  closed and are not advertised as complete NMDA support.
 - Namespace/schema-aware structural subtree filters, including RFC 6241
   namespace wildcards, for `<get-config>` and `<get>`. Bounded subtree
   content-match and attribute-match forms are classified and rejected
@@ -140,10 +149,10 @@ out-of-range `<session-id>`. Custom transports that advertise a server
 It still does not implement SSH host-key generation/storage/rotation, SSH
 certificate CA authorization, password authentication, TLS Call Home,
 NMS-profile-specific Call Home endpoint policy, notification replay or
-notification filters, NMDA `<get-data>` / `<edit-data>`, a full RFC XPath
-instance evaluator or advertised `:xpath`, URL and inline-config copy/validate
-forms, `:rollback-on-error`, or external interop against `netopeer2-cli`,
-`ncclient`, or a target NMS. CNFs may use generated NETCONF XML projection/edit
-support for supported shapes, but unsupported YANG shapes remain fail-closed and
-model-specific bindings still own any projection/edit behavior outside the
-generated support matrix.
+notification filters, NMDA `<edit-data>`, full NMDA discovery/datastore mapping
+and origin metadata, a full RFC XPath instance evaluator or advertised
+`:xpath`, URL and inline-config copy/validate forms, `:rollback-on-error`, or
+external interop against `netopeer2-cli`, `ncclient`, or a target NMS. CNFs may
+use generated NETCONF XML projection/edit support for supported shapes, but
+unsupported YANG shapes remain fail-closed and model-specific bindings still
+own any projection/edit behavior outside the generated support matrix.

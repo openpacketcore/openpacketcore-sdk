@@ -10,6 +10,10 @@ use crate::error::xml_escape;
 
 /// NETCONF base namespace URI.
 pub const NETCONF_BASE_NS: &str = "urn:ietf:params:xml:ns:netconf:base:1.0";
+/// RFC 8342 `ietf-datastores` XML namespace.
+pub const IETF_DATASTORES_NS: &str = "urn:ietf:params:xml:ns:yang:ietf-datastores";
+/// RFC 8526 `ietf-netconf-nmda` XML namespace.
+pub const NETCONF_NMDA_NS: &str = "urn:ietf:params:xml:ns:yang:ietf-netconf-nmda";
 /// NETCONF base 1.0 capability.
 pub const NETCONF_BASE_1_0: &str = "urn:ietf:params:netconf:base:1.0";
 /// NETCONF base 1.1 capability.

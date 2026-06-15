@@ -13,7 +13,8 @@ use quick_xml::XmlVersion;
 use thiserror::Error;
 
 use crate::capabilities::{
-    NETCONF_BASE_NS, NETCONF_MONITORING_NS, NETCONF_NOTIFICATION_NS, WITH_DEFAULTS_NS,
+    IETF_DATASTORES_NS, NETCONF_BASE_NS, NETCONF_MONITORING_NS, NETCONF_NMDA_NS,
+    NETCONF_NOTIFICATION_NS, WITH_DEFAULTS_NS,
 };
 use crate::error::RpcReplyAttributes;
 use crate::session_registry::is_valid_session_id;
@@ -96,6 +97,8 @@ pub(crate) enum RpcOperationHint {
     Get,
     /// Base NETCONF `<get-config>`.
     GetConfig,
+    /// RFC 8526 `<get-data>`.
+    GetData,
     /// Base NETCONF `<lock>`.
     Lock,
     /// Base NETCONF `<unlock>`.
@@ -117,6 +120,8 @@ pub enum RpcOperation {
     GetConfig(GetConfigRequest),
     /// `<get>`.
     Get(GetRequest),
+    /// RFC 8526 `<get-data>`.
+    GetData(GetDataRequest),
     /// `<close-session>`.
     CloseSession,
     /// `<lock>`.
@@ -355,6 +360,25 @@ pub struct GetConfigRequest {
     pub with_defaults: Option<WithDefaultsMode>,
 }
 
+/// RFC 8526 `<get-data>` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetDataRequest {
+    /// NMDA datastore identity.
+    pub datastore: NmdaDatastore,
+    /// Optional subtree or bounded XPath filter.
+    pub filter: Option<Filter>,
+    /// Optional RFC 8526 config-filter.
+    pub config_filter: Option<bool>,
+    /// Whether an origin filter leaf was supplied.
+    pub origin_filter_present: bool,
+    /// Whether a non-default max-depth value was supplied.
+    pub max_depth_limited: bool,
+    /// Whether `<with-origin/>` was supplied.
+    pub with_origin: bool,
+    /// RFC 6243 `<with-defaults>` parameter.
+    pub with_defaults: Option<WithDefaultsMode>,
+}
+
 /// `<edit-config>` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditConfigRequest {
@@ -456,6 +480,21 @@ pub enum Datastore {
     Candidate,
     /// `startup`, not implemented in this slice.
     Startup,
+}
+
+/// RFC 8526 NMDA datastore identities recognized by the parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NmdaDatastore {
+    /// `ds:running`.
+    Running,
+    /// `ds:candidate`.
+    Candidate,
+    /// `ds:startup`.
+    Startup,
+    /// `ds:intended`.
+    Intended,
+    /// `ds:operational`.
+    Operational,
 }
 
 /// NETCONF filter kind recognized by the parser.
@@ -720,6 +759,24 @@ struct PartialGetConfig {
 }
 
 #[derive(Debug, Clone, Default)]
+struct PartialGetData {
+    datastore_seen: bool,
+    datastore: Option<NmdaDatastore>,
+    filter: Option<Filter>,
+    xpath_filter_seen: bool,
+    xpath_filter_namespaces: BTreeMap<String, String>,
+    xpath_filter: Option<String>,
+    config_filter_seen: bool,
+    config_filter: Option<bool>,
+    origin_filter_present: bool,
+    max_depth_seen: bool,
+    max_depth_limited: bool,
+    with_origin: bool,
+    with_defaults_seen: bool,
+    with_defaults: Option<WithDefaultsMode>,
+}
+
+#[derive(Debug, Clone, Default)]
 struct PartialEditConfig {
     target: Option<Datastore>,
     default_operation_seen: bool,
@@ -816,6 +873,7 @@ struct ParserState {
     edit_config: Option<PartialEditConfig>,
     get: Option<PartialGet>,
     get_config: Option<PartialGetConfig>,
+    get_data: Option<PartialGetData>,
     get_schema: Option<PartialGetSchema>,
     create_subscription: Option<PartialCreateSubscription>,
     kill_session: Option<PartialKillSession>,
@@ -1021,6 +1079,20 @@ impl ParserState {
             self.set_get_with_defaults_text(text)?;
         } else if self.local_path_is(&["rpc", "get-config", "with-defaults"]) {
             self.set_get_config_with_defaults_text(text)?;
+        } else if self.local_path_is(&["rpc", "get-data", "datastore"]) {
+            self.set_get_data_datastore_text(text)?;
+        } else if self.local_path_is(&["rpc", "get-data", "xpath-filter"]) {
+            self.set_get_data_xpath_filter_text(text)?;
+        } else if self.local_path_is(&["rpc", "get-data", "config-filter"]) {
+            self.set_get_data_config_filter_text(text)?;
+        } else if self.local_path_is(&["rpc", "get-data", "origin-filter"])
+            || self.local_path_is(&["rpc", "get-data", "negated-origin-filter"])
+        {
+            self.set_get_data_origin_filter_text(text)?;
+        } else if self.local_path_is(&["rpc", "get-data", "max-depth"]) {
+            self.set_get_data_max_depth_text(text)?;
+        } else if self.local_path_is(&["rpc", "get-data", "with-defaults"]) {
+            self.set_get_data_with_defaults_text(text)?;
         } else if self.local_path_is(&["rpc", "edit-config", "default-operation"]) {
             self.set_edit_default_operation_text(text)?;
         } else if self.local_path_is(&["rpc", "edit-config", "test-option"]) {
@@ -1065,6 +1137,7 @@ impl ParserState {
         if element.namespace == NETCONF_BASE_NS
             || self.get_schema_namespace_is_allowed(element)
             || self.with_defaults_namespace_is_allowed(element)
+            || self.nmda_namespace_is_allowed(element)
             || self.notification_namespace_is_allowed(element)
         {
             Ok(())
@@ -1150,6 +1223,16 @@ impl ParserState {
                     }
                     self.operation_hint = Some(RpcOperationHint::GetConfig);
                     self.get_config = Some(PartialGetConfig::default());
+                }
+                "get-data" if element.namespace == NETCONF_NMDA_NS => {
+                    if self.has_rpc_operation() {
+                        return Err(XmlError::DuplicateElement);
+                    }
+                    self.operation_hint = Some(RpcOperationHint::GetData);
+                    self.get_data = Some(PartialGetData::default());
+                    if !attrs.is_empty() {
+                        return Err(XmlError::Malformed);
+                    }
                 }
                 "edit-config" => {
                     if self.has_rpc_operation() {
@@ -1298,6 +1381,31 @@ impl ParserState {
                 }
                 "with-defaults" if element.namespace == WITH_DEFAULTS_NS => {
                     self.install_get_config_with_defaults(attrs)
+                }
+                _ => Err(XmlError::Malformed),
+            }
+        } else if self.local_path_is(&["rpc", "get-data"]) {
+            match element.local.as_str() {
+                "datastore"
+                | "config-filter"
+                | "origin-filter"
+                | "negated-origin-filter"
+                | "max-depth"
+                    if element.namespace == NETCONF_NMDA_NS && attrs.is_empty() =>
+                {
+                    self.install_get_data_scalar(element.local.as_str())
+                }
+                "with-origin" if element.namespace == NETCONF_NMDA_NS && attrs.is_empty() => {
+                    self.install_get_data_with_origin()
+                }
+                "subtree-filter" if element.namespace == NETCONF_NMDA_NS && attrs.is_empty() => {
+                    self.install_get_data_subtree_filter()
+                }
+                "xpath-filter" if element.namespace == NETCONF_NMDA_NS && attrs.is_empty() => {
+                    self.install_get_data_xpath_filter(scope)
+                }
+                "with-defaults" if element.namespace == WITH_DEFAULTS_NS => {
+                    self.install_get_data_with_defaults(attrs)
                 }
                 _ => Err(XmlError::Malformed),
             }
@@ -1488,6 +1596,14 @@ impl ParserState {
             || self.local_path_is(&["rpc", "cancel-commit", "persist-id"])
             || self.local_path_is(&["rpc", "get", "with-defaults"])
             || self.local_path_is(&["rpc", "get-config", "with-defaults"])
+            || self.local_path_is(&["rpc", "get-data", "datastore"])
+            || self.local_path_is(&["rpc", "get-data", "config-filter"])
+            || self.local_path_is(&["rpc", "get-data", "origin-filter"])
+            || self.local_path_is(&["rpc", "get-data", "negated-origin-filter"])
+            || self.local_path_is(&["rpc", "get-data", "max-depth"])
+            || self.local_path_is(&["rpc", "get-data", "with-origin"])
+            || self.local_path_is(&["rpc", "get-data", "xpath-filter"])
+            || self.local_path_is(&["rpc", "get-data", "with-defaults"])
         {
             Err(XmlError::Malformed)
         } else if self.local_path_is(&["rpc", "get-config", "source"]) {
@@ -1509,6 +1625,7 @@ impl ParserState {
         self.edit_config.is_some()
             || self.get.is_some()
             || self.get_config.is_some()
+            || self.get_data.is_some()
             || self.get_schema.is_some()
             || self.create_subscription.is_some()
             || self.kill_session.is_some()
@@ -1562,10 +1679,36 @@ impl ParserState {
     fn with_defaults_namespace_is_allowed(&self, element: &Element) -> bool {
         element.namespace == WITH_DEFAULTS_NS
             && (((self.local_path_is(&["rpc", "get"])
-                || self.local_path_is(&["rpc", "get-config"]))
+                || self.local_path_is(&["rpc", "get-config"])
+                || self.local_path_is(&["rpc", "get-data"]))
                 && element.local == "with-defaults")
                 || self.local_path_is(&["rpc", "get", "with-defaults"])
-                || self.local_path_is(&["rpc", "get-config", "with-defaults"]))
+                || self.local_path_is(&["rpc", "get-config", "with-defaults"])
+                || self.local_path_is(&["rpc", "get-data", "with-defaults"]))
+    }
+
+    fn nmda_namespace_is_allowed(&self, element: &Element) -> bool {
+        element.namespace == NETCONF_NMDA_NS
+            && ((self.local_path_is(&["rpc"]) && element.local == "get-data")
+                || (self.local_path_is(&["rpc", "get-data"])
+                    && matches!(
+                        element.local.as_str(),
+                        "datastore"
+                            | "subtree-filter"
+                            | "xpath-filter"
+                            | "config-filter"
+                            | "origin-filter"
+                            | "negated-origin-filter"
+                            | "max-depth"
+                            | "with-origin"
+                    ))
+                || self.local_path_is(&["rpc", "get-data", "datastore"])
+                || self.local_path_is(&["rpc", "get-data", "xpath-filter"])
+                || self.local_path_is(&["rpc", "get-data", "config-filter"])
+                || self.local_path_is(&["rpc", "get-data", "origin-filter"])
+                || self.local_path_is(&["rpc", "get-data", "negated-origin-filter"])
+                || self.local_path_is(&["rpc", "get-data", "max-depth"])
+                || self.local_path_is(&["rpc", "get-data", "with-origin"]))
     }
 
     fn notification_namespace_is_allowed(&self, element: &Element) -> bool {
@@ -1852,6 +1995,176 @@ impl ParserState {
         Ok(())
     }
 
+    fn install_get_data_scalar(&mut self, local: &str) -> Result<(), XmlError> {
+        let get_data = self
+            .get_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        match local {
+            "datastore" => {
+                if get_data.datastore_seen {
+                    return Err(XmlError::DuplicateElement);
+                }
+                get_data.datastore_seen = true;
+            }
+            "config-filter" => {
+                if get_data.config_filter_seen {
+                    return Err(XmlError::DuplicateElement);
+                }
+                get_data.config_filter_seen = true;
+            }
+            "origin-filter" | "negated-origin-filter" => {
+                get_data.origin_filter_present = true;
+            }
+            "max-depth" => {
+                if get_data.max_depth_seen {
+                    return Err(XmlError::DuplicateElement);
+                }
+                get_data.max_depth_seen = true;
+            }
+            _ => return Err(XmlError::Malformed),
+        }
+        Ok(())
+    }
+
+    fn install_get_data_with_origin(&mut self) -> Result<(), XmlError> {
+        let get_data = self
+            .get_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if get_data.with_origin {
+            return Err(XmlError::DuplicateElement);
+        }
+        get_data.with_origin = true;
+        Ok(())
+    }
+
+    fn install_get_data_subtree_filter(&mut self) -> Result<(), XmlError> {
+        let get_data = self
+            .get_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if get_data.filter.is_some() || get_data.xpath_filter_seen {
+            return Err(XmlError::DuplicateElement);
+        }
+        get_data.filter = Some(Filter::Subtree(SubtreeFilter::default()));
+        self.filter_depth = 1;
+        Ok(())
+    }
+
+    fn install_get_data_xpath_filter(&mut self, scope: &NamespaceScope) -> Result<(), XmlError> {
+        let get_data = self
+            .get_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if get_data.filter.is_some() || get_data.xpath_filter_seen {
+            return Err(XmlError::DuplicateElement);
+        }
+        get_data.xpath_filter_seen = true;
+        get_data.xpath_filter_namespaces = scope.bindings.clone();
+        Ok(())
+    }
+
+    fn install_get_data_with_defaults(
+        &mut self,
+        attrs: &[(String, String)],
+    ) -> Result<(), XmlError> {
+        if !attrs.is_empty() {
+            return Err(XmlError::Malformed);
+        }
+        let get_data = self
+            .get_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if get_data.with_defaults_seen {
+            return Err(XmlError::DuplicateElement);
+        }
+        get_data.with_defaults_seen = true;
+        Ok(())
+    }
+
+    fn set_get_data_datastore_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let value = text.trim();
+        if value.is_empty() {
+            return Err(XmlError::InvalidValue);
+        }
+        let datastore = parse_nmda_datastore(value, self.scopes.last())?;
+        let get_data = self
+            .get_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if get_data.datastore.replace(datastore).is_some() {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn set_get_data_xpath_filter_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let value = text.trim();
+        if value.is_empty() {
+            return Err(XmlError::InvalidValue);
+        }
+        self.limits.check_xpath_filter_bytes(value.len())?;
+        let get_data = self
+            .get_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if get_data.xpath_filter.replace(value.to_string()).is_some() {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn set_get_data_config_filter_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let get_data = self
+            .get_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if get_data
+            .config_filter
+            .replace(parse_xml_bool(text)?)
+            .is_some()
+        {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn set_get_data_origin_filter_text(&mut self, text: &str) -> Result<(), XmlError> {
+        if text.trim().is_empty() {
+            return Err(XmlError::InvalidValue);
+        }
+        Ok(())
+    }
+
+    fn set_get_data_max_depth_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let value = text.trim();
+        if value.is_empty() {
+            return Err(XmlError::InvalidValue);
+        }
+        let get_data = self
+            .get_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        get_data.max_depth_limited = value != "unbounded";
+        Ok(())
+    }
+
+    fn set_get_data_with_defaults_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let get_data = self
+            .get_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if get_data
+            .with_defaults
+            .replace(WithDefaultsMode::parse(text))
+            .is_some()
+        {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
     fn install_edit_default_operation(&mut self) -> Result<(), XmlError> {
         let edit_config = self
             .edit_config
@@ -2112,15 +2425,24 @@ impl ParserState {
                     .as_ref()
                     .and_then(|get_config| get_config.filter.as_ref())
             })
+            .or_else(|| {
+                self.get_data
+                    .as_ref()
+                    .and_then(|get_data| get_data.filter.as_ref())
+            })
     }
 
     fn active_filter_mut(&mut self) -> Option<&mut Filter> {
         if let Some(get) = self.get.as_mut() {
             return get.filter.as_mut();
         }
-        self.get_config
-            .as_mut()
-            .and_then(|get_config| get_config.filter.as_mut())
+        if let Some(get_config) = self.get_config.as_mut() {
+            return get_config.filter.as_mut();
+        }
+        if let Some(get_data) = self.get_data.as_mut() {
+            return get_data.filter.as_mut();
+        }
+        None
     }
 
     fn finish(mut self) -> Result<ParsedMessage, XmlError> {
@@ -2193,6 +2515,24 @@ impl ParserState {
                         operation: RpcOperation::GetConfig(GetConfigRequest {
                             source,
                             filter: get_config.filter,
+                            with_defaults,
+                        }),
+                    }));
+                }
+                if let Some(mut get_data) = self.get_data {
+                    let filter = finish_get_data_filter(&mut get_data)?;
+                    let with_defaults =
+                        finish_with_defaults(get_data.with_defaults_seen, get_data.with_defaults);
+                    return Ok(ParsedMessage::Rpc(ParsedRpc {
+                        message_id,
+                        reply_attrs,
+                        operation: RpcOperation::GetData(GetDataRequest {
+                            datastore: finish_get_data_datastore(&get_data)?,
+                            filter,
+                            config_filter: finish_get_data_config_filter(&get_data)?,
+                            origin_filter_present: get_data.origin_filter_present,
+                            max_depth_limited: get_data.max_depth_limited,
+                            with_origin: get_data.with_origin,
                             with_defaults,
                         }),
                     }));
@@ -2651,6 +2991,39 @@ fn datastore_from_local(local: &str) -> Result<Datastore, XmlError> {
     }
 }
 
+fn parse_nmda_datastore(
+    value: &str,
+    scope: Option<&NamespaceScope>,
+) -> Result<NmdaDatastore, XmlError> {
+    let local = if let Some((prefix, local)) = value.split_once(':') {
+        let namespace = scope
+            .and_then(|scope| scope.bindings.get(prefix))
+            .ok_or(XmlError::InvalidValue)?;
+        if namespace != IETF_DATASTORES_NS {
+            return Err(XmlError::InvalidValue);
+        }
+        local
+    } else {
+        value
+    };
+    match local {
+        "running" => Ok(NmdaDatastore::Running),
+        "candidate" => Ok(NmdaDatastore::Candidate),
+        "startup" => Ok(NmdaDatastore::Startup),
+        "intended" => Ok(NmdaDatastore::Intended),
+        "operational" => Ok(NmdaDatastore::Operational),
+        _ => Err(XmlError::InvalidValue),
+    }
+}
+
+fn parse_xml_bool(value: &str) -> Result<bool, XmlError> {
+    match value.trim() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(XmlError::InvalidValue),
+    }
+}
+
 fn filter_kind(attrs: &[(String, String)]) -> Result<FilterKind, XmlError> {
     if attr_occurrences(attrs, "type") > 1 {
         return Err(XmlError::InvalidFilterType);
@@ -2717,6 +3090,35 @@ fn finish_with_defaults(seen: bool, mode: Option<WithDefaultsMode>) -> Option<Wi
         Some(mode.unwrap_or(WithDefaultsMode::Unrecognized))
     } else {
         None
+    }
+}
+
+fn finish_get_data_filter(get_data: &mut PartialGetData) -> Result<Option<Filter>, XmlError> {
+    if get_data.xpath_filter_seen {
+        let select = get_data.xpath_filter.take().ok_or(XmlError::InvalidValue)?;
+        return Ok(Some(Filter::XPath(XPathFilter::new(
+            select,
+            std::mem::take(&mut get_data.xpath_filter_namespaces),
+        ))));
+    }
+    Ok(get_data.filter.take())
+}
+
+fn finish_get_data_datastore(get_data: &PartialGetData) -> Result<NmdaDatastore, XmlError> {
+    match (get_data.datastore_seen, get_data.datastore) {
+        (false, None) => Err(XmlError::MissingElement),
+        (true, Some(datastore)) => Ok(datastore),
+        (true, None) => Err(XmlError::InvalidValue),
+        (false, Some(_)) => Err(XmlError::Malformed),
+    }
+}
+
+fn finish_get_data_config_filter(get_data: &PartialGetData) -> Result<Option<bool>, XmlError> {
+    match (get_data.config_filter_seen, get_data.config_filter) {
+        (false, None) => Ok(None),
+        (true, Some(value)) => Ok(Some(value)),
+        (true, None) => Err(XmlError::InvalidValue),
+        (false, Some(_)) => Err(XmlError::Malformed),
     }
 }
 
@@ -2850,6 +3252,33 @@ mod tests {
         assert_eq!(
             request.with_defaults,
             Some(WithDefaultsMode::ReportAllTagged)
+        );
+    }
+
+    #[test]
+    fn parses_get_data_with_nmda_fields() {
+        let xml = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="701"><ncds:get-data xmlns:ncds="{NETCONF_NMDA_NS}" xmlns:ds="{IETF_DATASTORES_NS}" xmlns:sys="urn:opc:test"><ncds:datastore>ds:operational</ncds:datastore><ncds:config-filter>false</ncds:config-filter><ncds:xpath-filter>/sys:system/sys:uptime</ncds:xpath-filter><wd:with-defaults xmlns:wd="{WITH_DEFAULTS_NS}">trim</wd:with-defaults></ncds:get-data></rpc>"#
+        );
+        let parsed = parse_rpc(&xml, &MgmtLimits::default()).expect("parse get-data");
+
+        assert_eq!(parsed.message_id, "701");
+        let RpcOperation::GetData(request) = parsed.operation else {
+            panic!("expected get-data operation");
+        };
+        assert_eq!(request.datastore, NmdaDatastore::Operational);
+        assert_eq!(request.config_filter, Some(false));
+        assert!(!request.origin_filter_present);
+        assert!(!request.max_depth_limited);
+        assert!(!request.with_origin);
+        assert_eq!(request.with_defaults, Some(WithDefaultsMode::Trim));
+        let Some(Filter::XPath(filter)) = request.filter else {
+            panic!("expected xpath filter");
+        };
+        assert_eq!(filter.select(), "/sys:system/sys:uptime");
+        assert_eq!(
+            filter.namespaces().get("sys").map(String::as_str),
+            Some("urn:opc:test")
         );
     }
 
@@ -3257,6 +3686,14 @@ mod tests {
         .expect_err("wrong namespace get-config");
         assert_eq!(wrong_get_config.error, XmlError::UnknownNamespace);
         assert_eq!(wrong_get_config.operation_hint, None);
+
+        let wrong_get_data = parse_rpc_with_context(
+            r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" xmlns:bad="urn:example:bad" message-id="wrong-get-data"><bad:get-data/></rpc>"#,
+            &MgmtLimits::default(),
+        )
+        .expect_err("wrong namespace get-data");
+        assert_eq!(wrong_get_data.error, XmlError::UnknownNamespace);
+        assert_eq!(wrong_get_data.operation_hint, None);
 
         let wrong_kill = parse_rpc_with_context(
             r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" xmlns:bad="urn:example:bad" message-id="wrong-kill"><bad:kill-session><session-id>42</session-id></bad:kill-session></rpc>"#,

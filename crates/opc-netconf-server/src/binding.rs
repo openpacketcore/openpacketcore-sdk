@@ -626,6 +626,25 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         None
     }
 
+    /// Returns whether the CNF enables RFC 8526 `<get-data>` dispatch.
+    ///
+    /// RFC 8526 does not define a standalone `:nmda` hello capability; clients
+    /// discover NMDA support through YANG Library data that includes the
+    /// `ietf-netconf-nmda` module and datastore module-set mappings. This
+    /// boolean only gates server-side dispatch. The default is fail-closed.
+    fn nmda_get_data_supported(&self) -> bool {
+        false
+    }
+
+    /// Returns whether the binding intentionally maps NMDA `intended` reads to
+    /// the current running snapshot.
+    ///
+    /// This is false by default because `intended` can differ from `running`
+    /// once validation, expansion, or system transformations exist.
+    fn nmda_intended_equals_running(&self) -> bool {
+        false
+    }
+
     /// Renders the RFC 6022 `/netconf-state` operational tree for the
     /// authorized schema-node paths in `selection`.
     ///
