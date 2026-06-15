@@ -9,6 +9,7 @@
 //! 3. select base 1.1 chunked framing only when the client advertised it,
 //! 4. dispatch bounded RPC frames through [`ReadOnlyNetconfServer`].
 
+use std::num::NonZeroU32;
 use std::str;
 use std::time::Duration;
 
@@ -23,7 +24,9 @@ use crate::binding::NetconfConfigBinding;
 use crate::capabilities::{NETCONF_BASE_1_0, NETCONF_BASE_1_1};
 use crate::framing::{base10, base11, FramingError};
 use crate::server::ReadOnlyNetconfServer;
-use crate::session_registry::{session_id_for_hello, SessionRegistry, SessionRegistryError};
+use crate::session_registry::{
+    session_id_for_hello, SessionRegistration, SessionRegistry, SessionRegistryError,
+};
 use crate::xml::{parse_client_hello, ClientHello, XmlError};
 
 /// Negotiated NETCONF message framing after hello exchange.
@@ -149,6 +152,38 @@ where
         SessionRegistryError::DuplicateSessionId => SessionError::DuplicateSessionId,
     })?;
 
+    let result = run_registered_session_loop(
+        server,
+        principal,
+        stream,
+        config,
+        &mut registration,
+        hello_session_id,
+        sessions,
+    )
+    .await;
+    server
+        .rollback_pending_confirmed_commit_for_session(registration.session_id(), principal)
+        .await;
+    result
+}
+
+async fn run_registered_session_loop<C, B, P, A, S>(
+    server: &ReadOnlyNetconfServer<C, B, P, A>,
+    principal: &TrustedPrincipal,
+    stream: &mut S,
+    config: SessionConfig,
+    registration: &mut SessionRegistration,
+    hello_session_id: NonZeroU32,
+    sessions: &SessionRegistry,
+) -> Result<SessionResult, SessionError>
+where
+    C: OpcConfig,
+    B: NetconfConfigBinding<C>,
+    P: PolicySource,
+    A: AuditSink,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let server_hello = server.server_hello(Some(hello_session_id));
     tokio::select! {
         _ = registration.terminated() => {

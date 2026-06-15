@@ -944,6 +944,90 @@ where
         startup.load_startup_config()
     }
 
+    pub(crate) async fn rollback_pending_confirmed_commit_for_session(
+        &self,
+        session_id: u64,
+        principal: &TrustedPrincipal,
+    ) {
+        let now = Instant::now();
+        let pending = {
+            let mut state = self
+                .confirmed_commit
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            match state.active(now).cloned() {
+                Some(pending)
+                    if pending.owner_session_id == session_id && pending.persist.is_none() =>
+                {
+                    state.clear();
+                    Some(pending)
+                }
+                _ => None,
+            }
+        };
+        if pending.is_none() {
+            return;
+        }
+
+        let request_id = RequestId::new();
+        let bus = self.binding.config_bus();
+        let snapshot = bus.current_snapshot();
+        let request = CommitRequest::cancel_confirmed(
+            request_id,
+            principal.clone(),
+            self.transport,
+            RequestSource::Internal,
+            Vec::new(),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .with_base_version(snapshot.version);
+
+        match bus.submit(request).await {
+            Ok(result) => {
+                let paths = self.schema_paths_for_changed_paths(
+                    &result.changed_paths,
+                    NETCONF_CANCEL_COMMIT_PATH,
+                );
+                if self
+                    .audit
+                    .record(
+                        &AuditEvent::new(
+                            request_id,
+                            principal,
+                            self.transport,
+                            AuditOperation::Update,
+                            AuditOutcome::Success,
+                        )
+                        .with_paths(paths),
+                    )
+                    .is_err()
+                {
+                    tracing::warn!(
+                        session_id,
+                        "NETCONF confirmed-commit session-exit rollback succeeded but audit failed"
+                    );
+                }
+            }
+            Err(error) => {
+                let _ = self.audit.record(
+                    &AuditEvent::new(
+                        request_id,
+                        principal,
+                        self.transport,
+                        AuditOperation::Update,
+                        audit_failed(error.code.as_str()),
+                    )
+                    .with_paths([schema_node_path(NETCONF_CANCEL_COMMIT_PATH)]),
+                );
+                tracing::warn!(
+                    session_id,
+                    commit_error_code = %error.code,
+                    "NETCONF confirmed-commit session-exit rollback failed"
+                );
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn startup_get_config_failure_reply(
         &self,
@@ -10998,6 +11082,70 @@ mod tests {
         );
         assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
 
+        wait_for_hostname(&bus, "amf-1").await;
+    }
+
+    #[tokio::test]
+    async fn nonpersistent_confirmed_commit_rolls_back_when_owner_session_exits() {
+        let (server, bus, _audit) = generated_edit_server_fixture().await;
+        let principal = principal();
+        let sessions = SessionRegistry::new();
+        let (mut client, mut server_io) = tokio::io::duplex(64 * 1024);
+        let limits = MgmtLimits::default();
+
+        let session_task = tokio::spawn(async move {
+            crate::session::run_read_only_session_with_registry(
+                &server,
+                &principal,
+                &mut server_io,
+                SessionConfig::default(),
+                501,
+                &sessions,
+            )
+            .await
+        });
+
+        let server_hello =
+            String::from_utf8(read_base10_frame(&mut client).await).expect("hello utf8");
+        assert!(server_hello.contains(NETCONF_BASE_1_0));
+
+        let client_hello = format!(
+            r#"<hello xmlns="{NETCONF_BASE_NS}"><capabilities><capability>{NETCONF_BASE_1_0}</capability></capabilities></hello>"#
+        );
+        client
+            .write_all(&base10::encode_message(client_hello.as_bytes(), &limits).expect("hello"))
+            .await
+            .expect("write client hello");
+
+        let edit = edit_config_rpc_to(
+            "candidate",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        client
+            .write_all(&base10::encode_message(edit.as_bytes(), &limits).expect("edit"))
+            .await
+            .expect("write edit");
+        let reply = String::from_utf8(read_base10_frame(&mut client).await).expect("edit reply");
+        assert!(reply.contains("<ok/>"), "edit reply: {reply}");
+
+        client
+            .write_all(
+                &base10::encode_message(confirmed_commit_rpc(30).as_bytes(), &limits)
+                    .expect("confirmed commit"),
+            )
+            .await
+            .expect("write confirmed commit");
+        let reply = String::from_utf8(read_base10_frame(&mut client).await).expect("commit reply");
+        assert!(reply.contains("<ok/>"), "commit reply: {reply}");
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+
+        drop(client);
+        let result = session_task
+            .await
+            .expect("session join")
+            .expect("session result");
+        assert_eq!(result.rpc_count, 2);
         wait_for_hostname(&bus, "amf-1").await;
     }
 
