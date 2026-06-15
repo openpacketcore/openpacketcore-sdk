@@ -10,6 +10,8 @@ use opc_redaction::metrics::{metrics_label_safe, LatencyHistogram, METRICS};
 pub(crate) enum NetconfOperation {
     /// `<edit-config>`.
     EditConfig,
+    /// RFC 8526 `<edit-data>`.
+    EditData,
     /// `<commit>`.
     Commit,
     /// `<cancel-commit>`.
@@ -50,6 +52,7 @@ impl NetconfOperation {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::EditConfig => "edit-config",
+            Self::EditData => "edit-data",
             Self::Commit => "commit",
             Self::CancelCommit => "cancel-commit",
             Self::DiscardChanges => "discard-changes",

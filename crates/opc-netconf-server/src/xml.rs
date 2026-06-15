@@ -83,6 +83,8 @@ impl RpcParseError {
 pub(crate) enum RpcOperationHint {
     /// Base NETCONF `<edit-config>`.
     EditConfig,
+    /// RFC 8526 `<edit-data>`.
+    EditData,
     /// Base NETCONF `<commit>`.
     Commit,
     /// Base NETCONF `<cancel-commit>`.
@@ -116,6 +118,8 @@ pub(crate) enum RpcOperationHint {
 pub enum RpcOperation {
     /// `<edit-config>`.
     EditConfig(EditConfigRequest),
+    /// RFC 8526 `<edit-data>`.
+    EditData(EditDataRequest),
     /// `<get-config>`.
     GetConfig(GetConfigRequest),
     /// `<get>`.
@@ -255,6 +259,8 @@ pub struct DeleteConfigRequest {
 pub enum UnsupportedOperation {
     /// `<edit-config>`.
     EditConfig,
+    /// RFC 8526 `<edit-data>`.
+    EditData,
     /// `<copy-config>`.
     CopyConfig,
     /// `<delete-config>`.
@@ -280,6 +286,7 @@ impl UnsupportedOperation {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::EditConfig => "edit-config",
+            Self::EditData => "edit-data",
             Self::CopyConfig => "copy-config",
             Self::DeleteConfig => "delete-config",
             Self::Lock => "lock",
@@ -400,6 +407,23 @@ pub struct EditConfigRequest {
     /// generic server treats this as opaque; the CNF binding translates the
     /// bounded element payload into a full candidate config.
     pub config_xml: String,
+}
+
+/// RFC 8526 `<edit-data>` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditDataRequest {
+    /// Requested NMDA datastore identity.
+    pub datastore: NmdaDatastore,
+    /// RFC 6241-compatible default operation carried by RFC 8526.
+    pub default_operation: EditDefaultOperation,
+    /// Namespace-preserving XML for the complete NMDA `<config>` element when
+    /// inline config input was supplied.
+    pub config_xml: Option<String>,
+    /// Whether the RFC 8526 `<url>` input branch was supplied.
+    ///
+    /// The server currently rejects URL edits at the operation boundary without
+    /// retaining the client-supplied URL value.
+    pub url_present: bool,
 }
 
 /// RFC 6241 `<default-operation>` value.
@@ -789,6 +813,16 @@ struct PartialEditConfig {
 }
 
 #[derive(Debug, Clone, Default)]
+struct PartialEditData {
+    datastore_seen: bool,
+    datastore: Option<NmdaDatastore>,
+    default_operation_seen: bool,
+    default_operation: Option<EditDefaultOperation>,
+    config_xml: Option<String>,
+    url_seen: bool,
+}
+
+#[derive(Debug, Clone, Default)]
 struct PartialGetSchema {
     identifier: Option<String>,
     version: Option<String>,
@@ -871,6 +905,7 @@ struct ParserState {
     capabilities: Vec<String>,
     hello_capabilities_seen: bool,
     edit_config: Option<PartialEditConfig>,
+    edit_data: Option<PartialEditData>,
     get: Option<PartialGet>,
     get_config: Option<PartialGetConfig>,
     get_data: Option<PartialGetData>,
@@ -931,12 +966,17 @@ impl ParserState {
         };
 
         limits.check_depth(self.stack.len() + 1)?;
-        let capture_start =
-            self.edit_config_capture.is_some() || self.is_edit_config_config_start(&element);
+        let capture_root =
+            self.edit_config_capture.is_none() && self.is_edit_config_config_start(&element);
+        let capture_start = self.edit_config_capture.is_some() || capture_root;
         self.validate_protocol_namespace(&element)?;
         self.process_start(&element, &scoped.attrs, &scoped.reply_attrs, &scoped.scope)?;
         if capture_start {
-            self.capture_event(Event::Start(start.borrow()))?;
+            if capture_root {
+                self.capture_config_root_start(start, &scoped.scope)?;
+            } else {
+                self.capture_event(Event::Start(start.borrow()))?;
+            }
             self.edit_config_capture_depth = self.edit_config_capture_depth.saturating_add(1);
         }
         self.stack.push(element);
@@ -958,7 +998,8 @@ impl ParserState {
         let scope = self.scopes.last().ok_or(XmlError::Malformed)?;
         let (prefix, local) = split_qname(raw_name)?;
         let namespace = resolve_namespace(prefix, scope)?;
-        let closing_edit_config_root = self.local_path_is(&["rpc", "edit-config", "config"]);
+        let closing_config_capture_root = self.local_path_is(&["rpc", "edit-config", "config"])
+            || self.local_path_is(&["rpc", "edit-data", "config"]);
         let Some(current) = self.stack.pop() else {
             return Err(XmlError::Malformed);
         };
@@ -971,7 +1012,7 @@ impl ParserState {
                 .edit_config_capture_depth
                 .checked_sub(1)
                 .ok_or(XmlError::Malformed)?;
-            if closing_edit_config_root {
+            if closing_config_capture_root {
                 if self.edit_config_capture_depth != 0 {
                     return Err(XmlError::Malformed);
                 }
@@ -1093,6 +1134,12 @@ impl ParserState {
             self.set_get_data_max_depth_text(text)?;
         } else if self.local_path_is(&["rpc", "get-data", "with-defaults"]) {
             self.set_get_data_with_defaults_text(text)?;
+        } else if self.local_path_is(&["rpc", "edit-data", "datastore"]) {
+            self.set_edit_data_datastore_text(text)?;
+        } else if self.local_path_is(&["rpc", "edit-data", "default-operation"]) {
+            self.set_edit_data_default_operation_text(text)?;
+        } else if self.local_path_is(&["rpc", "edit-data", "url"]) {
+            self.set_edit_data_url_text(text)?;
         } else if self.local_path_is(&["rpc", "edit-config", "default-operation"]) {
             self.set_edit_default_operation_text(text)?;
         } else if self.local_path_is(&["rpc", "edit-config", "test-option"]) {
@@ -1230,6 +1277,16 @@ impl ParserState {
                     }
                     self.operation_hint = Some(RpcOperationHint::GetData);
                     self.get_data = Some(PartialGetData::default());
+                    if !attrs.is_empty() {
+                        return Err(XmlError::Malformed);
+                    }
+                }
+                "edit-data" if element.namespace == NETCONF_NMDA_NS => {
+                    if self.has_rpc_operation() {
+                        return Err(XmlError::DuplicateElement);
+                    }
+                    self.operation_hint = Some(RpcOperationHint::EditData);
+                    self.edit_data = Some(PartialEditData::default());
                     if !attrs.is_empty() {
                         return Err(XmlError::Malformed);
                     }
@@ -1406,6 +1463,22 @@ impl ParserState {
                 }
                 "with-defaults" if element.namespace == WITH_DEFAULTS_NS => {
                     self.install_get_data_with_defaults(attrs)
+                }
+                _ => Err(XmlError::Malformed),
+            }
+        } else if self.local_path_is(&["rpc", "edit-data"]) {
+            match element.local.as_str() {
+                "datastore" if element.namespace == NETCONF_NMDA_NS && attrs.is_empty() => {
+                    self.install_edit_data_datastore()
+                }
+                "default-operation" if element.namespace == NETCONF_NMDA_NS && attrs.is_empty() => {
+                    self.install_edit_data_default_operation()
+                }
+                "config" if element.namespace == NETCONF_NMDA_NS && attrs.is_empty() => {
+                    self.install_edit_data_config_capture()
+                }
+                "url" if element.namespace == NETCONF_NMDA_NS && attrs.is_empty() => {
+                    self.install_edit_data_url()
                 }
                 _ => Err(XmlError::Malformed),
             }
@@ -1604,6 +1677,9 @@ impl ParserState {
             || self.local_path_is(&["rpc", "get-data", "with-origin"])
             || self.local_path_is(&["rpc", "get-data", "xpath-filter"])
             || self.local_path_is(&["rpc", "get-data", "with-defaults"])
+            || self.local_path_is(&["rpc", "edit-data", "datastore"])
+            || self.local_path_is(&["rpc", "edit-data", "default-operation"])
+            || self.local_path_is(&["rpc", "edit-data", "url"])
         {
             Err(XmlError::Malformed)
         } else if self.local_path_is(&["rpc", "get-config", "source"]) {
@@ -1623,6 +1699,7 @@ impl ParserState {
 
     fn has_rpc_operation(&self) -> bool {
         self.edit_config.is_some()
+            || self.edit_data.is_some()
             || self.get.is_some()
             || self.get_config.is_some()
             || self.get_data.is_some()
@@ -1690,6 +1767,7 @@ impl ParserState {
     fn nmda_namespace_is_allowed(&self, element: &Element) -> bool {
         element.namespace == NETCONF_NMDA_NS
             && ((self.local_path_is(&["rpc"]) && element.local == "get-data")
+                || (self.local_path_is(&["rpc"]) && element.local == "edit-data")
                 || (self.local_path_is(&["rpc", "get-data"])
                     && matches!(
                         element.local.as_str(),
@@ -1708,7 +1786,15 @@ impl ParserState {
                 || self.local_path_is(&["rpc", "get-data", "origin-filter"])
                 || self.local_path_is(&["rpc", "get-data", "negated-origin-filter"])
                 || self.local_path_is(&["rpc", "get-data", "max-depth"])
-                || self.local_path_is(&["rpc", "get-data", "with-origin"]))
+                || self.local_path_is(&["rpc", "get-data", "with-origin"])
+                || (self.local_path_is(&["rpc", "edit-data"])
+                    && matches!(
+                        element.local.as_str(),
+                        "datastore" | "default-operation" | "config" | "url"
+                    ))
+                || self.local_path_is(&["rpc", "edit-data", "datastore"])
+                || self.local_path_is(&["rpc", "edit-data", "default-operation"])
+                || self.local_path_is(&["rpc", "edit-data", "url"]))
     }
 
     fn notification_namespace_is_allowed(&self, element: &Element) -> bool {
@@ -2214,6 +2300,61 @@ impl ParserState {
         Ok(())
     }
 
+    fn install_edit_data_datastore(&mut self) -> Result<(), XmlError> {
+        let edit_data = self
+            .edit_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if edit_data.datastore_seen {
+            return Err(XmlError::DuplicateElement);
+        }
+        edit_data.datastore_seen = true;
+        Ok(())
+    }
+
+    fn install_edit_data_default_operation(&mut self) -> Result<(), XmlError> {
+        let edit_data = self
+            .edit_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if edit_data.default_operation_seen {
+            return Err(XmlError::DuplicateElement);
+        }
+        edit_data.default_operation_seen = true;
+        Ok(())
+    }
+
+    fn install_edit_data_config_capture(&mut self) -> Result<(), XmlError> {
+        let edit_data = self
+            .edit_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if edit_data.config_xml.is_some()
+            || edit_data.url_seen
+            || self.edit_config_capture.is_some()
+        {
+            return Err(XmlError::DuplicateElement);
+        }
+        self.edit_config_capture = Some(Writer::new(Vec::new()));
+        self.edit_config_capture_depth = 0;
+        Ok(())
+    }
+
+    fn install_edit_data_url(&mut self) -> Result<(), XmlError> {
+        let edit_data = self
+            .edit_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if edit_data.url_seen
+            || edit_data.config_xml.is_some()
+            || self.edit_config_capture.is_some()
+        {
+            return Err(XmlError::DuplicateElement);
+        }
+        edit_data.url_seen = true;
+        Ok(())
+    }
+
     fn set_edit_default_operation_text(&mut self, text: &str) -> Result<(), XmlError> {
         let edit_config = self
             .edit_config
@@ -2259,10 +2400,49 @@ impl ParserState {
         Ok(())
     }
 
+    fn set_edit_data_datastore_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let datastore = {
+            let scope = self.scopes.last().ok_or(XmlError::Malformed)?;
+            parse_nmda_datastore(text.trim(), Some(scope))?
+        };
+        let edit_data = self
+            .edit_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if edit_data.datastore.replace(datastore).is_some() {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn set_edit_data_default_operation_text(&mut self, text: &str) -> Result<(), XmlError> {
+        let edit_data = self
+            .edit_data
+            .as_mut()
+            .ok_or(XmlError::UnsupportedOperation)?;
+        if edit_data
+            .default_operation
+            .replace(EditDefaultOperation::parse(text)?)
+            .is_some()
+        {
+            return Err(XmlError::DuplicateElement);
+        }
+        Ok(())
+    }
+
+    fn set_edit_data_url_text(&mut self, text: &str) -> Result<(), XmlError> {
+        if text.trim().is_empty() {
+            return Err(XmlError::InvalidValue);
+        }
+        Ok(())
+    }
+
     fn is_edit_config_config_start(&self, element: &Element) -> bool {
-        self.local_path_is(&["rpc", "edit-config"])
-            && element.namespace == NETCONF_BASE_NS
-            && element.local == "config"
+        element.local == "config"
+            && ((self.local_path_is(&["rpc", "edit-config"])
+                && element.namespace == NETCONF_BASE_NS)
+                || (self.local_path_is(&["rpc", "edit-data"])
+                    && element.namespace == NETCONF_NMDA_NS))
     }
 
     fn edit_config_capture_is_active(&self) -> bool {
@@ -2283,15 +2463,39 @@ impl ParserState {
         writer.write_event(event).map_err(|_| XmlError::Malformed)
     }
 
+    fn capture_config_root_start(
+        &mut self,
+        start: &BytesStart<'_>,
+        scope: &NamespaceScope,
+    ) -> Result<(), XmlError> {
+        let raw_name = start.name();
+        let name = qname_bytes_to_str(raw_name.as_ref())?;
+        let mut rewritten = BytesStart::new(name);
+        if let Some(default) = scope.default.as_deref() {
+            rewritten.push_attribute(("xmlns", default));
+        }
+        for (prefix, namespace) in &scope.bindings {
+            let attr = format!("xmlns:{prefix}");
+            rewritten.push_attribute((attr.as_str(), namespace.as_str()));
+        }
+        self.capture_event(Event::Start(rewritten))
+    }
+
     fn finish_edit_config_capture(&mut self) -> Result<(), XmlError> {
         let writer = self.edit_config_capture.take().ok_or(XmlError::Malformed)?;
         let bytes = writer.into_inner();
         let config_xml = String::from_utf8(bytes).map_err(|_| XmlError::Malformed)?;
-        let edit_config = self
-            .edit_config
+        if let Some(edit_config) = self.edit_config.as_mut() {
+            if edit_config.config_xml.replace(config_xml).is_some() {
+                return Err(XmlError::DuplicateElement);
+            }
+            return Ok(());
+        }
+        let edit_data = self
+            .edit_data
             .as_mut()
             .ok_or(XmlError::UnsupportedOperation)?;
-        if edit_config.config_xml.replace(config_xml).is_some() {
+        if edit_data.config_xml.replace(config_xml).is_some() || edit_data.url_seen {
             return Err(XmlError::DuplicateElement);
         }
         Ok(())
@@ -2488,6 +2692,28 @@ impl ParserState {
                                 edit_config.error_option,
                             )?,
                             config_xml: edit_config.config_xml.ok_or(XmlError::MissingElement)?,
+                        }),
+                    }));
+                }
+                if let Some(edit_data) = self.edit_data {
+                    if edit_data.config_xml.is_none() && !edit_data.url_seen {
+                        return Err(XmlError::MissingElement);
+                    }
+                    return Ok(ParsedMessage::Rpc(ParsedRpc {
+                        message_id,
+                        reply_attrs,
+                        operation: RpcOperation::EditData(EditDataRequest {
+                            datastore: finish_get_data_datastore(&PartialGetData {
+                                datastore_seen: edit_data.datastore_seen,
+                                datastore: edit_data.datastore,
+                                ..PartialGetData::default()
+                            })?,
+                            default_operation: finish_edit_option(
+                                edit_data.default_operation_seen,
+                                edit_data.default_operation,
+                            )?,
+                            config_xml: edit_data.config_xml,
+                            url_present: edit_data.url_seen,
                         }),
                     }));
                 }
@@ -3283,6 +3509,55 @@ mod tests {
     }
 
     #[test]
+    fn parses_edit_data_with_nmda_config() {
+        let xml = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="801"><ncds:edit-data xmlns:ncds="{NETCONF_NMDA_NS}" xmlns:ds="{IETF_DATASTORES_NS}"><ncds:datastore>ds:running</ncds:datastore><ncds:default-operation>replace</ncds:default-operation><ncds:config><sys:system xmlns:sys="urn:opc:test"><sys:hostname>amf-2</sys:hostname></sys:system></ncds:config></ncds:edit-data></rpc>"#
+        );
+        let parsed = parse_rpc(&xml, &MgmtLimits::default()).expect("parse edit-data");
+
+        assert_eq!(parsed.message_id, "801");
+        let RpcOperation::EditData(request) = parsed.operation else {
+            panic!("expected edit-data operation");
+        };
+        assert_eq!(request.datastore, NmdaDatastore::Running);
+        assert_eq!(request.default_operation, EditDefaultOperation::Replace);
+        let expected_config = format!(
+            r#"<ncds:config xmlns="{NETCONF_BASE_NS}" xmlns:ds="{IETF_DATASTORES_NS}" xmlns:ncds="{NETCONF_NMDA_NS}"><sys:system xmlns:sys="urn:opc:test"><sys:hostname>amf-2</sys:hostname></sys:system></ncds:config>"#
+        );
+        assert_eq!(
+            request.config_xml.as_deref(),
+            Some(expected_config.as_str())
+        );
+        assert!(!request.url_present);
+    }
+
+    #[test]
+    fn parses_edit_data_url_without_retaining_url_value() {
+        let xml = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="802"><ncds:edit-data xmlns:ncds="{NETCONF_NMDA_NS}" xmlns:ds="{IETF_DATASTORES_NS}"><ncds:datastore>ds:running</ncds:datastore><ncds:url>https://example.invalid/do-not-leak</ncds:url></ncds:edit-data></rpc>"#
+        );
+        let parsed = parse_rpc(&xml, &MgmtLimits::default()).expect("parse edit-data url");
+
+        let RpcOperation::EditData(request) = parsed.operation else {
+            panic!("expected edit-data operation");
+        };
+        assert_eq!(request.datastore, NmdaDatastore::Running);
+        assert_eq!(request.default_operation, EditDefaultOperation::Merge);
+        assert!(request.config_xml.is_none());
+        assert!(request.url_present);
+    }
+
+    #[test]
+    fn edit_data_rejects_config_and_url_choice_collision() {
+        let xml = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="803"><ncds:edit-data xmlns:ncds="{NETCONF_NMDA_NS}" xmlns:ds="{IETF_DATASTORES_NS}"><ncds:datastore>ds:running</ncds:datastore><ncds:config><sys:system xmlns:sys="urn:opc:test"/></ncds:config><ncds:url>https://example.invalid/do-not-leak</ncds:url></ncds:edit-data></rpc>"#
+        );
+        let err = parse_rpc(&xml, &MgmtLimits::default()).expect_err("choice collision");
+
+        assert_eq!(err, XmlError::DuplicateElement);
+    }
+
+    #[test]
     fn unrecognized_with_defaults_value_is_payload_free() {
         let parsed = parse_rpc(
             &rpc(&format!(
@@ -3695,6 +3970,14 @@ mod tests {
         assert_eq!(wrong_get_data.error, XmlError::UnknownNamespace);
         assert_eq!(wrong_get_data.operation_hint, None);
 
+        let wrong_edit_data = parse_rpc_with_context(
+            r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" xmlns:bad="urn:example:bad" message-id="wrong-edit-data"><bad:edit-data/></rpc>"#,
+            &MgmtLimits::default(),
+        )
+        .expect_err("wrong namespace edit-data");
+        assert_eq!(wrong_edit_data.error, XmlError::UnknownNamespace);
+        assert_eq!(wrong_edit_data.operation_hint, None);
+
         let wrong_kill = parse_rpc_with_context(
             r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" xmlns:bad="urn:example:bad" message-id="wrong-kill"><bad:kill-session><session-id>42</session-id></bad:kill-session></rpc>"#,
             &MgmtLimits::default(),
@@ -3858,7 +4141,9 @@ mod tests {
                 test_option: EditTestOption::TestThenSet,
                 test_option_explicit: false,
                 error_option: EditErrorOption::StopOnError,
-                config_xml: r#"<config><sys:secret xmlns:sys="urn:opc:test">do-not-leak</sys:secret></config>"#.to_string(),
+                config_xml: format!(
+                    r#"<config xmlns="{NETCONF_BASE_NS}"><sys:secret xmlns:sys="urn:opc:test">do-not-leak</sys:secret></config>"#
+                ),
             })
         );
     }
@@ -3881,7 +4166,9 @@ mod tests {
                 test_option: EditTestOption::TestThenSet,
                 test_option_explicit: false,
                 error_option: EditErrorOption::StopOnError,
-                config_xml: "<config><![CDATA[do-not-leak]]></config>".to_string(),
+                config_xml: format!(
+                    r#"<config xmlns="{NETCONF_BASE_NS}"><![CDATA[do-not-leak]]></config>"#
+                ),
             })
         );
     }
@@ -3904,9 +4191,9 @@ mod tests {
                 test_option: EditTestOption::Set,
                 test_option_explicit: true,
                 error_option: EditErrorOption::ContinueOnError,
-                config_xml:
-                    r#"<config xmlns:sys="urn:opc:test"><sys:system></sys:system></config>"#
-                        .to_string(),
+                config_xml: format!(
+                    r#"<config xmlns="{NETCONF_BASE_NS}" xmlns:sys="urn:opc:test"><sys:system></sys:system></config>"#
+                ),
             })
         );
     }

@@ -636,6 +636,17 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         false
     }
 
+    /// Returns whether the CNF enables RFC 8526 `<edit-data>` dispatch.
+    ///
+    /// This does not advertise a standalone hello capability. A binding that
+    /// returns true must intentionally expose the NMDA module through discovery,
+    /// implement the same edit translation used by `<edit-config>`, and accept
+    /// rollback-on-error behavior from the server's transactional write path.
+    /// The default is fail-closed.
+    fn nmda_edit_data_supported(&self) -> bool {
+        false
+    }
+
     /// Returns whether the binding intentionally maps NMDA `intended` reads to
     /// the current running snapshot.
     ///
