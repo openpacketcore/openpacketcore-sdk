@@ -210,6 +210,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 } else {
                                     quote! { parsed_item.#key_field_ident = LeafPresence::Explicit(parsed_key.clone()); }
                                 };
+                                let entry_key_assign = if key_is_sensitive {
+                                    quote! { entry.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(parsed_key.clone())); }
+                                } else {
+                                    quote! { entry.#key_field_ident = LeafPresence::Explicit(parsed_key.clone()); }
+                                };
 
                                 quote! {
                                     #child_name_str => {
@@ -236,6 +241,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                 }
                                             } else {
                                                 let entry = self.#field_ident.entry(parsed_key.clone()).or_default();
+                                                #entry_key_assign
                                                 entry.apply_patch_segments(op, &segments[1..], value)?;
                                             }
                                         }
@@ -248,6 +254,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 let mut parse_keys = Vec::new();
                                 let mut key_idents = Vec::new();
                                 let mut key_assigns = Vec::new();
+                                let mut entry_key_assigns = Vec::new();
                                 let mut key_fields = TokenStream::new();
                                 for key_leaf in &child.key_leaves {
                                     let mut find_key_leaf_node = None;
@@ -290,8 +297,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         is_sensitive_node(find_key_leaf_node.unwrap());
                                     if is_sensitive {
                                         key_assigns.push(quote! { parsed_item.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(#key_ident.clone())); });
+                                        entry_key_assigns.push(quote! { entry.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(#key_ident.clone())); });
                                     } else {
                                         key_assigns.push(quote! { parsed_item.#key_field_ident = LeafPresence::Explicit(#key_ident.clone()); });
+                                        entry_key_assigns.push(quote! { entry.#key_field_ident = LeafPresence::Explicit(#key_ident.clone()); });
                                     }
                                 }
 
@@ -322,6 +331,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                 }
                                             } else {
                                                 let entry = self.#field_ident.entry(parsed_key.clone()).or_default();
+                                                #(#entry_key_assigns)*
                                                 entry.apply_patch_segments(op, &segments[1..], value)?;
                                             }
                                         }

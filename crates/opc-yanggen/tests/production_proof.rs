@@ -459,6 +459,7 @@ fn test_production_proof_codegen() {
     use generated_test::patch::{apply_patch, ConfigDelta};
     use opc_config_model::{OpcConfig, YangPath, ValidationContext, ConfigError};
     use opc_data_governance::DataClass;
+    use opc_gnmi_server::{Encoding, GnmiPatchApplicator, NormalizedSet, NormalizedValue};
     use serde_json::json;
     
     fn create_ctx() -> ValidationContext<System> {
@@ -477,6 +478,19 @@ fn test_production_proof_codegen() {
             base_version: opc_types::ConfigVersion::INITIAL,
             previous: None,
         }
+    }
+
+    fn gnmi_value(value: &str) -> NormalizedValue {
+        NormalizedValue::new(
+            Encoding::JsonIetf,
+            value,
+            &opc_mgmt_limits::MgmtLimits::default(),
+        )
+        .expect("valid gNMI JSON value")
+    }
+
+    fn yang_path(path: &str) -> YangPath {
+        YangPath::new(path).expect("valid test path")
     }
 
     #[test]
@@ -554,6 +568,98 @@ fn test_production_proof_codegen() {
             ConfigDelta::Remove(YangPath::new("/proof:system/interfaces/interface[name='non-existent']").unwrap())
         ];
         assert!(apply_patch(&mut sys, &remove_deltas).is_ok());
+    }
+
+    #[test]
+    fn test_generated_gnmi_set_applicator_rich_shapes() {
+        let patcher = generated_test::gnmi_set::patcher();
+        let set = NormalizedSet {
+            updates: vec![
+                (yang_path("/proof:system/proof:enabled"), gnmi_value("true")),
+                (
+                    yang_path("/proof:system/proof:nested-container"),
+                    gnmi_value("{\"inner-leaf\":\"inside\"}"),
+                ),
+                (
+                    yang_path("/proof:system/proof:admin-password"),
+                    gnmi_value("\"secret-1\""),
+                ),
+                (
+                    yang_path("/proof:system/proof:dns-servers"),
+                    gnmi_value("[\"1.1.1.1\",\"8.8.8.8\"]"),
+                ),
+                (
+                    yang_path("/proof:system/proof:interfaces/proof:interface[proof:name='eth0']/proof:enabled"),
+                    gnmi_value("true"),
+                ),
+                (
+                    yang_path("/proof:system/proof:subscribers/proof:subscriber[proof:imsi='001'][proof:plmn-id='01']"),
+                    gnmi_value("{}"),
+                ),
+            ],
+            union_replaces: vec![(
+                yang_path("/proof:system/proof:config-leaf"),
+                gnmi_value("7"),
+            )],
+            ..NormalizedSet::default()
+        };
+
+        let candidate = patcher.apply_set(&System::default(), &set).expect("gNMI set");
+
+        assert_eq!(candidate.enabled, LeafPresence::Explicit(true));
+        assert_eq!(
+            candidate
+                .nested_container
+                .as_ref()
+                .unwrap()
+                .inner_leaf,
+            LeafPresence::Explicit("inside".to_string())
+        );
+        assert_eq!(
+            candidate.admin_password.get().as_option().map(String::as_str),
+            Some("secret-1")
+        );
+        assert_eq!(candidate.dns_servers, vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]);
+        assert_eq!(candidate.config_leaf, LeafPresence::Explicit(7));
+
+        let iface = candidate
+            .interfaces
+            .as_ref()
+            .unwrap()
+            .interface
+            .get("eth0")
+            .unwrap();
+        assert_eq!(iface.name, LeafPresence::Explicit("eth0".to_string()));
+        assert_eq!(iface.enabled, LeafPresence::Explicit(true));
+
+        let subscriber_key = SubscriberKey {
+            imsi: "001".to_string(),
+            plmn_id: "01".to_string(),
+        };
+        assert!(candidate
+            .subscribers
+            .as_ref()
+            .unwrap()
+            .subscriber
+            .contains_key(&subscriber_key));
+    }
+
+    #[test]
+    fn test_generated_gnmi_set_applicator_fails_closed_atomically() {
+        let patcher = generated_test::gnmi_set::patcher();
+        let running = System::default();
+        let set = NormalizedSet {
+            updates: vec![
+                (yang_path("/proof:system/proof:enabled"), gnmi_value("true")),
+                (yang_path("/proof:system/proof:state-leaf"), gnmi_value("10")),
+            ],
+            ..NormalizedSet::default()
+        };
+
+        let err = patcher.apply_set(&running, &set).expect_err("read-only path rejected");
+        assert_eq!(err.status().as_str(), "INVALID_ARGUMENT");
+        assert!(!err.to_string().contains("10"));
+        assert_eq!(running.enabled, LeafPresence::Absent);
     }
 
     #[test]
@@ -1123,6 +1229,7 @@ opc-config-model = {{ path = "{}" }}
 opc-types = {{ path = "{}" }}
 opc-data-governance = {{ path = "{}" }}
 opc-mgmt-schema = {{ path = "{}" }}
+opc-mgmt-limits = {{ path = "{}" }}
 opc-gnmi-server = {{ path = "{}" }}
 opc-redaction = {{ path = "{}" }}
 "#,
@@ -1131,6 +1238,7 @@ opc-redaction = {{ path = "{}" }}
         workspace_dir.join("crates/opc-types").display(),
         workspace_dir.join("crates/opc-data-governance").display(),
         workspace_dir.join("crates/opc-mgmt-schema").display(),
+        workspace_dir.join("crates/opc-mgmt-limits").display(),
         workspace_dir.join("crates/opc-gnmi-server").display(),
         workspace_dir.join("crates/opc-redaction").display()
     );
