@@ -84,6 +84,8 @@ impl SessionRegistry {
             state.sessions.remove(&session_id);
             state.release_running_lock(session_id);
             state.release_running_write(session_id);
+            state.release_candidate_lock(session_id);
+            state.release_candidate_write(session_id);
             return Ok(KillSessionResult::NotFound);
         }
         before_signal()?;
@@ -93,6 +95,8 @@ impl SessionRegistry {
             state.sessions.remove(&session_id);
             state.release_running_lock(session_id);
             state.release_running_write(session_id);
+            state.release_candidate_lock(session_id);
+            state.release_candidate_write(session_id);
             Ok(KillSessionResult::NotFound)
         }
     }
@@ -177,6 +181,86 @@ impl SessionRegistry {
         }
     }
 
+    /// Acquires the global candidate datastore lock after `before_lock` succeeds.
+    pub(crate) fn lock_candidate_after<F, E>(
+        &self,
+        session_id: u64,
+        before_lock: F,
+    ) -> Result<LockCandidateResult, E>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if !state.sessions.contains_key(&session_id) {
+            return Ok(LockCandidateResult::SessionNotRegistered);
+        }
+        if let Some(owner) = state.candidate_lock {
+            return Ok(LockCandidateResult::Denied {
+                owner_session_id: owner.session_id,
+            });
+        }
+        if let Some(owner) = state.candidate_write {
+            return Ok(LockCandidateResult::Denied {
+                owner_session_id: owner.session_id,
+            });
+        }
+        before_lock()?;
+        state.candidate_lock = Some(CandidateLock { session_id });
+        Ok(LockCandidateResult::Acquired)
+    }
+
+    /// Acquires a short-lived candidate datastore write guard.
+    pub(crate) fn begin_candidate_write(&self, session_id: u64) -> CandidateWriteResult {
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if !state.sessions.contains_key(&session_id) {
+            return CandidateWriteResult::SessionNotRegistered;
+        }
+        if let Some(owner) = state.candidate_lock {
+            if owner.session_id != session_id {
+                return CandidateWriteResult::Denied {
+                    owner_session_id: owner.session_id,
+                };
+            }
+        }
+        if let Some(owner) = state.candidate_write {
+            return CandidateWriteResult::Denied {
+                owner_session_id: owner.session_id,
+            };
+        }
+        state.candidate_write = Some(CandidateWrite { session_id });
+        CandidateWriteResult::Acquired(CandidateWriteGuard {
+            registry: self.clone(),
+            session_id,
+        })
+    }
+
+    /// Releases the global candidate datastore lock after `before_unlock`
+    /// succeeds.
+    pub(crate) fn unlock_candidate_after<F, E>(
+        &self,
+        session_id: u64,
+        before_unlock: F,
+    ) -> Result<UnlockCandidateResult, E>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if !state.sessions.contains_key(&session_id) {
+            return Ok(UnlockCandidateResult::SessionNotRegistered);
+        }
+        match state.candidate_lock {
+            Some(owner) if owner.session_id == session_id => {
+                before_unlock()?;
+                state.candidate_lock = None;
+                Ok(UnlockCandidateResult::Unlocked)
+            }
+            Some(owner) => Ok(UnlockCandidateResult::NotOwner {
+                owner_session_id: owner.session_id,
+            }),
+            None => Ok(UnlockCandidateResult::NotLocked),
+        }
+    }
+
     fn deregister(&self, session_id: u64, entry: &Arc<SessionEntry>) {
         let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         if state
@@ -187,6 +271,8 @@ impl SessionRegistry {
             state.sessions.remove(&session_id);
             state.release_running_lock(session_id);
             state.release_running_write(session_id);
+            state.release_candidate_lock(session_id);
+            state.release_candidate_write(session_id);
         }
     }
 
@@ -216,6 +302,24 @@ impl SessionRegistry {
             .running_write
             .map(|write| write.session_id)
     }
+
+    #[cfg(test)]
+    pub(crate) fn candidate_lock_owner_for_test(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .candidate_lock
+            .map(|lock| lock.session_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn candidate_write_owner_for_test(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .candidate_write
+            .map(|write| write.session_id)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -223,6 +327,8 @@ struct RegistryState {
     sessions: HashMap<u64, Arc<SessionEntry>>,
     running_lock: Option<RunningLock>,
     running_write: Option<RunningWrite>,
+    candidate_lock: Option<CandidateLock>,
+    candidate_write: Option<CandidateWrite>,
 }
 
 impl RegistryState {
@@ -243,6 +349,24 @@ impl RegistryState {
             self.running_write = None;
         }
     }
+
+    fn release_candidate_lock(&mut self, session_id: u64) {
+        if self
+            .candidate_lock
+            .is_some_and(|lock| lock.session_id == session_id)
+        {
+            self.candidate_lock = None;
+        }
+    }
+
+    fn release_candidate_write(&mut self, session_id: u64) {
+        if self
+            .candidate_write
+            .is_some_and(|write| write.session_id == session_id)
+        {
+            self.candidate_write = None;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -260,6 +384,16 @@ struct RunningWrite {
     session_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CandidateLock {
+    session_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CandidateWrite {
+    session_id: u64,
+}
+
 /// Drop guard for an in-flight running datastore write.
 pub(crate) struct RunningWriteGuard {
     registry: SessionRegistry,
@@ -274,6 +408,23 @@ impl Drop for RunningWriteGuard {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         state.release_running_write(self.session_id);
+    }
+}
+
+/// Drop guard for an in-flight candidate datastore write.
+pub(crate) struct CandidateWriteGuard {
+    registry: SessionRegistry,
+    session_id: u64,
+}
+
+impl Drop for CandidateWriteGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .registry
+            .inner
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        state.release_candidate_write(self.session_id);
     }
 }
 
@@ -370,6 +521,49 @@ pub(crate) enum RunningWriteResult {
     /// The running datastore is locked or being written by another session.
     Denied {
         /// NETCONF session id that currently owns running.
+        owner_session_id: u64,
+    },
+    /// The current session id is not registered in this registry.
+    SessionNotRegistered,
+}
+
+/// Result of a candidate datastore lock request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockCandidateResult {
+    /// The calling session now owns the candidate lock.
+    Acquired,
+    /// The candidate lock is already owned by a NETCONF session.
+    Denied {
+        /// NETCONF session id that owns the lock.
+        owner_session_id: u64,
+    },
+    /// The current session id is not registered in this registry.
+    SessionNotRegistered,
+}
+
+/// Result of a candidate datastore unlock request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnlockCandidateResult {
+    /// The calling session's candidate lock was released.
+    Unlocked,
+    /// No candidate lock is currently active.
+    NotLocked,
+    /// A different NETCONF session owns the candidate lock.
+    NotOwner {
+        /// NETCONF session id that owns the lock.
+        owner_session_id: u64,
+    },
+    /// The current session id is not registered in this registry.
+    SessionNotRegistered,
+}
+
+/// Result of acquiring a short-lived candidate write guard.
+pub(crate) enum CandidateWriteResult {
+    /// The calling session may write candidate until the guard is dropped.
+    Acquired(CandidateWriteGuard),
+    /// The candidate datastore is locked or being written by another session.
+    Denied {
+        /// NETCONF session id that currently owns candidate.
         owner_session_id: u64,
     },
     /// The current session id is not registered in this registry.
@@ -574,5 +768,79 @@ mod tests {
             registry.begin_running_write(10),
             RunningWriteResult::Acquired(_)
         ));
+    }
+
+    #[test]
+    fn candidate_lock_is_independent_from_running_lock() {
+        let registry = SessionRegistry::new();
+        let _running_owner = registry.register(10).expect("running owner");
+        let _candidate_owner = registry.register(11).expect("candidate owner");
+
+        assert_eq!(
+            registry.lock_running_after(10, || Ok::<(), ()>(())),
+            Ok(LockRunningResult::Acquired)
+        );
+        assert_eq!(
+            registry.lock_candidate_after(11, || Ok::<(), ()>(())),
+            Ok(LockCandidateResult::Acquired)
+        );
+
+        assert_eq!(registry.running_lock_owner_for_test(), Some(10));
+        assert_eq!(registry.candidate_lock_owner_for_test(), Some(11));
+    }
+
+    #[test]
+    fn candidate_write_guard_denies_parallel_candidate_writes_and_releases_on_drop() {
+        let registry = SessionRegistry::new();
+        let _first = registry.register(10).expect("register first");
+        let _second = registry.register(11).expect("register second");
+
+        let guard = match registry.begin_candidate_write(10) {
+            CandidateWriteResult::Acquired(guard) => guard,
+            _ => panic!("first candidate writer should acquire"),
+        };
+        assert_eq!(registry.candidate_write_owner_for_test(), Some(10));
+
+        assert!(matches!(
+            registry.begin_candidate_write(11),
+            CandidateWriteResult::Denied {
+                owner_session_id: 10
+            }
+        ));
+        assert!(matches!(
+            registry.lock_candidate_after(11, || Ok::<(), ()>(())),
+            Ok(LockCandidateResult::Denied {
+                owner_session_id: 10
+            })
+        ));
+
+        drop(guard);
+        assert_eq!(registry.candidate_write_owner_for_test(), None);
+        assert!(matches!(
+            registry.begin_candidate_write(11),
+            CandidateWriteResult::Acquired(_)
+        ));
+    }
+
+    #[test]
+    fn candidate_lock_and_write_release_when_session_deregisters() {
+        let registry = SessionRegistry::new();
+        let owner = registry.register(10).expect("owner");
+        assert_eq!(
+            registry.lock_candidate_after(10, || Ok::<(), ()>(())),
+            Ok(LockCandidateResult::Acquired)
+        );
+        let guard = match registry.begin_candidate_write(10) {
+            CandidateWriteResult::Acquired(guard) => guard,
+            _ => panic!("candidate write should acquire for lock owner"),
+        };
+        assert_eq!(registry.candidate_lock_owner_for_test(), Some(10));
+        assert_eq!(registry.candidate_write_owner_for_test(), Some(10));
+
+        drop(owner);
+
+        assert_eq!(registry.candidate_lock_owner_for_test(), None);
+        assert_eq!(registry.candidate_write_owner_for_test(), None);
+        drop(guard);
     }
 }

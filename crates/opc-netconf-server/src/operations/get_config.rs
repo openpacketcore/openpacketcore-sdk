@@ -19,8 +19,9 @@ use crate::metrics::{
 use crate::xml::{Datastore, GetConfigRequest, WithDefaultsMode};
 
 /// Shared context for handling one `<get-config>` request.
-pub struct GetConfigContext<'a, P, A>
+pub struct GetConfigContext<'a, C, P, A>
 where
+    C: OpcConfig,
     P: PolicySource,
     A: AuditSink,
 {
@@ -42,12 +43,16 @@ where
     pub started: std::time::Instant,
     /// Shared management-plane input and fanout limits.
     pub limits: &'a MgmtLimits,
+    /// Snapshot of the server-owned candidate datastore for candidate reads.
+    pub candidate_config: Option<&'a C>,
+    /// Whether this binding explicitly advertised RFC 6241 `:candidate`.
+    pub candidate_supported: bool,
 }
 
 /// Handles a parsed `<get-config>` request.
 pub fn handle_get_config<C, B, P, A>(
     binding: &B,
-    ctx: GetConfigContext<'_, P, A>,
+    ctx: GetConfigContext<'_, C, P, A>,
     request: &GetConfigRequest,
 ) -> String
 where
@@ -56,7 +61,38 @@ where
     P: PolicySource,
     A: AuditSink,
 {
-    if request.source != Datastore::Running {
+    if request.source == Datastore::Candidate
+        && ctx.candidate_supported
+        && ctx.candidate_config.is_none()
+    {
+        if audit_failure(
+            ctx.audit,
+            ctx.request_id,
+            ctx.principal,
+            ctx.transport,
+            "operation-failed",
+            Vec::new(),
+        )
+        .is_err()
+        {
+            record_rpc_error(
+                NetconfOperation::GetConfig,
+                NetconfErrorTag::OperationFailed,
+                ctx.started.elapsed(),
+            );
+            return error_reply(&ctx, RpcError::operation_failed());
+        }
+        record_rpc_error(
+            NetconfOperation::GetConfig,
+            NetconfErrorTag::OperationFailed,
+            ctx.started.elapsed(),
+        );
+        return error_reply(&ctx, RpcError::operation_failed());
+    }
+
+    if request.source != Datastore::Running
+        && !(request.source == Datastore::Candidate && ctx.candidate_supported)
+    {
         if audit_failure(
             ctx.audit,
             ctx.request_id,
@@ -294,13 +330,21 @@ where
         return ok_reply(&ctx, "");
     }
 
-    let snapshot = binding.config_bus().current_snapshot();
+    let snapshot =
+        (request.source == Datastore::Running).then(|| binding.config_bus().current_snapshot());
+    let config = if let Some(candidate) = ctx.candidate_config {
+        candidate
+    } else {
+        snapshot
+            .as_ref()
+            .expect("running get-config snapshot is present")
+            .config
+            .as_ref()
+    };
     let selection = ReadSelection::new(&allowed_paths);
     let rendered = match with_defaults_mode {
-        Some(mode) => {
-            binding.render_running_config_with_defaults(snapshot.config.as_ref(), selection, mode)
-        }
-        None => binding.render_running_config(snapshot.config.as_ref(), selection),
+        Some(mode) => binding.render_running_config_with_defaults(config, selection, mode),
+        None => binding.render_running_config(config, selection),
     };
 
     match rendered {
@@ -358,16 +402,18 @@ where
     }
 }
 
-fn error_reply<P, A>(ctx: &GetConfigContext<'_, P, A>, error: RpcError) -> String
+fn error_reply<C, P, A>(ctx: &GetConfigContext<'_, C, P, A>, error: RpcError) -> String
 where
+    C: OpcConfig,
     P: PolicySource,
     A: AuditSink,
 {
     rpc_error_reply_with_attrs(Some(ctx.message_id), ctx.reply_attrs, error)
 }
 
-fn ok_reply<P, A>(ctx: &GetConfigContext<'_, P, A>, data_xml: &str) -> String
+fn ok_reply<C, P, A>(ctx: &GetConfigContext<'_, C, P, A>, data_xml: &str) -> String
 where
+    C: OpcConfig,
     P: PolicySource,
     A: AuditSink,
 {
