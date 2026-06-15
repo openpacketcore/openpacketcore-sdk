@@ -2,9 +2,9 @@
 
 Protocol-neutral gNMI server foundation for OpenPacketCore.
 
-This crate intentionally does not contain a gRPC service yet. ADR 0016 is still
-`Proposed`, so `tonic`/`prost` are not allowed to enter the workspace. The code
-here locks the parts that are independent of protobuf generation:
+This crate contains the pinned protobuf service skeleton for OpenPacketCore
+gNMI. ADR 0016 allows `tonic`/`prost` only in this crate. The code here locks
+the parts that are independent of full RPC behavior:
 
 - CNF embedding traits over `C: OpcConfig`;
 - schema-backed capability data;
@@ -13,6 +13,6 @@ here locks the parts that are independent of protobuf generation:
 - fail-safe extension handling;
 - shared gNMI metrics recorders.
 
-The future protobuf layer should adapt generated gNMI messages into these
-contracts rather than duplicating schema, path, value, extension, or metrics
-logic in RPC handlers.
+Current RPC behavior is intentionally capability-honest: `Capabilities` is
+served from the generated schema registry, while `Get`, `Set`, and `Subscribe`
+return `UNIMPLEMENTED` until backed by code and tests.

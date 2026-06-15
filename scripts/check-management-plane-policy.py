@@ -4,7 +4,8 @@
 This script backs ADR 0016 and ADR 0017 while those decisions are still gated by
 human acceptance. It enforces two mechanical invariants:
 
-* `tonic`, `prost`, and `tonic-build` stay scoped to `opc-gnmi-server`.
+* `tonic`, `prost`, `prost-types`, and `tonic-build` stay scoped to
+  `opc-gnmi-server`.
 * Rust `unsafe` tokens stay scoped to the future `opc-libsctp-sys` sys crate,
   where each token must be documented by a nearby `SAFETY:` comment and a local
   unsafe lint policy must be declared.
@@ -22,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-GRPC_STACK = {"tonic", "prost", "tonic-build"}
+GRPC_STACK = {"tonic", "prost", "prost-types", "tonic-build"}
 GRPC_ALLOWED_ROOTS = {"opc-gnmi-server"}
 UNSAFE_ALLOWED_ROOTS = {"opc-libsctp-sys"}
 
@@ -546,11 +547,12 @@ def run_self_test() -> None:
             {
                 "opc-gnmi-server": [
                     ("prost", None),
+                    ("prost-types", None),
                     ("tonic", None),
                     ("tonic-build", "build"),
                 ]
             },
-            {"opc-gnmi-server": ["prost", "tonic", "tonic-build"]},
+            {"opc-gnmi-server": ["prost", "prost-types", "tonic", "tonic-build"]},
         ),
         [],
     )
