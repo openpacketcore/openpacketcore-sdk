@@ -1,0 +1,29 @@
+[package]
+name = "opc-gnmi-server"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Capability-honest gNMI server foundation for the OpenPacketCore management plane"
+readme = "README.md"
+documentation = "https://docs.rs/opc-gnmi-server"
+keywords = ["5g", "cnf", "gnmi", "yang", "management"]
+categories = ["network-programming"]
+
+[dependencies]
+opc-config-bus = { path = "../opc-config-bus", version = "0.2.0" }
+opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
+opc-mgmt-authz = { path = "../opc-mgmt-authz", version = "0.2.0" }
+opc-mgmt-errors = { path = "../opc-mgmt-errors", version = "0.2.0" }
+opc-mgmt-limits = { path = "../opc-mgmt-limits", version = "0.2.0" }
+opc-mgmt-opstate = { path = "../opc-mgmt-opstate", version = "0.2.0" }
+opc-mgmt-path = { path = "../opc-mgmt-path", version = "0.2.0" }
+opc-mgmt-schema = { path = "../opc-mgmt-schema", version = "0.2.0" }
+opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

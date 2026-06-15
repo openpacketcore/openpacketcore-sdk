@@ -1969,6 +1969,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-gnmi-server"
+version = "0.2.0"
+dependencies = [
+ "opc-config-bus",
+ "opc-config-model",
+ "opc-mgmt-authz",
+ "opc-mgmt-errors",
+ "opc-mgmt-limits",
+ "opc-mgmt-opstate",
+ "opc-mgmt-path",
+ "opc-mgmt-schema",
+ "opc-redaction",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "opc-identity"
 version = "0.2.0"
 dependencies = [
