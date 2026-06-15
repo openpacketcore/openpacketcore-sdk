@@ -22,6 +22,7 @@
 
 #![forbid(unsafe_code)]
 
+mod audit;
 pub mod binding;
 pub mod capabilities;
 pub mod encoding;
@@ -40,8 +41,10 @@ pub mod transport;
 pub mod value;
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use opc_config_model::OpcConfig;
+use opc_mgmt_audit::{AuditSink, TracingAuditSink};
 use opc_mgmt_limits::MgmtLimits;
 
 pub use binding::{
@@ -85,6 +88,7 @@ where
     limits: MgmtLimits,
     profile: CapabilityProfile,
     extensions: ExtensionRegistry,
+    audit: Arc<dyn AuditSink>,
     _config: PhantomData<C>,
 }
 
@@ -103,6 +107,27 @@ where
         profile: CapabilityProfile,
         extensions: ExtensionRegistry,
     ) -> Result<Self, GnmiError> {
+        Self::new_with_audit(
+            binding,
+            limits,
+            profile,
+            extensions,
+            Arc::new(TracingAuditSink),
+        )
+    }
+
+    /// Builds a proto-free gNMI foundation handle with an explicit audit sink.
+    ///
+    /// Production CNFs should pass a durable, tamper-evident sink. The default
+    /// [`Self::new`] constructor uses [`TracingAuditSink`] for compatibility and
+    /// development deployments.
+    pub fn new_with_audit(
+        binding: B,
+        limits: MgmtLimits,
+        profile: CapabilityProfile,
+        extensions: ExtensionRegistry,
+        audit: Arc<dyn AuditSink>,
+    ) -> Result<Self, GnmiError> {
         limits.validate().map_err(GnmiError::from_limits)?;
         binding
             .schema()
@@ -115,6 +140,7 @@ where
             limits,
             profile,
             extensions,
+            audit,
             _config: PhantomData,
         })
     }
@@ -137,6 +163,11 @@ where
     /// Registered gNMI extension policy.
     pub const fn extensions(&self) -> &ExtensionRegistry {
         &self.extensions
+    }
+
+    /// Audit sink used for management-plane operation records.
+    pub fn audit(&self) -> &dyn AuditSink {
+        self.audit.as_ref()
     }
 
     /// Renders protocol-neutral gNMI Capabilities data from the schema registry.

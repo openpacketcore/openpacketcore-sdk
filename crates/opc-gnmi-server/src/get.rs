@@ -180,7 +180,7 @@ where
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GetDataType {
+pub(crate) enum GetDataType {
     All,
     Config,
     State,
@@ -207,12 +207,12 @@ impl GetDataType {
     }
 }
 
-struct ModelFilter {
+pub(crate) struct ModelFilter {
     modules: Option<HashSet<&'static str>>,
 }
 
 impl ModelFilter {
-    fn new(
+    pub(crate) fn new(
         registry: &'static dyn SchemaRegistry,
         requested: &[gnmi::ModelData],
     ) -> Result<Self, GnmiError> {
@@ -242,7 +242,7 @@ impl ModelFilter {
     }
 }
 
-fn select_paths(
+pub(crate) fn select_paths(
     registry: &'static dyn SchemaRegistry,
     limits: &opc_mgmt_limits::MgmtLimits,
     prefix: Option<&GnmiPath>,

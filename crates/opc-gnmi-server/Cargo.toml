@@ -15,6 +15,7 @@ categories = ["network-programming"]
 [dependencies]
 opc-config-bus = { path = "../opc-config-bus", version = "0.2.0" }
 opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
+opc-mgmt-audit = { path = "../opc-mgmt-audit", version = "0.2.0" }
 opc-mgmt-authz = { path = "../opc-mgmt-authz", version = "0.2.0" }
 opc-mgmt-errors = { path = "../opc-mgmt-errors", version = "0.2.0" }
 opc-mgmt-limits = { path = "../opc-mgmt-limits", version = "0.2.0" }
@@ -40,6 +41,8 @@ tonic-build = { version = "0.13.1", default-features = false, features = ["prost
 
 [dev-dependencies]
 async-trait = { workspace = true }
+bytes = { workspace = true }
+http-body-util = "0.1"
 hyper-util = { version = "0.1.20", features = ["client", "tokio"] }
 opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
 opc-tls = { path = "../opc-tls", version = "0.2.0" }
