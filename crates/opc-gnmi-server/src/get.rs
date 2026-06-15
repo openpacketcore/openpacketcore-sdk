@@ -28,6 +28,27 @@ where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
 {
+    handle_read_request(
+        server,
+        principal,
+        request,
+        ReadAction::Read,
+        GnmiNacmAction::Read,
+    )
+}
+
+/// Executes a schema-backed read request for Get or Subscribe.
+pub(crate) fn handle_read_request<C, B>(
+    server: &GnmiServer<C, B>,
+    principal: &TrustedPrincipal,
+    request: &gnmi::GetRequest,
+    read_action: ReadAction,
+    metric_action: GnmiNacmAction,
+) -> Result<gnmi::GetResponse, GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
     let encoding = encoding_from_proto(request.encoding)?;
     if !server.profile().encodings().supports(encoding) {
         return Err(GnmiError::from(encoding));
@@ -71,14 +92,14 @@ where
         .map(ReadSelectionEntry::schema_path)
         .collect::<Vec<_>>();
     let decisions = authz
-        .authorize(principal, ReadAction::Read, &decision_input)
+        .authorize(principal, read_action, &decision_input)
         .map_err(|_| GnmiError::unavailable("gNMI read policy source unavailable"))?;
 
     let denied_count = decisions
         .iter()
         .filter(|decision| !decision.allowed)
         .count();
-    record_nacm_denials(GnmiNacmAction::Read, denied_count);
+    record_nacm_denials(metric_action, denied_count);
 
     let allowed_entries = decisions
         .iter()
