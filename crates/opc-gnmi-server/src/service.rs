@@ -298,7 +298,7 @@ pub const fn code_from_status(status: opc_mgmt_errors::MgmtStatus) -> tonic::Cod
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::Ordering;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use opc_config_bus::{
         AuthorizationContext, AuthorizationError, ConfigAuthorizer, ConfigBus, MockManagedDatastore,
@@ -310,8 +310,9 @@ mod tests {
     use opc_mgmt_authz::{AuthzError, PolicySource};
     use opc_mgmt_limits::MgmtLimits;
     use opc_mgmt_opstate::{
-        OperationalError, OperationalRequest, OperationalResponse, OperationalStateProvider,
-        OperationalValue,
+        operational_event_channel, OperationalError, OperationalEvent, OperationalEventReceiver,
+        OperationalEventSource, OperationalRequest, OperationalResponse, OperationalStateProvider,
+        OperationalSubscriptionRequest, OperationalValue,
     };
     use opc_mgmt_schema::{
         DataClass, LeafType, ModelData, NodeKind, NodeMeta, OriginEntry, SchemaRegistry,
@@ -323,7 +324,7 @@ mod tests {
 
     use super::*;
     use crate::proto::gnmi::g_nmi_server::GNmi;
-    use crate::subscribe::{render_snapshot_responses, SubscribePlan};
+    use crate::subscribe::{render_snapshot_responses, send_operational_event, SubscribePlan};
     use crate::{
         CapabilityProfile, ExtensionRegistry, GnmiJsonProjectionError, GnmiJsonUpdate,
         GnmiPatchApplicator, GnmiVersion, ReadSelection, GNMI_VERSION,
@@ -497,6 +498,25 @@ mod tests {
             } else {
                 Ok(OperationalResponse::default())
             }
+        }
+    }
+
+    #[derive(Default)]
+    struct TestOperationalEvents {
+        requests: Mutex<Vec<OperationalSubscriptionRequest>>,
+    }
+
+    impl OperationalEventSource for TestOperationalEvents {
+        fn subscribe(
+            &self,
+            request: &OperationalSubscriptionRequest,
+        ) -> Result<OperationalEventReceiver, OperationalError> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(request.clone());
+            let (_tx, rx) = operational_event_channel(request.max_queued_events());
+            Ok(rx)
         }
     }
 
@@ -692,6 +712,7 @@ mod tests {
         bus: Arc<ConfigBus<DemoConfig>>,
         policy: Arc<dyn PolicySource>,
         operational: Arc<dyn OperationalStateProvider>,
+        events: Option<Arc<dyn OperationalEventSource>>,
     }
 
     impl GnmiConfigBinding<DemoConfig> for TestBinding {
@@ -709,6 +730,10 @@ mod tests {
 
         fn operational_state(&self) -> Arc<dyn OperationalStateProvider> {
             Arc::clone(&self.operational)
+        }
+
+        fn operational_events(&self) -> Option<Arc<dyn OperationalEventSource>> {
+            self.events.clone()
         }
 
         fn policy_source(&self) -> Arc<dyn PolicySource> {
@@ -790,6 +815,7 @@ mod tests {
                 bus,
                 policy: Arc::new(FixedPolicy(allow_all_read_policy())),
                 operational: Arc::new(TestOperationalState),
+                events: None,
             },
             limits,
             profile,
@@ -893,13 +919,15 @@ mod tests {
     async fn authenticated_service_with_policy(
         policy: NacmPolicy,
     ) -> GnmiService<DemoConfig, TestBinding> {
-        authenticated_service_with_policy_and_bus(
+        authenticated_service_with_policy_bus_events(
             policy,
             Arc::new(
                 ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
                     .await
                     .expect("bus"),
             ),
+            None,
+            MgmtLimits::default(),
         )
         .await
     }
@@ -919,6 +947,41 @@ mod tests {
         policy: NacmPolicy,
         bus: Arc<ConfigBus<DemoConfig>>,
     ) -> GnmiService<DemoConfig, TestBinding> {
+        authenticated_service_with_policy_bus_events(policy, bus, None, MgmtLimits::default()).await
+    }
+
+    async fn authenticated_service_with_policy_and_event_source(
+        policy: NacmPolicy,
+        events: Arc<dyn OperationalEventSource>,
+    ) -> GnmiService<DemoConfig, TestBinding> {
+        authenticated_service_with_policy_limits_events(policy, MgmtLimits::default(), Some(events))
+            .await
+    }
+
+    async fn authenticated_service_with_policy_limits_events(
+        policy: NacmPolicy,
+        limits: MgmtLimits,
+        events: Option<Arc<dyn OperationalEventSource>>,
+    ) -> GnmiService<DemoConfig, TestBinding> {
+        authenticated_service_with_policy_bus_events(
+            policy,
+            Arc::new(
+                ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
+                    .await
+                    .expect("bus"),
+            ),
+            events,
+            limits,
+        )
+        .await
+    }
+
+    async fn authenticated_service_with_policy_bus_events(
+        policy: NacmPolicy,
+        bus: Arc<ConfigBus<DemoConfig>>,
+        events: Option<Arc<dyn OperationalEventSource>>,
+        limits: MgmtLimits,
+    ) -> GnmiService<DemoConfig, TestBinding> {
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
         let server = GnmiServer::new(
@@ -926,8 +989,9 @@ mod tests {
                 bus,
                 policy: Arc::new(FixedPolicy(policy)),
                 operational: Arc::new(TestOperationalState),
+                events,
             },
-            MgmtLimits::default(),
+            limits,
             profile,
             ExtensionRegistry::default(),
         )
@@ -1881,6 +1945,291 @@ mod tests {
 
         assert_eq!(err.status().as_str(), "UNIMPLEMENTED");
         assert_eq!(err.to_string(), "gNMI operation is not supported");
+    }
+
+    #[tokio::test]
+    async fn subscribe_on_change_accepts_operational_paths_with_event_source() {
+        let events: Arc<dyn OperationalEventSource> = Arc::new(TestOperationalEvents::default());
+        let service = authenticated_service_with_policy_and_event_source(
+            allow_all_subscribe_policy(),
+            events,
+        )
+        .await;
+
+        SubscribePlan::from_subscription_list(
+            service.server(),
+            subscribe_list(
+                gnmi::subscription_list::Mode::Stream,
+                uptime_path(),
+                gnmi::SubscriptionMode::OnChange,
+            ),
+        )
+        .expect("operational on-change plan");
+    }
+
+    #[tokio::test]
+    async fn subscribe_on_change_accepts_mixed_config_and_operational_paths() {
+        let events: Arc<dyn OperationalEventSource> = Arc::new(TestOperationalEvents::default());
+        let service = authenticated_service_with_policy_and_event_source(
+            allow_all_read_and_subscribe_policy(),
+            events,
+        )
+        .await;
+        let mut list = subscribe_list(
+            gnmi::subscription_list::Mode::Stream,
+            hostname_path(),
+            gnmi::SubscriptionMode::OnChange,
+        );
+        list.subscription.push(gnmi::Subscription {
+            path: Some(uptime_path()),
+            mode: gnmi::SubscriptionMode::OnChange as i32,
+            sample_interval: 1_000_000,
+            suppress_redundant: false,
+            heartbeat_interval: 0,
+        });
+
+        SubscribePlan::from_subscription_list(service.server(), list)
+            .expect("mixed on-change plan");
+    }
+
+    #[tokio::test]
+    async fn subscribe_operational_event_sends_authorized_update() {
+        let events: Arc<dyn OperationalEventSource> = Arc::new(TestOperationalEvents::default());
+        let service = authenticated_service_with_policy_and_event_source(
+            allow_all_subscribe_policy(),
+            events,
+        )
+        .await;
+        let plan = SubscribePlan::from_subscription_list(
+            service.server(),
+            subscribe_list(
+                gnmi::subscription_list::Mode::Stream,
+                uptime_path(),
+                gnmi::SubscriptionMode::OnChange,
+            ),
+        )
+        .expect("plan");
+        let principal = authenticated_principal();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+        let sent = send_operational_event(
+            service.server(),
+            principal.principal(),
+            &plan,
+            OperationalEvent::Update(
+                OperationalValue::new(
+                    YangPath::new("/sys:system/sys:uptime").expect("static path"),
+                    "321",
+                )
+                .expect("json"),
+            ),
+            &tx,
+        )
+        .await
+        .expect("send event");
+
+        assert!(sent);
+        let response = rx.recv().await.expect("response").expect("ok response");
+        let notification = match response.response.expect("response") {
+            gnmi::subscribe_response::Response::Update(notification) => notification,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(notification.update.len(), 1);
+        assert_eq!(
+            notification.update[0]
+                .val
+                .as_ref()
+                .and_then(|value| value.value.as_ref()),
+            Some(&gnmi::typed_value::Value::JsonIetfVal(b"321".to_vec()))
+        );
+        assert_eq!(
+            notification.update[0]
+                .path
+                .as_ref()
+                .expect("path")
+                .elem
+                .iter()
+                .map(|elem| elem.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sys:system", "sys:uptime"]
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_operational_event_sends_authorized_delete() {
+        let events: Arc<dyn OperationalEventSource> = Arc::new(TestOperationalEvents::default());
+        let service = authenticated_service_with_policy_and_event_source(
+            allow_all_subscribe_policy(),
+            events,
+        )
+        .await;
+        let plan = SubscribePlan::from_subscription_list(
+            service.server(),
+            subscribe_list(
+                gnmi::subscription_list::Mode::Stream,
+                uptime_path(),
+                gnmi::SubscriptionMode::OnChange,
+            ),
+        )
+        .expect("plan");
+        let principal = authenticated_principal();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+        send_operational_event(
+            service.server(),
+            principal.principal(),
+            &plan,
+            OperationalEvent::Delete {
+                path: YangPath::new("/sys:system/sys:uptime").expect("static path"),
+            },
+            &tx,
+        )
+        .await
+        .expect("send event");
+
+        let response = rx.recv().await.expect("response").expect("ok response");
+        let notification = match response.response.expect("response") {
+            gnmi::subscribe_response::Response::Update(notification) => notification,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(notification.update.is_empty());
+        assert_eq!(notification.delete.len(), 1);
+        assert_eq!(
+            notification.delete[0]
+                .elem
+                .iter()
+                .map(|elem| elem.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sys:system", "sys:uptime"]
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_operational_event_omits_nacm_denied_update() {
+        let events: Arc<dyn OperationalEventSource> = Arc::new(TestOperationalEvents::default());
+        let service =
+            authenticated_service_with_policy_and_event_source(allow_all_read_policy(), events)
+                .await;
+        let plan = SubscribePlan::from_subscription_list(
+            service.server(),
+            subscribe_list(
+                gnmi::subscription_list::Mode::Stream,
+                uptime_path(),
+                gnmi::SubscriptionMode::OnChange,
+            ),
+        )
+        .expect("plan");
+        let principal = authenticated_principal();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+        let sent = send_operational_event(
+            service.server(),
+            principal.principal(),
+            &plan,
+            OperationalEvent::Update(
+                OperationalValue::new(
+                    YangPath::new("/sys:system/sys:uptime").expect("static path"),
+                    "321",
+                )
+                .expect("json"),
+            ),
+            &tx,
+        )
+        .await
+        .expect("send event");
+
+        assert!(sent);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn subscribe_operational_event_rejects_unrequested_path_without_leak() {
+        let events: Arc<dyn OperationalEventSource> = Arc::new(TestOperationalEvents::default());
+        let service = authenticated_service_with_policy_and_event_source(
+            allow_all_subscribe_policy(),
+            events,
+        )
+        .await;
+        let plan = SubscribePlan::from_subscription_list(
+            service.server(),
+            subscribe_list(
+                gnmi::subscription_list::Mode::Stream,
+                uptime_path(),
+                gnmi::SubscriptionMode::OnChange,
+            ),
+        )
+        .expect("plan");
+        let principal = authenticated_principal();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        let err = send_operational_event(
+            service.server(),
+            principal.principal(),
+            &plan,
+            OperationalEvent::Update(
+                OperationalValue::new(
+                    YangPath::new("/sys:system/sys:user[sys:name='secret-admin']/sys:role")
+                        .expect("secret path"),
+                    r#""secret-role""#,
+                )
+                .expect("json"),
+            ),
+            &tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status().as_str(), "INTERNAL");
+        assert_eq!(err.to_string(), "gNMI internal error");
+        assert!(!err.to_string().contains("secret-admin"));
+        assert!(!err.detail().unwrap_or_default().contains("secret-admin"));
+        assert!(!err.detail().unwrap_or_default().contains("secret-role"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_operational_event_enforces_value_limit_without_leak() {
+        let events: Arc<dyn OperationalEventSource> = Arc::new(TestOperationalEvents::default());
+        let limits = MgmtLimits {
+            max_value_bytes: 2,
+            ..MgmtLimits::default()
+        };
+        let service = authenticated_service_with_policy_limits_events(
+            allow_all_subscribe_policy(),
+            limits,
+            Some(events),
+        )
+        .await;
+        let plan = SubscribePlan::from_subscription_list(
+            service.server(),
+            subscribe_list(
+                gnmi::subscription_list::Mode::Stream,
+                uptime_path(),
+                gnmi::SubscriptionMode::OnChange,
+            ),
+        )
+        .expect("plan");
+        let principal = authenticated_principal();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        let err = send_operational_event(
+            service.server(),
+            principal.principal(),
+            &plan,
+            OperationalEvent::Update(
+                OperationalValue::new(
+                    YangPath::new("/sys:system/sys:uptime").expect("static path"),
+                    "321",
+                )
+                .expect("json"),
+            ),
+            &tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status().as_str(), "INVALID_ARGUMENT");
+        assert_eq!(err.to_string(), "invalid gNMI request");
+        assert!(!err.to_string().contains("321"));
     }
 
     #[tokio::test]

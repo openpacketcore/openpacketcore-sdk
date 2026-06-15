@@ -13,8 +13,9 @@
 //! Paths are carried as SDK-canonical [`opc_config_model::YangPath`] values,
 //! normally produced by `opc-mgmt-path` after schema validation. Values are
 //! carried as syntax-checked RFC 7951 JSON strings so this crate stays decoupled
-//! from any generated model. The streaming on-change subscription consumed by
-//! gNMI `Subscribe` / NETCONF notifications is added in the Subscribe slice.
+//! from any generated model. Streaming operational changes use the same
+//! canonical path and JSON contracts and stay protocol-neutral: gNMI/NETCONF
+//! adapters decide how to frame events on their own wire protocols.
 
 #![forbid(unsafe_code)]
 
@@ -22,6 +23,9 @@ use std::collections::HashSet;
 
 use opc_config_model::YangPath;
 use thiserror::Error;
+use tokio::sync::mpsc;
+
+const DEFAULT_OPERATIONAL_EVENT_QUEUE_CAPACITY: usize = 1;
 
 /// NMDA origin (RFC 8342 `ietf-origin`) of an operational value.
 ///
@@ -177,6 +181,306 @@ pub struct OperationalResponse {
     pub values: Vec<OperationalValue>,
 }
 
+/// A request for operational-state change events.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OperationalSubscriptionRequest {
+    /// SDK-canonical paths the server is subscribing to. List instances include
+    /// canonical key predicates when the northbound request addressed one.
+    pub paths: Vec<YangPath>,
+    /// Maximum queued events the protocol adapter is willing to buffer for this
+    /// subscription.
+    pub max_queued_events: usize,
+}
+
+impl OperationalSubscriptionRequest {
+    /// Builds a subscription request for the given paths.
+    pub fn new(paths: impl IntoIterator<Item = YangPath>) -> Self {
+        Self {
+            paths: paths.into_iter().collect(),
+            max_queued_events: DEFAULT_OPERATIONAL_EVENT_QUEUE_CAPACITY,
+        }
+    }
+
+    /// Returns the subscribed paths.
+    pub fn paths(&self) -> &[YangPath] {
+        &self.paths
+    }
+
+    /// Sets the maximum event queue depth for this subscription. Zero is
+    /// normalized to one so event streams are always bounded but usable.
+    pub fn with_max_queued_events(mut self, capacity: usize) -> Self {
+        self.max_queued_events = capacity.max(1);
+        self
+    }
+
+    /// Maximum queued events requested by the management protocol adapter.
+    pub const fn max_queued_events(&self) -> usize {
+        self.max_queued_events
+    }
+}
+
+/// One operational-state change event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationalEvent {
+    /// An operational value was created or changed.
+    Update(OperationalValue),
+    /// An operational value is no longer present. Absence is a protocol-neutral
+    /// signal; protocol adapters may map it to deletes or omit it depending on
+    /// the RPC semantics.
+    Delete {
+        /// The SDK-canonical path that disappeared.
+        path: YangPath,
+    },
+}
+
+impl OperationalEvent {
+    /// The SDK-canonical path this event concerns.
+    pub fn path(&self) -> &YangPath {
+        match self {
+            Self::Update(value) => value.path(),
+            Self::Delete { path } => path,
+        }
+    }
+
+    /// Validates the event against the subscription that produced it.
+    pub fn validate_for_request(
+        &self,
+        request: &OperationalSubscriptionRequest,
+    ) -> Result<(), OperationalEventError> {
+        if !request
+            .paths
+            .iter()
+            .any(|path| canonical_path_matches(path.as_str(), self.path().as_str()))
+        {
+            return Err(OperationalEventError::UnexpectedPath);
+        }
+        Ok(())
+    }
+}
+
+fn canonical_path_matches(selection: &str, candidate: &str) -> bool {
+    let Ok(selection) = parse_canonical_path(selection) else {
+        return false;
+    };
+    let Ok(candidate) = parse_canonical_path(candidate) else {
+        return false;
+    };
+    if selection.len() != candidate.len() {
+        return false;
+    }
+    selection
+        .iter()
+        .zip(candidate.iter())
+        .all(|(selected, actual)| {
+            selected.name == actual.name
+                && selected.keys.iter().all(|(key, value)| {
+                    actual.keys.iter().any(|(actual_key, actual_value)| {
+                        actual_key == key && actual_value == value
+                    })
+                })
+        })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CanonicalSegment<'a> {
+    name: &'a str,
+    keys: Vec<(&'a str, String)>,
+}
+
+fn parse_canonical_path(path: &str) -> Result<Vec<CanonicalSegment<'_>>, ()> {
+    let mut segments = Vec::new();
+    for segment in split_canonical_segments(path)? {
+        let (name, predicates) = segment
+            .split_once('[')
+            .map(|(name, rest)| (name, Some(rest)))
+            .unwrap_or((segment, None));
+        if name.is_empty() {
+            return Err(());
+        }
+        let mut keys = Vec::new();
+        if let Some(mut rest) = predicates {
+            loop {
+                let end = find_predicate_end(rest)?;
+                let predicate = &rest[..end];
+                let (key, value) = parse_predicate(predicate)?;
+                keys.push((key, value));
+                rest = &rest[end + 1..];
+                if rest.is_empty() {
+                    break;
+                }
+                rest = rest.strip_prefix('[').ok_or(())?;
+            }
+        }
+        segments.push(CanonicalSegment { name, keys });
+    }
+    Ok(segments)
+}
+
+fn split_canonical_segments(path: &str) -> Result<Vec<&str>, ()> {
+    if !path.starts_with('/') {
+        return Err(());
+    }
+    let mut out = Vec::new();
+    let mut start = 1;
+    let mut quote = false;
+    let mut escape = false;
+    for (idx, ch) in path.char_indices().skip(1) {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match ch {
+            '\\' if quote => escape = true,
+            '\'' => quote = !quote,
+            '/' if !quote => {
+                out.push(&path[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    if quote || escape {
+        return Err(());
+    }
+    if start < path.len() {
+        out.push(&path[start..]);
+    }
+    Ok(out)
+}
+
+fn find_predicate_end(rest: &str) -> Result<usize, ()> {
+    let mut quote = false;
+    let mut escape = false;
+    for (idx, ch) in rest.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match ch {
+            '\\' if quote => escape = true,
+            '\'' => quote = !quote,
+            ']' if !quote => return Ok(idx),
+            _ => {}
+        }
+    }
+    Err(())
+}
+
+fn parse_predicate(predicate: &str) -> Result<(&str, String), ()> {
+    let (key, raw_value) = predicate.split_once('=').ok_or(())?;
+    let quoted = raw_value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .ok_or(())?;
+    Ok((key, unescape_predicate_value(quoted)?))
+}
+
+fn unescape_predicate_value(value: &str) -> Result<String, ()> {
+    let mut out = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            out.push(chars.next().ok_or(())?);
+        } else {
+            out.push(ch);
+        }
+    }
+    Ok(out)
+}
+
+/// A malformed operational-state event supplied by a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum OperationalEventError {
+    /// A value was reported for a path that was not subscribed.
+    #[error("operational event included an unrequested path")]
+    UnexpectedPath,
+}
+
+impl From<OperationalEventError> for OperationalError {
+    fn from(_value: OperationalEventError) -> Self {
+        Self::InvalidValue
+    }
+}
+
+/// Sender side of a bounded operational-event queue.
+#[derive(Clone)]
+pub struct OperationalEventSender {
+    inner: mpsc::Sender<Result<OperationalEvent, OperationalError>>,
+}
+
+impl OperationalEventSender {
+    /// Sends an operational event, awaiting queue capacity. Returns
+    /// `StreamClosed` if the receiver is gone.
+    pub async fn send(&self, event: OperationalEvent) -> Result<(), OperationalStreamError> {
+        self.inner
+            .send(Ok(event))
+            .await
+            .map_err(|_| OperationalStreamError::StreamClosed)
+    }
+
+    /// Attempts to send an operational event without waiting for queue
+    /// capacity.
+    pub fn try_send(&self, event: OperationalEvent) -> Result<(), OperationalStreamError> {
+        self.inner.try_send(Ok(event)).map_err(map_try_send_error)
+    }
+
+    /// Sends a provider error to the receiver, awaiting queue capacity.
+    pub async fn send_error(&self, error: OperationalError) -> Result<(), OperationalStreamError> {
+        self.inner
+            .send(Err(error))
+            .await
+            .map_err(|_| OperationalStreamError::StreamClosed)
+    }
+}
+
+/// Receiver side of a bounded operational-event queue.
+pub struct OperationalEventReceiver {
+    inner: mpsc::Receiver<Result<OperationalEvent, OperationalError>>,
+}
+
+impl OperationalEventReceiver {
+    /// Awaits the next event, provider error, or stream closure.
+    pub async fn recv(&mut self) -> Option<Result<OperationalEvent, OperationalError>> {
+        self.inner.recv().await
+    }
+
+    /// Attempts to receive without waiting.
+    pub fn try_recv(&mut self) -> Option<Result<OperationalEvent, OperationalError>> {
+        self.inner.try_recv().ok()
+    }
+}
+
+/// Operational event stream queue failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum OperationalStreamError {
+    /// The bounded queue is full.
+    #[error("operational event queue is full")]
+    QueueFull,
+    /// The receiver has closed.
+    #[error("operational event stream is closed")]
+    StreamClosed,
+}
+
+/// Builds a bounded operational-event channel.
+pub fn operational_event_channel(
+    capacity: usize,
+) -> (OperationalEventSender, OperationalEventReceiver) {
+    let (tx, rx) = mpsc::channel(capacity.max(1));
+    (
+        OperationalEventSender { inner: tx },
+        OperationalEventReceiver { inner: rx },
+    )
+}
+
+fn map_try_send_error(
+    error: mpsc::error::TrySendError<Result<OperationalEvent, OperationalError>>,
+) -> OperationalStreamError {
+    match error {
+        mpsc::error::TrySendError::Full(_) => OperationalStreamError::QueueFull,
+        mpsc::error::TrySendError::Closed(_) => OperationalStreamError::StreamClosed,
+    }
+}
+
 impl OperationalResponse {
     /// Builds a response from a value list.
     pub fn new(values: impl IntoIterator<Item = OperationalValue>) -> Self {
@@ -298,6 +602,25 @@ pub trait OperationalStateProvider: Send + Sync {
     /// than fabricating a value, and MUST attach [`Origin`] only when
     /// `request.include_origin` is set and the origin is genuinely known.
     fn get(&self, request: &OperationalRequest) -> Result<OperationalResponse, OperationalError>;
+}
+
+/// Optional NF-supplied operational-state change source.
+///
+/// This trait is deliberately protocol-neutral. It does not know about gNMI,
+/// NETCONF, subscriptions modes, or NACM. Management protocol adapters pass
+/// schema-validated canonical paths and remain responsible for authorization,
+/// framing, backpressure policy, and redaction-safe error mapping.
+pub trait OperationalEventSource: Send + Sync {
+    /// Subscribes to changes for the requested canonical paths.
+    ///
+    /// Implementations that create an SDK queue should use
+    /// [`OperationalSubscriptionRequest::max_queued_events`] with
+    /// [`operational_event_channel`] so protocol-level backpressure limits are
+    /// preserved end to end.
+    fn subscribe(
+        &self,
+        request: &OperationalSubscriptionRequest,
+    ) -> Result<OperationalEventReceiver, OperationalError>;
 }
 
 #[cfg(test)]
@@ -459,6 +782,106 @@ mod tests {
             err.detail(),
             Some("failed reading /sys:system/sys:user[sys:name='secret-admin']")
         );
+        assert!(!err.to_string().contains("secret-admin"));
+    }
+
+    #[test]
+    fn operational_events_validate_against_subscription_paths() {
+        let uptime = path("/sys:system/sys:uptime");
+        let unknown = path("/sys:system/sys:unknown");
+        let request = OperationalSubscriptionRequest::new([uptime.clone()]);
+
+        let update =
+            OperationalEvent::Update(OperationalValue::new(uptime.clone(), "42").expect("json"));
+        update
+            .validate_for_request(&request)
+            .expect("subscribed update");
+
+        let delete = OperationalEvent::Delete { path: uptime };
+        delete
+            .validate_for_request(&request)
+            .expect("subscribed delete");
+
+        let unexpected = OperationalEvent::Delete { path: unknown };
+        assert_eq!(
+            unexpected.validate_for_request(&request).unwrap_err(),
+            OperationalEventError::UnexpectedPath
+        );
+    }
+
+    #[test]
+    fn operational_events_match_requested_key_predicate_subset() {
+        let wildcard_leaf = path("/if:interfaces/if:interface/if:oper-status");
+        let keyed_leaf = path("/if:interfaces/if:interface[if:name='n3']/if:oper-status");
+        let other_keyed_leaf = path("/if:interfaces/if:interface[if:name='n6']/if:oper-status");
+
+        OperationalEvent::Update(
+            OperationalValue::new(keyed_leaf.clone(), r#""up""#).expect("json"),
+        )
+        .validate_for_request(&OperationalSubscriptionRequest::new([wildcard_leaf]))
+        .expect("unkeyed selection matches keyed list instance");
+
+        OperationalEvent::Update(
+            OperationalValue::new(keyed_leaf.clone(), r#""up""#).expect("json"),
+        )
+        .validate_for_request(&OperationalSubscriptionRequest::new([keyed_leaf]))
+        .expect("keyed selection matches same instance");
+
+        assert_eq!(
+            OperationalEvent::Update(
+                OperationalValue::new(other_keyed_leaf, r#""down""#).expect("json")
+            )
+            .validate_for_request(&OperationalSubscriptionRequest::new([path(
+                "/if:interfaces/if:interface[if:name='n3']/if:oper-status"
+            )]))
+            .unwrap_err(),
+            OperationalEventError::UnexpectedPath
+        );
+    }
+
+    #[test]
+    fn operational_update_events_reuse_json_validation() {
+        let err = OperationalValue::new(path("/sys:system/sys:uptime"), "{secret-not-json")
+            .expect_err("invalid JSON");
+        assert_eq!(err, OperationalValueError::InvalidJson);
+    }
+
+    #[tokio::test]
+    async fn operational_event_channel_is_bounded_and_reports_closed() {
+        let (tx, mut rx) = operational_event_channel(1);
+        tx.try_send(OperationalEvent::Delete { path: path("/one") })
+            .expect("first send fits");
+        assert_eq!(
+            tx.try_send(OperationalEvent::Delete { path: path("/two") })
+                .unwrap_err(),
+            OperationalStreamError::QueueFull
+        );
+
+        let first = rx.recv().await.expect("event").expect("event ok");
+        assert_eq!(first.path().as_str(), "/one");
+
+        drop(rx);
+        assert_eq!(
+            tx.send(OperationalEvent::Delete {
+                path: path("/three")
+            })
+            .await
+            .unwrap_err(),
+            OperationalStreamError::StreamClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn operational_event_channel_carries_payload_free_errors() {
+        let (tx, mut rx) = operational_event_channel(1);
+        tx.send_error(OperationalError::unavailable(
+            "backend failed for /sys:system/sys:user[sys:name='secret-admin']",
+        ))
+        .await
+        .expect("send error");
+
+        let err = rx.recv().await.expect("item").unwrap_err();
+        assert_eq!(err.to_string(), "operational state unavailable");
         assert!(!err.to_string().contains("secret-admin"));
     }
 }
