@@ -508,7 +508,7 @@ fn update_to_proto(
     })
 }
 
-fn yang_path_to_proto(path: &YangPath) -> Result<gnmi::Path, GnmiError> {
+pub(crate) fn yang_path_to_proto(path: &YangPath) -> Result<gnmi::Path, GnmiError> {
     let elems = split_yang_path(path.as_str())?
         .into_iter()
         .map(segment_to_path_elem)
@@ -633,7 +633,7 @@ fn unescape_predicate_value(value: &str) -> Result<String, GnmiError> {
     Ok(out)
 }
 
-fn now_nanos() -> i64 {
+pub(crate) fn now_nanos() -> i64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())

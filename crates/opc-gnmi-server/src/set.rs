@@ -1,9 +1,25 @@
 //! Protocol-neutral gNMI Set model.
 
-use opc_config_model::{ConfigOperation, YangPath};
-use opc_mgmt_limits::MgmtLimits;
+#![allow(deprecated)]
 
-use crate::{GnmiError, NormalizedValue};
+use std::time::{Duration, Instant};
+
+use opc_config_model::{
+    CommitError, CommitRequest, ConfigOperation, OpcConfig, RequestId, RequestSource,
+    TransportType, TrustedPrincipal, YangPath,
+};
+use opc_mgmt_errors::{commit_error_to_status, MgmtStatus};
+use opc_mgmt_limits::MgmtLimits;
+use opc_mgmt_schema::SchemaRegistry;
+
+use crate::get::{now_nanos, yang_path_to_proto};
+use crate::metrics::{record_set_commit_latency, SetCommitMetric};
+use crate::proto::gnmi;
+use crate::proto_adapter::{path_from_proto, typed_value_from_proto};
+use crate::{
+    normalize_typed_value, GnmiConfigBinding, GnmiError, GnmiPath, GnmiServer, NormalizedValue,
+    ResolvedGnmiPath,
+};
 
 /// gNMI Set operation kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +30,8 @@ pub enum SetOperation {
     Replace,
     /// `update`.
     Update,
+    /// `union_replace`.
+    UnionReplace,
 }
 
 impl SetOperation {
@@ -23,6 +41,7 @@ impl SetOperation {
             Self::Delete => "delete",
             Self::Replace => "replace",
             Self::Update => "update",
+            Self::UnionReplace => "union_replace",
         }
     }
 }
@@ -36,6 +55,8 @@ pub struct NormalizedSet {
     pub replaces: Vec<(YangPath, NormalizedValue)>,
     /// Update paths and normalized JSON values.
     pub updates: Vec<(YangPath, NormalizedValue)>,
+    /// Union-replace paths and normalized JSON values.
+    pub union_replaces: Vec<(YangPath, NormalizedValue)>,
 }
 
 impl NormalizedSet {
@@ -46,7 +67,7 @@ impl NormalizedSet {
 
     /// Total addressed operation count.
     pub fn len(&self) -> usize {
-        self.deletes.len() + self.replaces.len() + self.updates.len()
+        self.deletes.len() + self.replaces.len() + self.updates.len() + self.union_replaces.len()
     }
 
     /// Whether the set contains no operations.
@@ -70,6 +91,7 @@ impl NormalizedSet {
         paths.extend(self.deletes.iter().cloned());
         paths.extend(self.replaces.iter().map(|(path, _)| path.clone()));
         paths.extend(self.updates.iter().map(|(path, _)| path.clone()));
+        paths.extend(self.union_replaces.iter().map(|(path, _)| path.clone()));
         paths
     }
 
@@ -81,13 +103,197 @@ impl NormalizedSet {
         if self.is_empty() {
             return Err(GnmiError::invalid("gNMI Set request is empty"));
         }
-        if !self.deletes.is_empty() && self.replaces.is_empty() && self.updates.is_empty() {
+        if !self.deletes.is_empty()
+            && self.replaces.is_empty()
+            && self.updates.is_empty()
+            && self.union_replaces.is_empty()
+        {
             Ok(ConfigOperation::Delete)
-        } else if self.deletes.is_empty() && !self.replaces.is_empty() && self.updates.is_empty() {
+        } else if self.deletes.is_empty()
+            && self.updates.is_empty()
+            && (!self.replaces.is_empty() || !self.union_replaces.is_empty())
+        {
             Ok(ConfigOperation::Replace)
         } else {
             Ok(ConfigOperation::Patch)
         }
+    }
+}
+
+/// Executes an authenticated gNMI Set request as one atomic config-bus commit.
+pub(crate) async fn handle_set<C, B>(
+    server: &GnmiServer<C, B>,
+    principal: &TrustedPrincipal,
+    request: &gnmi::SetRequest,
+) -> Result<gnmi::SetResponse, GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    let normalized = normalize_set_request(server.binding().schema(), server.limits(), request)?;
+    let operation = normalized.config_operation()?;
+    let commit_metric = set_commit_metric(operation);
+
+    let bus = server.binding().config_bus();
+    let snapshot = bus.current_snapshot();
+    let candidate = server
+        .binding()
+        .patcher()
+        .apply_set(snapshot.config.as_ref(), &normalized)?;
+
+    let commit = CommitRequest::commit(
+        RequestId::new(),
+        principal.clone(),
+        TransportType::Gnmi,
+        RequestSource::Northbound,
+        operation,
+        candidate,
+        normalized.changed_paths_hint(),
+        Instant::now() + Duration::from_secs(30),
+    )
+    .with_base_version(snapshot.version);
+
+    let start = Instant::now();
+    bus.submit(commit)
+        .await
+        .map_err(commit_error_to_gnmi)
+        .inspect(|_| record_set_commit_latency(commit_metric, start.elapsed()))?;
+
+    Ok(gnmi::SetResponse {
+        prefix: None,
+        response: update_results(&normalized)?,
+        message: None,
+        timestamp: now_nanos(),
+        extension: Vec::new(),
+    })
+}
+
+fn normalize_set_request(
+    registry: &'static dyn SchemaRegistry,
+    limits: &MgmtLimits,
+    request: &gnmi::SetRequest,
+) -> Result<NormalizedSet, GnmiError> {
+    let prefix = request.prefix.as_ref().map(path_from_proto).transpose()?;
+    let mut normalized = NormalizedSet::new();
+
+    for path in &request.delete {
+        let path = path_from_proto(path)?;
+        normalized
+            .deletes
+            .push(resolve_writable_path(registry, prefix.as_ref(), &path)?.canonical);
+    }
+    for update in &request.replace {
+        normalized
+            .replaces
+            .push(resolve_update(registry, limits, prefix.as_ref(), update)?);
+    }
+    for update in &request.update {
+        normalized
+            .updates
+            .push(resolve_update(registry, limits, prefix.as_ref(), update)?);
+    }
+    for update in &request.union_replace {
+        normalized
+            .union_replaces
+            .push(resolve_update(registry, limits, prefix.as_ref(), update)?);
+    }
+
+    normalized.validate(limits)?;
+    Ok(normalized)
+}
+
+fn resolve_update(
+    registry: &'static dyn SchemaRegistry,
+    limits: &MgmtLimits,
+    prefix: Option<&GnmiPath>,
+    update: &gnmi::Update,
+) -> Result<(YangPath, NormalizedValue), GnmiError> {
+    let path = update
+        .path
+        .as_ref()
+        .map(path_from_proto)
+        .transpose()?
+        .unwrap_or_default();
+    let resolved = resolve_writable_path(registry, prefix, &path)?;
+    let value = update
+        .val
+        .as_ref()
+        .ok_or_else(|| GnmiError::invalid("gNMI Set update is missing TypedValue"))?;
+    let typed = typed_value_from_proto(value)?;
+    let value = normalize_typed_value(&typed, limits)?;
+    Ok((resolved.canonical, value))
+}
+
+fn resolve_writable_path(
+    registry: &'static dyn SchemaRegistry,
+    prefix: Option<&GnmiPath>,
+    path: &GnmiPath,
+) -> Result<ResolvedGnmiPath, GnmiError> {
+    let resolved = crate::resolve_path(registry, prefix, path)?;
+    if !resolved.node.config {
+        return Err(GnmiError::invalid("gNMI Set path is not writable"));
+    }
+    Ok(resolved)
+}
+
+fn update_results(normalized: &NormalizedSet) -> Result<Vec<gnmi::UpdateResult>, GnmiError> {
+    let mut results = Vec::with_capacity(normalized.len());
+    for path in &normalized.deletes {
+        results.push(update_result(path, SetOperation::Delete)?);
+    }
+    for (path, _) in &normalized.replaces {
+        results.push(update_result(path, SetOperation::Replace)?);
+    }
+    for (path, _) in &normalized.updates {
+        results.push(update_result(path, SetOperation::Update)?);
+    }
+    for (path, _) in &normalized.union_replaces {
+        results.push(update_result(path, SetOperation::UnionReplace)?);
+    }
+    Ok(results)
+}
+
+fn update_result(
+    path: &YangPath,
+    operation: SetOperation,
+) -> Result<gnmi::UpdateResult, GnmiError> {
+    Ok(gnmi::UpdateResult {
+        timestamp: 0,
+        path: Some(yang_path_to_proto(path)?),
+        message: None,
+        op: set_operation_to_proto(operation),
+    })
+}
+
+fn set_operation_to_proto(operation: SetOperation) -> i32 {
+    match operation {
+        SetOperation::Delete => gnmi::update_result::Operation::Delete as i32,
+        SetOperation::Replace => gnmi::update_result::Operation::Replace as i32,
+        SetOperation::Update => gnmi::update_result::Operation::Update as i32,
+        SetOperation::UnionReplace => gnmi::update_result::Operation::UnionReplace as i32,
+    }
+}
+
+fn set_commit_metric(operation: ConfigOperation) -> SetCommitMetric {
+    match operation {
+        ConfigOperation::Delete => SetCommitMetric::Delete,
+        ConfigOperation::Replace => SetCommitMetric::Replace,
+        ConfigOperation::Patch | ConfigOperation::Rollback => SetCommitMetric::Patch,
+    }
+}
+
+fn commit_error_to_gnmi(error: CommitError) -> GnmiError {
+    match commit_error_to_status(error.code) {
+        MgmtStatus::InvalidArgument => GnmiError::invalid("gNMI Set commit failed"),
+        MgmtStatus::NotFound => GnmiError::not_found("gNMI Set commit failed"),
+        MgmtStatus::PermissionDenied => GnmiError::PermissionDenied,
+        MgmtStatus::Unauthenticated => GnmiError::Unauthenticated,
+        MgmtStatus::Unimplemented => GnmiError::unimplemented("gNMI Set commit failed"),
+        MgmtStatus::Unavailable => GnmiError::unavailable("gNMI Set commit failed"),
+        MgmtStatus::DeadlineExceeded => GnmiError::DeadlineExceeded,
+        MgmtStatus::FailedPrecondition => GnmiError::failed_precondition("gNMI Set commit failed"),
+        MgmtStatus::Internal | MgmtStatus::Ok => GnmiError::schema("gNMI Set commit failed"),
+        _ => GnmiError::schema("gNMI Set commit failed"),
     }
 }
 
@@ -117,6 +323,7 @@ mod tests {
             deletes: vec![path("/a:b")],
             replaces: vec![(path("/a:c"), json("1"))],
             updates: Vec::new(),
+            union_replaces: Vec::new(),
         };
         assert!(set.validate(&limits).is_err());
     }
@@ -135,6 +342,7 @@ mod tests {
         assert_eq!(
             NormalizedSet {
                 replaces: vec![(path("/a:b"), json("1"))],
+                union_replaces: vec![(path("/a:c"), json("2"))],
                 ..NormalizedSet::default()
             }
             .config_operation()

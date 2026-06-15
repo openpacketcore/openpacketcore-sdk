@@ -11,6 +11,7 @@ use crate::{
     metrics::{record_rpc_error, record_rpc_success, GnmiOperation},
     proto::{gnmi, gnmi_ext},
     proto_adapter::extension_from_proto,
+    set::handle_set,
     GnmiConfigBinding, GnmiError, GnmiServer,
 };
 
@@ -188,10 +189,34 @@ where
         &self,
         request: Request<gnmi::SetRequest>,
     ) -> Result<Response<gnmi::SetResponse>, Status> {
+        let start = std::time::Instant::now();
         if let Err(err) = self.validate_authenticated_request(&request) {
+            record_rpc_error(GnmiOperation::Set, err.status(), start.elapsed());
             return Err(status_from_error(err));
         }
-        Err(unsupported_rpc_status(GnmiOperation::Set))
+        let principal = match request_principal(&request) {
+            Ok(principal) => principal,
+            Err(err) => {
+                record_rpc_error(GnmiOperation::Set, err.status(), start.elapsed());
+                return Err(status_from_error(err));
+            }
+        };
+        if let Err(err) =
+            validate_extensions(self.server.extensions(), &request.get_ref().extension)
+        {
+            record_rpc_error(GnmiOperation::Set, err.status(), start.elapsed());
+            return Err(status_from_error(err));
+        }
+        match handle_set(&self.server, principal.principal(), request.get_ref()).await {
+            Ok(response) => {
+                record_rpc_success(GnmiOperation::Set, start.elapsed());
+                Ok(Response::new(response))
+            }
+            Err(err) => {
+                record_rpc_error(GnmiOperation::Set, err.status(), start.elapsed());
+                Err(status_from_error(err))
+            }
+        }
     }
 
     async fn subscribe(
@@ -249,9 +274,12 @@ pub const fn code_from_status(status: opc_mgmt_errors::MgmtStatus) -> tonic::Cod
 #[allow(deprecated)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
-    use opc_config_bus::{ConfigBus, MockManagedDatastore};
+    use opc_config_bus::{
+        AuthorizationContext, AuthorizationError, ConfigAuthorizer, ConfigBus, MockManagedDatastore,
+    };
     use opc_config_model::{
         AuthStrength, ConfigError, TrustedPrincipal, ValidationContext, ValidationError,
         WorkloadIdentity as ConfigWorkloadIdentity, YangPath,
@@ -266,6 +294,7 @@ mod tests {
         DataClass, LeafType, ModelData, NodeKind, NodeMeta, OriginEntry, SchemaRegistry,
     };
     use opc_nacm::{ModuleRegistry, NacmAction, NacmPolicy, NacmRule, YangPathPattern};
+    use opc_redaction::metrics::METRICS;
     use tonic::codec::Codec;
     use tonic::Code;
 
@@ -449,12 +478,12 @@ mod tests {
 
     struct UnitPatcher;
 
-    #[derive(Clone)]
+    #[derive(Clone, PartialEq, Eq)]
     struct DemoUser {
         role: String,
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, PartialEq, Eq)]
     struct DemoConfig {
         hostname: String,
         users: BTreeMap<String, DemoUser>,
@@ -467,18 +496,37 @@ mod tests {
             SchemaDigest::from_bytes([2u8; 32])
         }
 
-        fn diff(&self, _previous: &Self) -> Result<Vec<Self::Delta>, ConfigError> {
-            Ok(Vec::new())
+        fn diff(&self, previous: &Self) -> Result<Vec<Self::Delta>, ConfigError> {
+            if self == previous {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![()])
+            }
         }
 
         fn changed_paths(
             &self,
-            _previous: &Self,
+            previous: &Self,
             _deltas: &[Self::Delta],
         ) -> Result<Vec<YangPath>, ConfigError> {
-            Ok(vec![
-                YangPath::new("/sys:system/sys:hostname").expect("static path")
-            ])
+            let mut paths = Vec::new();
+            if self.hostname != previous.hostname {
+                paths.push(YangPath::new("/sys:system/sys:hostname").expect("static path"));
+            }
+            for (name, current) in &self.users {
+                match previous.users.get(name) {
+                    Some(previous) if previous.role == current.role => {}
+                    _ => paths.push(user_role_yang_path(name)),
+                }
+            }
+            for name in previous.users.keys() {
+                if !self.users.contains_key(name) {
+                    paths.push(user_entry_yang_path(name));
+                }
+            }
+            paths.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            paths.dedup();
+            Ok(paths)
         }
 
         fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), ConfigError> {
@@ -486,6 +534,11 @@ mod tests {
         }
 
         fn validate_syntax(&self) -> Result<(), ValidationError> {
+            if self.hostname == "invalid-syntax-secret" {
+                return Err(ValidationError::syntax(
+                    "hostname contains forbidden syntax",
+                ));
+            }
             Ok(())
         }
 
@@ -500,11 +553,94 @@ mod tests {
     impl GnmiPatchApplicator<DemoConfig> for UnitPatcher {
         fn apply_set(
             &self,
-            _running: &DemoConfig,
-            _set: &crate::NormalizedSet,
+            running: &DemoConfig,
+            set: &crate::NormalizedSet,
         ) -> Result<DemoConfig, GnmiError> {
-            Ok(initial_config())
+            let mut candidate = running.clone();
+            for path in &set.deletes {
+                apply_demo_delete(&mut candidate, path)?;
+            }
+            for (path, value) in &set.replaces {
+                apply_demo_value(&mut candidate, path, value)?;
+            }
+            for (path, value) in &set.updates {
+                apply_demo_value(&mut candidate, path, value)?;
+            }
+            for (path, value) in &set.union_replaces {
+                apply_demo_value(&mut candidate, path, value)?;
+            }
+            Ok(candidate)
         }
+    }
+
+    fn apply_demo_value(
+        candidate: &mut DemoConfig,
+        path: &YangPath,
+        value: &crate::NormalizedValue,
+    ) -> Result<(), GnmiError> {
+        let path = path.as_str();
+        if path == "/sys:system/sys:hostname" {
+            candidate.hostname = serde_json::from_str::<String>(value.json())
+                .map_err(|_| GnmiError::invalid("invalid hostname value"))?;
+            return Ok(());
+        }
+        if let Some(name) = role_user_name(path) {
+            let role = serde_json::from_str::<String>(value.json())
+                .map_err(|_| GnmiError::invalid("invalid role value"))?;
+            candidate
+                .users
+                .entry(name.to_string())
+                .or_insert_with(|| DemoUser {
+                    role: String::new(),
+                })
+                .role = role;
+            return Ok(());
+        }
+        Err(GnmiError::invalid("unsupported demo Set path"))
+    }
+
+    fn apply_demo_delete(candidate: &mut DemoConfig, path: &YangPath) -> Result<(), GnmiError> {
+        let path = path.as_str();
+        if path == "/sys:system/sys:hostname" {
+            candidate.hostname.clear();
+            return Ok(());
+        }
+        if let Some(name) = entry_user_name(path) {
+            candidate.users.remove(name);
+            return Ok(());
+        }
+        if let Some(name) = role_user_name(path) {
+            if let Some(user) = candidate.users.get_mut(name) {
+                user.role.clear();
+            }
+            return Ok(());
+        }
+        Err(GnmiError::invalid("unsupported demo Set path"))
+    }
+
+    fn user_entry_yang_path(name: &str) -> YangPath {
+        YangPath::new(format!(
+            "/sys:system/sys:user[sys:name='{}']",
+            name.replace('\\', "\\\\").replace('\'', "\\'")
+        ))
+        .expect("static user path")
+    }
+
+    fn user_role_yang_path(name: &str) -> YangPath {
+        YangPath::new(format!("{}/sys:role", user_entry_yang_path(name).as_str()))
+            .expect("static user role path")
+    }
+
+    fn entry_user_name(path: &str) -> Option<&str> {
+        let rest = path.strip_prefix("/sys:system/sys:user[sys:name='")?;
+        let (name, suffix) = rest.split_once("']")?;
+        suffix.is_empty().then_some(name)
+    }
+
+    fn role_user_name(path: &str) -> Option<&str> {
+        let rest = path.strip_prefix("/sys:system/sys:user[sys:name='")?;
+        let (name, suffix) = rest.split_once("']")?;
+        (suffix == "/sys:role").then_some(name)
     }
 
     fn initial_config() -> DemoConfig {
@@ -605,6 +741,19 @@ mod tests {
     async fn service_with_authentication(
         authenticated: bool,
     ) -> GnmiService<DemoConfig, TestBinding> {
+        service_with_authentication_and_limits(authenticated, MgmtLimits::default()).await
+    }
+
+    async fn authenticated_service_with_limits(
+        limits: MgmtLimits,
+    ) -> GnmiService<DemoConfig, TestBinding> {
+        service_with_authentication_and_limits(true, limits).await
+    }
+
+    async fn service_with_authentication_and_limits(
+        authenticated: bool,
+        limits: MgmtLimits,
+    ) -> GnmiService<DemoConfig, TestBinding> {
         let bus = Arc::new(
             ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
                 .await
@@ -618,7 +767,7 @@ mod tests {
                 policy: Arc::new(FixedPolicy(allow_all_read_policy())),
                 operational: Arc::new(TestOperationalState),
             },
-            MgmtLimits::default(),
+            limits,
             profile,
             ExtensionRegistry::default(),
         )
@@ -683,11 +832,32 @@ mod tests {
     async fn authenticated_service_with_policy(
         policy: NacmPolicy,
     ) -> GnmiService<DemoConfig, TestBinding> {
+        authenticated_service_with_policy_and_bus(
+            policy,
+            Arc::new(
+                ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
+                    .await
+                    .expect("bus"),
+            ),
+        )
+        .await
+    }
+
+    async fn authenticated_service_with_write_authorizer(
+        authorizer: Arc<dyn ConfigAuthorizer>,
+    ) -> GnmiService<DemoConfig, TestBinding> {
         let bus = Arc::new(
-            ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
+            ConfigBus::new(initial_config(), MockManagedDatastore::new(), authorizer)
                 .await
                 .expect("bus"),
         );
+        authenticated_service_with_policy_and_bus(allow_all_read_policy(), bus).await
+    }
+
+    async fn authenticated_service_with_policy_and_bus(
+        policy: NacmPolicy,
+        bus: Arc<ConfigBus<DemoConfig>>,
+    ) -> GnmiService<DemoConfig, TestBinding> {
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
         let server = GnmiServer::new(
@@ -702,6 +872,115 @@ mod tests {
         )
         .expect("server");
         GnmiService::new_authenticated(server)
+    }
+
+    struct DenyWriteAuthorizer;
+
+    #[async_trait::async_trait]
+    impl ConfigAuthorizer for DenyWriteAuthorizer {
+        async fn authorize(&self, ctx: &AuthorizationContext) -> Result<(), AuthorizationError> {
+            assert_eq!(ctx.transport, opc_config_model::TransportType::Gnmi);
+            assert_eq!(ctx.source, opc_config_model::RequestSource::Northbound);
+            assert_eq!(ctx.operation, opc_config_model::ConfigOperation::Replace);
+            assert_eq!(
+                ctx.changed_paths,
+                vec![YangPath::new("/sys:system/sys:hostname").expect("static path")]
+            );
+            Err(AuthorizationError::new("secret-authorizer-detail"))
+        }
+    }
+
+    fn path_elem(name: &str) -> gnmi::PathElem {
+        gnmi::PathElem {
+            name: name.to_string(),
+            key: Default::default(),
+        }
+    }
+
+    fn keyed_path_elem(name: &str, key: &str, value: &str) -> gnmi::PathElem {
+        gnmi::PathElem {
+            name: name.to_string(),
+            key: [(key.to_string(), value.to_string())].into_iter().collect(),
+        }
+    }
+
+    fn gnmi_path(elems: Vec<gnmi::PathElem>) -> gnmi::Path {
+        gnmi::Path {
+            element: Vec::new(),
+            origin: String::new(),
+            elem: elems,
+            target: String::new(),
+        }
+    }
+
+    fn hostname_path() -> gnmi::Path {
+        gnmi_path(vec![path_elem("system"), path_elem("hostname")])
+    }
+
+    fn uptime_path() -> gnmi::Path {
+        gnmi_path(vec![path_elem("system"), path_elem("uptime")])
+    }
+
+    fn user_path(name: &str) -> gnmi::Path {
+        gnmi_path(vec![
+            path_elem("system"),
+            keyed_path_elem("user", "name", name),
+        ])
+    }
+
+    fn user_role_path(name: &str) -> gnmi::Path {
+        gnmi_path(vec![
+            path_elem("system"),
+            keyed_path_elem("user", "name", name),
+            path_elem("role"),
+        ])
+    }
+
+    fn json_update(path: gnmi::Path, json: impl Into<Vec<u8>>) -> gnmi::Update {
+        gnmi::Update {
+            path: Some(path),
+            value: None,
+            val: Some(gnmi::TypedValue {
+                value: Some(gnmi::typed_value::Value::JsonIetfVal(json.into())),
+            }),
+            duplicates: 0,
+        }
+    }
+
+    fn authenticated_set_request(set: gnmi::SetRequest) -> Request<gnmi::SetRequest> {
+        let mut request = Request::new(set);
+        request.extensions_mut().insert(authenticated_principal());
+        request
+    }
+
+    fn gnmi_rpc_request_count(operation: &str, outcome: &str) -> u64 {
+        METRICS
+            .gnmi_rpc_requests_total
+            .lock()
+            .expect("metrics")
+            .get(&(operation.to_string(), outcome.to_string()))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn gnmi_rpc_error_count(operation: &str, status: &str) -> u64 {
+        METRICS
+            .gnmi_rpc_errors_total
+            .lock()
+            .expect("metrics")
+            .get(&(operation.to_string(), status.to_string()))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn gnmi_set_commit_count(operation: &str) -> u64 {
+        METRICS
+            .gnmi_set_commit_seconds
+            .lock()
+            .expect("metrics")
+            .get(operation)
+            .map(|hist| hist.count.load(Ordering::Relaxed))
+            .unwrap_or_default()
     }
 
     #[tokio::test]
@@ -1098,7 +1377,327 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthenticated_get_is_rejected_and_set_subscribe_are_unimplemented() {
+    async fn authenticated_set_update_commits_running_and_returns_result() {
+        let service = authenticated_service().await;
+        let response = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(hostname_path(), br#""amf-2""#.to_vec())],
+                union_replace: Vec::new(),
+                extension: Vec::new(),
+            }))
+            .await
+            .expect("set")
+            .into_inner();
+
+        assert_eq!(response.response.len(), 1);
+        assert_eq!(
+            response.response[0].op,
+            gnmi::update_result::Operation::Update as i32
+        );
+        assert_eq!(
+            response.response[0].path.as_ref().unwrap().elem[1].name,
+            "sys:hostname"
+        );
+        assert!(response.timestamp > 0);
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_records_success_and_commit_metrics() {
+        let rpc_success_before = gnmi_rpc_request_count("Set", "success");
+        let patch_commit_before = gnmi_set_commit_count("patch");
+        let service = authenticated_service().await;
+
+        service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(hostname_path(), br#""amf-metrics""#.to_vec())],
+                union_replace: Vec::new(),
+                extension: Vec::new(),
+            }))
+            .await
+            .expect("set");
+
+        assert!(gnmi_rpc_request_count("Set", "success") > rpc_success_before);
+        assert!(gnmi_set_commit_count("patch") > patch_commit_before);
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_delete_replace_and_union_replace_are_atomic() {
+        let service = authenticated_service().await;
+        let response = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: vec![user_path("guest")],
+                replace: vec![json_update(hostname_path(), br#""amf-3""#.to_vec())],
+                update: Vec::new(),
+                union_replace: vec![json_update(
+                    user_role_path("admin"),
+                    br#""operator""#.to_vec(),
+                )],
+                extension: Vec::new(),
+            }))
+            .await
+            .expect("set")
+            .into_inner();
+
+        let ops = response
+            .response
+            .iter()
+            .map(|result| result.op)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ops,
+            vec![
+                gnmi::update_result::Operation::Delete as i32,
+                gnmi::update_result::Operation::Replace as i32,
+                gnmi::update_result::Operation::UnionReplace as i32,
+            ]
+        );
+
+        let snapshot = service.server().binding().config_bus().current_snapshot();
+        assert_eq!(snapshot.config.hostname, "amf-3");
+        assert_eq!(
+            snapshot
+                .config
+                .users
+                .get("admin")
+                .map(|user| user.role.as_str()),
+            Some("operator")
+        );
+        assert!(!snapshot.config.users.contains_key("guest"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_enforces_path_and_value_limits_without_mutation() {
+        let path_limited = authenticated_service_with_limits(MgmtLimits {
+            max_paths_per_request: 1,
+            ..MgmtLimits::default()
+        })
+        .await;
+        let error_before = gnmi_rpc_error_count("Set", "INVALID_ARGUMENT");
+        let too_many_paths = path_limited
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![
+                    json_update(hostname_path(), br#""amf-4""#.to_vec()),
+                    json_update(user_role_path("admin"), br#""operator""#.to_vec()),
+                ],
+                union_replace: Vec::new(),
+                extension: Vec::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(too_many_paths.code(), Code::InvalidArgument);
+        assert_eq!(too_many_paths.message(), "invalid gNMI request");
+        assert_eq!(
+            path_limited
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-1"
+        );
+
+        let value_limited = authenticated_service_with_limits(MgmtLimits {
+            max_value_bytes: 8,
+            ..MgmtLimits::default()
+        })
+        .await;
+        let too_large_value = value_limited
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(
+                    hostname_path(),
+                    br#""secret-too-long""#.to_vec(),
+                )],
+                union_replace: Vec::new(),
+                extension: Vec::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(too_large_value.code(), Code::InvalidArgument);
+        assert_eq!(too_large_value.message(), "invalid gNMI request");
+        assert!(!too_large_value.message().contains("secret-too-long"));
+        assert_eq!(
+            value_limited
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-1"
+        );
+        assert!(gnmi_rpc_error_count("Set", "INVALID_ARGUMENT") > error_before);
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_rejects_readonly_and_malformed_values_without_leak() {
+        let service = authenticated_service().await;
+        let readonly = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(uptime_path(), b"10".to_vec())],
+                union_replace: Vec::new(),
+                extension: Vec::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(readonly.code(), Code::InvalidArgument);
+
+        let malformed = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(hostname_path(), b"\"secret-host".to_vec())],
+                union_replace: Vec::new(),
+                extension: Vec::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(malformed.code(), Code::InvalidArgument);
+        assert_eq!(malformed.message(), "invalid gNMI request");
+        assert!(!malformed.message().contains("secret-host"));
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_commit_validation_error_is_mapped_without_leak() {
+        let service = authenticated_service().await;
+        let status = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: vec![json_update(
+                    hostname_path(),
+                    br#""invalid-syntax-secret""#.to_vec(),
+                )],
+                update: Vec::new(),
+                union_replace: Vec::new(),
+                extension: Vec::new(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "invalid gNMI request");
+        assert!(!status.message().contains("invalid-syntax-secret"));
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_commit_authorization_denial_is_generic_and_atomic() {
+        let service =
+            authenticated_service_with_write_authorizer(Arc::new(DenyWriteAuthorizer)).await;
+        let status = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: vec![json_update(hostname_path(), br#""secret-host""#.to_vec())],
+                update: Vec::new(),
+                union_replace: Vec::new(),
+                extension: Vec::new(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_eq!(status.message(), "gNMI access denied");
+        assert!(!status.message().contains("secret-host"));
+        assert!(!status.message().contains("secret-authorizer-detail"));
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_rejects_unknown_extension_before_mutation_without_leak() {
+        let service = authenticated_service().await;
+        let status = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(hostname_path(), br#""amf-4""#.to_vec())],
+                union_replace: Vec::new(),
+                extension: vec![gnmi_ext::Extension {
+                    ext: Some(gnmi_ext::extension::Ext::RegisteredExt(
+                        gnmi_ext::RegisteredExtension {
+                            id: gnmi_ext::ExtensionId::EidExperimental as i32,
+                            msg: b"secret-extension-payload".to_vec(),
+                        },
+                    )),
+                }],
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::Unimplemented);
+        assert_eq!(status.message(), "gNMI operation is not supported");
+        assert!(!status.message().contains("secret-extension-payload"));
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_get_and_set_are_rejected_and_subscribe_is_unimplemented() {
         let service = service().await;
 
         let get = service
@@ -1125,7 +1724,7 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert_eq!(set.code(), Code::Unimplemented);
+        assert_eq!(set.code(), Code::Unauthenticated);
 
         let mut codec =
             tonic::codec::ProstCodec::<gnmi::SubscribeResponse, gnmi::SubscribeRequest>::default();
