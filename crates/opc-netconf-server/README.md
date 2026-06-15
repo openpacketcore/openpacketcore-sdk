@@ -28,6 +28,9 @@ The current slice is capability-gated and capability-honest:
   registry-aware NETCONF session execution. Verified SSH usernames are mapped
   through `opc-mgmt-principal` into grant-free `TrustedPrincipal` values stamped
   `AuthStrength::SshPublicKey`.
+- NETCONF-over-SSH Call Home loop that dials configured NMS endpoints
+  round-robin with bounded reconnect backoff and deterministic jitter, then runs
+  the same SSH server/auth/subsystem/session path over the outbound TCP stream.
 - Bounded XML parsing for client `<hello>` and RPC envelopes, including
   fail-closed rejection of missing, empty, or duplicate client hello capability
   containers, plus `MgmtLimits::max_paths_per_request` enforcement after subtree
@@ -135,11 +138,12 @@ out-of-range `<session-id>`. Custom transports that advertise a server
 `<kill-session>` and datastore lock/write semantics.
 
 It still does not implement SSH host-key generation/storage/rotation, SSH
-certificate CA authorization, password authentication, Call Home, notification
-replay or notification filters, NMDA `<get-data>` / `<edit-data>`, a full RFC
-XPath instance evaluator or advertised `:xpath`, URL and inline-config
-copy/validate forms, `:rollback-on-error`, or external interop against
-`netopeer2-cli`, `ncclient`, or a target NMS. CNFs may use generated NETCONF XML
-projection/edit support for supported shapes, but unsupported YANG shapes remain
-fail-closed and model-specific bindings still own any projection/edit behavior
-outside the generated support matrix.
+certificate CA authorization, password authentication, TLS Call Home,
+NMS-profile-specific Call Home endpoint policy, notification replay or
+notification filters, NMDA `<get-data>` / `<edit-data>`, a full RFC XPath
+instance evaluator or advertised `:xpath`, URL and inline-config copy/validate
+forms, `:rollback-on-error`, or external interop against `netopeer2-cli`,
+`ncclient`, or a target NMS. CNFs may use generated NETCONF XML projection/edit
+support for supported shapes, but unsupported YANG shapes remain fail-closed and
+model-specific bindings still own any projection/edit behavior outside the
+generated support matrix.
