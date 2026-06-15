@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opc_config_bus::{ConfigEvent, SubscriberLagPolicy};
-use opc_config_model::{OpcConfig, TrustedPrincipal, YangPath};
+use opc_config_model::{OpcConfig, RequestId, TrustedPrincipal, YangPath};
+use opc_mgmt_audit::{AuditOperation, AuditOutcome, SchemaNodePath};
 use opc_mgmt_authz::{ReadAction, ReadAuthorizer};
 use opc_mgmt_opstate::{
     OperationalEvent, OperationalEventReceiver, OperationalSubscriptionRequest,
@@ -16,9 +17,10 @@ use prost::Message;
 use tokio::sync::mpsc;
 use tonic::{Status, Streaming};
 
+use crate::audit::{outcome_for_error, record_audit, schema_paths_for_schema};
 use crate::get::{
-    encoding_from_proto, handle_read_request, now_nanos, operational_error, update_to_proto,
-    yang_path_to_proto,
+    encoding_from_proto, handle_read_request, now_nanos, operational_error, select_paths,
+    update_to_proto, yang_path_to_proto, GetDataType, ModelFilter,
 };
 use crate::metrics::{
     active_stream, record_nacm_denials, record_rpc_error, GnmiNacmAction, GnmiOperation,
@@ -43,19 +45,72 @@ where
     C: OpcConfig + 'static,
     B: GnmiConfigBinding<C> + 'static,
 {
-    let first = inbound
-        .message()
-        .await
-        .map_err(|_| GnmiError::unavailable("gNMI Subscribe request stream failed"))?
-        .ok_or_else(|| GnmiError::invalid("gNMI Subscribe stream ended before subscription"))?;
-    validate_extensions(server.extensions(), &first.extension)?;
-    let plan = SubscribePlan::from_first_request(server.as_ref(), first)?;
+    let request_id = RequestId::new();
+    let first = match inbound.message().await {
+        Ok(Some(first)) => first,
+        Ok(None) => {
+            let err = GnmiError::invalid("gNMI Subscribe stream ended before subscription");
+            audit_subscribe_result(
+                server.as_ref(),
+                request_id,
+                &principal,
+                outcome_for_error(&err),
+                Vec::new(),
+            )?;
+            return Err(err);
+        }
+        Err(_) => {
+            let err = GnmiError::unavailable("gNMI Subscribe request stream failed");
+            audit_subscribe_result(
+                server.as_ref(),
+                request_id,
+                &principal,
+                outcome_for_error(&err),
+                Vec::new(),
+            )?;
+            return Err(err);
+        }
+    };
+    if let Err(err) = validate_extensions(server.extensions(), &first.extension) {
+        audit_subscribe_result(
+            server.as_ref(),
+            request_id,
+            &principal,
+            outcome_for_error(&err),
+            Vec::new(),
+        )?;
+        return Err(err);
+    }
+    let plan = match SubscribePlan::from_first_request(server.as_ref(), first) {
+        Ok(plan) => plan,
+        Err(err) => {
+            audit_subscribe_result(
+                server.as_ref(),
+                request_id,
+                &principal,
+                outcome_for_error(&err),
+                Vec::new(),
+            )?;
+            return Err(err);
+        }
+    };
+    audit_subscribe_result(
+        server.as_ref(),
+        request_id,
+        &principal,
+        AuditOutcome::Success,
+        plan.audit_paths.clone(),
+    )?;
     let _guard = active_stream(plan.metric_mode());
 
     match plan.mode {
         SubscribeListMode::Once => serve_once(server.as_ref(), &principal, &plan, &outbound).await,
-        SubscribeListMode::Poll => serve_poll(server, principal, plan, inbound, outbound).await,
-        SubscribeListMode::Stream => serve_stream(server, principal, plan, inbound, outbound).await,
+        SubscribeListMode::Poll => {
+            serve_poll(server, request_id, principal, plan, inbound, outbound).await
+        }
+        SubscribeListMode::Stream => {
+            serve_stream(server, request_id, principal, plan, inbound, outbound).await
+        }
     }
 }
 
@@ -81,6 +136,7 @@ where
 
 async fn serve_poll<C, B>(
     server: Arc<GnmiServer<C, B>>,
+    request_id: RequestId,
     principal: TrustedPrincipal,
     plan: SubscribePlan,
     mut inbound: Streaming<gnmi::SubscribeRequest>,
@@ -99,7 +155,16 @@ where
         else {
             return Ok(());
         };
-        validate_extensions(server.extensions(), &request.extension)?;
+        if let Err(err) = validate_extensions(server.extensions(), &request.extension) {
+            audit_subscribe_result(
+                server.as_ref(),
+                request_id,
+                &principal,
+                outcome_for_error(&err),
+                plan.audit_paths.clone(),
+            )?;
+            return Err(err);
+        }
         match request.request {
             Some(gnmi::subscribe_request::Request::Poll(_)) => {
                 if !plan.updates_only {
@@ -120,17 +185,36 @@ where
                 send_sync(&outbound).await?;
             }
             Some(gnmi::subscribe_request::Request::Subscribe(_)) => {
-                return Err(GnmiError::invalid(
+                let err = GnmiError::invalid(
                     "gNMI Subscribe stream cannot replace an active subscription",
-                ));
+                );
+                audit_subscribe_result(
+                    server.as_ref(),
+                    request_id,
+                    &principal,
+                    outcome_for_error(&err),
+                    plan.audit_paths.clone(),
+                )?;
+                return Err(err);
             }
-            None => return Err(GnmiError::invalid("empty gNMI Subscribe request")),
+            None => {
+                let err = GnmiError::invalid("empty gNMI Subscribe request");
+                audit_subscribe_result(
+                    server.as_ref(),
+                    request_id,
+                    &principal,
+                    outcome_for_error(&err),
+                    plan.audit_paths.clone(),
+                )?;
+                return Err(err);
+            }
         }
     }
 }
 
 async fn serve_stream<C, B>(
     server: Arc<GnmiServer<C, B>>,
+    request_id: RequestId,
     principal: TrustedPrincipal,
     plan: SubscribePlan,
     mut inbound: Streaming<gnmi::SubscribeRequest>,
@@ -200,15 +284,50 @@ where
                 let Some(request) = request else {
                     return Ok(());
                 };
-                validate_extensions(server.extensions(), &request.extension)?;
+                if let Err(err) = validate_extensions(server.extensions(), &request.extension) {
+                    audit_subscribe_result(
+                        server.as_ref(),
+                        request_id,
+                        &principal,
+                        outcome_for_error(&err),
+                        plan.audit_paths.clone(),
+                    )?;
+                    return Err(err);
+                }
                 match request.request {
                     Some(gnmi::subscribe_request::Request::Poll(_)) => {
-                        return Err(GnmiError::invalid("poll request sent to STREAM subscription"));
+                        let err = GnmiError::invalid("poll request sent to STREAM subscription");
+                        audit_subscribe_result(
+                            server.as_ref(),
+                            request_id,
+                            &principal,
+                            outcome_for_error(&err),
+                            plan.audit_paths.clone(),
+                        )?;
+                        return Err(err);
                     }
                     Some(gnmi::subscribe_request::Request::Subscribe(_)) => {
-                        return Err(GnmiError::invalid("gNMI Subscribe stream cannot replace an active subscription"));
+                        let err = GnmiError::invalid("gNMI Subscribe stream cannot replace an active subscription");
+                        audit_subscribe_result(
+                            server.as_ref(),
+                            request_id,
+                            &principal,
+                            outcome_for_error(&err),
+                            plan.audit_paths.clone(),
+                        )?;
+                        return Err(err);
                     }
-                    None => return Err(GnmiError::invalid("empty gNMI Subscribe request")),
+                    None => {
+                        let err = GnmiError::invalid("empty gNMI Subscribe request");
+                        audit_subscribe_result(
+                            server.as_ref(),
+                            request_id,
+                            &principal,
+                            outcome_for_error(&err),
+                            plan.audit_paths.clone(),
+                        )?;
+                        return Err(err);
+                    }
                 }
             }
             event = async {
@@ -240,7 +359,7 @@ where
             }, if operational_rx.is_some() => {
                 match event {
                     Some(Ok(event)) => {
-                        if !send_operational_event(server.as_ref(), &principal, &plan, event, &outbound).await? {
+                        if !send_operational_event(server.as_ref(), request_id, &principal, &plan, event, &outbound).await? {
                             return Ok(());
                         }
                     }
@@ -358,6 +477,7 @@ where
 
 pub(crate) async fn send_operational_event<C, B>(
     server: &GnmiServer<C, B>,
+    request_id: RequestId,
     principal: &TrustedPrincipal,
     plan: &SubscribePlan,
     event: OperationalEvent,
@@ -398,6 +518,13 @@ where
         .map_err(|_| GnmiError::unavailable("gNMI subscribe policy source unavailable"))?;
     if decisions.first().is_none_or(|decision| !decision.allowed) {
         record_nacm_denials(GnmiNacmAction::Subscribe, 1);
+        audit_subscribe_result(
+            server,
+            request_id,
+            principal,
+            AuditOutcome::denied_code(opc_mgmt_audit::AuditReasonCode::ACCESS_DENIED),
+            schema_paths_for_schema([node.path])?,
+        )?;
         return Ok(true);
     }
 
@@ -437,6 +564,27 @@ where
     Ok(true)
 }
 
+fn audit_subscribe_result<C, B>(
+    server: &GnmiServer<C, B>,
+    request_id: RequestId,
+    principal: &TrustedPrincipal,
+    outcome: AuditOutcome,
+    paths: Vec<SchemaNodePath>,
+) -> Result<(), GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    record_audit(
+        server.audit(),
+        request_id,
+        principal,
+        AuditOperation::Subscribe,
+        outcome,
+        paths,
+    )
+}
+
 async fn send_sync(
     outbound: &mpsc::Sender<Result<gnmi::SubscribeResponse, Status>>,
 ) -> Result<(), GnmiError> {
@@ -470,6 +618,7 @@ pub(crate) struct SubscribePlan {
     updates_only: bool,
     get_request: gnmi::GetRequest,
     stream: Option<StreamPlan>,
+    audit_paths: Vec<SchemaNodePath>,
 }
 
 impl SubscribePlan {
@@ -530,6 +679,7 @@ impl SubscribePlan {
         let stream = (mode == SubscribeListMode::Stream)
             .then(|| stream_plan(server, &list))
             .transpose()?;
+        let audit_paths = subscribe_audit_paths(server, &list)?;
         let paths = list
             .subscription
             .iter()
@@ -548,6 +698,7 @@ impl SubscribePlan {
             updates_only: list.updates_only,
             get_request,
             stream,
+            audit_paths,
         })
     }
 
@@ -558,6 +709,45 @@ impl SubscribePlan {
             SubscribeListMode::Stream => SubscribeModeMetric::Stream,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn audit_paths(&self) -> &[SchemaNodePath] {
+        &self.audit_paths
+    }
+}
+
+fn subscribe_audit_paths<C, B>(
+    server: &GnmiServer<C, B>,
+    list: &gnmi::SubscriptionList,
+) -> Result<Vec<SchemaNodePath>, GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    let registry = server.binding().schema();
+    let model_filter = ModelFilter::new(registry, &list.use_models)?;
+    let prefix = list.prefix.as_ref().map(path_from_proto).transpose()?;
+    let request_paths = list
+        .subscription
+        .iter()
+        .map(|subscription| {
+            subscription
+                .path
+                .as_ref()
+                .map(path_from_proto)
+                .transpose()
+                .map(|path| path.unwrap_or_default())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let entries = select_paths(
+        registry,
+        server.limits(),
+        prefix.as_ref(),
+        &request_paths,
+        GetDataType::All,
+        &model_filter,
+    )?;
+    schema_paths_for_schema(entries.iter().map(|entry| entry.schema_path()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

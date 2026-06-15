@@ -8,10 +8,12 @@ use opc_config_model::{
     CommitError, CommitRequest, ConfigOperation, OpcConfig, RequestId, RequestSource,
     TransportType, TrustedPrincipal, YangPath,
 };
+use opc_mgmt_audit::{AuditOperation, AuditOutcome};
 use opc_mgmt_errors::{commit_error_to_status, MgmtStatus};
 use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_schema::SchemaRegistry;
 
+use crate::audit::{outcome_for_error, record_audit, schema_paths_for_yang};
 use crate::get::{now_nanos, yang_path_to_proto};
 use crate::metrics::{record_set_commit_latency, SetCommitMetric};
 use crate::proto::gnmi;
@@ -130,19 +132,51 @@ where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
 {
-    let normalized = normalize_set_request(server.binding().schema(), server.limits(), request)?;
+    let request_id = RequestId::new();
+    let normalized =
+        match normalize_set_request(server.binding().schema(), server.limits(), request) {
+            Ok(normalized) => normalized,
+            Err(err) => {
+                audit_set_result(
+                    server,
+                    request_id,
+                    principal,
+                    AuditOperation::Update,
+                    outcome_for_error(&err),
+                    Vec::new(),
+                )?;
+                return Err(err);
+            }
+        };
     let operation = normalized.config_operation()?;
     let commit_metric = set_commit_metric(operation);
+    let audit_operation = set_audit_operation(operation);
+    let audit_paths =
+        schema_paths_for_yang(server.binding().schema(), normalized.changed_paths_hint())?;
 
     let bus = server.binding().config_bus();
     let snapshot = bus.current_snapshot();
-    let candidate = server
+    let candidate = match server
         .binding()
         .patcher()
-        .apply_set(snapshot.config.as_ref(), &normalized)?;
+        .apply_set(snapshot.config.as_ref(), &normalized)
+    {
+        Ok(candidate) => candidate,
+        Err(err) => {
+            audit_set_result(
+                server,
+                request_id,
+                principal,
+                audit_operation,
+                outcome_for_error(&err),
+                audit_paths,
+            )?;
+            return Err(err);
+        }
+    };
 
     let commit = CommitRequest::commit(
-        RequestId::new(),
+        request_id,
         principal.clone(),
         TransportType::Gnmi,
         RequestSource::Northbound,
@@ -154,10 +188,31 @@ where
     .with_base_version(snapshot.version);
 
     let start = Instant::now();
-    bus.submit(commit)
-        .await
-        .map_err(commit_error_to_gnmi)
-        .inspect(|_| record_set_commit_latency(commit_metric, start.elapsed()))?;
+    match bus.submit(commit).await {
+        Ok(_) => {
+            record_set_commit_latency(commit_metric, start.elapsed());
+            audit_set_result(
+                server,
+                request_id,
+                principal,
+                audit_operation,
+                AuditOutcome::Success,
+                audit_paths,
+            )?;
+        }
+        Err(err) => {
+            let err = commit_error_to_gnmi(err);
+            audit_set_result(
+                server,
+                request_id,
+                principal,
+                audit_operation,
+                outcome_for_error(&err),
+                audit_paths,
+            )?;
+            return Err(err);
+        }
+    }
 
     Ok(gnmi::SetResponse {
         prefix: None,
@@ -166,6 +221,28 @@ where
         timestamp: now_nanos(),
         extension: Vec::new(),
     })
+}
+
+fn audit_set_result<C, B>(
+    server: &GnmiServer<C, B>,
+    request_id: RequestId,
+    principal: &TrustedPrincipal,
+    operation: AuditOperation,
+    outcome: AuditOutcome,
+    paths: Vec<opc_mgmt_audit::SchemaNodePath>,
+) -> Result<(), GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    record_audit(
+        server.audit(),
+        request_id,
+        principal,
+        operation,
+        outcome,
+        paths,
+    )
 }
 
 fn normalize_set_request(
@@ -279,6 +356,14 @@ fn set_commit_metric(operation: ConfigOperation) -> SetCommitMetric {
         ConfigOperation::Delete => SetCommitMetric::Delete,
         ConfigOperation::Replace => SetCommitMetric::Replace,
         ConfigOperation::Patch | ConfigOperation::Rollback => SetCommitMetric::Patch,
+    }
+}
+
+fn set_audit_operation(operation: ConfigOperation) -> AuditOperation {
+    match operation {
+        ConfigOperation::Delete => AuditOperation::Delete,
+        ConfigOperation::Replace => AuditOperation::Replace,
+        ConfigOperation::Patch | ConfigOperation::Rollback => AuditOperation::Update,
     }
 }
 

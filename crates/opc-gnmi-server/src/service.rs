@@ -2,10 +2,12 @@
 
 use std::{pin::Pin, sync::Arc};
 
-use opc_config_model::{AuthStrength, OpcConfig, TrustedPrincipal};
+use opc_config_model::{AuthStrength, OpcConfig, RequestId, TrustedPrincipal};
+use opc_mgmt_audit::AuditOperation;
 use tonic::{Request, Response, Status};
 
 use crate::{
+    audit::{outcome_for_error, record_audit},
     encoding_to_proto,
     get::handle_get,
     metrics::{record_rpc_error, record_rpc_success, GnmiOperation},
@@ -205,8 +207,18 @@ where
         if let Err(err) =
             validate_extensions(self.server.extensions(), &request.get_ref().extension)
         {
-            record_rpc_error(GnmiOperation::Set, err.status(), start.elapsed());
-            return Err(status_from_error(err));
+            let final_err = record_audit(
+                self.server.audit(),
+                RequestId::new(),
+                principal.principal(),
+                AuditOperation::Update,
+                outcome_for_error(&err),
+                Vec::new(),
+            )
+            .err()
+            .unwrap_or(err);
+            record_rpc_error(GnmiOperation::Set, final_err.status(), start.elapsed());
+            return Err(status_from_error(final_err));
         }
         match handle_set(&self.server, principal.principal(), request.get_ref()).await {
             Ok(response) => {
@@ -304,8 +316,11 @@ mod tests {
         AuthorizationContext, AuthorizationError, ConfigAuthorizer, ConfigBus, MockManagedDatastore,
     };
     use opc_config_model::{
-        AuthStrength, ConfigError, TrustedPrincipal, ValidationContext, ValidationError,
+        AuthStrength, ConfigError, RequestId, TrustedPrincipal, ValidationContext, ValidationError,
         WorkloadIdentity as ConfigWorkloadIdentity, YangPath,
+    };
+    use opc_mgmt_audit::{
+        AuditError, AuditEvent, AuditOutcome, AuditReasonCode, AuditSink, SchemaNodePath,
     };
     use opc_mgmt_authz::{AuthzError, PolicySource};
     use opc_mgmt_limits::MgmtLimits;
@@ -319,12 +334,15 @@ mod tests {
     };
     use opc_nacm::{ModuleRegistry, NacmAction, NacmPolicy, NacmRule, YangPathPattern};
     use opc_redaction::metrics::METRICS;
+    use prost::Message;
     use tonic::codec::Codec;
     use tonic::Code;
 
     use super::*;
     use crate::proto::gnmi::g_nmi_server::GNmi;
-    use crate::subscribe::{render_snapshot_responses, send_operational_event, SubscribePlan};
+    use crate::subscribe::{
+        render_snapshot_responses, send_operational_event, serve_subscribe_stream, SubscribePlan,
+    };
     use crate::{
         CapabilityProfile, ExtensionRegistry, GnmiJsonProjectionError, GnmiJsonUpdate,
         GnmiPatchApplicator, GnmiVersion, ReadSelection, GNMI_VERSION,
@@ -517,6 +535,29 @@ mod tests {
                 .push(request.clone());
             let (_tx, rx) = operational_event_channel(request.max_queued_events());
             Ok(rx)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturingAudit {
+        events: Arc<Mutex<Vec<AuditEvent>>>,
+    }
+
+    impl AuditSink for CapturingAudit {
+        fn record(&self, event: &AuditEvent) -> Result<(), AuditError> {
+            self.events.lock().expect("audit mutex").push(event.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingAudit;
+
+    impl AuditSink for FailingAudit {
+        fn record(&self, _event: &AuditEvent) -> Result<(), AuditError> {
+            Err(AuditError::unavailable(
+                "failed writing audit for /sys:system/sys:user[sys:name='secret-admin']",
+            ))
         }
     }
 
@@ -932,22 +973,23 @@ mod tests {
         .await
     }
 
-    async fn authenticated_service_with_write_authorizer(
+    async fn authenticated_service_with_write_authorizer_and_audit(
         authorizer: Arc<dyn ConfigAuthorizer>,
+        audit: Arc<dyn AuditSink>,
     ) -> GnmiService<DemoConfig, TestBinding> {
         let bus = Arc::new(
             ConfigBus::new(initial_config(), MockManagedDatastore::new(), authorizer)
                 .await
                 .expect("bus"),
         );
-        authenticated_service_with_policy_and_bus(allow_all_read_policy(), bus).await
-    }
-
-    async fn authenticated_service_with_policy_and_bus(
-        policy: NacmPolicy,
-        bus: Arc<ConfigBus<DemoConfig>>,
-    ) -> GnmiService<DemoConfig, TestBinding> {
-        authenticated_service_with_policy_bus_events(policy, bus, None, MgmtLimits::default()).await
+        authenticated_service_with_policy_bus_events_audit(
+            allow_all_read_policy(),
+            bus,
+            None,
+            MgmtLimits::default(),
+            audit,
+        )
+        .await
     }
 
     async fn authenticated_service_with_policy_and_event_source(
@@ -956,6 +998,24 @@ mod tests {
     ) -> GnmiService<DemoConfig, TestBinding> {
         authenticated_service_with_policy_limits_events(policy, MgmtLimits::default(), Some(events))
             .await
+    }
+
+    async fn authenticated_service_with_policy_and_audit(
+        policy: NacmPolicy,
+        audit: Arc<dyn AuditSink>,
+    ) -> GnmiService<DemoConfig, TestBinding> {
+        authenticated_service_with_policy_bus_events_audit(
+            policy,
+            Arc::new(
+                ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
+                    .await
+                    .expect("bus"),
+            ),
+            None,
+            MgmtLimits::default(),
+            audit,
+        )
+        .await
     }
 
     async fn authenticated_service_with_policy_limits_events(
@@ -994,6 +1054,31 @@ mod tests {
             limits,
             profile,
             ExtensionRegistry::default(),
+        )
+        .expect("server");
+        GnmiService::new_authenticated(server)
+    }
+
+    async fn authenticated_service_with_policy_bus_events_audit(
+        policy: NacmPolicy,
+        bus: Arc<ConfigBus<DemoConfig>>,
+        events: Option<Arc<dyn OperationalEventSource>>,
+        limits: MgmtLimits,
+        audit: Arc<dyn AuditSink>,
+    ) -> GnmiService<DemoConfig, TestBinding> {
+        let profile =
+            CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
+        let server = GnmiServer::new_with_audit(
+            TestBinding {
+                bus,
+                policy: Arc::new(FixedPolicy(policy)),
+                operational: Arc::new(TestOperationalState),
+                events,
+            },
+            limits,
+            profile,
+            ExtensionRegistry::default(),
+            audit,
         )
         .expect("server");
         GnmiService::new_authenticated(server)
@@ -1108,6 +1193,18 @@ mod tests {
             .unwrap_or_default()
     }
 
+    fn schema_node_path(path: &'static str) -> SchemaNodePath {
+        SchemaNodePath::new(path).expect("valid schema node path")
+    }
+
+    fn audit_failed(code: AuditReasonCode) -> AuditOutcome {
+        AuditOutcome::failed_code(code)
+    }
+
+    fn audit_denied(code: AuditReasonCode) -> AuditOutcome {
+        AuditOutcome::denied_code(code)
+    }
+
     fn subscribe_list(
         mode: gnmi::subscription_list::Mode,
         path: gnmi::Path,
@@ -1129,6 +1226,28 @@ mod tests {
             encoding: gnmi::Encoding::JsonIetf as i32,
             updates_only: false,
         }
+    }
+
+    fn subscribe_request(list: gnmi::SubscriptionList) -> gnmi::SubscribeRequest {
+        gnmi::SubscribeRequest {
+            request: Some(gnmi::subscribe_request::Request::Subscribe(list)),
+            extension: Vec::new(),
+        }
+    }
+
+    fn subscribe_stream_from(
+        request: gnmi::SubscribeRequest,
+    ) -> tonic::Streaming<gnmi::SubscribeRequest> {
+        let mut payload = Vec::new();
+        request.encode(&mut payload).expect("encode request");
+        let mut frame = Vec::with_capacity(payload.len() + 5);
+        frame.push(0);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        let body = tonic::body::Body::new(http_body_util::Full::new(bytes::Bytes::from(frame)));
+        let mut codec =
+            tonic::codec::ProstCodec::<gnmi::SubscribeResponse, gnmi::SubscribeRequest>::default();
+        tonic::Streaming::new_request(codec.decoder(), body, None, None)
     }
 
     #[tokio::test]
@@ -1563,6 +1682,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_set_success_is_audited_without_values_or_key_predicates() {
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_policy_and_audit(
+            allow_all_read_policy(),
+            Arc::new(audit.clone()),
+        )
+        .await;
+
+        service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(hostname_path(), br#""amf-audit""#.to_vec())],
+                union_replace: Vec::new(),
+                extension: Vec::new(),
+            }))
+            .await
+            .expect("set");
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, AuditOutcome::Success);
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path("/sys:system/sys:hostname")]
+        );
+        let audit_debug = format!("{:?}", events);
+        assert!(!audit_debug.contains("amf-audit"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_empty_request_is_audited_without_paths() {
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_policy_and_audit(
+            allow_all_read_policy(),
+            Arc::new(audit.clone()),
+        )
+        .await;
+
+        let status = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: Vec::new(),
+                union_replace: Vec::new(),
+                extension: Vec::new(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "invalid gNMI request");
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(
+            events[0].outcome,
+            audit_failed(AuditReasonCode::INVALID_VALUE)
+        );
+        assert!(events[0].schema_paths.is_empty());
+    }
+
+    #[tokio::test]
     async fn authenticated_set_records_success_and_commit_metrics() {
         let rpc_success_before = gnmi_rpc_request_count("Set", "success");
         let patch_commit_before = gnmi_set_commit_count("patch");
@@ -1777,8 +1962,12 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_set_commit_authorization_denial_is_generic_and_atomic() {
-        let service =
-            authenticated_service_with_write_authorizer(Arc::new(DenyWriteAuthorizer)).await;
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_write_authorizer_and_audit(
+            Arc::new(DenyWriteAuthorizer),
+            Arc::new(audit.clone()),
+        )
+        .await;
         let status = service
             .set(authenticated_set_request(gnmi::SetRequest {
                 prefix: None,
@@ -1805,11 +1994,29 @@ mod tests {
                 .hostname,
             "amf-1"
         );
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Replace);
+        assert_eq!(
+            events[0].outcome,
+            audit_denied(AuditReasonCode::ACCESS_DENIED)
+        );
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path("/sys:system/sys:hostname")]
+        );
+        assert!(!format!("{:?}", events).contains("secret-host"));
     }
 
     #[tokio::test]
     async fn authenticated_set_rejects_unknown_extension_before_mutation_without_leak() {
-        let service = authenticated_service().await;
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_policy_and_audit(
+            allow_all_read_policy(),
+            Arc::new(audit.clone()),
+        )
+        .await;
         let status = service
             .set(authenticated_set_request(gnmi::SetRequest {
                 prefix: None,
@@ -1832,6 +2039,15 @@ mod tests {
         assert_eq!(status.code(), Code::Unimplemented);
         assert_eq!(status.message(), "gNMI operation is not supported");
         assert!(!status.message().contains("secret-extension-payload"));
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(
+            events[0].outcome,
+            audit_failed(AuditReasonCode::OPERATION_NOT_SUPPORTED)
+        );
+        assert!(events[0].schema_paths.is_empty());
+        assert!(!format!("{:?}", events).contains("secret-extension-payload"));
         assert_eq!(
             service
                 .server()
@@ -1841,6 +2057,44 @@ mod tests {
                 .config
                 .hostname,
             "amf-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_success_audit_failure_is_generic_after_commit() {
+        let service = authenticated_service_with_policy_and_audit(
+            allow_all_read_policy(),
+            Arc::new(FailingAudit),
+        )
+        .await;
+
+        let status = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(
+                    hostname_path(),
+                    br#""amf-after-audit""#.to_vec(),
+                )],
+                union_replace: Vec::new(),
+                extension: Vec::new(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::Internal);
+        assert_eq!(status.message(), "gNMI internal error");
+        assert!(!status.message().contains("secret-admin"));
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-after-audit"
         );
     }
 
@@ -2014,6 +2268,7 @@ mod tests {
 
         let sent = send_operational_event(
             service.server(),
+            RequestId::new(),
             principal.principal(),
             &plan,
             OperationalEvent::Update(
@@ -2077,6 +2332,7 @@ mod tests {
 
         send_operational_event(
             service.server(),
+            RequestId::new(),
             principal.principal(),
             &plan,
             OperationalEvent::Delete {
@@ -2107,9 +2363,19 @@ mod tests {
     #[tokio::test]
     async fn subscribe_operational_event_omits_nacm_denied_update() {
         let events: Arc<dyn OperationalEventSource> = Arc::new(TestOperationalEvents::default());
-        let service =
-            authenticated_service_with_policy_and_event_source(allow_all_read_policy(), events)
-                .await;
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_policy_bus_events_audit(
+            allow_all_read_policy(),
+            Arc::new(
+                ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
+                    .await
+                    .expect("bus"),
+            ),
+            Some(events),
+            MgmtLimits::default(),
+            Arc::new(audit.clone()),
+        )
+        .await;
         let plan = SubscribePlan::from_subscription_list(
             service.server(),
             subscribe_list(
@@ -2124,6 +2390,7 @@ mod tests {
 
         let sent = send_operational_event(
             service.server(),
+            RequestId::new(),
             principal.principal(),
             &plan,
             OperationalEvent::Update(
@@ -2140,6 +2407,17 @@ mod tests {
 
         assert!(sent);
         assert!(rx.try_recv().is_err());
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Subscribe);
+        assert_eq!(
+            events[0].outcome,
+            audit_denied(AuditReasonCode::ACCESS_DENIED)
+        );
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path("/sys:system/sys:uptime")]
+        );
     }
 
     #[tokio::test]
@@ -2164,6 +2442,7 @@ mod tests {
 
         let err = send_operational_event(
             service.server(),
+            RequestId::new(),
             principal.principal(),
             &plan,
             OperationalEvent::Update(
@@ -2213,6 +2492,7 @@ mod tests {
 
         let err = send_operational_event(
             service.server(),
+            RequestId::new(),
             principal.principal(),
             &plan,
             OperationalEvent::Update(
@@ -2230,6 +2510,136 @@ mod tests {
         assert_eq!(err.status().as_str(), "INVALID_ARGUMENT");
         assert_eq!(err.to_string(), "invalid gNMI request");
         assert!(!err.to_string().contains("321"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_plan_audit_paths_are_schema_only_without_key_values() {
+        let service =
+            authenticated_service_with_policy(allow_all_read_and_subscribe_policy()).await;
+        let plan = SubscribePlan::from_subscription_list(
+            service.server(),
+            subscribe_list(
+                gnmi::subscription_list::Mode::Once,
+                user_role_path("secret-admin"),
+                gnmi::SubscriptionMode::Sample,
+            ),
+        )
+        .expect("plan");
+
+        assert_eq!(plan.audit_paths().len(), 1);
+        assert_eq!(
+            plan.audit_paths()[0],
+            schema_node_path("/sys:system/sys:user/sys:role")
+        );
+        let debug = format!("{:?}", plan.audit_paths());
+        assert!(!debug.contains("secret-admin"));
+        assert!(!debug.contains("[sys:name"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_empty_stream_setup_failure_is_audited() {
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_policy_and_audit(
+            allow_all_read_and_subscribe_policy(),
+            Arc::new(audit.clone()),
+        )
+        .await;
+        let mut codec =
+            tonic::codec::ProstCodec::<gnmi::SubscribeResponse, gnmi::SubscribeRequest>::default();
+        let stream = tonic::Streaming::new_empty(codec.decoder(), tonic::body::Body::empty());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        let err = serve_subscribe_stream(
+            Arc::clone(&service.server),
+            authenticated_principal().principal().clone(),
+            stream,
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status().as_str(), "INVALID_ARGUMENT");
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Subscribe);
+        assert_eq!(
+            events[0].outcome,
+            audit_failed(AuditReasonCode::INVALID_VALUE)
+        );
+        assert!(events[0].schema_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscribe_operational_event_source_absence_is_audited() {
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_policy_and_audit(
+            allow_all_subscribe_policy(),
+            Arc::new(audit.clone()),
+        )
+        .await;
+        let stream = subscribe_stream_from(subscribe_request(subscribe_list(
+            gnmi::subscription_list::Mode::Stream,
+            uptime_path(),
+            gnmi::SubscriptionMode::OnChange,
+        )));
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        let err = serve_subscribe_stream(
+            Arc::clone(&service.server),
+            authenticated_principal().principal().clone(),
+            stream,
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status().as_str(), "UNIMPLEMENTED");
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Subscribe);
+        assert_eq!(
+            events[0].outcome,
+            audit_failed(AuditReasonCode::OPERATION_NOT_SUPPORTED)
+        );
+        assert!(events[0].schema_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscribe_unsupported_shape_is_audited_without_path_values() {
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_policy_and_audit(
+            allow_all_read_and_subscribe_policy(),
+            Arc::new(audit.clone()),
+        )
+        .await;
+        let mut list = subscribe_list(
+            gnmi::subscription_list::Mode::Once,
+            user_role_path("secret-admin"),
+            gnmi::SubscriptionMode::Sample,
+        );
+        list.qos = Some(gnmi::QosMarking { marking: 46 });
+        let stream = subscribe_stream_from(subscribe_request(list));
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        let err = serve_subscribe_stream(
+            Arc::clone(&service.server),
+            authenticated_principal().principal().clone(),
+            stream,
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status().as_str(), "UNIMPLEMENTED");
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Subscribe);
+        assert_eq!(
+            events[0].outcome,
+            audit_failed(AuditReasonCode::OPERATION_NOT_SUPPORTED)
+        );
+        assert!(events[0].schema_paths.is_empty());
+        assert!(!format!("{:?}", events).contains("secret-admin"));
     }
 
     #[tokio::test]
