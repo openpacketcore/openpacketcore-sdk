@@ -270,6 +270,67 @@ impl BindingError {
     }
 }
 
+/// Failure returned by a CNF-supplied NETCONF startup datastore facade.
+///
+/// Display text is payload-free. Local diagnostic details must stay on the
+/// server side and are intentionally not written into `<rpc-error>`.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum StartupDatastoreError {
+    /// The requested startup datastore object does not exist.
+    #[error("NETCONF startup datastore entry is missing")]
+    NotFound,
+    /// The requested startup datastore operation is intentionally unsupported.
+    #[error("NETCONF startup datastore operation is not supported")]
+    Unsupported,
+    /// Startup datastore access failed for an internal reason.
+    #[error("NETCONF startup datastore operation failed")]
+    Failed {
+        /// Server-side diagnostic detail. Do not surface directly to clients.
+        detail: String,
+    },
+}
+
+impl StartupDatastoreError {
+    /// Constructs an internal startup datastore failure.
+    pub fn failed(detail: impl Into<String>) -> Self {
+        Self::Failed {
+            detail: detail.into(),
+        }
+    }
+
+    /// Server-side diagnostic detail, if present.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Failed { detail } => Some(detail),
+            Self::NotFound | Self::Unsupported => None,
+        }
+    }
+}
+
+/// CNF-provided RFC 6241 startup datastore facade.
+///
+/// `ConfigBus::restore_or_new` is SDK boot recovery, not the NETCONF
+/// `startup` datastore. A binding advertises `:startup` only by returning this
+/// facade from [`NetconfConfigBinding::startup_datastore`]. Implementations are
+/// responsible for durable, atomic writes appropriate for their CNF.
+pub trait StartupDatastore<C: OpcConfig>: Send + Sync {
+    /// Loads the complete startup config, if one exists.
+    fn load_startup_config(&self) -> Result<Option<C>, StartupDatastoreError>;
+
+    /// Replaces the complete startup config.
+    fn store_startup_config(&self, config: &C) -> Result<(), StartupDatastoreError>;
+
+    /// Returns whether `<delete-config><target><startup/>` is safe.
+    fn delete_startup_supported(&self) -> bool {
+        false
+    }
+
+    /// Deletes the startup config.
+    fn delete_startup_config(&self) -> Result<(), StartupDatastoreError> {
+        Err(StartupDatastoreError::Unsupported)
+    }
+}
+
 /// Binding supplied by the CNF embedding the NETCONF server.
 ///
 /// The server owns the protocol, framing, authz, audit, and datastore read path.
@@ -343,6 +404,21 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
     /// for the generated config root.
     fn candidate_datastore_capability(&self) -> bool {
         false
+    }
+
+    /// Optional RFC 6241 startup datastore facade.
+    ///
+    /// The default is `None`: no `:startup` capability is advertised, startup
+    /// lock/copy/delete/validate/get-config operations fail closed, and the
+    /// server does not mistake config-bus startup recovery for a NETCONF
+    /// startup datastore.
+    fn startup_datastore(&self) -> Option<&dyn StartupDatastore<C>> {
+        None
+    }
+
+    /// Returns true when this binding supports the RFC 6241 startup datastore.
+    fn startup_datastore_capability(&self) -> bool {
+        self.startup_datastore().is_some()
     }
 
     /// Returns the advertised RFC 6243 with-defaults capability, if this

@@ -86,6 +86,8 @@ impl SessionRegistry {
             state.release_running_write(session_id);
             state.release_candidate_lock(session_id);
             state.release_candidate_write(session_id);
+            state.release_startup_lock(session_id);
+            state.release_startup_write(session_id);
             return Ok(KillSessionResult::NotFound);
         }
         before_signal()?;
@@ -97,6 +99,8 @@ impl SessionRegistry {
             state.release_running_write(session_id);
             state.release_candidate_lock(session_id);
             state.release_candidate_write(session_id);
+            state.release_startup_lock(session_id);
+            state.release_startup_write(session_id);
             Ok(KillSessionResult::NotFound)
         }
     }
@@ -261,6 +265,86 @@ impl SessionRegistry {
         }
     }
 
+    /// Acquires the global startup datastore lock after `before_lock` succeeds.
+    pub(crate) fn lock_startup_after<F, E>(
+        &self,
+        session_id: u64,
+        before_lock: F,
+    ) -> Result<LockStartupResult, E>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if !state.sessions.contains_key(&session_id) {
+            return Ok(LockStartupResult::SessionNotRegistered);
+        }
+        if let Some(owner) = state.startup_lock {
+            return Ok(LockStartupResult::Denied {
+                owner_session_id: owner.session_id,
+            });
+        }
+        if let Some(owner) = state.startup_write {
+            return Ok(LockStartupResult::Denied {
+                owner_session_id: owner.session_id,
+            });
+        }
+        before_lock()?;
+        state.startup_lock = Some(StartupLock { session_id });
+        Ok(LockStartupResult::Acquired)
+    }
+
+    /// Acquires a short-lived startup datastore write guard.
+    pub(crate) fn begin_startup_write(&self, session_id: u64) -> StartupWriteResult {
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if !state.sessions.contains_key(&session_id) {
+            return StartupWriteResult::SessionNotRegistered;
+        }
+        if let Some(owner) = state.startup_lock {
+            if owner.session_id != session_id {
+                return StartupWriteResult::Denied {
+                    owner_session_id: owner.session_id,
+                };
+            }
+        }
+        if let Some(owner) = state.startup_write {
+            return StartupWriteResult::Denied {
+                owner_session_id: owner.session_id,
+            };
+        }
+        state.startup_write = Some(StartupWrite { session_id });
+        StartupWriteResult::Acquired(StartupWriteGuard {
+            registry: self.clone(),
+            session_id,
+        })
+    }
+
+    /// Releases the global startup datastore lock after `before_unlock`
+    /// succeeds.
+    pub(crate) fn unlock_startup_after<F, E>(
+        &self,
+        session_id: u64,
+        before_unlock: F,
+    ) -> Result<UnlockStartupResult, E>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if !state.sessions.contains_key(&session_id) {
+            return Ok(UnlockStartupResult::SessionNotRegistered);
+        }
+        match state.startup_lock {
+            Some(owner) if owner.session_id == session_id => {
+                before_unlock()?;
+                state.startup_lock = None;
+                Ok(UnlockStartupResult::Unlocked)
+            }
+            Some(owner) => Ok(UnlockStartupResult::NotOwner {
+                owner_session_id: owner.session_id,
+            }),
+            None => Ok(UnlockStartupResult::NotLocked),
+        }
+    }
+
     fn deregister(&self, session_id: u64, entry: &Arc<SessionEntry>) {
         let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         if state
@@ -273,6 +357,8 @@ impl SessionRegistry {
             state.release_running_write(session_id);
             state.release_candidate_lock(session_id);
             state.release_candidate_write(session_id);
+            state.release_startup_lock(session_id);
+            state.release_startup_write(session_id);
         }
     }
 
@@ -320,6 +406,24 @@ impl SessionRegistry {
             .candidate_write
             .map(|write| write.session_id)
     }
+
+    #[cfg(test)]
+    pub(crate) fn startup_lock_owner_for_test(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .startup_lock
+            .map(|lock| lock.session_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn startup_write_owner_for_test(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .startup_write
+            .map(|write| write.session_id)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -329,6 +433,8 @@ struct RegistryState {
     running_write: Option<RunningWrite>,
     candidate_lock: Option<CandidateLock>,
     candidate_write: Option<CandidateWrite>,
+    startup_lock: Option<StartupLock>,
+    startup_write: Option<StartupWrite>,
 }
 
 impl RegistryState {
@@ -367,6 +473,24 @@ impl RegistryState {
             self.candidate_write = None;
         }
     }
+
+    fn release_startup_lock(&mut self, session_id: u64) {
+        if self
+            .startup_lock
+            .is_some_and(|lock| lock.session_id == session_id)
+        {
+            self.startup_lock = None;
+        }
+    }
+
+    fn release_startup_write(&mut self, session_id: u64) {
+        if self
+            .startup_write
+            .is_some_and(|write| write.session_id == session_id)
+        {
+            self.startup_write = None;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -394,6 +518,16 @@ struct CandidateWrite {
     session_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StartupLock {
+    session_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StartupWrite {
+    session_id: u64,
+}
+
 /// Drop guard for an in-flight running datastore write.
 pub(crate) struct RunningWriteGuard {
     registry: SessionRegistry,
@@ -415,6 +549,23 @@ impl Drop for RunningWriteGuard {
 pub(crate) struct CandidateWriteGuard {
     registry: SessionRegistry,
     session_id: u64,
+}
+
+/// Drop guard for an in-flight startup datastore write.
+pub(crate) struct StartupWriteGuard {
+    registry: SessionRegistry,
+    session_id: u64,
+}
+
+impl Drop for StartupWriteGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .registry
+            .inner
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        state.release_startup_write(self.session_id);
+    }
 }
 
 impl Drop for CandidateWriteGuard {
@@ -564,6 +715,49 @@ pub(crate) enum CandidateWriteResult {
     /// The candidate datastore is locked or being written by another session.
     Denied {
         /// NETCONF session id that currently owns candidate.
+        owner_session_id: u64,
+    },
+    /// The current session id is not registered in this registry.
+    SessionNotRegistered,
+}
+
+/// Result of a startup datastore lock request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockStartupResult {
+    /// The calling session now owns the startup lock.
+    Acquired,
+    /// The startup lock is already owned by a NETCONF session.
+    Denied {
+        /// NETCONF session id that owns the lock.
+        owner_session_id: u64,
+    },
+    /// The current session id is not registered in this registry.
+    SessionNotRegistered,
+}
+
+/// Result of a startup datastore unlock request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnlockStartupResult {
+    /// The calling session's startup lock was released.
+    Unlocked,
+    /// No startup lock is currently active.
+    NotLocked,
+    /// A different NETCONF session owns the startup lock.
+    NotOwner {
+        /// NETCONF session id that owns the lock.
+        owner_session_id: u64,
+    },
+    /// The current session id is not registered in this registry.
+    SessionNotRegistered,
+}
+
+/// Result of acquiring a short-lived startup write guard.
+pub(crate) enum StartupWriteResult {
+    /// The calling session may write startup until the guard is dropped.
+    Acquired(StartupWriteGuard),
+    /// The startup datastore is locked or being written by another session.
+    Denied {
+        /// NETCONF session id that currently owns startup.
         owner_session_id: u64,
     },
     /// The current session id is not registered in this registry.
@@ -841,6 +1035,28 @@ mod tests {
 
         assert_eq!(registry.candidate_lock_owner_for_test(), None);
         assert_eq!(registry.candidate_write_owner_for_test(), None);
+        drop(guard);
+    }
+
+    #[test]
+    fn startup_lock_and_write_release_when_session_deregisters() {
+        let registry = SessionRegistry::new();
+        let owner = registry.register(10).expect("owner");
+        assert_eq!(
+            registry.lock_startup_after(10, || Ok::<(), ()>(())),
+            Ok(LockStartupResult::Acquired)
+        );
+        let guard = match registry.begin_startup_write(10) {
+            StartupWriteResult::Acquired(guard) => guard,
+            _ => panic!("startup write should acquire for lock owner"),
+        };
+        assert_eq!(registry.startup_lock_owner_for_test(), Some(10));
+        assert_eq!(registry.startup_write_owner_for_test(), Some(10));
+
+        drop(owner);
+
+        assert_eq!(registry.startup_lock_owner_for_test(), None);
+        assert_eq!(registry.startup_write_owner_for_test(), None);
         drop(guard);
     }
 }

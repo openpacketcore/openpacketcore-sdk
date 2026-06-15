@@ -14,6 +14,10 @@ pub(crate) enum NetconfOperation {
     Commit,
     /// `<discard-changes>`.
     DiscardChanges,
+    /// `<copy-config>`.
+    CopyConfig,
+    /// `<delete-config>`.
+    DeleteConfig,
     /// `<close-session>`.
     CloseSession,
     /// `<lock>`.
@@ -42,6 +46,8 @@ impl NetconfOperation {
             Self::EditConfig => "edit-config",
             Self::Commit => "commit",
             Self::DiscardChanges => "discard-changes",
+            Self::CopyConfig => "copy-config",
+            Self::DeleteConfig => "delete-config",
             Self::CloseSession => "close-session",
             Self::Lock => "lock",
             Self::Unlock => "unlock",
