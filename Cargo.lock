@@ -1286,6 +1286,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-timeout"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b90d566bffbce6a75bd8b09a05aa8c2cb1fabb6cb348f8840c9e4c90a0d83b0"
+dependencies = [
+ "hyper",
+ "hyper-util",
+ "pin-project-lite",
+ "tokio",
+ "tower-service",
+]
+
+[[package]]
 name = "hyper-util"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1984,23 +1997,35 @@ dependencies = [
 name = "opc-gnmi-server"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
+ "hyper-util",
  "opc-config-bus",
  "opc-config-model",
+ "opc-identity",
  "opc-mgmt-authz",
  "opc-mgmt-errors",
  "opc-mgmt-limits",
  "opc-mgmt-opstate",
  "opc-mgmt-path",
+ "opc-mgmt-principal",
  "opc-mgmt-schema",
+ "opc-mgmt-transport",
  "opc-nacm",
  "opc-redaction",
+ "opc-runtime",
+ "opc-tls",
+ "opc-types",
  "prost",
  "prost-types",
+ "rcgen",
  "serde_json",
  "thiserror 2.0.18",
+ "time",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "tonic-build",
+ "tracing",
 ]
 
 [[package]]
@@ -4023,6 +4048,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e581ba15a835f4d9ea06c55ab1bd4dce26fc53752c69a04aac00703bfb49ba9"
 dependencies = [
  "async-trait",
+ "axum",
  "base64",
  "bytes",
  "h2",
@@ -4030,6 +4056,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "hyper",
+ "hyper-timeout",
  "hyper-util",
  "percent-encoding",
  "pin-project",
@@ -4065,7 +4092,9 @@ checksum = "ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4"
 dependencies = [
  "futures-core",
  "futures-util",
+ "indexmap",
  "pin-project-lite",
+ "slab",
  "sync_wrapper",
  "tokio",
  "tokio-util",

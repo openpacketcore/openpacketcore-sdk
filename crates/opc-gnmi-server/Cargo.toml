@@ -20,20 +20,34 @@ opc-mgmt-errors = { path = "../opc-mgmt-errors", version = "0.2.0" }
 opc-mgmt-limits = { path = "../opc-mgmt-limits", version = "0.2.0" }
 opc-mgmt-opstate = { path = "../opc-mgmt-opstate", version = "0.2.0" }
 opc-mgmt-path = { path = "../opc-mgmt-path", version = "0.2.0" }
+opc-mgmt-principal = { path = "../opc-mgmt-principal", version = "0.2.0" }
 opc-mgmt-schema = { path = "../opc-mgmt-schema", version = "0.2.0" }
+opc-mgmt-transport = { path = "../opc-mgmt-transport", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
+opc-identity = { path = "../opc-identity", version = "0.2.0" }
+opc-runtime = { path = "../opc-runtime", version = "0.2.0" }
 prost = { version = "0.13.5", default-features = true }
 prost-types = { version = "0.13.5", default-features = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tonic = { version = "0.13.1", default-features = false, features = ["codegen", "prost", "server"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
+tokio-rustls = { workspace = true }
+tonic = { version = "0.13.1", default-features = false, features = ["codegen", "prost", "router", "server"] }
+tracing = { workspace = true }
 
 [build-dependencies]
 tonic-build = { version = "0.13.1", default-features = false, features = ["prost", "transport"] }
 
 [dev-dependencies]
+async-trait = { workspace = true }
+hyper-util = { version = "0.1.20", features = ["client", "tokio"] }
 opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
-tokio = { workspace = true, features = ["macros", "rt"] }
+opc-tls = { path = "../opc-tls", version = "0.2.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
+rcgen = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tonic = { version = "0.13.1", default-features = false, features = ["channel"] }
 
 [lints]
 workspace = true
