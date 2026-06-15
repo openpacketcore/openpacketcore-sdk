@@ -5,7 +5,7 @@ use std::sync::Arc;
 use opc_config_bus::ConfigBus;
 use opc_config_model::{OpcConfig, YangPath};
 use opc_mgmt_authz::PolicySource;
-use opc_mgmt_opstate::{OperationalResponse, OperationalStateProvider};
+use opc_mgmt_opstate::{OperationalEventSource, OperationalResponse, OperationalStateProvider};
 use opc_mgmt_schema::SchemaRegistry;
 
 use crate::{GnmiError, NormalizedSet};
@@ -350,6 +350,15 @@ pub trait GnmiConfigBinding<C: OpcConfig>: Send + Sync {
 
     /// NF-supplied operational-state provider.
     fn operational_state(&self) -> Arc<dyn OperationalStateProvider>;
+
+    /// Optional NF-supplied operational-state event source.
+    ///
+    /// The default is fail-closed. STREAM ON_CHANGE subscriptions to
+    /// operational/state nodes are accepted only when a binding explicitly
+    /// exposes a source here.
+    fn operational_events(&self) -> Option<Arc<dyn OperationalEventSource>> {
+        None
+    }
 
     /// Active NACM policy source for read/subscribe preflight.
     fn policy_source(&self) -> Arc<dyn PolicySource>;

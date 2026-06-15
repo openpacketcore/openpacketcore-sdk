@@ -7,20 +7,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opc_config_bus::{ConfigEvent, SubscriberLagPolicy};
-use opc_config_model::{OpcConfig, TrustedPrincipal};
-use opc_mgmt_authz::ReadAction;
+use opc_config_model::{OpcConfig, TrustedPrincipal, YangPath};
+use opc_mgmt_authz::{ReadAction, ReadAuthorizer};
+use opc_mgmt_opstate::{
+    OperationalEvent, OperationalEventReceiver, OperationalSubscriptionRequest,
+};
 use prost::Message;
 use tokio::sync::mpsc;
 use tonic::{Status, Streaming};
 
-use crate::get::handle_read_request;
+use crate::get::{
+    encoding_from_proto, handle_read_request, now_nanos, operational_error, update_to_proto,
+    yang_path_to_proto,
+};
 use crate::metrics::{
-    active_stream, record_rpc_error, GnmiNacmAction, GnmiOperation, SubscribeModeMetric,
+    active_stream, record_nacm_denials, record_rpc_error, GnmiNacmAction, GnmiOperation,
+    SubscribeModeMetric,
 };
 use crate::proto::gnmi;
 use crate::proto_adapter::path_from_proto;
 use crate::service::{status_from_error, validate_extensions};
-use crate::{GnmiConfigBinding, GnmiError, GnmiServer};
+use crate::{GnmiConfigBinding, GnmiError, GnmiJsonUpdate, GnmiServer, ResolvedGnmiPath};
 
 const RESPONSE_QUEUE_BYTES_ESTIMATE: usize = 4096;
 const MAX_SUBSCRIBE_QUEUE_MESSAGES: usize = 1024;
@@ -150,10 +157,18 @@ where
     send_sync(&outbound).await?;
 
     let queue_capacity = subscribe_queue_capacity(server.limits())?;
+    let mut operational_rx = match plan
+        .stream
+        .as_ref()
+        .and_then(|stream| stream.operational_request.as_ref())
+    {
+        Some(request) => Some(subscribe_operational_events(server.as_ref(), request)?),
+        None => None,
+    };
     let config_rx = plan
         .stream
         .as_ref()
-        .filter(|stream| stream.has_on_change)
+        .filter(|stream| stream.has_config_on_change)
         .map(|_| {
             server
                 .binding()
@@ -214,6 +229,22 @@ where
                         }
                         send_sync(&outbound).await?;
                     }
+                    None => return Ok(()),
+                }
+            }
+            event = async {
+                match operational_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => future::pending().await,
+                }
+            }, if operational_rx.is_some() => {
+                match event {
+                    Some(Ok(event)) => {
+                        if !send_operational_event(server.as_ref(), &principal, &plan, event, &outbound).await? {
+                            return Ok(());
+                        }
+                    }
+                    Some(Err(err)) => return Err(operational_error(err)),
                     None => return Ok(()),
                 }
             }
@@ -305,6 +336,105 @@ where
             extension: Vec::new(),
         })
         .collect())
+}
+
+fn subscribe_operational_events<C, B>(
+    server: &GnmiServer<C, B>,
+    request: &OperationalSubscriptionRequest,
+) -> Result<OperationalEventReceiver, GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    server
+        .binding()
+        .operational_events()
+        .ok_or_else(|| {
+            GnmiError::unimplemented("gNMI operational on-change event source is not configured")
+        })?
+        .subscribe(request)
+        .map_err(operational_error)
+}
+
+pub(crate) async fn send_operational_event<C, B>(
+    server: &GnmiServer<C, B>,
+    principal: &TrustedPrincipal,
+    plan: &SubscribePlan,
+    event: OperationalEvent,
+    outbound: &mpsc::Sender<Result<gnmi::SubscribeResponse, Status>>,
+) -> Result<bool, GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    let stream = plan
+        .stream
+        .as_ref()
+        .ok_or_else(|| GnmiError::schema("operational event sent to non-stream subscription"))?;
+    let request = stream
+        .operational_request
+        .as_ref()
+        .ok_or_else(|| GnmiError::schema("operational event sent without subscription request"))?;
+    event
+        .validate_for_request(request)
+        .map_err(|_| GnmiError::schema("invalid operational event"))?;
+
+    let node = server
+        .binding()
+        .schema()
+        .node(event.path().as_str())
+        .ok_or_else(|| GnmiError::schema("operational event path is outside schema"))?;
+    if node.config {
+        return Err(GnmiError::schema(
+            "operational event path resolved to config data",
+        ));
+    }
+
+    let policy = server.binding().policy_source();
+    let authz = ReadAuthorizer::new(server.binding().schema(), policy.as_ref())
+        .map_err(|_| GnmiError::schema("gNMI subscribe authorizer setup failed"))?;
+    let decisions = authz
+        .authorize(principal, ReadAction::Subscribe, &[node.path])
+        .map_err(|_| GnmiError::unavailable("gNMI subscribe policy source unavailable"))?;
+    if decisions.first().is_none_or(|decision| !decision.allowed) {
+        record_nacm_denials(GnmiNacmAction::Subscribe, 1);
+        return Ok(true);
+    }
+
+    let encoding = encoding_from_proto(plan.get_request.encoding)?;
+    if !server.profile().encodings().supports(encoding) {
+        return Err(GnmiError::from(encoding));
+    }
+
+    let notification = match event {
+        OperationalEvent::Update(value) => {
+            let update = GnmiJsonUpdate::new(value.path().clone(), value.value_json().to_string())
+                .map_err(|err| GnmiError::schema(err.detail().to_string()))?;
+            gnmi::Notification {
+                timestamp: now_nanos(),
+                prefix: None,
+                update: vec![update_to_proto(&update, encoding, server.limits())?],
+                delete: Vec::new(),
+                atomic: true,
+            }
+        }
+        OperationalEvent::Delete { path } => gnmi::Notification {
+            timestamp: now_nanos(),
+            prefix: None,
+            update: Vec::new(),
+            delete: vec![yang_path_to_proto(&path)?],
+            atomic: true,
+        },
+    };
+
+    let response = gnmi::SubscribeResponse {
+        response: Some(gnmi::subscribe_response::Response::Update(notification)),
+        extension: Vec::new(),
+    };
+    if outbound.send(Ok(response)).await.is_err() {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 async fn send_sync(
@@ -439,7 +569,8 @@ enum SubscribeListMode {
 
 #[derive(Debug, Clone)]
 struct StreamPlan {
-    has_on_change: bool,
+    has_config_on_change: bool,
+    operational_request: Option<OperationalSubscriptionRequest>,
     sample_interval: Option<Duration>,
     heartbeat_interval: Option<Duration>,
     suppress_redundant: bool,
@@ -495,51 +626,242 @@ where
         }
     }
 
-    if has_on_change && !subscription_paths_are_config_only(server, list)? {
+    let on_change_classes = has_on_change
+        .then(|| classify_on_change_paths(server, list))
+        .transpose()?
+        .unwrap_or_default();
+    if !on_change_classes.operational_paths.is_empty()
+        && server.binding().operational_events().is_none()
+    {
         return Err(GnmiError::unimplemented(
-            "gNMI operational on-change subscriptions are not implemented",
+            "gNMI operational on-change subscriptions require an event source",
         ));
     }
+    let operational_request = if on_change_classes.operational_paths.is_empty() {
+        None
+    } else {
+        Some(
+            OperationalSubscriptionRequest::new(on_change_classes.operational_paths)
+                .with_max_queued_events(subscribe_queue_capacity(server.limits())?),
+        )
+    };
     Ok(StreamPlan {
-        has_on_change,
+        has_config_on_change: on_change_classes.has_config,
+        operational_request,
         sample_interval,
         heartbeat_interval,
         suppress_redundant,
     })
 }
 
-fn subscription_paths_are_config_only<C, B>(
+#[derive(Debug, Default)]
+struct OnChangePathClasses {
+    has_config: bool,
+    operational_paths: Vec<YangPath>,
+}
+
+fn classify_on_change_paths<C, B>(
     server: &GnmiServer<C, B>,
     list: &gnmi::SubscriptionList,
-) -> Result<bool, GnmiError>
+) -> Result<OnChangePathClasses, GnmiError>
 where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
 {
+    let registry = server.binding().schema();
+    let model_filter = SubscribeModelFilter::new(registry, &list.use_models)?;
     let prefix = list.prefix.as_ref().map(path_from_proto).transpose()?;
+    if prefix.as_ref().is_some_and(path_has_target) {
+        return Err(GnmiError::unimplemented(
+            "non-empty gNMI target is not supported",
+        ));
+    }
+    let mut classes = OnChangePathClasses::default();
     for subscription in &list.subscription {
+        if !matches!(
+            gnmi::SubscriptionMode::try_from(subscription.mode),
+            Ok(gnmi::SubscriptionMode::OnChange)
+        ) {
+            continue;
+        }
         let path = subscription
             .path
             .as_ref()
             .map(path_from_proto)
             .transpose()?
             .unwrap_or_default();
-        if path.elems.is_empty() {
-            return Ok(false);
+        if path_has_target(&path) {
+            return Err(GnmiError::unimplemented(
+                "non-empty gNMI target is not supported",
+            ));
         }
-        let resolved = crate::resolve_path(server.binding().schema(), prefix.as_ref(), &path)?;
-        for node in server.binding().schema().nodes() {
-            let under_root = node.path == resolved.schema_path.as_str()
-                || node
-                    .path
-                    .strip_prefix(resolved.schema_path.as_str())
-                    .is_some_and(|suffix| suffix.starts_with('/'));
-            if under_root && !node.config {
-                return Ok(false);
+        if path.elems.is_empty() {
+            let origin_modules = root_origin_modules(registry, prefix.as_ref(), Some(&path))?;
+            if let Some(prefix) = prefix.as_ref().filter(|prefix| !prefix.elems.is_empty()) {
+                let resolved = crate::resolve_path(registry, None, prefix)?;
+                classify_from_resolved(registry, &resolved, &model_filter, &mut classes)?;
+            } else {
+                classify_all_matching(
+                    registry,
+                    &model_filter,
+                    origin_modules.as_ref(),
+                    &mut classes,
+                )?;
             }
+            continue;
+        }
+        let resolved = crate::resolve_path(registry, prefix.as_ref(), &path)?;
+        classify_from_resolved(registry, &resolved, &model_filter, &mut classes)?;
+    }
+    classes
+        .operational_paths
+        .sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    classes
+        .operational_paths
+        .dedup_by(|a, b| a.as_str() == b.as_str());
+    server
+        .limits()
+        .check_paths(classes.operational_paths.len())
+        .map_err(GnmiError::from_limits)?;
+    Ok(classes)
+}
+
+struct SubscribeModelFilter {
+    modules: Option<Vec<&'static str>>,
+}
+
+impl SubscribeModelFilter {
+    fn new(
+        registry: &'static dyn opc_mgmt_schema::SchemaRegistry,
+        requested: &[gnmi::ModelData],
+    ) -> Result<Self, GnmiError> {
+        if requested.is_empty() {
+            return Ok(Self { modules: None });
+        }
+
+        let mut modules = Vec::new();
+        for model in requested {
+            let Some(served) = registry.served_models().iter().find(|served| {
+                served.name == model.name
+                    && (model.version.is_empty() || served.revision == model.version)
+            }) else {
+                return Err(GnmiError::invalid(
+                    "gNMI Subscribe requested an unserved model",
+                ));
+            };
+            modules.push(served.name);
+        }
+        modules.sort();
+        modules.dedup();
+        Ok(Self {
+            modules: Some(modules),
+        })
+    }
+
+    fn allows(&self, module: &str) -> bool {
+        self.modules
+            .as_ref()
+            .is_none_or(|modules| modules.contains(&module))
+    }
+}
+
+fn classify_all_matching(
+    registry: &'static dyn opc_mgmt_schema::SchemaRegistry,
+    model_filter: &SubscribeModelFilter,
+    origin_modules: Option<&std::collections::HashSet<&'static str>>,
+    classes: &mut OnChangePathClasses,
+) -> Result<(), GnmiError> {
+    for node in registry.nodes() {
+        if !model_filter.allows(node.module)
+            || origin_modules.is_some_and(|modules| !modules.contains(node.module))
+        {
+            continue;
+        }
+        if node.config {
+            classes.has_config = true;
+        } else {
+            classes.operational_paths.push(
+                YangPath::new(node.path).map_err(|_| GnmiError::schema("invalid schema path"))?,
+            );
         }
     }
-    Ok(true)
+    Ok(())
+}
+
+fn classify_from_resolved(
+    registry: &'static dyn opc_mgmt_schema::SchemaRegistry,
+    resolved: &ResolvedGnmiPath,
+    model_filter: &SubscribeModelFilter,
+    classes: &mut OnChangePathClasses,
+) -> Result<(), GnmiError> {
+    if !model_filter.allows(resolved.node.module) {
+        return Err(GnmiError::invalid(
+            "gNMI Subscribe path is outside the requested model set",
+        ));
+    }
+
+    let root = resolved.schema_path.as_str();
+    for node in registry.nodes() {
+        let under_root = node.path == root
+            || node
+                .path
+                .strip_prefix(root)
+                .is_some_and(|suffix| suffix.starts_with('/'));
+        if !under_root || !model_filter.allows(node.module) {
+            continue;
+        }
+        if node.config {
+            classes.has_config = true;
+        } else {
+            classes
+                .operational_paths
+                .push(canonical_descendant_path(resolved, node.path)?);
+        }
+    }
+    Ok(())
+}
+
+fn canonical_descendant_path(
+    resolved: &ResolvedGnmiPath,
+    schema_path: &'static str,
+) -> Result<YangPath, GnmiError> {
+    if schema_path == resolved.schema_path {
+        return Ok(resolved.canonical.clone());
+    }
+    let suffix = schema_path
+        .strip_prefix(resolved.schema_path.as_str())
+        .ok_or_else(|| GnmiError::schema("invalid selected schema descendant"))?;
+    YangPath::new(format!("{}{}", resolved.canonical.as_str(), suffix))
+        .map_err(|_| GnmiError::schema("invalid selected canonical path"))
+}
+
+fn root_origin_modules(
+    registry: &'static dyn opc_mgmt_schema::SchemaRegistry,
+    prefix: Option<&crate::GnmiPath>,
+    path: Option<&crate::GnmiPath>,
+) -> Result<Option<std::collections::HashSet<&'static str>>, GnmiError> {
+    let prefix_origin = prefix.and_then(|path| path.origin.as_deref());
+    let path_origin = path.and_then(|path| path.origin.as_deref());
+    let origin = match (prefix_origin, path_origin) {
+        (Some(prefix), Some(path)) if prefix != path => {
+            return Err(GnmiError::invalid(
+                "gNMI prefix origin and path origin differ",
+            ));
+        }
+        (Some(origin), _) | (_, Some(origin)) => Some(origin),
+        (None, None) => None,
+    };
+    let Some(origin) = origin else {
+        return Ok(None);
+    };
+    let modules = registry
+        .modules_for_origin(origin)
+        .ok_or_else(|| GnmiError::invalid("unknown gNMI origin"))?;
+    Ok(Some(modules.iter().copied().collect()))
+}
+
+fn path_has_target(path: &crate::GnmiPath) -> bool {
+    path.target.is_some()
 }
 
 fn subscribe_queue_capacity(limits: &opc_mgmt_limits::MgmtLimits) -> Result<usize, GnmiError> {

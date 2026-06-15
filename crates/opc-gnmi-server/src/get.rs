@@ -469,7 +469,7 @@ where
     Ok(response)
 }
 
-fn operational_error(err: OperationalError) -> GnmiError {
+pub(crate) fn operational_error(err: OperationalError) -> GnmiError {
     match err {
         OperationalError::Unavailable { .. } => {
             GnmiError::unavailable("gNMI operational provider unavailable")
@@ -491,7 +491,7 @@ fn state_entries_with_values(
         .collect()
 }
 
-fn encoding_from_proto(value: i32) -> Result<Encoding, GnmiError> {
+pub(crate) fn encoding_from_proto(value: i32) -> Result<Encoding, GnmiError> {
     match gnmi::Encoding::try_from(value) {
         Ok(gnmi::Encoding::Json) => Ok(Encoding::Json),
         Ok(gnmi::Encoding::JsonIetf) => Ok(Encoding::JsonIetf),
@@ -502,7 +502,7 @@ fn encoding_from_proto(value: i32) -> Result<Encoding, GnmiError> {
     }
 }
 
-fn update_to_proto(
+pub(crate) fn update_to_proto(
     update: &GnmiJsonUpdate,
     encoding: Encoding,
     limits: &opc_mgmt_limits::MgmtLimits,

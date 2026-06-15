@@ -16,6 +16,10 @@ categories = ["network-programming"]
 opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [lints]
 workspace = true
