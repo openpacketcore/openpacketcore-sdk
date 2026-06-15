@@ -15,7 +15,7 @@ use opc_mgmt_schema::{
 use quick_xml::events::BytesStart;
 use quick_xml::reader::Reader;
 
-use crate::capabilities::NETCONF_BASE_NS;
+use crate::capabilities::{NETCONF_BASE_NS, NETCONF_NMDA_NS};
 use crate::xml::EditDefaultOperation;
 
 /// Parses a NETCONF `<config>` element into a schema-bound edit tree.
@@ -258,7 +258,8 @@ fn resolve_start(
 
 /// Resolves the `<config>` wrapper element. Unlike ordinary data nodes, the
 /// bounded config fragment may omit the base NETCONF namespace because it was
-/// inherited from `<rpc>`; this helper treats a bare `<config>` as base-NS.
+/// inherited from `<rpc>`; this helper treats a bare `<config>` as base-NS and
+/// also accepts the RFC 8526 NMDA wrapper namespace.
 fn resolve_config_start(
     start: &BytesStart<'_>,
     decoder: quick_xml::encoding::Decoder,
@@ -302,7 +303,7 @@ fn resolve_config_start(
         None => scope.default.clone().expect("default set above"),
     };
 
-    if namespace != NETCONF_BASE_NS {
+    if namespace != NETCONF_BASE_NS && namespace != NETCONF_NMDA_NS {
         return Err(NetconfEditError::MalformedXml);
     }
 

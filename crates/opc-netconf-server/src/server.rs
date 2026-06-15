@@ -48,21 +48,31 @@ use crate::xml::{
     parse_rpc_with_context, CancelCommitRequest as XmlCancelCommitRequest,
     CommitRequest as XmlCommitRequest, CopyConfigRequest as XmlCopyConfigRequest,
     CreateSubscriptionRequest as XmlCreateSubscriptionRequest, Datastore as XmlDatastore,
-    EditConfigRequest as XmlEditConfigRequest, EditErrorOption, EditTestOption,
-    GetSchemaRequest as XmlGetSchemaRequest, KillSessionRequest as XmlKillSessionRequest,
-    LockRequest as XmlLockRequest, RpcOperation, RpcOperationHint, RpcParseError,
+    EditConfigRequest as XmlEditConfigRequest, EditDataRequest as XmlEditDataRequest,
+    EditErrorOption, EditTestOption, GetSchemaRequest as XmlGetSchemaRequest,
+    KillSessionRequest as XmlKillSessionRequest, LockRequest as XmlLockRequest,
+    NmdaDatastore as XmlNmdaDatastore, RpcOperation, RpcOperationHint, RpcParseError,
     UnlockRequest as XmlUnlockRequest, UnsupportedOperation, ValidateRequest as XmlValidateRequest,
 };
 
-const NETCONF_BASE_MODEL: &[ModelData] = &[ModelData {
-    name: "ietf-netconf",
-    revision: "2011-06-01",
-    namespace: "urn:ietf:params:xml:ns:netconf:base:1.0",
-    prefix: "nc",
-}];
+const NETCONF_EXEC_MODELS: &[ModelData] = &[
+    ModelData {
+        name: "ietf-netconf",
+        revision: "2011-06-01",
+        namespace: "urn:ietf:params:xml:ns:netconf:base:1.0",
+        prefix: "nc",
+    },
+    ModelData {
+        name: "ietf-netconf-nmda",
+        revision: "2019-01-07",
+        namespace: "urn:ietf:params:xml:ns:yang:ietf-netconf-nmda",
+        prefix: "ncds",
+    },
+];
 
 const NETCONF_CLOSE_SESSION_PATH: &str = "/nc:close-session";
 const NETCONF_EDIT_CONFIG_PATH: &str = "/nc:edit-config";
+const NETCONF_EDIT_DATA_PATH: &str = "/ncds:edit-data";
 const NETCONF_LOCK_PATH: &str = "/nc:lock";
 const NETCONF_UNLOCK_PATH: &str = "/nc:unlock";
 const NETCONF_KILL_SESSION_PATH: &str = "/nc:kill-session";
@@ -156,6 +166,28 @@ struct RpcExecContext<'a> {
     message_id: &'a str,
     reply_attrs: &'a RpcReplyAttributes,
     started: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EditRpcKind {
+    EditConfig,
+    EditData,
+}
+
+impl EditRpcKind {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::EditConfig => NETCONF_EDIT_CONFIG_PATH,
+            Self::EditData => NETCONF_EDIT_DATA_PATH,
+        }
+    }
+
+    const fn metric(self) -> NetconfOperation {
+        match self {
+            Self::EditConfig => NetconfOperation::EditConfig,
+            Self::EditData => NetconfOperation::EditData,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -533,6 +565,14 @@ where
                 &parsed.reply_attrs,
                 started,
             ),
+            RpcOperation::EditData(_) => self.handle_unsupported_operation(
+                UnsupportedOperation::EditData,
+                request_id,
+                principal,
+                &parsed.message_id,
+                &parsed.reply_attrs,
+                started,
+            ),
             RpcOperation::Get(request) => RpcHandlingResult::keep_open(handle_get::<C, B, P, A>(
                 &self.binding,
                 GetContext {
@@ -794,6 +834,20 @@ where
         let reply = match &parsed.operation {
             RpcOperation::EditConfig(request) => {
                 self.handle_edit_config(
+                    request,
+                    RpcExecContext {
+                        request_id,
+                        principal,
+                        message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
+                        started,
+                    },
+                    session_context,
+                )
+                .await
+            }
+            RpcOperation::EditData(request) => {
+                self.handle_edit_data(
                     request,
                     RpcExecContext {
                         request_id,
@@ -3871,6 +3925,77 @@ where
         context: RpcExecContext<'_>,
         session_context: Option<(u64, &SessionRegistry)>,
     ) -> RpcHandlingResult {
+        self.handle_edit_request(request, context, session_context, EditRpcKind::EditConfig)
+            .await
+    }
+
+    async fn handle_edit_data(
+        &self,
+        request: &XmlEditDataRequest,
+        context: RpcExecContext<'_>,
+        session_context: Option<(u64, &SessionRegistry)>,
+    ) -> RpcHandlingResult {
+        if !self.binding.nmda_edit_data_supported() {
+            return self.edit_config_failure_reply(
+                &context,
+                EditRpcKind::EditData,
+                audit_failed("operation-not-supported"),
+                RpcError::operation_not_supported(),
+            );
+        }
+        if request.url_present {
+            return self.edit_config_failure_reply(
+                &context,
+                EditRpcKind::EditData,
+                audit_failed("operation-not-supported"),
+                RpcError::operation_not_supported(),
+            );
+        }
+        let Some(config_xml) = request.config_xml.clone() else {
+            return self.edit_config_failure_reply(
+                &context,
+                EditRpcKind::EditData,
+                audit_failed("missing-element"),
+                RpcError::operation_failed(),
+            );
+        };
+        let target = match request.datastore {
+            XmlNmdaDatastore::Running => XmlDatastore::Running,
+            XmlNmdaDatastore::Candidate => XmlDatastore::Candidate,
+            XmlNmdaDatastore::Startup => XmlDatastore::Startup,
+            XmlNmdaDatastore::Intended | XmlNmdaDatastore::Operational => {
+                return self.edit_config_failure_reply(
+                    &context,
+                    EditRpcKind::EditData,
+                    audit_failed("invalid-value"),
+                    RpcError::invalid_value(),
+                );
+            }
+        };
+        let edit_request = XmlEditConfigRequest {
+            target,
+            default_operation: request.default_operation,
+            test_option: EditTestOption::TestThenSet,
+            test_option_explicit: false,
+            error_option: EditErrorOption::StopOnError,
+            config_xml,
+        };
+        self.handle_edit_request(
+            &edit_request,
+            context,
+            session_context,
+            EditRpcKind::EditData,
+        )
+        .await
+    }
+
+    async fn handle_edit_request(
+        &self,
+        request: &XmlEditConfigRequest,
+        context: RpcExecContext<'_>,
+        session_context: Option<(u64, &SessionRegistry)>,
+        kind: EditRpcKind,
+    ) -> RpcHandlingResult {
         let target_supported = match request.target {
             XmlDatastore::Running => self.binding.writable_running_capability(),
             XmlDatastore::Candidate => self.binding.candidate_datastore_capability(),
@@ -3879,6 +4004,7 @@ where
         if !target_supported {
             return self.edit_config_failure_reply(
                 &context,
+                kind,
                 audit_failed("operation-not-supported"),
                 RpcError::operation_not_supported(),
             );
@@ -3890,16 +4016,18 @@ where
         {
             return self.edit_config_failure_reply(
                 &context,
+                kind,
                 audit_failed("operation-not-supported"),
                 RpcError::operation_not_supported(),
             );
         }
 
-        match self.authorize_exec(context.principal, NETCONF_EDIT_CONFIG_PATH) {
+        match self.authorize_exec(context.principal, kind.path()) {
             Ok(true) => {}
             Ok(false) => {
                 return self.edit_config_failure_reply(
                     &context,
+                    kind,
                     audit_denied("access-denied"),
                     RpcError::access_denied(),
                 );
@@ -3907,6 +4035,7 @@ where
             Err(()) => {
                 return self.edit_config_failure_reply(
                     &context,
+                    kind,
                     audit_failed("resource-denied"),
                     RpcError::resource_denied(),
                 );
@@ -3916,6 +4045,7 @@ where
         let Some((current_session_id, sessions)) = session_context else {
             return self.edit_config_failure_reply(
                 &context,
+                kind,
                 audit_failed("operation-not-supported"),
                 RpcError::operation_not_supported(),
             );
@@ -3927,6 +4057,7 @@ where
                 &context,
                 current_session_id,
                 sessions,
+                kind,
             );
         }
 
@@ -3936,17 +4067,19 @@ where
                 &context,
                 current_session_id,
                 sessions,
+                kind,
             );
         }
 
         let _write_guard = match sessions.begin_running_write(current_session_id) {
             RunningWriteResult::Acquired(guard) => guard,
             RunningWriteResult::Denied { owner_session_id } => {
-                return self.edit_config_lock_denied_reply(&context, owner_session_id);
+                return self.edit_config_lock_denied_reply(&context, kind, owner_session_id);
             }
             RunningWriteResult::SessionNotRegistered => {
                 return self.edit_config_failure_reply(
                     &context,
+                    kind,
                     audit_failed("operation-failed"),
                     RpcError::operation_failed(),
                 );
@@ -3963,6 +4096,7 @@ where
             Err(EditConfigError::Unsupported) => {
                 return self.edit_config_failure_reply(
                     &context,
+                    kind,
                     audit_failed("operation-not-supported"),
                     RpcError::operation_not_supported(),
                 );
@@ -3970,6 +4104,7 @@ where
             Err(EditConfigError::InvalidValue) => {
                 return self.edit_config_failure_reply(
                     &context,
+                    kind,
                     audit_failed("invalid-value"),
                     RpcError::invalid_value(),
                 );
@@ -3977,6 +4112,7 @@ where
             Err(EditConfigError::Failed { .. }) => {
                 return self.edit_config_failure_reply(
                     &context,
+                    kind,
                     audit_failed("operation-failed"),
                     RpcError::operation_failed(),
                 );
@@ -3997,10 +4133,7 @@ where
 
         match bus.submit(commit_request).await {
             Ok(result) => {
-                let paths = self.schema_paths_for_changed_paths(
-                    &result.changed_paths,
-                    NETCONF_EDIT_CONFIG_PATH,
-                );
+                let paths = self.schema_paths_for_changed_paths(&result.changed_paths, kind.path());
                 if self
                     .audit
                     .record(
@@ -4016,7 +4149,7 @@ where
                     .is_err()
                 {
                     record_rpc_error(
-                        NetconfOperation::EditConfig,
+                        kind.metric(),
                         NetconfErrorTag::OperationFailed,
                         context.started.elapsed(),
                     );
@@ -4026,7 +4159,7 @@ where
                         RpcError::operation_failed(),
                     ));
                 }
-                record_rpc_success(NetconfOperation::EditConfig, context.started.elapsed());
+                record_rpc_success(kind.metric(), context.started.elapsed());
                 RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
                     context.message_id,
                     context.reply_attrs,
@@ -4036,6 +4169,7 @@ where
                 let classification = commit_error_to_netconf(error.code);
                 self.edit_config_failure_reply(
                     &context,
+                    kind,
                     audit_failed(error.code.as_str()),
                     rpc_error_for_netconf(classification),
                 )
@@ -4046,6 +4180,7 @@ where
     fn edit_config_failure_reply(
         &self,
         context: &RpcExecContext<'_>,
+        kind: EditRpcKind,
         outcome: AuditOutcome,
         rpc_error: RpcError,
     ) -> RpcHandlingResult {
@@ -4059,12 +4194,12 @@ where
                     AuditOperation::Update,
                     outcome,
                 )
-                .with_paths([schema_node_path(NETCONF_EDIT_CONFIG_PATH)]),
+                .with_paths([schema_node_path(kind.path())]),
             )
             .is_err()
         {
             record_rpc_error(
-                NetconfOperation::EditConfig,
+                kind.metric(),
                 NetconfErrorTag::OperationFailed,
                 context.started.elapsed(),
             );
@@ -4076,7 +4211,7 @@ where
         }
 
         record_rpc_error(
-            NetconfOperation::EditConfig,
+            kind.metric(),
             rpc_error.classification.tag,
             context.started.elapsed(),
         );
@@ -4090,6 +4225,7 @@ where
     fn edit_config_lock_denied_reply(
         &self,
         context: &RpcExecContext<'_>,
+        kind: EditRpcKind,
         owner_session_id: u64,
     ) -> RpcHandlingResult {
         if self
@@ -4102,12 +4238,12 @@ where
                     AuditOperation::Update,
                     audit_failed("lock-denied"),
                 )
-                .with_paths([schema_node_path(NETCONF_EDIT_CONFIG_PATH)]),
+                .with_paths([schema_node_path(kind.path())]),
             )
             .is_err()
         {
             record_rpc_error(
-                NetconfOperation::EditConfig,
+                kind.metric(),
                 NetconfErrorTag::OperationFailed,
                 context.started.elapsed(),
             );
@@ -4119,7 +4255,7 @@ where
         }
 
         record_rpc_error(
-            NetconfOperation::EditConfig,
+            kind.metric(),
             NetconfErrorTag::LockDenied,
             context.started.elapsed(),
         );
@@ -4136,15 +4272,17 @@ where
         context: &RpcExecContext<'_>,
         current_session_id: u64,
         sessions: &SessionRegistry,
+        kind: EditRpcKind,
     ) -> RpcHandlingResult {
         let _write_guard = match sessions.begin_candidate_write(current_session_id) {
             CandidateWriteResult::Acquired(guard) => guard,
             CandidateWriteResult::Denied { owner_session_id } => {
-                return self.edit_config_lock_denied_reply(context, owner_session_id);
+                return self.edit_config_lock_denied_reply(context, kind, owner_session_id);
             }
             CandidateWriteResult::SessionNotRegistered => {
                 return self.edit_config_failure_reply(
                     context,
+                    kind,
                     audit_failed("operation-failed"),
                     RpcError::operation_failed(),
                 );
@@ -4159,6 +4297,7 @@ where
         if base.base_version != running.version {
             return self.edit_config_failure_reply(
                 context,
+                kind,
                 audit_failed("operation-failed"),
                 RpcError::operation_failed(),
             );
@@ -4171,6 +4310,7 @@ where
             Err(EditConfigError::Unsupported) => {
                 return self.edit_config_failure_reply(
                     context,
+                    kind,
                     audit_failed("operation-not-supported"),
                     RpcError::operation_not_supported(),
                 );
@@ -4178,6 +4318,7 @@ where
             Err(EditConfigError::InvalidValue) => {
                 return self.edit_config_failure_reply(
                     context,
+                    kind,
                     audit_failed("invalid-value"),
                     RpcError::invalid_value(),
                 );
@@ -4185,14 +4326,14 @@ where
             Err(EditConfigError::Failed { .. }) => {
                 return self.edit_config_failure_reply(
                     context,
+                    kind,
                     audit_failed("operation-failed"),
                     RpcError::operation_failed(),
                 );
             }
         };
 
-        let paths =
-            self.schema_paths_for_changed_paths(&candidate.changed_paths, NETCONF_EDIT_CONFIG_PATH);
+        let paths = self.schema_paths_for_changed_paths(&candidate.changed_paths, kind.path());
         self.candidate
             .lock()
             .unwrap_or_else(|err| err.into_inner())
@@ -4213,7 +4354,7 @@ where
             .is_err()
         {
             record_rpc_error(
-                NetconfOperation::EditConfig,
+                kind.metric(),
                 NetconfErrorTag::OperationFailed,
                 context.started.elapsed(),
             );
@@ -4223,7 +4364,7 @@ where
                 RpcError::operation_failed(),
             ));
         }
-        record_rpc_success(NetconfOperation::EditConfig, context.started.elapsed());
+        record_rpc_success(kind.metric(), context.started.elapsed());
         RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
             context.message_id,
             context.reply_attrs,
@@ -4236,15 +4377,17 @@ where
         context: &RpcExecContext<'_>,
         current_session_id: u64,
         sessions: &SessionRegistry,
+        kind: EditRpcKind,
     ) -> RpcHandlingResult {
         let _write_guard = match sessions.begin_startup_write(current_session_id) {
             StartupWriteResult::Acquired(guard) => guard,
             StartupWriteResult::Denied { owner_session_id } => {
-                return self.edit_config_lock_denied_reply(context, owner_session_id);
+                return self.edit_config_lock_denied_reply(context, kind, owner_session_id);
             }
             StartupWriteResult::SessionNotRegistered => {
                 return self.edit_config_failure_reply(
                     context,
+                    kind,
                     audit_failed("operation-failed"),
                     RpcError::operation_failed(),
                 );
@@ -4254,6 +4397,7 @@ where
         let Some(startup) = self.binding.startup_datastore() else {
             return self.edit_config_failure_reply(
                 context,
+                kind,
                 audit_failed("operation-not-supported"),
                 RpcError::operation_not_supported(),
             );
@@ -4263,6 +4407,7 @@ where
             Ok(None) | Err(StartupDatastoreError::NotFound) => {
                 return self.edit_config_failure_reply(
                     context,
+                    kind,
                     audit_failed("data-missing"),
                     RpcError::data_missing(),
                 );
@@ -4270,6 +4415,7 @@ where
             Err(StartupDatastoreError::Unsupported) => {
                 return self.edit_config_failure_reply(
                     context,
+                    kind,
                     audit_failed("operation-not-supported"),
                     RpcError::operation_not_supported(),
                 );
@@ -4277,6 +4423,7 @@ where
             Err(StartupDatastoreError::Failed { .. }) => {
                 return self.edit_config_failure_reply(
                     context,
+                    kind,
                     audit_failed("operation-failed"),
                     RpcError::operation_failed(),
                 );
@@ -4287,6 +4434,7 @@ where
             Err(EditConfigError::Unsupported) => {
                 return self.edit_config_failure_reply(
                     context,
+                    kind,
                     audit_failed("operation-not-supported"),
                     RpcError::operation_not_supported(),
                 );
@@ -4294,6 +4442,7 @@ where
             Err(EditConfigError::InvalidValue) => {
                 return self.edit_config_failure_reply(
                     context,
+                    kind,
                     audit_failed("invalid-value"),
                     RpcError::invalid_value(),
                 );
@@ -4301,6 +4450,7 @@ where
             Err(EditConfigError::Failed { .. }) => {
                 return self.edit_config_failure_reply(
                     context,
+                    kind,
                     audit_failed("operation-failed"),
                     RpcError::operation_failed(),
                 );
@@ -4318,6 +4468,7 @@ where
         {
             return self.edit_config_failure_reply(
                 context,
+                kind,
                 audit_failed("operation-failed"),
                 RpcError::operation_failed(),
             );
@@ -4327,6 +4478,7 @@ where
             Err(StartupDatastoreError::Unsupported) => {
                 return self.edit_config_failure_reply(
                     context,
+                    kind,
                     audit_failed("operation-not-supported"),
                     RpcError::operation_not_supported(),
                 );
@@ -4334,14 +4486,14 @@ where
             Err(StartupDatastoreError::NotFound | StartupDatastoreError::Failed { .. }) => {
                 return self.edit_config_failure_reply(
                     context,
+                    kind,
                     audit_failed("operation-failed"),
                     RpcError::operation_failed(),
                 );
             }
         }
 
-        let paths =
-            self.schema_paths_for_changed_paths(&candidate.changed_paths, NETCONF_EDIT_CONFIG_PATH);
+        let paths = self.schema_paths_for_changed_paths(&candidate.changed_paths, kind.path());
         if self
             .audit
             .record(
@@ -4357,7 +4509,7 @@ where
             .is_err()
         {
             record_rpc_error(
-                NetconfOperation::EditConfig,
+                kind.metric(),
                 NetconfErrorTag::OperationFailed,
                 context.started.elapsed(),
             );
@@ -4367,7 +4519,7 @@ where
                 RpcError::operation_failed(),
             ));
         }
-        record_rpc_success(NetconfOperation::EditConfig, context.started.elapsed());
+        record_rpc_success(kind.metric(), context.started.elapsed());
         RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
             context.message_id,
             context.reply_attrs,
@@ -5062,7 +5214,7 @@ where
 
     fn authorize_exec(&self, principal: &TrustedPrincipal, path: &str) -> Result<bool, ()> {
         let authz =
-            ExecAuthorizer::new(NETCONF_BASE_MODEL, self.authz.policy_source()).map_err(|_| ())?;
+            ExecAuthorizer::new(NETCONF_EXEC_MODELS, self.authz.policy_source()).map_err(|_| ())?;
         authz.may_exec(principal, path).map_err(|_| ())
     }
 
@@ -5096,6 +5248,9 @@ where
         let event = match err.operation_hint {
             Some(RpcOperationHint::EditConfig) => {
                 event.with_paths([schema_node_path(NETCONF_EDIT_CONFIG_PATH)])
+            }
+            Some(RpcOperationHint::EditData) => {
+                event.with_paths([schema_node_path(NETCONF_EDIT_DATA_PATH)])
             }
             Some(RpcOperationHint::Commit) => {
                 event.with_paths([schema_node_path(NETCONF_COMMIT_PATH)])
@@ -5158,7 +5313,7 @@ fn validate_confirmed_commit_access(
 
 fn audit_operation_for_parse_failure(err: &RpcParseError) -> AuditOperation {
     match err.operation_hint {
-        Some(RpcOperationHint::EditConfig) => AuditOperation::Update,
+        Some(RpcOperationHint::EditConfig | RpcOperationHint::EditData) => AuditOperation::Update,
         Some(
             RpcOperationHint::Commit
             | RpcOperationHint::CancelCommit
@@ -5178,6 +5333,7 @@ fn audit_operation_for_parse_failure(err: &RpcParseError) -> AuditOperation {
 fn netconf_operation_for_parse_failure(err: &RpcParseError) -> NetconfOperation {
     match err.operation_hint {
         Some(RpcOperationHint::EditConfig) => NetconfOperation::EditConfig,
+        Some(RpcOperationHint::EditData) => NetconfOperation::EditData,
         Some(RpcOperationHint::Commit) => NetconfOperation::Commit,
         Some(RpcOperationHint::CancelCommit) => NetconfOperation::CancelCommit,
         Some(RpcOperationHint::DiscardChanges) => NetconfOperation::DiscardChanges,
@@ -5225,7 +5381,7 @@ fn netconf_error_message(tag: NetconfErrorTag) -> &'static str {
 
 fn audit_operation_for_unsupported(operation: UnsupportedOperation) -> AuditOperation {
     match operation {
-        UnsupportedOperation::EditConfig => AuditOperation::Update,
+        UnsupportedOperation::EditConfig | UnsupportedOperation::EditData => AuditOperation::Update,
         UnsupportedOperation::CopyConfig => AuditOperation::Replace,
         UnsupportedOperation::DeleteConfig => AuditOperation::Delete,
         UnsupportedOperation::CreateSubscription => AuditOperation::Subscribe,
@@ -6647,6 +6803,12 @@ mod tests {
             .expect("NETCONF module");
     }
 
+    fn register_netconf_nmda_module(modules: &mut ModuleRegistry) {
+        modules
+            .register_module("ietf-netconf-nmda", "ncds")
+            .expect("NETCONF NMDA module");
+    }
+
     fn allow_close_session_rule(modules: &ModuleRegistry) -> NacmRule {
         NacmRule::allow(
             NacmAction::Exec,
@@ -6660,6 +6822,13 @@ mod tests {
             NacmAction::Exec,
             YangPathPattern::parse(NETCONF_EDIT_CONFIG_PATH, modules)
                 .expect("allow edit-config path"),
+        )
+    }
+
+    fn allow_edit_data_rule(modules: &ModuleRegistry) -> NacmRule {
+        NacmRule::allow(
+            NacmAction::Exec,
+            YangPathPattern::parse(NETCONF_EDIT_DATA_PATH, modules).expect("allow edit-data path"),
         )
     }
 
@@ -6737,6 +6906,7 @@ mod tests {
             .register_module("demo-system", "sys")
             .expect("module");
         register_netconf_module(&mut modules);
+        register_netconf_nmda_module(&mut modules);
         NacmPolicy::builder(PolicyVersion::new(1))
             .add_rule(NacmRule::deny(
                 NacmAction::Read,
@@ -6764,6 +6934,7 @@ mod tests {
             .add_rule(allow_copy_config_rule(&modules))
             .add_rule(allow_delete_config_rule(&modules))
             .add_rule(allow_edit_config_rule(&modules))
+            .add_rule(allow_edit_data_rule(&modules))
             .add_rule(allow_kill_session_rule(&modules))
             .build()
     }
@@ -11985,6 +12156,10 @@ mod tests {
             true
         }
 
+        fn nmda_edit_data_supported(&self) -> bool {
+            true
+        }
+
         fn startup_datastore(&self) -> Option<&dyn StartupDatastore<DemoConfig>> {
             self.startup
                 .as_deref()
@@ -12085,6 +12260,18 @@ mod tests {
     fn edit_config_rpc_to(target: &str, config_xml: &str, default_operation: &str) -> String {
         format!(
             r#"<?xml version="1.0"?><rpc xmlns="{NETCONF_BASE_NS}" message-id="1"><edit-config><target><{target}/></target><default-operation>{default_operation}</default-operation><config>{config_xml}</config></edit-config></rpc>"#
+        )
+    }
+
+    fn edit_data_rpc(datastore: &str, config_xml: &str, default_operation: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><rpc xmlns="{NETCONF_BASE_NS}" message-id="1"><ncds:edit-data xmlns:ncds="{NETCONF_NMDA_NS}" xmlns:ds="urn:ietf:params:xml:ns:yang:ietf-datastores"><ncds:datastore>ds:{datastore}</ncds:datastore><ncds:default-operation>{default_operation}</ncds:default-operation><ncds:config>{config_xml}</ncds:config></ncds:edit-data></rpc>"#
+        )
+    }
+
+    fn edit_data_url_rpc(datastore: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><rpc xmlns="{NETCONF_BASE_NS}" message-id="1"><ncds:edit-data xmlns:ncds="{NETCONF_NMDA_NS}" xmlns:ds="urn:ietf:params:xml:ns:yang:ietf-datastores"><ncds:datastore>ds:{datastore}</ncds:datastore><ncds:url>https://example.invalid/do-not-leak</ncds:url></ncds:edit-data></rpc>"#
         )
     }
 
@@ -12281,6 +12468,255 @@ mod tests {
             .collect();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].outcome, AuditOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn edit_data_requires_nmda_opt_in_before_candidate_builder_or_commit() {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+            )
+            .await
+            .expect("bus"),
+        );
+        let candidate_builder_called = Arc::new(AtomicBool::new(false));
+        let binding = WritableCountingEditBinding {
+            bus: Arc::clone(&bus),
+            candidate_builder_called: Arc::clone(&candidate_builder_called),
+        };
+        let audit = CapturingAudit::default();
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            audit.clone(),
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_data_rpc(
+            "running",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>operation-not-supported</error-tag>"));
+        assert!(!candidate_builder_called.load(Ordering::SeqCst));
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_EDIT_DATA_PATH)]
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_edit_applicator_wires_through_running_edit_data() {
+        let (server, bus, audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+        let successes_before = netconf_rpc_requests("edit-data", "success");
+
+        let rpc = edit_data_rpc(
+            "running",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(result.reply_xml.contains("<ok/>"), "{}", result.reply_xml);
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+        assert!(!result.reply_xml.contains("amf-2"));
+        assert!(!result.reply_xml.contains("do-not-leak"));
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, AuditOutcome::Success);
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path("/sys:system/sys:hostname")]
+        );
+        assert!(netconf_rpc_requests("edit-data", "success") > successes_before);
+    }
+
+    #[tokio::test]
+    async fn edit_data_candidate_is_visible_only_after_commit() {
+        let (server, bus, _audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_data_rpc(
+            "candidate",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let edited = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(edited.reply_xml.contains("<ok/>"), "{}", edited.reply_xml);
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+
+        let committed = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &commit_rpc(),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            committed.reply_xml.contains("<ok/>"),
+            "commit reply: {}",
+            committed.reply_xml
+        );
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+    }
+
+    #[tokio::test]
+    async fn edit_data_startup_mutates_only_startup() {
+        let (server, bus, startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_data_rpc(
+            "startup",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>boot-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let edited = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(edited.reply_xml.contains("<ok/>"), "{}", edited.reply_xml);
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+        assert_eq!(
+            startup.current().expect("startup config").hostname,
+            "boot-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_data_rejects_url_branch_without_echoing_url() {
+        let (server, bus, audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+        let errors_before = netconf_rpc_errors("edit-data", "operation-not-supported");
+
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &edit_data_url_rpc("running"),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>operation-not-supported</error-tag>"));
+        assert!(!result.reply_xml.contains("example.invalid"));
+        assert!(!result.reply_xml.contains("do-not-leak"));
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_EDIT_DATA_PATH)]
+        );
+        assert!(netconf_rpc_errors("edit-data", "operation-not-supported") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn edit_data_rejects_read_only_nmda_datastore_targets() {
+        let (server, bus, audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+        let errors_before = netconf_rpc_errors("edit-data", "invalid-value");
+
+        let rpc = edit_data_rpc(
+            "operational",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>invalid-value</error-tag>"));
+        assert!(!result.reply_xml.contains("amf-2"));
+        assert!(!result.reply_xml.contains("do-not-leak"));
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, audit_failed("invalid-value"));
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path(NETCONF_EDIT_DATA_PATH)]
+        );
+        assert!(netconf_rpc_errors("edit-data", "invalid-value") > errors_before);
     }
 
     #[tokio::test]
