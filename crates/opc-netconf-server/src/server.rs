@@ -9751,10 +9751,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn xpath_filter_remains_rejected_until_bounded_evaluator_exists() {
+    async fn xpath_filter_selects_structural_schema_paths_before_nacm() {
         let (server, observed, audit) = server_fixture().await;
         let get_config = format!(
-            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="104"><get-config><source><running/></source><filter type="xpath" select="/sys:system/sys:hostname"/></get-config></rpc>"#
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="104"><get-config><source><running/></source><filter xmlns:sys="urn:opc:demo" type="xpath" select="/sys:system/sys:hostname"/></get-config></rpc>"#
         );
         let get_config_reply = server.handle_rpc_xml(
             RequestId::new(),
@@ -9762,23 +9762,54 @@ mod tests {
             &get_config,
             &MgmtLimits::default(),
         );
-        assert!(get_config_reply.contains("<error-tag>operation-not-supported</error-tag>"));
-        assert!(!get_config_reply.contains("sys:hostname"));
-        assert!(observed.lock().expect("observed paths mutex").is_empty());
+        assert!(get_config_reply.contains("<sys:hostname>amf-1</sys:hostname>"));
+        assert!(!get_config_reply.contains("<sys:secret>"));
+        assert!(!get_config_reply.contains("do-not-leak"));
 
         let get = format!(
-            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="105"><get><filter type="xpath" select="/sys:system/sys:hostname"/></get></rpc>"#
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="105"><get><filter xmlns:sys="urn:opc:demo" type="xpath" select="/sys:system/sys:hostname"/></get></rpc>"#
         );
         let get_reply =
             server.handle_rpc_xml(RequestId::new(), &principal(), &get, &MgmtLimits::default());
-        assert!(get_reply.contains("<error-tag>operation-not-supported</error-tag>"));
-        assert!(!get_reply.contains("sys:hostname"));
-        assert!(observed.lock().expect("observed paths mutex").is_empty());
+        assert!(get_reply.contains("<sys:hostname>amf-1</sys:hostname>"));
+        assert!(!get_reply.contains("<sys:secret>"));
+        assert!(!get_reply.contains("do-not-leak"));
+
+        let paths = observed.lock().expect("observed paths mutex");
+        assert_eq!(
+            paths.as_slice(),
+            &[
+                vec!["/sys:system", "/sys:system/sys:hostname"],
+                vec!["/sys:system", "/sys:system/sys:hostname"]
+            ]
+        );
 
         let events = audit.events.lock().expect("audit mutex");
         assert_eq!(events.len(), 2);
+        assert_eq!(events[0].outcome, AuditOutcome::Success);
+        assert_eq!(events[1].outcome, AuditOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn xpath_predicate_filter_remains_rejected_without_payload() {
+        let (server, observed, audit) = server_fixture().await;
+        let get = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="106"><get><filter xmlns:sys="urn:opc:demo" type="xpath" select="/sys:system/sys:hostname[.='do-not-leak']"/></get></rpc>"#
+        );
+        let reply =
+            server.handle_rpc_xml(RequestId::new(), &principal(), &get, &MgmtLimits::default());
+
+        assert!(reply.contains(r#"message-id="106""#));
+        assert!(reply.contains("<error-tag>operation-not-supported</error-tag>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(!reply.contains("sys:hostname"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Read);
         assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
-        assert_eq!(events[1].outcome, audit_failed("operation-not-supported"));
+        assert!(events[0].schema_paths.is_empty());
     }
 
     #[tokio::test]

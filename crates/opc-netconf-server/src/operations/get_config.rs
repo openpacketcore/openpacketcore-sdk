@@ -12,7 +12,7 @@ use crate::binding::{NetconfConfigBinding, ReadSelection};
 use crate::error::{
     rpc_error_reply_with_attrs, rpc_ok_reply_with_attrs, RpcError, RpcReplyAttributes,
 };
-use crate::filter::get_config_paths;
+use crate::filter::get_config_paths_with_limits;
 use crate::metrics::{
     record_nacm_denials, record_rpc_error, record_rpc_success, NetconfNacmAction, NetconfOperation,
 };
@@ -197,41 +197,42 @@ where
     };
 
     let registry = binding.schema_registry();
-    let config_paths = match get_config_paths(registry, request.filter.as_ref()) {
-        Ok(paths) => paths,
-        Err(err) => {
-            let rpc_error = err.rpc_error();
-            let error_tag = rpc_error.classification.tag;
-            if audit_failure(
-                ctx.audit,
-                ctx.request_id,
-                ctx.principal,
-                ctx.transport,
-                err.audit_reason(),
-                Vec::new(),
-            )
-            .is_err()
-            {
+    let config_paths =
+        match get_config_paths_with_limits(registry, request.filter.as_ref(), ctx.limits) {
+            Ok(paths) => paths,
+            Err(err) => {
+                let rpc_error = err.rpc_error();
+                let error_tag = rpc_error.classification.tag;
+                if audit_failure(
+                    ctx.audit,
+                    ctx.request_id,
+                    ctx.principal,
+                    ctx.transport,
+                    err.audit_reason(),
+                    Vec::new(),
+                )
+                .is_err()
+                {
+                    record_rpc_error(
+                        NetconfOperation::GetConfig,
+                        NetconfErrorTag::OperationFailed,
+                        ctx.started.elapsed(),
+                    );
+                    return error_reply(&ctx, RpcError::operation_failed());
+                }
                 record_rpc_error(
                     NetconfOperation::GetConfig,
-                    NetconfErrorTag::OperationFailed,
+                    error_tag,
                     ctx.started.elapsed(),
                 );
-                return error_reply(&ctx, RpcError::operation_failed());
+                tracing::debug!(
+                    operation = "get-config",
+                    error_tag = error_tag.as_str(),
+                    "NETCONF get-config rejected unsupported or invalid filter"
+                );
+                return error_reply(&ctx, rpc_error);
             }
-            record_rpc_error(
-                NetconfOperation::GetConfig,
-                error_tag,
-                ctx.started.elapsed(),
-            );
-            tracing::debug!(
-                operation = "get-config",
-                error_tag = error_tag.as_str(),
-                "NETCONF get-config rejected unsupported or invalid filter"
-            );
-            return error_reply(&ctx, rpc_error);
-        }
-    };
+        };
     if ctx.limits.check_paths(config_paths.len()).is_err() {
         if audit_failure(
             ctx.audit,

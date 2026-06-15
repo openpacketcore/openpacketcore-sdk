@@ -111,6 +111,14 @@ pub struct MgmtLimits {
     /// semantics, but the bound still limits how many rejected nodes a client can
     /// force the parser to classify before failing closed.
     pub max_subtree_filter_attribute_match_nodes: usize,
+    /// Maximum byte length of one NETCONF XPath `select` expression.
+    pub max_xpath_filter_bytes: usize,
+    /// Maximum number of union arms (`|` separated location paths) in one XPath
+    /// filter expression.
+    pub max_xpath_filter_unions: usize,
+    /// Maximum total number of location-path segments evaluated across all union
+    /// arms in one XPath filter expression.
+    pub max_xpath_filter_segments: usize,
 }
 
 impl Default for MgmtLimits {
@@ -132,6 +140,9 @@ impl Default for MgmtLimits {
             max_sessions: 1024,
             max_subtree_filter_content_match_nodes: 16,
             max_subtree_filter_attribute_match_nodes: 16,
+            max_xpath_filter_bytes: 4096,
+            max_xpath_filter_unions: 32,
+            max_xpath_filter_segments: 256,
         }
     }
 }
@@ -141,7 +152,7 @@ impl MgmtLimits {
     /// is never "unbounded"), and a single value/queue may not be larger than a
     /// whole message would allow, which would make the per-value bound dead.
     pub fn validate(&self) -> Result<(), LimitsError> {
-        let fields: [(&'static str, usize); 12] = [
+        let fields: [(&'static str, usize); 15] = [
             ("request_bytes", self.max_request_bytes),
             (
                 "frame_chunks_per_message",
@@ -169,6 +180,9 @@ impl MgmtLimits {
                 "subtree_filter_attribute_match_nodes",
                 self.max_subtree_filter_attribute_match_nodes,
             ),
+            ("xpath_filter_bytes", self.max_xpath_filter_bytes),
+            ("xpath_filter_unions", self.max_xpath_filter_unions),
+            ("xpath_filter_segments", self.max_xpath_filter_segments),
         ];
         for (name, value) in fields {
             if value == 0 {
@@ -179,6 +193,11 @@ impl MgmtLimits {
         if self.max_value_bytes > self.max_request_bytes {
             return Err(LimitsError::Inconsistent {
                 detail: "max_value_bytes exceeds max_request_bytes",
+            });
+        }
+        if self.max_xpath_filter_bytes > self.max_request_bytes {
+            return Err(LimitsError::Inconsistent {
+                detail: "max_xpath_filter_bytes exceeds max_request_bytes",
             });
         }
 
@@ -266,6 +285,27 @@ impl MgmtLimits {
         )
     }
 
+    /// Rejects an XPath filter expression larger than [`Self::max_xpath_filter_bytes`].
+    pub fn check_xpath_filter_bytes(&self, actual: usize) -> Result<(), LimitsError> {
+        Self::check("xpath_filter_bytes", self.max_xpath_filter_bytes, actual)
+    }
+
+    /// Rejects an XPath filter expression with more than
+    /// [`Self::max_xpath_filter_unions`] union arms.
+    pub fn check_xpath_filter_unions(&self, actual: usize) -> Result<(), LimitsError> {
+        Self::check("xpath_filter_unions", self.max_xpath_filter_unions, actual)
+    }
+
+    /// Rejects an XPath filter expression with more than
+    /// [`Self::max_xpath_filter_segments`] location-path segments.
+    pub fn check_xpath_filter_segments(&self, actual: usize) -> Result<(), LimitsError> {
+        Self::check(
+            "xpath_filter_segments",
+            self.max_xpath_filter_segments,
+            actual,
+        )
+    }
+
     #[inline]
     fn check(limit: &'static str, max: usize, actual: usize) -> Result<(), LimitsError> {
         if actual > max {
@@ -341,6 +381,18 @@ mod tests {
                 max_subtree_filter_attribute_match_nodes: 0,
                 ..base
             },
+            MgmtLimits {
+                max_xpath_filter_bytes: 0,
+                ..base
+            },
+            MgmtLimits {
+                max_xpath_filter_unions: 0,
+                ..base
+            },
+            MgmtLimits {
+                max_xpath_filter_segments: 0,
+                ..base
+            },
         ];
         for limits in zeroed {
             assert!(
@@ -378,6 +430,9 @@ mod tests {
             max_sessions: 3,
             max_subtree_filter_content_match_nodes: 1,
             max_subtree_filter_attribute_match_nodes: 1,
+            max_xpath_filter_bytes: 10,
+            max_xpath_filter_unions: 2,
+            max_xpath_filter_segments: 3,
         };
 
         // At the limit is allowed; one past is rejected with the named limit.
@@ -410,6 +465,12 @@ mod tests {
         assert!(limits
             .check_subtree_filter_attribute_match_nodes(2)
             .is_err());
+        assert!(limits.check_xpath_filter_bytes(10).is_ok());
+        assert!(limits.check_xpath_filter_bytes(11).is_err());
+        assert!(limits.check_xpath_filter_unions(2).is_ok());
+        assert!(limits.check_xpath_filter_unions(3).is_err());
+        assert!(limits.check_xpath_filter_segments(3).is_ok());
+        assert!(limits.check_xpath_filter_segments(4).is_err());
     }
 
     #[test]

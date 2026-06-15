@@ -60,11 +60,11 @@ const READ_ONLY_CAPABILITIES: [&str; 2] = [NETCONF_BASE_1_0, NETCONF_BASE_1_1];
 
 /// Returns the base capabilities implemented by the current read-only server core.
 ///
-/// Startup, validate, XPath, and notifications are intentionally absent until
-/// those behaviors exist and are tested. Candidate and confirmed-commit are
-/// advertised only when the binding exposes their backing datastore behavior. Optional
-/// binding-backed capabilities are appended by [`read_only_capabilities`] only
-/// when their hooks are present.
+/// Validate, full RFC XPath capability, and notifications are intentionally
+/// absent until those behaviors exist and are tested. Candidate, startup, and
+/// confirmed-commit are advertised only when the binding exposes their backing
+/// datastore behavior. Optional binding-backed capabilities are appended by
+/// [`read_only_capabilities`] only when their hooks are present.
 pub const fn read_only_base_capabilities() -> &'static [&'static str] {
     &READ_ONLY_CAPABILITIES
 }

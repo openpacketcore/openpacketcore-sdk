@@ -450,9 +450,34 @@ pub enum FilterKind {
 pub enum Filter {
     /// Structural subtree filter.
     Subtree(SubtreeFilter),
-    /// XPath filter. Recognized so it can be rejected honestly until a bounded
-    /// evaluator exists.
-    XPath,
+    /// XPath filter.
+    XPath(XPathFilter),
+}
+
+/// Parsed XPath filter envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XPathFilter {
+    select: String,
+    namespaces: BTreeMap<String, String>,
+}
+
+impl XPathFilter {
+    /// Builds a parsed XPath filter.
+    pub(crate) fn new(select: String, namespaces: BTreeMap<String, String>) -> Self {
+        Self { select, namespaces }
+    }
+
+    /// The bounded, non-empty `select` expression.
+    pub fn select(&self) -> &str {
+        &self.select
+    }
+
+    /// Prefix bindings visible on the `<filter>` element. The default XML
+    /// namespace is intentionally absent because XPath 1.0 does not apply it to
+    /// unprefixed element names.
+    pub fn namespaces(&self) -> &BTreeMap<String, String> {
+        &self.namespaces
+    }
 }
 
 /// Parsed structural subtree filter.
@@ -816,7 +841,7 @@ impl ParserState {
         let capture_start =
             self.edit_config_capture.is_some() || self.is_edit_config_config_start(&element);
         self.validate_protocol_namespace(&element)?;
-        self.process_start(&element, &scoped.attrs, &scoped.reply_attrs)?;
+        self.process_start(&element, &scoped.attrs, &scoped.reply_attrs, &scoped.scope)?;
         if capture_start {
             self.capture_event(Event::Start(start.borrow()))?;
             self.edit_config_capture_depth = self.edit_config_capture_depth.saturating_add(1);
@@ -1002,6 +1027,7 @@ impl ParserState {
         element: &Element,
         attrs: &[(String, String)],
         reply_attrs: &[(String, String)],
+        scope: &NamespaceScope,
     ) -> Result<(), XmlError> {
         if self.filter_depth > 0 {
             self.process_filter_content_start(element, attrs)?;
@@ -1028,7 +1054,7 @@ impl ParserState {
 
         match self.root {
             Some(RootKind::Hello) => self.process_hello_start(element),
-            Some(RootKind::Rpc) => self.process_rpc_start(element, attrs),
+            Some(RootKind::Rpc) => self.process_rpc_start(element, attrs, scope),
             None => Err(XmlError::Malformed),
         }
     }
@@ -1051,6 +1077,7 @@ impl ParserState {
         &mut self,
         element: &Element,
         attrs: &[(String, String)],
+        scope: &NamespaceScope,
     ) -> Result<(), XmlError> {
         if self.local_path_is(&["rpc"]) {
             match element.local.as_str() {
@@ -1189,7 +1216,9 @@ impl ParserState {
 
         if self.local_path_is(&["rpc", "get"]) {
             match element.local.as_str() {
-                "filter" if element.namespace == NETCONF_BASE_NS => self.install_filter(attrs),
+                "filter" if element.namespace == NETCONF_BASE_NS => {
+                    self.install_filter(attrs, scope)
+                }
                 "with-defaults" if element.namespace == WITH_DEFAULTS_NS => {
                     self.install_get_with_defaults(attrs)
                 }
@@ -1198,7 +1227,9 @@ impl ParserState {
         } else if self.local_path_is(&["rpc", "get-config"]) {
             match element.local.as_str() {
                 "source" if element.namespace == NETCONF_BASE_NS => Ok(()),
-                "filter" if element.namespace == NETCONF_BASE_NS => self.install_filter(attrs),
+                "filter" if element.namespace == NETCONF_BASE_NS => {
+                    self.install_filter(attrs, scope)
+                }
                 "with-defaults" if element.namespace == WITH_DEFAULTS_NS => {
                     self.install_get_config_with_defaults(attrs)
                 }
@@ -1775,11 +1806,19 @@ impl ParserState {
         Ok(())
     }
 
-    fn install_filter(&mut self, attrs: &[(String, String)]) -> Result<(), XmlError> {
+    fn install_filter(
+        &mut self,
+        attrs: &[(String, String)],
+        scope: &NamespaceScope,
+    ) -> Result<(), XmlError> {
         let filter = filter_kind(attrs)?;
         let parsed_filter = match filter {
             FilterKind::Subtree => Filter::Subtree(SubtreeFilter::default()),
-            FilterKind::XPath => Filter::XPath,
+            FilterKind::XPath => {
+                let select = attr_value(attrs, "select").ok_or(XmlError::MissingAttribute)?;
+                self.limits.check_xpath_filter_bytes(select.len())?;
+                Filter::XPath(XPathFilter::new(select.to_string(), scope.bindings.clone()))
+            }
         };
         let duplicate = if self.local_path_is(&["rpc", "get"]) {
             self.get
@@ -3364,7 +3403,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_well_shaped_xpath_filter_for_unsupported_evaluator() {
+    fn parses_well_shaped_xpath_filter_envelope() {
         let get_config = parse_rpc(
             &rpc(r#"<get-config><source><running/></source><filter type="xpath" select="/sys:system/sys:hostname"/></get-config>"#),
             &MgmtLimits::default(),
@@ -3373,7 +3412,10 @@ mod tests {
         let RpcOperation::GetConfig(request) = get_config.operation else {
             panic!("expected get-config operation");
         };
-        assert_eq!(request.filter, Some(Filter::XPath));
+        let Some(Filter::XPath(xpath)) = request.filter else {
+            panic!("expected XPath filter");
+        };
+        assert_eq!(xpath.select(), "/sys:system/sys:hostname");
 
         let get = parse_rpc(
             &rpc(r#"<get><filter type="xpath" select="/sys:system/sys:hostname"/></get>"#),
@@ -3383,7 +3425,10 @@ mod tests {
         let RpcOperation::Get(request) = get.operation else {
             panic!("expected get operation");
         };
-        assert_eq!(request.filter, Some(Filter::XPath));
+        let Some(Filter::XPath(xpath)) = request.filter else {
+            panic!("expected XPath filter");
+        };
+        assert_eq!(xpath.select(), "/sys:system/sys:hostname");
 
         let namespaced_select = parse_rpc(
             &rpc(r#"<get><filter xmlns:sys="urn:opc:test" type="xpath" select="/sys:system/sys:hostname"/></get>"#),
@@ -3393,7 +3438,13 @@ mod tests {
         let RpcOperation::Get(request) = namespaced_select.operation else {
             panic!("expected get operation");
         };
-        assert_eq!(request.filter, Some(Filter::XPath));
+        let Some(Filter::XPath(xpath)) = request.filter else {
+            panic!("expected XPath filter");
+        };
+        assert_eq!(
+            xpath.namespaces().get("sys").map(String::as_str),
+            Some("urn:opc:test")
+        );
     }
 
     #[test]
@@ -3413,6 +3464,31 @@ mod tests {
                 limit: "xml_namespace_decls",
                 max: 1,
                 actual: 2
+            })
+        );
+    }
+
+    #[test]
+    fn xpath_filter_select_obeys_byte_limit() {
+        let limits = MgmtLimits {
+            max_xpath_filter_bytes: 4,
+            ..MgmtLimits::default()
+        };
+        let select = "/sys:system";
+        let err = parse_rpc(
+            &rpc(&format!(
+                r#"<get><filter xmlns:sys="urn:opc:test" type="xpath" select="{select}"/></get>"#
+            )),
+            &limits,
+        )
+        .expect_err("xpath select over byte limit");
+
+        assert_eq!(
+            err,
+            XmlError::Limit(opc_mgmt_limits::LimitsError::Exceeded {
+                limit: "xpath_filter_bytes",
+                max: 4,
+                actual: select.len()
             })
         );
     }
