@@ -24,12 +24,14 @@ pub mod capabilities;
 pub mod encoding;
 pub mod error;
 pub mod extension;
+pub mod listener;
 pub mod metrics;
 pub mod path;
 pub mod proto;
 pub mod proto_adapter;
 pub mod service;
 pub mod set;
+pub mod transport;
 pub mod value;
 
 use std::marker::PhantomData;
@@ -44,13 +46,20 @@ pub use error::GnmiError;
 pub use extension::{
     AcceptedExtension, Extension, ExtensionDisposition, ExtensionRegistry, RegisteredExtension,
 };
+pub use listener::{
+    run_gnmi_tls_listener, GnmiListenerConfig, GnmiListenerError, GnmiListenerResult,
+};
 pub use path::{resolve_path, resolve_paths, GnmiPath, GnmiPathElem, ResolvedGnmiPath};
 pub use proto::GNMI_VERSION;
 pub use proto_adapter::{
     encoding_to_proto, extension_from_proto, path_from_proto, typed_value_from_proto,
 };
-pub use service::GnmiService;
+pub use service::{AuthenticatedGnmiPrincipal, GnmiService};
 pub use set::{NormalizedSet, SetOperation};
+pub use transport::{
+    principal_from_identity_state, principal_from_identity_watch, principal_from_tls_stream,
+    GnmiTlsPrincipalError,
+};
 pub use value::{normalize_typed_value, NormalizedValue, TypedValue};
 
 /// Protocol-neutral gNMI server foundation.

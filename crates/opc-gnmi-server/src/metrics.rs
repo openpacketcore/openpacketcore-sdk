@@ -230,7 +230,12 @@ mod tests {
 
     #[test]
     fn records_low_cardinality_metrics() {
-        METRICS.reset_all();
+        let capability_success_before = rpc_request_count(GnmiOperation::Capabilities, "success");
+        let get_failure_before = rpc_request_count(GnmiOperation::Get, "failure");
+        let get_error_before =
+            rpc_error_count(GnmiOperation::Get, MgmtStatus::InvalidArgument.as_str());
+        let read_denials_before = nacm_denial_count(GnmiNacmAction::Read);
+        let active_stream_before = active_stream_count(SubscribeModeMetric::Stream);
 
         record_rpc_success(GnmiOperation::Capabilities, Duration::from_millis(10));
         record_rpc_error(
@@ -243,33 +248,64 @@ mod tests {
         record_set_commit_latency(SetCommitMetric::Patch, Duration::from_millis(20));
         {
             let _guard = active_stream(SubscribeModeMetric::Stream);
-            let active = METRICS.gnmi_active_streams.lock().expect("metrics");
-            assert_eq!(active.get("stream").copied(), Some(1));
+            assert_eq!(
+                active_stream_count(SubscribeModeMetric::Stream),
+                active_stream_before + 1
+            );
         }
 
-        let requests = METRICS.gnmi_rpc_requests_total.lock().expect("metrics");
-        assert_eq!(
-            requests.get(&("Capabilities".to_string(), "success".to_string())),
-            Some(&1)
+        assert!(
+            rpc_request_count(GnmiOperation::Capabilities, "success") > capability_success_before
         );
-        assert_eq!(
-            requests.get(&("Get".to_string(), "failure".to_string())),
-            Some(&1)
+        assert!(rpc_request_count(GnmiOperation::Get, "failure") > get_failure_before);
+        assert!(
+            rpc_error_count(GnmiOperation::Get, MgmtStatus::InvalidArgument.as_str())
+                > get_error_before
         );
-        drop(requests);
-
-        let errors = METRICS.gnmi_rpc_errors_total.lock().expect("metrics");
+        assert!(nacm_denial_count(GnmiNacmAction::Read) >= read_denials_before + 2);
         assert_eq!(
-            errors.get(&("Get".to_string(), "INVALID_ARGUMENT".to_string())),
-            Some(&1)
+            active_stream_count(SubscribeModeMetric::Stream),
+            active_stream_before
         );
-        drop(errors);
+    }
 
-        let denials = METRICS.gnmi_nacm_denials_total.lock().expect("metrics");
-        assert_eq!(denials.get("read"), Some(&2));
-        drop(denials);
+    fn rpc_request_count(operation: GnmiOperation, outcome: &str) -> u64 {
+        METRICS
+            .gnmi_rpc_requests_total
+            .lock()
+            .expect("metrics")
+            .get(&(operation.as_str().to_string(), outcome.to_string()))
+            .copied()
+            .unwrap_or_default()
+    }
 
-        let active = METRICS.gnmi_active_streams.lock().expect("metrics");
-        assert_eq!(active.get("stream"), Some(&0));
+    fn rpc_error_count(operation: GnmiOperation, status: &str) -> u64 {
+        METRICS
+            .gnmi_rpc_errors_total
+            .lock()
+            .expect("metrics")
+            .get(&(operation.as_str().to_string(), status.to_string()))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn nacm_denial_count(action: GnmiNacmAction) -> u64 {
+        METRICS
+            .gnmi_nacm_denials_total
+            .lock()
+            .expect("metrics")
+            .get(action.as_str())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn active_stream_count(mode: SubscribeModeMetric) -> i64 {
+        METRICS
+            .gnmi_active_streams
+            .lock()
+            .expect("metrics")
+            .get(mode.as_str())
+            .copied()
+            .unwrap_or_default()
     }
 }

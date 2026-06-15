@@ -2,7 +2,7 @@
 
 use std::{pin::Pin, sync::Arc};
 
-use opc_config_model::OpcConfig;
+use opc_config_model::{AuthStrength, OpcConfig, TrustedPrincipal};
 use tonic::{Request, Response, Status};
 
 use crate::{
@@ -21,6 +21,25 @@ type SubscribeStream = Pin<
     >,
 >;
 
+/// Authenticated gNMI principal attached to each request by the TLS listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedGnmiPrincipal {
+    principal: TrustedPrincipal,
+}
+
+impl AuthenticatedGnmiPrincipal {
+    /// Wraps a grant-free, transport-authenticated principal for request
+    /// extensions.
+    pub fn new(principal: TrustedPrincipal) -> Self {
+        Self { principal }
+    }
+
+    /// Returns the authenticated management principal.
+    pub const fn principal(&self) -> &TrustedPrincipal {
+        &self.principal
+    }
+}
+
 /// Tonic service implementation over the protocol-neutral [`GnmiServer`]
 /// foundation.
 #[derive(Clone)]
@@ -30,6 +49,7 @@ where
     B: GnmiConfigBinding<C>,
 {
     server: Arc<GnmiServer<C, B>>,
+    require_principal: bool,
 }
 
 impl<C, B> GnmiService<C, B>
@@ -41,12 +61,39 @@ where
     pub fn new(server: GnmiServer<C, B>) -> Self {
         Self {
             server: Arc::new(server),
+            require_principal: false,
+        }
+    }
+
+    /// Wraps a validated gNMI foundation handle and requires every RPC to carry
+    /// an authenticated principal extension supplied by the transport listener.
+    pub fn new_authenticated(server: GnmiServer<C, B>) -> Self {
+        Self {
+            server: Arc::new(server),
+            require_principal: true,
         }
     }
 
     /// Returns the underlying foundation handle.
     pub fn server(&self) -> &GnmiServer<C, B> {
         &self.server
+    }
+
+    fn validate_authenticated_request<T>(&self, request: &Request<T>) -> Result<(), GnmiError> {
+        if !self.require_principal {
+            return Ok(());
+        }
+        let principal = request
+            .extensions()
+            .get::<AuthenticatedGnmiPrincipal>()
+            .ok_or(GnmiError::Unauthenticated)?;
+        if principal.principal().auth_strength != AuthStrength::MutualTls {
+            return Err(GnmiError::PermissionDenied);
+        }
+        if !principal.principal().roles.is_empty() || !principal.principal().groups.is_empty() {
+            return Err(GnmiError::PermissionDenied);
+        }
+        Ok(())
     }
 }
 
@@ -63,6 +110,10 @@ where
         request: Request<gnmi::CapabilityRequest>,
     ) -> Result<Response<gnmi::CapabilityResponse>, Status> {
         let start = std::time::Instant::now();
+        if let Err(err) = self.validate_authenticated_request(&request) {
+            record_rpc_error(GnmiOperation::Capabilities, err.status(), start.elapsed());
+            return Err(status_from_error(err));
+        }
         if let Err(err) =
             validate_extensions(self.server.extensions(), &request.get_ref().extension)
         {
@@ -96,22 +147,31 @@ where
 
     async fn get(
         &self,
-        _request: Request<gnmi::GetRequest>,
+        request: Request<gnmi::GetRequest>,
     ) -> Result<Response<gnmi::GetResponse>, Status> {
+        if let Err(err) = self.validate_authenticated_request(&request) {
+            return Err(status_from_error(err));
+        }
         Err(unsupported_rpc_status(GnmiOperation::Get))
     }
 
     async fn set(
         &self,
-        _request: Request<gnmi::SetRequest>,
+        request: Request<gnmi::SetRequest>,
     ) -> Result<Response<gnmi::SetResponse>, Status> {
+        if let Err(err) = self.validate_authenticated_request(&request) {
+            return Err(status_from_error(err));
+        }
         Err(unsupported_rpc_status(GnmiOperation::Set))
     }
 
     async fn subscribe(
         &self,
-        _request: Request<tonic::Streaming<gnmi::SubscribeRequest>>,
+        request: Request<tonic::Streaming<gnmi::SubscribeRequest>>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        if let Err(err) = self.validate_authenticated_request(&request) {
+            return Err(status_from_error(err));
+        }
         Err(unsupported_rpc_status(GnmiOperation::Subscribe))
     }
 }
@@ -161,6 +221,9 @@ mod tests {
     use std::sync::Arc;
 
     use opc_config_bus::{ConfigBus, MockManagedDatastore};
+    use opc_config_model::{
+        AuthStrength, TrustedPrincipal, WorkloadIdentity as ConfigWorkloadIdentity,
+    };
     use opc_mgmt_authz::{AuthzError, PolicySource};
     use opc_mgmt_limits::MgmtLimits;
     use opc_mgmt_opstate::{
@@ -175,6 +238,7 @@ mod tests {
     use crate::{
         CapabilityProfile, ExtensionRegistry, GnmiPatchApplicator, GnmiVersion, GNMI_VERSION,
     };
+    use opc_types::TenantId;
 
     struct TestRegistry;
 
@@ -285,6 +349,14 @@ mod tests {
     }
 
     async fn service() -> GnmiService<(), TestBinding> {
+        service_with_authentication(false).await
+    }
+
+    async fn authenticated_service() -> GnmiService<(), TestBinding> {
+        service_with_authentication(true).await
+    }
+
+    async fn service_with_authentication(authenticated: bool) -> GnmiService<(), TestBinding> {
         let bus = Arc::new(
             ConfigBus::new_dev_only((), MockManagedDatastore::new())
                 .await
@@ -299,7 +371,21 @@ mod tests {
             ExtensionRegistry::default(),
         )
         .expect("server");
-        GnmiService::new(server)
+        if authenticated {
+            GnmiService::new_authenticated(server)
+        } else {
+            GnmiService::new(server)
+        }
+    }
+
+    fn authenticated_principal() -> AuthenticatedGnmiPrincipal {
+        AuthenticatedGnmiPrincipal::new(
+            TrustedPrincipal::new(
+                ConfigWorkloadIdentity::User("gnmi-client".to_string()),
+                TenantId::from_static("test"),
+            )
+            .with_auth_strength(AuthStrength::MutualTls),
+        )
     }
 
     #[tokio::test]
@@ -345,6 +431,79 @@ mod tests {
         assert_eq!(status.code(), Code::Unimplemented);
         assert_eq!(status.message(), "gNMI operation is not supported");
         assert!(!status.message().contains("secret-extension-payload"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_capabilities_requires_transport_principal() {
+        let service = authenticated_service().await;
+        let status = service
+            .capabilities(Request::new(gnmi::CapabilityRequest {
+                extension: Vec::new(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::Unauthenticated);
+        assert_eq!(status.message(), "gNMI authentication required");
+    }
+
+    #[tokio::test]
+    async fn authenticated_capabilities_accepts_grant_free_principal() {
+        let service = authenticated_service().await;
+        let mut request = Request::new(gnmi::CapabilityRequest {
+            extension: Vec::new(),
+        });
+        request.extensions_mut().insert(authenticated_principal());
+
+        let response = service
+            .capabilities(request)
+            .await
+            .expect("capabilities")
+            .into_inner();
+
+        assert_eq!(response.g_nmi_version, "0.10.0");
+    }
+
+    #[tokio::test]
+    async fn authenticated_capabilities_rejects_non_mtls_principal() {
+        let service = authenticated_service().await;
+        let principal = TrustedPrincipal::new(
+            ConfigWorkloadIdentity::User("gnmi-client".to_string()),
+            TenantId::from_static("test"),
+        );
+        let mut request = Request::new(gnmi::CapabilityRequest {
+            extension: Vec::new(),
+        });
+        request
+            .extensions_mut()
+            .insert(AuthenticatedGnmiPrincipal::new(principal));
+
+        let status = service.capabilities(request).await.unwrap_err();
+
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_eq!(status.message(), "gNMI access denied");
+    }
+
+    #[tokio::test]
+    async fn authenticated_capabilities_rejects_transport_derived_grants() {
+        let service = authenticated_service().await;
+        let principal = TrustedPrincipal::new(
+            ConfigWorkloadIdentity::User("gnmi-client".to_string()),
+            TenantId::from_static("test"),
+        )
+        .with_auth_strength(AuthStrength::MutualTls)
+        .with_roles(["admin"]);
+        let mut request = Request::new(gnmi::CapabilityRequest {
+            extension: Vec::new(),
+        });
+        request
+            .extensions_mut()
+            .insert(AuthenticatedGnmiPrincipal::new(principal));
+
+        let status = service.capabilities(request).await.unwrap_err();
+
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_eq!(status.message(), "gNMI access denied");
     }
 
     #[tokio::test]
