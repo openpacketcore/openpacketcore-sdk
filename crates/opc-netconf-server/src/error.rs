@@ -188,17 +188,33 @@ pub fn rpc_ok_reply_with_attrs(
     reply_attrs: &RpcReplyAttributes,
     data_xml: &str,
 ) -> String {
+    rpc_ok_reply_with_attrs_and_data_ns(message_id, reply_attrs, NETCONF_BASE_NS, data_xml)
+}
+
+/// Renders a successful `<rpc-reply>` whose `<data>` element is in `data_ns`.
+pub fn rpc_ok_reply_with_attrs_and_data_ns(
+    message_id: &str,
+    reply_attrs: &RpcReplyAttributes,
+    data_ns: &str,
+    data_xml: &str,
+) -> String {
     let mut out = String::new();
     let prefix = append_rpc_reply_start(&mut out, Some(message_id), reply_attrs);
     out.push('>');
-    let data_tag = netconf_tag(prefix.as_deref(), "data");
+    let data_tag = if data_ns == NETCONF_BASE_NS {
+        netconf_tag(prefix.as_deref(), "data")
+    } else {
+        "data".to_string()
+    };
     if data_xml.trim().is_empty() {
         out.push('<');
         out.push_str(&data_tag);
+        append_data_namespace(&mut out, data_ns);
         out.push_str("/>");
     } else {
         out.push('<');
         out.push_str(&data_tag);
+        append_data_namespace(&mut out, data_ns);
         out.push('>');
         out.push_str(data_xml);
         out.push_str("</");
@@ -207,6 +223,15 @@ pub fn rpc_ok_reply_with_attrs(
     }
     append_rpc_reply_end(&mut out, prefix.as_deref());
     out
+}
+
+fn append_data_namespace(out: &mut String, data_ns: &str) {
+    if data_ns == NETCONF_BASE_NS {
+        return;
+    }
+    out.push_str(r#" xmlns=""#);
+    out.push_str(data_ns);
+    out.push('"');
 }
 
 /// Renders a successful RFC 6022 `<get-schema>` `<rpc-reply>`.

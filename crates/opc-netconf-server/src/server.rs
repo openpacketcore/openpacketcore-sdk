@@ -36,6 +36,7 @@ use crate::metrics::{
 };
 use crate::operations::get::{handle_get, GetContext};
 use crate::operations::get_config::{handle_get_config, GetConfigContext};
+use crate::operations::get_data::{handle_get_data, GetDataContext};
 use crate::session_registry::{
     CandidateWriteResult, KillSessionResult, LockCandidateResult, RunningWriteResult,
     SessionRegistry, StartupWriteResult, UnlockCandidateResult,
@@ -582,6 +583,41 @@ where
                     request,
                 ))
             }
+            RpcOperation::GetData(request) => {
+                let candidate_config = self.candidate_config_for_get_data(request);
+                let startup_config = match self.startup_config_for_get_data(request) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        return self.startup_get_data_failure_reply(
+                            error,
+                            request_id,
+                            principal,
+                            &parsed.message_id,
+                            &parsed.reply_attrs,
+                            started,
+                        );
+                    }
+                };
+                RpcHandlingResult::keep_open(handle_get_data::<C, B, P, A>(
+                    &self.binding,
+                    GetDataContext {
+                        authz: &self.authz,
+                        audit: &self.audit,
+                        transport: self.transport,
+                        request_id,
+                        principal,
+                        message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
+                        started,
+                        limits,
+                        candidate_config: candidate_config.as_ref(),
+                        candidate_supported: self.binding.candidate_datastore_capability(),
+                        startup_config: startup_config.as_ref(),
+                        startup_supported: self.binding.startup_datastore_capability(),
+                    },
+                    request,
+                ))
+            }
             RpcOperation::CloseSession => self.handle_close_session(
                 request_id,
                 principal,
@@ -805,6 +841,43 @@ where
                 RpcHandlingResult::keep_open(handle_get_config::<C, B, P, A>(
                     &self.binding,
                     GetConfigContext {
+                        authz: &self.authz,
+                        audit: &self.audit,
+                        transport: self.transport,
+                        request_id,
+                        principal,
+                        message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
+                        started,
+                        limits,
+                        candidate_config: candidate_config.as_ref(),
+                        candidate_supported: self.binding.candidate_datastore_capability(),
+                        startup_config: startup_config.as_ref(),
+                        startup_supported: self.binding.startup_datastore_capability(),
+                    },
+                    request,
+                ))
+            }
+            RpcOperation::GetData(request) => {
+                let candidate_config = self.candidate_config_for_get_data(request);
+                let startup_config = match self.startup_config_for_get_data(request) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        return self
+                            .startup_get_data_failure_reply(
+                                error,
+                                request_id,
+                                principal,
+                                &parsed.message_id,
+                                &parsed.reply_attrs,
+                                started,
+                            )
+                            .into();
+                    }
+                };
+                RpcHandlingResult::keep_open(handle_get_data::<C, B, P, A>(
+                    &self.binding,
+                    GetDataContext {
                         authz: &self.authz,
                         audit: &self.audit,
                         transport: self.transport,
@@ -1232,11 +1305,39 @@ where
         (candidate.base_version == running.version).then_some(candidate.config)
     }
 
+    fn candidate_config_for_get_data(&self, request: &crate::xml::GetDataRequest) -> Option<C> {
+        if request.datastore != crate::xml::NmdaDatastore::Candidate
+            || !self.binding.candidate_datastore_capability()
+        {
+            return None;
+        }
+        let running = self.binding.config_bus().current_snapshot();
+        let candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
+        let candidate = candidate.snapshot_or(running.config.as_ref(), running.version);
+        (candidate.base_version == running.version).then_some(candidate.config)
+    }
+
     fn startup_config_for_get_config(
         &self,
         request: &crate::xml::GetConfigRequest,
     ) -> Result<Option<C>, StartupDatastoreError> {
         if request.source != XmlDatastore::Startup || !self.binding.startup_datastore_capability() {
+            return Ok(None);
+        }
+        let startup = self
+            .binding
+            .startup_datastore()
+            .ok_or(StartupDatastoreError::Unsupported)?;
+        startup.load_startup_config()
+    }
+
+    fn startup_config_for_get_data(
+        &self,
+        request: &crate::xml::GetDataRequest,
+    ) -> Result<Option<C>, StartupDatastoreError> {
+        if request.datastore != crate::xml::NmdaDatastore::Startup
+            || !self.binding.startup_datastore_capability()
+        {
             return Ok(None);
         }
         let startup = self
@@ -1374,6 +1475,57 @@ where
         }
         record_rpc_error(
             NetconfOperation::GetConfig,
+            rpc_error.classification.tag,
+            started.elapsed(),
+        );
+        RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+            Some(message_id),
+            reply_attrs,
+            rpc_error,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn startup_get_data_failure_reply(
+        &self,
+        error: StartupDatastoreError,
+        request_id: RequestId,
+        principal: &TrustedPrincipal,
+        message_id: &str,
+        reply_attrs: &RpcReplyAttributes,
+        started: Instant,
+    ) -> RpcHandlingResult {
+        let (reason, rpc_error) = match error {
+            StartupDatastoreError::NotFound => ("data-missing", RpcError::data_missing()),
+            StartupDatastoreError::Unsupported => ("invalid-value", RpcError::invalid_value()),
+            StartupDatastoreError::Failed { .. } => {
+                ("operation-failed", RpcError::operation_failed())
+            }
+        };
+        if self
+            .audit
+            .record(&AuditEvent::new(
+                request_id,
+                principal,
+                self.transport,
+                AuditOperation::Read,
+                audit_failed(reason),
+            ))
+            .is_err()
+        {
+            record_rpc_error(
+                NetconfOperation::GetData,
+                NetconfErrorTag::OperationFailed,
+                started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(message_id),
+                reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
+        record_rpc_error(
+            NetconfOperation::GetData,
             rpc_error.classification.tag,
             started.elapsed(),
         );
@@ -4973,7 +5125,10 @@ where
             Some(RpcOperationHint::Validate) => {
                 event.with_paths([schema_node_path(NETCONF_VALIDATE_PATH)])
             }
-            Some(RpcOperationHint::Get | RpcOperationHint::GetConfig) | None => event,
+            Some(
+                RpcOperationHint::Get | RpcOperationHint::GetConfig | RpcOperationHint::GetData,
+            )
+            | None => event,
         };
         self.audit.record(&event)
     }
@@ -5015,7 +5170,8 @@ fn audit_operation_for_parse_failure(err: &RpcParseError) -> AuditOperation {
         Some(RpcOperationHint::KillSession) => AuditOperation::Exec,
         Some(RpcOperationHint::CreateSubscription) => AuditOperation::Subscribe,
         Some(RpcOperationHint::Validate) => AuditOperation::Validate,
-        Some(RpcOperationHint::Get | RpcOperationHint::GetConfig) | None => AuditOperation::Read,
+        Some(RpcOperationHint::Get | RpcOperationHint::GetConfig | RpcOperationHint::GetData)
+        | None => AuditOperation::Read,
     }
 }
 
@@ -5029,6 +5185,7 @@ fn netconf_operation_for_parse_failure(err: &RpcParseError) -> NetconfOperation 
         Some(RpcOperationHint::DeleteConfig) => NetconfOperation::DeleteConfig,
         Some(RpcOperationHint::Get) => NetconfOperation::Get,
         Some(RpcOperationHint::GetConfig) => NetconfOperation::GetConfig,
+        Some(RpcOperationHint::GetData) => NetconfOperation::GetData,
         Some(RpcOperationHint::Lock) => NetconfOperation::Lock,
         Some(RpcOperationHint::Unlock) => NetconfOperation::Unlock,
         Some(RpcOperationHint::KillSession) => NetconfOperation::KillSession,
@@ -5164,9 +5321,9 @@ mod tests {
         YangLibraryCapability,
     };
     use crate::capabilities::{
-        CANDIDATE_1_0, CONFIRMED_COMMIT_1_1, NETCONF_BASE_1_0, NETCONF_BASE_1_1, NETCONF_BASE_NS,
-        NETCONF_MONITORING_NS, NOTIFICATION_1_0, STARTUP_1_0, WITH_DEFAULTS_NS,
-        WRITABLE_RUNNING_1_0,
+        CANDIDATE_1_0, CONFIRMED_COMMIT_1_1, IETF_DATASTORES_NS, NETCONF_BASE_1_0,
+        NETCONF_BASE_1_1, NETCONF_BASE_NS, NETCONF_MONITORING_NS, NETCONF_NMDA_NS,
+        NOTIFICATION_1_0, STARTUP_1_0, WITH_DEFAULTS_NS, WRITABLE_RUNNING_1_0,
     };
     use crate::framing::base10;
     use crate::listener::{run_read_only_tls_listener, TlsListenerConfig};
@@ -5979,6 +6136,10 @@ mod tests {
         ) -> Option<crate::binding::NetconfNotificationCapability> {
             self.notifications
                 .then_some(crate::binding::NetconfNotificationCapability)
+        }
+
+        fn nmda_get_data_supported(&self) -> bool {
+            true
         }
 
         fn render_netconf_monitoring(
@@ -7177,6 +7338,12 @@ mod tests {
         format!(r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="201"><get/></rpc>"#)
     }
 
+    fn get_data_rpc(datastore: &str, inner: &str) -> String {
+        format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="301"><ncds:get-data xmlns:ncds="{NETCONF_NMDA_NS}" xmlns:ds="{IETF_DATASTORES_NS}"><ncds:datastore>ds:{datastore}</ncds:datastore>{inner}</ncds:get-data></rpc>"#
+        )
+    }
+
     fn create_subscription_rpc(message_id: &str) -> String {
         format!(
             r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="{message_id}"><ncn:create-subscription xmlns:ncn="urn:ietf:params:xml:ns:netconf:notification:1.0"/></rpc>"#
@@ -7505,6 +7672,171 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].outcome, AuditOutcome::Success);
         assert!(netconf_rpc_requests("get", "success") > success_before);
+    }
+
+    #[tokio::test]
+    async fn get_data_fails_closed_without_binding_opt_in() {
+        let server = generated_renderer_server_fixture(OperationalMode::Normal).await;
+        let errors_before = netconf_rpc_errors("get-data", "operation-not-supported");
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &get_data_rpc("running", ""),
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains(r#"message-id="301""#));
+        assert!(reply.contains("<error-tag>operation-not-supported</error-tag>"));
+        assert!(!reply.contains("<sys:hostname>"));
+        assert!(!reply.contains("<sys:secret>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(netconf_rpc_errors("get-data", "operation-not-supported") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn get_data_running_reads_config_with_nmda_data_namespace() {
+        let (server, observed, audit) = server_fixture().await;
+        let success_before = netconf_rpc_requests("get-data", "success");
+        let rpc = get_data_rpc(
+            "running",
+            r#"<ncds:subtree-filter><sys:system xmlns:sys="urn:opc:demo"><sys:hostname/></sys:system></ncds:subtree-filter>"#,
+        );
+
+        let reply =
+            server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &MgmtLimits::default());
+
+        assert!(reply.contains(r#"message-id="301""#));
+        assert!(reply.contains(&format!(r#"<data xmlns="{NETCONF_NMDA_NS}">"#)));
+        assert!(reply.contains("<sys:hostname>amf-1</sys:hostname>"));
+        assert!(!reply.contains("<sys:secret>"));
+        assert!(!reply.contains("do-not-leak"));
+
+        let paths = observed.lock().expect("observed paths mutex");
+        assert_eq!(
+            paths.as_slice(),
+            &[vec!["/sys:system", "/sys:system/sys:hostname"]]
+        );
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Read);
+        assert_eq!(events[0].outcome, AuditOutcome::Success);
+        assert!(events[0]
+            .schema_paths
+            .iter()
+            .any(|path| path.as_str() == "/sys:system/sys:hostname"));
+        assert!(netconf_rpc_requests("get-data", "success") > success_before);
+    }
+
+    #[tokio::test]
+    async fn get_data_operational_config_filter_false_returns_state_only() {
+        let (server, observed, audit) = server_fixture().await;
+        let success_before = netconf_rpc_requests("get-data", "success");
+        let rpc = get_data_rpc(
+            "operational",
+            r#"<ncds:config-filter>false</ncds:config-filter><ncds:subtree-filter><sys:system xmlns:sys="urn:opc:demo"><sys:uptime/></sys:system></ncds:subtree-filter>"#,
+        );
+
+        let reply =
+            server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &MgmtLimits::default());
+
+        assert!(reply.contains(r#"message-id="301""#));
+        assert!(reply.contains(&format!(r#"<data xmlns="{NETCONF_NMDA_NS}">"#)));
+        assert!(reply.contains("<sys:uptime>12345</sys:uptime>"));
+        assert!(!reply.contains("<sys:hostname>"));
+        assert!(!reply.contains("<sys:secret>"));
+        assert!(!reply.contains("do-not-leak"));
+
+        let paths = observed.lock().expect("observed paths mutex");
+        assert_eq!(paths.as_slice(), &[Vec::<&'static str>::new()]);
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, AuditOutcome::Success);
+        assert!(events[0]
+            .schema_paths
+            .iter()
+            .any(|path| path.as_str() == "/sys:system/sys:uptime"));
+        assert!(!events[0]
+            .schema_paths
+            .iter()
+            .any(|path| path.as_str() == "/sys:system/sys:hostname"));
+        assert!(netconf_rpc_requests("get-data", "success") > success_before);
+    }
+
+    #[tokio::test]
+    async fn get_data_unsupported_nmda_features_fail_closed() {
+        let (server, observed, audit) = server_fixture().await;
+        let errors_before = netconf_rpc_errors("get-data", "operation-not-supported");
+        let rpc = get_data_rpc("operational", r#"<ncds:max-depth>1</ncds:max-depth>"#);
+
+        let reply =
+            server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &MgmtLimits::default());
+
+        assert!(reply.contains(r#"message-id="301""#));
+        assert!(reply.contains("<error-tag>operation-not-supported</error-tag>"));
+        assert!(!reply.contains("<sys:hostname>"));
+        assert!(!reply.contains("<sys:uptime>"));
+        assert!(!reply.contains("<sys:secret>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
+        assert!(netconf_rpc_errors("get-data", "operation-not-supported") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn get_data_unsupported_with_defaults_matches_existing_read_semantics() {
+        let (server, observed, audit) = server_fixture().await;
+        let errors_before = netconf_rpc_errors("get-data", "operation-not-supported");
+        let rpc = get_data_rpc(
+            "running",
+            &format!(r#"<wd:with-defaults xmlns:wd="{WITH_DEFAULTS_NS}">trim</wd:with-defaults>"#),
+        );
+
+        let reply =
+            server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &MgmtLimits::default());
+
+        assert!(reply.contains(r#"message-id="301""#));
+        assert!(reply.contains("<error-tag>operation-not-supported</error-tag>"));
+        assert!(!reply.contains("<sys:hostname>"));
+        assert!(!reply.contains("<sys:secret>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, audit_failed("operation-not-supported"));
+        assert!(netconf_rpc_errors("get-data", "operation-not-supported") > errors_before);
+    }
+
+    #[tokio::test]
+    async fn get_data_rejects_datastore_identity_outside_ds_namespace() {
+        let (server, observed, audit) = server_fixture().await;
+        let errors_before = netconf_rpc_errors("get-data", "invalid-value");
+        let rpc = format!(
+            r#"<rpc xmlns="{NETCONF_BASE_NS}" message-id="302"><ncds:get-data xmlns:ncds="{NETCONF_NMDA_NS}" xmlns:bad="urn:bad"><ncds:datastore>bad:running</ncds:datastore></ncds:get-data></rpc>"#
+        );
+
+        let reply =
+            server.handle_rpc_xml(RequestId::new(), &principal(), &rpc, &MgmtLimits::default());
+
+        assert!(reply.contains(r#"message-id="302""#));
+        assert!(reply.contains("<error-tag>invalid-value</error-tag>"));
+        assert!(!reply.contains("bad:running"));
+        assert!(!reply.contains("<sys:hostname>"));
+        assert!(!reply.contains("<sys:secret>"));
+        assert!(!reply.contains("do-not-leak"));
+        assert!(observed.lock().expect("observed paths mutex").is_empty());
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Read);
+        assert_eq!(events[0].outcome, audit_failed("invalid-value"));
+        assert!(netconf_rpc_errors("get-data", "invalid-value") > errors_before);
     }
 
     #[tokio::test]

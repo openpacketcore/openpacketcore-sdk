@@ -34,6 +34,8 @@ pub(crate) enum NetconfOperation {
     Get,
     /// `<get-config>`.
     GetConfig,
+    /// RFC 8526 `<get-data>`.
+    GetData,
     /// RFC 6022 `<get-schema>`.
     GetSchema,
     /// RFC 5277 `<create-subscription>`.
@@ -60,6 +62,7 @@ impl NetconfOperation {
             Self::Validate => "validate",
             Self::Get => "get",
             Self::GetConfig => "get-config",
+            Self::GetData => "get-data",
             Self::GetSchema => "get-schema",
             Self::CreateSubscription => "create-subscription",
             Self::Unsupported(operation) => operation,
