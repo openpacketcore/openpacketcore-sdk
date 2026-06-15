@@ -19,14 +19,6 @@ fn build_input() -> CanonicalInput {
         source: source.clone(),
         ..Default::default()
     };
-    let wd_prefix_module = SchemaModule {
-        name: "wd-prefix-module".to_string(),
-        revision: "2026-06-01".to_string(),
-        namespace: "urn:wd-prefix-module".to_string(),
-        prefix: "wd".to_string(),
-        source: source.clone(),
-        ..Default::default()
-    };
 
     let nodes = vec![
         SchemaNode {
@@ -36,17 +28,13 @@ fn build_input() -> CanonicalInput {
             config: true,
             child_paths: vec![
                 "/ex:system/ex:hostname".to_string(),
-                "/ex:system/ex:enabled".to_string(),
                 "/ex:system/ex:secret".to_string(),
-                "/ex:system/ex:uptime".to_string(),
                 "/ex:system/ex:dns".to_string(),
                 "/ex:system/ex:interfaces".to_string(),
                 "/ex:system/ex:routes".to_string(),
+                "/ex:system/ex:subscriber".to_string(),
                 "/ex:system/ex:servers".to_string(),
-                "/ex:system/ex:tags".to_string(),
-                "/ex:system/ex:secret-codes".to_string(),
                 "/ex:system/ex:custom-tags".to_string(),
-                "/ex:system/wd:colliding-default".to_string(),
             ],
             source: source.clone(),
             ..Default::default()
@@ -61,31 +49,12 @@ fn build_input() -> CanonicalInput {
             ..Default::default()
         },
         SchemaNode {
-            path: "/ex:system/ex:enabled".to_string(),
-            module: "example".to_string(),
-            kind: SchemaNodeKind::Leaf,
-            config: true,
-            type_ref: Some(TypeRef::Boolean),
-            default: Some("true".to_string()),
-            source: source.clone(),
-            ..Default::default()
-        },
-        SchemaNode {
             path: "/ex:system/ex:secret".to_string(),
             module: "example".to_string(),
             kind: SchemaNodeKind::Leaf,
             config: true,
             type_ref: Some(TypeRef::String),
             data_class: Some("security-secret".to_string()),
-            source: source.clone(),
-            ..Default::default()
-        },
-        SchemaNode {
-            path: "/ex:system/ex:uptime".to_string(),
-            module: "example".to_string(),
-            kind: SchemaNodeKind::Leaf,
-            config: false,
-            type_ref: Some(TypeRef::Uint32),
             source: source.clone(),
             ..Default::default()
         },
@@ -104,7 +73,6 @@ fn build_input() -> CanonicalInput {
             kind: SchemaNodeKind::Leaf,
             config: true,
             type_ref: Some(TypeRef::String),
-            default: Some("8.8.8.8".to_string()),
             source: source.clone(),
             ..Default::default()
         },
@@ -118,8 +86,6 @@ fn build_input() -> CanonicalInput {
                 "/ex:system/ex:interfaces/ex:name".to_string(),
                 "/ex:system/ex:interfaces/ex:mtu".to_string(),
                 "/ex:system/ex:interfaces/ex:admin".to_string(),
-                "/ex:system/ex:interfaces/ex:auth-key".to_string(),
-                "/ex:system/ex:interfaces/ex:sub-interfaces".to_string(),
             ],
             source: source.clone(),
             ..Default::default()
@@ -148,47 +114,6 @@ fn build_input() -> CanonicalInput {
             kind: SchemaNodeKind::Leaf,
             config: true,
             type_ref: Some(TypeRef::Boolean),
-            source: source.clone(),
-            ..Default::default()
-        },
-        SchemaNode {
-            path: "/ex:system/ex:interfaces/ex:auth-key".to_string(),
-            module: "example".to_string(),
-            kind: SchemaNodeKind::Leaf,
-            config: true,
-            type_ref: Some(TypeRef::String),
-            data_class: Some("security-secret".to_string()),
-            source: source.clone(),
-            ..Default::default()
-        },
-        SchemaNode {
-            path: "/ex:system/ex:interfaces/ex:sub-interfaces".to_string(),
-            module: "example".to_string(),
-            kind: SchemaNodeKind::List,
-            config: true,
-            key_leaves: vec!["id".to_string()],
-            child_paths: vec![
-                "/ex:system/ex:interfaces/ex:sub-interfaces/ex:id".to_string(),
-                "/ex:system/ex:interfaces/ex:sub-interfaces/ex:description".to_string(),
-            ],
-            source: source.clone(),
-            ..Default::default()
-        },
-        SchemaNode {
-            path: "/ex:system/ex:interfaces/ex:sub-interfaces/ex:id".to_string(),
-            module: "example".to_string(),
-            kind: SchemaNodeKind::Leaf,
-            config: true,
-            type_ref: Some(TypeRef::Uint16),
-            source: source.clone(),
-            ..Default::default()
-        },
-        SchemaNode {
-            path: "/ex:system/ex:interfaces/ex:sub-interfaces/ex:description".to_string(),
-            module: "example".to_string(),
-            kind: SchemaNodeKind::Leaf,
-            config: true,
-            type_ref: Some(TypeRef::String),
             source: source.clone(),
             ..Default::default()
         },
@@ -234,30 +159,43 @@ fn build_input() -> CanonicalInput {
             ..Default::default()
         },
         SchemaNode {
+            path: "/ex:system/ex:subscriber".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::List,
+            config: true,
+            key_leaves: vec!["imsi".to_string()],
+            child_paths: vec![
+                "/ex:system/ex:subscriber/ex:imsi".to_string(),
+                "/ex:system/ex:subscriber/ex:tier".to_string(),
+            ],
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:subscriber/ex:imsi".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            data_class: Some("subscriber-id".to_string()),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:subscriber/ex:tier".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
             path: "/ex:system/ex:servers".to_string(),
             module: "example".to_string(),
             kind: SchemaNodeKind::LeafList,
             config: true,
             type_ref: Some(TypeRef::String),
-            source: source.clone(),
-            ..Default::default()
-        },
-        SchemaNode {
-            path: "/ex:system/ex:tags".to_string(),
-            module: "example".to_string(),
-            kind: SchemaNodeKind::LeafList,
-            config: true,
-            type_ref: Some(TypeRef::Uint16),
-            source: source.clone(),
-            ..Default::default()
-        },
-        SchemaNode {
-            path: "/ex:system/ex:secret-codes".to_string(),
-            module: "example".to_string(),
-            kind: SchemaNodeKind::LeafList,
-            config: true,
-            type_ref: Some(TypeRef::String),
-            data_class: Some("security-secret".to_string()),
             source: source.clone(),
             ..Default::default()
         },
@@ -272,16 +210,6 @@ fn build_input() -> CanonicalInput {
             source: source.clone(),
             ..Default::default()
         },
-        SchemaNode {
-            path: "/ex:system/wd:colliding-default".to_string(),
-            module: "wd-prefix-module".to_string(),
-            kind: SchemaNodeKind::Leaf,
-            config: true,
-            type_ref: Some(TypeRef::String),
-            default: Some("collision".to_string()),
-            source: source.clone(),
-            ..Default::default()
-        },
     ];
 
     let input = GenerationInput {
@@ -290,7 +218,7 @@ fn build_input() -> CanonicalInput {
             profile: "test".to_string(),
             modules: vec![],
         },
-        schema_modules: vec![module, wd_prefix_module],
+        schema_modules: vec![module],
         nodes,
         constraints: vec![],
         unsupported_features: vec![],
@@ -316,7 +244,7 @@ fn build_input() -> CanonicalInput {
 }
 
 #[test]
-fn generated_netconf_xml_projection() {
+fn generated_gnmi_json_projection() {
     let input = build_input();
     let files = generate_rust(&input).unwrap();
 
@@ -332,13 +260,9 @@ fn generated_netconf_xml_projection() {
         };
         fs::write(src_dir.join(&name), content).unwrap();
         if name == "types.rs" {
-            // The schema intentionally contains a custom-typed leaf-list so that
-            // the projection can exercise runtime fail-closed for unsupported
-            // custom types. Provide a minimal placeholder type that satisfies
-            // the generated struct's trait bounds without claiming a real codec.
             let placeholder = r#"
 
-/// Placeholder for the intentionally-unsupported custom leaf-list element type.
+/// Placeholder for the intentionally unsupported custom leaf-list element type.
 pub type CustomTag = String;
 "#;
             let augmented = fs::read_to_string(src_dir.join("types.rs")).unwrap() + placeholder;
@@ -357,9 +281,8 @@ pub type CustomTag = String;
     let types_path = workspace_dir.join("crates/opc-types");
     let data_gov_path = workspace_dir.join("crates/opc-data-governance");
     let mgmt_schema_path = workspace_dir.join("crates/opc-mgmt-schema");
-    let redaction_path = workspace_dir.join("crates/opc-redaction");
     let gnmi_server_path = workspace_dir.join("crates/opc-gnmi-server");
-
+    let redaction_path = workspace_dir.join("crates/opc-redaction");
     let time_version = common::locked_version(&workspace_dir, "time");
 
     let cargo_toml = format!(
@@ -377,24 +300,24 @@ opc-config-model = {{ path = "{}" }}
 opc-types = {{ path = "{}" }}
 opc-data-governance = {{ path = "{}" }}
 opc-mgmt-schema = {{ path = "{}" }}
-opc-redaction = {{ path = "{}" }}
 opc-gnmi-server = {{ path = "{}" }}
+opc-redaction = {{ path = "{}" }}
 "#,
         time_version,
         config_model_path.display(),
         types_path.display(),
         data_gov_path.display(),
         mgmt_schema_path.display(),
-        redaction_path.display(),
         gnmi_server_path.display(),
+        redaction_path.display(),
     );
     fs::write(dir.path().join("Cargo.toml"), cargo_toml).unwrap();
 
     let tests_dir = dir.path().join("tests");
     fs::create_dir(&tests_dir).unwrap();
     fs::write(
-        tests_dir.join("netconf_xml.rs"),
-        include_str!("fixtures/netconf_xml_projection_test.rs"),
+        tests_dir.join("gnmi_json.rs"),
+        include_str!("fixtures/gnmi_json_projection_test.rs"),
     )
     .unwrap();
 

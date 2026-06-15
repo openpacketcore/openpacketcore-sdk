@@ -312,12 +312,16 @@ opc-config-model = {{ path = "{}" }}
 opc-types = {{ path = "{}" }}
 opc-data-governance = {{ path = "{}" }}
 opc-mgmt-schema = {{ path = "{}" }}
+opc-gnmi-server = {{ path = "{}" }}
+opc-redaction = {{ path = "{}" }}
 "#,
         common::locked_version(&workspace_dir, "time"),
         workspace_dir.join("crates/opc-config-model").display(),
         workspace_dir.join("crates/opc-types").display(),
         workspace_dir.join("crates/opc-data-governance").display(),
-        workspace_dir.join("crates/opc-mgmt-schema").display()
+        workspace_dir.join("crates/opc-mgmt-schema").display(),
+        workspace_dir.join("crates/opc-gnmi-server").display(),
+        workspace_dir.join("crates/opc-redaction").display()
     );
 
     fs::write(dir.path().join("Cargo.toml"), cargo_toml).unwrap();

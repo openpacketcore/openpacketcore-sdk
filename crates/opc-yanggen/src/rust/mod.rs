@@ -1,3 +1,4 @@
+pub mod gnmi_json;
 pub mod metadata;
 pub mod netconf_xml;
 pub mod netconf_xml_edit;
@@ -56,6 +57,7 @@ pub mod paths;
 pub mod patch;
 pub mod validate;
 pub mod metadata;
+pub mod gnmi_json;
 pub mod netconf_xml;
 pub mod netconf_xml_edit;
 pub mod redaction;
@@ -120,6 +122,7 @@ impl OpcConfig for types::__ROOT_TYPE__ {
     files.insert("patch.rs".to_string(), patch::generate(input)?);
     files.insert("validate.rs".to_string(), validate::generate(input)?);
     files.insert("metadata.rs".to_string(), metadata::generate(input)?);
+    files.insert("gnmi_json.rs".to_string(), gnmi_json::generate(input)?);
     files.insert("netconf_xml.rs".to_string(), netconf_xml::generate(input)?);
     files.insert(
         "netconf_xml_edit.rs".to_string(),

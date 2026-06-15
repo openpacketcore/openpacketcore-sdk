@@ -248,6 +248,7 @@ pub const fn code_from_status(status: opc_mgmt_errors::MgmtStatus) -> tonic::Cod
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use opc_config_bus::{ConfigBus, MockManagedDatastore};
@@ -314,6 +315,7 @@ mod tests {
                 "/sys:system/sys:contact",
                 "/sys:system/sys:hostname",
                 "/sys:system/sys:uptime",
+                "/sys:system/sys:user",
             ],
         },
         NodeMeta {
@@ -348,6 +350,48 @@ mod tests {
             kind: NodeKind::Leaf,
             config: false,
             leaf_type: Some(LeafType::Uint32),
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[],
+        },
+        NodeMeta {
+            path: "/sys:system/sys:user",
+            module: "demo-system",
+            kind: NodeKind::List,
+            config: true,
+            leaf_type: None,
+            key_leaves: &["name"],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[
+                "/sys:system/sys:user/sys:name",
+                "/sys:system/sys:user/sys:role",
+            ],
+        },
+        NodeMeta {
+            path: "/sys:system/sys:user/sys:name",
+            module: "demo-system",
+            kind: NodeKind::Leaf,
+            config: true,
+            leaf_type: Some(LeafType::String),
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[],
+        },
+        NodeMeta {
+            path: "/sys:system/sys:user/sys:role",
+            module: "demo-system",
+            kind: NodeKind::Leaf,
+            config: true,
+            leaf_type: Some(LeafType::String),
             key_leaves: &[],
             data_class: DataClass::Public,
             default: None,
@@ -406,8 +450,14 @@ mod tests {
     struct UnitPatcher;
 
     #[derive(Clone)]
+    struct DemoUser {
+        role: String,
+    }
+
+    #[derive(Clone)]
     struct DemoConfig {
         hostname: String,
+        users: BTreeMap<String, DemoUser>,
     }
 
     impl OpcConfig for DemoConfig {
@@ -453,15 +503,27 @@ mod tests {
             _running: &DemoConfig,
             _set: &crate::NormalizedSet,
         ) -> Result<DemoConfig, GnmiError> {
-            Ok(DemoConfig {
-                hostname: "amf-1".to_string(),
-            })
+            Ok(initial_config())
         }
     }
 
     fn initial_config() -> DemoConfig {
+        let mut users = BTreeMap::new();
+        users.insert(
+            "admin".to_string(),
+            DemoUser {
+                role: "superuser".to_string(),
+            },
+        );
+        users.insert(
+            "guest".to_string(),
+            DemoUser {
+                role: "readonly".to_string(),
+            },
+        );
         DemoConfig {
             hostname: "amf-1".to_string(),
+            users,
         }
     }
 
@@ -513,6 +575,20 @@ mod tests {
                         .expect("static config path"),
                     r#""ops""#,
                 )?);
+            }
+            for (name, user) in &config.users {
+                let role_path = opc_config_model::YangPath::new(format!(
+                    "/sys:system/sys:user[sys:name='{}']/sys:role",
+                    name.replace('\\', "\\\\").replace('\'', "\\'")
+                ))
+                .expect("static user role path");
+                if selection.contains_path("/sys:system/sys:user/sys:role", &role_path) {
+                    updates.push(GnmiJsonUpdate::new(
+                        role_path,
+                        serde_json::to_string(&user.role)
+                            .map_err(|_| GnmiJsonProjectionError::projection("role JSON"))?,
+                    )?);
+                }
             }
             Ok(updates)
         }
@@ -871,6 +947,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_get_keyed_list_predicate_reads_only_selected_instance() {
+        let service = authenticated_service().await;
+        let mut request = Request::new(gnmi::GetRequest {
+            prefix: None,
+            path: vec![gnmi::Path {
+                element: Vec::new(),
+                origin: String::new(),
+                elem: vec![
+                    gnmi::PathElem {
+                        name: "system".to_string(),
+                        key: Default::default(),
+                    },
+                    gnmi::PathElem {
+                        name: "user".to_string(),
+                        key: [("name".to_string(), "admin".to_string())]
+                            .into_iter()
+                            .collect(),
+                    },
+                    gnmi::PathElem {
+                        name: "role".to_string(),
+                        key: Default::default(),
+                    },
+                ],
+                target: String::new(),
+            }],
+            r#type: gnmi::get_request::DataType::Config as i32,
+            encoding: gnmi::Encoding::JsonIetf as i32,
+            use_models: Vec::new(),
+            extension: Vec::new(),
+        });
+        request.extensions_mut().insert(authenticated_principal());
+
+        let response = service.get(request).await.expect("get").into_inner();
+
+        assert_eq!(response.notification[0].update.len(), 1);
+        let update = &response.notification[0].update[0];
+        assert_eq!(
+            update.path.as_ref().expect("path").elem[1]
+                .key
+                .get("sys:name"),
+            Some(&"admin".to_string())
+        );
+        assert_eq!(
+            update.val.as_ref().and_then(|value| value.value.as_ref()),
+            Some(&gnmi::typed_value::Value::JsonIetfVal(
+                br#""superuser""#.to_vec()
+            ))
+        );
+    }
+
+    #[tokio::test]
     async fn authenticated_get_all_merges_config_and_state() {
         let service = authenticated_service().await;
         let mut request = Request::new(gnmi::GetRequest {
@@ -930,7 +1057,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_get_rejects_unsupported_encoding_and_list_predicates_without_leak() {
+    async fn authenticated_get_rejects_unsupported_encoding_and_unknown_keyed_paths_without_leak() {
         let service = authenticated_service().await;
         let mut unsupported_encoding = Request::new(gnmi::GetRequest {
             prefix: None,
@@ -966,7 +1093,7 @@ mod tests {
         });
         keyed.extensions_mut().insert(authenticated_principal());
         let status = service.get(keyed).await.unwrap_err();
-        assert_eq!(status.code(), Code::Unimplemented);
+        assert_eq!(status.code(), Code::InvalidArgument);
         assert!(!status.message().contains("secret-admin"));
     }
 

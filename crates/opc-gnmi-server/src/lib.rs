@@ -43,7 +43,8 @@ use opc_config_model::OpcConfig;
 use opc_mgmt_limits::MgmtLimits;
 
 pub use binding::{
-    GnmiConfigBinding, GnmiJsonProjectionError, GnmiJsonUpdate, GnmiPatchApplicator, ReadSelection,
+    GnmiConfigBinding, GnmiJsonProjectionError, GnmiJsonRenderer, GnmiJsonUpdate,
+    GnmiPatchApplicator, ReadSelection, ReadSelectionEntry,
 };
 pub use capabilities::{CapabilityProfile, GnmiCapabilities, GnmiModelData, GnmiVersion};
 pub use encoding::{Encoding, EncodingRegistry};
