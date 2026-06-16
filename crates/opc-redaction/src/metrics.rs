@@ -325,6 +325,8 @@ pub struct SdkMetrics {
     pub gnmi_rpc_seconds: Mutex<HashMap<String, LatencyHistogram>>,
     pub gnmi_set_commit_seconds: Mutex<HashMap<String, LatencyHistogram>>,
     pub gnmi_active_streams: Mutex<HashMap<String, i64>>,
+    pub gnmi_sessions_active: Mutex<HashMap<String, i64>>,
+    pub gnmi_listener_events_total: Mutex<HashMap<(String, String), u64>>,
     pub gnmi_subscription_events_total: Mutex<HashMap<(String, String), u64>>,
     pub gnmi_subscription_lag_total: Mutex<HashMap<String, u64>>,
     pub gnmi_nacm_denials_total: Mutex<HashMap<String, u64>>,
@@ -436,6 +438,8 @@ impl SdkMetrics {
             gnmi_rpc_seconds: Mutex::new(HashMap::new()),
             gnmi_set_commit_seconds: Mutex::new(HashMap::new()),
             gnmi_active_streams: Mutex::new(HashMap::new()),
+            gnmi_sessions_active: Mutex::new(HashMap::new()),
+            gnmi_listener_events_total: Mutex::new(HashMap::new()),
             gnmi_subscription_events_total: Mutex::new(HashMap::new()),
             gnmi_subscription_lag_total: Mutex::new(HashMap::new()),
             gnmi_nacm_denials_total: Mutex::new(HashMap::new()),
@@ -586,6 +590,7 @@ impl SdkMetrics {
         for map in [
             &self.gnmi_rpc_requests_total,
             &self.gnmi_rpc_errors_total,
+            &self.gnmi_listener_events_total,
             &self.gnmi_subscription_events_total,
             &self.gnmi_extensions_total,
             &self.netconf_rpc_requests_total,
@@ -608,6 +613,7 @@ impl SdkMetrics {
         }
         for map in [
             &self.gnmi_active_streams,
+            &self.gnmi_sessions_active,
             &self.netconf_sessions_active,
             &self.netconf_locks_active,
         ] {
@@ -1537,6 +1543,21 @@ pub fn export_prometheus_text() -> String {
         &METRICS.gnmi_active_streams,
         "mode",
     );
+    write_labeled_gauge_1(
+        &mut out,
+        "opc_gnmi_sessions_active",
+        "Active gNMI sessions by transport",
+        &METRICS.gnmi_sessions_active,
+        "transport",
+    );
+    write_labeled_counter_2(
+        &mut out,
+        "opc_gnmi_listener_events_total",
+        "Total gNMI listener events by transport and event",
+        &METRICS.gnmi_listener_events_total,
+        "transport",
+        "event",
+    );
     write_labeled_counter_2(
         &mut out,
         "opc_gnmi_subscription_events_total",
@@ -1736,6 +1757,13 @@ mod tests {
         if let Ok(mut m) = METRICS.gnmi_active_streams.lock() {
             m.insert("stream".to_string(), 2);
         }
+        if let Ok(mut m) = METRICS.gnmi_sessions_active.lock() {
+            m.insert("gnmi-tls".to_string(), 1);
+        }
+        if let Ok(mut m) = METRICS.gnmi_listener_events_total.lock() {
+            m.insert(("gnmi-tls".to_string(), "start".to_string()), 1);
+            m.insert(("spiffe://test/leak".to_string(), "failure".to_string()), 7);
+        }
         if let Ok(mut m) = METRICS.gnmi_nacm_denials_total.lock() {
             m.insert("read".to_string(), 1);
             // A path-shaped label value must be sanitized, not leaked, in export.
@@ -1773,6 +1801,13 @@ mod tests {
         // Management-plane families export with sanitized labels.
         assert!(exported.contains("opc_gnmi_rpc_requests_total{rpc=\"Get\",outcome=\"ok\"} 5\n"));
         assert!(exported.contains("opc_gnmi_active_streams{mode=\"stream\"} 2\n"));
+        assert!(exported.contains("opc_gnmi_sessions_active{transport=\"gnmi-tls\"} 1\n"));
+        assert!(exported.contains(
+            "opc_gnmi_listener_events_total{transport=\"gnmi-tls\",event=\"start\"} 1\n"
+        ));
+        assert!(exported.contains(
+            "opc_gnmi_listener_events_total{transport=\"redacted\",event=\"failure\"} 7\n"
+        ));
         assert!(exported.contains("opc_gnmi_nacm_denials_total{action=\"read\"} 1\n"));
         // Path-shaped label value must be redacted, never leaked verbatim.
         assert!(exported.contains("opc_gnmi_nacm_denials_total{action=\"redacted\"} 9\n"));
@@ -1790,6 +1825,8 @@ mod tests {
         METRICS.reset_all();
         let after = export_prometheus_text();
         assert!(!after.contains("opc_gnmi_rpc_requests_total{rpc=\"Get\""));
+        assert!(!after.contains("opc_gnmi_sessions_active{transport=\"gnmi-tls\""));
+        assert!(!after.contains("opc_gnmi_listener_events_total{transport=\"gnmi-tls\""));
         assert!(!after.contains("opc_netconf_sessions_active{transport=\"netconf-tls\""));
     }
 }

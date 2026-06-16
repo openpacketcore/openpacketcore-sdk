@@ -79,6 +79,13 @@ where
         }
     }
 
+    pub(crate) fn new_authenticated_shared(server: Arc<GnmiServer<C, B>>) -> Self {
+        Self {
+            server,
+            require_principal: true,
+        }
+    }
+
     /// Returns the underlying foundation handle.
     pub fn server(&self) -> &GnmiServer<C, B> {
         &self.server
