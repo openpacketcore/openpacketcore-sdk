@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use opc_config_model::{
-    CommitError, CommitRequest, ConfigOperation, OpcConfig, RequestId, RequestSource,
+    CommitError, CommitMode, CommitRequest, ConfigOperation, OpcConfig, RequestId, RequestSource,
     TransportType, TrustedPrincipal, YangPath,
 };
 use opc_mgmt_audit::{AuditOperation, AuditOutcome};
@@ -14,6 +14,7 @@ use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_schema::SchemaRegistry;
 
 use crate::audit::{outcome_for_error, record_audit, schema_paths_for_yang};
+use crate::confirmed_commit::{parse_set_commit_extension, SetCommitExtension};
 use crate::get::{now_nanos, yang_path_to_proto};
 use crate::metrics::{record_set_commit_latency, SetCommitMetric};
 use crate::proto::gnmi;
@@ -133,6 +134,32 @@ where
     B: GnmiConfigBinding<C>,
 {
     let request_id = RequestId::new();
+    let commit_extension = match parse_set_commit_extension(&request.extension) {
+        Ok(commit_extension) => commit_extension,
+        Err(err) => {
+            audit_set_result(
+                server,
+                request_id,
+                principal,
+                AuditOperation::Update,
+                outcome_for_error(&err),
+                Vec::new(),
+            )?;
+            return Err(err);
+        }
+    };
+    if let Some(response) = handle_set_commit_extension_control(
+        server,
+        principal,
+        request_id,
+        request,
+        commit_extension,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+
     let normalized =
         match normalize_set_request(server.binding().schema(), server.limits(), request) {
             Ok(normalized) => normalized,
@@ -175,15 +202,23 @@ where
         }
     };
 
-    let commit = CommitRequest::commit(
+    let mode = match commit_extension {
+        SetCommitExtension::Normal => CommitMode::Commit,
+        SetCommitExtension::Begin { timeout } => CommitMode::CommitConfirmed { timeout },
+        SetCommitExtension::Confirm | SetCommitExtension::Cancel => {
+            unreachable!("control actions returned before normalization")
+        }
+    };
+    let commit = CommitRequest::new(
         request_id,
         principal.clone(),
         TransportType::Gnmi,
         RequestSource::Northbound,
         operation,
-        candidate,
-        normalized.changed_paths_hint(),
+        mode,
         Instant::now() + Duration::from_secs(30),
+        Some(candidate),
+        normalized.changed_paths_hint(),
     )
     .with_base_version(snapshot.version);
 
@@ -221,6 +256,140 @@ where
         timestamp: now_nanos(),
         extension: Vec::new(),
     })
+}
+
+async fn handle_set_commit_extension_control<C, B>(
+    server: &GnmiServer<C, B>,
+    principal: &TrustedPrincipal,
+    request_id: RequestId,
+    request: &gnmi::SetRequest,
+    commit_extension: SetCommitExtension,
+) -> Result<Option<gnmi::SetResponse>, GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    match commit_extension {
+        SetCommitExtension::Normal | SetCommitExtension::Begin { .. } => {
+            if commit_extension == SetCommitExtension::Normal || set_operation_count(request) > 0 {
+                Ok(None)
+            } else {
+                let err = GnmiError::invalid(
+                    "OpenPacketCore commit-confirmed begin requires Set operations",
+                );
+                audit_set_result(
+                    server,
+                    request_id,
+                    principal,
+                    AuditOperation::Update,
+                    outcome_for_error(&err),
+                    Vec::new(),
+                )?;
+                Err(err)
+            }
+        }
+        SetCommitExtension::Confirm | SetCommitExtension::Cancel => {
+            if set_operation_count(request) != 0 {
+                let err = GnmiError::invalid(
+                    "OpenPacketCore commit-confirmed control action cannot include Set operations",
+                );
+                audit_set_result(
+                    server,
+                    request_id,
+                    principal,
+                    AuditOperation::Update,
+                    outcome_for_error(&err),
+                    Vec::new(),
+                )?;
+                return Err(err);
+            }
+            submit_commit_confirmed_control(server, principal, request_id, commit_extension)
+                .await
+                .map(Some)
+        }
+    }
+}
+
+async fn submit_commit_confirmed_control<C, B>(
+    server: &GnmiServer<C, B>,
+    principal: &TrustedPrincipal,
+    request_id: RequestId,
+    commit_extension: SetCommitExtension,
+) -> Result<gnmi::SetResponse, GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    let bus = server.binding().config_bus();
+    let snapshot = bus.current_snapshot();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let commit = match commit_extension {
+        SetCommitExtension::Confirm => CommitRequest::new(
+            request_id,
+            principal.clone(),
+            TransportType::Gnmi,
+            RequestSource::Northbound,
+            ConfigOperation::Patch,
+            CommitMode::Commit,
+            deadline,
+            None,
+            Vec::new(),
+        ),
+        SetCommitExtension::Cancel => CommitRequest::cancel_confirmed(
+            request_id,
+            principal.clone(),
+            TransportType::Gnmi,
+            RequestSource::Northbound,
+            Vec::new(),
+            deadline,
+        ),
+        SetCommitExtension::Normal | SetCommitExtension::Begin { .. } => {
+            unreachable!("only control actions reach this helper")
+        }
+    }
+    .with_base_version(snapshot.version);
+
+    let start = Instant::now();
+    match bus.submit(commit).await {
+        Ok(_) => {
+            record_set_commit_latency(SetCommitMetric::Patch, start.elapsed());
+            audit_set_result(
+                server,
+                request_id,
+                principal,
+                AuditOperation::Update,
+                AuditOutcome::Success,
+                Vec::new(),
+            )?;
+        }
+        Err(err) => {
+            let err = commit_error_to_gnmi(err);
+            audit_set_result(
+                server,
+                request_id,
+                principal,
+                AuditOperation::Update,
+                outcome_for_error(&err),
+                Vec::new(),
+            )?;
+            return Err(err);
+        }
+    }
+
+    Ok(gnmi::SetResponse {
+        prefix: None,
+        response: Vec::new(),
+        message: None,
+        timestamp: now_nanos(),
+        extension: Vec::new(),
+    })
+}
+
+fn set_operation_count(request: &gnmi::SetRequest) -> usize {
+    request.delete.len()
+        + request.replace.len()
+        + request.update.len()
+        + request.union_replace.len()
 }
 
 fn audit_set_result<C, B>(

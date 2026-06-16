@@ -25,6 +25,7 @@
 mod audit;
 pub mod binding;
 pub mod capabilities;
+pub mod confirmed_commit;
 pub mod encoding;
 pub mod error;
 pub mod extension;
@@ -53,6 +54,10 @@ pub use binding::{
     GnmiPatchApplicator, ReadSelection, ReadSelectionEntry,
 };
 pub use capabilities::{CapabilityProfile, GnmiCapabilities, GnmiModelData, GnmiVersion};
+pub use confirmed_commit::{
+    CommitConfirmedAction, CommitConfirmedExtension, DEFAULT_COMMIT_CONFIRMED_TIMEOUT,
+    OPC_COMMIT_CONFIRMED_EXTENSION_ID, OPC_COMMIT_CONFIRMED_EXTENSION_NAME,
+};
 pub use encoding::{Encoding, EncodingRegistry};
 pub use error::GnmiError;
 pub use extension::{

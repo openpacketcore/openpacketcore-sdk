@@ -28,7 +28,7 @@ use crate::metrics::{
 };
 use crate::proto::gnmi;
 use crate::proto_adapter::path_from_proto;
-use crate::service::{status_from_error, validate_extensions};
+use crate::service::{status_from_error, validate_extensions_for_operation, ExtensionOperation};
 use crate::{GnmiConfigBinding, GnmiError, GnmiJsonUpdate, GnmiServer, ResolvedGnmiPath};
 
 const RESPONSE_QUEUE_BYTES_ESTIMATE: usize = 4096;
@@ -71,7 +71,11 @@ where
             return Err(err);
         }
     };
-    if let Err(err) = validate_extensions(server.extensions(), &first.extension) {
+    if let Err(err) = validate_extensions_for_operation(
+        server.extensions(),
+        &first.extension,
+        ExtensionOperation::Subscribe,
+    ) {
         audit_subscribe_result(
             server.as_ref(),
             request_id,
@@ -155,7 +159,11 @@ where
         else {
             return Ok(());
         };
-        if let Err(err) = validate_extensions(server.extensions(), &request.extension) {
+        if let Err(err) = validate_extensions_for_operation(
+            server.extensions(),
+            &request.extension,
+            ExtensionOperation::Subscribe,
+        ) {
             audit_subscribe_result(
                 server.as_ref(),
                 request_id,
@@ -284,7 +292,11 @@ where
                 let Some(request) = request else {
                     return Ok(());
                 };
-                if let Err(err) = validate_extensions(server.extensions(), &request.extension) {
+                if let Err(err) = validate_extensions_for_operation(
+                    server.extensions(),
+                    &request.extension,
+                    ExtensionOperation::Subscribe,
+                ) {
                     audit_subscribe_result(
                         server.as_ref(),
                         request_id,

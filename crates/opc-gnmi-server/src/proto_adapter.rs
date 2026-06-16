@@ -83,7 +83,11 @@ pub fn typed_value_from_proto(value: &gnmi::TypedValue) -> Result<TypedValue, Gn
 pub fn extension_from_proto(extension: &gnmi_ext::Extension) -> Result<Extension, GnmiError> {
     use gnmi_ext::extension::Ext;
     match extension.ext.as_ref() {
-        Some(Ext::RegisteredExt(ext)) => Ok(Extension::new(ext.id as u32, true, ext.msg.clone())),
+        Some(Ext::RegisteredExt(ext)) => {
+            let id = u32::try_from(ext.id)
+                .map_err(|_| GnmiError::invalid("invalid registered gNMI extension id"))?;
+            Ok(Extension::new(id, true, ext.msg.clone()))
+        }
         Some(Ext::MasterArbitration(_)) => Err(GnmiError::unimplemented(
             "gNMI master-arbitration extension is not implemented",
         )),

@@ -39,6 +39,9 @@ impl RegisteredExtension {
     /// implemented end to end.
     pub fn new(id: u32, name: impl Into<String>, advertised: bool) -> Result<Self, GnmiError> {
         let name = name.into();
+        if id > i32::MAX as u32 {
+            return Err(GnmiError::invalid("invalid gNMI extension id"));
+        }
         if name.is_empty()
             || name.trim() != name
             || name.chars().any(char::is_control)
@@ -114,7 +117,9 @@ impl ExtensionRegistry {
     /// Validates registry consistency.
     pub fn validate(&self) -> Result<(), GnmiError> {
         for ext in self.registered.values() {
-            if ext.advertised() {
+            if ext.advertised()
+                && !crate::confirmed_commit::is_implemented_extension(ext.id(), ext.name())
+            {
                 return Err(GnmiError::unimplemented(format!(
                     "gNMI extension {} is registered but not implemented end to end",
                     ext.name()
@@ -122,6 +127,16 @@ impl ExtensionRegistry {
             }
         }
         Ok(())
+    }
+
+    /// Builds a registry that advertises OpenPacketCore commit-confirmed
+    /// semantics on the experimental registered extension ID.
+    pub fn with_commit_confirmed() -> Result<Self, GnmiError> {
+        Self::new([RegisteredExtension::new(
+            crate::OPC_COMMIT_CONFIRMED_EXTENSION_ID,
+            crate::OPC_COMMIT_CONFIRMED_EXTENSION_NAME,
+            true,
+        )?])
     }
 
     /// IDs that should appear in Capabilities.
@@ -198,6 +213,25 @@ mod tests {
         assert!(matches!(
             registry
                 .validate_request(&[Extension::new(1, true, Vec::new())])
+                .expect("known")[0],
+            ExtensionDisposition::Accepted(_)
+        ));
+    }
+
+    #[test]
+    fn commit_confirmed_extension_can_be_advertised() {
+        let registry = ExtensionRegistry::with_commit_confirmed().expect("registry");
+        assert_eq!(
+            registry.advertised_ids(),
+            vec![crate::OPC_COMMIT_CONFIRMED_EXTENSION_ID]
+        );
+        assert!(matches!(
+            registry
+                .validate_request(&[Extension::new(
+                    crate::OPC_COMMIT_CONFIRMED_EXTENSION_ID,
+                    true,
+                    Vec::new()
+                )])
                 .expect("known")[0],
             ExtensionDisposition::Accepted(_)
         ));
