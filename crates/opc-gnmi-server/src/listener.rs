@@ -24,6 +24,10 @@ use tokio_rustls::TlsAcceptor;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::server::Connected;
 
+use crate::metrics::{
+    active_session, record_listener_event, ActiveSessionGuard, GnmiListenerEvent,
+    TRANSPORT_GNMI_TLS,
+};
 use crate::proto::gnmi;
 use crate::service::AuthenticatedGnmiPrincipal;
 use crate::transport::{principal_from_tls_stream, GnmiTlsPrincipalError};
@@ -109,13 +113,49 @@ where
     C: OpcConfig + 'static,
     B: GnmiConfigBinding<C> + 'static,
 {
-    validate_listener_config(&config)?;
-    server.limits().validate()?;
+    run_gnmi_tls_listener_shared(
+        Arc::new(server),
+        Arc::new(listener),
+        tls,
+        identity_rx,
+        shutdown,
+        config,
+    )
+    .await
+}
+
+pub(crate) async fn run_gnmi_tls_listener_shared<C, B>(
+    server: Arc<GnmiServer<C, B>>,
+    listener: Arc<TcpListener>,
+    tls: TlsBootstrap,
+    identity_rx: watch::Receiver<Option<IdentityState>>,
+    shutdown: ShutdownToken,
+    config: GnmiListenerConfig,
+) -> Result<GnmiListenerResult, GnmiListenerError>
+where
+    C: OpcConfig + 'static,
+    B: GnmiConfigBinding<C> + 'static,
+{
+    if let Err(err) = validate_listener_config(&config) {
+        record_listener_event(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Failure);
+        return Err(err);
+    }
+    if let Err(err) = server.limits().validate() {
+        record_listener_event(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Failure);
+        return Err(err.into());
+    }
     let max_sessions = server.limits().max_sessions;
-    let tls_config = Arc::new(
-        tls.with_alpn([ALPN_H2.to_vec()])
-            .build_server_config(identity_rx.clone())?,
-    );
+    let tls_config = match tls
+        .with_alpn([ALPN_H2.to_vec()])
+        .build_server_config(identity_rx.clone())
+    {
+        Ok(config) => Arc::new(config),
+        Err(err) => {
+            record_listener_event(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Failure);
+            return Err(err.into());
+        }
+    };
+    record_listener_event(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Start);
     let acceptor = TlsAcceptor::from(tls_config);
     let semaphore = Arc::new(Semaphore::new(max_sessions));
     let counters = Arc::new(ListenerCounters::default());
@@ -137,7 +177,8 @@ where
         .await;
     });
 
-    let service = gnmi::g_nmi_server::GNmiServer::new(GnmiService::new_authenticated(server));
+    let service =
+        gnmi::g_nmi_server::GNmiServer::new(GnmiService::new_authenticated_shared(server));
     let incoming = ReceiverStream::new(rx);
     let serve_result = tonic::transport::Server::builder()
         .add_service(service)
@@ -145,8 +186,15 @@ where
         .await;
 
     shutdown.request_shutdown();
-    accept_task.await?;
-    serve_result?;
+    if let Err(err) = accept_task.await {
+        record_listener_event(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Failure);
+        return Err(err.into());
+    }
+    if let Err(err) = serve_result {
+        record_listener_event(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Failure);
+        return Err(err.into());
+    }
+    record_listener_event(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Stop);
     Ok(counters.snapshot())
 }
 
@@ -159,7 +207,7 @@ fn validate_listener_config(config: &GnmiListenerConfig) -> Result<(), GnmiListe
 
 #[allow(clippy::too_many_arguments)]
 async fn accept_loop(
-    listener: TcpListener,
+    listener: Arc<TcpListener>,
     acceptor: TlsAcceptor,
     identity_rx: watch::Receiver<Option<IdentityState>>,
     shutdown: ShutdownToken,
@@ -185,6 +233,7 @@ async fn accept_loop(
                     Err(err) => {
                         tracing::warn!(error = ?err, "gNMI TCP accept failed");
                         counters.failed_connections.fetch_add(1, Ordering::Relaxed);
+                        record_listener_event(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Failure);
                         break;
                     }
                 };
@@ -193,6 +242,7 @@ async fn accept_loop(
                     Ok(permit) => permit,
                     Err(TryAcquireError::NoPermits) => {
                         counters.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                        record_listener_event(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Rejected);
                         continue;
                     }
                     Err(TryAcquireError::Closed) => break,
@@ -215,13 +265,22 @@ async fn accept_loop(
                         Ok(stream) => {
                             if tx.send(Ok(stream)).await.is_ok() {
                                 counters.accepted_connections.fetch_add(1, Ordering::Relaxed);
+                                record_listener_event(
+                                    TRANSPORT_GNMI_TLS,
+                                    GnmiListenerEvent::Accepted,
+                                );
                             } else {
                                 counters.failed_connections.fetch_add(1, Ordering::Relaxed);
+                                record_listener_event(
+                                    TRANSPORT_GNMI_TLS,
+                                    GnmiListenerEvent::Failure,
+                                );
                             }
                         }
                         Err(err) => {
                             tracing::debug!(error = ?err, "gNMI TLS handshake rejected");
                             counters.failed_connections.fetch_add(1, Ordering::Relaxed);
+                            record_listener_event(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Failure);
                         }
                     }
                 });
@@ -251,12 +310,14 @@ async fn accept_authenticated_stream(
         inner: tls,
         principal: AuthenticatedGnmiPrincipal::new(principal),
         _permit: permit,
+        _active_session: active_session(TRANSPORT_GNMI_TLS),
     })
 }
 
 fn record_handshake_join(joined: Result<(), JoinError>, counters: &ListenerCounters) {
     if joined.is_err() {
         counters.failed_connections.fetch_add(1, Ordering::Relaxed);
+        record_listener_event(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Failure);
     }
 }
 
@@ -264,6 +325,7 @@ fn record_shutdown_handshake_join(joined: Result<(), JoinError>, counters: &List
     if let Err(err) = joined {
         if err.is_panic() {
             counters.failed_connections.fetch_add(1, Ordering::Relaxed);
+            record_listener_event(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Failure);
         }
     }
 }
@@ -289,6 +351,7 @@ struct AuthenticatedTlsStream {
     inner: TlsStream<TcpStream>,
     principal: AuthenticatedGnmiPrincipal,
     _permit: OwnedSemaphorePermit,
+    _active_session: ActiveSessionGuard,
 }
 
 impl Connected for AuthenticatedTlsStream {
@@ -341,7 +404,11 @@ mod tests {
         OperationalError, OperationalRequest, OperationalResponse, OperationalStateProvider,
     };
     use opc_mgmt_schema::{DataClass, ModelData, NodeKind, NodeMeta, OriginEntry, SchemaRegistry};
-    use opc_runtime::RuntimeMode;
+    use opc_mgmt_transport::ensure_plaintext_permitted;
+    use opc_redaction::metrics::METRICS;
+    use opc_runtime::{
+        Readiness, RestartPolicy, RuntimeMode, RuntimeProfile, ShutdownPolicy, Supervisor, TaskName,
+    };
     use opc_tls::{PeerPolicy, TlsConfigBuilder};
     use rcgen::{CertificateParams, DnType, KeyPair, SanType};
     use tokio::net::TcpStream;
@@ -352,10 +419,12 @@ mod tests {
     use tonic::codegen::http::uri::PathAndQuery;
     use tonic::codegen::http::Uri;
     use tonic::codegen::Service;
-    use tonic::transport::Endpoint;
+    use tonic::transport::{Channel, Endpoint};
     use tonic::Request;
 
     use super::*;
+    use crate::metrics::{GnmiListenerEvent, TRANSPORT_GNMI_TLS};
+    use crate::supervision::{spawn_gnmi_tls_listener, SupervisedGnmiTlsListenerConfig};
     use crate::{
         CapabilityProfile, ExtensionRegistry, GnmiError, GnmiPatchApplicator, GnmiVersion,
         GNMI_VERSION,
@@ -461,7 +530,9 @@ mod tests {
         }
     }
 
-    async fn server() -> GnmiServer<(), TestBinding> {
+    async fn server_with_limits(
+        limits: opc_mgmt_limits::MgmtLimits,
+    ) -> GnmiServer<(), TestBinding> {
         let bus = Arc::new(
             ConfigBus::new_dev_only((), MockManagedDatastore::new())
                 .await
@@ -471,11 +542,15 @@ mod tests {
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
         GnmiServer::new(
             TestBinding { bus },
-            opc_mgmt_limits::MgmtLimits::default(),
+            limits,
             profile,
             ExtensionRegistry::default(),
         )
         .expect("server")
+    }
+
+    async fn server() -> GnmiServer<(), TestBinding> {
+        server_with_limits(opc_mgmt_limits::MgmtLimits::default()).await
     }
 
     fn peer_policy() -> PeerPolicy {
@@ -571,10 +646,10 @@ mod tests {
         }
     }
 
-    async fn connect_client(
+    async fn try_connect_client(
         addr: SocketAddr,
         identity_rx: watch::Receiver<Option<IdentityState>>,
-    ) -> Grpc<tonic::transport::Channel> {
+    ) -> Result<Grpc<Channel>, tonic::transport::Error> {
         let client_config = Arc::new(
             TlsConfigBuilder::new(identity_rx)
                 .with_policy(peer_policy())
@@ -582,13 +657,100 @@ mod tests {
                 .expect("client tls config"),
         );
         let channel = Endpoint::from_static("http://gnmi.test")
+            .connect_timeout(Duration::from_millis(500))
+            .timeout(Duration::from_secs(2))
             .connect_with_connector(TlsTestConnector {
                 addr,
                 config: client_config,
             })
+            .await?;
+        Ok(Grpc::new(channel))
+    }
+
+    async fn connect_client(
+        addr: SocketAddr,
+        identity_rx: watch::Receiver<Option<IdentityState>>,
+    ) -> Grpc<Channel> {
+        try_connect_client(addr, identity_rx)
             .await
-            .expect("channel");
-        Grpc::new(channel)
+            .expect("channel")
+    }
+
+    async fn request_capabilities(grpc: &mut Grpc<Channel>) -> gnmi::CapabilityResponse {
+        grpc.ready().await.expect("capabilities ready");
+        grpc.unary(
+            Request::new(gnmi::CapabilityRequest {
+                extension: Vec::new(),
+            }),
+            PathAndQuery::from_static("/gnmi.gNMI/Capabilities"),
+            ProstCodec::<gnmi::CapabilityRequest, gnmi::CapabilityResponse>::default(),
+        )
+        .await
+        .expect("capabilities")
+        .into_inner()
+    }
+
+    async fn request_get(grpc: &mut Grpc<Channel>) -> gnmi::GetResponse {
+        grpc.ready().await.expect("get ready");
+        grpc.unary(
+            Request::new(gnmi::GetRequest {
+                prefix: None,
+                path: Vec::new(),
+                r#type: gnmi::get_request::DataType::All as i32,
+                encoding: gnmi::Encoding::JsonIetf as i32,
+                use_models: Vec::new(),
+                extension: Vec::new(),
+            }),
+            PathAndQuery::from_static("/gnmi.gNMI/Get"),
+            ProstCodec::<gnmi::GetRequest, gnmi::GetResponse>::default(),
+        )
+        .await
+        .expect("get")
+        .into_inner()
+    }
+
+    async fn wait_for_readiness(supervisor: &Supervisor, expected: Readiness) {
+        for _ in 0..100 {
+            if supervisor.readiness().await == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "readiness did not reach {expected:?}; last={:?}",
+            supervisor.readiness().await
+        );
+    }
+
+    async fn wait_for_degraded(supervisor: &Supervisor) {
+        for _ in 0..100 {
+            let health = supervisor.health().await;
+            if health.degraded && health.degrade_count > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("supervisor did not degrade after listener failure");
+    }
+
+    fn listener_event_count(event: GnmiListenerEvent) -> u64 {
+        METRICS
+            .gnmi_listener_events_total
+            .lock()
+            .expect("metrics")
+            .get(&(TRANSPORT_GNMI_TLS.to_string(), event.as_str().to_string()))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn active_session_count() -> i64 {
+        METRICS
+            .gnmi_sessions_active
+            .lock()
+            .expect("metrics")
+            .get(TRANSPORT_GNMI_TLS)
+            .copied()
+            .unwrap_or_default()
     }
 
     #[tokio::test]
@@ -619,6 +781,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_listener_rejects_unconstrained_peer_policy() {
+        let state =
+            identity_state("spiffe://test-domain/tenant/test/ns/default/sa/gnmi/nf/amf/instance/0");
+        let (_identity_tx, identity_rx) = watch::channel(Some(state));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let shutdown = ShutdownToken::new();
+
+        let err = run_gnmi_tls_listener(
+            server().await,
+            listener,
+            TlsBootstrap::new(RuntimeMode::Conformance, PeerPolicy::default()),
+            identity_rx,
+            shutdown,
+            GnmiListenerConfig::default(),
+        )
+        .await
+        .expect_err("unconstrained policy");
+
+        assert!(matches!(
+            err,
+            GnmiListenerError::Transport(TransportError::UnconstrainedPeerPolicy {
+                mode: RuntimeMode::Conformance
+            })
+        ));
+    }
+
+    #[test]
+    fn production_plaintext_gnmi_transport_is_rejected_by_shared_policy() {
+        assert!(matches!(
+            ensure_plaintext_permitted(RuntimeMode::Production),
+            Err(TransportError::PlaintextForbidden {
+                mode: RuntimeMode::Production
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn tls_listener_serves_authenticated_capabilities_over_real_mtls() {
         let state =
             identity_state("spiffe://test-domain/tenant/test/ns/default/sa/gnmi/nf/amf/instance/0");
@@ -639,40 +838,13 @@ mod tests {
         ));
 
         let mut grpc = connect_client(addr, identity_rx).await;
-        grpc.ready().await.expect("capabilities ready");
-        let response = grpc
-            .unary(
-                Request::new(gnmi::CapabilityRequest {
-                    extension: Vec::new(),
-                }),
-                PathAndQuery::from_static("/gnmi.gNMI/Capabilities"),
-                ProstCodec::<gnmi::CapabilityRequest, gnmi::CapabilityResponse>::default(),
-            )
-            .await
-            .expect("capabilities")
-            .into_inner();
+        let response = request_capabilities(&mut grpc).await;
 
         assert_eq!(response.g_nmi_version, "0.10.0");
         assert_eq!(response.supported_models.len(), 1);
         assert_eq!(response.supported_models[0].name, "demo-system");
 
-        grpc.ready().await.expect("get ready");
-        let get = grpc
-            .unary(
-                Request::new(gnmi::GetRequest {
-                    prefix: None,
-                    path: Vec::new(),
-                    r#type: gnmi::get_request::DataType::All as i32,
-                    encoding: gnmi::Encoding::JsonIetf as i32,
-                    use_models: Vec::new(),
-                    extension: Vec::new(),
-                }),
-                PathAndQuery::from_static("/gnmi.gNMI/Get"),
-                ProstCodec::<gnmi::GetRequest, gnmi::GetResponse>::default(),
-            )
-            .await
-            .expect("get")
-            .into_inner();
+        let get = request_get(&mut grpc).await;
         assert!(get.notification.is_empty());
 
         let (subscribe_tx, subscribe_rx) = mpsc::channel(1);
@@ -738,5 +910,155 @@ mod tests {
         assert_eq!(result.accepted_connections, 1);
         assert_eq!(result.rejected_connections, 0);
         assert_eq!(result.failed_connections, 0);
+    }
+
+    #[tokio::test]
+    async fn tls_listener_enforces_max_sessions_without_peer_leak() {
+        let state =
+            identity_state("spiffe://test-domain/tenant/test/ns/default/sa/gnmi/nf/amf/instance/0");
+        let (_identity_tx, identity_rx) = watch::channel(Some(state));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = ShutdownToken::new();
+        let rejected_before = listener_event_count(GnmiListenerEvent::Rejected);
+        let limits = opc_mgmt_limits::MgmtLimits {
+            max_sessions: 1,
+            ..Default::default()
+        };
+        let listener_task = tokio::spawn(run_gnmi_tls_listener(
+            server_with_limits(limits).await,
+            listener,
+            TlsBootstrap::new(RuntimeMode::Production, peer_policy()),
+            identity_rx.clone(),
+            shutdown.clone(),
+            GnmiListenerConfig {
+                handshake_timeout: Duration::from_secs(5),
+                incoming_channel_capacity: 4,
+            },
+        ));
+
+        let mut first = connect_client(addr, identity_rx.clone()).await;
+        let response = request_capabilities(&mut first).await;
+        assert_eq!(response.g_nmi_version, "0.10.0");
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(3),
+            try_connect_client(addr, identity_rx.clone()),
+        )
+        .await
+        .expect("second connection attempt timed out");
+        let err = match second {
+            Ok(_) => panic!("second session should be rejected"),
+            Err(err) => err,
+        };
+        let rendered = err.to_string();
+        assert!(!rendered.contains("spiffe://"));
+        assert!(!rendered.contains("tenant/test"));
+
+        drop(first);
+        shutdown.request_shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(5), listener_task)
+            .await
+            .expect("listener timeout")
+            .expect("listener join")
+            .expect("listener result");
+
+        assert_eq!(result.accepted_connections, 1);
+        assert!(result.rejected_connections >= 1);
+        assert_eq!(result.failed_connections, 0);
+        assert!(listener_event_count(GnmiListenerEvent::Rejected) > rejected_before);
+    }
+
+    #[tokio::test]
+    async fn supervised_tls_listener_registers_runtime_listener_and_serves_get() {
+        let state =
+            identity_state("spiffe://test-domain/tenant/test/ns/default/sa/gnmi/nf/amf/instance/0");
+        let (_identity_tx, identity_rx) = watch::channel(Some(state));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = ShutdownToken::new();
+        let mut profile = RuntimeProfile::conformance("amf");
+        profile.drain_timeout = Duration::from_secs(2);
+        let supervisor = Supervisor::new(profile, shutdown.clone());
+        let start_before = listener_event_count(GnmiListenerEvent::Start);
+        let stop_before = listener_event_count(GnmiListenerEvent::Stop);
+        let active_before = active_session_count();
+
+        let handle = spawn_gnmi_tls_listener(
+            &supervisor,
+            Arc::new(server().await),
+            listener,
+            TlsBootstrap::new(RuntimeMode::Conformance, peer_policy()),
+            identity_rx.clone(),
+            shutdown.clone(),
+            SupervisedGnmiTlsListenerConfig {
+                restart: RestartPolicy::no_restart(),
+                listener: GnmiListenerConfig {
+                    handshake_timeout: Duration::from_secs(5),
+                    incoming_channel_capacity: 4,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn supervised listener");
+
+        wait_for_readiness(&supervisor, Readiness::Ready).await;
+        let health = supervisor.health().await;
+        let task = health
+            .task_states
+            .get("gnmi-tls-listener")
+            .expect("task state");
+        assert_eq!(task.kind, "listener");
+        assert!(task.running);
+        assert!(listener_event_count(GnmiListenerEvent::Start) > start_before);
+
+        let mut grpc = connect_client(addr, identity_rx).await;
+        let response = request_capabilities(&mut grpc).await;
+        assert_eq!(response.supported_models[0].name, "demo-system");
+        assert!(active_session_count() > active_before);
+        let get = request_get(&mut grpc).await;
+        assert!(get.notification.is_empty());
+
+        drop(grpc);
+        supervisor
+            .shutdown_all(ShutdownPolicy::DrainWithTimeout(Duration::from_secs(2)))
+            .await;
+        assert!(!handle.is_running());
+        assert!(listener_event_count(GnmiListenerEvent::Stop) > stop_before);
+    }
+
+    #[tokio::test]
+    async fn supervised_tls_listener_failure_degrades_readiness() {
+        let state =
+            identity_state("spiffe://test-domain/tenant/test/ns/default/sa/gnmi/nf/amf/instance/0");
+        let (_identity_tx, identity_rx) = watch::channel(Some(state));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let shutdown = ShutdownToken::new();
+        let mut profile = RuntimeProfile::conformance("amf");
+        profile.drain_timeout = Duration::from_secs(2);
+        let supervisor = Supervisor::new(profile, shutdown.clone());
+        let failure_before = listener_event_count(GnmiListenerEvent::Failure);
+
+        let handle = spawn_gnmi_tls_listener(
+            &supervisor,
+            Arc::new(server().await),
+            listener,
+            TlsBootstrap::new(RuntimeMode::Conformance, PeerPolicy::default()),
+            identity_rx,
+            shutdown,
+            SupervisedGnmiTlsListenerConfig {
+                task_name: TaskName::new("gnmi-tls-listener-fails"),
+                restart: RestartPolicy::no_restart(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn supervised listener");
+
+        wait_for_degraded(&supervisor).await;
+        assert_eq!(supervisor.readiness().await, Readiness::Degraded);
+        assert!(!handle.is_running());
+        assert!(listener_event_count(GnmiListenerEvent::Failure) > failure_before);
     }
 }

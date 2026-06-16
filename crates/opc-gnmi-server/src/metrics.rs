@@ -52,6 +52,9 @@ impl GnmiNacmAction {
     }
 }
 
+/// Listener transport label for gNMI over TLS.
+pub(crate) const TRANSPORT_GNMI_TLS: &str = "gnmi-tls";
+
 const OUTCOME_SUCCESS: &str = "success";
 const OUTCOME_FAILURE: &str = "failure";
 
@@ -120,6 +123,43 @@ pub fn record_extension(extension: &str, outcome: ExtensionMetricOutcome) {
     }
 }
 
+/// Records a low-cardinality gNMI listener lifecycle or pressure event.
+pub(crate) fn record_listener_event(transport: &'static str, event: GnmiListenerEvent) {
+    if let Ok(mut map) = METRICS.gnmi_listener_events_total.lock() {
+        let entry = map
+            .entry((safe_label(transport), safe_label(event.as_str())))
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+}
+
+/// gNMI listener event labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GnmiListenerEvent {
+    /// Listener task started serving.
+    Start,
+    /// Listener task stopped cleanly.
+    Stop,
+    /// Authenticated connection was accepted.
+    Accepted,
+    /// Connection was rejected before reading peer payload.
+    Rejected,
+    /// Listener, accept, TLS, or serve failure.
+    Failure,
+}
+
+impl GnmiListenerEvent {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Failure => "failure",
+        }
+    }
+}
+
 /// Extension metric outcome labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionMetricOutcome {
@@ -147,6 +187,12 @@ impl ExtensionMetricOutcome {
 pub fn active_stream(mode: SubscribeModeMetric) -> ActiveStreamGuard {
     adjust_active_streams(mode.as_str(), 1);
     ActiveStreamGuard { mode }
+}
+
+/// Increments the active-session gauge and returns a guard that decrements it.
+pub(crate) fn active_session(transport: &'static str) -> ActiveSessionGuard {
+    adjust_active_sessions(transport, 1);
+    ActiveSessionGuard { transport }
 }
 
 /// Subscribe mode labels.
@@ -180,6 +226,18 @@ pub struct ActiveStreamGuard {
 impl Drop for ActiveStreamGuard {
     fn drop(&mut self) {
         adjust_active_streams(self.mode.as_str(), -1);
+    }
+}
+
+/// Active-session gauge guard.
+#[derive(Debug)]
+pub(crate) struct ActiveSessionGuard {
+    transport: &'static str,
+}
+
+impl Drop for ActiveSessionGuard {
+    fn drop(&mut self) {
+        adjust_active_sessions(self.transport, -1);
     }
 }
 
@@ -220,6 +278,17 @@ fn adjust_active_streams(mode: &'static str, delta: i64) {
     }
 }
 
+fn adjust_active_sessions(transport: &'static str, delta: i64) {
+    if let Ok(mut map) = METRICS.gnmi_sessions_active.lock() {
+        let entry = map.entry(safe_label(transport)).or_insert(0);
+        if delta >= 0 {
+            *entry = entry.saturating_add(delta);
+        } else {
+            *entry = entry.saturating_sub(delta.saturating_abs());
+        }
+    }
+}
+
 fn safe_label(label: &str) -> String {
     metrics_label_safe(label)
 }
@@ -236,6 +305,9 @@ mod tests {
             rpc_error_count(GnmiOperation::Get, MgmtStatus::InvalidArgument.as_str());
         let read_denials_before = nacm_denial_count(GnmiNacmAction::Read);
         let active_stream_before = active_stream_count(SubscribeModeMetric::Stream);
+        let active_session_before = active_session_count(TRANSPORT_GNMI_TLS);
+        let listener_start_before =
+            listener_event_count(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Start);
 
         record_rpc_success(GnmiOperation::Capabilities, Duration::from_millis(10));
         record_rpc_error(
@@ -245,12 +317,20 @@ mod tests {
         );
         record_nacm_denials(GnmiNacmAction::Read, 2);
         record_extension("unknown", ExtensionMetricOutcome::Rejected);
+        record_listener_event(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Start);
         record_set_commit_latency(SetCommitMetric::Patch, Duration::from_millis(20));
         {
             let _guard = active_stream(SubscribeModeMetric::Stream);
             assert_eq!(
                 active_stream_count(SubscribeModeMetric::Stream),
                 active_stream_before + 1
+            );
+        }
+        {
+            let _guard = active_session(TRANSPORT_GNMI_TLS);
+            assert_eq!(
+                active_session_count(TRANSPORT_GNMI_TLS),
+                active_session_before + 1
             );
         }
 
@@ -266,6 +346,14 @@ mod tests {
         assert_eq!(
             active_stream_count(SubscribeModeMetric::Stream),
             active_stream_before
+        );
+        assert_eq!(
+            active_session_count(TRANSPORT_GNMI_TLS),
+            active_session_before
+        );
+        assert!(
+            listener_event_count(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Start)
+                > listener_start_before
         );
     }
 
@@ -305,6 +393,26 @@ mod tests {
             .lock()
             .expect("metrics")
             .get(mode.as_str())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn active_session_count(transport: &'static str) -> i64 {
+        METRICS
+            .gnmi_sessions_active
+            .lock()
+            .expect("metrics")
+            .get(transport)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn listener_event_count(transport: &'static str, event: GnmiListenerEvent) -> u64 {
+        METRICS
+            .gnmi_listener_events_total
+            .lock()
+            .expect("metrics")
+            .get(&(transport.to_string(), event.as_str().to_string()))
             .copied()
             .unwrap_or_default()
     }
