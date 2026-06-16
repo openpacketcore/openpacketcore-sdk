@@ -304,9 +304,10 @@ use opc_config_bus::{ConfigBus, MockManagedDatastore};
 use opc_config_model::YangPath;
 use opc_gnmi_server::proto::{gnmi, gnmi_ext};
 use opc_gnmi_server::{
-    CapabilityProfile, ExtensionRegistry, GnmiConfigBinding, GnmiJsonProjectionError,
-    GnmiJsonRenderer, GnmiJsonUpdate, GnmiListenerConfig, GnmiPatchApplicator, GnmiServer,
-    GnmiVersion, ReadSelection, SupervisedGnmiTlsListenerConfig, GNMI_VERSION,
+    CapabilityProfile, CommitConfirmedExtension, ExtensionRegistry, GnmiConfigBinding,
+    GnmiJsonProjectionError, GnmiJsonRenderer, GnmiJsonUpdate, GnmiListenerConfig,
+    GnmiPatchApplicator, GnmiServer, GnmiVersion, ReadSelection,
+    SupervisedGnmiTlsListenerConfig, GNMI_VERSION, OPC_COMMIT_CONFIRMED_EXTENSION_ID,
 };
 use opc_identity::IdentityState;
 use opc_mgmt_audit::{AuditError, AuditEvent, AuditOutcome, AuditSink};
@@ -478,6 +479,15 @@ async fn start_harness(
     limits: MgmtLimits,
     events: Option<Arc<CapturingOperationalEvents>>,
 ) -> Harness {
+    start_harness_with_extensions(policy, limits, events, ExtensionRegistry::default()).await
+}
+
+async fn start_harness_with_extensions(
+    policy: NacmPolicy,
+    limits: MgmtLimits,
+    events: Option<Arc<CapturingOperationalEvents>>,
+    extensions: ExtensionRegistry,
+) -> Harness {
     let state =
         identity_state("spiffe://test-domain/tenant/test/ns/default/sa/gnmi/nf/amf/instance/0");
     let (_identity_tx, identity_rx) = watch::channel(Some(state));
@@ -504,7 +514,7 @@ async fn start_harness(
         },
         limits,
         CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version")),
-        ExtensionRegistry::default(),
+        extensions,
         Arc::new(audit.clone()),
     )
     .expect("server");
@@ -926,6 +936,28 @@ fn json_update(path: gnmi::Path, json: impl Into<Vec<u8>>) -> gnmi::Update {
     }
 }
 
+fn commit_confirmed_extension(payload: CommitConfirmedExtension) -> gnmi_ext::Extension {
+    gnmi_ext::Extension {
+        ext: Some(gnmi_ext::extension::Ext::RegisteredExt(
+            gnmi_ext::RegisteredExtension {
+                id: OPC_COMMIT_CONFIRMED_EXTENSION_ID as i32,
+                msg: payload.encode_payload(),
+            },
+        )),
+    }
+}
+
+async fn wait_for_wire_hostname(harness: &Harness, expected: &str) {
+    let expected = LeafPresence::Explicit(expected.to_string());
+    for _ in 0..50 {
+        if harness.bus.current_snapshot().config.hostname == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(harness.bus.current_snapshot().config.hostname, expected);
+}
+
 fn subscription_list(
     mode: gnmi::subscription_list::Mode,
     path: gnmi::Path,
@@ -1224,6 +1256,115 @@ async fn generated_stack_serves_gnmi_over_real_mtls() {
     let audit_debug = format!("{audit:?}");
     assert!(!audit_debug.contains("hunter2"));
     assert!(!audit_debug.contains("router3"));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn generated_stack_supports_commit_confirmed_extension_over_real_mtls() {
+    let harness = start_harness_with_extensions(
+        allow_all_read_subscribe_policy(),
+        MgmtLimits::default(),
+        None,
+        ExtensionRegistry::with_commit_confirmed().expect("registry"),
+    )
+    .await;
+    let mut grpc = harness.client().await;
+
+    let caps = capabilities(&mut grpc).await;
+    assert_eq!(caps.extension.len(), 1);
+    let Some(gnmi_ext::extension::Ext::RegisteredExt(extension)) = caps.extension[0].ext.as_ref()
+    else {
+        panic!("expected registered extension");
+    };
+    assert_eq!(extension.id, OPC_COMMIT_CONFIRMED_EXTENSION_ID as i32);
+    assert!(extension.msg.is_empty());
+
+    set(
+        &mut grpc,
+        gnmi::SetRequest {
+            prefix: None,
+            delete: Vec::new(),
+            replace: Vec::new(),
+            update: vec![json_update(hostname_path(), br#""wire-parent""#.to_vec())],
+            union_replace: Vec::new(),
+            extension: Vec::new(),
+        },
+    )
+    .await
+    .expect("parent commit");
+
+    set(
+        &mut grpc,
+        gnmi::SetRequest {
+            prefix: None,
+            delete: Vec::new(),
+            replace: Vec::new(),
+            update: vec![json_update(hostname_path(), br#""wire-confirmed""#.to_vec())],
+            union_replace: Vec::new(),
+            extension: vec![commit_confirmed_extension(CommitConfirmedExtension::begin(
+                Duration::from_millis(120),
+            )
+            .expect("payload"))],
+        },
+    )
+    .await
+    .expect("begin confirmed");
+    assert_eq!(
+        harness.bus.current_snapshot().config.hostname,
+        LeafPresence::Explicit("wire-confirmed".to_string())
+    );
+
+    let confirm = set(
+        &mut grpc,
+        gnmi::SetRequest {
+            prefix: None,
+            delete: Vec::new(),
+            replace: Vec::new(),
+            update: Vec::new(),
+            union_replace: Vec::new(),
+            extension: vec![commit_confirmed_extension(CommitConfirmedExtension::confirm())],
+        },
+    )
+    .await
+    .expect("confirm");
+    assert!(confirm.response.is_empty());
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    assert_eq!(
+        harness.bus.current_snapshot().config.hostname,
+        LeafPresence::Explicit("wire-confirmed".to_string())
+    );
+
+    set(
+        &mut grpc,
+        gnmi::SetRequest {
+            prefix: None,
+            delete: Vec::new(),
+            replace: Vec::new(),
+            update: vec![json_update(hostname_path(), br#""wire-cancelled""#.to_vec())],
+            union_replace: Vec::new(),
+            extension: vec![commit_confirmed_extension(CommitConfirmedExtension::begin(
+                Duration::from_secs(30),
+            )
+            .expect("payload"))],
+        },
+    )
+    .await
+    .expect("begin to cancel");
+    set(
+        &mut grpc,
+        gnmi::SetRequest {
+            prefix: None,
+            delete: Vec::new(),
+            replace: Vec::new(),
+            update: Vec::new(),
+            union_replace: Vec::new(),
+            extension: vec![commit_confirmed_extension(CommitConfirmedExtension::cancel())],
+        },
+    )
+    .await
+    .expect("cancel");
+    wait_for_wire_hostname(&harness, "wire-confirmed").await;
+
     harness.shutdown().await;
 }
 

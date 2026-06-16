@@ -8,6 +8,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     audit::{outcome_for_error, record_audit},
+    confirmed_commit::reject_set_only_extension,
     encoding_to_proto,
     get::handle_get,
     metrics::{record_rpc_error, record_rpc_success, GnmiOperation},
@@ -130,9 +131,11 @@ where
             record_rpc_error(GnmiOperation::Capabilities, err.status(), start.elapsed());
             return Err(status_from_error(err));
         }
-        if let Err(err) =
-            validate_extensions(self.server.extensions(), &request.get_ref().extension)
-        {
+        if let Err(err) = validate_extensions_for_operation(
+            self.server.extensions(),
+            &request.get_ref().extension,
+            ExtensionOperation::Capabilities,
+        ) {
             record_rpc_error(GnmiOperation::Capabilities, err.status(), start.elapsed());
             return Err(status_from_error(err));
         }
@@ -155,7 +158,11 @@ where
                 .collect(),
             supported_encodings: caps.encodings.into_iter().map(encoding_to_proto).collect(),
             g_nmi_version: caps.gnmi_version,
-            extension: Vec::new(),
+            extension: caps
+                .extensions
+                .into_iter()
+                .map(capability_extension)
+                .collect(),
         };
         record_rpc_success(GnmiOperation::Capabilities, start.elapsed());
         Ok(Response::new(response))
@@ -177,9 +184,11 @@ where
                 return Err(status_from_error(err));
             }
         };
-        if let Err(err) =
-            validate_extensions(self.server.extensions(), &request.get_ref().extension)
-        {
+        if let Err(err) = validate_extensions_for_operation(
+            self.server.extensions(),
+            &request.get_ref().extension,
+            ExtensionOperation::Get,
+        ) {
             let final_err = record_audit(
                 self.server.audit(),
                 RequestId::new(),
@@ -221,9 +230,11 @@ where
                 return Err(status_from_error(err));
             }
         };
-        if let Err(err) =
-            validate_extensions(self.server.extensions(), &request.get_ref().extension)
-        {
+        if let Err(err) = validate_extensions_for_operation(
+            self.server.extensions(),
+            &request.get_ref().extension,
+            ExtensionOperation::Set,
+        ) {
             let final_err = record_audit(
                 self.server.audit(),
                 RequestId::new(),
@@ -286,16 +297,39 @@ fn subscribe_response_queue_capacity(limits: &opc_mgmt_limits::MgmtLimits) -> us
     (limits.max_subscriber_queue_bytes / 4096).clamp(1, 1024)
 }
 
-pub(crate) fn validate_extensions(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExtensionOperation {
+    Capabilities,
+    Get,
+    Set,
+    Subscribe,
+}
+
+pub(crate) fn validate_extensions_for_operation(
     registry: &crate::ExtensionRegistry,
     extensions: &[gnmi_ext::Extension],
+    operation: ExtensionOperation,
 ) -> Result<(), GnmiError> {
     let normalized = extensions
         .iter()
         .map(extension_from_proto)
         .collect::<Result<Vec<_>, _>>()?;
     registry.validate_request(&normalized)?;
+    if !matches!(operation, ExtensionOperation::Set) {
+        reject_set_only_extension(extensions)?;
+    }
     Ok(())
+}
+
+fn capability_extension(id: u32) -> gnmi_ext::Extension {
+    gnmi_ext::Extension {
+        ext: Some(gnmi_ext::extension::Ext::RegisteredExt(
+            gnmi_ext::RegisteredExtension {
+                id: id as i32,
+                msg: Vec::new(),
+            },
+        )),
+    }
 }
 
 /// Converts a gNMI foundation error into a tonic status without surfacing local
@@ -361,8 +395,9 @@ mod tests {
         render_snapshot_responses, send_operational_event, serve_subscribe_stream, SubscribePlan,
     };
     use crate::{
-        CapabilityProfile, ExtensionRegistry, GnmiJsonProjectionError, GnmiJsonUpdate,
-        GnmiPatchApplicator, GnmiVersion, ReadSelection, GNMI_VERSION,
+        CapabilityProfile, CommitConfirmedExtension, ExtensionRegistry, GnmiJsonProjectionError,
+        GnmiJsonUpdate, GnmiPatchApplicator, GnmiVersion, ReadSelection, GNMI_VERSION,
+        OPC_COMMIT_CONFIRMED_EXTENSION_ID,
     };
     use opc_types::{SchemaDigest, TenantId};
 
@@ -882,6 +917,32 @@ mod tests {
         authenticated: bool,
         limits: MgmtLimits,
     ) -> GnmiService<DemoConfig, TestBinding> {
+        service_with_authentication_limits_extensions(
+            authenticated,
+            limits,
+            ExtensionRegistry::default(),
+        )
+        .await
+    }
+
+    async fn authenticated_service_with_extensions(
+        extensions: ExtensionRegistry,
+    ) -> GnmiService<DemoConfig, TestBinding> {
+        service_with_authentication_limits_extensions(true, MgmtLimits::default(), extensions).await
+    }
+
+    async fn service_with_extensions(
+        extensions: ExtensionRegistry,
+    ) -> GnmiService<DemoConfig, TestBinding> {
+        service_with_authentication_limits_extensions(false, MgmtLimits::default(), extensions)
+            .await
+    }
+
+    async fn service_with_authentication_limits_extensions(
+        authenticated: bool,
+        limits: MgmtLimits,
+        extensions: ExtensionRegistry,
+    ) -> GnmiService<DemoConfig, TestBinding> {
         let bus = Arc::new(
             ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
                 .await
@@ -898,7 +959,7 @@ mod tests {
             },
             limits,
             profile,
-            ExtensionRegistry::default(),
+            extensions,
         )
         .expect("server");
         if authenticated {
@@ -1135,6 +1196,27 @@ mod tests {
         audit: Arc<dyn AuditSink>,
         operational: Arc<dyn OperationalStateProvider>,
     ) -> GnmiService<DemoConfig, TestBinding> {
+        authenticated_service_with_policy_bus_events_audit_extensions(
+            policy,
+            bus,
+            events,
+            limits,
+            audit,
+            operational,
+            ExtensionRegistry::default(),
+        )
+        .await
+    }
+
+    async fn authenticated_service_with_policy_bus_events_audit_extensions(
+        policy: Arc<dyn PolicySource>,
+        bus: Arc<ConfigBus<DemoConfig>>,
+        events: Option<Arc<dyn OperationalEventSource>>,
+        limits: MgmtLimits,
+        audit: Arc<dyn AuditSink>,
+        operational: Arc<dyn OperationalStateProvider>,
+        extensions: ExtensionRegistry,
+    ) -> GnmiService<DemoConfig, TestBinding> {
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
         let server = GnmiServer::new_with_audit(
@@ -1146,11 +1228,31 @@ mod tests {
             },
             limits,
             profile,
-            ExtensionRegistry::default(),
+            extensions,
             audit,
         )
         .expect("server");
         GnmiService::new_authenticated(server)
+    }
+
+    async fn authenticated_service_with_extensions_and_audit(
+        extensions: ExtensionRegistry,
+        audit: Arc<dyn AuditSink>,
+    ) -> GnmiService<DemoConfig, TestBinding> {
+        authenticated_service_with_policy_bus_events_audit_extensions(
+            Arc::new(FixedPolicy(allow_all_read_policy())),
+            Arc::new(
+                ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
+                    .await
+                    .expect("bus"),
+            ),
+            None,
+            MgmtLimits::default(),
+            audit,
+            Arc::new(TestOperationalState),
+            extensions,
+        )
+        .await
     }
 
     struct DenyWriteAuthorizer;
@@ -1236,6 +1338,72 @@ mod tests {
         let mut request = Request::new(get);
         request.extensions_mut().insert(authenticated_principal());
         request
+    }
+
+    fn commit_confirmed_extension(payload: CommitConfirmedExtension) -> gnmi_ext::Extension {
+        gnmi_ext::Extension {
+            ext: Some(gnmi_ext::extension::Ext::RegisteredExt(
+                gnmi_ext::RegisteredExtension {
+                    id: OPC_COMMIT_CONFIRMED_EXTENSION_ID as i32,
+                    msg: payload.encode_payload(),
+                },
+            )),
+        }
+    }
+
+    fn malformed_commit_confirmed_extension(payload: impl Into<Vec<u8>>) -> gnmi_ext::Extension {
+        gnmi_ext::Extension {
+            ext: Some(gnmi_ext::extension::Ext::RegisteredExt(
+                gnmi_ext::RegisteredExtension {
+                    id: OPC_COMMIT_CONFIRMED_EXTENSION_ID as i32,
+                    msg: payload.into(),
+                },
+            )),
+        }
+    }
+
+    async fn wait_for_hostname(service: &GnmiService<DemoConfig, TestBinding>, expected: &str) {
+        for _ in 0..50 {
+            if service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname
+                == expected
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            expected
+        );
+    }
+
+    async fn commit_hostname(service: &GnmiService<DemoConfig, TestBinding>, hostname: &str) {
+        service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(
+                    hostname_path(),
+                    serde_json::to_vec(hostname).expect("hostname json"),
+                )],
+                union_replace: Vec::new(),
+                extension: Vec::new(),
+            }))
+            .await
+            .expect("commit hostname");
     }
 
     fn gnmi_rpc_request_count(operation: &str, outcome: &str) -> u64 {
@@ -1349,6 +1517,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capabilities_advertises_commit_confirmed_only_when_registered() {
+        let service =
+            service_with_extensions(ExtensionRegistry::with_commit_confirmed().expect("registry"))
+                .await;
+        let response = service
+            .capabilities(Request::new(gnmi::CapabilityRequest {
+                extension: Vec::new(),
+            }))
+            .await
+            .expect("capabilities")
+            .into_inner();
+
+        assert_eq!(response.extension.len(), 1);
+        let Some(gnmi_ext::extension::Ext::RegisteredExt(extension)) =
+            response.extension[0].ext.as_ref()
+        else {
+            panic!("expected registered extension");
+        };
+        assert_eq!(extension.id, OPC_COMMIT_CONFIRMED_EXTENSION_ID as i32);
+        assert!(extension.msg.is_empty());
+    }
+
+    #[tokio::test]
     async fn capabilities_reject_unknown_registered_extension_without_payload_leak() {
         let service = service().await;
         let status = service
@@ -1368,6 +1559,24 @@ mod tests {
         assert_eq!(status.code(), Code::Unimplemented);
         assert_eq!(status.message(), "gNMI operation is not supported");
         assert!(!status.message().contains("secret-extension-payload"));
+    }
+
+    #[tokio::test]
+    async fn capabilities_rejects_set_only_commit_confirmed_extension() {
+        let service =
+            service_with_extensions(ExtensionRegistry::with_commit_confirmed().expect("registry"))
+                .await;
+        let status = service
+            .capabilities(Request::new(gnmi::CapabilityRequest {
+                extension: vec![commit_confirmed_extension(
+                    CommitConfirmedExtension::confirm(),
+                )],
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::Unimplemented);
+        assert_eq!(status.message(), "gNMI operation is not supported");
     }
 
     #[tokio::test]
@@ -2163,6 +2372,273 @@ mod tests {
                 .hostname,
             "amf-2"
         );
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_commit_confirmed_rolls_back_on_timeout() {
+        let service = authenticated_service_with_extensions(
+            ExtensionRegistry::with_commit_confirmed().expect("registry"),
+        )
+        .await;
+        commit_hostname(&service, "rollback-parent").await;
+        let response = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(hostname_path(), br#""pending-host""#.to_vec())],
+                union_replace: Vec::new(),
+                extension: vec![commit_confirmed_extension(
+                    CommitConfirmedExtension::begin(std::time::Duration::from_millis(50))
+                        .expect("payload"),
+                )],
+            }))
+            .await
+            .expect("confirmed set")
+            .into_inner();
+
+        assert_eq!(response.response.len(), 1);
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "pending-host"
+        );
+
+        wait_for_hostname(&service, "rollback-parent").await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_commit_confirmed_can_be_confirmed() {
+        let service = authenticated_service_with_extensions(
+            ExtensionRegistry::with_commit_confirmed().expect("registry"),
+        )
+        .await;
+        commit_hostname(&service, "rollback-parent").await;
+        service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(
+                    hostname_path(),
+                    br#""confirmed-host""#.to_vec(),
+                )],
+                union_replace: Vec::new(),
+                extension: vec![commit_confirmed_extension(
+                    CommitConfirmedExtension::begin(std::time::Duration::from_millis(120))
+                        .expect("payload"),
+                )],
+            }))
+            .await
+            .expect("begin confirmed");
+
+        let confirm = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: Vec::new(),
+                union_replace: Vec::new(),
+                extension: vec![commit_confirmed_extension(
+                    CommitConfirmedExtension::confirm(),
+                )],
+            }))
+            .await
+            .expect("confirm")
+            .into_inner();
+        assert!(confirm.response.is_empty());
+
+        tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "confirmed-host"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_commit_confirmed_can_be_cancelled() {
+        let service = authenticated_service_with_extensions(
+            ExtensionRegistry::with_commit_confirmed().expect("registry"),
+        )
+        .await;
+        commit_hostname(&service, "rollback-parent").await;
+        service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(
+                    hostname_path(),
+                    br#""cancelled-host""#.to_vec(),
+                )],
+                union_replace: Vec::new(),
+                extension: vec![commit_confirmed_extension(
+                    CommitConfirmedExtension::begin(std::time::Duration::from_secs(30))
+                        .expect("payload"),
+                )],
+            }))
+            .await
+            .expect("begin confirmed");
+
+        service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: Vec::new(),
+                union_replace: Vec::new(),
+                extension: vec![commit_confirmed_extension(
+                    CommitConfirmedExtension::cancel(),
+                )],
+            }))
+            .await
+            .expect("cancel");
+
+        wait_for_hostname(&service, "rollback-parent").await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_commit_confirmed_control_shapes_fail_closed() {
+        let service = authenticated_service_with_extensions(
+            ExtensionRegistry::with_commit_confirmed().expect("registry"),
+        )
+        .await;
+        let confirm_with_update = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(hostname_path(), br#""bad-shape""#.to_vec())],
+                union_replace: Vec::new(),
+                extension: vec![commit_confirmed_extension(
+                    CommitConfirmedExtension::confirm(),
+                )],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(confirm_with_update.code(), Code::InvalidArgument);
+
+        let begin_without_update = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: Vec::new(),
+                union_replace: Vec::new(),
+                extension: vec![commit_confirmed_extension(
+                    CommitConfirmedExtension::begin(std::time::Duration::from_secs(30))
+                        .expect("payload"),
+                )],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(begin_without_update.code(), Code::InvalidArgument);
+
+        let confirm_without_pending = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: Vec::new(),
+                union_replace: Vec::new(),
+                extension: vec![commit_confirmed_extension(
+                    CommitConfirmedExtension::confirm(),
+                )],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(confirm_without_pending.code(), Code::InvalidArgument);
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_commit_confirmed_malformed_payload_is_audited_without_leak() {
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_extensions_and_audit(
+            ExtensionRegistry::with_commit_confirmed().expect("registry"),
+            Arc::new(audit.clone()),
+        )
+        .await;
+        let status = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(hostname_path(), br#""ignored-host""#.to_vec())],
+                union_replace: Vec::new(),
+                extension: vec![malformed_commit_confirmed_extension(
+                    b"secret-extension-payload".to_vec(),
+                )],
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "invalid gNMI request");
+        assert!(!status.message().contains("secret-extension-payload"));
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-1"
+        );
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(
+            events[0].outcome,
+            audit_failed(AuditReasonCode::INVALID_VALUE)
+        );
+        assert!(events[0].schema_paths.is_empty());
+        assert!(!format!("{:?}", events).contains("secret-extension-payload"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_get_rejects_set_only_commit_confirmed_extension() {
+        let service = authenticated_service_with_extensions(
+            ExtensionRegistry::with_commit_confirmed().expect("registry"),
+        )
+        .await;
+        let status = service
+            .get(authenticated_get_request(gnmi::GetRequest {
+                prefix: None,
+                path: vec![hostname_path()],
+                r#type: gnmi::get_request::DataType::Config as i32,
+                encoding: gnmi::Encoding::JsonIetf as i32,
+                use_models: Vec::new(),
+                extension: vec![commit_confirmed_extension(
+                    CommitConfirmedExtension::confirm(),
+                )],
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::Unimplemented);
+        assert_eq!(status.message(), "gNMI operation is not supported");
     }
 
     #[tokio::test]
