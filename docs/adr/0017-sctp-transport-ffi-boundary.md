@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Date
 
@@ -16,7 +16,7 @@ ADR 0014 §8 states `unsafe_code = "forbid"` is workspace-wide and
 because foreign C code parsing attacker-controlled bytes turns memory-safety bugs
 into SDK security issues.
 
-`opc-sctp` (see `.planning/opc-sctp-spec.md`) is required for CNFs that terminate
+`opc-sctp` is required for CNFs that terminate
 N2/NGAP or other SCTP interfaces. Unlike NGAP, SCTP is not a codec — it is an
 **OS transport**. Linux implements SCTP in the kernel (lksctp); a userspace
 program reaches it through SCTP sockets:
@@ -105,8 +105,8 @@ scope:
   unsafe surface, and `unsafe_code = "forbid"` remains true everywhere else.
 - The CI gate from point 3 exists, mirroring the "policy must be mechanically
   enforced" lesson of ADR 0014.
-- `opc-sctp` spec v0.3 already specifies the non-inheritance mechanism and the
-  `AsyncFd` model, so it is consistent with this decision; its §16 corrections
-  remain the implementation contract.
+- `opc-sctp` uses the non-inheritance mechanism and `AsyncFd` model described
+  by this ADR. Its README and tests record the current capability profile and
+  explicit deferrals.
 - NGAP-over-SCTP wiring (PPID 60) is separate integration work and is not
   authorized to use FFI for the NGAP codec itself.
