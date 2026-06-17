@@ -17,6 +17,10 @@ the parts that are independent of full RPC behavior:
   data through explicit CNF/generated projection hooks;
 - authenticated atomic `Set` through generated patch applicators and
   `opc-config-bus`;
+- opt-in OpenPacketCore commit-confirmed `Set` extension for begin, confirm,
+  cancel, and timeout. The gNMI extension does not implement NETCONF
+  `persist`/`persist-id` or operator-token semantics; token-like unknown payload
+  fields are rejected instead of ignored;
 - opt-in gNMI master-arbitration for `Set`, fenced by authenticated tenant plus
   gNMI role. Missing role uses the OpenConfig empty-role default. Disabled
   servers reject the extension, optional servers enforce it when present, and
@@ -28,9 +32,13 @@ Current RPC behavior is intentionally capability-honest: `Capabilities` is
 served from the generated schema registry and can be exposed over the
 `run_gnmi_tls_listener` mTLS path. `Get` is implemented for authenticated
 read-only JSON/JSON_IETF reads when the binding supplies projection support.
-`Set` is implemented for generated config roots with explicit patch support and
-can be configured to advertise and enforce OpenConfig master-arbitration before
-candidate construction, patching, or commit-confirmed control. `Subscribe`
-supports JSON/JSON_IETF ONCE, POLL, STREAM SAMPLE, and config ON_CHANGE;
-TARGET_DEFINED, aggregation, QoS marking, history replay, and operational
-on-change remain fail-closed until backed by SDK contracts and tests.
+`Set` is implemented for generated config roots with explicit patch support.
+When the OpenPacketCore commit-confirmed extension is registered, `Set` supports
+begin/confirm/cancel and timeout only. Persist-token semantics are NETCONF-only
+until the config-bus model has a durable protocol-neutral token contract. `Set`
+can also be configured to advertise and enforce OpenConfig master-arbitration
+before candidate construction, patching, or commit-confirmed control.
+`Subscribe` supports JSON/JSON_IETF ONCE, POLL, STREAM SAMPLE, and config
+ON_CHANGE; TARGET_DEFINED, aggregation, QoS marking, history replay, and
+operational on-change remain fail-closed until backed by SDK contracts and
+tests.

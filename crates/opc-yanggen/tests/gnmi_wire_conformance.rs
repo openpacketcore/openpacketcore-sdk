@@ -965,6 +965,24 @@ fn commit_confirmed_extension(payload: CommitConfirmedExtension) -> gnmi_ext::Ex
     }
 }
 
+fn token_like_commit_confirmed_extension(
+    payload: CommitConfirmedExtension,
+    token: &[u8],
+) -> gnmi_ext::Extension {
+    let mut msg = payload.encode_payload();
+    msg.push((3 << 3) | 2);
+    msg.push(u8::try_from(token.len()).expect("test token length"));
+    msg.extend_from_slice(token);
+    gnmi_ext::Extension {
+        ext: Some(gnmi_ext::extension::Ext::RegisteredExt(
+            gnmi_ext::RegisteredExtension {
+                id: OPC_COMMIT_CONFIRMED_EXTENSION_ID as i32,
+                msg,
+            },
+        )),
+    }
+}
+
 fn master_arbitration_extension(role_id: Option<&str>, high: u64, low: u64) -> gnmi_ext::Extension {
     gnmi_ext::Extension {
         ext: Some(gnmi_ext::extension::Ext::MasterArbitration(
@@ -1379,6 +1397,29 @@ async fn generated_stack_supports_commit_confirmed_extension_over_real_mtls() {
     )
     .await
     .expect("begin to cancel");
+    let token_like_cancel = set(
+        &mut grpc,
+        gnmi::SetRequest {
+            prefix: None,
+            delete: Vec::new(),
+            replace: Vec::new(),
+            update: Vec::new(),
+            union_replace: Vec::new(),
+            extension: vec![token_like_commit_confirmed_extension(
+                CommitConfirmedExtension::cancel(),
+                b"wire-secret-token",
+            )],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(token_like_cancel.code(), Code::InvalidArgument);
+    assert_eq!(token_like_cancel.message(), "invalid gNMI request");
+    assert!(!token_like_cancel.message().contains("wire-secret-token"));
+    assert_eq!(
+        harness.bus.current_snapshot().config.hostname,
+        LeafPresence::Explicit("wire-cancelled".to_string())
+    );
     set(
         &mut grpc,
         gnmi::SetRequest {
@@ -1393,6 +1434,8 @@ async fn generated_stack_supports_commit_confirmed_extension_over_real_mtls() {
     .await
     .expect("cancel");
     wait_for_wire_hostname(&harness, "wire-confirmed").await;
+    let audit_debug = format!("{:?}", harness.audit.events.lock().expect("audit"));
+    assert!(!audit_debug.contains("wire-secret-token"));
 
     harness.shutdown().await;
 }

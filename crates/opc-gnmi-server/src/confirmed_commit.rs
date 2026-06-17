@@ -142,6 +142,7 @@ fn commit_confirmed_registered_extension(
 }
 
 fn parse_payload(payload: &[u8]) -> Result<SetCommitExtension, GnmiError> {
+    validate_payload_wire_shape(payload)?;
     let message = CommitConfirmedExtension::decode(payload)
         .map_err(|_| GnmiError::invalid("invalid OpenPacketCore commit-confirmed payload"))?;
     let action = CommitConfirmedAction::try_from(message.action)
@@ -165,6 +166,48 @@ fn parse_payload(payload: &[u8]) -> Result<SetCommitExtension, GnmiError> {
     }
 }
 
+fn validate_payload_wire_shape(payload: &[u8]) -> Result<(), GnmiError> {
+    let mut cursor = 0;
+    while cursor < payload.len() {
+        let key = read_varint(payload, &mut cursor)?;
+        let field_number = key >> 3;
+        let wire_type = key & 0b111;
+        match (field_number, wire_type) {
+            (1 | 2, 0) => {
+                read_varint(payload, &mut cursor)?;
+            }
+            _ => {
+                return Err(GnmiError::invalid(
+                    "invalid OpenPacketCore commit-confirmed payload",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_varint(payload: &[u8], cursor: &mut usize) -> Result<u64, GnmiError> {
+    let mut value = 0u64;
+    for index in 0..10 {
+        let byte = *payload
+            .get(*cursor)
+            .ok_or_else(|| GnmiError::invalid("invalid OpenPacketCore commit-confirmed payload"))?;
+        *cursor += 1;
+        if index == 9 && byte > 1 {
+            return Err(GnmiError::invalid(
+                "invalid OpenPacketCore commit-confirmed payload",
+            ));
+        }
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(GnmiError::invalid(
+        "invalid OpenPacketCore commit-confirmed payload",
+    ))
+}
+
 fn timeout_from_nanos(nanos: u64) -> Duration {
     if nanos == 0 {
         DEFAULT_COMMIT_CONFIRMED_TIMEOUT
@@ -184,6 +227,14 @@ mod tests {
                 msg: payload.encode_payload(),
             })),
         }
+    }
+
+    fn token_like_payload(payload: CommitConfirmedExtension, token: &[u8]) -> Vec<u8> {
+        let mut encoded = payload.encode_payload();
+        encoded.push((3 << 3) | 2);
+        encoded.push(u8::try_from(token.len()).expect("test token length"));
+        encoded.extend_from_slice(token);
+        encoded
     }
 
     #[test]
@@ -241,6 +292,20 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(err.status().as_str(), "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn rejects_unknown_fields_so_tokens_are_not_silently_ignored() {
+        let payload = token_like_payload(CommitConfirmedExtension::confirm(), b"secret-token");
+        let extension = gnmi_ext::Extension {
+            ext: Some(Ext::RegisteredExt(gnmi_ext::RegisteredExtension {
+                id: OPC_COMMIT_CONFIRMED_EXTENSION_ID as i32,
+                msg: payload,
+            })),
+        };
+        let err = parse_set_commit_extension(&[extension]).unwrap_err();
+        assert_eq!(err.status().as_str(), "INVALID_ARGUMENT");
+        assert!(!err.to_string().contains("secret-token"));
     }
 
     #[test]
