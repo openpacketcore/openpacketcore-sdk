@@ -12,10 +12,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - ""
   resources:
@@ -31,10 +27,8 @@ rules:
   - get
   - list
   - watch
-  - create
   - update
   - patch
-  - delete
 - apiGroups:
   - reference.openpacketcore.io
   resources:

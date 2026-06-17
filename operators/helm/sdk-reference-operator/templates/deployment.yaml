@@ -14,9 +14,10 @@ spec:
       labels:
         {{- include "sdk-reference-operator.selectorLabels" . | nindent 8 }}
     spec:
+      automountServiceAccountToken: true
       serviceAccountName: {{ include "sdk-reference-operator.serviceAccountName" . }}
       securityContext:
-        runAsNonRoot: true
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
       - name: manager
         command:
@@ -35,10 +36,7 @@ spec:
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
+          {{- toYaml .Values.securityContext | nindent 10 }}
         livenessProbe:
           httpGet:
             path: /healthz

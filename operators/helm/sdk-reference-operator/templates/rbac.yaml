@@ -14,10 +14,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - ""
   resources:
@@ -33,10 +29,8 @@ rules:
   - get
   - list
   - watch
-  - create
   - update
   - patch
-  - delete
 - apiGroups:
   - reference.openpacketcore.io
   resources:
@@ -51,6 +45,7 @@ rules:
   - sdkmanagednetworkfunctions/finalizers
   verbs:
   - update
+{{- if .Values.workloadSynthesis.enabled }}
 - apiGroups:
   - apps
   resources:
@@ -62,7 +57,7 @@ rules:
   - create
   - update
   - patch
-  - delete
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

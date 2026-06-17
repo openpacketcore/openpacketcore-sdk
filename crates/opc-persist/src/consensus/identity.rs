@@ -200,10 +200,7 @@ pub fn build_client_tls_connector(
     expected_node_id: usize,
 ) -> Result<tokio_rustls::TlsConnector, PersistError> {
     let rx = create_identity_state_receiver(identity);
-    let mut policy = opc_tls::PeerPolicy::default();
-    let mut allowed_instances = HashSet::new();
-    allowed_instances.insert(opc_types::InstanceId::new(expected_node_id.to_string()).unwrap());
-    policy.allowed_instances = Some(allowed_instances);
+    let policy = consensus_peer_policy(identity, Some(expected_node_id))?;
 
     let builder = opc_tls::TlsConfigBuilder::new(rx).with_policy(policy);
     let client_config = builder.build_client_config().map_err(|e| {
@@ -217,12 +214,49 @@ pub fn build_server_tls_acceptor(
     identity: &NodeIdentity,
 ) -> Result<tokio_rustls::TlsAcceptor, PersistError> {
     let rx = create_identity_state_receiver(identity);
-    let builder = opc_tls::TlsConfigBuilder::new(rx);
+    let policy = consensus_peer_policy(identity, None)?;
+    let builder = opc_tls::TlsConfigBuilder::new(rx).with_policy(policy);
     let server_config = builder.build_server_config().map_err(|e| {
         PersistError::inconsistent_state(format!("Failed to build server config: {e}"))
     })?;
 
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server_config)))
+}
+
+pub(super) fn consensus_peer_policy(
+    identity: &NodeIdentity,
+    expected_node_id: Option<usize>,
+) -> Result<opc_tls::PeerPolicy, PersistError> {
+    let profile = parse_local_spiffe_profile(identity)?;
+    let allowed_trust_domains = Some(HashSet::from([opc_identity::TrustDomain::new(
+        profile.trust_domain,
+    )
+    .map_err(|_| PersistError::inconsistent_state("local identity has invalid trust domain"))?]));
+    let allowed_tenants = Some(HashSet::from([opc_types::TenantId::new(profile.tenant_id)
+        .map_err(|_| {
+            PersistError::inconsistent_state("local identity has invalid tenant")
+        })?]));
+    let allowed_nf_kinds = Some(HashSet::from([opc_types::NfKind::new(profile.nf_kind)
+        .map_err(|_| {
+            PersistError::inconsistent_state("local identity has invalid NF kind")
+        })?]));
+    let allowed_instances = if let Some(node_id) = expected_node_id {
+        Some(HashSet::from([opc_types::InstanceId::new(
+            node_id.to_string(),
+        )
+        .map_err(|_| {
+            PersistError::inconsistent_state("expected node id is not a valid instance id")
+        })?]))
+    } else {
+        None
+    };
+
+    Ok(opc_tls::PeerPolicy {
+        allowed_trust_domains,
+        allowed_tenants,
+        allowed_nf_kinds,
+        allowed_instances,
+    })
 }
 
 impl ConsensusConfigStore {

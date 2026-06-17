@@ -19,6 +19,7 @@ leaderElection:
 
 webhook:
   certMode: cert-manager
+  caBundle: ""
   secretName: ""
 
 metrics:
@@ -27,7 +28,7 @@ metrics:
     enabled: false
 
 cliBridge:
-  path: "/usr/local/bin/operator-lifecycle"
+  path: "/usr/local/bin/operator-lifecycle-cli"
 
 workloadSynthesis:
   enabled: false
@@ -36,3 +37,18 @@ serviceAccount:
   create: true
   annotations: {}
   name: ""
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+    - ALL

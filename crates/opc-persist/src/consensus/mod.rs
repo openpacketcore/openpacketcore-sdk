@@ -14,6 +14,9 @@ pub mod snapshot;
 pub mod transport;
 pub mod types;
 
+#[cfg(test)]
+mod tests;
+
 // Re-exports
 pub use types::{
     AppendEntriesRequest, AppendEntriesResponse, ClusterMembership, ConsensusClock,
