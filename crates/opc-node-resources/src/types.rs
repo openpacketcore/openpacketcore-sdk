@@ -51,7 +51,10 @@ pub enum DataPlaneProfile {
     AfXdpFastPath,
     /// SR-IOV direct assignment of a virtual function to the CNF pod.
     SriovFastPath,
-    /// IPsec gateway mode (crypto offload).
+    /// IPsec gateway resource profile for future ePDG/N3IWF workloads.
+    ///
+    /// This selects resource/admission checks only; it does not imply IKEv2,
+    /// ESP, or xfrm protocol implementation in this crate.
     IpsecGateway,
 }
 
