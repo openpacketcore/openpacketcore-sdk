@@ -13,7 +13,6 @@ use crate::{
     get::handle_get,
     metrics::{record_rpc_error, record_rpc_success, GnmiOperation},
     proto::{gnmi, gnmi_ext},
-    proto_adapter::extension_from_proto,
     set::handle_set,
     subscribe::{send_subscribe_error, serve_subscribe_stream},
     GnmiConfigBinding, GnmiError, GnmiServer,
@@ -146,6 +145,15 @@ where
             return Err(status_from_error(err));
         }
 
+        let mut response_extensions = caps
+            .extensions
+            .into_iter()
+            .map(capability_extension)
+            .collect::<Vec<_>>();
+        if self.server.arbitration().advertised() {
+            response_extensions.push(master_arbitration_capability_extension());
+        }
+
         let response = gnmi::CapabilityResponse {
             supported_models: caps
                 .models
@@ -158,11 +166,7 @@ where
                 .collect(),
             supported_encodings: caps.encodings.into_iter().map(encoding_to_proto).collect(),
             g_nmi_version: caps.gnmi_version,
-            extension: caps
-                .extensions
-                .into_iter()
-                .map(capability_extension)
-                .collect(),
+            extension: response_extensions,
         };
         record_rpc_success(GnmiOperation::Capabilities, start.elapsed());
         Ok(Response::new(response))
@@ -310,10 +314,29 @@ pub(crate) fn validate_extensions_for_operation(
     extensions: &[gnmi_ext::Extension],
     operation: ExtensionOperation,
 ) -> Result<(), GnmiError> {
-    let normalized = extensions
-        .iter()
-        .map(extension_from_proto)
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut normalized = Vec::new();
+    for extension in extensions {
+        match extension.ext.as_ref() {
+            Some(gnmi_ext::extension::Ext::RegisteredExt(registered)) => {
+                let id = u32::try_from(registered.id)
+                    .map_err(|_| GnmiError::invalid("invalid registered gNMI extension id"))?;
+                normalized.push(crate::Extension::new(id, true, registered.msg.clone()));
+            }
+            Some(gnmi_ext::extension::Ext::MasterArbitration(_)) => {
+                if !matches!(operation, ExtensionOperation::Set) {
+                    return Err(GnmiError::unimplemented(
+                        "gNMI master-arbitration extension is only supported on Set",
+                    ));
+                }
+            }
+            Some(gnmi_ext::extension::Ext::History(_)) => {
+                return Err(GnmiError::unimplemented(
+                    "gNMI history extension is not implemented",
+                ));
+            }
+            None => return Err(GnmiError::invalid("gNMI extension is empty")),
+        }
+    }
     registry.validate_request(&normalized)?;
     if !matches!(operation, ExtensionOperation::Set) {
         reject_set_only_extension(extensions)?;
@@ -327,6 +350,17 @@ fn capability_extension(id: u32) -> gnmi_ext::Extension {
             gnmi_ext::RegisteredExtension {
                 id: id as i32,
                 msg: Vec::new(),
+            },
+        )),
+    }
+}
+
+fn master_arbitration_capability_extension() -> gnmi_ext::Extension {
+    gnmi_ext::Extension {
+        ext: Some(gnmi_ext::extension::Ext::MasterArbitration(
+            gnmi_ext::MasterArbitration {
+                role: None,
+                election_id: None,
             },
         )),
     }
@@ -395,9 +429,9 @@ mod tests {
         render_snapshot_responses, send_operational_event, serve_subscribe_stream, SubscribePlan,
     };
     use crate::{
-        CapabilityProfile, CommitConfirmedExtension, ExtensionRegistry, GnmiJsonProjectionError,
-        GnmiJsonUpdate, GnmiPatchApplicator, GnmiVersion, ReadSelection, GNMI_VERSION,
-        OPC_COMMIT_CONFIRMED_EXTENSION_ID,
+        CapabilityProfile, CommitConfirmedExtension, ExtensionRegistry, GnmiArbitrationConfig,
+        GnmiJsonProjectionError, GnmiJsonUpdate, GnmiPatchApplicator, GnmiVersion, ReadSelection,
+        GNMI_VERSION, OPC_COMMIT_CONFIRMED_EXTENSION_ID,
     };
     use opc_types::{SchemaDigest, TenantId};
 
@@ -943,6 +977,46 @@ mod tests {
         limits: MgmtLimits,
         extensions: ExtensionRegistry,
     ) -> GnmiService<DemoConfig, TestBinding> {
+        service_with_authentication_limits_extensions_arbitration(
+            authenticated,
+            limits,
+            extensions,
+            GnmiArbitrationConfig::disabled(),
+        )
+        .await
+    }
+
+    async fn authenticated_service_with_arbitration(
+        arbitration: GnmiArbitrationConfig,
+    ) -> GnmiService<DemoConfig, TestBinding> {
+        service_with_authentication_limits_extensions_arbitration(
+            true,
+            MgmtLimits::default(),
+            ExtensionRegistry::default(),
+            arbitration,
+        )
+        .await
+    }
+
+    async fn authenticated_service_with_extensions_and_arbitration(
+        extensions: ExtensionRegistry,
+        arbitration: GnmiArbitrationConfig,
+    ) -> GnmiService<DemoConfig, TestBinding> {
+        service_with_authentication_limits_extensions_arbitration(
+            true,
+            MgmtLimits::default(),
+            extensions,
+            arbitration,
+        )
+        .await
+    }
+
+    async fn service_with_authentication_limits_extensions_arbitration(
+        authenticated: bool,
+        limits: MgmtLimits,
+        extensions: ExtensionRegistry,
+        arbitration: GnmiArbitrationConfig,
+    ) -> GnmiService<DemoConfig, TestBinding> {
         let bus = Arc::new(
             ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
                 .await
@@ -950,7 +1024,7 @@ mod tests {
         );
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
-        let server = GnmiServer::new(
+        let server = GnmiServer::new_with_arbitration(
             TestBinding {
                 bus,
                 policy: Arc::new(FixedPolicy(allow_all_read_policy())),
@@ -960,6 +1034,7 @@ mod tests {
             limits,
             profile,
             extensions,
+            arbitration,
         )
         .expect("server");
         if authenticated {
@@ -970,10 +1045,14 @@ mod tests {
     }
 
     fn authenticated_principal() -> AuthenticatedGnmiPrincipal {
+        authenticated_principal_for("gnmi-client", "test")
+    }
+
+    fn authenticated_principal_for(user: &str, tenant: &'static str) -> AuthenticatedGnmiPrincipal {
         AuthenticatedGnmiPrincipal::new(
             TrustedPrincipal::new(
-                ConfigWorkloadIdentity::User("gnmi-client".to_string()),
-                TenantId::from_static("test"),
+                ConfigWorkloadIdentity::User(user.to_string()),
+                TenantId::from_static(tenant),
             )
             .with_auth_strength(AuthStrength::MutualTls),
         )
@@ -1217,9 +1296,44 @@ mod tests {
         operational: Arc<dyn OperationalStateProvider>,
         extensions: ExtensionRegistry,
     ) -> GnmiService<DemoConfig, TestBinding> {
+        authenticated_service_with_policy_bus_events_audit_extensions_arbitration(
+            policy,
+            bus,
+            events,
+            limits,
+            audit,
+            operational,
+            TestProtocolOptions::new(extensions, GnmiArbitrationConfig::disabled()),
+        )
+        .await
+    }
+
+    struct TestProtocolOptions {
+        extensions: ExtensionRegistry,
+        arbitration: GnmiArbitrationConfig,
+    }
+
+    impl TestProtocolOptions {
+        fn new(extensions: ExtensionRegistry, arbitration: GnmiArbitrationConfig) -> Self {
+            Self {
+                extensions,
+                arbitration,
+            }
+        }
+    }
+
+    async fn authenticated_service_with_policy_bus_events_audit_extensions_arbitration(
+        policy: Arc<dyn PolicySource>,
+        bus: Arc<ConfigBus<DemoConfig>>,
+        events: Option<Arc<dyn OperationalEventSource>>,
+        limits: MgmtLimits,
+        audit: Arc<dyn AuditSink>,
+        operational: Arc<dyn OperationalStateProvider>,
+        protocol: TestProtocolOptions,
+    ) -> GnmiService<DemoConfig, TestBinding> {
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
-        let server = GnmiServer::new_with_audit(
+        let server = GnmiServer::new_with_audit_and_arbitration(
             TestBinding {
                 bus,
                 policy,
@@ -1228,7 +1342,8 @@ mod tests {
             },
             limits,
             profile,
-            extensions,
+            protocol.extensions,
+            protocol.arbitration,
             audit,
         )
         .expect("server");
@@ -1329,8 +1444,15 @@ mod tests {
     }
 
     fn authenticated_set_request(set: gnmi::SetRequest) -> Request<gnmi::SetRequest> {
+        authenticated_set_request_for(set, authenticated_principal())
+    }
+
+    fn authenticated_set_request_for(
+        set: gnmi::SetRequest,
+        principal: AuthenticatedGnmiPrincipal,
+    ) -> Request<gnmi::SetRequest> {
         let mut request = Request::new(set);
-        request.extensions_mut().insert(authenticated_principal());
+        request.extensions_mut().insert(principal);
         request
     }
 
@@ -1359,6 +1481,46 @@ mod tests {
                     msg: payload.into(),
                 },
             )),
+        }
+    }
+
+    fn master_arbitration_extension(
+        role_id: Option<&str>,
+        high: u64,
+        low: u64,
+    ) -> gnmi_ext::Extension {
+        gnmi_ext::Extension {
+            ext: Some(gnmi_ext::extension::Ext::MasterArbitration(
+                gnmi_ext::MasterArbitration {
+                    role: role_id.map(|id| gnmi_ext::Role { id: id.to_string() }),
+                    election_id: Some(gnmi_ext::Uint128 { high, low }),
+                },
+            )),
+        }
+    }
+
+    fn malformed_master_arbitration_extension(role_id: Option<&str>) -> gnmi_ext::Extension {
+        gnmi_ext::Extension {
+            ext: Some(gnmi_ext::extension::Ext::MasterArbitration(
+                gnmi_ext::MasterArbitration {
+                    role: role_id.map(|id| gnmi_ext::Role { id: id.to_string() }),
+                    election_id: None,
+                },
+            )),
+        }
+    }
+
+    fn hostname_set(hostname: &str, extension: Vec<gnmi_ext::Extension>) -> gnmi::SetRequest {
+        gnmi::SetRequest {
+            prefix: None,
+            delete: Vec::new(),
+            replace: Vec::new(),
+            update: vec![json_update(
+                hostname_path(),
+                serde_json::to_vec(hostname).expect("hostname json"),
+            )],
+            union_replace: Vec::new(),
+            extension,
         }
     }
 
@@ -1433,6 +1595,16 @@ mod tests {
             .expect("metrics")
             .get(operation)
             .map(|hist| hist.count.load(Ordering::Relaxed))
+            .unwrap_or_default()
+    }
+
+    fn gnmi_extension_count(extension: &str, outcome: &str) -> u64 {
+        METRICS
+            .gnmi_extensions_total
+            .lock()
+            .expect("metrics")
+            .get(&(extension.to_string(), outcome.to_string()))
+            .copied()
             .unwrap_or_default()
     }
 
@@ -1537,6 +1709,40 @@ mod tests {
         };
         assert_eq!(extension.id, OPC_COMMIT_CONFIRMED_EXTENSION_ID as i32);
         assert!(extension.msg.is_empty());
+    }
+
+    #[tokio::test]
+    async fn capabilities_advertises_master_arbitration_only_when_configured() {
+        let disabled = service().await;
+        let disabled_response = disabled
+            .capabilities(Request::new(gnmi::CapabilityRequest {
+                extension: Vec::new(),
+            }))
+            .await
+            .expect("capabilities")
+            .into_inner();
+        assert!(
+            !disabled_response.extension.iter().any(|extension| matches!(
+                extension.ext.as_ref(),
+                Some(gnmi_ext::extension::Ext::MasterArbitration(_))
+            ))
+        );
+
+        let enabled =
+            authenticated_service_with_arbitration(GnmiArbitrationConfig::optional()).await;
+        let mut request = Request::new(gnmi::CapabilityRequest {
+            extension: Vec::new(),
+        });
+        request.extensions_mut().insert(authenticated_principal());
+        let enabled_response = enabled
+            .capabilities(request)
+            .await
+            .expect("capabilities")
+            .into_inner();
+        assert!(enabled_response.extension.iter().any(|extension| matches!(
+            extension.ext.as_ref(),
+            Some(gnmi_ext::extension::Ext::MasterArbitration(_))
+        )));
     }
 
     #[tokio::test]
@@ -2375,6 +2581,344 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_set_master_arbitration_missing_extension_policy_is_honest() {
+        let optional =
+            authenticated_service_with_arbitration(GnmiArbitrationConfig::optional()).await;
+        optional
+            .set(authenticated_set_request(hostname_set(
+                "optional-host",
+                Vec::new(),
+            )))
+            .await
+            .expect("optional arbitration does not require extension");
+        assert_eq!(
+            optional
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "optional-host"
+        );
+
+        let audit = CapturingAudit::default();
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
+                .await
+                .expect("bus"),
+        );
+        let required = authenticated_service_with_policy_bus_events_audit_extensions_arbitration(
+            Arc::new(FixedPolicy(allow_all_read_policy())),
+            bus,
+            None,
+            MgmtLimits::default(),
+            Arc::new(audit.clone()),
+            Arc::new(TestOperationalState),
+            TestProtocolOptions::new(
+                ExtensionRegistry::default(),
+                GnmiArbitrationConfig::required(),
+            ),
+        )
+        .await;
+        let rejected = required
+            .set(authenticated_set_request(hostname_set(
+                "required-denied",
+                Vec::new(),
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code(), Code::PermissionDenied);
+        assert_eq!(rejected.message(), "gNMI access denied");
+        assert_eq!(
+            required
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-1"
+        );
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(
+            events[0].outcome,
+            audit_denied(AuditReasonCode::ACCESS_DENIED)
+        );
+        assert!(events[0].schema_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_master_arbitration_rejects_when_disabled_or_malformed() {
+        let disabled = authenticated_service().await;
+        let disabled_status = disabled
+            .set(authenticated_set_request(hostname_set(
+                "disabled-arbitration",
+                vec![master_arbitration_extension(Some("ops"), 1, 0)],
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(disabled_status.code(), Code::Unimplemented);
+        assert_eq!(disabled_status.message(), "gNMI operation is not supported");
+        assert_eq!(
+            disabled
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-1"
+        );
+
+        let enabled =
+            authenticated_service_with_arbitration(GnmiArbitrationConfig::required()).await;
+        let malformed = enabled
+            .set(authenticated_set_request(hostname_set(
+                "malformed-arbitration",
+                vec![malformed_master_arbitration_extension(Some("secret-role"))],
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(malformed.code(), Code::InvalidArgument);
+        assert_eq!(malformed.message(), "invalid gNMI request");
+        assert!(!malformed.message().contains("secret-role"));
+        assert_eq!(
+            enabled
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_master_arbitration_election_rules_are_enforced() {
+        let service =
+            authenticated_service_with_arbitration(GnmiArbitrationConfig::required()).await;
+        let principal_a = authenticated_principal_for("gnmi-a", "test");
+        let principal_b = authenticated_principal_for("gnmi-b", "test");
+
+        service
+            .set(authenticated_set_request_for(
+                hostname_set(
+                    "first-master",
+                    vec![master_arbitration_extension(Some("ops"), 1, 0)],
+                ),
+                principal_a.clone(),
+            ))
+            .await
+            .expect("first writer");
+        service
+            .set(authenticated_set_request_for(
+                hostname_set(
+                    "higher-master",
+                    vec![master_arbitration_extension(Some("ops"), 2, 0)],
+                ),
+                principal_b.clone(),
+            ))
+            .await
+            .expect("higher takeover");
+
+        let stale = service
+            .set(authenticated_set_request_for(
+                hostname_set(
+                    "stale-writer",
+                    vec![master_arbitration_extension(Some("ops"), 1, u64::MAX)],
+                ),
+                principal_a.clone(),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), Code::PermissionDenied);
+        assert_eq!(stale.message(), "gNMI access denied");
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "higher-master"
+        );
+
+        service
+            .set(authenticated_set_request_for(
+                hostname_set(
+                    "same-principal",
+                    vec![master_arbitration_extension(Some("ops"), 2, 0)],
+                ),
+                principal_b,
+            ))
+            .await
+            .expect("same election same principal accepted");
+
+        let same_different = service
+            .set(authenticated_set_request_for(
+                hostname_set(
+                    "same-different",
+                    vec![master_arbitration_extension(Some("ops"), 2, 0)],
+                ),
+                principal_a,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(same_different.code(), Code::PermissionDenied);
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "same-principal"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_master_arbitration_tenant_role_and_default_role_fences() {
+        let service =
+            authenticated_service_with_arbitration(GnmiArbitrationConfig::required()).await;
+
+        service
+            .set(authenticated_set_request_for(
+                hostname_set(
+                    "tenant-a-ops",
+                    vec![master_arbitration_extension(Some("ops"), 9, 0)],
+                ),
+                authenticated_principal_for("gnmi-a", "tenant-a"),
+            ))
+            .await
+            .expect("tenant a ops master");
+        service
+            .set(authenticated_set_request_for(
+                hostname_set(
+                    "tenant-b-ops",
+                    vec![master_arbitration_extension(Some("ops"), 1, 0)],
+                ),
+                authenticated_principal_for("gnmi-b", "tenant-b"),
+            ))
+            .await
+            .expect("tenant b independent");
+        service
+            .set(authenticated_set_request_for(
+                hostname_set(
+                    "tenant-a-readonly",
+                    vec![master_arbitration_extension(Some("readonly"), 1, 0)],
+                ),
+                authenticated_principal_for("gnmi-a", "tenant-a"),
+            ))
+            .await
+            .expect("role independent");
+        service
+            .set(authenticated_set_request_for(
+                hostname_set(
+                    "tenant-a-default-role",
+                    vec![master_arbitration_extension(None, 1, 0)],
+                ),
+                authenticated_principal_for("gnmi-a", "tenant-a"),
+            ))
+            .await
+            .expect("missing role defaults to empty role");
+
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "tenant-a-default-role"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_master_arbitration_denials_do_not_leak_or_mutate() {
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_policy_bus_events_audit_extensions_arbitration(
+            Arc::new(FixedPolicy(allow_all_read_policy())),
+            Arc::new(
+                ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
+                    .await
+                    .expect("bus"),
+            ),
+            None,
+            MgmtLimits::default(),
+            Arc::new(audit.clone()),
+            Arc::new(TestOperationalState),
+            TestProtocolOptions::new(
+                ExtensionRegistry::default(),
+                GnmiArbitrationConfig::required(),
+            ),
+        )
+        .await;
+        let principal_a = authenticated_principal_for("gnmi-a", "test");
+        let principal_b = authenticated_principal_for("gnmi-b", "test");
+        service
+            .set(authenticated_set_request_for(
+                hostname_set(
+                    "secret-master-host",
+                    vec![master_arbitration_extension(Some("secret-role"), 5, 0)],
+                ),
+                principal_a,
+            ))
+            .await
+            .expect("first master");
+        let rejected_before = gnmi_extension_count("master-arbitration", "rejected");
+        let status = service
+            .set(authenticated_set_request_for(
+                hostname_set(
+                    "secret-stale-host",
+                    vec![master_arbitration_extension(Some("secret-role"), 4, 0)],
+                ),
+                principal_b,
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_eq!(status.message(), "gNMI access denied");
+        assert!(!status.message().contains("secret-role"));
+        assert!(!status.message().contains("secret-stale-host"));
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "secret-master-host"
+        );
+        assert!(gnmi_extension_count("master-arbitration", "rejected") > rejected_before);
+        let metrics_debug = format!(
+            "{:?}",
+            METRICS.gnmi_extensions_total.lock().expect("metrics")
+        );
+        assert!(!metrics_debug.contains("secret-role"));
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].operation, AuditOperation::Update);
+        assert_eq!(
+            events[1].outcome,
+            audit_denied(AuditReasonCode::ACCESS_DENIED)
+        );
+        assert!(events[1].schema_paths.is_empty());
+        let audit_debug = format!("{:?}", events);
+        assert!(!audit_debug.contains("secret-role"));
+        assert!(!audit_debug.contains("secret-stale-host"));
+    }
+
+    #[tokio::test]
     async fn authenticated_set_commit_confirmed_rolls_back_on_timeout() {
         let service = authenticated_service_with_extensions(
             ExtensionRegistry::with_commit_confirmed().expect("registry"),
@@ -2572,6 +3116,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_set_master_arbitration_fences_commit_confirmed_control() {
+        let service = authenticated_service_with_extensions_and_arbitration(
+            ExtensionRegistry::with_commit_confirmed().expect("registry"),
+            GnmiArbitrationConfig::required(),
+        )
+        .await;
+        let master = authenticated_principal_for("gnmi-master", "test");
+        let stale = authenticated_principal_for("gnmi-stale", "test");
+
+        service
+            .set(authenticated_set_request_for(
+                hostname_set(
+                    "master-host",
+                    vec![master_arbitration_extension(Some("ops"), 10, 0)],
+                ),
+                master.clone(),
+            ))
+            .await
+            .expect("master acquired");
+
+        let stale_begin = service
+            .set(authenticated_set_request_for(
+                hostname_set(
+                    "stale-begin",
+                    vec![
+                        master_arbitration_extension(Some("ops"), 9, 0),
+                        commit_confirmed_extension(
+                            CommitConfirmedExtension::begin(std::time::Duration::from_secs(30))
+                                .expect("payload"),
+                        ),
+                    ],
+                ),
+                stale.clone(),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(stale_begin.code(), Code::PermissionDenied);
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "master-host"
+        );
+
+        service
+            .set(authenticated_set_request_for(
+                hostname_set(
+                    "pending-host",
+                    vec![
+                        master_arbitration_extension(Some("ops"), 10, 0),
+                        commit_confirmed_extension(
+                            CommitConfirmedExtension::begin(std::time::Duration::from_secs(30))
+                                .expect("payload"),
+                        ),
+                    ],
+                ),
+                master.clone(),
+            ))
+            .await
+            .expect("master begin confirmed");
+
+        for extension in [
+            commit_confirmed_extension(CommitConfirmedExtension::confirm()),
+            commit_confirmed_extension(CommitConfirmedExtension::cancel()),
+        ] {
+            let status = service
+                .set(authenticated_set_request_for(
+                    gnmi::SetRequest {
+                        prefix: None,
+                        delete: Vec::new(),
+                        replace: Vec::new(),
+                        update: Vec::new(),
+                        union_replace: Vec::new(),
+                        extension: vec![master_arbitration_extension(Some("ops"), 9, 0), extension],
+                    },
+                    stale.clone(),
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), Code::PermissionDenied);
+            assert_eq!(
+                service
+                    .server()
+                    .binding()
+                    .config_bus()
+                    .current_snapshot()
+                    .config
+                    .hostname,
+                "pending-host"
+            );
+        }
+
+        service
+            .set(authenticated_set_request_for(
+                gnmi::SetRequest {
+                    prefix: None,
+                    delete: Vec::new(),
+                    replace: Vec::new(),
+                    update: Vec::new(),
+                    union_replace: Vec::new(),
+                    extension: vec![
+                        master_arbitration_extension(Some("ops"), 10, 0),
+                        commit_confirmed_extension(CommitConfirmedExtension::cancel()),
+                    ],
+                },
+                master,
+            ))
+            .await
+            .expect("master can cancel");
+        wait_for_hostname(&service, "master-host").await;
+    }
+
+    #[tokio::test]
     async fn authenticated_set_commit_confirmed_malformed_payload_is_audited_without_leak() {
         let audit = CapturingAudit::default();
         let service = authenticated_service_with_extensions_and_audit(
@@ -2639,6 +3300,27 @@ mod tests {
 
         assert_eq!(status.code(), Code::Unimplemented);
         assert_eq!(status.message(), "gNMI operation is not supported");
+    }
+
+    #[tokio::test]
+    async fn authenticated_get_rejects_master_arbitration_extension() {
+        let service =
+            authenticated_service_with_arbitration(GnmiArbitrationConfig::optional()).await;
+        let status = service
+            .get(authenticated_get_request(gnmi::GetRequest {
+                prefix: None,
+                path: vec![hostname_path()],
+                r#type: gnmi::get_request::DataType::Config as i32,
+                encoding: gnmi::Encoding::JsonIetf as i32,
+                use_models: Vec::new(),
+                extension: vec![master_arbitration_extension(Some("secret-role"), 1, 0)],
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::Unimplemented);
+        assert_eq!(status.message(), "gNMI operation is not supported");
+        assert!(!status.message().contains("secret-role"));
     }
 
     #[tokio::test]

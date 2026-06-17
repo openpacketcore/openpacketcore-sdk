@@ -6,6 +6,9 @@ const GNMI_PROTO: &str = "proto/github.com/openconfig/gnmi/proto/gnmi/gnmi.proto
 const GNMI_EXT_PROTO: &str = "proto/github.com/openconfig/gnmi/proto/gnmi_ext/gnmi_ext.proto";
 
 fn main() {
+    let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc is available");
+    env::set_var("PROTOC", protoc);
+
     println!("cargo:rerun-if-changed={GNMI_PROTO}");
     println!("cargo:rerun-if-changed={GNMI_EXT_PROTO}");
     println!("cargo:rerun-if-changed=proto/README.md");
