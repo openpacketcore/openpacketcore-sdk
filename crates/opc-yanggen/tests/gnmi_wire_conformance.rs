@@ -994,6 +994,17 @@ fn master_arbitration_extension(role_id: Option<&str>, high: u64, low: u64) -> g
     }
 }
 
+fn history_extension() -> gnmi_ext::Extension {
+    gnmi_ext::Extension {
+        ext: Some(gnmi_ext::extension::Ext::History(gnmi_ext::History {
+            request: Some(gnmi_ext::history::Request::Range(gnmi_ext::TimeRange {
+                start: 1,
+                end: 2,
+            })),
+        })),
+    }
+}
+
 async fn wait_for_wire_hostname(harness: &Harness, expected: &str) {
     let expected = LeafPresence::Explicit(expected.to_string());
     for _ in 0..50 {
@@ -1122,6 +1133,10 @@ async fn generated_stack_serves_gnmi_over_real_mtls() {
     assert_eq!(caps.g_nmi_version, "0.10.0");
     assert_eq!(caps.supported_models.len(), 1);
     assert_eq!(caps.supported_models[0].name, "example");
+    assert!(!caps.extension.iter().any(|extension| matches!(
+        extension.ext.as_ref(),
+        Some(gnmi_ext::extension::Ext::History(_))
+    )));
     assert_eq!(
         caps.supported_encodings,
         vec![gnmi::Encoding::JsonIetf as i32, gnmi::Encoding::Json as i32]
@@ -1605,8 +1620,34 @@ async fn generated_stack_fails_closed_without_wire_leaks() {
     assert_eq!(status.code(), Code::Unimplemented);
     assert_eq!(status.message(), "gNMI operation is not supported");
 
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tx.send(gnmi::SubscribeRequest {
+        request: Some(gnmi::subscribe_request::Request::Subscribe(
+            subscription_list(
+                gnmi::subscription_list::Mode::Once,
+                route_metric_path("secret-destination", "secret-next-hop"),
+                gnmi::SubscriptionMode::Sample,
+            ),
+        )),
+        extension: vec![history_extension()],
+    })
+    .await
+    .expect("send history subscribe");
+    drop(tx);
+    let mut history = open_subscribe(&mut harness.client().await, rx).await;
+    let history_status = tokio::time::timeout(Duration::from_secs(3), history.message())
+        .await
+        .expect("history status timeout")
+        .expect_err("history should fail closed");
+    assert_eq!(history_status.code(), Code::Unimplemented);
+    assert_eq!(history_status.message(), "gNMI operation is not supported");
+    assert!(!history_status.message().contains("secret-destination"));
+    assert!(!history_status.message().contains("secret-next-hop"));
+
     let audit_debug = format!("{:?}", harness.audit.events.lock().expect("audit"));
     assert!(!audit_debug.contains("secret-extension-payload"));
+    assert!(!audit_debug.contains("secret-destination"));
+    assert!(!audit_debug.contains("secret-next-hop"));
     assert!(!audit_debug.contains("hunter2"));
     harness.shutdown().await;
 
