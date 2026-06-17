@@ -253,6 +253,12 @@ work for a selected ePDG, N3IWF, or other untrusted-access/IPsec product target;
 until then, `IpsecGateway` in `opc-node-resources` is only a resource/admission
 profile and not a claim of protocol implementation.
 
+Likewise, AF_XDP is not required for the AMF-lite first-NF readiness boundary.
+`AfXdpFastPath` in `opc-node-resources` models node/resource admission and BPF
+artifact governance for future UPF or other accelerated data-plane CNFs; it is
+not a claim that this repository ships AF_XDP socket, UMEM, ring, or packet I/O
+runtime support.
+
 The following items are updated in `docs/implementation-status.md`:
 
 - **Closed / Hardened Foundation** (June 2026):
