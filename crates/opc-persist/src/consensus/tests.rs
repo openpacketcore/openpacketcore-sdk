@@ -1,4 +1,8 @@
-use super::identity::parse_spiffe_id;
+use super::identity::{consensus_peer_policy, parse_spiffe_id};
+use super::types::NodeIdentity;
+use opc_identity::{Namespace, ServiceAccount, TrustDomain, WorkloadIdentity};
+use opc_types::{InstanceId, NfKind, SpiffeId, TenantId, Timestamp};
+use rcgen::{CertificateParams, DnType, KeyPair, SanType};
 
 #[test]
 fn parse_spiffe_id_accepts_canonical_profile() {
@@ -45,4 +49,140 @@ fn spiffe_workload_profile_ignores_instance_only() {
 
     assert!(node_a.same_workload_profile(&node_b));
     assert!(!node_a.same_workload_profile(&other_workload));
+}
+
+fn node_identity(spiffe_id: &str) -> NodeIdentity {
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "Consensus Test CA");
+    let ca_key = KeyPair::generate().expect("ca key");
+    let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+
+    let mut node_params = CertificateParams::default();
+    node_params
+        .distinguished_name
+        .push(DnType::CommonName, "Consensus Node");
+    node_params.subject_alt_names.push(SanType::URI(
+        rcgen::Ia5String::try_from(spiffe_id).expect("spiffe san"),
+    ));
+    let now = ::time::OffsetDateTime::now_utc();
+    node_params.not_before = now - ::time::Duration::days(1);
+    node_params.not_after = now + ::time::Duration::days(1);
+
+    let node_key = KeyPair::generate().expect("node key");
+    let node_cert = node_params
+        .signed_by(&node_key, &ca_cert, &ca_key)
+        .expect("node cert");
+
+    NodeIdentity {
+        cert_chain_pem: format!("{}{}", node_cert.pem(), ca_cert.pem()),
+        private_key_pem: node_key.serialize_pem(),
+        ca_cert_pem: ca_cert.pem(),
+    }
+}
+
+fn workload(
+    trust_domain: &str,
+    tenant: &str,
+    namespace: &str,
+    service_account: &str,
+    nf_kind: &str,
+    instance: &str,
+) -> WorkloadIdentity {
+    WorkloadIdentity {
+        trust_domain: TrustDomain::new(trust_domain).expect("trust domain"),
+        tenant: TenantId::new(tenant).expect("tenant"),
+        namespace: Namespace::new(namespace).expect("namespace"),
+        service_account: ServiceAccount::new(service_account).expect("service account"),
+        nf_kind: NfKind::new(nf_kind).expect("nf kind"),
+        instance: InstanceId::new(instance).expect("instance"),
+        spiffe_id: SpiffeId::new(format!(
+            "spiffe://{trust_domain}/tenant/{tenant}/ns/{namespace}/sa/{service_account}/nf/{nf_kind}/instance/{instance}"
+        ))
+        .expect("spiffe id"),
+        expires_at: Timestamp::now_utc(),
+    }
+}
+
+#[test]
+fn consensus_server_tls_policy_is_workload_profile_constrained() {
+    let identity = node_identity(
+        "spiffe://prod.example.org/tenant/carrier/ns/core/sa/opc-consensus/nf/amf/instance/1",
+    );
+    let policy = consensus_peer_policy(&identity, None).expect("policy");
+
+    assert!(!policy.is_unconstrained());
+    assert!(policy.allowed_instances.is_none());
+    assert!(policy
+        .check(&workload(
+            "prod.example.org",
+            "carrier",
+            "core",
+            "opc-consensus",
+            "amf",
+            "2",
+        ))
+        .is_ok());
+    assert!(policy
+        .check(&workload(
+            "prod.example.org",
+            "other-tenant",
+            "core",
+            "opc-consensus",
+            "amf",
+            "2",
+        ))
+        .is_err());
+    assert!(policy
+        .check(&workload(
+            "prod.example.org",
+            "carrier",
+            "core",
+            "opc-consensus",
+            "smf",
+            "2",
+        ))
+        .is_err());
+    assert!(policy
+        .check(&workload(
+            "other.example.org",
+            "carrier",
+            "core",
+            "opc-consensus",
+            "amf",
+            "2",
+        ))
+        .is_err());
+}
+
+#[test]
+fn consensus_client_tls_policy_fences_expected_peer_instance() {
+    let identity = node_identity(
+        "spiffe://prod.example.org/tenant/carrier/ns/core/sa/opc-consensus/nf/amf/instance/1",
+    );
+    let policy = consensus_peer_policy(&identity, Some(2)).expect("policy");
+
+    assert!(!policy.is_unconstrained());
+    assert!(policy
+        .check(&workload(
+            "prod.example.org",
+            "carrier",
+            "core",
+            "opc-consensus",
+            "amf",
+            "2",
+        ))
+        .is_ok());
+    assert!(policy
+        .check(&workload(
+            "prod.example.org",
+            "carrier",
+            "core",
+            "opc-consensus",
+            "amf",
+            "3",
+        ))
+        .is_err());
 }
