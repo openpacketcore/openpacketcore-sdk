@@ -47,7 +47,10 @@ pub enum DataPlaneProfile {
     SignalingHeavy,
     /// Kernel networking stack (standard socket / `AF_PACKET` path).
     KernelNetworking,
-    /// AF_XDP fast path (DPDK-like zero-copy userspace networking via XDP).
+    /// AF_XDP fast-path resource profile for future UPF/data-plane workloads.
+    ///
+    /// This selects resource/admission checks only; it does not imply AF_XDP
+    /// socket, UMEM, ring, or packet I/O implementation in this crate.
     AfXdpFastPath,
     /// SR-IOV direct assignment of a virtual function to the CNF pod.
     SriovFastPath,

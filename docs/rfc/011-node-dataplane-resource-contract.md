@@ -216,6 +216,12 @@ the NF kind.
 
 ## 10. AF_XDP and XDP/eBPF
 
+`AfXdpFastPath` is a resource and admission profile only in the current SDK. It
+does not imply that this repository ships AF_XDP sockets, UMEM management, RX/TX
+rings, or packet I/O runtime support. Those crates are required for a selected
+UPF or other accelerated data-plane product target, but are not a blocker for
+the current AMF-lite/N2/N1 first-NF profile.
+
 ### 10.1 Kernel Requirements
 
 AF_XDP fast-path profiles MUST declare:
