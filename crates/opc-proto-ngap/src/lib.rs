@@ -2,20 +2,19 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![deny(missing_docs)]
 
-//! NGAP protocol codec (3GPP TS 38.413) for OpenPacketCore — v0.
+//! NGAP protocol codec (3GPP TS 38.413) for OpenPacketCore — v1 subset.
 //!
-//! v0 scope (see CONFORMANCE.md): NGAP-PDU framing (initiating / successful /
-//! unsuccessful outcomes) and typed decoding of NGSetupRequest,
-//! NGSetupResponse, NGSetupFailure, and InitialUEMessage. Encoding is
-//! raw-preserving: the message body captured during decoding is re-emitted
-//! byte-identically inside a freshly-encoded NGAP-PDU wrapper. This works
-//! around an APER encoder alignment issue in `rasn` 0.28 that prevents the
-//! generated inner-message types from re-encoding to the exact bytes produced
-//! by other APER implementations.
+//! Scope (see CONFORMANCE.md): NGAP-PDU framing (initiating / successful /
+//! unsuccessful outcomes), fixture-proven NGSetupRequest decoding, and
+//! structural typed dispatch for the first AMF N2 procedure subset. Encoding is
+//! raw-preserving only: the PDU bytes captured during decoding are re-emitted
+//! byte-identically. This works around an APER encoder alignment issue in
+//! `rasn` 0.28 that prevents canonical typed encoding from meeting ADR 0015
+//! byte-exact requirements.
 //!
 //! @spec 3GPP TS38413 R18
 //! @req REQ-3GPP-TS38413-R18-001
-//! @conformance v0 — see CONFORMANCE.md
+//! @conformance v1-subset — see CONFORMANCE.md
 
 use bytes::{Bytes, BytesMut};
 use opc_protocol::{
@@ -26,6 +25,22 @@ use opc_protocol::{
 mod generated;
 
 pub use generated::ngap_common_data_types::{Criticality, ProcedureCode};
+
+/// Generated NGAP message types that can appear in [`Message`].
+///
+/// These are generated from the pinned TS 38.413 R18 ASN.1 source. The SDK
+/// wrapper controls dispatch, error handling, and raw-preserving encode policy;
+/// this module exposes the selected generated types so downstream code can
+/// inspect typed decodes without depending on private module paths.
+pub mod messages {
+    pub use super::generated::ngap_pdu_contents::{
+        DownlinkNASTransport, InitialContextSetupFailure, InitialContextSetupRequest,
+        InitialContextSetupResponse, InitialUEMessage, NGSetupFailure, NGSetupRequest,
+        NGSetupResponse, PDUSessionResourceReleaseCommand, PDUSessionResourceReleaseResponse,
+        PDUSessionResourceSetupRequest, PDUSessionResourceSetupResponse, Paging,
+        UEContextReleaseCommand, UEContextReleaseComplete, UplinkNASTransport,
+    };
+}
 
 /// A decoded NGAP PDU with raw-preserving re-encode support.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,25 +83,59 @@ pub enum PduKind {
     },
 }
 
-/// Decoded NGAP message body for the v0 subset.
+/// Decoded NGAP message body for the supported typed subset.
 ///
-/// Typed decoding is only offered where conformance fixtures prove the
-/// mapping (see CONFORMANCE.md); every other procedure/outcome combination —
-/// including NGSetupResponse and NGSetupFailure until external fixtures
-/// exist for them — is surfaced as [`Message::Unknown`] with the body bytes
-/// preserved raw.
+/// See CONFORMANCE.md for which variants are fixture-proven and which are
+/// structural typed-dispatch coverage only. Unsupported procedure/outcome
+/// combinations are surfaced as [`Message::Unknown`] with body bytes preserved
+/// raw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     /// NG Setup Request (initiating message, procedure code 21).
-    NgSetupRequest(generated::ngap_pdu_contents::NGSetupRequest),
-    /// Initial UE Message (procedure code 15).
-    InitialUeMessage(generated::ngap_pdu_contents::InitialUEMessage),
-    /// Message not in the v0 typed subset; raw bytes are preserved.
+    NgSetupRequest(messages::NGSetupRequest),
+    /// NG Setup Response (successful outcome, procedure code 21).
+    NgSetupResponse(messages::NGSetupResponse),
+    /// NG Setup Failure (unsuccessful outcome, procedure code 21).
+    NgSetupFailure(messages::NGSetupFailure),
+    /// Initial UE Message (initiating message, procedure code 15).
+    InitialUeMessage(messages::InitialUEMessage),
+    /// Downlink NAS Transport (initiating message, procedure code 4).
+    DownlinkNasTransport(messages::DownlinkNASTransport),
+    /// Uplink NAS Transport (initiating message, procedure code 46).
+    UplinkNasTransport(messages::UplinkNASTransport),
+    /// Initial Context Setup Request (initiating message, procedure code 14).
+    InitialContextSetupRequest(messages::InitialContextSetupRequest),
+    /// Initial Context Setup Response (successful outcome, procedure code 14).
+    InitialContextSetupResponse(messages::InitialContextSetupResponse),
+    /// Initial Context Setup Failure (unsuccessful outcome, procedure code 14).
+    InitialContextSetupFailure(messages::InitialContextSetupFailure),
+    /// PDU Session Resource Setup Request (initiating message, procedure code 29).
+    PduSessionResourceSetupRequest(messages::PDUSessionResourceSetupRequest),
+    /// PDU Session Resource Setup Response (successful outcome, procedure code 29).
+    PduSessionResourceSetupResponse(messages::PDUSessionResourceSetupResponse),
+    /// PDU Session Resource Release Command (initiating message, procedure code 28).
+    PduSessionResourceReleaseCommand(messages::PDUSessionResourceReleaseCommand),
+    /// PDU Session Resource Release Response (successful outcome, procedure code 28).
+    PduSessionResourceReleaseResponse(messages::PDUSessionResourceReleaseResponse),
+    /// UE Context Release Command (initiating message, procedure code 41).
+    UeContextReleaseCommand(messages::UEContextReleaseCommand),
+    /// UE Context Release Complete (successful outcome, procedure code 41).
+    UeContextReleaseComplete(messages::UEContextReleaseComplete),
+    /// Paging (initiating message, procedure code 24).
+    Paging(messages::Paging),
+    /// Message not in the typed subset; raw bytes are preserved.
     Unknown(Bytes),
 }
 
 const PROCEDURE_CODE_NG_SETUP: u8 = 21;
 const PROCEDURE_CODE_INITIAL_UE: u8 = 15;
+const PROCEDURE_CODE_DOWNLINK_NAS_TRANSPORT: u8 = 4;
+const PROCEDURE_CODE_INITIAL_CONTEXT_SETUP: u8 = 14;
+const PROCEDURE_CODE_PAGING: u8 = 24;
+const PROCEDURE_CODE_PDU_SESSION_RESOURCE_RELEASE: u8 = 28;
+const PROCEDURE_CODE_PDU_SESSION_RESOURCE_SETUP: u8 = 29;
+const PROCEDURE_CODE_UE_CONTEXT_RELEASE: u8 = 41;
+const PROCEDURE_CODE_UPLINK_NAS_TRANSPORT: u8 = 46;
 
 fn length_error(len: usize, limit: usize) -> DecodeError {
     DecodeError::new(DecodeErrorCode::MessageLengthExceeded, len.min(limit))
@@ -96,7 +145,7 @@ fn length_error(len: usize, limit: usize) -> DecodeError {
 ///
 /// @spec 3GPP TS38413 R18 9.1
 /// @req REQ-3GPP-TS38413-R18-9.1-001
-/// @conformance v0
+/// @conformance v1-subset
 pub fn decode(buf: &[u8], ctx: DecodeContext) -> Result<Pdu, DecodeError> {
     if buf.len() > ctx.max_message_len {
         return Err(length_error(buf.len(), ctx.max_message_len));
@@ -185,52 +234,124 @@ fn decode_message(
         return Err(length_error(value.len(), ctx.max_message_len));
     }
 
+    macro_rules! decode_as {
+        ($ty:ty, $variant:ident, $reason:literal) => {{
+            let msg: $ty = rasn::aper::decode(value).map_err(|_| {
+                DecodeError::new(DecodeErrorCode::Structural { reason: $reason }, 0)
+            })?;
+            Ok(Message::$variant(msg))
+        }};
+    }
+
     match (outcome, procedure_code) {
         (Outcome::Initiating, PROCEDURE_CODE_NG_SETUP) => {
-            let msg: generated::ngap_pdu_contents::NGSetupRequest = rasn::aper::decode(value)
-                .map_err(|_| {
-                    DecodeError::new(DecodeErrorCode::Structural { reason: "ngsetup" }, 0)
-                })?;
-            Ok(Message::NgSetupRequest(msg))
+            decode_as!(messages::NGSetupRequest, NgSetupRequest, "ngsetup request")
         }
-        (Outcome::Initiating, PROCEDURE_CODE_INITIAL_UE) => {
-            let msg: generated::ngap_pdu_contents::InitialUEMessage = rasn::aper::decode(value)
-                .map_err(|_| {
-                    DecodeError::new(
-                        DecodeErrorCode::Structural {
-                            reason: "initial ue",
-                        },
-                        0,
-                    )
-                })?;
-            Ok(Message::InitialUeMessage(msg))
+        (Outcome::Successful, PROCEDURE_CODE_NG_SETUP) => {
+            decode_as!(
+                messages::NGSetupResponse,
+                NgSetupResponse,
+                "ngsetup response"
+            )
         }
-        // NGSetupResponse/NGSetupFailure (successful/unsuccessful outcome of
-        // procedure 21) intentionally remain raw until external conformance
-        // fixtures exist for them; decoding them with the request type would
-        // silently mislabel peer messages.
+        (Outcome::Unsuccessful, PROCEDURE_CODE_NG_SETUP) => {
+            decode_as!(messages::NGSetupFailure, NgSetupFailure, "ngsetup failure")
+        }
+        (Outcome::Initiating, PROCEDURE_CODE_INITIAL_UE) => decode_as!(
+            messages::InitialUEMessage,
+            InitialUeMessage,
+            "initial ue message"
+        ),
+        (Outcome::Initiating, PROCEDURE_CODE_DOWNLINK_NAS_TRANSPORT) => decode_as!(
+            messages::DownlinkNASTransport,
+            DownlinkNasTransport,
+            "downlink nas transport"
+        ),
+        (Outcome::Initiating, PROCEDURE_CODE_UPLINK_NAS_TRANSPORT) => decode_as!(
+            messages::UplinkNASTransport,
+            UplinkNasTransport,
+            "uplink nas transport"
+        ),
+        (Outcome::Initiating, PROCEDURE_CODE_INITIAL_CONTEXT_SETUP) => decode_as!(
+            messages::InitialContextSetupRequest,
+            InitialContextSetupRequest,
+            "initial context setup request"
+        ),
+        (Outcome::Successful, PROCEDURE_CODE_INITIAL_CONTEXT_SETUP) => decode_as!(
+            messages::InitialContextSetupResponse,
+            InitialContextSetupResponse,
+            "initial context setup response"
+        ),
+        (Outcome::Unsuccessful, PROCEDURE_CODE_INITIAL_CONTEXT_SETUP) => decode_as!(
+            messages::InitialContextSetupFailure,
+            InitialContextSetupFailure,
+            "initial context setup failure"
+        ),
+        (Outcome::Initiating, PROCEDURE_CODE_PDU_SESSION_RESOURCE_SETUP) => decode_as!(
+            messages::PDUSessionResourceSetupRequest,
+            PduSessionResourceSetupRequest,
+            "pdu session resource setup request"
+        ),
+        (Outcome::Successful, PROCEDURE_CODE_PDU_SESSION_RESOURCE_SETUP) => decode_as!(
+            messages::PDUSessionResourceSetupResponse,
+            PduSessionResourceSetupResponse,
+            "pdu session resource setup response"
+        ),
+        (Outcome::Initiating, PROCEDURE_CODE_PDU_SESSION_RESOURCE_RELEASE) => decode_as!(
+            messages::PDUSessionResourceReleaseCommand,
+            PduSessionResourceReleaseCommand,
+            "pdu session resource release command"
+        ),
+        (Outcome::Successful, PROCEDURE_CODE_PDU_SESSION_RESOURCE_RELEASE) => decode_as!(
+            messages::PDUSessionResourceReleaseResponse,
+            PduSessionResourceReleaseResponse,
+            "pdu session resource release response"
+        ),
+        (Outcome::Initiating, PROCEDURE_CODE_UE_CONTEXT_RELEASE) => decode_as!(
+            messages::UEContextReleaseCommand,
+            UeContextReleaseCommand,
+            "ue context release command"
+        ),
+        (Outcome::Successful, PROCEDURE_CODE_UE_CONTEXT_RELEASE) => decode_as!(
+            messages::UEContextReleaseComplete,
+            UeContextReleaseComplete,
+            "ue context release complete"
+        ),
+        (Outcome::Initiating, PROCEDURE_CODE_PAGING) => {
+            decode_as!(messages::Paging, Paging, "paging")
+        }
         _ => Ok(Message::Unknown(Bytes::copy_from_slice(value))),
     }
 }
 
 /// Encode a [`Pdu`] back to APER bytes.
 ///
-/// v0 only supports raw-preserving mode; any other mode returns an error
+/// The v1 subset only supports raw-preserving mode; any other mode returns an error
 /// because `rasn` 0.28's APER encoder does not reproduce the byte alignment
 /// used by the external fixtures for the inner message types.
 ///
 /// @spec 3GPP TS38413 R18 9.1
 /// @req REQ-3GPP-TS38413-R18-9.1-002
-/// @conformance v0
+/// @conformance v1-subset
 pub fn encode(pdu: &Pdu, ctx: EncodeContext) -> Result<Vec<u8>, EncodeError> {
+    let len = checked_raw_preserving_len(pdu, ctx)?;
+    Ok(pdu.raw[..len].to_vec())
+}
+
+fn checked_raw_preserving_len(pdu: &Pdu, ctx: EncodeContext) -> Result<usize, EncodeError> {
     if !ctx.raw_preserving {
         return Err(EncodeError::new(EncodeErrorCode::Structural {
-            reason: "v0 NGAP encode only supports raw-preserving mode",
+            reason: "NGAP encode only supports raw-preserving mode",
+        }));
+    }
+    if pdu.raw.is_empty() {
+        return Err(EncodeError::new(EncodeErrorCode::Structural {
+            reason: "raw-preserving NGAP encode requires decoded raw bytes",
         }));
     }
 
     ctx.check_capacity(pdu.raw.len())?;
-    Ok(pdu.raw.to_vec())
+    Ok(pdu.raw.len())
 }
 
 impl<'a> BorrowDecode<'a> for Pdu {
@@ -267,8 +388,8 @@ impl Encode for Pdu {
         Ok(())
     }
 
-    fn wire_len(&self, _ctx: EncodeContext) -> Result<usize, EncodeError> {
-        Ok(self.raw.len())
+    fn wire_len(&self, ctx: EncodeContext) -> Result<usize, EncodeError> {
+        checked_raw_preserving_len(self, ctx)
     }
 }
 
@@ -290,6 +411,55 @@ mod tests {
             0x80, 0x00, 0x00, 0x01, 0x00, 0x02, 0xf8, 0x39, 0x00, 0x01, 0x00, 0x18, 0x81, 0xc0,
             0x00, 0x13, 0x88, 0x00, 0x15, 0x40, 0x01, 0x40,
         ]
+    }
+
+    #[derive(Clone, Copy)]
+    enum FixtureOutcome {
+        Initiating,
+        Successful,
+        Unsuccessful,
+    }
+
+    impl FixtureOutcome {
+        const fn choice_octet(self) -> u8 {
+            match self {
+                Self::Initiating => 0x00,
+                Self::Successful => 0x20,
+                Self::Unsuccessful => 0x40,
+            }
+        }
+    }
+
+    fn empty_ie_pdu(
+        outcome: FixtureOutcome,
+        procedure_code: u8,
+        criticality: Criticality,
+    ) -> Vec<u8> {
+        let criticality_octet = match criticality {
+            Criticality::reject => 0x00,
+            Criticality::ignore => 0x40,
+            Criticality::notify => 0x80,
+        };
+
+        // The body is an extensible SEQUENCE with extension-present bit 0
+        // followed by a constrained SEQUENCE OF length determinant of zero:
+        // 00 00 00. The outer open type length is therefore 3 octets.
+        vec![
+            outcome.choice_octet(),
+            procedure_code,
+            criticality_octet,
+            0x03,
+            0x00,
+            0x00,
+            0x00,
+        ]
+    }
+
+    fn raw_preserving_context() -> EncodeContext {
+        EncodeContext {
+            raw_preserving: true,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -358,28 +528,22 @@ mod tests {
             _ => panic!("expected initiating message"),
         }
 
-        let encoded = encode(
-            &pdu,
-            EncodeContext {
-                raw_preserving: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let encoded = encode(&pdu, raw_preserving_context()).unwrap();
         assert_eq!(encoded, bytes);
     }
 
     /// Hand-authored successfulOutcome wrapper per TS 38.413 §9.2 / X.691:
     /// octet 0 = 0x20 (extension bit 0, CHOICE index 01 = successfulOutcome,
     /// then padding to the octet boundary), octet 1 = procedureCode 21,
-    /// octet 2 = criticality reject (00 in the top two bits), octet 3 =
-    /// open-type length 3, then an opaque 3-octet body. v0 has no external
-    /// NGSetupResponse fixture, so the body must surface as
-    /// `Message::Unknown` — never be mislabeled as an NGSetupRequest — and
-    /// re-encode byte-exactly.
+    /// octet 2 = criticality reject (00 in the top two bits), octet 3 = open
+    /// type length 3, then the empty-IE body 00 00 00.
     #[test]
-    fn successful_outcome_framing_roundtrip() {
-        let bytes = vec![0x20, 0x15, 0x00, 0x03, 0xAA, 0xBB, 0xCC];
+    fn ngsetup_response_framing_dispatch_and_roundtrip() {
+        let bytes = empty_ie_pdu(
+            FixtureOutcome::Successful,
+            PROCEDURE_CODE_NG_SETUP,
+            Criticality::reject,
+        );
         let pdu = decode(&bytes, DecodeContext::default()).unwrap();
         match &pdu.kind {
             PduKind::Successful {
@@ -390,29 +554,25 @@ mod tests {
                 assert_eq!(*procedure_code, PROCEDURE_CODE_NG_SETUP);
                 assert_eq!(*criticality, Criticality::reject);
                 match message {
-                    Message::Unknown(body) => assert_eq!(&body[..], &[0xAA, 0xBB, 0xCC]),
-                    other => panic!("successful outcome must stay raw in v0, got {other:?}"),
+                    Message::NgSetupResponse(resp) => assert!(resp.protocol_ies.0.is_empty()),
+                    other => panic!("expected NGSetupResponse, got {other:?}"),
                 }
             }
             other => panic!("expected successful outcome, got {other:?}"),
         }
-        let encoded = encode(
-            &pdu,
-            EncodeContext {
-                raw_preserving: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let encoded = encode(&pdu, raw_preserving_context()).unwrap();
         assert_eq!(encoded, bytes);
     }
 
     /// Hand-authored unsuccessfulOutcome wrapper: octet 0 = 0x40 (CHOICE
-    /// index 10 = unsuccessfulOutcome), then as above. Must surface as
-    /// `Message::Unknown` and round-trip byte-exactly.
+    /// index 10 = unsuccessfulOutcome), then as above.
     #[test]
-    fn unsuccessful_outcome_framing_roundtrip() {
-        let bytes = vec![0x40, 0x15, 0x00, 0x02, 0xDE, 0xAD];
+    fn ngsetup_failure_framing_dispatch_and_roundtrip() {
+        let bytes = empty_ie_pdu(
+            FixtureOutcome::Unsuccessful,
+            PROCEDURE_CODE_NG_SETUP,
+            Criticality::reject,
+        );
         let pdu = decode(&bytes, DecodeContext::default()).unwrap();
         match &pdu.kind {
             PduKind::Unsuccessful {
@@ -421,19 +581,223 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*procedure_code, PROCEDURE_CODE_NG_SETUP);
-                assert!(matches!(message, Message::Unknown(_)));
+                match message {
+                    Message::NgSetupFailure(failure) => assert!(failure.protocol_ies.0.is_empty()),
+                    other => panic!("expected NGSetupFailure, got {other:?}"),
+                }
             }
             other => panic!("expected unsuccessful outcome, got {other:?}"),
         }
-        let encoded = encode(
-            &pdu,
-            EncodeContext {
-                raw_preserving: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let encoded = encode(&pdu, raw_preserving_context()).unwrap();
         assert_eq!(encoded, bytes);
+    }
+
+    #[test]
+    fn recognized_invalid_successful_outcome_fails_closed() {
+        let bytes = vec![0x20, PROCEDURE_CODE_NG_SETUP, 0x00, 0x03, 0xAA, 0xBB, 0xCC];
+        let err = decode(&bytes, DecodeContext::default()).unwrap_err();
+        assert!(matches!(
+            err.code(),
+            DecodeErrorCode::Structural { reason } if reason.contains("ngsetup response")
+        ));
+    }
+
+    #[test]
+    fn first_cnf_n2_procedure_dispatch_is_outcome_aware() {
+        let cases = [
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_INITIAL_UE,
+                "initial ue message",
+            ),
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_DOWNLINK_NAS_TRANSPORT,
+                "downlink nas transport",
+            ),
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_UPLINK_NAS_TRANSPORT,
+                "uplink nas transport",
+            ),
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_INITIAL_CONTEXT_SETUP,
+                "initial context setup request",
+            ),
+            (
+                FixtureOutcome::Successful,
+                PROCEDURE_CODE_INITIAL_CONTEXT_SETUP,
+                "initial context setup response",
+            ),
+            (
+                FixtureOutcome::Unsuccessful,
+                PROCEDURE_CODE_INITIAL_CONTEXT_SETUP,
+                "initial context setup failure",
+            ),
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_PDU_SESSION_RESOURCE_SETUP,
+                "pdu session resource setup request",
+            ),
+            (
+                FixtureOutcome::Successful,
+                PROCEDURE_CODE_PDU_SESSION_RESOURCE_SETUP,
+                "pdu session resource setup response",
+            ),
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_PDU_SESSION_RESOURCE_RELEASE,
+                "pdu session resource release command",
+            ),
+            (
+                FixtureOutcome::Successful,
+                PROCEDURE_CODE_PDU_SESSION_RESOURCE_RELEASE,
+                "pdu session resource release response",
+            ),
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_UE_CONTEXT_RELEASE,
+                "ue context release command",
+            ),
+            (
+                FixtureOutcome::Successful,
+                PROCEDURE_CODE_UE_CONTEXT_RELEASE,
+                "ue context release complete",
+            ),
+            (FixtureOutcome::Initiating, PROCEDURE_CODE_PAGING, "paging"),
+        ];
+
+        for (outcome, procedure_code, expected) in cases {
+            let bytes = empty_ie_pdu(outcome, procedure_code, Criticality::reject);
+            let pdu = decode(&bytes, DecodeContext::default()).unwrap();
+            let message = match &pdu.kind {
+                PduKind::Initiating { message, .. }
+                | PduKind::Successful { message, .. }
+                | PduKind::Unsuccessful { message, .. } => message,
+            };
+
+            let actual = match message {
+                Message::InitialUeMessage(msg) if msg.protocol_ies.0.is_empty() => {
+                    "initial ue message"
+                }
+                Message::DownlinkNasTransport(msg) if msg.protocol_ies.0.is_empty() => {
+                    "downlink nas transport"
+                }
+                Message::UplinkNasTransport(msg) if msg.protocol_ies.0.is_empty() => {
+                    "uplink nas transport"
+                }
+                Message::InitialContextSetupRequest(msg) if msg.protocol_ies.0.is_empty() => {
+                    "initial context setup request"
+                }
+                Message::InitialContextSetupResponse(msg) if msg.protocol_ies.0.is_empty() => {
+                    "initial context setup response"
+                }
+                Message::InitialContextSetupFailure(msg) if msg.protocol_ies.0.is_empty() => {
+                    "initial context setup failure"
+                }
+                Message::PduSessionResourceSetupRequest(msg) if msg.protocol_ies.0.is_empty() => {
+                    "pdu session resource setup request"
+                }
+                Message::PduSessionResourceSetupResponse(msg) if msg.protocol_ies.0.is_empty() => {
+                    "pdu session resource setup response"
+                }
+                Message::PduSessionResourceReleaseCommand(msg) if msg.protocol_ies.0.is_empty() => {
+                    "pdu session resource release command"
+                }
+                Message::PduSessionResourceReleaseResponse(msg)
+                    if msg.protocol_ies.0.is_empty() =>
+                {
+                    "pdu session resource release response"
+                }
+                Message::UeContextReleaseCommand(msg) if msg.protocol_ies.0.is_empty() => {
+                    "ue context release command"
+                }
+                Message::UeContextReleaseComplete(msg) if msg.protocol_ies.0.is_empty() => {
+                    "ue context release complete"
+                }
+                Message::Paging(msg) if msg.protocol_ies.0.is_empty() => "paging",
+                other => panic!("unexpected message for procedure {procedure_code}: {other:?}"),
+            };
+
+            assert_eq!(actual, expected);
+            assert_eq!(encode(&pdu, raw_preserving_context()).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn generated_procedure_constants_match_dispatch_table() {
+        assert_eq!(
+            generated::ngap_constants::ID_NGSETUP.0,
+            PROCEDURE_CODE_NG_SETUP
+        );
+        assert_eq!(
+            generated::ngap_constants::ID_INITIAL_UEMESSAGE.0,
+            PROCEDURE_CODE_INITIAL_UE
+        );
+        assert_eq!(
+            generated::ngap_constants::ID_DOWNLINK_NASTRANSPORT.0,
+            PROCEDURE_CODE_DOWNLINK_NAS_TRANSPORT
+        );
+        assert_eq!(
+            generated::ngap_constants::ID_UPLINK_NASTRANSPORT.0,
+            PROCEDURE_CODE_UPLINK_NAS_TRANSPORT
+        );
+        assert_eq!(
+            generated::ngap_constants::ID_INITIAL_CONTEXT_SETUP.0,
+            PROCEDURE_CODE_INITIAL_CONTEXT_SETUP
+        );
+        assert_eq!(
+            generated::ngap_constants::ID_PDUSESSION_RESOURCE_SETUP.0,
+            PROCEDURE_CODE_PDU_SESSION_RESOURCE_SETUP
+        );
+        assert_eq!(
+            generated::ngap_constants::ID_PDUSESSION_RESOURCE_RELEASE.0,
+            PROCEDURE_CODE_PDU_SESSION_RESOURCE_RELEASE
+        );
+        assert_eq!(
+            generated::ngap_constants::ID_UECONTEXT_RELEASE.0,
+            PROCEDURE_CODE_UE_CONTEXT_RELEASE
+        );
+        assert_eq!(
+            generated::ngap_constants::ID_PAGING.0,
+            PROCEDURE_CODE_PAGING
+        );
+    }
+
+    #[test]
+    fn raw_preserving_encode_requires_decoded_raw_bytes() {
+        let pdu = Pdu {
+            raw: Bytes::new(),
+            kind: PduKind::Initiating {
+                procedure_code: PROCEDURE_CODE_NG_SETUP,
+                criticality: Criticality::ignore,
+                message: Message::Unknown(Bytes::from_static(b"body")),
+            },
+        };
+        let err = encode(&pdu, raw_preserving_context()).unwrap_err();
+        assert!(matches!(
+            err.code(),
+            EncodeErrorCode::Structural { reason } if reason.contains("decoded raw")
+        ));
+        let err = pdu.wire_len(raw_preserving_context()).unwrap_err();
+        assert!(matches!(
+            err.code(),
+            EncodeErrorCode::Structural { reason } if reason.contains("decoded raw")
+        ));
+    }
+
+    #[test]
+    fn canonical_wire_len_is_rejected_like_canonical_encode() {
+        let bytes = ngsetup_request_fixture();
+        let pdu = decode(&bytes, DecodeContext::default()).unwrap();
+        assert_eq!(pdu.wire_len(raw_preserving_context()).unwrap(), bytes.len());
+
+        let err = pdu.wire_len(EncodeContext::default()).unwrap_err();
+        assert!(matches!(
+            err.code(),
+            EncodeErrorCode::Structural { reason } if reason.contains("raw-preserving")
+        ));
     }
 
     #[test]

@@ -27,6 +27,7 @@ ASN_FILES = [
     "NGAP-PDU-Contents.asn",
     "NGAP-PDU-Descriptions.asn",
 ]
+PINNED_WIRESHARK_SHA = "d296f939b42891994714939384adc3deaef3f180"
 
 
 def fetch_asn(sha: str, out_dir: Path) -> None:
@@ -73,8 +74,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--wireshark-sha",
-        default="master",
-        help="Wireshark Git SHA to fetch ASN.1 files from (default: master)",
+        default=PINNED_WIRESHARK_SHA,
+        help=(
+            "Wireshark Git SHA to fetch ASN.1 files from "
+            f"(default: pinned {PINNED_WIRESHARK_SHA})"
+        ),
     )
     parser.add_argument(
         "--output",
