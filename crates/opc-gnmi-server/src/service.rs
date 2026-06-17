@@ -11,7 +11,10 @@ use crate::{
     confirmed_commit::reject_set_only_extension,
     encoding_to_proto,
     get::handle_get,
-    metrics::{record_rpc_error, record_rpc_success, GnmiOperation},
+    metrics::{
+        record_extension, record_rpc_error, record_rpc_success, ExtensionMetricOutcome,
+        GnmiOperation,
+    },
     proto::{gnmi, gnmi_ext},
     set::handle_set,
     subscribe::{send_subscribe_error, serve_subscribe_stream},
@@ -330,6 +333,7 @@ pub(crate) fn validate_extensions_for_operation(
                 }
             }
             Some(gnmi_ext::extension::Ext::History(_)) => {
+                record_extension("history", ExtensionMetricOutcome::Rejected);
                 return Err(GnmiError::unimplemented(
                     "gNMI history extension is not implemented",
                 ));
@@ -1510,6 +1514,17 @@ mod tests {
         }
     }
 
+    fn history_extension() -> gnmi_ext::Extension {
+        gnmi_ext::Extension {
+            ext: Some(gnmi_ext::extension::Ext::History(gnmi_ext::History {
+                request: Some(gnmi_ext::history::Request::Range(gnmi_ext::TimeRange {
+                    start: 1,
+                    end: 2,
+                })),
+            })),
+        }
+    }
+
     fn malformed_master_arbitration_extension(role_id: Option<&str>) -> gnmi_ext::Extension {
         gnmi_ext::Extension {
             ext: Some(gnmi_ext::extension::Ext::MasterArbitration(
@@ -1753,6 +1768,37 @@ mod tests {
         assert!(enabled_response.extension.iter().any(|extension| matches!(
             extension.ext.as_ref(),
             Some(gnmi_ext::extension::Ext::MasterArbitration(_))
+        )));
+    }
+
+    #[tokio::test]
+    async fn capabilities_does_not_advertise_history_without_replay_source() {
+        let service = authenticated_service_with_extensions_and_arbitration(
+            ExtensionRegistry::with_commit_confirmed().expect("registry"),
+            GnmiArbitrationConfig::optional(),
+        )
+        .await;
+        let mut request = Request::new(gnmi::CapabilityRequest {
+            extension: Vec::new(),
+        });
+        request.extensions_mut().insert(authenticated_principal());
+        let response = service
+            .capabilities(request)
+            .await
+            .expect("capabilities")
+            .into_inner();
+
+        assert!(response.extension.iter().any(|extension| matches!(
+            extension.ext.as_ref(),
+            Some(gnmi_ext::extension::Ext::RegisteredExt(_))
+        )));
+        assert!(response.extension.iter().any(|extension| matches!(
+            extension.ext.as_ref(),
+            Some(gnmi_ext::extension::Ext::MasterArbitration(_))
+        )));
+        assert!(!response.extension.iter().any(|extension| matches!(
+            extension.ext.as_ref(),
+            Some(gnmi_ext::extension::Ext::History(_))
         )));
     }
 
@@ -4354,6 +4400,47 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.status().as_str(), "UNIMPLEMENTED");
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Subscribe);
+        assert_eq!(
+            events[0].outcome,
+            audit_failed(AuditReasonCode::OPERATION_NOT_SUPPORTED)
+        );
+        assert!(events[0].schema_paths.is_empty());
+        assert!(!format!("{:?}", events).contains("secret-admin"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_history_extension_fails_closed_without_replay_source() {
+        let rejected_before = gnmi_extension_count("history", "rejected");
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_policy_and_audit(
+            allow_all_read_and_subscribe_policy(),
+            Arc::new(audit.clone()),
+        )
+        .await;
+        let mut request = subscribe_request(subscribe_list(
+            gnmi::subscription_list::Mode::Once,
+            user_role_path("secret-admin"),
+            gnmi::SubscriptionMode::Sample,
+        ));
+        request.extension = vec![history_extension()];
+        let stream = subscribe_stream_from(request);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        let err = serve_subscribe_stream(
+            Arc::clone(&service.server),
+            authenticated_principal().principal().clone(),
+            stream,
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status().as_str(), "UNIMPLEMENTED");
+        assert_eq!(err.to_string(), "gNMI operation is not supported");
+        assert!(gnmi_extension_count("history", "rejected") > rejected_before);
         let events = audit.events.lock().expect("audit mutex");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].operation, AuditOperation::Subscribe);

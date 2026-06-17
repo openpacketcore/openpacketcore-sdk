@@ -26,7 +26,9 @@ the parts that are independent of full RPC behavior:
   servers reject the extension, optional servers enforce it when present, and
   required servers deny writes that omit it;
 - authenticated `Subscribe` for ONCE/POLL snapshots and STREAM sample/config
-  on-change delivery.
+  on-change delivery. OpenConfig `History` replay is not advertised or
+  implemented; replay requests fail closed until a durable, bounded,
+  NACM-enforced history source is available.
 
 Current RPC behavior is intentionally capability-honest: `Capabilities` is
 served from the generated schema registry and can be exposed over the
@@ -38,7 +40,7 @@ begin/confirm/cancel and timeout only. Persist-token semantics are NETCONF-only
 until the config-bus model has a durable protocol-neutral token contract. `Set`
 can also be configured to advertise and enforce OpenConfig master-arbitration
 before candidate construction, patching, or commit-confirmed control.
-`Subscribe` supports JSON/JSON_IETF ONCE, POLL, STREAM SAMPLE, and config
-ON_CHANGE; TARGET_DEFINED, aggregation, QoS marking, history replay, and
-operational on-change remain fail-closed until backed by SDK contracts and
-tests.
+`Subscribe` supports JSON/JSON_IETF ONCE, POLL, STREAM SAMPLE, config
+ON_CHANGE, and operational ON_CHANGE when the binding supplies an event source;
+TARGET_DEFINED, aggregation, QoS marking, and history replay remain fail-closed
+until backed by SDK contracts and tests.
