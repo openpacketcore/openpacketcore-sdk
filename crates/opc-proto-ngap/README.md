@@ -1,18 +1,22 @@
 # opc-proto-ngap
 
-NGAP (NG Application Protocol, 3GPP TS 38.413) v0 codec for OpenPacketCore.
+NGAP (NG Application Protocol, 3GPP TS 38.413) v1 subset codec for
+OpenPacketCore.
 
 ## Purpose
 
-This crate provides the first NGAP codec in the SDK, built on the `rasn`
-ASN.1 / APER toolchain per ADR 0013. It currently covers:
+This crate provides the NGAP codec in the SDK, built on the `rasn` ASN.1 /
+APER toolchain per ADR 0013. It currently covers:
 
 - NGAP-PDU framing: initiating message, successful outcome, unsuccessful outcome.
-- Typed decoding of the fixture-proven v0 subset: `NGSetupRequest`
-  (field-level conformance fixture) and `InitialUEMessage` (decode path,
-  fixture pending). `NGSetupResponse` and `NGSetupFailure` are intentionally
-  surfaced as raw `Message::Unknown` bodies until external fixtures exist —
-  decoding them without fixtures risks silently mislabeling peer messages.
+- Fixture-proven typed decoding for `NGSetupRequest`.
+- Structural typed dispatch for the first AMF N2 procedure subset:
+  `NGSetupResponse`, `NGSetupFailure`, `InitialUEMessage`,
+  `DownlinkNASTransport`, `UplinkNASTransport`,
+  `InitialContextSetup{Request,Response,Failure}`,
+  `PDUSessionResourceSetup{Request,Response}`,
+  `PDUSessionResourceRelease{Command,Response}`,
+  `UEContextRelease{Command,Complete}`, and `Paging`.
 - Byte-exact raw-preserving round-trip at the NGAP-PDU level.
 
 ## Important caveat
@@ -20,10 +24,10 @@ ASN.1 / APER toolchain per ADR 0013. It currently covers:
 `rasn` 0.28 decodes NGAP APER correctly but its encoder does not reproduce the
 octet alignment used by independent APER implementations for the inner message
 bodies. Because ADR 0015 requires byte-exact round-trips against spec-authored
-fixtures, v0 encoding is **raw-preserving only**: the message body captured
-during decode is re-emitted byte-identically inside a freshly encoded NGAP-PDU
-wrapper. A non-raw-preserving typed encode will return an error until the
-underlying encoder issue is resolved.
+fixtures, encoding is **raw-preserving only**: the message body captured
+during decode is re-emitted byte-identically. Raw-preserving encode also
+requires decoded raw bytes; constructing a typed PDU from scratch is rejected
+until the underlying encoder issue is resolved.
 
 ## Regenerating
 
@@ -34,9 +38,9 @@ regenerate (requires Python 3.9+, `rasn-compiler` 0.16, and network access):
 make generate-ngap
 ```
 
-Inputs are fetched from Wireshark's ASN.1 dissector files and patched to fix
-`rasn-compiler` import emission. The output is deterministic for a given
-Wireshark Git SHA.
+Inputs are fetched from Wireshark's ASN.1 dissector files at pinned commit
+`d296f939b42891994714939384adc3deaef3f180` and patched to fix
+`rasn-compiler` import emission. The output is deterministic for that commit.
 
 ## Conformance
 
