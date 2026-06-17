@@ -246,6 +246,13 @@ The P0 Rust SDK production-readiness blockers are closed, but the SDK should not
 
 Furthermore, the SDK provides procedure-faithful peer simulators, reusable testkits, dry-run runners, and compliant evidence output, but the SDK does not become a production CNF, nor does it become the production Kubernetes operator. Live hardware lab execution remains dependent on downstream environment wiring.
 
+The first in-tree NF proof is `opc-amf-lite`, an AMF-oriented N2/N1 control-plane
+slice. IKEv2/IPsec, ESP/xfrm orchestration, and N3IWF/NWu procedure crates are
+therefore not required for this first-NF readiness boundary. They remain future
+work for a selected ePDG, N3IWF, or other untrusted-access/IPsec product target;
+until then, `IpsecGateway` in `opc-node-resources` is only a resource/admission
+profile and not a claim of protocol implementation.
+
 The following items are updated in `docs/implementation-status.md`:
 
 - **Closed / Hardened Foundation** (June 2026):

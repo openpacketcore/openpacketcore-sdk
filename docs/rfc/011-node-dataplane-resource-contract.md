@@ -86,6 +86,12 @@ pub enum DataPlaneProfile {
 Profiles determine required node labels, capabilities, CNI attachments, and
 preflight checks.
 
+`IpsecGateway` is a resource and admission profile only in the current SDK. It
+does not imply that this repository ships IKEv2, ESP, xfrm orchestration, or
+N3IWF/NWu procedure implementations. Those protocol crates are required for a
+selected ePDG/N3IWF/untrusted-access product target, but are not a blocker for
+the current AMF-lite/N2/N1 first-NF profile.
+
 ## 5. Node Capability Discovery
 
 The platform MUST provide a node capability report:
