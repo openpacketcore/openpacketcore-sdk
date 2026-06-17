@@ -134,6 +134,20 @@ where
     B: GnmiConfigBinding<C>,
 {
     let request_id = RequestId::new();
+    if let Err(err) = server
+        .arbitration()
+        .authorize_set(principal, &request.extension)
+    {
+        audit_set_result(
+            server,
+            request_id,
+            principal,
+            AuditOperation::Update,
+            outcome_for_error(&err),
+            Vec::new(),
+        )?;
+        return Err(err);
+    }
     let commit_extension = match parse_set_commit_extension(&request.extension) {
         Ok(commit_extension) => commit_extension,
         Err(err) => {

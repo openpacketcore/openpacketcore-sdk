@@ -304,9 +304,9 @@ use opc_config_bus::{ConfigBus, MockManagedDatastore};
 use opc_config_model::YangPath;
 use opc_gnmi_server::proto::{gnmi, gnmi_ext};
 use opc_gnmi_server::{
-    CapabilityProfile, CommitConfirmedExtension, ExtensionRegistry, GnmiConfigBinding,
-    GnmiJsonProjectionError, GnmiJsonRenderer, GnmiJsonUpdate, GnmiListenerConfig,
-    GnmiPatchApplicator, GnmiServer, GnmiVersion, ReadSelection,
+    CapabilityProfile, CommitConfirmedExtension, ExtensionRegistry, GnmiArbitrationConfig,
+    GnmiConfigBinding, GnmiJsonProjectionError, GnmiJsonRenderer, GnmiJsonUpdate,
+    GnmiListenerConfig, GnmiPatchApplicator, GnmiServer, GnmiVersion, ReadSelection,
     SupervisedGnmiTlsListenerConfig, GNMI_VERSION, OPC_COMMIT_CONFIRMED_EXTENSION_ID,
 };
 use opc_identity::IdentityState;
@@ -488,6 +488,23 @@ async fn start_harness_with_extensions(
     events: Option<Arc<CapturingOperationalEvents>>,
     extensions: ExtensionRegistry,
 ) -> Harness {
+    start_harness_with_extensions_arbitration(
+        policy,
+        limits,
+        events,
+        extensions,
+        GnmiArbitrationConfig::disabled(),
+    )
+    .await
+}
+
+async fn start_harness_with_extensions_arbitration(
+    policy: NacmPolicy,
+    limits: MgmtLimits,
+    events: Option<Arc<CapturingOperationalEvents>>,
+    extensions: ExtensionRegistry,
+    arbitration: GnmiArbitrationConfig,
+) -> Harness {
     let state =
         identity_state("spiffe://test-domain/tenant/test/ns/default/sa/gnmi/nf/amf/instance/0");
     let (_identity_tx, identity_rx) = watch::channel(Some(state));
@@ -503,7 +520,7 @@ async fn start_harness_with_extensions(
             .expect("bus"),
     );
     let audit = CapturingAudit::default();
-    let server = GnmiServer::new_with_audit(
+    let server = GnmiServer::new_with_audit_and_arbitration(
         TestBinding {
             bus: Arc::clone(&bus),
             policy: Arc::new(FixedPolicy(policy)),
@@ -515,6 +532,7 @@ async fn start_harness_with_extensions(
         limits,
         CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version")),
         extensions,
+        arbitration,
         Arc::new(audit.clone()),
     )
     .expect("server");
@@ -947,6 +965,17 @@ fn commit_confirmed_extension(payload: CommitConfirmedExtension) -> gnmi_ext::Ex
     }
 }
 
+fn master_arbitration_extension(role_id: Option<&str>, high: u64, low: u64) -> gnmi_ext::Extension {
+    gnmi_ext::Extension {
+        ext: Some(gnmi_ext::extension::Ext::MasterArbitration(
+            gnmi_ext::MasterArbitration {
+                role: role_id.map(|id| gnmi_ext::Role { id: id.to_string() }),
+                election_id: Some(gnmi_ext::Uint128 { high, low }),
+            },
+        )),
+    }
+}
+
 async fn wait_for_wire_hostname(harness: &Harness, expected: &str) {
     let expected = LeafPresence::Explicit(expected.to_string());
     for _ in 0..50 {
@@ -1365,6 +1394,96 @@ async fn generated_stack_supports_commit_confirmed_extension_over_real_mtls() {
     .expect("cancel");
     wait_for_wire_hostname(&harness, "wire-confirmed").await;
 
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn generated_stack_supports_master_arbitration_set_over_real_mtls() {
+    let harness = start_harness_with_extensions_arbitration(
+        allow_all_read_subscribe_policy(),
+        MgmtLimits::default(),
+        None,
+        ExtensionRegistry::default(),
+        GnmiArbitrationConfig::required(),
+    )
+    .await;
+    let mut grpc = harness.client().await;
+
+    let caps = capabilities(&mut grpc).await;
+    assert!(caps.extension.iter().any(|extension| matches!(
+        extension.ext.as_ref(),
+        Some(gnmi_ext::extension::Ext::MasterArbitration(_))
+    )));
+
+    let missing = set(
+        &mut grpc,
+        gnmi::SetRequest {
+            prefix: None,
+            delete: Vec::new(),
+            replace: Vec::new(),
+            update: vec![json_update(
+                hostname_path(),
+                br#""wire-arb-missing""#.to_vec(),
+            )],
+            union_replace: Vec::new(),
+            extension: Vec::new(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(missing.code(), Code::PermissionDenied);
+    assert_eq!(
+        harness.bus.current_snapshot().config.hostname,
+        LeafPresence::Explicit("router1".to_string())
+    );
+
+    set(
+        &mut grpc,
+        gnmi::SetRequest {
+            prefix: None,
+            delete: Vec::new(),
+            replace: Vec::new(),
+            update: vec![json_update(
+                hostname_path(),
+                br#""wire-arb-master""#.to_vec(),
+            )],
+            union_replace: Vec::new(),
+            extension: vec![master_arbitration_extension(Some("ops"), 3, 0)],
+        },
+    )
+    .await
+    .expect("arbitration-backed set");
+    assert_eq!(
+        harness.bus.current_snapshot().config.hostname,
+        LeafPresence::Explicit("wire-arb-master".to_string())
+    );
+
+    let stale = set(
+        &mut grpc,
+        gnmi::SetRequest {
+            prefix: None,
+            delete: Vec::new(),
+            replace: Vec::new(),
+            update: vec![json_update(
+                hostname_path(),
+                br#""wire-arb-stale""#.to_vec(),
+            )],
+            union_replace: Vec::new(),
+            extension: vec![master_arbitration_extension(Some("ops"), 2, u64::MAX)],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale.code(), Code::PermissionDenied);
+    assert_eq!(stale.message(), "gNMI access denied");
+    assert_eq!(
+        harness.bus.current_snapshot().config.hostname,
+        LeafPresence::Explicit("wire-arb-master".to_string())
+    );
+    assert!(!stale.message().contains("wire-arb-stale"));
+
+    let audit_debug = format!("{:?}", harness.audit.events.lock().expect("audit"));
+    assert!(!audit_debug.contains("wire-arb-stale"));
     harness.shutdown().await;
 }
 

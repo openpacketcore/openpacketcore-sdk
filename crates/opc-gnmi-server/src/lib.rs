@@ -22,6 +22,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod arbitration;
 mod audit;
 pub mod binding;
 pub mod capabilities;
@@ -49,6 +50,9 @@ use opc_config_model::OpcConfig;
 use opc_mgmt_audit::{AuditSink, TracingAuditSink};
 use opc_mgmt_limits::MgmtLimits;
 
+pub use arbitration::{
+    GnmiArbitrationConfig, GnmiArbitrationMode, GnmiArbitrationState, GnmiElectionId,
+};
 pub use binding::{
     GnmiConfigBinding, GnmiJsonProjectionError, GnmiJsonRenderer, GnmiJsonUpdate,
     GnmiPatchApplicator, ReadSelection, ReadSelectionEntry,
@@ -95,6 +99,7 @@ where
     limits: MgmtLimits,
     profile: CapabilityProfile,
     extensions: ExtensionRegistry,
+    arbitration: GnmiArbitrationState,
     audit: Arc<dyn AuditSink>,
     _config: PhantomData<C>,
 }
@@ -114,11 +119,31 @@ where
         profile: CapabilityProfile,
         extensions: ExtensionRegistry,
     ) -> Result<Self, GnmiError> {
-        Self::new_with_audit(
+        Self::new_with_audit_and_arbitration(
             binding,
             limits,
             profile,
             extensions,
+            GnmiArbitrationConfig::disabled(),
+            Arc::new(TracingAuditSink),
+        )
+    }
+
+    /// Builds a gNMI foundation handle with explicit master-arbitration
+    /// behavior and the default tracing audit sink.
+    pub fn new_with_arbitration(
+        binding: B,
+        limits: MgmtLimits,
+        profile: CapabilityProfile,
+        extensions: ExtensionRegistry,
+        arbitration: GnmiArbitrationConfig,
+    ) -> Result<Self, GnmiError> {
+        Self::new_with_audit_and_arbitration(
+            binding,
+            limits,
+            profile,
+            extensions,
+            arbitration,
             Arc::new(TracingAuditSink),
         )
     }
@@ -135,6 +160,26 @@ where
         extensions: ExtensionRegistry,
         audit: Arc<dyn AuditSink>,
     ) -> Result<Self, GnmiError> {
+        Self::new_with_audit_and_arbitration(
+            binding,
+            limits,
+            profile,
+            extensions,
+            GnmiArbitrationConfig::disabled(),
+            audit,
+        )
+    }
+
+    /// Builds a gNMI foundation handle with explicit audit and
+    /// master-arbitration behavior.
+    pub fn new_with_audit_and_arbitration(
+        binding: B,
+        limits: MgmtLimits,
+        profile: CapabilityProfile,
+        extensions: ExtensionRegistry,
+        arbitration: GnmiArbitrationConfig,
+        audit: Arc<dyn AuditSink>,
+    ) -> Result<Self, GnmiError> {
         limits.validate().map_err(GnmiError::from_limits)?;
         binding
             .schema()
@@ -147,6 +192,7 @@ where
             limits,
             profile,
             extensions,
+            arbitration: GnmiArbitrationState::new(arbitration),
             audit,
             _config: PhantomData,
         })
@@ -170,6 +216,11 @@ where
     /// Registered gNMI extension policy.
     pub const fn extensions(&self) -> &ExtensionRegistry {
         &self.extensions
+    }
+
+    /// Master-arbitration state and configured enforcement mode.
+    pub const fn arbitration(&self) -> &GnmiArbitrationState {
+        &self.arbitration
     }
 
     /// Audit sink used for management-plane operation records.
