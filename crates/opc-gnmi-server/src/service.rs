@@ -4412,6 +4412,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscribe_unsupported_encoding_is_audited_without_path_values() {
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_policy_and_audit(
+            allow_all_read_and_subscribe_policy(),
+            Arc::new(audit.clone()),
+        )
+        .await;
+        let mut list = subscribe_list(
+            gnmi::subscription_list::Mode::Once,
+            user_role_path("secret-admin"),
+            gnmi::SubscriptionMode::Sample,
+        );
+        list.encoding = gnmi::Encoding::Bytes as i32;
+        let stream = subscribe_stream_from(subscribe_request(list));
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        let err = serve_subscribe_stream(
+            Arc::clone(&service.server),
+            authenticated_principal().principal().clone(),
+            stream,
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status().as_str(), "UNIMPLEMENTED");
+        assert_eq!(err.to_string(), "gNMI operation is not supported");
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Subscribe);
+        assert_eq!(
+            events[0].outcome,
+            audit_failed(AuditReasonCode::OPERATION_NOT_SUPPORTED)
+        );
+        assert!(events[0].schema_paths.is_empty());
+        assert!(!format!("{:?}", events).contains("secret-admin"));
+    }
+
+    #[tokio::test]
     async fn subscribe_history_extension_fails_closed_without_replay_source() {
         let rejected_before = gnmi_extension_count("history", "rejected");
         let audit = CapturingAudit::default();

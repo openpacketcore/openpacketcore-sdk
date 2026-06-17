@@ -681,6 +681,10 @@ impl SubscribePlan {
                 "gNMI Subscribe aggregation is not implemented",
             ));
         }
+        let encoding = encoding_from_proto(list.encoding)?;
+        if !server.profile().encodings().supports(encoding) {
+            return Err(GnmiError::from(encoding));
+        }
 
         let mode = match gnmi::subscription_list::Mode::try_from(list.mode) {
             Ok(gnmi::subscription_list::Mode::Once) => SubscribeListMode::Once,

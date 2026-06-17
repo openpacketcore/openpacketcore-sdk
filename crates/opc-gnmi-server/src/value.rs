@@ -198,13 +198,20 @@ mod tests {
     #[test]
     fn unsupported_encodings_fail_closed() {
         let limits = MgmtLimits::default();
-        assert_eq!(
-            normalize_typed_value(&TypedValue::Proto(vec![1, 2, 3]), &limits)
-                .unwrap_err()
-                .status()
-                .as_str(),
-            "UNIMPLEMENTED"
-        );
+        let unsupported = [
+            TypedValue::Bytes(vec![1, 2, 3]),
+            TypedValue::Ascii("secret-ascii".to_string()),
+            TypedValue::Proto(vec![1, 2, 3]),
+        ];
+        for value in unsupported {
+            assert_eq!(
+                normalize_typed_value(&value, &limits)
+                    .unwrap_err()
+                    .status()
+                    .as_str(),
+                "UNIMPLEMENTED"
+            );
+        }
         assert!(normalize_typed_value(&TypedValue::Double(f64::NAN), &limits).is_err());
     }
 

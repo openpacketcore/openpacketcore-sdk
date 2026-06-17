@@ -130,10 +130,12 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_and_misordered_encodings() {
-        assert_eq!(
-            EncodingRegistry::new([Encoding::Proto]).unwrap_err(),
-            EncodingError::Unsupported(Encoding::Proto)
-        );
+        for encoding in [Encoding::Bytes, Encoding::Proto, Encoding::Ascii] {
+            assert_eq!(
+                EncodingRegistry::new([encoding]).unwrap_err(),
+                EncodingError::Unsupported(encoding)
+            );
+        }
         assert_eq!(
             EncodingRegistry::new([Encoding::Json, Encoding::JsonIetf]).unwrap_err(),
             EncodingError::JsonIetfNotFirst
