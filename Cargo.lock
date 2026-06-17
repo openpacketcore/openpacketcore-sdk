@@ -2090,6 +2090,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-libsctp-sys"
+version = "0.2.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "opc-mgmt-audit"
 version = "0.2.0"
 dependencies = [
@@ -2382,6 +2389,17 @@ name = "opc-schema-validate"
 version = "0.2.0"
 dependencies = [
  "serde_json",
+]
+
+[[package]]
+name = "opc-sctp"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "opc-libsctp-sys",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -29,4 +29,4 @@ accepted.
 | [0014](0014-dependency-toolchain-policy.md) | rustls/tokio-only dependency policy, no gRPC stack in SDK crates, and a measured (not aspirational) MSRV. |
 | [0015](0015-protocol-codec-conformance-policy.md) | Protocol codecs are proven against spec-authored byte fixtures, never only their own encoder output. |
 | [0016](0016-northbound-grpc-stack-exception.md) | _(proposed)_ `tonic`/`prost` are permitted only for `opc-gnmi-server` as the ADR 0014 §3 exception; core SDK crates stay gRPC-free. |
-| [0017](0017-sctp-transport-ffi-boundary.md) | _(proposed)_ Kernel SCTP is reached through a single `opc-libsctp-sys` crate that holds all `unsafe` SCTP UAPI/`libsctp` helper FFI; this OS-transport exception to ADR 0014 §8 does not reopen ADR 0013's rejection of foreign C codec FFI. |
+| [0017](0017-sctp-transport-ffi-boundary.md) | Kernel SCTP is reached through a single `opc-libsctp-sys` crate that holds all `unsafe` SCTP UAPI/`libsctp` helper FFI; this OS-transport exception to ADR 0014 §8 does not reopen ADR 0013's rejection of foreign C codec FFI. |

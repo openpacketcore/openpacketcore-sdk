@@ -1,0 +1,21 @@
+[package]
+name = "opc-libsctp-sys"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Narrow Linux SCTP socket UAPI boundary for OpenPacketCore"
+readme = "README.md"
+documentation = "https://docs.rs/opc-libsctp-sys"
+keywords = ["5g", "sctp", "ffi", "linux", "packet-core"]
+categories = ["network-programming", "external-ffi-bindings"]
+publish = false
+
+[dependencies]
+libc = "0.2"
+
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"

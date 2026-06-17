@@ -1,0 +1,27 @@
+[package]
+name = "opc-sctp"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Safe SCTP transport foundation for OpenPacketCore N2/NGAP interfaces"
+readme = "README.md"
+documentation = "https://docs.rs/opc-sctp"
+keywords = ["5g", "sctp", "ngap", "transport", "packet-core"]
+categories = ["network-programming", "asynchronous"]
+publish = false
+
+[dependencies]
+bytes = { workspace = true }
+opc-libsctp-sys = { path = "../opc-libsctp-sys", version = "0.2.0" }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "time", "io-util"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[lints]
+workspace = true
