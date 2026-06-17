@@ -7,9 +7,9 @@ This document defines the conformance of the `opc-proto-nas` crate against
 
 - **Document**: 3GPP TS 24.501 (with header formats per TS 24.007)
 - **Release**: Release 18 (R18)
-- **Status**: v1 — experimental; message framing, mobile identity, BCD, and
-  the two most common 5GMM registration messages are structured. Other
-  messages keep the v0 raw-body behavior.
+- **Status**: v2 — experimental; message framing, mobile identity, BCD,
+  first-CNF body dispatch, selected 5GMM message bodies, and NAS security
+  helper hooks are structured. Procedure state machines remain out of scope.
 
 ## Supported Features
 
@@ -19,8 +19,13 @@ This document defines the conformance of the `opc-proto-nas` crate against
   preserved; rejected non-zero in strict mode), message type, raw body.
 - 5GSM header (4 octets): PDU session identity, PTI, message type, raw body.
 - Security-protected envelope (security header types 1–4, §9.3.1): MAC
-  (4 octets) and NAS sequence number framed; payload kept opaque.
-  **No integrity verification and no deciphering** — recognition only.
+  (4 octets), NAS sequence number, and protected payload framed.
+- `NasSecurityContext` verifies/generates MACs and applies ciphering through
+  caller-provided `NasSecurityAlgorithms`; `NullNasSecurityAlgorithms`
+  implements only NIA0/NEA0. NIA1/2/3 and NEA1/2/3 fail closed unless the
+  caller supplies a concrete provider.
+- NAS COUNT helpers model the 16-bit overflow plus 8-bit sequence number, and
+  `NasReplayWindow` rejects stale or repeated COUNT values for one direction.
 - Reserved security header types (5–15) rejected.
 - NAS PDUs carry no internal length framing; decode consumes the entire
   input (the transport delimits PDUs).
@@ -44,9 +49,11 @@ Decodes IE *content* (caller strips IEI/length framing):
 
 ### 3. Message-Type Registries (Tables 9.7.1 / 9.7.2)
 - 5GMM: 29 message types, Registration Request (0x41) through DL NAS
-  Transport (0x68), names and code points only.
+  Transport (0x68), with typed-or-raw body dispatch through
+  `decode_mm_message_body` / `PlainMm::decode_body`.
 - 5GSM: 16 message types, PDU Session Establishment Request (0xC1) through
-  5GSM Status (0xD6), names and code points only.
+  5GSM Status (0xD6), with raw-preserving first-CNF body dispatch through
+  `decode_sm_message_body` / `Sm::decode_body`.
 - Unknown code points do not fail decoding; `from_u8` returns `None` and
   the raw code remains available on the header.
 
@@ -60,7 +67,7 @@ Decodes IE *content* (caller strips IEI/length framing):
 - Filler-nibble, odd-count, and MNC-padding cases are covered by hand-
   authored spec-byte fixtures.
 
-### 5. IE-Level Message Bodies (v1)
+### 5. IE-Level Message Bodies And Dispatch (v2)
 
 #### 5.1 Registration Request (§8.2.6)
 - Mandatory IEs decoded: 5GS registration type, follow-on-request pending
@@ -77,14 +84,35 @@ Decodes IE *content* (caller strips IEI/length framing):
 - Optional IEs iterated and raw-preserved with the same registry as
   Registration Request.
 
+#### 5.3 Security Mode Command (§8.2.20)
+- Mandatory selected NAS security algorithms decoded into NIA/NEA enums.
+- Mandatory ngKSI decoded and raw-preserved.
+- Mandatory replayed UE security capability LV decoded and raw-preserved;
+  zero-length capabilities and truncated LV values are rejected.
+- Optional IEs are iterated and raw-preserved.
+
+#### 5.4 Security Mode Complete (§8.2.21)
+- Optional IEs are iterated and raw-preserved.
+
+#### 5.5 First-CNF Raw Body Dispatch
+- 5GMM first-CNF messages without field-level parsing are exposed through
+  named `MmMessageBody` raw-preserving variants, including Registration
+  Complete, Authentication Response, UL NAS Transport, and DL NAS Transport.
+- 5GSM first-CNF messages are exposed through named `SmMessageBody`
+  raw-preserving variants, including PDU Session Establishment and Release
+  request/accept/command/complete/status messages.
+- Unknown message type code points decode into `Unknown` raw-preserving body
+  variants.
+
 ## Out of Scope
 
-- NAS security: integrity verification, ciphering/deciphering, key
-  derivation, COUNT handling — out of scope for this crate entirely
-  (a future `opc-nas-security` concern).
+- NAS key derivation, key lifecycle, and concrete NIA1/2/3 or NEA1/2/3
+  implementations. This crate validates `opc-key` session key handles and
+  provides algorithm hooks; it does not own security context selection.
 - SUCI de-concealment (home-network private key operations).
-- Structured parsing of 5GSM message bodies and 5GMM messages other than
-  Registration Request/Accept.
+- NAS procedure state machines and policy validation.
+- Field-level parsing of 5GSM message bodies and 5GMM messages other than
+  Registration Request/Accept/Security Mode Command/Security Mode Complete.
 - Semantic validation of optional IE contents beyond length/format framing.
 - EPS (4G) NAS interworking formats.
 
@@ -98,6 +126,9 @@ Decodes IE *content* (caller strips IEI/length framing):
 - The Registration Result `SMS over NAS` flag (bit 4 of the result value)
   is not surfaced separately; the raw value is preserved for byte-exact
   re-encode.
+- The in-tree null security provider is useful only for explicit NIA0/NEA0
+  profiles and tests. Production deployments using non-null NAS algorithms
+  must supply an external `NasSecurityAlgorithms` implementation.
 
 ## Robustness & Fuzzing
 
@@ -106,7 +137,7 @@ preallocate from a wire-declared length. Three layers guard them:
 
 - **Per-PR regression guard** — `tests/corpus_replay.rs` replays every committed
   corpus entry, byte-truncations of each, and hostile constant inputs through the
-  decode entry points (`NasMessage::decode`/`decode_owned`, the v1 message bodies,
+  decode entry points (`NasMessage::decode`/`decode_owned`, the v2 message bodies,
   `MobileIdentity::decode`, and the BCD digit helpers), under `catch_unwind`. Runs
   in ordinary `cargo test`; no nightly toolchain or libFuzzer required.
 - **Scheduled fuzzing** — `fuzz/fuzz_targets/decode_nas.rs` with a seeded corpus,
