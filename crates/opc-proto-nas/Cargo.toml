@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "NAS-5GS (TS 24.501) v1 codec: framing, 5GS mobile identity, BCD unpacking, and Registration Request/Accept IE parsing"
+description = "NAS-5GS (TS 24.501) v2 codec: framing, body dispatch, mobile identity, BCD unpacking, and NAS security hooks"
 readme = "README.md"
 documentation = "https://docs.rs/opc-proto-nas"
 keywords = ["5g", "nas", "packet-core", "codec", "telecom"]
@@ -15,10 +15,12 @@ publish = false # experimental: not published until graduation
 
 [dependencies]
 opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
+opc-key = { path = "../opc-key", version = "0.2.0" }
 bytes = { workspace = true }
 
 [dev-dependencies]
 quickcheck = "1"
+opc-types = { path = "../opc-types", version = "0.2.0" }
 
 [lints]
 workspace = true

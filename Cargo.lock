@@ -2286,7 +2286,9 @@ name = "opc-proto-nas"
 version = "0.2.0"
 dependencies = [
  "bytes",
+ "opc-key",
  "opc-protocol",
+ "opc-types",
  "quickcheck",
 ]
 

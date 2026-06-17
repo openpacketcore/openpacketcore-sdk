@@ -2,24 +2,27 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![deny(missing_docs)]
 
-//! NAS-5GS protocol codec (TS 24.501) for OpenPacketCore — v1.
+//! NAS-5GS protocol codec (TS 24.501) for OpenPacketCore — v2.
 //!
-//! v1 scope (see CONFORMANCE.md): plain 5GMM and 5GSM header parsing,
-//! security-protected envelope *recognition* (no integrity or ciphering),
-//! 5GS mobile identity decoding, BCD digit unpacking for PLMN/routing
-//! indicator/IMEI/IMEISV, and IE-level decoding of Registration Request and
-//! Registration Accept. Other 5GMM/5GSM message bodies are preserved raw.
+//! v2 scope (see CONFORMANCE.md): plain 5GMM and 5GSM header parsing,
+//! security-protected envelope framing with algorithm hooks, 5GS mobile
+//! identity decoding, BCD digit unpacking for PLMN/routing indicator/IMEI/
+//! IMEISV, and first-CNF message body dispatch. Registration Request,
+//! Registration Accept, Security Mode Command, and Security Mode Complete are
+//! structurally decoded; other registered 5GMM/5GSM bodies are named and
+//! preserved raw.
 //!
 //! NAS PDUs carry no internal length framing — the transport (NGAP, N1)
 //! delimits them — so decoding consumes the entire input slice.
 //!
 //! @spec 3GPP TS24501 R18
 //! @req REQ-3GPP-TS24501-R18-001
-//! @conformance v0 — see CONFORMANCE.md
+//! @conformance v2 — see CONFORMANCE.md
 
 pub mod bcd;
 pub mod identity;
 pub mod messages;
+pub mod security;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
@@ -30,8 +33,14 @@ use opc_protocol::{
 pub use bcd::{unpack_imei, unpack_plmn, unpack_routing_indicator, BcdError, Plmn};
 pub use identity::{GutiView, IdentityType, IdentityView, MobileIdentity, SuciView};
 pub use messages::{
-    NasKeySetIdentifier, OptionalIe, RegistrationAccept, RegistrationRequest, RegistrationResult,
-    RegistrationType,
+    decode_mm_message_body, decode_sm_message_body, MmMessageBody, NasKeySetIdentifier, OptionalIe,
+    RawMessageBody, RegistrationAccept, RegistrationRequest, RegistrationResult, RegistrationType,
+    SecurityModeCommand, SecurityModeComplete, SelectedNasSecurityAlgorithms, SmMessageBody,
+};
+pub use security::{
+    NasCipheringAlgorithm, NasCount, NasIntegrityAlgorithm, NasReplayWindow, NasSecurityAlgorithms,
+    NasSecurityContext, NasSecurityDirection, NasSecurityError, NullNasSecurityAlgorithms,
+    VerifiedNasPayload,
 };
 
 /// Extended protocol discriminator for 5GS mobility management (TS 24.007).
@@ -64,6 +73,14 @@ impl SecurityHeaderType {
             4 => Some(Self::IntegrityProtectedAndCipheredNewContext),
             _ => None,
         }
+    }
+
+    /// `true` when the security header type carries a ciphered payload.
+    pub const fn is_ciphered(self) -> bool {
+        matches!(
+            self,
+            Self::IntegrityProtectedAndCiphered | Self::IntegrityProtectedAndCipheredNewContext
+        )
     }
 }
 
@@ -104,7 +121,7 @@ pub enum MmMessageType {
 
 impl MmMessageType {
     /// Look up a 5GMM message type by code point; `None` for codes not in
-    /// the v0 registry (the message still decodes — the raw code is always
+    /// the v2 registry (the message still decodes — the raw code is always
     /// available on the header).
     pub fn from_u8(value: u8) -> Option<Self> {
         Some(match value {
@@ -166,7 +183,7 @@ pub enum SmMessageType {
 
 impl SmMessageType {
     /// Look up a 5GSM message type by code point; `None` for codes not in
-    /// the v0 registry.
+    /// the v2 registry.
     pub fn from_u8(value: u8) -> Option<Self> {
         Some(match value {
             0xC1 => Self::PduSessionEstablishmentRequest,
@@ -194,7 +211,7 @@ impl SmMessageType {
 ///
 /// @spec 3GPP TS24501 R18 9.1.1
 /// @req REQ-3GPP-TS24501-R18-9.1.1-001
-/// @conformance v0
+/// @conformance v2
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlainMm {
     /// Spare high nibble of the security-header octet (must be 0 in strict
@@ -202,23 +219,31 @@ pub struct PlainMm {
     pub spare: u8,
     /// Message type code point (consult [`MmMessageType::from_u8`]).
     pub message_type: u8,
-    /// Everything after the 3-octet header, raw (IEs are not parsed in v0).
+    /// Everything after the 3-octet header, raw until [`PlainMm::decode_body`]
+    /// is called.
     pub body: Bytes,
 }
 
-/// Security-protected 5GS NAS envelope (TS 24.501 §9.1.1): recognized and
-/// framed, but never integrity-verified or deciphered by this crate.
+impl PlainMm {
+    /// Decode the raw body according to this 5GMM message type.
+    pub fn decode_body(&self, ctx: DecodeContext) -> Result<MmMessageBody, DecodeError> {
+        messages::decode_mm_message_body(self.message_type, &self.body, ctx)
+    }
+}
+
+/// Security-protected 5GS NAS envelope (TS 24.501 §9.1.1): framed with MAC,
+/// sequence number, and protected payload.
 ///
 /// @spec 3GPP TS24501 R18 9.1.1
 /// @req REQ-3GPP-TS24501-R18-9.1.1-002
-/// @conformance v0
+/// @conformance v2
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecurityProtected {
     /// Security header type (1–4).
     pub security_header_type: SecurityHeaderType,
     /// Spare high nibble of the security-header octet.
     pub spare: u8,
-    /// Message authentication code, as received (not verified).
+    /// Message authentication code, as received.
     pub mac: [u8; 4],
     /// NAS sequence number.
     pub sequence_number: u8,
@@ -231,7 +256,7 @@ pub struct SecurityProtected {
 ///
 /// @spec 3GPP TS24501 R18 9.1.1
 /// @req REQ-3GPP-TS24501-R18-9.1.1-003
-/// @conformance v0
+/// @conformance v2
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sm {
     /// PDU session identity (octet 2).
@@ -240,11 +265,19 @@ pub struct Sm {
     pub pti: u8,
     /// Message type code point (consult [`SmMessageType::from_u8`]).
     pub message_type: u8,
-    /// Everything after the 4-octet header, raw (IEs are not parsed in v0).
+    /// Everything after the 4-octet header, raw until [`Sm::decode_body`] is
+    /// called.
     pub body: Bytes,
 }
 
-/// A decoded 5GS NAS message at v0 granularity.
+impl Sm {
+    /// Decode the raw body according to this 5GSM message type.
+    pub fn decode_body(&self, ctx: DecodeContext) -> Result<SmMessageBody, DecodeError> {
+        messages::decode_sm_message_body(self.message_type, &self.body, ctx)
+    }
+}
+
+/// A decoded 5GS NAS message at v2 granularity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NasMessage {
     /// Plain (unprotected) 5GMM message.
@@ -267,7 +300,7 @@ impl<'a> BorrowDecode<'a> for NasMessage {
     ///
     /// @spec 3GPP TS24501 R18 9.1.1
     /// @req REQ-3GPP-TS24501-R18-9.1.1-004
-    /// @conformance v0
+    /// @conformance v2
     fn decode(input: &'a [u8], ctx: DecodeContext) -> DecodeResult<'a, Self> {
         if input.len() > ctx.max_message_len {
             return Err(DecodeError::new(DecodeErrorCode::MessageLengthExceeded, 0)
