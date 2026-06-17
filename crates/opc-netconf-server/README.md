@@ -132,6 +132,11 @@ The current slice is capability-gated and capability-honest:
   base 1.0 and base 1.1 framing with running/candidate/startup, confirmed
   commit rollback, bounded XPath selection, `<get-schema>`, and with-defaults
   dispatch.
+- Optional third-party smoke fixtures for live targets:
+  `scripts/netconf-interop-netopeer2-smoke.sh` exercises `netopeer2-cli`
+  against SSH or TLS transports, and `scripts/netconf-interop-ncclient-smoke.sh`
+  exercises `ncclient` over SSH. Both skip unless `OPC_NETCONF_INTEROP=1` is
+  set and are deterministic when the external clients are absent.
 
 Complete base-session behavior is provided by the session runners. Direct
 `ReadOnlyNetconfServer::handle_rpc` and `handle_rpc_xml` calls are low-level,
@@ -149,10 +154,31 @@ out-of-range `<session-id>`. Custom transports that advertise a server
 It still does not implement SSH host-key generation/storage/rotation, SSH
 certificate CA authorization, password authentication, TLS Call Home,
 NMS-profile-specific Call Home endpoint policy, notification replay or
-notification filters, NMDA `<edit-data>`, full NMDA discovery/datastore mapping
-and origin metadata, a full RFC XPath instance evaluator or advertised
-`:xpath`, URL and inline-config copy/validate forms, `:rollback-on-error`, or
-external interop against `netopeer2-cli`, `ncclient`, or a target NMS. CNFs may
-use generated NETCONF XML projection/edit support for supported shapes, but
-unsupported YANG shapes remain fail-closed and model-specific bindings still
-own any projection/edit behavior outside the generated support matrix.
+notification filters, full NMDA discovery/datastore mapping and origin
+metadata, a full RFC XPath instance evaluator or advertised `:xpath`, URL and
+inline-config copy/validate forms, `:rollback-on-error`, or a target NMS
+profile. NMDA `<edit-data>` is implemented only for running/candidate/startup
+config datastores when the same backing edit facades used by `<edit-config>`
+exist; unsupported datastore/URL forms fail closed. CNFs may use generated
+NETCONF XML projection/edit support for supported shapes, but unsupported YANG
+shapes remain fail-closed and model-specific bindings still own any
+projection/edit behavior outside the generated support matrix.
+
+## External Interop
+
+The external scripts are opt-in live-target checks, not unit tests:
+
+- `OPC_NETCONF_INTEROP=1 scripts/netconf-interop-netopeer2-smoke.sh`
+- `OPC_NETCONF_INTEROP=1 scripts/netconf-interop-ncclient-smoke.sh`
+
+Common variables are `OPC_NETCONF_HOST`, `OPC_NETCONF_PORT`, and
+`OPC_NETCONF_USERNAME` for SSH targets. The `netopeer2-cli` script also
+supports `OPC_NETCONF_TRANSPORT=tls` with `OPC_NETCONF_CLIENT_CERT`,
+`OPC_NETCONF_CLIENT_KEY`, and `OPC_NETCONF_CA_CERT`. SSH mode requires
+`OPC_NETCONF_SSH_KEY` for `netopeer2-cli`; the `ncclient` script requires an
+SSH key, password, or `OPC_NETCONF_ALLOW_AGENT=1`.
+
+Both scripts run Capabilities/session establishment implicitly, then
+`get-config` from running and `get`. Set-like mutation is opt-in with
+`OPC_NETCONF_ENABLE_EDIT=1` and `OPC_NETCONF_EDIT_CONFIG_FILE`; candidate edits
+can be committed with `OPC_NETCONF_COMMIT_AFTER_EDIT=1`.
