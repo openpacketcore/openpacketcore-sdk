@@ -44,3 +44,32 @@ before candidate construction, patching, or commit-confirmed control.
 ON_CHANGE, and operational ON_CHANGE when the binding supplies an event source;
 TARGET_DEFINED, aggregation, QoS marking, and history replay remain fail-closed
 until backed by SDK contracts and tests.
+
+## Encodings
+
+`Capabilities` advertises only `JSON_IETF` and `JSON`. `BYTES`, `ASCII`, and
+`PROTO` are intentionally not advertised and return fail-closed errors for
+`Get`, `Set`, and `Subscribe` until the SDK has schema-backed codecs and
+generated renderers for those formats. Generated renderers currently produce
+JSON/RFC 7951 payloads only.
+
+## External Interop
+
+Generated tonic/prost conformance covers Capabilities, Get, Set, Subscribe,
+commit-confirmed, master-arbitration-backed Set, and fail-closed unsupported
+encoding/history behavior over the supervised mTLS listener.
+
+`scripts/gnmi-interop-gnmic-smoke.sh` provides an optional live-target smoke
+test with `gnmic`. It skips unless `OPC_GNMI_INTEROP=1` is set and also skips
+when `gnmic` is not on `PATH`. When enabled, it requires:
+
+- `OPC_GNMI_ADDR`
+- `OPC_GNMI_CA_CERT`
+- `OPC_GNMI_CLIENT_CERT`
+- `OPC_GNMI_CLIENT_KEY`
+
+Optional variables are `OPC_GNMI_TLS_SERVER_NAME`, `OPC_GNMI_TIMEOUT`,
+`OPC_GNMI_GET_PATH`, `OPC_GNMI_SUBSCRIBE_PATH`, and `OPC_GNMI_ENABLE_SET=1`
+with `OPC_GNMI_SET_PATH` plus `OPC_GNMI_SET_JSON` for a mutating Set smoke
+test. The script runs Capabilities, Get, Subscribe ONCE, and optional Set over
+mTLS using `json_ietf`.

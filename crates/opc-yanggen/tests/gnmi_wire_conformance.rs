@@ -1574,11 +1574,16 @@ async fn generated_stack_fails_closed_without_wire_leaks() {
     .expect("redacted secret read");
     assert!(!format!("{secret:?}").contains("hunter2"));
 
-    let unsupported = get_with_encoding(&mut grpc, gnmi::Encoding::Proto)
-        .await
-        .unwrap_err();
-    assert_eq!(unsupported.code(), Code::Unimplemented);
-    assert_eq!(unsupported.message(), "gNMI operation is not supported");
+    for encoding in [
+        gnmi::Encoding::Bytes,
+        gnmi::Encoding::Ascii,
+        gnmi::Encoding::Proto,
+    ] {
+        let unsupported = get_with_encoding(&mut grpc, encoding).await.unwrap_err();
+        assert_eq!(unsupported.code(), Code::Unimplemented);
+        assert_eq!(unsupported.message(), "gNMI operation is not supported");
+        assert!(!unsupported.message().contains("router1"));
+    }
 
     let extension = set(
         &mut grpc,
@@ -1602,6 +1607,25 @@ async fn generated_stack_fails_closed_without_wire_leaks() {
     .unwrap_err();
     assert_eq!(extension.code(), Code::Unimplemented);
     assert!(!extension.message().contains("secret-extension-payload"));
+
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let mut list = subscription_list(
+        gnmi::subscription_list::Mode::Once,
+        route_metric_path("secret-destination", "secret-next-hop"),
+        gnmi::SubscriptionMode::Sample,
+    );
+    list.encoding = gnmi::Encoding::Bytes as i32;
+    send_subscribe(&tx, list).await;
+    drop(tx);
+    let mut stream = open_subscribe(&mut harness.client().await, rx).await;
+    let status = tokio::time::timeout(Duration::from_secs(3), stream.message())
+        .await
+        .expect("encoding status timeout")
+        .expect_err("unsupported encoding should fail closed");
+    assert_eq!(status.code(), Code::Unimplemented);
+    assert_eq!(status.message(), "gNMI operation is not supported");
+    assert!(!status.message().contains("secret-destination"));
+    assert!(!status.message().contains("secret-next-hop"));
 
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     let mut list = subscription_list(
