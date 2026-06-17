@@ -1484,6 +1484,17 @@ mod tests {
         }
     }
 
+    fn token_like_commit_confirmed_extension(
+        payload: CommitConfirmedExtension,
+        token: &[u8],
+    ) -> gnmi_ext::Extension {
+        let mut encoded = payload.encode_payload();
+        encoded.push((3 << 3) | 2);
+        encoded.push(u8::try_from(token.len()).expect("test token length"));
+        encoded.extend_from_slice(token);
+        malformed_commit_confirmed_extension(encoded)
+    }
+
     fn master_arbitration_extension(
         role_id: Option<&str>,
         high: u64,
@@ -3113,6 +3124,75 @@ mod tests {
                 .hostname,
             "amf-1"
         );
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_commit_confirmed_rejects_token_like_payload_without_confirming() {
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_extensions_and_audit(
+            ExtensionRegistry::with_commit_confirmed().expect("registry"),
+            Arc::new(audit.clone()),
+        )
+        .await;
+        commit_hostname(&service, "rollback-parent").await;
+        service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(
+                    hostname_path(),
+                    br#""pending-token-host""#.to_vec(),
+                )],
+                union_replace: Vec::new(),
+                extension: vec![commit_confirmed_extension(
+                    CommitConfirmedExtension::begin(std::time::Duration::from_secs(30))
+                        .expect("payload"),
+                )],
+            }))
+            .await
+            .expect("begin confirmed");
+
+        let status = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: Vec::new(),
+                union_replace: Vec::new(),
+                extension: vec![token_like_commit_confirmed_extension(
+                    CommitConfirmedExtension::confirm(),
+                    b"secret-persist-token",
+                )],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "invalid gNMI request");
+        assert!(!status.message().contains("secret-persist-token"));
+
+        service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: Vec::new(),
+                union_replace: Vec::new(),
+                extension: vec![commit_confirmed_extension(
+                    CommitConfirmedExtension::cancel(),
+                )],
+            }))
+            .await
+            .expect("pending commit remains cancellable");
+        wait_for_hostname(&service, "rollback-parent").await;
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert!(events.iter().any(|event| {
+            event.operation == AuditOperation::Update
+                && event.outcome == audit_failed(AuditReasonCode::INVALID_VALUE)
+                && event.schema_paths.is_empty()
+        }));
+        assert!(!format!("{:?}", events).contains("secret-persist-token"));
     }
 
     #[tokio::test]
