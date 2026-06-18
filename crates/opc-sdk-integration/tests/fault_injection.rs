@@ -846,7 +846,7 @@ async fn test_fault_injection_rollback_audit_chain_corruption() {
         .unwrap();
 
     // Commit 2 (pending)
-    let req2 = test_commit_request("commit-2", deadline);
+    let req2 = test_commit_request("commit-2", deadline).with_base_version(bus.version());
     bus.submit(req2).await.unwrap();
 
     // Enable audit chain corruption fault
@@ -898,7 +898,7 @@ async fn test_fault_injection_failed_rollback_load() {
         .await
         .unwrap();
 
-    let req2 = test_commit_request("commit-2", deadline);
+    let req2 = test_commit_request("commit-2", deadline).with_base_version(bus.version());
     bus.submit(req2).await.unwrap();
 
     fault_store.enable_fault(FaultType::FailedRollbackLoad);
@@ -942,11 +942,10 @@ async fn test_fault_injection_mark_confirmed_failure() {
         .await
         .unwrap();
     let _commit = bus
-        .submit(test_commit_confirmed_request(
-            "commit-1",
-            deadline,
-            std::time::Duration::from_secs(30),
-        ))
+        .submit(
+            test_commit_confirmed_request("commit-1", deadline, std::time::Duration::from_secs(30))
+                .with_base_version(bus.version()),
+        )
         .await
         .unwrap();
 
@@ -1015,11 +1014,10 @@ async fn test_fault_injection_recovery_restart_remains_fenced() {
 
     // Commit 2 (commit-confirmed pending)
     let _commit2 = bus
-        .submit(test_commit_confirmed_request(
-            "commit-2",
-            deadline,
-            std::time::Duration::from_secs(30),
-        ))
+        .submit(
+            test_commit_confirmed_request("commit-2", deadline, std::time::Duration::from_secs(30))
+                .with_base_version(bus.version()),
+        )
         .await
         .unwrap();
 
@@ -1087,7 +1085,7 @@ async fn test_fault_injection_recovery_restart_remains_fenced() {
 
     // Submitting a write succeeds now
     let _commit3 = bus2
-        .submit(test_commit_request("commit-3", deadline))
+        .submit(test_commit_request("commit-3", deadline).with_base_version(bus2.version()))
         .await
         .unwrap();
 }
