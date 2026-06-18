@@ -1010,19 +1010,6 @@ mod tests {
         .await
     }
 
-    async fn authenticated_service_with_extensions(
-        extensions: ExtensionRegistry,
-    ) -> GnmiService<DemoConfig, TestBinding> {
-        service_with_authentication_limits_extensions(true, MgmtLimits::default(), extensions).await
-    }
-
-    async fn service_with_extensions(
-        extensions: ExtensionRegistry,
-    ) -> GnmiService<DemoConfig, TestBinding> {
-        service_with_authentication_limits_extensions(false, MgmtLimits::default(), extensions)
-            .await
-    }
-
     async fn service_with_authentication_limits_extensions(
         authenticated: bool,
         limits: MgmtLimits,
@@ -1404,11 +1391,12 @@ mod tests {
         GnmiService::new_authenticated(server)
     }
 
-    async fn authenticated_service_with_extensions_and_audit(
+    async fn authenticated_service_with_extensions_arbitration_and_audit(
         extensions: ExtensionRegistry,
+        arbitration: GnmiArbitrationConfig,
         audit: Arc<dyn AuditSink>,
     ) -> GnmiService<DemoConfig, TestBinding> {
-        authenticated_service_with_policy_bus_events_audit_extensions(
+        authenticated_service_with_policy_bus_events_audit_extensions_arbitration(
             Arc::new(FixedPolicy(allow_all_read_policy())),
             Arc::new(
                 ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
@@ -1419,7 +1407,7 @@ mod tests {
             MgmtLimits::default(),
             audit,
             Arc::new(TestOperationalState),
-            extensions,
+            TestProtocolOptions::new(extensions, arbitration),
         )
         .await
     }
@@ -1525,6 +1513,15 @@ mod tests {
                 },
             )),
         }
+    }
+
+    fn fenced_commit_confirmed_extensions(
+        payload: CommitConfirmedExtension,
+    ) -> Vec<gnmi_ext::Extension> {
+        vec![
+            master_arbitration_extension(Some("commit-confirmed"), 1, 0),
+            commit_confirmed_extension(payload),
+        ]
     }
 
     fn malformed_commit_confirmed_extension(payload: impl Into<Vec<u8>>) -> gnmi_ext::Extension {
@@ -1766,9 +1763,13 @@ mod tests {
 
     #[tokio::test]
     async fn capabilities_advertises_commit_confirmed_only_when_registered() {
-        let service =
-            service_with_extensions(ExtensionRegistry::with_commit_confirmed().expect("registry"))
-                .await;
+        let service = service_with_authentication_limits_extensions_arbitration(
+            false,
+            MgmtLimits::default(),
+            ExtensionRegistry::with_commit_confirmed().expect("registry"),
+            GnmiArbitrationConfig::optional(),
+        )
+        .await;
         let response = service
             .capabilities(Request::new(gnmi::CapabilityRequest {
                 extension: Vec::new(),
@@ -1777,14 +1778,46 @@ mod tests {
             .expect("capabilities")
             .into_inner();
 
-        assert_eq!(response.extension.len(), 1);
-        let Some(gnmi_ext::extension::Ext::RegisteredExt(extension)) =
-            response.extension[0].ext.as_ref()
-        else {
-            panic!("expected registered extension");
-        };
+        let extension = response
+            .extension
+            .iter()
+            .find_map(|extension| match extension.ext.as_ref() {
+                Some(gnmi_ext::extension::Ext::RegisteredExt(extension)) => Some(extension),
+                _ => None,
+            })
+            .expect("expected registered extension");
         assert_eq!(extension.id, OPC_COMMIT_CONFIRMED_EXTENSION_ID as i32);
         assert!(extension.msg.is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_confirmed_registry_requires_arbitration_config() {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
+                .await
+                .expect("bus"),
+        );
+        let profile =
+            CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
+
+        let err = match GnmiServer::new(
+            TestBinding {
+                bus,
+                policy: Arc::new(FixedPolicy(allow_all_read_policy())),
+                operational: Arc::new(TestOperationalState),
+                events: None,
+                patcher: unit_patcher(),
+            },
+            MgmtLimits::default(),
+            profile,
+            ExtensionRegistry::with_commit_confirmed().expect("registry"),
+        ) {
+            Ok(_) => panic!("commit-confirmed without arbitration must fail closed"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.status().as_str(), "UNIMPLEMENTED");
+        assert!(!err.to_string().contains("commit-confirmed.v1"));
     }
 
     #[tokio::test]
@@ -1876,9 +1909,13 @@ mod tests {
 
     #[tokio::test]
     async fn capabilities_rejects_set_only_commit_confirmed_extension() {
-        let service =
-            service_with_extensions(ExtensionRegistry::with_commit_confirmed().expect("registry"))
-                .await;
+        let service = service_with_authentication_limits_extensions_arbitration(
+            false,
+            MgmtLimits::default(),
+            ExtensionRegistry::with_commit_confirmed().expect("registry"),
+            GnmiArbitrationConfig::optional(),
+        )
+        .await;
         let status = service
             .capabilities(Request::new(gnmi::CapabilityRequest {
                 extension: vec![commit_confirmed_extension(
@@ -3027,8 +3064,9 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_set_commit_confirmed_rolls_back_on_timeout() {
-        let service = authenticated_service_with_extensions(
+        let service = authenticated_service_with_extensions_and_arbitration(
             ExtensionRegistry::with_commit_confirmed().expect("registry"),
+            GnmiArbitrationConfig::optional(),
         )
         .await;
         commit_hostname(&service, "rollback-parent").await;
@@ -3039,10 +3077,10 @@ mod tests {
                 replace: Vec::new(),
                 update: vec![json_update(hostname_path(), br#""pending-host""#.to_vec())],
                 union_replace: Vec::new(),
-                extension: vec![commit_confirmed_extension(
+                extension: fenced_commit_confirmed_extensions(
                     CommitConfirmedExtension::begin(std::time::Duration::from_millis(50))
                         .expect("payload"),
-                )],
+                ),
             }))
             .await
             .expect("confirmed set")
@@ -3065,8 +3103,9 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_set_commit_confirmed_can_be_confirmed() {
-        let service = authenticated_service_with_extensions(
+        let service = authenticated_service_with_extensions_and_arbitration(
             ExtensionRegistry::with_commit_confirmed().expect("registry"),
+            GnmiArbitrationConfig::optional(),
         )
         .await;
         commit_hostname(&service, "rollback-parent").await;
@@ -3080,10 +3119,10 @@ mod tests {
                     br#""confirmed-host""#.to_vec(),
                 )],
                 union_replace: Vec::new(),
-                extension: vec![commit_confirmed_extension(
+                extension: fenced_commit_confirmed_extensions(
                     CommitConfirmedExtension::begin(std::time::Duration::from_millis(120))
                         .expect("payload"),
-                )],
+                ),
             }))
             .await
             .expect("begin confirmed");
@@ -3095,9 +3134,7 @@ mod tests {
                 replace: Vec::new(),
                 update: Vec::new(),
                 union_replace: Vec::new(),
-                extension: vec![commit_confirmed_extension(
-                    CommitConfirmedExtension::confirm(),
-                )],
+                extension: fenced_commit_confirmed_extensions(CommitConfirmedExtension::confirm()),
             }))
             .await
             .expect("confirm")
@@ -3119,8 +3156,9 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_set_commit_confirmed_can_be_cancelled() {
-        let service = authenticated_service_with_extensions(
+        let service = authenticated_service_with_extensions_and_arbitration(
             ExtensionRegistry::with_commit_confirmed().expect("registry"),
+            GnmiArbitrationConfig::optional(),
         )
         .await;
         commit_hostname(&service, "rollback-parent").await;
@@ -3134,10 +3172,10 @@ mod tests {
                     br#""cancelled-host""#.to_vec(),
                 )],
                 union_replace: Vec::new(),
-                extension: vec![commit_confirmed_extension(
+                extension: fenced_commit_confirmed_extensions(
                     CommitConfirmedExtension::begin(std::time::Duration::from_secs(30))
                         .expect("payload"),
-                )],
+                ),
             }))
             .await
             .expect("begin confirmed");
@@ -3149,9 +3187,7 @@ mod tests {
                 replace: Vec::new(),
                 update: Vec::new(),
                 union_replace: Vec::new(),
-                extension: vec![commit_confirmed_extension(
-                    CommitConfirmedExtension::cancel(),
-                )],
+                extension: fenced_commit_confirmed_extensions(CommitConfirmedExtension::cancel()),
             }))
             .await
             .expect("cancel");
@@ -3161,8 +3197,9 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_set_commit_confirmed_control_shapes_fail_closed() {
-        let service = authenticated_service_with_extensions(
+        let service = authenticated_service_with_extensions_and_arbitration(
             ExtensionRegistry::with_commit_confirmed().expect("registry"),
+            GnmiArbitrationConfig::optional(),
         )
         .await;
         let confirm_with_update = service
@@ -3172,9 +3209,7 @@ mod tests {
                 replace: Vec::new(),
                 update: vec![json_update(hostname_path(), br#""bad-shape""#.to_vec())],
                 union_replace: Vec::new(),
-                extension: vec![commit_confirmed_extension(
-                    CommitConfirmedExtension::confirm(),
-                )],
+                extension: fenced_commit_confirmed_extensions(CommitConfirmedExtension::confirm()),
             }))
             .await
             .unwrap_err();
@@ -3187,10 +3222,10 @@ mod tests {
                 replace: Vec::new(),
                 update: Vec::new(),
                 union_replace: Vec::new(),
-                extension: vec![commit_confirmed_extension(
+                extension: fenced_commit_confirmed_extensions(
                     CommitConfirmedExtension::begin(std::time::Duration::from_secs(30))
                         .expect("payload"),
-                )],
+                ),
             }))
             .await
             .unwrap_err();
@@ -3203,9 +3238,7 @@ mod tests {
                 replace: Vec::new(),
                 update: Vec::new(),
                 union_replace: Vec::new(),
-                extension: vec![commit_confirmed_extension(
-                    CommitConfirmedExtension::confirm(),
-                )],
+                extension: fenced_commit_confirmed_extensions(CommitConfirmedExtension::confirm()),
             }))
             .await
             .unwrap_err();
@@ -3223,10 +3256,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_set_commit_confirmed_requires_master_arbitration() {
+        let service = authenticated_service_with_extensions_and_arbitration(
+            ExtensionRegistry::with_commit_confirmed().expect("registry"),
+            GnmiArbitrationConfig::optional(),
+        )
+        .await;
+
+        let status = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(
+                    hostname_path(),
+                    br#""unfenced-pending""#.to_vec(),
+                )],
+                union_replace: Vec::new(),
+                extension: vec![commit_confirmed_extension(
+                    CommitConfirmedExtension::begin(std::time::Duration::from_secs(30))
+                        .expect("payload"),
+                )],
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_eq!(status.message(), "gNMI access denied");
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-1"
+        );
+    }
+
+    #[tokio::test]
     async fn authenticated_set_commit_confirmed_rejects_token_like_payload_without_confirming() {
         let audit = CapturingAudit::default();
-        let service = authenticated_service_with_extensions_and_audit(
+        let service = authenticated_service_with_extensions_arbitration_and_audit(
             ExtensionRegistry::with_commit_confirmed().expect("registry"),
+            GnmiArbitrationConfig::optional(),
             Arc::new(audit.clone()),
         )
         .await;
@@ -3241,10 +3315,10 @@ mod tests {
                     br#""pending-token-host""#.to_vec(),
                 )],
                 union_replace: Vec::new(),
-                extension: vec![commit_confirmed_extension(
+                extension: fenced_commit_confirmed_extensions(
                     CommitConfirmedExtension::begin(std::time::Duration::from_secs(30))
                         .expect("payload"),
-                )],
+                ),
             }))
             .await
             .expect("begin confirmed");
@@ -3256,10 +3330,15 @@ mod tests {
                 replace: Vec::new(),
                 update: Vec::new(),
                 union_replace: Vec::new(),
-                extension: vec![token_like_commit_confirmed_extension(
-                    CommitConfirmedExtension::confirm(),
-                    b"secret-persist-token",
-                )],
+                extension: {
+                    let mut extensions =
+                        vec![master_arbitration_extension(Some("commit-confirmed"), 1, 0)];
+                    extensions.push(token_like_commit_confirmed_extension(
+                        CommitConfirmedExtension::confirm(),
+                        b"secret-persist-token",
+                    ));
+                    extensions
+                },
             }))
             .await
             .unwrap_err();
@@ -3274,9 +3353,7 @@ mod tests {
                 replace: Vec::new(),
                 update: Vec::new(),
                 union_replace: Vec::new(),
-                extension: vec![commit_confirmed_extension(
-                    CommitConfirmedExtension::cancel(),
-                )],
+                extension: fenced_commit_confirmed_extensions(CommitConfirmedExtension::cancel()),
             }))
             .await
             .expect("pending commit remains cancellable");
@@ -3411,8 +3488,9 @@ mod tests {
     #[tokio::test]
     async fn authenticated_set_commit_confirmed_malformed_payload_is_audited_without_leak() {
         let audit = CapturingAudit::default();
-        let service = authenticated_service_with_extensions_and_audit(
+        let service = authenticated_service_with_extensions_arbitration_and_audit(
             ExtensionRegistry::with_commit_confirmed().expect("registry"),
+            GnmiArbitrationConfig::optional(),
             Arc::new(audit.clone()),
         )
         .await;
@@ -3456,8 +3534,9 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_get_rejects_set_only_commit_confirmed_extension() {
-        let service = authenticated_service_with_extensions(
+        let service = authenticated_service_with_extensions_and_arbitration(
             ExtensionRegistry::with_commit_confirmed().expect("registry"),
+            GnmiArbitrationConfig::optional(),
         )
         .await;
         let status = service

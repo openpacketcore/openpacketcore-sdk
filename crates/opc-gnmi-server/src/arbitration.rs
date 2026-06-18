@@ -170,6 +170,30 @@ impl GnmiArbitrationState {
         }
     }
 
+    /// Ensures OpenPacketCore commit-confirmed Set requests are protected by
+    /// gNMI master arbitration. The caller invokes this after ordinary Set
+    /// arbitration authorization, so this method only checks that the server is
+    /// arbitration-capable and that the request carried the already-authorized
+    /// arbitration extension.
+    pub(crate) fn ensure_commit_confirmed_fenced(
+        &self,
+        extensions: &[gnmi_ext::Extension],
+    ) -> Result<(), GnmiError> {
+        if !self.config.is_enabled() {
+            return Err(GnmiError::unimplemented(
+                "OpenPacketCore commit-confirmed requires gNMI master arbitration",
+            ));
+        }
+        if parse_set_arbitration_extension(extensions)?.is_none() {
+            record_extension(
+                MASTER_ARBITRATION_METRIC_LABEL,
+                ExtensionMetricOutcome::Rejected,
+            );
+            return Err(GnmiError::PermissionDenied);
+        }
+        Ok(())
+    }
+
     fn authorize_present(
         &self,
         principal: &TrustedPrincipal,

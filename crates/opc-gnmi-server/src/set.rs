@@ -162,6 +162,22 @@ where
             return Err(err);
         }
     };
+    if commit_extension.requires_arbitration() {
+        if let Err(err) = server
+            .arbitration()
+            .ensure_commit_confirmed_fenced(&request.extension)
+        {
+            audit_set_result(
+                server,
+                request_id,
+                principal,
+                AuditOperation::Update,
+                outcome_for_error(&err),
+                Vec::new(),
+            )?;
+            return Err(err);
+        }
+    }
     if let Some(response) = handle_set_commit_extension_control(
         server,
         principal,
