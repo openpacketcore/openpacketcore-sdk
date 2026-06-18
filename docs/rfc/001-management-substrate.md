@@ -182,7 +182,7 @@ global bottleneck.
 ### 5.3 Commit Request
 
 ```rust
-pub struct CommitRequest {
+pub struct CommitRequest<C: OpcConfig> {
     pub request_id: RequestId,
     pub principal: TrustedPrincipal,
     pub transport: TransportType,
@@ -191,6 +191,9 @@ pub struct CommitRequest {
     pub mode: CommitMode,
     pub deadline: std::time::Instant,
     pub idempotency_key: Option<IdempotencyKey>,
+    pub base_version: ConfigVersion,
+    pub candidate: Option<C>,
+    pub changed_paths: Vec<YangPath>,
 }
 
 pub enum CommitMode {
@@ -203,6 +206,12 @@ pub enum CommitMode {
 
 `idempotency_key` SHOULD be supported for northbound clients that retry after
 `UNAVAILABLE`.
+
+Candidate-bearing requests MUST carry the running config `base_version` used to
+build the candidate. The ConfigBus worker MUST reject the request before
+validation or publication when that value no longer matches the current running
+version, so stale full-candidate writers cannot overwrite an intervening
+commit.
 
 ### 5.4 Commit Result
 
@@ -514,6 +523,7 @@ pub struct ConfigChange<C: OpcConfig> {
     pub previous: std::sync::Arc<C>,
     pub current: std::sync::Arc<C>,
     pub deltas: Vec<C::Delta>,
+    pub changed_paths: Vec<YangPath>,
 }
 ```
 

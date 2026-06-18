@@ -12,7 +12,9 @@
 //!   notification capabilities only when their CNF binding hooks are present.
 //! - Transport-neutral session handshake and RPC dispatch over an already
 //!   authenticated stream.
-//! - NETCONF-over-TLS TCP listener accept loop over `opc-mgmt-transport`.
+//! - NETCONF-over-TLS TCP listener accept loop over `opc-mgmt-transport`, with
+//!   bounded TLS handshake timeout and session-permit release for stalled
+//!   handshakes.
 //! - NETCONF-over-SSH TCP listener accept loop with caller-provisioned host
 //!   keys, exact public-key authorization, and `subsystem "netconf"` admission.
 //! - NETCONF-over-SSH Call Home loop that dials configured NMS endpoints with

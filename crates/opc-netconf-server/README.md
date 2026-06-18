@@ -16,7 +16,8 @@ The current slice is capability-gated and capability-honest:
 - Transport-neutral session handshake and RPC loop over an already-authenticated
   stream.
 - NETCONF-over-TLS TCP listener accept loop over `opc-mgmt-transport` TLS
-  bootstrap, with shutdown-aware accept stop and `max_sessions` enforcement.
+  bootstrap, with shutdown-aware accept stop, bounded TLS handshake timeout,
+  permit release for stalled handshakes, and `max_sessions` enforcement.
 - Optional `opc-runtime::Supervisor` task wrappers for the TLS and SSH
   listeners.
 - NETCONF-over-TLS principal extraction from verified rustls peer
