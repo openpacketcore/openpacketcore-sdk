@@ -65,8 +65,20 @@ where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
 {
-    /// Wraps a validated gNMI foundation handle in the generated service.
+    /// Wraps a validated gNMI foundation handle in the generated service and
+    /// requires every RPC to carry an authenticated transport principal.
     pub fn new(server: GnmiServer<C, B>) -> Self {
+        Self::new_authenticated(server)
+    }
+
+    /// Wraps a validated gNMI foundation handle without transport-principal
+    /// enforcement.
+    ///
+    /// This is intended only for crate-local tests and conformance fixtures that
+    /// exercise unauthenticated protocol behavior directly. Runtime listeners
+    /// and production CNFs must use [`Self::new`] or [`Self::new_authenticated`].
+    #[cfg(test)]
+    pub(crate) fn new_unauthenticated_dev_only(server: GnmiServer<C, B>) -> Self {
         Self {
             server: Arc::new(server),
             require_principal: false,
@@ -1062,7 +1074,7 @@ mod tests {
         );
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
-        let server = GnmiServer::new_with_arbitration(
+        let server = GnmiServer::new_with_arbitration_dev_only(
             TestBinding {
                 bus,
                 policy: Arc::new(FixedPolicy(allow_all_read_policy())),
@@ -1079,7 +1091,7 @@ mod tests {
         if authenticated {
             GnmiService::new_authenticated(server)
         } else {
-            GnmiService::new(server)
+            GnmiService::new_unauthenticated_dev_only(server)
         }
     }
 
@@ -1291,7 +1303,7 @@ mod tests {
     ) -> GnmiService<DemoConfig, TestBinding> {
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
-        let server = GnmiServer::new(
+        let server = GnmiServer::new_dev_only(
             TestBinding {
                 bus,
                 policy: Arc::new(FixedPolicy(policy)),
@@ -1800,7 +1812,7 @@ mod tests {
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
 
-        let err = match GnmiServer::new(
+        let err = match GnmiServer::new_dev_only(
             TestBinding {
                 bus,
                 policy: Arc::new(FixedPolicy(allow_all_read_policy())),
@@ -3677,7 +3689,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
-        let server = GnmiServer::new(
+        let server = GnmiServer::new_dev_only(
             TestBinding {
                 bus: Arc::clone(&bus),
                 policy: Arc::new(FixedPolicy(allow_all_read_policy())),

@@ -540,7 +540,7 @@ mod tests {
         );
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
-        GnmiServer::new(
+        GnmiServer::new_dev_only(
             TestBinding { bus },
             limits,
             profile,

@@ -109,11 +109,26 @@ where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
 {
-    /// Builds a proto-free gNMI foundation handle.
+    /// Builds a proto-free gNMI foundation handle with an explicit audit sink.
     ///
     /// Fails closed if limits are invalid, the schema registry self-check fails,
     /// or the capability profile would over-advertise unsupported behavior.
     pub fn new(
+        binding: B,
+        limits: MgmtLimits,
+        profile: CapabilityProfile,
+        extensions: ExtensionRegistry,
+        audit: Arc<dyn AuditSink>,
+    ) -> Result<Self, GnmiError> {
+        Self::new_with_audit(binding, limits, profile, extensions, audit)
+    }
+
+    /// Builds a proto-free gNMI foundation handle with the tracing audit sink.
+    ///
+    /// This constructor is intended for tests, conformance harnesses, and local
+    /// development only. Production CNFs should use [`Self::new`] or
+    /// [`Self::new_with_arbitration`] with a durable, tamper-evident audit sink.
+    pub fn new_dev_only(
         binding: B,
         limits: MgmtLimits,
         profile: CapabilityProfile,
@@ -130,8 +145,32 @@ where
     }
 
     /// Builds a gNMI foundation handle with explicit master-arbitration
-    /// behavior and the default tracing audit sink.
+    /// behavior and an explicit audit sink.
     pub fn new_with_arbitration(
+        binding: B,
+        limits: MgmtLimits,
+        profile: CapabilityProfile,
+        extensions: ExtensionRegistry,
+        arbitration: GnmiArbitrationConfig,
+        audit: Arc<dyn AuditSink>,
+    ) -> Result<Self, GnmiError> {
+        Self::new_with_audit_and_arbitration(
+            binding,
+            limits,
+            profile,
+            extensions,
+            arbitration,
+            audit,
+        )
+    }
+
+    /// Builds a gNMI foundation handle with explicit master-arbitration behavior
+    /// and the tracing audit sink.
+    ///
+    /// This constructor is intended for tests, conformance harnesses, and local
+    /// development only. Production CNFs should use [`Self::new_with_arbitration`]
+    /// with a durable, tamper-evident audit sink.
+    pub fn new_with_arbitration_dev_only(
         binding: B,
         limits: MgmtLimits,
         profile: CapabilityProfile,
@@ -149,10 +188,6 @@ where
     }
 
     /// Builds a proto-free gNMI foundation handle with an explicit audit sink.
-    ///
-    /// Production CNFs should pass a durable, tamper-evident sink. The default
-    /// [`Self::new`] constructor uses [`TracingAuditSink`] for compatibility and
-    /// development deployments.
     pub fn new_with_audit(
         binding: B,
         limits: MgmtLimits,
