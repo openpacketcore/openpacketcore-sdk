@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/openpacketcore/openpacketcore-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/openpacketcore/openpacketcore-sdk/actions/workflows/ci.yml)
 
-A robust, polyglot software development kit for building resilient, cloud-native 5G packet core network functions (CNFs). This SDK provides the standardized runtime chassis, quorum-replicated session storage, encrypted config persistence, data-governance/redaction boundary enforcement, and release-assurance evidence pipelines for packet core software with high-assurance deployment requirements.
+A robust, polyglot software development kit for building resilient, cloud-native 5G packet core network functions (CNFs). This SDK provides the standardized runtime chassis, quorum-replicated session storage, encrypted config persistence, northbound gNMI/NETCONF management-plane foundations, data-governance/redaction boundary enforcement, and release-assurance evidence pipelines for packet core software with high-assurance deployment requirements.
 
 The GTP-U user-plane codec is also applicable to LTE/EPC user plane. No EPC control-plane protocols (GTP-C, Diameter, S1AP) are provided.
 
@@ -34,6 +34,8 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | [`opc-proto-pfcp`](crates/opc-proto-pfcp/) | PFCP codec (TS 29.244): message layer, raw TLV preservation, and typed session-management IEs *(experimental)*. | — |
 | [`opc-proto-nas`](crates/opc-proto-nas/) | NAS-5GS (TS 24.501) codec: headers, body dispatch, mobile identity, BCD unpacking, Registration/Security Mode IEs, and NAS security hooks *(experimental)*. | — |
 | [`opc-proto-ngap`](crates/opc-proto-ngap/) | NGAP (TS 38.413) v0 decoder via `rasn` APER: PDU framing, fixture-proven NGSetupRequest, raw-preserving re-encode *(experimental v0)*. | [ADR 0013](docs/adr/0013-ngap-asn1-strategy.md) |
+| [`opc-sctp`](crates/opc-sctp/) | Safe Linux SCTP transport wrapper for CNFs that terminate N2/NGAP or other SCTP interfaces. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
+| [`opc-libsctp-sys`](crates/opc-libsctp-sys/) | Narrow unsafe Linux SCTP UAPI boundary used only by `opc-sctp`; unsupported platforms fail explicitly. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
 | [`opc-node-resources`](crates/opc-node-resources/) | Validates `ResourceProfile` compatibility against observed `NodeCapabilityReport`. | [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md) |
 
 ### Config & Management (`crates/`)
@@ -44,7 +46,18 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | [`opc-config-model`](crates/opc-config-model/) | Shared config-model request, result, identity, and error types. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-persist`](crates/opc-persist/) | Tamper-evident SQLite datastores, consensus config store membership, and fail-closed storage fault injection hooks. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-nacm`](crates/opc-nacm/) | Normalized YANG path parsing and NACM authorization evaluation. | [RFC 001](docs/rfc/001-management-substrate.md) |
-| [`opc-yanggen`](crates/opc-yanggen/) | YANG-to-Rust type projection, RFC 7951 JSON serde, iterative semantic constraint validation, and patch applicator. | [RFC 002](docs/rfc/002-yang-projection.md) |
+| [`opc-yanggen`](crates/opc-yanggen/) | YANG-to-Rust type projection, RFC 7951 JSON serde, schema registry generation, NETCONF XML/gNMI JSON projections, and patch applicators. | [RFC 002](docs/rfc/002-yang-projection.md) |
+| [`opc-mgmt-schema`](crates/opc-mgmt-schema/) | Runtime schema-registry contract consumed by generated CNF models and northbound servers. | [RFC 002](docs/rfc/002-yang-projection.md) |
+| [`opc-mgmt-path`](crates/opc-mgmt-path/) | Registry-validated YANG path normalization shared by gNMI, NETCONF, NACM, config commits, and audit. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-principal`](crates/opc-mgmt-principal/) | Converts transport-authenticated SPIFFE or SSH identities into grant-free config principals. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-authz`](crates/opc-mgmt-authz/) | Shared NACM authorization facade for reads, subscriptions, and management RPC/action execution. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-audit`](crates/opc-mgmt-audit/) | Management operation audit event model and pluggable audit sink for allowed, failed, and denied requests. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-errors`](crates/opc-mgmt-errors/) | Transport-neutral management status taxonomy and gNMI/NETCONF error mappings. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-limits`](crates/opc-mgmt-limits/) | Shared fail-closed input limits for management protocol parsers and sessions. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-opstate`](crates/opc-mgmt-opstate/) | CNF-supplied operational-state provider contract for gNMI `Get`/`Subscribe` and NETCONF `<get>`. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-transport`](crates/opc-mgmt-transport/) | Fail-closed mTLS and plaintext-policy bootstrap for management listeners. | [RFC 003](docs/rfc/003-security-substrate.md) |
+| [`opc-gnmi-server`](crates/opc-gnmi-server/) | Capability-honest gNMI server foundation with schema-backed Capabilities/Get/Set/Subscribe over SDK-managed mTLS. | [gNMI spec](docs/design/opc-gnmi-server-spec.md) |
+| [`opc-netconf-server`](crates/opc-netconf-server/) | Capability-gated NETCONF server core with SSH/TLS transports, datastore operations, NACM, audit, and bounded XML handling. | [RFC 001](docs/rfc/001-management-substrate.md) |
 
 ### Security & Identity (`crates/`)
 
@@ -157,26 +170,47 @@ git diff --check
 ### 3. Rust Clippy Linters
 Ensure the workspace is warning-free across all compilation targets and feature sets:
 ```bash
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ```
 
-### 4. Workspace Test Suite
+### 4. Management-Plane Policy Gates
+Ensure dependency-boundary, SCTP FFI, and generated-management policy checks pass:
+```bash
+python3 scripts/check-management-plane-policy.py --self-test
+python3 scripts/check-management-plane-policy.py --check
+```
+
+### 5. Workspace Test Suite
 Run all unit, integration, and chaos test suites:
 ```bash
-cargo test --workspace --all-features --quiet -- --test-threads=4
+cargo test --locked --workspace --exclude opc-persist --all-features --quiet -- --test-threads=4
+cargo test --locked -p opc-persist --all-features --quiet -- --test-threads=1
 ```
 
-### 5. Go Operator Tests
-Run reference operator unit and mock-client integration tests:
+### 6. Rust Documentation
+Build workspace documentation with warnings denied:
+```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+```
+
+### 7. Go Operator Tests
+Run reference operator and reusable Go operator SDK tests:
 ```bash
 cd operators/sdk-reference-operator
 go test ./...
+
+cd ../operator-sdk-go
+go test ./...
 ```
 
-### 6. Kubernetes Manifest Validation
-Compile and validate Kustomize reference manifests:
+### 8. Kubernetes Manifest Validation
+Compile Kustomize reference manifests and render the Helm chart in both cert-manager and manual-certificate modes:
 ```bash
 kubectl kustomize operators/sdk-reference-operator/config/default
+
+helm lint operators/helm/sdk-reference-operator/
+helm template sdk-ref operators/helm/sdk-reference-operator/ > /tmp/rendered-certmanager.yaml
+helm template sdk-ref operators/helm/sdk-reference-operator/ --set webhook.certMode=manual --set webhook.secretName=my-secret > /tmp/rendered-manual.yaml
 ```
 
 ---
