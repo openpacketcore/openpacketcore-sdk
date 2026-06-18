@@ -96,6 +96,12 @@ pub(crate) enum SetCommitExtension {
     Cancel,
 }
 
+impl SetCommitExtension {
+    pub(crate) const fn requires_arbitration(self) -> bool {
+        !matches!(self, Self::Normal)
+    }
+}
+
 pub(crate) fn parse_set_commit_extension(
     extensions: &[gnmi_ext::Extension],
 ) -> Result<SetCommitExtension, GnmiError> {

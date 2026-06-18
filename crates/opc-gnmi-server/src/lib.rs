@@ -187,6 +187,15 @@ where
             .map_err(|err| GnmiError::schema(format!("{err:?}")))?;
         profile.validate()?;
         extensions.validate()?;
+        if extensions
+            .advertised_ids()
+            .contains(&OPC_COMMIT_CONFIRMED_EXTENSION_ID)
+            && !arbitration.is_enabled()
+        {
+            return Err(GnmiError::unimplemented(
+                "OpenPacketCore commit-confirmed requires gNMI master arbitration",
+            ));
+        }
         Ok(Self {
             binding,
             limits,
