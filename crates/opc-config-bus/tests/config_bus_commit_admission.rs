@@ -172,6 +172,35 @@ async fn validation_failure_raises_warning_commit_alarm_and_success_clears_it() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_candidate_base_version_is_rejected_without_publish() {
+    let store = Arc::new(MockManagedDatastore::new());
+    let bus = ConfigBus::new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
+        .await
+        .expect("startup succeeds");
+
+    let stale_base = bus.version();
+    bus.submit(
+        commit_request("first", Instant::now() + Duration::from_secs(1))
+            .with_base_version(stale_base),
+    )
+    .await
+    .expect("first commit succeeds");
+
+    let err = bus
+        .submit(
+            commit_request("stale", Instant::now() + Duration::from_secs(1))
+                .with_base_version(stale_base),
+        )
+        .await
+        .expect_err("stale candidate should be rejected");
+
+    assert_eq!(err.code, CommitErrorCode::AdmissionRejected);
+    assert_eq!(bus.version(), ConfigVersion::new(1));
+    assert_eq!(bus.load().name, "first");
+    assert_eq!(store.history().await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn validate_only_success_clears_config_apply_commit_alarm() {
     let store = Arc::new(MockManagedDatastore::new());
     let alarms = SharedAlarmManager::default();
@@ -383,19 +412,23 @@ async fn queue_full_rejection_raises_warning_commit_alarm() {
         .expect("first commit succeeds");
     assert_eq!(first_result.new_version, Some(ConfigVersion::new(1)));
 
-    let queued_result = if second_rejected {
+    let queued_err = if second_rejected {
         third
             .await
             .expect("third submit task completed")
-            .expect("queued commit succeeds")
+            .expect_err("queued stale commit should be rejected")
     } else {
         second
             .await
             .expect("second submit task completed")
-            .expect("queued commit succeeds")
+            .expect_err("queued stale commit should be rejected")
     };
-    assert_eq!(queued_result.new_version, Some(ConfigVersion::new(2)));
-    assert_eq!(alarms.active_count(), 0);
+    assert_eq!(queued_err.code, CommitErrorCode::AdmissionRejected);
+    assert_eq!(bus.version(), ConfigVersion::new(1));
+    let stale_alarm = single_active_alarm(&alarms, "config-bus.commit.failure");
+    assert_eq!(stale_alarm.severity, Severity::Warning);
+    assert_eq!(stale_alarm.probable_cause, ProbableCause::ConfigApplyFailed);
+    assert_alarm_details_code(&stale_alarm, "admission_rejected");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

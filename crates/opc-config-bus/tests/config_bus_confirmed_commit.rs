@@ -44,19 +44,22 @@ async fn commit_confirmed_stores_deadline_and_publishes() {
     let subscriber = bus.subscribe(SubscriberLagPolicy::DropOldest, 1);
 
     let result = bus
-        .submit(CommitRequest::new(
-            RequestId::new(),
-            principal(),
-            TransportType::Internal,
-            RequestSource::Northbound,
-            ConfigOperation::Replace,
-            CommitMode::CommitConfirmed {
-                timeout: Duration::from_millis(200),
-            },
-            Instant::now() + Duration::from_secs(1),
-            Some(TestConfig::new("tentative")),
-            vec![changed_path()],
-        ))
+        .submit(
+            CommitRequest::new(
+                RequestId::new(),
+                principal(),
+                TransportType::Internal,
+                RequestSource::Northbound,
+                ConfigOperation::Replace,
+                CommitMode::CommitConfirmed {
+                    timeout: Duration::from_millis(200),
+                },
+                Instant::now() + Duration::from_secs(1),
+                Some(TestConfig::new("tentative")),
+                vec![changed_path()],
+            )
+            .with_base_version(bus.version()),
+        )
         .await
         .expect("commit-confirmed submission should succeed");
 
@@ -126,19 +129,22 @@ async fn commit_confirmed_update_while_pending_fails_closed() {
         .await
         .expect("startup succeeds");
 
-    bus.submit(CommitRequest::new(
-        RequestId::new(),
-        principal(),
-        TransportType::Internal,
-        RequestSource::Northbound,
-        ConfigOperation::Replace,
-        CommitMode::CommitConfirmed {
-            timeout: Duration::from_secs(60),
-        },
-        Instant::now() + Duration::from_secs(1),
-        Some(TestConfig::new("tentative")),
-        vec![changed_path()],
-    ))
+    bus.submit(
+        CommitRequest::new(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            CommitMode::CommitConfirmed {
+                timeout: Duration::from_secs(60),
+            },
+            Instant::now() + Duration::from_secs(1),
+            Some(TestConfig::new("tentative")),
+            vec![changed_path()],
+        )
+        .with_base_version(bus.version()),
+    )
     .await
     .expect("first commit-confirmed succeeds");
 
@@ -182,19 +188,22 @@ async fn commit_confirmed_explicit_confirm_prevents_rollback() {
         .expect("startup succeeds");
     let subscriber = bus.subscribe(SubscriberLagPolicy::DropOldest, 1);
 
-    bus.submit(CommitRequest::new(
-        RequestId::new(),
-        principal(),
-        TransportType::Internal,
-        RequestSource::Northbound,
-        ConfigOperation::Replace,
-        CommitMode::CommitConfirmed {
-            timeout: Duration::from_millis(100),
-        },
-        Instant::now() + Duration::from_secs(1),
-        Some(TestConfig::new("tentative")),
-        vec![changed_path()],
-    ))
+    bus.submit(
+        CommitRequest::new(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            CommitMode::CommitConfirmed {
+                timeout: Duration::from_millis(100),
+            },
+            Instant::now() + Duration::from_secs(1),
+            Some(TestConfig::new("tentative")),
+            vec![changed_path()],
+        )
+        .with_base_version(bus.version()),
+    )
     .await
     .expect("commit-confirmed succeeds");
 
@@ -248,19 +257,22 @@ async fn commit_confirmed_cancel_rolls_back_immediately() {
         .expect("startup succeeds");
     let subscriber = bus.subscribe(SubscriberLagPolicy::DropOldest, 5);
 
-    bus.submit(CommitRequest::new(
-        RequestId::new(),
-        principal(),
-        TransportType::Internal,
-        RequestSource::Northbound,
-        ConfigOperation::Replace,
-        CommitMode::CommitConfirmed {
-            timeout: Duration::from_secs(60),
-        },
-        Instant::now() + Duration::from_secs(1),
-        Some(TestConfig::new("tentative")),
-        vec![changed_path()],
-    ))
+    bus.submit(
+        CommitRequest::new(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            CommitMode::CommitConfirmed {
+                timeout: Duration::from_secs(60),
+            },
+            Instant::now() + Duration::from_secs(1),
+            Some(TestConfig::new("tentative")),
+            vec![changed_path()],
+        )
+        .with_base_version(bus.version()),
+    )
     .await
     .expect("commit-confirmed succeeds");
     let _ = subscriber.recv().await.expect("tentative event");
@@ -317,19 +329,22 @@ async fn commit_confirmed_expiry_rollback_restores_previous() {
         .expect("startup succeeds");
     let subscriber = bus.subscribe(SubscriberLagPolicy::DropOldest, 5);
 
-    bus.submit(CommitRequest::new(
-        RequestId::new(),
-        principal(),
-        TransportType::Internal,
-        RequestSource::Northbound,
-        ConfigOperation::Replace,
-        CommitMode::CommitConfirmed {
-            timeout: Duration::from_millis(50),
-        },
-        Instant::now() + Duration::from_secs(1),
-        Some(TestConfig::new("tentative")),
-        vec![changed_path()],
-    ))
+    bus.submit(
+        CommitRequest::new(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            CommitMode::CommitConfirmed {
+                timeout: Duration::from_millis(50),
+            },
+            Instant::now() + Duration::from_secs(1),
+            Some(TestConfig::new("tentative")),
+            vec![changed_path()],
+        )
+        .with_base_version(bus.version()),
+    )
     .await
     .expect("commit-confirmed succeeds");
 
@@ -426,19 +441,22 @@ async fn commit_confirmed_expiry_rollback_failure_fences_and_alarms() {
     .await
     .expect("startup succeeds");
 
-    bus.submit(CommitRequest::new(
-        RequestId::new(),
-        principal(),
-        TransportType::Internal,
-        RequestSource::Northbound,
-        ConfigOperation::Replace,
-        CommitMode::CommitConfirmed {
-            timeout: Duration::from_millis(50),
-        },
-        Instant::now() + Duration::from_secs(1),
-        Some(TestConfig::new("tentative")),
-        vec![changed_path()],
-    ))
+    bus.submit(
+        CommitRequest::new(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            CommitMode::CommitConfirmed {
+                timeout: Duration::from_millis(50),
+            },
+            Instant::now() + Duration::from_secs(1),
+            Some(TestConfig::new("tentative")),
+            vec![changed_path()],
+        )
+        .with_base_version(bus.version()),
+    )
     .await
     .expect("commit-confirmed succeeds");
 
@@ -507,19 +525,22 @@ async fn commit_confirmed_confirm_marker_failure_fences_after_append() {
         .await
         .expect("startup succeeds");
 
-    bus.submit(CommitRequest::new(
-        RequestId::new(),
-        principal(),
-        TransportType::Internal,
-        RequestSource::Northbound,
-        ConfigOperation::Replace,
-        CommitMode::CommitConfirmed {
-            timeout: Duration::from_secs(5),
-        },
-        Instant::now() + Duration::from_secs(1),
-        Some(TestConfig::new("tentative")),
-        vec![changed_path()],
-    ))
+    bus.submit(
+        CommitRequest::new(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            CommitMode::CommitConfirmed {
+                timeout: Duration::from_secs(5),
+            },
+            Instant::now() + Duration::from_secs(1),
+            Some(TestConfig::new("tentative")),
+            vec![changed_path()],
+        )
+        .with_base_version(bus.version()),
+    )
     .await
     .expect("commit-confirmed succeeds");
 

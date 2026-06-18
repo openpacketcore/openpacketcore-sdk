@@ -642,10 +642,12 @@ pub struct CommitRequest<C: OpcConfig> {
     pub mode: CommitMode,
     pub deadline: Instant,
     pub idempotency_key: Option<IdempotencyKey>,
-    /// Caller-asserted base version.
+    /// Caller-asserted running-config base version.
     ///
-    /// The config bus skeleton does not enforce optimistic concurrency yet; the
-    /// field is reserved for future compare-and-swap style commit admission.
+    /// Candidate-bearing requests are admitted only when this value matches the
+    /// worker's current running version. This compare-and-swap check prevents a
+    /// full candidate built from an older snapshot from overwriting intervening
+    /// commits.
     pub base_version: ConfigVersion,
     pub candidate: Option<C>,
     /// Caller-supplied changed-path hint.
