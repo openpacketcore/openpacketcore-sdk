@@ -176,7 +176,11 @@ pub fn send_msg(fd: BorrowedFd<'_>, payload: &[u8], info: SendInfo) -> io::Resul
         iov_base: payload.as_ptr().cast::<libc::c_void>().cast_mut(),
         iov_len: payload.len(),
     };
-    let control_len = libc::CMSG_SPACE(mem::size_of::<libc::sctp_sndinfo>() as libc::c_uint);
+    let control_len = {
+        // SAFETY: The argument is the size of the control-message payload type
+        // and the returned buffer size is used only for ancillary data allocation.
+        unsafe { libc::CMSG_SPACE(mem::size_of::<libc::sctp_sndinfo>() as libc::c_uint) }
+    };
     let mut control = vec![0_u8; control_len as usize];
     // SAFETY: Zeroed `msghdr` is initialized below before `sendmsg`.
     let mut header: libc::msghdr = unsafe { mem::zeroed() };
@@ -227,7 +231,11 @@ pub fn recv_msg(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<Received> {
         iov_base: buffer.as_mut_ptr().cast::<libc::c_void>(),
         iov_len: buffer.len(),
     };
-    let control_len = libc::CMSG_SPACE(mem::size_of::<libc::sctp_rcvinfo>() as libc::c_uint);
+    let control_len = {
+        // SAFETY: The argument is the size of the control-message payload type
+        // and the returned buffer size is used only for ancillary data allocation.
+        unsafe { libc::CMSG_SPACE(mem::size_of::<libc::sctp_rcvinfo>() as libc::c_uint) }
+    };
     let mut control = vec![0_u8; control_len as usize];
     // SAFETY: Zeroed `msghdr` is initialized below before `recvmsg`.
     let mut header: libc::msghdr = unsafe { mem::zeroed() };
