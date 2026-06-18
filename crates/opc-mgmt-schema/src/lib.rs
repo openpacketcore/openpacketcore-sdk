@@ -697,7 +697,7 @@ impl std::error::Error for NetconfProjectionError {}
 ///
 /// `opc-yanggen` emits an implementation of this trait for the generated root
 /// type. A CNF binding returns the renderer through
-/// [`opc_netconf_server::binding::NetconfConfigBinding::generated_xml_renderer`]
+/// `opc_netconf_server::binding::NetconfConfigBinding::generated_xml_renderer`
 /// so the server can render running config (and the config part of `<get>`)
 /// without hand-written XML projection.
 pub trait NetconfXmlRenderer<C: OpcConfig>: Send + Sync {
@@ -838,7 +838,7 @@ impl std::error::Error for NetconfEditError {}
 ///
 /// `opc-yanggen` emits an implementation of this trait for the generated root
 /// type. A CNF binding returns the applicator through
-/// [`opc_netconf_server::binding::NetconfConfigBinding::generated_xml_edit_applicator`]
+/// `opc_netconf_server::binding::NetconfConfigBinding::generated_xml_edit_applicator`
 /// so the server can apply running `<edit-config>` requests without a hand-written
 /// candidate builder.
 pub trait NetconfXmlEditApplicator<C: OpcConfig>: Send + Sync {

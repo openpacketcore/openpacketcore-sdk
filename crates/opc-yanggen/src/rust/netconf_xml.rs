@@ -1,6 +1,6 @@
 //! Generates a schema-backed NETCONF XML projection for read paths.
 //!
-//! The emitted module implements [`opc_mgmt_schema::NetconfXmlRenderer`] for the
+//! The emitted module implements `opc_mgmt_schema::NetconfXmlRenderer` for the
 //! generated root config type. It renders deterministic XML fragments for
 //! authorized schema-node paths, preserves YANG module prefixes and namespaces,
 //! escapes values at the XML boundary, omits unauthorized paths, and defers
