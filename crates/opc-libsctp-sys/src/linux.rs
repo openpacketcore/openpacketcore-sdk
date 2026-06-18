@@ -422,8 +422,8 @@ mod tests {
         assert_eq!(size_of::<libc::sctp_sndinfo>(), 16);
         assert_eq!(offset_of!(libc::sctp_rcvinfo, rcv_sid), 0);
         assert_eq!(offset_of!(libc::sctp_rcvinfo, rcv_ppid), 8);
-        assert_eq!(offset_of!(libc::sctp_rcvinfo, rcv_assoc_id), 28);
-        assert_eq!(size_of::<libc::sctp_rcvinfo>(), 32);
+        assert_eq!(offset_of!(libc::sctp_rcvinfo, rcv_assoc_id), 24);
+        assert_eq!(size_of::<libc::sctp_rcvinfo>(), 28);
         assert_eq!(size_of::<SctpEventSubscribe>(), 10);
         assert_eq!(align_of::<SctpEventSubscribe>(), 1);
     }
