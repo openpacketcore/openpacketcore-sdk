@@ -398,7 +398,7 @@ pub const fn code_from_status(status: opc_mgmt_errors::MgmtStatus) -> tonic::Cod
 #[allow(deprecated)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use opc_config_bus::{
@@ -769,6 +769,48 @@ mod tests {
         }
     }
 
+    struct BlockingOncePatcher {
+        blocked: AtomicBool,
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl BlockingOncePatcher {
+        fn new(
+            started: tokio::sync::oneshot::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        ) -> Self {
+            Self {
+                blocked: AtomicBool::new(false),
+                started: Mutex::new(Some(started)),
+                release: Mutex::new(Some(release)),
+            }
+        }
+    }
+
+    impl GnmiPatchApplicator<DemoConfig> for BlockingOncePatcher {
+        fn apply_set(
+            &self,
+            running: &DemoConfig,
+            set: &crate::NormalizedSet,
+        ) -> Result<DemoConfig, GnmiError> {
+            let candidate = UnitPatcher.apply_set(running, set)?;
+            if !self.blocked.swap(true, Ordering::SeqCst) {
+                if let Some(started) = self.started.lock().expect("started mutex").take() {
+                    let _ = started.send(());
+                }
+                let release = self
+                    .release
+                    .lock()
+                    .expect("release mutex")
+                    .take()
+                    .expect("release receiver present");
+                release.recv().expect("release stale Set");
+            }
+            Ok(candidate)
+        }
+    }
+
     fn apply_demo_value(
         candidate: &mut DemoConfig,
         path: &YangPath,
@@ -865,6 +907,7 @@ mod tests {
         policy: Arc<dyn PolicySource>,
         operational: Arc<dyn OperationalStateProvider>,
         events: Option<Arc<dyn OperationalEventSource>>,
+        patcher: Arc<dyn GnmiPatchApplicator<DemoConfig>>,
     }
 
     impl GnmiConfigBinding<DemoConfig> for TestBinding {
@@ -877,7 +920,7 @@ mod tests {
         }
 
         fn patcher(&self) -> Arc<dyn GnmiPatchApplicator<DemoConfig>> {
-            Arc::new(UnitPatcher)
+            Arc::clone(&self.patcher)
         }
 
         fn operational_state(&self) -> Arc<dyn OperationalStateProvider> {
@@ -933,6 +976,10 @@ mod tests {
 
     async fn service() -> GnmiService<DemoConfig, TestBinding> {
         service_with_authentication(false).await
+    }
+
+    fn unit_patcher() -> Arc<dyn GnmiPatchApplicator<DemoConfig>> {
+        Arc::new(UnitPatcher)
     }
 
     async fn authenticated_service() -> GnmiService<DemoConfig, TestBinding> {
@@ -1034,6 +1081,7 @@ mod tests {
                 policy: Arc::new(FixedPolicy(allow_all_read_policy())),
                 operational: Arc::new(TestOperationalState),
                 events: None,
+                patcher: unit_patcher(),
             },
             limits,
             profile,
@@ -1262,6 +1310,7 @@ mod tests {
                 policy: Arc::new(FixedPolicy(policy)),
                 operational: Arc::new(TestOperationalState),
                 events,
+                patcher: unit_patcher(),
             },
             limits,
             profile,
@@ -1343,6 +1392,7 @@ mod tests {
                 policy,
                 operational,
                 events,
+                patcher: unit_patcher(),
             },
             limits,
             profile,
@@ -3535,6 +3585,66 @@ mod tests {
 
         assert!(gnmi_rpc_request_count("Set", "success") > rpc_success_before);
         assert!(gnmi_set_commit_count("patch") > patch_commit_before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authenticated_set_rejects_stale_candidate_after_intervening_commit() {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
+                .await
+                .expect("bus"),
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let profile =
+            CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
+        let server = GnmiServer::new(
+            TestBinding {
+                bus: Arc::clone(&bus),
+                policy: Arc::new(FixedPolicy(allow_all_read_policy())),
+                operational: Arc::new(TestOperationalState),
+                events: None,
+                patcher: Arc::new(BlockingOncePatcher::new(started_tx, release_rx)),
+            },
+            MgmtLimits::default(),
+            profile,
+            ExtensionRegistry::default(),
+        )
+        .expect("server");
+        let service = Arc::new(GnmiService::new_authenticated(server));
+
+        let stale_service = Arc::clone(&service);
+        let stale = tokio::spawn(async move {
+            stale_service
+                .set(authenticated_set_request(hostname_set(
+                    "stale-candidate-host",
+                    Vec::new(),
+                )))
+                .await
+        });
+        started_rx.await.expect("first Set reached patcher");
+
+        service
+            .set(authenticated_set_request(hostname_set(
+                "intervening-host",
+                Vec::new(),
+            )))
+            .await
+            .expect("intervening Set commits");
+        release_tx.send(()).expect("release first Set");
+
+        let status = stale
+            .await
+            .expect("stale Set task completed")
+            .expect_err("stale Set should be rejected");
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(status.message(), "gNMI service unavailable");
+        assert!(!status.message().contains("stale-candidate-host"));
+        assert_eq!(bus.current_snapshot().config.hostname, "intervening-host");
+        assert_eq!(
+            bus.current_snapshot().version,
+            opc_types::ConfigVersion::new(1)
+        );
     }
 
     #[tokio::test]

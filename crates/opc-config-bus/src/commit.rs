@@ -50,6 +50,8 @@ const RECOVERY_RECONCILIATION_FAILED_MESSAGE: &str =
     "commit was published but the recovery marker could not be cleared durably";
 const PENDING_CONFIRMED_UPDATE_UNSUPPORTED_MESSAGE: &str =
     "commit-confirmed update while another confirmed commit is pending is not supported";
+const STALE_BASE_VERSION_MESSAGE: &str =
+    "commit base version does not match running config version";
 
 pub(crate) struct Submission<C: OpcConfig> {
     pub(crate) request: CommitRequest<C>,
@@ -489,6 +491,7 @@ async fn process_commit<C: OpcConfig>(
 
     match request.mode.clone() {
         CommitMode::ValidateOnly => {
+            ensure_candidate_base_version(&request, current.version)?;
             ensure_supported_validate_only_operation(request.operation)?;
             let candidate = request
                 .candidate
@@ -560,6 +563,8 @@ async fn process_commit<C: OpcConfig>(
                     ));
                 }
             }
+
+            ensure_candidate_base_version(&request, current.version)?;
 
             let apply_start = std::time::Instant::now();
             let previous = Arc::clone(&current.config);
@@ -679,6 +684,26 @@ async fn process_commit<C: OpcConfig>(
             })
         }
     }
+}
+
+fn ensure_candidate_base_version<C: OpcConfig>(
+    request: &CommitRequest<C>,
+    running_version: ConfigVersion,
+) -> Result<(), CommitError> {
+    let candidate_bearing_mode = matches!(
+        request.mode,
+        CommitMode::ValidateOnly | CommitMode::Commit | CommitMode::CommitConfirmed { .. }
+    );
+    if candidate_bearing_mode
+        && request.candidate.is_some()
+        && request.base_version != running_version
+    {
+        return Err(CommitError::new(
+            CommitErrorCode::AdmissionRejected,
+            STALE_BASE_VERSION_MESSAGE,
+        ));
+    }
+    Ok(())
 }
 
 async fn authorize_request<C: OpcConfig>(

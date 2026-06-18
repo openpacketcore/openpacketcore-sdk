@@ -157,16 +157,19 @@ fn test_provider() -> Arc<MemoryKeyProvider> {
 }
 
 async fn submit_commit(bus: &ConfigBus<TestConfig>, name: &str) -> opc_config_model::CommitResult {
-    bus.submit(CommitRequest::commit(
-        RequestId::new(),
-        principal(),
-        TransportType::Internal,
-        RequestSource::Northbound,
-        ConfigOperation::Replace,
-        TestConfig::new(name),
-        vec![YangPath::new("/system/hostname").expect("path")],
-        Instant::now() + Duration::from_secs(1),
-    ))
+    bus.submit(
+        CommitRequest::commit(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            TestConfig::new(name),
+            vec![YangPath::new("/system/hostname").expect("path")],
+            Instant::now() + Duration::from_secs(1),
+        )
+        .with_base_version(bus.version()),
+    )
     .await
     .expect("commit")
 }

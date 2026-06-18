@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use opc_config_bus::{ConfigBus, ConfigEvent, SubscriberLagPolicy};
+use opc_config_bus::{ConfigBus, ConfigEvent, ConfigSnapshot, SubscriberLagPolicy};
 use opc_types::ConfigVersion;
 
 mod config_bus_common;
@@ -16,10 +16,10 @@ async fn drop_oldest_lag_policy_stays_bounded() {
     let subscriber = bus.subscribe(SubscriberLagPolicy::DropOldest, 1);
 
     for name in ["v1", "v2", "v3"] {
-        bus.submit(commit_request(
-            name,
-            Instant::now() + Duration::from_secs(1),
-        ))
+        bus.submit(
+            commit_request(name, Instant::now() + Duration::from_secs(1))
+                .with_base_version(bus.version()),
+        )
         .await
         .expect("commit succeeds");
     }
@@ -42,16 +42,16 @@ async fn drop_newest_lag_policy_stays_bounded() {
         .expect("startup succeeds");
     let subscriber = bus.subscribe(SubscriberLagPolicy::DropNewest, 1);
 
-    bus.submit(commit_request(
-        "v1",
-        Instant::now() + Duration::from_secs(1),
-    ))
+    bus.submit(
+        commit_request("v1", Instant::now() + Duration::from_secs(1))
+            .with_base_version(bus.version()),
+    )
     .await
     .expect("first commit succeeds");
-    bus.submit(commit_request(
-        "v2",
-        Instant::now() + Duration::from_secs(1),
-    ))
+    bus.submit(
+        commit_request("v2", Instant::now() + Duration::from_secs(1))
+            .with_base_version(bus.version()),
+    )
     .await
     .expect("second commit succeeds");
 
@@ -74,16 +74,16 @@ async fn disconnect_on_lag_policy_closes_receiver() {
         .expect("startup succeeds");
     let subscriber = bus.subscribe(SubscriberLagPolicy::DisconnectOnLag, 1);
 
-    bus.submit(commit_request(
-        "v1",
-        Instant::now() + Duration::from_secs(1),
-    ))
+    bus.submit(
+        commit_request("v1", Instant::now() + Duration::from_secs(1))
+            .with_base_version(bus.version()),
+    )
     .await
     .expect("first commit succeeds");
-    bus.submit(commit_request(
-        "v2",
-        Instant::now() + Duration::from_secs(1),
-    ))
+    bus.submit(
+        commit_request("v2", Instant::now() + Duration::from_secs(1))
+            .with_base_version(bus.version()),
+    )
     .await
     .expect("second commit succeeds");
 
@@ -104,16 +104,16 @@ async fn force_resync_lag_policy_stays_bounded() {
         .expect("startup succeeds");
     let subscriber = bus.subscribe(SubscriberLagPolicy::ForceResync, 1);
 
-    bus.submit(commit_request(
-        "v1",
-        Instant::now() + Duration::from_secs(1),
-    ))
+    bus.submit(
+        commit_request("v1", Instant::now() + Duration::from_secs(1))
+            .with_base_version(bus.version()),
+    )
     .await
     .expect("first commit succeeds");
-    bus.submit(commit_request(
-        "v2",
-        Instant::now() + Duration::from_secs(1),
-    ))
+    bus.submit(
+        commit_request("v2", Instant::now() + Duration::from_secs(1))
+            .with_base_version(bus.version()),
+    )
     .await
     .expect("second commit succeeds");
 
