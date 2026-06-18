@@ -366,16 +366,15 @@ pub trait GnmiConfigBinding<C: OpcConfig>: Send + Sync {
     /// Renders the currently published running config as JSON/RFC 7951 gNMI
     /// updates for the authorized paths.
     ///
-    /// The default fails closed. CNFs should expose a generated renderer once
-    /// `opc-yanggen` emits a schema-aware gNMI JSON projection for their root
-    /// config type.
+    /// The default fails closed. CNFs should expose the schema-aware gNMI JSON
+    /// renderer generated for their root config type.
     fn render_running_json(
         &self,
         _config: &C,
         _selection: ReadSelection<'_>,
     ) -> Result<Vec<GnmiJsonUpdate>, GnmiJsonProjectionError> {
         Err(GnmiJsonProjectionError::projection(
-            "gNMI running JSON projection is not implemented",
+            "gNMI running JSON projection is not provided by this binding",
         ))
     }
 

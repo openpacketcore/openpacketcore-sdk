@@ -9,7 +9,8 @@ This document defines the conformance of the `opc-proto-nas` crate against
 - **Release**: Release 18 (R18)
 - **Status**: v2 — experimental; message framing, mobile identity, BCD,
   first-CNF body dispatch, selected 5GMM message bodies, and NAS security
-  helper hooks are structured. Procedure state machines remain out of scope.
+  helper hooks are structured. Procedure state machines are owned by consuming
+  NF crates.
 
 ## Supported Features
 
@@ -38,7 +39,8 @@ Decodes IE *content* (caller strips IEI/length framing):
 - **SUCI** (type 1): SUPI format 0 (IMSI) parsed into PLMN, routing
   indicator, protection scheme id, home network public key id, and scheme
   output; SUPI format 1 (NAI) kept raw; other formats preserved raw.
-  **SUCI de-concealment is explicitly out of scope.**
+  **SUCI de-concealment is a home-network key-management function, not a NAS
+  codec function.**
 - **5G-GUTI** (type 2): PLMN, AMF Region ID, AMF Set ID (10 bits),
   AMF Pointer (6 bits), 5G-TMSI; exact 11-octet length enforced.
 - **IMEI (3) / IMEISV (5)**: length-checked, odd/even digit indicator
@@ -104,7 +106,7 @@ Decodes IE *content* (caller strips IEI/length framing):
 - Unknown message type code points decode into `Unknown` raw-preserving body
   variants.
 
-## Out of Scope
+## Codec Boundary
 
 - NAS key derivation, key lifecycle, and concrete NIA1/2/3 or NEA1/2/3
   implementations. This crate validates `opc-key` session key handles and

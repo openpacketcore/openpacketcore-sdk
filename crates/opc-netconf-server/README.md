@@ -116,9 +116,9 @@ The current slice is capability-gated and capability-honest:
   accepts bounded `<create-subscription>`, authorizes through NACM `subscribe`,
   allows one active live subscription per session, subscribes to
   `opc-config-bus`, and emits schema-path-only RFC 6470-style config-change
-  events without config values. Replay, `stopTime`, and
-  notification filters are parsed within limits but rejected with
-  `operation-not-supported` until bounded replay/filter semantics exist.
+  events without config values. Replay, `stopTime`, and notification filters are
+  parsed within limits but are not advertised by this live-only notification
+  profile.
 - Read authorization through `opc-mgmt-authz`; if NACM denies every selected
   `<get-config>` or `<get>` data path, the server returns empty `<data/>`
   without calling the CNF config projection hook or operational-state provider.
@@ -152,18 +152,18 @@ out-of-range `<session-id>`. Custom transports that advertise a server
 `run_read_only_ssh_session_with_registry` for audited cross-session
 `<kill-session>` and datastore lock/write semantics.
 
-It still does not implement SSH host-key generation/storage/rotation, SSH
-certificate CA authorization, password authentication, TLS Call Home,
-NMS-profile-specific Call Home endpoint policy, notification replay or
-notification filters, full NMDA discovery/datastore mapping and origin
-metadata, a full RFC XPath instance evaluator or advertised `:xpath`, URL and
-inline-config copy/validate forms, `:rollback-on-error`, or a target NMS
-profile. NMDA `<edit-data>` is implemented only for running/candidate/startup
-config datastores when the same backing edit facades used by `<edit-config>`
-exist; unsupported datastore/URL forms fail closed. CNFs may use generated
-NETCONF XML projection/edit support for supported shapes, but unsupported YANG
-shapes remain fail-closed and model-specific bindings still own any
-projection/edit behavior outside the generated support matrix.
+This server profile expects deployments to provide SSH host-key
+generation/storage/rotation, SSH certificate CA authorization when used,
+NMS-specific Call Home endpoint policy, and any target NMS profile. Password
+authentication, TLS Call Home, notification replay/filtering, full NMDA intended
+datastore/origin semantics, a full RFC XPath instance evaluator or advertised
+`:xpath`, URL and inline-config copy/validate forms, and `:rollback-on-error`
+are not advertised by this profile. NMDA `<edit-data>` is supported only for
+running/candidate/startup config datastores when the same backing edit facades
+used by `<edit-config>` exist; unsupported datastore/URL forms fail closed. CNFs
+may use generated NETCONF XML projection/edit support for supported shapes, and
+model-specific bindings own projection/edit behavior outside the generated
+support matrix.
 
 ## External Interop
 

@@ -153,10 +153,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 LeafType::Decimal64 => Ok(Value::String(decimal64_value(value)?.to_string())),
                 LeafType::Empty => Ok(Value::Array(vec![Value::Null])),
                 LeafType::Custom { .. } => Err(GnmiError::unimplemented(
-                    "gNMI custom typedef Set codec is not implemented",
+                    "gNMI custom typedef Set codec is outside the generated profile",
                 )),
                 _ => Err(GnmiError::unimplemented(
-                    "gNMI Set codec is not implemented for this leaf type",
+                    "gNMI Set codec is outside the generated profile for this leaf type",
                 )),
             }
         }
@@ -181,10 +181,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     }
                 }
                 LeafType::Custom { .. } => Err(GnmiError::unimplemented(
-                    "gNMI custom typedef Set codec is not implemented",
+                    "gNMI custom typedef Set codec is outside the generated profile",
                 )),
                 _ => Err(GnmiError::unimplemented(
-                    "gNMI Set codec is not implemented for this leaf type",
+                    "gNMI Set codec is outside the generated profile for this leaf type",
                 )),
             }
         }

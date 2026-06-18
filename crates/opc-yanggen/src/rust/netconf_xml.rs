@@ -3,8 +3,8 @@
 //! The emitted module implements `opc_mgmt_schema::NetconfXmlRenderer` for the
 //! generated root config type. It renders deterministic XML fragments for
 //! authorized schema-node paths, preserves YANG module prefixes and namespaces,
-//! escapes values at the XML boundary, omits unauthorized paths, and defers
-//! shapes that cannot be rendered correctly in this slice (custom leaf types,
+//! escapes values at the XML boundary, omits unauthorized paths, and rejects
+//! shapes outside the generated renderer profile (custom leaf types,
 //! choice/case) with an explicit error.
 
 use super::{clean_segment, last_segment, to_pascal_case, to_snake_case, RustGenerationError};

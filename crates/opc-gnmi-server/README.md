@@ -27,8 +27,7 @@ the parts that are independent of full RPC behavior:
   required servers deny writes that omit it;
 - authenticated `Subscribe` for ONCE/POLL snapshots and STREAM sample/config
   on-change delivery. OpenConfig `History` replay is not advertised or
-  implemented; replay requests fail closed until a durable, bounded,
-  NACM-enforced history source is available.
+  implemented by this live/snapshot profile; replay requests fail closed.
 
 Current RPC behavior is intentionally capability-honest: `Capabilities` is
 served from the generated schema registry and can be exposed over the
@@ -37,21 +36,20 @@ read-only JSON/JSON_IETF reads when the binding supplies projection support.
 `Set` is implemented for generated config roots with explicit patch support.
 When the OpenPacketCore commit-confirmed extension is registered, `Set` supports
 begin/confirm/cancel and timeout only. Persist-token semantics are NETCONF-only
-until the config-bus model has a durable protocol-neutral token contract. `Set`
-can also be configured to advertise and enforce OpenConfig master-arbitration
-before candidate construction, patching, or commit-confirmed control.
+for this SDK boundary. `Set` can also be configured to advertise and enforce
+OpenConfig master-arbitration before candidate construction, patching, or
+commit-confirmed control.
 `Subscribe` supports JSON/JSON_IETF ONCE, POLL, STREAM SAMPLE, config
 ON_CHANGE, and operational ON_CHANGE when the binding supplies an event source;
-TARGET_DEFINED, aggregation, QoS marking, and history replay remain fail-closed
-until backed by SDK contracts and tests.
+TARGET_DEFINED, aggregation, QoS marking, and history replay are not advertised
+by this profile and fail closed.
 
 ## Encodings
 
 `Capabilities` advertises only `JSON_IETF` and `JSON`. `BYTES`, `ASCII`, and
 `PROTO` are intentionally not advertised and return fail-closed errors for
-`Get`, `Set`, and `Subscribe` until the SDK has schema-backed codecs and
-generated renderers for those formats. Generated renderers currently produce
-JSON/RFC 7951 payloads only.
+`Get`, `Set`, and `Subscribe`. Generated renderers produce JSON/RFC 7951
+payloads only.
 
 ## External Interop
 

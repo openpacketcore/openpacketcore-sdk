@@ -78,8 +78,8 @@ Reuse the established C NGAP implementations from srsRAN or OpenAirInterface.
 
 ### Option D: Hand-written subset
 
-Implement only NGSetupRequest/Response and InitialUEMessage by hand, deferring
-the rest.
+Implement only NGSetupRequest/Response and InitialUEMessage by hand and omit the
+rest.
 
 **Pros:** Zero new dependencies; full control over decode limits and fuzzing.
 **Cons:** Maintenance nightmare on every 3GPP release; no spec-traceability to
@@ -140,6 +140,6 @@ Consequences acted on:
 
 ## Evidence
 
-- Gap register updated: `GAP-PROTO-003` (NGAP codec) status changed from
-  `not-implemented` to `tracked-deferred`, target v0.3.0.
+- Gap register updated: `GAP-PROTO-003` now records the partially closed codec
+  boundary.
 - `docs/implementation-status.md` linked.

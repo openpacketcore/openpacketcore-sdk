@@ -1143,7 +1143,7 @@ where
         tracing::debug!(
             operation = operation.as_str(),
             error_tag = NetconfErrorTag::OperationNotSupported.as_str(),
-            "NETCONF operation is recognized but not implemented in this slice"
+            "NETCONF operation is recognized but outside the active server profile"
         );
         RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
             Some(message_id),

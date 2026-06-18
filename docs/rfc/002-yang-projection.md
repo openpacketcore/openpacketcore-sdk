@@ -30,7 +30,8 @@ differential tests against a reference YANG engine.
   `min-elements`, `max-elements`, `mandatory`, and defaults.
 - gNMI/NETCONF patch application metadata.
 - Secret/redaction metadata for RFC 001 and RFC 003.
-- Go/Kubernetes projection for operator-owned configuration roots.
+- Runtime schema metadata consumed by gNMI, NETCONF, NACM, audit, and operator
+  policy helpers.
 - Conformance tags for RFC 006.
 
 ### 2.2 Out of Scope
@@ -38,6 +39,8 @@ differential tests against a reference YANG engine.
 - Runtime session state schema. See RFC 004.
 - Protocol wire codecs. See RFC 005.
 - UI form generation.
+- Go/Kubernetes CRD generation. Product operators own their API shape and may
+  consume the generated Rust schema/policy metadata through RFC 009 helpers.
 - Support for proprietary YANG extensions unless explicitly registered in the
   extension registry defined here.
 
@@ -88,7 +91,6 @@ The code generator consumes:
 - A module lockfile containing exact module names, revisions, and checksums.
 - A generation profile.
 - Optional extension registry.
-- Optional projection map for Go/Kubernetes schemas.
 
 ### 4.2 Outputs
 
@@ -99,7 +101,6 @@ For each generation unit, the tool emits:
 - Path constants and path parser helpers.
 - Redaction and NACM metadata.
 - Property test fixtures.
-- Optional Go structs and CRD fragments for selected operator roots.
 - `schema-digest.json` for runtime compatibility checks.
 - `conformance-tags.json` for RFC 006.
 
@@ -140,12 +141,11 @@ that point back to the original YANG module and line.
 
 ### 5.3 Backend
 
-The backend emits Rust and optional Go. It MUST:
+The backend emits Rust and schema metadata. It MUST:
 
 - Sort emitted items deterministically.
 - Use stable generated filenames.
 - Run generated Rust through `rustfmt`.
-- Run generated Go through `gofmt`.
 - Fail generation if generated code does not compile.
 - Emit compile-time size checks.
 
@@ -451,30 +451,27 @@ Generated `Debug`, audit, telemetry, and error rendering MUST redact these
 values. Serialization for persistence may include encrypted secret values only
 through the RFC 001/RFC 003 envelope.
 
-## 14. Go and Kubernetes Projection
+## 14. Operator Schema Boundary
 
-The generator MUST support Go projection for selected operator-owned roots. It
-SHOULD NOT blindly emit Kubernetes CRDs for every generated internal Rust type.
+The generator MUST expose enough Rust schema metadata for operator policy code to
+validate compatibility, migrations, admission, and config-apply decisions without
+hand-maintained side schemas.
 
-The projection map defines:
+Generated schema metadata MUST include:
 
-- YANG root path.
-- Go package.
-- Kubernetes group, version, and kind.
-- Whether status subresources are emitted.
-- Which fields are operator-writable.
+- canonical YANG paths and module identity;
+- config/state classification;
+- list-key ordering;
+- NACM action mapping;
+- redaction data classes;
+- schema digest data for compatibility checks.
 
-Generated Go code MUST include:
-
-- JSON tags.
-- Deepcopy methods.
-- OpenAPI validation where representable.
-- Comments linking fields to YANG paths.
-- Conversion between Kubernetes types and RFC 7951 payloads.
-
-Projection MUST account for Kubernetes object size limits. Large NF configs
-SHOULD be split into multiple resources or referenced through ConfigMaps/Secrets
-where appropriate.
+The SDK does not generate Go structs or Kubernetes CRD fragments from
+`opc-yanggen`. Product operators own their Kubernetes API shape and may use the
+Rust `operator-lifecycle`, `operator-controller`, and `operator-lifecycle-cli`
+contracts to bridge those APIs into the SDK policy surface. Large NF configs are
+therefore split, referenced, or summarized by the product operator rather than by
+the YANG generator.
 
 ## 15. Schema Migration
 
@@ -598,6 +595,6 @@ This RFC is implemented when:
 4. Unsupported XPath/YANG constructs fail generation with diagnostics.
 5. Generated patch applicators support gNMI and NETCONF operation semantics.
 6. Secret metadata integrates with audit redaction and persistence.
-7. Go/Kubernetes projection works for selected operator roots and is not
-   emitted indiscriminately for every internal type.
+7. Operator policy helpers can consume generated schema metadata without a
+   hand-maintained side schema or generated Go/Kubernetes projection.
 8. Output is deterministic and suitable for parallel implementation.

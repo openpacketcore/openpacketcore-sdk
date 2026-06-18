@@ -37,7 +37,7 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
 - **Reason**: The crate strictly handles GTPv1-U which is standard for modern 3GPP LTE and 5G networks.
 
 ### 2. Control Plane GTP-C
-- **Description**: Crate is dedicated to the User Plane (GTP-U). GTP-C messages (TS 29.274) are out of scope.
+- **Description**: Crate is dedicated to the User Plane (GTP-U). GTP-C messages (TS 29.274) belong to a separate control-plane codec boundary.
 
 ---
 

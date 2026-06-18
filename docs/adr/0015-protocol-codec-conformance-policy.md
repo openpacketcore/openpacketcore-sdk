@@ -49,7 +49,8 @@ tests do not prove:
    (`BorrowDecode`/`OwnedDecode`/`Encode`) and carry `@spec`/`@req`
    traceability tags so RFC 006 evidence tooling can index them.
 7. **CONFORMANCE.md** enumerates exactly which messages, elements, and
-   fields are covered, at which 3GPP release, and what is out of scope.
+   fields are covered, at which 3GPP release, and what belongs outside the codec
+   boundary.
 
 ## Consequences
 

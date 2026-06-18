@@ -22,7 +22,7 @@ PFCP codec (3GPP TS 29.244) for the N4 reference point — **experimental**.
 
 Conformance is proven against hand-authored spec-byte fixtures citing
 TS 29.244 section numbers — see [CONFORMANCE.md](CONFORMANCE.md) for the
-exact coverage and out-of-scope list.
+exact coverage and codec boundary.
 
 ## Quick start
 

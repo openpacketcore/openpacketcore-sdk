@@ -13,10 +13,10 @@ Current support:
 - NGAP PPID helper for PPID 60 with explicit host/network byte-order handling.
 - Capability-honest unsupported-platform errors on non-Linux hosts.
 
-Current explicit deferrals:
+Current capability limits:
 
-- Multi-address bind/connect fails closed until a layout-backed
-  `sctp_bindx`/`sctp_connectx` helper boundary is added.
+- Multi-address bind/connect fails closed in this profile; callers must use a
+  single local and remote address per association.
 - Custom RTO and heartbeat options are represented in config but non-default
-  values fail closed until their Linux UAPI layouts are bound and tested.
+  values fail closed unless the Linux UAPI layouts are explicitly supported.
 - Live loopback tests are ignored unless run on a host with kernel SCTP support.

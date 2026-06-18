@@ -19,9 +19,10 @@
 | `ConditionEventType` | 5.2.2.2.10 | generated | `NF_ADDED`, `NF_REMOVED`. |
 | `NotifCondition` | 5.2.2.2.11 | generated | `monitoredAttributes` / `unmonitoredAttributes` condition for notifications. |
 
-## Out of Scope
+## Boundary
 
-- Client/server stubs (path/operation generation) — deferred to a follow-up pilot.
+- Client/server stubs and path/operation generation are owned by `opc-sbi` and
+  consuming NF crates, not by this generated payload-type crate.
 - Full TS 29.510 operation surface (registration, deregistration, heartbeat, discovery) beyond payload types.
 - Polymorphic `oneOf` types that require manual enum design (mapped to `serde_json::Value` for now).
 - `additionalProperties` maps with complex value types (mapped to `HashMap<String, serde_json::Value>`).

@@ -386,7 +386,9 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         selection: ReadSelection<'_>,
     ) -> Result<String, BindingError> {
         let renderer = self.generated_xml_renderer().ok_or_else(|| {
-            BindingError::projection("NETCONF running XML projection is not implemented")
+            BindingError::projection(
+                "NETCONF running XML projection is not provided by this binding",
+            )
         })?;
         renderer
             .render_running_config(config, selection.schema_paths(), DefaultReport::Trim)
@@ -464,7 +466,9 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         mode: WithDefaultsMode,
     ) -> Result<String, BindingError> {
         let renderer = self.generated_xml_renderer().ok_or_else(|| {
-            BindingError::projection("NETCONF with-defaults running projection is not implemented")
+            BindingError::projection(
+                "NETCONF with-defaults running projection is not provided by this binding",
+            )
         })?;
         let report = with_defaults_mode_to_report(mode)?;
         if !renderer.supported_default_reports().contains(&report) {
@@ -517,7 +521,7 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
             );
         } else if !operational.values.is_empty() {
             return Err(BindingError::projection(
-                "NETCONF operational XML projection is not implemented",
+                "NETCONF operational XML projection is not provided by this binding",
             ));
         }
         out.push_str(&render_operational_xml(
@@ -543,7 +547,9 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         mode: WithDefaultsMode,
     ) -> Result<String, BindingError> {
         let renderer = self.generated_xml_renderer().ok_or_else(|| {
-            BindingError::projection("NETCONF with-defaults data projection is not implemented")
+            BindingError::projection(
+                "NETCONF with-defaults data projection is not provided by this binding",
+            )
         })?;
         let report = with_defaults_mode_to_report(mode)?;
         if !renderer.supported_default_reports().contains(&report) {

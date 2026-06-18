@@ -26,8 +26,8 @@
 //!   certificates.
 //! - NETCONF-over-SSH authenticated-channel helpers that require
 //!   `TransportType::NetconfSsh` and an `AuthStrength::SshPublicKey` principal.
-//!   Host-key generation/storage/rotation and SSH certificate CA policy remain
-//!   future work.
+//!   Host-key generation/storage/rotation and SSH certificate CA policy are
+//!   deployment-owned inputs to this server profile.
 //! - Bounded XML parsing for client `<hello>` and RPC envelopes, including
 //!   fail-closed rejection of missing, empty, or duplicate client hello
 //!   capability containers, bounded XPath filter `select` expressions, plus

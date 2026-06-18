@@ -22,7 +22,7 @@ impl ProtocolVersion {
 /// Validation strictness level.
 ///
 /// Data-plane fast paths SHOULD use the minimum level needed for safe routing
-/// and defer expensive semantic validation to control-plane paths where
+/// and leave expensive semantic validation to control-plane paths where
 /// appropriate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ValidationLevel {

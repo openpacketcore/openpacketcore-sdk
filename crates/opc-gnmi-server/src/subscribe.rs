@@ -673,12 +673,12 @@ impl SubscribePlan {
             .map_err(GnmiError::from_limits)?;
         if list.qos.is_some() {
             return Err(GnmiError::unimplemented(
-                "gNMI Subscribe QoS marking is not implemented",
+                "gNMI Subscribe QoS marking is not supported by this profile",
             ));
         }
         if list.allow_aggregation {
             return Err(GnmiError::unimplemented(
-                "gNMI Subscribe aggregation is not implemented",
+                "gNMI Subscribe aggregation is not supported by this profile",
             ));
         }
         let encoding = encoding_from_proto(list.encoding)?;
@@ -811,7 +811,7 @@ where
             }
             Ok(gnmi::SubscriptionMode::TargetDefined) => {
                 return Err(GnmiError::unimplemented(
-                    "gNMI TARGET_DEFINED subscriptions are not implemented",
+                    "gNMI TARGET_DEFINED subscriptions are not supported by this profile",
                 ));
             }
             Err(_) => return Err(GnmiError::invalid("unknown gNMI subscription mode")),

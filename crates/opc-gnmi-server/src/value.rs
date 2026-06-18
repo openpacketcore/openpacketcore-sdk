@@ -25,14 +25,14 @@ pub enum TypedValue {
     Float(f32),
     /// `double_val`.
     Double(f64),
-    /// `leaflist_val` / nested scalar values are intentionally deferred.
+    /// `leaflist_val` / nested scalar values are outside the scalar
+    /// normalization profile.
     LeafList,
     /// `bytes_val` is not a schema-safe global encoding yet.
     Bytes(Vec<u8>),
     /// `ascii_val` is not a schema-safe global encoding yet.
     Ascii(String),
-    /// `proto_bytes` is not implemented until per-model protobuf descriptors
-    /// exist.
+    /// `proto_bytes` is outside the JSON/RFC 7951 renderer profile.
     Proto(Vec<u8>),
 }
 
@@ -114,7 +114,7 @@ pub fn normalize_typed_value(
         TypedValue::Float(value) => finite_float_to_normalized(*value as f64, limits),
         TypedValue::Double(value) => finite_float_to_normalized(*value, limits),
         TypedValue::LeafList => Err(GnmiError::unimplemented(
-            "gNMI leaf-list TypedValue normalization is not implemented",
+            "gNMI leaf-list TypedValue normalization is not supported by this profile",
         )),
         TypedValue::Bytes(_) => Err(GnmiError::from(Encoding::Bytes)),
         TypedValue::Ascii(_) => Err(GnmiError::from(Encoding::Ascii)),
