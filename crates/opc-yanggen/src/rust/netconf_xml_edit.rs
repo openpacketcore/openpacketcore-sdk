@@ -1,7 +1,7 @@
 //! Generates a schema-backed NETCONF `<edit-config>` applicator for write paths.
 //!
-//! The emitted module implements [`opc_mgmt_schema::NetconfXmlEditApplicator`] for
-//! the generated root config type. It applies a normalized [`EditConfigNode`]
+//! The emitted module implements `opc_mgmt_schema::NetconfXmlEditApplicator` for
+//! the generated root config type. It applies a normalized `EditConfigNode`
 //! tree produced by the server-side XML parser to a clone of the running config
 //! and returns the full candidate. It is fail-closed for shapes whose edit
 //! semantics are ambiguous in this slice (leaf-lists, keyless lists, custom

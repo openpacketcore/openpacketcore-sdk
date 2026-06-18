@@ -1,6 +1,6 @@
 //! Generates a schema-backed gNMI JSON/RFC 7951 projection for read paths.
 //!
-//! The emitted module implements [`opc_gnmi_server::GnmiJsonRenderer`] for the
+//! The emitted module implements `opc_gnmi_server::GnmiJsonRenderer` for the
 //! generated root config type. It renders deterministic gNMI updates for
 //! authorized canonical paths, preserves YANG module prefixes in update paths,
 //! redacts non-cleartext data classes at the JSON boundary, and fails closed for

@@ -19,8 +19,8 @@ webhooks:
       name: {{ include "sdk-reference-operator.fullname" . }}-webhook-service
       namespace: {{ .Release.Namespace }}
       path: /validate-reference-openpacketcore-io-v1beta1-sdkmanagednetworkfunction
-    {{- if eq .Values.webhook.certMode "manual" }}
-    caBundle: {{ required "webhook.caBundle must be set when webhook.certMode=manual" .Values.webhook.caBundle | quote }}
+    {{- if and (eq .Values.webhook.certMode "manual") .Values.webhook.caBundle }}
+    caBundle: {{ .Values.webhook.caBundle | quote }}
     {{- end }}
   failurePolicy: Fail
   name: vsdkmanagednetworkfunction.reference.openpacketcore.io
