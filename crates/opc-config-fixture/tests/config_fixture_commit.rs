@@ -276,16 +276,19 @@ async fn toy_config_commit() {
     let secret_paths = deltas_to_changed_paths(secret_candidate.applied_deltas().unwrap_or(&[]));
 
     let secret_result = bus2
-        .submit(CommitRequest::commit(
-            RequestId::new(),
-            principal(), // no security-admin
-            TransportType::Internal,
-            RequestSource::Northbound,
-            ConfigOperation::Replace,
-            secret_candidate,
-            secret_paths,
-            Instant::now() + Duration::from_secs(5),
-        ))
+        .submit(
+            CommitRequest::commit(
+                RequestId::new(),
+                principal(), // no security-admin
+                TransportType::Internal,
+                RequestSource::Northbound,
+                ConfigOperation::Replace,
+                secret_candidate,
+                secret_paths,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .with_base_version(bus2.version()),
+        )
         .await;
 
     assert!(
@@ -310,16 +313,19 @@ async fn toy_config_commit() {
     let admin_paths = deltas_to_changed_paths(admin_candidate.applied_deltas().unwrap_or(&[]));
 
     let admin_result = bus2
-        .submit(CommitRequest::commit(
-            RequestId::new(),
-            security_admin_principal(),
-            TransportType::Internal,
-            RequestSource::Northbound,
-            ConfigOperation::Replace,
-            admin_candidate,
-            admin_paths,
-            Instant::now() + Duration::from_secs(5),
-        ))
+        .submit(
+            CommitRequest::commit(
+                RequestId::new(),
+                security_admin_principal(),
+                TransportType::Internal,
+                RequestSource::Northbound,
+                ConfigOperation::Replace,
+                admin_candidate,
+                admin_paths,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .with_base_version(bus2.version()),
+        )
         .await
         .expect("security-admin secret write succeeds");
 
@@ -358,16 +364,19 @@ async fn toy_config_commit() {
     let bypass_paths = deltas_to_changed_paths(cloned.applied_deltas().unwrap_or(&[]));
 
     let bypass_result = bus2
-        .submit(CommitRequest::commit(
-            RequestId::new(),
-            principal(), // no security-admin
-            TransportType::Internal,
-            RequestSource::Northbound,
-            ConfigOperation::Replace,
-            cloned,
-            bypass_paths,
-            Instant::now() + Duration::from_secs(5),
-        ))
+        .submit(
+            CommitRequest::commit(
+                RequestId::new(),
+                principal(), // no security-admin
+                TransportType::Internal,
+                RequestSource::Northbound,
+                ConfigOperation::Replace,
+                cloned,
+                bypass_paths,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .with_base_version(bus2.version()),
+        )
         .await;
 
     assert!(
