@@ -33,6 +33,8 @@ use crate::transport::{run_read_only_tls_session_with_registry, TlsSessionError}
 pub struct TlsListenerConfig {
     /// Per-session protocol bounds and frame timeout.
     pub session: SessionConfig,
+    /// Maximum time allowed for one TLS handshake.
+    pub handshake_timeout: Duration,
     /// First NETCONF session id assigned by this listener instance.
     pub first_session_id: u64,
     /// Maximum time to wait for in-flight sessions after shutdown begins.
@@ -43,6 +45,7 @@ impl Default for TlsListenerConfig {
     fn default() -> Self {
         Self {
             session: SessionConfig::default(),
+            handshake_timeout: Duration::from_secs(10),
             first_session_id: 1,
             drain_timeout: Duration::from_secs(30),
         }
@@ -84,6 +87,8 @@ pub enum TlsListenerError {
 enum WorkerError {
     #[error("NETCONF TLS accept failed")]
     TlsAccept(#[source] std::io::Error),
+    #[error("NETCONF TLS handshake timed out")]
+    TlsHandshakeTimeout,
     #[error(transparent)]
     Session(#[from] TlsSessionError),
 }
@@ -173,6 +178,7 @@ where
                 let acceptor = acceptor.clone();
                 let identity_rx = identity_rx.clone();
                 let session_config = config.session;
+                let handshake_timeout = config.handshake_timeout;
                 let session_registry = session_registry.clone();
                 let Some(session_id) = allocate_session_id(&next_session_id) else {
                     result.rejected_sessions = result.rejected_sessions.saturating_add(1);
@@ -187,9 +193,12 @@ where
                 workers.spawn(async move {
                     let _permit = permit;
                     let _active_session = active_session(TRANSPORT_NETCONF_TLS);
-                    let mut stream = acceptor
-                        .accept(stream)
+                    let mut stream = tokio::time::timeout(
+                        handshake_timeout,
+                        acceptor.accept(stream),
+                    )
                         .await
+                        .map_err(|_| WorkerError::TlsHandshakeTimeout)?
                         .map_err(WorkerError::TlsAccept)?;
                     run_read_only_tls_session_with_registry(
                         server.as_ref(),
