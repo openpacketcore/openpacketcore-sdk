@@ -180,7 +180,7 @@ pub struct OriginEntry {
 pub enum ModuleConformance {
     /// The module is implemented by the server.
     Implement,
-    /// The module is imported only (not implemented).
+    /// The module is imported only.
     Import,
 }
 
@@ -649,7 +649,7 @@ pub enum NetconfProjectionError {
         /// Kind of node that is not supported.
         kind: NodeKind,
     },
-    /// A requested with-defaults report mode is not implemented.
+    /// A requested with-defaults report mode is outside the renderer profile.
     UnsupportedDefaultReport {
         /// The requested report mode.
         report: DefaultReport,

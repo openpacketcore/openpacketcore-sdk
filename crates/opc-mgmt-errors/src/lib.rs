@@ -41,7 +41,7 @@ pub enum MgmtStatus {
     PermissionDenied,
     /// No valid transport authentication.
     Unauthenticated,
-    /// Capability/encoding/operation not implemented.
+    /// Capability/encoding/operation outside the advertised profile.
     Unimplemented,
     /// Transient backend unavailability (queue full, rollback target pending).
     Unavailable,

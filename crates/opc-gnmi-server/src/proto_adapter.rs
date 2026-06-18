@@ -76,10 +76,10 @@ pub fn typed_value_from_proto(value: &gnmi::TypedValue) -> Result<TypedValue, Gn
 
 /// Converts a generated gNMI extension into the crate's extension policy input.
 ///
-/// OpenConfig `gnmi_ext.Extension` does not carry a generic criticality bit. For
-/// this skeleton, registered extensions are treated as critical because the
-/// server has no per-extension semantics yet; well-known master-arbitration and
-/// history extensions are rejected before request handling.
+/// OpenConfig `gnmi_ext.Extension` does not carry a generic criticality bit.
+/// Registered extensions are treated as critical. Native OpenConfig
+/// master-arbitration and history extensions are handled by the service profile,
+/// not by this generic registered-extension adapter.
 pub fn extension_from_proto(extension: &gnmi_ext::Extension) -> Result<Extension, GnmiError> {
     use gnmi_ext::extension::Ext;
     match extension.ext.as_ref() {
@@ -89,10 +89,10 @@ pub fn extension_from_proto(extension: &gnmi_ext::Extension) -> Result<Extension
             Ok(Extension::new(id, true, ext.msg.clone()))
         }
         Some(Ext::MasterArbitration(_)) => Err(GnmiError::unimplemented(
-            "gNMI master-arbitration extension is not implemented",
+            "native gNMI master-arbitration is not supported by this adapter",
         )),
         Some(Ext::History(_)) => Err(GnmiError::unimplemented(
-            "gNMI history extension is not implemented",
+            "gNMI history extension is not supported by this profile",
         )),
         None => Err(GnmiError::invalid("gNMI extension is empty")),
     }

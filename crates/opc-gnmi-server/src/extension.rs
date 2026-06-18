@@ -121,7 +121,7 @@ impl ExtensionRegistry {
                 && !crate::confirmed_commit::is_implemented_extension(ext.id(), ext.name())
             {
                 return Err(GnmiError::unimplemented(format!(
-                    "gNMI extension {} is registered but not implemented end to end",
+                    "gNMI extension {} is registered but not supported end to end",
                     ext.name()
                 )));
             }

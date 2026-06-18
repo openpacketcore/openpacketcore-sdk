@@ -150,8 +150,7 @@ pub enum RpcOperation {
     GetSchema(GetSchemaRequest),
     /// RFC 5277 `<create-subscription>`.
     CreateSubscription(CreateSubscriptionRequest),
-    /// A known NETCONF operation that this read-only slice deliberately does
-    /// not implement yet.
+    /// A known NETCONF operation that is outside the active server profile.
     Unsupported(UnsupportedOperation),
 }
 
@@ -162,9 +161,9 @@ pub struct CreateSubscriptionRequest {
     pub stream: Option<String>,
     /// Whether a notification filter element was supplied.
     pub filter_present: bool,
-    /// Optional replay start time. Unsupported until replay storage exists.
+    /// Optional replay start time. Outside the live-only notification profile.
     pub start_time: Option<String>,
-    /// Optional replay stop time. Unsupported until replay storage exists.
+    /// Optional replay stop time. Outside the live-only notification profile.
     pub stop_time: Option<String>,
 }
 
@@ -500,9 +499,9 @@ impl EditErrorOption {
 pub enum Datastore {
     /// `running`, backed today by `ConfigBus::current_snapshot()`.
     Running,
-    /// `candidate`, not implemented in this slice.
+    /// `candidate`, available only when the binding advertises candidate support.
     Candidate,
-    /// `startup`, not implemented in this slice.
+    /// `startup`, available only when the binding advertises startup support.
     Startup,
 }
 
@@ -3838,7 +3837,7 @@ mod tests {
             &rpc("<validate><source><config><sys:system xmlns:sys=\"urn:opc:demo\"/></config></source></validate>"),
             &MgmtLimits::default(),
         )
-        .expect_err("inline config validate not implemented");
+        .expect_err("inline config validate is outside the active profile");
         assert_eq!(inline_config, XmlError::Malformed);
     }
 

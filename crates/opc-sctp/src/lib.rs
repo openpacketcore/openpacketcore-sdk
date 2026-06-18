@@ -279,7 +279,7 @@ pub enum SctpError {
     /// SCTP is available only on Linux in this crate.
     #[error("SCTP transport is supported only on Linux")]
     UnsupportedPlatform,
-    /// A requested SCTP feature is not implemented by this capability profile.
+    /// A requested SCTP feature is outside this capability profile.
     #[error("SCTP feature is unsupported: {feature}")]
     UnsupportedFeature {
         /// Stable feature label.

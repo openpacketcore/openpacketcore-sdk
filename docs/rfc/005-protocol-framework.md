@@ -293,7 +293,7 @@ pub enum ValidationLevel {
 - `ProcedureAware`: call NF-specific semantic validators.
 
 Data-plane fast paths SHOULD use the minimum level needed for safe routing and
-defer expensive semantic validation to control-plane paths where appropriate.
+leave expensive semantic validation to control-plane paths where appropriate.
 
 ## 11. Unknown and Duplicate Elements
 

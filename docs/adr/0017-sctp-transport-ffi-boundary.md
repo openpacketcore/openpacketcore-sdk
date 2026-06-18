@@ -52,7 +52,7 @@ The distinction is decisive:
   retransmission, multihoming, chunk bundling) and is *more* likely to harbor
   exploitable bugs than thin syscall FFI over the hardened kernel stack; no
   maintained pure-Rust SCTP stack exists to adopt.
-- **C. Defer SCTP.** Ship no SCTP transport. Acceptable only if the first
+- **C. Omit SCTP from the SDK.** Ship no SCTP transport. Acceptable only if the first
   production CNF does not terminate N2/NGAP or any SCTP interface; it blocks
   N2-terminating CNFs.
 
@@ -92,10 +92,9 @@ scope:
    UAPI. FFI that links a foreign **C protocol codec** (parsing
    attacker-controlled bytes — NGAP/NAS/etc.) remains rejected; those stay
    pure-Rust per ADR 0013/0015.
-6. If the first production CNF does not terminate SCTP, implementation may be
-   deferred (Option C); when it is built, it is built per Option A behind this
-   boundary, never as scattered `unsafe` and never as a userspace reimplementation
-   without revisiting this ADR.
+6. SCTP is implemented per Option A behind this boundary, never as scattered
+   `unsafe` and never as a userspace reimplementation without revisiting this
+   ADR.
 
 ## Consequences
 
@@ -106,7 +105,6 @@ scope:
 - The CI gate from point 3 exists, mirroring the "policy must be mechanically
   enforced" lesson of ADR 0014.
 - `opc-sctp` uses the non-inheritance mechanism and `AsyncFd` model described
-  by this ADR. Its README and tests record the current capability profile and
-  explicit deferrals.
+  by this ADR. Its README and tests record the current capability profile.
 - NGAP-over-SCTP wiring (PPID 60) is separate integration work and is not
   authorized to use FFI for the NGAP codec itself.

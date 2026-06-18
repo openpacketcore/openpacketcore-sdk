@@ -40,10 +40,9 @@ applied to the first-CNF N2 subset above.
   error.
   `rasn` 0.28's APER encoder does not reproduce the octet alignment of the
   external fixtures for the inner message types (and its output for those
-  types does not survive its own decoder), so constructing new NGAP
-  messages from typed values is out of scope until that is resolved upstream
-  or replaced. Raw-preserving encode also rejects PDUs without decoded raw
-  bytes.
+  types does not survive its own decoder), so this codec profile preserves raw
+  bytes instead of constructing new NGAP messages from typed values.
+  Raw-preserving encode also rejects PDUs without decoded raw bytes.
 
 ## Fixtures
 
@@ -70,7 +69,7 @@ preallocates from a wire-declared length. Three layers guard it:
 - **Verification** — a deep `cargo-fuzz` pass over the decoder completed ~26M
   executions with no crash, leak, or OOM.
 
-## Out of scope (v1 subset)
+## Codec Boundary (v1 subset)
 
 - Canonical (typed) encoding of any message.
 - External field-level fixtures for the structural typed-dispatch subset above.

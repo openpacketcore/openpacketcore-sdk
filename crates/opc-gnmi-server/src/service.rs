@@ -1,4 +1,4 @@
-//! Generated gNMI service skeleton.
+//! Generated gNMI service implementation.
 
 use std::{pin::Pin, sync::Arc};
 
@@ -347,7 +347,7 @@ pub(crate) fn validate_extensions_for_operation(
             Some(gnmi_ext::extension::Ext::History(_)) => {
                 record_extension("history", ExtensionMetricOutcome::Rejected);
                 return Err(GnmiError::unimplemented(
-                    "gNMI history extension is not implemented",
+                    "gNMI history extension is not supported by this profile",
                 ));
             }
             None => return Err(GnmiError::invalid("gNMI extension is empty")),

@@ -28,8 +28,8 @@ The final pass ran after these hardening seams closed:
 - **Runtime Drain Visibility** — drain hook timeouts and returned hook errors
   raise drain-incomplete alarms, and production AMF/SMF/UPF profiles require
   the NRF drain hook unless explicitly changed by carrier integration.
-- `T-bdfee7cb` — the remaining cross-epic seam bucket is resolved or explicitly
-  deferred in the gap registry.
+- `T-bdfee7cb` — the remaining cross-epic seam bucket is resolved or recorded as
+  an explicit SDK/profile boundary in the status matrix.
 
 Validation commands for this pass:
 
@@ -248,16 +248,13 @@ Furthermore, the SDK provides procedure-faithful peer simulators, reusable testk
 
 The first in-tree NF proof is `opc-amf-lite`, an AMF-oriented N2/N1 control-plane
 slice. IKEv2/IPsec, ESP/xfrm orchestration, and N3IWF/NWu procedure crates are
-therefore not required for this first-NF readiness boundary. They remain future
-work for a selected ePDG, N3IWF, or other untrusted-access/IPsec product target;
-until then, `IpsecGateway` in `opc-node-resources` is only a resource/admission
-profile and not a claim of protocol implementation.
+not part of this SDK foundation boundary. `IpsecGateway` in
+`opc-node-resources` is a resource/admission profile, not a claim that this
+repository implements an untrusted-access/IPsec product stack.
 
-Likewise, AF_XDP is not required for the AMF-lite first-NF readiness boundary.
-`AfXdpFastPath` in `opc-node-resources` models node/resource admission and BPF
-artifact governance for future UPF or other accelerated data-plane CNFs; it is
-not a claim that this repository ships AF_XDP socket, UMEM, ring, or packet I/O
-runtime support.
+Likewise, `AfXdpFastPath` in `opc-node-resources` models node/resource admission
+and BPF artifact governance only; it is not a claim that this repository ships
+AF_XDP socket, UMEM, ring, or packet I/O runtime support.
 
 The following items are updated in `docs/implementation-status.md`:
 

@@ -142,7 +142,7 @@ preallocate from a wire-declared length. Three layers guard them:
 - **Verification** — a deep `cargo-fuzz` pass over the decoder completed ~41M
   executions with no crash, leak, or OOM.
 
-## Out of Scope (v1+)
+## Codec Boundary (v1+)
 
 - Remaining simple IEs not listed above (e.g., Packet Rate, DL Flow Level
   Marking, SDF Filter, Application ID, Traffic Endpoint, BAR, MAR,

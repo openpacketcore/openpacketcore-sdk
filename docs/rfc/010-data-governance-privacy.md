@@ -23,7 +23,8 @@ contract, not as scattered per-NF convention.
 
 - Data classification taxonomy.
 - SUPI/GPSI/MSISDN/IP address handling.
-- Charging, audit, LI, analytics, and session state records.
+- Charging, audit, lawful-intercept data classification, analytics, and session
+  state records.
 - Redaction and pseudonymization.
 - Retention and deletion.
 - Backup and restore handling.
@@ -36,6 +37,9 @@ contract, not as scattered per-NF convention.
 - Cryptographic key management internals. See RFC 003.
 - Session store consistency. See RFC 004.
 - Evidence bundle mechanics. See RFC 006.
+- Product lawful-intercept mediation, collection workflows, and target-specific
+  LI policy engines. The SDK classifies and protects LI material; it does not
+  implement an LI product subsystem.
 - Jurisdiction-specific legal interpretation.
 
 ## 3. Design Goals
@@ -66,7 +70,8 @@ contract, not as scattered per-NF convention.
 
 - Support operational debugging without leaking raw subscriber data.
 - Support charging and audit records with correct retention.
-- Support LI material with strict plane separation.
+- Classify lawful-intercept material and keep it separated from ordinary
+  telemetry, analytics, support bundles, and exports.
 - Support analytics minimization and privacy-preserving export.
 
 ## 4. Data Classification
@@ -318,7 +323,7 @@ RFC 006 evidence MUST include:
 - retention policy report,
 - redaction test report,
 - export policy report,
-- legal hold test report where supported,
+- legal hold test report,
 - privacy minimization report for analytics NFs,
 - known gaps for any class not fully handled.
 
@@ -326,13 +331,12 @@ RFC 006 evidence MUST include:
 
 | Module | Responsibility |
 | :--- | :--- |
-| `opc-data-classification` | class registry and annotations |
+| `opc-data-governance` | class registry, retention policy, legal-hold policy, and annotations |
 | `opc-redaction` | redaction renderers and generated metadata adapter |
 | `opc-privacy` | digesting, minimization, support bundle policy |
-| `opc-retention` | retention jobs and legal hold interface |
 | `opc-export` | signed/exported data handling |
-| `opc-li-governance` | LI class boundaries and policy helpers |
-| `opc-data-testkit` | fake records, redaction assertions, retention tests |
+| `opc-evidence` | data-governance evidence reports and release gates |
+| `opc-sdk-integration` | integration tests covering redaction, retention, export, and analytics policy |
 
 Agents implementing NF features must classify new fields before exposing logs,
 metrics, storage, or exports.

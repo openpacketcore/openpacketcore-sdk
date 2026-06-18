@@ -6,9 +6,9 @@
 > deterministic `make generate-api` target). The v0.4 expansion added the
 > NFManagement subscription and notification payloads
 > (`SubscriptionData`, `NotificationData`, `NotifCondition`, and the
-> `NotificationEventType`/`ConditionEventType` enums). The remainder of this
-> note — extending generation to further TS 29.5xx interfaces beyond NRF — is
-> future work.
+> `NotificationEventType`/`ConditionEventType` enums). This note now describes
+> the generated-type boundary for NRF and the criteria for adding additional
+> TS 29.5xx generated crates when a consuming CNF needs them.
 
 ## Goal
 
@@ -69,9 +69,10 @@ Each crate:
 - `types/` — `typify`-generated structs with `#[derive(Serialize, Deserialize)]`
 - `client/` — thin `reqwest`/`hyper` client wrapper (optional, behind feature)
 - `server/` — `axum`/`hyper` route trait stubs (optional, behind feature)
-- `CONFORMANCE.md` — which operations are generated vs. hand-written vs. out-of-scope
+- `CONFORMANCE.md` — which operations are generated, hand-written, or outside
+  the generated-type crate boundary
 
-## Why this was initially deferred
+## Why this was staged as a generated-type boundary
 
 1. **MSRV risk** — `typify` and `openapiv3` may require newer Rust features.
 2. **3GPP YAML quality** — the published OpenAPI files contain vendor-specific
@@ -79,8 +80,8 @@ Each crate:
 3. **SDK pattern alignment** — the generated types must integrate with
    `opc-types` identifiers (`NfInstanceId`, `PlmnId`, etc.) rather than generating
    redundant string wrappers.
-4. **Priority** — the PFCP and NAS codecs are higher-leverage for the first
-   production NF vertical (SMF/UPF).
+4. **Ownership** — runtime client/server behavior remains in `opc-sbi` and
+   consuming NF crates; generated API crates own pinned OpenAPI payload types.
 
 ## Acceptance criteria
 

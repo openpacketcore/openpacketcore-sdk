@@ -31,7 +31,7 @@ pub enum GnmiError {
     /// No valid authentication was available.
     #[error("gNMI authentication required")]
     Unauthenticated,
-    /// Capability, encoding, extension, or operation is not implemented.
+    /// Capability, encoding, extension, or operation is outside the advertised profile.
     #[error("gNMI operation is not supported")]
     Unimplemented {
         /// Server-local, payload-free detail.

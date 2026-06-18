@@ -64,14 +64,14 @@ read-repair scenario.
   keeps one persistent connection with a single in-flight request; the watch
   stream holds its own dedicated long-lived connection.
 
-## Roadmap to non-experimental
+## Experimental Boundary
 
-The crate keeps its experimental label until:
+The crate keeps its experimental label because:
 
 1. **Connection pooling / multiplexing** — ✅ single persistent connection
-   per `RemoteSessionBackend` with one in-flight request at a time; full
-   pipelining is still out of scope and will be required before production
-   traffic levels.
+   per `RemoteSessionBackend` with one in-flight request at a time. This keeps
+   replica ordering simple and bounds memory; high-throughput deployments should
+   validate this profile against their own latency and replication budget.
 2. **Wire-format freeze** — the length-prefixed JSON framing is
    version-gated via the `Hello` handshake but not yet stable; a freeze
    requires a documented compatibility policy (and likely a binary
