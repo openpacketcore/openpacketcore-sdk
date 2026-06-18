@@ -102,11 +102,15 @@ fn session_record(
 async fn fault_injection_missing_key_fails_closed_without_secret_leak() {
     let provider = provider_with_active_key();
     let aad = config_aad();
-    let raw_secret = "subscriber-msisdn-5551234";
-    let envelope =
-        encrypt_envelope_with_nonce(&provider, &aad, raw_secret.as_bytes(), *b"0123456789ab")
-            .await
-            .expect("encrypt test payload");
+    let leak_probe_payload = "subscriber-msisdn-redaction-probe";
+    let envelope = encrypt_envelope_with_nonce(
+        &provider,
+        &aad,
+        leak_probe_payload.as_bytes(),
+        *b"0123456789ab",
+    )
+    .await
+    .expect("encrypt test payload");
 
     let mut decoded = CryptoEnvelopeV1::decode(&envelope).expect("decode envelope");
     decoded.key_id = KeyId::new("config-key-2026-missing").expect("missing key id");
@@ -121,7 +125,7 @@ async fn fault_injection_missing_key_fails_closed_without_secret_leak() {
 
     assert_eq!(err, CryptoError::DecryptionFailed);
     assert_eq!(err.to_string(), "envelope decryption failed");
-    assert!(!err.to_string().contains(raw_secret));
+    assert!(!err.to_string().contains(leak_probe_payload));
 }
 
 #[test]
