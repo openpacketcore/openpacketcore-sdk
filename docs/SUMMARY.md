@@ -41,6 +41,7 @@
   - [0015 — Protocol Codec Conformance Policy](adr/0015-protocol-codec-conformance-policy.md)
   - [0016 — Northbound gRPC Stack Exception](adr/0016-northbound-grpc-stack-exception.md)
   - [0017 — SCTP Transport FFI Boundary](adr/0017-sctp-transport-ffi-boundary.md)
+- [OPC gNMI Server Spec](design/opc-gnmi-server-spec.md)
 
 # Operator Guide
 

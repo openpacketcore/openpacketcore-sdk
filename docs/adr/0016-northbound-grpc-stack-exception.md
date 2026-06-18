@@ -17,7 +17,8 @@ framing over tokio/rustls, and external 3GPP interfaces are HTTP/2 (`hyper`) or
 raw protocol codecs.
 
 The management-plane work introduces `opc-gnmi-server` (see
-`.planning/opc-gnmi-server-spec.md`). gNMI (OpenConfig) **is** a gRPC service:
+[`docs/design/opc-gnmi-server-spec.md`](../design/opc-gnmi-server-spec.md)).
+gNMI (OpenConfig) **is** a gRPC service:
 its contract is a protobuf service over HTTP/2. There is no rustls/`hyper`-only
 or hand-framed path to a conformant gNMI server — a client (`gnmic`, `gNMIc`,
 OpenConfig collectors) speaks gRPC and nothing else. So `opc-gnmi-server` cannot
