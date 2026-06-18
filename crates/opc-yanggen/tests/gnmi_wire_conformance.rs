@@ -1323,23 +1323,27 @@ async fn generated_stack_serves_gnmi_over_real_mtls() {
 
 #[tokio::test]
 async fn generated_stack_supports_commit_confirmed_extension_over_real_mtls() {
-    let harness = start_harness_with_extensions(
+    let harness = start_harness_with_extensions_arbitration(
         allow_all_read_subscribe_policy(),
         MgmtLimits::default(),
         None,
         ExtensionRegistry::with_commit_confirmed().expect("registry"),
+        GnmiArbitrationConfig::optional(),
     )
     .await;
     let mut grpc = harness.client().await;
 
     let caps = capabilities(&mut grpc).await;
-    assert_eq!(caps.extension.len(), 1);
-    let Some(gnmi_ext::extension::Ext::RegisteredExt(extension)) = caps.extension[0].ext.as_ref()
-    else {
-        panic!("expected registered extension");
-    };
-    assert_eq!(extension.id, OPC_COMMIT_CONFIRMED_EXTENSION_ID as i32);
-    assert!(extension.msg.is_empty());
+    assert!(caps.extension.iter().any(|extension| matches!(
+        extension.ext.as_ref(),
+        Some(gnmi_ext::extension::Ext::RegisteredExt(registered))
+            if registered.id == OPC_COMMIT_CONFIRMED_EXTENSION_ID as i32
+                && registered.msg.is_empty()
+    )));
+    assert!(caps.extension.iter().any(|extension| matches!(
+        extension.ext.as_ref(),
+        Some(gnmi_ext::extension::Ext::MasterArbitration(_))
+    )));
 
     set(
         &mut grpc,
@@ -1363,10 +1367,13 @@ async fn generated_stack_supports_commit_confirmed_extension_over_real_mtls() {
             replace: Vec::new(),
             update: vec![json_update(hostname_path(), br#""wire-confirmed""#.to_vec())],
             union_replace: Vec::new(),
-            extension: vec![commit_confirmed_extension(CommitConfirmedExtension::begin(
-                Duration::from_millis(120),
-            )
-            .expect("payload"))],
+            extension: vec![
+                commit_confirmed_extension(
+                    CommitConfirmedExtension::begin(Duration::from_millis(120))
+                        .expect("payload"),
+                ),
+                master_arbitration_extension(Some("commit-confirmed"), 1, 0),
+            ],
         },
     )
     .await
@@ -1384,7 +1391,10 @@ async fn generated_stack_supports_commit_confirmed_extension_over_real_mtls() {
             replace: Vec::new(),
             update: Vec::new(),
             union_replace: Vec::new(),
-            extension: vec![commit_confirmed_extension(CommitConfirmedExtension::confirm())],
+            extension: vec![
+                commit_confirmed_extension(CommitConfirmedExtension::confirm()),
+                master_arbitration_extension(Some("commit-confirmed"), 1, 0),
+            ],
         },
     )
     .await
@@ -1404,10 +1414,13 @@ async fn generated_stack_supports_commit_confirmed_extension_over_real_mtls() {
             replace: Vec::new(),
             update: vec![json_update(hostname_path(), br#""wire-cancelled""#.to_vec())],
             union_replace: Vec::new(),
-            extension: vec![commit_confirmed_extension(CommitConfirmedExtension::begin(
-                Duration::from_secs(30),
-            )
-            .expect("payload"))],
+            extension: vec![
+                commit_confirmed_extension(
+                    CommitConfirmedExtension::begin(Duration::from_secs(30))
+                        .expect("payload"),
+                ),
+                master_arbitration_extension(Some("commit-confirmed"), 1, 0),
+            ],
         },
     )
     .await
@@ -1420,10 +1433,13 @@ async fn generated_stack_supports_commit_confirmed_extension_over_real_mtls() {
             replace: Vec::new(),
             update: Vec::new(),
             union_replace: Vec::new(),
-            extension: vec![token_like_commit_confirmed_extension(
-                CommitConfirmedExtension::cancel(),
-                b"wire-secret-token",
-            )],
+            extension: vec![
+                token_like_commit_confirmed_extension(
+                    CommitConfirmedExtension::cancel(),
+                    b"wire-secret-token",
+                ),
+                master_arbitration_extension(Some("commit-confirmed"), 1, 0),
+            ],
         },
     )
     .await
@@ -1443,7 +1459,10 @@ async fn generated_stack_supports_commit_confirmed_extension_over_real_mtls() {
             replace: Vec::new(),
             update: Vec::new(),
             union_replace: Vec::new(),
-            extension: vec![commit_confirmed_extension(CommitConfirmedExtension::cancel())],
+            extension: vec![
+                commit_confirmed_extension(CommitConfirmedExtension::cancel()),
+                master_arbitration_extension(Some("commit-confirmed"), 1, 0),
+            ],
         },
     )
     .await
