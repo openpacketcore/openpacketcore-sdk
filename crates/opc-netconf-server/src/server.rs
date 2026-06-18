@@ -8982,6 +8982,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tls_listener_times_out_slow_handshake_and_releases_session_permit() {
+        let (server, _observed, _audit) = server_fixture().await;
+        let state = identity_state(
+            "spiffe://test-domain/tenant/test/ns/default/sa/netconf/nf/amf/instance/0",
+        );
+        let (_identity_tx, identity_rx) = watch::channel(Some(state));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = ShutdownToken::new();
+        let limits = MgmtLimits {
+            max_sessions: 1,
+            ..MgmtLimits::default()
+        };
+        let listener_config = TlsListenerConfig {
+            session: SessionConfig {
+                limits,
+                frame_timeout: Duration::from_secs(5),
+            },
+            handshake_timeout: Duration::from_millis(50),
+            drain_timeout: Duration::from_secs(5),
+            ..TlsListenerConfig::default()
+        };
+
+        let listener_task = tokio::spawn(run_read_only_tls_listener(
+            Arc::new(server),
+            listener,
+            TlsBootstrap::new(RuntimeMode::Production, peer_policy()),
+            identity_rx,
+            shutdown.clone(),
+            listener_config,
+        ));
+
+        let first = TcpStream::connect(addr).await.expect("first connect");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let second = TcpStream::connect(addr).await.expect("second connect");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        drop(first);
+        drop(second);
+        shutdown.request_shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(5), listener_task)
+            .await
+            .expect("listener timeout")
+            .expect("listener join")
+            .expect("listener result");
+
+        assert_eq!(result.accepted_sessions, 2);
+        assert_eq!(result.completed_sessions, 0);
+        assert_eq!(result.failed_sessions, 2);
+        assert_eq!(result.rejected_sessions, 0);
+    }
+
+    #[tokio::test]
     async fn supervised_tls_listener_registers_as_runtime_listener_and_drains() {
         let (server, _observed, _audit) = server_fixture().await;
         let (_identity_tx, identity_rx) = watch::channel(None);
