@@ -34,7 +34,7 @@ h2 = "0.4.14"
 # the rsa crate / RUSTSEC-2023-0071. See ADR 0014 point 9; the future goal is
 # to move to rust_crypto once rsa ships a constant-time release.
 jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
-tower-http = { version = "0.6.11", features = ["limit", "timeout", "trace"] }
+tower-http = { version = "0.7.0", features = ["limit", "timeout", "trace"] }
 opc-tls = { version = "0.2.0", path = "../opc-tls" }
 serde_json.workspace = true
 opc-redaction = { version = "0.2.0", path = "../opc-redaction" }
