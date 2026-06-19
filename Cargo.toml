@@ -37,7 +37,7 @@ hmac = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-pki-types = { version = "1.8", features = ["std"] }
-x509-parser = { version = "0.16" }
+x509-parser = { version = "0.18" }
 rcgen = { version = "0.13" }
 
 [workspace.lints.rust]
