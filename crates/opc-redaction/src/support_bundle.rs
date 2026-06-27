@@ -70,6 +70,7 @@ pub enum RedactionError {
 }
 
 /// A summary of the redactions applied to the support bundle.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RedactionSummary {
@@ -77,10 +78,10 @@ pub struct RedactionSummary {
     pub subscriber_identifiers: usize,
     /// Secret-bearing values such as JWTs, private key material, and SPIs.
     ///
-    /// Serialized as the legacy `secrets` field for backward compatibility.
-    /// The new name `security_secrets` is also accepted during deserialization.
-    #[serde(rename = "secrets", alias = "security_secrets")]
-    pub security_secrets: usize,
+    /// The `security_secrets` name is also accepted during deserialization for
+    /// compatibility with summaries produced during the short-lived rename.
+    #[serde(alias = "security_secrets")]
+    pub secrets: usize,
     /// Session endpoint identifiers such as TEIDs.
     pub session_endpoints: usize,
     /// Lawful-intercept identifiers such as LI ID, warrant ID, and correlation ID.
@@ -102,7 +103,7 @@ pub struct RedactionSummary {
 impl RedactionSummary {
     pub fn total_redactions(&self) -> usize {
         self.subscriber_identifiers
-            + self.security_secrets
+            + self.secrets
             + self.session_endpoints
             + self.lawful_intercept_identifiers
             + self.network_sensitive_identifiers
@@ -213,7 +214,7 @@ fn record_telco_redaction_by_type(
     match data_class {
         DataClass::SubscriberId => summary.subscriber_identifiers += 1,
         DataClass::LawfulIntercept => summary.lawful_intercept_identifiers += 1,
-        DataClass::SecuritySecret => summary.security_secrets += 1,
+        DataClass::SecuritySecret => summary.secrets += 1,
         DataClass::SubscriberSession => summary.session_endpoints += 1,
         DataClass::NetworkSensitive => summary.network_sensitive_identifiers += 1,
         _ => summary.subscriber_identifiers += 1,
@@ -258,10 +259,18 @@ pub fn redact_text_with_policy(
 ) -> String {
     // If the whole input is JSON, redact it structurally so numeric/boolean/null
     // telco-marker values are caught and the output stays valid JSON.
-    if let Ok(serde_json::Value::Object(_) | serde_json::Value::Array(_)) =
-        serde_json::from_str::<serde_json::Value>(input)
-    {
-        return redact_json_with_policy(input, summary, policy);
+    match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(value)
+            if matches!(
+                value,
+                serde_json::Value::Object(_) | serde_json::Value::Array(_)
+            ) =>
+        {
+            let mut value = value;
+            redact_json_value(&mut value, summary, policy);
+            return value.to_string();
+        }
+        _ => {}
     }
 
     let mut output_lines = Vec::new();
@@ -273,7 +282,7 @@ pub fn redact_text_with_policy(
         // 1. Check for PEM/cert material blocks or lines
         if lower_line.contains("-----begin") {
             in_pem_block = true;
-            summary.security_secrets += 1;
+            summary.secrets += 1;
             output_lines.push("[REDACTED_PEM_CERT_MATERIAL]".to_string());
             continue;
         }
@@ -286,7 +295,7 @@ pub fn redact_text_with_policy(
             continue;
         }
         if lower_line.contains("-----end") || lower_line.contains("ssh-rsa") {
-            summary.security_secrets += 1;
+            summary.secrets += 1;
             output_lines.push("[REDACTED_PEM_CERT_MATERIAL]".to_string());
             continue;
         }
@@ -308,7 +317,7 @@ pub fn redact_text_with_policy(
         }
 
         if line_contains_secret_marker(&lower_line) {
-            summary.security_secrets += 1;
+            summary.secrets += 1;
             output_lines.push("[REDACTED_LINE_CONTAINING_SECRET]".to_string());
             continue;
         }
@@ -504,7 +513,7 @@ fn redact_json_value(
         serde_json::Value::Object(map) => {
             for (key, val) in map.iter_mut() {
                 if json_key_is_secret_marker(key) {
-                    summary.security_secrets += 1;
+                    summary.secrets += 1;
                     *val = serde_json::Value::String("[REDACTED_SECURITY_SECRET]".to_string());
                 } else if let Some(id_type) = identifier_type_for_json_key(key) {
                     let placeholder = record_telco_redaction_by_type(summary, id_type, policy);
@@ -633,7 +642,7 @@ fn classify_token(
 
     // D. JWT
     if is_jwt(trimmed) {
-        summary.security_secrets += 1;
+        summary.secrets += 1;
         return Some("[REDACTED_JWT]".to_string());
     }
 
@@ -643,7 +652,7 @@ fn classify_token(
         && !trimmed.contains("REDACTED_")
         && trimmed.to_ascii_lowercase().contains("secret")
     {
-        summary.security_secrets += 1;
+        summary.secrets += 1;
         return Some("[REDACTED_SECURITY_SECRET]".to_string());
     }
 
@@ -714,7 +723,7 @@ fn redact_marker_value_pairs(
                     && bytes.get(key_end) == Some(&quote)
                 {
                     if let Some((value_start, value_end)) =
-                        scan_marker_value(input, bytes, key_end + 1, quote)
+                        scan_marker_value(bytes, key_end + 1, quote)
                     {
                         if value_start >= value_end {
                             continue;
@@ -786,7 +795,7 @@ fn redact_marker_value_pairs(
                     // handled by the generic value scanner.
                     scan_diameter_session_id_value(bytes, sep_pos)
                 } else {
-                    scan_marker_value(input, bytes, sep_pos, 0)
+                    scan_marker_value(bytes, sep_pos, 0)
                 };
                 if let Some((value_start, value_end)) = scanned {
                     if value_start >= value_end {
@@ -827,12 +836,7 @@ fn redact_marker_value_pairs(
 /// `:` or `=`, optional-whitespace, and a value. Returns the byte range of the
 /// value itself (excluding any surrounding quotes). `quote` is the expected
 /// quote character for quoted values; use 0 for unquoted values.
-fn scan_marker_value(
-    _input: &str,
-    bytes: &[u8],
-    mut pos: usize,
-    quote: u8,
-) -> Option<(usize, usize)> {
+fn scan_marker_value(bytes: &[u8], mut pos: usize, quote: u8) -> Option<(usize, usize)> {
     while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
         pos += 1;
     }
@@ -1034,7 +1038,7 @@ fn json_key_is_secret_marker(key: &str) -> bool {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect();
-    let is_token_key = compact == "token" || compact.ends_with("token");
+    let is_token_key = compact.ends_with("token");
 
     compact.contains("password")
         || compact.contains("passwd")
@@ -1248,7 +1252,7 @@ mod tests {
         assert_eq!(summary.subscriber_identifiers, 1);
         assert_eq!(summary.ip_addresses, 1);
         assert_eq!(summary.spiffe_ids, 1);
-        assert_eq!(summary.security_secrets, 1);
+        assert_eq!(summary.secrets, 1);
         assert_eq!(summary.paths_and_files, 2); // /var/lib/opc/users.db and users.db
     }
 
@@ -1261,7 +1265,7 @@ mod tests {
         );
         let redacted_pem = redact_text(&pem_log, &mut summary);
         assert_eq!(redacted_pem, "[REDACTED_PEM_CERT_MATERIAL]");
-        assert_eq!(summary.security_secrets, 1);
+        assert_eq!(summary.secrets, 1);
 
         let mut summary2 = RedactionSummary::default();
         let sql_log = "Executing query: SELECT * FROM subscribers WHERE imsi = '208950000000001'";
@@ -1315,7 +1319,7 @@ mod tests {
         let redacted = redact_text(log, &mut summary);
 
         assert_eq!(redacted, "[REDACTED_LINE_CONTAINING_SECRET]");
-        assert_eq!(summary.security_secrets, 1);
+        assert_eq!(summary.secrets, 1);
 
         let mut summary = RedactionSummary::default();
         let log = "imsi-208950000000001 msisdn:+15551234567 peer=192.168.1.10:443";
@@ -1383,7 +1387,7 @@ mod tests {
         // by their accurate data categories.
         assert_eq!(summary.subscriber_identifiers, 1); // nai
         assert_eq!(summary.network_sensitive_identifiers, 4); // sip, apn, dnn, diameter-session-id
-        assert_eq!(summary.security_secrets, 1); // spi
+        assert_eq!(summary.secrets, 1); // spi
         assert_eq!(summary.session_endpoints, 1); // teid
         assert_eq!(summary.lawful_intercept_identifiers, 4); // li-id, li-warrant-id, li-correlation-id, delivery-address
         assert_eq!(summary.total_redactions(), 11);
@@ -1555,11 +1559,7 @@ mod tests {
                         );
                     }
                     Some(TelcoIdentifierClass::SecurityAssociation) => {
-                        assert_eq!(
-                            summary.security_secrets, 1,
-                            "wrong bucket for input: {}",
-                            log
-                        );
+                        assert_eq!(summary.secrets, 1, "wrong bucket for input: {}", log);
                     }
                     Some(TelcoIdentifierClass::Application) => {
                         assert_eq!(
@@ -1796,7 +1796,7 @@ mod tests {
         assert!(!redacted.contains("[REDACTED_SUBSCRIBER_ID][REDACTED_SUBSCRIBER_ID]"));
         assert!(redacted.contains("[REDACTED_SESSION_ENDPOINT]"));
         assert_eq!(summary.session_endpoints, 1);
-        assert_eq!(summary.security_secrets, 0);
+        assert_eq!(summary.secrets, 0);
         assert_eq!(summary.network_sensitive_identifiers, 0);
         assert_eq!(summary.lawful_intercept_identifiers, 0);
     }
@@ -1843,7 +1843,7 @@ mod tests {
         assert!(redacted.contains("[REDACTED_LAWFUL_INTERCEPT_ID]"));
 
         assert_eq!(summary.session_endpoints, 2); // top-level + nested teid
-        assert_eq!(summary.security_secrets, 1); // spi
+        assert_eq!(summary.secrets, 1); // spi
         assert_eq!(summary.network_sensitive_identifiers, 3); // dnn + apn + ids[0]
         assert_eq!(summary.subscriber_identifiers, 3); // imsi + subscriber + raw_imsi
         assert_eq!(summary.lawful_intercept_identifiers, 3); // li_warrant_id + li_correlation_id + delivery_address
@@ -1886,7 +1886,7 @@ mod tests {
         assert!(!text_redacted.contains("2596069104"));
         assert!(serde_json::from_str::<serde_json::Value>(&text_redacted).is_ok());
         assert_eq!(summary3.session_endpoints, 2);
-        assert_eq!(summary3.security_secrets, 1);
+        assert_eq!(summary3.secrets, 1);
     }
 
     #[test]
@@ -1985,7 +1985,7 @@ mod tests {
                 json,
                 redacted
             );
-            assert_eq!(summary.security_secrets, 1, "wrong counter for {}", json);
+            assert_eq!(summary.secrets, 1, "wrong counter for {}", json);
             assert!(serde_json::from_str::<serde_json::Value>(&redacted).is_ok());
         }
 
@@ -1996,7 +1996,7 @@ mod tests {
         assert!(!redacted.contains("nested"));
         assert!(!redacted.contains("arr"));
         assert!(redacted.contains("[REDACTED_SECURITY_SECRET]"));
-        assert_eq!(summary.security_secrets, 2);
+        assert_eq!(summary.secrets, 2);
         assert!(serde_json::from_str::<serde_json::Value>(&redacted).is_ok());
     }
 
@@ -2013,7 +2013,7 @@ mod tests {
         assert!(redacted.contains("\"token_count\":2"));
         assert!(redacted.contains("\"tokenizer\":\"wordpiece\""));
         assert!(!redacted.contains("[REDACTED_SECURITY_SECRET]"));
-        assert_eq!(summary.security_secrets, 0);
+        assert_eq!(summary.secrets, 0);
         assert!(serde_json::from_str::<serde_json::Value>(&redacted).is_ok());
     }
 
@@ -2045,7 +2045,7 @@ mod tests {
         assert!(bundle.entries[1]
             .content
             .contains("[REDACTED_SECURITY_SECRET]"));
-        assert_eq!(bundle.redaction_summary.security_secrets, 12);
+        assert_eq!(bundle.redaction_summary.secrets, 12);
         assert!(bundle.redaction_applied);
     }
 
@@ -2089,7 +2089,7 @@ mod tests {
         // output still deserializes and missing counters default to zero.
         let json = r#"{"subscriber_identifiers":1,"secrets":2,"ip_addresses":3,"spiffe_ids":0,"paths_and_files":4,"sql_statements_or_errors":0,"unknown_entries_rejected":0}"#;
         let summary: RedactionSummary = serde_json::from_str(json).unwrap();
-        assert_eq!(summary.security_secrets, 2);
+        assert_eq!(summary.secrets, 2);
         assert_eq!(summary.subscriber_identifiers, 1);
         assert_eq!(summary.ip_addresses, 3);
         assert_eq!(summary.paths_and_files, 4);
@@ -2105,7 +2105,7 @@ mod tests {
         // `security_secrets` name is still accepted during deserialization.
         let summary = RedactionSummary {
             subscriber_identifiers: 1,
-            security_secrets: 2,
+            secrets: 2,
             ip_addresses: 3,
             ..RedactionSummary::default()
         };
@@ -2120,7 +2120,7 @@ mod tests {
         // Deserialization also accepts the new `security_secrets` name.
         let json_new = r#"{"subscriber_identifiers":1,"security_secrets":2,"ip_addresses":3}"#;
         let from_new: RedactionSummary = serde_json::from_str(json_new).unwrap();
-        assert_eq!(from_new.security_secrets, 2);
+        assert_eq!(from_new.secrets, 2);
     }
 
     #[test]
