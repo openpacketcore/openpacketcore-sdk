@@ -3,7 +3,7 @@
 //! Converts OPC alarm records into Kubernetes-style status conditions and
 //! events for operator integration.
 
-use opc_alarm::{Alarm, AlarmState, Severity};
+use opc_alarm::{Alarm, AlarmState, ProbableCause, Severity};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 
@@ -74,8 +74,7 @@ pub fn alarm_to_condition(alarm: &Alarm) -> K8sCondition {
 
     let last_transition_time = alarm.updated_at.format(&Rfc3339).unwrap_or_default();
 
-    // Reason is CamelCase representation of probable cause
-    let reason = to_camel_case(&alarm.probable_cause.to_string());
+    let reason = probable_cause_reason(&alarm.probable_cause);
 
     K8sCondition {
         type_,
@@ -88,7 +87,7 @@ pub fn alarm_to_condition(alarm: &Alarm) -> K8sCondition {
 
 /// Projects an alarm state change to a Kubernetes event.
 pub fn alarm_to_event(alarm: &Alarm) -> K8sEvent {
-    let reason = to_camel_case(&alarm.probable_cause.to_string());
+    let reason = probable_cause_reason(&alarm.probable_cause);
 
     let type_ = match alarm.severity {
         Severity::Cleared => "Normal",
@@ -125,6 +124,37 @@ pub fn alarm_to_event(alarm: &Alarm) -> K8sEvent {
     }
 }
 
+fn probable_cause_reason(probable_cause: &ProbableCause) -> String {
+    match probable_cause {
+        ProbableCause::Other(value) => custom_probable_cause_reason(value),
+        _ => to_camel_case(&probable_cause.to_string()),
+    }
+}
+
+fn custom_probable_cause_reason(value: &str) -> String {
+    let mut out = String::new();
+    let mut capitalize = true;
+
+    for c in value.chars() {
+        if c.is_ascii_alphanumeric() {
+            if capitalize {
+                out.push(c.to_ascii_uppercase());
+                capitalize = false;
+            } else {
+                out.push(c);
+            }
+        } else {
+            capitalize = true;
+        }
+    }
+
+    if out.is_empty() {
+        "Other".to_string()
+    } else {
+        out
+    }
+}
+
 fn to_camel_case(s: &str) -> String {
     let mut out = String::new();
     let mut capitalize = true;
@@ -147,22 +177,12 @@ mod tests {
     use opc_alarm::prelude::*;
     use time::OffsetDateTime;
 
-    #[test]
-    fn test_to_camel_case() {
-        assert_eq!(to_camel_case("config-apply-failed"), "ConfigApplyFailed");
-        assert_eq!(
-            to_camel_case("config-bus.commit.failure"),
-            "ConfigBusCommitFailure"
-        );
-    }
-
-    #[test]
-    fn test_conversion_mappings() {
-        let alarm = Alarm {
+    fn alarm_with_cause(probable_cause: ProbableCause) -> Alarm {
+        Alarm {
             alarm_id: AlarmId::new("alarm-123"),
             alarm_type: AlarmType::new("peer.disconnected"),
             severity: Severity::Critical,
-            probable_cause: ProbableCause::PeerUnreachable,
+            probable_cause,
             affected_object: AffectedObject::NfInstance {
                 kind: "upf".to_string(),
                 instance: "upf-1".to_string(),
@@ -177,7 +197,21 @@ mod tests {
             updated_at: OffsetDateTime::now_utc(),
             cleared_at: None,
             correlation_id: None,
-        };
+        }
+    }
+
+    #[test]
+    fn test_to_camel_case() {
+        assert_eq!(to_camel_case("config-apply-failed"), "ConfigApplyFailed");
+        assert_eq!(
+            to_camel_case("config-bus.commit.failure"),
+            "ConfigBusCommitFailure"
+        );
+    }
+
+    #[test]
+    fn test_conversion_mappings() {
+        let alarm = alarm_with_cause(ProbableCause::PeerUnreachable);
 
         let cond = alarm_to_condition(&alarm);
         assert_eq!(cond.type_, "PeerDisconnected");
@@ -190,5 +224,56 @@ mod tests {
         assert_eq!(event.type_, "Warning");
         assert_eq!(event.action, "Raised");
         assert_eq!(event.source_component, "nf:upf:upf-1");
+    }
+
+    #[test]
+    fn custom_probable_causes_drop_other_prefix_and_camel_case_reason() {
+        let alarm = alarm_with_cause(ProbableCause::Other(
+            "epdg.config.workflow-required".to_string(),
+        ));
+
+        let cond = alarm_to_condition(&alarm);
+        assert_eq!(cond.reason, "EpdgConfigWorkflowRequired");
+    }
+
+    #[test]
+    fn custom_probable_cause_separator_normalization_is_k8s_safe() {
+        assert_eq!(
+            custom_probable_cause_reason("upf.path-failure"),
+            "UpfPathFailure"
+        );
+        assert_eq!(
+            custom_probable_cause_reason("smf/session_rebind"),
+            "SmfSessionRebind"
+        );
+        assert_eq!(
+            custom_probable_cause_reason("amf  peer__timeout///retry"),
+            "AmfPeerTimeoutRetry"
+        );
+    }
+
+    #[test]
+    fn custom_probable_cause_empty_fallback_is_deterministic() {
+        assert_eq!(custom_probable_cause_reason(""), "Other");
+        assert_eq!(custom_probable_cause_reason("...---///___   "), "Other");
+    }
+
+    #[test]
+    fn custom_probable_cause_condition_and_event_reasons_match() {
+        let alarm = alarm_with_cause(ProbableCause::Other("smf/session_rebind".to_string()));
+
+        let cond = alarm_to_condition(&alarm);
+        let event = alarm_to_event(&alarm);
+
+        assert_eq!(cond.reason, "SmfSessionRebind");
+        assert_eq!(event.reason, cond.reason);
+    }
+
+    #[test]
+    fn standard_probable_cause_reason_is_unchanged() {
+        let alarm = alarm_with_cause(ProbableCause::PeerUnreachable);
+
+        assert_eq!(alarm_to_condition(&alarm).reason, "PeerUnreachable");
+        assert_eq!(alarm_to_event(&alarm).reason, "PeerUnreachable");
     }
 }

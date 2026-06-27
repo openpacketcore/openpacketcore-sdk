@@ -27,7 +27,7 @@ pub use fixtures::{FixtureProvenance, FixtureRegistry};
 pub use runner::{
     HardwareLabRunner, HardwareLabRunnerConfig, KindRunner, KindRunnerConfig, LocalRunner,
 };
-pub use scenario::{NfSpec, Scenario, Step, Topology, DSL_VERSION};
+pub use scenario::{NfSpec, ProtocolFixtureStep, Scenario, Step, Topology, DSL_VERSION};
 pub use virtual_time::{Clock, VirtualClock};
 
 // simulators::* intentionally not glob-reexported; use opc_testbed::simulators::...

@@ -213,6 +213,272 @@
           {
             "type": "object",
             "additionalProperties": false,
+            "required": ["kind", "from", "to", "fixture"],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "send_ikev2",
+                  "expect_ikev2",
+                  "send_diameter",
+                  "expect_diameter",
+                  "send_gtpv2c",
+                  "expect_gtpv2c",
+                  "send_gtpu",
+                  "expect_gtpu",
+                  "expect_esp"
+                ]
+              },
+              "from": {
+                "type": "string",
+                "minLength": 1
+              },
+              "to": {
+                "type": "string",
+                "minLength": 1
+              },
+              "fixture": {
+                "type": "string",
+                "minLength": 1
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
+              },
+              "transport": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "oneOf": [
+              { "required": ["send_ikev2"] },
+              { "required": ["expect_ikev2"] },
+              { "required": ["send_diameter"] },
+              { "required": ["expect_diameter"] },
+              { "required": ["send_gtpv2c"] },
+              { "required": ["expect_gtpv2c"] },
+              { "required": ["send_gtpu"] },
+              { "required": ["expect_gtpu"] },
+              { "required": ["expect_esp"] }
+            ],
+            "properties": {
+              "send_ikev2": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["from", "to", "fixture"],
+                "properties": {
+                  "from": { "type": "string", "minLength": 1 },
+                  "to": { "type": "string", "minLength": 1 },
+                  "fixture": { "type": "string", "minLength": 1 },
+                  "label": { "type": "string", "minLength": 1 },
+                  "transport": { "type": "string", "minLength": 1 }
+                }
+              },
+              "expect_ikev2": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["from", "to", "fixture"],
+                "properties": {
+                  "from": { "type": "string", "minLength": 1 },
+                  "to": { "type": "string", "minLength": 1 },
+                  "fixture": { "type": "string", "minLength": 1 },
+                  "label": { "type": "string", "minLength": 1 },
+                  "transport": { "type": "string", "minLength": 1 }
+                }
+              },
+              "send_diameter": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["from", "to", "fixture"],
+                "properties": {
+                  "from": { "type": "string", "minLength": 1 },
+                  "to": { "type": "string", "minLength": 1 },
+                  "fixture": { "type": "string", "minLength": 1 },
+                  "label": { "type": "string", "minLength": 1 },
+                  "transport": { "type": "string", "minLength": 1 }
+                }
+              },
+              "expect_diameter": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["from", "to", "fixture"],
+                "properties": {
+                  "from": { "type": "string", "minLength": 1 },
+                  "to": { "type": "string", "minLength": 1 },
+                  "fixture": { "type": "string", "minLength": 1 },
+                  "label": { "type": "string", "minLength": 1 },
+                  "transport": { "type": "string", "minLength": 1 }
+                }
+              },
+              "send_gtpv2c": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["from", "to", "fixture"],
+                "properties": {
+                  "from": { "type": "string", "minLength": 1 },
+                  "to": { "type": "string", "minLength": 1 },
+                  "fixture": { "type": "string", "minLength": 1 },
+                  "label": { "type": "string", "minLength": 1 },
+                  "transport": { "type": "string", "minLength": 1 }
+                }
+              },
+              "expect_gtpv2c": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["from", "to", "fixture"],
+                "properties": {
+                  "from": { "type": "string", "minLength": 1 },
+                  "to": { "type": "string", "minLength": 1 },
+                  "fixture": { "type": "string", "minLength": 1 },
+                  "label": { "type": "string", "minLength": 1 },
+                  "transport": { "type": "string", "minLength": 1 }
+                }
+              },
+              "send_gtpu": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["from", "to", "fixture"],
+                "properties": {
+                  "from": { "type": "string", "minLength": 1 },
+                  "to": { "type": "string", "minLength": 1 },
+                  "fixture": { "type": "string", "minLength": 1 },
+                  "label": { "type": "string", "minLength": 1 },
+                  "transport": { "type": "string", "minLength": 1 }
+                }
+              },
+              "expect_gtpu": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["from", "to", "fixture"],
+                "properties": {
+                  "from": { "type": "string", "minLength": 1 },
+                  "to": { "type": "string", "minLength": 1 },
+                  "fixture": { "type": "string", "minLength": 1 },
+                  "label": { "type": "string", "minLength": 1 },
+                  "transport": { "type": "string", "minLength": 1 }
+                }
+              },
+              "expect_esp": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["from", "to", "fixture"],
+                "properties": {
+                  "from": { "type": "string", "minLength": 1 },
+                  "to": { "type": "string", "minLength": 1 },
+                  "fixture": { "type": "string", "minLength": 1 },
+                  "label": { "type": "string", "minLength": 1 },
+                  "transport": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "target"],
+            "properties": {
+              "kind": { "const": "peer_down" },
+              "target": { "type": "string", "minLength": 1 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "target"],
+            "properties": {
+              "kind": { "const": "timeout" },
+              "target": { "type": "string", "minLength": 1 },
+              "protocol": { "type": "string", "minLength": 1 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "target", "protocol", "attempts"],
+            "properties": {
+              "kind": { "const": "retransmission" },
+              "target": { "type": "string", "minLength": 1 },
+              "protocol": { "type": "string", "minLength": 1 },
+              "attempts": { "type": "integer", "minimum": 1 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "target", "protocol", "packet_count"],
+            "properties": {
+              "kind": { "enum": ["packet_loss", "duplicate_packet"] },
+              "target": { "type": "string", "minLength": 1 },
+              "protocol": { "type": "string", "minLength": 1 },
+              "packet_count": { "type": "integer", "minimum": 1 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "oneOf": [
+              { "required": ["peer_down"] },
+              { "required": ["timeout"] },
+              { "required": ["retransmission"] },
+              { "required": ["packet_loss"] },
+              { "required": ["duplicate_packet"] }
+            ],
+            "properties": {
+              "peer_down": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["target"],
+                "properties": {
+                  "target": { "type": "string", "minLength": 1 }
+                }
+              },
+              "timeout": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["target"],
+                "properties": {
+                  "target": { "type": "string", "minLength": 1 },
+                  "protocol": { "type": "string", "minLength": 1 }
+                }
+              },
+              "retransmission": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["target", "protocol", "attempts"],
+                "properties": {
+                  "target": { "type": "string", "minLength": 1 },
+                  "protocol": { "type": "string", "minLength": 1 },
+                  "attempts": { "type": "integer", "minimum": 1 }
+                }
+              },
+              "packet_loss": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["target", "protocol", "packet_count"],
+                "properties": {
+                  "target": { "type": "string", "minLength": 1 },
+                  "protocol": { "type": "string", "minLength": 1 },
+                  "packet_count": { "type": "integer", "minimum": 1 }
+                }
+              },
+              "duplicate_packet": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["target", "protocol", "packet_count"],
+                "properties": {
+                  "target": { "type": "string", "minLength": 1 },
+                  "protocol": { "type": "string", "minLength": 1 },
+                  "packet_count": { "type": "integer", "minimum": 1 }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
             "required": ["kind", "target"],
             "properties": {
               "kind": { "const": "peer_unavailable" },

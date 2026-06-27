@@ -96,6 +96,35 @@ impl LocalRunner {
     }
 
     fn execute_step(&mut self, step: &Step) -> Result<(), crate::TestbedError> {
+        if let Some((kind, protocol_step)) = step.protocol_fixture() {
+            self.state.insert(
+                format!(
+                    "protocol.{kind}.{}.{}.fixture",
+                    protocol_step.from, protocol_step.to
+                ),
+                protocol_step.fixture.clone(),
+            );
+            if let Some(label) = &protocol_step.label {
+                self.state.insert(
+                    format!(
+                        "protocol.{kind}.{}.{}.label",
+                        protocol_step.from, protocol_step.to
+                    ),
+                    label.clone(),
+                );
+            }
+            if let Some(transport) = &protocol_step.transport {
+                self.state.insert(
+                    format!(
+                        "protocol.{kind}.{}.{}.transport",
+                        protocol_step.from, protocol_step.to
+                    ),
+                    transport.clone(),
+                );
+            }
+            return Ok(());
+        }
+
         match step {
             Step::ClockJump { duration_ms } => {
                 self.clock
@@ -139,6 +168,63 @@ impl LocalRunner {
                 let sim = self.simulator_mut(target)?;
                 sim.handle_step(step)
             }
+            Step::PeerDown { target } => {
+                self.state
+                    .insert(format!("fault.{target}.peer_down"), "true".to_string());
+                Ok(())
+            }
+            Step::Timeout { target, protocol } => {
+                self.state.insert(
+                    format!("fault.{target}.timeout.protocol"),
+                    protocol.clone().unwrap_or_else(|| "any".to_string()),
+                );
+                Ok(())
+            }
+            Step::Retransmission {
+                target,
+                protocol,
+                attempts,
+            } => {
+                self.state.insert(
+                    format!("fault.{target}.retransmission.protocol"),
+                    protocol.clone(),
+                );
+                self.state.insert(
+                    format!("fault.{target}.retransmission.attempts"),
+                    attempts.to_string(),
+                );
+                Ok(())
+            }
+            Step::PacketLoss {
+                target,
+                protocol,
+                packet_count,
+            } => {
+                self.state.insert(
+                    format!("fault.{target}.packet_loss.protocol"),
+                    protocol.clone(),
+                );
+                self.state.insert(
+                    format!("fault.{target}.packet_loss.count"),
+                    packet_count.to_string(),
+                );
+                Ok(())
+            }
+            Step::DuplicatePacket {
+                target,
+                protocol,
+                packet_count,
+            } => {
+                self.state.insert(
+                    format!("fault.{target}.duplicate_packet.protocol"),
+                    protocol.clone(),
+                );
+                self.state.insert(
+                    format!("fault.{target}.duplicate_packet.count"),
+                    packet_count.to_string(),
+                );
+                Ok(())
+            }
             Step::DelayedResponse { target, delay_ms } => {
                 self.simulator_mut(target)?;
                 self.clock
@@ -168,6 +254,15 @@ impl LocalRunner {
                 );
                 Ok(())
             }
+            Step::SendIkev2(_)
+            | Step::ExpectIkev2(_)
+            | Step::SendDiameter(_)
+            | Step::ExpectDiameter(_)
+            | Step::SendGtpv2c(_)
+            | Step::ExpectGtpv2c(_)
+            | Step::SendGtpu(_)
+            | Step::ExpectGtpu(_)
+            | Step::ExpectEsp(_) => unreachable!("protocol fixture steps are handled above"),
             Step::Other => Err(crate::TestbedError::Validation(
                 "unsupported scenario step".to_string(),
             )),

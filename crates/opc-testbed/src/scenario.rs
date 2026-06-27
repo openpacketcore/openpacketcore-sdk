@@ -143,6 +143,7 @@ impl Scenario {
                     "step {idx} is an unsupported/unknown step kind"
                 )));
             }
+            step.validate(idx)?;
         }
         for req in &self.requirements {
             if req.trim().is_empty() {
@@ -195,6 +196,20 @@ pub struct NfSpec {
     pub simulator: Option<String>,
 }
 
+/// Opaque fixture-backed protocol step metadata.
+///
+/// The testbed DSL can validate and carry EPC/ePDG scenario intent before the
+/// protocol codecs or simulators exist. `fixture` is a repository-relative
+/// fixture identifier; the payload is not parsed by this crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolFixtureStep {
+    pub from: String,
+    pub to: String,
+    pub fixture: String,
+    pub label: Option<String>,
+    pub transport: Option<String>,
+}
+
 /// A single step in the scenario (send/expect over NGAP, SBI, etc., or failure injection).
 ///
 /// Serializes to the tagged wire form (`{ "kind": "send_ngap", ... }`) so
@@ -216,8 +231,39 @@ pub enum Step {
         to: String,
         message: String,
     },
+    SendIkev2(ProtocolFixtureStep),
+    ExpectIkev2(ProtocolFixtureStep),
+    SendDiameter(ProtocolFixtureStep),
+    ExpectDiameter(ProtocolFixtureStep),
+    SendGtpv2c(ProtocolFixtureStep),
+    ExpectGtpv2c(ProtocolFixtureStep),
+    SendGtpu(ProtocolFixtureStep),
+    ExpectGtpu(ProtocolFixtureStep),
+    ExpectEsp(ProtocolFixtureStep),
     PeerUnavailable {
         target: String,
+    },
+    PeerDown {
+        target: String,
+    },
+    Timeout {
+        target: String,
+        protocol: Option<String>,
+    },
+    Retransmission {
+        target: String,
+        protocol: String,
+        attempts: u64,
+    },
+    PacketLoss {
+        target: String,
+        protocol: String,
+        packet_count: u64,
+    },
+    DuplicatePacket {
+        target: String,
+        protocol: String,
+        packet_count: u64,
     },
     DelayedResponse {
         target: String,
@@ -240,6 +286,45 @@ pub enum Step {
         node_b: String,
     },
     Other,
+}
+
+impl Step {
+    pub(crate) fn protocol_fixture(&self) -> Option<(&'static str, &ProtocolFixtureStep)> {
+        match self {
+            Self::SendIkev2(step) => Some(("send_ikev2", step)),
+            Self::ExpectIkev2(step) => Some(("expect_ikev2", step)),
+            Self::SendDiameter(step) => Some(("send_diameter", step)),
+            Self::ExpectDiameter(step) => Some(("expect_diameter", step)),
+            Self::SendGtpv2c(step) => Some(("send_gtpv2c", step)),
+            Self::ExpectGtpv2c(step) => Some(("expect_gtpv2c", step)),
+            Self::SendGtpu(step) => Some(("send_gtpu", step)),
+            Self::ExpectGtpu(step) => Some(("expect_gtpu", step)),
+            Self::ExpectEsp(step) => Some(("expect_esp", step)),
+            _ => None,
+        }
+    }
+
+    fn validate(&self, idx: usize) -> Result<(), crate::TestbedError> {
+        if let Some((kind, step)) = self.protocol_fixture() {
+            validate_protocol_fixture_ref(idx, kind, &step.fixture)?;
+        }
+
+        match self {
+            Self::Retransmission { attempts, .. } if *attempts == 0 => {
+                Err(crate::TestbedError::Validation(format!(
+                    "step {idx} retransmission attempts must be greater than zero"
+                )))
+            }
+            Self::PacketLoss { packet_count, .. } | Self::DuplicatePacket { packet_count, .. }
+                if *packet_count == 0 =>
+            {
+                Err(crate::TestbedError::Validation(format!(
+                    "step {idx} packet_count must be greater than zero"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 impl Serialize for Step {
@@ -272,9 +357,61 @@ impl Serialize for Step {
                 map.serialize_entry("to", to)?;
                 map.serialize_entry("message", message)?;
             }
+            Step::SendIkev2(step) => serialize_protocol_step(&mut map, "send_ikev2", step)?,
+            Step::ExpectIkev2(step) => serialize_protocol_step(&mut map, "expect_ikev2", step)?,
+            Step::SendDiameter(step) => serialize_protocol_step(&mut map, "send_diameter", step)?,
+            Step::ExpectDiameter(step) => {
+                serialize_protocol_step(&mut map, "expect_diameter", step)?;
+            }
+            Step::SendGtpv2c(step) => serialize_protocol_step(&mut map, "send_gtpv2c", step)?,
+            Step::ExpectGtpv2c(step) => serialize_protocol_step(&mut map, "expect_gtpv2c", step)?,
+            Step::SendGtpu(step) => serialize_protocol_step(&mut map, "send_gtpu", step)?,
+            Step::ExpectGtpu(step) => serialize_protocol_step(&mut map, "expect_gtpu", step)?,
+            Step::ExpectEsp(step) => serialize_protocol_step(&mut map, "expect_esp", step)?,
             Step::PeerUnavailable { target } => {
                 map.serialize_entry("kind", "peer_unavailable")?;
                 map.serialize_entry("target", target)?;
+            }
+            Step::PeerDown { target } => {
+                map.serialize_entry("kind", "peer_down")?;
+                map.serialize_entry("target", target)?;
+            }
+            Step::Timeout { target, protocol } => {
+                map.serialize_entry("kind", "timeout")?;
+                map.serialize_entry("target", target)?;
+                if let Some(protocol) = protocol {
+                    map.serialize_entry("protocol", protocol)?;
+                }
+            }
+            Step::Retransmission {
+                target,
+                protocol,
+                attempts,
+            } => {
+                map.serialize_entry("kind", "retransmission")?;
+                map.serialize_entry("target", target)?;
+                map.serialize_entry("protocol", protocol)?;
+                map.serialize_entry("attempts", attempts)?;
+            }
+            Step::PacketLoss {
+                target,
+                protocol,
+                packet_count,
+            } => {
+                map.serialize_entry("kind", "packet_loss")?;
+                map.serialize_entry("target", target)?;
+                map.serialize_entry("protocol", protocol)?;
+                map.serialize_entry("packet_count", packet_count)?;
+            }
+            Step::DuplicatePacket {
+                target,
+                protocol,
+                packet_count,
+            } => {
+                map.serialize_entry("kind", "duplicate_packet")?;
+                map.serialize_entry("target", target)?;
+                map.serialize_entry("protocol", protocol)?;
+                map.serialize_entry("packet_count", packet_count)?;
             }
             Step::DelayedResponse { target, delay_ms } => {
                 map.serialize_entry("kind", "delayed_response")?;
@@ -308,6 +445,27 @@ impl Serialize for Step {
         }
         map.end()
     }
+}
+
+fn serialize_protocol_step<M>(
+    map: &mut M,
+    kind: &str,
+    step: &ProtocolFixtureStep,
+) -> Result<(), M::Error>
+where
+    M: serde::ser::SerializeMap,
+{
+    map.serialize_entry("kind", kind)?;
+    map.serialize_entry("from", &step.from)?;
+    map.serialize_entry("to", &step.to)?;
+    map.serialize_entry("fixture", &step.fixture)?;
+    if let Some(label) = &step.label {
+        map.serialize_entry("label", label)?;
+    }
+    if let Some(transport) = &step.transport {
+        map.serialize_entry("transport", transport)?;
+    }
+    Ok(())
 }
 
 impl<'de> Deserialize<'de> for Step {
@@ -360,8 +518,112 @@ enum TaggedStep {
         to: String,
         message: String,
     },
+    SendIkev2 {
+        from: String,
+        to: String,
+        fixture: String,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        transport: Option<String>,
+    },
+    ExpectIkev2 {
+        from: String,
+        to: String,
+        fixture: String,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        transport: Option<String>,
+    },
+    SendDiameter {
+        from: String,
+        to: String,
+        fixture: String,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        transport: Option<String>,
+    },
+    ExpectDiameter {
+        from: String,
+        to: String,
+        fixture: String,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        transport: Option<String>,
+    },
+    SendGtpv2c {
+        from: String,
+        to: String,
+        fixture: String,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        transport: Option<String>,
+    },
+    ExpectGtpv2c {
+        from: String,
+        to: String,
+        fixture: String,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        transport: Option<String>,
+    },
+    SendGtpu {
+        from: String,
+        to: String,
+        fixture: String,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        transport: Option<String>,
+    },
+    ExpectGtpu {
+        from: String,
+        to: String,
+        fixture: String,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        transport: Option<String>,
+    },
+    ExpectEsp {
+        from: String,
+        to: String,
+        fixture: String,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        transport: Option<String>,
+    },
     PeerUnavailable {
         target: String,
+    },
+    PeerDown {
+        target: String,
+    },
+    Timeout {
+        target: String,
+        #[serde(default)]
+        protocol: Option<String>,
+    },
+    Retransmission {
+        target: String,
+        protocol: String,
+        attempts: u64,
+    },
+    PacketLoss {
+        target: String,
+        protocol: String,
+        packet_count: u64,
+    },
+    DuplicatePacket {
+        target: String,
+        protocol: String,
+        packet_count: u64,
     },
     DelayedResponse {
         target: String,
@@ -401,7 +663,99 @@ impl From<TaggedStep> for Step {
                 operation,
             },
             TaggedStep::ExpectNgap { from, to, message } => Step::ExpectNgap { from, to, message },
+            TaggedStep::SendIkev2 {
+                from,
+                to,
+                fixture,
+                label,
+                transport,
+            } => Step::SendIkev2(protocol_step(from, to, fixture, label, transport)),
+            TaggedStep::ExpectIkev2 {
+                from,
+                to,
+                fixture,
+                label,
+                transport,
+            } => Step::ExpectIkev2(protocol_step(from, to, fixture, label, transport)),
+            TaggedStep::SendDiameter {
+                from,
+                to,
+                fixture,
+                label,
+                transport,
+            } => Step::SendDiameter(protocol_step(from, to, fixture, label, transport)),
+            TaggedStep::ExpectDiameter {
+                from,
+                to,
+                fixture,
+                label,
+                transport,
+            } => Step::ExpectDiameter(protocol_step(from, to, fixture, label, transport)),
+            TaggedStep::SendGtpv2c {
+                from,
+                to,
+                fixture,
+                label,
+                transport,
+            } => Step::SendGtpv2c(protocol_step(from, to, fixture, label, transport)),
+            TaggedStep::ExpectGtpv2c {
+                from,
+                to,
+                fixture,
+                label,
+                transport,
+            } => Step::ExpectGtpv2c(protocol_step(from, to, fixture, label, transport)),
+            TaggedStep::SendGtpu {
+                from,
+                to,
+                fixture,
+                label,
+                transport,
+            } => Step::SendGtpu(protocol_step(from, to, fixture, label, transport)),
+            TaggedStep::ExpectGtpu {
+                from,
+                to,
+                fixture,
+                label,
+                transport,
+            } => Step::ExpectGtpu(protocol_step(from, to, fixture, label, transport)),
+            TaggedStep::ExpectEsp {
+                from,
+                to,
+                fixture,
+                label,
+                transport,
+            } => Step::ExpectEsp(protocol_step(from, to, fixture, label, transport)),
             TaggedStep::PeerUnavailable { target } => Step::PeerUnavailable { target },
+            TaggedStep::PeerDown { target } => Step::PeerDown { target },
+            TaggedStep::Timeout { target, protocol } => Step::Timeout { target, protocol },
+            TaggedStep::Retransmission {
+                target,
+                protocol,
+                attempts,
+            } => Step::Retransmission {
+                target,
+                protocol,
+                attempts,
+            },
+            TaggedStep::PacketLoss {
+                target,
+                protocol,
+                packet_count,
+            } => Step::PacketLoss {
+                target,
+                protocol,
+                packet_count,
+            },
+            TaggedStep::DuplicatePacket {
+                target,
+                protocol,
+                packet_count,
+            } => Step::DuplicatePacket {
+                target,
+                protocol,
+                packet_count,
+            },
             TaggedStep::DelayedResponse { target, delay_ms } => {
                 Step::DelayedResponse { target, delay_ms }
             }
@@ -414,6 +768,22 @@ impl From<TaggedStep> for Step {
             }
             TaggedStep::Other => Step::Other,
         }
+    }
+}
+
+fn protocol_step(
+    from: String,
+    to: String,
+    fixture: String,
+    label: Option<String>,
+    transport: Option<String>,
+) -> ProtocolFixtureStep {
+    ProtocolFixtureStep {
+        from,
+        to,
+        fixture,
+        label,
+        transport,
     }
 }
 
@@ -443,8 +813,50 @@ struct ExpectNgapCanonical {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ProtocolStepCanonical {
+    from: String,
+    to: String,
+    fixture: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    transport: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PeerUnavailableCanonical {
     target: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerDownCanonical {
+    target: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TimeoutCanonical {
+    target: String,
+    #[serde(default)]
+    protocol: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetransmissionCanonical {
+    target: String,
+    protocol: String,
+    attempts: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PacketCountFailureCanonical {
+    target: String,
+    protocol: String,
+    packet_count: u64,
 }
 
 #[derive(Deserialize)]
@@ -517,11 +929,62 @@ where
                 message: payload.message,
             })
         }
+        "send_ikev2" => parse_protocol_canonical::<E>(val, Step::SendIkev2),
+        "expect_ikev2" => parse_protocol_canonical::<E>(val, Step::ExpectIkev2),
+        "send_diameter" => parse_protocol_canonical::<E>(val, Step::SendDiameter),
+        "expect_diameter" => parse_protocol_canonical::<E>(val, Step::ExpectDiameter),
+        "send_gtpv2c" => parse_protocol_canonical::<E>(val, Step::SendGtpv2c),
+        "expect_gtpv2c" => parse_protocol_canonical::<E>(val, Step::ExpectGtpv2c),
+        "send_gtpu" => parse_protocol_canonical::<E>(val, Step::SendGtpu),
+        "expect_gtpu" => parse_protocol_canonical::<E>(val, Step::ExpectGtpu),
+        "expect_esp" => parse_protocol_canonical::<E>(val, Step::ExpectEsp),
         "peer_unavailable" => {
             let payload: PeerUnavailableCanonical = serde_json::from_value(val.clone())
                 .map_err(|e| E::custom(format!("invalid peer_unavailable step: {e}")))?;
             Ok(Step::PeerUnavailable {
                 target: payload.target,
+            })
+        }
+        "peer_down" => {
+            let payload: PeerDownCanonical = serde_json::from_value(val.clone())
+                .map_err(|e| E::custom(format!("invalid peer_down step: {e}")))?;
+            Ok(Step::PeerDown {
+                target: payload.target,
+            })
+        }
+        "timeout" => {
+            let payload: TimeoutCanonical = serde_json::from_value(val.clone())
+                .map_err(|e| E::custom(format!("invalid timeout step: {e}")))?;
+            Ok(Step::Timeout {
+                target: payload.target,
+                protocol: payload.protocol,
+            })
+        }
+        "retransmission" => {
+            let payload: RetransmissionCanonical = serde_json::from_value(val.clone())
+                .map_err(|e| E::custom(format!("invalid retransmission step: {e}")))?;
+            Ok(Step::Retransmission {
+                target: payload.target,
+                protocol: payload.protocol,
+                attempts: payload.attempts,
+            })
+        }
+        "packet_loss" => {
+            let payload: PacketCountFailureCanonical = serde_json::from_value(val.clone())
+                .map_err(|e| E::custom(format!("invalid packet_loss step: {e}")))?;
+            Ok(Step::PacketLoss {
+                target: payload.target,
+                protocol: payload.protocol,
+                packet_count: payload.packet_count,
+            })
+        }
+        "duplicate_packet" => {
+            let payload: PacketCountFailureCanonical = serde_json::from_value(val.clone())
+                .map_err(|e| E::custom(format!("invalid duplicate_packet step: {e}")))?;
+            Ok(Step::DuplicatePacket {
+                target: payload.target,
+                protocol: payload.protocol,
+                packet_count: payload.packet_count,
             })
         }
         "delayed_response" => {
@@ -570,4 +1033,48 @@ where
         }
         _ => Ok(Step::Other),
     }
+}
+
+fn parse_protocol_canonical<E>(
+    val: &serde_json::Value,
+    build: fn(ProtocolFixtureStep) -> Step,
+) -> Result<Step, E>
+where
+    E: serde::de::Error,
+{
+    let payload: ProtocolStepCanonical = serde_json::from_value(val.clone())
+        .map_err(|e| E::custom(format!("invalid protocol fixture step: {e}")))?;
+    Ok(build(protocol_step(
+        payload.from,
+        payload.to,
+        payload.fixture,
+        payload.label,
+        payload.transport,
+    )))
+}
+
+fn validate_protocol_fixture_ref(
+    idx: usize,
+    kind: &str,
+    fixture: &str,
+) -> Result<(), crate::TestbedError> {
+    let invalid = fixture.is_empty()
+        || fixture.trim() != fixture
+        || fixture.starts_with('/')
+        || fixture.contains('\\')
+        || fixture.contains("://")
+        || fixture.split('/').any(|segment| {
+            segment.is_empty()
+                || segment == "."
+                || segment == ".."
+                || segment.chars().any(|c| c.is_whitespace() || c.is_control())
+        });
+
+    if invalid {
+        return Err(crate::TestbedError::Validation(format!(
+            "step {idx} {kind} fixture reference '{fixture}' must be a relative fixture id without whitespace or traversal"
+        )));
+    }
+
+    Ok(())
 }
