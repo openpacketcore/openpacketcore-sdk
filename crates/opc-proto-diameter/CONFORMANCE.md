@@ -107,13 +107,16 @@ preallocate from a wire-declared length. Three layers guard them:
   fuzz corpus entry, byte-truncations of each entry, and hostile constant
   inputs through the message and AVP decode entry points under `catch_unwind`.
   Runs in ordinary `cargo test`; no nightly toolchain or libFuzzer required.
-- **Scheduled fuzzing** — `.github/workflows/fuzz.yml` includes
-  `opc-proto-diameter` in the weekly/manual fuzz matrix. That workflow runs
-  `cargo +nightly fuzz list` and then executes the registered
-  `fuzz/fuzz_targets/decode_message.rs` and `fuzz/fuzz_targets/decode_avp.rs`
-  targets for a bounded smoke interval. Each target seeds *only* from its own
-  directory under `fuzz/corpus/<target>/`; no committed seed file lives solely
-  in a provenance or documentation directory.
+- **Fuzz target registration and scheduled coverage** — `fuzz/Cargo.toml`
+  registers `fuzz/fuzz_targets/decode_message.rs` and
+  `fuzz/fuzz_targets/decode_avp.rs`. The repository-level
+  `.github/workflows/fuzz.yml` matrix is the source of truth for weekly/manual
+  fuzz-smoke scheduling; keep that matrix aligned with this document before
+  citing scheduled CI coverage. When the workflow includes `opc-proto-diameter`,
+  it runs `cargo +nightly fuzz list` and then executes the registered targets
+  for a bounded smoke interval. Each target seeds *only* from its own directory
+  under `fuzz/corpus/<target>/`; no committed seed file lives solely in a
+  provenance or documentation directory.
 - **Fuzz target compilation** — the per-PR `.github/workflows/ci.yml` gate does
   not currently run `cargo +nightly fuzz list`; local fuzz-target registration
   is checked with `cargo +nightly fuzz list` (and, when needed,

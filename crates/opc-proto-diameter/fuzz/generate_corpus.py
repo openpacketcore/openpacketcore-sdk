@@ -104,6 +104,24 @@ def u32(value: int) -> bytes:
     return struct.pack(">I", value)
 
 
+def self_test_avp_flag_validation() -> None:
+    """Assert corpus helper flag validation fails closed for reserved bits."""
+    avp(264, 0x40, b"x", None)
+    avp(874, 0xC0, b"x", vendor=10415)
+    for flags, vendor in ((0x41, None), (0x9F, 10415)):
+        try:
+            avp(264, flags, b"x", vendor)
+        except ValueError as exc:
+            if "reserved flag bits" not in str(exc):
+                raise AssertionError(
+                    f"unexpected error for reserved AVP flags 0x{flags:02x}: {exc}"
+                ) from exc
+        else:
+            raise AssertionError(
+                f"reserved AVP flags 0x{flags:02x} were accepted by corpus helper"
+            )
+
+
 def main() -> None:
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -352,4 +370,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    self_test_avp_flag_validation()
     main()

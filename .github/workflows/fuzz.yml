@@ -24,6 +24,7 @@ jobs:
           - opc-proto-pfcp
           - opc-proto-nas
           - opc-proto-ngap
+          # Keep the Diameter CONFORMANCE.md scheduled-fuzz statement aligned.
           - opc-proto-diameter
     steps:
       - name: Checkout
