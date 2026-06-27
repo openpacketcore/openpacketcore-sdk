@@ -32,4 +32,7 @@ assert_eq!(message.header.sequence_number, 1);
 
 ```bash
 cargo check -p opc-proto-gtpv2c --all-targets --all-features
+cargo test -p opc-proto-gtpv2c --all-features header
+cargo test -p opc-proto-gtpv2c --all-features ie_raw
+cargo test -p opc-proto-gtpv2c --all-features malformed
 ```
