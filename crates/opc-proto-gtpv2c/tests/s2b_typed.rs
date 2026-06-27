@@ -1,12 +1,13 @@
 use bytes::BytesMut;
 use opc_proto_gtpv2c::{
-    decode_typed_ie_sequence, s2b, CauseValue, Message, MessageType, S2bMessage, TbcdDigits,
-    TypedIe, TypedIeValue, IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE,
-    IE_TYPE_CHARGING_ID, IE_TYPE_INDICATION, IE_TYPE_PCO,
+    decode_typed_ie_sequence, s2b, CauseValue, FullyQualifiedTeid, Message, MessageType,
+    S2bMessage, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT,
+    IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_IMSI,
+    IE_TYPE_INDICATION, IE_TYPE_PCO,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
-    ValidationLevel,
+    EncodeErrorCode, ValidationLevel,
 };
 
 fn procedure_context() -> DecodeContext {
@@ -626,4 +627,114 @@ fn procedure_aware_validation_rejects_missing_mandatory_ies_for_every_claimed_pa
             Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
         ));
     }
+}
+
+#[test]
+fn fteid_encode_rejects_missing_v4_and_v6() {
+    let fteid = FullyQualifiedTeid {
+        interface_type: 10,
+        teid: 0x1122_3344,
+        ipv4: None,
+        ipv6: None,
+    };
+    let ie = TypedIe {
+        instance: 0,
+        value: TypedIeValue::FullyQualifiedTeid(fteid),
+    };
+    let mut dst = BytesMut::new();
+    let result = ie.encode(&mut dst, EncodeContext::default());
+    assert!(matches!(
+        result,
+        Err(error) if matches!(error.code(), EncodeErrorCode::Structural { .. })
+    ));
+}
+
+#[test]
+fn fteid_encode_rejects_out_of_range_interface_type() {
+    let fteid = FullyQualifiedTeid {
+        interface_type: 0x40,
+        teid: 0,
+        ipv4: Some([192, 0, 2, 1]),
+        ipv6: None,
+    };
+    let ie = TypedIe {
+        instance: 0,
+        value: TypedIeValue::FullyQualifiedTeid(fteid),
+    };
+    let mut dst = BytesMut::new();
+    let result = ie.encode(&mut dst, EncodeContext::default());
+    assert!(matches!(
+        result,
+        Err(error) if matches!(error.code(), EncodeErrorCode::Structural { .. })
+    ));
+}
+
+#[test]
+fn nested_bearer_context_rejects_depth_exceeded() {
+    // Outer Bearer Context containing one nested Bearer Context containing EBI.
+    let nested = [
+        IE_TYPE_BEARER_CONTEXT,
+        0x00,
+        0x09,
+        0x00, // Outer Bearer Context header, length 9.
+        IE_TYPE_BEARER_CONTEXT,
+        0x00,
+        0x05,
+        0x00, // Inner Bearer Context header, length 5.
+        IE_TYPE_EBI,
+        0x00,
+        0x01,
+        0x00,
+        0x05, // EBI = 5.
+    ];
+    let ctx = DecodeContext {
+        max_depth: 1,
+        ..DecodeContext::default()
+    };
+    let result = decode_typed_ie_sequence(&nested, ctx, 0);
+    assert!(matches!(
+        result,
+        Err(error) if matches!(error.code(), DecodeErrorCode::DepthExceeded) && error.offset() == 8
+    ));
+}
+
+#[test]
+fn duplicate_ie_reject_includes_ie_offset() {
+    let duplicate_ebi = [
+        IE_TYPE_EBI,
+        0x00,
+        0x01,
+        0x00,
+        0x05, // EBI instance 0 = 5.
+        IE_TYPE_EBI,
+        0x00,
+        0x01,
+        0x00,
+        0x06, // Duplicate EBI instance 0 = 6.
+    ];
+    let ctx = DecodeContext {
+        duplicate_ie_policy: DuplicateIePolicy::Reject,
+        ..DecodeContext::default()
+    };
+    let result = decode_typed_ie_sequence(&duplicate_ebi, ctx, 0);
+    assert!(matches!(
+        result,
+        Err(error) if matches!(error.code(), DecodeErrorCode::DuplicateIe) && error.offset() == 5
+    ));
+}
+
+#[test]
+fn typed_value_decode_error_includes_ie_value_offset() {
+    let invalid_imsi = [
+        IE_TYPE_IMSI,
+        0x00,
+        0x01,
+        0x00, // IMSI IE header.
+        0x0a, // Invalid TBCD digit in low nibble.
+    ];
+    let result = decode_typed_ie_sequence(&invalid_imsi, DecodeContext::default(), 0);
+    assert!(matches!(
+        result,
+        Err(error) if matches!(error.code(), DecodeErrorCode::InvalidEnumValue { .. }) && error.offset() == 4
+    ));
 }

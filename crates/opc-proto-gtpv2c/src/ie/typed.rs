@@ -314,10 +314,11 @@ impl Cause {
         })
     }
 
-    fn encode_value(&self, dst: &mut BytesMut) {
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
         dst.put_u8(self.value.into());
         dst.put_u8(self.flags_octet);
         dst.put_slice(&self.offending_ie);
+        Ok(())
     }
 }
 
@@ -349,8 +350,9 @@ impl Recovery {
         })
     }
 
-    fn encode_value(&self, dst: &mut BytesMut) {
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
         dst.put_u8(self.restart_counter);
+        Ok(())
     }
 }
 
@@ -473,9 +475,10 @@ impl AggregateMaximumBitRate {
         })
     }
 
-    fn encode_value(&self, dst: &mut BytesMut) {
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
         dst.put_u32(self.uplink);
         dst.put_u32(self.downlink);
+        Ok(())
     }
 }
 
@@ -507,8 +510,9 @@ impl EpsBearerId {
         })
     }
 
-    fn encode_value(&self, dst: &mut BytesMut) {
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
         dst.put_u8(self.value & 0x0f);
+        Ok(())
     }
 }
 
@@ -718,8 +722,9 @@ impl RatType {
         })
     }
 
-    fn encode_value(&self, dst: &mut BytesMut) {
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
         dst.put_u8(self.value.into());
+        Ok(())
     }
 }
 
@@ -896,8 +901,18 @@ impl FullyQualifiedTeid {
         })
     }
 
-    fn encode_value(&self, dst: &mut BytesMut) {
-        let mut flags = self.interface_type & 0x3f;
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        if self.ipv4.is_none() && self.ipv6.is_none() {
+            return Err(encode_structural_error(
+                "F-TEID IE must set V4, V6, or both",
+            ));
+        }
+        if self.interface_type > 0x3f {
+            return Err(encode_structural_error(
+                "F-TEID interface type must be a six-bit value",
+            ));
+        }
+        let mut flags = self.interface_type;
         if self.ipv4.is_some() {
             flags |= 0x80;
         }
@@ -912,6 +927,7 @@ impl FullyQualifiedTeid {
         if let Some(ipv6) = self.ipv6 {
             dst.put_slice(&ipv6);
         }
+        Ok(())
     }
 }
 
@@ -988,8 +1004,9 @@ impl PdnType {
         })
     }
 
-    fn encode_value(&self, dst: &mut BytesMut) {
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
         dst.put_u8(u8::from(self.value) & 0x07);
+        Ok(())
     }
 }
 
@@ -1130,8 +1147,9 @@ impl ApnRestriction {
         Ok(Self { value: value[0] })
     }
 
-    fn encode_value(&self, dst: &mut BytesMut) {
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
         dst.put_u8(self.value);
+        Ok(())
     }
 }
 
@@ -1200,8 +1218,9 @@ impl SelectionMode {
         })
     }
 
-    fn encode_value(&self, dst: &mut BytesMut) {
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
         dst.put_u8(u8::from(self.value) & 0x03);
+        Ok(())
     }
 }
 
@@ -1223,14 +1242,16 @@ impl<'a> BearerContext<'a> {
         value: &'a [u8],
         ctx: DecodeContext,
         depth: usize,
+        base_offset: usize,
     ) -> Result<Self, DecodeError> {
         if depth.saturating_add(1) > ctx.max_depth {
             return Err(
-                DecodeError::new(DecodeErrorCode::DepthExceeded, 0).with_spec_ref(spec_ref())
+                DecodeError::new(DecodeErrorCode::DepthExceeded, base_offset)
+                    .with_spec_ref(spec_ref()),
             );
         }
         Ok(Self {
-            members: decode_typed_ie_sequence(value, ctx, depth.saturating_add(1))?,
+            members: decode_typed_ie_sequence_at(value, ctx, depth.saturating_add(1), base_offset)?,
         })
     }
 
@@ -1260,8 +1281,9 @@ impl ChargingId {
         })
     }
 
-    fn encode_value(&self, dst: &mut BytesMut) {
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
         dst.put_u32(self.value);
+        Ok(())
     }
 }
 
@@ -1382,63 +1404,83 @@ impl<'a> TypedIe<'a> {
     }
 
     /// Decode one typed IE from an already-decoded raw IE.
+    ///
+    /// `base_offset` is the absolute byte position of the start of the raw IE
+    /// header within the containing input. It is used so that value-level decode
+    /// errors report offsets relative to the message rather than to the IE value.
     pub fn decode_from_raw(
         raw: RawIe<'a>,
         ctx: DecodeContext,
         depth: usize,
+        base_offset: usize,
     ) -> Result<Self, DecodeError> {
-        let offset = 0usize;
+        let value_offset = checked_add_offset(base_offset, IE_HEADER_LEN)?;
         let value = match raw.ie_type {
-            IE_TYPE_IMSI => TypedIeValue::Imsi(TbcdDigits::decode_value(raw.value, offset)?),
-            IE_TYPE_CAUSE => TypedIeValue::Cause(Cause::decode_value(raw.value, offset)?),
-            IE_TYPE_RECOVERY => TypedIeValue::Recovery(Recovery::decode_value(raw.value, offset)?),
-            IE_TYPE_APN => {
-                TypedIeValue::AccessPointName(AccessPointName::decode_value(raw.value, offset)?)
+            IE_TYPE_IMSI => TypedIeValue::Imsi(TbcdDigits::decode_value(raw.value, value_offset)?),
+            IE_TYPE_CAUSE => TypedIeValue::Cause(Cause::decode_value(raw.value, value_offset)?),
+            IE_TYPE_RECOVERY => {
+                TypedIeValue::Recovery(Recovery::decode_value(raw.value, value_offset)?)
             }
+            IE_TYPE_APN => TypedIeValue::AccessPointName(AccessPointName::decode_value(
+                raw.value,
+                value_offset,
+            )?),
             IE_TYPE_AMBR => TypedIeValue::AggregateMaximumBitRate(
-                AggregateMaximumBitRate::decode_value(raw.value, offset)?,
+                AggregateMaximumBitRate::decode_value(raw.value, value_offset)?,
             ),
             IE_TYPE_EBI => {
-                TypedIeValue::EpsBearerId(EpsBearerId::decode_value(raw.value, offset, ctx)?)
+                TypedIeValue::EpsBearerId(EpsBearerId::decode_value(raw.value, value_offset, ctx)?)
             }
-            IE_TYPE_MEI => TypedIeValue::Mei(TbcdDigits::decode_value(raw.value, offset)?),
-            IE_TYPE_MSISDN => TypedIeValue::Msisdn(TbcdDigits::decode_value(raw.value, offset)?),
+            IE_TYPE_MEI => TypedIeValue::Mei(TbcdDigits::decode_value(raw.value, value_offset)?),
+            IE_TYPE_MSISDN => {
+                TypedIeValue::Msisdn(TbcdDigits::decode_value(raw.value, value_offset)?)
+            }
             IE_TYPE_INDICATION => {
-                TypedIeValue::Indication(Indication::decode_value(raw.value, offset)?)
+                TypedIeValue::Indication(Indication::decode_value(raw.value, value_offset)?)
             }
             IE_TYPE_PCO => TypedIeValue::ProtocolConfigurationOptions(
-                ProtocolConfigurationOptions::decode_value(raw.value, offset)?,
+                ProtocolConfigurationOptions::decode_value(raw.value, value_offset)?,
             ),
             IE_TYPE_PAA => TypedIeValue::PdnAddressAllocation(PdnAddressAllocation::decode_value(
-                raw.value, offset, ctx,
+                raw.value,
+                value_offset,
+                ctx,
             )?),
             IE_TYPE_BEARER_QOS => {
-                TypedIeValue::BearerQos(BearerQos::decode_value(raw.value, offset)?)
+                TypedIeValue::BearerQos(BearerQos::decode_value(raw.value, value_offset)?)
             }
-            IE_TYPE_RAT_TYPE => TypedIeValue::RatType(RatType::decode_value(raw.value, offset)?),
+            IE_TYPE_RAT_TYPE => {
+                TypedIeValue::RatType(RatType::decode_value(raw.value, value_offset)?)
+            }
             IE_TYPE_SERVING_NETWORK => {
-                TypedIeValue::ServingNetwork(ServingNetwork::decode_value(raw.value, offset)?)
+                TypedIeValue::ServingNetwork(ServingNetwork::decode_value(raw.value, value_offset)?)
             }
             IE_TYPE_F_TEID => TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid::decode_value(
-                raw.value, offset,
+                raw.value,
+                value_offset,
             )?),
-            IE_TYPE_BEARER_CONTEXT => {
-                TypedIeValue::BearerContext(BearerContext::decode_value(raw.value, ctx, depth)?)
-            }
+            IE_TYPE_BEARER_CONTEXT => TypedIeValue::BearerContext(BearerContext::decode_value(
+                raw.value,
+                ctx,
+                depth,
+                value_offset,
+            )?),
             IE_TYPE_CHARGING_ID => {
-                TypedIeValue::ChargingId(ChargingId::decode_value(raw.value, offset)?)
+                TypedIeValue::ChargingId(ChargingId::decode_value(raw.value, value_offset)?)
             }
             IE_TYPE_PDN_TYPE => {
-                TypedIeValue::PdnType(PdnType::decode_value(raw.value, offset, ctx)?)
+                TypedIeValue::PdnType(PdnType::decode_value(raw.value, value_offset, ctx)?)
             }
             IE_TYPE_APN_RESTRICTION => {
-                TypedIeValue::ApnRestriction(ApnRestriction::decode_value(raw.value, offset)?)
+                TypedIeValue::ApnRestriction(ApnRestriction::decode_value(raw.value, value_offset)?)
             }
-            IE_TYPE_SELECTION_MODE => {
-                TypedIeValue::SelectionMode(SelectionMode::decode_value(raw.value, offset, ctx)?)
-            }
+            IE_TYPE_SELECTION_MODE => TypedIeValue::SelectionMode(SelectionMode::decode_value(
+                raw.value,
+                value_offset,
+                ctx,
+            )?),
             IE_TYPE_APCO => TypedIeValue::AdditionalProtocolConfigurationOptions(
-                AdditionalProtocolConfigurationOptions::decode_value(raw.value, offset)?,
+                AdditionalProtocolConfigurationOptions::decode_value(raw.value, value_offset)?,
             ),
             _ => TypedIeValue::Raw(raw.clone()),
         };
@@ -1510,53 +1552,23 @@ impl<'a> TypedIe<'a> {
             TypedIeValue::Imsi(value) | TypedIeValue::Mei(value) | TypedIeValue::Msisdn(value) => {
                 value.encode_value(dst)
             }
-            TypedIeValue::Cause(value) => {
-                value.encode_value(dst);
-                Ok(())
-            }
-            TypedIeValue::Recovery(value) => {
-                value.encode_value(dst);
-                Ok(())
-            }
+            TypedIeValue::Cause(value) => value.encode_value(dst),
+            TypedIeValue::Recovery(value) => value.encode_value(dst),
             TypedIeValue::AccessPointName(value) => value.encode_value(dst),
-            TypedIeValue::AggregateMaximumBitRate(value) => {
-                value.encode_value(dst);
-                Ok(())
-            }
-            TypedIeValue::EpsBearerId(value) => {
-                value.encode_value(dst);
-                Ok(())
-            }
+            TypedIeValue::AggregateMaximumBitRate(value) => value.encode_value(dst),
+            TypedIeValue::EpsBearerId(value) => value.encode_value(dst),
             TypedIeValue::Indication(value) => value.encode_value(dst),
             TypedIeValue::ProtocolConfigurationOptions(value) => value.encode_value(dst),
             TypedIeValue::PdnAddressAllocation(value) => value.encode_value(dst),
             TypedIeValue::BearerQos(value) => value.encode_value(dst),
-            TypedIeValue::RatType(value) => {
-                value.encode_value(dst);
-                Ok(())
-            }
+            TypedIeValue::RatType(value) => value.encode_value(dst),
             TypedIeValue::ServingNetwork(value) => value.encode_value(dst),
-            TypedIeValue::FullyQualifiedTeid(value) => {
-                value.encode_value(dst);
-                Ok(())
-            }
+            TypedIeValue::FullyQualifiedTeid(value) => value.encode_value(dst),
             TypedIeValue::BearerContext(value) => value.encode_value(dst, ctx),
-            TypedIeValue::ChargingId(value) => {
-                value.encode_value(dst);
-                Ok(())
-            }
-            TypedIeValue::PdnType(value) => {
-                value.encode_value(dst);
-                Ok(())
-            }
-            TypedIeValue::ApnRestriction(value) => {
-                value.encode_value(dst);
-                Ok(())
-            }
-            TypedIeValue::SelectionMode(value) => {
-                value.encode_value(dst);
-                Ok(())
-            }
+            TypedIeValue::ChargingId(value) => value.encode_value(dst),
+            TypedIeValue::PdnType(value) => value.encode_value(dst),
+            TypedIeValue::ApnRestriction(value) => value.encode_value(dst),
+            TypedIeValue::SelectionMode(value) => value.encode_value(dst),
             TypedIeValue::AdditionalProtocolConfigurationOptions(value) => value.encode_value(dst),
             TypedIeValue::Raw(_) => unreachable!("raw IEs are encoded by the raw-preserving path"),
         }
@@ -1629,14 +1641,28 @@ pub fn decode_typed_ie_sequence<'a>(
     ctx: DecodeContext,
     depth: usize,
 ) -> Result<Vec<TypedIe<'a>>, DecodeError> {
+    decode_typed_ie_sequence_at(input, ctx, depth, 0)
+}
+
+fn decode_typed_ie_sequence_at<'a>(
+    input: &'a [u8],
+    ctx: DecodeContext,
+    depth: usize,
+    base_offset: usize,
+) -> Result<Vec<TypedIe<'a>>, DecodeError> {
     if depth > ctx.max_depth {
-        return Err(DecodeError::new(DecodeErrorCode::DepthExceeded, 0).with_spec_ref(spec_ref()));
+        return Err(
+            DecodeError::new(DecodeErrorCode::DepthExceeded, base_offset).with_spec_ref(spec_ref()),
+        );
     }
     let mut ies = Vec::new();
+    let mut offset = base_offset;
     for item in RawIeIterator::new(input, ctx) {
         let raw = item?;
-        let typed = TypedIe::decode_from_raw(raw, ctx, depth)?;
-        apply_duplicate_policy(&mut ies, typed, ctx.duplicate_ie_policy)?;
+        let wire_len = IE_HEADER_LEN + raw.value.len();
+        let typed = TypedIe::decode_from_raw(raw, ctx, depth, offset)?;
+        apply_duplicate_policy(&mut ies, typed, ctx.duplicate_ie_policy, offset)?;
+        offset = checked_add_offset(offset, wire_len)?;
     }
     Ok(ies)
 }
@@ -1645,6 +1671,7 @@ fn apply_duplicate_policy<'a>(
     ies: &mut Vec<TypedIe<'a>>,
     typed: TypedIe<'a>,
     policy: DuplicateIePolicy,
+    offset: usize,
 ) -> Result<(), DecodeError> {
     let duplicate = ies.iter().position(|existing| {
         existing.ie_type() == typed.ie_type() && existing.instance == typed.instance
@@ -1652,7 +1679,7 @@ fn apply_duplicate_policy<'a>(
 
     match duplicate {
         Some(_) if matches!(policy, DuplicateIePolicy::Reject) => {
-            Err(DecodeError::new(DecodeErrorCode::DuplicateIe, 0).with_spec_ref(spec_ref()))
+            Err(DecodeError::new(DecodeErrorCode::DuplicateIe, offset).with_spec_ref(spec_ref()))
         }
         Some(_) if matches!(policy, DuplicateIePolicy::First) => Ok(()),
         Some(index) => {
