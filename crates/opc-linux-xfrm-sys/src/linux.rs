@@ -228,13 +228,24 @@ mod tests {
         Some(sock)
     }
 
+    /// Unwrap a test fixture, or print a skip diagnostic and return from the
+    /// calling test when the sandbox denies local datagram IPC.
+    macro_rules! skip_if_sandbox_denies {
+        ($sock:expr) => {
+            match $sock {
+                Some(sock) => sock,
+                None => {
+                    eprintln!("skipping: local datagram IPC denied by sandbox");
+                    return;
+                }
+            }
+        };
+    }
+
     #[test]
     fn receive_message_reads_fitting_datagram() {
         let payload = b"hello xfrm";
-        let sock = match datagram_socket_with(payload) {
-            Some(sock) => sock,
-            None => return,
-        };
+        let sock = skip_if_sandbox_denies!(datagram_socket_with(payload));
 
         let mut buf = [0_u8; 32];
         let n = receive_message(&sock, &mut buf).unwrap();
@@ -246,10 +257,7 @@ mod tests {
     fn receive_message_reads_exact_fit_datagram() {
         let payload = b"exactfit";
         assert_eq!(payload.len(), 8);
-        let sock = match datagram_socket_with(payload) {
-            Some(sock) => sock,
-            None => return,
-        };
+        let sock = skip_if_sandbox_denies!(datagram_socket_with(payload));
 
         let mut buf = [0_u8; 8];
         let n = receive_message(&sock, &mut buf).unwrap();
@@ -261,10 +269,7 @@ mod tests {
     fn receive_message_rejects_truncated_datagram() {
         let payload = b"0123456789abcdef";
         assert_eq!(payload.len(), 16);
-        let sock = match datagram_socket_with(payload) {
-            Some(sock) => sock,
-            None => return,
-        };
+        let sock = skip_if_sandbox_denies!(datagram_socket_with(payload));
 
         let mut buf = [0_u8; 8];
         let err = receive_message(&sock, &mut buf).unwrap_err();
