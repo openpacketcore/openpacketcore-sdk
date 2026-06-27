@@ -228,10 +228,33 @@ fn strict_message_validation_reports_absolute_avp_offsets() {
     assert!(matches!(
         result,
         Err(error) if matches!(error.code(), DecodeErrorCode::InvalidLength { .. })
-            // The malformed AVP is the last one in `region`. Its length field starts at
+            // The malformed AVP's header starts at
             // `DIAMETER_HEADER_LEN + region.len() - AVP_HEADER_LEN`; the invalid length is
-            // reported at byte 5 of the AVP header, hence the `+ 5`.
+            // reported at byte 5 of that header, hence the `+ 5`.
             && error.offset() == DIAMETER_HEADER_LEN + region.len() - AVP_HEADER_LEN + 5
+    ));
+}
+
+#[test]
+fn grouped_value_validation_respects_max_depth_at_entry() {
+    let child = encode_raw_avp(AvpHeader::ietf(AvpCode::new(264), true), b"host.example");
+    let grouped = encode_raw_avp(AvpHeader::ietf(AvpCode::new(279), true), &child);
+
+    let grouped_avp = match RawAvp::decode(&grouped, DecodeContext::default()) {
+        Ok((_, avp)) => avp,
+        Err(error) => panic!("grouped AVP decode failed: {error}"),
+    };
+
+    let max_depth_zero = DecodeContext {
+        max_depth: 0,
+        validation_level: ValidationLevel::Strict,
+        ..DecodeContext::default()
+    };
+    let result = grouped_avp.validate_grouped_value_with_dictionary(max_depth_zero, dictionary_set());
+    assert!(matches!(
+        result,
+        Err(error) if matches!(error.code(), DecodeErrorCode::DepthExceeded)
+            && error.offset() == 0
     ));
 }
 

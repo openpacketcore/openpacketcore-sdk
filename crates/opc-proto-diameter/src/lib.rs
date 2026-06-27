@@ -19,6 +19,8 @@
 //! @req REQ-IETF-RFC6733-SCAFFOLD-001
 //! @conformance scaffold — see CONFORMANCE.md
 
+use std::collections::HashSet;
+
 #[cfg(any(
     feature = "app-gx",
     feature = "app-rf",
@@ -33,8 +35,6 @@ pub mod base;
 pub mod dictionary;
 #[cfg(feature = "peer")]
 pub mod peer;
-
-use std::collections::HashSet;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
@@ -985,6 +985,13 @@ fn validate_avp_region_at(
     dictionaries: Option<DictionarySet<'_>>,
 ) -> Result<(), DecodeError> {
     let spec_ref = SpecRef::new("ietf", "RFC6733", "4");
+    // This catches public grouped-value entry points (which start at depth 1)
+    // as well as any direct call with a depth already over the limit.
+    if depth > ctx.max_depth {
+        return Err(
+            DecodeError::new(DecodeErrorCode::DepthExceeded, base_offset).with_spec_ref(spec_ref),
+        );
+    }
 
     let mut remaining = input;
     let mut relative_offset = 0usize;
@@ -1023,8 +1030,9 @@ fn validate_avp_region_at(
 
         if dictionary_marks_grouped(&avp, dictionaries) {
             let child_depth = depth.saturating_add(1);
-            // Early depth check so the reported offset points to the grouping AVP
-            // rather than to the first child inside it.
+            // The entry-level guard catches depth violations from direct callers;
+            // this early check gives an offset pointing to the grouping AVP rather
+            // than to the first child inside it when recursing from a parent region.
             if child_depth > ctx.max_depth {
                 return Err(DecodeError::new(DecodeErrorCode::DepthExceeded, offset)
                     .with_spec_ref(spec_ref));
