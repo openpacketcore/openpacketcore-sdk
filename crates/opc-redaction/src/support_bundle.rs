@@ -1027,6 +1027,7 @@ fn json_key_is_secret_marker(key: &str) -> bool {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect();
+    let is_token_key = lower == "token" || lower.ends_with("_token");
 
     compact.contains("password")
         || compact.contains("passwd")
@@ -1040,7 +1041,7 @@ fn json_key_is_secret_marker(key: &str) -> bool {
         || compact == "secret"
         || compact.ends_with("secret")
         || compact.ends_with("secretkey")
-        || compact.ends_with("token")
+        || is_token_key
 }
 
 fn strip_port(token: &str) -> &str {
@@ -1938,6 +1939,7 @@ mod tests {
             ),
             (r#"{"refresh_token":"rt_abc"}"#, "rt_abc"),
             (r#"{"auth_token":"tok_abc"}"#, "tok_abc"),
+            (r#"{"token":"opaque-token-value"}"#, "opaque-token-value"),
             (r#"{"authorization":"Basic abc123"}"#, "Basic abc123"),
             (
                 r#"{"secret":"generic-secret-value"}"#,
@@ -2008,7 +2010,7 @@ mod tests {
     fn test_redact_support_bundle_telco_secret_keys() {
         // Support-bundle JSON entry types (HealthDebugJson and ConfigSnapshot)
         // must redact values under secret-bearing keys.
-        let json = r#"{"password":"super-secret-password","client_secret":"client-secret-value","api_key":"api-key-value","authorization":"Basic abc123","secret_key":"secret-key-value"}"#;
+        let json = r#"{"password":"super-secret-password","client_secret":"client-secret-value","api_key":"api-key-value","authorization":"Basic abc123","secret":"generic-secret-value","secret_key":"secret-key-value"}"#;
         let entries = vec![
             DiagnosticEntry::HealthDebugJson(json.to_string()),
             DiagnosticEntry::ConfigSnapshot(json.to_string()),
@@ -2018,6 +2020,7 @@ mod tests {
         assert!(!bundle.entries[0].content.contains("client-secret-value"));
         assert!(!bundle.entries[0].content.contains("api-key-value"));
         assert!(!bundle.entries[0].content.contains("Basic abc123"));
+        assert!(!bundle.entries[0].content.contains("generic-secret-value"));
         assert!(!bundle.entries[0].content.contains("secret-key-value"));
         assert!(bundle.entries[0]
             .content
@@ -2026,11 +2029,12 @@ mod tests {
         assert!(!bundle.entries[1].content.contains("client-secret-value"));
         assert!(!bundle.entries[1].content.contains("api-key-value"));
         assert!(!bundle.entries[1].content.contains("Basic abc123"));
+        assert!(!bundle.entries[1].content.contains("generic-secret-value"));
         assert!(!bundle.entries[1].content.contains("secret-key-value"));
         assert!(bundle.entries[1]
             .content
             .contains("[REDACTED_SECURITY_SECRET]"));
-        assert_eq!(bundle.redaction_summary.security_secrets, 10);
+        assert_eq!(bundle.redaction_summary.security_secrets, 12);
         assert!(bundle.redaction_applied);
     }
 
