@@ -191,6 +191,8 @@ mod tests {
         }
         // SAFETY: On success `socketpair` returned two fresh, live descriptors.
         let local = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: `fds[1]` is the second fresh descriptor returned by `socketpair`
+        // and is not owned anywhere else.
         let peer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
         Some((NetlinkSocket { fd: local }, peer))
     }

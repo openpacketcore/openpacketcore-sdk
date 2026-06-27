@@ -2051,6 +2051,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-ipsec-xfrm"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "opc-linux-xfrm-sys",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "opc-key"
 version = "0.2.0"
 dependencies = [
