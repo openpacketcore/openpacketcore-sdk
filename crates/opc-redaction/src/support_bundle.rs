@@ -120,6 +120,7 @@ impl RedactionSummary {
 /// Session-Id are treated as [`DataClass::NetworkSensitive`]. Callers that
 /// deploy APN/DNN as subscriber-sensitive can override just that mapping;
 /// all other identifier types keep their SDK-mandated classification.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RedactionPolicy {
     /// How to classify APN and DNN values for redaction.
@@ -131,6 +132,11 @@ impl RedactionPolicy {
     pub const DEFAULT: Self = Self {
         apn_dnn_class: ApnDnnClass::NetworkSensitive,
     };
+
+    /// Builds a redaction policy with a specific APN/DNN classification.
+    pub const fn with_apn_dnn_class(apn_dnn_class: ApnDnnClass) -> Self {
+        Self { apn_dnn_class }
+    }
 
     /// Returns the [`DataClass`] to use for a given identifier type under this
     /// policy.
@@ -150,6 +156,7 @@ impl RedactionPolicy {
 /// Some deployments treat APN/DNN as public/operational data; the SDK default
 /// is fail-closed (`NetworkSensitive`). This enum lets those deployments move
 /// APN/DNN values into the subscriber-identifier redaction bucket instead.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApnDnnClass {
@@ -1027,7 +1034,7 @@ fn json_key_is_secret_marker(key: &str) -> bool {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect();
-    let is_token_key = lower == "token" || lower.ends_with("_token");
+    let is_token_key = compact == "token" || compact.ends_with("token");
 
     compact.contains("password")
         || compact.contains("passwd")
@@ -1940,6 +1947,10 @@ mod tests {
             (r#"{"refresh_token":"rt_abc"}"#, "rt_abc"),
             (r#"{"auth_token":"tok_abc"}"#, "tok_abc"),
             (r#"{"token":"opaque-token-value"}"#, "opaque-token-value"),
+            (r#"{"authToken":"tok_camel"}"#, "tok_camel"),
+            (r#"{"accessToken":"access_camel"}"#, "access_camel"),
+            (r#"{"refresh-token":"rt_hyphen"}"#, "rt_hyphen"),
+            (r#"{"refresh.token":"rt_dot"}"#, "rt_dot"),
             (r#"{"authorization":"Basic abc123"}"#, "Basic abc123"),
             (
                 r#"{"secret":"generic-secret-value"}"#,
@@ -2055,9 +2066,7 @@ mod tests {
         assert_eq!(bundle_default.redaction_summary.subscriber_identifiers, 0);
         assert!(!bundle_default.entries[0].content.contains("internet"));
 
-        let policy = RedactionPolicy {
-            apn_dnn_class: ApnDnnClass::SubscriberId,
-        };
+        let policy = RedactionPolicy::with_apn_dnn_class(ApnDnnClass::SubscriberId);
         let bundle_subscriber =
             redact_support_bundle_with_policy(&entries, BundleMode::Production, policy).unwrap();
         assert_eq!(
