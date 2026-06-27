@@ -5,7 +5,7 @@ use opc_alarm::{
     AffectedObject, AlarmDetails, AlarmType, ProbableCause, RedactedText, Severity,
     SharedAlarmManager,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,6 +64,626 @@ async fn test_run_returns_fatal_task_failure() {
             assert_eq!(message, "fatal run failure");
         }
         other => panic!("expected fatal task failure, got {other:?}"),
+    }
+}
+
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn try_with_init_error_returns_from_build() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "fallible-init-error-test".to_string(),
+        ..Default::default()
+    };
+
+    let result = Builder::new(profile)
+        .try_with_init(|_supervisor, _shutdown| {
+            Box::pin(async { Err(RuntimeError::Supervisor("init failed".to_string())) })
+        })
+        .build()
+        .await;
+
+    match result {
+        Err(RuntimeError::Supervisor(message)) => assert_eq!(message, "init failed"),
+        other => panic!("expected init supervisor error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_try_with_init_never_promotes_ready() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "fallible-init-phase-test".to_string(),
+        ..Default::default()
+    };
+    let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let phases_for_observer = phases.clone();
+
+    let result = Builder::new(profile)
+        .with_phase_observer(move |phase| {
+            phases_for_observer.lock().unwrap().push(phase);
+        })
+        .try_with_init(|_supervisor, _shutdown| {
+            Box::pin(async { Err(RuntimeError::Supervisor("phase test failed".to_string())) })
+        })
+        .build()
+        .await;
+
+    assert!(matches!(result, Err(RuntimeError::Supervisor(_))));
+    let observed = phases.lock().unwrap().clone();
+    assert!(
+        !observed.contains(&RuntimePhase::Ready),
+        "failed init must not notify Ready: {observed:?}"
+    );
+    assert!(
+        observed.contains(&RuntimePhase::Stopped),
+        "startup-abort cleanup should stop the runtime: {observed:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_try_with_init_after_spawn_cleans_up_task() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "fallible-init-cleanup-test".to_string(),
+        drain_timeout: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (started_tx, mut started_rx) = tokio::sync::watch::channel(false);
+
+    let result = Builder::new(profile)
+        .try_with_init({
+            let dropped = dropped.clone();
+            move |supervisor, _shutdown| {
+                let dropped = dropped.clone();
+                let started_tx = started_tx.clone();
+                Box::pin(async move {
+                    supervisor
+                        .spawn(
+                            TaskName::new("partially-started-task"),
+                            TaskKind::ProtocolWorker,
+                            Criticality::Fatal,
+                            RestartPolicy::no_restart(),
+                            move || {
+                                let dropped = dropped.clone();
+                                let started_tx = started_tx.clone();
+                                Box::pin(async move {
+                                    let _guard = DropFlag(dropped);
+                                    started_tx.send_replace(true);
+                                    std::future::pending::<Result<(), TaskError>>().await
+                                })
+                            },
+                        )
+                        .await?;
+
+                    while !*started_rx.borrow_and_update() {
+                        if started_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+
+                    Err(RuntimeError::Supervisor(
+                        "init failed after spawn".to_string(),
+                    ))
+                })
+            }
+        })
+        .build()
+        .await;
+
+    assert!(matches!(result, Err(RuntimeError::Supervisor(_))));
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "startup-abort cleanup must stop partially spawned tasks"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn successful_try_with_init_spawns_listener_before_ready() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "fallible-init-listener-test".to_string(),
+        ..Default::default()
+    };
+
+    let handle = Builder::new(profile)
+        .try_with_init(|supervisor, shutdown| {
+            Box::pin(async move {
+                let task_shutdown = shutdown.clone();
+                supervisor
+                    .spawn(
+                        TaskName::new("required-listener"),
+                        TaskKind::Listener,
+                        Criticality::Fatal,
+                        RestartPolicy::no_restart(),
+                        move || {
+                            let task_shutdown = task_shutdown.clone();
+                            Box::pin(async move {
+                                task_shutdown.shutdown_acknowledged().await;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await?;
+                Ok(())
+            })
+        })
+        .build()
+        .await
+        .unwrap();
+
+    wait_for_runtime_phase(&handle, RuntimePhase::Ready).await;
+    assert_eq!(handle.readiness().await, Readiness::Ready);
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn successful_try_with_init_gated_listener_waits_for_ready_signal() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "fallible-init-gated-listener-test".to_string(),
+        ..Default::default()
+    };
+    let (serve_tx, serve_rx) = tokio::sync::watch::channel(false);
+
+    let handle = Builder::new(profile)
+        .try_with_init(move |supervisor, shutdown| {
+            let serve_rx = serve_rx.clone();
+            Box::pin(async move {
+                let task_name = TaskName::new("gated-required-listener");
+                supervisor
+                    .register(
+                        task_name.clone(),
+                        TaskKind::Listener,
+                        Criticality::Fatal,
+                        RestartPolicy::no_restart(),
+                    )
+                    .await?;
+                supervisor.set_readiness_gated(&task_name, true).await;
+
+                let supervisor_for_task = supervisor.clone();
+                let task_name_for_task = task_name.clone();
+                let task_shutdown = shutdown.clone();
+                supervisor
+                    .spawn(
+                        task_name,
+                        TaskKind::Listener,
+                        Criticality::Fatal,
+                        RestartPolicy::no_restart(),
+                        move || {
+                            let supervisor_for_task = supervisor_for_task.clone();
+                            let task_name_for_task = task_name_for_task.clone();
+                            let task_shutdown = task_shutdown.clone();
+                            let mut serve_rx = serve_rx.clone();
+                            Box::pin(async move {
+                                while !*serve_rx.borrow_and_update() {
+                                    if serve_rx.changed().await.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                                supervisor_for_task
+                                    .set_task_ready(&task_name_for_task, true)
+                                    .await;
+                                task_shutdown.shutdown_acknowledged().await;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await?;
+                Ok(())
+            })
+        })
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(handle.phase().await, RuntimePhase::PeerWarmup);
+    assert_eq!(handle.readiness().await, Readiness::NotReady);
+
+    serve_tx.send_replace(true);
+    wait_for_runtime_phase(&handle, RuntimePhase::Ready).await;
+    assert_eq!(handle.readiness().await, Readiness::Ready);
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn duplicate_registration_during_try_with_init_fails_build() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "fallible-init-duplicate-register-test".to_string(),
+        ..Default::default()
+    };
+
+    let result = Builder::new(profile)
+        .try_with_init(|supervisor, _shutdown| {
+            Box::pin(async move {
+                let task_name = TaskName::new("duplicate-task");
+                supervisor
+                    .register(
+                        task_name.clone(),
+                        TaskKind::Listener,
+                        Criticality::Fatal,
+                        RestartPolicy::no_restart(),
+                    )
+                    .await?;
+                supervisor
+                    .register(
+                        task_name,
+                        TaskKind::Listener,
+                        Criticality::Fatal,
+                        RestartPolicy::no_restart(),
+                    )
+                    .await?;
+                Ok(())
+            })
+        })
+        .build()
+        .await;
+
+    match result {
+        Err(RuntimeError::Supervisor(message)) => {
+            assert!(message.contains("already registered"));
+        }
+        other => panic!("expected duplicate registration error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn duplicate_running_spawn_during_try_with_init_fails_build() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "fallible-init-duplicate-spawn-test".to_string(),
+        drain_timeout: Duration::from_millis(50),
+        ..Default::default()
+    };
+
+    let result = Builder::new(profile)
+        .try_with_init(|supervisor, _shutdown| {
+            Box::pin(async move {
+                let task_name = TaskName::new("duplicate-running-task");
+                supervisor
+                    .spawn(
+                        task_name.clone(),
+                        TaskKind::ProtocolWorker,
+                        Criticality::Fatal,
+                        RestartPolicy::no_restart(),
+                        || Box::pin(std::future::pending::<Result<(), TaskError>>()),
+                    )
+                    .await?;
+                supervisor
+                    .spawn(
+                        task_name,
+                        TaskKind::ProtocolWorker,
+                        Criticality::Fatal,
+                        RestartPolicy::no_restart(),
+                        || Box::pin(std::future::pending::<Result<(), TaskError>>()),
+                    )
+                    .await?;
+                Ok(())
+            })
+        })
+        .build()
+        .await;
+
+    match result {
+        Err(RuntimeError::Supervisor(message)) => {
+            assert!(message.contains("already running"));
+        }
+        other => panic!("expected duplicate running task error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn try_run_returns_init_error() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "try-run-init-error-test".to_string(),
+        ..Default::default()
+    };
+
+    let result = try_run(profile, |_supervisor, _shutdown| {
+        Box::pin(async { Err(RuntimeError::Supervisor("try_run init failed".to_string())) })
+    })
+    .await;
+
+    match result {
+        Err(RuntimeError::Supervisor(message)) => assert_eq!(message, "try_run init failed"),
+        other => panic!("expected try_run init error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn try_run_with_hooks_returns_init_error() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "try-run-hooks-init-error-test".to_string(),
+        ..Default::default()
+    };
+
+    let result = try_run_with_hooks(profile, Vec::new(), |_supervisor, _shutdown| {
+        Box::pin(async {
+            Err(RuntimeError::Supervisor(
+                "try_run_with_hooks init failed".to_string(),
+            ))
+        })
+    })
+    .await;
+
+    match result {
+        Err(RuntimeError::Supervisor(message)) => {
+            assert_eq!(message, "try_run_with_hooks init failed");
+        }
+        other => panic!("expected try_run_with_hooks init error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn try_with_init_replaces_prior_with_init_callback() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "init-replacement-try-wins-test".to_string(),
+        ..Default::default()
+    };
+    let marker = Arc::new(AtomicUsize::new(0));
+
+    let handle = Builder::new(profile)
+        .with_init({
+            let marker = marker.clone();
+            move |_supervisor, _shutdown| {
+                Box::pin(async move {
+                    marker.store(1, Ordering::SeqCst);
+                })
+            }
+        })
+        .try_with_init({
+            let marker = marker.clone();
+            move |_supervisor, _shutdown| {
+                Box::pin(async move {
+                    marker.store(2, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        })
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(marker.load(Ordering::SeqCst), 2);
+    handle.complete_shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn with_init_replaces_prior_try_with_init_callback() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "init-replacement-with-wins-test".to_string(),
+        ..Default::default()
+    };
+    let marker = Arc::new(AtomicUsize::new(0));
+
+    let handle = Builder::new(profile)
+        .try_with_init({
+            let marker = marker.clone();
+            move |_supervisor, _shutdown| {
+                Box::pin(async move {
+                    marker.store(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        })
+        .with_init({
+            let marker = marker.clone();
+            move |_supervisor, _shutdown| {
+                Box::pin(async move {
+                    marker.store(2, Ordering::SeqCst);
+                })
+            }
+        })
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(marker.load(Ordering::SeqCst), 2);
+    handle.complete_shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn wait_stopped_returns_immediately_when_already_stopped() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "wait-stopped-already-stopped-test".to_string(),
+        ..Default::default()
+    };
+    let handle = Builder::new(profile).build().await.unwrap();
+    handle.complete_shutdown().await;
+
+    tokio::time::timeout(Duration::from_millis(50), handle.wait_stopped())
+        .await
+        .expect("wait_stopped should return immediately for stopped runtime");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn wait_stopped_completes_after_explicit_shutdown() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "wait-stopped-explicit-shutdown-test".to_string(),
+        drain_timeout: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let handle = Builder::new(profile)
+        .with_init(|supervisor, shutdown| {
+            Box::pin(async move {
+                let task_shutdown = shutdown.clone();
+                supervisor
+                    .spawn(
+                        TaskName::new("explicit-shutdown-task"),
+                        TaskKind::ProtocolWorker,
+                        Criticality::Fatal,
+                        RestartPolicy::no_restart(),
+                        move || {
+                            let task_shutdown = task_shutdown.clone();
+                            Box::pin(async move {
+                                task_shutdown.shutdown_acknowledged().await;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                    .unwrap();
+            })
+        })
+        .build()
+        .await
+        .unwrap();
+
+    handle.shutdown().await;
+    tokio::time::timeout(Duration::from_millis(50), handle.wait_stopped())
+        .await
+        .expect("wait_stopped should complete after explicit shutdown");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn wait_stopped_completes_after_complete_shutdown() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "wait-stopped-complete-shutdown-test".to_string(),
+        drain_timeout: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let handle = Builder::new(profile)
+        .with_init(|supervisor, shutdown| {
+            Box::pin(async move {
+                let task_shutdown = shutdown.clone();
+                supervisor
+                    .spawn(
+                        TaskName::new("complete-shutdown-task"),
+                        TaskKind::ProtocolWorker,
+                        Criticality::Fatal,
+                        RestartPolicy::no_restart(),
+                        move || {
+                            let task_shutdown = task_shutdown.clone();
+                            Box::pin(async move {
+                                task_shutdown.shutdown_acknowledged().await;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                    .unwrap();
+            })
+        })
+        .build()
+        .await
+        .unwrap();
+
+    handle.complete_shutdown().await;
+    tokio::time::timeout(Duration::from_millis(50), handle.wait_stopped())
+        .await
+        .expect("wait_stopped should complete after complete_shutdown");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn wait_stopped_completes_after_fatal_task_failure() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Dev,
+        nf_kind: "wait-stopped-fatal-task-test".to_string(),
+        shutdown_grace: Duration::from_millis(1),
+        drain_timeout: Duration::from_millis(50),
+        ..Default::default()
+    };
+
+    let handle = Builder::new(profile)
+        .with_init(|supervisor, _shutdown| {
+            Box::pin(async move {
+                supervisor
+                    .spawn(
+                        TaskName::new("fatal-wait-stopped-task"),
+                        TaskKind::ProtocolWorker,
+                        Criticality::Fatal,
+                        RestartPolicy::no_restart(),
+                        || {
+                            Box::pin(async {
+                                Err(TaskError::Failed(
+                                    "fatal wait_stopped failure".to_string(),
+                                    std::sync::Arc::new(std::io::Error::other("fatal")),
+                                ))
+                            })
+                        },
+                    )
+                    .await
+                    .unwrap();
+            })
+        })
+        .build()
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_stopped())
+        .await
+        .expect("wait_stopped should complete after fatal task shutdown");
+    assert!(handle.supervisor().fatal_task_failure().await.is_some());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn wait_stopped_wakes_multiple_concurrent_waiters() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Dev,
+        nf_kind: "wait-stopped-multi-waiter-test".to_string(),
+        shutdown_grace: Duration::from_millis(1),
+        drain_timeout: Duration::from_millis(50),
+        ..Default::default()
+    };
+
+    let handle = Builder::new(profile)
+        .with_init(|supervisor, shutdown| {
+            Box::pin(async move {
+                let task_shutdown = shutdown.clone();
+                supervisor
+                    .spawn(
+                        TaskName::new("multi-waiter-task"),
+                        TaskKind::ProtocolWorker,
+                        Criticality::Fatal,
+                        RestartPolicy::no_restart(),
+                        move || {
+                            let task_shutdown = task_shutdown.clone();
+                            Box::pin(async move {
+                                task_shutdown.shutdown_acknowledged().await;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                    .unwrap();
+            })
+        })
+        .build()
+        .await
+        .unwrap();
+
+    let waiters = (0..4)
+        .map(|_| {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                handle.wait_stopped().await;
+            })
+        })
+        .collect::<Vec<_>>();
+
+    handle.shutdown().await;
+
+    for waiter in waiters {
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should be notified")
+            .expect("waiter task should not panic");
     }
 }
 
