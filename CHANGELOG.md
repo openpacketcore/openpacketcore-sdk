@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-proto-diameter` (experimental): RFC 6733 header/AVP framing, dictionary
+  metadata, feature-gated base peer procedures (CER/CEA, DWR/DWA, DPR/DPA),
+  registered fuzz targets, and initial Rf/SWm 3GPP application dictionaries;
+  consumed as a direct protocol dependency rather than through the `opc-sdk`
+  default facade/prelude.
 - `opc-proto-gtpv2c` (experimental): S2b typed subset, consumed as a direct
   protocol dependency rather than through the `opc-sdk` default facade/prelude.
 - `opc-proto-pfcp`: typed IE coverage for the Session Modification lifecycle
