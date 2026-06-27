@@ -19,3 +19,13 @@ bytes = "1.8"
 name = "decode_message"
 path = "fuzz_targets/decode_message.rs"
 test = false
+
+[[bin]]
+name = "decode_s2b"
+path = "fuzz_targets/decode_s2b.rs"
+test = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false

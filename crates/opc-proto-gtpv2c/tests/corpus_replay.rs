@@ -1,0 +1,556 @@
+//! Deterministic GTPv2-C fixture and fuzz-corpus replay guard.
+//!
+//! Replays the committed provenance-labeled fixture corpus and cargo-fuzz seed
+//! corpus through the same decode, typed-view, IE-iteration, and raw-preserving
+//! encode surfaces used by the fuzz targets. This test is stable-Rust CI
+//! coverage for ADR 0015 hostile-input and byte-exact forwarding guarantees.
+
+use bytes::{Bytes, BytesMut};
+use opc_proto_gtpv2c::{
+    decode_typed_ie_sequence, validate_ie_region, Message, OwnedMessage, RawIeIterator, S2bMessage,
+};
+use opc_protocol::{
+    BorrowDecode, DecodeContext, DecodeErrorCode, Encode, EncodeContext, OwnedDecode,
+    ValidationLevel,
+};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixtureClass {
+    Spec,
+    Independent,
+    EpdgParity,
+    Malformed,
+}
+
+fn procedure_context() -> DecodeContext {
+    DecodeContext {
+        validation_level: ValidationLevel::ProcedureAware,
+        ..DecodeContext::default()
+    }
+}
+
+fn strict_context() -> DecodeContext {
+    DecodeContext {
+        validation_level: ValidationLevel::Strict,
+        ..DecodeContext::default()
+    }
+}
+
+fn fixture_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+fn fuzz_corpus_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus")
+}
+
+fn read_files(root: &Path, only_bin: bool) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) => panic!(
+                "failed to read fixture directory {}: {error}",
+                dir.display()
+            ),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => panic!("failed to read fixture entry in {}: {error}", dir.display()),
+            };
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if only_bin && path.extension().and_then(|ext| ext.to_str()) != Some("bin") {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => panic!("failed to read fixture file {}: {error}", path.display()),
+            };
+            files.push((path, bytes));
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
+fn class_for(path: &Path) -> Option<FixtureClass> {
+    for component in path.components() {
+        let text = component.as_os_str().to_string_lossy();
+        match text.as_ref() {
+            "spec" => return Some(FixtureClass::Spec),
+            "independent" => return Some(FixtureClass::Independent),
+            "epdg-parity" => return Some(FixtureClass::EpdgParity),
+            "malformed" => return Some(FixtureClass::Malformed),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn fixture_files(class: FixtureClass) -> Vec<(PathBuf, Vec<u8>)> {
+    read_files(&fixture_root(), true)
+        .into_iter()
+        .filter(|(path, _bytes)| class_for(path) == Some(class))
+        .collect()
+}
+
+fn assert_raw_preserving_message_roundtrip(path: &Path, data: &[u8]) {
+    let (_, message) = match Message::decode(data, DecodeContext::default()) {
+        Ok(decoded) => decoded,
+        Err(error) => panic!(
+            "{} did not decode as a raw message: {error:?}",
+            path.display()
+        ),
+    };
+    let mut encoded = BytesMut::new();
+    let result = message.encode(
+        &mut encoded,
+        EncodeContext {
+            raw_preserving: true,
+            ..EncodeContext::default()
+        },
+    );
+    match result {
+        Ok(()) => assert_eq!(
+            encoded.as_ref(),
+            data,
+            "{} failed raw-preserving Message encode(decode(input))",
+            path.display()
+        ),
+        Err(error) => panic!(
+            "{} failed raw-preserving Message encode: {error:?}",
+            path.display()
+        ),
+    }
+}
+
+fn assert_canonical_message_idempotence(path: &Path, data: &[u8]) {
+    let Ok((tail, message)) = Message::decode(data, DecodeContext::default()) else {
+        return;
+    };
+    let parsed_len = data.len() - tail.len();
+    let original_parsed = &data[..parsed_len];
+
+    let mut raw_encoded = BytesMut::new();
+    if message
+        .encode(
+            &mut raw_encoded,
+            EncodeContext {
+                raw_preserving: true,
+                ..EncodeContext::default()
+            },
+        )
+        .is_ok()
+    {
+        assert_eq!(
+            raw_encoded.as_ref(),
+            original_parsed,
+            "{} raw-preserving roundtrip changed parsed bytes",
+            path.display()
+        );
+    }
+
+    let mut canonical = BytesMut::new();
+    if message
+        .encode(&mut canonical, EncodeContext::default())
+        .is_err()
+    {
+        return;
+    }
+    let Ok((canonical_tail, canonical_message)) =
+        Message::decode(canonical.as_ref(), DecodeContext::default())
+    else {
+        panic!(
+            "{} canonical Message encoding did not decode",
+            path.display()
+        );
+    };
+    assert!(
+        canonical_tail.is_empty(),
+        "{} canonical Message encoding left a tail",
+        path.display()
+    );
+    let mut canonical_again = BytesMut::new();
+    match canonical_message.encode(&mut canonical_again, EncodeContext::default()) {
+        Ok(()) => assert_eq!(
+            canonical_again.as_ref(),
+            canonical.as_ref(),
+            "{} canonical Message encode/decode/encode is not idempotent",
+            path.display()
+        ),
+        Err(error) => panic!(
+            "{} canonical Message re-encode failed: {error:?}",
+            path.display()
+        ),
+    }
+}
+
+fn assert_spec_s2b_roundtrip(path: &Path, data: &[u8]) {
+    let (_, message) = match S2bMessage::decode(data, procedure_context()) {
+        Ok(decoded) => decoded,
+        Err(error) => panic!(
+            "{} did not decode as a ProcedureAware S2b fixture: {error:?}",
+            path.display()
+        ),
+    };
+    assert!(
+        message.as_view().is_some(),
+        "{} decoded as raw fallback instead of S2b typed view",
+        path.display()
+    );
+
+    let mut canonical = BytesMut::new();
+    match message.encode(&mut canonical, EncodeContext::default()) {
+        Ok(()) => assert_eq!(
+            canonical.as_ref(),
+            data,
+            "{} canonical S2b encode changed spec fixture bytes",
+            path.display()
+        ),
+        Err(error) => panic!("{} canonical S2b encode failed: {error:?}", path.display()),
+    }
+
+    let mut raw_preserving = BytesMut::new();
+    match message.encode(
+        &mut raw_preserving,
+        EncodeContext {
+            raw_preserving: true,
+            ..EncodeContext::default()
+        },
+    ) {
+        Ok(()) => assert_eq!(
+            raw_preserving.as_ref(),
+            data,
+            "{} raw-preserving S2b encode changed spec fixture bytes",
+            path.display()
+        ),
+        Err(error) => panic!(
+            "{} raw-preserving S2b encode failed: {error:?}",
+            path.display()
+        ),
+    }
+}
+
+fn exercise_decode_surfaces(data: &[u8]) {
+    let decoded_message = Message::decode(data, DecodeContext::default());
+
+    for level in [
+        ValidationLevel::HeaderOnly,
+        ValidationLevel::Strict,
+        ValidationLevel::ProcedureAware,
+    ] {
+        let ctx = DecodeContext {
+            validation_level: level,
+            ..DecodeContext::default()
+        };
+        let _ = Message::decode(data, ctx);
+    }
+
+    let _ = S2bMessage::decode(data, DecodeContext::default());
+    let _ = S2bMessage::decode(data, procedure_context());
+    let _ = OwnedMessage::decode_owned(Bytes::copy_from_slice(data), DecodeContext::default());
+
+    let shallow = DecodeContext {
+        max_ies: 4,
+        ..DecodeContext::default()
+    };
+    let _ = validate_ie_region(data, shallow);
+    for item in RawIeIterator::new(data, shallow) {
+        if item.is_err() {
+            break;
+        }
+    }
+    let _ = decode_typed_ie_sequence(data, shallow, 0);
+
+    if let Ok((_tail, message)) = decoded_message {
+        let _ = validate_ie_region(message.raw_ies, shallow);
+        for item in RawIeIterator::new(message.raw_ies, shallow) {
+            if item.is_err() {
+                break;
+            }
+        }
+        let _ = decode_typed_ie_sequence(message.raw_ies, shallow, 0);
+    }
+
+    assert_canonical_message_idempotence(Path::new("<in-memory>"), data);
+}
+
+fn adversarial_seeds() -> Vec<Vec<u8>> {
+    vec![
+        vec![],
+        vec![0x00],
+        vec![0xff],
+        vec![0x00; 8],
+        vec![0xff; 8],
+        vec![0x00; 4096],
+        vec![0xff; 4096],
+        (0..=255u8).collect(),
+        vec![0x40, 0x01, 0xff, 0xff, 0x00, 0x00, 0x01, 0x00],
+        vec![0x48, 0x20, 0x00, 0x0d, 0x01, 0x02, 0x03, 0x04],
+    ]
+}
+
+#[test]
+fn fixture_corpus_is_split_by_provenance() {
+    let root = fixture_root();
+    for subdir in ["spec", "independent", "epdg-parity", "malformed"] {
+        assert!(
+            root.join(subdir).is_dir(),
+            "missing fixture provenance directory {subdir}"
+        );
+    }
+    assert_eq!(fixture_files(FixtureClass::Spec).len(), 10);
+    assert!(fixture_files(FixtureClass::EpdgParity).len() >= 3);
+    assert!(fixture_files(FixtureClass::Malformed).len() >= 9);
+    assert!(
+        root.join("independent/README.md").is_file(),
+        "independent capture gap must remain documented"
+    );
+}
+
+#[test]
+fn spec_fixture_corpus_roundtrips_byte_exact() {
+    let fixtures = fixture_files(FixtureClass::Spec);
+    assert!(!fixtures.is_empty(), "spec fixture corpus is empty");
+    for (path, data) in fixtures {
+        assert_raw_preserving_message_roundtrip(&path, &data);
+        assert_spec_s2b_roundtrip(&path, &data);
+    }
+}
+
+#[test]
+fn epdg_parity_corpus_roundtrips_but_is_not_conformance() {
+    let fixtures = fixture_files(FixtureClass::EpdgParity);
+    assert!(!fixtures.is_empty(), "ePDG parity fixture corpus is empty");
+    for (path, data) in fixtures {
+        assert_raw_preserving_message_roundtrip(&path, &data);
+        assert_canonical_message_idempotence(&path, &data);
+    }
+}
+
+fn one_ie_limit_context() -> DecodeContext {
+    DecodeContext {
+        max_ies: 1,
+        ..DecodeContext::default()
+    }
+}
+
+fn assert_error_code(
+    path: &Path,
+    actual: Result<(), opc_protocol::DecodeError>,
+    expected: fn(&DecodeErrorCode) -> bool,
+    expectation: &str,
+) {
+    match actual {
+        Ok(()) => panic!("{} unexpectedly passed {expectation}", path.display()),
+        Err(error) => assert!(
+            expected(error.code()),
+            "{} returned {error:?} for {expectation}",
+            path.display()
+        ),
+    }
+}
+
+fn assert_message_decode_error(
+    path: &Path,
+    data: &[u8],
+    ctx: DecodeContext,
+    expected: fn(&DecodeErrorCode) -> bool,
+    expectation: &str,
+) {
+    assert_error_code(
+        path,
+        Message::decode(data, ctx).map(|(_tail, _message)| ()),
+        expected,
+        expectation,
+    );
+}
+
+fn assert_raw_ie_region_error(
+    path: &Path,
+    data: &[u8],
+    ctx: DecodeContext,
+    expected: fn(&DecodeErrorCode) -> bool,
+    expectation: &str,
+) {
+    let (_tail, message) = match Message::decode(data, DecodeContext::default()) {
+        Ok(decoded) => decoded,
+        Err(error) => panic!(
+            "{} could not be decoded before raw IE-region check {expectation}: {error:?}",
+            path.display()
+        ),
+    };
+    assert_error_code(
+        path,
+        validate_ie_region(message.raw_ies, ctx),
+        expected,
+        expectation,
+    );
+}
+
+fn assert_typed_ie_region_error(
+    path: &Path,
+    data: &[u8],
+    ctx: DecodeContext,
+    expected: fn(&DecodeErrorCode) -> bool,
+    expectation: &str,
+) {
+    let (_tail, message) = match Message::decode(data, DecodeContext::default()) {
+        Ok(decoded) => decoded,
+        Err(error) => panic!(
+            "{} could not be decoded before typed IE-region check {expectation}: {error:?}",
+            path.display()
+        ),
+    };
+    assert_error_code(
+        path,
+        decode_typed_ie_sequence(message.raw_ies, ctx, 0).map(|_ies| ()),
+        expected,
+        expectation,
+    );
+}
+
+fn fixture_file_name(path: &Path) -> &str {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        panic!("fixture path has no UTF-8 file name: {}", path.display());
+    };
+    name
+}
+
+fn assert_malformed_fixture_rejection(path: &Path, data: &[u8]) {
+    match fixture_file_name(path) {
+        "declared_length_overrun.bin" => assert_message_decode_error(
+            path,
+            data,
+            DecodeContext::default(),
+            |code| matches!(code, DecodeErrorCode::MessageLengthExceeded),
+            "declared message length limit rejection",
+        ),
+        "empty.bin"
+        | "truncated_no_teid_header.bin"
+        | "truncated_teid_header.bin"
+        | "truncated_ie_value.bin" => assert_message_decode_error(
+            path,
+            data,
+            DecodeContext::default(),
+            |code| matches!(code, DecodeErrorCode::Truncated),
+            "truncation rejection",
+        ),
+        "strict_header_spare_bits.bin" => assert_message_decode_error(
+            path,
+            data,
+            strict_context(),
+            |code| matches!(code, DecodeErrorCode::Structural { .. }),
+            "strict header spare-bit rejection",
+        ),
+        "strict_ie_spare_bits.bin" => {
+            assert_message_decode_error(
+                path,
+                data,
+                strict_context(),
+                |code| matches!(code, DecodeErrorCode::Structural { .. }),
+                "strict message IE spare-bit rejection",
+            );
+            assert_raw_ie_region_error(
+                path,
+                data,
+                strict_context(),
+                |code| matches!(code, DecodeErrorCode::Structural { .. }),
+                "strict raw IE-region spare-bit rejection",
+            );
+        }
+        "too_many_small_ies.bin" => {
+            assert_message_decode_error(
+                path,
+                data,
+                one_ie_limit_context(),
+                |code| matches!(code, DecodeErrorCode::IeCountExceeded),
+                "low-limit message IE-count rejection",
+            );
+            assert_raw_ie_region_error(
+                path,
+                data,
+                one_ie_limit_context(),
+                |code| matches!(code, DecodeErrorCode::IeCountExceeded),
+                "low-limit raw IE-region count rejection",
+            );
+        }
+        "nested_bearer_context_depth_limit.bin" => {
+            let ctx = DecodeContext {
+                max_depth: 1,
+                ..DecodeContext::default()
+            };
+            assert_typed_ie_region_error(
+                path,
+                data,
+                ctx,
+                |code| matches!(code, DecodeErrorCode::DepthExceeded),
+                "low-limit grouped IE recursion-depth rejection",
+            );
+        }
+        name => panic!("unclassified malformed fixture {name}: {}", path.display()),
+    }
+}
+
+#[test]
+fn malformed_fixture_corpus_rejects_without_panics() {
+    let fixtures = fixture_files(FixtureClass::Malformed);
+    assert!(!fixtures.is_empty(), "malformed fixture corpus is empty");
+
+    let mut failures = Vec::new();
+    for (path, data) in fixtures {
+        if std::panic::catch_unwind(|| exercise_decode_surfaces(&data)).is_err() {
+            failures.push(format!("panic:{}", path.display()));
+            continue;
+        }
+        if std::panic::catch_unwind(|| assert_malformed_fixture_rejection(&path, &data)).is_err() {
+            failures.push(format!("unexpected-rejection-path:{}", path.display()));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "malformed fixture corpus failures: {failures:#?}"
+    );
+}
+
+#[test]
+fn fuzz_corpus_and_adversarial_inputs_never_panic() {
+    let mut corpus = read_files(&fuzz_corpus_root(), false);
+    assert!(
+        !corpus.is_empty(),
+        "expected committed seed corpus under fuzz/corpus; found none"
+    );
+    for (idx, seed) in adversarial_seeds().into_iter().enumerate() {
+        corpus.push((PathBuf::from(format!("adversarial#{idx}")), seed));
+    }
+
+    let mut failures = Vec::new();
+    let mut checked = 0usize;
+    for (path, data) in &corpus {
+        if std::panic::catch_unwind(|| exercise_decode_surfaces(data)).is_err() {
+            failures.push(format!("input:{}", path.display()));
+        }
+        checked += 1;
+
+        for len in 0..=data.len().min(256) {
+            if std::panic::catch_unwind(|| exercise_decode_surfaces(&data[..len])).is_err() {
+                failures.push(format!("truncation:{}[..{len}]", path.display()));
+            }
+            checked += 1;
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "decode panicked on {} of {checked} known input(s): {failures:#?}",
+        failures.len()
+    );
+}

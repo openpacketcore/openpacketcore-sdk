@@ -6,9 +6,9 @@
 - **Crate status:** experimental S2b-focused typed subset with a raw-preserving
   message/IE shell.
 - **Implemented evidence:** common-header structural parsing, raw TLIV IE
-  boundary validation, raw-preserving encode/decode, typed S2b IE examples,
-  and typed S2b views for Echo plus Create/Modify/Delete/Update
-  Session-oriented procedures.
+  boundary validation, raw-preserving encode/decode, provenance-labeled fixture
+  corpus replay, malformed-input replay, typed S2b IE examples, and typed S2b
+  views for Echo plus Create/Modify/Delete/Update Session-oriented procedures.
 
 ## Covered in this subset
 
@@ -81,9 +81,30 @@
    - `Debug` output for S2b typed message views redacts IMSI/MEI/MSISDN digits
      and summarizes raw IE buffers by length.
 
-6. **Fuzz shell**
-   - `fuzz/Cargo.toml` and `fuzz/fuzz_targets/decode_message.rs` compile the
-     decode/owned-decode/IE-iteration surfaces under cargo-fuzz.
+6. **Fixture and corpus replay**
+   - `tests/fixtures/spec/` contains the ADR 0015 conformance fixtures for the
+     S2b subset. The accompanying `tests/fixtures/README.md` records
+     octet-level comments for each spec-authored fixture.
+   - `tests/fixtures/independent/` is intentionally empty except for a README;
+     no independent GTPv2-C capture is claimed until capture provenance,
+     license/permission, implementation version, redaction status, and expected
+     re-encode behavior are documented.
+   - `tests/fixtures/epdg-parity/` contains parity/regression bytes only. These
+     inputs exercise raw/private IE preservation but are not counted as
+     conformance evidence.
+   - `tests/fixtures/malformed/` contains synthetic hostile inputs for
+     truncation, declared-length overrun, strict spare-bit rejection,
+     grouped-IE recursion-depth rejection, and low-limit IE-count paths.
+   - `tests/corpus_replay.rs` replays fixture and fuzz corpora through raw
+     decode, owned decode, strict/procedure-aware decode, typed S2b decode,
+     IE iteration, raw-preserving encode, and truncation/adversarial no-panic
+     checks.
+
+7. **Fuzz shell**
+   - `fuzz/Cargo.toml`, `fuzz/fuzz_targets/decode_message.rs`,
+     `fuzz/fuzz_targets/decode_s2b.rs`, and
+     `fuzz/fuzz_targets/roundtrip.rs` compile decode, typed S2b, owned-decode,
+     IE-iteration, and raw-preserving round-trip surfaces under cargo-fuzz.
    - The repository fuzz workflow includes this crate in its scheduled matrix.
 
 ## Known limitations
@@ -118,25 +139,44 @@ freshly decoded S2b view for byte-exact forwarding.
 
 ## Fixture provenance
 
-The initial unit fixtures are hand-authored from the TS 29.274 common-header
-and IE TLIV layouts:
+The committed fixture corpus is split by provenance class:
 
-- Echo Request without TEID validates the no-TEID common-header shape and
-  mandatory Recovery IE.
-- Create Session Request without TEID validates mandatory S2b request examples:
-  IMSI, RAT Type, Serving Network, Sender F-TEID, APN, Selection Mode, PDN
-  Type, PAA, Bearer Context/EBI, nested Bearer QoS and Charging ID, typed PCO,
-  Indication, APCO, and raw fallback for an unsupported private IE.
-- Create Session Response with TEID validates response Cause, Sender F-TEID,
-  PAA, and Bearer Context examples.
-- Modify Bearer, Delete Session, and Update Bearer fixtures validate the S2b
-  Modify/Delete/Update Session-oriented views and ProcedureAware mandatory
-  checks.
-- Header, raw IE, malformed-input, and S2b integration tests under `tests/`
-  exercise raw-preserving spare-bit round trips, multi-IE unknown TLIV
-  preservation, truncation/count-limit errors, prefix/malformed input no-panic
-  regressions, typed decode → encode fixtures, and missing-mandatory-IE
-  rejection.
+- **Spec-authored conformance fixtures** live in `tests/fixtures/spec/`. They
+  are hand-authored from the TS 29.274 common-header and IE TLIV layouts and
+  are the only GTPv2-C fixtures currently counted as conformance evidence:
+  - Echo Request without TEID validates the no-TEID common-header shape and
+    mandatory Recovery IE.
+  - Create Session Request without TEID validates mandatory S2b request
+    examples: IMSI, RAT Type, Serving Network, Sender F-TEID, APN, Selection
+    Mode, PDN Type, PAA, Bearer Context/EBI, nested Bearer QoS and Charging ID,
+    typed PCO, Indication, APCO, and raw fallback for an unsupported private
+    IE.
+  - Create Session Response with TEID validates response Cause, Sender F-TEID,
+    PAA, and Bearer Context examples.
+  - Modify Bearer, Delete Session, and Update Bearer fixtures validate the S2b
+    Modify/Delete/Update Session-oriented views and ProcedureAware mandatory
+    checks.
+
+- **Independent-capture fixtures** would live in `tests/fixtures/independent/`.
+  None are committed yet, so this crate makes no independent-peer
+  interoperability claim.
+- **ePDG parity fixtures** live in `tests/fixtures/epdg-parity/`. They are
+  regression seeds for raw/private IE and piggybacking preservation only. They
+  are not spec-authored, not independently captured, and must not be cited as
+  SDK wire-format conformance evidence.
+- **Synthetic malformed fixtures** live in `tests/fixtures/malformed/`; they
+  exercise hostile-input no-panic behavior and expected structured rejection,
+  including low-limit grouped Bearer Context recursion-depth rejection.
+- The fuzz seed corpus mirrors the full spec fixture set plus representative
+  parity and malformed inputs under `fuzz/corpus/` so scheduled fuzzing starts
+  from the same S2b conformance cases that `tests/corpus_replay.rs` replays
+  deterministically.
+
+Header, raw IE, malformed-input, corpus-replay, and S2b integration tests under
+`tests/` exercise raw-preserving spare-bit round trips, multi-IE unknown TLIV
+preservation, truncation/count-limit errors, prefix/malformed input no-panic
+regressions, typed decode → encode fixtures, and missing-mandatory-IE
+rejection.
 
 Future typed S2b expansion must add spec-authored fixtures for every newly
 claimed message and IE, with octet-level comments and byte-exact decode → encode

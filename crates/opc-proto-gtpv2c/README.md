@@ -15,9 +15,11 @@ Current scope is intentionally narrow:
 - typed S2b message views for Echo plus Create/Modify/Delete/Update
   Session-oriented flows, with ProcedureAware mandatory-IE checks for the
   claimed examples;
+- provenance-labeled fixture replay that separates spec-authored conformance
+  bytes from parity-only ePDG regression seeds and synthetic malformed inputs;
 - a public `MessageType` enum with `Unknown(u8)` fallback plus raw fallback for
   unsupported/private IEs; and
-- a cargo-fuzz manifest and decode target skeleton.
+- cargo-fuzz decode, typed S2b, and raw-preserving round-trip targets.
 
 It does **not** provide a complete GTPv2-C implementation, full S2b semantic
 state-machine validation, carrier acceptance evidence, or a production ePDG/PGW
@@ -43,5 +45,7 @@ cargo check -p opc-proto-gtpv2c --all-targets --all-features
 cargo test -p opc-proto-gtpv2c --all-features header
 cargo test -p opc-proto-gtpv2c --all-features ie_raw
 cargo test -p opc-proto-gtpv2c --all-features malformed
-cargo test -p opc-proto-gtpv2c --all-features s2b_typed
+cargo test -p opc-proto-gtpv2c --all-features --test corpus_replay
+cargo test -p opc-proto-gtpv2c --all-features --test s2b_typed
+(cd crates/opc-proto-gtpv2c && cargo +nightly fuzz list)
 ```
