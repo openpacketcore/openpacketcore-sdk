@@ -22,8 +22,8 @@ pub use mock::{MockOperation, MockXfrmBackend};
 pub use model::{
     Algorithm, AllocateSpiRequest, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest,
     IpAddress, KeyMaterial, LifetimeConfig, PolicyParameters, RekeyPolicyRequest, RekeySaRequest,
-    RemovePolicyRequest, RemoveSaRequest, SaParameters, SpiAllocation, XfrmAction, XfrmDirection,
-    XfrmId, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
+    RemovePolicyRequest, RemoveSaRequest, SaParameters, SpiAllocation, XfrmAction, XfrmBackendKind,
+    XfrmCapability, XfrmDirection, XfrmId, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
 };
 pub use unsupported::UnsupportedXfrmBackend;
 
@@ -33,8 +33,8 @@ mod integration_tests {
     use crate::model::{
         Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
         LifetimeConfig, PolicyParameters, RekeyPolicyRequest, RekeySaRequest, RemovePolicyRequest,
-        RemoveSaRequest, SaParameters, XfrmAction, XfrmDirection, XfrmId, XfrmMode, XfrmProbe,
-        XfrmSelector, XfrmTemplate,
+        RemoveSaRequest, SaParameters, XfrmAction, XfrmBackendKind, XfrmDirection, XfrmId,
+        XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
     };
     use crate::XfrmBackend;
 
@@ -145,7 +145,10 @@ mod integration_tests {
             .unwrap();
 
         let probe = backend.probe().await.unwrap();
+        assert_eq!(probe.kind, XfrmBackendKind::Mock);
         assert!(probe.platform_supported);
+        assert!(!probe.kernel_reachable);
+        assert!(!probe.net_admin_capable);
 
         assert_eq!(backend.operations().len(), 8);
     }
@@ -177,13 +180,6 @@ mod integration_tests {
     async fn unsupported_backend_is_trait_object_safe() {
         let backend: Box<dyn XfrmBackend> = Box::new(UnsupportedXfrmBackend::new());
         let probe = backend.probe().await.unwrap();
-        assert_eq!(
-            probe,
-            XfrmProbe {
-                platform_supported: false,
-                kernel_reachable: false,
-                net_admin_capable: false,
-            }
-        );
+        assert_eq!(probe, XfrmProbe::unsupported());
     }
 }

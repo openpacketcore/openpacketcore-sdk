@@ -334,15 +334,75 @@ pub struct RemovePolicyRequest {
     pub direction: XfrmDirection,
 }
 
+/// Kind of XFRM backend implementation.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum XfrmBackendKind {
+    /// Backend is not implemented for the current platform.
+    #[default]
+    Unsupported,
+    /// Backend talks to the Linux kernel XFRM netlink interface.
+    LinuxKernel,
+    /// In-memory mock/dry-run backend for tests and offline development.
+    Mock,
+}
+
+/// Capability state reported by a probe.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum XfrmCapability {
+    /// Capability state has not been determined.
+    #[default]
+    Unknown,
+    /// The capability is available.
+    Available,
+    /// The capability is missing (e.g. kernel lacks an algorithm).
+    Missing,
+    /// The capability is denied by privileges (e.g. no `CAP_NET_ADMIN`).
+    PermissionDenied,
+}
+
 /// Capability and health probe for an XFRM backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct XfrmProbe {
+    /// Kind of backend that produced the probe.
+    pub kind: XfrmBackendKind,
     /// The platform supports XFRM operations (e.g. Linux).
     pub platform_supported: bool,
     /// The backend believes it can reach the kernel netlink endpoint.
     pub kernel_reachable: bool,
     /// The process has the privileges needed to mutate XFRM state.
     pub net_admin_capable: bool,
+    /// Availability of required XFRM algorithms.
+    pub algorithms: XfrmCapability,
+    /// Optional human-readable detail; static so the probe stays `Copy`.
+    pub details: Option<&'static str>,
+}
+
+impl XfrmProbe {
+    /// Probe result for the in-memory mock backend.
+    pub const fn mock() -> Self {
+        Self {
+            kind: XfrmBackendKind::Mock,
+            platform_supported: true,
+            kernel_reachable: false,
+            net_admin_capable: false,
+            algorithms: XfrmCapability::Available,
+            details: Some("dry-run/mock backend"),
+        }
+    }
+
+    /// Probe result for an unsupported platform.
+    pub const fn unsupported() -> Self {
+        Self {
+            kind: XfrmBackendKind::Unsupported,
+            platform_supported: false,
+            kernel_reachable: false,
+            net_admin_capable: false,
+            algorithms: XfrmCapability::Unknown,
+            details: Some("XFRM operations are not supported on this platform"),
+        }
+    }
 }
 
 #[cfg(test)]

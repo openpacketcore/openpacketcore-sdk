@@ -1,5 +1,6 @@
 //! Deterministic mock XFRM backend for tests and offline development.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -7,12 +8,16 @@ use async_trait::async_trait;
 use crate::backend::XfrmBackend;
 use crate::error::XfrmError;
 use crate::model::{
-    AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, IpAddress, RekeyPolicyRequest,
-    RekeySaRequest, RemovePolicyRequest, RemoveSaRequest, SpiAllocation, XfrmDirection, XfrmProbe,
-    XfrmSelector,
+    AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, IpAddress, LifetimeConfig,
+    RekeyPolicyRequest, RekeySaRequest, RemovePolicyRequest, RemoveSaRequest, SpiAllocation,
+    XfrmAction, XfrmDirection, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
 };
 
 /// One recorded call against the mock backend.
+///
+/// These snapshots deliberately include all non-secret request fields plus the
+/// lengths of any key material, relying on [`KeyMaterial`]'s redacted `Debug`
+/// for sensitive bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MockOperation {
     /// SPI allocation.
@@ -28,21 +33,57 @@ pub enum MockOperation {
     },
     /// SA installation.
     InstallSa {
-        /// Selector destination.
+        /// Packet selector.
+        selector: XfrmSelector,
+        /// Source tunnel endpoint.
+        source_address: IpAddress,
+        /// Destination tunnel endpoint.
         destination: IpAddress,
         /// SPI in host byte order.
         spi: u32,
         /// Transform protocol.
         protocol: u8,
+        /// Authentication algorithm name, if present.
+        auth_algo: Option<String>,
+        /// Authentication key length in bytes.
+        auth_key_len: usize,
+        /// Encryption algorithm name, if present.
+        crypt_algo: Option<String>,
+        /// Encryption key length in bytes.
+        crypt_key_len: usize,
+        /// XFRM mode.
+        mode: XfrmMode,
+        /// Lifetime limits.
+        lifetime: LifetimeConfig,
+        /// Replay window size.
+        replay_window: u8,
     },
     /// SA rekey.
     RekeySa {
-        /// Selector destination.
+        /// Packet selector.
+        selector: XfrmSelector,
+        /// Source tunnel endpoint.
+        source_address: IpAddress,
+        /// Destination tunnel endpoint.
         destination: IpAddress,
         /// SPI in host byte order.
         spi: u32,
         /// Transform protocol.
         protocol: u8,
+        /// Authentication algorithm name, if present.
+        auth_algo: Option<String>,
+        /// Authentication key length in bytes.
+        auth_key_len: usize,
+        /// Encryption algorithm name, if present.
+        crypt_algo: Option<String>,
+        /// Encryption key length in bytes.
+        crypt_key_len: usize,
+        /// XFRM mode.
+        mode: XfrmMode,
+        /// Lifetime limits.
+        lifetime: LifetimeConfig,
+        /// Replay window size.
+        replay_window: u8,
     },
     /// SA removal.
     RemoveSa {
@@ -59,6 +100,12 @@ pub enum MockOperation {
         selector: XfrmSelector,
         /// Policy direction.
         direction: XfrmDirection,
+        /// Policy action.
+        action: XfrmAction,
+        /// Policy priority.
+        priority: u32,
+        /// Templates describing SAs that satisfy the policy.
+        templates: Vec<XfrmTemplate>,
     },
     /// Policy rekey.
     RekeyPolicy {
@@ -66,6 +113,12 @@ pub enum MockOperation {
         selector: XfrmSelector,
         /// Policy direction.
         direction: XfrmDirection,
+        /// Policy action.
+        action: XfrmAction,
+        /// Policy priority.
+        priority: u32,
+        /// Templates describing SAs that satisfy the policy.
+        templates: Vec<XfrmTemplate>,
     },
     /// Policy removal.
     RemovePolicy {
@@ -91,19 +144,15 @@ pub struct MockXfrmBackend {
 #[derive(Debug)]
 struct MockState {
     operations: Vec<MockOperation>,
-    next_spi: u32,
+    allocated_spis: BTreeSet<u32>,
     probe_result: XfrmProbe,
     failure: Option<XfrmError>,
 }
 
 impl MockXfrmBackend {
-    /// Create a mock backend that reports a healthy probe.
+    /// Create a mock backend that reports itself as a dry-run/mock probe.
     pub fn new() -> Self {
-        Self::with_probe(XfrmProbe {
-            platform_supported: true,
-            kernel_reachable: true,
-            net_admin_capable: true,
-        })
+        Self::with_probe(XfrmProbe::mock())
     }
 
     /// Create a mock backend with a specific probe result.
@@ -111,7 +160,7 @@ impl MockXfrmBackend {
         Self {
             state: Arc::new(Mutex::new(MockState {
                 operations: Vec::new(),
-                next_spi: 0x0000_0100,
+                allocated_spis: BTreeSet::new(),
                 probe_result,
                 failure: None,
             })),
@@ -167,8 +216,21 @@ impl XfrmBackend for MockXfrmBackend {
     async fn allocate_spi(&self, request: AllocateSpiRequest) -> Result<SpiAllocation, XfrmError> {
         let mut state = self.state.lock().expect("mock state mutex poisoned");
         Self::check_failure(&state)?;
-        let spi = state.next_spi;
-        state.next_spi = state.next_spi.wrapping_add(1);
+
+        if request.min_spi > request.max_spi {
+            return Err(XfrmError::invalid_config(
+                "min_spi",
+                "min_spi must not exceed max_spi",
+            ));
+        }
+
+        // SPI 0 is reserved ("any" / wildcard) in XFRM; never allocate it.
+        let start = request.min_spi.max(1);
+        let spi = (start..=request.max_spi)
+            .find(|spi| !state.allocated_spis.contains(spi))
+            .ok_or(XfrmError::Unavailable)?;
+
+        state.allocated_spis.insert(spi);
         state.operations.push(MockOperation::AllocateSpi {
             destination: request.destination,
             protocol: request.protocol,
@@ -186,9 +248,36 @@ impl XfrmBackend for MockXfrmBackend {
         let mut state = self.state.lock().expect("mock state mutex poisoned");
         Self::check_failure(&state)?;
         state.operations.push(MockOperation::InstallSa {
+            selector: request.parameters.selector.clone(),
+            source_address: request.parameters.source_address,
             destination: request.parameters.id.destination,
             spi: request.parameters.id.spi,
             protocol: request.parameters.id.protocol,
+            auth_algo: request
+                .parameters
+                .auth
+                .as_ref()
+                .map(|(a, _)| a.name.clone()),
+            auth_key_len: request
+                .parameters
+                .auth
+                .as_ref()
+                .map(|(_, k)| k.len())
+                .unwrap_or(0),
+            crypt_algo: request
+                .parameters
+                .crypt
+                .as_ref()
+                .map(|(a, _)| a.name.clone()),
+            crypt_key_len: request
+                .parameters
+                .crypt
+                .as_ref()
+                .map(|(_, k)| k.len())
+                .unwrap_or(0),
+            mode: request.parameters.mode,
+            lifetime: request.parameters.lifetime,
+            replay_window: request.parameters.replay_window,
         });
         Ok(())
     }
@@ -197,9 +286,36 @@ impl XfrmBackend for MockXfrmBackend {
         let mut state = self.state.lock().expect("mock state mutex poisoned");
         Self::check_failure(&state)?;
         state.operations.push(MockOperation::RekeySa {
+            selector: request.parameters.selector.clone(),
+            source_address: request.parameters.source_address,
             destination: request.parameters.id.destination,
             spi: request.parameters.id.spi,
             protocol: request.parameters.id.protocol,
+            auth_algo: request
+                .parameters
+                .auth
+                .as_ref()
+                .map(|(a, _)| a.name.clone()),
+            auth_key_len: request
+                .parameters
+                .auth
+                .as_ref()
+                .map(|(_, k)| k.len())
+                .unwrap_or(0),
+            crypt_algo: request
+                .parameters
+                .crypt
+                .as_ref()
+                .map(|(a, _)| a.name.clone()),
+            crypt_key_len: request
+                .parameters
+                .crypt
+                .as_ref()
+                .map(|(_, k)| k.len())
+                .unwrap_or(0),
+            mode: request.parameters.mode,
+            lifetime: request.parameters.lifetime,
+            replay_window: request.parameters.replay_window,
         });
         Ok(())
     }
@@ -221,6 +337,9 @@ impl XfrmBackend for MockXfrmBackend {
         state.operations.push(MockOperation::InstallPolicy {
             selector: request.parameters.selector.clone(),
             direction: request.parameters.direction,
+            action: request.parameters.action,
+            priority: request.parameters.priority,
+            templates: request.parameters.templates.clone(),
         });
         Ok(())
     }
@@ -231,6 +350,9 @@ impl XfrmBackend for MockXfrmBackend {
         state.operations.push(MockOperation::RekeyPolicy {
             selector: request.parameters.selector.clone(),
             direction: request.parameters.direction,
+            action: request.parameters.action,
+            priority: request.parameters.priority,
+            templates: request.parameters.templates.clone(),
         });
         Ok(())
     }
@@ -258,7 +380,8 @@ mod tests {
     use super::*;
     use crate::model::{
         Algorithm, AuthAlgorithm, IpAddress, KeyMaterial, LifetimeConfig, PolicyParameters,
-        SaParameters, XfrmAction, XfrmDirection, XfrmId, XfrmMode, XfrmSelector, XfrmTemplate,
+        SaParameters, XfrmAction, XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmMode,
+        XfrmSelector, XfrmTemplate,
     };
 
     fn ipv4(a: u8, b: u8, c: u8, d: u8) -> IpAddress {
@@ -334,6 +457,40 @@ mod tests {
         );
     }
 
+    fn expected_install_sa(params: &SaParameters) -> MockOperation {
+        MockOperation::InstallSa {
+            selector: params.selector.clone(),
+            source_address: params.source_address,
+            destination: params.id.destination,
+            spi: params.id.spi,
+            protocol: params.id.protocol,
+            auth_algo: Some("hmac-sha256".to_string()),
+            auth_key_len: 32,
+            crypt_algo: Some("aes-cbc".to_string()),
+            crypt_key_len: 32,
+            mode: XfrmMode::Tunnel,
+            lifetime: LifetimeConfig::default(),
+            replay_window: 32,
+        }
+    }
+
+    fn expected_rekey_sa(params: &SaParameters) -> MockOperation {
+        MockOperation::RekeySa {
+            selector: params.selector.clone(),
+            source_address: params.source_address,
+            destination: params.id.destination,
+            spi: params.id.spi,
+            protocol: params.id.protocol,
+            auth_algo: Some("hmac-sha256".to_string()),
+            auth_key_len: 32,
+            crypt_algo: Some("aes-cbc".to_string()),
+            crypt_key_len: 32,
+            mode: XfrmMode::Tunnel,
+            lifetime: LifetimeConfig::default(),
+            replay_window: 32,
+        }
+    }
+
     #[tokio::test]
     async fn mock_install_sa_records_operation() {
         let backend = MockXfrmBackend::new();
@@ -347,14 +504,7 @@ mod tests {
 
         let ops = backend.operations();
         assert_eq!(ops.len(), 1);
-        assert_eq!(
-            ops[0],
-            MockOperation::InstallSa {
-                destination: params.id.destination,
-                spi: params.id.spi,
-                protocol: params.id.protocol,
-            }
-        );
+        assert_eq!(ops[0], expected_install_sa(&params));
     }
 
     #[tokio::test]
@@ -370,14 +520,7 @@ mod tests {
 
         let ops = backend.operations();
         assert_eq!(ops.len(), 1);
-        assert_eq!(
-            ops[0],
-            MockOperation::RekeySa {
-                destination: params.id.destination,
-                spi: params.id.spi,
-                protocol: params.id.protocol,
-            }
-        );
+        assert_eq!(ops[0], expected_rekey_sa(&params));
     }
 
     #[tokio::test]
@@ -402,6 +545,26 @@ mod tests {
         );
     }
 
+    fn expected_install_policy(params: &PolicyParameters) -> MockOperation {
+        MockOperation::InstallPolicy {
+            selector: params.selector.clone(),
+            direction: params.direction,
+            action: params.action,
+            priority: params.priority,
+            templates: params.templates.clone(),
+        }
+    }
+
+    fn expected_rekey_policy(params: &PolicyParameters) -> MockOperation {
+        MockOperation::RekeyPolicy {
+            selector: params.selector.clone(),
+            direction: params.direction,
+            action: params.action,
+            priority: params.priority,
+            templates: params.templates.clone(),
+        }
+    }
+
     #[tokio::test]
     async fn mock_install_policy_records_operation() {
         let backend = MockXfrmBackend::new();
@@ -415,13 +578,7 @@ mod tests {
 
         let ops = backend.operations();
         assert_eq!(ops.len(), 1);
-        assert_eq!(
-            ops[0],
-            MockOperation::InstallPolicy {
-                selector: params.selector,
-                direction: params.direction,
-            }
-        );
+        assert_eq!(ops[0], expected_install_policy(&params));
     }
 
     #[tokio::test]
@@ -437,13 +594,7 @@ mod tests {
 
         let ops = backend.operations();
         assert_eq!(ops.len(), 1);
-        assert_eq!(
-            ops[0],
-            MockOperation::RekeyPolicy {
-                selector: params.selector,
-                direction: params.direction,
-            }
-        );
+        assert_eq!(ops[0], expected_rekey_policy(&params));
     }
 
     #[tokio::test]
@@ -469,9 +620,12 @@ mod tests {
     #[tokio::test]
     async fn mock_probe_returns_configured_result() {
         let probe = XfrmProbe {
+            kind: XfrmBackendKind::Mock,
             platform_supported: true,
             kernel_reachable: false,
-            net_admin_capable: true,
+            net_admin_capable: false,
+            algorithms: XfrmCapability::Available,
+            details: Some("configured probe"),
         };
         let backend = MockXfrmBackend::with_probe(probe);
         let result = backend.probe().await.unwrap();
@@ -508,7 +662,53 @@ mod tests {
         };
         let a1 = backend.allocate_spi(request).await.unwrap();
         let a2 = backend.allocate_spi(request).await.unwrap();
-        assert_eq!(a1.spi, 0x100);
-        assert_eq!(a2.spi, 0x101);
+        // SPI 0 is reserved, so allocation starts at 1.
+        assert_eq!(a1.spi, 1);
+        assert_eq!(a2.spi, 2);
+    }
+
+    #[tokio::test]
+    async fn mock_allocate_spi_respects_requested_range() {
+        let backend = MockXfrmBackend::new();
+        let request = AllocateSpiRequest {
+            destination: ipv4(10, 0, 0, 2),
+            protocol: 50,
+            min_spi: 0x200,
+            max_spi: 0x200,
+        };
+        let allocation = backend.allocate_spi(request).await.unwrap();
+        assert_eq!(allocation.spi, 0x200);
+    }
+
+    #[tokio::test]
+    async fn mock_allocate_spi_rejects_invalid_range() {
+        let backend = MockXfrmBackend::new();
+        let request = AllocateSpiRequest {
+            destination: ipv4(10, 0, 0, 2),
+            protocol: 50,
+            min_spi: 0x300,
+            max_spi: 0x200,
+        };
+        let err = backend.allocate_spi(request).await.unwrap_err();
+        assert!(
+            matches!(err, XfrmError::InvalidConfig { field, .. } if field == "min_spi"),
+            "expected InvalidConfig for min_spi, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_allocate_spi_returns_unavailable_when_exhausted() {
+        let backend = MockXfrmBackend::new();
+        let request = AllocateSpiRequest {
+            destination: ipv4(10, 0, 0, 2),
+            protocol: 50,
+            min_spi: 0x10,
+            max_spi: 0x12,
+        };
+        backend.allocate_spi(request).await.unwrap();
+        backend.allocate_spi(request).await.unwrap();
+        backend.allocate_spi(request).await.unwrap();
+        let err = backend.allocate_spi(request).await.unwrap_err();
+        assert!(matches!(err, XfrmError::Unavailable));
     }
 }

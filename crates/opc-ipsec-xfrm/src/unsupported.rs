@@ -55,18 +55,14 @@ impl XfrmBackend for UnsupportedXfrmBackend {
     }
 
     async fn probe(&self) -> Result<XfrmProbe, XfrmError> {
-        Ok(XfrmProbe {
-            platform_supported: false,
-            kernel_reachable: false,
-            net_admin_capable: false,
-        })
+        Ok(XfrmProbe::unsupported())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::IpAddress;
+    use crate::model::{IpAddress, XfrmBackendKind};
 
     #[tokio::test]
     async fn unsupported_backend_returns_unsupported_platform_for_all_ops() {
@@ -84,6 +80,7 @@ mod tests {
     async fn unsupported_probe_reports_unsupported() {
         let backend = UnsupportedXfrmBackend::new();
         let probe = backend.probe().await.unwrap();
+        assert_eq!(probe.kind, XfrmBackendKind::Unsupported);
         assert!(!probe.platform_supported);
         assert!(!probe.kernel_reachable);
         assert!(!probe.net_admin_capable);

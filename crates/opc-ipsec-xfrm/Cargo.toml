@@ -17,8 +17,6 @@ publish = false
 opc-linux-xfrm-sys = { path = "../opc-linux-xfrm-sys", version = "0.2.0" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "rt"] }
-tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]

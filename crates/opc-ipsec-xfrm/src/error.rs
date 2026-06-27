@@ -11,9 +11,10 @@ use thiserror::Error;
 /// Error type for safe XFRM backend operations.
 ///
 /// The type is `Clone` so mock/test backends can reuse injected failures. I/O
-/// errors are captured as their [`io::ErrorKind`] plus a payload-free message so
-/// the original error does not need to be cloned and no raw OS strings leak in
-/// `Display` output.
+/// errors are captured only as their [`io::ErrorKind`] plus a stable operation
+/// label; the original OS error string is intentionally discarded so that
+/// `Debug` and `Display` never leak addresses, SPIs, subscriber context, or key
+/// material.
 #[non_exhaustive]
 #[derive(Debug, Clone, Error)]
 pub enum XfrmError {
@@ -41,8 +42,6 @@ pub enum XfrmError {
         operation: &'static str,
         /// Captured I/O error kind.
         kind: io::ErrorKind,
-        /// Payload-free OS message kept for diagnostics; not rendered by `Display`.
-        message: String,
     },
     /// The requested SA or policy was not found.
     #[error("XFRM state not found")]
@@ -62,11 +61,13 @@ impl XfrmError {
     }
 
     /// Build an `Io` error with a stable operation label.
+    ///
+    /// The original OS error message is discarded; only [`io::ErrorKind`] is
+    /// retained to keep `Debug` output safe for logs and support bundles.
     pub fn io(operation: &'static str, source: io::Error) -> Self {
         Self::Io {
             operation,
             kind: source.kind(),
-            message: source.to_string(),
         }
     }
 
@@ -120,5 +121,17 @@ mod tests {
         let err = XfrmError::io("allocspi", source);
         let cloned = err.clone();
         assert_eq!(cloned.io_kind(), Some(io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn io_error_debug_does_not_leak_source_message() {
+        let sensitive = "subscriber=123456789012345 spi=0x12345678";
+        let source = io::Error::new(io::ErrorKind::PermissionDenied, sensitive);
+        let err = XfrmError::io("netlink_send", source);
+        let debug = format!("{err:?}");
+        assert!(debug.contains("PermissionDenied"));
+        assert!(!debug.contains("subscriber"));
+        assert!(!debug.contains("123456789012345"));
+        assert!(!debug.contains("0x12345678"));
     }
 }
