@@ -25,6 +25,8 @@ jobs:
           - opc-proto-nas
           - opc-proto-ngap
           - opc-proto-gtpv2c
+          # Keep the Diameter CONFORMANCE.md scheduled-fuzz statement aligned.
+          - opc-proto-diameter
     steps:
       - name: Checkout
         uses: actions/checkout@v4
