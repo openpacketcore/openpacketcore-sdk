@@ -23,16 +23,16 @@ use std::time::Duration;
 ///   helper does not consult `TMPDIR` or `std::env::temp_dir()` because deep
 ///   temporary directories would reintroduce the `sun_path` length problem.
 /// * `name` must be a short filename-safe label. It must not contain path
-///   separators and should be no more than a few tens of bytes so the final
-///   path stays comfortably below the 108-byte `sun_path` limit.
+///   separators and must be no more than 44 bytes so the final path stays
+///   comfortably below the 108-byte `sun_path` limit.
 pub fn short_unix_socket_path(name: &str) -> PathBuf {
     assert!(
         !name.contains('/') && !name.contains('\\'),
         "short_unix_socket_path name must be a filename-safe label, got {name:?}"
     );
     assert!(
-        name.len() <= 48,
-        "short_unix_socket_path name must be <= 48 bytes, got {} bytes in {name:?}",
+        name.len() <= 44,
+        "short_unix_socket_path name must be <= 44 bytes, got {} bytes in {name:?}",
         name.len()
     );
     let path = PathBuf::from(format!(
@@ -518,34 +518,10 @@ mod tests {
     /// overhead when `tokio::net::UnixListener::bind` converts the path.
     const COMFORTABLE_LIMIT: usize = 100;
 
-    /// Restores the previous `TMPDIR` value when dropped.
-    struct TmpdirGuard(Option<String>);
-
-    impl TmpdirGuard {
-        fn set_deep() -> Self {
-            let previous = std::env::var("TMPDIR").ok();
-            std::env::set_var(
-                "TMPDIR",
-                "/very/deep/temporary/directory/that/would/exceed/the/unix/socket/path/limit/if/used",
-            );
-            Self(previous)
-        }
-    }
-
-    impl Drop for TmpdirGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => std::env::set_var("TMPDIR", v),
-                None => std::env::remove_var("TMPDIR"),
-            }
-        }
-    }
-
     #[test]
-    fn short_unix_socket_path_ignores_deep_tmpdir() {
-        let _guard = TmpdirGuard::set_deep();
-
+    fn short_unix_socket_path_is_short_and_unique() {
         let spire = short_unix_socket_path("spire");
+        let spire2 = short_unix_socket_path("spire");
         let kms = short_unix_socket_path("kms");
 
         assert!(
@@ -575,7 +551,11 @@ mod tests {
             "kms path must fit inside sun_path: {kms:?}"
         );
 
-        assert_ne!(spire, kms, "two calls should produce unique paths");
+        assert_ne!(
+            spire, spire2,
+            "two calls with the same label should produce unique paths"
+        );
+        assert_ne!(spire, kms, "different labels should produce unique paths");
     }
 
     #[test]
@@ -585,8 +565,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "short_unix_socket_path name must be <= 48 bytes")]
+    #[should_panic(expected = "short_unix_socket_path name must be <= 44 bytes")]
     fn short_unix_socket_path_rejects_long_name() {
-        let _ = short_unix_socket_path(&"a".repeat(49));
+        let _ = short_unix_socket_path(&"a".repeat(45));
+    }
+
+    #[test]
+    fn short_unix_socket_path_max_length_name_binds() {
+        let path = short_unix_socket_path(&"a".repeat(44));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
     }
 }
