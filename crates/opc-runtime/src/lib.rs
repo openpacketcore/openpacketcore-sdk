@@ -13,6 +13,22 @@
 //! spawning the task and call `Supervisor::set_task_ready` only after the
 //! listener is actually serving.
 //!
+//! # Shutdown Listener Timing
+//!
+//! Traffic listeners should stop accepting new external traffic when shutdown
+//! is requested, or when their domain-specific no-new-work phase begins.
+//! Management and admin readiness endpoints may remain alive until
+//! [`ShutdownPhase::ProtocolDraining`] so readiness=false and drain state remain
+//! observable during the shutdown observation window.
+//!
+//! [`ShutdownPhase::ManagementStopped`] means mutable management operations and
+//! writes have stopped. It does not require every management, admin, or
+//! readiness listener task to exit at that phase. Long-running protocol and
+//! session workers should honor their supervised task shutdown token and drain
+//! within the runtime drain timeout. Products may choose stricter behavior, but
+//! should document it because it affects Kubernetes and OpenShift probe
+//! observability.
+//!
 //! # RFC Reference
 //! Owned by [RFC 008: CNF Runtime Chassis and Resource Governance](../../docs/rfc/008-cnf-runtime-chassis.md).
 
@@ -36,7 +52,7 @@ pub use admin::ConfigVersionMetadata;
 pub use bootstrap::BootstrapError;
 pub use health::{HealthModel, Readiness, StartupPhase};
 pub use profile::{ResourceBudget, RuntimeMode, RuntimeProfile, SigintHandling};
-pub use shutdown::{DrainHook, ShutdownToken};
+pub use shutdown::{DrainHook, ShutdownPhase, ShutdownToken};
 pub use supervisor::{MemoryLimiter, Supervisor};
 pub use task::{
     Criticality, RestartPolicy, RuntimeError, ShutdownPolicy, TaskError, TaskHandle, TaskKind,
