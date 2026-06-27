@@ -131,7 +131,7 @@ fn capable_node() -> NodeCapabilityReport {
             udp_500_bind_allowed: true,
             udp_4500_bind_allowed: true,
             sctp_supported: true,
-            available_kernel_modules: BTreeSet::from(["xfrm_user".to_string(), "esp4".to_string()]),
+            required_kernel_modules: BTreeSet::from(["xfrm_user".to_string(), "esp4".to_string()]),
             supported_esp_algorithms: BTreeSet::from([
                 "aes-cbc".to_string(),
                 "hmac-sha256".to_string(),
@@ -2315,7 +2315,7 @@ fn ipsec_profile_missing_is_rejected() {
 fn ipsec_missing_required_kernel_module_is_rejected() {
     let profile = production_ipsec_gateway_profile();
     let mut node = capable_node();
-    node.ipsec.available_kernel_modules = BTreeSet::new();
+    node.ipsec.required_kernel_modules = BTreeSet::new();
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
     let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));

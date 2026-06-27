@@ -494,7 +494,7 @@ pub struct IpsecCapabilities {
     /// Whether the node reports SCTP support.
     pub sctp_supported: bool,
     /// Kernel modules that are available on the node.
-    pub available_kernel_modules: BTreeSet<String>,
+    pub required_kernel_modules: BTreeSet<String>,
     /// ESP algorithms supported by the node.
     pub supported_esp_algorithms: BTreeSet<String>,
 }

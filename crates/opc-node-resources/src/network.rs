@@ -459,7 +459,7 @@ pub fn validate_ipsec_gateway(
 
     // Required kernel module checks
     for module in &ipsec.required_kernel_modules {
-        if !context.node.ipsec.available_kernel_modules.contains(module) {
+        if !context.node.ipsec.required_kernel_modules.contains(module) {
             if is_lab_software_fallback_allowed {
                 report.activate_fallback(
                     FallbackMode::SoftwarePacketPath,
