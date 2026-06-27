@@ -12,18 +12,75 @@ use tokio::{sync::Notify, time::timeout};
 
 use opc_alarm::{Alarm, AlarmState, ProbableCause, Severity, SharedAlarmManager};
 use opc_config_bus::{
-    ConfigBus, ConfigEvent, ConfigSnapshot, DriftState, ManagedDatastore, MockManagedDatastore,
-    StoreError, StoreErrorCode, StoredConfig, SubscriberLagPolicy,
+    AllowAllAuthorizer, ConfigBus, ConfigEvent, ConfigSnapshot, DriftState, ManagedDatastore,
+    MockManagedDatastore, StoreError, StoreErrorCode, StoredConfig, SubscriberLagPolicy,
 };
 use opc_config_model::{
-    CommitErrorCode, CommitMode, CommitRequest, ConfigError, ConfigOperation, IdempotencyKey,
-    OpcConfig, RequestId, RequestSource, RollbackTarget, TransportType, TrustedPrincipal,
-    ValidationContext, ValidationError, WorkloadIdentity, YangPath,
+    ApplyPlan, ApplyPlanChange, ChangeImpact, ChangeImpactClass, CommitErrorCode, CommitMode,
+    CommitRequest, ConfigError, ConfigImpactClassifier, ConfigOperation, IdempotencyKey, OpcConfig,
+    RequestId, RequestSource, RollbackTarget, TransportType, TrustedPrincipal, ValidationContext,
+    ValidationError, WorkloadIdentity, YangPath,
 };
 use opc_types::{ConfigVersion, SchemaDigest, TenantId, Timestamp};
 
 mod config_bus_common;
 use config_bus_common::*;
+
+struct StaticImpactClassifier {
+    plan: ApplyPlan,
+}
+
+impl StaticImpactClassifier {
+    fn new(plan: ApplyPlan) -> Self {
+        Self { plan }
+    }
+}
+
+impl ConfigImpactClassifier<TestConfig> for StaticImpactClassifier {
+    fn classify(
+        &self,
+        _ctx: &ValidationContext<TestConfig>,
+        _previous: Option<&TestConfig>,
+        _candidate: &TestConfig,
+        _changed_paths: &[YangPath],
+    ) -> Result<ApplyPlan, ConfigError> {
+        Ok(self.plan.clone())
+    }
+}
+
+struct FailingImpactClassifier;
+
+impl ConfigImpactClassifier<TestConfig> for FailingImpactClassifier {
+    fn classify(
+        &self,
+        _ctx: &ValidationContext<TestConfig>,
+        _previous: Option<&TestConfig>,
+        _candidate: &TestConfig,
+        _changed_paths: &[YangPath],
+    ) -> Result<ApplyPlan, ConfigError> {
+        Err(ConfigError::new("apply-plan", "raw-secret=value"))
+    }
+}
+
+fn single_change_plan(class: ChangeImpactClass, reason_code: &str) -> ApplyPlan {
+    ApplyPlan {
+        class,
+        changes: vec![ApplyPlanChange {
+            path: changed_path(),
+            class,
+            reason_code: reason_code.into(),
+            affected_sessions_estimate: Some(3),
+        }],
+        impact: ChangeImpact {
+            class: ChangeImpactClass::Hot,
+            affected_sessions_estimate: None,
+            requires_external_workflow: false,
+        },
+        rollback_target: None,
+        hard_errors: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_load_does_not_wait_on_a_commit() {
@@ -82,6 +139,17 @@ async fn validate_only_does_not_publish_or_notify() {
         .expect("validate-only succeeds");
 
     assert_eq!(result.status, opc_config_model::CommitStatus::Validated);
+    let apply_plan = result.apply_plan.expect("validate-only returns apply plan");
+    assert_eq!(apply_plan.class, ChangeImpactClass::Hot);
+    assert_eq!(
+        apply_plan.changes,
+        vec![ApplyPlanChange {
+            path: changed_path(),
+            class: ChangeImpactClass::Hot,
+            reason_code: "config_changed".into(),
+            affected_sessions_estimate: None,
+        }]
+    );
     assert_eq!(bus.version(), ConfigVersion::INITIAL);
     assert_eq!(bus.load().name, "initial");
     assert_eq!(store.history().await.len(), 0);
@@ -113,6 +181,114 @@ async fn validate_only_surfaces_diff_failures_without_publish() {
 
     assert_eq!(err.code, CommitErrorCode::DiffFailed);
     assert_eq!(bus.version(), ConfigVersion::INITIAL);
+    assert_eq!(bus.load().name, "initial");
+    assert_eq!(store.history().await.len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_returns_admitted_apply_plan_and_replays_it() {
+    let store = Arc::new(MockManagedDatastore::new());
+    let admitted_plan =
+        single_change_plan(ChangeImpactClass::DrainRequired, "hostname_drain_required");
+    let bus = ConfigBus::with_queue_capacity_and_alarm_manager_and_impact_classifier(
+        TestConfig::new("initial"),
+        Arc::clone(&store),
+        32,
+        Arc::new(AllowAllAuthorizer),
+        SharedAlarmManager::default(),
+        Arc::new(StaticImpactClassifier::new(admitted_plan.clone())),
+    )
+    .await
+    .expect("startup succeeds");
+    let key = IdempotencyKey::new("apply-plan-replay").expect("key");
+
+    let result = bus
+        .submit(
+            commit_request("next", Instant::now() + Duration::from_secs(1))
+                .with_idempotency_key(key.clone()),
+        )
+        .await
+        .expect("commit succeeds");
+
+    let result_plan = result.apply_plan.expect("commit returns apply plan");
+    assert_eq!(result_plan.class, ChangeImpactClass::DrainRequired);
+    assert!(result_plan.blocks_traffic_until_workflow());
+    assert_eq!(
+        store.latest().await.expect("record").apply_plan,
+        Some(result_plan.clone())
+    );
+
+    let replay = bus
+        .submit(
+            commit_request("next", Instant::now() + Duration::from_secs(1))
+                .with_idempotency_key(key),
+        )
+        .await
+        .expect("idempotent replay succeeds");
+
+    assert_eq!(replay.apply_plan, Some(result_plan));
+    assert_eq!(store.history().await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forbidden_live_apply_plan_rejects_before_append_or_publish() {
+    let store = Arc::new(MockManagedDatastore::new());
+    let bus = ConfigBus::with_queue_capacity_and_alarm_manager_and_impact_classifier(
+        TestConfig::new("initial"),
+        Arc::clone(&store),
+        32,
+        Arc::new(AllowAllAuthorizer),
+        SharedAlarmManager::default(),
+        Arc::new(StaticImpactClassifier::new(single_change_plan(
+            ChangeImpactClass::ForbiddenLive,
+            "session_store_backend_changed",
+        ))),
+    )
+    .await
+    .expect("startup succeeds");
+
+    let err = bus
+        .submit(commit_request(
+            "next",
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .await
+        .expect_err("forbidden-live plan rejects");
+
+    assert_eq!(err.code, CommitErrorCode::ApplyPlanRejected);
+    let rejected_plan = err.apply_plan.expect("rejected plan is attached");
+    assert_eq!(rejected_plan.class, ChangeImpactClass::ForbiddenLive);
+    assert!(!rejected_plan.hard_errors.is_empty());
+    assert_eq!(bus.load().name, "initial");
+    assert_eq!(bus.version(), ConfigVersion::INITIAL);
+    assert_eq!(store.history().await.len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn classifier_failure_surfaces_stable_error_without_raw_detail() {
+    let store = Arc::new(MockManagedDatastore::new());
+    let bus = ConfigBus::with_queue_capacity_and_alarm_manager_and_impact_classifier(
+        TestConfig::new("initial"),
+        Arc::clone(&store),
+        32,
+        Arc::new(AllowAllAuthorizer),
+        SharedAlarmManager::default(),
+        Arc::new(FailingImpactClassifier),
+    )
+    .await
+    .expect("startup succeeds");
+
+    let err = bus
+        .submit(commit_request(
+            "next",
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .await
+        .expect_err("classifier failure rejects");
+
+    assert_eq!(err.code, CommitErrorCode::ApplyPlanRejected);
+    assert_eq!(err.apply_plan, None);
+    assert!(!err.message.contains("raw-secret"));
     assert_eq!(bus.load().name, "initial");
     assert_eq!(store.history().await.len(), 0);
 }
