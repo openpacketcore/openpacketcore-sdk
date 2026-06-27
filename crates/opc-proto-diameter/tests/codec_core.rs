@@ -228,6 +228,61 @@ fn strict_message_validation_reports_absolute_avp_offsets() {
     assert!(matches!(
         result,
         Err(error) if matches!(error.code(), DecodeErrorCode::InvalidLength { .. })
+            // The malformed AVP is the last one in `region`. Its length field starts at
+            // `DIAMETER_HEADER_LEN + region.len() - AVP_HEADER_LEN`; the invalid length is
+            // reported at byte 5 of the AVP header, hence the `+ 5`.
             && error.offset() == DIAMETER_HEADER_LEN + region.len() - AVP_HEADER_LEN + 5
+    ));
+}
+
+#[test]
+fn per_region_avp_count_limit_is_enforced() {
+    let first = encode_raw_avp(AvpHeader::ietf(AvpCode::new(264), true), b"host.example");
+    let second = encode_raw_avp(AvpHeader::ietf(AvpCode::new(296), true), b"realm.example");
+    let mut region = BytesMut::new();
+    region.put_slice(&first);
+    region.put_slice(&second);
+
+    let limited = DecodeContext {
+        max_ies: 1,
+        ..DecodeContext::default()
+    };
+    let result = validate_avp_region(&region, limited);
+    assert!(matches!(
+        result,
+        Err(error) if matches!(error.code(), DecodeErrorCode::IeCountExceeded)
+            && error.offset() == first.len()
+    ));
+}
+
+#[test]
+fn strict_mode_rejects_non_zero_padding() {
+    let avp_with_bad_padding = [
+        0,
+        0,
+        1,
+        8,
+        AvpFlags::MANDATORY,
+        0,
+        0,
+        (AVP_HEADER_LEN + 1) as u8,
+        b'x',
+        0xFF,
+        0xFF,
+        0xFF,
+    ];
+    let strict = DecodeContext {
+        validation_level: ValidationLevel::Strict,
+        ..DecodeContext::default()
+    };
+    let result = validate_avp_region(&avp_with_bad_padding, strict);
+    assert!(matches!(
+        result,
+        Err(error) if matches!(
+            error.code(),
+            DecodeErrorCode::Structural {
+                reason: "diameter AVP padding must be zero"
+            }
+        ) && error.offset() == AVP_HEADER_LEN + 1
     ));
 }

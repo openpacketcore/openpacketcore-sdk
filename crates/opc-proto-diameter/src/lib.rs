@@ -34,6 +34,8 @@ pub mod dictionary;
 #[cfg(feature = "peer")]
 pub mod peer;
 
+use std::collections::HashSet;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, DuplicateIePolicy,
@@ -983,16 +985,11 @@ fn validate_avp_region_at(
     dictionaries: Option<DictionarySet<'_>>,
 ) -> Result<(), DecodeError> {
     let spec_ref = SpecRef::new("ietf", "RFC6733", "4");
-    if depth > ctx.max_depth {
-        return Err(
-            DecodeError::new(DecodeErrorCode::DepthExceeded, base_offset).with_spec_ref(spec_ref),
-        );
-    }
 
     let mut remaining = input;
     let mut relative_offset = 0usize;
     let mut avp_count = 0usize;
-    let mut seen_keys = Vec::new();
+    let mut seen_keys: Option<HashSet<AvpKey>> = None;
 
     while !remaining.is_empty() {
         let offset = base_offset.checked_add(relative_offset).ok_or_else(|| {
@@ -1017,16 +1014,17 @@ fn validate_avp_region_at(
 
         if ctx.duplicate_ie_policy == DuplicateIePolicy::Reject {
             let key = avp.header.key();
-            if seen_keys.contains(&key) {
+            if !seen_keys.get_or_insert_with(HashSet::new).insert(key) {
                 return Err(
                     DecodeError::new(DecodeErrorCode::DuplicateIe, offset).with_spec_ref(spec_ref)
                 );
             }
-            seen_keys.push(key);
         }
 
         if dictionary_marks_grouped(&avp, dictionaries) {
             let child_depth = depth.saturating_add(1);
+            // Early depth check so the reported offset points to the grouping AVP
+            // rather than to the first child inside it.
             if child_depth > ctx.max_depth {
                 return Err(DecodeError::new(DecodeErrorCode::DepthExceeded, offset)
                     .with_spec_ref(spec_ref));
