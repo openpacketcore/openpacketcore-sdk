@@ -43,8 +43,10 @@ This document defines the conformance status of the `opc-proto-diameter` crate.
 - Duplicate AVP-key policy: `Reject`, `First`, `Last`.
 - Dictionary-defined grouped AVP recursion bounded by
   `DecodeContext::max_depth`.
-- Unknown mandatory AVPs rejected; unknown non-mandatory AVPs tolerated under
-  `UnknownIePolicy::Permit`.
+- Raw AVP-region validation checks lengths, counts, duplicates, padding, and
+  dictionary-defined grouped-AVP recursion; it preserves unknown AVPs as opaque
+  bytes. Unknown-mandatory rejection is a typed-layer policy enforced by the
+  `peer` and application parsers (see below), not by the raw validator.
 
 ### 4. Base peer procedures (RFC 6733 §5.3–5.5)
 
@@ -61,6 +63,8 @@ Peer helpers include:
   awareness.
 - Result-code family classification and E-bit derivation per RFC 6733 §7.2.
 - Optional answer diagnostics (`Error-Message`, raw `Failed-AVP` values).
+- Unknown AVP handling: mandatory unknown AVPs are rejected; non-mandatory
+  unknown AVPs are handled per `UnknownIePolicy` (`Drop`, `Preserve`, `Reject`).
 
 ### 5. Application dictionaries
 

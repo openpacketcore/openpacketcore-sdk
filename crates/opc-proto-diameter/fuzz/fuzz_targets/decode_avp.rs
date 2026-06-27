@@ -11,8 +11,10 @@ fuzz_target!(|data: &[u8]| {
     let _ = validate_avp_region_with_dictionary(data, ctx, APP_DICTIONARIES);
 
     // Strict validation (reserved bits, zero padding).
-    let mut ctx_strict = DecodeContext::default();
-    ctx_strict.validation_level = ValidationLevel::Strict;
+    let ctx_strict = DecodeContext {
+        validation_level: ValidationLevel::Strict,
+        ..Default::default()
+    };
     let _ = validate_avp_region_with_dictionary(data, ctx_strict, APP_DICTIONARIES);
 
     // Iterate raw AVPs one-by-one to exercise the iterator error path.

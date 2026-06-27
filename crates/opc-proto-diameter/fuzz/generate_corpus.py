@@ -34,18 +34,25 @@ def avp(code: int, flags: int, value: bytes, vendor: int | None = None) -> bytes
     Octet layout (non-vendor, 8-octet header):
       0-3   AVP Code (RFC 6733 §4)
       4     AVP Flags (V/M/P/r/r/r/r/r per RFC 6733 §4)
-      5-7   24-bit AVP Length including header, value, and padding (RFC 6733 §4)
+      5-7   24-bit AVP Length including header and AVP data; padding is excluded
+        from the length field and follows the AVP Data (RFC 6733 §4)
       8+    AVP Data
       tail  0-3 octets of zero padding to 4-octet boundary (RFC 6733 §4)
 
     Octet layout (vendor-specific, 12-octet header):
       0-3   AVP Code
       4     AVP Flags (V bit set)
-      5-7   24-bit AVP Length
+      5-7   24-bit AVP Length (header + vendor-id + AVP data; padding excluded)
       8-11  Vendor-Id (RFC 6733 §4.3.2)
       12+   AVP Data + padding
     """
-    header_len = 12 if vendor is not None else 8
+    has_vendor = vendor is not None
+    v_bit_set = (flags & 0x80) != 0
+    if has_vendor and not v_bit_set:
+        raise ValueError("vendor provided but V bit (0x80) is not set in flags")
+    if not has_vendor and v_bit_set:
+        raise ValueError("V bit (0x80) set in flags but no vendor provided")
+    header_len = 12 if has_vendor else 8
     length = header_len + len(value)
     body = struct.pack(">I", code)          # octets 0-3: AVP Code
     body += struct.pack("B", flags)         # octet 4: AVP Flags

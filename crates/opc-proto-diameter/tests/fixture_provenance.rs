@@ -34,7 +34,7 @@ use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext, OwnedDeco
 /// Octet layout for a non-vendor AVP:
 ///   0-3   AVP Code
 ///   4     AVP Flags (V/M/P/r/r/r/r/r)
-///   5-7   24-bit AVP Length (header + value + padding)
+///   5-7   24-bit AVP Length (header + AVP data; padding is excluded)
 ///   8+    AVP Data
 ///   tail  0-3 octets of zero padding to a 4-octet boundary
 fn rfc_avp(code: u32, flags: u8, value: &[u8]) -> Vec<u8> {
@@ -232,6 +232,16 @@ fn rfc6733_fixtures_round_trip_byte_exact() {
 // 3GPP hand-authored fixtures
 // -----------------------------------------------------------------------------
 
+#[cfg(any(
+    feature = "app-gx",
+    feature = "app-rf",
+    feature = "app-s6a",
+    feature = "app-s6b",
+    feature = "app-swm",
+    feature = "app-swx"
+))]
+use opc_proto_diameter::apps::APP_DICTIONARIES;
+
 /// 3GPP TS 32.299 Rf Accounting-Request (START record) fixture.
 ///
 /// Fixture provenance: hand-authored from RFC 6733 §3/§4 wire framing and
@@ -239,6 +249,7 @@ fn rfc6733_fixtures_round_trip_byte_exact() {
 /// ePDG-required subset used by the SDK `app-rf` helpers. It is
 /// application-dictionary evidence, not full Rf-application conformance
 /// evidence.
+#[cfg(feature = "app-rf")]
 fn ts32299_rf_acr_start_bytes() -> Vec<u8> {
     let mut avps = Vec::new();
     // Session-Id AVP (code 263, M), RFC 6733 §8.8.
@@ -269,6 +280,7 @@ fn ts32299_rf_acr_start_bytes() -> Vec<u8> {
 /// ePDG-required subset used by the SDK `app-swm` helpers. It is
 /// application-dictionary evidence, not full SWm-application conformance
 /// evidence.
+#[cfg(feature = "app-swm")]
 fn ts29273_swm_der_bytes() -> Vec<u8> {
     let mut avps = Vec::new();
     // Session-Id AVP (code 263, M), RFC 6733 §8.8.
@@ -290,6 +302,7 @@ fn ts29273_swm_der_bytes() -> Vec<u8> {
     rfc_message(0xC0, 268, 16_777_264, 0x9999_9999, 0xAAAA_AAAA, &avps)
 }
 
+#[cfg(feature = "app-rf")]
 #[test]
 fn ts32299_rf_acr_start_decodes_with_app_dictionary() {
     let bytes = ts32299_rf_acr_start_bytes();
@@ -299,15 +312,13 @@ fn ts32299_rf_acr_start_decodes_with_app_dictionary() {
     assert_eq!(message.header.application_id, ApplicationId::new(3));
     assert!(
         message
-            .validate_avps_with_dictionary(
-                DecodeContext::default(),
-                opc_proto_diameter::apps::APP_DICTIONARIES,
-            )
+            .validate_avps_with_dictionary(DecodeContext::default(), APP_DICTIONARIES)
             .is_ok(),
         "Rf ACR fixture must validate against the app dictionary"
     );
 }
 
+#[cfg(feature = "app-swm")]
 #[test]
 fn ts29273_swm_der_decodes_with_app_dictionary() {
     let bytes = ts29273_swm_der_bytes();
@@ -320,10 +331,7 @@ fn ts29273_swm_der_decodes_with_app_dictionary() {
     );
     assert!(
         message
-            .validate_avps_with_dictionary(
-                DecodeContext::default(),
-                opc_proto_diameter::apps::APP_DICTIONARIES,
-            )
+            .validate_avps_with_dictionary(DecodeContext::default(), APP_DICTIONARIES)
             .is_ok(),
         "SWm DER fixture must validate against the app dictionary"
     );
@@ -335,6 +343,7 @@ fn ts29273_swm_der_decodes_with_app_dictionary() {
 
 /// A round-trip fixture built with this crate's encoder. It is a useful
 /// regression test but does not prove wire conformance by itself.
+#[cfg(feature = "peer")]
 fn generated_cer_bytes() -> Vec<u8> {
     use opc_proto_diameter::peer::{
         build_capabilities_exchange_request, HostIpAddress, PeerCapabilities, PeerIdentity,
@@ -361,6 +370,7 @@ fn generated_cer_bytes() -> Vec<u8> {
     encoded.to_vec()
 }
 
+#[cfg(feature = "peer")]
 #[test]
 fn generated_codec_round_trip_decodes_back_to_equal_message() {
     let bytes = generated_cer_bytes();

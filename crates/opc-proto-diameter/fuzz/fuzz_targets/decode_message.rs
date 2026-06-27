@@ -11,13 +11,17 @@ fuzz_target!(|data: &[u8]| {
     let _ = Message::decode(data, ctx);
 
     // Strict decode (reserved flag-bit / zero-padding enforcement).
-    let mut ctx_strict = DecodeContext::default();
-    ctx_strict.validation_level = ValidationLevel::Strict;
+    let ctx_strict = DecodeContext {
+        validation_level: ValidationLevel::Strict,
+        ..Default::default()
+    };
     let _ = Message::decode(data, ctx_strict);
 
     // Header-only decode (exercises framing without AVP validation).
-    let mut ctx_header = DecodeContext::default();
-    ctx_header.validation_level = ValidationLevel::HeaderOnly;
+    let ctx_header = DecodeContext {
+        validation_level: ValidationLevel::HeaderOnly,
+        ..Default::default()
+    };
     let _ = Message::decode(data, ctx_header);
 
     // Owned decode path.
@@ -32,8 +36,10 @@ fuzz_target!(|data: &[u8]| {
             DecodeContext::default(),
             APP_DICTIONARIES,
         );
-        let mut ctx_shallow = DecodeContext::default();
-        ctx_shallow.max_depth = 2;
+        let ctx_shallow = DecodeContext {
+            max_depth: 2,
+            ..Default::default()
+        };
         let _ = message.validate_avps_with_dictionary(ctx_shallow, APP_DICTIONARIES);
     }
 });

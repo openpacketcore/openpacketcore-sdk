@@ -10,11 +10,18 @@
 //! offending input.
 
 use bytes::Bytes;
-use opc_proto_diameter::apps::APP_DICTIONARIES;
-use opc_proto_diameter::{
-    validate_avp_region_with_dictionary, Message, OwnedMessage, RawAvp, DIAMETER_HEADER_LEN,
-};
+use opc_proto_diameter::{validate_avp_region, Message, OwnedMessage, RawAvp, DIAMETER_HEADER_LEN};
 use opc_protocol::{BorrowDecode, DecodeContext, OwnedDecode, ValidationLevel};
+
+#[cfg(any(
+    feature = "app-gx",
+    feature = "app-rf",
+    feature = "app-s6a",
+    feature = "app-s6b",
+    feature = "app-swm",
+    feature = "app-swx"
+))]
+use opc_proto_diameter::apps::APP_DICTIONARIES;
 
 /// Every decode entry point the fuzz targets exercise. Must never panic,
 /// regardless of input. Decode returning `Err` is expected and fine.
@@ -40,6 +47,14 @@ fn exercise_message(data: &[u8]) {
     let _ = OwnedMessage::decode_owned(Bytes::copy_from_slice(data), DecodeContext::default());
 
     // Dictionary-aware validation (grouped AVP recursion, depth-limited).
+    #[cfg(any(
+        feature = "app-gx",
+        feature = "app-rf",
+        feature = "app-s6a",
+        feature = "app-s6b",
+        feature = "app-swm",
+        feature = "app-swx"
+    ))]
     if let Ok((_, message)) = Message::decode(data, DecodeContext::default()) {
         let _ = message.validate_avps_with_dictionary(DecodeContext::default(), APP_DICTIONARIES);
         let ctx_shallow = DecodeContext {
@@ -52,19 +67,46 @@ fn exercise_message(data: &[u8]) {
 
 /// AVP-region entry points exercised by the `decode_avp` fuzz target.
 fn exercise_avp(data: &[u8]) {
-    let _ = validate_avp_region_with_dictionary(data, DecodeContext::default(), APP_DICTIONARIES);
+    let _ = validate_avp_region(data, DecodeContext::default());
 
     let ctx_strict = DecodeContext {
         validation_level: ValidationLevel::Strict,
         ..Default::default()
     };
-    let _ = validate_avp_region_with_dictionary(data, ctx_strict, APP_DICTIONARIES);
+    let _ = validate_avp_region(data, ctx_strict);
+
+    #[cfg(any(
+        feature = "app-gx",
+        feature = "app-rf",
+        feature = "app-s6a",
+        feature = "app-s6b",
+        feature = "app-swm",
+        feature = "app-swx"
+    ))]
+    {
+        let _ =
+            validate_avp_region_with_dictionary(data, DecodeContext::default(), APP_DICTIONARIES);
+
+        let ctx_strict = DecodeContext {
+            validation_level: ValidationLevel::Strict,
+            ..Default::default()
+        };
+        let _ = validate_avp_region_with_dictionary(data, ctx_strict, APP_DICTIONARIES);
+    }
 
     let mut remaining = data;
     while !remaining.is_empty() {
         match RawAvp::decode(remaining, DecodeContext::default()) {
-            Ok((next, avp)) => {
-                let _ = avp.validate_grouped_value_with_dictionary(
+            Ok((next, _avp)) => {
+                #[cfg(any(
+                    feature = "app-gx",
+                    feature = "app-rf",
+                    feature = "app-s6a",
+                    feature = "app-s6b",
+                    feature = "app-swm",
+                    feature = "app-swx"
+                ))]
+                let _ = _avp.validate_grouped_value_with_dictionary(
                     DecodeContext::default(),
                     APP_DICTIONARIES,
                 );
@@ -114,7 +156,7 @@ fn adversarial_seeds() -> Vec<Vec<u8>> {
         vec![0x00; 4096],
         vec![0xFF; 4096],
         (0..=255u8).collect(),
-        // Header claiming a 24-bit length of 0x00FF_FFFF over a short body.
+        // Header claiming a 24-bit length of 0xFF_FFFF over a short body.
         {
             let mut v = vec![0x01, 0xFF, 0xFF, 0xFF, 0x80, 0x00, 0x01, 0x00];
             v.extend_from_slice(&[0x00; 20]);
@@ -184,10 +226,28 @@ fn corpus_and_adversarial_inputs_never_panic() {
 
 use bytes::BufMut;
 use opc_proto_diameter::{
-    validate_avp_region, ApplicationId, AvpCode, AvpFlags, AvpHeader, CommandCode, CommandFlags,
-    Header, VendorId, AVP_HEADER_LEN, AVP_VENDOR_HEADER_LEN,
+    dictionary::{AvpDataType, AvpDefinition, AvpFlagRules, AvpKey, Dictionary, DictionarySet},
+    validate_avp_region_with_dictionary, ApplicationId, AvpCode, AvpFlags, AvpHeader, CommandCode,
+    CommandFlags, Header, VendorId, AVP_HEADER_LEN, AVP_VENDOR_HEADER_LEN,
 };
-use opc_protocol::{DuplicateIePolicy, Encode, EncodeContext};
+use opc_protocol::{DuplicateIePolicy, Encode, EncodeContext, SpecRef};
+
+/// Minimal dictionary that marks Failed-AVP (279) as grouped, used by the depth-bomb
+/// test so it does not depend on any `app-*` feature.
+static FAILED_AVP_DICTIONARY: [AvpDefinition; 1] = [AvpDefinition::new(
+    AvpKey::ietf(AvpCode::new(279)),
+    "Failed-AVP",
+    AvpDataType::Grouped,
+    AvpFlagRules::base_mandatory(),
+    SpecRef::new("ietf", "RFC6733", "7.5"),
+)];
+
+fn failed_avp_dictionary_set() -> DictionarySet<'static> {
+    static DICTIONARY: Dictionary =
+        Dictionary::new("corpus-replay-depth-bomb", &[], &[], &FAILED_AVP_DICTIONARY);
+    static DICTIONARIES: [&Dictionary; 1] = [&DICTIONARY];
+    DictionarySet::new(&DICTIONARIES)
+}
 
 fn encode_raw_avp(header: AvpHeader, value: &[u8]) -> Vec<u8> {
     let avp = RawAvp {
@@ -236,7 +296,8 @@ fn arbitrary_avp_tree_does_not_panic() {
         b"",
     ));
 
-    // Should not panic; validation may return Err for unknown mandatory AVPs.
+    // Should not panic; the raw region validator tolerates unknown AVPs and only
+    // rejects structural problems (length, count, duplicates).
     let _ = validate_avp_region(&region, DecodeContext::default());
 }
 
@@ -255,7 +316,7 @@ fn grouped_depth_bomb_is_rejected() {
         max_depth: 2,
         ..Default::default()
     };
-    let result = validate_avp_region_with_dictionary(&nested, ctx, APP_DICTIONARIES);
+    let result = validate_avp_region_with_dictionary(&nested, ctx, failed_avp_dictionary_set());
     assert!(
         matches!(
             result,
