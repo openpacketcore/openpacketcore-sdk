@@ -36,6 +36,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | [`opc-proto-ngap`](crates/opc-proto-ngap/) | NGAP (TS 38.413) v0 decoder via `rasn` APER: PDU framing, fixture-proven NGSetupRequest, raw-preserving re-encode *(experimental v0)*. | [ADR 0013](docs/adr/0013-ngap-asn1-strategy.md) |
 | [`opc-sctp`](crates/opc-sctp/) | Safe Linux SCTP transport wrapper for CNFs that terminate N2/NGAP or other SCTP interfaces. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
 | [`opc-libsctp-sys`](crates/opc-libsctp-sys/) | Narrow unsafe Linux SCTP UAPI boundary used only by `opc-sctp`; unsupported platforms fail explicitly. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
+| [`opc-linux-xfrm-sys`](crates/opc-linux-xfrm-sys/) | Narrow unsafe Linux XFRM netlink UAPI boundary; unsupported platforms fail explicitly. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
 | [`opc-node-resources`](crates/opc-node-resources/) | Validates `ResourceProfile` compatibility against observed `NodeCapabilityReport`. | [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md) |
 
 ### Config & Management (`crates/`)

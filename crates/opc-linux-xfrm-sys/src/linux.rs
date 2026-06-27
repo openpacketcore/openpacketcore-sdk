@@ -80,18 +80,32 @@ pub fn receive_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<
     }
     // SAFETY: `buffer` is a valid writable byte slice for its length and the
     // socket fd is live. `recv` writes at most `buffer.len()` bytes.
+    // `MSG_TRUNC` causes the kernel to return the real datagram length even
+    // when it exceeds the buffer, which lets us detect silent truncation below.
     let rc = unsafe {
         libc::recv(
             socket.fd.as_raw_fd(),
             buffer.as_mut_ptr().cast::<libc::c_void>(),
             buffer.len(),
-            0,
+            libc::MSG_TRUNC,
         )
     };
     if rc < 0 {
         Err(io::Error::last_os_error())
     } else {
-        Ok(rc as usize)
+        let total = rc as usize;
+        if total > buffer.len() {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "netlink XFRM datagram truncated: buffer is {} bytes but datagram is {} bytes",
+                    buffer.len(),
+                    total
+                ),
+            ))
+        } else {
+            Ok(total)
+        }
     }
 }
 

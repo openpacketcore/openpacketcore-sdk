@@ -52,6 +52,16 @@ pub fn send_message(socket: &NetlinkSocket, payload: &[u8]) -> io::Result<usize>
 }
 
 /// Receive one raw netlink XFRM message buffer from the kernel.
+///
+/// # Datagram sizing
+///
+/// Netlink is a datagram protocol. If `buffer` is smaller than the kernel's
+/// pending datagram, the kernel would silently drop the excess bytes when
+/// `recv` is called with `flags=0`. To avoid silent truncation, this wrapper
+/// passes `MSG_TRUNC` and returns an [`io::Error`] of kind
+/// [`io::ErrorKind::InvalidData`] if the real datagram length exceeds
+/// `buffer.len()`. Callers should size buffers to the largest expected XFRM
+/// message or be prepared to retry with a larger buffer.
 pub fn receive_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<usize> {
     platform::receive_message(&socket.inner, buffer)
 }
