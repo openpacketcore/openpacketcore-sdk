@@ -325,21 +325,9 @@ async fn test_sigterm_triggers_graceful_shutdown_impl() {
 
     assert!(status.success(), "kill command should succeed");
 
-    // Wait for the graceful shutdown to reach the Stopped phase with a 5 second timeout guard
-    let success = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if handle.is_stopped().await {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-
-    assert!(
-        success.is_ok(),
-        "SIGTERM must trigger full graceful shutdown to Stopped phase within 5 seconds"
-    );
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_stopped())
+        .await
+        .expect("SIGTERM must trigger full graceful shutdown to Stopped phase within 5 seconds");
     assert!(
         called.load(Ordering::SeqCst),
         "SIGTERM must trigger the drain hook execution"
@@ -415,16 +403,9 @@ async fn test_sigterm_during_init_never_promotes_ready_impl() {
     release_init.notify_one();
     let handle = build_task.await.unwrap();
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if handle.is_stopped().await {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("runtime should complete shutdown after init is released");
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_stopped())
+        .await
+        .expect("runtime should complete shutdown after init is released");
 
     let phases = phases.lock().unwrap();
     assert!(
