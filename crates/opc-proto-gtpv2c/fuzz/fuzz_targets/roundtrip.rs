@@ -32,7 +32,11 @@ fuzz_target!(|data: &[u8]| {
             if let Ok((canonical_tail, canonical_message)) =
                 Message::decode(canonical.as_ref(), DecodeContext::default())
             {
-                assert!(canonical_tail.is_empty());
+                assert!(
+                    canonical_tail.is_empty(),
+                    "canonical re-encode left a {}-byte tail",
+                    canonical_tail.len()
+                );
                 let mut canonical_again = BytesMut::new();
                 if canonical_message
                     .encode(&mut canonical_again, EncodeContext::default())

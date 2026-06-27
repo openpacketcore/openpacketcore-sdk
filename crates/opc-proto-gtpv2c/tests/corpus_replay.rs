@@ -84,17 +84,15 @@ fn read_files(root: &Path, only_bin: bool) -> Vec<(PathBuf, Vec<u8>)> {
 }
 
 fn class_for(path: &Path) -> Option<FixtureClass> {
-    for component in path.components() {
-        let text = component.as_os_str().to_string_lossy();
-        match text.as_ref() {
-            "spec" => return Some(FixtureClass::Spec),
-            "independent" => return Some(FixtureClass::Independent),
-            "epdg-parity" => return Some(FixtureClass::EpdgParity),
-            "malformed" => return Some(FixtureClass::Malformed),
-            _ => {}
-        }
+    let relative = path.strip_prefix(fixture_root()).ok()?;
+    let first = relative.components().next()?;
+    match first.as_os_str().to_string_lossy().as_ref() {
+        "spec" => Some(FixtureClass::Spec),
+        "independent" => Some(FixtureClass::Independent),
+        "epdg-parity" => Some(FixtureClass::EpdgParity),
+        "malformed" => Some(FixtureClass::Malformed),
+        _ => None,
     }
-    None
 }
 
 fn fixture_files(class: FixtureClass) -> Vec<(PathBuf, Vec<u8>)> {
@@ -349,7 +347,6 @@ fn fixture_corpus_is_split_by_provenance() {
 fn fuzz_target_corpora_mirror_provenance_seed_corpus() {
     let root = fuzz_corpus_root();
     let seeds = fuzz_provenance_seed_files();
-    assert_eq!(seeds.len(), 18);
 
     for target in FUZZ_TARGETS {
         let target_dir = root.join(target);

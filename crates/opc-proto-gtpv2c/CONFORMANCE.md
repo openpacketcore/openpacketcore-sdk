@@ -111,6 +111,9 @@
      without explicit corpus arguments. Each directory contains a flat,
      provenance-prefixed mirror of the committed spec, ePDG-parity, and
      malformed seed files.
+   - Two legacy flat seeds, `fuzz/corpus/echo_request` and
+     `fuzz/corpus/create_session_shell`, remain at the corpus root for backward
+     compatibility and are replayed by the never-panic corpus test.
    - The repository fuzz workflow includes this crate in its scheduled matrix.
 
 ## Known limitations
