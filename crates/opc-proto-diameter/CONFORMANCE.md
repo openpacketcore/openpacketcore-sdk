@@ -1,0 +1,44 @@
+# opc-proto-diameter Conformance Notes
+
+Status: **experimental scaffold**.
+
+This crate does not yet claim full RFC 6733 or 3GPP Diameter conformance. The
+current scope exists so follow-up tasks can add independently authored fixtures,
+AVP decoding, grouped-AVP bounds, base procedure helpers, app dictionaries, and
+fuzz coverage without importing ePDG product policy or local-builder bytes as
+conformance evidence.
+
+## Implemented scaffold
+
+- Diameter message header decode/encode for RFC 6733 section 3.
+- Raw Diameter message storage that preserves the top-level AVP byte region.
+- Raw AVP header/value/padding decode/encode for RFC 6733 section 4.
+- Dictionary metadata architecture for applications, commands, AVPs, data types,
+  and flag requirements.
+- Feature skeletons:
+  - `base`: common RFC 6733 application metadata, CER/CEA, DWR/DWA, DPR/DPA,
+    and selected base AVP definitions.
+  - `peer`: transport-neutral procedure classification for the base peer
+    commands.
+  - `app-gx`, `app-rf`, `app-s6a`, `app-s6b`, `app-swm`, `app-swx`: initial
+    per-application 3GPP dictionary slots.
+  - `all-apps`: enables every per-application dictionary slot.
+
+## Explicit gaps
+
+- No fixture is counted as ADR 0015 conformance evidence yet.
+- No ePDG-derived Diameter bytes are imported; source local-builder cases remain
+  parity/schema seeds until a later fixture-intake task records provenance.
+- Grouped AVP recursion limits and typed AVP value decoders are follow-up work.
+- Base procedure builders and application-specific command/AVP dictionaries are
+  follow-up work.
+- Fuzz targets and fixture manifests are follow-up work.
+- Transport operations, realm routing, peer topology, watchdog policy, AAA/HSS
+  behavior, and charging decisions are outside this crate.
+
+## Fixture intake rule
+
+Future conformance fixtures must be spec-authored with octet-level comments or
+captured from an independent implementation with source, license, redaction, and
+capture metadata. Local builder output and same-codec round trips may be useful
+regression tests, but they do not prove wire conformance by themselves.
