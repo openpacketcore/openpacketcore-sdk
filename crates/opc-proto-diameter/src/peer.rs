@@ -1621,7 +1621,7 @@ fn validate_peer_avp_flags(header: &AvpHeader, offset: usize) -> Result<(), Deco
         }
         FlagRequirement::MustBeUnset if header.vendor_id.is_some() => {
             return Err(decode_structural_error(
-                "diameter AVP V-bit must not be set per base dictionary",
+                "diameter AVP V-bit must not be set per dictionary",
                 offset,
                 section,
             ));
@@ -1631,14 +1631,14 @@ fn validate_peer_avp_flags(header: &AvpHeader, offset: usize) -> Result<(), Deco
     match flags.mandatory() {
         FlagRequirement::MustBeSet if !header.flags.is_mandatory() => {
             return Err(decode_structural_error(
-                "diameter AVP M-bit must be set per base dictionary",
+                "diameter AVP M-bit must be set per dictionary",
                 offset,
                 section,
             ));
         }
         FlagRequirement::MustBeUnset if header.flags.is_mandatory() => {
             return Err(decode_structural_error(
-                "diameter AVP M-bit must not be set per base dictionary",
+                "diameter AVP M-bit must not be set per dictionary",
                 offset,
                 section,
             ));
@@ -1655,7 +1655,7 @@ fn validate_peer_avp_flags(header: &AvpHeader, offset: usize) -> Result<(), Deco
         }
         FlagRequirement::MustBeUnset if header.flags.is_protected() => {
             return Err(decode_structural_error(
-                "diameter AVP P-bit must not be set per base dictionary",
+                "diameter AVP P-bit must not be set per dictionary",
                 offset,
                 section,
             ));
@@ -2767,7 +2767,7 @@ mod tests {
             Err(error) if matches!(
                 error.code(),
                 DecodeErrorCode::Structural {
-                    reason: "diameter AVP M-bit must be set per base dictionary"
+                    reason: "diameter AVP M-bit must be set per dictionary"
                 }
             )
         ));
@@ -2825,7 +2825,7 @@ mod tests {
             Err(error) if matches!(
                 error.code(),
                 DecodeErrorCode::Structural {
-                    reason: "diameter AVP M-bit must not be set per base dictionary"
+                    reason: "diameter AVP M-bit must not be set per dictionary"
                 }
             )
         ));
@@ -2901,7 +2901,7 @@ mod tests {
             Err(error) if matches!(
                 error.code(),
                 DecodeErrorCode::Structural {
-                    reason: "diameter AVP P-bit must not be set per base dictionary"
+                    reason: "diameter AVP P-bit must not be set per dictionary"
                 }
             )
         ));
