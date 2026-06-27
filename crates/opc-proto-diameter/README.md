@@ -16,7 +16,8 @@ currently provides:
 - feature-gated RFC 6733 base procedure helpers for CER/CEA, DWR/DWA, and
   DPR/DPA, including optional `Origin-State-Id`, answer diagnostics
   (`Error-Message`/raw `Failed-AVP` values), protocol-error E-bit derivation,
-  and transport-neutral peer capability/result-code helpers; and
+  minimal CEA protocol-error answers, and transport-neutral peer
+  capability/result-code helpers with Relay Application Id handling; and
 - feature-gated skeleton dictionaries for selected 3GPP application work.
 
 It intentionally does **not** provide realm routing, AAA/HSS/CDF behavior,
@@ -28,7 +29,7 @@ claim that a downstream EPC/ePDG product is carrier-ready.
 | Feature | Default | Scope |
 | --- | --- | --- |
 | `base` | yes | RFC 6733 common application, peer command names, and base AVP metadata scaffold. |
-| `peer` | no | Transport-neutral CER/CEA, DWR/DWA, DPR/DPA builders/parsers, diagnostics preservation, and peer capability/result-code helpers over the base command set. |
+| `peer` | no | Transport-neutral CER/CEA, minimal CEA protocol-error answer, DWR/DWA, DPR/DPA builders/parsers, diagnostics preservation, and peer capability/result-code helpers over the base command set. |
 | `app-gx` | no | Initial 3GPP Gx application dictionary slot. |
 | `app-rf` | no | Initial 3GPP Rf accounting application dictionary slot. |
 | `app-s6a` | no | Initial 3GPP S6a/S6d application dictionary slot. |

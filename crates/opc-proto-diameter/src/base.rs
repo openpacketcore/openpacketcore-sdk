@@ -14,6 +14,8 @@ use crate::{ApplicationId, AvpCode, CommandCode};
 
 /// Diameter Common Messages application identifier.
 pub const APPLICATION_ID_COMMON_MESSAGES: ApplicationId = ApplicationId::new(0);
+/// Diameter Relay Application identifier advertised by relay agents.
+pub const APPLICATION_ID_RELAY: ApplicationId = ApplicationId::new(u32::MAX);
 /// Capabilities-Exchange command code.
 pub const COMMAND_CAPABILITIES_EXCHANGE: CommandCode = CommandCode::new(257);
 /// Device-Watchdog command code.

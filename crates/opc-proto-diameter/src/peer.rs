@@ -19,10 +19,10 @@ use opc_protocol::{
 };
 
 use crate::base::{
-    self, AVP_ACCT_APPLICATION_ID, AVP_AUTH_APPLICATION_ID, AVP_DISCONNECT_CAUSE,
-    AVP_ERROR_MESSAGE, AVP_FAILED_AVP, AVP_FIRMWARE_REVISION, AVP_HOST_IP_ADDRESS,
-    AVP_INBAND_SECURITY_ID, AVP_ORIGIN_HOST, AVP_ORIGIN_REALM, AVP_ORIGIN_STATE_ID,
-    AVP_PRODUCT_NAME, AVP_RESULT_CODE, AVP_SUPPORTED_VENDOR_ID, AVP_VENDOR_ID,
+    self, APPLICATION_ID_RELAY, AVP_ACCT_APPLICATION_ID, AVP_AUTH_APPLICATION_ID,
+    AVP_DISCONNECT_CAUSE, AVP_ERROR_MESSAGE, AVP_FAILED_AVP, AVP_FIRMWARE_REVISION,
+    AVP_HOST_IP_ADDRESS, AVP_INBAND_SECURITY_ID, AVP_ORIGIN_HOST, AVP_ORIGIN_REALM,
+    AVP_ORIGIN_STATE_ID, AVP_PRODUCT_NAME, AVP_RESULT_CODE, AVP_SUPPORTED_VENDOR_ID, AVP_VENDOR_ID,
     AVP_VENDOR_SPECIFIC_APPLICATION_ID, COMMAND_CAPABILITIES_EXCHANGE, COMMAND_DEVICE_WATCHDOG,
     COMMAND_DISCONNECT_PEER, RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION,
     RESULT_CODE_DIAMETER_SUCCESS,
@@ -354,6 +354,14 @@ impl PeerCapabilities {
                 section,
             ));
         }
+        for vendor_id in &self.supported_vendor_ids {
+            if vendor_id.get() == 0 {
+                return Err(encode_structural_error(
+                    "diameter Supported-Vendor-Id must not be zero",
+                    "5.3.6",
+                ));
+            }
+        }
         for application in &self.vendor_specific_applications {
             application.validate_for_encode(section)?;
         }
@@ -384,6 +392,18 @@ pub struct CapabilitiesExchangeAnswer {
     pub result_code: u32,
     /// Peer capabilities carried by the answer.
     pub capabilities: PeerCapabilities,
+    /// Optional diagnostic AVPs carried by the answer.
+    pub diagnostics: AnswerDiagnostics,
+}
+
+/// Parsed Capabilities-Exchange protocol-error answer that follows the
+/// RFC 6733 section 7.2 error grammar without full capability AVPs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilitiesExchangeErrorAnswer {
+    /// Protocol-error Result-Code AVP value.
+    pub result_code: u32,
+    /// Origin-Host and Origin-Realm AVPs carried by the error answer.
+    pub identity: PeerIdentity,
     /// Optional diagnostic AVPs carried by the answer.
     pub diagnostics: AnswerDiagnostics,
 }
@@ -475,6 +495,14 @@ pub struct DisconnectPeerAnswer {
 /// Capability intersection computed from two CER/CEA capability sets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityNegotiation {
+    /// Common application identifiers computed across Auth-Application-Id,
+    /// Acct-Application-Id, and Vendor-Specific-Application-Id application
+    /// identifiers, preserving local order and ignoring nested VSA Vendor-Id
+    /// values per RFC 6733 section 5.3.
+    pub application_ids: Vec<ApplicationId>,
+    /// Whether either peer advertises the Diameter Relay Application Id, which
+    /// RFC 6733 treats as sufficient for a common-application readiness result.
+    pub relay_application: bool,
     /// Common Supported-Vendor-Id values, preserving local order.
     pub supported_vendor_ids: Vec<VendorId>,
     /// Common Auth-Application-Id values, preserving local order.
@@ -489,9 +517,11 @@ pub struct CapabilityNegotiation {
 
 impl CapabilityNegotiation {
     /// Return true when at least one auth, accounting, or vendor-specific
-    /// application is common to both peers.
+    /// application is common to both peers, or either peer advertises relay.
     pub fn has_common_application(&self) -> bool {
-        !self.auth_application_ids.is_empty()
+        !self.application_ids.is_empty()
+            || self.relay_application
+            || !self.auth_application_ids.is_empty()
             || !self.acct_application_ids.is_empty()
             || !self.vendor_specific_applications.is_empty()
     }
@@ -511,7 +541,12 @@ pub fn negotiate_capabilities(
     local: &PeerCapabilities,
     remote: &PeerCapabilities,
 ) -> CapabilityNegotiation {
+    let local_application_ids = advertised_non_relay_application_ids(local);
+    let remote_application_ids = advertised_non_relay_application_ids(remote);
     CapabilityNegotiation {
+        application_ids: common_copy(&local_application_ids, &remote_application_ids),
+        relay_application: advertises_relay_application(local)
+            || advertises_relay_application(remote),
         supported_vendor_ids: common_copy(
             &local.supported_vendor_ids,
             &remote.supported_vendor_ids,
@@ -638,6 +673,80 @@ pub fn parse_capabilities_exchange_answer(
         result_code,
         capabilities: avps.into_capabilities(section)?,
         diagnostics,
+    })
+}
+
+/// Build a minimal Capabilities-Exchange-Answer protocol-error message.
+pub fn build_capabilities_exchange_error_answer(
+    answer: &CapabilitiesExchangeErrorAnswer,
+    hop_by_hop_identifier: u32,
+    end_to_end_identifier: u32,
+    ctx: EncodeContext,
+) -> Result<OwnedMessage, EncodeError> {
+    let section = PeerProcedure::CapabilitiesExchange.spec_section(CommandKind::Answer);
+    if !result_code_requires_error_bit(answer.result_code) {
+        return Err(encode_structural_error(
+            "diameter CEA error answer Result-Code must be a protocol-error value",
+            "7.2",
+        ));
+    }
+    answer.identity.validate_for_encode(section)?;
+    let mut raw_avps = BytesMut::new();
+    append_u32_avp(
+        &mut raw_avps,
+        AVP_RESULT_CODE,
+        answer.result_code,
+        true,
+        ctx,
+    )?;
+    append_identity_avps(&mut raw_avps, &answer.identity, ctx)?;
+    append_answer_diagnostics(&mut raw_avps, &answer.diagnostics, ctx)?;
+    build_message(
+        peer_answer_flags(PeerProcedure::CapabilitiesExchange, true),
+        COMMAND_CAPABILITIES_EXCHANGE,
+        raw_avps,
+        hop_by_hop_identifier,
+        end_to_end_identifier,
+        ctx,
+        section,
+    )
+}
+
+/// Parse a minimal Capabilities-Exchange-Answer protocol-error message.
+pub fn parse_capabilities_exchange_error_answer(
+    message: &Message<'_>,
+    ctx: DecodeContext,
+) -> Result<CapabilitiesExchangeErrorAnswer, DecodeError> {
+    let section = PeerProcedure::CapabilitiesExchange.spec_section(CommandKind::Answer);
+    ensure_peer_header(
+        message,
+        PeerProcedure::CapabilitiesExchange,
+        CommandKind::Answer,
+    )?;
+    if !message.header.flags.is_error() {
+        return Err(decode_structural_error(
+            "diameter CEA error answer requires the error flag",
+            4,
+            "7.2",
+        ));
+    }
+    let avps = collect_procedure_avps(message.raw_avps, ctx, section)?;
+    let result_code = require_field(
+        avps.result_code.clone(),
+        "diameter CEA error answer requires Result-Code",
+        section,
+    )?;
+    if !result_code_requires_error_bit(result_code) {
+        return Err(decode_structural_error(
+            "diameter CEA error answer Result-Code must be a protocol-error value",
+            DIAMETER_HEADER_LEN,
+            "7.2",
+        ));
+    }
+    Ok(CapabilitiesExchangeErrorAnswer {
+        result_code,
+        identity: avps.identity(section)?,
+        diagnostics: avps.diagnostics(),
     })
 }
 
@@ -1231,7 +1340,7 @@ fn collect_procedure_avps(
             let cause = DisconnectCause::decode(value, value_offset)?;
             set_once(&mut parsed.disconnect_cause, cause, offset, section)
         } else if code == AVP_ERROR_MESSAGE {
-            let value = parse_string_value(avp.value, value_offset, "7.3")?;
+            let value = parse_utf8_value(avp.value, value_offset, "7.3")?;
             set_once(&mut parsed.error_message, value, offset, section)
         } else if code == AVP_FAILED_AVP {
             parsed.failed_avps.push(Bytes::copy_from_slice(avp.value));
@@ -1254,13 +1363,15 @@ fn collect_procedure_avps(
             let value = parse_u32_value(avp.value, value_offset, "5.3.4")?;
             set_once(&mut parsed.firmware_revision, value, offset, section)
         } else if code == AVP_SUPPORTED_VENDOR_ID {
-            parsed
-                .supported_vendor_ids
-                .push(VendorId::new(parse_u32_value(
-                    avp.value,
+            let value = parse_u32_value(avp.value, value_offset, "5.3.6")?;
+            if value == 0 {
+                return Err(decode_structural_error(
+                    "diameter Supported-Vendor-Id must not be zero",
                     value_offset,
                     "5.3.6",
-                )?));
+                ));
+            }
+            parsed.supported_vendor_ids.push(VendorId::new(value));
             Ok(())
         } else if code == AVP_AUTH_APPLICATION_ID {
             parsed
@@ -1291,7 +1402,6 @@ fn collect_procedure_avps(
                 .push(parse_vendor_specific_application(
                     &avp,
                     ctx,
-                    offset,
                     value_offset,
                     section,
                 )?);
@@ -1306,15 +1416,10 @@ fn collect_procedure_avps(
 fn parse_vendor_specific_application(
     avp: &RawAvp<'_>,
     ctx: DecodeContext,
-    avp_offset: usize,
     value_offset: usize,
     section: &'static str,
 ) -> Result<VendorSpecificApplication, DecodeError> {
     let child_depth = 1;
-    if child_depth > ctx.max_depth {
-        return Err(DecodeError::new(DecodeErrorCode::DepthExceeded, avp_offset)
-            .with_spec_ref(peer_spec(section)));
-    }
     let mut vendor_ids = Vec::new();
     let mut auth_application_id = None;
     let mut acct_application_id = None;
@@ -1420,13 +1525,7 @@ fn parse_string_value(
     offset: usize,
     section: &'static str,
 ) -> Result<String, DecodeError> {
-    let parsed = str::from_utf8(value).map_err(|_| {
-        decode_structural_error(
-            "diameter UTF-8 or DiameterIdentity AVP is not valid UTF-8",
-            offset,
-            section,
-        )
-    })?;
+    let parsed = parse_utf8_value(value, offset, section)?;
     if parsed.is_empty() {
         return Err(decode_structural_error(
             "diameter UTF-8 or DiameterIdentity AVP must not be empty",
@@ -1434,6 +1533,21 @@ fn parse_string_value(
             section,
         ));
     }
+    Ok(parsed)
+}
+
+fn parse_utf8_value(
+    value: &[u8],
+    offset: usize,
+    section: &'static str,
+) -> Result<String, DecodeError> {
+    let parsed = str::from_utf8(value).map_err(|_| {
+        decode_structural_error(
+            "diameter UTF-8 or DiameterIdentity AVP is not valid UTF-8",
+            offset,
+            section,
+        )
+    })?;
     Ok(parsed.to_owned())
 }
 
@@ -1518,34 +1632,77 @@ fn common_copy<T: Copy + Eq>(local: &[T], remote: &[T]) -> Vec<T> {
     common
 }
 
+fn advertised_non_relay_application_ids(capabilities: &PeerCapabilities) -> Vec<ApplicationId> {
+    let mut application_ids = Vec::new();
+    for application_id in &capabilities.auth_application_ids {
+        push_non_relay_application_id(&mut application_ids, *application_id);
+    }
+    for application_id in &capabilities.acct_application_ids {
+        push_non_relay_application_id(&mut application_ids, *application_id);
+    }
+    for application in &capabilities.vendor_specific_applications {
+        if let Some(application_id) = vendor_specific_application_id(application) {
+            push_non_relay_application_id(&mut application_ids, application_id);
+        }
+    }
+    application_ids
+}
+
+fn push_non_relay_application_id(application_ids: &mut Vec<ApplicationId>, value: ApplicationId) {
+    if value != APPLICATION_ID_RELAY && !application_ids.contains(&value) {
+        application_ids.push(value);
+    }
+}
+
+fn advertises_relay_application(capabilities: &PeerCapabilities) -> bool {
+    capabilities
+        .auth_application_ids
+        .contains(&APPLICATION_ID_RELAY)
+        || capabilities
+            .acct_application_ids
+            .contains(&APPLICATION_ID_RELAY)
+        || capabilities
+            .vendor_specific_applications
+            .iter()
+            .any(|application| {
+                vendor_specific_application_id(application) == Some(APPLICATION_ID_RELAY)
+            })
+}
+
 fn common_vendor_specific_applications(
     local: &[VendorSpecificApplication],
     remote: &[VendorSpecificApplication],
 ) -> Vec<VendorSpecificApplication> {
     let mut common = Vec::new();
     for local_application in local {
-        for remote_application in remote {
-            if local_application.auth_application_id == remote_application.auth_application_id
-                && local_application.acct_application_id == remote_application.acct_application_id
-            {
-                let vendor_ids = common_copy(
-                    &local_application.vendor_ids,
-                    &remote_application.vendor_ids,
-                );
-                if !vendor_ids.is_empty() {
-                    let candidate = VendorSpecificApplication {
-                        vendor_ids,
-                        auth_application_id: local_application.auth_application_id,
-                        acct_application_id: local_application.acct_application_id,
-                    };
-                    if !common.contains(&candidate) {
-                        common.push(candidate);
-                    }
-                }
-            }
+        let has_remote_match = remote.iter().any(|remote_application| {
+            same_vendor_specific_application_id(local_application, remote_application)
+        });
+        let already_recorded = common
+            .iter()
+            .any(|existing| same_vendor_specific_application_id(existing, local_application));
+        if has_remote_match && !already_recorded {
+            common.push(local_application.clone());
         }
     }
     common
+}
+
+fn same_vendor_specific_application_id(
+    left: &VendorSpecificApplication,
+    right: &VendorSpecificApplication,
+) -> bool {
+    (left.auth_application_id.is_some() && left.auth_application_id == right.auth_application_id)
+        || (left.acct_application_id.is_some()
+            && left.acct_application_id == right.acct_application_id)
+}
+
+fn vendor_specific_application_id(
+    application: &VendorSpecificApplication,
+) -> Option<ApplicationId> {
+    application
+        .auth_application_id
+        .or(application.acct_application_id)
 }
 
 fn offset_add(base: usize, delta: usize, section: &'static str) -> Result<usize, DecodeError> {
@@ -1586,7 +1743,10 @@ fn peer_spec(section: &'static str) -> SpecRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::base::{INBAND_SECURITY_ID_NO_INBAND_SECURITY, RESULT_CODE_DIAMETER_SUCCESS};
+    use crate::base::{
+        INBAND_SECURITY_ID_NO_INBAND_SECURITY, RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED,
+        RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION, RESULT_CODE_DIAMETER_SUCCESS,
+    };
     use crate::{AvpFlags, AVP_HEADER_LEN};
     use bytes::Bytes;
     use opc_protocol::{DecodeErrorCode, ValidationLevel};
@@ -1714,6 +1874,11 @@ mod tests {
         assert!(parsed.diagnostics.is_empty());
 
         let negotiated = negotiate_capabilities(&local, &parsed.capabilities);
+        assert_eq!(
+            negotiated.application_ids,
+            vec![ApplicationId::new(16_777_251), ApplicationId::new(3)]
+        );
+        assert!(!negotiated.relay_application);
         assert_eq!(negotiated.supported_vendor_ids, vec![VendorId::new(10415)]);
         assert_eq!(
             negotiated.auth_application_ids,
@@ -1742,6 +1907,8 @@ mod tests {
         remote.vendor_specific_applications.clear();
 
         let negotiated = negotiate_capabilities(&local, &remote);
+        assert!(negotiated.application_ids.is_empty());
+        assert!(!negotiated.relay_application);
         assert!(!negotiated.has_common_application());
         assert!(!has_common_application(&local, &remote));
         assert_eq!(
@@ -1764,7 +1931,7 @@ mod tests {
             panic!("Failed-AVP value build failed: {error}");
         }
         let answer = CapabilitiesExchangeAnswer {
-            result_code: crate::base::RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED,
+            result_code: RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED,
             capabilities: remote,
             diagnostics: AnswerDiagnostics {
                 error_message: Some("unsupported command".to_string()),
@@ -1785,6 +1952,200 @@ mod tests {
             Err(error) => panic!("CEA error answer parse failed: {error}"),
         };
         assert_eq!(parsed.diagnostics, answer.diagnostics);
+    }
+
+    #[test]
+    fn vendor_specific_application_common_result_ignores_nested_vendor_id() {
+        let application_id = ApplicationId::new(16_777_251);
+        let local_application =
+            VendorSpecificApplication::auth(VendorId::new(10415), application_id);
+        let remote_application =
+            VendorSpecificApplication::auth(VendorId::new(4_242), application_id);
+
+        let mut local = sample_capabilities();
+        local.auth_application_ids.clear();
+        local.acct_application_ids.clear();
+        local.vendor_specific_applications = vec![local_application.clone()];
+
+        let mut remote = sample_capabilities();
+        remote.auth_application_ids.clear();
+        remote.acct_application_ids.clear();
+        remote.vendor_specific_applications = vec![remote_application];
+
+        let negotiated = negotiate_capabilities(&local, &remote);
+        assert_eq!(negotiated.application_ids, vec![application_id]);
+        assert_eq!(
+            negotiated.vendor_specific_applications,
+            vec![local_application]
+        );
+        assert!(negotiated.has_common_application());
+        assert_eq!(negotiated.cea_result_code(), RESULT_CODE_DIAMETER_SUCCESS);
+    }
+
+    #[test]
+    fn relay_advertisement_counts_as_common_application() {
+        let mut local = sample_capabilities();
+        local.auth_application_ids.clear();
+        local.acct_application_ids.clear();
+        local.vendor_specific_applications.clear();
+
+        let mut remote = sample_capabilities();
+        remote.auth_application_ids = vec![APPLICATION_ID_RELAY];
+        remote.acct_application_ids.clear();
+        remote.vendor_specific_applications.clear();
+
+        let negotiated = negotiate_capabilities(&local, &remote);
+        assert!(negotiated.application_ids.is_empty());
+        assert!(negotiated.relay_application);
+        assert!(negotiated.has_common_application());
+        assert!(has_common_application(&local, &remote));
+        assert_eq!(
+            cea_result_code(&local, &remote),
+            RESULT_CODE_DIAMETER_SUCCESS
+        );
+    }
+
+    #[test]
+    fn common_application_ids_are_computed_across_advertisement_forms() {
+        let application_id = ApplicationId::new(16_777_272);
+        let mut local = sample_capabilities();
+        local.auth_application_ids = vec![application_id];
+        local.acct_application_ids.clear();
+        local.vendor_specific_applications.clear();
+
+        let mut remote = sample_capabilities();
+        remote.auth_application_ids.clear();
+        remote.acct_application_ids.clear();
+        remote.vendor_specific_applications = vec![VendorSpecificApplication::auth(
+            VendorId::new(10415),
+            application_id,
+        )];
+
+        let negotiated = negotiate_capabilities(&local, &remote);
+        assert_eq!(negotiated.application_ids, vec![application_id]);
+        assert!(negotiated.auth_application_ids.is_empty());
+        assert!(negotiated.vendor_specific_applications.is_empty());
+        assert!(negotiated.has_common_application());
+        assert_eq!(negotiated.cea_result_code(), RESULT_CODE_DIAMETER_SUCCESS);
+    }
+
+    #[test]
+    fn minimal_cea_error_answer_preserves_empty_message_and_failed_avp() {
+        let identity = PeerIdentity::new("aaa-error.example.net", "example.net");
+        let mut failed_avp_value = BytesMut::new();
+        if let Err(error) = append_utf8_avp(
+            &mut failed_avp_value,
+            AVP_ORIGIN_REALM,
+            "example.net",
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("Failed-AVP value build failed: {error}");
+        }
+
+        let answer = CapabilitiesExchangeErrorAnswer {
+            result_code: RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED,
+            identity,
+            diagnostics: AnswerDiagnostics {
+                error_message: Some(String::new()),
+                failed_avps: vec![failed_avp_value.freeze()],
+            },
+        };
+        let built = match build_capabilities_exchange_error_answer(
+            &answer,
+            0x1111_1111,
+            0x2222_2222,
+            EncodeContext::default(),
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("minimal CEA error answer build failed: {error}"),
+        };
+        let encoded = encode_owned(&built);
+        let message = decode_message(&encoded);
+        assert!(message.header.flags.is_error());
+        let parsed =
+            match parse_capabilities_exchange_error_answer(&message, DecodeContext::default()) {
+                Ok(parsed) => parsed,
+                Err(error) => panic!("minimal CEA error answer parse failed: {error}"),
+            };
+        assert_eq!(parsed, answer);
+    }
+
+    #[test]
+    fn supported_vendor_id_zero_is_rejected_for_encode_and_parse() {
+        let mut capabilities = sample_capabilities();
+        capabilities.supported_vendor_ids = vec![VendorId::new(0)];
+        let build_result = build_capabilities_exchange_request(
+            &capabilities,
+            0x0102_0304,
+            0x0506_0708,
+            EncodeContext::default(),
+        );
+        assert!(matches!(
+            build_result,
+            Err(error) if matches!(error.code(), EncodeErrorCode::Structural { .. })
+        ));
+
+        let valid = sample_capabilities();
+        let mut raw_avps = BytesMut::new();
+        if let Err(error) =
+            append_identity_avps(&mut raw_avps, &valid.identity, EncodeContext::default())
+        {
+            panic!("identity AVP build failed: {error}");
+        }
+        if let Err(error) = append_address_avp(
+            &mut raw_avps,
+            valid.host_ip_addresses[0],
+            EncodeContext::default(),
+        ) {
+            panic!("Host-IP-Address AVP build failed: {error}");
+        }
+        if let Err(error) = append_u32_avp(
+            &mut raw_avps,
+            AVP_VENDOR_ID,
+            valid.vendor_id.get(),
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("Vendor-Id AVP build failed: {error}");
+        }
+        if let Err(error) = append_utf8_avp(
+            &mut raw_avps,
+            AVP_PRODUCT_NAME,
+            &valid.product_name,
+            false,
+            EncodeContext::default(),
+        ) {
+            panic!("Product-Name AVP build failed: {error}");
+        }
+        if let Err(error) = append_u32_avp(
+            &mut raw_avps,
+            AVP_SUPPORTED_VENDOR_ID,
+            0,
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("Supported-Vendor-Id AVP build failed: {error}");
+        }
+        let built = match build_message(
+            peer_request_flags(PeerProcedure::CapabilitiesExchange),
+            COMMAND_CAPABILITIES_EXCHANGE,
+            raw_avps,
+            0x10,
+            0x20,
+            EncodeContext::default(),
+            "5.3.1",
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("CER build failed: {error}"),
+        };
+        let encoded = encode_owned(&built);
+        let message = decode_message(&encoded);
+        let parse_result = parse_capabilities_exchange_request(&message, DecodeContext::default());
+        assert!(matches!(
+            parse_result,
+            Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
+        ));
     }
 
     #[test]
@@ -1851,7 +2212,7 @@ mod tests {
             panic!("Failed-AVP value build failed: {error}");
         }
         let dpa_answer = DisconnectPeerAnswer {
-            result_code: crate::base::RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED,
+            result_code: RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED,
             identity,
             origin_state_id: Some(24),
             diagnostics: AnswerDiagnostics {
