@@ -507,6 +507,34 @@ impl FakeSessionBackend {
         }
     }
 
+    fn append_direct_replication_entry(
+        &self,
+        state: &mut FakeBackendState,
+        op: ReplicationOp,
+        timestamp: Timestamp,
+    ) {
+        if !self.caps.ordered_replication_log {
+            return;
+        }
+
+        let sequence = state
+            .replication_log
+            .last()
+            .map(|entry| entry.sequence.saturating_add(1))
+            .unwrap_or(1);
+        let entry = ReplicationEntry {
+            sequence,
+            tx_id: format!("fake-direct-{sequence}"),
+            op,
+            timestamp,
+        };
+        state.replication_log.push(entry.clone());
+
+        if self.caps.watch {
+            state.watchers.retain(|w| w.send(Ok(entry.clone())).is_ok());
+        }
+    }
+
     fn rebuild_replication_state_with_entries(
         &self,
         state: &mut FakeBackendState,
@@ -556,21 +584,51 @@ impl SessionBackend for FakeSessionBackend {
         let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
-        self.compare_and_set_with_state(&mut state, op, now)
+        let replication_op = ReplicationOp::CompareAndSet {
+            key: op.key.clone(),
+            expected_generation: op.expected_generation,
+            new_record: op.new_record.clone(),
+        };
+        let result = self.compare_and_set_with_state(&mut state, op, now)?;
+        if result == CompareAndSetResult::Success {
+            self.append_direct_replication_entry(&mut state, replication_op, now);
+        }
+        Ok(result)
     }
 
     async fn delete_fenced(&self, lease: &LeaseGuard) -> Result<(), StoreError> {
         let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
-        self.delete_fenced_with_state(&mut state, lease, now)
+        self.delete_fenced_with_state(&mut state, lease, now)?;
+        self.append_direct_replication_entry(
+            &mut state,
+            ReplicationOp::DeleteFenced {
+                key: lease.key().clone(),
+                owner: lease.owner().clone(),
+                fence: lease.fence(),
+            },
+            now,
+        );
+        Ok(())
     }
 
     async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
         let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
-        self.refresh_ttl_with_state(&mut state, lease, ttl, now)
+        self.refresh_ttl_with_state(&mut state, lease, ttl, now)?;
+        self.append_direct_replication_entry(
+            &mut state,
+            ReplicationOp::RefreshTtl {
+                key: lease.key().clone(),
+                owner: lease.owner().clone(),
+                fence: lease.fence(),
+                ttl,
+            },
+            now,
+        );
+        Ok(())
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
@@ -778,6 +836,18 @@ impl SessionLeaseManager for FakeSessionBackend {
         );
         state.key_fences.insert(mk, fence);
 
+        self.append_direct_replication_entry(
+            &mut state,
+            ReplicationOp::AcquireLease {
+                key: key.clone(),
+                owner: owner.clone(),
+                fence,
+                credential_id,
+                ttl,
+            },
+            now,
+        );
+
         Ok(LeaseGuard::new(
             key.clone(),
             owner,
@@ -833,6 +903,18 @@ impl SessionLeaseManager for FakeSessionBackend {
         entry.expires_at = expires_at;
         entry.guard_expires_at = expires_at;
 
+        self.append_direct_replication_entry(
+            &mut state,
+            ReplicationOp::RenewLease {
+                key: lease.key().clone(),
+                owner: lease.owner().clone(),
+                fence,
+                credential_id,
+                ttl,
+            },
+            now,
+        );
+
         Ok(LeaseGuard::new(
             lease.key().clone(),
             lease.owner().clone(),
@@ -873,6 +955,16 @@ impl SessionLeaseManager for FakeSessionBackend {
         entry.active = false;
         entry.expires_at = now;
         // Fence is NOT reduced; it remains the current recorded token.
+        self.append_direct_replication_entry(
+            &mut state,
+            ReplicationOp::ReleaseLease {
+                key: lease.key().clone(),
+                owner: lease.owner().clone(),
+                fence: lease.fence(),
+                credential_id: lease.credential_id(),
+            },
+            now,
+        );
         Ok(())
     }
 }

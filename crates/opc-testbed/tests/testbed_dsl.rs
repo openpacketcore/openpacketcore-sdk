@@ -124,6 +124,183 @@ assertions:
 }
 
 #[test]
+fn epdg_swu_attach_skeleton_parses_and_validates() {
+    let yaml = r#"
+id: EPDG-SWU-ATTACH-001
+title: SWu IKEv2 attach skeleton
+schema_version: "0.1.0"
+topology:
+  nfs:
+    ue: { simulator: ue-basic }
+    epdg: { image: opc-epdg:test }
+steps:
+  - kind: send_ikev2
+    from: ue
+    to: epdg
+    fixture: fixtures/swu/ike-sa-init.hex
+    label: ike-sa-init
+    transport: udp/500
+  - kind: expect_ikev2
+    from: epdg
+    to: ue
+    fixture: fixtures/swu/ike-sa-init-response.hex
+    transport: udp/500
+  - kind: packet_loss
+    target: epdg
+    protocol: ikev2
+    packet_count: 1
+  - kind: retransmission
+    target: ue
+    protocol: ikev2
+    attempts: 1
+"#;
+
+    let scenario = Scenario::from_yaml(yaml).expect("parse SWu skeleton");
+    scenario.validate().expect("validate SWu skeleton");
+}
+
+#[test]
+fn diameter_success_skeleton_parses_and_validates() {
+    let yaml = r#"
+id: EPC-DIAMETER-AAA-001
+title: Diameter AAA success skeleton
+schema_version: "0.1.0"
+topology:
+  nfs:
+    epdg: { image: opc-epdg:test }
+    aaa: { simulator: diameter-aaa-basic }
+steps:
+  - kind: send_diameter
+    from: epdg
+    to: aaa
+    fixture: fixtures/diameter/swm-auth-request.json
+    label: swm-auth-request
+  - kind: expect_diameter
+    from: aaa
+    to: epdg
+    fixture: fixtures/diameter/swm-auth-answer.json
+    label: swm-auth-answer
+"#;
+
+    let scenario = Scenario::from_yaml(yaml).expect("parse Diameter skeleton");
+    scenario.validate().expect("validate Diameter skeleton");
+}
+
+#[test]
+fn s2b_gtpv2c_create_session_skeleton_parses_and_validates() {
+    let yaml = r#"
+id: EPC-S2B-GTPV2C-001
+title: S2b GTPv2-C create session skeleton
+schema_version: "0.1.0"
+topology:
+  nfs:
+    epdg: { image: opc-epdg:test }
+    pgw: { simulator: gtpv2c-pgw-basic }
+steps:
+  - kind: send_gtpv2c
+    from: epdg
+    to: pgw
+    fixture: fixtures/s2b/create-session-request.bin
+    label: create-session-request
+  - kind: expect_gtpv2c
+    from: pgw
+    to: epdg
+    fixture: fixtures/s2b/create-session-response.bin
+    label: create-session-response
+  - kind: timeout
+    target: pgw
+    protocol: gtpv2c
+"#;
+
+    let scenario = Scenario::from_yaml(yaml).expect("parse S2b skeleton");
+    scenario.validate().expect("validate S2b skeleton");
+}
+
+#[test]
+fn gtpu_continuity_skeleton_parses_and_validates() {
+    let yaml = r#"
+id: EPC-GTPU-CONTINUITY-001
+title: GTP-U and ESP continuity skeleton
+schema_version: "0.1.0"
+topology:
+  nfs:
+    ue: { simulator: ue-basic }
+    epdg: { image: opc-epdg:test }
+    pgw-u: { simulator: gtpu-peer-basic }
+steps:
+  - kind: send_gtpu
+    from: epdg
+    to: pgw-u
+    fixture: fixtures/user-plane/gtpu-uplink.bin
+    label: uplink-user-plane
+  - kind: expect_gtpu
+    from: pgw-u
+    to: epdg
+    fixture: fixtures/user-plane/gtpu-downlink.bin
+    label: downlink-user-plane
+  - kind: expect_esp
+    from: epdg
+    to: ue
+    fixture: fixtures/user-plane/esp-downlink.bin
+    label: esp-continuity-evidence
+  - kind: duplicate_packet
+    target: epdg
+    protocol: gtpu
+    packet_count: 1
+"#;
+
+    let scenario = Scenario::from_yaml(yaml).expect("parse GTP-U skeleton");
+    scenario.validate().expect("validate GTP-U skeleton");
+}
+
+#[test]
+fn malformed_protocol_step_fixture_reference_is_rejected() {
+    let yaml = r#"
+id: BAD-PROTOCOL-FIXTURE
+title: malformed fixture ref
+schema_version: "0.1.0"
+topology:
+  nfs:
+    ue: { simulator: ue-basic }
+    epdg: { image: opc-epdg:test }
+steps:
+  - kind: send_ikev2
+    from: ue
+    to: epdg
+    fixture: ../secrets/ike-sa-init.hex
+"#;
+
+    let scenario = Scenario::from_yaml(yaml).expect("schema accepts opaque fixture string");
+    let err = scenario
+        .validate()
+        .expect_err("unsafe fixture reference must fail validation");
+    assert!(err.to_string().contains("fixture reference"));
+}
+
+#[test]
+fn unsupported_epc_protocol_step_kind_fails_closed() {
+    let yaml = r#"
+id: BAD-PROTOCOL-KIND
+title: unknown protocol step kind
+schema_version: "0.1.0"
+topology:
+  nfs: {}
+steps:
+  - kind: send_swu
+    from: ue
+    to: epdg
+    fixture: fixtures/swu/unknown.hex
+"#;
+
+    let err = Scenario::from_yaml(yaml).expect_err("unknown protocol kind must fail parse");
+    assert!(
+        err.to_string().contains("send_swu")
+            || err.to_string().contains("oneOf")
+            || err.to_string().contains("kind")
+    );
+}
+
+#[test]
 fn scenario_validate_rejects_empty_id() {
     let yaml = r#"
 id: ""

@@ -1042,7 +1042,21 @@ fn apply_step(
             });
         }
         Step::Other
+        | Step::SendIkev2(_)
+        | Step::ExpectIkev2(_)
+        | Step::SendDiameter(_)
+        | Step::ExpectDiameter(_)
+        | Step::SendGtpv2c(_)
+        | Step::ExpectGtpv2c(_)
+        | Step::SendGtpu(_)
+        | Step::ExpectGtpu(_)
+        | Step::ExpectEsp(_)
         | Step::PeerUnavailable { .. }
+        | Step::PeerDown { .. }
+        | Step::Timeout { .. }
+        | Step::Retransmission { .. }
+        | Step::PacketLoss { .. }
+        | Step::DuplicatePacket { .. }
         | Step::DelayedResponse { .. }
         | Step::MalformedResponse { .. }
         | Step::DependencyTimeout { .. }

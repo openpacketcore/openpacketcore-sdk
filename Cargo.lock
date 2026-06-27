@@ -2642,6 +2642,7 @@ dependencies = [
  "opc-config-bus",
  "opc-config-model",
  "opc-node-resources",
+ "opc-redaction",
  "opc-runtime",
  "opc-types",
  "semver",

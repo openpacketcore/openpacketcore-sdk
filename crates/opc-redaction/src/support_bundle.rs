@@ -135,17 +135,8 @@ pub fn redact_text(input: &str, summary: &mut RedactionSummary) -> String {
             continue;
         }
 
-        // 2. Check for SQL statements or database errors
-        if lower_line.contains("select ")
-            || lower_line.contains("insert ")
-            || lower_line.contains("delete from")
-            || lower_line.contains("update ")
-            || lower_line.contains("create table")
-            || lower_line.contains("sqlite")
-            || lower_line.contains("database is locked")
-            || lower_line.contains("database disk image")
-            || lower_line.contains("sql error")
-        {
+        // 2. Check for SQL statements or database errors.
+        if line_contains_sql_or_db_error(&lower_line) {
             summary.sql_statements_or_errors += 1;
             output_lines.push("[REDACTED_SQL_OR_DB_ERROR]".to_string());
             continue;
@@ -283,6 +274,19 @@ fn line_contains_secret_marker(lower_line: &str) -> bool {
         "token=",
     ];
     MARKERS.iter().any(|marker| lower_line.contains(marker))
+}
+
+fn line_contains_sql_or_db_error(lower_line: &str) -> bool {
+    lower_line.contains("sqlite error")
+        || lower_line.contains("sqlite3")
+        || lower_line.contains("database is locked")
+        || lower_line.contains("database disk image")
+        || lower_line.contains("sql error")
+        || lower_line.contains("select ") && lower_line.contains(" from ")
+        || lower_line.contains("insert into ")
+        || lower_line.contains("delete from ")
+        || lower_line.contains("update ") && lower_line.contains(" set ")
+        || lower_line.contains("create table")
 }
 
 fn strip_port(token: &str) -> &str {
@@ -487,6 +491,21 @@ mod tests {
         let redacted_sql = redact_text(sql_log, &mut summary2);
         assert_eq!(redacted_sql, "[REDACTED_SQL_OR_DB_ERROR]");
         assert_eq!(summary2.sql_statements_or_errors, 1);
+    }
+
+    #[test]
+    fn test_sql_redaction_does_not_match_status_update_prose() {
+        let mut summary = RedactionSummary::default();
+        let msg = "Stale status update rejected for cluster cluster-us-east: incoming resource version 4 is less than existing 5";
+        let redacted = redact_text(msg, &mut summary);
+        assert_eq!(redacted, msg);
+        assert_eq!(summary.sql_statements_or_errors, 0);
+
+        let mut summary = RedactionSummary::default();
+        let sql = "Database transaction failed on UPDATE sessions SET state = 'down' WHERE id = 42";
+        let redacted = redact_text(sql, &mut summary);
+        assert_eq!(redacted, "[REDACTED_SQL_OR_DB_ERROR]");
+        assert_eq!(summary.sql_statements_or_errors, 1);
     }
 
     #[test]

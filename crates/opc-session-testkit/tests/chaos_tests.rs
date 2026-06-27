@@ -237,12 +237,19 @@ async fn test_replication_lag() {
 
 #[tokio::test]
 async fn test_divergent_read_fails_closed_without_record_quorum() {
-    let testkit = ChaosTestkit::new(3);
+    let mut caps = BackendCapabilities::all_enabled();
+    caps.ordered_replication_log = false;
+    caps.watch = false;
+    let replicas: Vec<FencedSessionReplica> = (0..3)
+        .map(|id| {
+            FencedSessionReplica::new(id, Arc::new(FakeSessionBackend::with_capabilities(caps)))
+        })
+        .collect();
     let key = test_session_key();
 
     for (replica_id, generation) in [(0, 1), (1, 2), (2, 3)] {
         let owner = OwnerId::from_str(&format!("owner-{replica_id}")).unwrap();
-        let lease = testkit.replicas[replica_id]
+        let lease = replicas[replica_id]
             .inner
             .acquire(&key, owner, Duration::from_secs(10))
             .await
@@ -256,7 +263,7 @@ async fn test_divergent_read_fails_closed_without_record_quorum() {
         };
 
         assert_eq!(
-            testkit.replicas[replica_id]
+            replicas[replica_id]
                 .inner
                 .compare_and_set(op)
                 .await
@@ -265,7 +272,7 @@ async fn test_divergent_read_fails_closed_without_record_quorum() {
         );
     }
 
-    let coord = testkit.build_coordinator(&[0, 1, 2]);
+    let coord = QuorumSessionStore::new(replicas);
     let err = coord.get(&key).await.unwrap_err();
 
     assert!(matches!(

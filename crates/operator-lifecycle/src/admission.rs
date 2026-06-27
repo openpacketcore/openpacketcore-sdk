@@ -72,132 +72,47 @@ pub struct AdmissionStatus {
     pub reason: String,
 }
 
-/// Helper function to sanitize admission denial messages, redacting pathnames,
-/// auth tokens, IMSI/subscriber IDs, PEM certificates, SQL queries, and config blobs.
+/// Helper function to sanitize admission denial messages through `opc-redaction`.
+///
+/// A small compatibility pass keeps explicit admin token values redacted for
+/// existing admission callers before the SDK redaction engine handles paths,
+/// IP addresses, subscriber identifiers, PEM material, and SQL/database text.
 pub fn sanitize_denial_message(msg: &str) -> String {
-    let mut sanitized = msg.to_string();
+    let msg = redact_admin_token_values(msg);
+    let mut summary = opc_redaction::RedactionSummary::default();
+    opc_redaction::redact_text(&msg, &mut summary)
+}
 
-    // 1. Redact PEM blocks
-    if sanitized.contains("-----BEGIN") || sanitized.contains("-----END") {
-        return "[redacted-pem]".to_string();
-    }
-
-    // 2. Redact SQL clauses (case-insensitive checks)
-    let lower = sanitized.to_lowercase();
-    let is_sql = (lower.contains("select ") && lower.contains("from "))
-        || lower.contains("insert into")
-        || lower.contains("delete from")
-        || (lower.contains("update ") && lower.contains("set "))
-        || lower.contains("drop table")
-        || lower.contains("create table")
-        || lower.contains("alter table");
-    if is_sql {
-        return "[redacted-sql]".to_string();
-    }
-
-    // 3. Redact raw config blobs (JSON / XML / YAML style braces/brackets)
-    if (sanitized.contains('{') && sanitized.contains('}'))
-        || (sanitized.contains('[') && sanitized.contains(']'))
-    {
-        return "[redacted-config]".to_string();
-    }
-
-    // 4. Redact tokens, paths, and identifiers token-by-token
-    let mut words: Vec<String> = sanitized
-        .split_whitespace()
-        .map(|w| w.to_string())
-        .collect();
+fn redact_admin_token_values(msg: &str) -> String {
+    let mut words: Vec<String> = msg.split_whitespace().map(str::to_string).collect();
     let mut redact_next = false;
-    for w in words.iter_mut() {
-        let normalized = w
-            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '/' && c != '\\')
-            .to_lowercase();
+
+    for word in &mut words {
+        let normalized = word
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '=')
+            .to_ascii_lowercase();
 
         if redact_next {
-            *w = "[redacted-token]".to_string();
+            *word = "[redacted-token]".to_string();
             redact_next = false;
             continue;
         }
 
-        if contains_secret_assignment(&normalized) {
-            *w = "[redacted-token]".to_string();
-            redact_next = false;
+        if normalized.contains("token=") {
+            *word = "[redacted-token]".to_string();
             continue;
         }
 
-        if normalized == "token"
-            || normalized == "password"
-            || normalized == "credential"
-            || normalized == "secret"
-            || normalized == "bearer"
-            || normalized.ends_with("token")
-        {
+        if normalized == "token" || normalized.ends_with("_token") {
             redact_next = true;
-            continue;
-        }
-
-        // Redact absolute and relative paths without treating slash-separated prose
-        // such as "SQLite/Fake" or "insecure/unsafe" as paths.
-        if looks_like_path(w) {
-            *w = "[redacted-path]".to_string();
-        }
-        // Redact subscriber identifiers even when punctuation surrounds them.
-        else if contains_digit_run(w, 8) {
-            *w = "[redacted-subscriber-id]".to_string();
-        }
-        // Redact auth tokens / credentials.
-        else if looks_like_token(w) {
-            *w = "[redacted-token]".to_string();
         }
     }
-    sanitized = words.join(" ");
 
-    sanitized
+    words.join(" ")
 }
 
 fn canonical_backend_name(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace(['_', ' '], "-")
-}
-
-fn looks_like_path(value: &str) -> bool {
-    if value.starts_with("http://") || value.starts_with("https://") {
-        return false;
-    }
-    value.starts_with('/')
-        || value.starts_with("./")
-        || value.starts_with("../")
-        || value.starts_with("~/")
-        || value.contains('\\')
-        || (value.contains('/') && value.contains('.'))
-}
-
-fn contains_digit_run(value: &str, threshold: usize) -> bool {
-    let mut run = 0;
-    for c in value.chars() {
-        if c.is_ascii_digit() {
-            run += 1;
-            if run >= threshold {
-                return true;
-            }
-        } else {
-            run = 0;
-        }
-    }
-    false
-}
-
-fn looks_like_token(value: &str) -> bool {
-    let trimmed = value.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-    trimmed.len() >= 16
-        && trimmed.chars().all(|c| c.is_ascii_alphanumeric())
-        && trimmed.chars().any(|c| c.is_ascii_alphabetic())
-        && trimmed.chars().any(|c| c.is_ascii_digit())
-}
-
-fn contains_secret_assignment(value: &str) -> bool {
-    ["token", "password", "credential", "secret", "bearer"]
-        .iter()
-        .any(|key| value.contains(&format!("{key}=")) || value.contains(&format!("{key}:")))
 }
 
 fn parse_data_plane_profile(value: &str) -> Option<opc_node_resources::DataPlaneProfile> {
