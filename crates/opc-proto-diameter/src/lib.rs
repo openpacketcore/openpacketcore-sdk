@@ -6,10 +6,10 @@
 //!
 //! This crate starts the SDK-owned Diameter mechanism surface described by ADR
 //! 0018. It provides RFC 6733 header and raw AVP framing, dictionary metadata,
-//! and feature-gated skeleton dictionaries for base, peer, and initial 3GPP
-//! application work. It deliberately does **not** implement product policy such
-//! as realm routing, AAA/HSS behavior, charging decisions, watchdog thresholds,
-//! or peer transport operations.
+//! feature-gated base peer procedure helpers, and skeleton dictionaries for
+//! initial 3GPP application work. It deliberately does **not** implement product
+//! policy such as realm routing, AAA/HSS behavior, charging decisions, watchdog
+//! thresholds, or peer transport operations.
 //!
 //! The crate is experimental and not yet an ADR 0015 conformance claim; see
 //! `CONFORMANCE.md` before treating any fixture or dictionary entry as release

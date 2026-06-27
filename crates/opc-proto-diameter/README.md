@@ -13,8 +13,9 @@ currently provides:
   grouped AVP recursion bounded by `DecodeContext::max_depth`;
 - dictionary metadata types for applications, commands, AVPs, flag rules, and
   layered lookup; and
-- feature-gated skeleton dictionaries for base, peer, and selected 3GPP
-  application work.
+- feature-gated RFC 6733 base procedure helpers for CER/CEA, DWR/DWA, and
+  DPR/DPA, plus transport-neutral peer capability intersection; and
+- feature-gated skeleton dictionaries for selected 3GPP application work.
 
 It intentionally does **not** provide realm routing, AAA/HSS/CDF behavior,
 watchdog threshold policy, peer transport operation, charging decisions, or any
@@ -25,7 +26,7 @@ claim that a downstream EPC/ePDG product is carrier-ready.
 | Feature | Default | Scope |
 | --- | --- | --- |
 | `base` | yes | RFC 6733 common application, peer command names, and base AVP metadata scaffold. |
-| `peer` | no | Transport-neutral peer procedure classification over the base command set. |
+| `peer` | no | Transport-neutral CER/CEA, DWR/DWA, DPR/DPA builders/parsers and peer capability helpers over the base command set. |
 | `app-gx` | no | Initial 3GPP Gx application dictionary slot. |
 | `app-rf` | no | Initial 3GPP Rf accounting application dictionary slot. |
 | `app-s6a` | no | Initial 3GPP S6a/S6d application dictionary slot. |
@@ -35,12 +36,13 @@ claim that a downstream EPC/ePDG product is carrier-ready.
 | `all-apps` | no | Enables every `app-*` skeleton feature. |
 
 The crate is `publish = false` until the follow-up Diameter tasks add the
-fixture provenance, conformance coverage, fuzz targets, and typed procedure
-support required by ADR 0015.
+fixture provenance, conformance coverage, fuzz targets, and broader typed
+application support required by ADR 0015.
 
 ## Boundary
 
 This crate owns reusable protocol mechanisms only: wire framing, parser limits,
-raw preservation, dictionary metadata, and test helper building blocks. Products
-that consume it remain responsible for peer selection, realm policy, transport
-lifecycle, subscriber behavior, charging policy, and deployment readiness.
+raw preservation, dictionary metadata, base peer procedure message construction,
+and test helper building blocks. Products that consume it remain responsible for
+peer selection, realm policy, transport lifecycle, subscriber behavior, charging
+policy, watchdog thresholds, and deployment readiness.

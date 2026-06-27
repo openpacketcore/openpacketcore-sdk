@@ -250,7 +250,8 @@ fn grouped_value_validation_respects_max_depth_at_entry() {
         validation_level: ValidationLevel::Strict,
         ..DecodeContext::default()
     };
-    let result = grouped_avp.validate_grouped_value_with_dictionary(max_depth_zero, dictionary_set());
+    let result =
+        grouped_avp.validate_grouped_value_with_dictionary(max_depth_zero, dictionary_set());
     assert!(matches!(
         result,
         Err(error) if matches!(error.code(), DecodeErrorCode::DepthExceeded)

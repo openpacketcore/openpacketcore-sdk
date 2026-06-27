@@ -21,29 +21,59 @@ pub const COMMAND_DEVICE_WATCHDOG: CommandCode = CommandCode::new(280);
 /// Disconnect-Peer command code.
 pub const COMMAND_DISCONNECT_PEER: CommandCode = CommandCode::new(282);
 
-const AVP_USER_NAME: AvpCode = AvpCode::new(1);
-const AVP_HOST_IP_ADDRESS: AvpCode = AvpCode::new(257);
-const AVP_AUTH_APPLICATION_ID: AvpCode = AvpCode::new(258);
-const AVP_ACCT_APPLICATION_ID: AvpCode = AvpCode::new(259);
-const AVP_VENDOR_SPECIFIC_APPLICATION_ID: AvpCode = AvpCode::new(260);
-const AVP_SESSION_ID: AvpCode = AvpCode::new(263);
-const AVP_ORIGIN_HOST: AvpCode = AvpCode::new(264);
-const AVP_SUPPORTED_VENDOR_ID: AvpCode = AvpCode::new(265);
-const AVP_VENDOR_ID: AvpCode = AvpCode::new(266);
-const AVP_FIRMWARE_REVISION: AvpCode = AvpCode::new(267);
-const AVP_RESULT_CODE: AvpCode = AvpCode::new(268);
-const AVP_PRODUCT_NAME: AvpCode = AvpCode::new(269);
-const AVP_DISCONNECT_CAUSE: AvpCode = AvpCode::new(273);
-const AVP_ORIGIN_STATE_ID: AvpCode = AvpCode::new(278);
-const AVP_FAILED_AVP: AvpCode = AvpCode::new(279);
-const AVP_ERROR_MESSAGE: AvpCode = AvpCode::new(281);
-const AVP_DESTINATION_REALM: AvpCode = AvpCode::new(283);
-const AVP_ERROR_REPORTING_HOST: AvpCode = AvpCode::new(294);
-const AVP_DESTINATION_HOST: AvpCode = AvpCode::new(293);
-const AVP_ORIGIN_REALM: AvpCode = AvpCode::new(296);
-const AVP_EXPERIMENTAL_RESULT: AvpCode = AvpCode::new(297);
-const AVP_EXPERIMENTAL_RESULT_CODE: AvpCode = AvpCode::new(298);
-const AVP_INBAND_SECURITY_ID: AvpCode = AvpCode::new(299);
+/// User-Name AVP code.
+pub const AVP_USER_NAME: AvpCode = AvpCode::new(1);
+/// Host-IP-Address AVP code.
+pub const AVP_HOST_IP_ADDRESS: AvpCode = AvpCode::new(257);
+/// Auth-Application-Id AVP code.
+pub const AVP_AUTH_APPLICATION_ID: AvpCode = AvpCode::new(258);
+/// Acct-Application-Id AVP code.
+pub const AVP_ACCT_APPLICATION_ID: AvpCode = AvpCode::new(259);
+/// Vendor-Specific-Application-Id AVP code.
+pub const AVP_VENDOR_SPECIFIC_APPLICATION_ID: AvpCode = AvpCode::new(260);
+/// Session-Id AVP code.
+pub const AVP_SESSION_ID: AvpCode = AvpCode::new(263);
+/// Origin-Host AVP code.
+pub const AVP_ORIGIN_HOST: AvpCode = AvpCode::new(264);
+/// Supported-Vendor-Id AVP code.
+pub const AVP_SUPPORTED_VENDOR_ID: AvpCode = AvpCode::new(265);
+/// Vendor-Id AVP code.
+pub const AVP_VENDOR_ID: AvpCode = AvpCode::new(266);
+/// Firmware-Revision AVP code.
+pub const AVP_FIRMWARE_REVISION: AvpCode = AvpCode::new(267);
+/// Result-Code AVP code.
+pub const AVP_RESULT_CODE: AvpCode = AvpCode::new(268);
+/// Product-Name AVP code.
+pub const AVP_PRODUCT_NAME: AvpCode = AvpCode::new(269);
+/// Disconnect-Cause AVP code.
+pub const AVP_DISCONNECT_CAUSE: AvpCode = AvpCode::new(273);
+/// Origin-State-Id AVP code.
+pub const AVP_ORIGIN_STATE_ID: AvpCode = AvpCode::new(278);
+/// Failed-AVP AVP code.
+pub const AVP_FAILED_AVP: AvpCode = AvpCode::new(279);
+/// Error-Message AVP code.
+pub const AVP_ERROR_MESSAGE: AvpCode = AvpCode::new(281);
+/// Destination-Realm AVP code.
+pub const AVP_DESTINATION_REALM: AvpCode = AvpCode::new(283);
+/// Destination-Host AVP code.
+pub const AVP_DESTINATION_HOST: AvpCode = AvpCode::new(293);
+/// Error-Reporting-Host AVP code.
+pub const AVP_ERROR_REPORTING_HOST: AvpCode = AvpCode::new(294);
+/// Origin-Realm AVP code.
+pub const AVP_ORIGIN_REALM: AvpCode = AvpCode::new(296);
+/// Experimental-Result AVP code.
+pub const AVP_EXPERIMENTAL_RESULT: AvpCode = AvpCode::new(297);
+/// Experimental-Result-Code AVP code.
+pub const AVP_EXPERIMENTAL_RESULT_CODE: AvpCode = AvpCode::new(298);
+/// Inband-Security-Id AVP code.
+pub const AVP_INBAND_SECURITY_ID: AvpCode = AvpCode::new(299);
+
+/// Diameter success result code.
+pub const RESULT_CODE_DIAMETER_SUCCESS: u32 = 2001;
+/// Inband-Security-Id value for no in-band security.
+pub const INBAND_SECURITY_ID_NO_INBAND_SECURITY: u32 = 0;
+/// Inband-Security-Id value for TLS.
+pub const INBAND_SECURITY_ID_TLS: u32 = 1;
 
 const BASE_APPLICATIONS: [ApplicationDefinition; 1] = [ApplicationDefinition::new(
     APPLICATION_ID_COMMON_MESSAGES,
