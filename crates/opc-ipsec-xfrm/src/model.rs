@@ -203,6 +203,9 @@ impl fmt::Display for KeyMaterial {
 }
 
 impl PartialEq for KeyMaterial {
+    // Constant-time comparison is intentionally not unit-tested: timing
+    // properties cannot be verified deterministically in this test suite.
+    // Preserving `ct_eq` here is enforced by review only.
     fn eq(&self, other: &Self) -> bool {
         self.bytes.ct_eq(&other.bytes).into()
     }
@@ -440,7 +443,12 @@ mod tests {
     }
 
     #[test]
-    fn key_material_constant_time_equality() {
+    fn key_material_equality_semantics() {
+        // Verifies equality semantics only; the constant-time property is
+        // enforced by review, not by this test.
+        let empty = KeyMaterial::new(vec![]);
+        assert_eq!(empty, empty);
+
         let a = KeyMaterial::new(vec![1, 2, 3]);
         let b = KeyMaterial::new(vec![1, 2, 3]);
         assert_eq!(a, b);
