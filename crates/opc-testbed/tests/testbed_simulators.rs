@@ -1,8 +1,97 @@
 mod testbed_common;
+use opc_proto_gtpv2c::{
+    MessageDirection as Gtpv2cDirection, Procedure as Gtpv2cProcedure, S2bMessage,
+};
 use opc_testbed::simulators::amf::{AmfSimulator, AmfState};
+use opc_testbed::simulators::epc::{
+    DiameterApplication, DiameterMessageView, DiameterPeerSimulator, DiameterPeerState,
+    PeerMessageDirection, PgwS2bSimulator, PgwS2bState, S2bMessageView, S2bProcedure,
+};
 use opc_testbed::simulators::smf::{SmfSimulator, SmfState};
 use opc_testbed::simulators::upf::{UpfSimulator, UpfState};
+use opc_testbed::simulators::Simulator;
 use testbed_common::*;
+
+struct Gtpv2cS2bView<'a>(S2bMessage<'a>);
+
+impl S2bMessageView for Gtpv2cS2bView<'_> {
+    fn procedure(&self) -> S2bProcedure {
+        match self.0.as_view().map(|view| view.procedure) {
+            Some(Gtpv2cProcedure::Echo) => S2bProcedure::Echo,
+            Some(Gtpv2cProcedure::CreateSession) => S2bProcedure::CreateSession,
+            Some(Gtpv2cProcedure::ModifyBearer) => S2bProcedure::ModifyBearer,
+            Some(Gtpv2cProcedure::DeleteSession) => S2bProcedure::DeleteSession,
+            Some(Gtpv2cProcedure::UpdateSession) => S2bProcedure::UpdateSession,
+            None => S2bProcedure::Unsupported(self.0.message_type().as_u8()),
+        }
+    }
+
+    fn direction(&self) -> PeerMessageDirection {
+        match self.0.as_view().map(|view| view.direction) {
+            Some(Gtpv2cDirection::Request) | None => PeerMessageDirection::Request,
+            Some(Gtpv2cDirection::Response) => PeerMessageDirection::Response,
+        }
+    }
+
+    fn sequence_number(&self) -> u32 {
+        if let Some(view) = self.0.as_view() {
+            return view.header.sequence_number;
+        }
+        self.0
+            .as_raw()
+            .map(|message| message.header.sequence_number)
+            .unwrap_or(0)
+    }
+
+    fn teid(&self) -> Option<u32> {
+        if let Some(view) = self.0.as_view() {
+            return view.header.teid;
+        }
+        self.0.as_raw().and_then(|message| message.header.teid)
+    }
+
+    fn raw_preserving_view(&self) -> bool {
+        if let Some(view) = self.0.as_view() {
+            return !view.raw_ies.is_empty();
+        }
+        self.0
+            .as_raw()
+            .map(|message| !message.raw_ies.is_empty())
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Debug)]
+struct FakeDiameterFrame {
+    command_code: u32,
+    application_id: u32,
+    direction: PeerMessageDirection,
+    has_session_id: bool,
+}
+
+impl DiameterMessageView for FakeDiameterFrame {
+    fn command_code(&self) -> u32 {
+        self.command_code
+    }
+
+    fn application_id(&self) -> u32 {
+        self.application_id
+    }
+
+    fn direction(&self) -> PeerMessageDirection {
+        self.direction
+    }
+
+    fn has_session_id(&self) -> bool {
+        self.has_session_id
+    }
+}
+
+fn decode_s2b_fixture<'a>(bytes: &'a [u8], sim: &PgwS2bSimulator) -> Gtpv2cS2bView<'a> {
+    let (_, message) = S2bMessage::decode(bytes, sim.decode_profile.context)
+        .expect("S2b fixture decodes through opc-proto-gtpv2c");
+    Gtpv2cS2bView(message)
+}
 
 #[test]
 fn fake_simulator_state_and_steps() {
@@ -224,4 +313,129 @@ fn upf_simulator_dataplane_preflight_failure() {
         message: "associate".to_string(),
     };
     assert!(sim.handle_step(&step_assoc).is_err());
+}
+
+#[test]
+fn pgw_s2b_simulator_accepts_sdk_gtpv2c_decoded_messages() {
+    let mut sim = PgwS2bSimulator::new("pgw-s2b");
+    let echo = decode_s2b_fixture(
+        include_bytes!("../../opc-proto-gtpv2c/tests/fixtures/spec/echo_request_recovery.bin"),
+        &sim,
+    );
+    let echo_event = sim
+        .handle_sdk_message(&echo)
+        .expect("PGW S2b accepts SDK-decoded echo request");
+    assert_eq!(echo_event.procedure, S2bProcedure::Echo);
+    assert_eq!(sim.state, PgwS2bState::EchoSeen);
+    assert_eq!(
+        sim.get_state("sdk_protocol_profile").as_deref(),
+        Some("opc-protocol+s2b-procedure-aware")
+    );
+
+    let create = decode_s2b_fixture(
+        include_bytes!(
+            "../../opc-proto-gtpv2c/tests/fixtures/spec/create_session_request_s2b_subset.bin"
+        ),
+        &sim,
+    );
+    let create_event = sim
+        .handle_sdk_message(&create)
+        .expect("PGW S2b accepts SDK-decoded create-session request");
+    assert_eq!(create_event.procedure, S2bProcedure::CreateSession);
+    assert_eq!(sim.state, PgwS2bState::SessionCreated);
+    assert_eq!(sim.active_sessions, 1);
+    assert_eq!(sim.accepted_messages, 2);
+    assert!(sim.raw_preserving_messages >= 2);
+}
+
+#[test]
+fn pgw_s2b_simulator_rejects_state_changing_request_without_session() {
+    let mut sim = PgwS2bSimulator::new("pgw-s2b");
+    let modify = decode_s2b_fixture(
+        include_bytes!(
+            "../../opc-proto-gtpv2c/tests/fixtures/spec/modify_bearer_request_bearer_context.bin"
+        ),
+        &sim,
+    );
+    let err = sim
+        .handle_sdk_message(&modify)
+        .expect_err("modify before create must fail closed");
+    assert!(err
+        .to_string()
+        .contains("requires an active synthetic session"));
+    assert_eq!(sim.state, PgwS2bState::MalformedRejected);
+    assert_eq!(sim.rejected_messages, 1);
+}
+
+#[test]
+fn diameter_peer_simulator_records_sdk_decoded_interface_messages() {
+    let mut sim = DiameterPeerSimulator::new("aaa-hss");
+    let cer = FakeDiameterFrame {
+        command_code: 257,
+        application_id: 0,
+        direction: PeerMessageDirection::Request,
+        has_session_id: false,
+    };
+    let event = sim
+        .handle_sdk_message(&cer)
+        .expect("Diameter peer accepts SDK-decoded CER metadata");
+    assert_eq!(event.application, DiameterApplication::Base);
+    assert_eq!(event.state, DiameterPeerState::CapabilitiesExchanged);
+    assert_eq!(sim.capability_messages, 1);
+
+    let gx = FakeDiameterFrame {
+        command_code: 272,
+        application_id: 16_777_238,
+        direction: PeerMessageDirection::Request,
+        has_session_id: true,
+    };
+    let event = sim
+        .handle_sdk_message(&gx)
+        .expect("Diameter peer accepts SDK-decoded Gx metadata");
+    assert_eq!(event.application, DiameterApplication::Gx);
+    assert_eq!(sim.state, DiameterPeerState::ApplicationMessageSeen);
+    assert_eq!(sim.session_messages, 1);
+    assert_eq!(
+        sim.get_state("sdk_protocol_profile").as_deref(),
+        Some("opc-protocol+diameter-transport-neutral")
+    );
+}
+
+#[test]
+fn simulator_factory_accepts_epc_epdg_skeleton_names() {
+    let pgw_spec = NfSpec {
+        image: None,
+        simulator: Some("pgw-s2b".into()),
+    };
+    let pgw = Simulator::from_spec("pgw", &pgw_spec).expect("pgw-s2b simulator constructed");
+    assert_eq!(pgw.get_state("state").as_deref(), Some("IDLE"));
+
+    let diameter_spec = NfSpec {
+        image: None,
+        simulator: Some("diameter-peer".into()),
+    };
+    let diameter =
+        Simulator::from_spec("aaa", &diameter_spec).expect("diameter simulator constructed");
+    assert_eq!(diameter.get_state("state").as_deref(), Some("IDLE"));
+}
+
+#[test]
+fn epc_epdg_simulator_fixture_manifest_records_protocol_provenance() {
+    let manifest = include_str!("fixtures/epc_epdg_simulator_manifest.json");
+    let value: serde_json::Value =
+        serde_json::from_str(manifest).expect("simulator fixture manifest is valid JSON");
+    let packets = value["packets"]
+        .as_array()
+        .expect("manifest packets are an array");
+    assert!(packets
+        .iter()
+        .any(|packet| packet["sdk_protocol_crate"] == "opc-proto-gtpv2c"
+            && packet["provenance"] == "spec-authored"));
+    let interfaces = value["interfaces"]
+        .as_array()
+        .expect("manifest interfaces are an array");
+    assert!(interfaces.iter().any(
+        |interface| interface["id"] == "diameter-peer-decoded-message"
+            && interface["parser_policy"] == "sdk-protocol-crate-only"
+    ));
 }

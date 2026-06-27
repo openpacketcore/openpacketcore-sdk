@@ -2567,6 +2567,8 @@ version = "0.2.0"
 dependencies = [
  "opc-evidence",
  "opc-node-resources",
+ "opc-proto-gtpv2c",
+ "opc-protocol",
  "opc-redaction",
  "opc-schema-validate",
  "opc-types",

@@ -86,6 +86,7 @@ crates/opc-testbed/
       amf.rs
       smf.rs
       upf.rs
+      epc.rs
       gnb.rs
       ue.rs
       ausf.rs
@@ -192,6 +193,9 @@ Minimum simulator set:
 - NRF SBI simulator.
 - AUSF/UDM auth and subscription simulators.
 - SMF/UPF/PFCP simulator pair.
+- EPC and untrusted-access peer skeletons such as PGW S2b and Diameter
+  metadata peers. These must consume SDK protocol-crate decoded views and must
+  not introduce local product parsers.
 - PCF policy simulator.
 - NSSF slice selection simulator.
 - SCP routing simulator.
