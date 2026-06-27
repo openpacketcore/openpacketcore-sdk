@@ -10,7 +10,7 @@ use opc_proto_diameter::apps::swm::{
 };
 use opc_proto_diameter::{
     apps, base, ApplicationId, AvpCode, AvpDataType, AvpHeader, AvpKey, CommandCode, CommandFlags,
-    CommandKind, DictionarySet, Header, Message, OwnedMessage, RawAvp,
+    CommandKind, DictionarySet, Header, Message, OwnedMessage, RawAvp, VendorId,
 };
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
 
@@ -344,6 +344,24 @@ fn encode_raw_avp(code: AvpCode, mandatory: bool, value: &[u8]) -> BytesMut {
 }
 
 #[cfg(feature = "app-rf")]
+fn encode_raw_vendor_avp(
+    code: AvpCode,
+    vendor_id: VendorId,
+    mandatory: bool,
+    value: &[u8],
+) -> BytesMut {
+    let avp = RawAvp {
+        header: AvpHeader::vendor(code, vendor_id, mandatory),
+        value,
+        padding: &[],
+    };
+    let mut dst = BytesMut::new();
+    avp.encode(&mut dst, EncodeContext::default())
+        .expect("raw vendor AVP encode must succeed");
+    dst
+}
+
+#[cfg(feature = "app-rf")]
 fn build_raw_rf_acr(acct_application_id: Option<u32>, extras: &[BytesMut]) -> OwnedMessage {
     let mut raw_avps = BytesMut::new();
     raw_avps.extend_from_slice(&encode_raw_avp(
@@ -633,9 +651,12 @@ fn swm_der_rejects_missing_auth_application_id_in_parser() {
 fn swm_dea_rejects_wrong_auth_application_id_in_builder() {
     let mut answer = sample_swm_answer();
     answer.auth_application_id = 0;
-    assert!(
-        apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default()).is_err()
-    );
+    let err = apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default())
+        .expect_err("wrong Auth-Application-Id must fail DEA encode");
+    let spec_ref = err
+        .spec_ref()
+        .expect("DEA encode error must cite a spec ref");
+    assert_eq!(spec_ref.section(), "DEA");
 }
 
 #[test]
@@ -751,6 +772,33 @@ fn rf_grouped_subscription_id_rejects_too_many_children() {
     ));
     // The failure must be inside the Subscription-Id grouped value, not at top level.
     assert!(err.offset() > 120);
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn rf_acr_rejects_duplicate_ps_information() {
+    let ps_value = encode_raw_vendor_avp(
+        apps::rf::AVP_3GPP_CHARGING_ID,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &0x12345678u32.to_be_bytes(),
+    );
+    let ps_info = encode_raw_vendor_avp(
+        apps::rf::AVP_PS_INFORMATION,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &ps_value,
+    );
+    let extras = [ps_info.clone(), ps_info];
+    let message = build_raw_rf_acr(Some(apps::rf::APPLICATION_ID.get()), &extras);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    let err = apps::rf::parse_rf_accounting_request(&decoded, DecodeContext::default())
+        .expect_err("duplicate PS-Information must be rejected");
+    assert!(matches!(
+        err.code(),
+        opc_protocol::DecodeErrorCode::DuplicateIe
+    ));
 }
 
 #[test]
