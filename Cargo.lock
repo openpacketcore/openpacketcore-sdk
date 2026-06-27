@@ -2282,6 +2282,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-proto-gtpv2c"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "opc-protocol",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "opc-proto-nas"
 version = "0.2.0"
 dependencies = [
