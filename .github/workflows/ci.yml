@@ -196,7 +196,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
 
       - name: Helm lint
         run: helm lint operators/helm/sdk-reference-operator/
