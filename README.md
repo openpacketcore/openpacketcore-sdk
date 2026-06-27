@@ -4,7 +4,13 @@
 
 A robust, polyglot software development kit for building resilient, cloud-native 5G packet core network functions (CNFs). This SDK provides the standardized runtime chassis, quorum-replicated session storage, encrypted config persistence, northbound gNMI/NETCONF management-plane foundations, data-governance/redaction boundary enforcement, and release-assurance evidence pipelines for packet core software with high-assurance deployment requirements.
 
-The GTP-U user-plane codec is also applicable to LTE/EPC user plane. No EPC control-plane protocols (GTP-C, Diameter, S1AP) are provided.
+The GTP-U user-plane codec is also applicable to LTE/EPC user plane. The SDK
+now includes an experimental, transport-neutral Diameter mechanism crate for
+RFC 6733 framing, base peer procedures, and initial 3GPP application dictionary
+work. It does **not** provide a product-ready EPC control-plane stack: GTP-C and
+S1AP are not provided, and Diameter realm routing, AAA/HSS/CDF behavior,
+transport operations, and carrier-readiness decisions remain downstream product
+responsibilities.
 
 > [!IMPORTANT]
 > **Production Readiness & Reference Boundaries**
@@ -31,6 +37,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | [`opc-runtime`](crates/opc-runtime/) | CNF runtime chassis: process startup phases, task supervision, health probes, and graceful SIGTERM drains. | [RFC 008](docs/rfc/008-cnf-runtime-chassis.md) |
 | [`opc-protocol`](crates/opc-protocol/) | Zero-copy protocol codec framework: traits, context, errors, and fuzzing contracts. | [RFC 005](docs/rfc/005-protocol-framework.md) |
 | [`opc-proto-gtpu`](crates/opc-proto-gtpu/) | GTP-U protocol codec for the user-plane data path. | — |
+| [`opc-proto-diameter`](crates/opc-proto-diameter/) | Diameter base codec and dictionary scaffold: RFC 6733 header/AVP framing, base peer procedure helpers, bounded grouped AVP validation, fixture-provenance notes, fuzz targets, and selected 3GPP application dictionary subsets *(experimental; no realm routing, transport operation, AAA/HSS/CDF behavior, or product readiness claim)*. | [Conformance](crates/opc-proto-diameter/CONFORMANCE.md) |
 | [`opc-proto-pfcp`](crates/opc-proto-pfcp/) | PFCP codec (TS 29.244): message layer, raw TLV preservation, and typed session-management IEs *(experimental)*. | — |
 | [`opc-proto-nas`](crates/opc-proto-nas/) | NAS-5GS (TS 24.501) codec: headers, body dispatch, mobile identity, BCD unpacking, Registration/Security Mode IEs, and NAS security hooks *(experimental)*. | — |
 | [`opc-proto-ngap`](crates/opc-proto-ngap/) | NGAP (TS 38.413) v0 decoder via `rasn` APER: PDU framing, fixture-proven NGSetupRequest, raw-preserving re-encode *(experimental v0)*. | [ADR 0013](docs/adr/0013-ngap-asn1-strategy.md) |

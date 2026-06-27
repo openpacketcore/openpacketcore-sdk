@@ -38,9 +38,12 @@ claim that a downstream EPC/ePDG product is carrier-ready.
 | `app-swx` | no | Initial 3GPP SWx application dictionary slot. |
 | `all-apps` | no | Enables every `app-*` skeleton feature. |
 
-The crate is `publish = false` until the follow-up Diameter tasks add the
-fixture provenance, conformance coverage, fuzz targets, and broader typed
-application support required by ADR 0015.
+The crate is `publish = false` while its release boundary remains
+experimental. Fixture provenance, registered fuzz targets, and the current
+conformance scope are documented in [`CONFORMANCE.md`](CONFORMANCE.md);
+remaining publication gaps include broader typed application support,
+additional independently sourced fixture intake, and downstream product
+integration evidence.
 
 ## Boundary
 

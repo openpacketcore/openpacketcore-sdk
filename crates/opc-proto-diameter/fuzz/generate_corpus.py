@@ -105,9 +105,10 @@ def u32(value: int) -> bytes:
 
 
 def self_test_avp_flag_validation() -> None:
-    """Assert corpus helper flag validation fails closed for reserved bits."""
+    """Assert corpus helper flag validation fails closed for invalid flags."""
     avp(264, 0x40, b"x", None)
     avp(874, 0xC0, b"x", vendor=10415)
+
     for flags, vendor in ((0x41, None), (0x9F, 10415)):
         try:
             avp(264, flags, b"x", vendor)
@@ -119,6 +120,25 @@ def self_test_avp_flag_validation() -> None:
         else:
             raise AssertionError(
                 f"reserved AVP flags 0x{flags:02x} were accepted by corpus helper"
+            )
+
+    invalid_vendor_cases = (
+        (0x40, 10415, "vendor provided but V bit"),
+        (0xC0, None, "V bit (0x80) set"),
+    )
+    for flags, vendor, expected in invalid_vendor_cases:
+        try:
+            avp(264, flags, b"x", vendor)
+        except ValueError as exc:
+            if expected not in str(exc):
+                raise AssertionError(
+                    f"unexpected error for vendor/V-bit mismatch "
+                    f"0x{flags:02x}, vendor={vendor}: {exc}"
+                ) from exc
+        else:
+            raise AssertionError(
+                f"vendor/V-bit mismatch 0x{flags:02x}, vendor={vendor} "
+                "was accepted by corpus helper"
             )
 
 
