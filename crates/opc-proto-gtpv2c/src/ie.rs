@@ -9,7 +9,6 @@ use bytes::{BufMut, Bytes, BytesMut};
 pub mod typed;
 use opc_protocol::{
     DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, EncodeError, SpecRef,
-    ValidationLevel,
 };
 pub use typed::{
     decode_typed_ie_sequence, AccessPointName, AdditionalProtocolConfigurationOptions,
@@ -26,13 +25,6 @@ pub use typed::{
 
 /// Length, in octets, of the GTPv2-C IE header.
 pub const IE_HEADER_LEN: usize = 4;
-
-fn is_strict(level: ValidationLevel) -> bool {
-    matches!(
-        level,
-        ValidationLevel::Strict | ValidationLevel::ProcedureAware
-    )
-}
 
 fn spec_ref() -> SpecRef {
     SpecRef::new("3gpp", "TS29274", "8.2")
@@ -57,8 +49,6 @@ fn checked_offset(base: usize, delta: usize) -> Result<usize, DecodeError> {
 pub struct RawIe<'a> {
     /// One-octet IE type code.
     pub ie_type: u8,
-    /// Value length from the IE header, excluding the four-octet IE header.
-    pub length: u16,
     /// Low four-bit IE instance field.
     pub instance: u8,
     /// High four spare bits from the IE instance octet.
@@ -71,6 +61,20 @@ impl<'a> RawIe<'a> {
     /// Decode one borrowed raw IE from the front of `input`.
     pub fn decode(input: &'a [u8]) -> DecodeResult<'a, Self> {
         decode_raw_ie(input, DecodeContext::default(), 0)
+    }
+
+    /// Return the decoded IE value length in octets.
+    ///
+    /// This is the length carried in the IE header, which always equals
+    /// `self.value.len()` for a decoded IE. Encoders recompute the wire length
+    /// from `value` and ignore any caller-constructed length.
+    pub fn len(&self) -> usize {
+        self.value.len()
+    }
+
+    /// Return `true` when this IE carries an empty value.
+    pub fn is_empty(&self) -> bool {
+        self.value.is_empty()
     }
 
     /// Return this IE's exact wire length in octets.
@@ -96,7 +100,6 @@ impl<'a> RawIe<'a> {
     pub fn to_owned_ie(&self) -> OwnedRawIe {
         OwnedRawIe {
             ie_type: self.ie_type,
-            length: self.length,
             instance: self.instance,
             spare: self.spare,
             value: Bytes::copy_from_slice(self.value),
@@ -113,8 +116,6 @@ impl<'a> RawIe<'a> {
 pub struct OwnedRawIe {
     /// One-octet IE type code.
     pub ie_type: u8,
-    /// Value length from the IE header, excluding the four-octet IE header.
-    pub length: u16,
     /// Low four-bit IE instance field.
     pub instance: u8,
     /// High four spare bits from the IE instance octet.
@@ -128,11 +129,20 @@ impl OwnedRawIe {
     pub fn as_borrowed(&self) -> RawIe<'_> {
         RawIe {
             ie_type: self.ie_type,
-            length: self.length,
             instance: self.instance,
             spare: self.spare,
             value: &self.value,
         }
+    }
+
+    /// Return the decoded IE value length in octets.
+    pub fn len(&self) -> usize {
+        self.as_borrowed().len()
+    }
+
+    /// Return `true` when this IE carries an empty value.
+    pub fn is_empty(&self) -> bool {
+        self.as_borrowed().is_empty()
     }
 
     /// Return this IE's exact wire length in octets.
@@ -258,7 +268,7 @@ fn decode_raw_ie<'a>(
     let length = u16::from_be_bytes([input[1], input[2]]);
     let spare = (input[3] >> 4) & 0x0f;
     let instance = input[3] & 0x0f;
-    if is_strict(ctx.validation_level) && spare != 0 {
+    if crate::is_strict(ctx.validation_level) && spare != 0 {
         return Err(DecodeError::new(
             DecodeErrorCode::Structural {
                 reason: "IE spare bits must be zero",
@@ -285,7 +295,6 @@ fn decode_raw_ie<'a>(
         &input[total_len..],
         RawIe {
             ie_type,
-            length,
             instance,
             spare,
             value,

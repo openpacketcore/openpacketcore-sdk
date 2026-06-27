@@ -12,7 +12,7 @@ use core::fmt;
 use bytes::{BufMut, BytesMut};
 use opc_protocol::{
     DecodeContext, DecodeError, DecodeErrorCode, DuplicateIePolicy, EncodeContext, EncodeError,
-    EncodeErrorCode, SpecRef, ValidationLevel,
+    EncodeErrorCode, SpecRef,
 };
 
 use crate::ie::{RawIe, RawIeIterator, IE_HEADER_LEN};
@@ -64,13 +64,6 @@ const MAX_40BIT_BEARER_RATE: u64 = 0x00ff_ffff_ffff;
 
 fn spec_ref() -> SpecRef {
     SpecRef::new("3gpp", "TS29274", "8.2")
-}
-
-fn is_strict(level: ValidationLevel) -> bool {
-    matches!(
-        level,
-        ValidationLevel::Strict | ValidationLevel::ProcedureAware
-    )
 }
 
 fn checked_add_offset(base: usize, delta: usize) -> Result<usize, DecodeError> {
@@ -500,7 +493,7 @@ impl EpsBearerId {
     fn decode_value(value: &[u8], offset: usize, ctx: DecodeContext) -> Result<Self, DecodeError> {
         require_exact_len(value, 1, offset, "EBI IE must be one octet")?;
         let spare = value[0] >> 4;
-        if is_strict(ctx.validation_level) && spare != 0 {
+        if crate::is_strict(ctx.validation_level) && spare != 0 {
             return Err(DecodeError::new(
                 DecodeErrorCode::Structural {
                     reason: "EBI spare bits must be zero",
@@ -981,7 +974,7 @@ pub struct PdnType {
 impl PdnType {
     fn decode_value(value: &[u8], offset: usize, ctx: DecodeContext) -> Result<Self, DecodeError> {
         require_exact_len(value, 1, offset, "PDN Type IE must be one octet")?;
-        if is_strict(ctx.validation_level) && (value[0] & 0xf8) != 0 {
+        if crate::is_strict(ctx.validation_level) && (value[0] & 0xf8) != 0 {
             return Err(DecodeError::new(
                 DecodeErrorCode::Structural {
                     reason: "PDN Type spare bits must be zero",
@@ -1019,7 +1012,7 @@ pub struct PdnAddressAllocation {
 impl PdnAddressAllocation {
     fn decode_value(value: &[u8], offset: usize, ctx: DecodeContext) -> Result<Self, DecodeError> {
         require_min_len(value, 1, offset, "PAA IE must contain the PDN type octet")?;
-        if is_strict(ctx.validation_level) && (value[0] & 0xf8) != 0 {
+        if crate::is_strict(ctx.validation_level) && (value[0] & 0xf8) != 0 {
             return Err(DecodeError::new(
                 DecodeErrorCode::Structural {
                     reason: "PAA spare bits must be zero",
@@ -1193,7 +1186,7 @@ pub struct SelectionMode {
 impl SelectionMode {
     fn decode_value(value: &[u8], offset: usize, ctx: DecodeContext) -> Result<Self, DecodeError> {
         require_exact_len(value, 1, offset, "Selection Mode IE must be one octet")?;
-        if is_strict(ctx.validation_level) && (value[0] & 0xfc) != 0 {
+        if crate::is_strict(ctx.validation_level) && (value[0] & 0xfc) != 0 {
             return Err(DecodeError::new(
                 DecodeErrorCode::Structural {
                     reason: "Selection Mode spare bits must be zero",

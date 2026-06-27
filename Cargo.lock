@@ -2287,7 +2287,6 @@ version = "0.2.0"
 dependencies = [
  "bytes",
  "opc-protocol",
- "thiserror 2.0.18",
 ]
 
 [[package]]

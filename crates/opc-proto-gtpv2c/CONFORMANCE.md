@@ -86,6 +86,15 @@
      decode/owned-decode/IE-iteration surfaces under cargo-fuzz.
    - The repository fuzz workflow includes this crate in its scheduled matrix.
 
+## Known limitations
+
+- The common-header flags octet bit 3 is the Message Priority (MP) flag in
+  TS 29.274 R18, but this scaffold folds the low three bits into a single
+  `spare` field. Strict-mode decode rejects non-zero values there, so
+  otherwise-valid GTPv2-C messages that set MP=1 will fail strict validation.
+  Future typed S2b work must add explicit MP-flag handling before claiming
+  support for priority-bearing messages.
+
 ## Explicitly out of scope
 
 - A full Release 18 GTPv2-C implementation or a complete S2b IE/procedure

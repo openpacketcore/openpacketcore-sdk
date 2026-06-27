@@ -34,7 +34,7 @@ fn ie_raw_unknown_ie_region_roundtrips_byte_exact() {
         };
         seen.push((
             ie.ie_type,
-            ie.length,
+            ie.len() as u16,
             ie.instance,
             ie.spare,
             ie.value.to_vec(),
@@ -64,7 +64,6 @@ fn ie_raw_unknown_ie_region_roundtrips_byte_exact() {
 fn ie_raw_borrowed_and_owned_encoding_preserve_tliv_fields() {
     let ie = RawIe {
         ie_type: 0xfe,
-        length: 3,
         instance: 0x05,
         spare: 0x0a,
         value: &[0xde, 0xad, 0xbe],
@@ -80,7 +79,7 @@ fn ie_raw_borrowed_and_owned_encoding_preserve_tliv_fields() {
     let owned: OwnedRawIe = ie.to_owned_ie();
     let borrowed = owned.as_borrowed();
     assert_eq!(borrowed.ie_type, ie.ie_type);
-    assert_eq!(borrowed.length, ie.length);
+    assert_eq!(borrowed.len(), ie.len());
     assert_eq!(borrowed.instance, ie.instance);
     assert_eq!(borrowed.spare, ie.spare);
     assert_eq!(borrowed.value, ie.value);

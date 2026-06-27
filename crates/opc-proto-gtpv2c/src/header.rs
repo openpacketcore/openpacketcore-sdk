@@ -6,7 +6,7 @@
 use bytes::{BufMut, BytesMut};
 use opc_protocol::{
     DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, EncodeContext, EncodeError,
-    EncodeErrorCode, SpecRef, ValidationLevel,
+    EncodeErrorCode, SpecRef,
 };
 
 /// GTPv2-C protocol version carried in the common-header flags octet.
@@ -104,13 +104,6 @@ impl From<MessageType> for u8 {
     }
 }
 
-fn is_strict(level: ValidationLevel) -> bool {
-    matches!(
-        level,
-        ValidationLevel::Strict | ValidationLevel::ProcedureAware
-    )
-}
-
 fn spec_ref() -> SpecRef {
     SpecRef::new("3gpp", "TS29274", "5.1")
 }
@@ -132,7 +125,13 @@ pub struct Header {
     pub piggybacking: bool,
     /// TEID-present flag from the flags octet.
     pub teid_flag: bool,
-    /// Low three spare bits from the flags octet.
+    /// Low three bits from the flags octet.
+    ///
+    /// In TS 29.274 R18 bit 3 of the flags octet is the Message Priority (MP)
+    /// flag, but this structural scaffold treats the low three bits as a single
+    /// spare field. Strict-mode decode rejects non-zero values here, so
+    /// messages that set MP=1 will be rejected until typed S2b work adds
+    /// explicit MP handling. See CONFORMANCE.md for the known limitation.
     pub spare: u8,
     /// GTPv2-C message type.
     pub message_type: u8,
@@ -230,7 +229,7 @@ pub fn decode_header(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Heade
         .with_spec_ref(spec));
     }
 
-    if is_strict(ctx.validation_level) && spare != 0 {
+    if crate::is_strict(ctx.validation_level) && spare != 0 {
         return Err(DecodeError::new(
             DecodeErrorCode::Structural {
                 reason: "flags spare bits must be zero",
@@ -277,7 +276,7 @@ pub fn decode_header(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Heade
         | (input[sequence_offset + 2] as u32);
     let spare_octet = input[sequence_offset + 3];
 
-    if is_strict(ctx.validation_level) && spare_octet != 0 {
+    if crate::is_strict(ctx.validation_level) && spare_octet != 0 {
         return Err(DecodeError::new(
             DecodeErrorCode::Structural {
                 reason: "sequence spare octet must be zero",
@@ -344,7 +343,7 @@ pub fn encode_header(
     };
     if version != GTPV2C_VERSION {
         return Err(EncodeError::new(EncodeErrorCode::Structural {
-            reason: "GTPv2-C canonical version must be 2",
+            reason: "GTPv2-C version must be 2",
         })
         .with_spec_ref(spec));
     }
@@ -364,12 +363,8 @@ pub fn encode_header(
     dst.put_u8(header.message_type);
     dst.put_u16(header.length);
     if header.teid_flag {
-        let teid = header.teid.ok_or_else(|| {
-            EncodeError::new(EncodeErrorCode::Structural {
-                reason: "TEID flag set without TEID value",
-            })
-            .with_spec_ref(spec.clone())
-        })?;
+        #[allow(clippy::unwrap_used)]
+        let teid = header.teid.unwrap(); // SAFETY: TEID flag/value consistency validated above.
         dst.put_u32(teid);
     }
     dst.put_u8(((header.sequence_number >> 16) & 0xff) as u8);
@@ -387,6 +382,7 @@ pub fn encode_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opc_protocol::ValidationLevel;
 
     #[test]
     fn decodes_echo_request_header_without_teid() {

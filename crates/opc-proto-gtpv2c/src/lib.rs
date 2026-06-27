@@ -13,6 +13,16 @@
 //! @req REQ-3GPP-TS29274-R18-S2B-001
 //! @conformance s2b-subset — see CONFORMANCE.md
 
+use opc_protocol::ValidationLevel;
+
+/// Return `true` when `level` enables strict boundary checks.
+pub(crate) const fn is_strict(level: ValidationLevel) -> bool {
+    matches!(
+        level,
+        ValidationLevel::Strict | ValidationLevel::ProcedureAware
+    )
+}
+
 pub mod header;
 pub mod ie;
 pub mod message;

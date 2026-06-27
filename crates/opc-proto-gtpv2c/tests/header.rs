@@ -124,4 +124,68 @@ fn header_strict_decode_rejects_spares_and_encode_rejects_bad_shape() {
         encoded,
         Err(error) if matches!(error.code(), EncodeErrorCode::Structural { .. })
     ));
+
+    let mut value_without_flag = Header::without_teid(32, 1);
+    value_without_flag.teid = Some(0x0102_0304);
+    let encoded = encode_header(&value_without_flag, &mut dst, EncodeContext::default());
+    assert!(matches!(
+        encoded,
+        Err(error) if matches!(error.code(), EncodeErrorCode::Structural { .. })
+    ));
+
+    let mut bad_version = Header::without_teid(1, 1);
+    bad_version.version = 1;
+    let ctx = EncodeContext {
+        raw_preserving: true,
+        ..EncodeContext::default()
+    };
+    let encoded = encode_header(&bad_version, &mut dst, ctx);
+    assert!(matches!(
+        encoded,
+        Err(error) if matches!(error.code(), EncodeErrorCode::Structural { .. })
+    ));
+}
+
+#[test]
+fn header_canonical_encode_zeroes_spare_bits_and_spare_octet() {
+    let header = Header {
+        version: GTPV2C_VERSION,
+        piggybacking: false,
+        teid_flag: true,
+        spare: 0x07,
+        message_type: 0x20,
+        length: 8,
+        teid: Some(0x0102_0304),
+        sequence_number: 0x0000_abcd,
+        spare_octet: 0xee,
+    };
+    let mut dst = BytesMut::new();
+    let encoded = encode_header(&header, &mut dst, EncodeContext::default());
+    assert!(encoded.is_ok());
+    assert_eq!(dst[0], 0x48);
+    assert_eq!(dst[11], 0x00);
+}
+
+#[test]
+fn header_decode_rejects_truncated_and_under_length_inputs() {
+    let truncated_no_teid = [0x40, 0x01, 0x00, 0x04, 0x00, 0x00, 0x01];
+    let decoded = decode_header(&truncated_no_teid, DecodeContext::default());
+    assert!(matches!(
+        decoded,
+        Err(error) if matches!(error.code(), DecodeErrorCode::Truncated)
+    ));
+
+    let declared_shorter_than_header = [0x40, 0x01, 0x00, 0x03, 0x00, 0x00, 0x01, 0x00];
+    let decoded = decode_header(&declared_shorter_than_header, DecodeContext::default());
+    assert!(matches!(
+        decoded,
+        Err(error) if matches!(error.code(), DecodeErrorCode::InvalidLength { .. })
+    ));
+
+    let truncated_teid = [0x48, 0x20, 0x00, 0x08, 0x01, 0x02, 0x03, 0x04, 0x00, 0xab, 0xcd];
+    let decoded = decode_header(&truncated_teid, DecodeContext::default());
+    assert!(matches!(
+        decoded,
+        Err(error) if matches!(error.code(), DecodeErrorCode::Truncated)
+    ));
 }
