@@ -31,13 +31,21 @@
 
 3. **Typed S2b IE subset**
    - IMSI, Cause, Recovery, APN, Aggregate Maximum Bit Rate, EPS Bearer ID,
-     MEI, MSISDN, PDN Address Allocation, RAT Type, Serving Network, F-TEID,
-     Bearer Context, PDN Type, APN Restriction, and Selection Mode have typed
-     decode/encode support.
+     MEI, MSISDN, Indication, Protocol Configuration Options, PDN Address
+     Allocation, Bearer QoS, RAT Type, Serving Network, F-TEID, Bearer
+     Context, Charging ID, PDN Type, APN Restriction, Selection Mode, and
+     Additional Protocol Configuration Options have typed decode/encode
+     support.
+   - PCO/APCO and Indication are typed as opaque byte-preserving containers so
+     nested or future protocol options/flags are not silently dropped.
+   - Bearer QoS decodes the fixed 22-octet shape into priority/QCI plus
+     40-bit maximum and guaranteed bit-rate fields; Charging ID decodes as a
+     four-octet identifier.
    - Cause decoding preserves the mandatory flags/locality octet and opaque
      offending-IE bytes; one-octet Cause values are rejected as malformed.
    - F-TEID uses the TS 29.274 V4/V6 flag bits (`0x80`/`0x40`) and rejects
-     surplus value bytes after the declared IPv4/IPv6 address fields.
+     surplus value bytes after the declared IPv4/IPv6 address fields. F-TEID
+     values with neither V4 nor V6 set are rejected.
    - Non-IP, Ethernet, and unknown PAA typed values are accepted only in their
      one-octet form; over-long shapes are rejected instead of silently
      canonicalized.
@@ -45,8 +53,8 @@
      fallback for unsupported nested members.
    - Top-level and grouped typed IE sequences enforce
      `DecodeContext::duplicate_ie_policy` by IE type and instance.
-   - Unsupported S2b-adjacent IEs such as Protocol Configuration Options remain
-     available as `TypedIeValue::Raw` and re-encode byte-exact.
+   - Unsupported/private/future IEs outside the typed subset remain available as
+     `TypedIeValue::Raw` and re-encode byte-exact.
 
 4. **S2b message views**
    - `S2bMessage` decodes Echo Request/Response, Create Session
@@ -54,8 +62,8 @@
      view), Delete Session Request/Response, and Update Bearer
      Request/Response (the S2b Update Session view).
    - `ValidationLevel::ProcedureAware` checks the mandatory IE subset claimed
-     by this crate's S2b examples: Echo Response Recovery; Create Session
-     Request IMSI/RAT Type/Serving Network/Sender F-TEID/APN/Selection
+     by this crate's S2b examples: Echo Request/Response Recovery; Create
+     Session Request IMSI/RAT Type/Serving Network/Sender F-TEID/APN/Selection
      Mode/PDN Type/PAA/Bearer Context with nested EBI; Create Session Response
      Cause/Sender F-TEID/Bearer Context; Modify and Update request Bearer
      Context; Delete request linked EBI; and response Cause IEs.
@@ -64,6 +72,9 @@
 5. **OpenPacketCore protocol framework fit**
    - `Message<'_>` implements `BorrowDecode`, `Encode`, and `ToOwnedPdu`.
    - `OwnedMessage` implements `OwnedDecode` and `Encode`.
+   - `MessageType` provides a public typed message-type enum with
+     `Unknown(u8)` fallback; raw and S2b message views expose conversion
+     helpers without losing unsupported values.
    - `S2bMessage<'_>` and `S2bProcedureMessage<'_>` implement `Encode`, and
      `S2bMessage<'_>` implements `BorrowDecode`.
    - Decode errors use structured `opc-protocol` error types with spec refs.
@@ -90,8 +101,9 @@
 
 Raw-preserving encoding keeps the decoded header spare bits and raw IE bytes.
 Canonical encoding recomputes the Length field, emits version 2 with header and
-IE spare bits zeroed for typed IEs, encodes TBCD/APN/PLMN/PAA/F-TEID fields in
-canonical form, and still carries unsupported IEs through the raw fallback.
+IE spare bits zeroed for typed IEs, encodes TBCD/APN/PLMN/PAA/F-TEID/Bearer QoS
+fields in canonical form, preserves opaque PCO/APCO/Indication bytes, and still
+carries unsupported IEs through the raw fallback.
 Use the raw `Message` layer or `EncodeContext { raw_preserving: true, .. }` on a
 freshly decoded S2b view for byte-exact forwarding.
 
@@ -100,10 +112,12 @@ freshly decoded S2b view for byte-exact forwarding.
 The initial unit fixtures are hand-authored from the TS 29.274 common-header
 and IE TLIV layouts:
 
-- Echo Request without TEID validates the no-TEID common-header shape.
+- Echo Request without TEID validates the no-TEID common-header shape and
+  mandatory Recovery IE.
 - Create Session Request without TEID validates mandatory S2b request examples:
   IMSI, RAT Type, Serving Network, Sender F-TEID, APN, Selection Mode, PDN
-  Type, PAA, Bearer Context/EBI, and raw fallback for an unsupported PCO IE.
+  Type, PAA, Bearer Context/EBI, nested Bearer QoS and Charging ID, typed PCO,
+  Indication, APCO, and raw fallback for an unsupported private IE.
 - Create Session Response with TEID validates response Cause, Sender F-TEID,
   PAA, and Bearer Context examples.
 - Modify Bearer, Delete Session, and Update Bearer fixtures validate the S2b

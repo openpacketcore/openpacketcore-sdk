@@ -21,6 +21,89 @@ pub const HEADER_LEN_WITHOUT_TEID: usize = 8;
 /// Maximum value of the 24-bit GTPv2-C sequence number field.
 pub const MAX_SEQUENCE_NUMBER: u32 = 0x00ff_ffff;
 
+/// GTPv2-C message type values covered by the S2b typed subset.
+///
+/// Unsupported values remain available through [`MessageType::Unknown`] so
+/// callers can use a typed API without losing raw message-type bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MessageType {
+    /// Echo Request (1).
+    EchoRequest,
+    /// Echo Response (2).
+    EchoResponse,
+    /// Create Session Request (32).
+    CreateSessionRequest,
+    /// Create Session Response (33).
+    CreateSessionResponse,
+    /// Modify Bearer Request (34), used by the S2b Modify Session view.
+    ModifyBearerRequest,
+    /// Modify Bearer Response (35), used by the S2b Modify Session view.
+    ModifyBearerResponse,
+    /// Delete Session Request (36).
+    DeleteSessionRequest,
+    /// Delete Session Response (37).
+    DeleteSessionResponse,
+    /// Update Bearer Request (97), used by the S2b Update Session view.
+    UpdateBearerRequest,
+    /// Update Bearer Response (98), used by the S2b Update Session view.
+    UpdateBearerResponse,
+    /// Unsupported or future GTPv2-C message type.
+    Unknown(u8),
+}
+
+impl MessageType {
+    /// Convert a raw GTPv2-C message type octet into the typed view.
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::EchoRequest,
+            2 => Self::EchoResponse,
+            32 => Self::CreateSessionRequest,
+            33 => Self::CreateSessionResponse,
+            34 => Self::ModifyBearerRequest,
+            35 => Self::ModifyBearerResponse,
+            36 => Self::DeleteSessionRequest,
+            37 => Self::DeleteSessionResponse,
+            97 => Self::UpdateBearerRequest,
+            98 => Self::UpdateBearerResponse,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Return the raw GTPv2-C message type octet.
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::EchoRequest => 1,
+            Self::EchoResponse => 2,
+            Self::CreateSessionRequest => 32,
+            Self::CreateSessionResponse => 33,
+            Self::ModifyBearerRequest => 34,
+            Self::ModifyBearerResponse => 35,
+            Self::DeleteSessionRequest => 36,
+            Self::DeleteSessionResponse => 37,
+            Self::UpdateBearerRequest => 97,
+            Self::UpdateBearerResponse => 98,
+            Self::Unknown(value) => value,
+        }
+    }
+
+    /// Return `true` when this is one of the S2b typed subset message values.
+    pub const fn is_s2b(self) -> bool {
+        !matches!(self, Self::Unknown(_))
+    }
+}
+
+impl From<u8> for MessageType {
+    fn from(value: u8) -> Self {
+        Self::from_u8(value)
+    }
+}
+
+impl From<MessageType> for u8 {
+    fn from(value: MessageType) -> Self {
+        value.as_u8()
+    }
+}
+
 fn is_strict(level: ValidationLevel) -> bool {
     matches!(
         level,
@@ -102,6 +185,11 @@ impl Header {
         } else {
             HEADER_LEN_WITHOUT_TEID
         }
+    }
+
+    /// Return the typed GTPv2-C message type, with an unknown fallback.
+    pub const fn typed_message_type(&self) -> MessageType {
+        MessageType::from_u8(self.message_type)
     }
 
     /// Return the number of bytes declared by the header length field.

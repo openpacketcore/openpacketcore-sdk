@@ -33,10 +33,14 @@ pub const IE_TYPE_EBI: u8 = 73;
 pub const IE_TYPE_MEI: u8 = 75;
 /// GTPv2-C MSISDN IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_MSISDN: u8 = 76;
-/// GTPv2-C Protocol Configuration Options IE type (unsupported typed value).
+/// GTPv2-C Indication IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_INDICATION: u8 = 77;
+/// GTPv2-C Protocol Configuration Options IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_PCO: u8 = 78;
 /// GTPv2-C PDN Address Allocation IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_PAA: u8 = 79;
+/// GTPv2-C Bearer QoS IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_BEARER_QOS: u8 = 80;
 /// GTPv2-C RAT Type IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_RAT_TYPE: u8 = 82;
 /// GTPv2-C Serving Network IE type (TS 29.274 Table 8.1-1).
@@ -45,12 +49,18 @@ pub const IE_TYPE_SERVING_NETWORK: u8 = 83;
 pub const IE_TYPE_F_TEID: u8 = 87;
 /// GTPv2-C Bearer Context grouped IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_BEARER_CONTEXT: u8 = 93;
+/// GTPv2-C Charging ID IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_CHARGING_ID: u8 = 94;
 /// GTPv2-C PDN Type IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_PDN_TYPE: u8 = 99;
 /// GTPv2-C APN Restriction IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_APN_RESTRICTION: u8 = 127;
 /// GTPv2-C Selection Mode IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_SELECTION_MODE: u8 = 128;
+/// GTPv2-C Additional Protocol Configuration Options IE type.
+pub const IE_TYPE_APCO: u8 = 163;
+
+const MAX_40BIT_BEARER_RATE: u64 = 0x00ff_ffff_ffff;
 
 fn spec_ref() -> SpecRef {
     SpecRef::new("3gpp", "TS29274", "8.2")
@@ -98,6 +108,28 @@ fn require_min_len(
 
 fn encode_structural_error(reason: &'static str) -> EncodeError {
     EncodeError::new(EncodeErrorCode::Structural { reason }).with_spec_ref(spec_ref())
+}
+
+fn decode_u40(value: &[u8]) -> u64 {
+    ((value[0] as u64) << 32)
+        | ((value[1] as u64) << 24)
+        | ((value[2] as u64) << 16)
+        | ((value[3] as u64) << 8)
+        | (value[4] as u64)
+}
+
+fn encode_u40(value: u64, dst: &mut BytesMut) -> Result<(), EncodeError> {
+    if value > MAX_40BIT_BEARER_RATE {
+        return Err(encode_structural_error(
+            "Bearer QoS bitrate exceeds 40 bits",
+        ));
+    }
+    dst.put_u8((value >> 32) as u8);
+    dst.put_u8((value >> 24) as u8);
+    dst.put_u8((value >> 16) as u8);
+    dst.put_u8((value >> 8) as u8);
+    dst.put_u8(value as u8);
+    Ok(())
 }
 
 fn validate_decimal_digits(digits: &str, reason: &'static str) -> Result<(), EncodeError> {
@@ -487,6 +519,140 @@ impl EpsBearerId {
     }
 }
 
+/// Indication IE (type 77).
+///
+/// The Release 18 indication bitset is extension-friendly and varies in
+/// length as later octets are added. This typed view preserves the value
+/// octets byte-exact while exposing the IE as part of the S2b subset.
+///
+/// @spec 3GPP TS29274 R18 8.12
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-INDICATION-001
+#[derive(Clone, PartialEq, Eq)]
+pub struct Indication {
+    /// Raw indication flag octets.
+    pub flags: Vec<u8>,
+}
+
+impl Indication {
+    fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
+        require_min_len(value, 1, offset, "Indication IE must contain flag octets")?;
+        Ok(Self {
+            flags: value.to_vec(),
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        if self.flags.is_empty() {
+            return Err(encode_structural_error(
+                "Indication IE must contain flag octets",
+            ));
+        }
+        dst.put_slice(&self.flags);
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Indication {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Indication")
+            .field("flags_len", &self.flags.len())
+            .finish()
+    }
+}
+
+/// Protocol Configuration Options IE (type 78).
+///
+/// PCO carries a TS 24.008 protocol-configuration container. This S2b subset
+/// keeps the container opaque so unsupported nested protocols remain
+/// byte-exact on canonical encode.
+///
+/// @spec 3GPP TS29274 R18 8.13
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-PCO-001
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProtocolConfigurationOptions {
+    /// Raw TS 24.008 protocol-configuration container bytes.
+    pub value: Vec<u8>,
+}
+
+impl ProtocolConfigurationOptions {
+    fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
+        require_min_len(
+            value,
+            1,
+            offset,
+            "Protocol Configuration Options IE must not be empty",
+        )?;
+        Ok(Self {
+            value: value.to_vec(),
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        if self.value.is_empty() {
+            return Err(encode_structural_error(
+                "Protocol Configuration Options IE must not be empty",
+            ));
+        }
+        dst.put_slice(&self.value);
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ProtocolConfigurationOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProtocolConfigurationOptions")
+            .field("value_len", &self.value.len())
+            .finish()
+    }
+}
+
+/// Bearer QoS IE (type 80).
+///
+/// The S2b subset exposes the fixed-width Bearer QoS shape and preserves the
+/// ARP priority/flag octet for callers that need exact TS 29.274 bit handling.
+///
+/// @spec 3GPP TS29274 R18 8.15
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-BEARER-QOS-001
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BearerQos {
+    /// Raw allocation/retention priority flag octet.
+    pub priority_flags: u8,
+    /// QoS Class Identifier.
+    pub qci: u8,
+    /// Maximum bit rate for uplink, encoded as a 40-bit unsigned integer.
+    pub maximum_bitrate_uplink: u64,
+    /// Maximum bit rate for downlink, encoded as a 40-bit unsigned integer.
+    pub maximum_bitrate_downlink: u64,
+    /// Guaranteed bit rate for uplink, encoded as a 40-bit unsigned integer.
+    pub guaranteed_bitrate_uplink: u64,
+    /// Guaranteed bit rate for downlink, encoded as a 40-bit unsigned integer.
+    pub guaranteed_bitrate_downlink: u64,
+}
+
+impl BearerQos {
+    fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
+        require_exact_len(value, 22, offset, "Bearer QoS IE must be twenty-two octets")?;
+        Ok(Self {
+            priority_flags: value[0],
+            qci: value[1],
+            maximum_bitrate_uplink: decode_u40(&value[2..7]),
+            maximum_bitrate_downlink: decode_u40(&value[7..12]),
+            guaranteed_bitrate_uplink: decode_u40(&value[12..17]),
+            guaranteed_bitrate_downlink: decode_u40(&value[17..22]),
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        dst.put_u8(self.priority_flags);
+        dst.put_u8(self.qci);
+        encode_u40(self.maximum_bitrate_uplink, dst)?;
+        encode_u40(self.maximum_bitrate_downlink, dst)?;
+        encode_u40(self.guaranteed_bitrate_uplink, dst)?;
+        encode_u40(self.guaranteed_bitrate_downlink, dst)?;
+        Ok(())
+    }
+}
+
 /// RAT Type values used by the S2b subset.
 ///
 /// @spec 3GPP TS29274 R18 8.17
@@ -672,6 +838,15 @@ impl FullyQualifiedTeid {
         let flags = value[0];
         let has_ipv4 = (flags & 0x80) != 0;
         let has_ipv6 = (flags & 0x40) != 0;
+        if !has_ipv4 && !has_ipv6 {
+            return Err(DecodeError::new(
+                DecodeErrorCode::Structural {
+                    reason: "F-TEID IE must set V4, V6, or both",
+                },
+                offset,
+            )
+            .with_spec_ref(spec_ref()));
+        }
         let interface_type = flags & 0x3f;
         let teid = u32::from_be_bytes([value[1], value[2], value[3], value[4]]);
         let mut position = 5usize;
@@ -1074,6 +1249,75 @@ impl<'a> BearerContext<'a> {
     }
 }
 
+/// Charging ID IE (type 94).
+///
+/// @spec 3GPP TS29274 R18 8.29
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-CHARGING-ID-001
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChargingId {
+    /// Charging identifier value.
+    pub value: u32,
+}
+
+impl ChargingId {
+    fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
+        require_exact_len(value, 4, offset, "Charging ID IE must be four octets")?;
+        Ok(Self {
+            value: u32::from_be_bytes([value[0], value[1], value[2], value[3]]),
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) {
+        dst.put_u32(self.value);
+    }
+}
+
+/// Additional Protocol Configuration Options IE (type 163).
+///
+/// APCO carries an additional TS 24.008 protocol-configuration container. Like
+/// PCO, this typed view keeps nested protocol identifiers opaque and
+/// byte-exact.
+///
+/// @spec 3GPP TS29274 R18 8.104
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-APCO-001
+#[derive(Clone, PartialEq, Eq)]
+pub struct AdditionalProtocolConfigurationOptions {
+    /// Raw additional protocol-configuration container bytes.
+    pub value: Vec<u8>,
+}
+
+impl AdditionalProtocolConfigurationOptions {
+    fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
+        require_min_len(
+            value,
+            1,
+            offset,
+            "Additional Protocol Configuration Options IE must not be empty",
+        )?;
+        Ok(Self {
+            value: value.to_vec(),
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        if self.value.is_empty() {
+            return Err(encode_structural_error(
+                "Additional Protocol Configuration Options IE must not be empty",
+            ));
+        }
+        dst.put_slice(&self.value);
+        Ok(())
+    }
+}
+
+impl fmt::Debug for AdditionalProtocolConfigurationOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdditionalProtocolConfigurationOptions")
+            .field("value_len", &self.value.len())
+            .finish()
+    }
+}
+
 /// Typed GTPv2-C IE value subset for S2b message views.
 ///
 /// @spec 3GPP TS29274 R18 8.2
@@ -1096,8 +1340,14 @@ pub enum TypedIeValue<'a> {
     Mei(TbcdDigits),
     /// MSISDN IE (type 76).
     Msisdn(TbcdDigits),
+    /// Indication IE (type 77).
+    Indication(Indication),
+    /// Protocol Configuration Options IE (type 78).
+    ProtocolConfigurationOptions(ProtocolConfigurationOptions),
     /// PDN Address Allocation IE (type 79).
     PdnAddressAllocation(PdnAddressAllocation),
+    /// Bearer QoS IE (type 80).
+    BearerQos(BearerQos),
     /// RAT Type IE (type 82).
     RatType(RatType),
     /// Serving Network IE (type 83).
@@ -1106,12 +1356,16 @@ pub enum TypedIeValue<'a> {
     FullyQualifiedTeid(FullyQualifiedTeid),
     /// Bearer Context IE (type 93).
     BearerContext(BearerContext<'a>),
+    /// Charging ID IE (type 94).
+    ChargingId(ChargingId),
     /// PDN Type IE (type 99).
     PdnType(PdnType),
     /// APN Restriction IE (type 127).
     ApnRestriction(ApnRestriction),
     /// Selection Mode IE (type 128).
     SelectionMode(SelectionMode),
+    /// Additional Protocol Configuration Options IE (type 163).
+    AdditionalProtocolConfigurationOptions(AdditionalProtocolConfigurationOptions),
     /// Unsupported, unknown, private, or future IE preserved byte-exact.
     Raw(RawIe<'a>),
 }
@@ -1156,9 +1410,18 @@ impl<'a> TypedIe<'a> {
             }
             IE_TYPE_MEI => TypedIeValue::Mei(TbcdDigits::decode_value(raw.value, offset)?),
             IE_TYPE_MSISDN => TypedIeValue::Msisdn(TbcdDigits::decode_value(raw.value, offset)?),
+            IE_TYPE_INDICATION => {
+                TypedIeValue::Indication(Indication::decode_value(raw.value, offset)?)
+            }
+            IE_TYPE_PCO => TypedIeValue::ProtocolConfigurationOptions(
+                ProtocolConfigurationOptions::decode_value(raw.value, offset)?,
+            ),
             IE_TYPE_PAA => TypedIeValue::PdnAddressAllocation(PdnAddressAllocation::decode_value(
                 raw.value, offset, ctx,
             )?),
+            IE_TYPE_BEARER_QOS => {
+                TypedIeValue::BearerQos(BearerQos::decode_value(raw.value, offset)?)
+            }
             IE_TYPE_RAT_TYPE => TypedIeValue::RatType(RatType::decode_value(raw.value, offset)?),
             IE_TYPE_SERVING_NETWORK => {
                 TypedIeValue::ServingNetwork(ServingNetwork::decode_value(raw.value, offset)?)
@@ -1169,6 +1432,9 @@ impl<'a> TypedIe<'a> {
             IE_TYPE_BEARER_CONTEXT => {
                 TypedIeValue::BearerContext(BearerContext::decode_value(raw.value, ctx, depth)?)
             }
+            IE_TYPE_CHARGING_ID => {
+                TypedIeValue::ChargingId(ChargingId::decode_value(raw.value, offset)?)
+            }
             IE_TYPE_PDN_TYPE => {
                 TypedIeValue::PdnType(PdnType::decode_value(raw.value, offset, ctx)?)
             }
@@ -1178,6 +1444,9 @@ impl<'a> TypedIe<'a> {
             IE_TYPE_SELECTION_MODE => {
                 TypedIeValue::SelectionMode(SelectionMode::decode_value(raw.value, offset, ctx)?)
             }
+            IE_TYPE_APCO => TypedIeValue::AdditionalProtocolConfigurationOptions(
+                AdditionalProtocolConfigurationOptions::decode_value(raw.value, offset)?,
+            ),
             _ => TypedIeValue::Raw(raw.clone()),
         };
         Ok(Self {
@@ -1197,14 +1466,19 @@ impl<'a> TypedIe<'a> {
             TypedIeValue::EpsBearerId(_) => IE_TYPE_EBI,
             TypedIeValue::Mei(_) => IE_TYPE_MEI,
             TypedIeValue::Msisdn(_) => IE_TYPE_MSISDN,
+            TypedIeValue::Indication(_) => IE_TYPE_INDICATION,
+            TypedIeValue::ProtocolConfigurationOptions(_) => IE_TYPE_PCO,
             TypedIeValue::PdnAddressAllocation(_) => IE_TYPE_PAA,
+            TypedIeValue::BearerQos(_) => IE_TYPE_BEARER_QOS,
             TypedIeValue::RatType(_) => IE_TYPE_RAT_TYPE,
             TypedIeValue::ServingNetwork(_) => IE_TYPE_SERVING_NETWORK,
             TypedIeValue::FullyQualifiedTeid(_) => IE_TYPE_F_TEID,
             TypedIeValue::BearerContext(_) => IE_TYPE_BEARER_CONTEXT,
+            TypedIeValue::ChargingId(_) => IE_TYPE_CHARGING_ID,
             TypedIeValue::PdnType(_) => IE_TYPE_PDN_TYPE,
             TypedIeValue::ApnRestriction(_) => IE_TYPE_APN_RESTRICTION,
             TypedIeValue::SelectionMode(_) => IE_TYPE_SELECTION_MODE,
+            TypedIeValue::AdditionalProtocolConfigurationOptions(_) => IE_TYPE_APCO,
             TypedIeValue::Raw(raw) => raw.ie_type,
         }
     }
@@ -1260,7 +1534,10 @@ impl<'a> TypedIe<'a> {
                 value.encode_value(dst);
                 Ok(())
             }
+            TypedIeValue::Indication(value) => value.encode_value(dst),
+            TypedIeValue::ProtocolConfigurationOptions(value) => value.encode_value(dst),
             TypedIeValue::PdnAddressAllocation(value) => value.encode_value(dst),
+            TypedIeValue::BearerQos(value) => value.encode_value(dst),
             TypedIeValue::RatType(value) => {
                 value.encode_value(dst);
                 Ok(())
@@ -1271,6 +1548,10 @@ impl<'a> TypedIe<'a> {
                 Ok(())
             }
             TypedIeValue::BearerContext(value) => value.encode_value(dst, ctx),
+            TypedIeValue::ChargingId(value) => {
+                value.encode_value(dst);
+                Ok(())
+            }
             TypedIeValue::PdnType(value) => {
                 value.encode_value(dst);
                 Ok(())
@@ -1283,6 +1564,7 @@ impl<'a> TypedIe<'a> {
                 value.encode_value(dst);
                 Ok(())
             }
+            TypedIeValue::AdditionalProtocolConfigurationOptions(value) => value.encode_value(dst),
             TypedIeValue::Raw(_) => unreachable!("raw IEs are encoded by the raw-preserving path"),
         }
     }
@@ -1302,18 +1584,29 @@ impl fmt::Debug for TypedIeValue<'_> {
             Self::EpsBearerId(value) => f.debug_tuple("EpsBearerId").field(value).finish(),
             Self::Mei(value) => f.debug_tuple("Mei").field(value).finish(),
             Self::Msisdn(value) => f.debug_tuple("Msisdn").field(value).finish(),
+            Self::Indication(value) => f.debug_tuple("Indication").field(value).finish(),
+            Self::ProtocolConfigurationOptions(value) => f
+                .debug_tuple("ProtocolConfigurationOptions")
+                .field(value)
+                .finish(),
             Self::PdnAddressAllocation(value) => {
                 f.debug_tuple("PdnAddressAllocation").field(value).finish()
             }
+            Self::BearerQos(value) => f.debug_tuple("BearerQos").field(value).finish(),
             Self::RatType(value) => f.debug_tuple("RatType").field(value).finish(),
             Self::ServingNetwork(value) => f.debug_tuple("ServingNetwork").field(value).finish(),
             Self::FullyQualifiedTeid(value) => {
                 f.debug_tuple("FullyQualifiedTeid").field(value).finish()
             }
             Self::BearerContext(value) => f.debug_tuple("BearerContext").field(value).finish(),
+            Self::ChargingId(value) => f.debug_tuple("ChargingId").field(value).finish(),
             Self::PdnType(value) => f.debug_tuple("PdnType").field(value).finish(),
             Self::ApnRestriction(value) => f.debug_tuple("ApnRestriction").field(value).finish(),
             Self::SelectionMode(value) => f.debug_tuple("SelectionMode").field(value).finish(),
+            Self::AdditionalProtocolConfigurationOptions(value) => f
+                .debug_tuple("AdditionalProtocolConfigurationOptions")
+                .field(value)
+                .finish(),
             Self::Raw(raw) => f
                 .debug_struct("Raw")
                 .field("ie_type", &raw.ie_type)

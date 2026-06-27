@@ -18,16 +18,18 @@ pub mod ie;
 pub mod message;
 pub mod s2b;
 
-pub use header::{decode_header, encode_header, Header, GTPV2C_VERSION};
+pub use header::{decode_header, encode_header, Header, MessageType, GTPV2C_VERSION};
 pub use ie::{
-    decode_typed_ie_sequence, validate_ie_region, AccessPointName, AggregateMaximumBitRate,
-    ApnRestriction, BearerContext, Cause, CauseValue, EpsBearerId, FullyQualifiedTeid, OwnedRawIe,
-    PdnAddressAllocation, PdnType, PdnTypeValue, PlmnId, RatType, RatTypeValue, RawIe,
-    RawIeIterator, Recovery, SelectionMode, SelectionModeValue, ServingNetwork, TbcdDigits,
-    TypedIe, TypedIeValue, IE_HEADER_LEN, IE_TYPE_AMBR, IE_TYPE_APN, IE_TYPE_APN_RESTRICTION,
-    IE_TYPE_BEARER_CONTEXT, IE_TYPE_CAUSE, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_MEI,
-    IE_TYPE_MSISDN, IE_TYPE_PAA, IE_TYPE_PCO, IE_TYPE_PDN_TYPE, IE_TYPE_RAT_TYPE, IE_TYPE_RECOVERY,
-    IE_TYPE_SELECTION_MODE, IE_TYPE_SERVING_NETWORK,
+    decode_typed_ie_sequence, validate_ie_region, AccessPointName,
+    AdditionalProtocolConfigurationOptions, AggregateMaximumBitRate, ApnRestriction, BearerContext,
+    BearerQos, Cause, CauseValue, ChargingId, EpsBearerId, FullyQualifiedTeid, Indication,
+    OwnedRawIe, PdnAddressAllocation, PdnType, PdnTypeValue, PlmnId, ProtocolConfigurationOptions,
+    RatType, RatTypeValue, RawIe, RawIeIterator, Recovery, SelectionMode, SelectionModeValue,
+    ServingNetwork, TbcdDigits, TypedIe, TypedIeValue, IE_HEADER_LEN, IE_TYPE_AMBR, IE_TYPE_APCO,
+    IE_TYPE_APN, IE_TYPE_APN_RESTRICTION, IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS,
+    IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI,
+    IE_TYPE_INDICATION, IE_TYPE_MEI, IE_TYPE_MSISDN, IE_TYPE_PAA, IE_TYPE_PCO, IE_TYPE_PDN_TYPE,
+    IE_TYPE_RAT_TYPE, IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE, IE_TYPE_SERVING_NETWORK,
 };
 pub use message::{Message, OwnedMessage};
 pub use s2b::{

@@ -1,10 +1,12 @@
 use bytes::BytesMut;
 use opc_proto_gtpv2c::{
-    decode_typed_ie_sequence, s2b, CauseValue, S2bMessage, TbcdDigits, TypedIe, TypedIeValue,
-    IE_TYPE_BEARER_CONTEXT, IE_TYPE_CAUSE, IE_TYPE_PCO,
+    decode_typed_ie_sequence, s2b, CauseValue, Message, MessageType, S2bMessage, TbcdDigits,
+    TypedIe, TypedIeValue, IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE,
+    IE_TYPE_CHARGING_ID, IE_TYPE_INDICATION, IE_TYPE_PCO,
 };
 use opc_protocol::{
-    DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext, ValidationLevel,
+    BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
+    ValidationLevel,
 };
 
 fn procedure_context() -> DecodeContext {
@@ -18,9 +20,10 @@ fn procedure_context() -> DecodeContext {
 const ECHO_REQUEST_FIXTURE: &[u8] = &[
     0x40, // Version 2, no piggybacking, no TEID, spare zero.
     0x01, // Echo Request.
-    0x00, 0x04, // Length = sequence/spare only.
+    0x00, 0x09, // Length = sequence/spare + Recovery IE.
     0x00, 0x00, 0x01, // Sequence number 1.
     0x00, // Spare.
+    0x03, 0x00, 0x01, 0x00, 0x2a, // Recovery restart counter.
 ];
 
 const ECHO_RESPONSE_FIXTURE: &[u8] = &[
@@ -39,7 +42,7 @@ const ECHO_RESPONSE_FIXTURE: &[u8] = &[
 const CREATE_SESSION_REQUEST_FIXTURE: &[u8] = &[
     0x40, // Version 2, no TEID.
     0x20, // Create Session Request (32).
-    0x00, 0x69, // Length = sequence/spare (4) + 101 octets of IEs.
+    0x00, 0x9d, // Length = sequence/spare (4) + 153 octets of IEs.
     0x00, 0x10, 0x01, 0x00, // Sequence/spare.
     0x01, 0x00, 0x08, 0x00, // IMSI IE header, instance 0.
     0x00, 0x01, 0x01, 0x21, 0x43, 0x65, 0x87, 0xf9, // IMSI 001010123456789.
@@ -57,10 +60,21 @@ const CREATE_SESSION_REQUEST_FIXTURE: &[u8] = &[
     0x63, 0x00, 0x01, 0x00, 0x01, // PDN Type = IPv4.
     0x4f, 0x00, 0x05, 0x00, // PAA IE header.
     0x01, 0xc6, 0x33, 0x64, 0x07, // IPv4 PAA 198.51.100.7.
-    0x5d, 0x00, 0x05, 0x00, // Bearer Context grouped IE header.
+    0x5d, 0x00, 0x27, 0x00, // Bearer Context grouped IE header.
     0x49, 0x00, 0x01, 0x00, 0x05, // Nested EBI = 5.
-    0x4e, 0x00, 0x03, 0x02, // Unsupported PCO IE, instance 2.
-    0x80, 0x21, 0x00, // PCO bytes preserved as raw fallback.
+    0x50, 0x00, 0x16, 0x00, // Nested Bearer QoS.
+    0x49, 0x09, // Priority/flag octet, QCI 9.
+    0x00, 0x00, 0x00, 0x10, 0x00, // MBR uplink 4096.
+    0x00, 0x00, 0x00, 0x20, 0x00, // MBR downlink 8192.
+    0x00, 0x00, 0x00, 0x04, 0x00, // GBR uplink 1024.
+    0x00, 0x00, 0x00, 0x08, 0x00, // GBR downlink 2048.
+    0x5e, 0x00, 0x04, 0x00, // Nested Charging ID.
+    0x12, 0x34, 0x56, 0x78, 0x4e, 0x00, 0x03, 0x02, // PCO IE, instance 2.
+    0x80, 0x21, 0x00, // PCO bytes preserved by typed value.
+    0x4d, 0x00, 0x02, 0x00, // Indication IE.
+    0x40, 0x01, 0xa3, 0x00, 0x03, 0x01, // APCO IE, instance 1.
+    0x80, 0x21, 0x01, 0xfe, 0x00, 0x01, 0x00,
+    0xaa, // Unsupported IE preserved as raw fallback.
 ];
 
 const CREATE_SESSION_RESPONSE_FIXTURE: &[u8] = &[
@@ -232,18 +246,55 @@ fn create_session_request_exposes_mandatory_typed_ies_and_raw_fallback() {
                 TypedIeValue::EpsBearerId(value) => assert_eq!(value.value, 5),
                 other => panic!("unexpected EBI value: {other:?}"),
             }
+            let bearer_qos = find_ie(&context.members, IE_TYPE_BEARER_QOS);
+            match &bearer_qos.value {
+                TypedIeValue::BearerQos(value) => {
+                    assert_eq!(value.priority_flags, 0x49);
+                    assert_eq!(value.qci, 9);
+                    assert_eq!(value.maximum_bitrate_uplink, 4096);
+                    assert_eq!(value.maximum_bitrate_downlink, 8192);
+                    assert_eq!(value.guaranteed_bitrate_uplink, 1024);
+                    assert_eq!(value.guaranteed_bitrate_downlink, 2048);
+                }
+                other => panic!("unexpected Bearer QoS value: {other:?}"),
+            }
+            let charging_id = find_ie(&context.members, IE_TYPE_CHARGING_ID);
+            match &charging_id.value {
+                TypedIeValue::ChargingId(value) => assert_eq!(value.value, 0x1234_5678),
+                other => panic!("unexpected Charging ID value: {other:?}"),
+            }
         }
         other => panic!("unexpected Bearer Context value: {other:?}"),
     }
 
     let pco = find_ie(&view.ies, IE_TYPE_PCO);
     match &pco.value {
-        TypedIeValue::Raw(raw) => {
-            assert_eq!(raw.ie_type, IE_TYPE_PCO);
-            assert_eq!(raw.instance, 2);
-            assert_eq!(raw.value, [0x80, 0x21, 0x00]);
+        TypedIeValue::ProtocolConfigurationOptions(value) => {
+            assert_eq!(pco.instance, 2);
+            assert_eq!(value.value, [0x80, 0x21, 0x00]);
         }
-        other => panic!("unexpected PCO fallback value: {other:?}"),
+        other => panic!("unexpected PCO value: {other:?}"),
+    }
+    let indication = find_ie(&view.ies, IE_TYPE_INDICATION);
+    match &indication.value {
+        TypedIeValue::Indication(value) => assert_eq!(value.flags, [0x40, 0x01]),
+        other => panic!("unexpected Indication value: {other:?}"),
+    }
+    let apco = find_ie(&view.ies, IE_TYPE_APCO);
+    match &apco.value {
+        TypedIeValue::AdditionalProtocolConfigurationOptions(value) => {
+            assert_eq!(apco.instance, 1);
+            assert_eq!(value.value, [0x80, 0x21, 0x01]);
+        }
+        other => panic!("unexpected APCO value: {other:?}"),
+    }
+    let unsupported = find_ie(&view.ies, 0xfe);
+    match &unsupported.value {
+        TypedIeValue::Raw(raw) => {
+            assert_eq!(raw.ie_type, 0xfe);
+            assert_eq!(raw.value, [0xaa]);
+        }
+        other => panic!("unexpected raw fallback value: {other:?}"),
     }
 }
 
@@ -271,12 +322,46 @@ fn response_and_update_views_expose_cause_and_procedure() {
 }
 
 #[test]
+fn message_type_unknown_fallback_roundtrips_through_raw_shell() {
+    let unknown_fixture = [
+        0x40, 0xc8, 0x00, 0x04, // Unknown message type 200, no TEID.
+        0x00, 0x20, 0xaa, 0x00,
+    ];
+
+    let (_, raw_message) = match Message::decode(&unknown_fixture, DecodeContext::default()) {
+        Ok(decoded) => decoded,
+        Err(error) => panic!("raw unknown message decode failed: {error:?}"),
+    };
+    assert_eq!(raw_message.message_type(), MessageType::Unknown(0xc8));
+
+    let (_, s2b_message) = match S2bMessage::decode(&unknown_fixture, DecodeContext::default()) {
+        Ok(decoded) => decoded,
+        Err(error) => panic!("S2b unknown message decode failed: {error:?}"),
+    };
+    assert_eq!(s2b_message.message_type(), MessageType::Unknown(0xc8));
+    assert!(s2b_message.as_raw().is_some());
+
+    let encoded = encode_s2b(&s2b_message, EncodeContext::default());
+    assert_eq!(&encoded[..], unknown_fixture);
+}
+
+#[test]
 fn procedure_aware_validation_rejects_missing_mandatory_ies() {
     let create_without_mandatory_ies = [
         0x40, 0x20, 0x00, 0x04, // Create Session Request, no TEID, no IE region.
         0x00, 0x20, 0x01, 0x00,
     ];
     let decoded = S2bMessage::decode(&create_without_mandatory_ies, procedure_context());
+    assert!(matches!(
+        decoded,
+        Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
+    ));
+
+    let echo_request_without_recovery = [
+        0x40, 0x01, 0x00, 0x04, // Echo Request missing mandatory Recovery IE.
+        0x00, 0x20, 0x00, 0x00,
+    ];
+    let decoded = S2bMessage::decode(&echo_request_without_recovery, procedure_context());
     assert!(matches!(
         decoded,
         Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
@@ -361,6 +446,42 @@ fn typed_ie_duplicate_policy_applies_to_top_level_and_grouped_sequences() {
 }
 
 #[test]
+fn required_s2b_typed_ie_subset_decodes_and_encodes_byte_exact() {
+    let typed_subset = [
+        0x4e, 0x00, 0x03, 0x02, 0x80, 0x21, 0x00, // PCO instance 2.
+        0xa3, 0x00, 0x03, 0x01, 0x80, 0x21, 0x01, // APCO instance 1.
+        0x4d, 0x00, 0x02, 0x00, 0x40, 0x01, // Indication flags.
+        0x50, 0x00, 0x16, 0x00, // Bearer QoS.
+        0x49, 0x09, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00,
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x5e, 0x00, 0x04, 0x00, 0x12, 0x34, 0x56,
+        0x78, // Charging ID.
+    ];
+
+    let decoded = match decode_typed_ie_sequence(&typed_subset, DecodeContext::default(), 0) {
+        Ok(ies) => ies,
+        Err(error) => panic!("required typed subset decode failed: {error:?}"),
+    };
+    assert_eq!(decoded.len(), 5);
+    assert!(matches!(
+        decoded[0].value,
+        TypedIeValue::ProtocolConfigurationOptions(_)
+    ));
+    assert!(matches!(
+        decoded[1].value,
+        TypedIeValue::AdditionalProtocolConfigurationOptions(_)
+    ));
+    assert!(matches!(decoded[2].value, TypedIeValue::Indication(_)));
+    assert!(matches!(decoded[3].value, TypedIeValue::BearerQos(_)));
+    assert!(matches!(decoded[4].value, TypedIeValue::ChargingId(_)));
+
+    let mut encoded = BytesMut::new();
+    for ie in &decoded {
+        ie.encode(&mut encoded, EncodeContext::default()).unwrap();
+    }
+    assert_eq!(&encoded[..], typed_subset);
+}
+
+#[test]
 fn typed_ie_decode_rejects_noncanonical_trailing_bytes() {
     let fteid_with_trailing = [
         0x57, 0x00, 0x0a, 0x00, // F-TEID value declares one trailing byte.
@@ -380,6 +501,16 @@ fn typed_ie_decode_rejects_noncanonical_trailing_bytes() {
     assert!(matches!(
         decoded,
         Err(error) if matches!(error.code(), DecodeErrorCode::InvalidLength { .. })
+    ));
+
+    let fteid_without_address = [
+        0x57, 0x00, 0x05, 0x00, // F-TEID with no V4/V6 flag set.
+        0x0a, 0x11, 0x22, 0x33, 0x44,
+    ];
+    let decoded = decode_typed_ie_sequence(&fteid_without_address, DecodeContext::default(), 0);
+    assert!(matches!(
+        decoded,
+        Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
     ));
 }
 
@@ -450,6 +581,10 @@ fn debug_output_redacts_subscriber_identifiers_and_raw_ie_bytes() {
 #[test]
 fn procedure_aware_validation_rejects_missing_mandatory_ies_for_every_claimed_pair() {
     let mut cases: Vec<Vec<u8>> = Vec::new();
+    cases.push(vec![
+        0x40, 0x01, 0x00, 0x04, // Echo Request missing mandatory Recovery IE.
+        0x00, 0x20, 0x00, 0x00,
+    ]);
     cases.push(vec![
         0x40, 0x20, 0x00, 0x04, // Create Session Request, no TEID, no IE region.
         0x00, 0x20, 0x01, 0x00,

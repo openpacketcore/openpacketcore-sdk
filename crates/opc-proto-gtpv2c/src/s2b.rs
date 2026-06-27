@@ -18,6 +18,7 @@ use opc_protocol::{
 };
 
 use crate::header::Header;
+pub use crate::header::MessageType;
 use crate::ie::{
     decode_typed_ie_sequence, TypedIe, TypedIeValue, IE_TYPE_APN, IE_TYPE_BEARER_CONTEXT,
     IE_TYPE_CAUSE, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_PAA, IE_TYPE_PDN_TYPE,
@@ -109,23 +110,21 @@ impl Procedure {
             Self::UpdateSession => UPDATE_BEARER_RESPONSE,
         }
     }
+
+    /// Return the typed GTPv2-C request message type for this procedure.
+    pub const fn request_message_type(self) -> MessageType {
+        MessageType::from_u8(self.request_type())
+    }
+
+    /// Return the typed GTPv2-C response message type for this procedure.
+    pub const fn response_message_type(self) -> MessageType {
+        MessageType::from_u8(self.response_type())
+    }
 }
 
 /// Return `true` when `message_type` belongs to the S2b typed subset.
 pub const fn is_s2b_message_type(message_type: u8) -> bool {
-    matches!(
-        message_type,
-        ECHO_REQUEST
-            | ECHO_RESPONSE
-            | CREATE_SESSION_REQUEST
-            | CREATE_SESSION_RESPONSE
-            | MODIFY_BEARER_REQUEST
-            | MODIFY_BEARER_RESPONSE
-            | DELETE_SESSION_REQUEST
-            | DELETE_SESSION_RESPONSE
-            | UPDATE_BEARER_REQUEST
-            | UPDATE_BEARER_RESPONSE
-    )
+    MessageType::from_u8(message_type).is_s2b()
 }
 
 /// Return `true` when `message_type` belongs to the S2b procedure set for this crate.
@@ -136,19 +135,35 @@ pub const fn is_scaffolded_s2b_message_type(message_type: u8) -> bool {
     is_s2b_message_type(message_type)
 }
 
-fn procedure_and_direction(message_type: u8) -> Option<(Procedure, MessageDirection)> {
+fn procedure_and_direction(message_type: MessageType) -> Option<(Procedure, MessageDirection)> {
     match message_type {
-        ECHO_REQUEST => Some((Procedure::Echo, MessageDirection::Request)),
-        ECHO_RESPONSE => Some((Procedure::Echo, MessageDirection::Response)),
-        CREATE_SESSION_REQUEST => Some((Procedure::CreateSession, MessageDirection::Request)),
-        CREATE_SESSION_RESPONSE => Some((Procedure::CreateSession, MessageDirection::Response)),
-        MODIFY_BEARER_REQUEST => Some((Procedure::ModifyBearer, MessageDirection::Request)),
-        MODIFY_BEARER_RESPONSE => Some((Procedure::ModifyBearer, MessageDirection::Response)),
-        DELETE_SESSION_REQUEST => Some((Procedure::DeleteSession, MessageDirection::Request)),
-        DELETE_SESSION_RESPONSE => Some((Procedure::DeleteSession, MessageDirection::Response)),
-        UPDATE_BEARER_REQUEST => Some((Procedure::UpdateSession, MessageDirection::Request)),
-        UPDATE_BEARER_RESPONSE => Some((Procedure::UpdateSession, MessageDirection::Response)),
-        _ => None,
+        MessageType::EchoRequest => Some((Procedure::Echo, MessageDirection::Request)),
+        MessageType::EchoResponse => Some((Procedure::Echo, MessageDirection::Response)),
+        MessageType::CreateSessionRequest => {
+            Some((Procedure::CreateSession, MessageDirection::Request))
+        }
+        MessageType::CreateSessionResponse => {
+            Some((Procedure::CreateSession, MessageDirection::Response))
+        }
+        MessageType::ModifyBearerRequest => {
+            Some((Procedure::ModifyBearer, MessageDirection::Request))
+        }
+        MessageType::ModifyBearerResponse => {
+            Some((Procedure::ModifyBearer, MessageDirection::Response))
+        }
+        MessageType::DeleteSessionRequest => {
+            Some((Procedure::DeleteSession, MessageDirection::Request))
+        }
+        MessageType::DeleteSessionResponse => {
+            Some((Procedure::DeleteSession, MessageDirection::Response))
+        }
+        MessageType::UpdateBearerRequest => {
+            Some((Procedure::UpdateSession, MessageDirection::Request))
+        }
+        MessageType::UpdateBearerResponse => {
+            Some((Procedure::UpdateSession, MessageDirection::Response))
+        }
+        MessageType::Unknown(_) => None,
     }
 }
 
@@ -177,6 +192,11 @@ pub struct S2bProcedureMessage<'a> {
 }
 
 impl<'a> S2bProcedureMessage<'a> {
+    /// Return this view's typed GTPv2-C message type.
+    pub fn message_type(&self) -> MessageType {
+        self.header.typed_message_type()
+    }
+
     /// Return `true` if a top-level IE with `ie_type` is present.
     pub fn has_ie(&self, ie_type: u8) -> bool {
         contains_ie(&self.ies, ie_type)
@@ -331,8 +351,8 @@ impl<'a> S2bMessage<'a> {
 
     /// Convert a decoded raw [`Message`] into a typed S2b view when possible.
     pub fn from_message(message: Message<'a>, ctx: DecodeContext) -> Result<Self, DecodeError> {
-        let Some((procedure, direction)) = procedure_and_direction(message.header.message_type)
-        else {
+        let message_type = message.message_type();
+        let Some((procedure, direction)) = procedure_and_direction(message_type) else {
             return Ok(Self::Raw(message));
         };
 
@@ -399,6 +419,23 @@ impl<'a> S2bMessage<'a> {
         match self {
             Self::Raw(message) => Some(message),
             _ => None,
+        }
+    }
+
+    /// Return this message's typed GTPv2-C message type, including unknown raw fallbacks.
+    pub fn message_type(&self) -> MessageType {
+        match self {
+            Self::EchoRequest(view)
+            | Self::EchoResponse(view)
+            | Self::CreateSessionRequest(view)
+            | Self::CreateSessionResponse(view)
+            | Self::ModifySessionRequest(view)
+            | Self::ModifySessionResponse(view)
+            | Self::DeleteSessionRequest(view)
+            | Self::DeleteSessionResponse(view)
+            | Self::UpdateSessionRequest(view)
+            | Self::UpdateSessionResponse(view) => view.message_type(),
+            Self::Raw(message) => message.message_type(),
         }
     }
 }
@@ -479,7 +516,11 @@ fn validate_required_ies(
     }
 
     match (view.procedure, view.direction) {
-        (Procedure::Echo, MessageDirection::Request) => Ok(()),
+        (Procedure::Echo, MessageDirection::Request) => require_ie(
+            &view.ies,
+            IE_TYPE_RECOVERY,
+            "Echo Request requires Recovery IE",
+        ),
         (Procedure::Echo, MessageDirection::Response) => require_ie(
             &view.ies,
             IE_TYPE_RECOVERY,

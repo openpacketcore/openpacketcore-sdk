@@ -9,7 +9,7 @@ use opc_protocol::{
     EncodeError, EncodeErrorCode, OwnedDecode, SpecRef, ToOwnedPdu,
 };
 
-use crate::header::{decode_header, encode_header, Header};
+use crate::header::{decode_header, encode_header, Header, MessageType};
 use crate::ie::{validate_ie_region, RawIeIterator};
 
 fn spec_ref() -> SpecRef {
@@ -37,6 +37,11 @@ pub struct Message<'a> {
 }
 
 impl<'a> Message<'a> {
+    /// Return the typed GTPv2-C message type, with an unknown fallback.
+    pub fn message_type(&self) -> MessageType {
+        self.header.typed_message_type()
+    }
+
     /// Iterate over the raw IE region with a default decode context.
     pub fn ies(&self) -> RawIeIterator<'a> {
         self.ies_with_context(DecodeContext::default())
@@ -163,6 +168,11 @@ pub struct OwnedMessage {
 }
 
 impl OwnedMessage {
+    /// Return the typed GTPv2-C message type, with an unknown fallback.
+    pub fn message_type(&self) -> MessageType {
+        self.header.typed_message_type()
+    }
+
     /// Borrow this owned message for encode and IE iteration.
     pub fn as_borrowed(&self) -> Message<'_> {
         Message {

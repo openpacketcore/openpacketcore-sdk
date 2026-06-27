@@ -9,12 +9,14 @@ Current scope is intentionally narrow:
 - raw-preserving TLIV Information Element validation and iteration;
 - owned and borrowed message shells for async handoff and forwarding paths;
 - typed S2b IE examples for IMSI, Cause, Recovery, APN, AMBR, EBI, MEI,
-  MSISDN, PAA, RAT Type, Serving Network, F-TEID, Bearer Context, PDN Type,
-  APN Restriction, and Selection Mode;
+  MSISDN, Indication, PCO, PAA, Bearer QoS, RAT Type, Serving Network,
+  F-TEID, Bearer Context, Charging ID, PDN Type, APN Restriction, Selection
+  Mode, and APCO;
 - typed S2b message views for Echo plus Create/Modify/Delete/Update
   Session-oriented flows, with ProcedureAware mandatory-IE checks for the
   claimed examples;
-- raw fallback for unsupported IEs such as PCO; and
+- a public `MessageType` enum with `Unknown(u8)` fallback plus raw fallback for
+  unsupported/private IEs; and
 - a cargo-fuzz manifest and decode target skeleton.
 
 It does **not** provide a complete GTPv2-C implementation, full S2b semantic
