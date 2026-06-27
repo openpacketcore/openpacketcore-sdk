@@ -310,9 +310,10 @@ mod tests {
     #[test]
     fn base_dictionary_user_name_requires_m_bit() {
         let dictionary = dictionary();
-        let user_name = dictionary
-            .find_avp(AvpKey::ietf(AVP_USER_NAME))
-            .expect("User-Name missing from base dictionary");
+        let user_name = match dictionary.find_avp(AvpKey::ietf(AVP_USER_NAME)) {
+            Some(definition) => definition,
+            None => panic!("User-Name missing from base dictionary"),
+        };
         assert_eq!(user_name.name(), "User-Name");
         let flags = user_name.flags();
         assert_eq!(flags.vendor(), FlagRequirement::MustBeUnset);

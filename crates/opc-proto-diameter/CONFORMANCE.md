@@ -4,8 +4,8 @@ Status: **experimental scaffold**.
 
 This crate does not yet claim full RFC 6733 or 3GPP Diameter conformance. The
 current scope exists so follow-up tasks can add independently authored fixtures,
-AVP decoding, grouped-AVP bounds, base procedure helpers, app dictionaries, and
-fuzz coverage without importing ePDG product policy or local-builder bytes as
+typed AVP value decoding, base procedure helpers, app dictionaries, and fuzz
+coverage without importing ePDG product policy or local-builder bytes as
 conformance evidence.
 
 ## Implemented scaffold
@@ -13,6 +13,9 @@ conformance evidence.
 - Diameter message header decode/encode for RFC 6733 section 3.
 - Raw Diameter message storage that preserves the top-level AVP byte region.
 - Raw AVP header/value/padding decode/encode for RFC 6733 section 4.
+- AVP-region validation for padding, per-region AVP count limits, duplicate
+  AVP-key rejection policy, and dictionary-defined grouped AVP recursion capped
+  by `DecodeContext::max_depth`.
 - Dictionary metadata architecture for applications, commands, AVPs, data types,
   and flag requirements.
 - Feature skeletons:
@@ -29,7 +32,7 @@ conformance evidence.
 - No fixture is counted as ADR 0015 conformance evidence yet.
 - No ePDG-derived Diameter bytes are imported; source local-builder cases remain
   parity/schema seeds until a later fixture-intake task records provenance.
-- Grouped AVP recursion limits and typed AVP value decoders are follow-up work.
+- Typed AVP value decoders are follow-up work.
 - Base procedure builders and application-specific command/AVP dictionaries are
   follow-up work.
 - Fuzz targets and fixture manifests are follow-up work.

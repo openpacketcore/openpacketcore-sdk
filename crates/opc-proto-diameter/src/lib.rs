@@ -36,8 +36,9 @@ pub mod peer;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
-    BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, Encode, EncodeContext,
-    EncodeError, EncodeErrorCode, OwnedDecode, SpecRef, ToOwnedPdu, ValidationLevel,
+    BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, DuplicateIePolicy,
+    Encode, EncodeContext, EncodeError, EncodeErrorCode, OwnedDecode, SpecRef, ToOwnedPdu,
+    ValidationLevel,
 };
 
 pub use dictionary::{
@@ -477,6 +478,28 @@ impl<'a> Message<'a> {
         RawAvpIterator::new(self.raw_avps, ctx)
     }
 
+    /// Validate the top-level AVP region with offsets relative to the message start.
+    pub fn validate_avps(&self, ctx: DecodeContext) -> Result<(), DecodeError> {
+        validate_top_level_avps(self.raw_avps, ctx)
+    }
+
+    /// Validate AVPs and dictionary-defined grouped AVP values recursively.
+    ///
+    /// The returned error offsets are relative to the Diameter message start.
+    pub fn validate_avps_with_dictionary(
+        &self,
+        ctx: DecodeContext,
+        dictionaries: DictionarySet<'_>,
+    ) -> Result<(), DecodeError> {
+        validate_avp_region_at(
+            self.raw_avps,
+            ctx,
+            DIAMETER_HEADER_LEN,
+            0,
+            Some(dictionaries),
+        )
+    }
+
     fn encoded_len(&self) -> Result<u32, EncodeError> {
         let len = DIAMETER_HEADER_LEN
             .checked_add(self.raw_avps.len())
@@ -764,7 +787,32 @@ impl Encode for RawAvp<'_> {
     }
 }
 
-impl RawAvp<'_> {
+impl<'a> RawAvp<'a> {
+    /// Return an iterator over this AVP's value as a grouped AVP region.
+    ///
+    /// Iterator error offsets are relative to the grouped value slice.
+    pub fn grouped_avps(&self, ctx: DecodeContext) -> RawAvpIterator<'a> {
+        RawAvpIterator::new(self.value, ctx)
+    }
+
+    /// Validate this AVP's value as a grouped AVP region.
+    ///
+    /// The returned error offsets are relative to the grouped value slice.
+    pub fn validate_grouped_value(&self, ctx: DecodeContext) -> Result<(), DecodeError> {
+        validate_avp_region_at(self.value, ctx, 0, 1, None)
+    }
+
+    /// Validate this AVP's value and dictionary-defined nested grouped AVPs recursively.
+    ///
+    /// The returned error offsets are relative to the grouped value slice.
+    pub fn validate_grouped_value_with_dictionary(
+        &self,
+        ctx: DecodeContext,
+        dictionaries: DictionarySet<'_>,
+    ) -> Result<(), DecodeError> {
+        validate_avp_region_at(self.value, ctx, 0, 1, Some(dictionaries))
+    }
+
     fn encoded_lens(&self) -> Result<(u32, usize), EncodeError> {
         let header_len = self.header.header_len();
         let unpadded = header_len
@@ -779,7 +827,7 @@ impl RawAvp<'_> {
     }
 }
 
-/// Iterator over borrowed top-level raw AVPs.
+/// Iterator over a borrowed raw AVP region.
 pub struct RawAvpIterator<'a> {
     remaining: &'a [u8],
     ctx: DecodeContext,
@@ -815,6 +863,30 @@ impl<'a> Iterator for RawAvpIterator<'a> {
             }
         }
     }
+}
+
+/// Validate a Diameter AVP region as a sequence of raw AVPs.
+///
+/// Error offsets are relative to the start of `input`. This validates AVP
+/// length fields, padding, per-region AVP counts, and duplicate AVP keys
+/// according to the supplied [`DecodeContext`]. It does not recurse into
+/// grouped AVP values without dictionary metadata; use
+/// [`validate_avp_region_with_dictionary`] for dictionary-defined grouped AVPs.
+pub fn validate_avp_region(input: &[u8], ctx: DecodeContext) -> Result<(), DecodeError> {
+    validate_avp_region_at(input, ctx, 0, 0, None)
+}
+
+/// Validate a Diameter AVP region using dictionary metadata for grouped AVPs.
+///
+/// Error offsets are relative to the start of `input`. AVPs whose dictionary
+/// definition has [`AvpDataType::Grouped`] are recursively validated as nested
+/// AVP regions, bounded by [`DecodeContext::max_depth`].
+pub fn validate_avp_region_with_dictionary(
+    input: &[u8],
+    ctx: DecodeContext,
+    dictionaries: DictionarySet<'_>,
+) -> Result<(), DecodeError> {
+    validate_avp_region_at(input, ctx, 0, 0, Some(dictionaries))
 }
 
 fn decode_raw_avp<'a>(input: &'a [u8], ctx: DecodeContext) -> DecodeResult<'a, RawAvp<'a>> {
@@ -900,12 +972,33 @@ fn decode_raw_avp<'a>(input: &'a [u8], ctx: DecodeContext) -> DecodeResult<'a, R
 }
 
 fn validate_top_level_avps(input: &[u8], ctx: DecodeContext) -> Result<(), DecodeError> {
+    validate_avp_region_at(input, ctx, DIAMETER_HEADER_LEN, 0, None)
+}
+
+fn validate_avp_region_at(
+    input: &[u8],
+    ctx: DecodeContext,
+    base_offset: usize,
+    depth: usize,
+    dictionaries: Option<DictionarySet<'_>>,
+) -> Result<(), DecodeError> {
     let spec_ref = SpecRef::new("ietf", "RFC6733", "4");
+    if depth > ctx.max_depth {
+        return Err(
+            DecodeError::new(DecodeErrorCode::DepthExceeded, base_offset).with_spec_ref(spec_ref),
+        );
+    }
+
     let mut remaining = input;
-    let mut offset = DIAMETER_HEADER_LEN;
+    let mut relative_offset = 0usize;
     let mut avp_count = 0usize;
+    let mut seen_keys = Vec::new();
 
     while !remaining.is_empty() {
+        let offset = base_offset.checked_add(relative_offset).ok_or_else(|| {
+            DecodeError::new(DecodeErrorCode::LengthOverflow, base_offset)
+                .with_spec_ref(spec_ref.clone())
+        })?;
         avp_count = avp_count.checked_add(1).ok_or_else(|| {
             DecodeError::new(DecodeErrorCode::LengthOverflow, offset)
                 .with_spec_ref(spec_ref.clone())
@@ -915,16 +1008,41 @@ fn validate_top_level_avps(input: &[u8], ctx: DecodeContext) -> Result<(), Decod
                 DecodeError::new(DecodeErrorCode::IeCountExceeded, offset).with_spec_ref(spec_ref)
             );
         }
+
         let before = remaining.len();
-        let (next, _) = match RawAvp::decode(remaining, ctx) {
+        let (next, avp) = match RawAvp::decode(remaining, ctx) {
             Ok(decoded) => decoded,
             Err(error) => return Err(shift_decode_error(error, offset)),
         };
+
+        if ctx.duplicate_ie_policy == DuplicateIePolicy::Reject {
+            let key = avp.header.key();
+            if seen_keys.contains(&key) {
+                return Err(
+                    DecodeError::new(DecodeErrorCode::DuplicateIe, offset).with_spec_ref(spec_ref)
+                );
+            }
+            seen_keys.push(key);
+        }
+
+        if dictionary_marks_grouped(&avp, dictionaries) {
+            let child_depth = depth.saturating_add(1);
+            if child_depth > ctx.max_depth {
+                return Err(DecodeError::new(DecodeErrorCode::DepthExceeded, offset)
+                    .with_spec_ref(spec_ref));
+            }
+            let child_base = offset.checked_add(avp.header.header_len()).ok_or_else(|| {
+                DecodeError::new(DecodeErrorCode::LengthOverflow, offset)
+                    .with_spec_ref(spec_ref.clone())
+            })?;
+            validate_avp_region_at(avp.value, ctx, child_base, child_depth, dictionaries)?;
+        }
+
         let consumed = before.checked_sub(next.len()).ok_or_else(|| {
             DecodeError::new(DecodeErrorCode::LengthOverflow, offset)
                 .with_spec_ref(spec_ref.clone())
         })?;
-        offset = offset.checked_add(consumed).ok_or_else(|| {
+        relative_offset = relative_offset.checked_add(consumed).ok_or_else(|| {
             DecodeError::new(DecodeErrorCode::LengthOverflow, offset)
                 .with_spec_ref(spec_ref.clone())
         })?;
@@ -932,6 +1050,16 @@ fn validate_top_level_avps(input: &[u8], ctx: DecodeContext) -> Result<(), Decod
     }
 
     Ok(())
+}
+
+fn dictionary_marks_grouped(avp: &RawAvp<'_>, dictionaries: Option<DictionarySet<'_>>) -> bool {
+    let Some(dictionaries) = dictionaries else {
+        return false;
+    };
+    dictionaries
+        .find_avp(avp.header.key())
+        .map(|definition| definition.data_type() == AvpDataType::Grouped)
+        .unwrap_or(false)
 }
 
 fn shift_decode_error(error: DecodeError, base_offset: usize) -> DecodeError {

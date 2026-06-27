@@ -8,6 +8,9 @@ currently provides:
 - RFC 6733 Diameter header framing and raw AVP framing with checked 24-bit
   length/command fields;
 - raw-preserving message and AVP storage for future byte-exact fixtures;
+- AVP-region validation for per-message/per-group AVP count limits, duplicate
+  AVP-key rejection policy, zero padding in strict mode, and dictionary-marked
+  grouped AVP recursion bounded by `DecodeContext::max_depth`;
 - dictionary metadata types for applications, commands, AVPs, flag rules, and
   layered lookup; and
 - feature-gated skeleton dictionaries for base, peer, and selected 3GPP
