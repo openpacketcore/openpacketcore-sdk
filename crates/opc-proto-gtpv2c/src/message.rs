@@ -47,8 +47,8 @@ impl<'a> Message<'a> {
     /// This method does **not** inherit the [`DecodeContext`] used during
     /// message decode; it always uses [`DecodeContext::default()`]. Callers
     /// that decoded with a non-default context (for example
-    /// [`ValidationLevel::Strict`]) and want the same limits applied to IE
-    /// iteration should use [`Self::ies_with_context`] instead.
+    /// [`opc_protocol::ValidationLevel::Strict`]) and want the same limits
+    /// applied to IE iteration should use [`Self::ies_with_context`] instead.
     pub fn ies(&self) -> RawIeIterator<'a> {
         self.ies_with_context(DecodeContext::default())
     }
@@ -341,25 +341,24 @@ mod tests {
             Err(error) => panic!("HeaderOnly decode failed: {error:?}"),
         };
         assert_eq!(message.header.teid, Some(0x0102_0304));
+
+        // Default ies() (Structural) and explicit HeaderOnly iteration both accept
+        // the spare bits.
+        let default_ies: Vec<_> = message.ies().collect();
+        assert_eq!(default_ies.len(), 1);
+        assert!(default_ies[0].is_ok());
+
         let ies: Vec<_> = message.ies_with_context(header_only_ctx).collect();
         assert_eq!(ies.len(), 1);
-        let ie = match ies.into_iter().next() {
-            Some(Ok(ie)) => ie,
-            Some(Err(error)) => panic!("HeaderOnly IE decode failed: {error:?}"),
-            None => panic!("expected one IE"),
+        let ie = match &ies[0] {
+            Ok(ie) => ie.clone(),
+            Err(error) => panic!("HeaderOnly IE decode failed: {error:?}"),
         };
         assert_eq!(ie.ie_type, 0xff);
         assert_eq!(ie.value, [0xaa]);
 
-        // Structural (default) also accepts spare bits; only Strict rejects.
-        let strict_ctx = DecodeContext {
-            validation_level: ValidationLevel::Strict,
-            ..DecodeContext::default()
-        };
-        assert!(
-            Message::decode(&bytes, strict_ctx).is_err(),
-            "Strict decode should reject IE spare bits"
-        );
+        // Only Strict rejects this payload; that behavior is covered by
+        // strict_decode_rejects_ie_spare_bits above.
     }
 
     #[test]
