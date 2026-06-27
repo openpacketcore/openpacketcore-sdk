@@ -70,7 +70,6 @@ pub enum RedactionError {
 }
 
 /// A summary of the redactions applied to the support bundle.
-#[non_exhaustive]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RedactionSummary {
