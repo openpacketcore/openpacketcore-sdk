@@ -5,9 +5,22 @@
 use rcgen::{CertificateParams, DnType, SanType};
 use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Return a short, unique Unix-domain socket path.
+///
+/// Tests that create sockets inside `tempfile::tempdir()` can fail when the
+/// effective temp directory is deep, because Linux's `sun_path` is limited to
+/// ~108 bytes. This helper places sockets directly under `/tmp` with a random
+/// UUID filename so the path is always short and unique per invocation.
+pub fn short_unix_socket_path(name: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "/tmp/opc-test-{name}-{}.sock",
+        uuid::Uuid::new_v4()
+    ))
+}
 
 pub struct FakeCa {
     pub ca_cert_pem: String,
