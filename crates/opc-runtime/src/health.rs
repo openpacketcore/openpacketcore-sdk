@@ -132,7 +132,7 @@ pub enum GateStatus {
     serde::Deserialize,
 )]
 #[serde(transparent)]
-pub struct GateName(pub String);
+pub struct GateName(String);
 
 impl GateName {
     /// Create a gate name from any string-like value.
@@ -144,10 +144,15 @@ impl GateName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Consume the gate name and return the owned string.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
 }
 
-impl From<&'static str> for GateName {
-    fn from(value: &'static str) -> Self {
+impl From<&str> for GateName {
+    fn from(value: &str) -> Self {
         Self::new(value)
     }
 }
@@ -561,6 +566,10 @@ impl HealthModel {
     }
 
     /// Insert or replace a named gate and recompute readiness.
+    ///
+    /// Note: this recomputes readiness from the model's signals. It does not
+    /// preserve an externally-imposed [`Readiness::Draining`] state; callers
+    /// should avoid mutating gates while the runtime is draining.
     pub fn set_gate(&mut self, gate: HealthGate) {
         self.gates.insert(gate);
         self.readiness = self.compute_readiness();
@@ -569,6 +578,10 @@ impl HealthModel {
     /// Update the status of an existing named gate and recompute readiness.
     ///
     /// Returns `true` if the gate existed.
+    ///
+    /// Note: this recomputes readiness from the model's signals. It does not
+    /// preserve an externally-imposed [`Readiness::Draining`] state; callers
+    /// should avoid mutating gates while the runtime is draining.
     pub fn update_gate_status(&mut self, name: &GateName, status: GateStatus) -> bool {
         if self.gates.set_status(name, status) {
             self.readiness = self.compute_readiness();
@@ -579,6 +592,10 @@ impl HealthModel {
     }
 
     /// Remove a named gate and recompute readiness.
+    ///
+    /// Note: this recomputes readiness from the model's signals. It does not
+    /// preserve an externally-imposed [`Readiness::Draining`] state; callers
+    /// should avoid mutating gates while the runtime is draining.
     pub fn remove_gate(&mut self, name: &GateName) -> Option<HealthGate> {
         let removed = self.gates.remove(name);
         if removed.is_some() {
@@ -994,6 +1011,68 @@ mod health_gate_tests {
 
         model.remove_gate(&gate_name);
         assert_eq!(model.readiness, Readiness::Ready);
+    }
+
+    #[test]
+    fn health_gate_set_status_missing_returns_false_and_leaves_readiness() {
+        let mut gates = HealthGateSet::new().with_gate(HealthGate::new(
+            known_gates::CONFIG,
+            GateImpact::BlocksReadiness,
+        ));
+        let before = gates.readiness();
+        let missing_name: GateName = "missing".into();
+
+        assert!(!gates.set_status(&missing_name, GateStatus::Passing));
+        assert_eq!(gates.readiness(), before);
+        assert!(gates.get(&known_gates::CONFIG.into()).unwrap().status == GateStatus::Unknown);
+    }
+
+    #[test]
+    fn health_gate_set_remove_missing_returns_none_and_leaves_readiness() {
+        let mut gates = HealthGateSet::new().with_gate(HealthGate::new(
+            known_gates::CONFIG,
+            GateImpact::BlocksReadiness,
+        ));
+        let before = gates.readiness();
+        let missing_name: GateName = "missing".into();
+
+        assert!(gates.remove(&missing_name).is_none());
+        assert_eq!(gates.readiness(), before);
+        assert_eq!(gates.len(), 1);
+    }
+
+    #[test]
+    fn health_model_update_gate_status_missing_returns_false_and_leaves_readiness() {
+        let mut model = HealthModel::new();
+        model.set_startup_complete();
+        model.set_config_applied(true);
+        model.set_critical_tasks_healthy(true);
+        model.set_listeners_bound(true);
+        model.set_security_material_valid(true);
+        model.set_backends_reachable(true);
+
+        let before = model.readiness;
+        let missing_name: GateName = "missing".into();
+
+        assert!(!model.update_gate_status(&missing_name, GateStatus::Passing));
+        assert_eq!(model.readiness, before);
+    }
+
+    #[test]
+    fn health_model_remove_gate_missing_returns_none_and_leaves_readiness() {
+        let mut model = HealthModel::new();
+        model.set_startup_complete();
+        model.set_config_applied(true);
+        model.set_critical_tasks_healthy(true);
+        model.set_listeners_bound(true);
+        model.set_security_material_valid(true);
+        model.set_backends_reachable(true);
+
+        let before = model.readiness;
+        let missing_name: GateName = "missing".into();
+
+        assert!(model.remove_gate(&missing_name).is_none());
+        assert_eq!(model.readiness, before);
     }
 
     #[test]
