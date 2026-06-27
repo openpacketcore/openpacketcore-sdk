@@ -108,7 +108,7 @@ const BASE_AVPS: [AvpDefinition; 23] = [
         AvpKey::ietf(AVP_USER_NAME),
         "User-Name",
         AvpDataType::Utf8String,
-        AvpFlagRules::base_must_not_set_m(),
+        AvpFlagRules::base_mandatory(),
         SpecRef::new("ietf", "RFC6733", "8.14"),
     ),
     AvpDefinition::new(
@@ -185,7 +185,7 @@ const BASE_AVPS: [AvpDefinition; 23] = [
         AvpKey::ietf(AVP_PRODUCT_NAME),
         "Product-Name",
         AvpDataType::Utf8String,
-        AvpFlagRules::base_optional(),
+        AvpFlagRules::base_must_not_set_m(),
         SpecRef::new("ietf", "RFC6733", "5.3.7"),
     ),
     AvpDefinition::new(
@@ -213,7 +213,7 @@ const BASE_AVPS: [AvpDefinition; 23] = [
         AvpKey::ietf(AVP_ERROR_MESSAGE),
         "Error-Message",
         AvpDataType::Utf8String,
-        AvpFlagRules::base_optional(),
+        AvpFlagRules::base_must_not_set_m(),
         SpecRef::new("ietf", "RFC6733", "7.3"),
     ),
     AvpDefinition::new(
@@ -234,7 +234,7 @@ const BASE_AVPS: [AvpDefinition; 23] = [
         AvpKey::ietf(AVP_ERROR_REPORTING_HOST),
         "Error-Reporting-Host",
         AvpDataType::DiameterIdentity,
-        AvpFlagRules::base_optional(),
+        AvpFlagRules::base_must_not_set_m(),
         SpecRef::new("ietf", "RFC6733", "7.4"),
     ),
     AvpDefinition::new(
