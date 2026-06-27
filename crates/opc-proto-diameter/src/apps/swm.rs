@@ -277,26 +277,31 @@ impl SwmDiameterEapRequest {
         if self.session_id.as_ref().is_empty() {
             return Err(encode_structural_error(
                 "SWm DER Session-Id must not be empty",
+                "DER",
             ));
         }
         if self.origin_host.as_ref().is_empty() {
             return Err(encode_structural_error(
                 "SWm DER Origin-Host must not be empty",
+                "DER",
             ));
         }
         if self.origin_realm.as_ref().is_empty() {
             return Err(encode_structural_error(
                 "SWm DER Origin-Realm must not be empty",
+                "DER",
             ));
         }
         if self.destination_realm.as_ref().is_empty() {
             return Err(encode_structural_error(
                 "SWm DER Destination-Realm must not be empty",
+                "DER",
             ));
         }
         if self.auth_application_id != APPLICATION_ID.get() {
             return Err(encode_structural_error(
                 "SWm DER Auth-Application-Id must be the SWm application id",
+                "DER",
             ));
         }
         Ok(())
@@ -308,21 +313,25 @@ impl SwmDiameterEapAnswer {
         if self.session_id.as_ref().is_empty() {
             return Err(encode_structural_error(
                 "SWm DEA Session-Id must not be empty",
+                "DEA",
             ));
         }
         if self.origin_host.as_ref().is_empty() {
             return Err(encode_structural_error(
                 "SWm DEA Origin-Host must not be empty",
+                "DEA",
             ));
         }
         if self.origin_realm.as_ref().is_empty() {
             return Err(encode_structural_error(
                 "SWm DEA Origin-Realm must not be empty",
+                "DEA",
             ));
         }
         if self.auth_application_id != APPLICATION_ID.get() {
             return Err(encode_structural_error(
                 "SWm DEA Auth-Application-Id must be the SWm application id",
+                "DEA",
             ));
         }
         Ok(())
@@ -820,7 +829,7 @@ pub fn parse_swm_diameter_eap_answer(
     })
 }
 
-fn encode_structural_error(reason: &'static str) -> EncodeError {
+fn encode_structural_error(reason: &'static str, section: &'static str) -> EncodeError {
     EncodeError::new(EncodeErrorCode::Structural { reason })
-        .with_spec_ref(SpecRef::new("3gpp", "TS29273", "DER"))
+        .with_spec_ref(SpecRef::new("3gpp", "TS29273", section))
 }

@@ -403,6 +403,57 @@ fn build_raw_rf_acr(acct_application_id: Option<u32>, extras: &[BytesMut]) -> Ow
     }
 }
 
+#[cfg(feature = "app-rf")]
+fn build_raw_rf_aca(acct_application_id: Option<u32>, extras: &[BytesMut]) -> OwnedMessage {
+    let mut raw_avps = BytesMut::new();
+    raw_avps.extend_from_slice(&encode_raw_avp(
+        base::AVP_SESSION_ID,
+        true,
+        b"session;rf;001",
+    ));
+    raw_avps.extend_from_slice(&encode_raw_avp(
+        base::AVP_RESULT_CODE,
+        true,
+        &2001u32.to_be_bytes(),
+    ));
+    raw_avps.extend_from_slice(&encode_raw_avp(base::AVP_ORIGIN_HOST, true, b"cdf.example"));
+    raw_avps.extend_from_slice(&encode_raw_avp(
+        base::AVP_ORIGIN_REALM,
+        true,
+        b"epc.example.org",
+    ));
+    raw_avps.extend_from_slice(&encode_raw_avp(
+        apps::rf::AVP_ACCOUNTING_RECORD_TYPE,
+        true,
+        &2u32.to_be_bytes(),
+    ));
+    raw_avps.extend_from_slice(&encode_raw_avp(
+        apps::rf::AVP_ACCOUNTING_RECORD_NUMBER,
+        true,
+        &0u32.to_be_bytes(),
+    ));
+    if let Some(id) = acct_application_id {
+        raw_avps.extend_from_slice(&encode_raw_avp(
+            base::AVP_ACCT_APPLICATION_ID,
+            true,
+            &id.to_be_bytes(),
+        ));
+    }
+    for extra in extras {
+        raw_avps.extend_from_slice(extra);
+    }
+    OwnedMessage {
+        header: Header::new(
+            CommandFlags::answer(true, false),
+            CommandCode::new(271),
+            ApplicationId::new(3),
+            1,
+            2,
+        ),
+        raw_avps: raw_avps.freeze(),
+    }
+}
+
 #[cfg(feature = "app-swm")]
 fn build_raw_swm_der(auth_application_id: Option<u32>) -> OwnedMessage {
     let mut raw_avps = BytesMut::new();
@@ -451,6 +502,49 @@ fn build_raw_swm_der(auth_application_id: Option<u32>) -> OwnedMessage {
     }
 }
 
+#[cfg(feature = "app-swm")]
+fn build_raw_swm_dea(auth_application_id: Option<u32>) -> OwnedMessage {
+    let mut raw_avps = BytesMut::new();
+    raw_avps.extend_from_slice(&encode_raw_avp(base::AVP_SESSION_ID, true, b"sess;swm;001"));
+    if let Some(id) = auth_application_id {
+        raw_avps.extend_from_slice(&encode_raw_avp(
+            base::AVP_AUTH_APPLICATION_ID,
+            true,
+            &id.to_be_bytes(),
+        ));
+    }
+    raw_avps.extend_from_slice(&encode_raw_avp(
+        apps::swm::AVP_AUTH_REQUEST_TYPE,
+        true,
+        &3u32.to_be_bytes(),
+    ));
+    raw_avps.extend_from_slice(&encode_raw_avp(
+        base::AVP_RESULT_CODE,
+        true,
+        &2001u32.to_be_bytes(),
+    ));
+    raw_avps.extend_from_slice(&encode_raw_avp(
+        base::AVP_ORIGIN_HOST,
+        true,
+        b"aaa.home.example",
+    ));
+    raw_avps.extend_from_slice(&encode_raw_avp(
+        base::AVP_ORIGIN_REALM,
+        true,
+        b"home.example",
+    ));
+    OwnedMessage {
+        header: Header::new(
+            CommandFlags::answer(true, false),
+            CommandCode::new(268),
+            ApplicationId::new(16_777_264),
+            1,
+            2,
+        ),
+        raw_avps: raw_avps.freeze(),
+    }
+}
+
 #[test]
 #[cfg(feature = "app-rf")]
 fn rf_acr_rejects_wrong_acct_application_id_in_builder() {
@@ -490,48 +584,16 @@ fn rf_aca_rejects_wrong_acct_application_id_in_builder() {
 #[test]
 #[cfg(feature = "app-rf")]
 fn rf_aca_rejects_wrong_acct_application_id_in_parser() {
-    let mut raw_avps = BytesMut::new();
-    raw_avps.extend_from_slice(&encode_raw_avp(
-        base::AVP_SESSION_ID,
-        true,
-        b"session;rf;001",
-    ));
-    raw_avps.extend_from_slice(&encode_raw_avp(
-        base::AVP_RESULT_CODE,
-        true,
-        &2001u32.to_be_bytes(),
-    ));
-    raw_avps.extend_from_slice(&encode_raw_avp(base::AVP_ORIGIN_HOST, true, b"cdf.example"));
-    raw_avps.extend_from_slice(&encode_raw_avp(
-        base::AVP_ORIGIN_REALM,
-        true,
-        b"epc.example.org",
-    ));
-    raw_avps.extend_from_slice(&encode_raw_avp(
-        apps::rf::AVP_ACCOUNTING_RECORD_TYPE,
-        true,
-        &2u32.to_be_bytes(),
-    ));
-    raw_avps.extend_from_slice(&encode_raw_avp(
-        apps::rf::AVP_ACCOUNTING_RECORD_NUMBER,
-        true,
-        &0u32.to_be_bytes(),
-    ));
-    raw_avps.extend_from_slice(&encode_raw_avp(
-        base::AVP_ACCT_APPLICATION_ID,
-        true,
-        &0u32.to_be_bytes(),
-    ));
-    let message = OwnedMessage {
-        header: Header::new(
-            CommandFlags::answer(true, false),
-            CommandCode::new(271),
-            ApplicationId::new(3),
-            1,
-            2,
-        ),
-        raw_avps: raw_avps.freeze(),
-    };
+    let message = build_raw_rf_aca(Some(0), &[]);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    assert!(apps::rf::parse_rf_accounting_answer(&decoded, DecodeContext::default()).is_err());
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn rf_aca_rejects_missing_acct_application_id_in_parser() {
+    let message = build_raw_rf_aca(None, &[]);
     let encoded = encode_message(&message);
     let decoded = decode_message(&encoded);
     assert!(apps::rf::parse_rf_accounting_answer(&decoded, DecodeContext::default()).is_err());
@@ -564,6 +626,34 @@ fn swm_der_rejects_missing_auth_application_id_in_parser() {
     let encoded = encode_message(&message);
     let decoded = decode_message(&encoded);
     assert!(apps::swm::parse_swm_diameter_eap_request(&decoded, DecodeContext::default()).is_err());
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_rejects_wrong_auth_application_id_in_builder() {
+    let mut answer = sample_swm_answer();
+    answer.auth_application_id = 0;
+    assert!(
+        apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default()).is_err()
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_rejects_wrong_auth_application_id_in_parser() {
+    let message = build_raw_swm_dea(Some(0));
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    assert!(apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::default()).is_err());
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_rejects_missing_auth_application_id_in_parser() {
+    let message = build_raw_swm_dea(None);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    assert!(apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::default()).is_err());
 }
 
 #[test]
@@ -636,8 +726,11 @@ fn rf_grouped_subscription_id_rejects_too_many_children() {
         true,
         b"001010123456789",
     ));
-    // Non-mandatory unknown AVP so the third child triggers IeCountExceeded.
-    sub_value.extend_from_slice(&encode_raw_avp(AvpCode::new(999), false, b"extra"));
+    // Add enough non-mandatory children inside Subscription-Id to overflow the
+    // grouped IE-count guard while keeping the top-level count below the limit.
+    for i in 0..10 {
+        sub_value.extend_from_slice(&encode_raw_avp(AvpCode::new(990 + i), false, b"extra"));
+    }
     let extras = [encode_raw_avp(
         apps::rf::AVP_SUBSCRIPTION_ID,
         true,
@@ -647,10 +740,17 @@ fn rf_grouped_subscription_id_rejects_too_many_children() {
     let encoded = encode_message(&message);
     let decoded = decode_message(&encoded);
     let ctx = DecodeContext {
-        max_ies: 2,
+        max_ies: 10,
         ..DecodeContext::default()
     };
-    assert!(apps::rf::parse_rf_accounting_request(&decoded, ctx).is_err());
+    let err = apps::rf::parse_rf_accounting_request(&decoded, ctx)
+        .expect_err("grouped IE-count guard must fire");
+    assert!(matches!(
+        err.code(),
+        opc_protocol::DecodeErrorCode::IeCountExceeded
+    ));
+    // The failure must be inside the Subscription-Id grouped value, not at top level.
+    assert!(err.offset() > 120);
 }
 
 #[test]

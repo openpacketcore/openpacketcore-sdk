@@ -342,21 +342,12 @@ impl SubscriptionIdType {
 }
 
 /// A single subscription identifier carried inside a Subscription-Id grouped AVP.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscriptionId {
     /// Type of subscription identifier.
     pub subscription_id_type: SubscriptionIdType,
     /// Subscription identifier value (redacted in diagnostic output).
     pub subscription_id_data: Redacted<String>,
-}
-
-impl std::fmt::Debug for SubscriptionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SubscriptionId")
-            .field("subscription_id_type", &self.subscription_id_type)
-            .field("subscription_id_data", &self.subscription_id_data)
-            .finish()
-    }
 }
 
 /// Used-Service-Unit grouped AVP (RFC 4006 §8.19).
@@ -397,7 +388,7 @@ pub struct PsInformation {
 }
 
 /// Rf Accounting-Request (ACR) for START, INTERIM, STOP, and EVENT records.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RfAccountingRequest {
     /// Session-Id (redacted in diagnostic output).
     pub session_id: Redacted<String>,
@@ -431,33 +422,8 @@ pub struct RfAccountingRequest {
     pub ps_information: Option<PsInformation>,
 }
 
-impl std::fmt::Debug for RfAccountingRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RfAccountingRequest")
-            .field("session_id", &self.session_id)
-            .field("origin_host", &self.origin_host)
-            .field("origin_realm", &self.origin_realm)
-            .field("destination_realm", &self.destination_realm)
-            .field("destination_host", &self.destination_host)
-            .field("accounting_record_type", &self.accounting_record_type)
-            .field("accounting_record_number", &self.accounting_record_number)
-            .field("acct_application_id", &self.acct_application_id)
-            .field("user_name", &self.user_name)
-            .field("origin_state_id", &self.origin_state_id)
-            .field("event_timestamp", &self.event_timestamp)
-            .field("service_context_id", &self.service_context_id)
-            .field("subscription_ids", &self.subscription_ids)
-            .field(
-                "multiple_services_credit_controls",
-                &self.multiple_services_credit_controls,
-            )
-            .field("ps_information", &self.ps_information)
-            .finish()
-    }
-}
-
 /// Rf Accounting-Answer (ACA).
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RfAccountingAnswer {
     /// Session-Id (redacted in diagnostic output).
     pub session_id: Redacted<String>,
@@ -477,22 +443,6 @@ pub struct RfAccountingAnswer {
     pub origin_state_id: Option<u32>,
     /// Event-Timestamp.
     pub event_timestamp: Option<u32>,
-}
-
-impl std::fmt::Debug for RfAccountingAnswer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RfAccountingAnswer")
-            .field("session_id", &self.session_id)
-            .field("result_code", &self.result_code)
-            .field("origin_host", &self.origin_host)
-            .field("origin_realm", &self.origin_realm)
-            .field("accounting_record_type", &self.accounting_record_type)
-            .field("accounting_record_number", &self.accounting_record_number)
-            .field("acct_application_id", &self.acct_application_id)
-            .field("origin_state_id", &self.origin_state_id)
-            .field("event_timestamp", &self.event_timestamp)
-            .finish()
-    }
 }
 
 impl RfAccountingRequest {
@@ -716,7 +666,12 @@ pub fn parse_rf_accounting_request(
             let code = avp.header.code;
             if let Some(vendor_id) = avp.header.vendor_id {
                 if code == AVP_PS_INFORMATION && vendor_id == VENDOR_ID_3GPP {
-                    ps_information = Some(parse_ps_information(avp.value, ctx, value_offset, 1)?);
+                    builder_helpers::set_once(
+                        &mut ps_information,
+                        parse_ps_information(avp.value, ctx, value_offset, 1)?,
+                        offset,
+                        "TS32299",
+                    )?;
                 } else {
                     builder_helpers::handle_unknown_avp(ctx, &avp, offset, "7")?;
                 }
@@ -1113,10 +1068,12 @@ fn parse_subscription_id(
         Ok(())
     })?;
     Ok(SubscriptionId {
-        subscription_id_type: subscription_id_type
-            .ok_or_else(|| missing_child_error(base_offset, "Subscription-Id-Type"))?,
-        subscription_id_data: subscription_id_data
-            .ok_or_else(|| missing_child_error(base_offset, "Subscription-Id-Data"))?,
+        subscription_id_type: subscription_id_type.ok_or_else(|| {
+            missing_child_error(base_offset, "missing Subscription-Id-Type child AVP")
+        })?,
+        subscription_id_data: subscription_id_data.ok_or_else(|| {
+            missing_child_error(base_offset, "missing Subscription-Id-Data child AVP")
+        })?,
     })
 }
 
@@ -1252,7 +1209,7 @@ fn parse_multiple_services_credit_control(
         if code == AVP_USED_SERVICE_UNIT {
             builder_helpers::set_once(
                 &mut used_service_unit,
-                parse_used_service_unit(avp.value, ctx, offset, depth + 1)?,
+                parse_used_service_unit(avp.value, ctx, value_offset, depth + 1)?,
                 offset,
                 "8.16",
             )?;
@@ -1387,14 +1344,9 @@ fn parse_ps_information(
     })
 }
 
-fn missing_child_error(base_offset: usize, _avp_name: &'static str) -> DecodeError {
-    DecodeError::new(
-        DecodeErrorCode::Structural {
-            reason: "missing required child AVP",
-        },
-        base_offset,
-    )
-    .with_spec_ref(SpecRef::new("ietf", "RFC6733", "grouped"))
+fn missing_child_error(base_offset: usize, reason: &'static str) -> DecodeError {
+    DecodeError::new(DecodeErrorCode::Structural { reason }, base_offset)
+        .with_spec_ref(SpecRef::new("ietf", "RFC6733", "grouped"))
 }
 
 fn encode_structural_error(reason: &'static str) -> EncodeError {
