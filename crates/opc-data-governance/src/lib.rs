@@ -11,5 +11,5 @@
 mod class;
 mod retention;
 
-pub use class::{DataClass, IdentifierType};
+pub use class::{DataClass, IdentifierType, TelcoIdentifierClass};
 pub use retention::{DisposalAction, PolicyError, RetentionPolicy};
