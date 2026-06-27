@@ -1,8 +1,8 @@
 //! Redaction-safe error types for XFRM backend operations.
 //!
 //! Error variants deliberately carry only stable operation/field labels and
-//! payload-free reasons. They never hold raw key material, SPIs, or addresses,
-//! so `Debug` and `Display` are safe for logs and support bundles.
+//! static payload-free reasons. They never hold raw key material, SPIs, or
+//! addresses, so `Debug` and `Display` are safe for logs and support bundles.
 
 use std::io;
 
@@ -32,8 +32,10 @@ pub enum XfrmError {
     InvalidConfig {
         /// Stable field label.
         field: &'static str,
-        /// Payload-free reason.
-        reason: String,
+        /// Static payload-free reason. Keeping this `&'static str` prevents
+        /// accidental inclusion of request-derived sensitive values in a
+        /// redaction-safe error.
+        reason: &'static str,
     },
     /// Kernel or socket I/O failed.
     #[error("XFRM {operation} failed")]
@@ -52,12 +54,9 @@ pub enum XfrmError {
 }
 
 impl XfrmError {
-    /// Build an `InvalidConfig` error with a converted reason.
-    pub fn invalid_config(field: &'static str, reason: impl Into<String>) -> Self {
-        Self::InvalidConfig {
-            field,
-            reason: reason.into(),
-        }
+    /// Build an `InvalidConfig` error with a static reason.
+    pub fn invalid_config(field: &'static str, reason: &'static str) -> Self {
+        Self::InvalidConfig { field, reason }
     }
 
     /// Build an `Io` error with a stable operation label.

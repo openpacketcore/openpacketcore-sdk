@@ -7,10 +7,11 @@
 
 use std::fmt;
 
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 /// IP address used by XFRM selectors and identities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum IpAddress {
     /// IPv4 address as four octets.
     Ipv4([u8; 4]),
@@ -153,7 +154,10 @@ impl AuthAlgorithm {
 ///
 /// The bytes are zeroized on drop. `Debug` and `Display` never emit the raw
 /// material; they show only the length and a redaction placeholder.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// Equality uses a constant-time byte comparison to avoid exposing the key
+/// through a timing side-channel.
+#[derive(Clone)]
 pub struct KeyMaterial {
     bytes: Zeroizing<Vec<u8>>,
 }
@@ -197,6 +201,14 @@ impl fmt::Display for KeyMaterial {
         write!(f, "<redacted:{} bytes>", self.bytes.len())
     }
 }
+
+impl PartialEq for KeyMaterial {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes.ct_eq(&other.bytes).into()
+    }
+}
+
+impl Eq for KeyMaterial {}
 
 /// Lifetime limits for an SA or policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

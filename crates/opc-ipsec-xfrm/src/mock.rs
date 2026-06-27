@@ -45,6 +45,8 @@ pub enum MockOperation {
         protocol: u8,
         /// Authentication algorithm name, if present.
         auth_algo: Option<String>,
+        /// Authentication truncation length in bits, if present.
+        auth_truncation_len_bits: Option<u32>,
         /// Authentication key length in bytes.
         auth_key_len: usize,
         /// Encryption algorithm name, if present.
@@ -72,6 +74,8 @@ pub enum MockOperation {
         protocol: u8,
         /// Authentication algorithm name, if present.
         auth_algo: Option<String>,
+        /// Authentication truncation length in bits, if present.
+        auth_truncation_len_bits: Option<u32>,
         /// Authentication key length in bytes.
         auth_key_len: usize,
         /// Encryption algorithm name, if present.
@@ -134,17 +138,22 @@ pub enum MockOperation {
 /// Deterministic in-memory XFRM backend.
 ///
 /// Records every operation so tests can assert on the requests that reached the
-/// backend. SPI allocations start at a fixed base and increment by one. Errors
-/// can be injected to exercise caller recovery paths.
+/// backend. SPI allocations choose the first free SPI in the requested
+/// inclusive range, skipping reserved SPI 0. Errors can be injected to exercise
+/// caller recovery paths.
 #[derive(Debug, Clone)]
 pub struct MockXfrmBackend {
     state: Arc<Mutex<MockState>>,
 }
 
+/// Allocated SPI identity used to allow the same SPI value to be reused for a
+/// different destination or protocol.
+type AllocatedSpiKey = (IpAddress, u8, u32);
+
 #[derive(Debug)]
 struct MockState {
     operations: Vec<MockOperation>,
-    allocated_spis: BTreeSet<u32>,
+    allocated_spis: BTreeSet<AllocatedSpiKey>,
     probe_result: XfrmProbe,
     failure: Option<XfrmError>,
 }
@@ -169,31 +178,46 @@ impl MockXfrmBackend {
 
     /// Inject an error that every subsequent operation will return.
     pub fn set_failure(&self, error: XfrmError) {
-        let mut state = self.state.lock().expect("mock state mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.failure = Some(error);
     }
 
     /// Clear any injected failure.
     pub fn clear_failure(&self) {
-        let mut state = self.state.lock().expect("mock state mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.failure = None;
     }
 
     /// Set the result returned by `probe`.
     pub fn set_probe_result(&self, probe_result: XfrmProbe) {
-        let mut state = self.state.lock().expect("mock state mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.probe_result = probe_result;
     }
 
     /// Return all recorded operations, in order.
     pub fn operations(&self) -> Vec<MockOperation> {
-        let state = self.state.lock().expect("mock state mutex poisoned");
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.operations.clone()
     }
 
     /// Clear the recorded operation log.
     pub fn clear_operations(&self) {
-        let mut state = self.state.lock().expect("mock state mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.operations.clear();
     }
 
@@ -214,7 +238,10 @@ impl Default for MockXfrmBackend {
 #[async_trait]
 impl XfrmBackend for MockXfrmBackend {
     async fn allocate_spi(&self, request: AllocateSpiRequest) -> Result<SpiAllocation, XfrmError> {
-        let mut state = self.state.lock().expect("mock state mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::check_failure(&state)?;
 
         if request.min_spi > request.max_spi {
@@ -227,10 +254,16 @@ impl XfrmBackend for MockXfrmBackend {
         // SPI 0 is reserved ("any" / wildcard) in XFRM; never allocate it.
         let start = request.min_spi.max(1);
         let spi = (start..=request.max_spi)
-            .find(|spi| !state.allocated_spis.contains(spi))
+            .find(|spi| {
+                !state
+                    .allocated_spis
+                    .contains(&(request.destination, request.protocol, *spi))
+            })
             .ok_or(XfrmError::Unavailable)?;
 
-        state.allocated_spis.insert(spi);
+        state
+            .allocated_spis
+            .insert((request.destination, request.protocol, spi));
         state.operations.push(MockOperation::AllocateSpi {
             destination: request.destination,
             protocol: request.protocol,
@@ -245,7 +278,10 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn install_sa(&self, request: InstallSaRequest) -> Result<(), XfrmError> {
-        let mut state = self.state.lock().expect("mock state mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::check_failure(&state)?;
         state.operations.push(MockOperation::InstallSa {
             selector: request.parameters.selector.clone(),
@@ -258,6 +294,11 @@ impl XfrmBackend for MockXfrmBackend {
                 .auth
                 .as_ref()
                 .map(|(a, _)| a.name.clone()),
+            auth_truncation_len_bits: request
+                .parameters
+                .auth
+                .as_ref()
+                .map(|(a, _)| a.truncation_len_bits),
             auth_key_len: request
                 .parameters
                 .auth
@@ -283,7 +324,10 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn rekey_sa(&self, request: RekeySaRequest) -> Result<(), XfrmError> {
-        let mut state = self.state.lock().expect("mock state mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::check_failure(&state)?;
         state.operations.push(MockOperation::RekeySa {
             selector: request.parameters.selector.clone(),
@@ -296,6 +340,11 @@ impl XfrmBackend for MockXfrmBackend {
                 .auth
                 .as_ref()
                 .map(|(a, _)| a.name.clone()),
+            auth_truncation_len_bits: request
+                .parameters
+                .auth
+                .as_ref()
+                .map(|(a, _)| a.truncation_len_bits),
             auth_key_len: request
                 .parameters
                 .auth
@@ -321,7 +370,10 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn remove_sa(&self, request: RemoveSaRequest) -> Result<(), XfrmError> {
-        let mut state = self.state.lock().expect("mock state mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::check_failure(&state)?;
         state.operations.push(MockOperation::RemoveSa {
             destination: request.destination,
@@ -332,7 +384,10 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn install_policy(&self, request: InstallPolicyRequest) -> Result<(), XfrmError> {
-        let mut state = self.state.lock().expect("mock state mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::check_failure(&state)?;
         state.operations.push(MockOperation::InstallPolicy {
             selector: request.parameters.selector.clone(),
@@ -345,7 +400,10 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn rekey_policy(&self, request: RekeyPolicyRequest) -> Result<(), XfrmError> {
-        let mut state = self.state.lock().expect("mock state mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::check_failure(&state)?;
         state.operations.push(MockOperation::RekeyPolicy {
             selector: request.parameters.selector.clone(),
@@ -358,7 +416,10 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn remove_policy(&self, request: RemovePolicyRequest) -> Result<(), XfrmError> {
-        let mut state = self.state.lock().expect("mock state mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::check_failure(&state)?;
         state.operations.push(MockOperation::RemovePolicy {
             selector: request.selector.clone(),
@@ -368,7 +429,10 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn probe(&self) -> Result<XfrmProbe, XfrmError> {
-        let mut state = self.state.lock().expect("mock state mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::check_failure(&state)?;
         state.operations.push(MockOperation::Probe);
         Ok(state.probe_result)
@@ -465,6 +529,7 @@ mod tests {
             spi: params.id.spi,
             protocol: params.id.protocol,
             auth_algo: Some("hmac-sha256".to_string()),
+            auth_truncation_len_bits: Some(96),
             auth_key_len: 32,
             crypt_algo: Some("aes-cbc".to_string()),
             crypt_key_len: 32,
@@ -482,6 +547,7 @@ mod tests {
             spi: params.id.spi,
             protocol: params.id.protocol,
             auth_algo: Some("hmac-sha256".to_string()),
+            auth_truncation_len_bits: Some(96),
             auth_key_len: 32,
             crypt_algo: Some("aes-cbc".to_string()),
             crypt_key_len: 32,
@@ -709,6 +775,43 @@ mod tests {
         backend.allocate_spi(request).await.unwrap();
         backend.allocate_spi(request).await.unwrap();
         let err = backend.allocate_spi(request).await.unwrap_err();
+        assert!(matches!(err, XfrmError::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn mock_allocate_spi_allows_same_spi_for_different_destination_or_protocol() {
+        let backend = MockXfrmBackend::new();
+        let base = AllocateSpiRequest {
+            destination: ipv4(10, 0, 0, 2),
+            protocol: 50,
+            min_spi: 0x100,
+            max_spi: 0x100,
+        };
+        let a1 = backend.allocate_spi(base).await.unwrap();
+        assert_eq!(a1.spi, 0x100);
+
+        let different_destination = AllocateSpiRequest {
+            destination: ipv4(10, 0, 0, 3),
+            ..base
+        };
+        let a2 = backend.allocate_spi(different_destination).await.unwrap();
+        assert_eq!(a2.spi, 0x100);
+
+        let different_protocol = AllocateSpiRequest {
+            destination: ipv4(10, 0, 0, 2),
+            protocol: 51,
+            ..base
+        };
+        let a3 = backend.allocate_spi(different_protocol).await.unwrap();
+        assert_eq!(a3.spi, 0x100);
+
+        let same_identity = AllocateSpiRequest {
+            destination: ipv4(10, 0, 0, 2),
+            protocol: 50,
+            min_spi: 0x100,
+            max_spi: 0x100,
+        };
+        let err = backend.allocate_spi(same_identity).await.unwrap_err();
         assert!(matches!(err, XfrmError::Unavailable));
     }
 }
