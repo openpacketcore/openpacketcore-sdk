@@ -283,7 +283,7 @@ pub const fn dictionary() -> &'static Dictionary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dictionary::CommandKind;
+    use crate::dictionary::{CommandKind, FlagRequirement};
 
     #[test]
     fn base_dictionary_contains_peer_commands() {
@@ -301,5 +301,57 @@ mod tests {
         let dictionary = dictionary();
         let origin_host = dictionary.find_avp(AvpKey::ietf(AVP_ORIGIN_HOST));
         assert!(matches!(origin_host, Some(definition) if definition.name() == "Origin-Host"));
+    }
+
+    /// Regression test for RFC 6733 §4.5 M-bit flag rules.
+    ///
+    /// User-Name is the only one of these four base AVPs whose M-bit must be set;
+    /// the other three must not set the M-bit.
+    #[test]
+    fn base_dictionary_user_name_requires_m_bit() {
+        let dictionary = dictionary();
+        let user_name = dictionary
+            .find_avp(AvpKey::ietf(AVP_USER_NAME))
+            .expect("User-Name missing from base dictionary");
+        assert_eq!(user_name.name(), "User-Name");
+        let flags = user_name.flags();
+        assert_eq!(flags.vendor(), FlagRequirement::MustBeUnset);
+        assert_eq!(flags.mandatory(), FlagRequirement::MustBeSet);
+        assert_eq!(flags.protected(), FlagRequirement::MustBeUnset);
+    }
+
+    /// Regression test for RFC 6733 §4.5 M-bit flag rules.
+    ///
+    /// Product-Name, Error-Message, and Error-Reporting-Host must not set the
+    /// M-bit in base Diameter messages.
+    #[test]
+    fn base_dictionary_avps_must_not_set_m_bit() {
+        let dictionary = dictionary();
+        for (code, name) in [
+            (AVP_PRODUCT_NAME, "Product-Name"),
+            (AVP_ERROR_MESSAGE, "Error-Message"),
+            (AVP_ERROR_REPORTING_HOST, "Error-Reporting-Host"),
+        ] {
+            let definition = dictionary
+                .find_avp(AvpKey::ietf(code))
+                .unwrap_or_else(|| panic!("{name} missing from base dictionary"));
+            assert_eq!(definition.name(), name);
+            let flags = definition.flags();
+            assert_eq!(
+                flags.vendor(),
+                FlagRequirement::MustBeUnset,
+                "{name} vendor bit must not be set"
+            );
+            assert_eq!(
+                flags.mandatory(),
+                FlagRequirement::MustBeUnset,
+                "{name} M-bit must not be set"
+            );
+            assert_eq!(
+                flags.protected(),
+                FlagRequirement::MustBeUnset,
+                "{name} protected bit must not be set"
+            );
+        }
     }
 }
