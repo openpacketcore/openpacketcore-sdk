@@ -1,6 +1,7 @@
 use crate::bpf::{is_controlled_bpffs_path, validate_bpf_artifacts};
 use crate::types::*;
 use std::collections::BTreeSet;
+use std::net::IpAddr;
 
 pub fn validate_af_xdp(
     profile: &ResourceProfile,
@@ -306,13 +307,13 @@ pub fn validate_ipsec_gateway(
     }
 
     // Lab-only fallback knobs must not appear on production profiles.
-    if profile.environment == Environment::Production && ipsec.allow_userspace_esp_fallback {
-        if !report
+    if profile.environment == Environment::Production
+        && ipsec.allow_userspace_esp_fallback
+        && !report
             .errors
             .contains(&ValidationError::ProductionLabFallbackForbidden)
-        {
-            report.push_error(ValidationError::ProductionLabFallbackForbidden);
-        }
+    {
+        report.push_error(ValidationError::ProductionLabFallbackForbidden);
     }
 
     let allowed_capabilities = ipsec_gateway_allowed_capabilities();
@@ -351,6 +352,24 @@ pub fn validate_ipsec_gateway(
                 capability: capability.clone(),
             });
         }
+    }
+
+    // When XFRM is required, CAP_NET_ADMIN is mandatory (it is needed to
+    // install and manage XFRM policies in the pod namespace). This is implied
+    // even if the profile author did not list it in required_capabilities or
+    // pod_security.added_capabilities.
+    if ipsec.require_xfrm
+        && !ipsec
+            .required_capabilities
+            .contains(&LinuxCapability::CapNetAdmin)
+        && !profile
+            .pod_security
+            .added_capabilities
+            .contains(&LinuxCapability::CapNetAdmin)
+    {
+        report.push_error(ValidationError::MissingCapability {
+            capability: LinuxCapability::CapNetAdmin,
+        });
     }
 
     validate_ipsec_network_attachments(ipsec, context, report);
@@ -519,6 +538,11 @@ pub fn validate_ipsec_gateway(
     }
 }
 
+/// Minimum MTU for an IPsec gateway attachment.  1280 bytes is the IPv6
+/// minimum and a practical floor for tunneled IPsec traffic without
+/// excessive fragmentation.
+const IPSEC_MINIMUM_MTU: u16 = 1280;
+
 fn validate_ipsec_network_attachments(
     ipsec: &IpsecGatewayProfile,
     context: &ValidationContext<'_>,
@@ -581,42 +605,48 @@ fn validate_ipsec_network_attachments(
                 });
             }
         }
+        if let Some(ref static_ip) = attachment.static_ip {
+            if !static_ip.trim().is_empty() && static_ip.trim().parse::<IpAddr>().is_err() {
+                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                    detail: format!(
+                        "static_ip '{static_ip}' is not a valid IPv4/IPv6 address for interface {}",
+                        attachment.interface_name
+                    ),
+                });
+            }
+        }
         if attachment.source_route_required {
             let provided = attachment
-                .static_ip
+                .source_route
                 .as_ref()
                 .map(|s| !s.trim().is_empty())
                 .unwrap_or(false);
             if !provided {
                 report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
                     detail: format!(
-                        "source_route_requires_static_ip for interface {}",
+                        "source_route is required for interface {}",
                         attachment.interface_name
                     ),
                 });
             }
         }
-        match (attachment.minimum_mtu, attachment.mtu) {
-            (Some(min), Some(mtu)) if mtu < min => {
+        let effective_minimum = attachment
+            .minimum_mtu
+            .map(|min| min.max(IPSEC_MINIMUM_MTU))
+            .unwrap_or(IPSEC_MINIMUM_MTU);
+        match attachment.mtu {
+            Some(mtu) if mtu < effective_minimum => {
                 report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
                     detail: format!(
-                        "mtu {mtu} is below minimum {min} for interface {}",
+                        "mtu {mtu} is below minimum {effective_minimum} for interface {}",
                         attachment.interface_name
                     ),
                 });
             }
-            (Some(_), None) => {
+            None if attachment.minimum_mtu.is_some() => {
                 report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
                     detail: format!(
                         "mtu is required when minimum_mtu is set for interface {}",
-                        attachment.interface_name
-                    ),
-                });
-            }
-            (_, Some(mtu)) if mtu == 0 => {
-                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
-                    detail: format!(
-                        "mtu must be non-zero for interface {}",
                         attachment.interface_name
                     ),
                 });

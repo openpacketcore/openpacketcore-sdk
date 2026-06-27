@@ -421,81 +421,90 @@ pub struct SriovProfile {
 }
 
 /// Constrained/custom CNI type for an IPsec gateway network attachment.
+///
+/// Matches the design §13.2 set: `{macvlan, ipvlan, sriov, host-network, custom}`.
+/// Multus is attachment plumbing and is modeled separately (e.g. as an
+/// annotation or network-selection policy), not as a CNI type here.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum CniType {
-    /// Multus secondary network attachment.
-    Multus,
+    /// SR-IOV direct-assignment CNI.
+    Sriov,
     /// MACVLAN CNI.
     Macvlan,
     /// IPVLAN CNI.
     Ipvlan,
-    /// Bridge CNI.
-    Bridge,
+    /// Host-network attachment.
+    HostNetwork,
     /// Operator-defined CNI type outside the built-in set.
     Custom(String),
 }
 
-/// Kernel module name, normalized to lowercase for equality and ordering.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// Kernel module identifier, normalized to lowercase for equality and ordering.
+#[derive(Clone, Debug, serde::Serialize)]
 #[serde(transparent)]
-pub struct KernelModuleName(String);
+pub struct KernelModuleId(String);
 
-impl KernelModuleName {
+impl KernelModuleId {
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into().to_lowercase())
     }
+}
 
-    fn key(&self) -> String {
-        self.0.to_lowercase()
+impl<'de> serde::Deserialize<'de> for KernelModuleId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(KernelModuleId::new)
     }
 }
 
-impl PartialEq for KernelModuleName {
+impl PartialEq for KernelModuleId {
     fn eq(&self, other: &Self) -> bool {
-        self.key() == other.key()
+        self.0 == other.0
     }
 }
 
-impl Eq for KernelModuleName {}
+impl Eq for KernelModuleId {}
 
-impl Hash for KernelModuleName {
+impl Hash for KernelModuleId {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.key().hash(state);
+        self.0.hash(state);
     }
 }
 
-impl PartialOrd for KernelModuleName {
+impl PartialOrd for KernelModuleId {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for KernelModuleName {
+impl Ord for KernelModuleId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key().cmp(&other.key())
+        self.0.cmp(&other.0)
     }
 }
 
-impl From<String> for KernelModuleName {
+impl From<String> for KernelModuleId {
     fn from(value: String) -> Self {
         Self::new(value)
     }
 }
 
-impl From<&str> for KernelModuleName {
+impl From<&str> for KernelModuleId {
     fn from(value: &str) -> Self {
         Self::new(value)
     }
 }
 
-impl fmt::Display for KernelModuleName {
+impl fmt::Display for KernelModuleId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
 /// ESP algorithm identifier, normalized to lowercase for equality and ordering.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[serde(transparent)]
 pub struct EspAlgorithmId(String);
 
@@ -503,15 +512,20 @@ impl EspAlgorithmId {
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into().to_lowercase())
     }
+}
 
-    fn key(&self) -> String {
-        self.0.to_lowercase()
+impl<'de> serde::Deserialize<'de> for EspAlgorithmId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(EspAlgorithmId::new)
     }
 }
 
 impl PartialEq for EspAlgorithmId {
     fn eq(&self, other: &Self) -> bool {
-        self.key() == other.key()
+        self.0 == other.0
     }
 }
 
@@ -519,7 +533,7 @@ impl Eq for EspAlgorithmId {}
 
 impl Hash for EspAlgorithmId {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.key().hash(state);
+        self.0.hash(state);
     }
 }
 
@@ -531,7 +545,7 @@ impl PartialOrd for EspAlgorithmId {
 
 impl Ord for EspAlgorithmId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key().cmp(&other.key())
+        self.0.cmp(&other.0)
     }
 }
 
@@ -571,16 +585,20 @@ pub struct IpsecNetworkAttachment {
     /// Whether a static IP is required for this attachment.
     pub static_ip_required: bool,
     /// Optional statically requested IP address.  Required when
-    /// `static_ip_required` is `true`.
+    /// `static_ip_required` is `true` and must be a valid IPv4 or IPv6
+    /// address when present.
     pub static_ip: Option<String>,
     /// Optional minimum required MTU.  When present the attachment's `mtu`
     /// must be at least this value.
     pub minimum_mtu: Option<u16>,
-    /// Optional requested MTU.  When present it must be non-zero and meet
-    /// `minimum_mtu`.
+    /// Optional requested MTU.  When present it must be at least
+    /// `IPSEC_MINIMUM_MTU` and meet `minimum_mtu`.
     pub mtu: Option<u16>,
     /// Whether source routing is required for this attachment.
     pub source_route_required: bool,
+    /// Optional source route configuration.  Required when
+    /// `source_route_required` is `true`.
+    pub source_route: Option<String>,
     /// Optional VLAN identifier.  When present it must be in the valid
     /// 802.1Q range.
     pub vlan_id: Option<u16>,
@@ -611,7 +629,7 @@ pub struct IpsecGatewayProfile {
     /// Whether the node must report SCTP support.
     pub require_sctp: bool,
     /// Kernel modules that must be available on the node (e.g. `xfrm_user`).
-    pub required_kernel_modules: BTreeSet<KernelModuleName>,
+    pub required_kernel_modules: BTreeSet<KernelModuleId>,
     /// ESP algorithms that must be supported by the node (e.g. `aes-cbc`).
     pub required_esp_algorithms: BTreeSet<EspAlgorithmId>,
     /// Required network attachments for the IPsec gateway workload.
@@ -637,7 +655,7 @@ pub struct IpsecCapabilities {
     /// Whether the node reports SCTP support.
     pub sctp_supported: bool,
     /// Kernel modules that are available on the node.
-    pub required_kernel_modules: BTreeSet<KernelModuleName>,
+    pub required_kernel_modules: BTreeSet<KernelModuleId>,
     /// ESP algorithms supported by the node.
     pub supported_esp_algorithms: BTreeSet<EspAlgorithmId>,
 }
