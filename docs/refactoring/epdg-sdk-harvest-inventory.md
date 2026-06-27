@@ -4,7 +4,8 @@ This inventory records the ePDG source surfaces reviewed for the EPC and
 untrusted-access SDK work stream. It is a planning and provenance aid only: no
 ePDG product policy, deployment default, attach orchestration, lawful-intercept
 business rule, charging policy, YANG model, CRD, or production-readiness claim is
-moved into the SDK by this document.
+moved into the SDK by this document. The Phase 0 exit review is
+recorded in the [M0 gate readiness check](epdg-sdk-m0-gate-readiness.md).
 
 ## Import roots and source-use rule
 
