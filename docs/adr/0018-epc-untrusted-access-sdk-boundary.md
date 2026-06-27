@@ -86,7 +86,7 @@ not as an `epdg` product facade or production-ready EPC control plane.
 
 | Surface from task 0.1 inventory | SDK-owned mechanism | Product-owned policy |
 | --- | --- | --- |
-| GTPv2-C S2b control plane | Future `opc-proto-gtpv2c` codec, IE framing, typed S2b views, raw/unknown IE preservation, hostile-input limits, fuzz and conformance scaffolding. | UDP peer lifecycle, PGW selection, APN/realm/PLMN policy, attach/session orchestration, retries, timers, and deployment readiness. |
+| GTPv2-C S2b control plane | Experimental `opc-proto-gtpv2c` codec subset, IE framing, typed S2b views, raw/unknown IE preservation, hostile-input limits, fuzz, and conformance scaffolding. | UDP peer lifecycle, PGW selection, APN/realm/PLMN policy, attach/session orchestration, retries, timers, and deployment readiness. |
 | Diameter base and 3GPP dictionaries | Future `opc-proto-diameter` header/AVP codec, bounded grouped AVPs, dictionary metadata, base-message helpers, and transport-neutral test helpers. | Realm routing, AAA/HSS/CDF business behavior, peer topology, transport operations, watchdog thresholds, and readiness policy. |
 | Linux XFRM / IPsec installer | Future narrow sys crate and safe wrapper for Linux XFRM UAPI, mock/dry-run backend, capability probes, and redaction-safe error/report types. | SA/SPD policy, IKE negotiation results, namespaces, privileges, key lifetime policy, kernel-module management, and product rollout defaults. |
 | Runtime health gates | Generic gate model, status/impact aggregation, stable JSON projection, and tests for blocking/degraded/unknown/informational gates. | Which gates are required, how peer health affects traffic, LI/charging/readiness thresholds, and drain/routing decisions. |

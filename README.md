@@ -4,7 +4,10 @@
 
 A robust, polyglot software development kit for building resilient, cloud-native 5G packet core network functions (CNFs). This SDK provides the standardized runtime chassis, quorum-replicated session storage, encrypted config persistence, northbound gNMI/NETCONF management-plane foundations, data-governance/redaction boundary enforcement, and release-assurance evidence pipelines for packet core software with high-assurance deployment requirements.
 
-The GTP-U user-plane codec is also applicable to LTE/EPC user plane. GTPv2-C support, where present, is limited to an experimental S2b typed subset; no Diameter or S1AP protocols are provided.
+The GTP-U user-plane codec is also applicable to LTE/EPC user plane. The
+experimental `opc-proto-gtpv2c` crate is limited to an S2b typed subset and is
+consumed as a direct protocol dependency, not through the `opc-sdk` default
+feature set or prelude; no Diameter or S1AP protocols are provided.
 
 > [!IMPORTANT]
 > **Production Readiness & Reference Boundaries**
