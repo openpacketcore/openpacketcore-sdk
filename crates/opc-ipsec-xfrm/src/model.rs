@@ -440,6 +440,19 @@ mod tests {
     }
 
     #[test]
+    fn key_material_constant_time_equality() {
+        let a = KeyMaterial::new(vec![1, 2, 3]);
+        let b = KeyMaterial::new(vec![1, 2, 3]);
+        assert_eq!(a, b);
+
+        let c = KeyMaterial::new(vec![1, 2, 4]);
+        assert_ne!(a, c);
+
+        let d = KeyMaterial::new(vec![1, 2]);
+        assert_ne!(a, d);
+    }
+
+    #[test]
     fn selector_defaults_full_prefix_length() {
         let sel = XfrmSelector::new(
             IpAddress::Ipv4([10, 0, 0, 1]),
