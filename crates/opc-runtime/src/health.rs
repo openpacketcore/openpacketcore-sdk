@@ -1051,6 +1051,9 @@ mod health_gate_tests {
         model.set_security_material_valid(true);
         model.set_backends_reachable(true);
 
+        // Seed a non-computed readiness sentinel so the assertion proves the
+        // missing-gate path does not recompute readiness.
+        model.readiness = Readiness::Draining;
         let before = model.readiness;
         let missing_name: GateName = "missing".into();
 
@@ -1068,6 +1071,9 @@ mod health_gate_tests {
         model.set_security_material_valid(true);
         model.set_backends_reachable(true);
 
+        // Seed a non-computed readiness sentinel so the assertion proves the
+        // missing-gate path does not recompute readiness.
+        model.readiness = Readiness::Draining;
         let before = model.readiness;
         let missing_name: GateName = "missing".into();
 
