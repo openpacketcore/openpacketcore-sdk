@@ -500,6 +500,36 @@ fn diameter_application_ids_include_rf_accounting_mapping() {
 }
 
 #[test]
+fn diameter_peer_rejection_requires_restart() {
+    let mut sim = DiameterPeerSimulator::new("aaa-hss");
+    let cer = FakeDiameterFrame {
+        command_code: 257,
+        application_id: 0,
+        direction: PeerMessageDirection::Request,
+        has_session_id: false,
+    };
+
+    sim.record_decode_failure("synthetic malformed Diameter packet")
+        .expect_err("decode failure records malformed rejection");
+    assert_eq!(sim.state, DiameterPeerState::MalformedRejected);
+    assert_eq!(sim.rejected_messages, 1);
+
+    let err = sim
+        .handle_sdk_message(&cer)
+        .expect_err("malformed rejection remains fail-closed until restart");
+    assert!(err.to_string().contains("requires restart"));
+    assert_eq!(sim.state, DiameterPeerState::MalformedRejected);
+    assert_eq!(sim.accepted_messages, 0);
+    assert_eq!(sim.rejected_messages, 2);
+
+    sim.restart();
+    sim.handle_sdk_message(&cer)
+        .expect("Diameter peer accepts decoded metadata after restart");
+    assert_eq!(sim.state, DiameterPeerState::CapabilitiesExchanged);
+    assert_eq!(sim.accepted_messages, 1);
+}
+
+#[test]
 fn diameter_peer_unavailable_fault_persists_until_restart() {
     let mut sim = DiameterPeerSimulator::new("aaa-hss");
     let cer = FakeDiameterFrame {
@@ -604,6 +634,11 @@ fn epc_epdg_simulator_fixture_manifest_records_protocol_provenance() {
         .iter()
         .any(|packet| packet["sdk_protocol_crate"] == "opc-proto-gtpv2c"
             && packet["provenance"] == "spec-authored"));
+    assert!(packets.iter().any(|packet| {
+        packet["id"] == "pgw-s2b-delete-session-request"
+        && packet["source"]
+            == "crates/opc-proto-gtpv2c/tests/fixtures/spec/delete_session_request_linked_ebi.bin"
+    }));
     let interfaces = value["interfaces"]
         .as_array()
         .expect("manifest interfaces are an array");

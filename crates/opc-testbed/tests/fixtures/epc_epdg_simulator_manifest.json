@@ -31,6 +31,16 @@
       "usage": "PGW S2b fail-closed state-machine regression",
       "conformance_owner": "opc-proto-gtpv2c",
       "redaction": "synthetic; no subscriber identifiers or key material"
+    },
+    {
+      "id": "pgw-s2b-delete-session-request",
+      "protocol": "gtpv2c-s2b",
+      "sdk_protocol_crate": "opc-proto-gtpv2c",
+      "source": "crates/opc-proto-gtpv2c/tests/fixtures/spec/delete_session_request_linked_ebi.bin",
+      "provenance": "spec-authored",
+      "usage": "PGW S2b fail-closed malformed-state regression",
+      "conformance_owner": "opc-proto-gtpv2c",
+      "redaction": "synthetic; no subscriber identifiers or key material"
     }
   ],
   "interfaces": [

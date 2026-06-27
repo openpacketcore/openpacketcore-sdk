@@ -17,13 +17,13 @@ Scenario DSL, virtual time, assertions, fixture provenance, and simulator framew
   mechanics for scenario runner tests.
 - `simulators::epc::PgwS2bSimulator` accepts SDK-decoded S2b views, with
   `opc-proto-gtpv2c` owning byte parsing and fixture conformance. RFC 012
-  fidelity: experimental `stateful-mock`; not procedure-faithful, not
+  fidelity = `stateful-mock` (experimental); not procedure-faithful, not
   conformance, and not a production PGW/ePDG control plane.
 - `simulators::epc::DiameterPeerSimulator` accepts decoded Diameter metadata
   only; it intentionally carries no local Diameter parser until an SDK
-  `opc-proto-diameter` crate exists. RFC 012 fidelity: experimental
-  `stateful-mock`; not procedure-faithful, not conformance, and not a
-  production AAA/HSS/CDF peer.
+  `opc-proto-diameter` crate exists. RFC 012 fidelity = `stateful-mock`
+  (experimental); not procedure-faithful, not conformance, and not a production
+  AAA/HSS/CDF peer.
 
 ## Quick start
 
