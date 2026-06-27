@@ -286,6 +286,127 @@ pub fn af_xdp_allowed_capabilities() -> BTreeSet<LinuxCapability> {
     ])
 }
 
+pub fn ipsec_gateway_allowed_capabilities() -> BTreeSet<LinuxCapability> {
+    BTreeSet::from([LinuxCapability::CapNetAdmin, LinuxCapability::CapNetRaw])
+}
+
+pub fn validate_ipsec_gateway(
+    profile: &ResourceProfile,
+    context: &ValidationContext<'_>,
+    report: &mut ValidationReport,
+) {
+    let Some(ipsec) = profile.ipsec.as_ref() else {
+        report.push_error(ValidationError::IpsecProfileMissing);
+        return;
+    };
+
+    // RFC 011 §9.1: IPsec gateway requires at least one named data-plane attachment.
+    if context.data_plane_interfaces.is_empty() {
+        report.push_error(ValidationError::IpsecNoDataPlaneInterfaces);
+    }
+
+    let allowed_capabilities = ipsec_gateway_allowed_capabilities();
+    for capability in &profile.pod_security.added_capabilities {
+        if !allowed_capabilities.contains(capability) {
+            let error = ValidationError::CapabilityNotAllowed {
+                capability: capability.clone(),
+                profile: DataPlaneProfile::IpsecGateway,
+            };
+            if !report.errors.contains(&error) {
+                report.push_error(error);
+            }
+        }
+    }
+
+    for capability in &ipsec.required_capabilities {
+        if capability == &LinuxCapability::CapSysAdmin
+            && profile.environment == Environment::Production
+            && !report
+                .errors
+                .contains(&ValidationError::ProductionCapSysAdminForbidden)
+        {
+            report.push_error(ValidationError::ProductionCapSysAdminForbidden);
+        }
+        if !allowed_capabilities.contains(capability) {
+            let error = ValidationError::CapabilityNotAllowed {
+                capability: capability.clone(),
+                profile: DataPlaneProfile::IpsecGateway,
+            };
+            if !report.errors.contains(&error) {
+                report.push_error(error);
+            }
+        }
+        if !profile.pod_security.added_capabilities.contains(capability) {
+            report.push_error(ValidationError::MissingCapability {
+                capability: capability.clone(),
+            });
+        }
+    }
+
+    let is_lab_software_fallback_allowed =
+        profile.environment == Environment::Lab && profile.lab_fallback.allow_software_packet_path;
+
+    // Kernel version check
+    if context.node.kernel < ipsec.minimum_kernel {
+        if is_lab_software_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::SoftwarePacketPath,
+                format!(
+                    "kernel {:?} is below IPsec gateway minimum {:?}; using lab software packet path",
+                    context.node.kernel, ipsec.minimum_kernel,
+                ),
+            );
+        } else {
+            report.push_error(ValidationError::UnsupportedKernelVersion {
+                found: context.node.kernel,
+                minimum: ipsec.minimum_kernel,
+            });
+        }
+    }
+
+    // XFRM support check
+    if ipsec.require_xfrm && !context.node.ipsec.xfrm_supported {
+        if is_lab_software_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::SoftwarePacketPath,
+                "node lacks XFRM support; using lab software packet path",
+            );
+        } else {
+            report.push_error(ValidationError::MissingNodeCapability {
+                capability: "xfrm_supported".to_string(),
+            });
+        }
+    }
+
+    // UDP 500/4500 encapsulation check
+    if ipsec.require_udp_encap && !context.node.ipsec.udp_encap_supported {
+        if is_lab_software_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::SoftwarePacketPath,
+                "node lacks UDP 500/4500 encapsulation support; using lab software packet path",
+            );
+        } else {
+            report.push_error(ValidationError::MissingNodeCapability {
+                capability: "udp_encap_supported".to_string(),
+            });
+        }
+    }
+
+    // SCTP support check
+    if ipsec.require_sctp && !context.node.ipsec.sctp_supported {
+        if is_lab_software_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::SoftwarePacketPath,
+                "node lacks SCTP support; using lab software packet path",
+            );
+        } else {
+            report.push_error(ValidationError::MissingNodeCapability {
+                capability: "sctp_supported".to_string(),
+            });
+        }
+    }
+}
+
 pub fn available_xdp_modes(
     node: &NodeCapabilityReport,
     interfaces: &[String],

@@ -344,6 +344,10 @@ impl PodSecurityExceptionModel {
                     read_only: false,
                 }];
             }
+            DataPlaneProfile::IpsecGateway => {
+                model.added_capabilities =
+                    BTreeSet::from([LinuxCapability::CapNetAdmin, LinuxCapability::CapNetRaw]);
+            }
             _ => {}
         }
         model
@@ -412,6 +416,40 @@ pub struct SriovProfile {
     pub ipam_mode: IpamMode,
 }
 
+/// IPsec gateway resource profile.
+///
+/// Describes the kernel, XFRM, UDP encapsulation, SCTP, and capability
+/// requirements that a node must satisfy for an IPsec gateway workload
+/// (e.g. future ePDG/N3IWF untrusted-access functions).
+///
+/// This crate is a pure model: it performs only structural validation of the
+/// declared requirements against the observed [`NodeCapabilityReport`] and never
+/// inspects the host filesystem or kernel state directly.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IpsecGatewayProfile {
+    /// Minimum kernel version required for the IPsec gateway profile.
+    pub minimum_kernel: KernelVersion,
+    /// Exact set of Linux capabilities that the CNF pod must hold.
+    pub required_capabilities: BTreeSet<LinuxCapability>,
+    /// Whether the node must report XFRM support.
+    pub require_xfrm: bool,
+    /// Whether the node must support UDP 500/4500 encapsulation.
+    pub require_udp_encap: bool,
+    /// Whether the node must report SCTP support.
+    pub require_sctp: bool,
+}
+
+/// IPsec-related capabilities reported by the node agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct IpsecCapabilities {
+    /// Whether the kernel/platform supports XFRM operations.
+    pub xfrm_supported: bool,
+    /// Whether the node supports UDP 500/4500 encapsulation for IKE/NAT-T.
+    pub udp_encap_supported: bool,
+    /// Whether the node reports SCTP support.
+    pub sctp_supported: bool,
+}
+
 /// Lab-only fallback policy.  Each flag enables a degraded-mode escape hatch
 /// that is **never** used in production.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -456,6 +494,9 @@ pub struct ResourceProfile {
     /// SR-IOV parameters.  Required when `data_plane_profile` is
     /// [`DataPlaneProfile::SriovFastPath`].
     pub sriov: Option<SriovProfile>,
+    /// IPsec gateway parameters.  Required when `data_plane_profile` is
+    /// [`DataPlaneProfile::IpsecGateway`].
+    pub ipsec: Option<IpsecGatewayProfile>,
     /// Lab-only fallback policy.
     pub lab_fallback: LabFallbackPolicy,
 }
@@ -465,7 +506,7 @@ impl ResourceProfile {
     /// environment.  All policy fields are set to their defaults:
     /// - [`CpuPolicy::default()`] (exclusive data-plane cores, NUMA locality required)
     /// - [`PodSecurityExceptionModel::secure_default()`] (K8s "restricted" PSS)
-    /// - No AF_XDP or SR-IOV configuration (`None`)
+    /// - No AF_XDP, SR-IOV, or IPsec gateway configuration (`None`)
     /// - All lab fallbacks disabled by default (opt-in)
     pub fn new(
         nf_kind: NetworkFunctionKind,
@@ -493,6 +534,7 @@ impl ResourceProfile {
             pod_security: PodSecurityExceptionModel::secure_default(),
             af_xdp: None,
             sriov: None,
+            ipsec: None,
             lab_fallback: LabFallbackPolicy::default(),
         }
     }
@@ -582,6 +624,9 @@ pub struct NodeCapabilityReport {
     pub memory: NodeMemoryCapabilities,
     /// Capabilities of all observed network interfaces.
     pub nics: Vec<NicCapability>,
+    /// IPsec-related capabilities.
+    #[serde(default)]
+    pub ipsec: IpsecCapabilities,
 }
 
 impl NodeCapabilityReport {
@@ -709,6 +754,12 @@ pub enum ValidationError {
     /// [`DataPlaneProfile::SriovFastPath`] is selected but no data-plane
     /// interfaces are specified (RFC 011 §9.1 requires named attachments).
     SriovNoDataPlaneInterfaces,
+    /// [`DataPlaneProfile::IpsecGateway`] is selected but no `ipsec` profile
+    /// is configured.
+    IpsecProfileMissing,
+    /// [`DataPlaneProfile::IpsecGateway`] is selected but no data-plane
+    /// interfaces are specified (RFC 011 §9.1 requires named attachments).
+    IpsecNoDataPlaneInterfaces,
     /// An SR-IOV data-plane interface exposes zero VFs, so no direct assignment
     /// is possible (RFC 011 §9.2).
     SriovNicZeroVfs { interface_name: String },
@@ -861,6 +912,15 @@ impl fmt::Display for ValidationError {
                 write!(
                     f,
                     "SR-IOV fast path requires at least one named data-plane interface"
+                )
+            }
+            ValidationError::IpsecProfileMissing => {
+                write!(f, "IPsec gateway profile selected but not configured")
+            }
+            ValidationError::IpsecNoDataPlaneInterfaces => {
+                write!(
+                    f,
+                    "IPsec gateway requires at least one named data-plane interface"
                 )
             }
             ValidationError::SriovNicZeroVfs { interface_name } => {

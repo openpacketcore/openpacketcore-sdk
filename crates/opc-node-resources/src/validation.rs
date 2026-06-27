@@ -1,4 +1,4 @@
-use crate::network::{validate_af_xdp, validate_sriov};
+use crate::network::{validate_af_xdp, validate_ipsec_gateway, validate_sriov};
 use crate::pod_security::validate_pod_security;
 use crate::types::*;
 
@@ -14,10 +14,10 @@ pub fn validate_resource_profile(
     match profile.data_plane_profile {
         DataPlaneProfile::AfXdpFastPath => validate_af_xdp(profile, context, &mut report),
         DataPlaneProfile::SriovFastPath => validate_sriov(profile, context, &mut report),
+        DataPlaneProfile::IpsecGateway => validate_ipsec_gateway(profile, context, &mut report),
         DataPlaneProfile::ControlPlaneOnly
         | DataPlaneProfile::SignalingHeavy
-        | DataPlaneProfile::KernelNetworking
-        | DataPlaneProfile::IpsecGateway => {}
+        | DataPlaneProfile::KernelNetworking => {}
     }
 
     report
@@ -111,6 +111,8 @@ pub fn run_data_plane_preflight(
                 | ValidationError::UnsupportedSriovDriver { .. }
                 | ValidationError::SriovNoDataPlaneInterfaces
                 | ValidationError::AfXdpNoDataPlaneInterfaces
+                | ValidationError::IpsecProfileMissing
+                | ValidationError::IpsecNoDataPlaneInterfaces
         )
     });
     checks.push(PreflightCheckResult {

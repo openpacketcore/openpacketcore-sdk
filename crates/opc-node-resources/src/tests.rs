@@ -124,6 +124,11 @@ fn capable_node() -> NodeCapabilityReport {
             queues: 32,
             numa_node: Some(0),
         }],
+        ipsec: IpsecCapabilities {
+            xfrm_supported: true,
+            udp_encap_supported: true,
+            sctp_supported: true,
+        },
     }
 }
 
@@ -494,6 +499,7 @@ fn lab_node_without_xdp_prerequisites_activates_software_packet_fallback() {
             queues: 32,
             numa_node: Some(0),
         }],
+        ipsec: IpsecCapabilities::default(),
     };
 
     let cpu_layout = standard_cpu_layout();
@@ -1868,4 +1874,299 @@ fn test_run_data_plane_preflight_report() {
     assert!(!report.blocks_readiness);
     assert_eq!(report.checks.len(), 5);
     assert!(report.checks.iter().all(|c| c.passed));
+}
+
+// ------------------------------------------------------------------------
+// IPsec gateway profile validation
+// ------------------------------------------------------------------------
+
+fn production_ipsec_gateway_profile() -> ResourceProfile {
+    let mut profile = ResourceProfile::new(
+        NetworkFunctionKind::Amf,
+        DataPlaneProfile::IpsecGateway,
+        Environment::Production,
+    );
+    profile.pod_security.security_evidence_id = Some("ipsec-preflight-ev-1".to_string());
+    profile.pod_security.added_capabilities =
+        BTreeSet::from([LinuxCapability::CapNetAdmin, LinuxCapability::CapNetRaw]);
+    profile.ipsec = Some(IpsecGatewayProfile {
+        minimum_kernel: KernelVersion::new(5, 15, 0),
+        required_capabilities: BTreeSet::from([
+            LinuxCapability::CapNetAdmin,
+            LinuxCapability::CapNetRaw,
+        ]),
+        require_xfrm: true,
+        require_udp_encap: true,
+        require_sctp: true,
+    });
+    profile
+}
+
+#[test]
+fn ipsec_gateway_validation_passes_for_production_node() {
+    let profile = production_ipsec_gateway_profile();
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(report.errors.is_empty(), "{report:#?}");
+    assert!(!report.fallback_status.active);
+}
+
+#[test]
+fn ipsec_production_rejects_cap_sys_admin() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile
+        .pod_security
+        .added_capabilities
+        .insert(LinuxCapability::CapSysAdmin);
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(report
+        .errors
+        .contains(&ValidationError::ProductionCapSysAdminForbidden));
+}
+
+#[test]
+fn ipsec_missing_required_capability_is_rejected() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.pod_security.added_capabilities.clear();
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report.errors.contains(&ValidationError::MissingCapability {
+        capability: LinuxCapability::CapNetAdmin,
+    }));
+    assert!(report.errors.contains(&ValidationError::MissingCapability {
+        capability: LinuxCapability::CapNetRaw,
+    }));
+}
+
+#[test]
+fn ipsec_disallowed_capability_is_rejected() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile
+        .pod_security
+        .added_capabilities
+        .insert(LinuxCapability::CapBpf);
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::CapabilityNotAllowed {
+            capability: LinuxCapability::CapBpf,
+            profile: DataPlaneProfile::IpsecGateway,
+        }));
+}
+
+#[test]
+fn ipsec_missing_xfrm_support_is_rejected() {
+    let profile = production_ipsec_gateway_profile();
+    let mut node = capable_node();
+    node.ipsec.xfrm_supported = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::MissingNodeCapability {
+            capability: "xfrm_supported".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_missing_udp_encap_support_is_rejected() {
+    let profile = production_ipsec_gateway_profile();
+    let mut node = capable_node();
+    node.ipsec.udp_encap_supported = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::MissingNodeCapability {
+            capability: "udp_encap_supported".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_missing_sctp_support_is_rejected() {
+    let profile = production_ipsec_gateway_profile();
+    let mut node = capable_node();
+    node.ipsec.sctp_supported = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::MissingNodeCapability {
+            capability: "sctp_supported".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_unsupported_kernel_version_is_rejected() {
+    let profile = production_ipsec_gateway_profile();
+    let mut node = capable_node();
+    node.kernel = KernelVersion::new(5, 10, 0);
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::UnsupportedKernelVersion {
+            found: KernelVersion::new(5, 10, 0),
+            minimum: KernelVersion::new(5, 15, 0),
+        }));
+}
+
+#[test]
+fn ipsec_lab_missing_xfrm_activates_software_packet_fallback() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.environment = Environment::Lab;
+    profile.lab_fallback.allow_software_packet_path = true;
+    let mut node = capable_node();
+    node.ipsec.xfrm_supported = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(report.is_eligible(), "{report:#?}");
+    assert!(report.fallback_status.active);
+    assert!(report
+        .fallback_status
+        .modes
+        .contains(&FallbackMode::SoftwarePacketPath));
+}
+
+#[test]
+fn ipsec_lab_missing_udp_encap_activates_software_packet_fallback() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.environment = Environment::Lab;
+    profile.lab_fallback.allow_software_packet_path = true;
+    let mut node = capable_node();
+    node.ipsec.udp_encap_supported = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(report.is_eligible(), "{report:#?}");
+    assert!(report.fallback_status.active);
+    assert!(report
+        .fallback_status
+        .modes
+        .contains(&FallbackMode::SoftwarePacketPath));
+}
+
+#[test]
+fn ipsec_lab_missing_sctp_activates_software_packet_fallback() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.environment = Environment::Lab;
+    profile.lab_fallback.allow_software_packet_path = true;
+    let mut node = capable_node();
+    node.ipsec.sctp_supported = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(report.is_eligible(), "{report:#?}");
+    assert!(report.fallback_status.active);
+    assert!(report
+        .fallback_status
+        .modes
+        .contains(&FallbackMode::SoftwarePacketPath));
+}
+
+#[test]
+fn ipsec_lab_unsupported_kernel_activates_software_packet_fallback() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.environment = Environment::Lab;
+    profile.lab_fallback.allow_software_packet_path = true;
+    let mut node = capable_node();
+    node.kernel = KernelVersion::new(5, 10, 0);
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(report.is_eligible(), "{report:#?}");
+    assert!(report.fallback_status.active);
+    assert!(report
+        .fallback_status
+        .modes
+        .contains(&FallbackMode::SoftwarePacketPath));
+}
+
+#[test]
+fn ipsec_no_data_plane_interfaces_is_rejected() {
+    let profile = production_ipsec_gateway_profile();
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let ctx = make_context(&node, &cpu_layout, &[], Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::IpsecNoDataPlaneInterfaces));
+}
+
+#[test]
+fn ipsec_profile_missing_is_rejected() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.ipsec = None;
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::IpsecProfileMissing));
 }
