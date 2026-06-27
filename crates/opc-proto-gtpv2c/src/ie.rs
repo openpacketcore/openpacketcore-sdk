@@ -175,14 +175,36 @@ pub struct RawIeIterator<'a> {
 
 impl<'a> RawIeIterator<'a> {
     /// Create an iterator over `region` with the supplied decode context.
+    ///
+    /// The iterator's internal offset starts at zero; callers that need
+    /// absolute offsets within a larger message should use [`Self::new_at_offset`].
     pub const fn new(region: &'a [u8], ctx: DecodeContext) -> Self {
+        Self::new_at_offset(region, ctx, 0)
+    }
+
+    /// Create an iterator over `region` whose internal offset starts at
+    /// `base_offset`.
+    ///
+    /// This is used when decoding a sub-region (e.g. a grouped IE value) so
+    /// that raw parse errors report positions relative to the containing
+    /// message rather than to the sub-region.
+    pub const fn new_at_offset(region: &'a [u8], ctx: DecodeContext, base_offset: usize) -> Self {
         Self {
             remaining: region,
             ctx,
-            offset: 0,
+            offset: base_offset,
             count: 0,
             stopped: false,
         }
+    }
+
+    /// Return the current byte offset of the iterator.
+    ///
+    /// At the start of iteration this equals the `base_offset` supplied to the
+    /// constructor; after each yielded IE it is advanced by that IE's wire
+    /// length. It therefore points to the start of the next IE to be decoded.
+    pub const fn offset(&self) -> usize {
+        self.offset
     }
 }
 

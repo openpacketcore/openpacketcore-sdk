@@ -1238,6 +1238,13 @@ pub struct BearerContext<'a> {
 }
 
 impl<'a> BearerContext<'a> {
+    /// Decode the grouped bearer value.
+    ///
+    /// `base_offset` is the absolute byte position of the first value octet
+    /// of this Bearer Context IE within the containing input (i.e. just after
+    /// the four-octet TLIV header). It is passed through to nested decoders so
+    /// that errors inside grouped members report offsets relative to the
+    /// message rather than to the grouped value.
     fn decode_value(
         value: &'a [u8],
         ctx: DecodeContext,
@@ -1644,6 +1651,15 @@ pub fn decode_typed_ie_sequence<'a>(
     decode_typed_ie_sequence_at(input, ctx, depth, 0)
 }
 
+/// Decode a sequence of GTPv2-C IEs into typed values with raw fallback,
+/// anchored at `base_offset`.
+///
+/// `base_offset` is the absolute byte position of the first octet of `input`
+/// within the containing message. The iterator returned by
+/// [`RawIeIterator::new_at_offset`] is the single source of truth for offsets;
+/// each decoded IE uses the iterator's current offset before it is advanced,
+/// and the iterator's absolute offsets are propagated to value decoders and
+/// duplicate-IE diagnostics.
 fn decode_typed_ie_sequence_at<'a>(
     input: &'a [u8],
     ctx: DecodeContext,
@@ -1656,13 +1672,17 @@ fn decode_typed_ie_sequence_at<'a>(
         );
     }
     let mut ies = Vec::new();
-    let mut offset = base_offset;
-    for item in RawIeIterator::new(input, ctx) {
-        let raw = item?;
-        let wire_len = IE_HEADER_LEN + raw.value.len();
-        let typed = TypedIe::decode_from_raw(raw, ctx, depth, offset)?;
-        apply_duplicate_policy(&mut ies, typed, ctx.duplicate_ie_policy, offset)?;
-        offset = checked_add_offset(offset, wire_len)?;
+    let mut iter = RawIeIterator::new_at_offset(input, ctx, base_offset);
+    loop {
+        let offset = iter.offset();
+        match iter.next() {
+            Some(Ok(raw)) => {
+                let typed = TypedIe::decode_from_raw(raw, ctx, depth, offset)?;
+                apply_duplicate_policy(&mut ies, typed, ctx.duplicate_ie_policy, offset)?;
+            }
+            Some(Err(error)) => return Err(error),
+            None => break,
+        }
     }
     Ok(ies)
 }

@@ -3,7 +3,7 @@ use opc_proto_gtpv2c::{
     decode_typed_ie_sequence, s2b, CauseValue, FullyQualifiedTeid, Message, MessageType,
     S2bMessage, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT,
     IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_IMSI,
-    IE_TYPE_INDICATION, IE_TYPE_PCO,
+    IE_TYPE_INDICATION, IE_TYPE_PCO, IE_TYPE_RECOVERY,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
@@ -736,5 +736,61 @@ fn typed_value_decode_error_includes_ie_value_offset() {
     assert!(matches!(
         result,
         Err(error) if matches!(error.code(), DecodeErrorCode::InvalidEnumValue { .. }) && error.offset() == 4
+    ));
+}
+
+#[test]
+fn malformed_nested_bearer_context_member_includes_bearer_value_offset() {
+    // Recovery IE (5 octets) pushes the Bearer Context value start to offset 9.
+    let recovery = [IE_TYPE_RECOVERY, 0x00, 0x01, 0x00, 0x2a];
+    // Bearer Context containing a nested IE header that is truncated mid-header.
+    let bearer_context = [
+        IE_TYPE_BEARER_CONTEXT,
+        0x00,
+        0x02,
+        0x00, // Bearer Context header, value length 2.
+        IE_TYPE_EBI,
+        0x00, // Truncated nested EBI header (only 2 of 4 header octets).
+    ];
+    let mut input = Vec::with_capacity(recovery.len() + bearer_context.len());
+    input.extend_from_slice(&recovery);
+    input.extend_from_slice(&bearer_context);
+
+    let result = decode_typed_ie_sequence(&input, DecodeContext::default(), 0);
+    assert!(matches!(
+        result,
+        Err(error) if matches!(error.code(), DecodeErrorCode::Truncated) && error.offset() == 9
+    ));
+}
+
+#[test]
+fn strict_nested_bearer_context_member_includes_bearer_value_offset() {
+    // Recovery IE (5 octets) pushes the Bearer Context value start to offset 9.
+    let recovery = [IE_TYPE_RECOVERY, 0x00, 0x01, 0x00, 0x2a];
+    // Bearer Context containing a nested EBI with non-zero spare bits in strict
+    // mode. The instance octet is at value offset 3, so absolute offset 12.
+    let bearer_context = [
+        IE_TYPE_BEARER_CONTEXT,
+        0x00,
+        0x05,
+        0x00, // Bearer Context header, value length 5.
+        IE_TYPE_EBI,
+        0x00,
+        0x01,
+        0xf0, // Instance 0 with non-zero spare high nibble.
+        0x05,
+    ];
+    let mut input = Vec::with_capacity(recovery.len() + bearer_context.len());
+    input.extend_from_slice(&recovery);
+    input.extend_from_slice(&bearer_context);
+
+    let ctx = DecodeContext {
+        validation_level: ValidationLevel::Strict,
+        ..DecodeContext::default()
+    };
+    let result = decode_typed_ie_sequence(&input, ctx, 0);
+    assert!(matches!(
+        result,
+        Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. }) && error.offset() == 12
     ));
 }
