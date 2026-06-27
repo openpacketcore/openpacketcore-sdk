@@ -13,9 +13,17 @@ use std::time::Duration;
 ///
 /// Tests that create sockets inside `tempfile::tempdir()` can fail when the
 /// effective temp directory is deep, because Linux's `sun_path` is limited to
-/// ~108 bytes. This helper places sockets directly under `/tmp` with a random
-/// UUID filename so the path is always short and unique per invocation.
+/// ~108 bytes. This helper deliberately hard-codes `/tmp` (instead of
+/// `std::env::temp_dir()`) so the path is always short and unique per
+/// invocation, regardless of the value of `TMPDIR`.
+///
+/// `name` must be a short filename-safe label (no path separators). It exists
+/// only to make parallel tests easier to identify in logs.
 pub fn short_unix_socket_path(name: &str) -> PathBuf {
+    debug_assert!(
+        !name.contains('/') && !name.contains('\\'),
+        "short_unix_socket_path name must be a filename-safe label, got {name:?}"
+    );
     PathBuf::from(format!(
         "/tmp/opc-test-{name}-{}.sock",
         uuid::Uuid::new_v4()
