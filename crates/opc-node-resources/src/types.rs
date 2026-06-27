@@ -425,23 +425,104 @@ pub struct SriovProfile {
 /// Matches the design §13.2 set: `{macvlan, ipvlan, sriov, host-network, custom}`.
 /// Multus is attachment plumbing and is modeled separately (e.g. as an
 /// annotation or network-selection policy), not as a CNI type here.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum CniType {
     /// SR-IOV direct-assignment CNI.
-    #[serde(rename = "sriov", alias = "Sriov")]
+    #[serde(rename = "sriov")]
     Sriov,
     /// MACVLAN CNI.
-    #[serde(rename = "macvlan", alias = "Macvlan")]
+    #[serde(rename = "macvlan")]
     Macvlan,
     /// IPVLAN CNI.
-    #[serde(rename = "ipvlan", alias = "Ipvlan")]
+    #[serde(rename = "ipvlan")]
     Ipvlan,
     /// Host-network attachment.
-    #[serde(rename = "host-network", alias = "HostNetwork")]
+    #[serde(rename = "host-network")]
     HostNetwork,
     /// Operator-defined CNI type outside the built-in set.
-    #[serde(rename = "custom", alias = "Custom")]
+    #[serde(rename = "custom")]
     Custom(String),
+}
+
+impl CniType {
+    /// Construct a [`CniType::Custom`] variant only if the supplied name is
+    /// non-empty and not whitespace-only.
+    pub fn try_custom(name: impl AsRef<str>) -> Option<Self> {
+        let name = name.as_ref();
+        if name.trim().is_empty() {
+            None
+        } else {
+            Some(Self::Custom(name.to_string()))
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CniType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CniTypeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for CniTypeVisitor {
+            type Value = CniType;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(
+                    "a built-in CNI type string or a custom CNI object such as {\"custom\":\"name\"}",
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "sriov" | "Sriov" => Ok(CniType::Sriov),
+                    "macvlan" | "Macvlan" => Ok(CniType::Macvlan),
+                    "ipvlan" | "Ipvlan" => Ok(CniType::Ipvlan),
+                    "host-network" | "HostNetwork" => Ok(CniType::HostNetwork),
+                    _ if value.trim().is_empty() => Err(serde::de::Error::custom(
+                        "CNI type string must be non-empty and not whitespace-only",
+                    )),
+                    _ => Err(serde::de::Error::custom(format!(
+                        "unknown CNI type string: {value}"
+                    ))),
+                }
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let key: String = map.next_key()?.ok_or_else(|| {
+                    serde::de::Error::custom("expected a key for custom CNI type")
+                })?;
+                let value: String = map.next_value()?;
+                if map.next_key::<String>()?.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "custom CNI object must contain exactly one key",
+                    ));
+                }
+                match key.as_str() {
+                    "custom" | "Custom" => {
+                        if value.trim().is_empty() {
+                            Err(serde::de::Error::custom(
+                                "custom CNI type name must be non-empty and not whitespace-only",
+                            ))
+                        } else {
+                            Ok(CniType::Custom(value))
+                        }
+                    }
+                    _ => Err(serde::de::Error::custom(format!(
+                        "unknown CNI type object key: {key}"
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(CniTypeVisitor)
+    }
 }
 
 /// Kernel module identifier, normalized to lowercase for equality and ordering.
@@ -450,6 +531,12 @@ pub enum CniType {
 pub struct KernelModuleId(String);
 
 impl KernelModuleId {
+    /// Construct a [`KernelModuleId`] from the supplied identifier.
+    ///
+    /// The identifier is normalized to lowercase. This constructor does **not**
+    /// validate that the identifier is non-empty; use [`KernelModuleId::try_new`]
+    /// or rely on the [`Deserialize`](serde::Deserialize) impl to enforce that
+    /// invariant at the serde boundary.
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into().to_lowercase())
     }
@@ -476,7 +563,12 @@ impl<'de> serde::Deserialize<'de> for KernelModuleId {
     where
         D: serde::Deserializer<'de>,
     {
-        String::deserialize(deserializer).map(KernelModuleId::new)
+        let name = String::deserialize(deserializer)?;
+        KernelModuleId::try_new(&name).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "kernel module identifier must be non-empty and not whitespace-only, got '{name}'"
+            ))
+        })
     }
 }
 
@@ -530,6 +622,12 @@ impl fmt::Display for KernelModuleId {
 pub struct EspAlgorithmId(String);
 
 impl EspAlgorithmId {
+    /// Construct an [`EspAlgorithmId`] from the supplied identifier.
+    ///
+    /// The identifier is normalized to lowercase. This constructor does **not**
+    /// validate that the identifier is non-empty; use [`EspAlgorithmId::try_new`]
+    /// or rely on the [`Deserialize`](serde::Deserialize) impl to enforce that
+    /// invariant at the serde boundary.
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into().to_lowercase())
     }
@@ -556,7 +654,12 @@ impl<'de> serde::Deserialize<'de> for EspAlgorithmId {
     where
         D: serde::Deserializer<'de>,
     {
-        String::deserialize(deserializer).map(EspAlgorithmId::new)
+        let name = String::deserialize(deserializer)?;
+        EspAlgorithmId::try_new(&name).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "ESP algorithm identifier must be non-empty and not whitespace-only, got '{name}'"
+            ))
+        })
     }
 }
 

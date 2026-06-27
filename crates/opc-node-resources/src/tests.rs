@@ -3127,3 +3127,30 @@ fn esp_algorithm_id_try_new_rejects_blank() {
     assert!(EspAlgorithmId::try_new("").is_none());
     assert!(EspAlgorithmId::try_new("   ").is_none());
 }
+
+#[test]
+fn kernel_module_id_deserialization_rejects_blank() {
+    assert!(serde_json::from_str::<KernelModuleId>("\"\"").is_err());
+    assert!(serde_json::from_str::<KernelModuleId>("\"   \"").is_err());
+    assert!(serde_json::from_str::<KernelModuleId>("\"xfrm_user\"").is_ok());
+}
+
+#[test]
+fn esp_algorithm_id_deserialization_rejects_blank() {
+    assert!(serde_json::from_str::<EspAlgorithmId>("\"\"").is_err());
+    assert!(serde_json::from_str::<EspAlgorithmId>("\"   \"").is_err());
+    assert!(serde_json::from_str::<EspAlgorithmId>("\"aes-cbc\"").is_ok());
+}
+
+#[test]
+fn cni_type_try_custom_rejects_blank() {
+    assert!(CniType::try_custom("my-cni").is_some());
+    assert!(CniType::try_custom("").is_none());
+    assert!(CniType::try_custom("   ").is_none());
+}
+
+#[test]
+fn cni_type_deserialization_rejects_empty_custom() {
+    assert!(serde_json::from_str::<CniType>(r#"{"custom":""}"#).is_err());
+    assert!(serde_json::from_str::<CniType>(r#"{"custom":"   "}"#).is_err());
+}
