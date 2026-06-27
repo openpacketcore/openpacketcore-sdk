@@ -11,7 +11,7 @@ use opc_persist::{
     AuditKey, ClusterMembership, ConfigStore, ConsensusClock, ConsensusConfigStore, NodeIdentity,
     SqliteBackend, TcpPeer, TcpRpcServer,
 };
-use opc_security_testkit::{FakeKms, KmsBehavior};
+use opc_security_testkit::{short_unix_socket_path, FakeKms, KmsBehavior};
 use opc_session_store::{
     CompareAndSet, OwnerId, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager,
     StateClass, StateType, StoreError, StoredSessionRecord,
@@ -248,7 +248,7 @@ async fn test_amf_lite_e2e_happy_path() {
 
     // 1. KMS Setup
     println!("[E2E] Setting up FakeKms (Unix)");
-    let kms_path = temp_dir.path().join("kms.sock");
+    let kms_path = short_unix_socket_path("kms");
     let kms = FakeKms::new_unix(&kms_path, KmsBehavior::default())
         .await
         .unwrap();
@@ -448,7 +448,7 @@ async fn test_amf_lite_ha_failover_and_recovery() {
 
     // 1. KMS Setup
     println!("[HA] Setting up FakeKms (Unix)");
-    let kms_path = temp_dir.path().join("kms.sock");
+    let kms_path = short_unix_socket_path("kms");
     let kms = FakeKms::new_unix(&kms_path, KmsBehavior::default())
         .await
         .unwrap();
@@ -705,7 +705,7 @@ async fn test_amf_lite_security_and_redaction() {
 
     // 1. KMS Setup
     println!("[Security] Setting up FakeKms (Unix)");
-    let kms_path = temp_dir.path().join("kms.sock");
+    let kms_path = short_unix_socket_path("kms");
     let kms = FakeKms::new_unix(&kms_path, KmsBehavior::default())
         .await
         .unwrap();

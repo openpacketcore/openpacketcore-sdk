@@ -2481,11 +2481,11 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "tempfile",
  "time",
  "tokio",
  "tokio-rustls",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

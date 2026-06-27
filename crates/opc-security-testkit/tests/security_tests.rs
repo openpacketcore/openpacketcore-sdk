@@ -7,7 +7,9 @@ use opc_identity::{
     IdentityReloadError, SvidWatcher, TrustBundle, TrustBundleSet, TrustDomain, WorkloadIdentity,
 };
 use opc_key::{KeyId, KeyProvider, KeyPurpose, KmsKeyProvider};
-use opc_security_testkit::{FakeCa, FakeKms, FakeSpire, KmsBehavior, SvidUpdateMsg};
+use opc_security_testkit::{
+    short_unix_socket_path, FakeCa, FakeKms, FakeSpire, KmsBehavior, SvidUpdateMsg,
+};
 use opc_tls::{PeerPolicy, TlsConfigBuilder};
 use opc_types::TenantId;
 
@@ -17,8 +19,7 @@ fn tenant() -> TenantId {
 
 #[tokio::test]
 async fn test_svid_rotation_and_handshake() {
-    let dir = tempfile::tempdir().unwrap();
-    let socket_path = dir.path().join("spire.sock");
+    let socket_path = short_unix_socket_path("spire");
 
     let td = "example.internal";
     let ca = FakeCa::new(td);
@@ -136,8 +137,7 @@ async fn test_expired_svid_rejected() {
 
 #[tokio::test]
 async fn test_removed_trust_bundle_revokes_handshake() {
-    let dir = tempfile::tempdir().unwrap();
-    let socket_path = dir.path().join("spire.sock");
+    let socket_path = short_unix_socket_path("spire");
 
     let td = "example.internal";
     let ca = FakeCa::new(td);
@@ -205,8 +205,7 @@ async fn test_spire_socket_unavailable_fails_startup() {
 #[tokio::test]
 async fn test_kms_key_provider_behavior() {
     let behavior = KmsBehavior::default();
-    let dir = tempfile::tempdir().unwrap();
-    let socket_path = dir.path().join("kms.sock");
+    let socket_path = short_unix_socket_path("kms");
     let fake_kms = FakeKms::new_unix(&socket_path, behavior).await.unwrap();
 
     let provider = KmsKeyProvider::new(
