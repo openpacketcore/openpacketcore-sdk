@@ -1,0 +1,31 @@
+[package]
+name = "opc-proto-gtpv2c-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+opc-protocol = { path = "../../opc-protocol" }
+opc-proto-gtpv2c = { path = ".." }
+bytes = "1.8"
+
+[workspace]
+
+[[bin]]
+name = "decode_message"
+path = "fuzz_targets/decode_message.rs"
+test = false
+
+[[bin]]
+name = "decode_s2b"
+path = "fuzz_targets/decode_s2b.rs"
+test = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false

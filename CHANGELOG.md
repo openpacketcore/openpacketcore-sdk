@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-proto-gtpv2c` (experimental): S2b typed subset, consumed as a direct
+  protocol dependency rather than through the `opc-sdk` default facade/prelude.
 - `opc-proto-pfcp`: typed IE coverage for the Session Modification lifecycle
   (Update PDR/FAR/URR/QER, Update Forwarding Parameters, Remove PDR/FAR/URR/QER)
   and the Session Report / usage-reporting flow (Report Type, Measurement

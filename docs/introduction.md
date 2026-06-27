@@ -7,8 +7,9 @@ flexibility.
 
 ## What the SDK Provides
 
-- **Rust crates** for protocol codecs (PFCP, NAS-5GS, GTP-U), session
-  management, configuration consensus, alarms, and runtime chassis.
+- **Rust crates** for protocol codecs (GTP-U, PFCP, NAS-5GS, NGAP v0, and the
+  experimental `opc-proto-gtpv2c` S2b subset), session management,
+  configuration consensus, alarms, and runtime chassis.
 - **Go packages** (`operator-sdk-go`) for Kubernetes operators: conditions,
   bridge to Rust policy, drain orchestration, workload synthesis, and
   metrics.

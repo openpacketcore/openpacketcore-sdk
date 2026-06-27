@@ -5,11 +5,14 @@
 A robust, polyglot software development kit for building resilient, cloud-native 5G packet core network functions (CNFs). This SDK provides the standardized runtime chassis, quorum-replicated session storage, encrypted config persistence, northbound gNMI/NETCONF management-plane foundations, data-governance/redaction boundary enforcement, and release-assurance evidence pipelines for packet core software with high-assurance deployment requirements.
 
 The GTP-U user-plane codec is also applicable to LTE/EPC user plane. The SDK
-now includes an experimental, transport-neutral Diameter mechanism crate for
-RFC 6733 framing, base peer procedures, and initial 3GPP application dictionary
-work. It does **not** provide a product-ready EPC control-plane stack: GTP-C and
-S1AP are not provided, and Diameter realm routing, AAA/HSS/CDF behavior,
-transport operations, and carrier-readiness decisions remain downstream product
+now includes two experimental, transport-neutral protocol crates: the
+`opc-proto-gtpv2c` crate, limited to an S2b typed GTPv2-C subset, and the
+`opc-proto-diameter` crate for RFC 6733 framing, base peer procedures, and
+initial 3GPP application dictionary work. Both are consumed as direct protocol
+dependencies, not through the `opc-sdk` default feature set or prelude. They do
+**not** provide a product-ready EPC control-plane stack: GTP-C and S1AP are not
+provided, and Diameter realm routing, AAA/HSS/CDF behavior, transport
+operations, and carrier-readiness decisions remain downstream product
 responsibilities.
 
 > [!IMPORTANT]
@@ -41,6 +44,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | [`opc-proto-pfcp`](crates/opc-proto-pfcp/) | PFCP codec (TS 29.244): message layer, raw TLV preservation, and typed session-management IEs *(experimental)*. | — |
 | [`opc-proto-nas`](crates/opc-proto-nas/) | NAS-5GS (TS 24.501) codec: headers, body dispatch, mobile identity, BCD unpacking, Registration/Security Mode IEs, and NAS security hooks *(experimental)*. | — |
 | [`opc-proto-ngap`](crates/opc-proto-ngap/) | NGAP (TS 38.413) v0 decoder via `rasn` APER: PDU framing, fixture-proven NGSetupRequest, raw-preserving re-encode *(experimental v0)*. | [ADR 0013](docs/adr/0013-ngap-asn1-strategy.md) |
+| [`opc-proto-gtpv2c`](crates/opc-proto-gtpv2c/) | GTPv2-C (TS 29.274) experimental S2b subset: raw-preserving header/IE shell plus typed Echo/Create/Modify/Delete/Update views. | — |
 | [`opc-sctp`](crates/opc-sctp/) | Safe Linux SCTP transport wrapper for CNFs that terminate N2/NGAP or other SCTP interfaces. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
 | [`opc-libsctp-sys`](crates/opc-libsctp-sys/) | Narrow unsafe Linux SCTP UAPI boundary used only by `opc-sctp`; unsupported platforms fail explicitly. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
 | [`opc-node-resources`](crates/opc-node-resources/) | Validates `ResourceProfile` compatibility against observed `NodeCapabilityReport`. | [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md) |
