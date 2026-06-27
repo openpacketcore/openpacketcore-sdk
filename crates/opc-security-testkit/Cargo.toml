@@ -24,7 +24,6 @@ opc-tls = { path = "../opc-tls" }
 opc-key = { path = "../opc-key" }
 opc-crypto = { path = "../opc-crypto" }
 tokio-rustls = { workspace = true }
-tempfile = "3"
 uuid = { workspace = true }
 
 [lints]

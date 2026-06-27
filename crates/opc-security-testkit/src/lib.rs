@@ -13,21 +13,38 @@ use std::time::Duration;
 ///
 /// Tests that create sockets inside `tempfile::tempdir()` can fail when the
 /// effective temp directory is deep, because Linux's `sun_path` is limited to
-/// ~108 bytes. This helper deliberately hard-codes `/tmp` (instead of
+/// 108 bytes. This helper deliberately hard-codes `/tmp` (instead of
 /// `std::env::temp_dir()`) so the path is always short and unique per
 /// invocation, regardless of the value of `TMPDIR`.
 ///
-/// `name` must be a short filename-safe label (no path separators). It exists
-/// only to make parallel tests easier to identify in logs.
+/// # Limitations
+///
+/// * `/tmp` is assumed to be a short, writable tmpfs on Linux test hosts. The
+///   helper does not consult `TMPDIR` or `std::env::temp_dir()` because deep
+///   temporary directories would reintroduce the `sun_path` length problem.
+/// * `name` must be a short filename-safe label. It must not contain path
+///   separators and should be no more than a few tens of bytes so the final
+///   path stays comfortably below the 108-byte `sun_path` limit.
 pub fn short_unix_socket_path(name: &str) -> PathBuf {
-    debug_assert!(
+    assert!(
         !name.contains('/') && !name.contains('\\'),
         "short_unix_socket_path name must be a filename-safe label, got {name:?}"
     );
-    PathBuf::from(format!(
+    assert!(
+        name.len() <= 48,
+        "short_unix_socket_path name must be <= 48 bytes, got {} bytes in {name:?}",
+        name.len()
+    );
+    let path = PathBuf::from(format!(
         "/tmp/opc-test-{name}-{}.sock",
         uuid::Uuid::new_v4()
-    ))
+    ));
+    assert!(
+        path.as_os_str().as_encoded_bytes().len() <= 100,
+        "short_unix_socket_path produced a path that is too long: {}",
+        path.display()
+    );
+    path
 }
 
 pub struct FakeCa {
@@ -486,5 +503,90 @@ impl Drop for FakeKms {
         if let Some(path) = &self.socket_path {
             let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::short_unix_socket_path;
+
+    /// Maximum bytes Linux reserves for `sockaddr_un.sun_path` (including the
+    /// trailing NUL).
+    const SUN_PATH_LEN: usize = 108;
+
+    /// Leave a small margin for the trailing NUL and any implementation
+    /// overhead when `tokio::net::UnixListener::bind` converts the path.
+    const COMFORTABLE_LIMIT: usize = 100;
+
+    /// Restores the previous `TMPDIR` value when dropped.
+    struct TmpdirGuard(Option<String>);
+
+    impl TmpdirGuard {
+        fn set_deep() -> Self {
+            let previous = std::env::var("TMPDIR").ok();
+            std::env::set_var(
+                "TMPDIR",
+                "/very/deep/temporary/directory/that/would/exceed/the/unix/socket/path/limit/if/used",
+            );
+            Self(previous)
+        }
+    }
+
+    impl Drop for TmpdirGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("TMPDIR", v),
+                None => std::env::remove_var("TMPDIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn short_unix_socket_path_ignores_deep_tmpdir() {
+        let _guard = TmpdirGuard::set_deep();
+
+        let spire = short_unix_socket_path("spire");
+        let kms = short_unix_socket_path("kms");
+
+        assert!(
+            spire.starts_with("/tmp/"),
+            "spire path should be under /tmp: {spire:?}"
+        );
+        assert!(
+            kms.starts_with("/tmp/"),
+            "kms path should be under /tmp: {kms:?}"
+        );
+
+        assert!(
+            spire.as_os_str().as_encoded_bytes().len() <= COMFORTABLE_LIMIT,
+            "spire path should be comfortably below the sun_path limit: {spire:?}"
+        );
+        assert!(
+            kms.as_os_str().as_encoded_bytes().len() <= COMFORTABLE_LIMIT,
+            "kms path should be comfortably below the sun_path limit: {kms:?}"
+        );
+
+        assert!(
+            spire.as_os_str().as_encoded_bytes().len() < SUN_PATH_LEN,
+            "spire path must fit inside sun_path: {spire:?}"
+        );
+        assert!(
+            kms.as_os_str().as_encoded_bytes().len() < SUN_PATH_LEN,
+            "kms path must fit inside sun_path: {kms:?}"
+        );
+
+        assert_ne!(spire, kms, "two calls should produce unique paths");
+    }
+
+    #[test]
+    #[should_panic(expected = "short_unix_socket_path name must be a filename-safe label")]
+    fn short_unix_socket_path_rejects_path_separator() {
+        let _ = short_unix_socket_path("foo/bar");
+    }
+
+    #[test]
+    #[should_panic(expected = "short_unix_socket_path name must be <= 48 bytes")]
+    fn short_unix_socket_path_rejects_long_name() {
+        let _ = short_unix_socket_path(&"a".repeat(49));
     }
 }
