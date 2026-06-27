@@ -343,8 +343,12 @@ pub fn validate_ipsec_gateway(
         }
     }
 
+    validate_ipsec_network_attachments(ipsec, context, report);
+
     let is_lab_software_fallback_allowed =
         profile.environment == Environment::Lab && profile.lab_fallback.allow_software_packet_path;
+    let is_lab_userspace_esp_fallback_allowed =
+        profile.environment == Environment::Lab && ipsec.allow_userspace_esp_fallback;
 
     // Kernel version check
     if context.node.kernel < ipsec.minimum_kernel {
@@ -364,30 +368,77 @@ pub fn validate_ipsec_gateway(
         }
     }
 
-    // XFRM support check
-    if ipsec.require_xfrm && !context.node.ipsec.xfrm_supported {
+    // XFRM netlink support check
+    if ipsec.require_xfrm && !context.node.ipsec.xfrm_netlink_available {
         if is_lab_software_fallback_allowed {
             report.activate_fallback(
                 FallbackMode::SoftwarePacketPath,
-                "node lacks XFRM support; using lab software packet path",
+                "node lacks XFRM netlink support; using lab software packet path",
             );
         } else {
             report.push_error(ValidationError::MissingNodeCapability {
-                capability: "xfrm_supported".to_string(),
+                capability: "xfrm_netlink_available".to_string(),
             });
         }
     }
 
-    // UDP 500/4500 encapsulation check
-    if ipsec.require_udp_encap && !context.node.ipsec.udp_encap_supported {
+    // XFRM user policy support check
+    if ipsec.require_xfrm && !context.node.ipsec.xfrm_user_policy_available {
         if is_lab_software_fallback_allowed {
             report.activate_fallback(
                 FallbackMode::SoftwarePacketPath,
-                "node lacks UDP 500/4500 encapsulation support; using lab software packet path",
+                "node lacks XFRM user policy support; using lab software packet path",
             );
         } else {
             report.push_error(ValidationError::MissingNodeCapability {
-                capability: "udp_encap_supported".to_string(),
+                capability: "xfrm_user_policy_available".to_string(),
+            });
+        }
+    }
+
+    // ESP support check
+    if ipsec.require_xfrm && !context.node.ipsec.esp_supported {
+        if is_lab_userspace_esp_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::UserspaceEsp,
+                "node lacks kernel ESP support; using lab userspace ESP fallback",
+            );
+        } else if is_lab_software_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::SoftwarePacketPath,
+                "node lacks kernel ESP support; using lab software packet path",
+            );
+        } else {
+            report.push_error(ValidationError::MissingNodeCapability {
+                capability: "esp_supported".to_string(),
+            });
+        }
+    }
+
+    // UDP 500 (IKE) bind check
+    if ipsec.require_udp_500 && !context.node.ipsec.udp_500_bind_allowed {
+        if is_lab_software_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::SoftwarePacketPath,
+                "node lacks UDP 500 bind support; using lab software packet path",
+            );
+        } else {
+            report.push_error(ValidationError::MissingNodeCapability {
+                capability: "udp_500_bind_allowed".to_string(),
+            });
+        }
+    }
+
+    // UDP 4500 (NAT-T) bind check
+    if ipsec.require_udp_4500 && !context.node.ipsec.udp_4500_bind_allowed {
+        if is_lab_software_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::SoftwarePacketPath,
+                "node lacks UDP 4500 bind support; using lab software packet path",
+            );
+        } else {
+            report.push_error(ValidationError::MissingNodeCapability {
+                capability: "udp_4500_bind_allowed".to_string(),
             });
         }
     }
@@ -403,6 +454,114 @@ pub fn validate_ipsec_gateway(
             report.push_error(ValidationError::MissingNodeCapability {
                 capability: "sctp_supported".to_string(),
             });
+        }
+    }
+
+    // Required kernel module checks
+    for module in &ipsec.required_kernel_modules {
+        if !context.node.ipsec.available_kernel_modules.contains(module) {
+            if is_lab_software_fallback_allowed {
+                report.activate_fallback(
+                    FallbackMode::SoftwarePacketPath,
+                    format!(
+                        "node lacks required kernel module {module}; using lab software packet path"
+                    ),
+                );
+            } else {
+                report.push_error(ValidationError::MissingNodeCapability {
+                    capability: format!("kernel_module:{module}"),
+                });
+            }
+        }
+    }
+
+    // Required ESP algorithm checks
+    for algorithm in &ipsec.required_esp_algorithms {
+        if !context
+            .node
+            .ipsec
+            .supported_esp_algorithms
+            .contains(algorithm)
+        {
+            if is_lab_software_fallback_allowed {
+                report.activate_fallback(
+                    FallbackMode::SoftwarePacketPath,
+                    format!(
+                        "node lacks required ESP algorithm {algorithm}; using lab software packet path"
+                    ),
+                );
+            } else {
+                report.push_error(ValidationError::MissingNodeCapability {
+                    capability: format!("esp_algorithm:{algorithm}"),
+                });
+            }
+        }
+    }
+}
+
+fn validate_ipsec_network_attachments(
+    ipsec: &IpsecGatewayProfile,
+    context: &ValidationContext<'_>,
+    report: &mut ValidationReport,
+) {
+    if ipsec.network_attachments.is_empty() {
+        report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+            detail: "at least one IPsec network attachment is required".to_string(),
+        });
+        return;
+    }
+
+    let interface_names: BTreeSet<&String> = context.data_plane_interfaces.iter().collect();
+
+    for attachment in &ipsec.network_attachments {
+        if attachment.interface_name.trim().is_empty() {
+            report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                detail: "interface_name is required".to_string(),
+            });
+            continue;
+        }
+        if attachment.plane.trim().is_empty() {
+            report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                detail: format!(
+                    "plane is required for interface {}",
+                    attachment.interface_name
+                ),
+            });
+            continue;
+        }
+        if attachment.cni_type.trim().is_empty() {
+            report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                detail: format!(
+                    "cni_type is required for interface {}",
+                    attachment.interface_name
+                ),
+            });
+            continue;
+        }
+        if !interface_names.contains(&attachment.interface_name) {
+            report.push_error(ValidationError::UnknownInterface {
+                interface_name: attachment.interface_name.clone(),
+            });
+        }
+        if let Some(mtu) = attachment.mtu {
+            if mtu == 0 {
+                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                    detail: format!(
+                        "mtu must be non-zero for interface {}",
+                        attachment.interface_name
+                    ),
+                });
+            }
+        }
+        if let Some(vlan_id) = attachment.vlan_id {
+            if vlan_id == 0 || vlan_id > 4094 {
+                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                    detail: format!(
+                        "vlan_id {vlan_id} is outside valid 1-4094 range for interface {}",
+                        attachment.interface_name
+                    ),
+                });
+            }
         }
     }
 }

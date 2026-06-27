@@ -113,6 +113,7 @@ pub fn run_data_plane_preflight(
                 | ValidationError::AfXdpNoDataPlaneInterfaces
                 | ValidationError::IpsecProfileMissing
                 | ValidationError::IpsecNoDataPlaneInterfaces
+                | ValidationError::IpsecNetworkAttachmentInvalid { .. }
         )
     });
     checks.push(PreflightCheckResult {

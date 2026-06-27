@@ -125,9 +125,17 @@ fn capable_node() -> NodeCapabilityReport {
             numa_node: Some(0),
         }],
         ipsec: IpsecCapabilities {
-            xfrm_supported: true,
-            udp_encap_supported: true,
+            xfrm_netlink_available: true,
+            xfrm_user_policy_available: true,
+            esp_supported: true,
+            udp_500_bind_allowed: true,
+            udp_4500_bind_allowed: true,
             sctp_supported: true,
+            available_kernel_modules: BTreeSet::from(["xfrm_user".to_string(), "esp4".to_string()]),
+            supported_esp_algorithms: BTreeSet::from([
+                "aes-cbc".to_string(),
+                "hmac-sha256".to_string(),
+            ]),
         },
     }
 }
@@ -1896,8 +1904,20 @@ fn production_ipsec_gateway_profile() -> ResourceProfile {
             LinuxCapability::CapNetRaw,
         ]),
         require_xfrm: true,
-        require_udp_encap: true,
+        require_udp_500: true,
+        require_udp_4500: true,
         require_sctp: true,
+        required_kernel_modules: BTreeSet::from(["xfrm_user".to_string(), "esp4".to_string()]),
+        required_esp_algorithms: BTreeSet::from(["aes-cbc".to_string(), "hmac-sha256".to_string()]),
+        network_attachments: vec![IpsecNetworkAttachment {
+            interface_name: "ens5f0".to_string(),
+            plane: "nwu".to_string(),
+            cni_type: "multus".to_string(),
+            static_ip: None,
+            mtu: Some(1500),
+            vlan_id: None,
+        }],
+        allow_userspace_esp_fallback: false,
     });
     profile
 }
@@ -1979,10 +1999,10 @@ fn ipsec_disallowed_capability_is_rejected() {
 }
 
 #[test]
-fn ipsec_missing_xfrm_support_is_rejected() {
+fn ipsec_missing_xfrm_netlink_support_is_rejected() {
     let profile = production_ipsec_gateway_profile();
     let mut node = capable_node();
-    node.ipsec.xfrm_supported = false;
+    node.ipsec.xfrm_netlink_available = false;
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
     let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
@@ -1993,15 +2013,15 @@ fn ipsec_missing_xfrm_support_is_rejected() {
     assert!(report
         .errors
         .contains(&ValidationError::MissingNodeCapability {
-            capability: "xfrm_supported".to_string(),
+            capability: "xfrm_netlink_available".to_string(),
         }));
 }
 
 #[test]
-fn ipsec_missing_udp_encap_support_is_rejected() {
+fn ipsec_missing_xfrm_user_policy_support_is_rejected() {
     let profile = production_ipsec_gateway_profile();
     let mut node = capable_node();
-    node.ipsec.udp_encap_supported = false;
+    node.ipsec.xfrm_user_policy_available = false;
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
     let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
@@ -2012,7 +2032,64 @@ fn ipsec_missing_udp_encap_support_is_rejected() {
     assert!(report
         .errors
         .contains(&ValidationError::MissingNodeCapability {
-            capability: "udp_encap_supported".to_string(),
+            capability: "xfrm_user_policy_available".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_missing_kernel_esp_support_is_rejected() {
+    let profile = production_ipsec_gateway_profile();
+    let mut node = capable_node();
+    node.ipsec.esp_supported = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::MissingNodeCapability {
+            capability: "esp_supported".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_missing_udp_500_bind_is_rejected() {
+    let profile = production_ipsec_gateway_profile();
+    let mut node = capable_node();
+    node.ipsec.udp_500_bind_allowed = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::MissingNodeCapability {
+            capability: "udp_500_bind_allowed".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_missing_udp_4500_bind_is_rejected() {
+    let profile = production_ipsec_gateway_profile();
+    let mut node = capable_node();
+    node.ipsec.udp_4500_bind_allowed = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::MissingNodeCapability {
+            capability: "udp_4500_bind_allowed".to_string(),
         }));
 }
 
@@ -2056,12 +2133,12 @@ fn ipsec_unsupported_kernel_version_is_rejected() {
 }
 
 #[test]
-fn ipsec_lab_missing_xfrm_activates_software_packet_fallback() {
+fn ipsec_lab_missing_xfrm_netlink_activates_software_packet_fallback() {
     let mut profile = production_ipsec_gateway_profile();
     profile.environment = Environment::Lab;
     profile.lab_fallback.allow_software_packet_path = true;
     let mut node = capable_node();
-    node.ipsec.xfrm_supported = false;
+    node.ipsec.xfrm_netlink_available = false;
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
     let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
@@ -2077,12 +2154,75 @@ fn ipsec_lab_missing_xfrm_activates_software_packet_fallback() {
 }
 
 #[test]
-fn ipsec_lab_missing_udp_encap_activates_software_packet_fallback() {
+fn ipsec_lab_missing_xfrm_user_policy_activates_software_packet_fallback() {
     let mut profile = production_ipsec_gateway_profile();
     profile.environment = Environment::Lab;
     profile.lab_fallback.allow_software_packet_path = true;
     let mut node = capable_node();
-    node.ipsec.udp_encap_supported = false;
+    node.ipsec.xfrm_user_policy_available = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(report.is_eligible(), "{report:#?}");
+    assert!(report.fallback_status.active);
+    assert!(report
+        .fallback_status
+        .modes
+        .contains(&FallbackMode::SoftwarePacketPath));
+}
+
+#[test]
+fn ipsec_lab_kernel_esp_unavailable_activates_userspace_esp_fallback() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.environment = Environment::Lab;
+    profile.ipsec.as_mut().unwrap().allow_userspace_esp_fallback = true;
+    let mut node = capable_node();
+    node.ipsec.esp_supported = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(report.is_eligible(), "{report:#?}");
+    assert!(report.fallback_status.active);
+    assert!(report
+        .fallback_status
+        .modes
+        .contains(&FallbackMode::UserspaceEsp));
+}
+
+#[test]
+fn ipsec_lab_missing_udp_500_bind_activates_software_packet_fallback() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.environment = Environment::Lab;
+    profile.lab_fallback.allow_software_packet_path = true;
+    let mut node = capable_node();
+    node.ipsec.udp_500_bind_allowed = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(report.is_eligible(), "{report:#?}");
+    assert!(report.fallback_status.active);
+    assert!(report
+        .fallback_status
+        .modes
+        .contains(&FallbackMode::SoftwarePacketPath));
+}
+
+#[test]
+fn ipsec_lab_missing_udp_4500_bind_activates_software_packet_fallback() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.environment = Environment::Lab;
+    profile.lab_fallback.allow_software_packet_path = true;
+    let mut node = capable_node();
+    node.ipsec.udp_4500_bind_allowed = false;
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
     let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
@@ -2169,4 +2309,154 @@ fn ipsec_profile_missing_is_rejected() {
     assert!(report
         .errors
         .contains(&ValidationError::IpsecProfileMissing));
+}
+
+#[test]
+fn ipsec_missing_required_kernel_module_is_rejected() {
+    let profile = production_ipsec_gateway_profile();
+    let mut node = capable_node();
+    node.ipsec.available_kernel_modules = BTreeSet::new();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::MissingNodeCapability {
+            capability: "kernel_module:xfrm_user".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_missing_required_esp_algorithm_is_rejected() {
+    let profile = production_ipsec_gateway_profile();
+    let mut node = capable_node();
+    node.ipsec.supported_esp_algorithms = BTreeSet::new();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::MissingNodeCapability {
+            capability: "esp_algorithm:aes-cbc".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_empty_network_attachments_is_rejected() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.ipsec.as_mut().unwrap().network_attachments = vec![];
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::IpsecNetworkAttachmentInvalid {
+            detail: "at least one IPsec network attachment is required".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_network_attachment_missing_plane_is_rejected() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.ipsec.as_mut().unwrap().network_attachments[0].plane = "   ".to_string();
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::IpsecNetworkAttachmentInvalid {
+            detail: "plane is required for interface ens5f0".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_network_attachment_unknown_interface_is_rejected() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.ipsec.as_mut().unwrap().network_attachments[0].interface_name = "ens6f0".to_string();
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report.errors.contains(&ValidationError::UnknownInterface {
+        interface_name: "ens6f0".to_string(),
+    }));
+}
+
+#[test]
+fn ipsec_network_attachment_invalid_vlan_is_rejected() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.ipsec.as_mut().unwrap().network_attachments[0].vlan_id = Some(5000);
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::IpsecNetworkAttachmentInvalid {
+            detail: "vlan_id 5000 is outside valid 1-4094 range for interface ens5f0".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_preflight_network_check_fails_when_profile_missing() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.ipsec = None;
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = run_data_plane_preflight(&profile, &ctx);
+
+    assert!(!report.passed);
+    let network_check = report
+        .checks
+        .iter()
+        .find(|c| c.name == "Network_Attachments")
+        .expect("Network_Attachments check missing");
+    assert!(!network_check.passed);
+}
+
+#[test]
+fn ipsec_preflight_network_check_fails_when_no_data_plane_interfaces() {
+    let profile = production_ipsec_gateway_profile();
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let ctx = make_context(&node, &cpu_layout, &[], Some(0));
+
+    let report = run_data_plane_preflight(&profile, &ctx);
+
+    assert!(!report.passed);
+    let network_check = report
+        .checks
+        .iter()
+        .find(|c| c.name == "Network_Attachments")
+        .expect("Network_Attachments check missing");
+    assert!(!network_check.passed);
 }

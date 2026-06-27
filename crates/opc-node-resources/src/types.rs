@@ -193,6 +193,9 @@ pub enum FallbackMode {
     Veth,
     /// Allow non-exclusive / non-isolated data-plane CPU placement in lab mode.
     RelaxedCpuPinning,
+    /// Use a userspace ESP implementation when kernel ESP offload is unavailable
+    /// in lab mode.
+    UserspaceEsp,
     /// Run without the requested huge-page reservation in lab mode.
     ///
     /// **Reserved for future use.**  This variant is defined but no validator
@@ -416,11 +419,36 @@ pub struct SriovProfile {
     pub ipam_mode: IpamMode,
 }
 
+/// IPsec gateway network attachment requirement.
+///
+/// Declares the requested attachment prerequisites for an IPsec gateway
+/// workload, such as the data-plane interface name, functional plane,
+/// CNI type, and optional L2/L3 constraints.  This is a pure model: it does
+/// not inspect the host network namespace or Multus state.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IpsecNetworkAttachment {
+    /// Logical data-plane interface name (must match a declared data-plane
+    /// interface in the validation context).
+    pub interface_name: String,
+    /// Functional plane of the attachment (e.g. `n3`, `n6`, `nwu`).
+    pub plane: String,
+    /// CNI type requested for this attachment (e.g. `multus`, `macvlan`).
+    pub cni_type: String,
+    /// Optional statically requested IP address.
+    pub static_ip: Option<String>,
+    /// Optional requested MTU.  When present it must be non-zero.
+    pub mtu: Option<u16>,
+    /// Optional VLAN identifier.  When present it must be in the valid
+    /// 802.1Q range.
+    pub vlan_id: Option<u16>,
+}
+
 /// IPsec gateway resource profile.
 ///
-/// Describes the kernel, XFRM, UDP encapsulation, SCTP, and capability
-/// requirements that a node must satisfy for an IPsec gateway workload
-/// (e.g. future ePDG/N3IWF untrusted-access functions).
+/// Describes the kernel, XFRM, UDP encapsulation, SCTP, capability,
+/// network-attachment, and ESP-fallback requirements that a node must satisfy
+/// for an IPsec gateway workload (e.g. future ePDG/N3IWF untrusted-access
+/// functions).
 ///
 /// This crate is a pure model: it performs only structural validation of the
 /// declared requirements against the observed [`NodeCapabilityReport`] and never
@@ -433,21 +461,42 @@ pub struct IpsecGatewayProfile {
     pub required_capabilities: BTreeSet<LinuxCapability>,
     /// Whether the node must report XFRM support.
     pub require_xfrm: bool,
-    /// Whether the node must support UDP 500/4500 encapsulation.
-    pub require_udp_encap: bool,
+    /// Whether the node must allow binding UDP port 500 (IKE).
+    pub require_udp_500: bool,
+    /// Whether the node must allow binding UDP port 4500 (NAT-T).
+    pub require_udp_4500: bool,
     /// Whether the node must report SCTP support.
     pub require_sctp: bool,
+    /// Kernel modules that must be available on the node (e.g. `xfrm_user`).
+    pub required_kernel_modules: BTreeSet<String>,
+    /// ESP algorithms that must be supported by the node (e.g. `aes-cbc`).
+    pub required_esp_algorithms: BTreeSet<String>,
+    /// Required network attachments for the IPsec gateway workload.
+    pub network_attachments: Vec<IpsecNetworkAttachment>,
+    /// Whether lab mode may fall back to userspace ESP when kernel ESP is
+    /// unavailable.
+    pub allow_userspace_esp_fallback: bool,
 }
 
 /// IPsec-related capabilities reported by the node agent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct IpsecCapabilities {
-    /// Whether the kernel/platform supports XFRM operations.
-    pub xfrm_supported: bool,
-    /// Whether the node supports UDP 500/4500 encapsulation for IKE/NAT-T.
-    pub udp_encap_supported: bool,
+    /// Whether the kernel XFRM netlink interface is available.
+    pub xfrm_netlink_available: bool,
+    /// Whether the kernel XFRM user policy interface is available.
+    pub xfrm_user_policy_available: bool,
+    /// Whether the kernel supports ESP offload/processing.
+    pub esp_supported: bool,
+    /// Whether the node allows binding UDP port 500 (IKE).
+    pub udp_500_bind_allowed: bool,
+    /// Whether the node allows binding UDP port 4500 (NAT-T).
+    pub udp_4500_bind_allowed: bool,
     /// Whether the node reports SCTP support.
     pub sctp_supported: bool,
+    /// Kernel modules that are available on the node.
+    pub available_kernel_modules: BTreeSet<String>,
+    /// ESP algorithms supported by the node.
+    pub supported_esp_algorithms: BTreeSet<String>,
 }
 
 /// Lab-only fallback policy.  Each flag enables a degraded-mode escape hatch
@@ -760,6 +809,9 @@ pub enum ValidationError {
     /// [`DataPlaneProfile::IpsecGateway`] is selected but no data-plane
     /// interfaces are specified (RFC 011 §9.1 requires named attachments).
     IpsecNoDataPlaneInterfaces,
+    /// An IPsec gateway network attachment requirement is missing a required
+    /// field or has an invalid value.
+    IpsecNetworkAttachmentInvalid { detail: String },
     /// An SR-IOV data-plane interface exposes zero VFs, so no direct assignment
     /// is possible (RFC 011 §9.2).
     SriovNicZeroVfs { interface_name: String },
@@ -922,6 +974,9 @@ impl fmt::Display for ValidationError {
                     f,
                     "IPsec gateway requires at least one named data-plane interface"
                 )
+            }
+            ValidationError::IpsecNetworkAttachmentInvalid { detail } => {
+                write!(f, "IPsec network attachment invalid: {detail}")
             }
             ValidationError::SriovNicZeroVfs { interface_name } => {
                 write!(f, "SR-IOV interface {interface_name} exposes zero VFs")
