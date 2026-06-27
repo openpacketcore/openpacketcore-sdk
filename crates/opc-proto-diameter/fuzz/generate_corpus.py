@@ -47,6 +47,8 @@ def avp(code: int, flags: int, value: bytes, vendor: int | None = None) -> bytes
       12+   AVP Data + padding
     """
     has_vendor = vendor is not None
+    if flags & 0x1F:
+        raise ValueError("AVP reserved flag bits (0x1F) must be zero")
     v_bit_set = (flags & 0x80) != 0
     if has_vendor and not v_bit_set:
         raise ValueError("vendor provided but V bit (0x80) is not set in flags")

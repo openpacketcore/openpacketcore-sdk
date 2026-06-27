@@ -389,8 +389,10 @@ fn generated_codec_round_trip_decodes_back_to_equal_message() {
 // Redaction evidence
 // -----------------------------------------------------------------------------
 
+#[cfg(feature = "base")]
 use opc_proto_diameter::avp::dictionary::Redacted;
 
+#[cfg(feature = "base")]
 #[test]
 fn redacted_string_does_not_leak_in_debug_or_display() {
     let sensitive = Redacted::<String>::from("001010123456789");
@@ -402,6 +404,7 @@ fn redacted_string_does_not_leak_in_debug_or_display() {
     assert!(display.contains("REDACTED"));
 }
 
+#[cfg(feature = "base")]
 #[test]
 fn redacted_bytes_does_not_leak_in_debug_or_display() {
     let key = Redacted::<Vec<u8>>::from(vec![0xAA; 32]);
@@ -412,6 +415,7 @@ fn redacted_bytes_does_not_leak_in_debug_or_display() {
     assert!(debug.contains("REDACTED"));
 }
 
+#[cfg(feature = "base")]
 #[test]
 fn redacted_ip_does_not_leak_in_debug_or_display() {
     use std::net::{IpAddr, Ipv4Addr};
@@ -424,6 +428,7 @@ fn redacted_ip_does_not_leak_in_debug_or_display() {
     assert!(debug.contains("REDACTED"));
 }
 
+#[cfg(feature = "base")]
 #[test]
 fn redacted_equality_allows_business_logic_without_leak() {
     let a = Redacted::<String>::from("secret");
