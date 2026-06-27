@@ -93,19 +93,27 @@ pub fn receive_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<
     if rc < 0 {
         Err(io::Error::last_os_error())
     } else {
-        let total = rc as usize;
-        if total > buffer.len() {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "netlink XFRM datagram truncated: buffer is {} bytes but datagram is {} bytes",
-                    buffer.len(),
-                    total
-                ),
-            ))
-        } else {
-            Ok(total)
-        }
+        classify_recv(rc as usize, buffer.len())
+    }
+}
+
+/// Classify a successful `recv` return value against the caller buffer.
+///
+/// Returns the number of bytes available in the buffer when the datagram fits
+/// (or exactly fits). Returns [`io::ErrorKind::InvalidData`] when the kernel
+/// reported a real datagram length larger than the buffer, which can only
+/// happen when `recv` was called with `MSG_TRUNC`.
+fn classify_recv(received_len: usize, buf_len: usize) -> io::Result<usize> {
+    if received_len > buf_len {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "netlink XFRM datagram truncated: buffer is {} bytes but datagram is {} bytes",
+                buf_len, received_len
+            ),
+        ))
+    } else {
+        Ok(received_len)
     }
 }
 
@@ -129,5 +137,112 @@ mod tests {
         assert_eq!(addr.nl_family, libc::AF_NETLINK as libc::sa_family_t);
         assert_eq!(addr.nl_pid, 0);
         assert_eq!(addr.nl_groups, 0);
+    }
+
+    #[test]
+    fn classify_recv_accepts_fits_and_exact_fit() {
+        let cases: &[(usize, usize, usize)] = &[(0, 1, 0), (5, 10, 5), (10, 10, 10)];
+        for &(received, buf_len, expected) in cases {
+            assert_eq!(
+                classify_recv(received, buf_len).unwrap(),
+                expected,
+                "received={received}, buf_len={buf_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_recv_rejects_truncated_datagram() {
+        let err = classify_recv(11, 10).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains("truncated"), "{msg}");
+        assert!(msg.contains("buffer is 10 bytes"), "{msg}");
+        assert!(msg.contains("datagram is 11 bytes"), "{msg}");
+    }
+
+    /// Build a connected pair of datagram sockets for testing `receive_message`
+    /// without requiring a live netlink endpoint or privileges.
+    fn local_datagram_pair() -> (NetlinkSocket, OwnedFd) {
+        let mut fds: [libc::c_int; 2] = [-1, -1];
+        // SAFETY: `fds` is a valid two-element array and the call writes exactly
+        // two descriptors into it on success.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "socketpair failed: {}", io::Error::last_os_error());
+        // SAFETY: On success `socketpair` returned two fresh, live descriptors.
+        let local = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let peer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        (NetlinkSocket { fd: local }, peer)
+    }
+
+    fn send_all(peer: &OwnedFd, payload: &[u8]) {
+        // SAFETY: `payload` is a valid immutable buffer for its length and the
+        // peer descriptor is live.
+        let rc = unsafe {
+            libc::send(
+                peer.as_raw_fd(),
+                payload.as_ptr().cast::<libc::c_void>(),
+                payload.len(),
+                0,
+            )
+        };
+        assert_eq!(
+            rc,
+            payload.len() as isize,
+            "short send: {}",
+            io::Error::last_os_error()
+        );
+    }
+
+    #[test]
+    fn receive_message_returns_zero_for_empty_buffer() {
+        let (sock, _peer) = local_datagram_pair();
+        let mut buf = [];
+        assert_eq!(receive_message(&sock, &mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn receive_message_reads_fitting_datagram() {
+        let (sock, peer) = local_datagram_pair();
+        let payload = b"hello xfrm";
+        send_all(&peer, payload);
+
+        let mut buf = [0_u8; 32];
+        let n = receive_message(&sock, &mut buf).unwrap();
+        assert_eq!(n, payload.len());
+        assert_eq!(&buf[..n], payload);
+    }
+
+    #[test]
+    fn receive_message_reads_exact_fit_datagram() {
+        let (sock, peer) = local_datagram_pair();
+        let payload = b"exactfit";
+        assert_eq!(payload.len(), 8);
+        send_all(&peer, payload);
+
+        let mut buf = [0_u8; 8];
+        let n = receive_message(&sock, &mut buf).unwrap();
+        assert_eq!(n, payload.len());
+        assert_eq!(&buf, payload);
+    }
+
+    #[test]
+    fn receive_message_rejects_truncated_datagram() {
+        let (sock, peer) = local_datagram_pair();
+        let payload = b"0123456789abcdef";
+        assert_eq!(payload.len(), 16);
+        send_all(&peer, payload);
+
+        let mut buf = [0_u8; 8];
+        let err = receive_message(&sock, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("truncated"), "{err}");
     }
 }
