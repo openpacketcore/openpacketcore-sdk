@@ -191,3 +191,45 @@ fn header_decode_rejects_truncated_and_under_length_inputs() {
         Err(error) if matches!(error.code(), DecodeErrorCode::Truncated)
     ));
 }
+
+#[test]
+fn header_decode_rejects_non_v2_version() {
+    // Version 7 in the top three bits of the flags octet (0xe0).
+    let bytes = [0xe0, 0x01, 0x00, 0x04, 0x00, 0x00, 0x01, 0x00];
+    let decoded = decode_header(&bytes, DecodeContext::default());
+    assert!(matches!(
+        decoded,
+        Err(error) if matches!(
+            error.code(),
+            DecodeErrorCode::InvalidEnumValue { field: "version", value: 7 }
+        )
+    ));
+}
+
+#[test]
+fn header_decodes_and_preserves_piggybacking_flag() {
+    // Piggybacking bit (0x10) set together with TEID flag (0x08) -> flags 0x58.
+    let bytes = [
+        0x58, 0x20, 0x00, 0x08, 0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x02, 0x00,
+    ];
+    let (tail, header) = match decode_header(&bytes, DecodeContext::default()) {
+        Ok(value) => value,
+        Err(error) => panic!("piggybacking header decode failed: {error:?}"),
+    };
+    assert!(tail.is_empty());
+    assert!(header.piggybacking);
+    assert!(header.teid_flag);
+    assert_eq!(header.teid, Some(0x0102_0304));
+
+    let mut dst = BytesMut::new();
+    let encoded = encode_header(
+        &header,
+        &mut dst,
+        EncodeContext {
+            raw_preserving: true,
+            ..EncodeContext::default()
+        },
+    );
+    assert!(encoded.is_ok());
+    assert_eq!(dst.as_ref(), bytes.as_slice());
+}

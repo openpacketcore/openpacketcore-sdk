@@ -43,6 +43,12 @@ impl<'a> Message<'a> {
     }
 
     /// Iterate over the raw IE region with a default decode context.
+    ///
+    /// This method does **not** inherit the [`DecodeContext`] used during
+    /// message decode; it always uses [`DecodeContext::default()`]. Callers
+    /// that decoded with a non-default context (for example
+    /// [`ValidationLevel::Strict`]) and want the same limits applied to IE
+    /// iteration should use [`Self::ies_with_context`] instead.
     pub fn ies(&self) -> RawIeIterator<'a> {
         self.ies_with_context(DecodeContext::default())
     }
@@ -183,6 +189,10 @@ impl OwnedMessage {
     }
 
     /// Iterate over the raw IE region with a default decode context.
+    ///
+    /// Like [`Message::ies`], this method does not inherit the decode context
+    /// used when the message was decoded. Use `self.as_borrowed().ies_with_context(ctx)`
+    /// to apply explicit limits.
     pub fn ies(&self) -> RawIeIterator<'_> {
         self.as_borrowed().ies()
     }
@@ -311,5 +321,70 @@ mod tests {
         };
         let decoded = Message::decode(&bytes, ctx);
         assert!(decoded.is_err());
+    }
+
+    #[test]
+    fn header_only_decode_skips_ie_spare_bit_validation() {
+        // Same payload as strict_decode_rejects_ie_spare_bits: IE instance octet
+        // carries non-zero spare bits (0xf0). HeaderOnly should still parse the
+        // common header and TLIV boundaries, but must not reject spare bits.
+        let bytes = [
+            0x48, 0x20, 0x00, 0x0d, 0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x02, 0x00, 0xff, 0x00,
+            0x01, 0xf0, 0xaa,
+        ];
+        let header_only_ctx = DecodeContext {
+            validation_level: ValidationLevel::HeaderOnly,
+            ..DecodeContext::default()
+        };
+        let (_, message) = match Message::decode(&bytes, header_only_ctx) {
+            Ok(value) => value,
+            Err(error) => panic!("HeaderOnly decode failed: {error:?}"),
+        };
+        assert_eq!(message.header.teid, Some(0x0102_0304));
+        let ies: Vec<_> = message.ies_with_context(header_only_ctx).collect();
+        assert_eq!(ies.len(), 1);
+        let ie = match ies.into_iter().next() {
+            Some(Ok(ie)) => ie,
+            Some(Err(error)) => panic!("HeaderOnly IE decode failed: {error:?}"),
+            None => panic!("expected one IE"),
+        };
+        assert_eq!(ie.ie_type, 0xff);
+        assert_eq!(ie.value, [0xaa]);
+
+        // Structural (default) also accepts spare bits; only Strict rejects.
+        let strict_ctx = DecodeContext {
+            validation_level: ValidationLevel::Strict,
+            ..DecodeContext::default()
+        };
+        assert!(
+            Message::decode(&bytes, strict_ctx).is_err(),
+            "Strict decode should reject IE spare bits"
+        );
+    }
+
+    #[test]
+    fn ies_uses_default_context_and_ies_with_context_honors_caller() {
+        // Manually construct a message whose IE region carries spare bits.
+        // This isolates IE iteration context from the original decode context.
+        let raw_ies = [0xff, 0x00, 0x01, 0xf0, 0xaa];
+        let message = Message {
+            header: Header::with_teid(32, 0x0102_0304, 2),
+            raw_ies: &raw_ies,
+            tail: &[],
+        };
+
+        // ies() always uses DecodeContext::default(), so it accepts spare bits.
+        let default_ies: Vec<_> = message.ies().collect();
+        assert_eq!(default_ies.len(), 1);
+        assert!(default_ies[0].is_ok());
+
+        // ies_with_context propagates the caller's context.
+        let strict_ctx = DecodeContext {
+            validation_level: ValidationLevel::Strict,
+            ..DecodeContext::default()
+        };
+        let strict_ies: Vec<_> = message.ies_with_context(strict_ctx).collect();
+        assert_eq!(strict_ies.len(), 1);
+        assert!(strict_ies[0].is_err());
     }
 }
