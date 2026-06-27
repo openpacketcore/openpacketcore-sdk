@@ -18,14 +18,17 @@ importing ePDG product policy or local-builder bytes as conformance evidence.
 - Dictionary metadata architecture for applications, commands, AVPs, data types,
   and flag requirements.
 - Transport-neutral RFC 6733 base procedure builders/parsers for CER/CEA,
-  DWR/DWA, and DPR/DPA, including peer capability intersection helpers. These
+  DWR/DWA, and DPR/DPA, including optional `Origin-State-Id`, answer diagnostic
+  AVPs (`Error-Message` and raw `Failed-AVP` values), protocol-error E-bit
+  derivation, peer capability intersection, and CEA result-code helpers. These
   helpers deliberately do not own socket management, realm routing, watchdog
   thresholds, or deployment readiness policy.
 - Feature skeletons:
   - `base`: common RFC 6733 application metadata, CER/CEA, DWR/DWA, DPR/DPA,
     and selected base AVP definitions.
   - `peer`: transport-neutral procedure classification, base peer procedure
-    builders/parsers, and capability helpers for the base peer commands.
+    builders/parsers, diagnostics preservation, and capability/result-code
+    helpers for the base peer commands.
   - `app-gx`, `app-rf`, `app-s6a`, `app-s6b`, `app-swm`, `app-swx`: initial
     per-application 3GPP dictionary slots.
   - `all-apps`: enables every per-application dictionary slot.

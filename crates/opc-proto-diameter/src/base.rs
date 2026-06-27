@@ -70,6 +70,10 @@ pub const AVP_INBAND_SECURITY_ID: AvpCode = AvpCode::new(299);
 
 /// Diameter success result code.
 pub const RESULT_CODE_DIAMETER_SUCCESS: u32 = 2001;
+/// Command unsupported protocol-error result code.
+pub const RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED: u32 = 3001;
+/// No common application permanent-failure result code.
+pub const RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION: u32 = 5010;
 /// Inband-Security-Id value for no in-band security.
 pub const INBAND_SECURITY_ID_NO_INBAND_SECURITY: u32 = 0;
 /// Inband-Security-Id value for TLS.

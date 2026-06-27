@@ -12,7 +12,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, Encode, EncodeContext, EncodeError,
     EncodeErrorCode, SpecRef, UnknownIePolicy,
@@ -20,10 +20,12 @@ use opc_protocol::{
 
 use crate::base::{
     self, AVP_ACCT_APPLICATION_ID, AVP_AUTH_APPLICATION_ID, AVP_DISCONNECT_CAUSE,
-    AVP_FIRMWARE_REVISION, AVP_HOST_IP_ADDRESS, AVP_INBAND_SECURITY_ID, AVP_ORIGIN_HOST,
-    AVP_ORIGIN_REALM, AVP_ORIGIN_STATE_ID, AVP_PRODUCT_NAME, AVP_RESULT_CODE,
-    AVP_SUPPORTED_VENDOR_ID, AVP_VENDOR_ID, AVP_VENDOR_SPECIFIC_APPLICATION_ID,
-    COMMAND_CAPABILITIES_EXCHANGE, COMMAND_DEVICE_WATCHDOG, COMMAND_DISCONNECT_PEER,
+    AVP_ERROR_MESSAGE, AVP_FAILED_AVP, AVP_FIRMWARE_REVISION, AVP_HOST_IP_ADDRESS,
+    AVP_INBAND_SECURITY_ID, AVP_ORIGIN_HOST, AVP_ORIGIN_REALM, AVP_ORIGIN_STATE_ID,
+    AVP_PRODUCT_NAME, AVP_RESULT_CODE, AVP_SUPPORTED_VENDOR_ID, AVP_VENDOR_ID,
+    AVP_VENDOR_SPECIFIC_APPLICATION_ID, COMMAND_CAPABILITIES_EXCHANGE, COMMAND_DEVICE_WATCHDOG,
+    COMMAND_DISCONNECT_PEER, RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION,
+    RESULT_CODE_DIAMETER_SUCCESS,
 };
 use crate::dictionary::{CommandKind, Dictionary, DictionarySet};
 use crate::{
@@ -200,6 +202,13 @@ impl HostIpAddress {
                 octets.copy_from_slice(rest);
                 Ok(Self::Ipv6(octets))
             }
+            [0, 1, ..] | [0, 2, ..] => Err(DecodeError::new(
+                DecodeErrorCode::InvalidLength {
+                    reason: "diameter Host-IP-Address value length does not match its address family",
+                },
+                offset,
+            )
+            .with_spec_ref(peer_spec("5.3.5"))),
             [family_hi, family_lo, ..] => {
                 let family = u16::from_be_bytes([*family_hi, *family_lo]);
                 Err(DecodeError::new(
@@ -352,13 +361,20 @@ impl PeerCapabilities {
     }
 }
 
-/// Parsed Diameter answer carrying a Result-Code and peer identity.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PeerAnswer {
-    /// Result-Code AVP value.
-    pub result_code: u32,
-    /// Origin-Host and Origin-Realm AVPs.
-    pub identity: PeerIdentity,
+/// Optional diagnostic AVPs carried by Diameter answer messages.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnswerDiagnostics {
+    /// Optional Error-Message AVP value.
+    pub error_message: Option<String>,
+    /// Raw Failed-AVP grouped values, preserving each AVP value exactly.
+    pub failed_avps: Vec<Bytes>,
+}
+
+impl AnswerDiagnostics {
+    /// Return true when no diagnostic AVPs are present.
+    pub fn is_empty(&self) -> bool {
+        self.error_message.is_none() && self.failed_avps.is_empty()
+    }
 }
 
 /// Parsed Capabilities-Exchange-Answer.
@@ -368,6 +384,8 @@ pub struct CapabilitiesExchangeAnswer {
     pub result_code: u32,
     /// Peer capabilities carried by the answer.
     pub capabilities: PeerCapabilities,
+    /// Optional diagnostic AVPs carried by the answer.
+    pub diagnostics: AnswerDiagnostics,
 }
 
 /// Disconnect-Cause AVP values used by DPR.
@@ -415,6 +433,43 @@ pub struct DisconnectPeerRequest {
     pub identity: PeerIdentity,
     /// Disconnect-Cause AVP value.
     pub disconnect_cause: DisconnectCause,
+    /// Optional Origin-State-Id AVP value.
+    pub origin_state_id: Option<u32>,
+}
+
+/// Parsed Device-Watchdog-Request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceWatchdogRequest {
+    /// Origin-Host and Origin-Realm AVPs.
+    pub identity: PeerIdentity,
+    /// Optional Origin-State-Id AVP value.
+    pub origin_state_id: Option<u32>,
+}
+
+/// Parsed Device-Watchdog-Answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceWatchdogAnswer {
+    /// Result-Code AVP value.
+    pub result_code: u32,
+    /// Origin-Host and Origin-Realm AVPs.
+    pub identity: PeerIdentity,
+    /// Optional Origin-State-Id AVP value.
+    pub origin_state_id: Option<u32>,
+    /// Optional diagnostic AVPs carried by the answer.
+    pub diagnostics: AnswerDiagnostics,
+}
+
+/// Parsed Disconnect-Peer-Answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisconnectPeerAnswer {
+    /// Result-Code AVP value.
+    pub result_code: u32,
+    /// Origin-Host and Origin-Realm AVPs.
+    pub identity: PeerIdentity,
+    /// Optional Origin-State-Id AVP value.
+    pub origin_state_id: Option<u32>,
+    /// Optional diagnostic AVPs carried by the answer.
+    pub diagnostics: AnswerDiagnostics,
 }
 
 /// Capability intersection computed from two CER/CEA capability sets.
@@ -430,6 +485,25 @@ pub struct CapabilityNegotiation {
     pub vendor_specific_applications: Vec<VendorSpecificApplication>,
     /// Common Inband-Security-Id values, preserving local order.
     pub inband_security_ids: Vec<u32>,
+}
+
+impl CapabilityNegotiation {
+    /// Return true when at least one auth, accounting, or vendor-specific
+    /// application is common to both peers.
+    pub fn has_common_application(&self) -> bool {
+        !self.auth_application_ids.is_empty()
+            || !self.acct_application_ids.is_empty()
+            || !self.vendor_specific_applications.is_empty()
+    }
+
+    /// Return the Capabilities-Exchange-Answer Result-Code for this negotiation.
+    pub fn cea_result_code(&self) -> u32 {
+        if self.has_common_application() {
+            RESULT_CODE_DIAMETER_SUCCESS
+        } else {
+            RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION
+        }
+    }
 }
 
 /// Intersect two Diameter peer capability sets without making transport policy decisions.
@@ -456,6 +530,21 @@ pub fn negotiate_capabilities(
         ),
         inband_security_ids: common_copy(&local.inband_security_ids, &remote.inband_security_ids),
     }
+}
+
+/// Return whether two capability sets share at least one Diameter application.
+pub fn has_common_application(local: &PeerCapabilities, remote: &PeerCapabilities) -> bool {
+    negotiate_capabilities(local, remote).has_common_application()
+}
+
+/// Return the CEA Result-Code implied by two peer capability sets.
+pub fn cea_result_code(local: &PeerCapabilities, remote: &PeerCapabilities) -> u32 {
+    negotiate_capabilities(local, remote).cea_result_code()
+}
+
+/// Return whether a Result-Code requires the Diameter E bit on an answer.
+pub const fn result_code_requires_error_bit(result_code: u32) -> bool {
+    result_code >= 3000 && result_code < 4000
 }
 
 /// Build a Capabilities-Exchange-Request message.
@@ -496,19 +585,28 @@ pub fn parse_capabilities_exchange_request(
 
 /// Build a Capabilities-Exchange-Answer message.
 pub fn build_capabilities_exchange_answer(
-    capabilities: &PeerCapabilities,
-    result_code: u32,
+    answer: &CapabilitiesExchangeAnswer,
     hop_by_hop_identifier: u32,
     end_to_end_identifier: u32,
     ctx: EncodeContext,
 ) -> Result<OwnedMessage, EncodeError> {
     let section = PeerProcedure::CapabilitiesExchange.spec_section(CommandKind::Answer);
-    capabilities.validate_for_encode(section)?;
+    answer.capabilities.validate_for_encode(section)?;
     let mut raw_avps = BytesMut::new();
-    append_u32_avp(&mut raw_avps, AVP_RESULT_CODE, result_code, true, ctx)?;
-    append_capability_avps(&mut raw_avps, capabilities, ctx, section)?;
+    append_u32_avp(
+        &mut raw_avps,
+        AVP_RESULT_CODE,
+        answer.result_code,
+        true,
+        ctx,
+    )?;
+    append_capability_avps(&mut raw_avps, &answer.capabilities, ctx, section)?;
+    append_answer_diagnostics(&mut raw_avps, &answer.diagnostics, ctx)?;
     build_message(
-        peer_answer_flags(PeerProcedure::CapabilitiesExchange, false),
+        peer_answer_flags(
+            PeerProcedure::CapabilitiesExchange,
+            result_code_requires_error_bit(answer.result_code),
+        ),
         COMMAND_CAPABILITIES_EXCHANGE,
         raw_avps,
         hop_by_hop_identifier,
@@ -535,23 +633,26 @@ pub fn parse_capabilities_exchange_answer(
         "diameter CEA requires Result-Code",
         section,
     )?;
+    let diagnostics = avps.diagnostics();
     Ok(CapabilitiesExchangeAnswer {
         result_code,
         capabilities: avps.into_capabilities(section)?,
+        diagnostics,
     })
 }
 
 /// Build a Device-Watchdog-Request message.
 pub fn build_device_watchdog_request(
-    identity: &PeerIdentity,
+    request: &DeviceWatchdogRequest,
     hop_by_hop_identifier: u32,
     end_to_end_identifier: u32,
     ctx: EncodeContext,
 ) -> Result<OwnedMessage, EncodeError> {
     let section = PeerProcedure::DeviceWatchdog.spec_section(CommandKind::Request);
-    identity.validate_for_encode(section)?;
+    request.identity.validate_for_encode(section)?;
     let mut raw_avps = BytesMut::new();
-    append_identity_avps(&mut raw_avps, identity, ctx)?;
+    append_identity_avps(&mut raw_avps, &request.identity, ctx)?;
+    append_origin_state_id_avp(&mut raw_avps, request.origin_state_id, ctx)?;
     build_message(
         peer_request_flags(PeerProcedure::DeviceWatchdog),
         COMMAND_DEVICE_WATCHDOG,
@@ -567,27 +668,41 @@ pub fn build_device_watchdog_request(
 pub fn parse_device_watchdog_request(
     message: &Message<'_>,
     ctx: DecodeContext,
-) -> Result<PeerIdentity, DecodeError> {
+) -> Result<DeviceWatchdogRequest, DecodeError> {
     let section = PeerProcedure::DeviceWatchdog.spec_section(CommandKind::Request);
     ensure_peer_header(message, PeerProcedure::DeviceWatchdog, CommandKind::Request)?;
-    collect_procedure_avps(message.raw_avps, ctx, section)?.into_identity(section)
+    let avps = collect_procedure_avps(message.raw_avps, ctx, section)?;
+    Ok(DeviceWatchdogRequest {
+        identity: avps.identity(section)?,
+        origin_state_id: avps.origin_state_id(),
+    })
 }
 
 /// Build a Device-Watchdog-Answer message.
 pub fn build_device_watchdog_answer(
-    identity: &PeerIdentity,
-    result_code: u32,
+    answer: &DeviceWatchdogAnswer,
     hop_by_hop_identifier: u32,
     end_to_end_identifier: u32,
     ctx: EncodeContext,
 ) -> Result<OwnedMessage, EncodeError> {
     let section = PeerProcedure::DeviceWatchdog.spec_section(CommandKind::Answer);
-    identity.validate_for_encode(section)?;
+    answer.identity.validate_for_encode(section)?;
     let mut raw_avps = BytesMut::new();
-    append_u32_avp(&mut raw_avps, AVP_RESULT_CODE, result_code, true, ctx)?;
-    append_identity_avps(&mut raw_avps, identity, ctx)?;
+    append_u32_avp(
+        &mut raw_avps,
+        AVP_RESULT_CODE,
+        answer.result_code,
+        true,
+        ctx,
+    )?;
+    append_identity_avps(&mut raw_avps, &answer.identity, ctx)?;
+    append_origin_state_id_avp(&mut raw_avps, answer.origin_state_id, ctx)?;
+    append_answer_diagnostics(&mut raw_avps, &answer.diagnostics, ctx)?;
     build_message(
-        peer_answer_flags(PeerProcedure::DeviceWatchdog, false),
+        peer_answer_flags(
+            PeerProcedure::DeviceWatchdog,
+            result_code_requires_error_bit(answer.result_code),
+        ),
         COMMAND_DEVICE_WATCHDOG,
         raw_avps,
         hop_by_hop_identifier,
@@ -601,7 +716,7 @@ pub fn build_device_watchdog_answer(
 pub fn parse_device_watchdog_answer(
     message: &Message<'_>,
     ctx: DecodeContext,
-) -> Result<PeerAnswer, DecodeError> {
+) -> Result<DeviceWatchdogAnswer, DecodeError> {
     let section = PeerProcedure::DeviceWatchdog.spec_section(CommandKind::Answer);
     ensure_peer_header(message, PeerProcedure::DeviceWatchdog, CommandKind::Answer)?;
     let avps = collect_procedure_avps(message.raw_avps, ctx, section)?;
@@ -610,28 +725,30 @@ pub fn parse_device_watchdog_answer(
         "diameter DWA requires Result-Code",
         section,
     )?;
-    Ok(PeerAnswer {
+    Ok(DeviceWatchdogAnswer {
         result_code,
-        identity: avps.into_identity(section)?,
+        identity: avps.identity(section)?,
+        origin_state_id: avps.origin_state_id(),
+        diagnostics: avps.diagnostics(),
     })
 }
 
 /// Build a Disconnect-Peer-Request message.
 pub fn build_disconnect_peer_request(
-    identity: &PeerIdentity,
-    disconnect_cause: DisconnectCause,
+    request: &DisconnectPeerRequest,
     hop_by_hop_identifier: u32,
     end_to_end_identifier: u32,
     ctx: EncodeContext,
 ) -> Result<OwnedMessage, EncodeError> {
     let section = PeerProcedure::DisconnectPeer.spec_section(CommandKind::Request);
-    identity.validate_for_encode(section)?;
+    request.identity.validate_for_encode(section)?;
     let mut raw_avps = BytesMut::new();
-    append_identity_avps(&mut raw_avps, identity, ctx)?;
+    append_identity_avps(&mut raw_avps, &request.identity, ctx)?;
+    append_origin_state_id_avp(&mut raw_avps, request.origin_state_id, ctx)?;
     append_u32_avp(
         &mut raw_avps,
         AVP_DISCONNECT_CAUSE,
-        disconnect_cause.value(),
+        request.disconnect_cause.value(),
         true,
         ctx,
     )?;
@@ -660,26 +777,37 @@ pub fn parse_disconnect_peer_request(
         section,
     )?;
     Ok(DisconnectPeerRequest {
-        identity: avps.into_identity(section)?,
+        identity: avps.identity(section)?,
         disconnect_cause,
+        origin_state_id: avps.origin_state_id(),
     })
 }
 
 /// Build a Disconnect-Peer-Answer message.
 pub fn build_disconnect_peer_answer(
-    identity: &PeerIdentity,
-    result_code: u32,
+    answer: &DisconnectPeerAnswer,
     hop_by_hop_identifier: u32,
     end_to_end_identifier: u32,
     ctx: EncodeContext,
 ) -> Result<OwnedMessage, EncodeError> {
     let section = PeerProcedure::DisconnectPeer.spec_section(CommandKind::Answer);
-    identity.validate_for_encode(section)?;
+    answer.identity.validate_for_encode(section)?;
     let mut raw_avps = BytesMut::new();
-    append_u32_avp(&mut raw_avps, AVP_RESULT_CODE, result_code, true, ctx)?;
-    append_identity_avps(&mut raw_avps, identity, ctx)?;
+    append_u32_avp(
+        &mut raw_avps,
+        AVP_RESULT_CODE,
+        answer.result_code,
+        true,
+        ctx,
+    )?;
+    append_identity_avps(&mut raw_avps, &answer.identity, ctx)?;
+    append_origin_state_id_avp(&mut raw_avps, answer.origin_state_id, ctx)?;
+    append_answer_diagnostics(&mut raw_avps, &answer.diagnostics, ctx)?;
     build_message(
-        peer_answer_flags(PeerProcedure::DisconnectPeer, false),
+        peer_answer_flags(
+            PeerProcedure::DisconnectPeer,
+            result_code_requires_error_bit(answer.result_code),
+        ),
         COMMAND_DISCONNECT_PEER,
         raw_avps,
         hop_by_hop_identifier,
@@ -693,7 +821,7 @@ pub fn build_disconnect_peer_answer(
 pub fn parse_disconnect_peer_answer(
     message: &Message<'_>,
     ctx: DecodeContext,
-) -> Result<PeerAnswer, DecodeError> {
+) -> Result<DisconnectPeerAnswer, DecodeError> {
     let section = PeerProcedure::DisconnectPeer.spec_section(CommandKind::Answer);
     ensure_peer_header(message, PeerProcedure::DisconnectPeer, CommandKind::Answer)?;
     let avps = collect_procedure_avps(message.raw_avps, ctx, section)?;
@@ -702,9 +830,11 @@ pub fn parse_disconnect_peer_answer(
         "diameter DPA requires Result-Code",
         section,
     )?;
-    Ok(PeerAnswer {
+    Ok(DisconnectPeerAnswer {
         result_code,
-        identity: avps.into_identity(section)?,
+        identity: avps.identity(section)?,
+        origin_state_id: avps.origin_state_id(),
+        diagnostics: avps.diagnostics(),
     })
 }
 
@@ -726,6 +856,8 @@ struct ProcedureAvps {
     origin_realm: Option<FieldValue<String>>,
     result_code: Option<FieldValue<u32>>,
     disconnect_cause: Option<FieldValue<DisconnectCause>>,
+    error_message: Option<FieldValue<String>>,
+    failed_avps: Vec<Bytes>,
     host_ip_addresses: Vec<HostIpAddress>,
     vendor_id: Option<FieldValue<VendorId>>,
     product_name: Option<FieldValue<String>>,
@@ -739,19 +871,32 @@ struct ProcedureAvps {
 }
 
 impl ProcedureAvps {
-    fn into_identity(self, section: &'static str) -> Result<PeerIdentity, DecodeError> {
+    fn identity(&self, section: &'static str) -> Result<PeerIdentity, DecodeError> {
         Ok(PeerIdentity {
-            origin_host: require_field(
-                self.origin_host,
+            origin_host: require_field_ref(
+                &self.origin_host,
                 "diameter peer procedure requires Origin-Host",
                 section,
-            )?,
-            origin_realm: require_field(
-                self.origin_realm,
+            )?
+            .clone(),
+            origin_realm: require_field_ref(
+                &self.origin_realm,
                 "diameter peer procedure requires Origin-Realm",
                 section,
-            )?,
+            )?
+            .clone(),
         })
+    }
+
+    fn origin_state_id(&self) -> Option<u32> {
+        self.origin_state_id.as_ref().map(|field| field.value)
+    }
+
+    fn diagnostics(&self) -> AnswerDiagnostics {
+        AnswerDiagnostics {
+            error_message: self.error_message.as_ref().map(|field| field.value.clone()),
+            failed_avps: self.failed_avps.clone(),
+        }
     }
 
     fn into_capabilities(self, section: &'static str) -> Result<PeerCapabilities, DecodeError> {
@@ -858,6 +1003,31 @@ fn append_identity_avps(
 ) -> Result<(), EncodeError> {
     append_utf8_avp(dst, AVP_ORIGIN_HOST, &identity.origin_host, true, ctx)?;
     append_utf8_avp(dst, AVP_ORIGIN_REALM, &identity.origin_realm, true, ctx)
+}
+
+fn append_origin_state_id_avp(
+    dst: &mut BytesMut,
+    origin_state_id: Option<u32>,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    if let Some(origin_state_id) = origin_state_id {
+        append_u32_avp(dst, AVP_ORIGIN_STATE_ID, origin_state_id, true, ctx)?;
+    }
+    Ok(())
+}
+
+fn append_answer_diagnostics(
+    dst: &mut BytesMut,
+    diagnostics: &AnswerDiagnostics,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    if let Some(error_message) = diagnostics.error_message.as_ref() {
+        append_utf8_avp(dst, AVP_ERROR_MESSAGE, error_message, false, ctx)?;
+    }
+    for failed_avp in &diagnostics.failed_avps {
+        append_avp(dst, AvpHeader::ietf(AVP_FAILED_AVP, true), failed_avp, ctx)?;
+    }
+    Ok(())
 }
 
 fn append_vendor_specific_application_avp(
@@ -1060,6 +1230,12 @@ fn collect_procedure_avps(
             let value = parse_u32_value(avp.value, value_offset, "5.4.3")?;
             let cause = DisconnectCause::decode(value, value_offset)?;
             set_once(&mut parsed.disconnect_cause, cause, offset, section)
+        } else if code == AVP_ERROR_MESSAGE {
+            let value = parse_string_value(avp.value, value_offset, "7.3")?;
+            set_once(&mut parsed.error_message, value, offset, section)
+        } else if code == AVP_FAILED_AVP {
+            parsed.failed_avps.push(Bytes::copy_from_slice(avp.value));
+            Ok(())
         } else if code == AVP_HOST_IP_ADDRESS {
             parsed
                 .host_ip_addresses
@@ -1317,6 +1493,21 @@ fn require_field<T>(
     }
 }
 
+fn require_field_ref<'a, T>(
+    field: &'a Option<FieldValue<T>>,
+    reason: &'static str,
+    section: &'static str,
+) -> Result<&'a T, DecodeError> {
+    match field {
+        Some(field) => Ok(&field.value),
+        None => Err(decode_structural_error(
+            reason,
+            DIAMETER_HEADER_LEN,
+            section,
+        )),
+    }
+}
+
 fn common_copy<T: Copy + Eq>(local: &[T], remote: &[T]) -> Vec<T> {
     let mut common = Vec::new();
     for value in local {
@@ -1501,16 +1692,17 @@ mod tests {
         remote.supported_vendor_ids = vec![VendorId::new(10415), VendorId::new(2)];
         remote.inband_security_ids = vec![INBAND_SECURITY_ID_NO_INBAND_SECURITY];
 
-        let built = match build_capabilities_exchange_answer(
-            &remote,
-            RESULT_CODE_DIAMETER_SUCCESS,
-            0x10,
-            0x20,
-            EncodeContext::default(),
-        ) {
-            Ok(message) => message,
-            Err(error) => panic!("CEA build failed: {error}"),
+        let answer = CapabilitiesExchangeAnswer {
+            result_code: RESULT_CODE_DIAMETER_SUCCESS,
+            capabilities: remote.clone(),
+            diagnostics: AnswerDiagnostics::default(),
         };
+        let built =
+            match build_capabilities_exchange_answer(&answer, 0x10, 0x20, EncodeContext::default())
+            {
+                Ok(message) => message,
+                Err(error) => panic!("CEA build failed: {error}"),
+            };
         let encoded = encode_owned(&built);
         let message = decode_message(&encoded);
         let parsed = match parse_capabilities_exchange_answer(&message, DecodeContext::default()) {
@@ -1519,6 +1711,7 @@ mod tests {
         };
         assert_eq!(parsed.result_code, RESULT_CODE_DIAMETER_SUCCESS);
         assert_eq!(parsed.capabilities, remote);
+        assert!(parsed.diagnostics.is_empty());
 
         let negotiated = negotiate_capabilities(&local, &parsed.capabilities);
         assert_eq!(negotiated.supported_vendor_ids, vec![VendorId::new(10415)]);
@@ -1532,79 +1725,149 @@ mod tests {
             negotiated.inband_security_ids,
             vec![INBAND_SECURITY_ID_NO_INBAND_SECURITY]
         );
+        assert!(negotiated.has_common_application());
+        assert_eq!(negotiated.cea_result_code(), RESULT_CODE_DIAMETER_SUCCESS);
+    }
+
+    #[test]
+    fn cea_result_helper_and_failed_avp_diagnostics_round_trip() {
+        let mut local = sample_capabilities();
+        local.auth_application_ids.clear();
+        local.acct_application_ids.clear();
+        local.vendor_specific_applications.clear();
+
+        let mut remote = sample_capabilities();
+        remote.auth_application_ids.clear();
+        remote.acct_application_ids.clear();
+        remote.vendor_specific_applications.clear();
+
+        let negotiated = negotiate_capabilities(&local, &remote);
+        assert!(!negotiated.has_common_application());
+        assert!(!has_common_application(&local, &remote));
+        assert_eq!(
+            negotiated.cea_result_code(),
+            RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION
+        );
+        assert_eq!(
+            cea_result_code(&local, &remote),
+            RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION
+        );
+
+        let mut failed_avp_value = BytesMut::new();
+        if let Err(error) = append_utf8_avp(
+            &mut failed_avp_value,
+            AVP_ORIGIN_REALM,
+            "example.net",
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("Failed-AVP value build failed: {error}");
+        }
+        let answer = CapabilitiesExchangeAnswer {
+            result_code: crate::base::RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED,
+            capabilities: remote,
+            diagnostics: AnswerDiagnostics {
+                error_message: Some("unsupported command".to_string()),
+                failed_avps: vec![failed_avp_value.freeze()],
+            },
+        };
+        let built =
+            match build_capabilities_exchange_answer(&answer, 0x11, 0x22, EncodeContext::default())
+            {
+                Ok(message) => message,
+                Err(error) => panic!("CEA error answer build failed: {error}"),
+            };
+        let encoded = encode_owned(&built);
+        let message = decode_message(&encoded);
+        assert!(message.header.flags.is_error());
+        let parsed = match parse_capabilities_exchange_answer(&message, DecodeContext::default()) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("CEA error answer parse failed: {error}"),
+        };
+        assert_eq!(parsed.diagnostics, answer.diagnostics);
     }
 
     #[test]
     fn watchdog_and_disconnect_builders_parse_without_transport_state() {
         let identity = PeerIdentity::new("aaa2.example.net", "example.net");
-        let dwr = match build_device_watchdog_request(&identity, 1, 2, EncodeContext::default()) {
+        let dwr_request = DeviceWatchdogRequest {
+            identity: identity.clone(),
+            origin_state_id: Some(21),
+        };
+        let dwr = match build_device_watchdog_request(&dwr_request, 1, 2, EncodeContext::default())
+        {
             Ok(message) => message,
             Err(error) => panic!("DWR build failed: {error}"),
         };
         let encoded = encode_owned(&dwr);
         let message = decode_message(&encoded);
         match parse_device_watchdog_request(&message, DecodeContext::default()) {
-            Ok(parsed) => assert_eq!(parsed, identity),
+            Ok(parsed) => assert_eq!(parsed, dwr_request),
             Err(error) => panic!("DWR parse failed: {error}"),
         }
 
-        let dwa = match build_device_watchdog_answer(
-            &identity,
-            RESULT_CODE_DIAMETER_SUCCESS,
-            3,
-            4,
-            EncodeContext::default(),
-        ) {
+        let dwa_answer = DeviceWatchdogAnswer {
+            result_code: RESULT_CODE_DIAMETER_SUCCESS,
+            identity: identity.clone(),
+            origin_state_id: Some(22),
+            diagnostics: AnswerDiagnostics::default(),
+        };
+        let dwa = match build_device_watchdog_answer(&dwa_answer, 3, 4, EncodeContext::default()) {
             Ok(message) => message,
             Err(error) => panic!("DWA build failed: {error}"),
         };
         let encoded = encode_owned(&dwa);
         let message = decode_message(&encoded);
         match parse_device_watchdog_answer(&message, DecodeContext::default()) {
-            Ok(parsed) => {
-                assert_eq!(parsed.identity, identity);
-                assert_eq!(parsed.result_code, RESULT_CODE_DIAMETER_SUCCESS);
-            }
+            Ok(parsed) => assert_eq!(parsed, dwa_answer),
             Err(error) => panic!("DWA parse failed: {error}"),
         }
 
-        let dpr = match build_disconnect_peer_request(
-            &identity,
-            DisconnectCause::Busy,
-            5,
-            6,
-            EncodeContext::default(),
-        ) {
+        let dpr_request = DisconnectPeerRequest {
+            identity: identity.clone(),
+            disconnect_cause: DisconnectCause::Busy,
+            origin_state_id: Some(23),
+        };
+        let dpr = match build_disconnect_peer_request(&dpr_request, 5, 6, EncodeContext::default())
+        {
             Ok(message) => message,
             Err(error) => panic!("DPR build failed: {error}"),
         };
         let encoded = encode_owned(&dpr);
         let message = decode_message(&encoded);
         match parse_disconnect_peer_request(&message, DecodeContext::default()) {
-            Ok(parsed) => {
-                assert_eq!(parsed.identity, identity);
-                assert_eq!(parsed.disconnect_cause, DisconnectCause::Busy);
-            }
+            Ok(parsed) => assert_eq!(parsed, dpr_request),
             Err(error) => panic!("DPR parse failed: {error}"),
         }
 
-        let dpa = match build_disconnect_peer_answer(
-            &identity,
-            RESULT_CODE_DIAMETER_SUCCESS,
-            7,
-            8,
+        let mut failed_avp_value = BytesMut::new();
+        if let Err(error) = append_utf8_avp(
+            &mut failed_avp_value,
+            AVP_ORIGIN_HOST,
+            "bad.example.net",
+            true,
             EncodeContext::default(),
         ) {
+            panic!("Failed-AVP value build failed: {error}");
+        }
+        let dpa_answer = DisconnectPeerAnswer {
+            result_code: crate::base::RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED,
+            identity,
+            origin_state_id: Some(24),
+            diagnostics: AnswerDiagnostics {
+                error_message: Some("unsupported command".to_string()),
+                failed_avps: vec![failed_avp_value.freeze()],
+            },
+        };
+        let dpa = match build_disconnect_peer_answer(&dpa_answer, 7, 8, EncodeContext::default()) {
             Ok(message) => message,
             Err(error) => panic!("DPA build failed: {error}"),
         };
         let encoded = encode_owned(&dpa);
         let message = decode_message(&encoded);
+        assert!(message.header.flags.is_error());
         match parse_disconnect_peer_answer(&message, DecodeContext::default()) {
-            Ok(parsed) => {
-                assert_eq!(parsed.identity, identity);
-                assert_eq!(parsed.result_code, RESULT_CODE_DIAMETER_SUCCESS);
-            }
+            Ok(parsed) => assert_eq!(parsed, dpa_answer),
             Err(error) => panic!("DPA parse failed: {error}"),
         }
     }
@@ -1639,6 +1902,129 @@ mod tests {
         assert!(matches!(
             result,
             Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
+        ));
+    }
+
+    #[test]
+    fn procedure_parser_rejects_duplicate_and_empty_identity_avps() {
+        let identity = PeerIdentity::new("aaa3.example.net", "example.net");
+        let mut duplicate_raw_avps = BytesMut::new();
+        if let Err(error) =
+            append_identity_avps(&mut duplicate_raw_avps, &identity, EncodeContext::default())
+        {
+            panic!("identity AVP build failed: {error}");
+        }
+        if let Err(error) = append_utf8_avp(
+            &mut duplicate_raw_avps,
+            AVP_ORIGIN_HOST,
+            "aaa3b.example.net",
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("duplicate Origin-Host AVP build failed: {error}");
+        }
+        let built = match build_message(
+            peer_request_flags(PeerProcedure::DeviceWatchdog),
+            COMMAND_DEVICE_WATCHDOG,
+            duplicate_raw_avps,
+            1,
+            2,
+            EncodeContext::default(),
+            "5.5.1",
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("message build failed: {error}"),
+        };
+        let encoded = encode_owned(&built);
+        let message = decode_message(&encoded);
+        let result = parse_device_watchdog_request(&message, DecodeContext::default());
+        assert!(matches!(
+            result,
+            Err(error) if matches!(error.code(), DecodeErrorCode::DuplicateIe)
+        ));
+
+        let mut empty_raw_avps = BytesMut::new();
+        if let Err(error) = append_utf8_avp(
+            &mut empty_raw_avps,
+            AVP_ORIGIN_HOST,
+            "",
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("empty Origin-Host AVP build failed: {error}");
+        }
+        if let Err(error) = append_utf8_avp(
+            &mut empty_raw_avps,
+            AVP_ORIGIN_REALM,
+            "example.net",
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("Origin-Realm AVP build failed: {error}");
+        }
+        let built = match build_message(
+            peer_request_flags(PeerProcedure::DeviceWatchdog),
+            COMMAND_DEVICE_WATCHDOG,
+            empty_raw_avps,
+            3,
+            4,
+            EncodeContext::default(),
+            "5.5.1",
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("message build failed: {error}"),
+        };
+        let encoded = encode_owned(&built);
+        let message = decode_message(&encoded);
+        let result = parse_device_watchdog_request(&message, DecodeContext::default());
+        assert!(matches!(
+            result,
+            Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
+        ));
+    }
+
+    #[test]
+    fn host_ip_address_ipv6_and_rejection_paths_are_covered() {
+        let ipv6 = [0x20, 0x01, 0x0d, 0xb8, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let mut capabilities = sample_capabilities();
+        capabilities.host_ip_addresses = vec![HostIpAddress::ipv6(ipv6)];
+        let built = match build_capabilities_exchange_request(
+            &capabilities,
+            0x33,
+            0x44,
+            EncodeContext::default(),
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("CER build failed: {error}"),
+        };
+        let encoded = encode_owned(&built);
+        let message = decode_message(&encoded);
+        let parsed = match parse_capabilities_exchange_request(&message, DecodeContext::default()) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("CER parse failed: {error}"),
+        };
+        assert_eq!(parsed.host_ip_addresses, vec![HostIpAddress::ipv6(ipv6)]);
+
+        let wrong_ipv4_length = HostIpAddress::decode_value(&[0, 1, 192, 0, 2], 10);
+        assert!(matches!(
+            wrong_ipv4_length,
+            Err(error) if matches!(error.code(), DecodeErrorCode::InvalidLength { .. })
+        ));
+        let unknown_family = HostIpAddress::decode_value(&[0, 99, 1, 2], 10);
+        assert!(matches!(
+            unknown_family,
+            Err(error) if matches!(
+                error.code(),
+                DecodeErrorCode::InvalidEnumValue {
+                    field: "Host-IP-Address AddressType",
+                    value: 99
+                }
+            )
+        ));
+        let missing_family = HostIpAddress::decode_value(&[0], 10);
+        assert!(matches!(
+            missing_family,
+            Err(error) if matches!(error.code(), DecodeErrorCode::InvalidLength { .. })
         ));
     }
 
