@@ -29,8 +29,8 @@ use crate::base::{
 };
 use crate::dictionary::{CommandKind, Dictionary, DictionarySet};
 use crate::{
-    ApplicationId, AvpCode, AvpHeader, CommandCode, CommandFlags, Header, Message, OwnedMessage,
-    RawAvp, VendorId, DIAMETER_HEADER_LEN, MAX_U24,
+    ApplicationId, AvpCode, AvpHeader, AvpKey, CommandCode, CommandFlags, FlagRequirement, Header,
+    Message, OwnedMessage, RawAvp, VendorId, DIAMETER_HEADER_LEN, MAX_U24,
 };
 
 static PEER_DICTIONARY_REFS: [&Dictionary; 1] = [base::dictionary()];
@@ -274,9 +274,9 @@ impl VendorSpecificApplication {
     }
 
     fn validate_for_encode(&self, section: &'static str) -> Result<(), EncodeError> {
-        if self.vendor_ids.is_empty() {
+        if self.vendor_ids.len() != 1 {
             return Err(encode_structural_error(
-                "diameter Vendor-Specific-Application-Id requires at least one Vendor-Id",
+                "diameter Vendor-Specific-Application-Id requires exactly one Vendor-Id",
                 section,
             ));
         }
@@ -578,6 +578,14 @@ pub fn cea_result_code(local: &PeerCapabilities, remote: &PeerCapabilities) -> u
 }
 
 /// Return whether a Result-Code requires the Diameter E bit on an answer.
+///
+/// This reflects RFC 6733 section 7.2, which links the E bit to answers carrying
+/// a protocol-error Result-Code in the 3xxx range. It does not return true for
+/// permanent-failure (5xxx) or transient-failure (4xxx) result codes. In
+/// particular, a Capabilities-Exchange-Answer with
+/// `DIAMETER_NO_COMMON_APPLICATION` (5010) will not have the E bit set by this
+/// helper, because 5010 is not a protocol error even though the capability
+/// exchange failed.
 pub const fn result_code_requires_error_bit(result_code: u32) -> bool {
     result_code >= 3000 && result_code < 4000
 }
@@ -1322,6 +1330,7 @@ fn collect_procedure_avps(
     let mut parsed = ProcedureAvps::default();
     for_each_avp(raw_avps, ctx, DIAMETER_HEADER_LEN, 0, |offset, avp| {
         let value_offset = offset_add(offset, avp.header.header_len(), section)?;
+        validate_peer_avp_flags(&avp.header, offset)?;
         if avp.header.vendor_id.is_some() {
             return handle_unknown_avp(ctx, &avp, offset, section);
         }
@@ -1420,7 +1429,7 @@ fn parse_vendor_specific_application(
     section: &'static str,
 ) -> Result<VendorSpecificApplication, DecodeError> {
     let child_depth = 1;
-    let mut vendor_ids = Vec::new();
+    let mut vendor_id: Option<FieldValue<VendorId>> = None;
     let mut auth_application_id = None;
     let mut acct_application_id = None;
     for_each_avp(
@@ -1430,17 +1439,15 @@ fn parse_vendor_specific_application(
         child_depth,
         |offset, child| {
             let child_value_offset = offset_add(offset, child.header.header_len(), section)?;
+            validate_peer_avp_flags(&child.header, offset)?;
             if child.header.vendor_id.is_some() {
                 return handle_unknown_avp(ctx, &child, offset, section);
             }
             let code = child.header.code;
             if code == AVP_VENDOR_ID {
-                vendor_ids.push(VendorId::new(parse_u32_value(
-                    child.value,
-                    child_value_offset,
-                    "5.3.3",
-                )?));
-                Ok(())
+                let value =
+                    VendorId::new(parse_u32_value(child.value, child_value_offset, "5.3.3")?);
+                set_once(&mut vendor_id, value, offset, section)
             } else if code == AVP_AUTH_APPLICATION_ID {
                 let value =
                     ApplicationId::new(parse_u32_value(child.value, child_value_offset, "6.8")?);
@@ -1454,13 +1461,11 @@ fn parse_vendor_specific_application(
             }
         },
     )?;
-    if vendor_ids.is_empty() {
-        return Err(decode_structural_error(
-            "diameter Vendor-Specific-Application-Id requires Vendor-Id",
-            value_offset,
-            section,
-        ));
-    }
+    let vendor_id = require_field(
+        vendor_id,
+        "diameter Vendor-Specific-Application-Id requires Vendor-Id",
+        section,
+    )?;
     if auth_application_id.is_some() == acct_application_id.is_some() {
         return Err(decode_structural_error(
             "diameter Vendor-Specific-Application-Id requires exactly one Auth-Application-Id or Acct-Application-Id",
@@ -1469,7 +1474,7 @@ fn parse_vendor_specific_application(
         ));
     }
     Ok(VendorSpecificApplication {
-        vendor_ids,
+        vendor_ids: vec![vendor_id],
         auth_application_id: auth_application_id.map(|field| field.value),
         acct_application_id: acct_application_id.map(|field| field.value),
     })
@@ -1589,6 +1594,44 @@ fn set_once<T>(
             .with_spec_ref(peer_spec(section)));
     }
     *slot = Some(FieldValue::new(value, offset));
+    Ok(())
+}
+
+fn validate_peer_avp_flags(header: &AvpHeader, offset: usize) -> Result<(), DecodeError> {
+    let key = AvpKey::ietf(header.code);
+    let Some(definition) = PEER_DICTIONARIES.find_avp(key) else {
+        return Ok(());
+    };
+    let flags = definition.flags();
+    let section = definition.spec_ref().section();
+    if flags.vendor() == FlagRequirement::MustBeUnset && header.vendor_id.is_some() {
+        return Err(decode_structural_error(
+            "diameter AVP V-bit must not be set per base dictionary",
+            offset,
+            section,
+        ));
+    }
+    if flags.mandatory() == FlagRequirement::MustBeSet && !header.flags.is_mandatory() {
+        return Err(decode_structural_error(
+            "diameter AVP M-bit must be set per base dictionary",
+            offset,
+            section,
+        ));
+    }
+    if flags.mandatory() == FlagRequirement::MustBeUnset && header.flags.is_mandatory() {
+        return Err(decode_structural_error(
+            "diameter AVP M-bit must not be set per base dictionary",
+            offset,
+            section,
+        ));
+    }
+    if flags.protected() == FlagRequirement::MustBeUnset && header.flags.is_protected() {
+        return Err(decode_structural_error(
+            "diameter AVP P-bit must not be set per base dictionary",
+            offset,
+            section,
+        ));
+    }
     Ok(())
 }
 
@@ -2520,11 +2563,11 @@ mod tests {
             Ok(message) => message,
             Err(error) => panic!("message build failed: {error}"),
         };
-        let message = Message {
-            header: built.header.clone(),
-            raw_avps: &built.raw_avps,
-            tail: &[],
-        };
+        let encoded = encode_owned(&built);
+        // Decode through the normal Message::decode path so the test tracks the
+        // code path callers use, while keeping the strict validation inside the
+        // procedure parser rather than the top-level AVP validator.
+        let message = decode_message(&encoded);
         let result = parse_device_watchdog_request(&message, DecodeContext::conservative());
         assert!(matches!(
             result,
@@ -2532,6 +2575,388 @@ mod tests {
                 error.code(),
                 DecodeErrorCode::Structural {
                     reason: "diameter AVP reserved flag bits must be zero"
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn vendor_specific_application_requires_exactly_one_vendor_id() {
+        let mut multi_vendor =
+            VendorSpecificApplication::auth(VendorId::new(10415), ApplicationId::new(16_777_251));
+        multi_vendor.vendor_ids.push(VendorId::new(123));
+
+        let mut capabilities = sample_capabilities();
+        capabilities.vendor_specific_applications = vec![multi_vendor];
+        let build_result = build_capabilities_exchange_request(
+            &capabilities,
+            0x0102_0304,
+            0x0506_0708,
+            EncodeContext::default(),
+        );
+        assert!(matches!(
+            build_result,
+            Err(error) if matches!(error.code(), EncodeErrorCode::Structural { .. })
+        ));
+
+        let identity = PeerIdentity::new("aaa-vsai.example.net", "example.net");
+        let mut raw_avps = BytesMut::new();
+        if let Err(error) = append_identity_avps(&mut raw_avps, &identity, EncodeContext::default())
+        {
+            panic!("identity AVP build failed: {error}");
+        }
+        if let Err(error) = append_address_avp(
+            &mut raw_avps,
+            HostIpAddress::ipv4([192, 0, 2, 1]),
+            EncodeContext::default(),
+        ) {
+            panic!("Host-IP-Address AVP build failed: {error}");
+        }
+        if let Err(error) = append_u32_avp(
+            &mut raw_avps,
+            AVP_VENDOR_ID,
+            10415,
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("Vendor-Id AVP build failed: {error}");
+        }
+        if let Err(error) = append_utf8_avp(
+            &mut raw_avps,
+            AVP_PRODUCT_NAME,
+            "test",
+            false,
+            EncodeContext::default(),
+        ) {
+            panic!("Product-Name AVP build failed: {error}");
+        }
+
+        let mut vsai_value = BytesMut::new();
+        if let Err(error) = append_u32_avp(
+            &mut vsai_value,
+            AVP_VENDOR_ID,
+            10415,
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("nested Vendor-Id AVP build failed: {error}");
+        }
+        if let Err(error) = append_u32_avp(
+            &mut vsai_value,
+            AVP_VENDOR_ID,
+            123,
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("duplicate nested Vendor-Id AVP build failed: {error}");
+        }
+        if let Err(error) = append_u32_avp(
+            &mut vsai_value,
+            AVP_AUTH_APPLICATION_ID,
+            16_777_251,
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("nested Auth-Application-Id AVP build failed: {error}");
+        }
+        if let Err(error) = append_avp(
+            &mut raw_avps,
+            AvpHeader::ietf(AVP_VENDOR_SPECIFIC_APPLICATION_ID, true),
+            &vsai_value,
+            EncodeContext::default(),
+        ) {
+            panic!("Vendor-Specific-Application-Id AVP build failed: {error}");
+        }
+
+        let built = match build_message(
+            peer_request_flags(PeerProcedure::CapabilitiesExchange),
+            COMMAND_CAPABILITIES_EXCHANGE,
+            raw_avps,
+            0x10,
+            0x20,
+            EncodeContext::default(),
+            "5.3.1",
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("CER build failed: {error}"),
+        };
+        let encoded = encode_owned(&built);
+        let message = decode_message(&encoded);
+        let parse_result = parse_capabilities_exchange_request(&message, DecodeContext::default());
+        assert!(matches!(
+            parse_result,
+            Err(error) if matches!(error.code(), DecodeErrorCode::DuplicateIe)
+        ));
+    }
+
+    #[test]
+    fn parser_rejects_base_dictionary_flag_violations_in_procedure_avps() {
+        let identity = PeerIdentity::new("aaa-flags.example.net", "example.net");
+
+        // Origin-Host without the M bit.
+        let mut origin_host_missing_m = BytesMut::new();
+        if let Err(error) = append_avp(
+            &mut origin_host_missing_m,
+            AvpHeader::ietf(AVP_ORIGIN_HOST, false).with_flags(AvpFlags::new(false, false, false)),
+            identity.origin_host.as_bytes(),
+            EncodeContext::default(),
+        ) {
+            panic!("Origin-Host AVP build failed: {error}");
+        }
+        if let Err(error) = append_utf8_avp(
+            &mut origin_host_missing_m,
+            AVP_ORIGIN_REALM,
+            &identity.origin_realm,
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("Origin-Realm AVP build failed: {error}");
+        }
+        let built = match build_message(
+            peer_request_flags(PeerProcedure::DeviceWatchdog),
+            COMMAND_DEVICE_WATCHDOG,
+            origin_host_missing_m,
+            1,
+            2,
+            EncodeContext::default(),
+            "5.5.1",
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("message build failed: {error}"),
+        };
+        let encoded = encode_owned(&built);
+        let message = decode_message(&encoded);
+        let result = parse_device_watchdog_request(&message, DecodeContext::default());
+        assert!(matches!(
+            result,
+            Err(error) if matches!(
+                error.code(),
+                DecodeErrorCode::Structural {
+                    reason: "diameter AVP M-bit must be set per base dictionary"
+                }
+            )
+        ));
+
+        // Product-Name with the M bit set.
+        let mut product_name_with_m = BytesMut::new();
+        if let Err(error) = append_identity_avps(
+            &mut product_name_with_m,
+            &identity,
+            EncodeContext::default(),
+        ) {
+            panic!("identity AVP build failed: {error}");
+        }
+        if let Err(error) = append_address_avp(
+            &mut product_name_with_m,
+            HostIpAddress::ipv4([192, 0, 2, 1]),
+            EncodeContext::default(),
+        ) {
+            panic!("Host-IP-Address AVP build failed: {error}");
+        }
+        if let Err(error) = append_u32_avp(
+            &mut product_name_with_m,
+            AVP_VENDOR_ID,
+            10415,
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("Vendor-Id AVP build failed: {error}");
+        }
+        if let Err(error) = append_avp(
+            &mut product_name_with_m,
+            AvpHeader::ietf(AVP_PRODUCT_NAME, false).with_flags(AvpFlags::new(false, true, false)),
+            b"opc-diameter-test",
+            EncodeContext::default(),
+        ) {
+            panic!("Product-Name AVP build failed: {error}");
+        }
+        let built = match build_message(
+            peer_request_flags(PeerProcedure::CapabilitiesExchange),
+            COMMAND_CAPABILITIES_EXCHANGE,
+            product_name_with_m,
+            1,
+            2,
+            EncodeContext::default(),
+            "5.3.1",
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("message build failed: {error}"),
+        };
+        let encoded = encode_owned(&built);
+        let message = decode_message(&encoded);
+        let result = parse_capabilities_exchange_request(&message, DecodeContext::default());
+        assert!(matches!(
+            result,
+            Err(error) if matches!(
+                error.code(),
+                DecodeErrorCode::Structural {
+                    reason: "diameter AVP M-bit must not be set per base dictionary"
+                }
+            )
+        ));
+
+        // Error-Message with the P bit set.
+        let mut error_message_with_p = BytesMut::new();
+        if let Err(error) = append_u32_avp(
+            &mut error_message_with_p,
+            AVP_RESULT_CODE,
+            RESULT_CODE_DIAMETER_SUCCESS,
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("Result-Code AVP build failed: {error}");
+        }
+        if let Err(error) = append_identity_avps(
+            &mut error_message_with_p,
+            &identity,
+            EncodeContext::default(),
+        ) {
+            panic!("identity AVP build failed: {error}");
+        }
+        if let Err(error) = append_address_avp(
+            &mut error_message_with_p,
+            HostIpAddress::ipv4([192, 0, 2, 1]),
+            EncodeContext::default(),
+        ) {
+            panic!("Host-IP-Address AVP build failed: {error}");
+        }
+        if let Err(error) = append_u32_avp(
+            &mut error_message_with_p,
+            AVP_VENDOR_ID,
+            10415,
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("Vendor-Id AVP build failed: {error}");
+        }
+        if let Err(error) = append_utf8_avp(
+            &mut error_message_with_p,
+            AVP_PRODUCT_NAME,
+            "opc-diameter-test",
+            false,
+            EncodeContext::default(),
+        ) {
+            panic!("Product-Name AVP build failed: {error}");
+        }
+        if let Err(error) = append_avp(
+            &mut error_message_with_p,
+            AvpHeader::ietf(AVP_ERROR_MESSAGE, false).with_flags(AvpFlags::new(false, false, true)),
+            b"diagnostic",
+            EncodeContext::default(),
+        ) {
+            panic!("Error-Message AVP build failed: {error}");
+        }
+        let built = match build_message(
+            peer_answer_flags(PeerProcedure::CapabilitiesExchange, false),
+            COMMAND_CAPABILITIES_EXCHANGE,
+            error_message_with_p,
+            1,
+            2,
+            EncodeContext::default(),
+            "5.3.2",
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("message build failed: {error}"),
+        };
+        let encoded = encode_owned(&built);
+        let message = decode_message(&encoded);
+        let result = parse_capabilities_exchange_answer(&message, DecodeContext::default());
+        assert!(matches!(
+            result,
+            Err(error) if matches!(
+                error.code(),
+                DecodeErrorCode::Structural {
+                    reason: "diameter AVP P-bit must not be set per base dictionary"
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn error_answer_guards_reject_invalid_result_codes_and_missing_error_flag() {
+        let identity = PeerIdentity::new("aaa-err.example.net", "example.net");
+
+        let success_error_answer = CapabilitiesExchangeErrorAnswer {
+            result_code: RESULT_CODE_DIAMETER_SUCCESS,
+            identity: identity.clone(),
+            diagnostics: AnswerDiagnostics::default(),
+        };
+        let build_result = build_capabilities_exchange_error_answer(
+            &success_error_answer,
+            0x1111_1111,
+            0x2222_2222,
+            EncodeContext::default(),
+        );
+        assert!(matches!(
+            build_result,
+            Err(error) if matches!(error.code(), EncodeErrorCode::Structural { .. })
+        ));
+
+        let valid_error_answer = CapabilitiesExchangeErrorAnswer {
+            result_code: RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED,
+            identity: identity.clone(),
+            diagnostics: AnswerDiagnostics::default(),
+        };
+        let built = match build_capabilities_exchange_error_answer(
+            &valid_error_answer,
+            0x1111_1111,
+            0x2222_2222,
+            EncodeContext::default(),
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("valid error answer build failed: {error}"),
+        };
+        let mut encoded = BytesMut::from(encode_owned(&built));
+        encoded[4] &= !CommandFlags::ERROR;
+        let message = decode_message(&encoded);
+        let parse_result =
+            parse_capabilities_exchange_error_answer(&message, DecodeContext::default());
+        assert!(matches!(
+            parse_result,
+            Err(error) if matches!(
+                error.code(),
+                DecodeErrorCode::Structural {
+                    reason: "diameter CEA error answer requires the error flag"
+                }
+            )
+        ));
+
+        let mut raw_avps = BytesMut::new();
+        if let Err(error) = append_u32_avp(
+            &mut raw_avps,
+            AVP_RESULT_CODE,
+            RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION,
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("Result-Code AVP build failed: {error}");
+        }
+        if let Err(error) = append_identity_avps(&mut raw_avps, &identity, EncodeContext::default())
+        {
+            panic!("identity AVP build failed: {error}");
+        }
+        let built = match build_message(
+            peer_answer_flags(PeerProcedure::CapabilitiesExchange, true),
+            COMMAND_CAPABILITIES_EXCHANGE,
+            raw_avps,
+            0x1111_1111,
+            0x2222_2222,
+            EncodeContext::default(),
+            "7.2",
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("error answer build failed: {error}"),
+        };
+        let encoded = encode_owned(&built);
+        let message = decode_message(&encoded);
+        let parse_result =
+            parse_capabilities_exchange_error_answer(&message, DecodeContext::default());
+        assert!(matches!(
+            parse_result,
+            Err(error) if matches!(
+                error.code(),
+                DecodeErrorCode::Structural {
+                    reason: "diameter CEA error answer Result-Code must be a protocol-error value"
                 }
             )
         ));
