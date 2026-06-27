@@ -19,11 +19,12 @@ pub fn validate_value_against_schema(schema: &Value, instance: &Value) -> Result
 }
 
 fn validate_format(string: &str, format_name: &str, path: &str) -> Result<(), String> {
-    static DATE_FMT: OnceLock<Vec<time::format_description::FormatItem<'static>>> = OnceLock::new();
+    static DATE_FMT: OnceLock<Vec<time::format_description::BorrowedFormatItem<'static>>> =
+        OnceLock::new();
     match format_name {
         "date" => {
             let format = DATE_FMT.get_or_init(|| {
-                time::format_description::parse("[year]-[month]-[day]")
+                time::format_description::parse_borrowed::<2>("[year]-[month]-[day]")
                     .expect("valid date format description")
             });
             time::Date::parse(string, format)
