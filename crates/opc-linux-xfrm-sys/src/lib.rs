@@ -131,13 +131,13 @@ pub const XFRMA_ENCAP: u16 = 4;
 /// XFRM optional policy template attribute.
 pub const XFRMA_TMPL: u16 = 5;
 /// XFRM optional source address attribute.
-pub const XFRMA_SRCADDR: u16 = 12;
+pub const XFRMA_SRCADDR: u16 = 13;
 /// XFRM optional authentication algorithm with truncation attribute.
 pub const XFRMA_ALG_AUTH_TRUNC: u16 = 20;
 /// XFRM optional packet mark attribute.
 pub const XFRMA_MARK: u16 = 21;
 /// XFRM optional interface identifier attribute.
-pub const XFRMA_IF_ID: u16 = 30;
+pub const XFRMA_IF_ID: u16 = 31;
 
 /// Netlink message header layout used by XFRM requests and responses.
 #[repr(C)]
@@ -315,7 +315,7 @@ pub struct XfrmUserSaInfo {
     pub mode: u8,
     /// Replay window size.
     pub replay_window: u8,
-    /// UAPI flags.
+    /// XFRM state flags from the kernel UAPI, such as NOECN or DECAP_DSCP.
     pub flags: u8,
 }
 
@@ -337,7 +337,7 @@ pub struct XfrmUserPolicyInfo {
     pub direction: u8,
     /// Action such as [`XFRM_POLICY_ALLOW`].
     pub action: u8,
-    /// UAPI flags.
+    /// XFRM policy flags from the kernel UAPI.
     pub flags: u8,
     /// Sharing mode.
     pub share: u8,
@@ -375,10 +375,10 @@ pub struct XfrmUserTemplate {
 pub struct XfrmUserSpiInfo {
     /// SA info prefix.
     pub info: XfrmUserSaInfo,
-    /// Minimum SPI in network byte order.
-    pub min_spi_network_order: u32,
-    /// Maximum SPI in network byte order.
-    pub max_spi_network_order: u32,
+    /// Minimum SPI allocation bound in host/native byte order.
+    pub min_spi: u32,
+    /// Maximum SPI allocation bound in host/native byte order.
+    pub max_spi: u32,
 }
 
 /// Fixed prefix of Linux `struct xfrm_algo` before key bytes.
@@ -450,6 +450,7 @@ pub struct XfrmEncapTemplate {
 pub const XFRM_ALG_NAME_LEN: usize = 64;
 
 /// Align a netlink message or route attribute length to the Linux 4-byte boundary.
+#[must_use]
 pub const fn align_to_netlink(value: usize) -> Option<usize> {
     match value.checked_add(3) {
         Some(padded) => Some(padded & !3),
@@ -465,16 +466,45 @@ mod tests {
     #[test]
     fn constants_cover_xfrm_sa_policy_and_mode_values() {
         assert_eq!(NETLINK_XFRM, 6);
+        assert_eq!(NLM_F_REQUEST, 0x0001);
+        assert_eq!(NLM_F_MULTI, 0x0002);
+        assert_eq!(NLM_F_ACK, 0x0004);
+        assert_eq!(NLM_F_ECHO, 0x0008);
+        assert_eq!(NLM_F_REPLACE, 0x0100);
+        assert_eq!(NLM_F_EXCL, 0x0200);
+        assert_eq!(NLM_F_CREATE, 0x0400);
+        assert_eq!(NLM_F_APPEND, 0x0800);
+        assert_eq!(XFRM_MSG_BASE, 0x10);
         assert_eq!(XFRM_MSG_NEWSA, 0x10);
+        assert_eq!(XFRM_MSG_DELSA, 0x11);
+        assert_eq!(XFRM_MSG_GETSA, 0x12);
         assert_eq!(XFRM_MSG_NEWPOLICY, 0x13);
+        assert_eq!(XFRM_MSG_DELPOLICY, 0x14);
+        assert_eq!(XFRM_MSG_GETPOLICY, 0x15);
         assert_eq!(XFRM_MSG_ALLOCSPI, 0x16);
+        assert_eq!(XFRM_MSG_UPDPOLICY, 0x19);
+        assert_eq!(XFRM_MSG_UPDSA, 0x1A);
+        assert_eq!(XFRM_MSG_FLUSHSA, 0x1C);
+        assert_eq!(XFRM_MSG_FLUSHPOLICY, 0x1D);
         assert_eq!(XFRM_POLICY_IN, 0);
         assert_eq!(XFRM_POLICY_OUT, 1);
         assert_eq!(XFRM_POLICY_FWD, 2);
+        assert_eq!(XFRM_POLICY_ALLOW, 0);
+        assert_eq!(XFRM_POLICY_BLOCK, 1);
         assert_eq!(XFRM_MODE_TRANSPORT, 0);
         assert_eq!(XFRM_MODE_TUNNEL, 1);
+        assert_eq!(XFRM_MODE_ROUTEOPTIMIZATION, 2);
+        assert_eq!(XFRM_MODE_IN_TRIGGER, 3);
+        assert_eq!(XFRM_MODE_BEET, 4);
+        assert_eq!(XFRMA_ALG_AUTH, 1);
         assert_eq!(XFRMA_ALG_CRYPT, 2);
+        assert_eq!(XFRMA_ALG_COMP, 3);
+        assert_eq!(XFRMA_ENCAP, 4);
         assert_eq!(XFRMA_TMPL, 5);
+        assert_eq!(XFRMA_SRCADDR, 13);
+        assert_eq!(XFRMA_ALG_AUTH_TRUNC, 20);
+        assert_eq!(XFRMA_MARK, 21);
+        assert_eq!(XFRMA_IF_ID, 31);
     }
 
     #[test]
@@ -530,7 +560,7 @@ mod tests {
         assert_eq!(offset_of!(XfrmUserTemplate, source_address), 28);
         assert_eq!(offset_of!(XfrmUserTemplate, auth_algorithms), 52);
         assert_eq!(size_of::<XfrmUserSpiInfo>(), 232);
-        assert_eq!(offset_of!(XfrmUserSpiInfo, min_spi_network_order), 224);
+        assert_eq!(offset_of!(XfrmUserSpiInfo, min_spi), 224);
         assert_eq!(size_of::<XfrmAlgoHeader>(), 68);
         assert_eq!(size_of::<XfrmAlgoAuthHeader>(), 72);
         assert_eq!(size_of::<XfrmMark>(), 8);

@@ -221,6 +221,7 @@ def check_sys_crate_lints(pkg: dict, root: Path) -> list[Violation]:
 
     return violations
 
+
 def inherits_workspace_lints(manifest_text: str) -> bool:
     return (
         re.search(

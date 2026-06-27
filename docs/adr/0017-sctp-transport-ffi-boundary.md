@@ -91,11 +91,11 @@ an SCTP-terminating CNF is in scope:
 4. **ABI safety.** Every C struct crossing the boundary has a struct-layout
    (size/alignment/offset) test; the sys crate builds on Linux in CI and
    compiles to a clean "unsupported platform" stub elsewhere.
-5. **This exception does not reopen ADR 0013.** It authorizes FFI only to the
-   **trusted kernel SCTP UAPI** and minimal `libsctp` helper calls that wrap that
-   UAPI. FFI that links a foreign **C protocol codec** (parsing
-   attacker-controlled bytes — NGAP/NAS/etc.) remains rejected; those stay
-   pure-Rust per ADR 0013/0015.
+5. **This exception pattern does not reopen ADR 0013.** It authorizes FFI only
+   to explicitly reviewed **trusted Linux kernel UAPI** boundaries such as SCTP
+   socket/XFRM netlink calls and minimal helper calls that wrap those UAPIs. FFI
+   that links a foreign **C protocol codec** (parsing attacker-controlled bytes
+   — NGAP/NAS/etc.) remains rejected; those stay pure-Rust per ADR 0013/0015.
 6. SCTP is implemented per Option A behind this boundary, never as scattered
    `unsafe` and never as a userspace reimplementation without revisiting this
    ADR.
