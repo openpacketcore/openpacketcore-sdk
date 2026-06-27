@@ -182,7 +182,9 @@ fn header_decode_rejects_truncated_and_under_length_inputs() {
         Err(error) if matches!(error.code(), DecodeErrorCode::InvalidLength { .. })
     ));
 
-    let truncated_teid = [0x48, 0x20, 0x00, 0x08, 0x01, 0x02, 0x03, 0x04, 0x00, 0xab, 0xcd];
+    let truncated_teid = [
+        0x48, 0x20, 0x00, 0x08, 0x01, 0x02, 0x03, 0x04, 0x00, 0xab, 0xcd,
+    ];
     let decoded = decode_header(&truncated_teid, DecodeContext::default());
     assert!(matches!(
         decoded,

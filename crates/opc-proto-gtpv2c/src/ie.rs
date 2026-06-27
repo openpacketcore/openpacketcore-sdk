@@ -67,7 +67,7 @@ impl<'a> RawIe<'a> {
     ///
     /// This is the length carried in the IE header, which always equals
     /// `self.value.len()` for a decoded IE. Encoders recompute the wire length
-    /// from `value` and ignore any caller-constructed length.
+    /// from `value.len()`.
     pub fn len(&self) -> usize {
         self.value.len()
     }
