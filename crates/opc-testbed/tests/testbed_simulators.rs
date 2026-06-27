@@ -31,14 +31,7 @@ impl S2bMessageView for Gtpv2cS2bView<'_> {
         match self.0.as_view().map(|view| view.direction) {
             Some(Gtpv2cDirection::Request) => PeerMessageDirection::Request,
             Some(Gtpv2cDirection::Response) => PeerMessageDirection::Response,
-            None => match self.0.message_type() {
-                Gtpv2cMessageType::EchoResponse
-                | Gtpv2cMessageType::CreateSessionResponse
-                | Gtpv2cMessageType::ModifyBearerResponse
-                | Gtpv2cMessageType::DeleteSessionResponse
-                | Gtpv2cMessageType::UpdateBearerResponse => PeerMessageDirection::Response,
-                _ => PeerMessageDirection::Request,
-            },
+            None => direction_from_raw_gtpv2c_header(self.0.message_type()),
         }
     }
 
@@ -67,6 +60,21 @@ impl S2bMessageView for Gtpv2cS2bView<'_> {
             .as_raw()
             .map(|message| !message.raw_ies.is_empty())
             .unwrap_or(false)
+    }
+}
+
+fn direction_from_raw_gtpv2c_header(message_type: Gtpv2cMessageType) -> PeerMessageDirection {
+    // GTPv2-C carries request/response semantics in the common-header message
+    // type value rather than a generic direction bit. Keep this adapter tied to
+    // the SDK header enum so future raw-preserved response fixtures do not
+    // silently default to Request.
+    match message_type {
+        Gtpv2cMessageType::EchoResponse
+        | Gtpv2cMessageType::CreateSessionResponse
+        | Gtpv2cMessageType::ModifyBearerResponse
+        | Gtpv2cMessageType::DeleteSessionResponse
+        | Gtpv2cMessageType::UpdateBearerResponse => PeerMessageDirection::Response,
+        _ => PeerMessageDirection::Request,
     }
 }
 
@@ -377,6 +385,39 @@ fn pgw_s2b_simulator_rejects_state_changing_request_without_session() {
 }
 
 #[test]
+fn pgw_s2b_rejection_clears_sessions_and_requires_restart() {
+    let mut sim = PgwS2bSimulator::new("pgw-s2b");
+    let create = decode_s2b_fixture(
+        include_bytes!(
+            "../../opc-proto-gtpv2c/tests/fixtures/spec/create_session_request_s2b_subset.bin"
+        ),
+        &sim,
+    );
+    let delete = decode_s2b_fixture(
+        include_bytes!(
+            "../../opc-proto-gtpv2c/tests/fixtures/spec/delete_session_request_linked_ebi.bin"
+        ),
+        &sim,
+    );
+
+    sim.handle_sdk_message(&create)
+        .expect("create establishes synthetic session");
+    assert_eq!(sim.active_sessions, 1);
+
+    sim.record_decode_failure("synthetic malformed S2b packet")
+        .expect_err("decode failure records malformed rejection");
+    assert_eq!(sim.state, PgwS2bState::MalformedRejected);
+    assert_eq!(sim.active_sessions, 0);
+
+    let err = sim
+        .handle_sdk_message(&delete)
+        .expect_err("malformed rejection remains fail-closed until restart");
+    assert!(err.to_string().contains("requires restart"));
+    assert_eq!(sim.state, PgwS2bState::MalformedRejected);
+    assert_eq!(sim.active_sessions, 0);
+}
+
+#[test]
 fn pgw_s2b_unavailable_fault_persists_until_restart() {
     let mut sim = PgwS2bSimulator::new("pgw-s2b");
     let create = decode_s2b_fixture(
@@ -435,6 +476,26 @@ fn diameter_peer_simulator_records_sdk_decoded_interface_messages() {
     assert_eq!(
         sim.get_state("sdk_protocol_profile").as_deref(),
         Some("opc-protocol+diameter-transport-neutral")
+    );
+}
+
+#[test]
+fn diameter_application_ids_include_rf_accounting_mapping() {
+    assert_eq!(
+        DiameterApplication::from_application_id(0),
+        DiameterApplication::Base
+    );
+    assert_eq!(
+        DiameterApplication::from_application_id(3),
+        DiameterApplication::Rf
+    );
+    assert_eq!(
+        DiameterApplication::from_application_id(16_777_238),
+        DiameterApplication::Gx
+    );
+    assert_eq!(
+        DiameterApplication::from_application_id(16_777_251),
+        DiameterApplication::S6a
     );
 }
 

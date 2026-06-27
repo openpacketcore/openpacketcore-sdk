@@ -388,6 +388,7 @@ impl PgwS2bSimulator {
 
     fn record_rejection(&mut self) {
         self.rejected_messages = self.rejected_messages.saturating_add(1);
+        self.active_sessions = 0;
         self.state = PgwS2bState::MalformedRejected;
     }
 
@@ -397,8 +398,9 @@ impl PgwS2bSimulator {
 }
 
 const DIAMETER_APP_BASE: u32 = 0;
-const DIAMETER_APP_3GPP_S6A_S6D: u32 = 16_777_251;
+const DIAMETER_APP_3GPP_RF_ACCOUNTING: u32 = 3;
 const DIAMETER_APP_3GPP_GX: u32 = 16_777_238;
+const DIAMETER_APP_3GPP_S6A_S6D: u32 = 16_777_251;
 const DIAMETER_CC_CAPABILITIES_EXCHANGE: u32 = 257;
 const DIAMETER_CC_DEVICE_WATCHDOG: u32 = 280;
 const DIAMETER_CC_DISCONNECT_PEER: u32 = 282;
@@ -414,8 +416,8 @@ pub enum DiameterApplication {
     Gx,
     /// 3GPP Rf accounting application family.
     ///
-    /// This skeleton does not map a numeric Rf application-id yet; the future
-    /// SDK Diameter crate should provide the authoritative dictionary value.
+    /// 3GPP TS 32.299 defines the Rf charging interface on the Diameter
+    /// accounting application; RFC 6733/IANA assign that application-id as 3.
     Rf,
     /// Unknown or future Diameter application ID.
     Unknown(u32),
@@ -426,6 +428,7 @@ impl DiameterApplication {
     pub const fn from_application_id(application_id: u32) -> Self {
         match application_id {
             DIAMETER_APP_BASE => Self::Base,
+            DIAMETER_APP_3GPP_RF_ACCOUNTING => Self::Rf,
             DIAMETER_APP_3GPP_S6A_S6D => Self::S6a,
             DIAMETER_APP_3GPP_GX => Self::Gx,
             other => Self::Unknown(other),
