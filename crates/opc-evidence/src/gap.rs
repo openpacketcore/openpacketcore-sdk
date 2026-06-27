@@ -6,12 +6,13 @@ use crate::{ConformanceStatus, EvidenceError};
 mod date_serde {
     use once_cell::sync::Lazy;
     use serde::{self, Deserialize, Deserializer, Serializer};
-    use time::{format_description::FormatItem, Date};
+    use time::{format_description::BorrowedFormatItem, Date};
 
     const FORMAT: &str = "[year]-[month]-[day]";
 
-    static FORMAT_DESCRIPTION: Lazy<Vec<FormatItem<'static>>> =
-        Lazy::new(|| time::format_description::parse(FORMAT).expect("valid date format string"));
+    static FORMAT_DESCRIPTION: Lazy<Vec<BorrowedFormatItem<'static>>> = Lazy::new(|| {
+        time::format_description::parse_borrowed::<2>(FORMAT).expect("valid date format string")
+    });
 
     pub fn serialize<S>(date: &Date, serializer: S) -> Result<S::Ok, S::Error>
     where
