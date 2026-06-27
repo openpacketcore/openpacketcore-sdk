@@ -40,7 +40,7 @@ fn spec_ref() -> SpecRef {
 ///
 /// @spec 3GPP TS29274 R18 5.1
 /// @req REQ-3GPP-TS29274-R18-5.1-002
-/// @conformance scaffold
+/// @conformance s2b-subset
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
     /// Protocol version from flags octet bits 8-6; valid GTPv2-C is `2`.
@@ -118,7 +118,7 @@ impl Header {
 ///
 /// @spec 3GPP TS29274 R18 5.1
 /// @req REQ-3GPP-TS29274-R18-5.1-003
-/// @conformance scaffold
+/// @conformance s2b-subset
 pub fn decode_header(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Header> {
     let spec = spec_ref();
     if input.len() < HEADER_LEN_WITHOUT_TEID {
@@ -223,7 +223,7 @@ pub fn decode_header(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Heade
 ///
 /// @spec 3GPP TS29274 R18 5.1
 /// @req REQ-3GPP-TS29274-R18-5.1-004
-/// @conformance scaffold
+/// @conformance s2b-subset
 pub fn encode_header(
     header: &Header,
     dst: &mut BytesMut,

@@ -4,9 +4,22 @@
 //! @req REQ-3GPP-TS29274-R18-8.2-001
 
 use bytes::{BufMut, Bytes, BytesMut};
+
+/// Typed S2b-oriented IE decoders and encoders.
+pub mod typed;
 use opc_protocol::{
     DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, EncodeError, SpecRef,
     ValidationLevel,
+};
+pub use typed::{
+    decode_typed_ie_sequence, AccessPointName, AggregateMaximumBitRate, ApnRestriction,
+    BearerContext, Cause, CauseValue, EpsBearerId, FullyQualifiedTeid, PdnAddressAllocation,
+    PdnType, PdnTypeValue, PlmnId, RatType, RatTypeValue, Recovery, SelectionMode,
+    SelectionModeValue, ServingNetwork, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_AMBR,
+    IE_TYPE_APN, IE_TYPE_APN_RESTRICTION, IE_TYPE_BEARER_CONTEXT, IE_TYPE_CAUSE, IE_TYPE_EBI,
+    IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_MEI, IE_TYPE_MSISDN, IE_TYPE_PAA, IE_TYPE_PCO,
+    IE_TYPE_PDN_TYPE, IE_TYPE_RAT_TYPE, IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE,
+    IE_TYPE_SERVING_NETWORK,
 };
 
 /// Length, in octets, of the GTPv2-C IE header.
@@ -31,13 +44,13 @@ fn checked_offset(base: usize, delta: usize) -> Result<usize, DecodeError> {
 
 /// A borrowed raw GTPv2-C Information Element.
 ///
-/// This is the scaffold layer used before typed S2b IE decoders are added.
-/// Unknown, vendor, and future IEs retain their original value bytes for
-/// byte-exact forwarding.
+/// This raw-preserving layer underpins both forwarding paths and the typed
+/// S2b IE subset. Unknown, vendor, unsupported, and future IEs retain their
+/// original value bytes for byte-exact forwarding.
 ///
 /// @spec 3GPP TS29274 R18 8.2
 /// @req REQ-3GPP-TS29274-R18-8.2-002
-/// @conformance scaffold
+/// @conformance s2b-subset
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawIe<'a> {
     /// One-octet IE type code.
@@ -93,7 +106,7 @@ impl<'a> RawIe<'a> {
 ///
 /// @spec 3GPP TS29274 R18 8.2
 /// @req REQ-3GPP-TS29274-R18-8.2-003
-/// @conformance scaffold
+/// @conformance s2b-subset
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedRawIe {
     /// One-octet IE type code.
@@ -139,7 +152,7 @@ impl OwnedRawIe {
 ///
 /// @spec 3GPP TS29274 R18 8.2
 /// @req REQ-3GPP-TS29274-R18-8.2-004
-/// @conformance scaffold
+/// @conformance s2b-subset
 pub struct RawIeIterator<'a> {
     remaining: &'a [u8],
     ctx: DecodeContext,
@@ -221,7 +234,7 @@ impl<'a> Iterator for RawIeIterator<'a> {
 ///
 /// @spec 3GPP TS29274 R18 8.2
 /// @req REQ-3GPP-TS29274-R18-8.2-005
-/// @conformance scaffold
+/// @conformance s2b-subset
 pub fn validate_ie_region(region: &[u8], ctx: DecodeContext) -> Result<(), DecodeError> {
     for item in RawIeIterator::new(region, ctx) {
         item?;

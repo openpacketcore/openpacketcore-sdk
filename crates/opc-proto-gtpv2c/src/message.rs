@@ -18,13 +18,13 @@ fn spec_ref() -> SpecRef {
 
 /// A borrowed GTPv2-C message.
 ///
-/// The current scaffold preserves the raw IE region byte-for-byte and exposes
-/// a lazy raw IE iterator. Typed S2b procedure views are deliberately not part
-/// of this v0 shell.
+/// The raw message shell preserves the IE region byte-for-byte and exposes
+/// a lazy raw IE iterator. Typed S2b procedure views are layered in
+/// [`crate::s2b`] without removing this forwarding-safe representation.
 ///
 /// @spec 3GPP TS29274 R18 5.1, 8.2
 /// @req REQ-3GPP-TS29274-R18-MESSAGE-002
-/// @conformance scaffold
+/// @conformance s2b-subset
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message<'a> {
     /// Parsed common header.
@@ -71,7 +71,7 @@ impl<'a> BorrowDecode<'a> for Message<'a> {
     ///
     /// @spec 3GPP TS29274 R18 5.1, 8.2
     /// @req REQ-3GPP-TS29274-R18-MESSAGE-003
-    /// @conformance scaffold
+    /// @conformance s2b-subset
     fn decode(input: &'a [u8], ctx: DecodeContext) -> DecodeResult<'a, Self> {
         let spec = spec_ref();
         let (_, header) = decode_header(input, ctx)?;
@@ -119,7 +119,7 @@ impl Encode for Message<'_> {
     ///
     /// @spec 3GPP TS29274 R18 5.1
     /// @req REQ-3GPP-TS29274-R18-MESSAGE-004
-    /// @conformance scaffold
+    /// @conformance s2b-subset
     fn encode(&self, dst: &mut BytesMut, ctx: EncodeContext) -> Result<(), EncodeError> {
         let (total_len, body_len) = self.encoded_lens()?;
         ctx.check_capacity(total_len)?;
@@ -153,7 +153,7 @@ impl ToOwnedPdu for Message<'_> {
 ///
 /// @spec 3GPP TS29274 R18 5.1, 8.2
 /// @req REQ-3GPP-TS29274-R18-MESSAGE-005
-/// @conformance scaffold
+/// @conformance s2b-subset
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedMessage {
     /// Parsed common header.
@@ -183,7 +183,7 @@ impl OwnedDecode for OwnedMessage {
     ///
     /// @spec 3GPP TS29274 R18 5.1, 8.2
     /// @req REQ-3GPP-TS29274-R18-MESSAGE-006
-    /// @conformance scaffold
+    /// @conformance s2b-subset
     fn decode_owned(input: Bytes, ctx: DecodeContext) -> Result<Self, DecodeError> {
         let (_, borrowed) = Message::decode(&input, ctx)?;
         let raw_start = borrowed.header.wire_len();

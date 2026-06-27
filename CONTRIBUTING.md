@@ -142,7 +142,7 @@ The current held crates and their graduation requirements are:
 | `opc-key-vault` | experimental | A production-readiness review covering Vault policy scoping, secret-zero handling, lease rotation, and an integration test against a real or containerized Vault Transit instance. |
 | `opc-proto-nas` | experimental | Structured parsing of the remaining 5GMM and 5GSM message bodies listed as out-of-scope in `crates/opc-proto-nas/CONFORMANCE.md`, with spec-byte fixtures for each message. |
 | `opc-proto-ngap` | experimental | A working canonical (typed) APER encoder path, verified by external fixtures for `NGSetupResponse` and `NGSetupFailure`, after the upstream `rasn` APER encoder misalignment is resolved or replaced. See `crates/opc-proto-ngap/CONFORMANCE.md`. |
-| `opc-proto-gtpv2c` | experimental scaffold | Typed S2b procedure models, mandatory-IE validation, and spec-authored byte fixtures for every claimed GTPv2-C message/IE. See `crates/opc-proto-gtpv2c/CONFORMANCE.md`. |
+| `opc-proto-gtpv2c` | experimental S2b subset | Expanded S2b procedure and IE coverage beyond the current typed subset, with mandatory-IE validation and spec-authored byte fixtures for every newly claimed GTPv2-C message/IE. See `crates/opc-proto-gtpv2c/CONFORMANCE.md`. |
 | `opc-api-nnrf` | experimental | Client/server stub generation and expanded OpenAPI operation coverage, plus generator stability across regenerated `types.rs` from the same pinned 3GPP YAML. See `crates/opc-api-nnrf/CONFORMANCE.md`. |
 
 To change a crate's tier, update `publish` in its `Cargo.toml` and move its row
