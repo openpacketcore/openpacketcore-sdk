@@ -305,11 +305,9 @@ fn decode_raw_ie<'a>(
         .ok_or_else(|| DecodeError::new(DecodeErrorCode::LengthOverflow, base_offset))
         .map_err(|error| error.with_spec_ref(spec.clone()))?;
     if input.len() < total_len {
-        return Err(DecodeError::new(
-            DecodeErrorCode::Truncated,
-            checked_offset(base_offset, input.len())?,
-        )
-        .with_spec_ref(spec));
+        // Report truncation at the start of the IE so both header-truncated and
+        // value-truncated cases use a consistent offset convention.
+        return Err(DecodeError::new(DecodeErrorCode::Truncated, base_offset).with_spec_ref(spec));
     }
 
     let value = &input[IE_HEADER_LEN..total_len];

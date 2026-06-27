@@ -436,8 +436,20 @@ fn typed_ie_duplicate_policy_applies_to_top_level_and_grouped_sequences() {
     assert_eq!(ebi_value(&last[0]), 6);
 
     let duplicate_group_member = [
-        0x5d, 0x00, 0x0a, 0x00, // Bearer Context containing two EBI members.
-        0x49, 0x00, 0x01, 0x00, 0x05, 0x49, 0x00, 0x01, 0x00, 0x06,
+        IE_TYPE_BEARER_CONTEXT,
+        0x00,
+        0x0a,
+        0x00, // Bearer Context containing two EBI members.
+        IE_TYPE_EBI,
+        0x00,
+        0x01,
+        0x00,
+        0x05,
+        IE_TYPE_EBI,
+        0x00,
+        0x01,
+        0x00,
+        0x06,
     ];
     assert_duplicate_rejected(decode_typed_ie_sequence(
         &duplicate_group_member,
@@ -724,6 +736,43 @@ fn duplicate_ie_reject_includes_ie_offset() {
 }
 
 #[test]
+fn nested_bearer_context_duplicate_ie_reject_includes_absolute_offset() {
+    // Recovery IE (5 octets) pushes the Bearer Context header to offset 5 and
+    // its value start to offset 9. The first nested EBI occupies offsets 9..13,
+    // so the duplicate second EBI begins at absolute offset 14.
+    let recovery = [IE_TYPE_RECOVERY, 0x00, 0x01, 0x00, 0x2a];
+    let bearer_context = [
+        IE_TYPE_BEARER_CONTEXT,
+        0x00,
+        0x0a,
+        0x00, // Bearer Context header, value length 10.
+        IE_TYPE_EBI,
+        0x00,
+        0x01,
+        0x00,
+        0x05, // First nested EBI instance 0 = 5.
+        IE_TYPE_EBI,
+        0x00,
+        0x01,
+        0x00,
+        0x06, // Duplicate nested EBI instance 0 = 6.
+    ];
+    let mut input = Vec::with_capacity(recovery.len() + bearer_context.len());
+    input.extend_from_slice(&recovery);
+    input.extend_from_slice(&bearer_context);
+
+    let ctx = DecodeContext {
+        duplicate_ie_policy: DuplicateIePolicy::Reject,
+        ..DecodeContext::default()
+    };
+    let result = decode_typed_ie_sequence(&input, ctx, 0);
+    assert!(matches!(
+        result,
+        Err(error) if matches!(error.code(), DecodeErrorCode::DuplicateIe) && error.offset() == 14
+    ));
+}
+
+#[test]
 fn typed_value_decode_error_includes_ie_value_offset() {
     let invalid_imsi = [
         IE_TYPE_IMSI,
@@ -792,5 +841,24 @@ fn strict_nested_bearer_context_member_includes_bearer_value_offset() {
     assert!(matches!(
         result,
         Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. }) && error.offset() == 12
+    ));
+}
+
+#[test]
+fn value_truncated_ie_reports_start_offset() {
+    // Header is complete but the declared value length (5 octets) exceeds the
+    // single value octet available. Truncation is reported at the start of the
+    // IE, matching the convention used for header-truncated IEs.
+    let truncated = [
+        IE_TYPE_EBI,
+        0x00,
+        0x05,
+        0x00, // Declares five value octets.
+        0x05, // Only one value octet present.
+    ];
+    let result = decode_typed_ie_sequence(&truncated, DecodeContext::default(), 0);
+    assert!(matches!(
+        result,
+        Err(error) if matches!(error.code(), DecodeErrorCode::Truncated) && error.offset() == 0
     ));
 }
