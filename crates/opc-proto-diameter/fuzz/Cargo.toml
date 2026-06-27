@@ -1,0 +1,26 @@
+[package]
+name = "opc-proto-diameter-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+opc-protocol = { path = "../../opc-protocol" }
+opc-proto-diameter = { path = "..", features = ["peer", "all-apps"] }
+bytes = "1.8"
+
+[workspace]
+
+[[bin]]
+name = "decode_message"
+path = "fuzz_targets/decode_message.rs"
+test = false
+
+[[bin]]
+name = "decode_avp"
+path = "fuzz_targets/decode_avp.rs"
+test = false
