@@ -41,7 +41,7 @@ fn test_support_bundle_redaction_integration() {
     assert_eq!(dev_bundle.redaction_summary.subscriber_identifiers, 1);
     assert_eq!(dev_bundle.redaction_summary.ip_addresses, 1);
     assert_eq!(dev_bundle.redaction_summary.paths_and_files, 1); // /var/lib/opc/amf.db
-    assert_eq!(dev_bundle.redaction_summary.secrets, 1);
+    assert_eq!(dev_bundle.redaction_summary.security_secrets, 1);
 
     // 2. Check failing closed on unknown / unsafe attachments in Production mode
     let unsafe_entries = vec![
