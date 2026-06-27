@@ -1,6 +1,7 @@
 mod testbed_common;
 use opc_proto_gtpv2c::{
-    MessageDirection as Gtpv2cDirection, Procedure as Gtpv2cProcedure, S2bMessage,
+    MessageDirection as Gtpv2cDirection, MessageType as Gtpv2cMessageType,
+    Procedure as Gtpv2cProcedure, S2bMessage,
 };
 use opc_testbed::simulators::amf::{AmfSimulator, AmfState};
 use opc_testbed::simulators::epc::{
@@ -28,8 +29,16 @@ impl S2bMessageView for Gtpv2cS2bView<'_> {
 
     fn direction(&self) -> PeerMessageDirection {
         match self.0.as_view().map(|view| view.direction) {
-            Some(Gtpv2cDirection::Request) | None => PeerMessageDirection::Request,
+            Some(Gtpv2cDirection::Request) => PeerMessageDirection::Request,
             Some(Gtpv2cDirection::Response) => PeerMessageDirection::Response,
+            None => match self.0.message_type() {
+                Gtpv2cMessageType::EchoResponse
+                | Gtpv2cMessageType::CreateSessionResponse
+                | Gtpv2cMessageType::ModifyBearerResponse
+                | Gtpv2cMessageType::DeleteSessionResponse
+                | Gtpv2cMessageType::UpdateBearerResponse => PeerMessageDirection::Response,
+                _ => PeerMessageDirection::Request,
+            },
         }
     }
 
@@ -368,6 +377,34 @@ fn pgw_s2b_simulator_rejects_state_changing_request_without_session() {
 }
 
 #[test]
+fn pgw_s2b_unavailable_fault_persists_until_restart() {
+    let mut sim = PgwS2bSimulator::new("pgw-s2b");
+    let create = decode_s2b_fixture(
+        include_bytes!(
+            "../../opc-proto-gtpv2c/tests/fixtures/spec/create_session_request_s2b_subset.bin"
+        ),
+        &sim,
+    );
+
+    sim.mark_peer_unavailable();
+    for expected_rejections in 1..=2 {
+        let err = sim
+            .handle_sdk_message(&create)
+            .expect_err("unavailable PGW must reject every decoded S2b message");
+        assert!(err.to_string().contains("unavailable"));
+        assert_eq!(sim.state, PgwS2bState::PeerUnavailable);
+        assert_eq!(sim.rejected_messages, expected_rejections);
+        assert_eq!(sim.accepted_messages, 0);
+    }
+
+    sim.restart();
+    sim.handle_sdk_message(&create)
+        .expect("PGW accepts decoded S2b message after restart");
+    assert_eq!(sim.state, PgwS2bState::SessionCreated);
+    assert_eq!(sim.accepted_messages, 1);
+}
+
+#[test]
 fn diameter_peer_simulator_records_sdk_decoded_interface_messages() {
     let mut sim = DiameterPeerSimulator::new("aaa-hss");
     let cer = FakeDiameterFrame {
@@ -402,6 +439,34 @@ fn diameter_peer_simulator_records_sdk_decoded_interface_messages() {
 }
 
 #[test]
+fn diameter_peer_unavailable_fault_persists_until_restart() {
+    let mut sim = DiameterPeerSimulator::new("aaa-hss");
+    let cer = FakeDiameterFrame {
+        command_code: 257,
+        application_id: 0,
+        direction: PeerMessageDirection::Request,
+        has_session_id: false,
+    };
+
+    sim.mark_peer_unavailable();
+    for expected_rejections in 1..=2 {
+        let err = sim
+            .handle_sdk_message(&cer)
+            .expect_err("unavailable Diameter peer must reject every decoded message");
+        assert!(err.to_string().contains("unavailable"));
+        assert_eq!(sim.state, DiameterPeerState::PeerUnavailable);
+        assert_eq!(sim.rejected_messages, expected_rejections);
+        assert_eq!(sim.accepted_messages, 0);
+    }
+
+    sim.restart();
+    sim.handle_sdk_message(&cer)
+        .expect("Diameter peer accepts decoded metadata after restart");
+    assert_eq!(sim.state, DiameterPeerState::CapabilitiesExchanged);
+    assert_eq!(sim.accepted_messages, 1);
+}
+
+#[test]
 fn simulator_factory_accepts_epc_epdg_skeleton_names() {
     let pgw_spec = NfSpec {
         image: None,
@@ -417,6 +482,53 @@ fn simulator_factory_accepts_epc_epdg_skeleton_names() {
     let diameter =
         Simulator::from_spec("aaa", &diameter_spec).expect("diameter simulator constructed");
     assert_eq!(diameter.get_state("state").as_deref(), Some("IDLE"));
+}
+
+#[test]
+fn epc_epdg_simulator_factory_fault_steps_are_fail_closed() {
+    for simulator in ["pgw-s2b", "diameter-peer"] {
+        let spec = NfSpec {
+            image: None,
+            simulator: Some(simulator.to_string()),
+        };
+        let mut sim = Simulator::from_spec(simulator, &spec).expect("simulator constructed");
+
+        sim.handle_step(&Step::PeerUnavailable {
+            target: simulator.to_string(),
+        })
+        .expect("peer-unavailable fault injection succeeds");
+        assert_eq!(sim.get_state("state").as_deref(), Some("PEER_UNAVAILABLE"));
+
+        sim.handle_step(&Step::ProcessRestart {
+            target: simulator.to_string(),
+        })
+        .expect("process restart clears unavailable state");
+        assert_eq!(sim.get_state("state").as_deref(), Some("IDLE"));
+
+        let malformed = sim
+            .handle_step(&Step::MalformedResponse {
+                target: simulator.to_string(),
+            })
+            .expect_err("malformed response records a decode failure");
+        assert!(malformed.to_string().contains("SDK decode failed"));
+        assert_eq!(
+            sim.get_state("state").as_deref(),
+            Some("MALFORMED_REJECTED")
+        );
+
+        sim.handle_step(&Step::ProcessRestart {
+            target: simulator.to_string(),
+        })
+        .expect("process restart clears malformed state");
+        let send_ngap = sim
+            .handle_step(&Step::SendNgap {
+                from: "peer".to_string(),
+                to: simulator.to_string(),
+                message: "registration".to_string(),
+            })
+            .expect_err("EPC/ePDG simulators require SDK-decoded protocol views");
+        assert!(send_ngap.to_string().contains("requires SDK-decoded"));
+    }
 }
 
 #[test]

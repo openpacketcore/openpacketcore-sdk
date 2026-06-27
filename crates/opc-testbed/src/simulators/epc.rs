@@ -239,9 +239,16 @@ impl PgwS2bSimulator {
         message: &impl S2bMessageView,
     ) -> Result<PgwS2bEvent, TestbedError> {
         if self.state == PgwS2bState::PeerUnavailable {
-            self.record_rejection();
+            self.record_unavailable_rejection();
             return Err(TestbedError::Simulator(format!(
                 "PGW S2b simulator '{}' is unavailable",
+                self.name
+            )));
+        }
+        if self.state == PgwS2bState::MalformedRejected {
+            self.record_rejection();
+            return Err(TestbedError::Simulator(format!(
+                "PGW S2b simulator '{}' requires restart after previous rejection",
                 self.name
             )));
         }
@@ -383,7 +390,18 @@ impl PgwS2bSimulator {
         self.rejected_messages = self.rejected_messages.saturating_add(1);
         self.state = PgwS2bState::MalformedRejected;
     }
+
+    fn record_unavailable_rejection(&mut self) {
+        self.rejected_messages = self.rejected_messages.saturating_add(1);
+    }
 }
+
+const DIAMETER_APP_BASE: u32 = 0;
+const DIAMETER_APP_3GPP_S6A_S6D: u32 = 16_777_251;
+const DIAMETER_APP_3GPP_GX: u32 = 16_777_238;
+const DIAMETER_CC_CAPABILITIES_EXCHANGE: u32 = 257;
+const DIAMETER_CC_DEVICE_WATCHDOG: u32 = 280;
+const DIAMETER_CC_DISCONNECT_PEER: u32 = 282;
 
 /// Diameter application families relevant to EPC/ePDG test peers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -395,6 +413,9 @@ pub enum DiameterApplication {
     /// 3GPP Gx application family.
     Gx,
     /// 3GPP Rf accounting application family.
+    ///
+    /// This skeleton does not map a numeric Rf application-id yet; the future
+    /// SDK Diameter crate should provide the authoritative dictionary value.
     Rf,
     /// Unknown or future Diameter application ID.
     Unknown(u32),
@@ -404,10 +425,9 @@ impl DiameterApplication {
     /// Map a Diameter application-id to the simulator's product-neutral family.
     pub const fn from_application_id(application_id: u32) -> Self {
         match application_id {
-            0 => Self::Base,
-            16_777_251 => Self::S6a,
-            16_777_238 => Self::Gx,
-            3 => Self::Rf,
+            DIAMETER_APP_BASE => Self::Base,
+            DIAMETER_APP_3GPP_S6A_S6D => Self::S6a,
+            DIAMETER_APP_3GPP_GX => Self::Gx,
             other => Self::Unknown(other),
         }
     }
@@ -545,9 +565,16 @@ impl DiameterPeerSimulator {
         message: &impl DiameterMessageView,
     ) -> Result<DiameterPeerEvent, TestbedError> {
         if self.state == DiameterPeerState::PeerUnavailable {
-            self.record_rejection();
+            self.record_unavailable_rejection();
             return Err(TestbedError::Simulator(format!(
                 "Diameter simulator '{}' is unavailable",
+                self.name
+            )));
+        }
+        if self.state == DiameterPeerState::MalformedRejected {
+            self.record_rejection();
+            return Err(TestbedError::Simulator(format!(
+                "Diameter simulator '{}' requires restart after previous rejection",
                 self.name
             )));
         }
@@ -557,7 +584,7 @@ impl DiameterPeerSimulator {
         let direction = message.direction();
 
         match command_code {
-            257 => {
+            DIAMETER_CC_CAPABILITIES_EXCHANGE => {
                 self.capability_messages =
                     self.capability_messages.checked_add(1).ok_or_else(|| {
                         TestbedError::Simulator(
@@ -566,14 +593,14 @@ impl DiameterPeerSimulator {
                     })?;
                 self.state = DiameterPeerState::CapabilitiesExchanged;
             }
-            280 => {
+            DIAMETER_CC_DEVICE_WATCHDOG => {
                 self.watchdog_messages =
                     self.watchdog_messages.checked_add(1).ok_or_else(|| {
                         TestbedError::Simulator("Diameter watchdog counter overflow".into())
                     })?;
                 self.state = DiameterPeerState::WatchdogSeen;
             }
-            282 => {
+            DIAMETER_CC_DISCONNECT_PEER => {
                 self.state = DiameterPeerState::DisconnectSeen;
             }
             _ => {
@@ -669,5 +696,9 @@ impl DiameterPeerSimulator {
     fn record_rejection(&mut self) {
         self.rejected_messages = self.rejected_messages.saturating_add(1);
         self.state = DiameterPeerState::MalformedRejected;
+    }
+
+    fn record_unavailable_rejection(&mut self) {
+        self.rejected_messages = self.rejected_messages.saturating_add(1);
     }
 }
