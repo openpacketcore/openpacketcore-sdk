@@ -29,8 +29,8 @@ use crate::base::{
 };
 use crate::dictionary::{CommandKind, Dictionary, DictionarySet};
 use crate::{
-    ApplicationId, AvpCode, AvpHeader, AvpKey, CommandCode, CommandFlags, FlagRequirement, Header,
-    Message, OwnedMessage, RawAvp, VendorId, DIAMETER_HEADER_LEN, MAX_U24,
+    ApplicationId, AvpCode, AvpHeader, CommandCode, CommandFlags, FlagRequirement, Header, Message,
+    OwnedMessage, RawAvp, VendorId, DIAMETER_HEADER_LEN, MAX_U24,
 };
 
 static PEER_DICTIONARY_REFS: [&Dictionary; 1] = [base::dictionary()];
@@ -1461,9 +1461,10 @@ fn parse_vendor_specific_application(
             }
         },
     )?;
-    let vendor_id = require_field(
+    let vendor_id = require_field_at(
         vendor_id,
         "diameter Vendor-Specific-Application-Id requires Vendor-Id",
+        value_offset,
         section,
     )?;
     if auth_application_id.is_some() == acct_application_id.is_some() {
@@ -1598,39 +1599,68 @@ fn set_once<T>(
 }
 
 fn validate_peer_avp_flags(header: &AvpHeader, offset: usize) -> Result<(), DecodeError> {
-    let key = AvpKey::ietf(header.code);
-    let Some(definition) = PEER_DICTIONARIES.find_avp(key) else {
+    // Look up the AVP by its actual code+Vendor-Id key so that a vendor-namespace
+    // AVP whose code collides with a base AVP code is validated against its own
+    // dictionary entry (if present) rather than the base definition. RFC 6733
+    // section 4.1 identifies an AVP by code plus Vendor-Id.
+    let Some(definition) = PEER_DICTIONARIES.find_avp(header.key()) else {
         return Ok(());
     };
     let flags = definition.flags();
     let section = definition.spec_ref().section();
-    if flags.vendor() == FlagRequirement::MustBeUnset && header.vendor_id.is_some() {
-        return Err(decode_structural_error(
-            "diameter AVP V-bit must not be set per base dictionary",
-            offset,
-            section,
-        ));
+    // PEER_DICTIONARIES currently contains only base AVPs, so V/P MustBeSet is
+    // unreachable today. Match those requirements defensively so a future
+    // vendor-specific entry added to the peer dictionary set is enforced.
+    match flags.vendor() {
+        FlagRequirement::MustBeSet if header.vendor_id.is_none() => {
+            return Err(decode_structural_error(
+                "diameter AVP V-bit must be set per dictionary",
+                offset,
+                section,
+            ));
+        }
+        FlagRequirement::MustBeUnset if header.vendor_id.is_some() => {
+            return Err(decode_structural_error(
+                "diameter AVP V-bit must not be set per base dictionary",
+                offset,
+                section,
+            ));
+        }
+        _ => {}
     }
-    if flags.mandatory() == FlagRequirement::MustBeSet && !header.flags.is_mandatory() {
-        return Err(decode_structural_error(
-            "diameter AVP M-bit must be set per base dictionary",
-            offset,
-            section,
-        ));
+    match flags.mandatory() {
+        FlagRequirement::MustBeSet if !header.flags.is_mandatory() => {
+            return Err(decode_structural_error(
+                "diameter AVP M-bit must be set per base dictionary",
+                offset,
+                section,
+            ));
+        }
+        FlagRequirement::MustBeUnset if header.flags.is_mandatory() => {
+            return Err(decode_structural_error(
+                "diameter AVP M-bit must not be set per base dictionary",
+                offset,
+                section,
+            ));
+        }
+        _ => {}
     }
-    if flags.mandatory() == FlagRequirement::MustBeUnset && header.flags.is_mandatory() {
-        return Err(decode_structural_error(
-            "diameter AVP M-bit must not be set per base dictionary",
-            offset,
-            section,
-        ));
-    }
-    if flags.protected() == FlagRequirement::MustBeUnset && header.flags.is_protected() {
-        return Err(decode_structural_error(
-            "diameter AVP P-bit must not be set per base dictionary",
-            offset,
-            section,
-        ));
+    match flags.protected() {
+        FlagRequirement::MustBeSet if !header.flags.is_protected() => {
+            return Err(decode_structural_error(
+                "diameter AVP P-bit must be set per dictionary",
+                offset,
+                section,
+            ));
+        }
+        FlagRequirement::MustBeUnset if header.flags.is_protected() => {
+            return Err(decode_structural_error(
+                "diameter AVP P-bit must not be set per base dictionary",
+                offset,
+                section,
+            ));
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -1640,13 +1670,18 @@ fn require_field<T>(
     reason: &'static str,
     section: &'static str,
 ) -> Result<T, DecodeError> {
+    require_field_at(field, reason, DIAMETER_HEADER_LEN, section)
+}
+
+fn require_field_at<T>(
+    field: Option<FieldValue<T>>,
+    reason: &'static str,
+    offset: usize,
+    section: &'static str,
+) -> Result<T, DecodeError> {
     match field {
         Some(field) => Ok(field.value),
-        None => Err(decode_structural_error(
-            reason,
-            DIAMETER_HEADER_LEN,
-            section,
-        )),
+        None => Err(decode_structural_error(reason, offset, section)),
     }
 }
 
@@ -2960,5 +2995,126 @@ mod tests {
                 }
             )
         ));
+    }
+
+    #[test]
+    fn vendor_avp_with_base_code_collision_is_not_flag_validated() {
+        let identity = PeerIdentity::new("aaa-vendor.example.net", "example.net");
+        let mut raw_avps = BytesMut::new();
+        if let Err(error) = append_identity_avps(&mut raw_avps, &identity, EncodeContext::default())
+        {
+            panic!("identity AVP build failed: {error}");
+        }
+        // A vendor-specific AVP whose code collides with Origin-Host (264) and
+        // deliberately violates the base dictionary's M-bit rule. Under a
+        // permissive unknown-IE policy it must be ignored, not rejected by the
+        // base dictionary's V-bit/M-bit rules.
+        if let Err(error) = append_avp(
+            &mut raw_avps,
+            AvpHeader::vendor(AVP_ORIGIN_HOST, VendorId::new(12345), false),
+            b"vendor.example.net",
+            EncodeContext::default(),
+        ) {
+            panic!("vendor Origin-Host AVP build failed: {error}");
+        }
+        let built = match build_message(
+            peer_request_flags(PeerProcedure::DeviceWatchdog),
+            COMMAND_DEVICE_WATCHDOG,
+            raw_avps,
+            1,
+            2,
+            EncodeContext::default(),
+            "5.5.1",
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("message build failed: {error}"),
+        };
+        let encoded = encode_owned(&built);
+        let message = decode_message(&encoded);
+        let result = parse_device_watchdog_request(&message, DecodeContext::default());
+        assert!(
+            result.is_ok(),
+            "expected vendor AVP to be ignored, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn vendor_specific_application_missing_vendor_id_reports_grouped_offset() {
+        let identity = PeerIdentity::new("h.example.net", "example.net");
+        let mut raw_avps = BytesMut::new();
+        if let Err(error) = append_identity_avps(&mut raw_avps, &identity, EncodeContext::default())
+        {
+            panic!("identity AVP build failed: {error}");
+        }
+        if let Err(error) = append_address_avp(
+            &mut raw_avps,
+            HostIpAddress::ipv4([192, 0, 2, 1]),
+            EncodeContext::default(),
+        ) {
+            panic!("Host-IP-Address AVP build failed: {error}");
+        }
+        if let Err(error) = append_u32_avp(
+            &mut raw_avps,
+            AVP_VENDOR_ID,
+            10415,
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("Vendor-Id AVP build failed: {error}");
+        }
+        if let Err(error) = append_utf8_avp(
+            &mut raw_avps,
+            AVP_PRODUCT_NAME,
+            "test",
+            false,
+            EncodeContext::default(),
+        ) {
+            panic!("Product-Name AVP build failed: {error}");
+        }
+
+        // Grouped VSAI containing only Auth-Application-Id; nested Vendor-Id is missing.
+        let mut vsai_value = BytesMut::new();
+        if let Err(error) = append_u32_avp(
+            &mut vsai_value,
+            AVP_AUTH_APPLICATION_ID,
+            16_777_251,
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("nested Auth-Application-Id AVP build failed: {error}");
+        }
+        if let Err(error) = append_avp(
+            &mut raw_avps,
+            AvpHeader::ietf(AVP_VENDOR_SPECIFIC_APPLICATION_ID, true),
+            &vsai_value,
+            EncodeContext::default(),
+        ) {
+            panic!("Vendor-Specific-Application-Id AVP build failed: {error}");
+        }
+
+        let built = match build_message(
+            peer_request_flags(PeerProcedure::CapabilitiesExchange),
+            COMMAND_CAPABILITIES_EXCHANGE,
+            raw_avps,
+            0x10,
+            0x20,
+            EncodeContext::default(),
+            "5.3.1",
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("CER build failed: {error}"),
+        };
+        let encoded = encode_owned(&built);
+        let message = decode_message(&encoded);
+        match parse_capabilities_exchange_request(&message, DecodeContext::default()) {
+            Ok(_) => panic!("expected missing nested Vendor-Id to fail"),
+            Err(error) => {
+                assert!(matches!(error.code(), DecodeErrorCode::Structural { .. }));
+                // Error offset must point at the grouped VSAI value, not the Diameter message header.
+                // 20 (header) + 24 (Origin-Host) + 20 (Origin-Realm) + 16 (Host-IP-Address)
+                // + 12 (Vendor-Id) + 12 (Product-Name) + 8 (VSAI AVP header) = 112.
+                assert_eq!(error.offset(), 112);
+            }
+        }
     }
 }
