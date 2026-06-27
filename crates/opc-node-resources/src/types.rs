@@ -428,14 +428,19 @@ pub struct SriovProfile {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum CniType {
     /// SR-IOV direct-assignment CNI.
+    #[serde(rename = "sriov")]
     Sriov,
     /// MACVLAN CNI.
+    #[serde(rename = "macvlan")]
     Macvlan,
     /// IPVLAN CNI.
+    #[serde(rename = "ipvlan")]
     Ipvlan,
     /// Host-network attachment.
+    #[serde(rename = "host-network")]
     HostNetwork,
     /// Operator-defined CNI type outside the built-in set.
+    #[serde(rename = "custom")]
     Custom(String),
 }
 
@@ -447,6 +452,22 @@ pub struct KernelModuleId(String);
 impl KernelModuleId {
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into().to_lowercase())
+    }
+
+    /// Construct a [`KernelModuleId`] only if the supplied identifier is
+    /// non-empty and not whitespace-only.
+    pub fn try_new(name: impl AsRef<str>) -> Option<Self> {
+        let name = name.as_ref();
+        if name.trim().is_empty() {
+            None
+        } else {
+            Some(Self::new(name))
+        }
+    }
+
+    /// Returns `true` if the identifier is non-empty and not whitespace-only.
+    pub fn is_valid(&self) -> bool {
+        !self.0.trim().is_empty()
     }
 }
 
@@ -511,6 +532,22 @@ pub struct EspAlgorithmId(String);
 impl EspAlgorithmId {
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into().to_lowercase())
+    }
+
+    /// Construct an [`EspAlgorithmId`] only if the supplied identifier is
+    /// non-empty and not whitespace-only.
+    pub fn try_new(name: impl AsRef<str>) -> Option<Self> {
+        let name = name.as_ref();
+        if name.trim().is_empty() {
+            None
+        } else {
+            Some(Self::new(name))
+        }
+    }
+
+    /// Returns `true` if the identifier is non-empty and not whitespace-only.
+    pub fn is_valid(&self) -> bool {
+        !self.0.trim().is_empty()
     }
 }
 
@@ -640,6 +677,12 @@ pub struct IpsecGatewayProfile {
 }
 
 /// IPsec-related capabilities reported by the node agent.
+///
+/// This is a pure model owned by `opc-node-resources`.  It deliberately does
+/// not depend on `opc-ipsec-xfrm`; products (or a dedicated adapter crate)
+/// should translate any `opc-ipsec-xfrm::XfrmCapabilityReport` into this
+/// structure at the integration boundary rather than pulling XFRM internals
+/// into the resource-validation layer.
 #[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct IpsecCapabilities {
     /// Whether the kernel XFRM netlink interface is available.
@@ -654,8 +697,8 @@ pub struct IpsecCapabilities {
     pub udp_4500_bind_allowed: bool,
     /// Whether the node reports SCTP support.
     pub sctp_supported: bool,
-    /// Kernel modules that are available on the node.
-    pub required_kernel_modules: BTreeSet<KernelModuleId>,
+    /// Kernel modules that are available on the node (e.g. `xfrm_user`).
+    pub available_kernel_modules: BTreeSet<KernelModuleId>,
     /// ESP algorithms supported by the node.
     pub supported_esp_algorithms: BTreeSet<EspAlgorithmId>,
 }
@@ -973,6 +1016,12 @@ pub enum ValidationError {
     /// An IPsec gateway network attachment requirement is missing a required
     /// field or has an invalid value.
     IpsecNetworkAttachmentInvalid { detail: String },
+    /// An IPsec gateway profile declares an empty or whitespace-only kernel
+    /// module identifier.
+    InvalidKernelModuleId { module: String },
+    /// An IPsec gateway profile declares an empty or whitespace-only ESP
+    /// algorithm identifier.
+    InvalidEspAlgorithmId { algorithm: String },
     /// An SR-IOV data-plane interface exposes zero VFs, so no direct assignment
     /// is possible (RFC 011 §9.2).
     SriovNicZeroVfs { interface_name: String },
@@ -1138,6 +1187,12 @@ impl fmt::Display for ValidationError {
             }
             ValidationError::IpsecNetworkAttachmentInvalid { detail } => {
                 write!(f, "IPsec network attachment invalid: {detail}")
+            }
+            ValidationError::InvalidKernelModuleId { module } => {
+                write!(f, "invalid IPsec kernel module identifier: {module:?}")
+            }
+            ValidationError::InvalidEspAlgorithmId { algorithm } => {
+                write!(f, "invalid IPsec ESP algorithm identifier: {algorithm:?}")
             }
             ValidationError::SriovNicZeroVfs { interface_name } => {
                 write!(f, "SR-IOV interface {interface_name} exposes zero VFs")

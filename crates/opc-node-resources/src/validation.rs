@@ -182,6 +182,8 @@ pub fn run_data_plane_preflight(
                 e,
                 ValidationError::MissingNodeCapability { .. }
                     | ValidationError::ProductionLabFallbackForbidden
+                    | ValidationError::UnsupportedKernelVersion { .. }
+                    | ValidationError::IpsecProfileMissing
             )
         })
     } else {

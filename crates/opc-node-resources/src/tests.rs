@@ -131,7 +131,7 @@ fn capable_node() -> NodeCapabilityReport {
             udp_500_bind_allowed: true,
             udp_4500_bind_allowed: true,
             sctp_supported: true,
-            required_kernel_modules: BTreeSet::from([
+            available_kernel_modules: BTreeSet::from([
                 KernelModuleId::from("xfrm_user"),
                 KernelModuleId::from("esp4"),
             ]),
@@ -2328,7 +2328,7 @@ fn ipsec_profile_missing_is_rejected() {
 fn ipsec_missing_required_kernel_module_is_rejected() {
     let profile = production_ipsec_gateway_profile();
     let mut node = capable_node();
-    node.ipsec.required_kernel_modules = BTreeSet::new();
+    node.ipsec.available_kernel_modules = BTreeSet::new();
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
     let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
@@ -2561,7 +2561,7 @@ fn ipsec_lab_missing_required_kernel_module_activates_software_packet_fallback()
     profile.environment = Environment::Lab;
     profile.lab_fallback.allow_software_packet_path = true;
     let mut node = capable_node();
-    node.ipsec.required_kernel_modules = BTreeSet::new();
+    node.ipsec.available_kernel_modules = BTreeSet::new();
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
     let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
@@ -2927,15 +2927,22 @@ fn ipsec_cni_type_supports_sriov_and_host_network() {
 
 #[test]
 fn ipsec_cni_type_serde_round_trips_builtin_variants() {
-    let variants = [
-        CniType::Sriov,
-        CniType::Macvlan,
-        CniType::Ipvlan,
-        CniType::HostNetwork,
-        CniType::Custom("my-cni".to_string()),
+    let cases = [
+        (CniType::Sriov, "\"sriov\""),
+        (CniType::Macvlan, "\"macvlan\""),
+        (CniType::Ipvlan, "\"ipvlan\""),
+        (CniType::HostNetwork, "\"host-network\""),
+        (
+            CniType::Custom("my-cni".to_string()),
+            "{\"custom\":\"my-cni\"}",
+        ),
     ];
-    for variant in &variants {
+    for (variant, expected_wire) in &cases {
         let json = serde_json::to_string(variant).expect("serialize");
+        assert_eq!(
+            &json, *expected_wire,
+            "wire format mismatch for {variant:?}"
+        );
         let deserialized: CniType = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(
             *variant, deserialized,
@@ -2958,4 +2965,106 @@ fn esp_algorithm_id_deserialization_normalizes_case() {
     let id: EspAlgorithmId = serde_json::from_str(json).unwrap();
     assert_eq!(id, EspAlgorithmId::from("hmac-sha256"));
     assert_eq!(format!("{id}"), "hmac-sha256");
+}
+
+#[test]
+fn ipsec_preflight_unsupported_kernel_version_fails_ipsec_capabilities_check() {
+    let profile = production_ipsec_gateway_profile();
+    let mut node = capable_node();
+    node.kernel = KernelVersion::new(5, 10, 0);
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = run_data_plane_preflight(&profile, &ctx);
+
+    assert!(!report.passed);
+    let ipsec_check = report
+        .checks
+        .iter()
+        .find(|c| c.name == "IPsec_Capabilities")
+        .expect("IPsec_Capabilities check missing");
+    assert!(!ipsec_check.passed);
+}
+
+#[test]
+fn ipsec_preflight_missing_profile_fails_ipsec_capabilities_check() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.ipsec = None;
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = run_data_plane_preflight(&profile, &ctx);
+
+    assert!(!report.passed);
+    let ipsec_check = report
+        .checks
+        .iter()
+        .find(|c| c.name == "IPsec_Capabilities")
+        .expect("IPsec_Capabilities check missing");
+    assert!(!ipsec_check.passed);
+}
+
+#[test]
+fn ipsec_blank_kernel_module_identifier_is_rejected() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile
+        .ipsec
+        .as_mut()
+        .unwrap()
+        .required_kernel_modules
+        .insert(KernelModuleId::from("   "));
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::InvalidKernelModuleId {
+            module: "   ".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_blank_esp_algorithm_identifier_is_rejected() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile
+        .ipsec
+        .as_mut()
+        .unwrap()
+        .required_esp_algorithms
+        .insert(EspAlgorithmId::from("   "));
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::InvalidEspAlgorithmId {
+            algorithm: "   ".to_string(),
+        }));
+}
+
+#[test]
+fn kernel_module_id_try_new_rejects_blank() {
+    assert!(KernelModuleId::try_new("xfrm_user").is_some());
+    assert!(KernelModuleId::try_new("").is_none());
+    assert!(KernelModuleId::try_new("   ").is_none());
+}
+
+#[test]
+fn esp_algorithm_id_try_new_rejects_blank() {
+    assert!(EspAlgorithmId::try_new("aes-cbc").is_some());
+    assert!(EspAlgorithmId::try_new("").is_none());
+    assert!(EspAlgorithmId::try_new("   ").is_none());
 }

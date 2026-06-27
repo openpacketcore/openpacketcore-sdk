@@ -498,7 +498,13 @@ pub fn validate_ipsec_gateway(
 
     // Required kernel module checks
     for module in &ipsec.required_kernel_modules {
-        if !context.node.ipsec.required_kernel_modules.contains(module) {
+        if !module.is_valid() {
+            report.push_error(ValidationError::InvalidKernelModuleId {
+                module: module.to_string(),
+            });
+            continue;
+        }
+        if !context.node.ipsec.available_kernel_modules.contains(module) {
             if is_lab_software_fallback_allowed {
                 report.activate_fallback(
                     FallbackMode::SoftwarePacketPath,
@@ -516,6 +522,12 @@ pub fn validate_ipsec_gateway(
 
     // Required ESP algorithm checks
     for algorithm in &ipsec.required_esp_algorithms {
+        if !algorithm.is_valid() {
+            report.push_error(ValidationError::InvalidEspAlgorithmId {
+                algorithm: algorithm.to_string(),
+            });
+            continue;
+        }
         if !context
             .node
             .ipsec
