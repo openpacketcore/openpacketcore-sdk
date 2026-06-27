@@ -23,6 +23,10 @@ use tokio::sync::watch;
 /// All hooks run concurrently and share a single timeout of
 /// `min(shutdown_grace, drain_timeout)`; a hook error or timeout raises a
 /// drain-incomplete alarm but does not stop the shutdown sequence.
+///
+/// Downstream implementations commonly need to annotate their impl block with
+/// `#[async_trait::async_trait]` and depend directly on the `async-trait`
+/// crate. `opc-runtime` does not re-export that macro.
 #[async_trait]
 pub trait DrainHook: Send + Sync {
     /// Returns the descriptive name of the drain hook, used for logging and startup validation.
@@ -143,6 +147,28 @@ impl ShutdownToken {
                 return;
             }
             if self.is_shutdown_requested() || *rx.borrow_and_update() != ShutdownPhase::Running {
+                return;
+            }
+        }
+    }
+
+    /// Wait until shutdown reaches at least the requested phase.
+    ///
+    /// The shutdown phase model is monotonic, so this returns immediately if
+    /// the token is already at or beyond `phase`. This method is
+    /// notification-only: it does not request shutdown, mutate the token, or
+    /// consume the token.
+    ///
+    /// The wait subscribes before checking the current value to avoid
+    /// lost-wakeup races. If the underlying watch channel is closed, the method
+    /// returns defensively.
+    pub async fn wait_for_phase(&self, phase: ShutdownPhase) {
+        let mut rx = self.inner.phase_tx.subscribe();
+        loop {
+            if *rx.borrow_and_update() >= phase {
+                return;
+            }
+            if rx.changed().await.is_err() {
                 return;
             }
         }
@@ -290,6 +316,179 @@ mod tests {
 
         let rx = token.subscribe();
         assert_eq!(*rx.borrow(), ShutdownPhase::Draining);
+    }
+
+    #[tokio::test]
+    async fn wait_for_phase_running_returns_immediately() {
+        let token = ShutdownToken::new();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            token.wait_for_phase(ShutdownPhase::Running),
+        )
+        .await
+        .expect("Running wait should return immediately for a new token");
+    }
+
+    #[tokio::test]
+    async fn wait_for_phase_draining_returns_immediately_after_shutdown_request() {
+        let token = ShutdownToken::new();
+        token.request_shutdown();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            token.wait_for_phase(ShutdownPhase::Draining),
+        )
+        .await
+        .expect("Draining wait should return after shutdown is already requested");
+    }
+
+    #[tokio::test]
+    async fn wait_for_phase_protocol_draining_completes_after_transition() {
+        let token = ShutdownToken::new();
+        let mut waiter = tokio::spawn({
+            let token = token.clone();
+            async move {
+                token.wait_for_phase(ShutdownPhase::ProtocolDraining).await;
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "waiter should remain pending before ProtocolDraining"
+        );
+
+        token.transition_phase(ShutdownPhase::ProtocolDraining);
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiter)
+            .await
+            .expect("ProtocolDraining waiter should complete")
+            .expect("waiter task should not panic");
+    }
+
+    #[tokio::test]
+    async fn wait_for_phase_draining_completes_when_phase_skips_to_stopped() {
+        let token = ShutdownToken::new();
+        let mut waiter = tokio::spawn({
+            let token = token.clone();
+            async move {
+                token.wait_for_phase(ShutdownPhase::Draining).await;
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "waiter should remain pending before shutdown advances"
+        );
+
+        token.transition_phase(ShutdownPhase::Stopped);
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiter)
+            .await
+            .expect("Draining waiter should complete when phase skips to Stopped")
+            .expect("waiter task should not panic");
+    }
+
+    #[tokio::test]
+    async fn wait_for_phase_stopped_completes_only_at_stopped() {
+        let token = ShutdownToken::new();
+        let mut waiter = tokio::spawn({
+            let token = token.clone();
+            async move {
+                token.wait_for_phase(ShutdownPhase::Stopped).await;
+            }
+        });
+
+        token.transition_phase(ShutdownPhase::ProtocolDraining);
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "Stopped waiter should remain pending before Stopped"
+        );
+
+        token.transition_phase(ShutdownPhase::Stopped);
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiter)
+            .await
+            .expect("Stopped waiter should complete at Stopped")
+            .expect("waiter task should not panic");
+    }
+
+    #[tokio::test]
+    async fn wait_for_phase_wakes_multiple_waiters_on_same_target() {
+        let token = ShutdownToken::new();
+        let waiters = (0..4)
+            .map(|_| {
+                let token = token.clone();
+                tokio::spawn(async move {
+                    token.wait_for_phase(ShutdownPhase::ProtocolDraining).await;
+                })
+            })
+            .collect::<Vec<_>>();
+
+        tokio::task::yield_now().await;
+        for waiter in &waiters {
+            assert!(
+                !waiter.is_finished(),
+                "waiter should remain pending before target phase"
+            );
+        }
+
+        token.transition_phase(ShutdownPhase::ProtocolDraining);
+
+        for waiter in waiters {
+            tokio::time::timeout(std::time::Duration::from_millis(50), waiter)
+                .await
+                .expect("waiter should complete")
+                .expect("waiter task should not panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_phase_waiters_complete_when_each_target_is_reached() {
+        let token = ShutdownToken::new();
+        let mut draining_waiter = tokio::spawn({
+            let token = token.clone();
+            async move {
+                token.wait_for_phase(ShutdownPhase::Draining).await;
+            }
+        });
+        let mut protocol_waiter = tokio::spawn({
+            let token = token.clone();
+            async move {
+                token.wait_for_phase(ShutdownPhase::ProtocolDraining).await;
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !draining_waiter.is_finished(),
+            "Draining waiter should remain pending before Draining"
+        );
+        assert!(
+            !protocol_waiter.is_finished(),
+            "ProtocolDraining waiter should remain pending before ProtocolDraining"
+        );
+
+        token.transition_phase(ShutdownPhase::Draining);
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut draining_waiter)
+            .await
+            .expect("Draining waiter should complete")
+            .expect("Draining waiter task should not panic");
+        assert!(
+            !protocol_waiter.is_finished(),
+            "ProtocolDraining waiter should remain pending at Draining"
+        );
+
+        token.transition_phase(ShutdownPhase::ProtocolDraining);
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut protocol_waiter)
+            .await
+            .expect("ProtocolDraining waiter should complete")
+            .expect("ProtocolDraining waiter task should not panic");
     }
 
     #[test]
