@@ -2,8 +2,8 @@ use bytes::BytesMut;
 use opc_proto_gtpv2c::{
     decode_typed_ie_sequence, s2b, CauseValue, FullyQualifiedTeid, Message, MessageType,
     S2bMessage, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT,
-    IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_IMSI,
-    IE_TYPE_INDICATION, IE_TYPE_PCO, IE_TYPE_RECOVERY,
+    IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID,
+    IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_PCO, IE_TYPE_RECOVERY,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
@@ -511,6 +511,136 @@ fn debug_output_redacts_subscriber_identifiers_and_raw_ie_bytes() {
     assert!(!msisdn_debug.contains("15551234567"));
     assert!(mei_debug.contains("<redacted>"));
     assert!(msisdn_debug.contains("<redacted>"));
+}
+
+/// Build a minimal Create Session Request where the Sender F-TEID IE appears at
+/// `fteid_instance`. All other mandatory S2b IEs are present at instance 0.
+fn create_session_request_with_fteid_instance(fteid_instance: u8) -> Vec<u8> {
+    let mut header = [
+        0x40,
+        s2b::CREATE_SESSION_REQUEST,
+        0x00,
+        0x00, // Length placeholder.
+        0x00,
+        0x20, // Sequence number.
+        0x00,
+        0x00, // Spare octets.
+    ];
+    let ies: &[&[u8]] = &[
+        &[
+            0x01, 0x00, 0x08, 0x00, 0x00, 0x01, 0x01, 0x21, 0x43, 0x65, 0x87, 0xf9,
+        ], // IMSI.
+        &[0x52, 0x00, 0x01, 0x00, 0x03],             // RAT Type.
+        &[0x53, 0x00, 0x03, 0x00, 0x00, 0xf1, 0x10], // Serving Network.
+        &[
+            IE_TYPE_F_TEID,
+            0x00,
+            0x09,
+            fteid_instance,
+            0x8a,
+            0x11,
+            0x22,
+            0x33,
+            0x44,
+            0xc0,
+            0x00,
+            0x02,
+            0x0a,
+        ], // Sender F-TEID.
+        &[
+            0x47, 0x00, 0x09, 0x00, 0x08, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x65, 0x74,
+        ], // APN.
+        &[0x80, 0x00, 0x01, 0x00, 0x00],             // Selection Mode.
+        &[0x63, 0x00, 0x01, 0x00, 0x01],             // PDN Type.
+        &[0x4f, 0x00, 0x05, 0x00, 0x01, 0xc6, 0x33, 0x64, 0x07], // PAA.
+        &[0x5d, 0x00, 0x05, 0x00, 0x49, 0x00, 0x01, 0x00, 0x05], // Bearer Context + EBI.
+    ];
+    let body: Vec<u8> = ies.iter().copied().flatten().copied().collect();
+    let length = u16::try_from(header.len() + body.len() - 4).unwrap();
+    header[2..4].copy_from_slice(&length.to_be_bytes());
+    let mut message = Vec::with_capacity(header.len() + body.len());
+    message.extend_from_slice(&header);
+    message.extend_from_slice(&body);
+    message
+}
+
+/// Build a minimal Create Session Response where the Sender F-TEID IE appears at
+/// `fteid_instance`. All other mandatory S2b IEs are present at instance 0.
+fn create_session_response_with_fteid_instance(fteid_instance: u8) -> Vec<u8> {
+    let mut header = [
+        0x48,
+        s2b::CREATE_SESSION_RESPONSE,
+        0x00,
+        0x00, // Length placeholder.
+        0x01,
+        0x02,
+        0x03,
+        0x04, // TEID.
+        0x00,
+        0x20, // Sequence number.
+        0x00,
+        0x00, // Spare octets.
+    ];
+    let ies: &[&[u8]] = &[
+        &[0x02, 0x00, 0x02, 0x00, 0x10, 0x00], // Cause.
+        &[
+            IE_TYPE_F_TEID,
+            0x00,
+            0x09,
+            fteid_instance,
+            0x8b,
+            0x55,
+            0x66,
+            0x77,
+            0x88,
+            0xc0,
+            0x00,
+            0x02,
+            0x01,
+        ], // Sender F-TEID.
+        &[0x5d, 0x00, 0x05, 0x00, 0x49, 0x00, 0x01, 0x00, 0x05], // Bearer Context + EBI.
+    ];
+    let body: Vec<u8> = ies.iter().copied().flatten().copied().collect();
+    let length = u16::try_from(header.len() + body.len() - 4).unwrap();
+    header[2..4].copy_from_slice(&length.to_be_bytes());
+    let mut message = Vec::with_capacity(header.len() + body.len());
+    message.extend_from_slice(&header);
+    message.extend_from_slice(&body);
+    message
+}
+
+#[test]
+fn procedure_aware_rejects_non_zero_instance_sender_fteid_for_create_session() {
+    // Sanity: instance-0 Sender F-TEID is accepted.
+    let valid_request = create_session_request_with_fteid_instance(0);
+    assert!(S2bMessage::decode(&valid_request, procedure_context()).is_ok());
+
+    let valid_response = create_session_response_with_fteid_instance(0);
+    assert!(S2bMessage::decode(&valid_response, procedure_context()).is_ok());
+
+    // Regression: non-zero instance Sender F-TEID must not satisfy the mandatory
+    // Sender F-TEID requirement for Create Session Request/Response.
+    for instance in [1u8, 2, 15] {
+        let bad_request = create_session_request_with_fteid_instance(instance);
+        let decoded = S2bMessage::decode(&bad_request, procedure_context());
+        assert!(
+            matches!(
+                decoded,
+                Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
+            ),
+            "Create Session Request with F-TEID instance {instance} should be rejected"
+        );
+
+        let bad_response = create_session_response_with_fteid_instance(instance);
+        let decoded = S2bMessage::decode(&bad_response, procedure_context());
+        assert!(
+            matches!(
+                decoded,
+                Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
+            ),
+            "Create Session Response with F-TEID instance {instance} should be rejected"
+        );
+    }
 }
 
 #[test]

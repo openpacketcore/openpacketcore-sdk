@@ -488,6 +488,11 @@ fn contains_ie(ies: &[TypedIe<'_>], ie_type: u8) -> bool {
     ies.iter().any(|ie| ie.ie_type() == ie_type)
 }
 
+fn contains_ie_instance(ies: &[TypedIe<'_>], ie_type: u8, instance: u8) -> bool {
+    ies.iter()
+        .any(|ie| ie.ie_type() == ie_type && ie.instance == instance)
+}
+
 fn contains_bearer_context_with_ebi(ies: &[TypedIe<'_>]) -> bool {
     ies.iter().any(|ie| match &ie.value {
         TypedIeValue::BearerContext(context) => contains_ie(&context.members, IE_TYPE_EBI),
@@ -501,6 +506,19 @@ fn missing_ie_error(reason: &'static str) -> DecodeError {
 
 fn require_ie(ies: &[TypedIe<'_>], ie_type: u8, reason: &'static str) -> Result<(), DecodeError> {
     if contains_ie(ies, ie_type) {
+        Ok(())
+    } else {
+        Err(missing_ie_error(reason))
+    }
+}
+
+fn require_ie_instance(
+    ies: &[TypedIe<'_>],
+    ie_type: u8,
+    instance: u8,
+    reason: &'static str,
+) -> Result<(), DecodeError> {
+    if contains_ie_instance(ies, ie_type, instance) {
         Ok(())
     } else {
         Err(missing_ie_error(reason))
@@ -542,10 +560,11 @@ fn validate_required_ies(
                 IE_TYPE_SERVING_NETWORK,
                 "Create Session Request requires Serving Network IE",
             )?;
-            require_ie(
+            require_ie_instance(
                 &view.ies,
                 IE_TYPE_F_TEID,
-                "Create Session Request requires Sender F-TEID IE",
+                0,
+                "Create Session Request requires Sender F-TEID IE at instance 0",
             )?;
             require_ie(
                 &view.ies,
@@ -586,10 +605,11 @@ fn validate_required_ies(
                 IE_TYPE_CAUSE,
                 "Create Session Response requires Cause IE",
             )?;
-            require_ie(
+            require_ie_instance(
                 &view.ies,
                 IE_TYPE_F_TEID,
-                "Create Session Response requires Sender F-TEID IE",
+                0,
+                "Create Session Response requires Sender F-TEID IE at instance 0",
             )?;
             require_ie(
                 &view.ies,
