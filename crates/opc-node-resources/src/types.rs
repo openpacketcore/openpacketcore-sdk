@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 /// Logical CPU identifier used in core-pinning layouts.
 pub type CpuId = u16;
@@ -419,6 +420,139 @@ pub struct SriovProfile {
     pub ipam_mode: IpamMode,
 }
 
+/// Constrained/custom CNI type for an IPsec gateway network attachment.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum CniType {
+    /// Multus secondary network attachment.
+    Multus,
+    /// MACVLAN CNI.
+    Macvlan,
+    /// IPVLAN CNI.
+    Ipvlan,
+    /// Bridge CNI.
+    Bridge,
+    /// Operator-defined CNI type outside the built-in set.
+    Custom(String),
+}
+
+/// Kernel module name, normalized to lowercase for equality and ordering.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct KernelModuleName(String);
+
+impl KernelModuleName {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into().to_lowercase())
+    }
+
+    fn key(&self) -> String {
+        self.0.to_lowercase()
+    }
+}
+
+impl PartialEq for KernelModuleName {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for KernelModuleName {}
+
+impl Hash for KernelModuleName {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+    }
+}
+
+impl PartialOrd for KernelModuleName {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KernelModuleName {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+impl From<String> for KernelModuleName {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for KernelModuleName {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl fmt::Display for KernelModuleName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// ESP algorithm identifier, normalized to lowercase for equality and ordering.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct EspAlgorithmId(String);
+
+impl EspAlgorithmId {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into().to_lowercase())
+    }
+
+    fn key(&self) -> String {
+        self.0.to_lowercase()
+    }
+}
+
+impl PartialEq for EspAlgorithmId {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for EspAlgorithmId {}
+
+impl Hash for EspAlgorithmId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+    }
+}
+
+impl PartialOrd for EspAlgorithmId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for EspAlgorithmId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+impl From<String> for EspAlgorithmId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for EspAlgorithmId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl fmt::Display for EspAlgorithmId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// IPsec gateway network attachment requirement.
 ///
 /// Declares the requested attachment prerequisites for an IPsec gateway
@@ -432,12 +566,21 @@ pub struct IpsecNetworkAttachment {
     pub interface_name: String,
     /// Functional plane of the attachment (e.g. `n3`, `n6`, `nwu`).
     pub plane: String,
-    /// CNI type requested for this attachment (e.g. `multus`, `macvlan`).
-    pub cni_type: String,
-    /// Optional statically requested IP address.
+    /// CNI type requested for this attachment.
+    pub cni_type: CniType,
+    /// Whether a static IP is required for this attachment.
+    pub static_ip_required: bool,
+    /// Optional statically requested IP address.  Required when
+    /// `static_ip_required` is `true`.
     pub static_ip: Option<String>,
-    /// Optional requested MTU.  When present it must be non-zero.
+    /// Optional minimum required MTU.  When present the attachment's `mtu`
+    /// must be at least this value.
+    pub minimum_mtu: Option<u16>,
+    /// Optional requested MTU.  When present it must be non-zero and meet
+    /// `minimum_mtu`.
     pub mtu: Option<u16>,
+    /// Whether source routing is required for this attachment.
+    pub source_route_required: bool,
     /// Optional VLAN identifier.  When present it must be in the valid
     /// 802.1Q range.
     pub vlan_id: Option<u16>,
@@ -468,9 +611,9 @@ pub struct IpsecGatewayProfile {
     /// Whether the node must report SCTP support.
     pub require_sctp: bool,
     /// Kernel modules that must be available on the node (e.g. `xfrm_user`).
-    pub required_kernel_modules: BTreeSet<String>,
+    pub required_kernel_modules: BTreeSet<KernelModuleName>,
     /// ESP algorithms that must be supported by the node (e.g. `aes-cbc`).
-    pub required_esp_algorithms: BTreeSet<String>,
+    pub required_esp_algorithms: BTreeSet<EspAlgorithmId>,
     /// Required network attachments for the IPsec gateway workload.
     pub network_attachments: Vec<IpsecNetworkAttachment>,
     /// Whether lab mode may fall back to userspace ESP when kernel ESP is
@@ -494,9 +637,9 @@ pub struct IpsecCapabilities {
     /// Whether the node reports SCTP support.
     pub sctp_supported: bool,
     /// Kernel modules that are available on the node.
-    pub required_kernel_modules: BTreeSet<String>,
+    pub required_kernel_modules: BTreeSet<KernelModuleName>,
     /// ESP algorithms supported by the node.
-    pub supported_esp_algorithms: BTreeSet<String>,
+    pub supported_esp_algorithms: BTreeSet<EspAlgorithmId>,
 }
 
 /// Lab-only fallback policy.  Each flag enables a degraded-mode escape hatch

@@ -305,6 +305,16 @@ pub fn validate_ipsec_gateway(
         report.push_error(ValidationError::IpsecNoDataPlaneInterfaces);
     }
 
+    // Lab-only fallback knobs must not appear on production profiles.
+    if profile.environment == Environment::Production && ipsec.allow_userspace_esp_fallback {
+        if !report
+            .errors
+            .contains(&ValidationError::ProductionLabFallbackForbidden)
+        {
+            report.push_error(ValidationError::ProductionLabFallbackForbidden);
+        }
+    }
+
     let allowed_capabilities = ipsec_gateway_allowed_capabilities();
     for capability in &profile.pod_security.added_capabilities {
         if !allowed_capabilities.contains(capability) {
@@ -370,7 +380,12 @@ pub fn validate_ipsec_gateway(
 
     // XFRM netlink support check
     if ipsec.require_xfrm && !context.node.ipsec.xfrm_netlink_available {
-        if is_lab_software_fallback_allowed {
+        if is_lab_userspace_esp_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::UserspaceEsp,
+                "node lacks XFRM netlink support; using lab userspace ESP fallback",
+            );
+        } else if is_lab_software_fallback_allowed {
             report.activate_fallback(
                 FallbackMode::SoftwarePacketPath,
                 "node lacks XFRM netlink support; using lab software packet path",
@@ -384,7 +399,12 @@ pub fn validate_ipsec_gateway(
 
     // XFRM user policy support check
     if ipsec.require_xfrm && !context.node.ipsec.xfrm_user_policy_available {
-        if is_lab_software_fallback_allowed {
+        if is_lab_userspace_esp_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::UserspaceEsp,
+                "node lacks XFRM user policy support; using lab userspace ESP fallback",
+            );
+        } else if is_lab_software_fallback_allowed {
             report.activate_fallback(
                 FallbackMode::SoftwarePacketPath,
                 "node lacks XFRM user policy support; using lab software packet path",
@@ -529,22 +549,71 @@ fn validate_ipsec_network_attachments(
             });
             continue;
         }
-        if attachment.cni_type.trim().is_empty() {
-            report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
-                detail: format!(
-                    "cni_type is required for interface {}",
-                    attachment.interface_name
-                ),
-            });
-            continue;
+        match &attachment.cni_type {
+            CniType::Custom(value) if value.trim().is_empty() => {
+                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                    detail: format!(
+                        "cni_type custom variant must not be empty for interface {}",
+                        attachment.interface_name
+                    ),
+                });
+                continue;
+            }
+            _ => {}
         }
         if !interface_names.contains(&attachment.interface_name) {
             report.push_error(ValidationError::UnknownInterface {
                 interface_name: attachment.interface_name.clone(),
             });
         }
-        if let Some(mtu) = attachment.mtu {
-            if mtu == 0 {
+        if attachment.static_ip_required {
+            let provided = attachment
+                .static_ip
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !provided {
+                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                    detail: format!(
+                        "static_ip is required for interface {}",
+                        attachment.interface_name
+                    ),
+                });
+            }
+        }
+        if attachment.source_route_required {
+            let provided = attachment
+                .static_ip
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !provided {
+                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                    detail: format!(
+                        "source_route_requires_static_ip for interface {}",
+                        attachment.interface_name
+                    ),
+                });
+            }
+        }
+        match (attachment.minimum_mtu, attachment.mtu) {
+            (Some(min), Some(mtu)) if mtu < min => {
+                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                    detail: format!(
+                        "mtu {mtu} is below minimum {min} for interface {}",
+                        attachment.interface_name
+                    ),
+                });
+            }
+            (Some(_), None) => {
+                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                    detail: format!(
+                        "mtu is required when minimum_mtu is set for interface {}",
+                        attachment.interface_name
+                    ),
+                });
+            }
+            (_, Some(mtu)) if mtu == 0 => {
                 report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
                     detail: format!(
                         "mtu must be non-zero for interface {}",
@@ -552,6 +621,7 @@ fn validate_ipsec_network_attachments(
                     ),
                 });
             }
+            _ => {}
         }
         if let Some(vlan_id) = attachment.vlan_id {
             if vlan_id == 0 || vlan_id > 4094 {

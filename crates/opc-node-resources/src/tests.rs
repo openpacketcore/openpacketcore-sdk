@@ -131,10 +131,13 @@ fn capable_node() -> NodeCapabilityReport {
             udp_500_bind_allowed: true,
             udp_4500_bind_allowed: true,
             sctp_supported: true,
-            required_kernel_modules: BTreeSet::from(["xfrm_user".to_string(), "esp4".to_string()]),
+            required_kernel_modules: BTreeSet::from([
+                KernelModuleName::from("xfrm_user"),
+                KernelModuleName::from("esp4"),
+            ]),
             supported_esp_algorithms: BTreeSet::from([
-                "aes-cbc".to_string(),
-                "hmac-sha256".to_string(),
+                EspAlgorithmId::from("aes-cbc"),
+                EspAlgorithmId::from("hmac-sha256"),
             ]),
         },
     }
@@ -1907,14 +1910,23 @@ fn production_ipsec_gateway_profile() -> ResourceProfile {
         require_udp_500: true,
         require_udp_4500: true,
         require_sctp: true,
-        required_kernel_modules: BTreeSet::from(["xfrm_user".to_string(), "esp4".to_string()]),
-        required_esp_algorithms: BTreeSet::from(["aes-cbc".to_string(), "hmac-sha256".to_string()]),
+        required_kernel_modules: BTreeSet::from([
+            KernelModuleName::from("xfrm_user"),
+            KernelModuleName::from("esp4"),
+        ]),
+        required_esp_algorithms: BTreeSet::from([
+            EspAlgorithmId::from("aes-cbc"),
+            EspAlgorithmId::from("hmac-sha256"),
+        ]),
         network_attachments: vec![IpsecNetworkAttachment {
             interface_name: "ens5f0".to_string(),
             plane: "nwu".to_string(),
-            cni_type: "multus".to_string(),
+            cni_type: CniType::Multus,
+            static_ip_required: false,
             static_ip: None,
+            minimum_mtu: None,
             mtu: Some(1500),
+            source_route_required: false,
             vlan_id: None,
         }],
         allow_userspace_esp_fallback: false,
@@ -2459,4 +2471,229 @@ fn ipsec_preflight_network_check_fails_when_no_data_plane_interfaces() {
         .find(|c| c.name == "Network_Attachments")
         .expect("Network_Attachments check missing");
     assert!(!network_check.passed);
+}
+
+#[test]
+fn ipsec_preflight_network_check_passes_for_capable_node() {
+    let profile = production_ipsec_gateway_profile();
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = run_data_plane_preflight(&profile, &ctx);
+
+    assert!(report.passed, "{report:#?}");
+    assert!(!report.blocks_readiness);
+    let network_check = report
+        .checks
+        .iter()
+        .find(|c| c.name == "Network_Attachments")
+        .expect("Network_Attachments check missing");
+    assert!(network_check.passed);
+}
+
+#[test]
+fn ipsec_production_rejects_userspace_esp_fallback() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.ipsec.as_mut().unwrap().allow_userspace_esp_fallback = true;
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::ProductionLabFallbackForbidden));
+}
+
+#[test]
+fn ipsec_lab_missing_xfrm_netlink_activates_userspace_esp_fallback() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.environment = Environment::Lab;
+    profile.ipsec.as_mut().unwrap().allow_userspace_esp_fallback = true;
+    let mut node = capable_node();
+    node.ipsec.xfrm_netlink_available = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(report.is_eligible(), "{report:#?}");
+    assert!(report.fallback_status.active);
+    assert!(report
+        .fallback_status
+        .modes
+        .contains(&FallbackMode::UserspaceEsp));
+}
+
+#[test]
+fn ipsec_lab_missing_xfrm_user_policy_activates_userspace_esp_fallback() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.environment = Environment::Lab;
+    profile.ipsec.as_mut().unwrap().allow_userspace_esp_fallback = true;
+    let mut node = capable_node();
+    node.ipsec.xfrm_user_policy_available = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(report.is_eligible(), "{report:#?}");
+    assert!(report.fallback_status.active);
+    assert!(report
+        .fallback_status
+        .modes
+        .contains(&FallbackMode::UserspaceEsp));
+}
+
+#[test]
+fn ipsec_lab_missing_required_kernel_module_activates_software_packet_fallback() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.environment = Environment::Lab;
+    profile.lab_fallback.allow_software_packet_path = true;
+    let mut node = capable_node();
+    node.ipsec.required_kernel_modules = BTreeSet::new();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(report.is_eligible(), "{report:#?}");
+    assert!(report.fallback_status.active);
+    assert!(report
+        .fallback_status
+        .modes
+        .contains(&FallbackMode::SoftwarePacketPath));
+}
+
+#[test]
+fn ipsec_lab_missing_required_esp_algorithm_activates_software_packet_fallback() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.environment = Environment::Lab;
+    profile.lab_fallback.allow_software_packet_path = true;
+    let mut node = capable_node();
+    node.ipsec.supported_esp_algorithms = BTreeSet::new();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(report.is_eligible(), "{report:#?}");
+    assert!(report.fallback_status.active);
+    assert!(report
+        .fallback_status
+        .modes
+        .contains(&FallbackMode::SoftwarePacketPath));
+}
+
+#[test]
+fn ipsec_network_attachment_static_ip_required_but_missing_is_rejected() {
+    let mut profile = production_ipsec_gateway_profile();
+    let attachment = &mut profile.ipsec.as_mut().unwrap().network_attachments[0];
+    attachment.static_ip_required = true;
+    attachment.static_ip = None;
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::IpsecNetworkAttachmentInvalid {
+            detail: "static_ip is required for interface ens5f0".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_network_attachment_source_route_requires_static_ip() {
+    let mut profile = production_ipsec_gateway_profile();
+    let attachment = &mut profile.ipsec.as_mut().unwrap().network_attachments[0];
+    attachment.source_route_required = true;
+    attachment.static_ip = None;
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::IpsecNetworkAttachmentInvalid {
+            detail: "source_route_requires_static_ip for interface ens5f0".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_network_attachment_mtu_below_minimum_is_rejected() {
+    let mut profile = production_ipsec_gateway_profile();
+    let attachment = &mut profile.ipsec.as_mut().unwrap().network_attachments[0];
+    attachment.minimum_mtu = Some(1500);
+    attachment.mtu = Some(1400);
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::IpsecNetworkAttachmentInvalid {
+            detail: "mtu 1400 is below minimum 1500 for interface ens5f0".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_network_attachment_minimum_mtu_without_mtu_is_rejected() {
+    let mut profile = production_ipsec_gateway_profile();
+    let attachment = &mut profile.ipsec.as_mut().unwrap().network_attachments[0];
+    attachment.minimum_mtu = Some(1500);
+    attachment.mtu = None;
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::IpsecNetworkAttachmentInvalid {
+            detail: "mtu is required when minimum_mtu is set for interface ens5f0".to_string(),
+        }));
+}
+
+#[test]
+fn ipsec_network_attachment_empty_custom_cni_type_is_rejected() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile.ipsec.as_mut().unwrap().network_attachments[0].cni_type =
+        CniType::Custom("   ".to_string());
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+
+    assert!(!report.is_eligible());
+    assert!(report
+        .errors
+        .contains(&ValidationError::IpsecNetworkAttachmentInvalid {
+            detail: "cni_type custom variant must not be empty for interface ens5f0".to_string(),
+        }));
 }
