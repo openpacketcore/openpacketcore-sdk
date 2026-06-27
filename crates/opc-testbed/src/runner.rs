@@ -150,10 +150,11 @@ impl LocalRunner {
                 Ok(())
             }
             Step::MalformedResponse { target } => {
-                self.simulator_mut(target)?;
+                let sim = self.simulator_mut(target)?;
+                let result = sim.handle_step(step);
                 self.state
                     .insert(format!("{target}.malformed_response"), "true".to_string());
-                Ok(())
+                result
             }
             Step::NetworkPartition { node_a, node_b } => {
                 self.simulator_mut(node_a)?;
