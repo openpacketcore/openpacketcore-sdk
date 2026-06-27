@@ -1,94 +1,175 @@
-# opc-proto-diameter Conformance Notes
+# opc-proto-diameter Conformance
 
-Status: **experimental scaffold**.
+This document defines the conformance status of the `opc-proto-diameter` crate.
 
-This crate does not yet claim full RFC 6733 or 3GPP Diameter conformance. The
-current scope exists so follow-up tasks can add independently authored fixtures,
-broader typed AVP value decoding, app dictionaries, and fuzz coverage without
-importing ePDG product policy or local-builder bytes as conformance evidence.
+## Specification Baseline
+
+- **Document**: IETF RFC 6733 — *Diameter Base Protocol*
+- **3GPP references**: 3GPP TS 32.299 (Rf offline charging), 3GPP TS 29.273
+  (SWm Diameter-EAP), 3GPP TS 29.212 (Gx), 3GPP TS 29.272 (S6a/S6d),
+  3GPP TS 29.273 (S6b/SWx).
+- **Status**: experimental scaffold with ADR 0015 evidence in progress
 
 ## Implemented scaffold
 
-- Diameter message header decode/encode for RFC 6733 section 3.
-- Raw Diameter message storage that preserves the top-level AVP byte region.
-- Raw AVP header/value/padding decode/encode for RFC 6733 section 4.
-- AVP-region validation for padding, per-region AVP count limits, duplicate
-  AVP-key rejection policy, and dictionary-defined grouped AVP recursion capped
-  by `DecodeContext::max_depth`.
-- Dictionary metadata architecture for applications, commands, AVPs, data types,
-  and flag requirements.
-- Transport-neutral RFC 6733 base procedure builders/parsers for CER/CEA,
-  DWR/DWA, and DPR/DPA, including optional `Origin-State-Id`, answer diagnostic
-  AVPs (`Error-Message` and raw `Failed-AVP` values), protocol-error E-bit
-  derivation, minimal CEA protocol-error answers, Relay Application Id aware
-  peer capability intersection, and CEA result-code helpers. These helpers
-  deliberately do not own socket management, realm routing, watchdog
-  thresholds, or deployment readiness policy.
-- Feature skeletons:
-  - `base`: common RFC 6733 application metadata, CER/CEA, DWR/DWA, DPR/DPA,
-    and selected base AVP definitions.
-  - `peer`: transport-neutral procedure classification, base peer procedure
-    builders/parsers, minimal CEA protocol-error answers, diagnostics
-    preservation, and capability/result-code helpers for the base peer
-    commands.
-  - `app-gx`, `app-rf`, `app-s6a`, `app-s6b`, `app-swm`, `app-swx`: initial
-    per-application 3GPP dictionary slots.
-  - `app-rf`: Rf Accounting-Request/Answer (START, INTERIM, STOP, EVENT)
-    dictionary subset plus redaction-safe typed builders/parsers.
-  - `app-swm`: SWm Diameter-EAP Request/Answer dictionary subset plus
-    redaction-safe typed builders/parsers.
-  - `all-apps`: enables every per-application dictionary slot.
+### 1. Message Header (RFC 6733 §3)
 
-## Rf subset coverage (`app-rf`)
+- Version 1 parsing and validation.
+- 24-bit message length field honored: shorter input rejected as truncated,
+  length smaller than the 20-octet header rejected as structural, length
+  exceeding `DecodeContext::max_message_len` rejected as too large.
+- Command flags: Request (`R`), Proxiable (`P`), Error (`E`), Potentially
+  Retransmitted (`T`); reserved bits rejected in strict mode.
+- 24-bit command code parsing; `CommandCode::fits_wire` rejects overflow at
+  encode time.
+- 32-bit application identifier, hop-by-hop identifier, and end-to-end
+  identifier parsing and preservation.
+- `Message::tail` returns unconsumed bytes after the header-declared boundary.
 
-- Application: 3GPP Rf accounting over Diameter accounting (id 3).
-- Commands: Accounting-Request / Accounting-Answer (command code 271).
-- Typed message builders/parsers: `RfAccountingRequest`, `RfAccountingAnswer`.
-- AVPs:
-  - Base: Session-Id, Origin-Host, Origin-Realm, Destination-Realm,
-    Destination-Host, User-Name, Origin-State-Id, Acct-Application-Id,
-    Result-Code.
-  - RFC 6733 accounting: Accounting-Record-Type, Accounting-Record-Number,
-    Event-Timestamp.
-  - RFC 4006 credit-control: Subscription-Id, Subscription-Id-Type,
-    Subscription-Id-Data, Used-Service-Unit, CC-Time, CC-Total-Octets,
-    CC-Input-Octets, CC-Output-Octets, Multiple-Services-Credit-Control,
-    Rating-Group, Service-Identifier, Service-Context-Id.
-  - 3GPP TS 32.299 (vendor 10415): PS-Information, 3GPP-Charging-Id,
-    3GPP-PDP-Type, SGSN-Address, GGSN-Address.
-- Sensitive fields use `Redacted<T>` so `Debug`/`Display` do not expose
-  Session-Id, User-Name, Subscription-Id-Data, or IP addresses.
+### 2. Generic AVP TLV Layer (RFC 6733 §4)
 
-## SWm subset coverage (`app-swm`)
+- Non-vendor AVP header (8 octets) and vendor-specific AVP header
+  (12 octets, V bit + Vendor-Id) parsing.
+- 24-bit AVP length field honored; length shorter than the header rejected,
+  length beyond input rejected as truncated.
+- Four-octet padding to boundary; strict mode rejects non-zero padding bytes.
+- Reserved AVP flag bits rejected in strict mode.
+- Vendor-specific AVPs with `Vendor-Id = 10415` (3GPP) recognized in
+  dictionary lookups.
 
-- Application: 3GPP SWm (id 16777264).
-- Commands: Diameter-EAP-Request / Diameter-EAP-Answer (command code 268).
-- Typed message builders/parsers: `SwmDiameterEapRequest`,
-  `SwmDiameterEapAnswer`.
-- AVPs:
-  - Base: Session-Id, Auth-Application-Id, Origin-Host, Origin-Realm,
-    Destination-Realm, Destination-Host, User-Name, Result-Code, Error-Message.
-  - RFC 4072 / RFC 6733: EAP-Payload, EAP-Reissued-Payload,
-    EAP-Master-Session-Key, Auth-Request-Type, State.
-- Sensitive fields use `Redacted<T>` so `Debug`/`Display` do not expose
-  Session-Id, User-Name, or EAP payloads/keys.
+### 3. AVP-region validation
 
-## Explicit gaps
+- Per-region AVP count limit via `DecodeContext::max_ies`.
+- Duplicate AVP-key policy: `Reject`, `First`, `Last`.
+- Dictionary-defined grouped AVP recursion bounded by
+  `DecodeContext::max_depth`.
+- Unknown mandatory AVPs rejected; unknown non-mandatory AVPs tolerated under
+  `UnknownIePolicy::Permit`.
 
-- No fixture is counted as ADR 0015 conformance evidence yet.
-- No ePDG-derived Diameter bytes are imported; source local-builder cases remain
-  parity/schema seeds until a later fixture-intake task records provenance.
-- Broader typed AVP value decoders are follow-up work; current typed values are
-  limited to the base peer procedures and the Rf/SWm subsets above.
-- Other 3GPP Diameter applications (`app-gx`, `app-s6a`, `app-s6b`,
-  `app-swx`) remain dictionary-only slots without typed helpers.
-- Fuzz targets and fixture manifests are follow-up work.
-- Transport operations, realm routing, peer topology, watchdog policy, AAA/HSS
-  behavior, and charging decisions are outside this crate.
+### 4. Base peer procedures (RFC 6733 §5.3–5.5)
 
-## Fixture intake rule
+Feature-gated under the `peer` feature.
 
-Future conformance fixtures must be spec-authored with octet-level comments or
-captured from an independent implementation with source, license, redaction, and
-capture metadata. Local builder output and same-codec round trips may be useful
-regression tests, but they do not prove wire conformance by themselves.
+| Procedure | Request | Answer | Notes |
+|:----------|:--------|:-------|:------|
+| Capabilities-Exchange | CER | CEA | Full capability AVPs, plus minimal protocol-error answer helper. |
+| Device-Watchdog | DWR | DWA | Optional `Origin-State-Id`. |
+| Disconnect-Peer | DPR | DPA | `Disconnect-Cause` enumeration. |
+
+Peer helpers include:
+- Capability intersection (`CapabilityNegotiation`) with Relay Application Id
+  awareness.
+- Result-code family classification and E-bit derivation per RFC 6733 §7.2.
+- Optional answer diagnostics (`Error-Message`, raw `Failed-AVP` values).
+
+### 5. Application dictionaries
+
+Feature-gated per application. Dictionary metadata (applications, commands,
+AVPs, data types, flag rules) is present; typed builders/parsers are limited to
+`app-rf` and `app-swm`.
+
+| Feature | Application | Command | Typed helpers |
+|:--------|:------------|:--------|:--------------|
+| `app-rf` | 3GPP Rf accounting (id 3) | Accounting-Request / Accounting-Answer (271) | `RfAccountingRequest`, `RfAccountingAnswer` |
+| `app-swm` | 3GPP SWm (id 16_777_264) | Diameter-EAP-Request / Diameter-EAP-Answer (268) | `SwmDiameterEapRequest`, `SwmDiameterEapAnswer` |
+| `app-gx` | 3GPP Gx (id 16_777_238) | — | dictionary only |
+| `app-s6a` | 3GPP S6a/S6d (id 16_777_251) | — | dictionary only |
+| `app-s6b` | 3GPP S6b (id 16_777_272) | — | dictionary only |
+| `app-swx` | 3GPP SWx (id 16_777_265) | — | dictionary only |
+
+### 6. Redaction
+
+Sensitive typed fields are wrapped in `Redacted<T>`. `Debug` and `Display`
+output the literal `REDACTED`; equality, cloning, and hashing delegate to the
+inner value so business logic can still operate on the real data.
+
+Covered redacted fields:
+- `RfAccountingRequest` / `RfAccountingAnswer`: `Session-Id`, `Origin-Host`,
+  `Origin-Realm`, `Destination-Realm`, `Destination-Host`, `User-Name`,
+  `SubscriptionId::subscription_id_data`, IP addresses inside `PsInformation`.
+- `SwmDiameterEapRequest` / `SwmDiameterEapAnswer`: `Session-Id`, `Origin-Host`,
+  `Origin-Realm`, `Destination-Realm`, `Destination-Host`, `User-Name`,
+  `EAP-Payload`, `EAP-Reissued-Payload`, `EAP-Master-Session-Key`.
+
+Raw AVP bytes are **not** redacted: the raw layer is intentionally a
+byte-preserving forwarding surface, and redaction is a typed-layer policy.
+
+## Robustness & Fuzzing
+
+Decode paths carry no `unsafe`, use checked length arithmetic, and never
+preallocate from a wire-declared length. Three layers guard them:
+
+- **Per-PR regression guard** — `tests/corpus_replay.rs` replays every committed
+  fuzz corpus entry, byte-truncations of each entry, and hostile constant
+  inputs through the message and AVP decode entry points under `catch_unwind`.
+  Runs in ordinary `cargo test`; no nightly toolchain or libFuzzer required.
+- **Scheduled fuzzing** — `fuzz/fuzz_targets/decode_message.rs` and
+  `fuzz/fuzz_targets/decode_avp.rs` are registered in `.github/workflows/fuzz.yml`
+  and run weekly. Each target seeds *only* from its own directory under
+  `fuzz/corpus/<target>/`; no committed seed file lives solely in a provenance
+  or documentation directory.
+- **Fuzz target compilation** — `cargo +nightly fuzz list` is exercised in CI
+  even when fuzzing is not executed.
+
+### On-disk corpus layout
+
+```text
+fuzz/corpus/
+├── decode_message/           # seeds for the decode_message fuzz target
+│   ├── header_only_cer-*
+│   ├── cer_request-*
+│   ├── cea_success-*
+│   ├── dwr_request-*
+│   ├── dpr_request-*
+│   ├── rf_acr_start-*
+│   ├── swm_der-*
+│   └── malformed_*-*         # hostile seeds: truncation, duplicate, depth, flags
+└── decode_avp/               # seeds for the decode_avp fuzz target
+    ├── ietf_origin_host-*
+    ├── vendor_ps_info-*
+    ├── grouped_failed_avp-*
+    ├── padded_single_octet-*
+    ├── arbitrary_avp_tree-*
+    └── malformed_*-*         # hostile seeds: length, padding, duplicate, depth
+```
+
+The `fuzz/generate_corpus.py` script is the source of truth for the named
+spec-valid and malformed seeds; running it regenerates the files above. Any
+additional hash-only files in these directories are libFuzzer-discovered
+regression seeds from prior runs.
+
+## Fixture provenance
+
+Test bytes are divided into four categories. Only categories 1 and 2 count as
+ADR 0015 conformance evidence; categories 3 and 4 are parity or regression
+evidence only.
+
+1. **RFC-authored fixtures** (`tests/fixture_provenance.rs` and the spec-valid
+   seeds in `fuzz/corpus/*/`) — hand-built from RFC 6733 §3 (header), §4 (AVP
+   framing), and the cited AVP sections. These are the only fixtures counted as
+   ADR 0015 conformance evidence for the base header and AVP layer.
+2. **3GPP-authored fixtures** (`tests/fixture_provenance.rs` and the spec-valid
+   seeds in `fuzz/corpus/*/`) — hand-built from RFC 6733 wire framing plus
+   3GPP TS 32.299 §5.1/§7.1 (Rf) and 3GPP TS 29.273 §6.1 (SWm) command/AVP
+   codes. They are application-dictionary evidence, not full
+   application-conformance evidence.
+3. **ePDG parity bytes** — *not imported*. The source plan references ePDG
+   local-builder cases; those remain external **parity-only** seeds until a
+   later fixture-intake task records provenance, license, and capture metadata.
+   They are deliberately **not** treated as conformance evidence.
+4. **Generated codec round trips** (`tests/fixture_provenance.rs` and existing
+   `tests/app_dictionaries.rs`) — built with this crate's own encoder. Useful
+   regression tests, but they do not prove wire conformance by themselves.
+
+## Codec Boundary
+
+The following are outside the current crate scope:
+
+- Full RFC 6733 typed AVP value decoding for every base AVP.
+- Typed helpers for `app-gx`, `app-s6a`, `app-s6b`, `app-swx`.
+- Full message-specific semantic validation (e.g., mandatory-AVP presence for
+  every command) beyond what the Rf/SWm typed helpers enforce.
+- Complete 3GPP Rf/SWm/Gx/S6a/S6b/SWx application coverage.
+- Transport operations, TCP/SCTP transport, TLS/TLS-PSK handling, realm routing,
+  peer topology, watchdog thresholds, failover state machines, AAA/HSS/CDF
+  behavior, charging decisions, and deployment readiness policy.

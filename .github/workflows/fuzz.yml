@@ -24,6 +24,7 @@ jobs:
           - opc-proto-pfcp
           - opc-proto-nas
           - opc-proto-ngap
+          - opc-proto-diameter
     steps:
       - name: Checkout
         uses: actions/checkout@v4
