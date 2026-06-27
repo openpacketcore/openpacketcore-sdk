@@ -105,6 +105,12 @@
      `fuzz/fuzz_targets/decode_s2b.rs`, and
      `fuzz/fuzz_targets/roundtrip.rs` compile decode, typed S2b, owned-decode,
      IE-iteration, and raw-preserving round-trip surfaces under cargo-fuzz.
+   - `fuzz/corpus/decode_message/`, `fuzz/corpus/decode_s2b/`, and
+     `fuzz/corpus/roundtrip/` are the target-specific seed directories used by
+     cargo-fuzz when the workflow runs `cargo +nightly fuzz run "$target"`
+     without explicit corpus arguments. Each directory contains a flat,
+     provenance-prefixed mirror of the committed spec, ePDG-parity, and
+     malformed seed files.
    - The repository fuzz workflow includes this crate in its scheduled matrix.
 
 ## Known limitations
@@ -167,10 +173,16 @@ The committed fixture corpus is split by provenance class:
 - **Synthetic malformed fixtures** live in `tests/fixtures/malformed/`; they
   exercise hostile-input no-panic behavior and expected structured rejection,
   including low-limit grouped Bearer Context recursion-depth rejection.
-- The fuzz seed corpus mirrors the full spec fixture set plus representative
-  parity and malformed inputs under `fuzz/corpus/` so scheduled fuzzing starts
-  from the same S2b conformance cases that `tests/corpus_replay.rs` replays
-  deterministically.
+- The fuzz seed corpus keeps provenance source directories under
+  `fuzz/corpus/spec/`, `fuzz/corpus/epdg-parity/`, and
+  `fuzz/corpus/malformed/`. Because cargo-fuzz uses one corpus directory per
+  target by default, the same seed bytes are also copied into
+  `fuzz/corpus/decode_message/`, `fuzz/corpus/decode_s2b/`, and
+  `fuzz/corpus/roundtrip/` using names like
+  `spec__echo_request_recovery.bin`. Scheduled fuzzing therefore starts each
+  registered target from the same S2b conformance, parity, and malformed cases
+  that `tests/corpus_replay.rs` replays deterministically; the replay test also
+  asserts those target-specific mirrors match the provenance source bytes.
 
 Header, raw IE, malformed-input, corpus-replay, and S2b integration tests under
 `tests/` exercise raw-preserving spare-bit round trips, multi-IE unknown TLIV

@@ -23,6 +23,9 @@ enum FixtureClass {
     Malformed,
 }
 
+const FUZZ_TARGETS: &[&str] = &["decode_message", "decode_s2b", "roundtrip"];
+const FUZZ_SEED_PROVENANCE_DIRS: &[&str] = &["spec", "epdg-parity", "malformed"];
+
 fn procedure_context() -> DecodeContext {
     DecodeContext {
         validation_level: ValidationLevel::ProcedureAware,
@@ -99,6 +102,33 @@ fn fixture_files(class: FixtureClass) -> Vec<(PathBuf, Vec<u8>)> {
         .into_iter()
         .filter(|(path, _bytes)| class_for(path) == Some(class))
         .collect()
+}
+
+fn fuzz_provenance_seed_files() -> Vec<(PathBuf, Vec<u8>)> {
+    let root = fuzz_corpus_root();
+    let mut files = Vec::new();
+    for dir in FUZZ_SEED_PROVENANCE_DIRS {
+        files.extend(read_files(&root.join(dir), true));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
+fn fuzz_target_seed_name(path: &Path) -> String {
+    let Some(provenance) = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+    else {
+        panic!(
+            "fuzz seed path has no provenance directory: {}",
+            path.display()
+        );
+    };
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        panic!("fuzz seed path has no UTF-8 file name: {}", path.display());
+    };
+    format!("{provenance}__{file_name}")
 }
 
 fn assert_raw_preserving_message_roundtrip(path: &Path, data: &[u8]) {
@@ -313,6 +343,48 @@ fn fixture_corpus_is_split_by_provenance() {
         root.join("independent/README.md").is_file(),
         "independent capture gap must remain documented"
     );
+}
+
+#[test]
+fn fuzz_target_corpora_mirror_provenance_seed_corpus() {
+    let root = fuzz_corpus_root();
+    let seeds = fuzz_provenance_seed_files();
+    assert_eq!(seeds.len(), 18);
+
+    for target in FUZZ_TARGETS {
+        let target_dir = root.join(target);
+        assert!(
+            target_dir.is_dir(),
+            "missing cargo-fuzz target corpus directory {}",
+            target_dir.display()
+        );
+        let target_files = read_files(&target_dir, true);
+        assert_eq!(
+            target_files.len(),
+            seeds.len(),
+            "{} must contain one flat copy of every provenance seed",
+            target_dir.display()
+        );
+
+        for (source_path, source_bytes) in &seeds {
+            let target_path = target_dir.join(fuzz_target_seed_name(source_path));
+            let target_bytes = match std::fs::read(&target_path) {
+                Ok(bytes) => bytes,
+                Err(error) => panic!(
+                    "{} is missing mirrored seed for {}: {error}",
+                    target_path.display(),
+                    source_path.display()
+                ),
+            };
+            assert_eq!(
+                &target_bytes,
+                source_bytes,
+                "{} does not match source seed {}",
+                target_path.display(),
+                source_path.display()
+            );
+        }
+    }
 }
 
 #[test]
