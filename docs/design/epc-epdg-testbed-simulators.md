@@ -28,6 +28,20 @@ Neither simulator parses raw protocol bytes locally. Callers must decode
 untrusted bytes through SDK protocol crates first, then pass decoded views into
 the simulator interfaces.
 
+## RFC 012 fidelity declaration
+
+Per RFC 012 §6, these first EPC/ePDG simulators declare fidelity per interface:
+
+| Simulator interface | RFC 012 fidelity level | Production/conformance status |
+| --- | --- | --- |
+| PGW S2b decoded-message interface | `stateful-mock` | Experimental skeleton only; not procedure-faithful, not a conformance simulator, and not a production PGW/ePDG control plane. |
+| Diameter peer decoded-metadata interface | `stateful-mock` | Experimental skeleton only; not procedure-faithful, not a Diameter conformance simulator, and not a production AAA/HSS/CDF peer. |
+
+The `stateful-mock` label means the simulators retain deterministic state and
+fail-closed fault-injection state for tests, but they do not implement full
+normative procedures, peer routing, business policy, retransmission behavior, or
+carrier acceptance evidence.
+
 ## Protocol-crate ownership
 
 | Simulator | Decode owner | Current interface |

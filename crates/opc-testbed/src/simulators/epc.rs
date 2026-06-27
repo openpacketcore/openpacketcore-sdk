@@ -4,6 +4,11 @@
 //! they record SDK-decoded protocol events and expose deterministic state for
 //! assertions. They do not choose APN/realm policy, subscriber authorization,
 //! charging behavior, or ePDG attach orchestration.
+//!
+//! RFC 012 fidelity: both the PGW S2b decoded-message interface and the
+//! Diameter peer decoded-metadata interface are experimental `stateful-mock`
+//! skeletons. They are not procedure-faithful simulators, conformance
+//! simulators, or production EPC/ePDG peers.
 
 use crate::TestbedError;
 use opc_protocol::{
@@ -182,6 +187,10 @@ pub struct PgwS2bEvent {
 }
 
 /// Product-neutral PGW S2b simulator skeleton.
+///
+/// RFC 012 fidelity: experimental `stateful-mock`. This is not a
+/// procedure-faithful S2b conformance simulator and not a production PGW/ePDG
+/// control plane.
 #[derive(Debug, Clone)]
 pub struct PgwS2bSimulator {
     /// Simulator instance name.
@@ -513,6 +522,10 @@ pub struct DiameterPeerEvent {
 }
 
 /// Product-neutral Diameter peer simulator skeleton.
+///
+/// RFC 012 fidelity: experimental `stateful-mock`. This is not a
+/// procedure-faithful Diameter conformance simulator and not a production
+/// AAA/HSS/CDF peer.
 #[derive(Debug, Clone)]
 pub struct DiameterPeerSimulator {
     /// Simulator instance name.
