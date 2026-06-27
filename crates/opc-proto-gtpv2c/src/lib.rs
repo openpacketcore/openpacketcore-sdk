@@ -10,7 +10,7 @@
 //! Session-oriented S2b message views. Unsupported IEs remain raw-preserved.
 //!
 //! @spec 3GPP TS29274 R18
-//! @req REQ-3GPP-TS29274-R18-SCAFFOLD-001
+//! @req REQ-3GPP-TS29274-R18-S2B-001
 //! @conformance s2b-subset — see CONFORMANCE.md
 
 pub mod header;

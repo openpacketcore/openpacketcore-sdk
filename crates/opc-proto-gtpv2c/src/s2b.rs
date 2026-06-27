@@ -9,6 +9,8 @@
 //! @spec 3GPP TS29274 R18 S2b procedure use
 //! @req REQ-3GPP-TS29274-R18-S2B-001
 
+use core::fmt;
+
 use bytes::BytesMut;
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, Encode, EncodeContext,
@@ -158,7 +160,7 @@ fn procedure_and_direction(message_type: u8) -> Option<(Procedure, MessageDirect
 ///
 /// @spec 3GPP TS29274 R18 S2b
 /// @req REQ-3GPP-TS29274-R18-S2B-MESSAGE-001
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S2bProcedureMessage<'a> {
     /// Parsed GTPv2-C common header.
     pub header: Header,
@@ -219,6 +221,19 @@ impl<'a> S2bProcedureMessage<'a> {
     }
 }
 
+impl fmt::Debug for S2bProcedureMessage<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S2bProcedureMessage")
+            .field("header", &self.header)
+            .field("procedure", &self.procedure)
+            .field("direction", &self.direction)
+            .field("ies", &self.ies)
+            .field("raw_ies_len", &self.raw_ies.len())
+            .field("tail_len", &self.tail.len())
+            .finish()
+    }
+}
+
 impl Encode for S2bProcedureMessage<'_> {
     /// Encode this S2b view as a GTPv2-C message.
     fn encode(&self, dst: &mut BytesMut, ctx: EncodeContext) -> Result<(), EncodeError> {
@@ -243,7 +258,7 @@ impl Encode for S2bProcedureMessage<'_> {
 ///
 /// @spec 3GPP TS29274 R18 S2b
 /// @req REQ-3GPP-TS29274-R18-S2B-MESSAGE-002
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum S2bMessage<'a> {
     /// Echo Request view.
     EchoRequest(S2bProcedureMessage<'a>),
@@ -267,6 +282,45 @@ pub enum S2bMessage<'a> {
     UpdateSessionResponse(S2bProcedureMessage<'a>),
     /// Non-S2b or unsupported message preserved as the raw shell.
     Raw(Message<'a>),
+}
+
+impl fmt::Debug for S2bMessage<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EchoRequest(view) => f.debug_tuple("EchoRequest").field(view).finish(),
+            Self::EchoResponse(view) => f.debug_tuple("EchoResponse").field(view).finish(),
+            Self::CreateSessionRequest(view) => {
+                f.debug_tuple("CreateSessionRequest").field(view).finish()
+            }
+            Self::CreateSessionResponse(view) => {
+                f.debug_tuple("CreateSessionResponse").field(view).finish()
+            }
+            Self::ModifySessionRequest(view) => {
+                f.debug_tuple("ModifySessionRequest").field(view).finish()
+            }
+            Self::ModifySessionResponse(view) => {
+                f.debug_tuple("ModifySessionResponse").field(view).finish()
+            }
+            Self::DeleteSessionRequest(view) => {
+                f.debug_tuple("DeleteSessionRequest").field(view).finish()
+            }
+            Self::DeleteSessionResponse(view) => {
+                f.debug_tuple("DeleteSessionResponse").field(view).finish()
+            }
+            Self::UpdateSessionRequest(view) => {
+                f.debug_tuple("UpdateSessionRequest").field(view).finish()
+            }
+            Self::UpdateSessionResponse(view) => {
+                f.debug_tuple("UpdateSessionResponse").field(view).finish()
+            }
+            Self::Raw(message) => f
+                .debug_struct("Raw")
+                .field("header", &message.header)
+                .field("raw_ies_len", &message.raw_ies.len())
+                .field("tail_len", &message.tail.len())
+                .finish(),
+        }
+    }
 }
 
 impl<'a> S2bMessage<'a> {

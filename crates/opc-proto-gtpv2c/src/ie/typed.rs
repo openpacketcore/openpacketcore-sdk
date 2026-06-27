@@ -7,10 +7,12 @@
 //! @spec 3GPP TS29274 R18 8.2
 //! @req REQ-3GPP-TS29274-R18-S2B-IE-001
 
+use core::fmt;
+
 use bytes::{BufMut, BytesMut};
 use opc_protocol::{
-    DecodeContext, DecodeError, DecodeErrorCode, EncodeContext, EncodeError, EncodeErrorCode,
-    SpecRef, ValidationLevel,
+    DecodeContext, DecodeError, DecodeErrorCode, DuplicateIePolicy, EncodeContext, EncodeError,
+    EncodeErrorCode, SpecRef, ValidationLevel,
 };
 
 use crate::ie::{RawIe, RawIeIterator, IE_HEADER_LEN};
@@ -86,16 +88,10 @@ fn require_min_len(
     value: &[u8],
     minimum: usize,
     offset: usize,
-    reason: &'static str,
+    _reason: &'static str,
 ) -> Result<(), DecodeError> {
     if value.len() < minimum {
         return Err(DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref()));
-    }
-    if minimum == 0 && value.is_empty() {
-        return Err(
-            DecodeError::new(DecodeErrorCode::InvalidLength { reason }, offset)
-                .with_spec_ref(spec_ref()),
-        );
     }
     Ok(())
 }
@@ -137,7 +133,7 @@ fn push_tbcd_digit(out: &mut String, digit: u8, offset: usize) -> Result<(), Dec
 ///
 /// @spec 3GPP TS29274 R18 8.3.2, 8.15, 8.16
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-TBCD-001
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TbcdDigits {
     /// Decimal digits decoded from the TBCD value.
     pub digits: String,
@@ -203,6 +199,15 @@ impl TbcdDigits {
     }
 }
 
+impl fmt::Debug for TbcdDigits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TbcdDigits")
+            .field("digits", &"<redacted>")
+            .field("digit_len", &self.digits.len())
+            .finish()
+    }
+}
+
 /// GTPv2-C Cause value subset used by S2b response examples.
 ///
 /// Unknown cause codes are preserved as [`CauseValue::Unknown`].
@@ -259,22 +264,45 @@ impl From<CauseValue> for u8 {
 ///
 /// @spec 3GPP TS29274 R18 8.4
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-CAUSE-002
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Cause {
     /// Cause code.
     pub value: CauseValue,
+    /// Raw cause flags/locality octet following the cause code.
+    pub flags_octet: u8,
+    /// Optional offending-IE payload bytes after the flags/locality octet.
+    pub offending_ie: Vec<u8>,
 }
 
 impl Cause {
     fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
-        require_min_len(value, 1, offset, "Cause IE must contain a cause octet")?;
+        require_min_len(
+            value,
+            2,
+            offset,
+            "Cause IE must contain cause and flags/locality octets",
+        )?;
         Ok(Self {
             value: CauseValue::from(value[0]),
+            flags_octet: value[1],
+            offending_ie: value[2..].to_vec(),
         })
     }
 
     fn encode_value(&self, dst: &mut BytesMut) {
         dst.put_u8(self.value.into());
+        dst.put_u8(self.flags_octet);
+        dst.put_slice(&self.offending_ie);
+    }
+}
+
+impl fmt::Debug for Cause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cause")
+            .field("value", &self.value)
+            .field("flags_octet", &self.flags_octet)
+            .field("offending_ie_len", &self.offending_ie.len())
+            .finish()
     }
 }
 
@@ -642,8 +670,8 @@ impl FullyQualifiedTeid {
     fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
         require_min_len(value, 5, offset, "F-TEID IE must include flags and TEID")?;
         let flags = value[0];
-        let has_ipv6 = (flags & 0x80) != 0;
-        let has_ipv4 = (flags & 0x40) != 0;
+        let has_ipv4 = (flags & 0x80) != 0;
+        let has_ipv6 = (flags & 0x40) != 0;
         let interface_type = flags & 0x3f;
         let teid = u32::from_be_bytes([value[1], value[2], value[3], value[4]]);
         let mut position = 5usize;
@@ -681,6 +709,16 @@ impl FullyQualifiedTeid {
             let mut addr = [0u8; 16];
             addr.copy_from_slice(&value[position..end]);
             ipv6 = Some(addr);
+            position = end;
+        }
+        if position != value.len() {
+            return Err(DecodeError::new(
+                DecodeErrorCode::InvalidLength {
+                    reason: "F-TEID IE contains trailing bytes after address fields",
+                },
+                checked_add_offset(offset, position)?,
+            )
+            .with_spec_ref(spec_ref()));
         }
         Ok(Self {
             interface_type,
@@ -692,10 +730,10 @@ impl FullyQualifiedTeid {
 
     fn encode_value(&self, dst: &mut BytesMut) {
         let mut flags = self.interface_type & 0x3f;
-        if self.ipv6.is_some() {
+        if self.ipv4.is_some() {
             flags |= 0x80;
         }
-        if self.ipv4.is_some() {
+        if self.ipv6.is_some() {
             flags |= 0x40;
         }
         dst.put_u8(flags);
@@ -852,12 +890,20 @@ impl PdnAddressAllocation {
                     ipv4: Some(ipv4),
                 })
             }
-            PdnTypeValue::NonIp | PdnTypeValue::Ethernet | PdnTypeValue::Unknown(_) => Ok(Self {
-                pdn_type,
-                ipv6_prefix_length: None,
-                ipv6_prefix: None,
-                ipv4: None,
-            }),
+            PdnTypeValue::NonIp | PdnTypeValue::Ethernet | PdnTypeValue::Unknown(_) => {
+                require_exact_len(
+                    value,
+                    1,
+                    offset,
+                    "Non-IP, Ethernet, and unknown PAA values must be one octet",
+                )?;
+                Ok(Self {
+                    pdn_type,
+                    ipv6_prefix_length: None,
+                    ipv6_prefix: None,
+                    ipv4: None,
+                })
+            }
         }
     }
 
@@ -1032,7 +1078,7 @@ impl<'a> BearerContext<'a> {
 ///
 /// @spec 3GPP TS29274 R18 8.2
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-002
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum TypedIeValue<'a> {
     /// IMSI IE (type 1).
     Imsi(TbcdDigits),
@@ -1074,7 +1120,7 @@ pub enum TypedIeValue<'a> {
 ///
 /// @spec 3GPP TS29274 R18 8.2
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-003
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TypedIe<'a> {
     /// IE instance from the low four bits of the TLIV instance octet.
     pub instance: u8,
@@ -1237,11 +1283,54 @@ impl<'a> TypedIe<'a> {
                 value.encode_value(dst);
                 Ok(())
             }
-            TypedIeValue::Raw(raw) => {
-                dst.put_slice(raw.value);
-                Ok(())
-            }
+            TypedIeValue::Raw(_) => unreachable!("raw IEs are encoded by the raw-preserving path"),
         }
+    }
+}
+
+impl fmt::Debug for TypedIeValue<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Imsi(value) => f.debug_tuple("Imsi").field(value).finish(),
+            Self::Cause(value) => f.debug_tuple("Cause").field(value).finish(),
+            Self::Recovery(value) => f.debug_tuple("Recovery").field(value).finish(),
+            Self::AccessPointName(value) => f.debug_tuple("AccessPointName").field(value).finish(),
+            Self::AggregateMaximumBitRate(value) => f
+                .debug_tuple("AggregateMaximumBitRate")
+                .field(value)
+                .finish(),
+            Self::EpsBearerId(value) => f.debug_tuple("EpsBearerId").field(value).finish(),
+            Self::Mei(value) => f.debug_tuple("Mei").field(value).finish(),
+            Self::Msisdn(value) => f.debug_tuple("Msisdn").field(value).finish(),
+            Self::PdnAddressAllocation(value) => {
+                f.debug_tuple("PdnAddressAllocation").field(value).finish()
+            }
+            Self::RatType(value) => f.debug_tuple("RatType").field(value).finish(),
+            Self::ServingNetwork(value) => f.debug_tuple("ServingNetwork").field(value).finish(),
+            Self::FullyQualifiedTeid(value) => {
+                f.debug_tuple("FullyQualifiedTeid").field(value).finish()
+            }
+            Self::BearerContext(value) => f.debug_tuple("BearerContext").field(value).finish(),
+            Self::PdnType(value) => f.debug_tuple("PdnType").field(value).finish(),
+            Self::ApnRestriction(value) => f.debug_tuple("ApnRestriction").field(value).finish(),
+            Self::SelectionMode(value) => f.debug_tuple("SelectionMode").field(value).finish(),
+            Self::Raw(raw) => f
+                .debug_struct("Raw")
+                .field("ie_type", &raw.ie_type)
+                .field("instance", &raw.instance)
+                .field("value_len", &raw.value.len())
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Debug for TypedIe<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TypedIe")
+            .field("ie_type", &self.ie_type())
+            .field("instance", &self.instance)
+            .field("value", &self.value)
+            .finish()
     }
 }
 
@@ -1260,7 +1349,34 @@ pub fn decode_typed_ie_sequence<'a>(
     let mut ies = Vec::new();
     for item in RawIeIterator::new(input, ctx) {
         let raw = item?;
-        ies.push(TypedIe::decode_from_raw(raw, ctx, depth)?);
+        let typed = TypedIe::decode_from_raw(raw, ctx, depth)?;
+        apply_duplicate_policy(&mut ies, typed, ctx.duplicate_ie_policy)?;
     }
     Ok(ies)
+}
+
+fn apply_duplicate_policy<'a>(
+    ies: &mut Vec<TypedIe<'a>>,
+    typed: TypedIe<'a>,
+    policy: DuplicateIePolicy,
+) -> Result<(), DecodeError> {
+    let duplicate = ies.iter().position(|existing| {
+        existing.ie_type() == typed.ie_type() && existing.instance == typed.instance
+    });
+
+    match duplicate {
+        Some(_) if matches!(policy, DuplicateIePolicy::Reject) => {
+            Err(DecodeError::new(DecodeErrorCode::DuplicateIe, 0).with_spec_ref(spec_ref()))
+        }
+        Some(_) if matches!(policy, DuplicateIePolicy::First) => Ok(()),
+        Some(index) => {
+            ies.remove(index);
+            ies.push(typed);
+            Ok(())
+        }
+        None => {
+            ies.push(typed);
+            Ok(())
+        }
+    }
 }

@@ -34,8 +34,17 @@
      MEI, MSISDN, PDN Address Allocation, RAT Type, Serving Network, F-TEID,
      Bearer Context, PDN Type, APN Restriction, and Selection Mode have typed
      decode/encode support.
+   - Cause decoding preserves the mandatory flags/locality octet and opaque
+     offending-IE bytes; one-octet Cause values are rejected as malformed.
+   - F-TEID uses the TS 29.274 V4/V6 flag bits (`0x80`/`0x40`) and rejects
+     surplus value bytes after the declared IPv4/IPv6 address fields.
+   - Non-IP, Ethernet, and unknown PAA typed values are accepted only in their
+     one-octet form; over-long shapes are rejected instead of silently
+     canonicalized.
    - Bearer Context is decoded as a grouped IE with bounded recursion and raw
      fallback for unsupported nested members.
+   - Top-level and grouped typed IE sequences enforce
+     `DecodeContext::duplicate_ie_policy` by IE type and instance.
    - Unsupported S2b-adjacent IEs such as Protocol Configuration Options remain
      available as `TypedIeValue::Raw` and re-encode byte-exact.
 
@@ -58,6 +67,8 @@
    - `S2bMessage<'_>` and `S2bProcedureMessage<'_>` implement `Encode`, and
      `S2bMessage<'_>` implements `BorrowDecode`.
    - Decode errors use structured `opc-protocol` error types with spec refs.
+   - `Debug` output for S2b typed message views redacts IMSI/MEI/MSISDN digits
+     and summarizes raw IE buffers by length.
 
 6. **Fuzz shell**
    - `fuzz/Cargo.toml` and `fuzz/fuzz_targets/decode_message.rs` compile the
