@@ -2952,6 +2952,24 @@ fn ipsec_cni_type_serde_round_trips_builtin_variants() {
 }
 
 #[test]
+fn ipsec_cni_type_deserializes_legacy_pascal_case_aliases() {
+    let legacy_cases = [
+        ("\"Sriov\"", CniType::Sriov),
+        ("\"Macvlan\"", CniType::Macvlan),
+        ("\"Ipvlan\"", CniType::Ipvlan),
+        ("\"HostNetwork\"", CniType::HostNetwork),
+        (
+            "{\"Custom\":\"my-cni\"}",
+            CniType::Custom("my-cni".to_string()),
+        ),
+    ];
+    for (json, expected) in &legacy_cases {
+        let deserialized: CniType = serde_json::from_str(json).expect("deserialize legacy");
+        assert_eq!(*expected, deserialized, "legacy alias mismatch for {json}");
+    }
+}
+
+#[test]
 fn kernel_module_id_deserialization_normalizes_case() {
     let json = "\"AES-CBC\"";
     let id: KernelModuleId = serde_json::from_str(json).unwrap();
@@ -2965,6 +2983,29 @@ fn esp_algorithm_id_deserialization_normalizes_case() {
     let id: EspAlgorithmId = serde_json::from_str(json).unwrap();
     assert_eq!(id, EspAlgorithmId::from("hmac-sha256"));
     assert_eq!(format!("{id}"), "hmac-sha256");
+}
+
+#[test]
+fn ipsec_capabilities_deserializes_legacy_required_kernel_modules_field() {
+    let json = r#"{
+        "xfrm_netlink_available": true,
+        "xfrm_user_policy_available": true,
+        "esp_supported": true,
+        "udp_500_bind_allowed": true,
+        "udp_4500_bind_allowed": true,
+        "sctp_supported": true,
+        "required_kernel_modules": ["xfrm_user"],
+        "supported_esp_algorithms": ["aes-cbc"]
+    }"#;
+    let caps: IpsecCapabilities = serde_json::from_str(json).expect("deserialize legacy field");
+    assert_eq!(
+        caps.available_kernel_modules,
+        BTreeSet::from([KernelModuleId::from("xfrm_user")])
+    );
+    assert_eq!(
+        caps.supported_esp_algorithms,
+        BTreeSet::from([EspAlgorithmId::from("aes-cbc")])
+    );
 }
 
 #[test]
@@ -3029,6 +3070,15 @@ fn ipsec_blank_kernel_module_identifier_is_rejected() {
         .contains(&ValidationError::InvalidKernelModuleId {
             module: "   ".to_string(),
         }));
+
+    let preflight = run_data_plane_preflight(&profile, &ctx);
+    assert!(!preflight.passed);
+    let ipsec_check = preflight
+        .checks
+        .iter()
+        .find(|c| c.name == "IPsec_Capabilities")
+        .expect("IPsec_Capabilities check missing");
+    assert!(!ipsec_check.passed);
 }
 
 #[test]
@@ -3053,6 +3103,15 @@ fn ipsec_blank_esp_algorithm_identifier_is_rejected() {
         .contains(&ValidationError::InvalidEspAlgorithmId {
             algorithm: "   ".to_string(),
         }));
+
+    let preflight = run_data_plane_preflight(&profile, &ctx);
+    assert!(!preflight.passed);
+    let ipsec_check = preflight
+        .checks
+        .iter()
+        .find(|c| c.name == "IPsec_Capabilities")
+        .expect("IPsec_Capabilities check missing");
+    assert!(!ipsec_check.passed);
 }
 
 #[test]

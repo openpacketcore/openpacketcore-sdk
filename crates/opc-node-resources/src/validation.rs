@@ -184,6 +184,8 @@ pub fn run_data_plane_preflight(
                     | ValidationError::ProductionLabFallbackForbidden
                     | ValidationError::UnsupportedKernelVersion { .. }
                     | ValidationError::IpsecProfileMissing
+                    | ValidationError::InvalidKernelModuleId { .. }
+                    | ValidationError::InvalidEspAlgorithmId { .. }
             )
         })
     } else {

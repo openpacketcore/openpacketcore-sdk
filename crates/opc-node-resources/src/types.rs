@@ -428,19 +428,19 @@ pub struct SriovProfile {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum CniType {
     /// SR-IOV direct-assignment CNI.
-    #[serde(rename = "sriov")]
+    #[serde(rename = "sriov", alias = "Sriov")]
     Sriov,
     /// MACVLAN CNI.
-    #[serde(rename = "macvlan")]
+    #[serde(rename = "macvlan", alias = "Macvlan")]
     Macvlan,
     /// IPVLAN CNI.
-    #[serde(rename = "ipvlan")]
+    #[serde(rename = "ipvlan", alias = "Ipvlan")]
     Ipvlan,
     /// Host-network attachment.
-    #[serde(rename = "host-network")]
+    #[serde(rename = "host-network", alias = "HostNetwork")]
     HostNetwork,
     /// Operator-defined CNI type outside the built-in set.
-    #[serde(rename = "custom")]
+    #[serde(rename = "custom", alias = "Custom")]
     Custom(String),
 }
 
@@ -698,6 +698,7 @@ pub struct IpsecCapabilities {
     /// Whether the node reports SCTP support.
     pub sctp_supported: bool,
     /// Kernel modules that are available on the node (e.g. `xfrm_user`).
+    #[serde(alias = "required_kernel_modules")]
     pub available_kernel_modules: BTreeSet<KernelModuleId>,
     /// ESP algorithms supported by the node.
     pub supported_esp_algorithms: BTreeSet<EspAlgorithmId>,
