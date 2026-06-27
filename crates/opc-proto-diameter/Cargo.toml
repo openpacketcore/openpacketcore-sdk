@@ -29,5 +29,10 @@ all-apps = ["app-gx", "app-rf", "app-s6a", "app-s6b", "app-swm", "app-swx"]
 bytes = { workspace = true }
 opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 
+[[test]]
+name = "app_dictionaries"
+path = "tests/app_dictionaries.rs"
+required-features = ["app-rf", "app-swm"]
+
 [lints]
 workspace = true

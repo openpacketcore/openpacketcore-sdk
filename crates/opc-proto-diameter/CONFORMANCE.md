@@ -33,7 +33,45 @@ importing ePDG product policy or local-builder bytes as conformance evidence.
     commands.
   - `app-gx`, `app-rf`, `app-s6a`, `app-s6b`, `app-swm`, `app-swx`: initial
     per-application 3GPP dictionary slots.
+  - `app-rf`: Rf Accounting-Request/Answer (START, INTERIM, STOP, EVENT)
+    dictionary subset plus redaction-safe typed builders/parsers.
+  - `app-swm`: SWm Diameter-EAP Request/Answer dictionary subset plus
+    redaction-safe typed builders/parsers.
   - `all-apps`: enables every per-application dictionary slot.
+
+## Rf subset coverage (`app-rf`)
+
+- Application: 3GPP Rf accounting over Diameter accounting (id 3).
+- Commands: Accounting-Request / Accounting-Answer (command code 271).
+- Typed message builders/parsers: `RfAccountingRequest`, `RfAccountingAnswer`.
+- AVPs:
+  - Base: Session-Id, Origin-Host, Origin-Realm, Destination-Realm,
+    Destination-Host, User-Name, Origin-State-Id, Acct-Application-Id,
+    Result-Code.
+  - RFC 6733 accounting: Accounting-Record-Type, Accounting-Record-Number,
+    Event-Timestamp.
+  - RFC 4006 credit-control: Subscription-Id, Subscription-Id-Type,
+    Subscription-Id-Data, Used-Service-Unit, CC-Time, CC-Total-Octets,
+    CC-Input-Octets, CC-Output-Octets, Multiple-Services-Credit-Control,
+    Rating-Group, Service-Identifier, Service-Context-Id.
+  - 3GPP TS 32.299 (vendor 10415): PS-Information, 3GPP-Charging-Id,
+    3GPP-PDP-Type, SGSN-Address, GGSN-Address.
+- Sensitive fields use `Redacted<T>` so `Debug`/`Display` do not expose
+  Session-Id, User-Name, Subscription-Id-Data, or IP addresses.
+
+## SWm subset coverage (`app-swm`)
+
+- Application: 3GPP SWm (id 16777264).
+- Commands: Diameter-EAP-Request / Diameter-EAP-Answer (command code 268).
+- Typed message builders/parsers: `SwmDiameterEapRequest`,
+  `SwmDiameterEapAnswer`.
+- AVPs:
+  - Base: Session-Id, Auth-Application-Id, Origin-Host, Origin-Realm,
+    Destination-Realm, Destination-Host, User-Name, Result-Code, Error-Message.
+  - RFC 4072 / RFC 6733: EAP-Payload, EAP-Reissued-Payload,
+    EAP-Master-Session-Key, Auth-Request-Type, State.
+- Sensitive fields use `Redacted<T>` so `Debug`/`Display` do not expose
+  Session-Id, User-Name, or EAP payloads/keys.
 
 ## Explicit gaps
 
@@ -41,8 +79,9 @@ importing ePDG product policy or local-builder bytes as conformance evidence.
 - No ePDG-derived Diameter bytes are imported; source local-builder cases remain
   parity/schema seeds until a later fixture-intake task records provenance.
 - Broader typed AVP value decoders are follow-up work; current typed values are
-  limited to the base peer procedures above.
-- Application-specific command/AVP dictionaries are follow-up work.
+  limited to the base peer procedures and the Rf/SWm subsets above.
+- Other 3GPP Diameter applications (`app-gx`, `app-s6a`, `app-s6b`,
+  `app-swx`) remain dictionary-only slots without typed helpers.
 - Fuzz targets and fixture manifests are follow-up work.
 - Transport operations, realm routing, peer topology, watchdog policy, AAA/HSS
   behavior, and charging decisions are outside this crate.

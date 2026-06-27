@@ -29,7 +29,9 @@ use std::collections::HashSet;
     feature = "app-swm",
     feature = "app-swx"
 ))]
-pub mod app;
+pub mod apps;
+#[cfg(feature = "base")]
+pub mod avp;
 #[cfg(feature = "base")]
 pub mod base;
 pub mod dictionary;
