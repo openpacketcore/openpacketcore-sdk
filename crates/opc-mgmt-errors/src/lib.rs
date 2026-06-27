@@ -192,6 +192,8 @@ pub const fn commit_error_to_status(code: CommitErrorCode) -> MgmtStatus {
     match code {
         // Admission queue full → retryable backpressure.
         CommitErrorCode::AdmissionRejected => MgmtStatus::Unavailable,
+        // Candidate is valid, but apply-plan policy/workflow blocks it.
+        CommitErrorCode::ApplyPlanRejected => MgmtStatus::FailedPrecondition,
         CommitErrorCode::DeadlineExceeded => MgmtStatus::DeadlineExceeded,
         CommitErrorCode::MissingCandidate => MgmtStatus::InvalidArgument,
         CommitErrorCode::SyntaxValidationFailed => MgmtStatus::InvalidArgument,
@@ -218,6 +220,9 @@ pub const fn commit_error_to_netconf(code: CommitErrorCode) -> NetconfError {
     match code {
         CommitErrorCode::AdmissionRejected => {
             NetconfError::new(Ty::Application, Tag::ResourceDenied)
+        }
+        CommitErrorCode::ApplyPlanRejected => {
+            NetconfError::new(Ty::Application, Tag::OperationFailed)
         }
         CommitErrorCode::DeadlineExceeded => {
             NetconfError::new(Ty::Application, Tag::OperationFailed)
@@ -271,8 +276,9 @@ mod tests {
     /// Every `CommitErrorCode` the SDK defines today; if a variant is added the
     /// match in the mapping functions stops compiling, and this list (used to
     /// assert totality of the mapping at runtime) is the place to extend.
-    const ALL_CODES: [CommitErrorCode; 13] = [
+    const ALL_CODES: [CommitErrorCode; 14] = [
         CommitErrorCode::AdmissionRejected,
+        CommitErrorCode::ApplyPlanRejected,
         CommitErrorCode::DeadlineExceeded,
         CommitErrorCode::MissingCandidate,
         CommitErrorCode::SyntaxValidationFailed,
@@ -319,6 +325,10 @@ mod tests {
             MgmtStatus::FailedPrecondition
         );
         assert_eq!(
+            commit_error_to_status(CommitErrorCode::ApplyPlanRejected),
+            MgmtStatus::FailedPrecondition
+        );
+        assert_eq!(
             commit_error_to_status(CommitErrorCode::SemanticValidationFailed),
             MgmtStatus::InvalidArgument
         );
@@ -349,6 +359,13 @@ mod tests {
         );
         assert_eq!(
             commit_error_to_netconf(CommitErrorCode::RecoveryRequired),
+            NetconfError::new(
+                NetconfErrorType::Application,
+                NetconfErrorTag::OperationFailed
+            )
+        );
+        assert_eq!(
+            commit_error_to_netconf(CommitErrorCode::ApplyPlanRejected),
             NetconfError::new(
                 NetconfErrorType::Application,
                 NetconfErrorTag::OperationFailed

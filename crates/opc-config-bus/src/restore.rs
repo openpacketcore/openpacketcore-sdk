@@ -5,8 +5,9 @@
 
 use opc_alarm::SharedAlarmManager;
 use opc_config_model::{
-    CommitMode, ConfigOperation, OpcConfig, RequestId, RequestSource, RollbackTarget,
-    TransportType, TrustedPrincipal, ValidationContext, ValidationError, WorkloadIdentity,
+    CommitMode, ConfigImpactClassifier, ConfigOperation, HotConfigImpactClassifier, OpcConfig,
+    RequestId, RequestSource, RollbackTarget, TransportType, TrustedPrincipal, ValidationContext,
+    ValidationError, WorkloadIdentity,
 };
 use opc_types::{redact, ConfigVersion, TenantId, Timestamp, TxId};
 use std::sync::{Arc, LazyLock};
@@ -37,6 +38,10 @@ static STARTUP_BOOTSTRAP_PRINCIPAL: LazyLock<TrustedPrincipal> = LazyLock::new(|
 
 pub(crate) fn startup_bootstrap_principal() -> TrustedPrincipal {
     STARTUP_BOOTSTRAP_PRINCIPAL.clone()
+}
+
+fn default_impact_classifier<C: OpcConfig>() -> Arc<dyn ConfigImpactClassifier<C>> {
+    Arc::new(HotConfigImpactClassifier)
 }
 
 pub(crate) fn startup_validation_context<C: OpcConfig>(
@@ -326,6 +331,30 @@ impl<C: OpcConfig> ConfigBus<C> {
     where
         S: ManagedDatastore<C> + 'static,
     {
+        Self::with_queue_capacity_and_alarm_manager_and_impact_classifier(
+            initial,
+            store,
+            queue_capacity,
+            authorizer,
+            alarm_manager,
+            default_impact_classifier(),
+        )
+        .await
+    }
+
+    /// Fully explicit fresh-start constructor with a product-supplied config
+    /// impact classifier.
+    pub async fn with_queue_capacity_and_alarm_manager_and_impact_classifier<S>(
+        initial: C,
+        store: S,
+        queue_capacity: usize,
+        authorizer: Arc<dyn ConfigAuthorizer>,
+        alarm_manager: SharedAlarmManager,
+        impact_classifier: Arc<dyn ConfigImpactClassifier<C>>,
+    ) -> Result<Self, StoreError>
+    where
+        S: ManagedDatastore<C> + 'static,
+    {
         let store: Arc<dyn ManagedDatastore<C>> = Arc::new(store);
         let initial = validate_startup_config(
             initial,
@@ -347,6 +376,7 @@ impl<C: OpcConfig> ConfigBus<C> {
             AuthorityMode::Authoritative,
             alarm_manager,
             authorizer,
+            impact_classifier,
             None,
         ))
     }
@@ -426,6 +456,27 @@ impl<C: OpcConfig> ConfigBus<C> {
         store: S,
         authorizer: Arc<dyn ConfigAuthorizer>,
         alarm_manager: SharedAlarmManager,
+    ) -> Result<Self, StoreError>
+    where
+        S: ManagedDatastore<C> + 'static,
+    {
+        Self::restore_or_new_with_alarm_manager_and_impact_classifier(
+            initial,
+            store,
+            authorizer,
+            alarm_manager,
+            default_impact_classifier(),
+        )
+        .await
+    }
+
+    /// Full restore path with a product-supplied config impact classifier.
+    pub async fn restore_or_new_with_alarm_manager_and_impact_classifier<S>(
+        initial: C,
+        store: S,
+        authorizer: Arc<dyn ConfigAuthorizer>,
+        alarm_manager: SharedAlarmManager,
+        impact_classifier: Arc<dyn ConfigImpactClassifier<C>>,
     ) -> Result<Self, StoreError>
     where
         S: ManagedDatastore<C> + 'static,
@@ -570,6 +621,7 @@ impl<C: OpcConfig> ConfigBus<C> {
             AuthorityMode::Authoritative,
             alarm_manager,
             authorizer,
+            impact_classifier,
             pending_deadline,
         ))
     }

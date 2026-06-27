@@ -1,8 +1,9 @@
 use opc_config_model::{
-    CommitError, CommitErrorCode, CommitMode, CommitRequest, CommitResult, CommitStatus,
-    ConfigError, ConfigOperation, IdempotencyKey, OpcConfig, RequestId, RequestSource,
-    RollbackTarget, TransportType, TrustedPrincipal, ValidationContext, ValidationError,
-    WorkloadIdentity, YangPath,
+    ApplyPlan, ApplyPlanChange, ChangeImpact, ChangeImpactClass, CommitError, CommitErrorCode,
+    CommitMode, CommitRequest, CommitResult, CommitStatus, ConfigError, ConfigOperation,
+    ConfigWorkflowRequirement, IdempotencyKey, OpcConfig, RequestId, RequestSource, RollbackTarget,
+    TransportType, TrustedPrincipal, ValidationContext, ValidationError, WorkloadIdentity,
+    YangPath, FORBIDDEN_LIVE_REQUIRES_MAINTENANCE_WORKFLOW,
 };
 use opc_types::{ConfigVersion, SchemaDigest, TenantId, TxId};
 use std::{str::FromStr, time::Instant};
@@ -131,12 +132,103 @@ fn public_types_round_trip_through_serde() {
         new_version: Some(ConfigVersion::new(8)),
         status: CommitStatus::Committed,
         changed_paths: vec![YangPath::new("/interfaces/interface[name='n1']").expect("path")],
+        apply_plan: None,
     };
 
     let json = serde_json::to_string(&result).expect("serialize commit result");
     let round: CommitResult = serde_json::from_str(&json).expect("deserialize commit result");
 
     assert_eq!(round, result);
+}
+
+#[test]
+fn apply_plan_default_hot_uses_authoritative_paths() {
+    let path = YangPath::new("/system/hostname").expect("path");
+    let plan = ApplyPlan::default_hot(vec![path.clone()], None);
+
+    assert_eq!(plan.class, ChangeImpactClass::Hot);
+    assert_eq!(plan.strongest_class(), ChangeImpactClass::Hot);
+    assert!(plan.commit_allowed());
+    assert!(!plan.blocks_traffic_until_workflow());
+    assert_eq!(plan.changes[0].path, path);
+    assert_eq!(plan.changes[0].reason_code, "config_changed");
+}
+
+#[test]
+fn apply_plan_strongest_class_and_estimates_are_canonicalized() {
+    let warm_path = YangPath::new("/aaa/peer").expect("path");
+    let restart_path = YangPath::new("/platform/listener").expect("path");
+    let plan = ApplyPlan {
+        class: ChangeImpactClass::Hot,
+        changes: vec![
+            ApplyPlanChange {
+                path: warm_path,
+                class: ChangeImpactClass::Warm,
+                reason_code: "aaa_peer_added".into(),
+                affected_sessions_estimate: Some(7),
+            },
+            ApplyPlanChange {
+                path: restart_path.clone(),
+                class: ChangeImpactClass::RestartRequired,
+                reason_code: "listener_changed".into(),
+                affected_sessions_estimate: Some(u64::MAX),
+            },
+        ],
+        impact: ChangeImpact {
+            class: ChangeImpactClass::Hot,
+            affected_sessions_estimate: None,
+            requires_external_workflow: false,
+        },
+        rollback_target: None,
+        hard_errors: Vec::new(),
+        warnings: Vec::new(),
+    }
+    .normalize();
+
+    assert_eq!(plan.class, ChangeImpactClass::RestartRequired);
+    assert_eq!(plan.impact.class, ChangeImpactClass::RestartRequired);
+    assert_eq!(plan.impact.affected_sessions_estimate, Some(u64::MAX));
+    assert!(plan.impact.requires_external_workflow);
+    assert!(plan.blocks_traffic_until_workflow());
+
+    let requirement =
+        ConfigWorkflowRequirement::from_apply_plan(&plan).expect("workflow requirement");
+    assert_eq!(requirement.class, ChangeImpactClass::RestartRequired);
+    assert_eq!(requirement.reason_code, "listener_changed");
+    assert_eq!(requirement.affected_paths, vec![restart_path]);
+}
+
+#[test]
+fn forbidden_live_normalization_adds_hard_error() {
+    let plan = ApplyPlan {
+        class: ChangeImpactClass::ForbiddenLive,
+        changes: vec![ApplyPlanChange {
+            path: YangPath::new("/session-store/backend").expect("path"),
+            class: ChangeImpactClass::ForbiddenLive,
+            reason_code: "session_store_backend_changed".into(),
+            affected_sessions_estimate: None,
+        }],
+        impact: ChangeImpact {
+            class: ChangeImpactClass::Hot,
+            affected_sessions_estimate: None,
+            requires_external_workflow: false,
+        },
+        rollback_target: None,
+        hard_errors: Vec::new(),
+        warnings: Vec::new(),
+    }
+    .normalize();
+
+    assert!(!plan.commit_allowed());
+    assert_eq!(plan.hard_errors.len(), 1);
+    assert_eq!(
+        plan.hard_errors[0].code,
+        FORBIDDEN_LIVE_REQUIRES_MAINTENANCE_WORKFLOW
+    );
+
+    let error = CommitError::apply_plan_rejected(plan.clone());
+    assert_eq!(error.code, CommitErrorCode::ApplyPlanRejected);
+    assert_eq!(error.apply_plan.as_deref(), Some(&plan));
 }
 
 #[test]
