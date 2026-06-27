@@ -58,13 +58,15 @@ The distinction is decisive:
 
 ## Decision
 
-Amend ADR 0014 §8 to permit a **single, narrowly scoped** unsafe exception for an
-OS-transport sys crate, and adopt **Option A** when an SCTP-terminating CNF is in
-scope:
+Amend ADR 0014 §8 to permit a **narrow, explicitly allowlisted** unsafe
+exception pattern for Linux kernel UAPI sys crates, and adopt **Option A** when
+an SCTP-terminating CNF is in scope:
 
 1. **`opc-libsctp-sys`** provides thin FFI over Linux SCTP socket UAPI and
-   minimal `libsctp` helpers where required. It is the **only OpenPacketCore
-   workspace crate** permitted to contain `unsafe`. It does **not** inherit
+   minimal `libsctp` helpers where required. It is the **only SCTP workspace
+   crate** permitted to contain `unsafe`; follow-on Linux kernel UAPI exceptions
+   such as `opc-linux-xfrm-sys` must be separately and explicitly allowlisted by
+   the same mechanical gate. It does **not** inherit
    `[workspace.lints]` (so the workspace-wide `unsafe_code = "forbid"` stays in
    force for every other crate); it sets its own local crate policy
    (`unsafe_code = "allow"` plus `unsafe_op_in_unsafe_fn = "deny"`, or
@@ -78,12 +80,14 @@ scope:
    instead of relying on feature unification from unrelated workspace crates.
 3. **Boundary is enforced mechanically.**
    `scripts/check-management-plane-policy.py --check` token-scans OpenPacketCore
-   workspace crate sources and asserts `unsafe` appears only in
-   `opc-libsctp-sys`; the same gate also rejects `opc-libsctp-sys` if it inherits
-   `[workspace.lints]`, rejects it if it lacks the required local unsafe lint
-   policy, and requires each allowed `unsafe` token in that sys crate to be
-   documented by an adjacent `SAFETY:` comment. The CI job runs this gate, so the
-   exception cannot silently spread or become undocumented.
+   workspace crate sources and asserts `unsafe` appears only in explicitly
+   allowlisted Linux UAPI sys crates (`opc-libsctp-sys` and later, reviewed
+   kernel-UAPI boundaries such as `opc-linux-xfrm-sys`); the same gate also
+   rejects each allowed sys crate if it inherits `[workspace.lints]`, rejects it
+   if it lacks the required local unsafe lint policy, and requires each allowed
+   `unsafe` token in that sys crate to be documented by an adjacent `SAFETY:`
+   comment. The CI job runs this gate, so the exception cannot silently spread or
+   become undocumented.
 4. **ABI safety.** Every C struct crossing the boundary has a struct-layout
    (size/alignment/offset) test; the sys crate builds on Linux in CI and
    compiles to a clean "unsupported platform" stub elsewhere.
@@ -98,10 +102,10 @@ scope:
 
 ## Consequences
 
-- The workspace gains exactly one small, auditable OpenPacketCore crate
-  containing `unsafe`;
-  downstream carrier auditors review that one sys crate rather than a diffuse
-  unsafe surface, and `unsafe_code = "forbid"` remains true everywhere else.
+- The workspace gains small, auditable OpenPacketCore Linux UAPI sys crates
+  containing `unsafe`; downstream carrier auditors review those explicitly
+  allowlisted sys crates rather than a diffuse unsafe surface, and
+  `unsafe_code = "forbid"` remains true everywhere else.
 - The CI gate from point 3 exists, mirroring the "policy must be mechanically
   enforced" lesson of ADR 0014.
 - `opc-sctp` uses the non-inheritance mechanism and `AsyncFd` model described

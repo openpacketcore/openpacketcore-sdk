@@ -1,0 +1,22 @@
+[package]
+name = "opc-linux-xfrm-sys"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Narrow Linux XFRM netlink UAPI boundary for OpenPacketCore"
+readme = "README.md"
+documentation = "https://docs.rs/opc-linux-xfrm-sys"
+keywords = ["5g", "xfrm", "ipsec", "linux", "packet-core"]
+categories = ["network-programming", "os::linux-apis"]
+publish = false
+
+[dependencies]
+libc = "0.2"
+
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(opc_linux_xfrm_sys_force_unsupported)'] }

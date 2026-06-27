@@ -6,9 +6,9 @@ human acceptance. It enforces two mechanical invariants:
 
 * `tonic`, `prost`, `prost-types`, and `tonic-build` stay scoped to
   `opc-gnmi-server`.
-* Rust `unsafe` tokens stay scoped to the future `opc-libsctp-sys` sys crate,
-  where each token must be documented by a nearby `SAFETY:` comment and a local
-  unsafe lint policy must be declared.
+* Rust `unsafe` tokens stay scoped to explicitly reviewed Linux UAPI sys
+  crates, where each token must be documented by a nearby `SAFETY:` comment
+  and a local unsafe lint policy must be declared.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from pathlib import Path
 
 GRPC_STACK = {"tonic", "prost", "prost-types", "tonic-build"}
 GRPC_ALLOWED_ROOTS = {"opc-gnmi-server"}
-UNSAFE_ALLOWED_ROOTS = {"opc-libsctp-sys"}
+UNSAFE_ALLOWED_ROOTS = {"opc-libsctp-sys", "opc-linux-xfrm-sys"}
 
 
 @dataclass(frozen=True)
@@ -154,7 +154,7 @@ def check_unsafe_boundary(metadata: dict) -> list[Violation]:
                 violations.append(
                     Violation(
                         f"{source}:{token.line}:{token.column}",
-                        "`unsafe` token is outside the ADR 0017 `opc-libsctp-sys` "
+                        "`unsafe` token is outside the ADR 0017 Linux UAPI sys-crate "
                         "allow-list",
                     )
                 )
@@ -170,8 +170,8 @@ def check_sys_crate_unsafe_comments(root: Path) -> list[Violation]:
                 violations.append(
                     Violation(
                         f"{source}:{token.line}:{token.column}",
-                        "`unsafe` token in `opc-libsctp-sys` must be documented "
-                        "by an adjacent `SAFETY:` comment",
+                        "`unsafe` token in an allowed Linux UAPI sys crate must be "
+                        "documented by an adjacent `SAFETY:` comment",
                     )
                 )
     return violations
@@ -180,13 +180,14 @@ def check_sys_crate_unsafe_comments(root: Path) -> list[Violation]:
 def check_sys_crate_lints(pkg: dict, root: Path) -> list[Violation]:
     manifest = Path(pkg["manifest_path"])
     text = manifest.read_text(encoding="utf-8")
+    package_name = pkg["name"]
     violations: list[Violation] = []
 
     if inherits_workspace_lints(text):
         violations.append(
             Violation(
                 str(manifest),
-                "`opc-libsctp-sys` must not inherit `[workspace.lints]`; ADR 0017 "
+                f"`{package_name}` must not inherit `[workspace.lints]`; ADR 0017 "
                 "requires a local unsafe policy",
             )
         )
@@ -196,7 +197,7 @@ def check_sys_crate_lints(pkg: dict, root: Path) -> list[Violation]:
         violations.append(
             Violation(
                 str(manifest),
-                "`opc-libsctp-sys` exists but has no Rust source to audit",
+                f"`{package_name}` exists but has no Rust source to audit",
             )
         )
         return violations
@@ -206,7 +207,7 @@ def check_sys_crate_lints(pkg: dict, root: Path) -> list[Violation]:
         violations.append(
             Violation(
                 str(manifest),
-                "`opc-libsctp-sys` must declare a local `unsafe_code = \"allow\"` "
+                f"`{package_name}` must declare a local `unsafe_code = \"allow\"` "
                 "policy or crate-level `#![allow(unsafe_code)]`",
             )
         )
@@ -214,12 +215,11 @@ def check_sys_crate_lints(pkg: dict, root: Path) -> list[Violation]:
         violations.append(
             Violation(
                 str(manifest),
-                "`opc-libsctp-sys` must deny `unsafe_op_in_unsafe_fn` locally",
+                f"`{package_name}` must deny `unsafe_op_in_unsafe_fn` locally",
             )
         )
 
     return violations
-
 
 def inherits_workspace_lints(manifest_text: str) -> bool:
     return (
