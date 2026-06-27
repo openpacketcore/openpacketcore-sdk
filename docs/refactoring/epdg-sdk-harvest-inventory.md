@@ -10,8 +10,8 @@ moved into the SDK by this document.
 
 | Role | Import path | Use in SDK work |
 | --- | --- | --- |
-| Task packet root | `/tmp/openpacketcore-epdg-sdk-task-packet` | Documentary context for imported task packets and shared context. |
-| Mirrored source root | `/tmp/openpacketcore-epdg-sdk-task-packet/epdg-source` | Read-only harvest seed and comparison oracle. |
+| Task packet root | the ePDG import packet provided to Phase 0 | Documentary context for imported task packets and shared context. |
+| Mirrored source root | the `epdg-source` subtree of the ePDG import packet provided to Phase 0 | Read-only harvest seed and comparison oracle. |
 
 The mirrored ePDG workspace is not a copy-paste target. Each SDK task must
 re-author reusable mechanisms in SDK style, keep protocol codecs pure Rust,

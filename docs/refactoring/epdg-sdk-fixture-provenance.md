@@ -9,8 +9,8 @@ provenance required by [ADR 0015](../adr/0015-protocol-codec-conformance-policy.
 
 | Role | Import path | Evidence use |
 | --- | --- | --- |
-| Task packet root | `/tmp/openpacketcore-epdg-sdk-task-packet` | Source of task packets, shared context, and source map for this import. |
-| Mirrored source root | `/tmp/openpacketcore-epdg-sdk-task-packet/epdg-source` | Read-only source for parity comparison and fixture triage. |
+| Task packet root | the ePDG import packet provided to Phase 0 | Source of task packets, shared context, and source map for this import. |
+| Mirrored source root | the `epdg-source` subtree of the ePDG import packet provided to Phase 0 | Read-only source for parity comparison and fixture triage. |
 
 ADR 0015 distinguishes conformance evidence from regression/parity evidence:
 
