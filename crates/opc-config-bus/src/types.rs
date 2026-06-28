@@ -4,7 +4,7 @@
 
 use opc_alarm::SharedAlarmManager;
 use opc_config_model::{
-    ConfigError, ConfigOperation, IdempotencyKey, OpcConfig, RequestId, RequestSource,
+    ApplyPlan, ConfigError, ConfigOperation, IdempotencyKey, OpcConfig, RequestId, RequestSource,
     RollbackTarget, TransportType, TrustedPrincipal, ValidationContext, ValidationError, YangPath,
 };
 use opc_types::{ConfigVersion, SchemaDigest, Timestamp, TxId};
@@ -248,6 +248,9 @@ pub struct StoredConfig<C: OpcConfig> {
     /// key and matching fingerprint replays this record's result instead of
     /// committing again; a mismatched request is rejected as a collision.
     pub idempotency_key: Option<IdempotencyKey>,
+    /// Apply plan admitted for this commit. Stored with request metadata so
+    /// idempotent replay can return the same northbound contract.
+    pub apply_plan: Option<ApplyPlan>,
     /// Shape of the original request, persisted so idempotent retries can be
     /// matched and replayed safely even across process restarts.
     pub request_fingerprint: Option<StoredRequestFingerprint>,
@@ -330,6 +333,7 @@ impl<C: OpcConfig> StoredConfig<C> {
             config,
             encrypted_blob: Vec::new(),
             idempotency_key: None,
+            apply_plan: None,
             request_fingerprint: None,
             request_id: None,
             recovery_required: false,
@@ -353,6 +357,7 @@ impl<C: OpcConfig> StoredConfig<C> {
             config,
             encrypted_blob: self.encrypted_blob,
             idempotency_key: self.idempotency_key,
+            apply_plan: self.apply_plan,
             request_fingerprint: self.request_fingerprint,
             request_id: self.request_id,
             recovery_required: self.recovery_required,

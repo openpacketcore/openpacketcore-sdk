@@ -8,6 +8,8 @@
 //! drain within `drain_timeout`).
 
 use opc_alarm::{ReadinessImpact, SharedAlarmManager};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{watch, RwLock};
@@ -117,8 +119,8 @@ pub struct RuntimeHandle {
     pub(crate) supervisor: Supervisor,
     /// Runtime-wide alarm manager used by supervised tasks and runtime lifecycle hooks.
     pub(crate) alarm_manager: SharedAlarmManager,
-    /// Notification channel for when the runtime has fully stopped.
-    pub(crate) stop_notify: Arc<tokio::sync::Notify>,
+    /// Latest-value notification channel for when the runtime has fully stopped.
+    pub(crate) stop_tx: watch::Sender<bool>,
     /// Phase observer callback.
     pub(crate) phase_observer: Option<Arc<dyn Fn(RuntimePhase) + Send + Sync>>,
     /// Panic hook metadata installed during this runtime's build.
@@ -149,7 +151,7 @@ impl std::fmt::Debug for RuntimeHandle {
             .field("phase", &self.phase)
             .field("shutdown", &self.shutdown)
             .field("supervisor", &self.supervisor)
-            .field("stop_notify", &self.stop_notify)
+            .field("stopped", &*self.stop_tx.borrow())
             .field("panic_hook_metadata", &self.panic_hook_metadata)
             .finish()
     }
@@ -165,7 +167,7 @@ impl Clone for RuntimeHandle {
             shutdown: self.shutdown.clone(),
             supervisor: self.supervisor.clone(),
             alarm_manager: self.alarm_manager.clone(),
-            stop_notify: self.stop_notify.clone(),
+            stop_tx: self.stop_tx.clone(),
             phase_observer: self.phase_observer.clone(),
             panic_hook_metadata: self.panic_hook_metadata.clone(),
             clock: self.clock.clone(),
@@ -231,7 +233,7 @@ impl RuntimeHandle {
             if new_phase == RuntimePhase::Stopped {
                 self.shutdown
                     .transition_phase(crate::shutdown::ShutdownPhase::Stopped);
-                self.stop_notify.notify_one();
+                self.stop_tx.send_replace(true);
             }
         }
     }
@@ -286,6 +288,25 @@ impl RuntimeHandle {
         *self.phase.read().await == RuntimePhase::Stopped
     }
 
+    /// Wait until the runtime reaches the fully stopped phase.
+    ///
+    /// This method is notification-only: it does not consume the handle and it
+    /// does not map fatal supervised task failures into a return value. Callers
+    /// that need fatal failure details should inspect
+    /// `self.supervisor().fatal_task_failure().await` after this method returns,
+    /// or use `try_run` / `try_run_with_hooks`.
+    pub async fn wait_stopped(&self) {
+        let mut stop_rx = self.stop_tx.subscribe();
+        loop {
+            if *stop_rx.borrow_and_update() {
+                return;
+            }
+            if stop_rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     /// Complete shutdown: transition to Draining, drain all tasks, then Stopped.
     ///
     /// Used by `run()` when no drain monitor is active (e.g., Conformance mode).
@@ -322,6 +343,10 @@ impl RuntimeHandle {
     pub(crate) async fn enter_draining(&self) {
         self.shutdown.request_shutdown();
         self.set_phase(RuntimePhase::Draining).await;
+    }
+
+    pub(crate) async fn abort_startup(&self) {
+        self.drive_drain_sequence(false).await;
     }
 
     fn drain_hook_timeout(&self) -> std::time::Duration {
@@ -461,7 +486,7 @@ impl RuntimeHandle {
             shutdown: self.shutdown.clone(),
             supervisor: self.supervisor.clone(),
             alarm_manager: self.alarm_manager.clone(),
-            stop_notify: self.stop_notify.clone(),
+            stop_tx: self.stop_tx.clone(),
             phase_observer: self.phase_observer.clone(),
             panic_hook_metadata: self.panic_hook_metadata.clone(),
             clock: self.clock.clone(),
@@ -480,10 +505,7 @@ impl RuntimeHandle {
 /// Run the CNF runtime with a profile and supervised tasks.
 pub async fn run(
     profile: RuntimeProfile,
-    init: impl FnOnce(
-            Supervisor,
-            ShutdownToken,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    init: impl FnOnce(Supervisor, ShutdownToken) -> Pin<Box<dyn Future<Output = ()> + Send>>
         + Send
         + 'static,
 ) -> Result<(), RuntimeError> {
@@ -494,15 +516,59 @@ pub async fn run(
 pub async fn run_with_hooks(
     profile: RuntimeProfile,
     drain_hooks: Vec<Arc<dyn DrainHook>>,
+    init: impl FnOnce(Supervisor, ShutdownToken) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + 'static,
+) -> Result<(), RuntimeError> {
+    try_run_with_hooks(profile, drain_hooks, move |supervisor, shutdown| {
+        Box::pin(async move {
+            init(supervisor, shutdown).await;
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// Run the CNF runtime with a profile and fallible supervised task initialization.
+///
+/// # Errors
+///
+/// Returns startup errors from `Builder::build`, including errors returned by
+/// the fallible init callback. After a successful startup, fatal supervised task
+/// failures are returned as `RuntimeError::TaskCriticalFailure` after shutdown
+/// completes.
+pub async fn try_run(
+    profile: RuntimeProfile,
     init: impl FnOnce(
             Supervisor,
             ShutdownToken,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send>>
+        + Send
+        + 'static,
+) -> Result<(), RuntimeError> {
+    try_run_with_hooks(profile, Vec::new(), init).await
+}
+
+/// Run the CNF runtime with custom drain hooks and fallible initialization.
+///
+/// # Errors
+///
+/// Returns startup errors from `Builder::build`, including errors returned by
+/// the fallible init callback. After a successful startup, fatal supervised task
+/// failures are returned as `RuntimeError::TaskCriticalFailure` after shutdown
+/// completes.
+pub async fn try_run_with_hooks(
+    profile: RuntimeProfile,
+    drain_hooks: Vec<Arc<dyn DrainHook>>,
+    init: impl FnOnce(
+            Supervisor,
+            ShutdownToken,
+        ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send>>
         + Send
         + 'static,
 ) -> Result<(), RuntimeError> {
     let mode = profile.mode;
-    let mut builder = crate::builder::Builder::new(profile).with_init(init);
+    let mut builder = crate::builder::Builder::new(profile).try_with_init(init);
     for hook in drain_hooks {
         builder = builder.with_drain_hook(hook);
     }
@@ -517,19 +583,7 @@ pub async fn run_with_hooks(
     if mode == RuntimeMode::Conformance {
         handle.complete_shutdown().await;
     } else {
-        // Wait for the runtime to complete its full drain sequence (reaches Stopped).
-        // To prevent lost-wakeup races, register the notification listener before checking state,
-        // and recheck in a loop.
-        loop {
-            if handle.is_stopped().await {
-                break;
-            }
-            let wait_for_stop = handle.stop_notify.notified();
-            if handle.is_stopped().await {
-                break;
-            }
-            wait_for_stop.await;
-        }
+        handle.wait_stopped().await;
     }
 
     if let Some((task, error)) = handle.supervisor.fatal_task_failure().await {

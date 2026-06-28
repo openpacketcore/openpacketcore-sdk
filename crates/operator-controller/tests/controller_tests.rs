@@ -94,6 +94,7 @@ fn valid_node_capability_report() -> opc_node_resources::NodeCapabilityReport {
             numa_node: Some(0),
         }],
         ipsec: IpsecCapabilities::default(),
+        ipsec_gateway: None,
     }
 }
 

@@ -795,6 +795,16 @@ pub struct IpsecGatewayProfile {
     pub require_udp_4500: bool,
     /// Whether the node must report SCTP support.
     pub require_sctp: bool,
+    /// Require evidence that the kernel exposes XFRM user API support.
+    pub require_xfrm_user: bool,
+    /// Require evidence that XFRM state operations are available.
+    pub require_xfrm_state: bool,
+    /// Require evidence that XFRM policy operations are available.
+    pub require_xfrm_policy: bool,
+    /// Require evidence that XFRM operations can be scoped to the pod network namespace.
+    pub require_netns_scoped_operation: bool,
+    /// Require evidence that route/rule prerequisites can be managed for the gateway.
+    pub require_route_rule_prerequisites: bool,
     /// Kernel modules that must be available on the node (e.g. `xfrm_user`).
     pub required_kernel_modules: BTreeSet<KernelModuleId>,
     /// ESP algorithms that must be supported by the node (e.g. `aes-cbc`).
@@ -804,6 +814,52 @@ pub struct IpsecGatewayProfile {
     /// Whether lab mode may fall back to userspace ESP when kernel ESP is
     /// unavailable.
     pub allow_userspace_esp_fallback: bool,
+    /// Evidence ID backing the declared IPsec gateway capability checks.
+    pub evidence_id: Option<String>,
+}
+
+impl IpsecGatewayProfile {
+    /// Returns a conservative production IPsec gateway profile.
+    pub fn standard(evidence_id: Option<String>) -> Self {
+        Self {
+            minimum_kernel: KernelVersion::new(5, 15, 0),
+            required_capabilities: BTreeSet::from([
+                LinuxCapability::CapNetAdmin,
+                LinuxCapability::CapNetRaw,
+            ]),
+            require_xfrm: true,
+            require_udp_500: true,
+            require_udp_4500: true,
+            require_sctp: true,
+            require_xfrm_user: true,
+            require_xfrm_state: true,
+            require_xfrm_policy: true,
+            require_netns_scoped_operation: true,
+            require_route_rule_prerequisites: true,
+            required_kernel_modules: BTreeSet::from([
+                KernelModuleId::from("xfrm_user"),
+                KernelModuleId::from("esp4"),
+            ]),
+            required_esp_algorithms: BTreeSet::from([
+                EspAlgorithmId::from("aes-cbc"),
+                EspAlgorithmId::from("hmac-sha256"),
+            ]),
+            network_attachments: vec![IpsecNetworkAttachment {
+                interface_name: "ens5f0".to_string(),
+                plane: "nwu".to_string(),
+                cni_type: CniType::Macvlan,
+                static_ip_required: false,
+                static_ip: None,
+                minimum_mtu: None,
+                mtu: Some(1500),
+                source_route_required: false,
+                source_route: None,
+                vlan_id: None,
+            }],
+            allow_userspace_esp_fallback: false,
+            evidence_id,
+        }
+    }
 }
 
 /// IPsec-related capabilities reported by the node agent.
@@ -878,9 +934,9 @@ pub struct ResourceProfile {
     /// SR-IOV parameters.  Required when `data_plane_profile` is
     /// [`DataPlaneProfile::SriovFastPath`].
     pub sriov: Option<SriovProfile>,
-    /// IPsec gateway parameters.  Required when `data_plane_profile` is
+    /// IPsec gateway parameters. Required when `data_plane_profile` is
     /// [`DataPlaneProfile::IpsecGateway`].
-    pub ipsec: Option<IpsecGatewayProfile>,
+    pub ipsec_gateway: Option<IpsecGatewayProfile>,
     /// Lab-only fallback policy.
     pub lab_fallback: LabFallbackPolicy,
 }
@@ -918,7 +974,7 @@ impl ResourceProfile {
             pod_security: PodSecurityExceptionModel::secure_default(),
             af_xdp: None,
             sriov: None,
-            ipsec: None,
+            ipsec_gateway: None,
             lab_fallback: LabFallbackPolicy::default(),
         }
     }
@@ -995,6 +1051,27 @@ pub struct NicCapability {
     pub numa_node: Option<NumaNodeId>,
 }
 
+/// Observed Linux XFRM/IPsec capability evidence for packet-core gateways.
+///
+/// A node agent or platform admission layer populates this from trusted host
+/// inspection. The SDK only consumes the report and produces redaction-safe
+/// validation results.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IpsecGatewayCapabilities {
+    /// Kernel exposes XFRM user API support.
+    pub xfrm_user: bool,
+    /// XFRM state operations are available.
+    pub xfrm_state: bool,
+    /// XFRM policy operations are available.
+    pub xfrm_policy: bool,
+    /// XFRM operations can be scoped to the pod network namespace.
+    pub netns_scoped_operation: bool,
+    /// Route/rule prerequisites for gateway traffic steering are available.
+    pub route_rule_prerequisites: bool,
+    /// Evidence ID for the host inspection report.
+    pub evidence_id: Option<String>,
+}
+
 /// Complete capability report for a node, as collected by the node agent.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NodeCapabilityReport {
@@ -1011,6 +1088,9 @@ pub struct NodeCapabilityReport {
     /// IPsec-related capabilities.
     #[serde(default)]
     pub ipsec: IpsecCapabilities,
+    /// Optional Linux XFRM/IPsec gateway capability evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipsec_gateway: Option<IpsecGatewayCapabilities>,
 }
 
 impl NodeCapabilityReport {
@@ -1138,12 +1218,17 @@ pub enum ValidationError {
     /// [`DataPlaneProfile::SriovFastPath`] is selected but no data-plane
     /// interfaces are specified (RFC 011 §9.1 requires named attachments).
     SriovNoDataPlaneInterfaces,
-    /// [`DataPlaneProfile::IpsecGateway`] is selected but no `ipsec` profile
-    /// is configured.
-    IpsecProfileMissing,
+    /// [`DataPlaneProfile::IpsecGateway`] is selected but no IPsec gateway
+    /// profile is configured.
+    IpsecGatewayProfileMissing,
     /// [`DataPlaneProfile::IpsecGateway`] is selected but no data-plane
-    /// interfaces are specified (RFC 011 §9.1 requires named attachments).
-    IpsecNoDataPlaneInterfaces,
+    /// interfaces are specified.
+    IpsecGatewayNoDataPlaneInterfaces,
+    /// [`DataPlaneProfile::IpsecGateway`] is selected but the node capability
+    /// report has no XFRM/IPsec gateway evidence.
+    IpsecGatewayCapabilitiesMissing,
+    /// Required XFRM/IPsec gateway feature is not available on the node.
+    MissingIpsecGatewayFeature { feature: String },
     /// An IPsec gateway network attachment requirement is missing a required
     /// field or has an invalid value.
     IpsecNetworkAttachmentInvalid { detail: String },
@@ -1307,14 +1392,20 @@ impl fmt::Display for ValidationError {
                     "SR-IOV fast path requires at least one named data-plane interface"
                 )
             }
-            ValidationError::IpsecProfileMissing => {
+            ValidationError::IpsecGatewayProfileMissing => {
                 write!(f, "IPsec gateway profile selected but not configured")
             }
-            ValidationError::IpsecNoDataPlaneInterfaces => {
+            ValidationError::IpsecGatewayNoDataPlaneInterfaces => {
                 write!(
                     f,
                     "IPsec gateway requires at least one named data-plane interface"
                 )
+            }
+            ValidationError::IpsecGatewayCapabilitiesMissing => {
+                write!(f, "node missing IPsec gateway XFRM capability evidence")
+            }
+            ValidationError::MissingIpsecGatewayFeature { feature } => {
+                write!(f, "node missing IPsec gateway feature: {feature}")
             }
             ValidationError::IpsecNetworkAttachmentInvalid { detail } => {
                 write!(f, "IPsec network attachment invalid: {detail}")

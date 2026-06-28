@@ -30,7 +30,7 @@ jobs:
           - opc-proto-diameter
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install nightly Rust toolchain
         uses: dtolnay/rust-toolchain@nightly

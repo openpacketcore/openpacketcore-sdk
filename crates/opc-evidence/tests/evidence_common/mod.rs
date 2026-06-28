@@ -61,9 +61,9 @@ pub fn validate_date_format(value: &str, format: &str) -> Result<(), String> {
     match format {
         "date" => {
             static DATE_FMT: once_cell::sync::Lazy<
-                Vec<time::format_description::FormatItem<'static>>,
+                Vec<time::format_description::BorrowedFormatItem<'static>>,
             > = once_cell::sync::Lazy::new(|| {
-                time::format_description::parse("[year]-[month]-[day]")
+                time::format_description::parse_borrowed::<2>("[year]-[month]-[day]")
                     .expect("valid date format description")
             });
             time::Date::parse(value, &DATE_FMT)

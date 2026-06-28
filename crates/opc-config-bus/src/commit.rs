@@ -13,9 +13,9 @@ use tokio::sync::{mpsc, mpsc::error::TrySendError, oneshot};
 
 use opc_alarm::{ProbableCause, Severity, SharedAlarmManager};
 use opc_config_model::{
-    CommitError, CommitErrorCode, CommitMode, CommitRequest, CommitResult, CommitStatus,
-    ConfigError, ConfigOperation, OpcConfig, RequestId, RequestSource, RollbackTarget,
-    TrustedPrincipal, ValidationContext, ValidationError, YangPath,
+    ApplyPlan, CommitError, CommitErrorCode, CommitMode, CommitRequest, CommitResult, CommitStatus,
+    ConfigError, ConfigImpactClassifier, ConfigOperation, OpcConfig, RequestId, RequestSource,
+    RollbackTarget, TrustedPrincipal, ValidationContext, ValidationError, YangPath,
 };
 use opc_types::{redact, ConfigVersion, Timestamp, TxId};
 
@@ -116,6 +116,7 @@ impl<C: OpcConfig> ConfigBus<C> {
         authority_mode: AuthorityMode,
         alarm_manager: SharedAlarmManager,
         authorizer: Arc<dyn ConfigAuthorizer>,
+        impact_classifier: Arc<dyn ConfigImpactClassifier<C>>,
         pending_deadline: Option<Timestamp>,
     ) -> Self {
         let queue_capacity = queue_capacity.max(1);
@@ -132,6 +133,7 @@ impl<C: OpcConfig> ConfigBus<C> {
             store,
             alarm_manager.clone(),
             authorizer.clone(),
+            impact_classifier.clone(),
             pending_deadline,
         ));
 
@@ -286,6 +288,7 @@ async fn worker_loop<C: OpcConfig>(
     store: Arc<dyn ManagedDatastore<C>>,
     alarm_manager: SharedAlarmManager,
     authorizer: Arc<dyn ConfigAuthorizer>,
+    impact_classifier: Arc<dyn ConfigImpactClassifier<C>>,
     initial_pending_deadline: Option<Timestamp>,
 ) {
     let mut pending_deadline: Option<Timestamp> = initial_pending_deadline;
@@ -309,6 +312,7 @@ async fn worker_loop<C: OpcConfig>(
                     Arc::clone(&recovery),
                     store.as_ref(),
                     authorizer.as_ref(),
+                    impact_classifier.clone(),
                     has_pending,
                 ))
                 .catch_unwind()
@@ -456,6 +460,7 @@ async fn process_commit<C: OpcConfig>(
     recovery: Arc<RecoveryState>,
     store: &dyn ManagedDatastore<C>,
     authorizer: &dyn ConfigAuthorizer,
+    impact_classifier: Arc<dyn ConfigImpactClassifier<C>>,
     has_pending: bool,
 ) -> Result<CommitResult, CommitError> {
     if let Some(reason) = recovery.reason() {
@@ -498,13 +503,27 @@ async fn process_commit<C: OpcConfig>(
                 .take()
                 .ok_or_else(CommitError::missing_candidate)?;
             let previous = Arc::clone(&current.config);
-            let (candidate, _deltas, changed_paths) =
-                compute_deltas_and_changed_paths(candidate, previous, request.request_id).await?;
+            let (candidate, _deltas, changed_paths) = compute_deltas_and_changed_paths(
+                candidate,
+                Arc::clone(&previous),
+                request.request_id,
+            )
+            .await?;
             authorize_request(&request, current.version, changed_paths.clone(), authorizer).await?;
 
             let validate_start = std::time::Instant::now();
-            validate_candidate(candidate, validation_context).await?;
+            let candidate = validate_candidate(candidate, validation_context.clone()).await?;
             crate::metrics::observe_validate_latency(validate_start.elapsed().as_secs_f64());
+
+            let (_candidate, apply_plan) = classify_apply_plan(
+                impact_classifier,
+                validation_context,
+                previous,
+                candidate,
+                changed_paths.clone(),
+                None,
+            )
+            .await?;
 
             ensure_deadline(request.deadline)?;
             Ok(CommitResult {
@@ -513,6 +532,7 @@ async fn process_commit<C: OpcConfig>(
                 new_version: None,
                 status: CommitStatus::Validated,
                 changed_paths,
+                apply_plan: Some(apply_plan),
             })
         }
         CommitMode::CommitConfirmed { .. }
@@ -588,8 +608,34 @@ async fn process_commit<C: OpcConfig>(
             authorize_request(&request, current.version, changed_paths.clone(), authorizer).await?;
 
             let validate_start = std::time::Instant::now();
-            let candidate = validate_candidate(candidate, validation_context).await?;
+            let candidate = validate_candidate(candidate, validation_context.clone()).await?;
             crate::metrics::observe_validate_latency(validate_start.elapsed().as_secs_f64());
+
+            let (candidate, apply_plan) = match &request.mode {
+                CommitMode::Commit | CommitMode::CommitConfirmed { .. } => {
+                    let (candidate, plan) = classify_apply_plan(
+                        impact_classifier,
+                        validation_context,
+                        Arc::clone(&previous),
+                        candidate,
+                        changed_paths.clone(),
+                        None,
+                    )
+                    .await?;
+                    (candidate, Some(plan))
+                }
+                CommitMode::Rollback { target } => (
+                    candidate,
+                    Some(
+                        ApplyPlan::default_hot(changed_paths.clone(), Some(target.clone()))
+                            .normalize(),
+                    ),
+                ),
+                CommitMode::CancelConfirmed => (candidate, None),
+                CommitMode::ValidateOnly => {
+                    unreachable!("handled above")
+                }
+            };
 
             ensure_deadline(request.deadline)?;
 
@@ -613,6 +659,7 @@ async fn process_commit<C: OpcConfig>(
             record.request_fingerprint = request_fingerprint;
             record.request_id = Some(request.request_id);
             record.idempotency_key = request.idempotency_key;
+            record.apply_plan = apply_plan.clone();
             record.recovery_required = true;
 
             if let CommitMode::CommitConfirmed { timeout } = &request.mode {
@@ -681,6 +728,7 @@ async fn process_commit<C: OpcConfig>(
                 new_version: Some(new_version),
                 status,
                 changed_paths,
+                apply_plan,
             })
         }
     }
@@ -764,6 +812,7 @@ fn replay_commit_result<C: OpcConfig>(
             .expect("checked above")
             .changed_paths
             .clone(),
+        apply_plan: stored.apply_plan.clone(),
     })
 }
 
@@ -904,6 +953,38 @@ async fn validate_candidate<C: OpcConfig>(
     .map_err(|_| CommitError::state_machine_fault("validation task panicked"))?
 }
 
+async fn classify_apply_plan<C: OpcConfig>(
+    impact_classifier: Arc<dyn ConfigImpactClassifier<C>>,
+    ctx: ValidationContext<C>,
+    previous: Arc<C>,
+    candidate: C,
+    changed_paths: Vec<YangPath>,
+    rollback_target: Option<RollbackTarget>,
+) -> Result<(C, ApplyPlan), CommitError> {
+    let request_id = ctx.request_id;
+    tokio::task::spawn_blocking(move || {
+        let mut plan = impact_classifier
+            .classify(&ctx, Some(previous.as_ref()), &candidate, &changed_paths)
+            .map_err(|err| {
+                log_apply_plan_classifier_failure(request_id, &err);
+                CommitError::new(
+                    CommitErrorCode::ApplyPlanRejected,
+                    "config apply plan classification failed",
+                )
+            })?;
+        if plan.rollback_target.is_none() {
+            plan.rollback_target = rollback_target;
+        }
+        let plan = plan.normalize();
+        if !plan.commit_allowed() {
+            return Err(CommitError::apply_plan_rejected(plan));
+        }
+        Ok::<_, CommitError>((candidate, plan))
+    })
+    .await
+    .map_err(|_| CommitError::state_machine_fault("apply-plan classification task panicked"))?
+}
+
 fn ensure_supported_validate_only_operation(operation: ConfigOperation) -> Result<(), CommitError> {
     if matches!(operation, ConfigOperation::Replace) {
         Ok(())
@@ -930,6 +1011,15 @@ fn log_diff_failure(request_id: RequestId, error: &ConfigError) {
         diff_error_kind = %error.kind(),
         diff_error = %redact(error.message()),
         "candidate config diff generation failed"
+    );
+}
+
+fn log_apply_plan_classifier_failure(request_id: RequestId, error: &ConfigError) {
+    tracing::warn!(
+        request_id = %request_id,
+        apply_plan_error_kind = %error.kind(),
+        apply_plan_error = %redact(error.message()),
+        "candidate config apply-plan classification failed"
     );
 }
 

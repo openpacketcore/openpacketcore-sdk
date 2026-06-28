@@ -87,6 +87,7 @@ pub(crate) fn commit_error_alarm_spec(code: CommitErrorCode) -> (Severity, Proba
         | CommitErrorCode::StateMachineFault => (Severity::Major, ProbableCause::StorageCorruption),
         CommitErrorCode::VersionExhausted => (Severity::Major, ProbableCause::ConfigApplyFailed),
         CommitErrorCode::AdmissionRejected
+        | CommitErrorCode::ApplyPlanRejected
         | CommitErrorCode::DeadlineExceeded
         | CommitErrorCode::MissingCandidate
         | CommitErrorCode::RollbackNotFound

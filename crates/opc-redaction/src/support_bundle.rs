@@ -299,17 +299,8 @@ pub fn redact_text_with_policy(
             continue;
         }
 
-        // 2. Check for SQL statements or database errors
-        if lower_line.contains("select ")
-            || lower_line.contains("insert ")
-            || lower_line.contains("delete from")
-            || lower_line.contains("update ")
-            || lower_line.contains("create table")
-            || lower_line.contains("sqlite")
-            || lower_line.contains("database is locked")
-            || lower_line.contains("database disk image")
-            || lower_line.contains("sql error")
-        {
+        // 2. Check for SQL statements or database errors.
+        if line_contains_sql_or_db_error(&lower_line) {
             summary.sql_statements_or_errors += 1;
             output_lines.push("[REDACTED_SQL_OR_DB_ERROR]".to_string());
             continue;
@@ -645,17 +636,7 @@ fn classify_token(
         return Some("[REDACTED_JWT]".to_string());
     }
 
-    // E. Obvious secret-bearing tokens that do not match the stricter line-level
-    // secret markers (e.g. dotted values such as `jwt.secret.token`).
-    if !is_already_redacted(trimmed)
-        && !trimmed.contains("REDACTED_")
-        && trimmed.to_ascii_lowercase().contains("secret")
-    {
-        summary.secrets += 1;
-        return Some("[REDACTED_SECURITY_SECRET]".to_string());
-    }
-
-    // F. Paths & DB files
+    // E. Paths & DB files
     if trimmed.ends_with(".db") || trimmed.ends_with(".sqlite") {
         summary.paths_and_files += 1;
         return Some("[REDACTED_DB_FILE]".to_string());
@@ -663,6 +644,16 @@ fn classify_token(
     if trimmed.starts_with('/') && trimmed.contains('/') && trimmed.len() > 2 {
         summary.paths_and_files += 1;
         return Some("[REDACTED_PATH]".to_string());
+    }
+
+    // F. Obvious secret-bearing tokens that do not match the stricter line-level
+    // secret markers (e.g. dotted values such as `jwt.secret.token`).
+    if !is_already_redacted(trimmed)
+        && !trimmed.contains("REDACTED_")
+        && trimmed.to_ascii_lowercase().contains("secret")
+    {
+        summary.secrets += 1;
+        return Some("[REDACTED_SECURITY_SECRET]".to_string());
     }
 
     // G. Legacy subscriber identifier fallback for shapes the telco classifier missed.
@@ -1054,6 +1045,19 @@ fn json_key_is_secret_marker(key: &str) -> bool {
         || is_token_key
 }
 
+fn line_contains_sql_or_db_error(lower_line: &str) -> bool {
+    lower_line.contains("sqlite error")
+        || lower_line.contains("sqlite3")
+        || lower_line.contains("database is locked")
+        || lower_line.contains("database disk image")
+        || lower_line.contains("sql error")
+        || lower_line.contains("select ") && lower_line.contains(" from ")
+        || lower_line.contains("insert into ")
+        || lower_line.contains("delete from ")
+        || lower_line.contains("update ") && lower_line.contains(" set ")
+        || lower_line.contains("create table")
+}
+
 fn strip_port(token: &str) -> &str {
     let Some((host, port)) = token.rsplit_once(':') else {
         return token;
@@ -1271,6 +1275,21 @@ mod tests {
         let redacted_sql = redact_text(sql_log, &mut summary2);
         assert_eq!(redacted_sql, "[REDACTED_SQL_OR_DB_ERROR]");
         assert_eq!(summary2.sql_statements_or_errors, 1);
+    }
+
+    #[test]
+    fn test_sql_redaction_does_not_match_status_update_prose() {
+        let mut summary = RedactionSummary::default();
+        let msg = "Stale status update rejected for cluster cluster-us-east: incoming resource version 4 is less than existing 5";
+        let redacted = redact_text(msg, &mut summary);
+        assert_eq!(redacted, msg);
+        assert_eq!(summary.sql_statements_or_errors, 0);
+
+        let mut summary = RedactionSummary::default();
+        let sql = "Database transaction failed on UPDATE sessions SET state = 'down' WHERE id = 42";
+        let redacted = redact_text(sql, &mut summary);
+        assert_eq!(redacted, "[REDACTED_SQL_OR_DB_ERROR]");
+        assert_eq!(summary.sql_statements_or_errors, 1);
     }
 
     #[test]

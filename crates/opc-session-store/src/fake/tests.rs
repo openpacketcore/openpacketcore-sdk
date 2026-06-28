@@ -1,6 +1,7 @@
 use super::*;
 use crate::model::{Generation, StateClass};
 use bytes::Bytes;
+use futures_util::StreamExt;
 use opc_types::{NetworkFunctionKind, TenantId};
 
 fn test_key(tenant: &str, stable_id: &[u8]) -> SessionKey {
@@ -101,12 +102,215 @@ fn cas_for_lease_with_state_class(
     }
 }
 
+async fn next_replication_entry<S>(stream: &mut S) -> ReplicationEntry
+where
+    S: futures_util::Stream<Item = Result<ReplicationEntry, StoreError>> + Unpin,
+{
+    tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("watch should receive replication entry")
+        .expect("watch stream should remain open")
+        .expect("replication entry should be ok")
+}
+
 #[tokio::test]
 async fn fake_backend_get_miss() {
     let backend = FakeSessionBackend::new();
     let key = test_key("t1", b"id1");
     let result = backend.get(&key).await.unwrap();
     assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn direct_successful_cas_emits_ordered_replication_entry_and_watch_event() {
+    let backend = FakeSessionBackend::new();
+    let key = test_key("t1", b"direct-cas");
+    let lease = acquire_test_lease(&backend, &key, "owner-a").await;
+    let start_sequence = backend.max_replication_sequence().await.unwrap() + 1;
+    let mut watch = backend.watch(start_sequence).await.unwrap();
+
+    let result = backend
+        .compare_and_set(cas_for_lease(key.clone(), &lease, None, 1))
+        .await
+        .unwrap();
+    assert_eq!(result, CompareAndSetResult::Success);
+
+    let watched = next_replication_entry(&mut watch).await;
+    assert_eq!(watched.sequence, start_sequence);
+    match &watched.op {
+        ReplicationOp::CompareAndSet {
+            key: logged_key,
+            expected_generation,
+            new_record,
+        } => {
+            assert_eq!(logged_key, &key);
+            assert_eq!(expected_generation, &None);
+            assert_eq!(new_record.generation, Generation::new(1));
+        }
+        other => panic!("expected direct CAS replication op, got {other:?}"),
+    }
+
+    assert_eq!(
+        backend.max_replication_sequence().await.unwrap(),
+        start_sequence
+    );
+    let log = backend.get_replication_log(1, 16).await.unwrap();
+    assert!(log.iter().any(|entry| entry == &watched));
+}
+
+#[tokio::test]
+async fn direct_conflicting_cas_does_not_advance_replication_sequence() {
+    let backend = FakeSessionBackend::new();
+    let key = test_key("t1", b"direct-cas-conflict");
+    let lease = acquire_test_lease(&backend, &key, "owner-a").await;
+
+    let result = backend
+        .compare_and_set(cas_for_lease(key.clone(), &lease, None, 1))
+        .await
+        .unwrap();
+    assert_eq!(result, CompareAndSetResult::Success);
+    let before_conflict = backend.max_replication_sequence().await.unwrap();
+
+    let result = backend
+        .compare_and_set(cas_for_lease(key, &lease, None, 2))
+        .await
+        .unwrap();
+    assert!(matches!(result, CompareAndSetResult::Conflict { .. }));
+    assert_eq!(
+        backend.max_replication_sequence().await.unwrap(),
+        before_conflict
+    );
+}
+
+#[tokio::test]
+async fn direct_delete_and_ttl_refresh_emit_matching_replication_ops() {
+    let backend = FakeSessionBackend::new();
+    let key = test_key("t1", b"direct-delete-refresh");
+    let lease = acquire_test_lease(&backend, &key, "owner-a").await;
+
+    let result = backend
+        .compare_and_set(cas_for_lease(key.clone(), &lease, None, 1))
+        .await
+        .unwrap();
+    assert_eq!(result, CompareAndSetResult::Success);
+
+    let refresh_sequence = backend.max_replication_sequence().await.unwrap() + 1;
+    let mut refresh_watch = backend.watch(refresh_sequence).await.unwrap();
+    backend
+        .refresh_ttl(&lease, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let refresh_entry = next_replication_entry(&mut refresh_watch).await;
+    assert_eq!(refresh_entry.sequence, refresh_sequence);
+    assert!(matches!(
+        refresh_entry.op,
+        ReplicationOp::RefreshTtl {
+            key: ref logged_key,
+            owner: ref logged_owner,
+            fence,
+            ttl,
+        } if logged_key == &key
+            && logged_owner == lease.owner()
+            && fence == lease.fence()
+            && ttl == Duration::from_secs(30)
+    ));
+
+    let delete_sequence = backend.max_replication_sequence().await.unwrap() + 1;
+    let mut delete_watch = backend.watch(delete_sequence).await.unwrap();
+    backend.delete_fenced(&lease).await.unwrap();
+    let delete_entry = next_replication_entry(&mut delete_watch).await;
+    assert_eq!(delete_entry.sequence, delete_sequence);
+    assert!(matches!(
+        delete_entry.op,
+        ReplicationOp::DeleteFenced {
+            key: ref logged_key,
+            owner: ref logged_owner,
+            fence,
+        } if logged_key == &key && logged_owner == lease.owner() && fence == lease.fence()
+    ));
+}
+
+#[tokio::test]
+async fn direct_lease_mutations_emit_matching_replication_ops() {
+    let backend = FakeSessionBackend::new();
+    let key = test_key("t1", b"direct-lease-log");
+    let owner = OwnerId::new("owner-a").unwrap();
+    let mut watch = backend.watch(1).await.unwrap();
+
+    let lease = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    let acquired = next_replication_entry(&mut watch).await;
+    assert!(matches!(
+        acquired.op,
+        ReplicationOp::AcquireLease {
+            key: ref logged_key,
+            owner: ref logged_owner,
+            fence,
+            credential_id,
+            ttl,
+        } if logged_key == &key
+            && logged_owner == &owner
+            && fence == lease.fence()
+            && credential_id == lease.credential_id()
+            && ttl == Duration::from_secs(60)
+    ));
+
+    let renewed = backend
+        .renew(&lease, Duration::from_secs(90))
+        .await
+        .unwrap();
+    let renewed_entry = next_replication_entry(&mut watch).await;
+    assert!(matches!(
+        renewed_entry.op,
+        ReplicationOp::RenewLease {
+            key: ref logged_key,
+            owner: ref logged_owner,
+            fence,
+            credential_id,
+            ttl,
+        } if logged_key == &key
+            && logged_owner == &owner
+            && fence == renewed.fence()
+            && credential_id == renewed.credential_id()
+            && ttl == Duration::from_secs(90)
+    ));
+
+    let released_fence = renewed.fence();
+    let released_credential_id = renewed.credential_id();
+    backend.release(renewed).await.unwrap();
+    let released_entry = next_replication_entry(&mut watch).await;
+    assert!(matches!(
+        released_entry.op,
+        ReplicationOp::ReleaseLease {
+            key: ref logged_key,
+            owner: ref logged_owner,
+            fence,
+            credential_id,
+        } if logged_key == &key
+            && logged_owner == &owner
+            && fence == released_fence
+            && credential_id == released_credential_id
+    ));
+}
+
+#[tokio::test]
+async fn direct_cas_succeeds_when_replication_log_and_watch_are_disabled() {
+    let mut caps = BackendCapabilities::all_enabled();
+    caps.ordered_replication_log = false;
+    caps.watch = false;
+    let backend = FakeSessionBackend::with_capabilities(caps);
+    let key = test_key("t1", b"log-watch-disabled");
+    let lease = acquire_test_lease(&backend, &key, "owner-a").await;
+
+    let result = backend
+        .compare_and_set(cas_for_lease(key.clone(), &lease, None, 1))
+        .await
+        .unwrap();
+    assert_eq!(result, CompareAndSetResult::Success);
+    assert!(backend.get(&key).await.unwrap().is_some());
+    assert_eq!(backend.max_replication_sequence().await.unwrap(), 0);
 }
 
 #[tokio::test]

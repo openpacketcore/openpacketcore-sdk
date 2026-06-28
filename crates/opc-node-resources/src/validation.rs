@@ -110,8 +110,8 @@ pub fn run_data_plane_preflight(
                 | ValidationError::SriovNicZeroVfs { .. }
                 | ValidationError::UnsupportedSriovDriver { .. }
                 | ValidationError::SriovNoDataPlaneInterfaces
+                | ValidationError::IpsecGatewayNoDataPlaneInterfaces
                 | ValidationError::AfXdpNoDataPlaneInterfaces
-                | ValidationError::IpsecNoDataPlaneInterfaces
                 | ValidationError::IpsecNetworkAttachmentInvalid { .. }
         )
     });
@@ -151,7 +151,29 @@ pub fn run_data_plane_preflight(
         },
     });
 
-    // Check 5: Pod Security exceptions
+    // Check 5: XFRM/IPsec gateway capability evidence
+    if profile.data_plane_profile == DataPlaneProfile::IpsecGateway {
+        let ipsec_passed = report.errors.iter().all(|e| {
+            !matches!(
+                e,
+                ValidationError::IpsecGatewayProfileMissing
+                    | ValidationError::IpsecGatewayCapabilitiesMissing
+                    | ValidationError::MissingIpsecGatewayFeature { .. }
+            )
+        });
+        checks.push(PreflightCheckResult {
+            name: "XFRM_IPsec_Gateway".to_string(),
+            passed: ipsec_passed,
+            message: if ipsec_passed {
+                "XFRM/IPsec gateway kernel, namespace, and route/rule prerequisites are evidenced."
+                    .to_string()
+            } else {
+                "XFRM/IPsec gateway capability evidence is missing or incomplete.".to_string()
+            },
+        });
+    }
+
+    // Check 6: Pod Security exceptions
     let sec_passed = report.errors.iter().all(|e| {
         !matches!(
             e,
@@ -183,7 +205,7 @@ pub fn run_data_plane_preflight(
                 ValidationError::MissingNodeCapability { .. }
                     | ValidationError::ProductionLabFallbackForbidden
                     | ValidationError::UnsupportedKernelVersion { .. }
-                    | ValidationError::IpsecProfileMissing
+                    | ValidationError::IpsecGatewayProfileMissing
                     | ValidationError::InvalidKernelModuleId { .. }
                     | ValidationError::InvalidEspAlgorithmId { .. }
             )
@@ -216,6 +238,18 @@ pub fn run_data_plane_preflight(
     if let Some(ref af) = profile.af_xdp {
         for art in &af.bpf_artifacts {
             if let Some(ref ev) = art.evidence_id {
+                evidence_ids.push(ev.clone());
+            }
+        }
+    }
+    if profile.data_plane_profile == DataPlaneProfile::IpsecGateway {
+        if let Some(ref ipsec) = profile.ipsec_gateway {
+            if let Some(ref ev) = ipsec.evidence_id {
+                evidence_ids.push(ev.clone());
+            }
+        }
+        if let Some(ref ipsec) = context.node.ipsec_gateway {
+            if let Some(ref ev) = ipsec.evidence_id {
                 evidence_ids.push(ev.clone());
             }
         }

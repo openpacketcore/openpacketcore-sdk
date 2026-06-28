@@ -82,6 +82,7 @@ pub fn valid_node_capability_report() -> opc_node_resources::NodeCapabilityRepor
             numa_node: Some(0),
         }],
         ipsec: IpsecCapabilities::default(),
+        ipsec_gateway: None,
     }
 }
 

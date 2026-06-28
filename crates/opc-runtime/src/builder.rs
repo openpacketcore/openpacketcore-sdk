@@ -7,6 +7,8 @@
 //! runtime to `Ready` once supervised tasks report readiness.
 
 use opc_alarm::SharedAlarmManager;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::admin::ConfigVersionMetadata;
@@ -26,11 +28,20 @@ use crate::runtime::{SignalHandlerGuard, UnixSignalFactory, UnixSignalKind};
 /// Receives the runtime's `Supervisor` and `ShutdownToken` and is awaited
 /// after `PeerWarmup` but before the runtime can transition to `Ready`, so it
 /// is the place to register and spawn all supervised tasks.
-pub type InitFn = Box<
+pub type InitFn =
+    Box<dyn FnOnce(Supervisor, ShutdownToken) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
+/// Boxed one-shot fallible initialization callback passed to `Builder::try_with_init`.
+///
+/// Receives the runtime's `Supervisor` and `ShutdownToken` after
+/// `PeerWarmup`, but before readiness promotion can start. Returning an error
+/// aborts startup, drains any partially spawned tasks, and makes
+/// `Builder::build` return the original `RuntimeError`.
+pub type TryInitFn = Box<
     dyn FnOnce(
             Supervisor,
             ShutdownToken,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send>>
         + Send,
 >;
 
@@ -51,7 +62,7 @@ pub struct Builder {
     pub(crate) profile: RuntimeProfile,
     pub(crate) phases: StartupPhases,
     pub(crate) phase_observer: Option<Arc<dyn Fn(RuntimePhase) + Send + Sync>>,
-    pub(crate) init: Option<InitFn>,
+    pub(crate) init: Option<TryInitFn>,
     pub(crate) alarm_manager: Option<SharedAlarmManager>,
     pub(crate) clock: Option<Arc<dyn Clock>>,
     pub(crate) drain_hooks: Vec<Arc<dyn DrainHook>>,
@@ -100,13 +111,42 @@ impl Builder {
         self
     }
 
-    /// Register a supervisor/shutdown initialization callback.
+    /// Register an infallible supervisor/shutdown initialization callback.
+    ///
+    /// The callback runs after `PeerWarmup` and before readiness promotion.
+    /// This method shares one effective init slot with `try_with_init`: if both
+    /// setters are called, the later setter replaces the earlier callback.
     pub fn with_init(
+        mut self,
+        init: impl FnOnce(Supervisor, ShutdownToken) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + 'static,
+    ) -> Self {
+        self.init = Some(Box::new(move |supervisor, shutdown| {
+            Box::pin(async move {
+                init(supervisor, shutdown).await;
+                Ok(())
+            })
+        }));
+        self
+    }
+
+    /// Register a fallible supervisor/shutdown initialization callback.
+    ///
+    /// The callback runs after `PeerWarmup` and before readiness promotion. Use
+    /// this for required startup work, such as binding listeners before their
+    /// long-running supervised tasks are spawned. If the callback returns an
+    /// error, `build` performs startup-abort cleanup and returns that original
+    /// `RuntimeError`.
+    ///
+    /// This method shares one effective init slot with `with_init`: if both
+    /// setters are called, the later setter replaces the earlier callback.
+    pub fn try_with_init(
         mut self,
         init: impl FnOnce(
                 Supervisor,
                 ShutdownToken,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send>>
             + Send
             + 'static,
     ) -> Self {
@@ -361,12 +401,14 @@ impl Builder {
         let started_at = clock.monotonic();
         let config_version = Arc::new(tokio::sync::RwLock::new(ConfigVersionMetadata::default()));
 
+        let (stop_tx, _) = tokio::sync::watch::channel(false);
+
         let handle = RuntimeHandle {
             phase,
             shutdown,
             supervisor: supervisor.clone(),
             alarm_manager,
-            stop_notify: Arc::new(tokio::sync::Notify::new()),
+            stop_tx,
             phase_observer: self.phase_observer.clone(),
             panic_hook_metadata,
             clock: clock.clone(),
@@ -380,10 +422,10 @@ impl Builder {
             config_version,
         };
 
-        if self.profile.mode != RuntimeMode::Conformance {
+        let drain_monitor = if self.profile.mode != RuntimeMode::Conformance {
             let h = handle.background_clone();
             let mut owner_drop_rx = handle.owner_drop_tx.subscribe();
-            tokio::spawn(async move {
+            Some(tokio::spawn(async move {
                 let observe_readiness = tokio::select! {
                     biased;
                     _ = h.shutdown_token().shutdown_acknowledged() => {
@@ -396,12 +438,20 @@ impl Builder {
 
                 // Now transition to draining (readiness will become NotReady/Draining).
                 h.drive_drain_sequence(observe_readiness).await;
-            });
-        }
+            }))
+        } else {
+            None
+        };
 
         // Run the init callback to spawn tasks before transitioning to Ready
         if let Some(init) = self.init {
-            init(supervisor, handle.shutdown_token().clone()).await;
+            if let Err(err) = init(supervisor, handle.shutdown_token().clone()).await {
+                handle.abort_startup().await;
+                if let Some(drain_monitor) = drain_monitor {
+                    let _ = drain_monitor.await;
+                }
+                return Err(err);
+            }
         }
 
         let readiness_handle = handle.background_clone();

@@ -32,6 +32,7 @@ pub mod model;
 pub mod owned_session;
 pub mod quorum;
 pub mod record;
+pub mod restore;
 pub mod sqlite;
 pub mod store;
 
@@ -55,5 +56,9 @@ pub use model::{
 pub use owned_session::OwnedSession;
 pub use quorum::{FencedSessionReplica, QuorumSessionStore, SessionStoreBackend};
 pub use record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
+pub use restore::{
+    summarize_restore_records, OwnerFenceMetadata, RestoreBlockReason, RestoreBlockReasonCode,
+    RestoreRecordSummary, RestoreStage, StoredRecordHeaderSummary,
+};
 pub use sqlite::SqliteSessionBackend;
 pub use store::SessionStore;

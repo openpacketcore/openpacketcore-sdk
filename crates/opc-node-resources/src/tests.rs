@@ -58,6 +58,22 @@ fn production_af_xdp_profile() -> ResourceProfile {
     profile
 }
 
+fn production_ipsec_gateway_profile() -> ResourceProfile {
+    let mut profile = ResourceProfile::new(
+        NetworkFunctionKind::Custom("n3iwf".to_string()),
+        DataPlaneProfile::IpsecGateway,
+        Environment::Production,
+    );
+    profile.pod_security = PodSecurityExceptionModel::minimal_required(
+        DataPlaneProfile::IpsecGateway,
+        Some("platform-ipsec-gateway-ev-1".to_string()),
+    );
+    profile.ipsec_gateway = Some(IpsecGatewayProfile::standard(Some(
+        "platform-ipsec-gateway-ev-1".to_string(),
+    )));
+    profile
+}
+
 fn capable_node() -> NodeCapabilityReport {
     NodeCapabilityReport {
         kernel: KernelVersion::new(6, 8, 0),
@@ -140,6 +156,14 @@ fn capable_node() -> NodeCapabilityReport {
                 EspAlgorithmId::from("hmac-sha256"),
             ]),
         },
+        ipsec_gateway: Some(IpsecGatewayCapabilities {
+            xfrm_user: true,
+            xfrm_state: true,
+            xfrm_policy: true,
+            netns_scoped_operation: true,
+            route_rule_prerequisites: true,
+            evidence_id: Some("platform-ipsec-gateway-ev-1".to_string()),
+        }),
     }
 }
 
@@ -174,6 +198,121 @@ fn make_sriov_allowlist() -> SriovAllowlistPolicy {
             BTreeSet::from(["intel.com/ice_sriov".to_string()]),
         )]),
     }
+}
+
+// ------------------------------------------------------------------------
+// XFRM/IPsec gateway profile validation
+// ------------------------------------------------------------------------
+
+#[test]
+fn ipsec_gateway_preflight_passes_with_xfrm_evidence() {
+    let profile = production_ipsec_gateway_profile();
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+    assert!(report.is_eligible(), "{report:#?}");
+
+    let preflight = run_data_plane_preflight(&profile, &ctx);
+    assert!(preflight.passed, "{preflight:#?}");
+    assert!(preflight
+        .checks
+        .iter()
+        .any(|check| check.name == "XFRM_IPsec_Gateway" && check.passed));
+    assert!(preflight
+        .evidence_ids
+        .contains(&"platform-ipsec-gateway-ev-1".to_string()));
+}
+
+#[test]
+fn ipsec_gateway_missing_xfrm_evidence_blocks_readiness() {
+    let profile = production_ipsec_gateway_profile();
+    let mut node = capable_node();
+    node.ipsec_gateway = None;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+    assert!(report
+        .errors
+        .contains(&ValidationError::IpsecGatewayCapabilitiesMissing));
+
+    let preflight = run_data_plane_preflight(&profile, &ctx);
+    assert!(!preflight.passed);
+    assert!(preflight.blocks_readiness);
+    assert!(preflight
+        .messages
+        .contains(&"node missing IPsec gateway XFRM capability evidence".to_string()));
+}
+
+#[test]
+fn ipsec_gateway_missing_policy_support_is_reported_safely() {
+    let profile = production_ipsec_gateway_profile();
+    let mut node = capable_node();
+    node.ipsec_gateway
+        .as_mut()
+        .expect("capabilities")
+        .xfrm_policy = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+    assert!(report
+        .errors
+        .contains(&ValidationError::MissingIpsecGatewayFeature {
+            feature: "xfrm_policy".to_string(),
+        }));
+    assert!(report
+        .errors
+        .iter()
+        .map(ToString::to_string)
+        .all(|message| !message.contains("/proc") && !message.contains("/sys")));
+}
+
+#[test]
+fn ipsec_gateway_requires_minimal_linux_capabilities() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile
+        .pod_security
+        .added_capabilities
+        .remove(&LinuxCapability::CapNetRaw);
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+    assert!(report.errors.contains(&ValidationError::MissingCapability {
+        capability: LinuxCapability::CapNetRaw,
+    }));
+}
+
+#[test]
+fn ipsec_gateway_rejects_unsupported_pod_capability() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile
+        .pod_security
+        .added_capabilities
+        .insert(LinuxCapability::CapSysAdmin);
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+    assert!(report
+        .errors
+        .contains(&ValidationError::ProductionCapSysAdminForbidden));
+    assert!(report
+        .errors
+        .contains(&ValidationError::CapabilityNotAllowed {
+            capability: LinuxCapability::CapSysAdmin,
+            profile: DataPlaneProfile::IpsecGateway,
+        }));
 }
 
 // ------------------------------------------------------------------------
@@ -511,6 +650,7 @@ fn lab_node_without_xdp_prerequisites_activates_software_packet_fallback() {
             numa_node: Some(0),
         }],
         ipsec: IpsecCapabilities::default(),
+        ipsec_gateway: None,
     };
 
     let cpu_layout = standard_cpu_layout();
@@ -1887,54 +2027,6 @@ fn test_run_data_plane_preflight_report() {
     assert!(report.checks.iter().all(|c| c.passed));
 }
 
-// ------------------------------------------------------------------------
-// IPsec gateway profile validation
-// ------------------------------------------------------------------------
-
-fn production_ipsec_gateway_profile() -> ResourceProfile {
-    let mut profile = ResourceProfile::new(
-        NetworkFunctionKind::Custom("ePDG".to_string()),
-        DataPlaneProfile::IpsecGateway,
-        Environment::Production,
-    );
-    profile.pod_security.security_evidence_id = Some("ipsec-preflight-ev-1".to_string());
-    profile.pod_security.added_capabilities =
-        BTreeSet::from([LinuxCapability::CapNetAdmin, LinuxCapability::CapNetRaw]);
-    profile.ipsec = Some(IpsecGatewayProfile {
-        minimum_kernel: KernelVersion::new(5, 15, 0),
-        required_capabilities: BTreeSet::from([
-            LinuxCapability::CapNetAdmin,
-            LinuxCapability::CapNetRaw,
-        ]),
-        require_xfrm: true,
-        require_udp_500: true,
-        require_udp_4500: true,
-        require_sctp: true,
-        required_kernel_modules: BTreeSet::from([
-            KernelModuleId::from("xfrm_user"),
-            KernelModuleId::from("esp4"),
-        ]),
-        required_esp_algorithms: BTreeSet::from([
-            EspAlgorithmId::from("aes-cbc"),
-            EspAlgorithmId::from("hmac-sha256"),
-        ]),
-        network_attachments: vec![IpsecNetworkAttachment {
-            interface_name: "ens5f0".to_string(),
-            plane: "nwu".to_string(),
-            cni_type: CniType::Macvlan,
-            static_ip_required: false,
-            static_ip: None,
-            minimum_mtu: None,
-            mtu: Some(1500),
-            source_route_required: false,
-            source_route: None,
-            vlan_id: None,
-        }],
-        allow_userspace_esp_fallback: false,
-    });
-    profile
-}
-
 #[test]
 fn ipsec_gateway_validation_passes_for_production_node() {
     let profile = production_ipsec_gateway_profile();
@@ -2191,7 +2283,11 @@ fn ipsec_lab_missing_xfrm_user_policy_activates_software_packet_fallback() {
 fn ipsec_lab_kernel_esp_unavailable_activates_userspace_esp_fallback() {
     let mut profile = production_ipsec_gateway_profile();
     profile.environment = Environment::Lab;
-    profile.ipsec.as_mut().unwrap().allow_userspace_esp_fallback = true;
+    profile
+        .ipsec_gateway
+        .as_mut()
+        .unwrap()
+        .allow_userspace_esp_fallback = true;
     let mut node = capable_node();
     node.ipsec.esp_supported = false;
     let cpu_layout = standard_cpu_layout();
@@ -2304,13 +2400,13 @@ fn ipsec_no_data_plane_interfaces_is_rejected() {
     assert!(!report.is_eligible());
     assert!(report
         .errors
-        .contains(&ValidationError::IpsecNoDataPlaneInterfaces));
+        .contains(&ValidationError::IpsecGatewayNoDataPlaneInterfaces));
 }
 
 #[test]
 fn ipsec_profile_missing_is_rejected() {
     let mut profile = production_ipsec_gateway_profile();
-    profile.ipsec = None;
+    profile.ipsec_gateway = None;
     let node = capable_node();
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
@@ -2321,7 +2417,7 @@ fn ipsec_profile_missing_is_rejected() {
     assert!(!report.is_eligible());
     assert!(report
         .errors
-        .contains(&ValidationError::IpsecProfileMissing));
+        .contains(&ValidationError::IpsecGatewayProfileMissing));
 }
 
 #[test]
@@ -2365,7 +2461,7 @@ fn ipsec_missing_required_esp_algorithm_is_rejected() {
 #[test]
 fn ipsec_empty_network_attachments_is_rejected() {
     let mut profile = production_ipsec_gateway_profile();
-    profile.ipsec.as_mut().unwrap().network_attachments = vec![];
+    profile.ipsec_gateway.as_mut().unwrap().network_attachments = vec![];
     let node = capable_node();
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
@@ -2384,7 +2480,7 @@ fn ipsec_empty_network_attachments_is_rejected() {
 #[test]
 fn ipsec_network_attachment_missing_plane_is_rejected() {
     let mut profile = production_ipsec_gateway_profile();
-    profile.ipsec.as_mut().unwrap().network_attachments[0].plane = "   ".to_string();
+    profile.ipsec_gateway.as_mut().unwrap().network_attachments[0].plane = "   ".to_string();
     let node = capable_node();
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
@@ -2403,7 +2499,8 @@ fn ipsec_network_attachment_missing_plane_is_rejected() {
 #[test]
 fn ipsec_network_attachment_unknown_interface_is_rejected() {
     let mut profile = production_ipsec_gateway_profile();
-    profile.ipsec.as_mut().unwrap().network_attachments[0].interface_name = "ens6f0".to_string();
+    profile.ipsec_gateway.as_mut().unwrap().network_attachments[0].interface_name =
+        "ens6f0".to_string();
     let node = capable_node();
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
@@ -2420,7 +2517,7 @@ fn ipsec_network_attachment_unknown_interface_is_rejected() {
 #[test]
 fn ipsec_network_attachment_invalid_vlan_is_rejected() {
     let mut profile = production_ipsec_gateway_profile();
-    profile.ipsec.as_mut().unwrap().network_attachments[0].vlan_id = Some(5000);
+    profile.ipsec_gateway.as_mut().unwrap().network_attachments[0].vlan_id = Some(5000);
     let node = capable_node();
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
@@ -2439,7 +2536,7 @@ fn ipsec_network_attachment_invalid_vlan_is_rejected() {
 #[test]
 fn ipsec_preflight_network_check_passes_when_profile_missing_is_unattributed() {
     let mut profile = production_ipsec_gateway_profile();
-    profile.ipsec = None;
+    profile.ipsec_gateway = None;
     let node = capable_node();
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
@@ -2448,7 +2545,7 @@ fn ipsec_preflight_network_check_passes_when_profile_missing_is_unattributed() {
     let report = run_data_plane_preflight(&profile, &ctx);
 
     assert!(!report.passed);
-    // IpsecProfileMissing follows the AF_XDP/SR-IOV precedent: it is not
+    // IpsecGatewayProfileMissing follows the AF_XDP/SR-IOV precedent: it is not
     // attributed to the Network_Attachments check.
     let network_check = report
         .checks
@@ -2499,7 +2596,11 @@ fn ipsec_preflight_network_check_passes_for_capable_node() {
 #[test]
 fn ipsec_production_rejects_userspace_esp_fallback() {
     let mut profile = production_ipsec_gateway_profile();
-    profile.ipsec.as_mut().unwrap().allow_userspace_esp_fallback = true;
+    profile
+        .ipsec_gateway
+        .as_mut()
+        .unwrap()
+        .allow_userspace_esp_fallback = true;
     let node = capable_node();
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
@@ -2517,7 +2618,11 @@ fn ipsec_production_rejects_userspace_esp_fallback() {
 fn ipsec_lab_missing_xfrm_netlink_activates_userspace_esp_fallback() {
     let mut profile = production_ipsec_gateway_profile();
     profile.environment = Environment::Lab;
-    profile.ipsec.as_mut().unwrap().allow_userspace_esp_fallback = true;
+    profile
+        .ipsec_gateway
+        .as_mut()
+        .unwrap()
+        .allow_userspace_esp_fallback = true;
     let mut node = capable_node();
     node.ipsec.xfrm_netlink_available = false;
     let cpu_layout = standard_cpu_layout();
@@ -2538,7 +2643,11 @@ fn ipsec_lab_missing_xfrm_netlink_activates_userspace_esp_fallback() {
 fn ipsec_lab_missing_xfrm_user_policy_activates_userspace_esp_fallback() {
     let mut profile = production_ipsec_gateway_profile();
     profile.environment = Environment::Lab;
-    profile.ipsec.as_mut().unwrap().allow_userspace_esp_fallback = true;
+    profile
+        .ipsec_gateway
+        .as_mut()
+        .unwrap()
+        .allow_userspace_esp_fallback = true;
     let mut node = capable_node();
     node.ipsec.xfrm_user_policy_available = false;
     let cpu_layout = standard_cpu_layout();
@@ -2600,7 +2709,7 @@ fn ipsec_lab_missing_required_esp_algorithm_activates_software_packet_fallback()
 #[test]
 fn ipsec_network_attachment_static_ip_required_but_missing_is_rejected() {
     let mut profile = production_ipsec_gateway_profile();
-    let attachment = &mut profile.ipsec.as_mut().unwrap().network_attachments[0];
+    let attachment = &mut profile.ipsec_gateway.as_mut().unwrap().network_attachments[0];
     attachment.static_ip_required = true;
     attachment.static_ip = None;
     let node = capable_node();
@@ -2621,7 +2730,7 @@ fn ipsec_network_attachment_static_ip_required_but_missing_is_rejected() {
 #[test]
 fn ipsec_network_attachment_source_route_required_but_missing_is_rejected() {
     let mut profile = production_ipsec_gateway_profile();
-    let attachment = &mut profile.ipsec.as_mut().unwrap().network_attachments[0];
+    let attachment = &mut profile.ipsec_gateway.as_mut().unwrap().network_attachments[0];
     attachment.source_route_required = true;
     attachment.source_route = None;
     let node = capable_node();
@@ -2642,7 +2751,7 @@ fn ipsec_network_attachment_source_route_required_but_missing_is_rejected() {
 #[test]
 fn ipsec_network_attachment_mtu_below_minimum_is_rejected() {
     let mut profile = production_ipsec_gateway_profile();
-    let attachment = &mut profile.ipsec.as_mut().unwrap().network_attachments[0];
+    let attachment = &mut profile.ipsec_gateway.as_mut().unwrap().network_attachments[0];
     attachment.minimum_mtu = Some(1500);
     attachment.mtu = Some(1400);
     let node = capable_node();
@@ -2663,7 +2772,7 @@ fn ipsec_network_attachment_mtu_below_minimum_is_rejected() {
 #[test]
 fn ipsec_network_attachment_minimum_mtu_without_mtu_is_rejected() {
     let mut profile = production_ipsec_gateway_profile();
-    let attachment = &mut profile.ipsec.as_mut().unwrap().network_attachments[0];
+    let attachment = &mut profile.ipsec_gateway.as_mut().unwrap().network_attachments[0];
     attachment.minimum_mtu = Some(1500);
     attachment.mtu = None;
     let node = capable_node();
@@ -2684,7 +2793,7 @@ fn ipsec_network_attachment_minimum_mtu_without_mtu_is_rejected() {
 #[test]
 fn ipsec_network_attachment_empty_custom_cni_type_is_rejected() {
     let mut profile = production_ipsec_gateway_profile();
-    profile.ipsec.as_mut().unwrap().network_attachments[0].cni_type =
+    profile.ipsec_gateway.as_mut().unwrap().network_attachments[0].cni_type =
         CniType::Custom("   ".to_string());
     let node = capable_node();
     let cpu_layout = standard_cpu_layout();
@@ -2704,7 +2813,7 @@ fn ipsec_network_attachment_empty_custom_cni_type_is_rejected() {
 #[test]
 fn ipsec_network_attachment_invalid_static_ip_format_is_rejected() {
     let mut profile = production_ipsec_gateway_profile();
-    let attachment = &mut profile.ipsec.as_mut().unwrap().network_attachments[0];
+    let attachment = &mut profile.ipsec_gateway.as_mut().unwrap().network_attachments[0];
     attachment.static_ip = Some("not-an-ip".to_string());
     let node = capable_node();
     let cpu_layout = standard_cpu_layout();
@@ -2726,7 +2835,7 @@ fn ipsec_network_attachment_invalid_static_ip_format_is_rejected() {
 fn ipsec_network_attachment_static_ip_accepts_ipv4_and_ipv6() {
     for ip in ["10.0.0.1", "2001:db8::1"] {
         let mut profile = production_ipsec_gateway_profile();
-        let attachment = &mut profile.ipsec.as_mut().unwrap().network_attachments[0];
+        let attachment = &mut profile.ipsec_gateway.as_mut().unwrap().network_attachments[0];
         attachment.static_ip = Some(ip.to_string());
         let node = capable_node();
         let cpu_layout = standard_cpu_layout();
@@ -2744,7 +2853,7 @@ fn ipsec_network_attachment_static_ip_accepts_ipv4_and_ipv6() {
 #[test]
 fn ipsec_network_attachment_mtu_below_absolute_minimum_is_rejected() {
     let mut profile = production_ipsec_gateway_profile();
-    let attachment = &mut profile.ipsec.as_mut().unwrap().network_attachments[0];
+    let attachment = &mut profile.ipsec_gateway.as_mut().unwrap().network_attachments[0];
     attachment.minimum_mtu = None;
     attachment.mtu = Some(1000);
     let node = capable_node();
@@ -2765,7 +2874,7 @@ fn ipsec_network_attachment_mtu_below_absolute_minimum_is_rejected() {
 #[test]
 fn ipsec_network_attachment_source_route_empty_is_rejected() {
     let mut profile = production_ipsec_gateway_profile();
-    let attachment = &mut profile.ipsec.as_mut().unwrap().network_attachments[0];
+    let attachment = &mut profile.ipsec_gateway.as_mut().unwrap().network_attachments[0];
     attachment.source_route_required = true;
     attachment.source_route = Some("   ".to_string());
     let node = capable_node();
@@ -2786,7 +2895,7 @@ fn ipsec_network_attachment_source_route_empty_is_rejected() {
 #[test]
 fn ipsec_profile_with_all_require_flags_false_passes_kernel_and_cap_checks() {
     let mut profile = production_ipsec_gateway_profile();
-    let ipsec = profile.ipsec.as_mut().unwrap();
+    let ipsec = profile.ipsec_gateway.as_mut().unwrap();
     ipsec.require_xfrm = false;
     ipsec.require_udp_500 = false;
     ipsec.require_udp_4500 = false;
@@ -2809,7 +2918,11 @@ fn ipsec_lab_missing_xfrm_degrades_via_userspace_esp_when_software_path_disallow
     let mut profile = production_ipsec_gateway_profile();
     profile.environment = Environment::Lab;
     profile.lab_fallback.allow_software_packet_path = false;
-    profile.ipsec.as_mut().unwrap().allow_userspace_esp_fallback = true;
+    profile
+        .ipsec_gateway
+        .as_mut()
+        .unwrap()
+        .allow_userspace_esp_fallback = true;
     let mut node = capable_node();
     node.ipsec.xfrm_netlink_available = false;
     node.ipsec.xfrm_user_policy_available = false;
@@ -2843,14 +2956,14 @@ fn ipsec_preflight_success_path_passes_all_checks() {
 
     assert!(report.passed, "preflight should pass: {report:#?}");
     assert!(!report.blocks_readiness);
-    assert_eq!(report.checks.len(), 6);
+    assert_eq!(report.checks.len(), 7);
     assert!(report.checks.iter().all(|c| c.passed));
 }
 
 #[test]
 fn ipsec_require_xfrm_implies_cap_net_admin_in_production() {
     let mut profile = production_ipsec_gateway_profile();
-    let ipsec = profile.ipsec.as_mut().unwrap();
+    let ipsec = profile.ipsec_gateway.as_mut().unwrap();
     ipsec.require_xfrm = true;
     ipsec.required_capabilities.clear();
     profile.pod_security.added_capabilities.clear();
@@ -2890,7 +3003,11 @@ fn ipsec_preflight_ipsec_capabilities_check_fails_on_missing_capability() {
 #[test]
 fn ipsec_preflight_ipsec_capabilities_check_fails_on_production_lab_fallback() {
     let mut profile = production_ipsec_gateway_profile();
-    profile.ipsec.as_mut().unwrap().allow_userspace_esp_fallback = true;
+    profile
+        .ipsec_gateway
+        .as_mut()
+        .unwrap()
+        .allow_userspace_esp_fallback = true;
     let node = capable_node();
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
@@ -2911,7 +3028,7 @@ fn ipsec_preflight_ipsec_capabilities_check_fails_on_production_lab_fallback() {
 fn ipsec_cni_type_supports_sriov_and_host_network() {
     for cni in [CniType::Sriov, CniType::HostNetwork] {
         let mut profile = production_ipsec_gateway_profile();
-        profile.ipsec.as_mut().unwrap().network_attachments[0].cni_type = cni.clone();
+        profile.ipsec_gateway.as_mut().unwrap().network_attachments[0].cni_type = cni.clone();
         let node = capable_node();
         let cpu_layout = standard_cpu_layout();
         let interfaces = vec!["ens5f0".to_string()];
@@ -3031,7 +3148,7 @@ fn ipsec_preflight_unsupported_kernel_version_fails_ipsec_capabilities_check() {
 #[test]
 fn ipsec_preflight_missing_profile_fails_ipsec_capabilities_check() {
     let mut profile = production_ipsec_gateway_profile();
-    profile.ipsec = None;
+    profile.ipsec_gateway = None;
     let node = capable_node();
     let cpu_layout = standard_cpu_layout();
     let interfaces = vec!["ens5f0".to_string()];
@@ -3052,7 +3169,7 @@ fn ipsec_preflight_missing_profile_fails_ipsec_capabilities_check() {
 fn ipsec_blank_kernel_module_identifier_is_rejected() {
     let mut profile = production_ipsec_gateway_profile();
     profile
-        .ipsec
+        .ipsec_gateway
         .as_mut()
         .unwrap()
         .required_kernel_modules
@@ -3085,7 +3202,7 @@ fn ipsec_blank_kernel_module_identifier_is_rejected() {
 fn ipsec_blank_esp_algorithm_identifier_is_rejected() {
     let mut profile = production_ipsec_gateway_profile();
     profile
-        .ipsec
+        .ipsec_gateway
         .as_mut()
         .unwrap()
         .required_esp_algorithms

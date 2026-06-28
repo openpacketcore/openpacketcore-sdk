@@ -4,6 +4,8 @@
 //! Configuration lives in `opc-config-bus`; config-false (operational/state) data
 //! does not. gNMI `Get(STATE|OPERATIONAL|ALL)` and NETCONF `<get>` read that data
 //! from the consuming NF through [`OperationalStateProvider`].
+//! [`ConfigApplyPlanState`] is a generic helper for products that expose the
+//! accepted/rejected config apply-plan state under their own YANG model.
 //!
 //! The contract is **anti-fabrication**: a provider returns a value only for a
 //! path it can actually supply. A requested path that is absent from the response
@@ -24,6 +26,10 @@ use std::collections::HashSet;
 use opc_config_model::YangPath;
 use thiserror::Error;
 use tokio::sync::mpsc;
+
+pub mod config_apply;
+
+pub use config_apply::ConfigApplyPlanState;
 
 const DEFAULT_OPERATIONAL_EVENT_QUEUE_CAPACITY: usize = 1;
 

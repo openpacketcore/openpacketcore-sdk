@@ -660,16 +660,9 @@ async fn test_sigterm_during_init_never_promotes_ready_impl() {
     release_init.notify_one();
     let handle = build_task.await.unwrap();
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if handle.is_stopped().await {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("runtime should complete shutdown after init is released");
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_stopped())
+        .await
+        .expect("runtime should complete shutdown after init is released");
 
     let phases = phases.lock().unwrap();
     assert!(

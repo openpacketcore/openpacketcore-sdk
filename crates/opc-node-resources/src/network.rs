@@ -296,14 +296,14 @@ pub fn validate_ipsec_gateway(
     context: &ValidationContext<'_>,
     report: &mut ValidationReport,
 ) {
-    let Some(ipsec) = profile.ipsec.as_ref() else {
-        report.push_error(ValidationError::IpsecProfileMissing);
+    let Some(ipsec) = profile.ipsec_gateway.as_ref() else {
+        report.push_error(ValidationError::IpsecGatewayProfileMissing);
         return;
     };
 
     // RFC 011 §9.1: IPsec gateway requires at least one named data-plane attachment.
     if context.data_plane_interfaces.is_empty() {
-        report.push_error(ValidationError::IpsecNoDataPlaneInterfaces);
+        report.push_error(ValidationError::IpsecGatewayNoDataPlaneInterfaces);
     }
 
     // Lab-only fallback knobs must not appear on production profiles.
@@ -353,6 +353,8 @@ pub fn validate_ipsec_gateway(
             });
         }
     }
+
+    validate_ipsec_gateway_evidence(ipsec, context, report);
 
     // When XFRM is required, CAP_NET_ADMIN is mandatory (it is needed to
     // install and manage XFRM policies in the pod namespace). This is implied
@@ -546,6 +548,54 @@ pub fn validate_ipsec_gateway(
                     capability: format!("esp_algorithm:{algorithm}"),
                 });
             }
+        }
+    }
+}
+
+fn validate_ipsec_gateway_evidence(
+    ipsec: &IpsecGatewayProfile,
+    context: &ValidationContext<'_>,
+    report: &mut ValidationReport,
+) {
+    let required_features = [
+        ("xfrm_user", ipsec.require_xfrm_user),
+        ("xfrm_state", ipsec.require_xfrm_state),
+        ("xfrm_policy", ipsec.require_xfrm_policy),
+        (
+            "netns_scoped_operation",
+            ipsec.require_netns_scoped_operation,
+        ),
+        (
+            "route_rule_prerequisites",
+            ipsec.require_route_rule_prerequisites,
+        ),
+    ];
+
+    if !required_features.iter().any(|(_, required)| *required) {
+        return;
+    }
+
+    let Some(capabilities) = context.node.ipsec_gateway.as_ref() else {
+        report.push_error(ValidationError::IpsecGatewayCapabilitiesMissing);
+        return;
+    };
+
+    for (feature, required) in required_features {
+        if !required {
+            continue;
+        }
+        let available = match feature {
+            "xfrm_user" => capabilities.xfrm_user,
+            "xfrm_state" => capabilities.xfrm_state,
+            "xfrm_policy" => capabilities.xfrm_policy,
+            "netns_scoped_operation" => capabilities.netns_scoped_operation,
+            "route_rule_prerequisites" => capabilities.route_rule_prerequisites,
+            _ => true,
+        };
+        if !available {
+            report.push_error(ValidationError::MissingIpsecGatewayFeature {
+                feature: feature.to_string(),
+            });
         }
     }
 }

@@ -21,3 +21,9 @@ servers reject provider responses that report unrequested paths, duplicate paths
 or origin metadata the request did not ask for. The streaming on-change
 subscription used by gNMI `Subscribe`/NETCONF notifications is layered in the
 Subscribe slice, not here.
+
+The `config_apply` helper module provides a generic projection DTO for accepted
+and rejected config apply plans. Products supply their own YANG placement, then
+use `ConfigApplyPlanState` to emit validated RFC 7951 JSON with the last
+accepted plan, last rejected plan, known active version/transaction id, and any
+active traffic block reason derived from an admitted drain/restart plan.

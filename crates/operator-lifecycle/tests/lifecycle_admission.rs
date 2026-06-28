@@ -198,6 +198,7 @@ fn test_data_plane_preflight_admission_rejection() {
             numa_node: Some(0),
         }],
         ipsec: IpsecCapabilities::default(),
+        ipsec_gateway: None,
     };
 
     req.node_capabilities = Some(node_report);
@@ -279,6 +280,7 @@ fn test_data_plane_preflight_admission_success() {
             numa_node: Some(0),
         }],
         ipsec: IpsecCapabilities::default(),
+        ipsec_gateway: None,
     };
 
     req.node_capabilities = Some(node_report);

@@ -4,6 +4,12 @@
 //! data-plane snapshot access. This crate holds the cross-crate request, result,
 //! identity, and validation types used by that boundary.
 //!
+//! Apply-plan types classify the operational impact of a validated candidate
+//! before durable append/publication. Products supply [`ConfigImpactClassifier`]
+//! implementations for domain-specific rules; the default
+//! [`HotConfigImpactClassifier`] preserves existing behavior by marking
+//! SDK-derived changed paths as [`ChangeImpactClass::Hot`].
+//!
 //! ```
 //! use opc_config_model::{
 //!     CommitMode, CommitRequest, ConfigOperation, OpcConfig, RequestId, RequestSource,
@@ -83,6 +89,14 @@ use std::{
 };
 use thiserror::Error;
 use uuid::Uuid;
+
+mod apply_plan;
+
+pub use apply_plan::{
+    ApplyPlan, ApplyPlanChange, ApplyPlanError, ApplyPlanWarning, ChangeImpact, ChangeImpactClass,
+    ConfigImpactClassifier, ConfigWorkflowRequirement, HotConfigImpactClassifier,
+    FORBIDDEN_LIVE_REQUIRES_MAINTENANCE_WORKFLOW,
+};
 
 /// Shared parse/validation error for config-model value objects.
 ///
@@ -367,6 +381,7 @@ pub enum CommitStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommitErrorCode {
     AdmissionRejected,
+    ApplyPlanRejected,
     DeadlineExceeded,
     MissingCandidate,
     SyntaxValidationFailed,
@@ -385,6 +400,7 @@ impl CommitErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AdmissionRejected => "admission_rejected",
+            Self::ApplyPlanRejected => "apply_plan_rejected",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::MissingCandidate => "missing_candidate",
             Self::SyntaxValidationFailed => "syntax_validation_failed",
@@ -413,6 +429,8 @@ impl fmt::Display for CommitErrorCode {
 pub struct CommitError {
     pub code: CommitErrorCode,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_plan: Option<Box<ApplyPlan>>,
 }
 
 impl CommitError {
@@ -420,6 +438,7 @@ impl CommitError {
         Self {
             code,
             message: message.into(),
+            apply_plan: None,
         }
     }
 
@@ -489,6 +508,14 @@ impl CommitError {
 
     pub fn authorization_denied(message: impl Into<String>) -> Self {
         Self::new(CommitErrorCode::AuthorizationDenied, message)
+    }
+
+    pub fn apply_plan_rejected(apply_plan: ApplyPlan) -> Self {
+        Self {
+            code: CommitErrorCode::ApplyPlanRejected,
+            message: "candidate config apply plan was rejected".to_string(),
+            apply_plan: Some(Box::new(apply_plan)),
+        }
     }
 }
 
@@ -797,4 +824,6 @@ pub struct CommitResult {
     pub new_version: Option<ConfigVersion>,
     pub status: CommitStatus,
     pub changed_paths: Vec<YangPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_plan: Option<ApplyPlan>,
 }

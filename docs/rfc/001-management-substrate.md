@@ -222,11 +222,21 @@ pub struct CommitResult {
     pub new_version: Option<ConfigVersion>,
     pub status: CommitStatus,
     pub changed_paths: Vec<YangPath>,
+    pub apply_plan: Option<ApplyPlan>,
 }
 ```
 
 Failed commits MUST include stable machine-readable error codes. Error strings
 MUST NOT contain secrets or raw config fragments.
+
+Candidate-bearing commit, commit-confirmed, and validate-only requests SHOULD
+return an `ApplyPlan` that classifies the operational impact of the
+SDK-derived changed paths after validation and before durable append. The
+default classifier returns `hot` plans so existing products remain compatible;
+products MAY install a `ConfigImpactClassifier` for domain-specific `warm`,
+`drain-required`, `restart-required`, or `forbidden-live` behavior.
+`forbidden-live` and apply-plan hard errors MUST fail closed before durable
+append/publication and attach the rejected plan to `CommitError.apply_plan`.
 
 ## 6. Management Thread Boundary
 

@@ -32,6 +32,8 @@ pub enum DiagnosticCode {
     #[serde(rename = "unsupported-xpath-function")]
     UnsupportedXPathFunction,
     UnsupportedYangFeature,
+    YangSourceSyntaxError,
+    YangSourceMismatch,
     /// Reserved for future XPath function arity validation once function
     /// lowering is enabled for the supported profile.
     ArityMismatch,
@@ -44,6 +46,8 @@ impl fmt::Display for DiagnosticCode {
             Self::ConstraintDepthExceeded => write!(f, "constraint-depth-exceeded"),
             Self::UnsupportedXPathFunction => write!(f, "unsupported-xpath-function"),
             Self::UnsupportedYangFeature => write!(f, "unsupported-yang-feature"),
+            Self::YangSourceSyntaxError => write!(f, "yang-source-syntax-error"),
+            Self::YangSourceMismatch => write!(f, "yang-source-mismatch"),
             Self::ArityMismatch => write!(f, "arity-mismatch"),
         }
     }

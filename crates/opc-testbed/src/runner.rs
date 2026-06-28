@@ -96,6 +96,35 @@ impl LocalRunner {
     }
 
     fn execute_step(&mut self, step: &Step) -> Result<(), crate::TestbedError> {
+        if let Some((kind, protocol_step)) = step.protocol_fixture() {
+            self.state.insert(
+                format!(
+                    "protocol.{kind}.{}.{}.fixture",
+                    protocol_step.from, protocol_step.to
+                ),
+                protocol_step.fixture.clone(),
+            );
+            if let Some(label) = &protocol_step.label {
+                self.state.insert(
+                    format!(
+                        "protocol.{kind}.{}.{}.label",
+                        protocol_step.from, protocol_step.to
+                    ),
+                    label.clone(),
+                );
+            }
+            if let Some(transport) = &protocol_step.transport {
+                self.state.insert(
+                    format!(
+                        "protocol.{kind}.{}.{}.transport",
+                        protocol_step.from, protocol_step.to
+                    ),
+                    transport.clone(),
+                );
+            }
+            return Ok(());
+        }
+
         match step {
             Step::ClockJump { duration_ms } => {
                 self.clock
@@ -139,6 +168,63 @@ impl LocalRunner {
                 let sim = self.simulator_mut(target)?;
                 sim.handle_step(step)
             }
+            Step::PeerDown { target } => {
+                self.state
+                    .insert(format!("fault.{target}.peer_down"), "true".to_string());
+                Ok(())
+            }
+            Step::Timeout { target, protocol } => {
+                self.state.insert(
+                    format!("fault.{target}.timeout.protocol"),
+                    protocol.clone().unwrap_or_else(|| "any".to_string()),
+                );
+                Ok(())
+            }
+            Step::Retransmission {
+                target,
+                protocol,
+                attempts,
+            } => {
+                self.state.insert(
+                    format!("fault.{target}.retransmission.protocol"),
+                    protocol.clone(),
+                );
+                self.state.insert(
+                    format!("fault.{target}.retransmission.attempts"),
+                    attempts.to_string(),
+                );
+                Ok(())
+            }
+            Step::PacketLoss {
+                target,
+                protocol,
+                packet_count,
+            } => {
+                self.state.insert(
+                    format!("fault.{target}.packet_loss.protocol"),
+                    protocol.clone(),
+                );
+                self.state.insert(
+                    format!("fault.{target}.packet_loss.count"),
+                    packet_count.to_string(),
+                );
+                Ok(())
+            }
+            Step::DuplicatePacket {
+                target,
+                protocol,
+                packet_count,
+            } => {
+                self.state.insert(
+                    format!("fault.{target}.duplicate_packet.protocol"),
+                    protocol.clone(),
+                );
+                self.state.insert(
+                    format!("fault.{target}.duplicate_packet.count"),
+                    packet_count.to_string(),
+                );
+                Ok(())
+            }
             Step::DelayedResponse { target, delay_ms } => {
                 self.simulator_mut(target)?;
                 self.clock
@@ -169,6 +255,15 @@ impl LocalRunner {
                 );
                 Ok(())
             }
+            Step::SendIkev2(_)
+            | Step::ExpectIkev2(_)
+            | Step::SendDiameter(_)
+            | Step::ExpectDiameter(_)
+            | Step::SendGtpv2c(_)
+            | Step::ExpectGtpv2c(_)
+            | Step::SendGtpu(_)
+            | Step::ExpectGtpu(_)
+            | Step::ExpectEsp(_) => unreachable!("protocol fixture steps are handled above"),
             Step::Other => Err(crate::TestbedError::Validation(
                 "unsupported scenario step".to_string(),
             )),
@@ -437,7 +532,8 @@ impl HardwarePreflight {
 fn build_hardware_preflight(config: &HardwareLabRunnerConfig) -> HardwarePreflight {
     use opc_node_resources::{
         AfXdpProfile, BpfCapabilities, CpuLayout, CpuManagerPolicy, DataPlaneProfile, Environment,
-        HugepagePool, IpsecCapabilities, KernelVersion, LinkStatePolicy, LinuxCapability,
+        EspAlgorithmId, HugepagePool, IpsecCapabilities, IpsecGatewayCapabilities,
+        IpsecGatewayProfile, KernelModuleId, KernelVersion, LinkStatePolicy, LinuxCapability,
         NetworkFunctionKind, NicCapability, NodeCapabilityReport, NodeCpuCapabilities,
         NodeMemoryCapabilities, PodSecurityExceptionModel, ResourceProfile, SriovAllowlistPolicy,
         SriovProfile, TopologyManagerPolicy, XdpMode,
@@ -447,6 +543,10 @@ fn build_hardware_preflight(config: &HardwareLabRunnerConfig) -> HardwarePreflig
         DataPlaneProfile::SriovFastPath
     } else if config.sriov_xdp_expectations.contains("xdp") {
         DataPlaneProfile::AfXdpFastPath
+    } else if config.sriov_xdp_expectations.contains("ipsec")
+        || config.sriov_xdp_expectations.contains("xfrm")
+    {
+        DataPlaneProfile::IpsecGateway
     } else {
         DataPlaneProfile::ControlPlaneOnly
     };
@@ -499,6 +599,11 @@ fn build_hardware_preflight(config: &HardwareLabRunnerConfig) -> HardwarePreflig
             bpf_artifacts: vec![],
         });
     }
+    if matches!(data_plane_profile, DataPlaneProfile::IpsecGateway) {
+        profile.ipsec_gateway = Some(IpsecGatewayProfile::standard(Some(
+            "hardware-lab-dry-run-ipsec-evidence".to_string(),
+        )));
+    }
 
     let nic_names = if data_plane_interfaces.is_empty() {
         vec!["net0".to_string()]
@@ -546,7 +651,30 @@ fn build_hardware_preflight(config: &HardwareLabRunnerConfig) -> HardwarePreflig
             }],
         },
         nics,
-        ipsec: IpsecCapabilities::default(),
+        ipsec: IpsecCapabilities {
+            xfrm_netlink_available: true,
+            xfrm_user_policy_available: true,
+            esp_supported: true,
+            udp_500_bind_allowed: true,
+            udp_4500_bind_allowed: true,
+            sctp_supported: true,
+            available_kernel_modules: BTreeSet::from([
+                KernelModuleId::from("xfrm_user"),
+                KernelModuleId::from("esp4"),
+            ]),
+            supported_esp_algorithms: BTreeSet::from([
+                EspAlgorithmId::from("aes-cbc"),
+                EspAlgorithmId::from("hmac-sha256"),
+            ]),
+        },
+        ipsec_gateway: Some(IpsecGatewayCapabilities {
+            xfrm_user: true,
+            xfrm_state: true,
+            xfrm_policy: true,
+            netns_scoped_operation: true,
+            route_rule_prerequisites: true,
+            evidence_id: Some("testbed-ipsec-gateway-capabilities".to_string()),
+        }),
     };
 
     let cpu_layout = if matches!(data_plane_profile, DataPlaneProfile::ControlPlaneOnly) {
