@@ -1,7 +1,7 @@
 //! Durable datastore contract for the commit worker, an AEAD-encrypting
 //! wrapper that binds records to RFC 001 §9.2 envelope AAD (transaction
-//! lineage, principal, tenant, schema digest, store kind), and an in-memory
-//! mock used by tests.
+//! lineage, principal, tenant, schema digest, store kind), and a non-durable
+//! in-memory backend for development, CI, and bootstrap-only runtimes.
 
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
@@ -313,25 +313,32 @@ where
     Ok(())
 }
 
-/// In-memory mock store for unit tests and early integration work.
-pub struct MockManagedDatastore<C: OpcConfig> {
-    state: AsyncMutex<MockStoreState<C>>,
+/// Non-durable in-process [`ManagedDatastore`] for local development, CI, and
+/// management-only bootstrap.
+///
+/// This backend preserves the same commit-bus invariants expected from a real
+/// store while the process is alive: append ordering, rollback lookup,
+/// idempotency-key replay, recovery markers, and commit-confirmed marker
+/// updates. It does **not** write to durable storage, does **not** survive
+/// process restart, and must not be used as production configuration storage.
+pub struct InMemoryManagedDatastore<C: OpcConfig> {
+    state: AsyncMutex<InMemoryStoreState<C>>,
 }
 
-struct MockStoreState<C: OpcConfig> {
+struct InMemoryStoreState<C: OpcConfig> {
     latest: Option<StoredConfig<C>>,
     history: Vec<StoredConfig<C>>,
     rollback_labels: HashMap<String, usize>,
 }
 
-impl<C: OpcConfig> MockManagedDatastore<C> {
+impl<C: OpcConfig> InMemoryManagedDatastore<C> {
     /// Creates an empty store. It enforces the same append invariants as a
     /// real backend (unique tx ids and versions, no rollback to pending
     /// commit-confirmed records) but keeps everything in process memory, so
     /// nothing survives a restart.
     pub fn new() -> Self {
         Self {
-            state: AsyncMutex::new(MockStoreState {
+            state: AsyncMutex::new(InMemoryStoreState {
                 latest: None,
                 history: Vec::new(),
                 rollback_labels: HashMap::new(),
@@ -364,14 +371,14 @@ impl<C: OpcConfig> MockManagedDatastore<C> {
     }
 }
 
-impl<C: OpcConfig> Default for MockManagedDatastore<C> {
+impl<C: OpcConfig> Default for InMemoryManagedDatastore<C> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl<C: OpcConfig> ManagedDatastore<C> for MockManagedDatastore<C> {
+impl<C: OpcConfig> ManagedDatastore<C> for InMemoryManagedDatastore<C> {
     async fn load_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError> {
         Ok(self.state.lock().await.latest.clone())
     }
@@ -386,7 +393,7 @@ impl<C: OpcConfig> ManagedDatastore<C> for MockManagedDatastore<C> {
                     .rev()
                     .find(|record| record.confirmed_deadline.is_none())
                     .ok_or_else(|| {
-                        StoreError::not_found("no confirmed config present in mock store")
+                        StoreError::not_found("no confirmed config present in in-memory store")
                     })?;
 
                 let parent_tx = latest_confirmed.parent_tx_id.ok_or_else(|| {
@@ -400,7 +407,7 @@ impl<C: OpcConfig> ManagedDatastore<C> for MockManagedDatastore<C> {
                     .find(|record| record.tx_id == parent_tx)
                     .cloned()
                     .ok_or_else(|| {
-                        StoreError::not_found("parent transaction not found in mock store")
+                        StoreError::not_found("parent transaction not found in in-memory store")
                     })?
             }
             RollbackTarget::Version(version) => state
@@ -411,7 +418,7 @@ impl<C: OpcConfig> ManagedDatastore<C> for MockManagedDatastore<C> {
                 .cloned()
                 .ok_or_else(|| {
                     StoreError::not_found(format!(
-                        "rollback version {version} not present in mock store"
+                        "rollback version {version} not present in in-memory store"
                     ))
                 })?,
             RollbackTarget::TxId(tx_id) => state
@@ -422,7 +429,7 @@ impl<C: OpcConfig> ManagedDatastore<C> for MockManagedDatastore<C> {
                 .cloned()
                 .ok_or_else(|| {
                     StoreError::not_found(format!(
-                        "rollback transaction {tx_id} not present in mock store"
+                        "rollback transaction {tx_id} not present in in-memory store"
                     ))
                 })?,
             RollbackTarget::Label(label) => state
@@ -432,7 +439,7 @@ impl<C: OpcConfig> ManagedDatastore<C> for MockManagedDatastore<C> {
                 .cloned()
                 .ok_or_else(|| {
                     StoreError::not_found(format!(
-                        "rollback label '{label}' not present in mock store"
+                        "rollback label '{label}' not present in in-memory store"
                     ))
                 })?,
         };
@@ -467,7 +474,7 @@ impl<C: OpcConfig> ManagedDatastore<C> for MockManagedDatastore<C> {
             .any(|record| record.tx_id == commit.tx_id)
         {
             return Err(StoreError::internal(format!(
-                "duplicate transaction {} rejected by mock store",
+                "duplicate transaction {} rejected by in-memory store",
                 commit.tx_id
             )));
         }
@@ -477,7 +484,7 @@ impl<C: OpcConfig> ManagedDatastore<C> for MockManagedDatastore<C> {
             .any(|record| record.version == commit.version)
         {
             return Err(StoreError::internal(format!(
-                "duplicate config version {} rejected by mock store",
+                "duplicate config version {} rejected by in-memory store",
                 commit.version
             )));
         }
@@ -498,7 +505,7 @@ impl<C: OpcConfig> ManagedDatastore<C> for MockManagedDatastore<C> {
             .position(|record| record.tx_id == tx_id)
             .ok_or_else(|| {
                 StoreError::not_found(format!(
-                    "transaction {tx_id} not present in mock store for recovery update"
+                    "transaction {tx_id} not present in in-memory store for recovery update"
                 ))
             })?;
 
@@ -521,7 +528,7 @@ impl<C: OpcConfig> ManagedDatastore<C> for MockManagedDatastore<C> {
             .position(|record| record.tx_id == tx_id)
             .ok_or_else(|| {
                 StoreError::not_found(format!(
-                    "transaction {tx_id} not present in mock store for confirmation"
+                    "transaction {tx_id} not present in in-memory store for confirmation"
                 ))
             })?;
         state.history[index].confirmed_deadline = None;
@@ -535,3 +542,9 @@ impl<C: OpcConfig> ManagedDatastore<C> for MockManagedDatastore<C> {
         Ok(())
     }
 }
+
+/// Compatibility alias for tests and older SDK consumers.
+///
+/// New product code that needs a non-production backend should prefer
+/// [`InMemoryManagedDatastore`] so runtime composition does not imply a mock.
+pub type MockManagedDatastore<C> = InMemoryManagedDatastore<C>;

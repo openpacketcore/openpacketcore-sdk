@@ -27,7 +27,9 @@ pub use authorizer::{
     AllowAllAuthorizer, AuthorizationContext, AuthorizationError, ConfigAuthorizer,
 };
 pub use commit::ConfigBus;
-pub use datastore::{EncryptingManagedDatastore, ManagedDatastore, MockManagedDatastore};
+pub use datastore::{
+    EncryptingManagedDatastore, InMemoryManagedDatastore, ManagedDatastore, MockManagedDatastore,
+};
 pub use subscribers::{ConfigReceiver, SubscriberLagPolicy};
 pub use types::{
     AtomicConfigSnapshot, AuthorityMode, ConfigChange, ConfigEvent, ConfigSnapshot, DriftState,
