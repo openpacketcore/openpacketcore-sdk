@@ -358,30 +358,59 @@ fn has_word_boundary_match(lower: &str, marker: &str) -> bool {
     })
 }
 
-/// Returns true when the whole value is an explicit redaction placeholder such
-/// as `<imsi-redacted>`. Only placeholders that contain the word `redacted`
-/// are accepted; bare placeholders like `<ue-id>` do not contain any of the
-/// sensitive markers and therefore never reach this check.
-fn is_redaction_placeholder(s: &str) -> bool {
-    let trimmed = s.trim();
-    trimmed.starts_with('<')
-        && trimmed.ends_with('>')
-        && trimmed.to_ascii_lowercase().contains("redacted")
+/// Returns the byte ranges of all redaction placeholders in `lower`.
+/// A placeholder is a `<...redacted...>` span.
+fn redaction_placeholder_ranges(lower: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while let Some(open) = lower[start..].find('<') {
+        let open_abs = start + open;
+        if let Some(close_rel) = lower[open_abs..].find('>') {
+            let close_abs = open_abs + close_rel + 1;
+            let inner = &lower[open_abs + 1..close_abs - 1];
+            if inner.contains("redacted") {
+                ranges.push((open_abs, close_abs));
+            }
+            start = close_abs;
+        } else {
+            break;
+        }
+    }
+    ranges
 }
 
-/// Returns true when the matched marker is part of a redaction placeholder.
-/// This covers both `<imsi-redacted>` and labelled forms such as
-/// `spi=<spi-redacted>`.
+/// Returns true only when every occurrence of `marker` in `lower` is part of a
+/// redaction placeholder. A marker occurrence is considered redacted if it lies
+/// inside a `<...redacted...>` placeholder anywhere in the string, or if it is
+/// immediately followed (with an optional `=`) by such a placeholder.
 fn marker_is_redacted(lower: &str, marker: &str) -> bool {
-    if is_redaction_placeholder(lower) {
-        return true;
+    let ranges = redaction_placeholder_ranges(lower);
+    for (idx, matched) in lower.match_indices(marker) {
+        if !marker_occurrence_is_redacted(lower, matched, idx, &ranges) {
+            return false;
+        }
     }
-    let Some(idx) = lower.find(marker) else {
-        return false;
-    };
-    let after = &lower[idx + marker.len()..];
+    true
+}
+
+fn marker_occurrence_is_redacted(
+    lower: &str,
+    marker: &str,
+    idx: usize,
+    ranges: &[(usize, usize)],
+) -> bool {
+    let end = idx + marker.len();
+
+    // Inside a redaction placeholder anywhere in the string.
+    for &(pstart, pend) in ranges {
+        if idx >= pstart && end <= pend {
+            return true;
+        }
+    }
+
+    // Adjacent to a redaction placeholder with an optional '=' separator.
+    let after = &lower[end..];
     let after = after.trim_start();
-    // Allow an optional `=` between the marker and the placeholder.
     let after = after.strip_prefix('=').unwrap_or(after);
     starts_with_redaction_placeholder(after)
 }
@@ -733,6 +762,33 @@ mod tests {
         assert!(has_raw_sensitive_identifier("redacted note; Session-Id abcdef").is_some());
         // A properly scoped placeholder is still allowed.
         assert!(has_raw_sensitive_identifier("<imsi-redacted>").is_none());
+    }
+
+    #[test]
+    fn every_marker_occurrence_must_be_redacted() {
+        // A redacted occurrence of a marker must not suppress detection of a
+        // later raw occurrence of the same marker.
+        assert!(
+            has_raw_sensitive_identifier("session-id=<session-redacted>; session-id abcdef")
+                .is_some()
+        );
+        assert!(has_raw_sensitive_identifier("spi=<spi-redacted> spi=0xdeadbeef").is_some());
+        assert!(
+            has_raw_sensitive_identifier("session-id=<session-redacted> session-id=rawvalue")
+                .is_some()
+        );
+        // A redacted occurrence on its own is still safe.
+        assert!(has_raw_sensitive_identifier("session-id=<session-redacted>").is_none());
+    }
+
+    #[test]
+    fn embedded_redaction_placeholder_is_allowed() {
+        // A marker inside a placeholder that is embedded in a larger string
+        // must not be flagged.
+        assert!(has_raw_sensitive_identifier("foo <imsi-redacted> bar").is_none());
+        assert!(has_raw_sensitive_identifier("prefix <session-redacted> suffix").is_none());
+        // But a raw marker outside the placeholder must still be caught.
+        assert!(has_raw_sensitive_identifier("<imsi-redacted> session-id abc>").is_some());
     }
 
     #[test]
