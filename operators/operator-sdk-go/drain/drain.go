@@ -11,7 +11,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -138,13 +140,13 @@ const DefaultDrainPort = 8080
 
 // BuildAdminURL constructs an HTTP URL for the given admin endpoint on a pod.
 // It accepts an IP (or hostname) and port, and returns a string like
-// "http://10.0.0.1:8080/debug/drain". The endpoint should be one of the
-// endpoint path constants in this package.
+// "http://10.0.0.1:8080/debug/drain". IPv6 hosts are wrapped in brackets.
+// The endpoint should be one of the endpoint path constants in this package.
 func BuildAdminURL(host string, port int32, endpoint string) string {
 	if port == 0 {
 		port = DefaultDrainPort
 	}
-	return fmt.Sprintf("http://%s:%d%s", host, port, endpoint)
+	return fmt.Sprintf("http://%s%s", net.JoinHostPort(host, strconv.Itoa(int(port))), endpoint)
 }
 
 // PreStopDrainHook returns a LifecycleHandler that sleeps for the requested

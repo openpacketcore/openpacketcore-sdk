@@ -104,13 +104,35 @@ func RenderDeployment(spec NetworkFunctionSpec, opts RenderOptions) (*appsv1.Dep
 		dep.Spec.Strategy = strategy
 	}
 
-	if len(opts.MultusAttachments) > 0 {
-		if err := cni.InjectMultusAnnotations(dep, opts.MultusAttachments, opts.SRIOVResources); err != nil {
+	attachments := multusAttachmentsForRender(spec, opts)
+	if len(attachments) > 0 {
+		if err := cni.InjectMultusAnnotations(dep, attachments, opts.SRIOVResources); err != nil {
 			return nil, fmt.Errorf("inject multus annotations: %w", err)
 		}
 	}
 
 	return dep, nil
+}
+
+func multusAttachmentsForRender(spec NetworkFunctionSpec, opts RenderOptions) []cni.Attachment {
+	// RenderOptions.MultusAttachments take precedence and are returned verbatim
+	// when provided. Otherwise fall back to the spec-level attachments.
+	if len(opts.MultusAttachments) > 0 {
+		return opts.MultusAttachments
+	}
+	if len(spec.MultusAttachments) == 0 {
+		return nil
+	}
+	attachments := make([]cni.Attachment, 0, len(spec.MultusAttachments))
+	for _, at := range spec.MultusAttachments {
+		attachments = append(attachments, cni.Attachment{
+			Name:          at.Name,
+			NetworkName:   at.NetworkName,
+			Namespace:     at.Namespace,
+			InterfaceName: at.InterfaceName,
+		})
+	}
+	return attachments
 }
 
 func buildPodSpec(spec NetworkFunctionSpec, opts RenderOptions, adminPort int32) (corev1.PodSpec, error) {
@@ -419,17 +441,28 @@ func ValidateImageTag(spec NetworkFunctionSpec, opts RenderOptions) error {
 }
 
 func imageTag(image string) string {
-	parts := strings.SplitN(image, ":", 2)
-	if len(parts) != 2 {
+	// Strip digest suffix if present; tags live before the '@'.
+	if idx := strings.LastIndex(image, "@"); idx >= 0 {
+		image = image[:idx]
+	}
+	// The tag is the suffix after the last ':' in the final path component,
+	// which avoids misparsing registry host ports such as
+	// "registry:5000/openpacketcore/nf:1.2.3".
+	if idx := strings.LastIndex(image, "/"); idx >= 0 {
+		image = image[idx+1:]
+	}
+	idx := strings.LastIndex(image, ":")
+	if idx < 0 {
 		return ""
 	}
-	return parts[1]
+	return image[idx+1:]
 }
 
-// ConfigPushObservedGenerationOK reports whether the spec generation has been
-// observed by a successful config push. It is the generic operator helper for
-// the "config applied" readiness gate used by products that push canonical
-// configuration to the workload.
-func ConfigPushObservedGenerationOK(spec NetworkFunctionSpec) bool {
-	return spec.ConfigPushObservedGeneration >= 0
+// ConfigPushObservedGenerationOK reports whether the current spec generation
+// has been observed by a successful config push. It is the generic operator
+// helper for the "config applied" readiness gate used by products that push
+// canonical configuration to the workload. It fails closed: an unset observed
+// generation (0) or a stale observed generation is not OK.
+func ConfigPushObservedGenerationOK(spec NetworkFunctionSpec, currentGeneration int64) bool {
+	return currentGeneration > 0 && spec.ConfigPushObservedGeneration >= currentGeneration
 }

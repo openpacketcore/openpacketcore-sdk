@@ -55,7 +55,7 @@ func InjectMultusAnnotations(deployment *appsv1.Deployment, attachments []Attach
 
 	annotations := make([]MultusAnnotation, 0, len(attachments))
 	for _, at := range attachments {
-		ns, name := resolveAttachmentNamespacedName(deployment.Namespace, at.NetworkName)
+		ns, name := resolveAttachmentNamespacedName(deployment.Namespace, at)
 		annotations = append(annotations, MultusAnnotation{
 			Name:      name,
 			Namespace: ns,
@@ -96,16 +96,19 @@ func BuildAttachments[T any](inputs []T, resolve func(T) Attachment) []Attachmen
 // qualified as "namespace/name" and returns the namespace and name. When no
 // namespace is present, defaultNamespace is returned.
 func ResolveAttachmentNamespacedName(defaultNamespace, attachment string) (namespace, name string) {
-	return resolveAttachmentNamespacedName(defaultNamespace, attachment)
-}
-
-func resolveAttachmentNamespacedName(defaultNamespace, attachment string) (namespace, name string) {
 	attachment = strings.TrimSpace(attachment)
 	parts := strings.SplitN(attachment, "/", 2)
 	if len(parts) == 2 {
 		return parts[0], parts[1]
 	}
 	return defaultNamespace, attachment
+}
+
+func resolveAttachmentNamespacedName(defaultNamespace string, at Attachment) (namespace, name string) {
+	if strings.TrimSpace(at.Namespace) != "" {
+		return strings.TrimSpace(at.Namespace), strings.TrimSpace(at.NetworkName)
+	}
+	return ResolveAttachmentNamespacedName(defaultNamespace, at.NetworkName)
 }
 
 // MergeSRIOVResources adds SR-IOV extended resource requests/limits to the

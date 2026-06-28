@@ -70,8 +70,10 @@ type NetworkFunctionSpec struct {
 	// MultusAttachments configure Multus network attachments on the pod.
 	MultusAttachments []MultusAttachment
 	// ConfigPushObservedGeneration records the last spec generation whose
-	// config was successfully pushed to the workload. It is part of the
-	// immutable-image-tag / observed-generation status surface.
+	// config was successfully pushed to the workload. The zero value means
+	// "never pushed"; products that number generations starting at 1 can treat
+	// 0 as uninitialized. It is part of the immutable-image-tag /
+	// observed-generation status surface.
 	ConfigPushObservedGeneration int64
 	// ImageTag is an optional immutable image tag. When set, RenderDeployment
 	// validates that it matches the tag portion of opts.Image so operators can

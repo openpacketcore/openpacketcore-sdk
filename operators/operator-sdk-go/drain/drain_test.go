@@ -132,6 +132,11 @@ func TestBuildAdminURL(t *testing.T) {
 	if got != want {
 		t.Errorf("BuildAdminURL() default port = %q, want %q", got, want)
 	}
+	got = BuildAdminURL("fd00::1", 8080, DrainEndpointPath)
+	want = "http://[fd00::1]:8080/debug/drain"
+	if got != want {
+		t.Errorf("BuildAdminURL() IPv6 = %q, want %q", got, want)
+	}
 }
 
 func TestPreStopDrainHook(t *testing.T) {

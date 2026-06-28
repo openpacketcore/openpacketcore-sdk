@@ -249,6 +249,55 @@ func TestRenderDeploymentWithMultusAttachments(t *testing.T) {
 	}
 }
 
+func TestRenderDeploymentWithSpecMultusAttachments(t *testing.T) {
+	spec := NetworkFunctionSpec{
+		Name:      "test-nf",
+		Namespace: "default",
+		Version:   "1.0.0",
+		MultusAttachments: []MultusAttachment{
+			{Name: "net0", NetworkName: "nad-a", InterfaceName: "net0"},
+		},
+	}
+	opts := DefaultRenderOptions()
+
+	dep, err := RenderDeployment(spec, opts)
+	if err != nil {
+		t.Fatalf("RenderDeployment failed: %v", err)
+	}
+
+	if _, ok := dep.Spec.Template.Annotations[cni.MultusNetworkAnnotationKey]; !ok {
+		t.Fatalf("expected multus annotation from spec.MultusAttachments to be set")
+	}
+}
+
+func TestRenderDeploymentOptsMultusOverridesSpec(t *testing.T) {
+	spec := NetworkFunctionSpec{
+		Name:      "test-nf",
+		Namespace: "default",
+		Version:   "1.0.0",
+		MultusAttachments: []MultusAttachment{
+			{Name: "net0", NetworkName: "nad-a", InterfaceName: "net0"},
+		},
+	}
+	opts := DefaultRenderOptions()
+	opts.MultusAttachments = []cni.Attachment{
+		{Name: "opt0", NetworkName: "nad-opts", InterfaceName: "net0"},
+	}
+
+	dep, err := RenderDeployment(spec, opts)
+	if err != nil {
+		t.Fatalf("RenderDeployment failed: %v", err)
+	}
+
+	raw := dep.Spec.Template.Annotations[cni.MultusNetworkAnnotationKey]
+	if !strings.Contains(raw, "nad-opts") {
+		t.Fatalf("expected opts.MultusAttachments to override spec attachments, got %s", raw)
+	}
+	if strings.Contains(raw, "nad-a") {
+		t.Fatalf("expected spec attachments to be overridden, got %s", raw)
+	}
+}
+
 func TestValidateImageTag(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -278,6 +327,17 @@ func TestValidateImageTag(t *testing.T) {
 			opts:    RenderOptions{Image: "openpacketcore/nf"},
 			wantErr: true,
 		},
+		{
+			name: "registry port image",
+			spec: NetworkFunctionSpec{ImageTag: "1.2.3"},
+			opts: RenderOptions{Image: "registry:5000/openpacketcore/nf:1.2.3"},
+		},
+		{
+			name:    "registry port image mismatch",
+			spec:    NetworkFunctionSpec{ImageTag: "1.2.3"},
+			opts:    RenderOptions{Image: "registry:5000/openpacketcore/nf:1.2.4"},
+			wantErr: true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -293,14 +353,26 @@ func TestValidateImageTag(t *testing.T) {
 }
 
 func TestConfigPushObservedGenerationOK(t *testing.T) {
-	if !ConfigPushObservedGenerationOK(NetworkFunctionSpec{ConfigPushObservedGeneration: 0}) {
-		t.Error("expected generation 0 to be observed")
+	cases := []struct {
+		name     string
+		observed int64
+		current  int64
+		want     bool
+	}{
+		{"never pushed", 0, 5, false},
+		{"stale observed", 3, 5, false},
+		{"current observed", 5, 5, true},
+		{"ahead observed", 7, 5, true},
+		{"current zero", 5, 0, false},
+		{"negative observed", -1, 5, false},
 	}
-	if !ConfigPushObservedGenerationOK(NetworkFunctionSpec{ConfigPushObservedGeneration: 5}) {
-		t.Error("expected generation 5 to be observed")
-	}
-	if ConfigPushObservedGenerationOK(NetworkFunctionSpec{ConfigPushObservedGeneration: -1}) {
-		t.Error("expected generation -1 to not be observed")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ConfigPushObservedGenerationOK(NetworkFunctionSpec{ConfigPushObservedGeneration: tc.observed}, tc.current)
+			if got != tc.want {
+				t.Errorf("ConfigPushObservedGenerationOK(observed=%d, current=%d) = %t, want %t", tc.observed, tc.current, got, tc.want)
+			}
+		})
 	}
 }
 
