@@ -252,7 +252,8 @@ pub fn evaluate_admission(req: &AdmissionRequest) -> AdmissionResponse {
         if allowed {
             if let Some(ref rp) = req.resource_profile {
                 let is_fast_path = rp.data_plane_profile == "AfXdpFastPath"
-                    || rp.data_plane_profile == "SriovFastPath";
+                    || rp.data_plane_profile == "SriovFastPath"
+                    || rp.data_plane_profile == "IpsecGateway";
 
                 // Fast path data-planes require exclusive CPU pinning and isolated cores in production
                 if is_fast_path && (!rp.require_exclusive_cores || rp.isolated_cores.is_empty()) {
@@ -352,6 +353,13 @@ pub fn evaluate_admission(req: &AdmissionRequest) -> AdmissionResponse {
                                             .collect(),
                                         ipam_mode: opc_node_resources::IpamMode::Static,
                                     });
+                                } else if profile.data_plane_profile
+                                    == opc_node_resources::DataPlaneProfile::IpsecGateway
+                                {
+                                    profile.ipsec_gateway =
+                                        Some(opc_node_resources::IpsecGatewayProfile::standard(
+                                            rp.pod_security_evidence_id.clone(),
+                                        ));
                                 }
 
                                 let cpu_layout = opc_node_resources::CpuLayout {

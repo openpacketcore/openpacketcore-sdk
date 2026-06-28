@@ -93,6 +93,7 @@ fn valid_node_capability_report() -> opc_node_resources::NodeCapabilityReport {
             queues: 4,
             numa_node: Some(0),
         }],
+        ipsec_gateway: None,
     }
 }
 

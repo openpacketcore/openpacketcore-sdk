@@ -531,16 +531,20 @@ impl HardwarePreflight {
 fn build_hardware_preflight(config: &HardwareLabRunnerConfig) -> HardwarePreflight {
     use opc_node_resources::{
         AfXdpProfile, BpfCapabilities, CpuLayout, CpuManagerPolicy, DataPlaneProfile, Environment,
-        HugepagePool, KernelVersion, LinkStatePolicy, LinuxCapability, NetworkFunctionKind,
-        NicCapability, NodeCapabilityReport, NodeCpuCapabilities, NodeMemoryCapabilities,
-        PodSecurityExceptionModel, ResourceProfile, SriovAllowlistPolicy, SriovProfile,
-        TopologyManagerPolicy, XdpMode,
+        HugepagePool, IpsecGatewayCapabilities, IpsecGatewayProfile, KernelVersion,
+        LinkStatePolicy, LinuxCapability, NetworkFunctionKind, NicCapability, NodeCapabilityReport,
+        NodeCpuCapabilities, NodeMemoryCapabilities, PodSecurityExceptionModel, ResourceProfile,
+        SriovAllowlistPolicy, SriovProfile, TopologyManagerPolicy, XdpMode,
     };
 
     let data_plane_profile = if config.sriov_xdp_expectations.contains("sriov") {
         DataPlaneProfile::SriovFastPath
     } else if config.sriov_xdp_expectations.contains("xdp") {
         DataPlaneProfile::AfXdpFastPath
+    } else if config.sriov_xdp_expectations.contains("ipsec")
+        || config.sriov_xdp_expectations.contains("xfrm")
+    {
+        DataPlaneProfile::IpsecGateway
     } else {
         DataPlaneProfile::ControlPlaneOnly
     };
@@ -593,6 +597,11 @@ fn build_hardware_preflight(config: &HardwareLabRunnerConfig) -> HardwarePreflig
             bpf_artifacts: vec![],
         });
     }
+    if matches!(data_plane_profile, DataPlaneProfile::IpsecGateway) {
+        profile.ipsec_gateway = Some(IpsecGatewayProfile::standard(Some(
+            "hardware-lab-dry-run-ipsec-evidence".to_string(),
+        )));
+    }
 
     let nic_names = if data_plane_interfaces.is_empty() {
         vec!["net0".to_string()]
@@ -640,6 +649,14 @@ fn build_hardware_preflight(config: &HardwareLabRunnerConfig) -> HardwarePreflig
             }],
         },
         nics,
+        ipsec_gateway: Some(IpsecGatewayCapabilities {
+            xfrm_user: true,
+            xfrm_state: true,
+            xfrm_policy: true,
+            netns_scoped_operation: true,
+            route_rule_prerequisites: true,
+            evidence_id: Some("testbed-ipsec-gateway-capabilities".to_string()),
+        }),
     };
 
     let cpu_layout = if matches!(data_plane_profile, DataPlaneProfile::ControlPlaneOnly) {

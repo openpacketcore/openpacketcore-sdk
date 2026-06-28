@@ -278,12 +278,106 @@ pub fn validate_sriov(
     }
 }
 
+pub fn validate_ipsec_gateway(
+    profile: &ResourceProfile,
+    context: &ValidationContext<'_>,
+    report: &mut ValidationReport,
+) {
+    let Some(ipsec) = profile.ipsec_gateway.as_ref() else {
+        report.push_error(ValidationError::IpsecGatewayProfileMissing);
+        return;
+    };
+
+    if context.data_plane_interfaces.is_empty() {
+        report.push_error(ValidationError::IpsecGatewayNoDataPlaneInterfaces);
+    }
+
+    let allowed_capabilities = ipsec_gateway_allowed_capabilities();
+    for capability in &profile.pod_security.added_capabilities {
+        if !allowed_capabilities.contains(capability) {
+            let error = ValidationError::CapabilityNotAllowed {
+                capability: capability.clone(),
+                profile: DataPlaneProfile::IpsecGateway,
+            };
+            if !report.errors.contains(&error) {
+                report.push_error(error);
+            }
+        }
+    }
+
+    for capability in &ipsec.required_capabilities {
+        if capability == &LinuxCapability::CapSysAdmin
+            && profile.environment == Environment::Production
+            && !report
+                .errors
+                .contains(&ValidationError::ProductionCapSysAdminForbidden)
+        {
+            report.push_error(ValidationError::ProductionCapSysAdminForbidden);
+        }
+        if !allowed_capabilities.contains(capability) {
+            let error = ValidationError::CapabilityNotAllowed {
+                capability: capability.clone(),
+                profile: DataPlaneProfile::IpsecGateway,
+            };
+            if !report.errors.contains(&error) {
+                report.push_error(error);
+            }
+        }
+        if !profile.pod_security.added_capabilities.contains(capability) {
+            report.push_error(ValidationError::MissingCapability {
+                capability: capability.clone(),
+            });
+        }
+    }
+
+    let Some(capabilities) = context.node.ipsec_gateway.as_ref() else {
+        report.push_error(ValidationError::IpsecGatewayCapabilitiesMissing);
+        return;
+    };
+
+    let required_features = [
+        (ipsec.require_xfrm_user, capabilities.xfrm_user, "xfrm_user"),
+        (
+            ipsec.require_xfrm_state,
+            capabilities.xfrm_state,
+            "xfrm_state",
+        ),
+        (
+            ipsec.require_xfrm_policy,
+            capabilities.xfrm_policy,
+            "xfrm_policy",
+        ),
+        (
+            ipsec.require_netns_scoped_operation,
+            capabilities.netns_scoped_operation,
+            "netns_scoped_operation",
+        ),
+        (
+            ipsec.require_route_rule_prerequisites,
+            capabilities.route_rule_prerequisites,
+            "route_rule_prerequisites",
+        ),
+    ];
+
+    for (required, available, feature) in required_features {
+        if required && !available {
+            report.push_error(ValidationError::MissingIpsecGatewayFeature {
+                feature: feature.to_string(),
+            });
+        }
+    }
+}
+
 pub fn af_xdp_allowed_capabilities() -> BTreeSet<LinuxCapability> {
     BTreeSet::from([
         LinuxCapability::CapBpf,
         LinuxCapability::CapNetAdmin,
         LinuxCapability::CapNetRaw,
     ])
+}
+
+pub fn ipsec_gateway_allowed_capabilities() -> BTreeSet<LinuxCapability> {
+    BTreeSet::from([LinuxCapability::CapNetAdmin, LinuxCapability::CapNetRaw])
 }
 
 pub fn available_xdp_modes(

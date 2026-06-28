@@ -197,6 +197,7 @@ fn test_data_plane_preflight_admission_rejection() {
             queues: 4,
             numa_node: Some(0),
         }],
+        ipsec_gateway: None,
     };
 
     req.node_capabilities = Some(node_report);
@@ -277,6 +278,7 @@ fn test_data_plane_preflight_admission_success() {
             queues: 4,
             numa_node: Some(0),
         }],
+        ipsec_gateway: None,
     };
 
     req.node_capabilities = Some(node_report);
