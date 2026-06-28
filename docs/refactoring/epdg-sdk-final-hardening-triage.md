@@ -28,14 +28,17 @@ and the phase gate notes.
 | EPC/ePDG simulator malformed-response runner path | `T-8eeb94b6` | Converted and closed. No final-hardening task needed. |
 | Deep worktree Unix-socket path failures in tests | Phase 0 seam steward notes and `T-d42e0d6c` | Converted and closed. No final-hardening task needed. |
 | Downstream ePDG adapter/product work | `docs/refactoring/epdg-sdk-m4-closeout.md` | Explicitly deferred outside this SDK plan by ADR 0018 boundary. Do not convert into final-hardening scope. |
-| Protocol-status documentation drift for Diameter | Current repo: `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `.github/workflows/fuzz.yml`, and `.github/workflows/ci.yml` include `opc-proto-diameter`, but `docs/implementation-status.md` RFC 005 rows 005-6/005-8 and the `opc-sdk` facade docs summarize the new direct-dependency protocol set without Diameter | Report to supervisor as a concrete final validation/docs-sync candidate. Suggested scope: update `docs/implementation-status.md` to include `opc-proto-diameter` and an appropriate known-gap row, and update `crates/opc-sdk/src/lib.rs` / `crates/opc-sdk/README.md` to mention Diameter and IKEv2 alongside GTPv2-C in the direct-dependency boundary. |
+| Protocol-status documentation drift for Diameter and IKEv2 | Current repo: `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `.github/workflows/fuzz.yml`, and `.github/workflows/ci.yml` include `opc-proto-diameter`, but `docs/implementation-status.md` RFC 005 rows 005-6/005-8 and the `opc-sdk` facade docs (`crates/opc-sdk/src/lib.rs`, `crates/opc-sdk/README.md`) summarize the new direct-dependency protocol set without `opc-proto-diameter` and the experimental `opc-proto-ikev2` | Converted to concrete final-hardening task `T-0cc9d976` (closed). Scope covers `docs/implementation-status.md`, `crates/opc-sdk/src/lib.rs`, and `crates/opc-sdk/README.md`; includes Diameter and experimental IKEv2 alongside GTPv2-C with no new production-readiness claims. |
 
 ## Current final-hardening state
 
-- `T-0e9cac9a` is the only already-converted concrete cleanup found during this
-  pass; it covers the packet-core redaction/schema and operator-gate residuals.
-- `T-0a1f3cdd` and `T-8c57ecee` remain blocked behind triage/final-hardening
-  sequencing. The docs-sync candidate above is suitable for one of those tasks
-  or a new narrow sibling task, at supervisor discretion.
+- `T-0e9cac9a` (packet-core redaction false-negatives and schema-version drift
+  guard) is converted and closed.
+- `T-0cc9d976` (docs sync for `opc-proto-diameter` and `opc-proto-ikev2` in
+  `docs/implementation-status.md` and the `opc-sdk` facade docs) is converted
+  and closed.
+- `T-0a1f3cdd` (resolve deferred cross-epic seams) and `T-8c57ecee` (final
+  validation and operator readiness pass) remain blocked behind
+  triage/final-hardening sequencing.
 - No broad rewrite candidate was identified. Downstream adapter/product work is
   intentionally outside the SDK final-hardening epic.
