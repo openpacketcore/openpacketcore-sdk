@@ -151,6 +151,42 @@ func TestInjectMultusAnnotationsExplicitNamespace(t *testing.T) {
 	}
 }
 
+func TestInjectMultusAnnotationsTrimsInterfaceName(t *testing.T) {
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "nf",
+			Namespace: "default",
+		},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "nf"}},
+				},
+			},
+		},
+	}
+
+	attachments := []Attachment{
+		{Name: "net0", NetworkName: "nad-a", InterfaceName: "  net0  "},
+	}
+
+	if err := InjectMultusAnnotations(dep, attachments, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	raw := dep.Spec.Template.Annotations[MultusNetworkAnnotationKey]
+	var got []MultusAnnotation
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("unmarshal annotation: %v", err)
+	}
+	if len(got) != 1 || got[0].Interface != "net0" {
+		t.Errorf("expected trimmed interface name net0, got %+v", got)
+	}
+}
+
 func TestBuildSRIOVResourceMap(t *testing.T) {
 	type item struct {
 		resource string

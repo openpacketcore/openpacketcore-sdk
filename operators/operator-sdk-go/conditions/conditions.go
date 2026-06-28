@@ -8,6 +8,7 @@ package conditions
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -124,7 +125,10 @@ const (
 
 // GateCondition builds a stable Kubernetes condition for a named runtime gate.
 // It is a convenience wrapper around ConditionManager.Set for the common case
-// of mapping gate name/status to a metav1.Condition.
+// of mapping gate name/status to a metav1.Condition. Both GatePassing and
+// GateDegraded are written as ConditionTrue; callers that intend to recover the
+// Degraded distinction via GateStatusFromCondition should use a Reason produced
+// by GateReason(gate, GateDegraded).
 func GateCondition(cm *ConditionManager, gate GateName, status GateStatus, reason, message string, generation int64) error {
 	condStatus := metav1.ConditionFalse
 	if status == GatePassing || status == GateDegraded {
@@ -134,11 +138,15 @@ func GateCondition(cm *ConditionManager, gate GateName, status GateStatus, reaso
 }
 
 // GateStatusFromCondition returns the GateStatus that corresponds to the given
-// metav1.Condition. A True condition maps to Passing; False maps to Failing;
-// Unknown maps to Unknown.
+// metav1.Condition. A True condition maps to Passing unless the Reason encodes
+// a Degraded gate (i.e. ends with "Degraded"), in which case it returns
+// GateDegraded. False maps to Failing; Unknown maps to Unknown.
 func GateStatusFromCondition(c metav1.Condition) GateStatus {
 	switch c.Status {
 	case metav1.ConditionTrue:
+		if strings.HasSuffix(c.Reason, string(GateDegraded)) {
+			return GateDegraded
+		}
 		return GatePassing
 	case metav1.ConditionFalse:
 		return GateFailing

@@ -44,6 +44,13 @@ func DefaultRenderOptions() RenderOptions {
 
 // RenderDeployment synthesizes a Deployment from the given NF spec.
 func RenderDeployment(spec NetworkFunctionSpec, opts RenderOptions) (*appsv1.Deployment, error) {
+	// Resolve the effective image before validation so that ValidateImageTag
+	// sees the same default image (openpacketcore/<name>:<version>) that the
+	// rendered container will use.
+	if opts.Image == "" {
+		opts.Image = fmt.Sprintf("openpacketcore/%s:%s", spec.Name, spec.Version)
+	}
+
 	if err := ValidateImageTag(spec, opts); err != nil {
 		return nil, err
 	}
@@ -165,7 +172,10 @@ func buildPodSpec(spec NetworkFunctionSpec, opts RenderOptions, adminPort int32)
 	if err != nil {
 		return podSpec, err
 	}
-	container.Ports = BuildContainerPorts(spec, adminPort)
+	container.Ports, err = BuildContainerPorts(spec, adminPort)
+	if err != nil {
+		return podSpec, fmt.Errorf("build container ports: %w", err)
+	}
 	podSpec.Containers = []corev1.Container{container}
 	podSpec.Volumes = volumes
 
@@ -194,9 +204,6 @@ func buildContainerAndVolumes(spec NetworkFunctionSpec, opts RenderOptions, admi
 
 	container.Name = "nf"
 	container.Image = opts.Image
-	if container.Image == "" {
-		container.Image = fmt.Sprintf("openpacketcore/%s:%s", spec.Name, spec.Version)
-	}
 
 	// Resources
 	res := corev1.ResourceRequirements{
@@ -396,18 +403,28 @@ func BuildDeploymentWithOwnership(spec NetworkFunctionSpec, opts RenderOptions, 
 
 // BuildContainerPorts returns the container ports for the workload, including
 // the admin port and any additional UDP/SCTP/TCP ports declared in the spec.
-func BuildContainerPorts(spec NetworkFunctionSpec, adminPort int32) []corev1.ContainerPort {
+// It returns an error if an additional port reuses the reserved name "admin"
+// or if additional port names are not unique.
+func BuildContainerPorts(spec NetworkFunctionSpec, adminPort int32) ([]corev1.ContainerPort, error) {
 	ports := []corev1.ContainerPort{
 		{Name: "admin", ContainerPort: adminPort, Protocol: corev1.ProtocolTCP},
 	}
+	seen := map[string]struct{}{"admin": {}}
 	for _, p := range spec.AdditionalPorts {
+		if p.Name == "admin" {
+			return nil, fmt.Errorf("additional port name %q is reserved for the admin port", p.Name)
+		}
+		if _, ok := seen[p.Name]; ok {
+			return nil, fmt.Errorf("duplicate additional port name %q", p.Name)
+		}
+		seen[p.Name] = struct{}{}
 		ports = append(ports, corev1.ContainerPort{
 			Name:          p.Name,
 			ContainerPort: p.Port,
 			Protocol:      ParsePortProtocol(p.Protocol),
 		})
 	}
-	return ports
+	return ports, nil
 }
 
 // ParsePortProtocol maps a protocol string to a corev1.Protocol. It accepts

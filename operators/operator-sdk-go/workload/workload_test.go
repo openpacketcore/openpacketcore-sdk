@@ -186,7 +186,10 @@ func TestBuildContainerPortsWithAdditionalPorts(t *testing.T) {
 		},
 	}
 
-	ports := BuildContainerPorts(spec, 8080)
+	ports, err := BuildContainerPorts(spec, 8080)
+	if err != nil {
+		t.Fatalf("BuildContainerPorts failed: %v", err)
+	}
 	if len(ports) != 4 {
 		t.Fatalf("expected 4 ports, got %d", len(ports))
 	}
@@ -203,6 +206,35 @@ func TestBuildContainerPortsWithAdditionalPorts(t *testing.T) {
 	}
 	if byName["diameter"].Protocol != corev1.ProtocolTCP {
 		t.Errorf("expected diameter protocol TCP, got %v", byName["diameter"].Protocol)
+	}
+}
+
+func TestBuildContainerPortsRejectsReservedAdminName(t *testing.T) {
+	spec := NetworkFunctionSpec{
+		Name:      "test-nf",
+		Namespace: "default",
+		Version:   "1.0.0",
+		AdditionalPorts: []PortSpec{
+			{Name: "admin", Port: 1234, Protocol: "tcp"},
+		},
+	}
+	if _, err := BuildContainerPorts(spec, 8080); err == nil {
+		t.Fatal("expected error for additional port named admin")
+	}
+}
+
+func TestBuildContainerPortsRejectsDuplicateNames(t *testing.T) {
+	spec := NetworkFunctionSpec{
+		Name:      "test-nf",
+		Namespace: "default",
+		Version:   "1.0.0",
+		AdditionalPorts: []PortSpec{
+			{Name: "diameter", Port: 3868, Protocol: "tcp"},
+			{Name: "diameter", Port: 3869, Protocol: "tcp"},
+		},
+	}
+	if _, err := BuildContainerPorts(spec, 8080); err == nil {
+		t.Fatal("expected error for duplicate additional port names")
 	}
 }
 
@@ -295,6 +327,23 @@ func TestRenderDeploymentOptsMultusOverridesSpec(t *testing.T) {
 	}
 	if strings.Contains(raw, "nad-a") {
 		t.Fatalf("expected spec attachments to be overridden, got %s", raw)
+	}
+}
+
+func TestRenderDeploymentDefaultImageMatchesImmutableTag(t *testing.T) {
+	spec := NetworkFunctionSpec{
+		Name:      "nf",
+		Namespace: "default",
+		Version:   "1.2.3",
+		ImageTag:  "1.2.3",
+	}
+
+	dep, err := RenderDeployment(spec, DefaultRenderOptions())
+	if err != nil {
+		t.Fatalf("RenderDeployment with default options and immutable tag failed: %v", err)
+	}
+	if dep.Spec.Template.Spec.Containers[0].Image != "openpacketcore/nf:1.2.3" {
+		t.Errorf("expected default image openpacketcore/nf:1.2.3, got %s", dep.Spec.Template.Spec.Containers[0].Image)
 	}
 }
 

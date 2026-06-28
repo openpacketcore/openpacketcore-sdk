@@ -8,7 +8,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 // MultusNetworkAnnotationKey is the canonical pod annotation used by Multus to
@@ -36,6 +35,10 @@ type Attachment struct {
 // template and aggregates SR-IOV resource requests when the attachment list is
 // non-empty. It is a no-op when attachments is empty and removes any stale
 // annotation in that case.
+//
+// SR-IOV resource requests are merged into the first container only
+// (deployment.Spec.Template.Spec.Containers[0]). Sidecars or additional
+// workload containers must request SR-IOV resources separately.
 func InjectMultusAnnotations(deployment *appsv1.Deployment, attachments []Attachment, sriovResources map[corev1.ResourceName]int64) error {
 	if deployment == nil {
 		return fmt.Errorf("deployment is nil")
@@ -59,7 +62,7 @@ func InjectMultusAnnotations(deployment *appsv1.Deployment, attachments []Attach
 		annotations = append(annotations, MultusAnnotation{
 			Name:      name,
 			Namespace: ns,
-			Interface: at.InterfaceName,
+			Interface: strings.TrimSpace(at.InterfaceName),
 		})
 	}
 
@@ -146,6 +149,3 @@ func BuildSRIOVResourceMap[T any](attachments []T, extract func(T) corev1.Resour
 	}
 	return aggregated
 }
-
-// NamespacedName is a small convenience type for attachment resolution.
-type NamespacedName = types.NamespacedName

@@ -267,18 +267,41 @@ func TestGateCondition(t *testing.T) {
 
 func TestGateStatusFromCondition(t *testing.T) {
 	cases := []struct {
-		status metav1.ConditionStatus
-		want   GateStatus
+		name string
+		cond metav1.Condition
+		want GateStatus
 	}{
-		{metav1.ConditionTrue, GatePassing},
-		{metav1.ConditionFalse, GateFailing},
-		{metav1.ConditionUnknown, GateUnknown},
+		{"true passing", metav1.Condition{Status: metav1.ConditionTrue, Reason: "ReadyPassing"}, GatePassing},
+		{"true degraded", metav1.Condition{Status: metav1.ConditionTrue, Reason: "ReadyDegraded"}, GateDegraded},
+		{"false", metav1.Condition{Status: metav1.ConditionFalse}, GateFailing},
+		{"unknown", metav1.Condition{Status: metav1.ConditionUnknown}, GateUnknown},
 	}
 	for _, tc := range cases {
-		got := GateStatusFromCondition(metav1.Condition{Status: tc.status})
-		if got != tc.want {
-			t.Errorf("GateStatusFromCondition(%s) = %s, want %s", tc.status, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			got := GateStatusFromCondition(tc.cond)
+			if got != tc.want {
+				t.Errorf("GateStatusFromCondition(%+v) = %s, want %s", tc.cond, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGateConditionDegradedRoundTrip(t *testing.T) {
+	cm := NewConditionManager(1)
+	reason := GateReason(GateDrain, GateDegraded)
+	message := GateMessage(GateDrain, GateDegraded)
+	if err := GateCondition(cm, GateDrain, GateDegraded, reason, message, 1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	c := cm.Get(ConditionType(GateDrain))
+	if c == nil {
+		t.Fatal("expected drain gate condition")
+	}
+	if c.Status != metav1.ConditionTrue {
+		t.Errorf("expected status True for degraded gate, got %s", c.Status)
+	}
+	if got := GateStatusFromCondition(*c); got != GateDegraded {
+		t.Errorf("expected GateDegraded round-trip, got %s", got)
 	}
 }
 
