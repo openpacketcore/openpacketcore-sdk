@@ -4,6 +4,7 @@
 //! identifiers (SUPI, GPSI, IMSI, PEI, IP addresses, paths, SQL errors, etc.)
 //! from Prometheus metric labels, and provides a thread-safe registry.
 
+use crate::TelcoIdentifier;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -43,7 +44,11 @@ pub fn metrics_label_safe(val: &str) -> String {
         return "redacted".to_string();
     }
 
-    if looks_like_ipv4(trimmed) || looks_like_jwt(trimmed) || contains_sensitive_id_marker(&lower) {
+    if looks_like_ipv4(trimmed)
+        || looks_like_jwt(trimmed)
+        || contains_sensitive_id_marker(&lower)
+        || TelcoIdentifier::classify(trimmed).is_some()
+    {
         return "redacted".to_string();
     }
 
@@ -1725,6 +1730,22 @@ mod tests {
         // SQL
         assert_eq!(metrics_label_safe("SELECT * FROM users"), "redacted");
         assert_eq!(metrics_label_safe("database is locked"), "redacted");
+
+        // Telco identifiers introduced by this task.
+        assert_eq!(metrics_label_safe("li-id-target-42"), "redacted");
+        assert_eq!(metrics_label_safe("li_id_target_42"), "redacted");
+        assert_eq!(metrics_label_safe("li-warrant-id-war-42"), "redacted");
+        assert_eq!(metrics_label_safe("li-correlation-id-corr-42"), "redacted");
+        assert_eq!(metrics_label_safe("delivery-address-mdf"), "redacted");
+        assert_eq!(metrics_label_safe("apn-internet.operator.com"), "redacted");
+        assert_eq!(metrics_label_safe("dnn-internet"), "redacted");
+        assert_eq!(metrics_label_safe("dnn_internet"), "redacted");
+        assert_eq!(metrics_label_safe("teid-0x12345678"), "redacted");
+        assert_eq!(metrics_label_safe("spi-0x9abcdef0"), "redacted");
+        assert_eq!(
+            metrics_label_safe("diameter-session-id-op.example.com;123;0"),
+            "redacted"
+        );
     }
 
     #[test]

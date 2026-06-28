@@ -1,6 +1,7 @@
 use crate::bpf::{is_controlled_bpffs_path, validate_bpf_artifacts};
 use crate::types::*;
 use std::collections::BTreeSet;
+use std::net::IpAddr;
 
 pub fn validate_af_xdp(
     profile: &ResourceProfile,
@@ -284,6 +285,397 @@ pub fn af_xdp_allowed_capabilities() -> BTreeSet<LinuxCapability> {
         LinuxCapability::CapNetAdmin,
         LinuxCapability::CapNetRaw,
     ])
+}
+
+pub fn ipsec_gateway_allowed_capabilities() -> BTreeSet<LinuxCapability> {
+    BTreeSet::from([LinuxCapability::CapNetAdmin, LinuxCapability::CapNetRaw])
+}
+
+pub fn validate_ipsec_gateway(
+    profile: &ResourceProfile,
+    context: &ValidationContext<'_>,
+    report: &mut ValidationReport,
+) {
+    let Some(ipsec) = profile.ipsec.as_ref() else {
+        report.push_error(ValidationError::IpsecProfileMissing);
+        return;
+    };
+
+    // RFC 011 §9.1: IPsec gateway requires at least one named data-plane attachment.
+    if context.data_plane_interfaces.is_empty() {
+        report.push_error(ValidationError::IpsecNoDataPlaneInterfaces);
+    }
+
+    // Lab-only fallback knobs must not appear on production profiles.
+    if profile.environment == Environment::Production
+        && ipsec.allow_userspace_esp_fallback
+        && !report
+            .errors
+            .contains(&ValidationError::ProductionLabFallbackForbidden)
+    {
+        report.push_error(ValidationError::ProductionLabFallbackForbidden);
+    }
+
+    let allowed_capabilities = ipsec_gateway_allowed_capabilities();
+    for capability in &profile.pod_security.added_capabilities {
+        if !allowed_capabilities.contains(capability) {
+            let error = ValidationError::CapabilityNotAllowed {
+                capability: capability.clone(),
+                profile: DataPlaneProfile::IpsecGateway,
+            };
+            if !report.errors.contains(&error) {
+                report.push_error(error);
+            }
+        }
+    }
+
+    for capability in &ipsec.required_capabilities {
+        if capability == &LinuxCapability::CapSysAdmin
+            && profile.environment == Environment::Production
+            && !report
+                .errors
+                .contains(&ValidationError::ProductionCapSysAdminForbidden)
+        {
+            report.push_error(ValidationError::ProductionCapSysAdminForbidden);
+        }
+        if !allowed_capabilities.contains(capability) {
+            let error = ValidationError::CapabilityNotAllowed {
+                capability: capability.clone(),
+                profile: DataPlaneProfile::IpsecGateway,
+            };
+            if !report.errors.contains(&error) {
+                report.push_error(error);
+            }
+        }
+        if !profile.pod_security.added_capabilities.contains(capability) {
+            report.push_error(ValidationError::MissingCapability {
+                capability: capability.clone(),
+            });
+        }
+    }
+
+    // When XFRM is required, CAP_NET_ADMIN is mandatory (it is needed to
+    // install and manage XFRM policies in the pod namespace). This is implied
+    // even if the profile author did not list it in required_capabilities or
+    // pod_security.added_capabilities.
+    if ipsec.require_xfrm
+        && !ipsec
+            .required_capabilities
+            .contains(&LinuxCapability::CapNetAdmin)
+        && !profile
+            .pod_security
+            .added_capabilities
+            .contains(&LinuxCapability::CapNetAdmin)
+    {
+        report.push_error(ValidationError::MissingCapability {
+            capability: LinuxCapability::CapNetAdmin,
+        });
+    }
+
+    validate_ipsec_network_attachments(ipsec, context, report);
+
+    let is_lab_software_fallback_allowed =
+        profile.environment == Environment::Lab && profile.lab_fallback.allow_software_packet_path;
+    let is_lab_userspace_esp_fallback_allowed =
+        profile.environment == Environment::Lab && ipsec.allow_userspace_esp_fallback;
+
+    // Kernel version check
+    if context.node.kernel < ipsec.minimum_kernel {
+        if is_lab_software_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::SoftwarePacketPath,
+                format!(
+                    "kernel {:?} is below IPsec gateway minimum {:?}; using lab software packet path",
+                    context.node.kernel, ipsec.minimum_kernel,
+                ),
+            );
+        } else {
+            report.push_error(ValidationError::UnsupportedKernelVersion {
+                found: context.node.kernel,
+                minimum: ipsec.minimum_kernel,
+            });
+        }
+    }
+
+    // XFRM netlink support check
+    if ipsec.require_xfrm && !context.node.ipsec.xfrm_netlink_available {
+        if is_lab_userspace_esp_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::UserspaceEsp,
+                "node lacks XFRM netlink support; using lab userspace ESP fallback",
+            );
+        } else if is_lab_software_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::SoftwarePacketPath,
+                "node lacks XFRM netlink support; using lab software packet path",
+            );
+        } else {
+            report.push_error(ValidationError::MissingNodeCapability {
+                capability: "xfrm_netlink_available".to_string(),
+            });
+        }
+    }
+
+    // XFRM user policy support check
+    if ipsec.require_xfrm && !context.node.ipsec.xfrm_user_policy_available {
+        if is_lab_userspace_esp_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::UserspaceEsp,
+                "node lacks XFRM user policy support; using lab userspace ESP fallback",
+            );
+        } else if is_lab_software_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::SoftwarePacketPath,
+                "node lacks XFRM user policy support; using lab software packet path",
+            );
+        } else {
+            report.push_error(ValidationError::MissingNodeCapability {
+                capability: "xfrm_user_policy_available".to_string(),
+            });
+        }
+    }
+
+    // ESP support check
+    if ipsec.require_xfrm && !context.node.ipsec.esp_supported {
+        if is_lab_userspace_esp_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::UserspaceEsp,
+                "node lacks kernel ESP support; using lab userspace ESP fallback",
+            );
+        } else if is_lab_software_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::SoftwarePacketPath,
+                "node lacks kernel ESP support; using lab software packet path",
+            );
+        } else {
+            report.push_error(ValidationError::MissingNodeCapability {
+                capability: "esp_supported".to_string(),
+            });
+        }
+    }
+
+    // UDP 500 (IKE) bind check
+    if ipsec.require_udp_500 && !context.node.ipsec.udp_500_bind_allowed {
+        if is_lab_software_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::SoftwarePacketPath,
+                "node lacks UDP 500 bind support; using lab software packet path",
+            );
+        } else {
+            report.push_error(ValidationError::MissingNodeCapability {
+                capability: "udp_500_bind_allowed".to_string(),
+            });
+        }
+    }
+
+    // UDP 4500 (NAT-T) bind check
+    if ipsec.require_udp_4500 && !context.node.ipsec.udp_4500_bind_allowed {
+        if is_lab_software_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::SoftwarePacketPath,
+                "node lacks UDP 4500 bind support; using lab software packet path",
+            );
+        } else {
+            report.push_error(ValidationError::MissingNodeCapability {
+                capability: "udp_4500_bind_allowed".to_string(),
+            });
+        }
+    }
+
+    // SCTP support check
+    if ipsec.require_sctp && !context.node.ipsec.sctp_supported {
+        if is_lab_software_fallback_allowed {
+            report.activate_fallback(
+                FallbackMode::SoftwarePacketPath,
+                "node lacks SCTP support; using lab software packet path",
+            );
+        } else {
+            report.push_error(ValidationError::MissingNodeCapability {
+                capability: "sctp_supported".to_string(),
+            });
+        }
+    }
+
+    // Required kernel module checks
+    for module in &ipsec.required_kernel_modules {
+        if !module.is_valid() {
+            report.push_error(ValidationError::InvalidKernelModuleId {
+                module: module.to_string(),
+            });
+            continue;
+        }
+        if !context.node.ipsec.available_kernel_modules.contains(module) {
+            if is_lab_software_fallback_allowed {
+                report.activate_fallback(
+                    FallbackMode::SoftwarePacketPath,
+                    format!(
+                        "node lacks required kernel module {module}; using lab software packet path"
+                    ),
+                );
+            } else {
+                report.push_error(ValidationError::MissingNodeCapability {
+                    capability: format!("kernel_module:{module}"),
+                });
+            }
+        }
+    }
+
+    // Required ESP algorithm checks
+    for algorithm in &ipsec.required_esp_algorithms {
+        if !algorithm.is_valid() {
+            report.push_error(ValidationError::InvalidEspAlgorithmId {
+                algorithm: algorithm.to_string(),
+            });
+            continue;
+        }
+        if !context
+            .node
+            .ipsec
+            .supported_esp_algorithms
+            .contains(algorithm)
+        {
+            if is_lab_software_fallback_allowed {
+                report.activate_fallback(
+                    FallbackMode::SoftwarePacketPath,
+                    format!(
+                        "node lacks required ESP algorithm {algorithm}; using lab software packet path"
+                    ),
+                );
+            } else {
+                report.push_error(ValidationError::MissingNodeCapability {
+                    capability: format!("esp_algorithm:{algorithm}"),
+                });
+            }
+        }
+    }
+}
+
+/// Minimum MTU for an IPsec gateway attachment.  1280 bytes is the IPv6
+/// minimum and a practical floor for tunneled IPsec traffic without
+/// excessive fragmentation.
+const IPSEC_MINIMUM_MTU: u16 = 1280;
+
+fn validate_ipsec_network_attachments(
+    ipsec: &IpsecGatewayProfile,
+    context: &ValidationContext<'_>,
+    report: &mut ValidationReport,
+) {
+    if ipsec.network_attachments.is_empty() {
+        report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+            detail: "at least one IPsec network attachment is required".to_string(),
+        });
+        return;
+    }
+
+    let interface_names: BTreeSet<&String> = context.data_plane_interfaces.iter().collect();
+
+    for attachment in &ipsec.network_attachments {
+        if attachment.interface_name.trim().is_empty() {
+            report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                detail: "interface_name is required".to_string(),
+            });
+            continue;
+        }
+        if attachment.plane.trim().is_empty() {
+            report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                detail: format!(
+                    "plane is required for interface {}",
+                    attachment.interface_name
+                ),
+            });
+            continue;
+        }
+        match &attachment.cni_type {
+            CniType::Custom(value) if value.trim().is_empty() => {
+                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                    detail: format!(
+                        "cni_type custom variant must not be empty for interface {}",
+                        attachment.interface_name
+                    ),
+                });
+                continue;
+            }
+            _ => {}
+        }
+        if !interface_names.contains(&attachment.interface_name) {
+            report.push_error(ValidationError::UnknownInterface {
+                interface_name: attachment.interface_name.clone(),
+            });
+        }
+        if attachment.static_ip_required {
+            let provided = attachment
+                .static_ip
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !provided {
+                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                    detail: format!(
+                        "static_ip is required for interface {}",
+                        attachment.interface_name
+                    ),
+                });
+            }
+        }
+        if let Some(ref static_ip) = attachment.static_ip {
+            if !static_ip.trim().is_empty() && static_ip.trim().parse::<IpAddr>().is_err() {
+                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                    detail: format!(
+                        "static_ip '{static_ip}' is not a valid IPv4/IPv6 address for interface {}",
+                        attachment.interface_name
+                    ),
+                });
+            }
+        }
+        if attachment.source_route_required {
+            let provided = attachment
+                .source_route
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !provided {
+                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                    detail: format!(
+                        "source_route is required for interface {}",
+                        attachment.interface_name
+                    ),
+                });
+            }
+        }
+        let effective_minimum = attachment
+            .minimum_mtu
+            .map(|min| min.max(IPSEC_MINIMUM_MTU))
+            .unwrap_or(IPSEC_MINIMUM_MTU);
+        match attachment.mtu {
+            Some(mtu) if mtu < effective_minimum => {
+                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                    detail: format!(
+                        "mtu {mtu} is below minimum {effective_minimum} for interface {}",
+                        attachment.interface_name
+                    ),
+                });
+            }
+            None if attachment.minimum_mtu.is_some() => {
+                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                    detail: format!(
+                        "mtu is required when minimum_mtu is set for interface {}",
+                        attachment.interface_name
+                    ),
+                });
+            }
+            _ => {}
+        }
+        if let Some(vlan_id) = attachment.vlan_id {
+            if vlan_id == 0 || vlan_id > 4094 {
+                report.push_error(ValidationError::IpsecNetworkAttachmentInvalid {
+                    detail: format!(
+                        "vlan_id {vlan_id} is outside valid 1-4094 range for interface {}",
+                        attachment.interface_name
+                    ),
+                });
+            }
+        }
+    }
 }
 
 pub fn available_xdp_modes(

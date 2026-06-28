@@ -50,6 +50,8 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | [`opc-proto-ikev2`](crates/opc-proto-ikev2/) | IKEv2 (RFC 7296) experimental scaffold: fixed header, raw generic payload-chain walking for unencrypted payloads, unknown payload preservation, and crypto-provider boundary traits *(no IKE SA state machine, EAP-AKA, or Child SA installation)*. | [Conformance](crates/opc-proto-ikev2/CONFORMANCE.md) |
 | [`opc-sctp`](crates/opc-sctp/) | Safe Linux SCTP transport wrapper for CNFs that terminate N2/NGAP or other SCTP interfaces. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
 | [`opc-libsctp-sys`](crates/opc-libsctp-sys/) | Narrow unsafe Linux SCTP UAPI boundary used only by `opc-sctp`; unsupported platforms fail explicitly. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
+| [`opc-linux-xfrm-sys`](crates/opc-linux-xfrm-sys/) | Narrow unsafe Linux XFRM netlink UAPI boundary; unsupported platforms fail explicitly. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
+| [`opc-ipsec-xfrm`](crates/opc-ipsec-xfrm/) | Safe Linux XFRM IPsec backend model, mock backend, and redaction-safe errors. | [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
 | [`opc-node-resources`](crates/opc-node-resources/) | Validates `ResourceProfile` compatibility against observed `NodeCapabilityReport`. | [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md) |
 
 ### Config & Management (`crates/`)

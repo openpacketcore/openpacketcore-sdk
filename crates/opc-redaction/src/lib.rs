@@ -10,11 +10,14 @@ mod digest;
 mod level;
 pub mod metrics;
 pub mod support_bundle;
+pub mod telco;
 
 pub use digest::{compute_digest, DigestError, DigestKey};
 pub use level::{redact, LengthBucket, RedactedValue, RedactionLevel};
 pub use metrics::metrics_label_safe;
 pub use support_bundle::{
-    redact_support_bundle, redact_text, BundleMode, DiagnosticEntry, RedactedEntry,
-    RedactedSupportBundle, RedactionError, RedactionSummary,
+    redact_support_bundle, redact_support_bundle_with_policy, redact_text, ApnDnnClass, BundleMode,
+    DiagnosticEntry, RedactedEntry, RedactedSupportBundle, RedactionError, RedactionPolicy,
+    RedactionSummary,
 };
+pub use telco::TelcoIdentifier;

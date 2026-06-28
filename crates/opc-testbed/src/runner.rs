@@ -437,10 +437,10 @@ impl HardwarePreflight {
 fn build_hardware_preflight(config: &HardwareLabRunnerConfig) -> HardwarePreflight {
     use opc_node_resources::{
         AfXdpProfile, BpfCapabilities, CpuLayout, CpuManagerPolicy, DataPlaneProfile, Environment,
-        HugepagePool, KernelVersion, LinkStatePolicy, LinuxCapability, NetworkFunctionKind,
-        NicCapability, NodeCapabilityReport, NodeCpuCapabilities, NodeMemoryCapabilities,
-        PodSecurityExceptionModel, ResourceProfile, SriovAllowlistPolicy, SriovProfile,
-        TopologyManagerPolicy, XdpMode,
+        HugepagePool, IpsecCapabilities, KernelVersion, LinkStatePolicy, LinuxCapability,
+        NetworkFunctionKind, NicCapability, NodeCapabilityReport, NodeCpuCapabilities,
+        NodeMemoryCapabilities, PodSecurityExceptionModel, ResourceProfile, SriovAllowlistPolicy,
+        SriovProfile, TopologyManagerPolicy, XdpMode,
     };
 
     let data_plane_profile = if config.sriov_xdp_expectations.contains("sriov") {
@@ -546,6 +546,7 @@ fn build_hardware_preflight(config: &HardwareLabRunnerConfig) -> HardwarePreflig
             }],
         },
         nics,
+        ipsec: IpsecCapabilities::default(),
     };
 
     let cpu_layout = if matches!(data_plane_profile, DataPlaneProfile::ControlPlaneOnly) {

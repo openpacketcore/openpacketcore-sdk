@@ -158,7 +158,7 @@ fn test_compatibility_admission_integration() {
 #[test]
 fn test_data_plane_preflight_admission_rejection() {
     use opc_node_resources::{
-        BpfCapabilities, CpuManagerPolicy, KernelVersion, NodeCapabilityReport,
+        BpfCapabilities, CpuManagerPolicy, IpsecCapabilities, KernelVersion, NodeCapabilityReport,
         NodeCpuCapabilities, NodeMemoryCapabilities, TopologyManagerPolicy,
     };
     use std::collections::BTreeSet;
@@ -197,6 +197,7 @@ fn test_data_plane_preflight_admission_rejection() {
             queues: 4,
             numa_node: Some(0),
         }],
+        ipsec: IpsecCapabilities::default(),
     };
 
     req.node_capabilities = Some(node_report);
@@ -227,7 +228,7 @@ fn test_data_plane_preflight_admission_rejects_missing_bpf_artifact() {
 #[test]
 fn test_data_plane_preflight_admission_success() {
     use opc_node_resources::{
-        BpfCapabilities, CpuManagerPolicy, KernelVersion, NodeCapabilityReport,
+        BpfCapabilities, CpuManagerPolicy, IpsecCapabilities, KernelVersion, NodeCapabilityReport,
         NodeCpuCapabilities, NodeMemoryCapabilities, TopologyManagerPolicy,
     };
     use std::collections::BTreeSet;
@@ -277,6 +278,7 @@ fn test_data_plane_preflight_admission_success() {
             queues: 4,
             numa_node: Some(0),
         }],
+        ipsec: IpsecCapabilities::default(),
     };
 
     req.node_capabilities = Some(node_report);
