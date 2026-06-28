@@ -67,6 +67,105 @@ func (e ErrStaleGeneration) Error() string {
 	return fmt.Sprintf("stale generation: target %d < observed %d", e.TargetGeneration, e.ObservedGeneration)
 }
 
+// GateName is a stable, product-neutral runtime-gate identifier compatible
+// with the opc-runtime named-gate model. Products may define custom names,
+// but these constants cover the gates shared across packet-core CNFs.
+type GateName string
+
+// Standard gate names from the opc-runtime health-gate model. These are
+// intentionally generic so that ePDG and other products can map product
+// specific checks to a common SDK vocabulary.
+const (
+	GateConfig                GateName = "config"
+	GateCriticalTasks         GateName = "critical_tasks"
+	GateListeners             GateName = "listeners"
+	GateSecurityMaterial      GateName = "security_material"
+	GateExternalPeer          GateName = "external_peer"
+	GateDiameterPeer          GateName = "diameter_peer"
+	GateSCTPAssociation       GateName = "sctp_association"
+	GateSessionStore          GateName = "session_store"
+	GateReplication           GateName = "replication"
+	GateDataplaneKernel       GateName = "dataplane_kernel"
+	GateXFRM                  GateName = "xfrm"
+	GateGTPUserPath           GateName = "gtp_user_path"
+	GateChargingPeer          GateName = "charging_peer"
+	GateLIDelivery            GateName = "li_delivery"
+	GateCertificateRevocation GateName = "certificate_revocation"
+	GateDrain                 GateName = "drain"
+)
+
+// GateImpact describes how a failing gate affects overall readiness.
+type GateImpact string
+
+const (
+	// GateImpactBlocking means a failing gate makes the workload NotReady.
+	GateImpactBlocking GateImpact = "BlocksReadiness"
+	// GateImpactDegrading means a failing gate contributes to Degraded status
+	// but does not block readiness by itself.
+	GateImpactDegrading GateImpact = "DegradesReadiness"
+	// GateImpactInformational means the gate is reported but does not affect
+	// the ready/degraded verdict.
+	GateImpactInformational GateImpact = "Informational"
+)
+
+// GateStatus is the observed status of a single named gate.
+type GateStatus string
+
+const (
+	// GateUnknown means the gate has not been evaluated yet.
+	GateUnknown GateStatus = "Unknown"
+	// GatePassing means the gate condition is satisfied.
+	GatePassing GateStatus = "Passing"
+	// GateDegraded means the gate is satisfied but with a non-critical caveat.
+	GateDegraded GateStatus = "Degraded"
+	// GateFailing means the gate condition is not satisfied.
+	GateFailing GateStatus = "Failing"
+)
+
+// GateCondition builds a stable Kubernetes condition for a named runtime gate.
+// It is a convenience wrapper around ConditionManager.Set for the common case
+// of mapping gate name/status to a metav1.Condition.
+func GateCondition(cm *ConditionManager, gate GateName, status GateStatus, reason, message string, generation int64) error {
+	condStatus := metav1.ConditionFalse
+	if status == GatePassing || status == GateDegraded {
+		condStatus = metav1.ConditionTrue
+	}
+	return cm.Set(ConditionType(gate), condStatus, reason, message, generation)
+}
+
+// GateStatusFromCondition returns the GateStatus that corresponds to the given
+// metav1.Condition. A True condition maps to Passing; False maps to Failing;
+// Unknown maps to Unknown.
+func GateStatusFromCondition(c metav1.Condition) GateStatus {
+	switch c.Status {
+	case metav1.ConditionTrue:
+		return GatePassing
+	case metav1.ConditionFalse:
+		return GateFailing
+	default:
+		return GateUnknown
+	}
+}
+
+// GateReason returns a stable reason string for a gate status transition.
+func GateReason(gate GateName, status GateStatus) string {
+	return fmt.Sprintf("%s%s", gate, status)
+}
+
+// GateMessage returns a stable message string for a gate status transition.
+func GateMessage(gate GateName, status GateStatus) string {
+	switch status {
+	case GatePassing:
+		return fmt.Sprintf("Gate %s is passing", gate)
+	case GateDegraded:
+		return fmt.Sprintf("Gate %s is degraded", gate)
+	case GateFailing:
+		return fmt.Sprintf("Gate %s is failing", gate)
+	default:
+		return fmt.Sprintf("Gate %s has not been evaluated", gate)
+	}
+}
+
 // ConditionManager wraps a condition slice with enforcement of RFC 009
 // semantics: monotonic observedGeneration, LastTransitionTime bumped only
 // on status change, and stable ordering.

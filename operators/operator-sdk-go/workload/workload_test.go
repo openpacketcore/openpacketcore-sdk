@@ -6,9 +6,11 @@ import (
 	"strings"
 	"testing"
 
+	"openpacketcore.io/operator-sdk-go/cni"
 	"openpacketcore.io/operator-sdk-go/rollout"
 
 	"gopkg.in/yaml.v2"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // updateGolden controls whether to overwrite golden files. Set to true to regenerate.
@@ -169,6 +171,136 @@ func assertGolden(t *testing.T, filename string, dep interface{}) {
 	gotStr := strings.TrimSpace(string(got))
 	if want != gotStr {
 		t.Errorf("golden mismatch for %s\n---want---\n%s\n---got---\n%s", filename, want, gotStr)
+	}
+}
+
+func TestBuildContainerPortsWithAdditionalPorts(t *testing.T) {
+	spec := NetworkFunctionSpec{
+		Name:      "test-nf",
+		Namespace: "default",
+		Version:   "1.0.0",
+		AdditionalPorts: []PortSpec{
+			{Name: "diameter", Port: 3868, Protocol: "tcp"},
+			{Name: "gtpu", Port: 2152, Protocol: "udp"},
+			{Name: "s1mme", Port: 36412, Protocol: "SCTP"},
+		},
+	}
+
+	ports := BuildContainerPorts(spec, 8080)
+	if len(ports) != 4 {
+		t.Fatalf("expected 4 ports, got %d", len(ports))
+	}
+
+	byName := make(map[string]corev1.ContainerPort)
+	for _, p := range ports {
+		byName[p.Name] = p
+	}
+	if byName["gtpu"].Protocol != corev1.ProtocolUDP {
+		t.Errorf("expected gtpu protocol UDP, got %v", byName["gtpu"].Protocol)
+	}
+	if byName["s1mme"].Protocol != corev1.ProtocolSCTP {
+		t.Errorf("expected s1mme protocol SCTP, got %v", byName["s1mme"].Protocol)
+	}
+	if byName["diameter"].Protocol != corev1.ProtocolTCP {
+		t.Errorf("expected diameter protocol TCP, got %v", byName["diameter"].Protocol)
+	}
+}
+
+func TestParsePortProtocol(t *testing.T) {
+	cases := []struct {
+		input string
+		want  corev1.Protocol
+	}{
+		{"tcp", corev1.ProtocolTCP},
+		{"TCP", corev1.ProtocolTCP},
+		{"Udp", corev1.ProtocolUDP},
+		{"UDP", corev1.ProtocolUDP},
+		{"sctp", corev1.ProtocolSCTP},
+		{"SCTP", corev1.ProtocolSCTP},
+		{"", corev1.ProtocolTCP},
+		{"unknown", corev1.ProtocolTCP},
+	}
+	for _, tc := range cases {
+		got := ParsePortProtocol(tc.input)
+		if got != tc.want {
+			t.Errorf("ParsePortProtocol(%q) = %v, want %v", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestRenderDeploymentWithMultusAttachments(t *testing.T) {
+	spec := NetworkFunctionSpec{
+		Name:      "test-nf",
+		Namespace: "default",
+		Version:   "1.0.0",
+	}
+	opts := DefaultRenderOptions()
+	opts.MultusAttachments = []cni.Attachment{
+		{Name: "net0", NetworkName: "nad-a", InterfaceName: "net0"},
+	}
+
+	dep, err := RenderDeployment(spec, opts)
+	if err != nil {
+		t.Fatalf("RenderDeployment failed: %v", err)
+	}
+
+	if _, ok := dep.Spec.Template.Annotations[cni.MultusNetworkAnnotationKey]; !ok {
+		t.Fatalf("expected multus annotation to be set")
+	}
+}
+
+func TestValidateImageTag(t *testing.T) {
+	cases := []struct {
+		name    string
+		spec    NetworkFunctionSpec
+		opts    RenderOptions
+		wantErr bool
+	}{
+		{
+			name: "no immutable tag required",
+			spec: NetworkFunctionSpec{ImageTag: ""},
+			opts: RenderOptions{Image: "openpacketcore/nf:latest"},
+		},
+		{
+			name: "matching immutable tag",
+			spec: NetworkFunctionSpec{ImageTag: "1.2.3"},
+			opts: RenderOptions{Image: "openpacketcore/nf:1.2.3"},
+		},
+		{
+			name:    "mismatched immutable tag",
+			spec:    NetworkFunctionSpec{ImageTag: "1.2.3"},
+			opts:    RenderOptions{Image: "openpacketcore/nf:1.2.4"},
+			wantErr: true,
+		},
+		{
+			name:    "missing image tag",
+			spec:    NetworkFunctionSpec{ImageTag: "1.2.3"},
+			opts:    RenderOptions{Image: "openpacketcore/nf"},
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateImageTag(tc.spec, tc.opts)
+			if tc.wantErr && err == nil {
+				t.Error("expected error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestConfigPushObservedGenerationOK(t *testing.T) {
+	if !ConfigPushObservedGenerationOK(NetworkFunctionSpec{ConfigPushObservedGeneration: 0}) {
+		t.Error("expected generation 0 to be observed")
+	}
+	if !ConfigPushObservedGenerationOK(NetworkFunctionSpec{ConfigPushObservedGeneration: 5}) {
+		t.Error("expected generation 5 to be observed")
+	}
+	if ConfigPushObservedGenerationOK(NetworkFunctionSpec{ConfigPushObservedGeneration: -1}) {
+		t.Error("expected generation -1 to not be observed")
 	}
 }
 

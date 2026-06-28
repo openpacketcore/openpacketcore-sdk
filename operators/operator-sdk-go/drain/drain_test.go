@@ -120,3 +120,36 @@ func TestFakeOrchestratorStartError(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestBuildAdminURL(t *testing.T) {
+	got := BuildAdminURL("10.0.0.1", 9090, DrainEndpointPath)
+	want := "http://10.0.0.1:9090/debug/drain"
+	if got != want {
+		t.Errorf("BuildAdminURL() = %q, want %q", got, want)
+	}
+	got = BuildAdminURL("10.0.0.1", 0, ReadyzEndpointPath)
+	want = "http://10.0.0.1:8080/readyz"
+	if got != want {
+		t.Errorf("BuildAdminURL() default port = %q, want %q", got, want)
+	}
+}
+
+func TestPreStopDrainHook(t *testing.T) {
+	hook := PreStopDrainHook(5)
+	if hook == nil || hook.Sleep == nil {
+		t.Fatal("expected preStop sleep hook")
+	}
+	if hook.Sleep.Seconds != 5 {
+		t.Errorf("expected sleep seconds 5, got %d", hook.Sleep.Seconds)
+	}
+}
+
+func TestBuildPreStopLifecycle(t *testing.T) {
+	lc := BuildPreStopLifecycle(10)
+	if lc == nil || lc.PreStop == nil || lc.PreStop.Sleep == nil {
+		t.Fatal("expected preStop lifecycle")
+	}
+	if lc.PreStop.Sleep.Seconds != 10 {
+		t.Errorf("expected sleep seconds 10, got %d", lc.PreStop.Sleep.Seconds)
+	}
+}
