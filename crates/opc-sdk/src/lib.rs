@@ -17,6 +17,15 @@
 //! | `key`     | `opc-key`, `opc-crypto`                    |
 //! | `types`   | `opc-types` (always on by default)         |
 //!
+//! ## Protocol codec boundary
+//!
+//! The facade intentionally does not re-export experimental protocol crates
+//! such as `opc-proto-gtpv2c`, `opc-proto-diameter`, or `opc-proto-ikev2`,
+//! and the default feature set does not pull them in. CNFs that need the
+//! GTPv2-C S2b subset, the Diameter base scaffold, or the IKEv2 scaffold
+//! should depend on the relevant protocol crate directly and follow its
+//! `CONFORMANCE.md` boundary.
+//!
 //! ## Architecture in five paragraphs
 //!
 //! **Runtime chassis.** [`opc_runtime`] provides the process lifecycle:

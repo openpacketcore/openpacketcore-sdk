@@ -1,0 +1,57 @@
+{
+  "schema_version": "0.1.0",
+  "purpose": "EPC/ePDG simulator skeleton interface fixtures and provenance labels",
+  "packets": [
+    {
+      "id": "pgw-s2b-echo-request",
+      "protocol": "gtpv2c-s2b",
+      "sdk_protocol_crate": "opc-proto-gtpv2c",
+      "source": "crates/opc-proto-gtpv2c/tests/fixtures/spec/echo_request_recovery.bin",
+      "provenance": "spec-authored",
+      "usage": "PGW S2b simulator decoded-message interface regression",
+      "conformance_owner": "opc-proto-gtpv2c",
+      "redaction": "synthetic; no subscriber identifiers or key material"
+    },
+    {
+      "id": "pgw-s2b-create-session-request",
+      "protocol": "gtpv2c-s2b",
+      "sdk_protocol_crate": "opc-proto-gtpv2c",
+      "source": "crates/opc-proto-gtpv2c/tests/fixtures/spec/create_session_request_s2b_subset.bin",
+      "provenance": "spec-authored",
+      "usage": "PGW S2b simulator synthetic session-state regression",
+      "conformance_owner": "opc-proto-gtpv2c",
+      "redaction": "synthetic documentation-range identifiers and addresses only"
+    },
+    {
+      "id": "pgw-s2b-modify-bearer-request",
+      "protocol": "gtpv2c-s2b",
+      "sdk_protocol_crate": "opc-proto-gtpv2c",
+      "source": "crates/opc-proto-gtpv2c/tests/fixtures/spec/modify_bearer_request_bearer_context.bin",
+      "provenance": "spec-authored",
+      "usage": "PGW S2b fail-closed state-machine regression",
+      "conformance_owner": "opc-proto-gtpv2c",
+      "redaction": "synthetic; no subscriber identifiers or key material"
+    },
+    {
+      "id": "pgw-s2b-delete-session-request",
+      "protocol": "gtpv2c-s2b",
+      "sdk_protocol_crate": "opc-proto-gtpv2c",
+      "source": "crates/opc-proto-gtpv2c/tests/fixtures/spec/delete_session_request_linked_ebi.bin",
+      "provenance": "spec-authored",
+      "usage": "PGW S2b fail-closed malformed-state regression",
+      "conformance_owner": "opc-proto-gtpv2c",
+      "redaction": "synthetic; no subscriber identifiers or key material"
+    }
+  ],
+  "interfaces": [
+    {
+      "id": "diameter-peer-decoded-message",
+      "protocol": "diameter",
+      "sdk_protocol_crate": "opc-proto-diameter",
+      "provenance": "no-packet-fixture-yet",
+      "parser_policy": "sdk-protocol-crate-only",
+      "usage": "Diameter peer simulator metadata interface bridged to the SDK Diameter codec without a local parser",
+      "redaction": "the simulator stores counters and booleans only; no Diameter Session-Id value is retained"
+    }
+  ]
+}

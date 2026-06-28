@@ -55,6 +55,31 @@ pub struct ResourceProfileSpec {
     pub sriov_resource_name: Option<String>,
     #[serde(default)]
     pub sriov_allowed_device_drivers: Vec<String>,
+    #[serde(default)]
+    pub ipsec_network_attachments: Vec<IpsecNetworkAttachmentSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpsecNetworkAttachmentSpec {
+    pub interface_name: String,
+    pub plane: String,
+    /// Built-in CNI type (`sriov`, `macvlan`, `ipvlan`, `host-network`) or an
+    /// operator-defined custom CNI name.
+    pub cni_type: String,
+    #[serde(default)]
+    pub static_ip_required: bool,
+    #[serde(default)]
+    pub static_ip: Option<String>,
+    #[serde(default)]
+    pub minimum_mtu: Option<u16>,
+    #[serde(default)]
+    pub mtu: Option<u16>,
+    #[serde(default)]
+    pub source_route_required: bool,
+    #[serde(default)]
+    pub source_route: Option<String>,
+    #[serde(default)]
+    pub vlan_id: Option<u16>,
 }
 
 /// Structure representing the response sent back to a Kubernetes admission controller webhook.
@@ -143,6 +168,46 @@ fn parse_nf_kind(value: &str) -> opc_node_resources::NetworkFunctionKind {
         "amf" => opc_node_resources::NetworkFunctionKind::Amf,
         "nrf" => opc_node_resources::NetworkFunctionKind::Nrf,
         other => opc_node_resources::NetworkFunctionKind::Custom(other.to_string()),
+    }
+}
+
+pub fn ipsec_gateway_profile_from_spec(
+    rp: &ResourceProfileSpec,
+) -> opc_node_resources::IpsecGatewayProfile {
+    let mut profile =
+        opc_node_resources::IpsecGatewayProfile::standard(rp.pod_security_evidence_id.clone());
+    profile.network_attachments = rp
+        .ipsec_network_attachments
+        .iter()
+        .map(ipsec_network_attachment_from_spec)
+        .collect();
+    profile
+}
+
+fn ipsec_network_attachment_from_spec(
+    spec: &IpsecNetworkAttachmentSpec,
+) -> opc_node_resources::IpsecNetworkAttachment {
+    opc_node_resources::IpsecNetworkAttachment {
+        interface_name: spec.interface_name.clone(),
+        plane: spec.plane.clone(),
+        cni_type: cni_type_from_spec(&spec.cni_type),
+        static_ip_required: spec.static_ip_required,
+        static_ip: spec.static_ip.clone(),
+        minimum_mtu: spec.minimum_mtu,
+        mtu: spec.mtu,
+        source_route_required: spec.source_route_required,
+        source_route: spec.source_route.clone(),
+        vlan_id: spec.vlan_id,
+    }
+}
+
+fn cni_type_from_spec(value: &str) -> opc_node_resources::CniType {
+    match value {
+        "sriov" | "Sriov" => opc_node_resources::CniType::Sriov,
+        "macvlan" | "Macvlan" => opc_node_resources::CniType::Macvlan,
+        "ipvlan" | "Ipvlan" => opc_node_resources::CniType::Ipvlan,
+        "host-network" | "HostNetwork" => opc_node_resources::CniType::HostNetwork,
+        custom => opc_node_resources::CniType::Custom(custom.to_string()),
     }
 }
 
@@ -357,9 +422,7 @@ pub fn evaluate_admission(req: &AdmissionRequest) -> AdmissionResponse {
                                     == opc_node_resources::DataPlaneProfile::IpsecGateway
                                 {
                                     profile.ipsec_gateway =
-                                        Some(opc_node_resources::IpsecGatewayProfile::standard(
-                                            rp.pod_security_evidence_id.clone(),
-                                        ));
+                                        Some(ipsec_gateway_profile_from_spec(rp));
                                 }
 
                                 let cpu_layout = opc_node_resources::CpuLayout {

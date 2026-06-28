@@ -4,11 +4,26 @@ Scenario DSL, virtual time, assertions, fixture provenance, and simulator framew
 
 ## Status
 
-**Production-ready**
+**Core framework: Production-ready. EPC/ePDG simulator skeletons: experimental.**
 
 ## Reference
 
-[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/012-cnf-simulators-and-testbeds.md)
+[`RFC 012`](../../docs/rfc/012-testbed-simulator-framework.md) and the
+[EPC/ePDG simulator design](../../docs/design/epc-epdg-testbed-simulators.md).
+
+## Simulator skeletons
+
+- `simulators::fake`, `amf`, `smf`, and `upf` provide existing in-process peer
+  mechanics for scenario runner tests.
+- `simulators::epc::PgwS2bSimulator` accepts SDK-decoded S2b views, with
+  `opc-proto-gtpv2c` owning byte parsing and fixture conformance. RFC 012
+  fidelity = `stateful-mock` (experimental); not procedure-faithful, not
+  conformance, and not a production PGW/ePDG control plane.
+- `simulators::epc::DiameterPeerSimulator` accepts decoded Diameter metadata
+  from the experimental `opc-proto-diameter` crate or compatible product
+  adapters; it intentionally carries no local Diameter parser. RFC 012 fidelity
+  = `stateful-mock` (experimental); not procedure-faithful, not conformance,
+  and not a production AAA/HSS/CDF peer.
 
 ## Quick start
 

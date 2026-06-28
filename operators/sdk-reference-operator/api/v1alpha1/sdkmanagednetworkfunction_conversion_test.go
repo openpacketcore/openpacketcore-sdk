@@ -14,6 +14,8 @@ func TestConversionRoundTrip(t *testing.T) {
 	podSecurityEvidence := "pod-sec-ev-1"
 	sriovResName := "intel.com/ice_sriov"
 	bpfEvidence := "bpf-ev-1"
+	staticIP := "10.0.0.10"
+	attachmentMTU := uint16(1500)
 
 	src := &SdkManagedNetworkFunction{
 		ObjectMeta: metav1.ObjectMeta{
@@ -45,6 +47,15 @@ func TestConversionRoundTrip(t *testing.T) {
 				PodSecurityEvidenceID:     &podSecurityEvidence,
 				SriovResourceName:         &sriovResName,
 				SriovAllowedDeviceDrivers: []string{"ice"},
+				IpsecNetworkAttachments: []IpsecNetworkAttachmentSpec{
+					{
+						InterfaceName: "eth1",
+						Plane:         "untrusted-access",
+						CniType:       "macvlan",
+						StaticIP:      &staticIP,
+						MTU:           &attachmentMTU,
+					},
+				},
 				BpfArtifacts: []BpfArtifact{
 					{
 						Name:                "upf-bpf",
@@ -103,6 +114,9 @@ func TestConversionRoundTrip(t *testing.T) {
 	}
 	if got := hub.Spec.ResourceProfile.BpfArtifacts[0].ExpectedAttachPoint; got != "eth1" {
 		t.Errorf("Expected BPF attach point eth1, got %q", got)
+	}
+	if got := hub.Spec.ResourceProfile.IpsecNetworkAttachments[0].InterfaceName; got != "eth1" {
+		t.Errorf("Expected IPsec attachment interface eth1, got %q", got)
 	}
 
 	// 2. Convert v1beta1 -> v1alpha1

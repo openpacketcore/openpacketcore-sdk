@@ -1,0 +1,23 @@
+{
+  "schema_version": "rfc006/v1/packet-core-experimental",
+  "evidence_id": "epdg-kernel-dataplane-001",
+  "interface_name": "eth0",
+  "xfrm_state_count": 4,
+  "xfrm_policy_count": 4,
+  "routing_entries": 12,
+  "iptables_rules": 0,
+  "nftables_rules": 8,
+  "observed_packets": 1000000,
+  "dropped_packets": 0,
+  "counters": [
+    { "name": "esp_packets", "value": 900000 },
+    { "name": "gtpu_packets", "value": 100000 }
+  ],
+  "xfrm_state_summary": [
+    "spi=<spi-redacted> mode=tunnel",
+    "spi=<spi-redacted> mode=tunnel"
+  ],
+  "timestamp": "2026-06-28T00:00:00Z",
+  "requirements": ["REQ-IETF-RFC7296-R1-1.2-001"],
+  "notes": "Experimental kernel dataplane evidence shape."
+}

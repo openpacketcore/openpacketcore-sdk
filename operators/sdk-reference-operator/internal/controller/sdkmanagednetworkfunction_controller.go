@@ -211,6 +211,7 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 				PodSecurityEvidenceID:     crd.Spec.ResourceProfile.PodSecurityEvidenceID,
 				SriovResourceName:         crd.Spec.ResourceProfile.SriovResourceName,
 				SriovAllowedDeviceDrivers: crd.Spec.ResourceProfile.SriovAllowedDeviceDrivers,
+				IpsecNetworkAttachments:   sdkbridgeIpsecNetworkAttachments(crd.Spec.ResourceProfile.IpsecNetworkAttachments),
 			},
 			NodeCapabilities: *nodeCaps,
 		}
@@ -432,6 +433,44 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func sdkbridgeIpsecNetworkAttachments(in []v1beta1.IpsecNetworkAttachmentSpec) []sdkbridge.IpsecNetworkAttachmentSpec {
+	if in == nil {
+		return nil
+	}
+	out := make([]sdkbridge.IpsecNetworkAttachmentSpec, len(in))
+	for i, attachment := range in {
+		out[i] = sdkbridge.IpsecNetworkAttachmentSpec{
+			InterfaceName:       attachment.InterfaceName,
+			Plane:               attachment.Plane,
+			CniType:             attachment.CniType,
+			StaticIPRequired:    attachment.StaticIPRequired,
+			StaticIP:            cloneStringPtr(attachment.StaticIP),
+			MinimumMTU:          cloneUint16Ptr(attachment.MinimumMTU),
+			MTU:                 cloneUint16Ptr(attachment.MTU),
+			SourceRouteRequired: attachment.SourceRouteRequired,
+			SourceRoute:         cloneStringPtr(attachment.SourceRoute),
+			VlanID:              cloneUint16Ptr(attachment.VlanID),
+		}
+	}
+	return out
+}
+
+func cloneStringPtr(in *string) *string {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+func cloneUint16Ptr(in *uint16) *uint16 {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
 }
 
 func (r *SdkManagedNetworkFunctionReconciler) runDrain(ctx context.Context, crd *v1beta1.SdkManagedNetworkFunction, cm *conditions.ConditionManager) error {

@@ -17,6 +17,12 @@ fn operator_readiness_doc_tracks_final_validation_boundaries() {
         "EncryptingSessionBackend",
         "NrfDrainHook",
         "not Kubernetes-operator-ready",
+        "T-8c57ecee",
+        "ADR 0018",
+        "opc-proto-diameter",
+        "Experimental protocol crates",
+        "operators/operator-sdk-go",
+        "docs/refactoring/epdg-sdk-final-hardening-triage.md",
     ] {
         assert!(
             readiness.contains(required),
@@ -31,5 +37,9 @@ fn operator_readiness_doc_tracks_final_validation_boundaries() {
     assert!(
         status.contains("Final validation snapshot — T-9be95f92"),
         "implementation status must retain the final validation snapshot"
+    );
+    assert!(
+        status.contains("Final hardening snapshot — T-8c57ecee"),
+        "implementation status must retain the EPC/untrusted-access final hardening snapshot"
     );
 }

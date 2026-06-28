@@ -51,9 +51,9 @@ fn valid_bpf_artifact(interface_name: &str) -> opc_node_resources::BpfArtifact {
 
 fn valid_node_capability_report() -> opc_node_resources::NodeCapabilityReport {
     use opc_node_resources::{
-        BpfCapabilities, CpuManagerPolicy, HugepagePool, KernelVersion, NicCapability,
-        NodeCapabilityReport, NodeCpuCapabilities, NodeMemoryCapabilities, TopologyManagerPolicy,
-        XdpMode,
+        BpfCapabilities, CpuManagerPolicy, HugepagePool, IpsecCapabilities, KernelVersion,
+        NicCapability, NodeCapabilityReport, NodeCpuCapabilities, NodeMemoryCapabilities,
+        TopologyManagerPolicy, XdpMode,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -93,6 +93,7 @@ fn valid_node_capability_report() -> opc_node_resources::NodeCapabilityReport {
             queues: 4,
             numa_node: Some(0),
         }],
+        ipsec: IpsecCapabilities::default(),
         ipsec_gateway: None,
     }
 }
@@ -193,6 +194,7 @@ fn create_admission_request(mode: RuntimeMode, token: Option<String>) -> Admissi
             bpf_artifacts: vec![valid_bpf_artifact("ens5f0")],
             sriov_resource_name: Some("intel.com/ice_sriov".to_string()),
             sriov_allowed_device_drivers: vec!["ice".to_string()],
+            ipsec_network_attachments: vec![],
         }),
         node_capabilities: Some(valid_node_capability_report()),
         operator_release: Some(op),

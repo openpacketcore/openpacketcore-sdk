@@ -158,7 +158,7 @@ fn test_compatibility_admission_integration() {
 #[test]
 fn test_data_plane_preflight_admission_rejection() {
     use opc_node_resources::{
-        BpfCapabilities, CpuManagerPolicy, KernelVersion, NodeCapabilityReport,
+        BpfCapabilities, CpuManagerPolicy, IpsecCapabilities, KernelVersion, NodeCapabilityReport,
         NodeCpuCapabilities, NodeMemoryCapabilities, TopologyManagerPolicy,
     };
     use std::collections::BTreeSet;
@@ -197,6 +197,7 @@ fn test_data_plane_preflight_admission_rejection() {
             queues: 4,
             numa_node: Some(0),
         }],
+        ipsec: IpsecCapabilities::default(),
         ipsec_gateway: None,
     };
 
@@ -228,7 +229,7 @@ fn test_data_plane_preflight_admission_rejects_missing_bpf_artifact() {
 #[test]
 fn test_data_plane_preflight_admission_success() {
     use opc_node_resources::{
-        BpfCapabilities, CpuManagerPolicy, KernelVersion, NodeCapabilityReport,
+        BpfCapabilities, CpuManagerPolicy, IpsecCapabilities, KernelVersion, NodeCapabilityReport,
         NodeCpuCapabilities, NodeMemoryCapabilities, TopologyManagerPolicy,
     };
     use std::collections::BTreeSet;
@@ -278,6 +279,7 @@ fn test_data_plane_preflight_admission_success() {
             queues: 4,
             numa_node: Some(0),
         }],
+        ipsec: IpsecCapabilities::default(),
         ipsec_gateway: None,
     };
 
@@ -288,5 +290,86 @@ fn test_data_plane_preflight_admission_success() {
     req.compatibility_matrix = None;
 
     let res = evaluate_admission(&req);
+    assert!(res.allowed, "Admission failed: {:?}", res.status);
+}
+
+fn valid_ipsec_node_capability_report() -> opc_node_resources::NodeCapabilityReport {
+    let mut node = valid_node_capability_report();
+    node.ipsec = opc_node_resources::IpsecCapabilities {
+        xfrm_netlink_available: true,
+        xfrm_user_policy_available: true,
+        esp_supported: true,
+        udp_500_bind_allowed: true,
+        udp_4500_bind_allowed: true,
+        sctp_supported: true,
+        available_kernel_modules: std::collections::BTreeSet::from([
+            opc_node_resources::KernelModuleId::from("xfrm_user"),
+            opc_node_resources::KernelModuleId::from("esp4"),
+        ]),
+        supported_esp_algorithms: std::collections::BTreeSet::from([
+            opc_node_resources::EspAlgorithmId::from("aes-cbc"),
+            opc_node_resources::EspAlgorithmId::from("hmac-sha256"),
+        ]),
+    };
+    node.ipsec_gateway = Some(opc_node_resources::IpsecGatewayCapabilities {
+        xfrm_user: true,
+        xfrm_state: true,
+        xfrm_policy: true,
+        netns_scoped_operation: true,
+        route_rule_prerequisites: true,
+        evidence_id: Some("node-ipsec-gateway-ev-1".to_string()),
+    });
+    node
+}
+
+fn configure_ipsec_gateway_request(req: &mut AdmissionRequest) {
+    req.claims_ha = false;
+    req.compatibility_matrix = None;
+    req.node_capabilities = Some(valid_ipsec_node_capability_report());
+    let rp = req.resource_profile.as_mut().unwrap();
+    rp.nf_kind = "n3iwf".to_string();
+    rp.data_plane_profile = "IpsecGateway".to_string();
+    rp.bpf_artifacts.clear();
+    rp.pod_security_evidence_id = Some("platform-ipsec-gateway-ev-1".to_string());
+}
+
+#[test]
+fn test_ipsec_gateway_admission_requires_explicit_network_attachment() {
+    let mut req = create_base_admission_request();
+    configure_ipsec_gateway_request(&mut req);
+
+    let res = evaluate_admission(&req);
+
+    assert!(!res.allowed);
+    let status = res.status.unwrap();
+    assert_eq!(status.reason, "DataPlanePreflightFailed");
+    assert!(status
+        .message
+        .contains("at least one IPsec network attachment is required"));
+    assert!(!status
+        .message
+        .contains("IPsec gateway profile selected but not configured"));
+}
+
+#[test]
+fn test_ipsec_gateway_admission_passes_with_explicit_network_attachment() {
+    let mut req = create_base_admission_request();
+    configure_ipsec_gateway_request(&mut req);
+    let rp = req.resource_profile.as_mut().unwrap();
+    rp.ipsec_network_attachments = vec![IpsecNetworkAttachmentSpec {
+        interface_name: "ens5f0".to_string(),
+        plane: "untrusted-access".to_string(),
+        cni_type: "macvlan".to_string(),
+        static_ip_required: false,
+        static_ip: None,
+        minimum_mtu: None,
+        mtu: Some(1500),
+        source_route_required: false,
+        source_route: None,
+        vlan_id: None,
+    }];
+
+    let res = evaluate_admission(&req);
+
     assert!(res.allowed, "Admission failed: {:?}", res.status);
 }

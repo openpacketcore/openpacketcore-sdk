@@ -4,7 +4,15 @@ OpenPacketCore SDK facade crate — compose CNFs from a single dependency.
 
 ## Status
 
-**Production-ready**
+**Production-ready core facade**
+
+The default feature set exposes the SDK runtime, configuration, session, SBI,
+alarm, identity, key, and shared-type composition surface. Experimental protocol
+codecs, including the S2b-focused `opc-proto-gtpv2c` crate, the Diameter base
+scaffold in `opc-proto-diameter`, and the IKEv2 scaffold in
+`opc-proto-ikev2`, are intentionally not re-exported by this facade or its
+prelude; CNFs that need them should add the relevant protocol crate as a
+direct dependency and follow that crate's conformance boundary.
 
 ## Reference
 

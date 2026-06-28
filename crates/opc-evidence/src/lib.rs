@@ -11,6 +11,7 @@ pub mod evidence;
 pub mod extract;
 pub mod gap;
 pub mod manifest;
+pub mod packet_core;
 pub mod performance;
 pub mod policy;
 pub mod provenance;
@@ -35,6 +36,11 @@ pub use evidence::EvidenceRecord;
 pub use extract::{scan_directory, scan_file, ExtractedTag, ExtractionError};
 pub use gap::{validate_status_for_gaps, Gap, GapError, GapOptions, GapSeverity, GapStatus};
 pub use manifest::{compute_digest, Manifest, ManifestEntry};
+pub use packet_core::{
+    has_raw_sensitive_identifier, AttachProcedureEvidence, AttachProcedureResult, AttachStep,
+    AttachStepResult, DataplaneCounter, KernelDataplaneEvidence, PacketCoreEvidencePack,
+    PacketCoreMessageDirection, PacketCoreProtocolEvidence, PACKET_CORE_SCHEMA_VERSION,
+};
 pub use performance::{
     capture_environment, evaluate_threshold, redact_secrets_and_paths, EnvironmentMetadata,
     PerformanceBaseline, PerformanceMetric, RegressionStatus,

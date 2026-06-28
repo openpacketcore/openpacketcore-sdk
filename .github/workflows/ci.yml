@@ -43,6 +43,9 @@ jobs:
           python3 scripts/check-management-plane-policy.py --self-test
           python3 scripts/check-management-plane-policy.py --check
 
+      - name: Run opc-proto-diameter corpus generator self-test
+        run: python3 crates/opc-proto-diameter/fuzz/generate_corpus.py self-test
+
       - name: Run clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 

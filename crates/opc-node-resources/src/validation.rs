@@ -112,6 +112,7 @@ pub fn run_data_plane_preflight(
                 | ValidationError::SriovNoDataPlaneInterfaces
                 | ValidationError::IpsecGatewayNoDataPlaneInterfaces
                 | ValidationError::AfXdpNoDataPlaneInterfaces
+                | ValidationError::IpsecNetworkAttachmentInvalid { .. }
         )
     });
     checks.push(PreflightCheckResult {
@@ -193,6 +194,32 @@ pub fn run_data_plane_preflight(
             "Pod security exceptions are minimal and correctly evidence-linked.".to_string()
         } else {
             "Pod security exceptions contain disallowed or unlinked policy escapes.".to_string()
+        },
+    });
+
+    // Check 6: IPsec capability and fallback policy requirements
+    let ipsec_passed = if profile.data_plane_profile == DataPlaneProfile::IpsecGateway {
+        report.errors.iter().all(|e| {
+            !matches!(
+                e,
+                ValidationError::MissingNodeCapability { .. }
+                    | ValidationError::ProductionLabFallbackForbidden
+                    | ValidationError::UnsupportedKernelVersion { .. }
+                    | ValidationError::IpsecGatewayProfileMissing
+                    | ValidationError::InvalidKernelModuleId { .. }
+                    | ValidationError::InvalidEspAlgorithmId { .. }
+            )
+        })
+    } else {
+        true
+    };
+    checks.push(PreflightCheckResult {
+        name: "IPsec_Capabilities".to_string(),
+        passed: ipsec_passed,
+        message: if ipsec_passed {
+            "IPsec kernel capabilities and fallback policy meet requirements.".to_string()
+        } else {
+            "IPsec kernel capability or fallback policy requirement is unmet.".to_string()
         },
     });
 

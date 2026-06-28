@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 /// Logical CPU identifier used in core-pinning layouts.
 pub type CpuId = u16;
@@ -193,6 +194,9 @@ pub enum FallbackMode {
     Veth,
     /// Allow non-exclusive / non-isolated data-plane CPU placement in lab mode.
     RelaxedCpuPinning,
+    /// Use a userspace ESP implementation when kernel ESP offload is unavailable
+    /// in lab mode.
+    UserspaceEsp,
     /// Run without the requested huge-page reservation in lab mode.
     ///
     /// **Reserved for future use.**  This variant is defined but no validator
@@ -416,15 +420,381 @@ pub struct SriovProfile {
     pub ipam_mode: IpamMode,
 }
 
-/// IPsec gateway data-plane profile.
+/// Constrained/custom CNI type for an IPsec gateway network attachment.
 ///
-/// This profile describes generic Linux XFRM/IPsec gateway prerequisites for
-/// packet-core CNFs. It validates host capability evidence only; it does not
-/// install XFRM state, policies, routes, rules, or packet handling behavior.
+/// Matches the design §13.2 set: `{macvlan, ipvlan, sriov, host-network, custom}`.
+/// Multus is attachment plumbing and is modeled separately (e.g. as an
+/// annotation or network-selection policy), not as a CNI type here.
+///
+/// The `Deserialize` implementation requires a self-describing format such as
+/// JSON; deserialization from binary formats is not currently supported.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum CniType {
+    /// SR-IOV direct-assignment CNI.
+    #[serde(rename = "sriov")]
+    Sriov,
+    /// MACVLAN CNI.
+    #[serde(rename = "macvlan")]
+    Macvlan,
+    /// IPVLAN CNI.
+    #[serde(rename = "ipvlan")]
+    Ipvlan,
+    /// Host-network attachment.
+    #[serde(rename = "host-network")]
+    HostNetwork,
+    /// Operator-defined CNI type outside the built-in set.
+    ///
+    /// The non-blank invariant is enforced by [`CniType::try_custom`] and by
+    /// the [`Deserialize`](serde::Deserialize) implementation. Directly
+    /// constructing this variant bypasses that invariant and should be
+    /// avoided; use [`CniType::try_custom`] instead.
+    #[serde(rename = "custom")]
+    Custom(String),
+}
+
+impl CniType {
+    /// Construct a [`CniType::Custom`] variant only if the supplied name is
+    /// non-empty and not whitespace-only.
+    ///
+    /// The supplied name is stored verbatim, including any leading or
+    /// trailing whitespace; only empty or whitespace-only inputs are rejected.
+    pub fn try_custom(name: impl AsRef<str>) -> Option<Self> {
+        let name = name.as_ref();
+        if name.trim().is_empty() {
+            None
+        } else {
+            Some(Self::Custom(name.to_string()))
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CniType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CniTypeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for CniTypeVisitor {
+            type Value = CniType;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(
+                    "a built-in CNI type string or a custom CNI object such as {\"custom\":\"name\"}",
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                // Reject blank strings up-front so the intent is explicit before
+                // falling through to the built-in arms.
+                if value.trim().is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "CNI type string must be non-empty and not whitespace-only",
+                    ));
+                }
+                match value {
+                    "sriov" | "Sriov" => Ok(CniType::Sriov),
+                    "macvlan" | "Macvlan" => Ok(CniType::Macvlan),
+                    "ipvlan" | "Ipvlan" => Ok(CniType::Ipvlan),
+                    "host-network" | "HostNetwork" => Ok(CniType::HostNetwork),
+                    _ => Err(serde::de::Error::custom(format!(
+                        "unknown CNI type string: {value}"
+                    ))),
+                }
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let key: String = map.next_key()?.ok_or_else(|| {
+                    serde::de::Error::custom("expected a key for custom CNI type")
+                })?;
+                let value: String = map.next_value()?;
+                if map.next_key::<String>()?.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "custom CNI object must contain exactly one key",
+                    ));
+                }
+                match key.as_str() {
+                    "custom" | "Custom" => {
+                        if value.trim().is_empty() {
+                            Err(serde::de::Error::custom(
+                                "custom CNI type name must be non-empty and not whitespace-only",
+                            ))
+                        } else {
+                            Ok(CniType::Custom(value))
+                        }
+                    }
+                    _ => Err(serde::de::Error::custom(format!(
+                        "unknown CNI type object key: {key}"
+                    ))),
+                }
+            }
+        }
+
+        // `deserialize_any` is used so the visitor can accept either a plain
+        // string or a `{"custom":"name"}` object. This requires a
+        // self-describing format such as JSON; binary formats would need a
+        // dedicated representation and are not currently supported.
+        deserializer.deserialize_any(CniTypeVisitor)
+    }
+}
+
+/// Kernel module identifier, normalized to lowercase for equality and ordering.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(transparent)]
+pub struct KernelModuleId(String);
+
+impl KernelModuleId {
+    /// Construct a [`KernelModuleId`] from the supplied identifier.
+    ///
+    /// The identifier is normalized to lowercase. Surrounding whitespace is
+    /// preserved; this constructor does **not** validate that the identifier is
+    /// non-empty. Use [`KernelModuleId::try_new`] or rely on the
+    /// [`Deserialize`](serde::Deserialize) impl to enforce the non-blank
+    /// invariant at the serde boundary.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into().to_lowercase())
+    }
+
+    /// Construct a [`KernelModuleId`] only if the supplied identifier is
+    /// non-empty and not whitespace-only.
+    ///
+    /// The identifier is normalized to lowercase; surrounding whitespace is
+    /// preserved and only empty or whitespace-only inputs are rejected.
+    pub fn try_new(name: impl AsRef<str>) -> Option<Self> {
+        let name = name.as_ref();
+        if name.trim().is_empty() {
+            None
+        } else {
+            Some(Self::new(name))
+        }
+    }
+
+    /// Returns `true` if the identifier is non-empty and not whitespace-only.
+    pub fn is_valid(&self) -> bool {
+        !self.0.trim().is_empty()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for KernelModuleId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let name = String::deserialize(deserializer)?;
+        KernelModuleId::try_new(&name).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "kernel module identifier must be non-empty and not whitespace-only, got '{name}'"
+            ))
+        })
+    }
+}
+
+impl PartialEq for KernelModuleId {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for KernelModuleId {}
+
+impl Hash for KernelModuleId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl PartialOrd for KernelModuleId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KernelModuleId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl From<String> for KernelModuleId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for KernelModuleId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl fmt::Display for KernelModuleId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// ESP algorithm identifier, normalized to lowercase for equality and ordering.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(transparent)]
+pub struct EspAlgorithmId(String);
+
+impl EspAlgorithmId {
+    /// Construct an [`EspAlgorithmId`] from the supplied identifier.
+    ///
+    /// The identifier is normalized to lowercase. Surrounding whitespace is
+    /// preserved; this constructor does **not** validate that the identifier is
+    /// non-empty. Use [`EspAlgorithmId::try_new`] or rely on the
+    /// [`Deserialize`](serde::Deserialize) impl to enforce the non-blank
+    /// invariant at the serde boundary.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into().to_lowercase())
+    }
+
+    /// Construct an [`EspAlgorithmId`] only if the supplied identifier is
+    /// non-empty and not whitespace-only.
+    ///
+    /// The identifier is normalized to lowercase; surrounding whitespace is
+    /// preserved and only empty or whitespace-only inputs are rejected.
+    pub fn try_new(name: impl AsRef<str>) -> Option<Self> {
+        let name = name.as_ref();
+        if name.trim().is_empty() {
+            None
+        } else {
+            Some(Self::new(name))
+        }
+    }
+
+    /// Returns `true` if the identifier is non-empty and not whitespace-only.
+    pub fn is_valid(&self) -> bool {
+        !self.0.trim().is_empty()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for EspAlgorithmId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let name = String::deserialize(deserializer)?;
+        EspAlgorithmId::try_new(&name).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "ESP algorithm identifier must be non-empty and not whitespace-only, got '{name}'"
+            ))
+        })
+    }
+}
+
+impl PartialEq for EspAlgorithmId {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for EspAlgorithmId {}
+
+impl Hash for EspAlgorithmId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl PartialOrd for EspAlgorithmId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for EspAlgorithmId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl From<String> for EspAlgorithmId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for EspAlgorithmId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl fmt::Display for EspAlgorithmId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// IPsec gateway network attachment requirement.
+///
+/// Declares the requested attachment prerequisites for an IPsec gateway
+/// workload, such as the data-plane interface name, functional plane,
+/// CNI type, and optional L2/L3 constraints.  This is a pure model: it does
+/// not inspect the host network namespace or Multus state.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IpsecNetworkAttachment {
+    /// Logical data-plane interface name (must match a declared data-plane
+    /// interface in the validation context).
+    pub interface_name: String,
+    /// Functional plane of the attachment (e.g. `n3`, `n6`, `nwu`).
+    pub plane: String,
+    /// CNI type requested for this attachment.
+    pub cni_type: CniType,
+    /// Whether a static IP is required for this attachment.
+    pub static_ip_required: bool,
+    /// Optional statically requested IP address.  Required when
+    /// `static_ip_required` is `true` and must be a valid IPv4 or IPv6
+    /// address when present.
+    pub static_ip: Option<String>,
+    /// Optional minimum required MTU.  When present the attachment's `mtu`
+    /// must be at least this value.
+    pub minimum_mtu: Option<u16>,
+    /// Optional requested MTU.  When present it must be at least
+    /// `IPSEC_MINIMUM_MTU` and meet `minimum_mtu`.
+    pub mtu: Option<u16>,
+    /// Whether source routing is required for this attachment.
+    pub source_route_required: bool,
+    /// Optional source route configuration.  Required when
+    /// `source_route_required` is `true`.
+    pub source_route: Option<String>,
+    /// Optional VLAN identifier.  When present it must be in the valid
+    /// 802.1Q range.
+    pub vlan_id: Option<u16>,
+}
+
+/// IPsec gateway resource profile.
+///
+/// Describes the kernel, XFRM, UDP encapsulation, SCTP, capability,
+/// network-attachment, and ESP-fallback requirements that a node must satisfy
+/// for an IPsec gateway workload (e.g. future ePDG/N3IWF untrusted-access
+/// functions).
+///
+/// This crate is a pure model: it performs only structural validation of the
+/// declared requirements against the observed [`NodeCapabilityReport`] and never
+/// inspects the host filesystem or kernel state directly.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IpsecGatewayProfile {
-    /// Exact set of Linux capabilities the gateway pod must hold.
+    /// Minimum kernel version required for the IPsec gateway profile.
+    pub minimum_kernel: KernelVersion,
+    /// Exact set of Linux capabilities that the CNF pod must hold.
     pub required_capabilities: BTreeSet<LinuxCapability>,
+    /// Whether the node must report XFRM support.
+    pub require_xfrm: bool,
+    /// Whether the node must allow binding UDP port 500 (IKE).
+    pub require_udp_500: bool,
+    /// Whether the node must allow binding UDP port 4500 (NAT-T).
+    pub require_udp_4500: bool,
+    /// Whether the node must report SCTP support.
+    pub require_sctp: bool,
     /// Require evidence that the kernel exposes XFRM user API support.
     pub require_xfrm_user: bool,
     /// Require evidence that XFRM state operations are available.
@@ -435,26 +805,83 @@ pub struct IpsecGatewayProfile {
     pub require_netns_scoped_operation: bool,
     /// Require evidence that route/rule prerequisites can be managed for the gateway.
     pub require_route_rule_prerequisites: bool,
-    /// Evidence ID backing the observed IPsec gateway capability checks.
+    /// Kernel modules that must be available on the node (e.g. `xfrm_user`).
+    pub required_kernel_modules: BTreeSet<KernelModuleId>,
+    /// ESP algorithms that must be supported by the node (e.g. `aes-cbc`).
+    pub required_esp_algorithms: BTreeSet<EspAlgorithmId>,
+    /// Required network attachments for the IPsec gateway workload.
+    pub network_attachments: Vec<IpsecNetworkAttachment>,
+    /// Whether lab mode may fall back to userspace ESP when kernel ESP is
+    /// unavailable.
+    pub allow_userspace_esp_fallback: bool,
+    /// Evidence ID backing the declared IPsec gateway capability checks.
     pub evidence_id: Option<String>,
 }
 
 impl IpsecGatewayProfile {
     /// Returns a conservative production IPsec gateway profile.
+    ///
+    /// Network attachments are intentionally left empty. Interface names,
+    /// functional planes, CNI types, MTU requirements, static IP assignment, and
+    /// source-route policy are deployment-owned inputs and must be declared by
+    /// the caller before validation.
     pub fn standard(evidence_id: Option<String>) -> Self {
         Self {
+            minimum_kernel: KernelVersion::new(5, 15, 0),
             required_capabilities: BTreeSet::from([
                 LinuxCapability::CapNetAdmin,
                 LinuxCapability::CapNetRaw,
             ]),
+            require_xfrm: true,
+            require_udp_500: true,
+            require_udp_4500: true,
+            require_sctp: true,
             require_xfrm_user: true,
             require_xfrm_state: true,
             require_xfrm_policy: true,
             require_netns_scoped_operation: true,
             require_route_rule_prerequisites: true,
+            required_kernel_modules: BTreeSet::from([
+                KernelModuleId::from("xfrm_user"),
+                KernelModuleId::from("esp4"),
+            ]),
+            required_esp_algorithms: BTreeSet::from([
+                EspAlgorithmId::from("aes-cbc"),
+                EspAlgorithmId::from("hmac-sha256"),
+            ]),
+            network_attachments: Vec::new(),
+            allow_userspace_esp_fallback: false,
             evidence_id,
         }
     }
+}
+
+/// IPsec-related capabilities reported by the node agent.
+///
+/// This is a pure model owned by `opc-node-resources`.  It deliberately does
+/// not depend on `opc-ipsec-xfrm`; products (or a dedicated adapter crate)
+/// should translate any `opc-ipsec-xfrm::XfrmCapabilityReport` into this
+/// structure at the integration boundary rather than pulling XFRM internals
+/// into the resource-validation layer.
+#[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct IpsecCapabilities {
+    /// Whether the kernel XFRM netlink interface is available.
+    pub xfrm_netlink_available: bool,
+    /// Whether the kernel XFRM user policy interface is available.
+    pub xfrm_user_policy_available: bool,
+    /// Whether the kernel supports ESP offload/processing.
+    pub esp_supported: bool,
+    /// Whether the node allows binding UDP port 500 (IKE).
+    pub udp_500_bind_allowed: bool,
+    /// Whether the node allows binding UDP port 4500 (NAT-T).
+    pub udp_4500_bind_allowed: bool,
+    /// Whether the node reports SCTP support.
+    pub sctp_supported: bool,
+    /// Kernel modules that are available on the node (e.g. `xfrm_user`).
+    #[serde(alias = "required_kernel_modules")]
+    pub available_kernel_modules: BTreeSet<KernelModuleId>,
+    /// ESP algorithms supported by the node.
+    pub supported_esp_algorithms: BTreeSet<EspAlgorithmId>,
 }
 
 /// Lab-only fallback policy.  Each flag enables a degraded-mode escape hatch
@@ -513,7 +940,7 @@ impl ResourceProfile {
     /// environment.  All policy fields are set to their defaults:
     /// - [`CpuPolicy::default()`] (exclusive data-plane cores, NUMA locality required)
     /// - [`PodSecurityExceptionModel::secure_default()`] (K8s "restricted" PSS)
-    /// - No AF_XDP or SR-IOV configuration (`None`)
+    /// - No AF_XDP, SR-IOV, or IPsec gateway configuration (`None`)
     /// - All lab fallbacks disabled by default (opt-in)
     pub fn new(
         nf_kind: NetworkFunctionKind,
@@ -652,6 +1079,9 @@ pub struct NodeCapabilityReport {
     pub memory: NodeMemoryCapabilities,
     /// Capabilities of all observed network interfaces.
     pub nics: Vec<NicCapability>,
+    /// IPsec-related capabilities.
+    #[serde(default)]
+    pub ipsec: IpsecCapabilities,
     /// Optional Linux XFRM/IPsec gateway capability evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipsec_gateway: Option<IpsecGatewayCapabilities>,
@@ -793,6 +1223,15 @@ pub enum ValidationError {
     IpsecGatewayCapabilitiesMissing,
     /// Required XFRM/IPsec gateway feature is not available on the node.
     MissingIpsecGatewayFeature { feature: String },
+    /// An IPsec gateway network attachment requirement is missing a required
+    /// field or has an invalid value.
+    IpsecNetworkAttachmentInvalid { detail: String },
+    /// An IPsec gateway profile declares an empty or whitespace-only kernel
+    /// module identifier.
+    InvalidKernelModuleId { module: String },
+    /// An IPsec gateway profile declares an empty or whitespace-only ESP
+    /// algorithm identifier.
+    InvalidEspAlgorithmId { algorithm: String },
     /// An SR-IOV data-plane interface exposes zero VFs, so no direct assignment
     /// is possible (RFC 011 §9.2).
     SriovNicZeroVfs { interface_name: String },
@@ -961,6 +1400,15 @@ impl fmt::Display for ValidationError {
             }
             ValidationError::MissingIpsecGatewayFeature { feature } => {
                 write!(f, "node missing IPsec gateway feature: {feature}")
+            }
+            ValidationError::IpsecNetworkAttachmentInvalid { detail } => {
+                write!(f, "IPsec network attachment invalid: {detail}")
+            }
+            ValidationError::InvalidKernelModuleId { module } => {
+                write!(f, "invalid IPsec kernel module identifier: {module:?}")
+            }
+            ValidationError::InvalidEspAlgorithmId { algorithm } => {
+                write!(f, "invalid IPsec ESP algorithm identifier: {algorithm:?}")
             }
             ValidationError::SriovNicZeroVfs { interface_name } => {
                 write!(f, "SR-IOV interface {interface_name} exposes zero VFs")

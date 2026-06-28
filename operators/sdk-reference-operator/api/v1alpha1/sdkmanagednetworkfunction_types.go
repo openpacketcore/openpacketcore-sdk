@@ -20,19 +20,33 @@ type BpfArtifact struct {
 }
 
 type ResourceProfileSpec struct {
-	NfKind                    string        `json:"nfKind"`
-	DataPlaneProfile          string        `json:"dataPlaneProfile"`
-	NumaPolicy                string        `json:"numaPolicy"`
-	GenericXdpFallbackAllowed bool          `json:"genericXdpFallbackAllowed"`
-	IsolatedCores             []uint16      `json:"isolatedCores"`
-	RequireExclusiveCores     bool          `json:"requireExclusiveCores"`
-	DataPlaneInterfaces       []string      `json:"dataPlaneInterfaces,omitempty"`
-	DataPlaneNumaNode         *uint16       `json:"dataPlaneNumaNode,omitempty"`
-	HugepageNumaNode          *uint16       `json:"hugepageNumaNode,omitempty"`
-	PodSecurityEvidenceID     *string       `json:"podSecurityEvidenceId,omitempty"`
-	BpfArtifacts              []BpfArtifact `json:"bpfArtifacts,omitempty"`
-	SriovResourceName         *string       `json:"sriovResourceName,omitempty"`
-	SriovAllowedDeviceDrivers []string      `json:"sriovAllowedDeviceDrivers,omitempty"`
+	NfKind                    string                       `json:"nfKind"`
+	DataPlaneProfile          string                       `json:"dataPlaneProfile"`
+	NumaPolicy                string                       `json:"numaPolicy"`
+	GenericXdpFallbackAllowed bool                         `json:"genericXdpFallbackAllowed"`
+	IsolatedCores             []uint16                     `json:"isolatedCores"`
+	RequireExclusiveCores     bool                         `json:"requireExclusiveCores"`
+	DataPlaneInterfaces       []string                     `json:"dataPlaneInterfaces,omitempty"`
+	DataPlaneNumaNode         *uint16                      `json:"dataPlaneNumaNode,omitempty"`
+	HugepageNumaNode          *uint16                      `json:"hugepageNumaNode,omitempty"`
+	PodSecurityEvidenceID     *string                      `json:"podSecurityEvidenceId,omitempty"`
+	BpfArtifacts              []BpfArtifact                `json:"bpfArtifacts,omitempty"`
+	SriovResourceName         *string                      `json:"sriovResourceName,omitempty"`
+	SriovAllowedDeviceDrivers []string                     `json:"sriovAllowedDeviceDrivers,omitempty"`
+	IpsecNetworkAttachments   []IpsecNetworkAttachmentSpec `json:"ipsecNetworkAttachments,omitempty"`
+}
+
+type IpsecNetworkAttachmentSpec struct {
+	InterfaceName       string  `json:"interfaceName"`
+	Plane               string  `json:"plane"`
+	CniType             string  `json:"cniType"`
+	StaticIPRequired    bool    `json:"staticIpRequired,omitempty"`
+	StaticIP            *string `json:"staticIp,omitempty"`
+	MinimumMTU          *uint16 `json:"minimumMtu,omitempty"`
+	MTU                 *uint16 `json:"mtu,omitempty"`
+	SourceRouteRequired bool    `json:"sourceRouteRequired,omitempty"`
+	SourceRoute         *string `json:"sourceRoute,omitempty"`
+	VlanID              *uint16 `json:"vlanId,omitempty"`
 }
 
 type IdentityRequirements struct {

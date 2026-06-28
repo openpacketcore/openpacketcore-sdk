@@ -35,9 +35,10 @@ pub mod validation;
 
 // Public re-exports
 pub use types::{
-    AfXdpProfile, BpfArtifact, BpfCapabilities, CpuId, CpuLayout, CpuManagerPolicy, CpuPolicy,
-    DataPlanePreflightReport, DataPlaneProfile, Environment, FallbackMode, FallbackStatus,
-    HostPathMount, HugepagePool, IpamMode, IpsecGatewayCapabilities, IpsecGatewayProfile,
+    AfXdpProfile, BpfArtifact, BpfCapabilities, CniType, CpuId, CpuLayout, CpuManagerPolicy,
+    CpuPolicy, DataPlanePreflightReport, DataPlaneProfile, Environment, EspAlgorithmId,
+    FallbackMode, FallbackStatus, HostPathMount, HugepagePool, IpamMode, IpsecCapabilities,
+    IpsecGatewayCapabilities, IpsecGatewayProfile, IpsecNetworkAttachment, KernelModuleId,
     KernelVersion, LabFallbackPolicy, LinkStatePolicy, LinuxCapability, NetworkFunctionKind,
     NicCapability, NodeCapabilityReport, NodeCpuCapabilities, NodeMemoryCapabilities,
     NumaComponent, NumaNodeId, NumaPolicy, PodSecurityExceptionModel, PreflightCheckResult,

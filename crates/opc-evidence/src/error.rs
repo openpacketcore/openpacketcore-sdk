@@ -11,6 +11,11 @@ pub enum EvidenceError {
     #[error("invalid tag: {0}")]
     InvalidTag(String),
 
+    /// A serialized evidence value contains a raw sensitive identifier or key
+    /// material, or otherwise violates a redaction invariant.
+    #[error("redaction violation: {0}")]
+    RedactionViolation(String),
+
     /// A gap record failed a release gate (missing owner, mitigation, etc.).
     #[error("gap gate failed: {0}")]
     GapGateFailed(String),

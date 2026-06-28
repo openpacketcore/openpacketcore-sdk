@@ -30,7 +30,8 @@ exceptions = [
     # Mozilla CA bundle data shipped with rustls.
     { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
     # UEFI-only transitive dependency of getrandom; never built for our targets.
-    { allow = ["LGPL-2.1-or-later"], crate = "r-efi" },
+    # cargo-deny 0.17 expects the bare GNU license identifier in exceptions.
+    { allow = ["LGPL-2.1"], crate = "r-efi" },
 ]
 
 [licenses.private]

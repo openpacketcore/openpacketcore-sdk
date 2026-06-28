@@ -236,10 +236,11 @@ impl LocalRunner {
                 Ok(())
             }
             Step::MalformedResponse { target } => {
-                self.simulator_mut(target)?;
+                let sim = self.simulator_mut(target)?;
+                let result = sim.handle_step(step);
                 self.state
                     .insert(format!("{target}.malformed_response"), "true".to_string());
-                Ok(())
+                result
             }
             Step::NetworkPartition { node_a, node_b } => {
                 self.simulator_mut(node_a)?;
@@ -530,8 +531,9 @@ impl HardwarePreflight {
 
 fn build_hardware_preflight(config: &HardwareLabRunnerConfig) -> HardwarePreflight {
     use opc_node_resources::{
-        AfXdpProfile, BpfCapabilities, CpuLayout, CpuManagerPolicy, DataPlaneProfile, Environment,
-        HugepagePool, IpsecGatewayCapabilities, IpsecGatewayProfile, KernelVersion,
+        AfXdpProfile, BpfCapabilities, CniType, CpuLayout, CpuManagerPolicy, DataPlaneProfile,
+        Environment, EspAlgorithmId, HugepagePool, IpsecCapabilities, IpsecGatewayCapabilities,
+        IpsecGatewayProfile, IpsecNetworkAttachment, KernelModuleId, KernelVersion,
         LinkStatePolicy, LinuxCapability, NetworkFunctionKind, NicCapability, NodeCapabilityReport,
         NodeCpuCapabilities, NodeMemoryCapabilities, PodSecurityExceptionModel, ResourceProfile,
         SriovAllowlistPolicy, SriovProfile, TopologyManagerPolicy, XdpMode,
@@ -598,9 +600,24 @@ fn build_hardware_preflight(config: &HardwareLabRunnerConfig) -> HardwarePreflig
         });
     }
     if matches!(data_plane_profile, DataPlaneProfile::IpsecGateway) {
-        profile.ipsec_gateway = Some(IpsecGatewayProfile::standard(Some(
-            "hardware-lab-dry-run-ipsec-evidence".to_string(),
-        )));
+        let mut ipsec =
+            IpsecGatewayProfile::standard(Some("hardware-lab-dry-run-ipsec-evidence".to_string()));
+        ipsec.network_attachments = data_plane_interfaces
+            .iter()
+            .map(|interface_name| IpsecNetworkAttachment {
+                interface_name: interface_name.clone(),
+                plane: "ipsec-gateway".to_string(),
+                cni_type: CniType::Custom("testbed-declared".to_string()),
+                static_ip_required: false,
+                static_ip: None,
+                minimum_mtu: None,
+                mtu: None,
+                source_route_required: false,
+                source_route: None,
+                vlan_id: None,
+            })
+            .collect();
+        profile.ipsec_gateway = Some(ipsec);
     }
 
     let nic_names = if data_plane_interfaces.is_empty() {
@@ -649,6 +666,22 @@ fn build_hardware_preflight(config: &HardwareLabRunnerConfig) -> HardwarePreflig
             }],
         },
         nics,
+        ipsec: IpsecCapabilities {
+            xfrm_netlink_available: true,
+            xfrm_user_policy_available: true,
+            esp_supported: true,
+            udp_500_bind_allowed: true,
+            udp_4500_bind_allowed: true,
+            sctp_supported: true,
+            available_kernel_modules: BTreeSet::from([
+                KernelModuleId::from("xfrm_user"),
+                KernelModuleId::from("esp4"),
+            ]),
+            supported_esp_algorithms: BTreeSet::from([
+                EspAlgorithmId::from("aes-cbc"),
+                EspAlgorithmId::from("hmac-sha256"),
+            ]),
+        },
         ipsec_gateway: Some(IpsecGatewayCapabilities {
             xfrm_user: true,
             xfrm_state: true,

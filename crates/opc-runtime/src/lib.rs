@@ -50,7 +50,10 @@ mod tests;
 
 pub use admin::ConfigVersionMetadata;
 pub use bootstrap::BootstrapError;
-pub use health::{HealthModel, Readiness, StartupPhase};
+pub use health::{
+    known_gates, GateImpact, GateName, GateStatus, HealthGate, HealthGateSet, HealthModel,
+    Readiness, StartupPhase,
+};
 pub use profile::{ResourceBudget, RuntimeMode, RuntimeProfile, SigintHandling};
 pub use shutdown::{DrainHook, ShutdownPhase, ShutdownToken};
 pub use supervisor::{MemoryLimiter, Supervisor};

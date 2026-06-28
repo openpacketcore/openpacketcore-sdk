@@ -8,9 +8,10 @@ use opc_node_resources::{
 };
 use opc_runtime::profile::RuntimeMode;
 use operator_lifecycle::{
-    evaluate_admission, evaluate_config_apply, sanitize_denial_message, AdmissionRequest,
-    CandidateMetadata, CompatibilityEvidence, CompatibilityMatrix, LifecycleStatus,
-    NfReleaseDescriptor, OperatorReleaseDescriptor, PendingConfirmationState, CONTRACT_VERSION,
+    evaluate_admission, evaluate_config_apply, ipsec_gateway_profile_from_spec,
+    sanitize_denial_message, AdmissionRequest, CandidateMetadata, CompatibilityEvidence,
+    CompatibilityMatrix, LifecycleStatus, NfReleaseDescriptor, OperatorReleaseDescriptor,
+    PendingConfirmationState, CONTRACT_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read};
@@ -199,6 +200,8 @@ fn evaluate_preflight(req: &PreflightRequest) -> Result<DataPlanePreflightReport
             allowed_device_drivers: rp.sriov_allowed_device_drivers.iter().cloned().collect(),
             ipam_mode: opc_node_resources::IpamMode::Static,
         });
+    } else if profile.data_plane_profile == opc_node_resources::DataPlaneProfile::IpsecGateway {
+        profile.ipsec_gateway = Some(ipsec_gateway_profile_from_spec(rp));
     }
 
     let cpu_layout = CpuLayout {

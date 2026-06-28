@@ -1,0 +1,31 @@
+{
+  "schema_version": "rfc006/v1/packet-core-experimental",
+  "evidence_id": "epdg-initial-attach-001",
+  "procedure": "initial-attach",
+  "result": "success",
+  "steps": [
+    {
+      "name": "IKE_SA_INIT",
+      "result": "success",
+      "message_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "notes": "Cookie challenged and accepted."
+    },
+    {
+      "name": "IKE_AUTH_EAP_AKA",
+      "result": "success",
+      "message_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    {
+      "name": "CREATE_CHILD_SA",
+      "result": "success",
+      "message_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
+  ],
+  "ue_identifier_redacted": "<supi-redacted>",
+  "session_id_redacted": "<s2b-session-redacted>",
+  "serving_node": "epdg-0",
+  "timestamp": "2026-06-28T00:00:00Z",
+  "duration_ms": 120,
+  "requirements": ["REQ-3GPP-TS29274-R18-7.1-001"],
+  "notes": "Experimental attach procedure evidence shape."
+}
