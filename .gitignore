@@ -70,3 +70,8 @@ playwright-report/
 
 # Generated docs site
 book/
+
+# Brehon orchestration data
+.brehon/
+.agents/mcp_config.json
+.antigravitycli

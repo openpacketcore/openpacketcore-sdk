@@ -18,6 +18,24 @@ plan on `CommitResult.apply_plan`; rejected plans are attached to
 
 **Production-ready**
 
+## Non-production bootstrap store
+
+`InMemoryManagedDatastore<C>` is available for local development, CI, and
+management-only bootstrap before a product has selected a durable production
+config backend. It preserves config-bus append, restore, rollback,
+idempotency, recovery-marker, and commit-confirmed behavior while the process
+is alive, but it is non-durable and must not be used as production config
+storage.
+
+```rust,no_run
+use opc_config_bus::{ConfigBus, InMemoryManagedDatastore};
+use opc_config_model::OpcConfig;
+
+async fn build_dev_bus<C: OpcConfig>(initial: C) -> Result<ConfigBus<C>, opc_config_bus::StoreError> {
+    ConfigBus::restore_or_new_dev_only(initial, InMemoryManagedDatastore::new()).await
+}
+```
+
 ## Reference
 
 [RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/001-management-substrate.md)

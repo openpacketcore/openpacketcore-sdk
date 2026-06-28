@@ -7,6 +7,7 @@ pub mod diagnostic;
 pub mod emit;
 pub mod ir;
 pub mod lower;
+pub mod source;
 
 pub use crate::diagnostic::{Diagnostic, DiagnosticCode, YangSourceLocation};
 pub use crate::emit::{
@@ -21,6 +22,10 @@ pub use crate::ir::{
     StackShape, TypeRef, UnsupportedFeature, UnsupportedFeatureKind,
 };
 pub use crate::lower::{lower_constraint, MAX_CONSTRAINT_EXPR_DEPTH};
+pub use crate::source::{
+    generation_input_from_yang_sources, validate_generation_input_embedded_yang_sources,
+    validate_generation_input_yang_sources, YangSource,
+};
 
 /// Flatten and validate operator input into the final [`SchemaIr`].
 ///
