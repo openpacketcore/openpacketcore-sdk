@@ -3,7 +3,7 @@
 //! @spec IETF RFC7296 3.2
 //! @req REQ-IETF-RFC7296-3.2-001
 
-use opc_protocol::{DecodeContext, DecodeError, DecodeErrorCode, SpecRef, UnknownIePolicy};
+use opc_protocol::{DecodeContext, DecodeError, DecodeErrorCode, SpecRef};
 
 use crate::crypto::ProtectedPayloadKind;
 
@@ -320,10 +320,7 @@ impl<'a> Iterator for RawPayloadIterator<'a> {
             )));
         }
 
-        if matches!(payload_type, PayloadType::Unknown(_))
-            && critical
-            && matches!(self.ctx.unknown_ie_policy, UnknownIePolicy::Reject)
-        {
+        if matches!(payload_type, PayloadType::Unknown(_)) && critical {
             let offset = self.offset;
             return Some(Err(self.fail(
                 DecodeErrorCode::UnknownCriticalIe,

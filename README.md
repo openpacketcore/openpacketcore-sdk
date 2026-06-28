@@ -14,8 +14,8 @@ protocol dependencies, not through the `opc-sdk` default feature set or prelude.
 They do **not** provide a product-ready EPC or ePDG control-plane stack: full
 GTP-C and S1AP stacks are not provided; Diameter realm routing, AAA/HSS/CDF
 behavior, IKE SA state machines, EAP-AKA, Child SA installation, transport
-operations, and
-carrier-readiness decisions remain downstream product responsibilities.
+operations, and carrier-readiness decisions remain downstream product
+responsibilities.
 
 > [!IMPORTANT]
 > **Production Readiness & Reference Boundaries**

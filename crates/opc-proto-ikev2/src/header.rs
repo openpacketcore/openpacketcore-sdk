@@ -9,6 +9,8 @@ use opc_protocol::{
     EncodeErrorCode, SpecRef,
 };
 
+use crate::payload::PayloadType;
+
 /// IKEv2 fixed header length in octets.
 pub const HEADER_LEN: usize = 28;
 
@@ -78,7 +80,7 @@ impl HeaderFlags {
         Self { raw }
     }
 
-    /// Construct canonical flags from individual named bits.
+    /// Construct flags from individual named bits.
     pub const fn from_bits(initiator: bool, response: bool, version: bool) -> Self {
         let mut raw = 0u8;
         if initiator {
@@ -109,6 +111,10 @@ impl HeaderFlags {
     }
 
     /// Return `true` when the Version bit is set.
+    ///
+    /// This is the RFC 7296 §3.1 "higher major version supported" flag, not
+    /// the IKE major-version field. IKEv2 senders clear it and receivers ignore
+    /// it.
     pub const fn version(self) -> bool {
         (self.raw & FLAG_VERSION) != 0
     }
@@ -118,9 +124,13 @@ impl HeaderFlags {
         self.raw & !FLAG_KNOWN_MASK
     }
 
-    /// Return a canonicalized flags octet that retains only named bits.
+    /// Return a canonicalized send-side flags octet.
+    ///
+    /// RFC 7296 §3.1 requires the Version bit and reserved bits to be cleared
+    /// when sending, so canonical output retains only the Initiator and
+    /// Response bits.
     pub const fn canonical_raw(self) -> u8 {
-        self.raw & FLAG_KNOWN_MASK
+        self.raw & (FLAG_INITIATOR | FLAG_RESPONSE)
     }
 }
 
@@ -159,7 +169,7 @@ impl Header {
     pub const fn new(
         initiator_spi: u64,
         responder_spi: u64,
-        next_payload: u8,
+        next_payload: PayloadType,
         exchange_type: u8,
         flags: HeaderFlags,
         message_id: u32,
@@ -167,7 +177,7 @@ impl Header {
         Self {
             initiator_spi,
             responder_spi,
-            next_payload,
+            next_payload: next_payload.as_u8(),
             major_version: IKEV2_MAJOR_VERSION,
             minor_version: IKEV2_MINOR_VERSION,
             exchange_type,
@@ -188,6 +198,12 @@ impl Header {
     }
 
     /// Return the declared body length after the fixed header.
+    ///
+    /// The value is derived from this header's stored Length field and does not
+    /// allocate. Headers decoded with [`decode_header`] are checked against the
+    /// supplied [`DecodeContext::max_message_len`]; manually constructed
+    /// headers should be bounded by callers before using this value to size any
+    /// allocation.
     pub fn body_len(&self) -> Result<usize, DecodeError> {
         let spec = spec_ref();
         let declared = usize::try_from(self.length).map_err(|_| {
@@ -207,7 +223,10 @@ impl Header {
 
 /// Decode an IKEv2 fixed header from the front of `input`.
 ///
-/// Full message-boundary validation happens in [`crate::Message`].
+/// Full message-boundary slicing happens in [`crate::Message`], but this
+/// header-only API still rejects declared lengths below [`HEADER_LEN`] or above
+/// [`DecodeContext::max_message_len`] so callers do not accidentally allocate
+/// from hostile length fields.
 ///
 /// @spec IETF RFC7296 3.1
 /// @req REQ-IETF-RFC7296-3.1-DECODE-001
@@ -271,6 +290,15 @@ pub fn decode_header(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Heade
         .with_spec_ref(spec));
     }
 
+    let declared_len = usize::try_from(length).map_err(|_| {
+        DecodeError::new(DecodeErrorCode::LengthOverflow, 24).with_spec_ref(spec.clone())
+    })?;
+    if declared_len > ctx.max_message_len {
+        return Err(
+            DecodeError::new(DecodeErrorCode::MessageLengthExceeded, 24).with_spec_ref(spec)
+        );
+    }
+
     Ok((
         &input[HEADER_LEN..],
         Header {
@@ -290,8 +318,8 @@ pub fn decode_header(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Heade
 /// Encode an IKEv2 fixed header.
 ///
 /// In raw-preserving mode this keeps the decoded minor version and reserved
-/// flag bits. In canonical mode it emits version 2.0 and clears reserved flag
-/// bits while retaining the named I, V, and R flags.
+/// flag bits. In canonical mode it emits version 2.0 and clears the RFC 7296
+/// §3.1 Version bit plus reserved flag bits while retaining the I and R flags.
 ///
 /// @spec IETF RFC7296 3.1
 /// @req REQ-IETF-RFC7296-3.1-ENCODE-001
@@ -308,12 +336,6 @@ pub fn encode_header(
         })
         .with_spec_ref(spec));
     }
-    if !ctx.raw_preserving && header.minor_version != IKEV2_MINOR_VERSION {
-        return Err(EncodeError::new(EncodeErrorCode::Structural {
-            reason: "canonical IKEv2 minor version must be 0",
-        })
-        .with_spec_ref(spec));
-    }
     if header.length < HEADER_LEN as u32 {
         return Err(EncodeError::new(EncodeErrorCode::Structural {
             reason: "IKEv2 length shorter than fixed header",
@@ -321,9 +343,7 @@ pub fn encode_header(
         .with_spec_ref(spec));
     }
 
-    let required = usize::try_from(header.length)
-        .map_err(|_| EncodeError::length_overflow().with_spec_ref(spec.clone()))?;
-    ctx.check_capacity(required)?;
+    ctx.check_capacity(HEADER_LEN)?;
 
     dst.reserve(HEADER_LEN);
     dst.put_u64(header.initiator_spi);

@@ -6,31 +6,56 @@ use opc_proto_ikev2::{
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, Encode, EncodeContext, OwnedDecode, ToOwnedPdu,
-    UnknownIePolicy, ValidationLevel,
+    ValidationLevel,
 };
 
 fn sa_nonce_message() -> [u8; HEADER_LEN + 16] {
-    let mut bytes = [0u8; HEADER_LEN + 16];
-    bytes[0..8].copy_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
-    bytes[8..16].copy_from_slice(&0u64.to_be_bytes());
-    bytes[16] = PayloadType::SecurityAssociation.as_u8();
-    bytes[17] = 0x20;
-    bytes[18] = EXCHANGE_TYPE_IKE_SA_INIT;
-    bytes[19] = 0x08;
-    bytes[20..24].copy_from_slice(&0u32.to_be_bytes());
-    bytes[24..28].copy_from_slice(&((HEADER_LEN + 16) as u32).to_be_bytes());
-    bytes[28..36].copy_from_slice(&[
-        PayloadType::Nonce.as_u8(),
-        0x00,
-        0x00,
-        0x08,
-        0xde,
-        0xad,
-        0xbe,
-        0xef,
-    ]);
-    bytes[36..44].copy_from_slice(&[0x00, 0x00, 0x00, 0x08, 0x11, 0x22, 0x33, 0x44]);
-    bytes
+    [
+        0x01,                      // RFC 7296 §3.1 octet 0: Initiator SPI byte 0.
+        0x02,                      // RFC 7296 §3.1 octet 1: Initiator SPI byte 1.
+        0x03,                      // RFC 7296 §3.1 octet 2: Initiator SPI byte 2.
+        0x04,                      // RFC 7296 §3.1 octet 3: Initiator SPI byte 3.
+        0x05,                      // RFC 7296 §3.1 octet 4: Initiator SPI byte 4.
+        0x06,                      // RFC 7296 §3.1 octet 5: Initiator SPI byte 5.
+        0x07,                      // RFC 7296 §3.1 octet 6: Initiator SPI byte 6.
+        0x08,                      // RFC 7296 §3.1 octet 7: Initiator SPI byte 7.
+        0x00,                      // RFC 7296 §3.1 octet 8: Responder SPI byte 0.
+        0x00,                      // RFC 7296 §3.1 octet 9: Responder SPI byte 1.
+        0x00,                      // RFC 7296 §3.1 octet 10: Responder SPI byte 2.
+        0x00,                      // RFC 7296 §3.1 octet 11: Responder SPI byte 3.
+        0x00,                      // RFC 7296 §3.1 octet 12: Responder SPI byte 4.
+        0x00,                      // RFC 7296 §3.1 octet 13: Responder SPI byte 5.
+        0x00,                      // RFC 7296 §3.1 octet 14: Responder SPI byte 6.
+        0x00,                      // RFC 7296 §3.1 octet 15: Responder SPI byte 7.
+        0x21,                      // RFC 7296 §3.1 octet 16: first payload SA (IANA value 33).
+        0x20,                      // RFC 7296 §3.1 octet 17: version 2.0.
+        EXCHANGE_TYPE_IKE_SA_INIT, // RFC 7296 §3.1 octet 18: IKE_SA_INIT (34).
+        0x08,                      // RFC 7296 §3.1 octet 19: Initiator flag set, V bit clear.
+        0x00,                      // RFC 7296 §3.1 octet 20: Message ID byte 0.
+        0x00,                      // RFC 7296 §3.1 octet 21: Message ID byte 1.
+        0x00,                      // RFC 7296 §3.1 octet 22: Message ID byte 2.
+        0x00,                      // RFC 7296 §3.1 octet 23: Message ID byte 3.
+        0x00,                      // RFC 7296 §3.1 octet 24: Length byte 0.
+        0x00,                      // RFC 7296 §3.1 octet 25: Length byte 1.
+        0x00,                      // RFC 7296 §3.1 octet 26: Length byte 2.
+        0x2c,                      // RFC 7296 §3.1 octet 27: Length byte 3 (44 octets).
+        0x28,                      // RFC 7296 §3.2 octet 28: SA next payload Nonce (IANA value 40).
+        0x00, // RFC 7296 §3.2 octet 29: SA critical bit clear, reserved bits zero.
+        0x00, // RFC 7296 §3.2 octet 30: SA payload length byte 0.
+        0x08, // RFC 7296 §3.2 octet 31: SA payload length byte 1 (8 octets).
+        0xde, // RFC 7296 §3.2 octet 32: Hand-authored SA body byte 0.
+        0xad, // RFC 7296 §3.2 octet 33: Hand-authored SA body byte 1.
+        0xbe, // RFC 7296 §3.2 octet 34: Hand-authored SA body byte 2.
+        0xef, // RFC 7296 §3.2 octet 35: Hand-authored SA body byte 3.
+        0x00, // RFC 7296 §3.2 octet 36: Nonce next payload No Next (IANA value 0).
+        0x00, // RFC 7296 §3.2 octet 37: Nonce critical bit clear, reserved bits zero.
+        0x00, // RFC 7296 §3.2 octet 38: Nonce payload length byte 0.
+        0x08, // RFC 7296 §3.2 octet 39: Nonce payload length byte 1 (8 octets).
+        0x11, // RFC 7296 §3.2 octet 40: Hand-authored Nonce body byte 0.
+        0x22, // RFC 7296 §3.2 octet 41: Hand-authored Nonce body byte 1.
+        0x33, // RFC 7296 §3.2 octet 42: Hand-authored Nonce body byte 2.
+        0x44, // RFC 7296 §3.2 octet 43: Hand-authored Nonce body byte 3.
+    ]
 }
 
 #[test]
@@ -82,6 +107,27 @@ fn decodes_unencrypted_payload_chain_and_roundtrips_raw_bytes() {
 }
 
 #[test]
+fn canonical_message_encode_rewrites_header_and_preserves_payload_bytes() {
+    let mut bytes = sa_nonce_message();
+    bytes[17] = 0x21; // RFC 7296 §3.1 version field decoded as major 2, minor 1.
+    bytes[19] = 0x9f; // RFC 7296 §3.1 I and V bits plus reserved bits on input.
+
+    let (_tail, message) = match Message::decode(&bytes, DecodeContext::default()) {
+        Ok(value) => value,
+        Err(error) => panic!("message decode failed: {error:?}"),
+    };
+
+    let mut encoded = BytesMut::new();
+    let result = message.encode(&mut encoded, EncodeContext::default());
+    assert!(result.is_ok());
+
+    let mut expected = sa_nonce_message();
+    expected[17] = 0x20; // RFC 7296 §3.1 canonical IKEv2 version 2.0.
+    expected[19] = 0x08; // RFC 7296 §3.1 canonical send flags keep only I/R bits.
+    assert_eq!(encoded.as_ref(), expected.as_slice());
+}
+
+#[test]
 fn owned_decode_slices_declared_message_without_tail() {
     let mut packet = sa_nonce_message().to_vec();
     packet.extend_from_slice(&[0xaa, 0xbb]);
@@ -114,14 +160,10 @@ fn unknown_noncritical_payload_is_preserved() {
 }
 
 #[test]
-fn unknown_critical_payload_can_fail_closed() {
+fn unknown_critical_payload_rejects_by_default() {
     let payload = [0x00, 0x80, 0x00, 0x04];
     let chain = PayloadChain::new(PayloadType::Unknown(200), &payload);
-    let ctx = DecodeContext {
-        unknown_ie_policy: UnknownIePolicy::Reject,
-        ..DecodeContext::default()
-    };
-    let mut iter = chain.iter_with_context(ctx);
+    let mut iter = chain.iter_with_context(DecodeContext::default());
     let result = match iter.next() {
         Some(value) => value,
         None => panic!("iterator ended before unknown critical payload"),
@@ -134,30 +176,35 @@ fn unknown_critical_payload_can_fail_closed() {
 
 #[test]
 fn protected_payload_boundary_does_not_parse_ciphertext() {
-    let payload_bytes = [
-        PayloadType::SecurityAssociation.as_u8(),
-        0x00,
-        0x00,
-        0x08,
-        0xaa,
-        0xbb,
-        0xcc,
-        0xdd,
-    ];
-    let chain = PayloadChain::new(PayloadType::Encrypted, &payload_bytes);
-    let mut iter = chain.iter_with_context(DecodeContext::default());
-    let protected = match iter.next() {
-        Some(Ok(value)) => value,
-        other => panic!("unexpected protected payload: {other:?}"),
-    };
-    assert_eq!(protected.payload_type, PayloadType::Encrypted);
-    assert_eq!(
-        protected.protected_kind(),
-        Some(ProtectedPayloadKind::Encrypted)
-    );
-    assert_eq!(protected.next_payload, PayloadType::SecurityAssociation);
-    assert_eq!(protected.body, [0xaa, 0xbb, 0xcc, 0xdd]);
-    assert!(iter.next().is_none());
+    for (payload_type, protected_kind) in [
+        (PayloadType::Encrypted, ProtectedPayloadKind::Encrypted),
+        (
+            PayloadType::EncryptedFragment,
+            ProtectedPayloadKind::EncryptedFragment,
+        ),
+    ] {
+        let payload_bytes = [
+            PayloadType::SecurityAssociation.as_u8(),
+            0x00,
+            0x00,
+            0x08,
+            0xaa,
+            0xbb,
+            0xcc,
+            0xdd,
+        ];
+        let chain = PayloadChain::new(payload_type, &payload_bytes);
+        let mut iter = chain.iter_with_context(DecodeContext::default());
+        let protected = match iter.next() {
+            Some(Ok(value)) => value,
+            other => panic!("unexpected protected payload: {other:?}"),
+        };
+        assert_eq!(protected.payload_type, payload_type);
+        assert_eq!(protected.protected_kind(), Some(protected_kind));
+        assert_eq!(protected.next_payload, PayloadType::SecurityAssociation);
+        assert_eq!(protected.body, [0xaa, 0xbb, 0xcc, 0xdd]);
+        assert!(iter.next().is_none());
+    }
 }
 
 struct EchoProvider;
@@ -184,7 +231,7 @@ fn crypto_provider_boundary_is_caller_supplied() {
     let header = Header::new(
         0x0102_0304_0506_0708,
         0,
-        PayloadType::Encrypted.as_u8(),
+        PayloadType::Encrypted,
         EXCHANGE_TYPE_IKE_SA_INIT,
         HeaderFlags::from_bits(true, false, false),
         0,
@@ -274,7 +321,7 @@ fn encode_rejects_empty_payload_region_with_payload_type() {
     let header = Header::new(
         0x0102_0304_0506_0708,
         0,
-        PayloadType::Nonce.as_u8(),
+        PayloadType::Nonce,
         EXCHANGE_TYPE_IKE_SA_INIT,
         HeaderFlags::from_bits(true, false, false),
         0,

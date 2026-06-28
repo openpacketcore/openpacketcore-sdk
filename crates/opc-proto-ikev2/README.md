@@ -7,8 +7,8 @@ Current scope is intentionally narrow:
 
 - IKEv2 fixed-header decode/encode over the shared `opc-protocol` traits;
 - raw-preserving generic payload-chain walking for unencrypted payloads;
-- unknown payload preservation, including fail-closed handling for unknown
-  critical payloads when requested by `DecodeContext`;
+- unknown non-critical payload preservation, while unknown critical payloads
+  always fail closed per RFC 7296;
 - protected-payload boundary metadata for `SK` and `SKF` payloads without
   decrypting or choosing algorithms; and
 - a caller-supplied `CryptoProvider` trait boundary for downstream SA state,
