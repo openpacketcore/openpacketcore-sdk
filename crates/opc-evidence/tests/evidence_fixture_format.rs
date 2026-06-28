@@ -138,3 +138,31 @@ fn evidence_fixture_roundtrips() {
     assert_eq!(round.requirement_id, record.requirement_id);
     assert_eq!(round.status, record.status);
 }
+
+#[test]
+fn fixture_packet_core_protocol_evidence_passes_format_validation() {
+    let raw = include_str!("fixtures/packet_core_protocol_evidence.json");
+    validate_fixture_formats(raw)
+        .expect("packet_core_protocol_evidence.json should pass format validation");
+}
+
+#[test]
+fn fixture_packet_core_attach_evidence_passes_format_validation() {
+    let raw = include_str!("fixtures/packet_core_attach_evidence.json");
+    validate_fixture_formats(raw)
+        .expect("packet_core_attach_evidence.json should pass format validation");
+}
+
+#[test]
+fn fixture_packet_core_kernel_dataplane_evidence_passes_format_validation() {
+    let raw = include_str!("fixtures/packet_core_kernel_dataplane_evidence.json");
+    validate_fixture_formats(raw)
+        .expect("packet_core_kernel_dataplane_evidence.json should pass format validation");
+}
+
+#[test]
+fn fixture_packet_core_evidence_pack_passes_format_validation() {
+    let raw = include_str!("fixtures/packet_core_evidence_pack.json");
+    validate_fixture_formats(raw)
+        .expect("packet_core_evidence_pack.json should pass format validation");
+}

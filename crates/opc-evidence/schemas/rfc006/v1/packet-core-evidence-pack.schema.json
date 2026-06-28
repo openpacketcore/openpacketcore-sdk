@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.openpacketcore.dev/rfc006/v1/packet-core-evidence-pack.schema.json",
+  "title": "OpenPacketCore RFC 006 packet-core evidence pack",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "pack_id",
+    "generated_at",
+    "generated_by",
+    "experimental"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pack_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "generated_by": {
+      "type": "string",
+      "minLength": 1
+    },
+    "experimental": {
+      "type": "boolean"
+    },
+    "protocol_evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "evidence_id",
+          "protocol",
+          "scenario",
+          "message_direction",
+          "payload_summary",
+          "payload_digest",
+          "fixture_source",
+          "fixture_provenance"
+        ],
+        "properties": {
+          "schema_version": { "type": "string", "minLength": 1 },
+          "evidence_id": { "type": "string", "minLength": 1 },
+          "protocol": { "type": "string", "minLength": 1 },
+          "scenario": { "type": "string", "minLength": 1 },
+          "message_direction": {
+            "type": "string",
+            "enum": ["uplink", "downlink", "control-plane", "user-plane"]
+          },
+          "payload_summary": { "type": "string" },
+          "payload_digest": { "type": "string", "format": "opc-sha256" },
+          "conformance_tags": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "requirements": {
+            "type": "array",
+            "items": { "type": "string", "format": "opc-requirement-id" }
+          },
+          "fixture_source": { "type": "string", "minLength": 1 },
+          "fixture_provenance": { "type": "string", "minLength": 1 },
+          "captured_at": { "type": "string", "format": "date-time" },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "attach_evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "evidence_id",
+          "procedure",
+          "result",
+          "ue_identifier_redacted",
+          "serving_node",
+          "timestamp"
+        ],
+        "properties": {
+          "schema_version": { "type": "string", "minLength": 1 },
+          "evidence_id": { "type": "string", "minLength": 1 },
+          "procedure": { "type": "string", "minLength": 1 },
+          "result": { "type": "string", "enum": ["success", "failure", "partial"] },
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "result"],
+              "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "result": { "type": "string", "enum": ["success", "failure", "skipped"] },
+                "message_digest": { "type": "string", "format": "opc-sha256" },
+                "notes": { "type": "string" }
+              }
+            }
+          },
+          "ue_identifier_redacted": { "type": "string", "minLength": 1 },
+          "session_id_redacted": { "type": "string" },
+          "serving_node": { "type": "string", "minLength": 1 },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "duration_ms": { "type": "integer", "minimum": 0 },
+          "requirements": {
+            "type": "array",
+            "items": { "type": "string", "format": "opc-requirement-id" }
+          },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "kernel_dataplane_evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "evidence_id",
+          "interface_name",
+          "xfrm_state_count",
+          "xfrm_policy_count",
+          "routing_entries",
+          "iptables_rules",
+          "nftables_rules",
+          "observed_packets",
+          "dropped_packets",
+          "timestamp"
+        ],
+        "properties": {
+          "schema_version": { "type": "string", "minLength": 1 },
+          "evidence_id": { "type": "string", "minLength": 1 },
+          "interface_name": { "type": "string", "minLength": 1 },
+          "xfrm_state_count": { "type": "integer", "minimum": 0 },
+          "xfrm_policy_count": { "type": "integer", "minimum": 0 },
+          "routing_entries": { "type": "integer", "minimum": 0 },
+          "iptables_rules": { "type": "integer", "minimum": 0 },
+          "nftables_rules": { "type": "integer", "minimum": 0 },
+          "observed_packets": { "type": "integer", "minimum": 0 },
+          "dropped_packets": { "type": "integer", "minimum": 0 },
+          "counters": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "value"],
+              "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "value": { "type": "integer", "minimum": 0 }
+              }
+            }
+          },
+          "xfrm_state_summary": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "requirements": {
+            "type": "array",
+            "items": { "type": "string", "format": "opc-requirement-id" }
+          },
+          "notes": { "type": "string" }
+        }
+      }
+    }
+  }
+}

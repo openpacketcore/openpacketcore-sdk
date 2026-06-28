@@ -33,6 +33,22 @@ pub const VEX_POLICY_RESULT_SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/schemas/rfc006/v1/vex-policy-result.schema.json"
 ));
+pub const PACKET_CORE_PROTOCOL_EVIDENCE_SCHEMA: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/schemas/rfc006/v1/packet-core-protocol-evidence.schema.json"
+));
+pub const PACKET_CORE_ATTACH_EVIDENCE_SCHEMA: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/schemas/rfc006/v1/packet-core-attach-evidence.schema.json"
+));
+pub const PACKET_CORE_KERNEL_DATAPLANE_EVIDENCE_SCHEMA: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/schemas/rfc006/v1/packet-core-kernel-dataplane-evidence.schema.json"
+));
+pub const PACKET_CORE_EVIDENCE_PACK_SCHEMA: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/schemas/rfc006/v1/packet-core-evidence-pack.schema.json"
+));
 
 // ---------------------------------------------------------------------------
 // JSON fixture format validation helpers

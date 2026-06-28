@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.openpacketcore.dev/rfc006/v1/packet-core-attach-evidence.schema.json",
+  "title": "OpenPacketCore RFC 006 packet-core attach procedure evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_id",
+    "procedure",
+    "result",
+    "ue_identifier_redacted",
+    "serving_node",
+    "timestamp"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "procedure": {
+      "type": "string",
+      "minLength": 1
+    },
+    "result": {
+      "type": "string",
+      "enum": ["success", "failure", "partial"]
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "result"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "result": {
+            "type": "string",
+            "enum": ["success", "failure", "skipped"]
+          },
+          "message_digest": {
+            "type": "string",
+            "format": "opc-sha256"
+          },
+          "notes": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "ue_identifier_redacted": {
+      "type": "string",
+      "minLength": 1
+    },
+    "session_id_redacted": {
+      "type": "string"
+    },
+    "serving_node": {
+      "type": "string",
+      "minLength": 1
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "opc-requirement-id"
+      }
+    },
+    "notes": {
+      "type": "string"
+    }
+  }
+}

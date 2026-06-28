@@ -423,6 +423,33 @@ evidence-bundle/
 - generation timestamp,
 - known incomplete sections.
 
+### 10.3 Packet-core evidence packs
+
+A release evidence bundle MAY include one or more packet-core evidence packs
+for protocol fixtures, attach procedure results, and kernel dataplane/XFRM
+proof. These packs are intended to make smoke artifacts and test evidence from
+different network functions comparable, not to create product-specific
+certification claims.
+
+Each pack is a JSON object conforming to `packet-core-evidence-pack.schema.json`
+and contains:
+
+- `protocol_evidence`: protocol fixture evidence records.
+- `attach_evidence`: attach and session-establishment procedure results.
+- `kernel_dataplane_evidence`: kernel dataplane, XFRM, routing, and firewall
+  state summaries.
+
+Packet-core evidence schemas are versioned independently within RFC 006 and
+are currently **experimental**. A pack MUST declare `experimental: true` until
+the schema graduates. Every pack MUST pass redaction validation before it is
+included in a bundle; validation fails closed if any string field contains a
+raw IMSI, MSISDN, IMEI, NAI, Session-Id, LI identifier, or key material.
+
+Downstream products (for example, ePDG smoke artifacts) MAY map their own
+evidence into this SDK format. Doing so documents how the product evidence
+corresponds to SDK schema fields; it does not imply the SDK has certified the
+product.
+
 ## 11. PR and Release Gates
 
 ### 11.1 PR Gates
@@ -512,7 +539,11 @@ The repository MUST version JSON schemas for:
 - gap record,
 - performance baseline,
 - bundle manifest,
-- VEX policy result.
+- VEX policy result,
+- packet-core protocol evidence,
+- packet-core attach evidence,
+- packet-core kernel dataplane evidence,
+- packet-core evidence pack.
 
 Schema changes MUST be backward compatible within a major SDK release or
 include a migration tool.
