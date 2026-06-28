@@ -250,9 +250,10 @@ The SDK is intentionally narrow. You must bring your own:
   See [RFC 009 §11](rfc/009-operator-lifecycle-upgrade.md).
 - **Multi-cluster federation** — the reconciler is single-cluster.
 - **Backup / restore** — etcd-level snapshots are outside scope.
-- **NF-specific protocol codecs** — PFCP, NAS-5GS, GTP-U, and the experimental
-  GTPv2-C S2b subset are separate crates (`opc-proto-pfcp`, `opc-proto-nas`,
-  `opc-proto-gtpu`, `opc-proto-gtpv2c`), not `opc-sdk` default facade exports.
+- **NF-specific protocol codecs** — PFCP, NAS-5GS, GTP-U, the experimental
+  GTPv2-C S2b subset, and the experimental IKEv2 header/payload-chain scaffold
+  are separate crates (`opc-proto-pfcp`, `opc-proto-nas`, `opc-proto-gtpu`,
+  `opc-proto-gtpv2c`, `opc-proto-ikev2`), not `opc-sdk` default facade exports.
 - **Custom resource conversion webhooks** — if you version your CRD, you must
   write and deploy conversion logic yourself.
 
