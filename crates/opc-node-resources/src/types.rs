@@ -440,6 +440,11 @@ pub enum CniType {
     #[serde(rename = "host-network")]
     HostNetwork,
     /// Operator-defined CNI type outside the built-in set.
+    ///
+    /// The non-blank invariant is enforced by [`CniType::try_custom`] and by
+    /// the [`Deserialize`](serde::Deserialize) implementation. Directly
+    /// constructing this variant bypasses that invariant and should be
+    /// avoided; use [`CniType::try_custom`] instead.
     #[serde(rename = "custom")]
     Custom(String),
 }
@@ -447,6 +452,9 @@ pub enum CniType {
 impl CniType {
     /// Construct a [`CniType::Custom`] variant only if the supplied name is
     /// non-empty and not whitespace-only.
+    ///
+    /// The supplied name is stored verbatim, including any leading or
+    /// trailing whitespace; only empty or whitespace-only inputs are rejected.
     pub fn try_custom(name: impl AsRef<str>) -> Option<Self> {
         let name = name.as_ref();
         if name.trim().is_empty() {
@@ -477,14 +485,18 @@ impl<'de> serde::Deserialize<'de> for CniType {
             where
                 E: serde::de::Error,
             {
+                // Reject blank strings up-front so the intent is explicit before
+                // falling through to the built-in arms.
+                if value.trim().is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "CNI type string must be non-empty and not whitespace-only",
+                    ));
+                }
                 match value {
                     "sriov" | "Sriov" => Ok(CniType::Sriov),
                     "macvlan" | "Macvlan" => Ok(CniType::Macvlan),
                     "ipvlan" | "Ipvlan" => Ok(CniType::Ipvlan),
                     "host-network" | "HostNetwork" => Ok(CniType::HostNetwork),
-                    _ if value.trim().is_empty() => Err(serde::de::Error::custom(
-                        "CNI type string must be non-empty and not whitespace-only",
-                    )),
                     _ => Err(serde::de::Error::custom(format!(
                         "unknown CNI type string: {value}"
                     ))),
@@ -521,6 +533,10 @@ impl<'de> serde::Deserialize<'de> for CniType {
             }
         }
 
+        // `deserialize_any` is used so the visitor can accept either a plain
+        // string or a `{"custom":"name"}` object. This requires a
+        // self-describing format such as JSON; binary formats would need a
+        // dedicated representation and are not currently supported.
         deserializer.deserialize_any(CniTypeVisitor)
     }
 }
@@ -533,9 +549,10 @@ pub struct KernelModuleId(String);
 impl KernelModuleId {
     /// Construct a [`KernelModuleId`] from the supplied identifier.
     ///
-    /// The identifier is normalized to lowercase. This constructor does **not**
-    /// validate that the identifier is non-empty; use [`KernelModuleId::try_new`]
-    /// or rely on the [`Deserialize`](serde::Deserialize) impl to enforce that
+    /// The identifier is normalized to lowercase. Surrounding whitespace is
+    /// preserved; this constructor does **not** validate that the identifier is
+    /// non-empty. Use [`KernelModuleId::try_new`] or rely on the
+    /// [`Deserialize`](serde::Deserialize) impl to enforce the non-blank
     /// invariant at the serde boundary.
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into().to_lowercase())
@@ -543,6 +560,9 @@ impl KernelModuleId {
 
     /// Construct a [`KernelModuleId`] only if the supplied identifier is
     /// non-empty and not whitespace-only.
+    ///
+    /// The identifier is normalized to lowercase; surrounding whitespace is
+    /// preserved and only empty or whitespace-only inputs are rejected.
     pub fn try_new(name: impl AsRef<str>) -> Option<Self> {
         let name = name.as_ref();
         if name.trim().is_empty() {
@@ -624,9 +644,10 @@ pub struct EspAlgorithmId(String);
 impl EspAlgorithmId {
     /// Construct an [`EspAlgorithmId`] from the supplied identifier.
     ///
-    /// The identifier is normalized to lowercase. This constructor does **not**
-    /// validate that the identifier is non-empty; use [`EspAlgorithmId::try_new`]
-    /// or rely on the [`Deserialize`](serde::Deserialize) impl to enforce that
+    /// The identifier is normalized to lowercase. Surrounding whitespace is
+    /// preserved; this constructor does **not** validate that the identifier is
+    /// non-empty. Use [`EspAlgorithmId::try_new`] or rely on the
+    /// [`Deserialize`](serde::Deserialize) impl to enforce the non-blank
     /// invariant at the serde boundary.
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into().to_lowercase())
@@ -634,6 +655,9 @@ impl EspAlgorithmId {
 
     /// Construct an [`EspAlgorithmId`] only if the supplied identifier is
     /// non-empty and not whitespace-only.
+    ///
+    /// The identifier is normalized to lowercase; surrounding whitespace is
+    /// preserved and only empty or whitespace-only inputs are rejected.
     pub fn try_new(name: impl AsRef<str>) -> Option<Self> {
         let name = name.as_ref();
         if name.trim().is_empty() {
