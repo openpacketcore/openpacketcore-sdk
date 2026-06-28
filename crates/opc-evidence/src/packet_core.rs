@@ -10,7 +10,7 @@
 //! All human-readable identifier fields MUST be redacted before they are placed
 //! in evidence. [`PacketCoreEvidencePack::validate_redaction`] walks the
 //! serialized pack and fails closed if it finds raw IMSI, MSISDN, IMEI, NAI,
-//! Session-Id, LI identifiers, or key material.
+//! Session-Id, LI identifiers, SPI values, or key material.
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -74,6 +74,7 @@ pub struct PacketCoreProtocolEvidence {
 /// Direction of a packet-core protocol message relative to the network function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum PacketCoreMessageDirection {
     Uplink,
     Downlink,
@@ -111,6 +112,7 @@ pub struct AttachProcedureEvidence {
 /// Outcome of an attach or session-establishment procedure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum AttachProcedureResult {
     Success,
     Failure,
@@ -131,6 +133,7 @@ pub struct AttachStep {
 /// Outcome of a single attach step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum AttachStepResult {
     Success,
     Failure,
@@ -173,37 +176,43 @@ pub struct DataplaneCounter {
 }
 
 impl PacketCoreEvidencePack {
-    /// Validates that the pack contains no raw sensitive identifiers in its
-    /// serialized string fields.
+    /// Validates the pack before it may be included in an evidence bundle.
     ///
-    /// Digest fields (`payload_digest`, `message_digest`, and values that are
-    /// well-formed `sha256:` digests) are skipped because they are safe by
-    /// construction. All other string fields are checked for raw IMSI, MSISDN,
-    /// IMEI, NAI, Session-Id, LI identifiers, and key material markers.
+    /// Checks:
+    ///
+    /// 1. The pack is marked `experimental: true` while the schema is
+    ///    experimental (see [`PACKET_CORE_SCHEMA_VERSION`]).
+    /// 2. No serialized string field contains a raw IMSI, MSISDN, IMEI, NAI,
+    ///    Session-Id, LI identifier, SPI, or key material.
+    ///
+    /// Well-formed `sha256:` digests are skipped because they are safe by
+    /// construction.
     ///
     /// Returns [`EvidenceError::InvalidTag`] with a descriptive message when a
     /// violation is found.
     pub fn validate_redaction(&self) -> Result<(), EvidenceError> {
+        if !self.experimental {
+            return Err(EvidenceError::InvalidTag(
+                "packet-core evidence pack must be marked experimental while the schema is experimental".into(),
+            ));
+        }
+
         let value = serde_json::to_value(self).map_err(|e| {
             EvidenceError::InvalidTag(format!("failed to serialize evidence pack: {e}"))
         })?;
-        if let Some(err) = validate_value_redaction(&value, "<root>", "") {
+        if let Some(err) = validate_value_redaction(&value, "<root>") {
             return Err(EvidenceError::InvalidTag(err));
         }
         Ok(())
     }
 }
 
-fn validate_value_redaction(
-    value: &serde_json::Value,
-    path: &str,
-    parent_field: &str,
-) -> Option<String> {
+fn validate_value_redaction(value: &serde_json::Value, path: &str) -> Option<String> {
     match value {
         serde_json::Value::Object(map) => {
             for (key, child) in map {
                 let child_path = format!("{path}.{key}");
-                if let Some(err) = validate_value_redaction(child, &child_path, key) {
+                if let Some(err) = validate_value_redaction(child, &child_path) {
                     return Some(err);
                 }
             }
@@ -212,24 +221,22 @@ fn validate_value_redaction(
         serde_json::Value::Array(arr) => {
             for (i, child) in arr.iter().enumerate() {
                 let child_path = format!("{path}[{i}]");
-                if let Some(err) = validate_value_redaction(child, &child_path, parent_field) {
+                if let Some(err) = validate_value_redaction(child, &child_path) {
                     return Some(err);
                 }
             }
             None
         }
         serde_json::Value::String(s) => {
-            let skip = parent_field.ends_with("_digest")
-                || parent_field.ends_with("_digests")
-                || is_sha256_digest(s);
-            if skip {
+            if is_sha256_digest(s) {
                 return None;
             }
             if let Some(reason) = has_raw_sensitive_identifier(s) {
-                let preview = if s.len() > 64 {
-                    format!("{}...", &s[..64])
+                let preview: String = s.chars().take(64).collect();
+                let preview = if s.chars().count() > 64 {
+                    format!("{preview}...")
                 } else {
-                    s.clone()
+                    preview
                 };
                 return Some(format!(
                     "redaction violation at {path}: {reason}; value: {preview:?}"
@@ -264,6 +271,7 @@ fn is_sha256_digest(s: &str) -> bool {
 /// * Long runs of digits (8 or more) that could be IMSI, IMEI, or MSISDN.
 /// * Key-material markers (`BEGIN`, `PRIVATE KEY`, `SECRET`, ...).
 /// * LI identifier markers (`liid`, `x1`, `x2`, `x3`).
+/// * Raw SPI values (`spi=...`).
 pub fn has_raw_sensitive_identifier(s: &str) -> Option<&'static str> {
     let lower = s.to_ascii_lowercase();
 
@@ -283,6 +291,7 @@ pub fn has_raw_sensitive_identifier(s: &str) -> Option<&'static str> {
         "x1-trace",
         "x2-trace",
         "x3-trace",
+        "spi=",
     ];
     for marker in MARKERS {
         if lower.contains(marker) {
@@ -443,5 +452,101 @@ mod tests {
         assert!(has_raw_sensitive_identifier("<ue-id>").is_none());
         assert!(has_raw_sensitive_identifier("<msisdn-redacted>").is_none());
         assert!(has_raw_sensitive_identifier("no sensitive content").is_none());
+        assert!(has_raw_sensitive_identifier("<spi-redacted>").is_none());
+    }
+
+    #[test]
+    fn detects_raw_spi_values() {
+        assert!(has_raw_sensitive_identifier("spi=12345678").is_some());
+        assert!(has_raw_sensitive_identifier("spi=0x12345678").is_some());
+        assert!(has_raw_sensitive_identifier("xfrm spi=0xdeadbeef").is_some());
+    }
+
+    #[test]
+    fn preview_does_not_panic_on_multibyte_input() {
+        // 22 '€' characters plus "imsi" makes a sensitive value longer than 64
+        // bytes where byte 64 falls inside a multi-byte UTF-8 character.
+        let value = "€".repeat(22) + "imsi";
+        let pack = PacketCoreEvidencePack {
+            schema_version: PACKET_CORE_SCHEMA_VERSION.to_string(),
+            pack_id: "preview-test".into(),
+            generated_at: OffsetDateTime::UNIX_EPOCH,
+            generated_by: "test".into(),
+            experimental: true,
+            protocol_evidence: Vec::new(),
+            attach_evidence: Vec::new(),
+            kernel_dataplane_evidence: vec![KernelDataplaneEvidence {
+                schema_version: PACKET_CORE_SCHEMA_VERSION.to_string(),
+                evidence_id: "k-1".into(),
+                interface_name: "eth0".into(),
+                xfrm_state_count: 0,
+                xfrm_policy_count: 0,
+                routing_entries: 0,
+                iptables_rules: 0,
+                nftables_rules: 0,
+                observed_packets: 0,
+                dropped_packets: 0,
+                counters: Vec::new(),
+                xfrm_state_summary: vec![value],
+                timestamp: OffsetDateTime::UNIX_EPOCH,
+                requirements: Vec::new(),
+                notes: None,
+            }],
+        };
+        let err = pack.validate_redaction().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("redaction violation"));
+        assert!(msg.contains("contains sensitive identifier marker"));
+    }
+
+    #[test]
+    fn validate_redaction_requires_experimental_flag() {
+        let mut pack = PacketCoreEvidencePack {
+            schema_version: PACKET_CORE_SCHEMA_VERSION.to_string(),
+            pack_id: "experimental-test".into(),
+            generated_at: OffsetDateTime::UNIX_EPOCH,
+            generated_by: "test".into(),
+            experimental: false,
+            protocol_evidence: Vec::new(),
+            attach_evidence: Vec::new(),
+            kernel_dataplane_evidence: Vec::new(),
+        };
+        let err = pack.validate_redaction().unwrap_err();
+        assert!(err.to_string().contains("must be marked experimental"));
+
+        pack.experimental = true;
+        pack.validate_redaction().expect("experimental pack passes");
+    }
+
+    #[test]
+    fn digest_fields_are_not_redaction_bypasses() {
+        // A raw identifier placed in a field whose name ends with `_digest`
+        // must still be caught; only well-formed sha256 digests are safe.
+        let pack = PacketCoreEvidencePack {
+            schema_version: PACKET_CORE_SCHEMA_VERSION.to_string(),
+            pack_id: "digest-bypass-test".into(),
+            generated_at: OffsetDateTime::UNIX_EPOCH,
+            generated_by: "test".into(),
+            experimental: true,
+            protocol_evidence: vec![PacketCoreProtocolEvidence {
+                schema_version: PACKET_CORE_SCHEMA_VERSION.to_string(),
+                evidence_id: "p-1".into(),
+                protocol: "IKEv2".into(),
+                scenario: "test".into(),
+                message_direction: PacketCoreMessageDirection::ControlPlane,
+                payload_summary: "summary".into(),
+                payload_digest: "imsi 208950000000001".into(),
+                conformance_tags: Vec::new(),
+                requirements: Vec::new(),
+                fixture_source: "test".into(),
+                fixture_provenance: "test".into(),
+                captured_at: None,
+                notes: None,
+            }],
+            attach_evidence: Vec::new(),
+            kernel_dataplane_evidence: Vec::new(),
+        };
+        let err = pack.validate_redaction().unwrap_err();
+        assert!(err.to_string().contains("redaction violation"));
     }
 }
