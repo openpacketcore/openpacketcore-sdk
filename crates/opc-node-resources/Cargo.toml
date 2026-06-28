@@ -16,5 +16,8 @@ categories = ["network-programming"]
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

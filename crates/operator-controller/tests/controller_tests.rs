@@ -51,9 +51,9 @@ fn valid_bpf_artifact(interface_name: &str) -> opc_node_resources::BpfArtifact {
 
 fn valid_node_capability_report() -> opc_node_resources::NodeCapabilityReport {
     use opc_node_resources::{
-        BpfCapabilities, CpuManagerPolicy, HugepagePool, KernelVersion, NicCapability,
-        NodeCapabilityReport, NodeCpuCapabilities, NodeMemoryCapabilities, TopologyManagerPolicy,
-        XdpMode,
+        BpfCapabilities, CpuManagerPolicy, HugepagePool, IpsecCapabilities, KernelVersion,
+        NicCapability, NodeCapabilityReport, NodeCpuCapabilities, NodeMemoryCapabilities,
+        TopologyManagerPolicy, XdpMode,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -93,6 +93,7 @@ fn valid_node_capability_report() -> opc_node_resources::NodeCapabilityReport {
             queues: 4,
             numa_node: Some(0),
         }],
+        ipsec: IpsecCapabilities::default(),
     }
 }
 

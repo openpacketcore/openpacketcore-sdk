@@ -1,4 +1,4 @@
-use crate::network::{validate_af_xdp, validate_sriov};
+use crate::network::{validate_af_xdp, validate_ipsec_gateway, validate_sriov};
 use crate::pod_security::validate_pod_security;
 use crate::types::*;
 
@@ -14,10 +14,10 @@ pub fn validate_resource_profile(
     match profile.data_plane_profile {
         DataPlaneProfile::AfXdpFastPath => validate_af_xdp(profile, context, &mut report),
         DataPlaneProfile::SriovFastPath => validate_sriov(profile, context, &mut report),
+        DataPlaneProfile::IpsecGateway => validate_ipsec_gateway(profile, context, &mut report),
         DataPlaneProfile::ControlPlaneOnly
         | DataPlaneProfile::SignalingHeavy
-        | DataPlaneProfile::KernelNetworking
-        | DataPlaneProfile::IpsecGateway => {}
+        | DataPlaneProfile::KernelNetworking => {}
     }
 
     report
@@ -111,6 +111,8 @@ pub fn run_data_plane_preflight(
                 | ValidationError::UnsupportedSriovDriver { .. }
                 | ValidationError::SriovNoDataPlaneInterfaces
                 | ValidationError::AfXdpNoDataPlaneInterfaces
+                | ValidationError::IpsecNoDataPlaneInterfaces
+                | ValidationError::IpsecNetworkAttachmentInvalid { .. }
         )
     });
     checks.push(PreflightCheckResult {
@@ -170,6 +172,32 @@ pub fn run_data_plane_preflight(
             "Pod security exceptions are minimal and correctly evidence-linked.".to_string()
         } else {
             "Pod security exceptions contain disallowed or unlinked policy escapes.".to_string()
+        },
+    });
+
+    // Check 6: IPsec capability and fallback policy requirements
+    let ipsec_passed = if profile.data_plane_profile == DataPlaneProfile::IpsecGateway {
+        report.errors.iter().all(|e| {
+            !matches!(
+                e,
+                ValidationError::MissingNodeCapability { .. }
+                    | ValidationError::ProductionLabFallbackForbidden
+                    | ValidationError::UnsupportedKernelVersion { .. }
+                    | ValidationError::IpsecProfileMissing
+                    | ValidationError::InvalidKernelModuleId { .. }
+                    | ValidationError::InvalidEspAlgorithmId { .. }
+            )
+        })
+    } else {
+        true
+    };
+    checks.push(PreflightCheckResult {
+        name: "IPsec_Capabilities".to_string(),
+        passed: ipsec_passed,
+        message: if ipsec_passed {
+            "IPsec kernel capabilities and fallback policy meet requirements.".to_string()
+        } else {
+            "IPsec kernel capability or fallback policy requirement is unmet.".to_string()
         },
     });
 

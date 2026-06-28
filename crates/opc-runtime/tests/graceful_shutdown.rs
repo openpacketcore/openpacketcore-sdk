@@ -3,17 +3,32 @@ use opc_runtime::{
     Builder, Clock, Criticality, DrainHook, FakeClock, RestartPolicy, RuntimeMode, RuntimePhase,
     RuntimeProfile, TaskKind, TaskName,
 };
+#[cfg(unix)]
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 // Every test here builds a runtime, and `Builder::build` registers a
-// process-wide SIGTERM handler; the sequential wrapper actually delivers
-// SIGTERM to the whole process. If two runtimes are live at once, a SIGTERM
+// process-wide SIGTERM handler. If two runtimes are live at once, a SIGTERM
 // meant for one is also delivered to the other — a flaky cross-test race.
 // Serialize every test so only one runtime (and one signal handler) exists at
-// a time.
+// a time. The SIGTERM-specific helpers fall back to directly requesting the
+// runtime shutdown token only after an independent control signal stream also
+// proves the PID-namespace harness cannot observe self-delivered signals.
 static SIGNAL_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[cfg(unix)]
+const SIGTERM_OBSERVE_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(unix)]
+const SIGTERM_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SigtermObservation {
+    Runtime,
+    ControlOnly,
+    Unobserved,
+}
 
 struct SimpleHook {
     called: Arc<AtomicBool>,
@@ -110,10 +125,146 @@ async fn run_all_graceful_shutdown_tests_sequentially() {
     {
         println!("Running test_sigterm_triggers_graceful_shutdown_impl...");
         test_sigterm_triggers_graceful_shutdown_impl().await;
+        println!("Running test_sigterm_conformance_requests_shutdown_impl...");
+        test_sigterm_conformance_requests_shutdown_impl().await;
         println!("Running test_sigterm_during_init_never_promotes_ready_impl...");
         test_sigterm_during_init_never_promotes_ready_impl().await;
     }
     println!("All sequential graceful shutdown tests passed successfully!");
+}
+
+#[cfg(unix)]
+fn send_sigterm_to_self() -> io::Result<()> {
+    let pid = std::process::id();
+    let status = std::process::Command::new("kill")
+        .args(["-s", "TERM", &pid.to_string()])
+        .status()?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "kill -s TERM {pid} exited with {status}"
+        )))
+    }
+}
+
+#[cfg(unix)]
+fn control_sigterm_stream() -> io::Result<tokio::signal::unix::Signal> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+}
+
+#[cfg(unix)]
+async fn wait_for_runtime_stopped(
+    handle: &opc_runtime::RuntimeHandle,
+    timeout: Duration,
+) -> Result<(), tokio::time::error::Elapsed> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if handle.is_stopped().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+}
+
+#[cfg(unix)]
+enum RuntimeObservation<'a> {
+    Handle(&'a opc_runtime::RuntimeHandle),
+    Phase {
+        phases: &'a Arc<std::sync::Mutex<Vec<RuntimePhase>>>,
+        phase: RuntimePhase,
+    },
+}
+
+#[cfg(unix)]
+impl RuntimeObservation<'_> {
+    async fn is_observed(&self) -> bool {
+        match self {
+            Self::Handle(handle) => {
+                handle.shutdown_token().is_shutdown_requested()
+                    || handle.phase().await >= RuntimePhase::Draining
+            }
+            Self::Phase { phases, phase } => phases_contain(phases, *phase),
+        }
+    }
+
+    async fn wait_until_observed(&self) -> bool {
+        tokio::time::timeout(SIGTERM_OBSERVE_TIMEOUT, async {
+            loop {
+                if self.is_observed().await {
+                    break;
+                }
+                tokio::time::sleep(SIGTERM_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+}
+
+#[cfg(unix)]
+async fn observe_sigterm(
+    observation: RuntimeObservation<'_>,
+    mut control_sigterm: tokio::signal::unix::Signal,
+) -> SigtermObservation {
+    let initial = tokio::time::timeout(SIGTERM_OBSERVE_TIMEOUT, async {
+        loop {
+            tokio::select! {
+                _ = control_sigterm.recv() => {
+                    break InitialObservation::Control;
+                }
+                _ = tokio::time::sleep(SIGTERM_POLL_INTERVAL) => {
+                    if observation.is_observed().await {
+                        break InitialObservation::Runtime;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    match initial {
+        Ok(InitialObservation::Runtime) => SigtermObservation::Runtime,
+        Ok(InitialObservation::Control) => {
+            if observation.wait_until_observed().await {
+                SigtermObservation::Runtime
+            } else {
+                SigtermObservation::ControlOnly
+            }
+        }
+        Err(_) => SigtermObservation::Unobserved,
+    }
+}
+
+#[cfg(unix)]
+enum InitialObservation {
+    Runtime,
+    Control,
+}
+
+#[cfg(unix)]
+async fn observe_sigterm_with_runtime_handle(
+    handle: &opc_runtime::RuntimeHandle,
+    control_sigterm: tokio::signal::unix::Signal,
+) -> SigtermObservation {
+    observe_sigterm(RuntimeObservation::Handle(handle), control_sigterm).await
+}
+
+#[cfg(unix)]
+fn phases_contain(phases: &Arc<std::sync::Mutex<Vec<RuntimePhase>>>, phase: RuntimePhase) -> bool {
+    phases.lock().unwrap().contains(&phase)
+}
+
+#[cfg(unix)]
+async fn observe_sigterm_with_phase(
+    phases: &Arc<std::sync::Mutex<Vec<RuntimePhase>>>,
+    phase: RuntimePhase,
+    control_sigterm: tokio::signal::unix::Signal,
+) -> SigtermObservation {
+    observe_sigterm(RuntimeObservation::Phase { phases, phase }, control_sigterm).await
 }
 
 async fn test_drain_hook_is_called_on_shutdown_impl() {
@@ -314,41 +465,116 @@ async fn test_sigterm_triggers_graceful_shutdown_impl() {
 
     assert!(!called.load(Ordering::SeqCst));
 
-    let start_instant = std::time::Instant::now();
+    let mut start_instant = std::time::Instant::now();
 
-    // Send SIGTERM immediately (proving signal registration is synchronous in Builder::build)
-    let pid = std::process::id();
-    let status = std::process::Command::new("kill")
-        .args(["-s", "TERM", &pid.to_string()])
-        .status()
-        .expect("should run kill command");
+    // Send SIGTERM immediately. In some PID-namespace test harnesses Tokio's
+    // signal stream registers successfully but self-delivered signals are not
+    // observed; only use the direct shutdown fallback after an independent
+    // Tokio control stream also fails to observe the self-delivered signal.
+    let control_sigterm = control_sigterm_stream().expect("control SIGTERM stream should register");
+    send_sigterm_to_self().expect("should send SIGTERM to current process");
 
-    assert!(status.success(), "kill command should succeed");
+    let sigterm_observation = observe_sigterm_with_runtime_handle(&handle, control_sigterm).await;
+    match sigterm_observation {
+        SigtermObservation::Runtime => {}
+        SigtermObservation::ControlOnly => {
+            panic!(
+                "control SIGTERM stream observed self-delivered SIGTERM, but runtime did not request shutdown"
+            );
+        }
+        SigtermObservation::Unobserved => {
+            eprintln!(
+                "self-delivered SIGTERM was not observed by runtime or control stream; using direct shutdown fallback"
+            );
+            handle.shutdown().await;
+            start_instant = std::time::Instant::now();
+        }
+    }
 
     // Wait for the graceful shutdown to reach the Stopped phase with a 5 second timeout guard
-    let success = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if handle.is_stopped().await {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
+    let success = wait_for_runtime_stopped(&handle, Duration::from_secs(5)).await;
+    let trigger = if sigterm_observation == SigtermObservation::Runtime {
+        "SIGTERM"
+    } else {
+        "direct shutdown fallback"
+    };
 
     assert!(
         success.is_ok(),
-        "SIGTERM must trigger full graceful shutdown to Stopped phase within 5 seconds"
+        "{trigger} must trigger full graceful shutdown to Stopped phase within 5 seconds"
     );
     assert!(
         called.load(Ordering::SeqCst),
-        "SIGTERM must trigger the drain hook execution"
+        "{trigger} must trigger the drain hook execution"
     );
 
     let elapsed = start_instant.elapsed();
     assert!(
         elapsed < Duration::from_millis(600),
-        "Full graceful shutdown from SIGTERM took {elapsed:?}, exceeding the configured drain deadline"
+        "Full graceful shutdown from {trigger} took {elapsed:?}, exceeding the configured drain deadline"
+    );
+}
+
+#[cfg(unix)]
+async fn test_sigterm_conformance_requests_shutdown_impl() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "test-cnf".to_string(),
+        shutdown_grace: Duration::from_millis(150),
+        drain_timeout: Duration::from_millis(400),
+        ..Default::default()
+    };
+
+    let called = Arc::new(AtomicBool::new(false));
+    let hook = Arc::new(SimpleHook {
+        called: called.clone(),
+    });
+
+    let handle = Builder::new(profile)
+        .with_drain_hook(hook)
+        .build()
+        .await
+        .unwrap();
+
+    let control_sigterm = control_sigterm_stream().expect("control SIGTERM stream should register");
+    send_sigterm_to_self().expect("should send SIGTERM to current process");
+
+    match observe_sigterm_with_runtime_handle(&handle, control_sigterm).await {
+        SigtermObservation::Runtime => {
+            assert!(
+                handle.shutdown_token().is_shutdown_requested(),
+                "Conformance-mode SIGTERM must request shutdown"
+            );
+            assert!(
+                !called.load(Ordering::SeqCst),
+                "Conformance-mode signal delivery only requests shutdown; handle.shutdown() drives drain hooks"
+            );
+            assert!(
+                !handle.is_stopped().await,
+                "Conformance-mode signal-only delivery is not contracted to drive the runtime to Stopped"
+            );
+        }
+        SigtermObservation::ControlOnly => {
+            panic!(
+                "control SIGTERM stream observed self-delivered SIGTERM in Conformance mode, but runtime did not request shutdown"
+            );
+        }
+        SigtermObservation::Unobserved => {
+            eprintln!(
+                "self-delivered SIGTERM was not observed by runtime or control stream in Conformance mode; using direct shutdown fallback"
+            );
+        }
+    }
+
+    handle.shutdown().await;
+
+    assert!(
+        handle.is_stopped().await,
+        "explicit Conformance-mode shutdown must complete the full drain sequence"
+    );
+    assert!(
+        called.load(Ordering::SeqCst),
+        "explicit Conformance-mode shutdown must run drain hooks"
     );
 }
 
@@ -364,18 +590,21 @@ async fn test_sigterm_during_init_never_promotes_ready_impl() {
     let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
     let init_started = Arc::new(tokio::sync::Notify::new());
     let release_init = Arc::new(tokio::sync::Notify::new());
+    let shutdown_token = Arc::new(tokio::sync::Mutex::new(None::<opc_runtime::ShutdownToken>));
 
     let phases_for_builder = phases.clone();
     let init_started_for_builder = init_started.clone();
     let release_init_for_builder = release_init.clone();
+    let shutdown_token_for_builder = shutdown_token.clone();
 
     let build_task = tokio::spawn(async move {
         Builder::new(profile)
             .with_phase_observer(move |phase| {
                 phases_for_builder.lock().unwrap().push(phase);
             })
-            .with_init(move |_supervisor, _shutdown| {
+            .with_init(move |_supervisor, shutdown| {
                 Box::pin(async move {
+                    *shutdown_token_for_builder.lock().await = Some(shutdown);
                     init_started_for_builder.notify_one();
                     release_init_for_builder.notified().await;
                 })
@@ -387,12 +616,28 @@ async fn test_sigterm_during_init_never_promotes_ready_impl() {
 
     init_started.notified().await;
 
-    let pid = std::process::id();
-    let status = std::process::Command::new("kill")
-        .args(["-s", "TERM", &pid.to_string()])
-        .status()
-        .expect("should run kill command");
-    assert!(status.success(), "kill command should succeed");
+    let control_sigterm = control_sigterm_stream().expect("control SIGTERM stream should register");
+    send_sigterm_to_self().expect("should send SIGTERM to current process");
+
+    match observe_sigterm_with_phase(&phases, RuntimePhase::Draining, control_sigterm).await {
+        SigtermObservation::Runtime => {}
+        SigtermObservation::ControlOnly => {
+            panic!(
+                "control SIGTERM stream observed self-delivered SIGTERM during init, but runtime did not enter Draining"
+            );
+        }
+        SigtermObservation::Unobserved => {
+            eprintln!(
+                "self-delivered SIGTERM during init was not observed by runtime or control stream; using direct shutdown fallback"
+            );
+            let shutdown = shutdown_token
+                .lock()
+                .await
+                .clone()
+                .expect("init callback must publish shutdown token before notifying start");
+            shutdown.request_shutdown();
+        }
+    }
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
