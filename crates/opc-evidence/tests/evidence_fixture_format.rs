@@ -166,3 +166,16 @@ fn fixture_packet_core_evidence_pack_passes_format_validation() {
     validate_fixture_formats(raw)
         .expect("packet_core_evidence_pack.json should pass format validation");
 }
+
+#[test]
+fn format_validator_checks_packet_core_timestamp_fields() {
+    let bad = r#"{"generated_at": "2026-05-19T17:25:13", "captured_at": "not-a-datetime", "timestamp": "2026-05-19 17:25:13Z"}"#;
+    let err = validate_fixture_formats(bad).unwrap_err();
+    assert!(err.contains("date-time"));
+}
+
+#[test]
+fn format_validator_accepts_packet_core_timestamp_fields() {
+    let good = r#"{"generated_at": "2026-05-19T17:25:13Z", "captured_at": "2026-05-19T17:25:13+00:00", "timestamp": "2026-05-19T17:25:13.123Z"}"#;
+    assert!(validate_fixture_formats(good).is_ok());
+}

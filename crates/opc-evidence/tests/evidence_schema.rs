@@ -171,3 +171,13 @@ fn packet_core_evidence_pack_fixture_matches_versioned_schema() {
     )
     .expect("packet-core evidence pack fixture must satisfy the committed RFC 006 schema");
 }
+
+#[test]
+fn packet_core_evidence_pack_schema_rejects_experimental_false() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/packet_core_evidence_pack.json")).unwrap();
+    value["experimental"] = serde_json::Value::Bool(false);
+    let schema: serde_json::Value = serde_json::from_str(PACKET_CORE_EVIDENCE_PACK_SCHEMA).unwrap();
+    let err = schema_support::validate_value_against_schema(&schema, &value).unwrap_err();
+    assert!(err.contains("experimental"));
+}

@@ -29,7 +29,8 @@
       "minLength": 1
     },
     "experimental": {
-      "type": "boolean"
+      "type": "boolean",
+      "const": true
     },
     "protocol_evidence": {
       "type": "array",

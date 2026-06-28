@@ -91,7 +91,12 @@ pub fn validate_formats_on_object(
         if let Some(s) = value.as_str() {
             let format_hint = match key.as_str() {
                 "created" | "created_date" => Some("date"),
-                "last_updated" | "generation_timestamp" | "updated_at" => Some("date-time"),
+                "last_updated"
+                | "generation_timestamp"
+                | "updated_at"
+                | "timestamp"
+                | "captured_at"
+                | "generated_at" => Some("date-time"),
                 _ => None,
             };
             if let Some(fmt) = format_hint {
