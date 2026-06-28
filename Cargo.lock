@@ -2318,6 +2318,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-proto-ikev2"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "opc-protocol",
+]
+
+[[package]]
 name = "opc-proto-nas"
 version = "0.2.0"
 dependencies = [
@@ -2596,6 +2604,8 @@ version = "0.2.0"
 dependencies = [
  "opc-evidence",
  "opc-node-resources",
+ "opc-proto-gtpv2c",
+ "opc-protocol",
  "opc-redaction",
  "opc-schema-validate",
  "opc-types",

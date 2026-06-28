@@ -11,8 +11,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 // Phase represents the current state of a drain operation.
@@ -116,4 +120,50 @@ func (f *FakeOrchestrator) Status(ctx context.Context, target string) (DrainStat
 		return f.StatusFunc(ctx, target)
 	}
 	return DrainStatus{Phase: Complete}, nil
+}
+
+// Admin endpoint paths used by opc-runtime for drain operations.
+const (
+	// DrainEndpointPath is the admin path for drain start/status.
+	DrainEndpointPath = "/debug/drain"
+	// LivezEndpointPath is the admin liveness path.
+	LivezEndpointPath = "/livez"
+	// ReadyzEndpointPath is the admin readiness path.
+	ReadyzEndpointPath = "/readyz"
+	// StartupzEndpointPath is the admin startup path.
+	StartupzEndpointPath = "/startupz"
+)
+
+// DefaultDrainPort is the conventional admin port for SDK-compatible drain
+// endpoints. Products may override it via RenderOptions.AdminPort.
+const DefaultDrainPort = 8080
+
+// BuildAdminURL constructs an HTTP URL for the given admin endpoint on a pod.
+// It accepts an IP (or hostname) and port, and returns a string like
+// "http://10.0.0.1:8080/debug/drain". IPv6 hosts are wrapped in brackets.
+// The endpoint should be one of the endpoint path constants in this package.
+func BuildAdminURL(host string, port int32, endpoint string) string {
+	if port == 0 {
+		port = DefaultDrainPort
+	}
+	return fmt.Sprintf("http://%s%s", net.JoinHostPort(host, strconv.Itoa(int(port))), endpoint)
+}
+
+// PreStopDrainHook returns a LifecycleHandler that sleeps for the requested
+// duration before SIGTERM reaches the container. The sleep gives the pod time
+// to finish in-flight sessions and lets the workload observe drain state
+// before the kernel starts tearing down sockets.
+func PreStopDrainHook(delaySeconds int64) *corev1.LifecycleHandler {
+	return &corev1.LifecycleHandler{
+		Sleep: &corev1.SleepAction{Seconds: delaySeconds},
+	}
+}
+
+// BuildPreStopLifecycle returns a Lifecycle configured with a preStop sleep
+// drain hook. It is a convenience wrapper for products that want the standard
+// drain hook without constructing the handler manually.
+func BuildPreStopLifecycle(delaySeconds int64) *corev1.Lifecycle {
+	return &corev1.Lifecycle{
+		PreStop: PreStopDrainHook(delaySeconds),
+	}
 }

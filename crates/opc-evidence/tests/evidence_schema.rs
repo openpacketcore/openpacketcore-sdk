@@ -12,6 +12,10 @@ fn rfc006_versioned_schemas_are_valid_json() {
         REQUIREMENT_INVENTORY_SCHEMA,
         PERFORMANCE_BASELINE_SCHEMA,
         VEX_POLICY_RESULT_SCHEMA,
+        PACKET_CORE_PROTOCOL_EVIDENCE_SCHEMA,
+        PACKET_CORE_ATTACH_EVIDENCE_SCHEMA,
+        PACKET_CORE_KERNEL_DATAPLANE_EVIDENCE_SCHEMA,
+        PACKET_CORE_EVIDENCE_PACK_SCHEMA,
     ] {
         serde_json::from_str::<serde_json::Value>(schema)
             .expect("versioned RFC 006 schema file must be valid JSON");
@@ -128,4 +132,125 @@ fn generated_gap_with_no_owner_matches_versioned_schema() {
     let value = serde_json::to_value(gap).unwrap();
     schema_support::validate_value_against_schema(&schema, &value)
         .expect("generated Gap with no owner must satisfy the committed RFC 006 schema");
+}
+
+#[test]
+fn packet_core_protocol_evidence_fixture_matches_versioned_schema() {
+    schema_support::validate_json_str_against_schema(
+        PACKET_CORE_PROTOCOL_EVIDENCE_SCHEMA,
+        include_str!("fixtures/packet_core_protocol_evidence.json"),
+    )
+    .expect("packet-core protocol evidence fixture must satisfy the committed RFC 006 schema");
+}
+
+#[test]
+fn packet_core_attach_evidence_fixture_matches_versioned_schema() {
+    schema_support::validate_json_str_against_schema(
+        PACKET_CORE_ATTACH_EVIDENCE_SCHEMA,
+        include_str!("fixtures/packet_core_attach_evidence.json"),
+    )
+    .expect("packet-core attach evidence fixture must satisfy the committed RFC 006 schema");
+}
+
+#[test]
+fn packet_core_kernel_dataplane_evidence_fixture_matches_versioned_schema() {
+    schema_support::validate_json_str_against_schema(
+        PACKET_CORE_KERNEL_DATAPLANE_EVIDENCE_SCHEMA,
+        include_str!("fixtures/packet_core_kernel_dataplane_evidence.json"),
+    )
+    .expect(
+        "packet-core kernel dataplane evidence fixture must satisfy the committed RFC 006 schema",
+    );
+}
+
+#[test]
+fn packet_core_evidence_pack_fixture_matches_versioned_schema() {
+    schema_support::validate_json_str_against_schema(
+        PACKET_CORE_EVIDENCE_PACK_SCHEMA,
+        include_str!("fixtures/packet_core_evidence_pack.json"),
+    )
+    .expect("packet-core evidence pack fixture must satisfy the committed RFC 006 schema");
+}
+
+#[test]
+fn packet_core_evidence_pack_schema_rejects_experimental_false() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/packet_core_evidence_pack.json")).unwrap();
+    value["experimental"] = serde_json::Value::Bool(false);
+    let schema: serde_json::Value = serde_json::from_str(PACKET_CORE_EVIDENCE_PACK_SCHEMA).unwrap();
+    let err = schema_support::validate_value_against_schema(&schema, &value).unwrap_err();
+    assert!(
+        err.contains("experimental"),
+        "error should mention experimental: {err}"
+    );
+}
+
+#[test]
+fn packet_core_evidence_pack_rejects_wrong_schema_version() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/packet_core_evidence_pack.json")).unwrap();
+    value["schema_version"] = "rfc006/v1/wrong".into();
+    let schema: serde_json::Value = serde_json::from_str(PACKET_CORE_EVIDENCE_PACK_SCHEMA).unwrap();
+    let err = schema_support::validate_value_against_schema(&schema, &value).unwrap_err();
+    assert!(
+        err.contains("schema_version"),
+        "error should mention schema_version: {err}"
+    );
+}
+
+#[test]
+fn packet_core_protocol_evidence_rejects_wrong_schema_version() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/packet_core_protocol_evidence.json")).unwrap();
+    value["schema_version"] = "rfc006/v1/wrong".into();
+    let schema: serde_json::Value =
+        serde_json::from_str(PACKET_CORE_PROTOCOL_EVIDENCE_SCHEMA).unwrap();
+    let err = schema_support::validate_value_against_schema(&schema, &value).unwrap_err();
+    assert!(
+        err.contains("schema_version"),
+        "error should mention schema_version: {err}"
+    );
+}
+
+#[test]
+fn packet_core_attach_evidence_rejects_wrong_schema_version() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/packet_core_attach_evidence.json")).unwrap();
+    value["schema_version"] = "rfc006/v1/wrong".into();
+    let schema: serde_json::Value =
+        serde_json::from_str(PACKET_CORE_ATTACH_EVIDENCE_SCHEMA).unwrap();
+    let err = schema_support::validate_value_against_schema(&schema, &value).unwrap_err();
+    assert!(
+        err.contains("schema_version"),
+        "error should mention schema_version: {err}"
+    );
+}
+
+#[test]
+fn packet_core_kernel_dataplane_evidence_rejects_wrong_schema_version() {
+    let mut value: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/packet_core_kernel_dataplane_evidence.json"
+    ))
+    .unwrap();
+    value["schema_version"] = "rfc006/v1/wrong".into();
+    let schema: serde_json::Value =
+        serde_json::from_str(PACKET_CORE_KERNEL_DATAPLANE_EVIDENCE_SCHEMA).unwrap();
+    let err = schema_support::validate_value_against_schema(&schema, &value).unwrap_err();
+    assert!(
+        err.contains("schema_version"),
+        "error should mention schema_version: {err}"
+    );
+}
+
+#[test]
+fn packet_core_evidence_pack_inline_items_reject_wrong_schema_version() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/packet_core_evidence_pack.json")).unwrap();
+    value["protocol_evidence"][0]["schema_version"] = "rfc006/v1/wrong".into();
+    let schema: serde_json::Value = serde_json::from_str(PACKET_CORE_EVIDENCE_PACK_SCHEMA).unwrap();
+    let err = schema_support::validate_value_against_schema(&schema, &value).unwrap_err();
+    assert!(
+        err.contains("schema_version"),
+        "error should mention schema_version: {err}"
+    );
 }

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.openpacketcore.dev/rfc006/v1/packet-core-protocol-evidence.schema.json",
+  "title": "OpenPacketCore RFC 006 packet-core protocol evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_id",
+    "protocol",
+    "scenario",
+    "message_direction",
+    "payload_summary",
+    "payload_digest",
+    "fixture_source",
+    "fixture_provenance"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "rfc006/v1/packet-core-experimental"
+    },
+    "evidence_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "protocol": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scenario": {
+      "type": "string",
+      "minLength": 1
+    },
+    "message_direction": {
+      "type": "string",
+      "enum": ["uplink", "downlink", "control-plane", "user-plane"]
+    },
+    "payload_summary": {
+      "type": "string"
+    },
+    "payload_digest": {
+      "type": "string",
+      "format": "opc-sha256"
+    },
+    "conformance_tags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "opc-requirement-id"
+      }
+    },
+    "fixture_source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "fixture_provenance": {
+      "type": "string",
+      "minLength": 1
+    },
+    "captured_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "notes": {
+      "type": "string"
+    }
+  }
+}

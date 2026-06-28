@@ -26,9 +26,13 @@ serde_json = { workspace = true }
 time = { workspace = true, features = ["formatting", "parsing", "serde"] }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 opc-evidence = { path = "../opc-evidence", version = "0.2.0" }
+opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 opc-node-resources = { path = "../opc-node-resources", version = "0.2.0" }
+
+[dev-dependencies]
+opc-proto-gtpv2c = { path = "../opc-proto-gtpv2c", version = "0.2.0" }
 
 [lints]
 workspace = true

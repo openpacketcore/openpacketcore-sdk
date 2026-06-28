@@ -233,3 +233,84 @@ func TestCanTransitionUnknown(t *testing.T) {
 		t.Error("expected Ready -> unknown to be illegal")
 	}
 }
+
+func TestGateConstantsAreNonEmpty(t *testing.T) {
+	want := []GateName{
+		GateConfig, GateCriticalTasks, GateListeners, GateSecurityMaterial,
+		GateExternalPeer, GateDiameterPeer, GateSCTPAssociation, GateSessionStore,
+		GateReplication, GateDataplaneKernel, GateXFRM, GateGTPUserPath,
+		GateChargingPeer, GateLIDelivery, GateCertificateRevocation, GateDrain,
+	}
+	for _, g := range want {
+		if g == "" {
+			t.Error("gate constant must not be empty")
+		}
+	}
+}
+
+func TestGateCondition(t *testing.T) {
+	cm := NewConditionManager(1)
+	if err := GateCondition(cm, GateDrain, GatePassing, "DrainPassing", "drain complete", 1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	c := cm.Get(ConditionType(GateDrain))
+	if c == nil {
+		t.Fatal("expected drain gate condition")
+	}
+	if c.Status != metav1.ConditionTrue {
+		t.Errorf("expected status True for passing gate, got %s", c.Status)
+	}
+	if c.Reason != "DrainPassing" {
+		t.Errorf("expected reason DrainPassing, got %s", c.Reason)
+	}
+}
+
+func TestGateStatusFromCondition(t *testing.T) {
+	cases := []struct {
+		name string
+		cond metav1.Condition
+		want GateStatus
+	}{
+		{"true passing", metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "ReadyPassing"}, GatePassing},
+		{"true degraded", metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "ReadyDegraded"}, GateDegraded},
+		{"false", metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse}, GateFailing},
+		{"unknown", metav1.Condition{Type: "Ready", Status: metav1.ConditionUnknown}, GateUnknown},
+		{"custom reason suffix degraded", metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "CustomDegraded"}, GatePassing},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := GateStatusFromCondition(tc.cond)
+			if got != tc.want {
+				t.Errorf("GateStatusFromCondition(%+v) = %s, want %s", tc.cond, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGateConditionDegradedRoundTrip(t *testing.T) {
+	cm := NewConditionManager(1)
+	reason := GateReason(GateDrain, GateDegraded)
+	message := GateMessage(GateDrain, GateDegraded)
+	if err := GateCondition(cm, GateDrain, GateDegraded, reason, message, 1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	c := cm.Get(ConditionType(GateDrain))
+	if c == nil {
+		t.Fatal("expected drain gate condition")
+	}
+	if c.Status != metav1.ConditionTrue {
+		t.Errorf("expected status True for degraded gate, got %s", c.Status)
+	}
+	if got := GateStatusFromCondition(*c); got != GateDegraded {
+		t.Errorf("expected GateDegraded round-trip, got %s", got)
+	}
+}
+
+func TestGateReasonAndMessage(t *testing.T) {
+	if got := GateReason(GateXFRM, GateFailing); got != "xfrmFailing" {
+		t.Errorf("unexpected reason: %s", got)
+	}
+	if got := GateMessage(GateXFRM, GatePassing); got != "Gate xfrm is passing" {
+		t.Errorf("unexpected message: %s", got)
+	}
+}

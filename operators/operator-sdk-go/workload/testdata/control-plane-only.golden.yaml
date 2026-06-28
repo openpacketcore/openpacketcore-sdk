@@ -53,7 +53,12 @@ spec:
         command: []
         args: []
         workingdir: ""
-        ports: []
+        ports:
+        - name: admin
+          hostport: 0
+          containerport: 8080
+          protocol: TCP
+          hostip: ""
         envfrom: []
         env: []
         resources:
