@@ -59,7 +59,8 @@ impl fmt::Display for DataClass {
 /// Canonical identifier types used in digest and redaction contexts.
 ///
 /// This is not an exhaustive 3GPP enumeration; it covers the identifiers that
-/// RFC 010 §5 explicitly requires to be digested or redacted.
+/// RFC 010 explicitly requires to be digested or redacted, plus additional
+/// telco-specific identifiers used across the OpenPacketCore SDK.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -72,6 +73,17 @@ pub enum IdentifierType {
     Guti,
     IpAddress,
     Dnn,
+    Imei,
+    Nai,
+    Sip,
+    Apn,
+    Teid,
+    Spi,
+    DiameterSessionId,
+    LiId,
+    LiWarrantId,
+    LiCorrelationId,
+    DeliveryAddress,
 }
 
 impl IdentifierType {
@@ -85,11 +97,94 @@ impl IdentifierType {
             Self::Guti => "guti",
             Self::IpAddress => "ip-address",
             Self::Dnn => "dnn",
+            Self::Imei => "imei",
+            Self::Nai => "nai",
+            Self::Sip => "sip",
+            Self::Apn => "apn",
+            Self::Teid => "teid",
+            Self::Spi => "spi",
+            Self::DiameterSessionId => "diameter-session-id",
+            Self::LiId => "li-id",
+            Self::LiWarrantId => "li-warrant-id",
+            Self::LiCorrelationId => "li-correlation-id",
+            Self::DeliveryAddress => "delivery-address",
         }
+    }
+
+    /// Returns the telco class for this identifier, if it is a telco identifier.
+    pub const fn telco_class(self) -> Option<TelcoIdentifierClass> {
+        match self {
+            Self::Imsi
+            | Self::Msisdn
+            | Self::Imei
+            | Self::Nai
+            | Self::Supi
+            | Self::Gpsi
+            | Self::Guti
+            | Self::Pei => Some(TelcoIdentifierClass::Subscriber),
+            Self::Teid => Some(TelcoIdentifierClass::SessionEndpoint),
+            Self::Spi => Some(TelcoIdentifierClass::SecurityAssociation),
+            Self::Apn | Self::Dnn | Self::Sip | Self::DiameterSessionId => {
+                Some(TelcoIdentifierClass::Application)
+            }
+            Self::LiId | Self::LiWarrantId | Self::LiCorrelationId | Self::DeliveryAddress => {
+                Some(TelcoIdentifierClass::LawfulIntercept)
+            }
+            Self::IpAddress => None,
+        }
+    }
+
+    /// Returns `true` if this identifier type is a telco identifier.
+    pub const fn is_telco(self) -> bool {
+        self.telco_class().is_some()
     }
 }
 
 impl fmt::Display for IdentifierType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Privacy-relevant telco identifier classes.
+///
+/// Each class groups identifiers that share the same redaction policy and
+/// operational sensitivity.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TelcoIdentifierClass {
+    Subscriber,
+    SessionEndpoint,
+    SecurityAssociation,
+    Application,
+    LawfulIntercept,
+}
+
+impl TelcoIdentifierClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Subscriber => "subscriber",
+            Self::SessionEndpoint => "session-endpoint",
+            Self::SecurityAssociation => "security-association",
+            Self::Application => "application",
+            Self::LawfulIntercept => "lawful-intercept",
+        }
+    }
+
+    /// Returns the default [`DataClass`] for this telco identifier class.
+    pub const fn default_data_class(self) -> DataClass {
+        match self {
+            Self::Subscriber => DataClass::SubscriberId,
+            Self::SessionEndpoint => DataClass::SubscriberSession,
+            Self::SecurityAssociation => DataClass::SecuritySecret,
+            Self::Application => DataClass::NetworkSensitive,
+            Self::LawfulIntercept => DataClass::LawfulIntercept,
+        }
+    }
+}
+
+impl fmt::Display for TelcoIdentifierClass {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -127,5 +222,94 @@ mod tests {
         assert_eq!(IdentifierType::Supi.to_string(), "supi");
         assert_eq!(IdentifierType::Msisdn.to_string(), "msisdn");
         assert_eq!(IdentifierType::IpAddress.to_string(), "ip-address");
+        assert_eq!(
+            IdentifierType::DiameterSessionId.to_string(),
+            "diameter-session-id"
+        );
+        assert_eq!(IdentifierType::LiId.to_string(), "li-id");
+        assert_eq!(IdentifierType::LiWarrantId.to_string(), "li-warrant-id");
+        assert_eq!(
+            IdentifierType::LiCorrelationId.to_string(),
+            "li-correlation-id"
+        );
+        assert_eq!(
+            IdentifierType::DeliveryAddress.to_string(),
+            "delivery-address"
+        );
+    }
+
+    #[test]
+    fn telco_identifier_classes_cover_required_identifiers() {
+        // IMSI/MSISDN/IMEI/NAI/SIP/APN/TEID/SPI/Diameter Session-Id/LI ID
+        assert_eq!(
+            IdentifierType::Imsi.telco_class(),
+            Some(TelcoIdentifierClass::Subscriber)
+        );
+        assert_eq!(
+            IdentifierType::Msisdn.telco_class(),
+            Some(TelcoIdentifierClass::Subscriber)
+        );
+        assert_eq!(
+            IdentifierType::Imei.telco_class(),
+            Some(TelcoIdentifierClass::Subscriber)
+        );
+        assert_eq!(
+            IdentifierType::Nai.telco_class(),
+            Some(TelcoIdentifierClass::Subscriber)
+        );
+        assert_eq!(
+            IdentifierType::Sip.telco_class(),
+            Some(TelcoIdentifierClass::Application)
+        );
+        assert_eq!(
+            IdentifierType::Apn.telco_class(),
+            Some(TelcoIdentifierClass::Application)
+        );
+        assert_eq!(
+            IdentifierType::Teid.telco_class(),
+            Some(TelcoIdentifierClass::SessionEndpoint)
+        );
+        assert_eq!(
+            IdentifierType::Spi.telco_class(),
+            Some(TelcoIdentifierClass::SecurityAssociation)
+        );
+        assert_eq!(
+            IdentifierType::DiameterSessionId.telco_class(),
+            Some(TelcoIdentifierClass::Application)
+        );
+        assert_eq!(
+            IdentifierType::LiId.telco_class(),
+            Some(TelcoIdentifierClass::LawfulIntercept)
+        );
+        assert_eq!(
+            IdentifierType::LiWarrantId.telco_class(),
+            Some(TelcoIdentifierClass::LawfulIntercept)
+        );
+        assert_eq!(
+            IdentifierType::LiCorrelationId.telco_class(),
+            Some(TelcoIdentifierClass::LawfulIntercept)
+        );
+        assert_eq!(
+            IdentifierType::DeliveryAddress.telco_class(),
+            Some(TelcoIdentifierClass::LawfulIntercept)
+        );
+        // DNN is the 5G equivalent of APN and belongs to the same telco class.
+        assert_eq!(
+            IdentifierType::Dnn.telco_class(),
+            Some(TelcoIdentifierClass::Application)
+        );
+        assert!(IdentifierType::Dnn.is_telco());
+    }
+
+    #[test]
+    fn telco_class_default_data_class_is_sensible() {
+        assert_eq!(
+            TelcoIdentifierClass::Subscriber.default_data_class(),
+            DataClass::SubscriberId
+        );
+        assert_eq!(
+            TelcoIdentifierClass::LawfulIntercept.default_data_class(),
+            DataClass::LawfulIntercept
+        );
     }
 }
