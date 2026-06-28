@@ -1,0 +1,82 @@
+{
+  "schema_version": "rfc006/v1/packet-core-experimental",
+  "pack_id": "epdg-smoke-2026-06-28",
+  "generated_at": "2026-06-28T00:00:00Z",
+  "generated_by": "opc-evidence packet-core schema tests",
+  "experimental": true,
+  "protocol_evidence": [
+    {
+      "schema_version": "rfc006/v1/packet-core-experimental",
+      "evidence_id": "epdg-ikev2-auth-request-001",
+      "protocol": "IKEv2",
+      "scenario": "IKE_AUTH exchange with EAP-AKA",
+      "message_direction": "uplink",
+      "payload_summary": "IKE_AUTH request carrying IDi and CP payload; no raw identifiers present",
+      "payload_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "conformance_tags": ["@spec RFC 7296 §1.2", "@req REQ-IETF-RFC7296-R1-1.2-001"],
+      "requirements": ["REQ-IETF-RFC7296-R1-1.2-001"],
+      "fixture_source": "spec-authored from RFC 7296 §1.2",
+      "fixture_provenance": "hand-authored from independent spec reading; not derived from SDK encoder output",
+      "captured_at": "2026-06-28T00:00:00Z",
+      "notes": "Experimental protocol evidence shape for ePDG smoke artifact comparability."
+    }
+  ],
+  "attach_evidence": [
+    {
+      "schema_version": "rfc006/v1/packet-core-experimental",
+      "evidence_id": "epdg-initial-attach-001",
+      "procedure": "initial-attach",
+      "result": "success",
+      "steps": [
+        {
+          "name": "IKE_SA_INIT",
+          "result": "success",
+          "message_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "notes": "Cookie challenged and accepted."
+        },
+        {
+          "name": "IKE_AUTH_EAP_AKA",
+          "result": "success",
+          "message_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        {
+          "name": "CREATE_CHILD_SA",
+          "result": "success",
+          "message_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        }
+      ],
+      "ue_identifier_redacted": "<supi-redacted>",
+      "session_id_redacted": "<s2b-session-redacted>",
+      "serving_node": "epdg-0",
+      "timestamp": "2026-06-28T00:00:00Z",
+      "duration_ms": 120,
+      "requirements": ["REQ-3GPP-TS29274-R18-7.1-001"],
+      "notes": "Experimental attach procedure evidence shape."
+    }
+  ],
+  "kernel_dataplane_evidence": [
+    {
+      "schema_version": "rfc006/v1/packet-core-experimental",
+      "evidence_id": "epdg-kernel-dataplane-001",
+      "interface_name": "eth0",
+      "xfrm_state_count": 4,
+      "xfrm_policy_count": 4,
+      "routing_entries": 12,
+      "iptables_rules": 0,
+      "nftables_rules": 8,
+      "observed_packets": 1000000,
+      "dropped_packets": 0,
+      "counters": [
+        { "name": "esp_packets", "value": 900000 },
+        { "name": "gtpu_packets", "value": 100000 }
+      ],
+      "xfrm_state_summary": [
+        "spi=<spi-redacted> mode=tunnel",
+        "spi=<spi-redacted> mode=tunnel"
+      ],
+      "timestamp": "2026-06-28T00:00:00Z",
+      "requirements": ["REQ-IETF-RFC7296-R1-1.2-001"],
+      "notes": "Experimental kernel dataplane evidence shape."
+    }
+  ]
+}

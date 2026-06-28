@@ -15,8 +15,11 @@ The OpenPacketCore SDK follows a **Rust policy / Go orchestration** split:
   contract-version enforcement, preflight validation, config-apply decisions,
   rollback logic, and redaction-safe status reporting.
 - **Go** (`operator-sdk-go` + your operator) handles Kubernetes mechanics:
-  reconciliation, conditions, finalizers, workload synthesis, metrics, and
-  events.
+  reconciliation, conditions, finalizers, workload synthesis, runtime-gate and
+  rollout helper evaluation, Multus/SR-IOV attachment rendering, metrics, and
+  events. The packet-core helper additions are experimental mechanism helpers:
+  your product operator still owns CRDs, Helm/RBAC, XFRM privileges, network
+  attachment definitions, readiness policy, and carrier acceptance.
 
 This split is deliberate: Rust gives us memory safety and auditable policy
 execution, while Go gives us native Kubernetes client ergonomics.
@@ -177,7 +180,8 @@ if !crd.DeletionTimestamp.IsZero() {
 ### 4.4 Workload — Manifest Synthesis
 
 `workload.RenderDeployment` turns your CR into a Kubernetes `Deployment` with
-correct resources, capabilities, hugepage volumes, and probes.
+correct resources, capabilities, hugepage volumes, extra UDP/SCTP/TCP ports,
+Multus/SR-IOV annotations, and probes.
 
 Excerpt from the reference controller:
 [operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/operators/sdk-reference-operator/internal/controller/sdkmanagednetworkfunction_controller.go)
@@ -215,6 +219,17 @@ defer func() {
 
 ---
 
+### 4.6 Runtime Gates, CNI, and Rollout Helpers
+
+The `conditions`, `gates`, `cni`, and `rollout` packages contain generic helper
+surfaces for named runtime gates, Deployment/Pod endpoint lineage, Multus
+network annotations, SR-IOV resource aggregation, and RFC 009 rollout-strategy
+checks. These helpers are experimental for packet-core workloads: pass
+product-specific CRD fields through your own adapter layer instead of adding
+product policy to `operator-sdk-go`.
+
+---
+
 ## 5. Packaging with Helm
 
 Use the reference Helm chart as a template:
@@ -246,17 +261,27 @@ helm template my-nf operators/helm/my-nf-operator/ \
 
 The SDK is intentionally narrow. You must bring your own:
 
-- **Rollout strategies** — canary, blue/green, percentage-based traffic shift.
-  See [RFC 009 §11](rfc/009-operator-lifecycle-upgrade.md).
+- **Traffic-shift implementation and product rollout policy** — the Go helpers
+  can evaluate RFC 009 strategy choices and render conservative Deployment
+  strategies, but your operator owns Service routing, canary percentages,
+  approvals, and product safety thresholds.
 - **Multi-cluster federation** — the reconciler is single-cluster.
 - **Backup / restore** — etcd-level snapshots are outside scope.
-- **NF-specific protocol codecs** — PFCP, NAS-5GS, GTP-U are separate crates
-  (`opc-proto-pfcp`, `opc-proto-nas`, `opc-proto-gtpu`).
+- **NF-specific protocol codecs** — PFCP, NAS-5GS, GTP-U, the experimental
+  Diameter base/application dictionaries, GTPv2-C S2b subset, and IKEv2
+  header/payload-chain scaffold are separate crates (`opc-proto-pfcp`,
+  `opc-proto-nas`, `opc-proto-gtpu`, `opc-proto-diameter`,
+  `opc-proto-gtpv2c`, `opc-proto-ikev2`), not `opc-sdk` default facade exports.
 - **Custom resource conversion webhooks** — if you version your CRD, you must
   write and deploy conversion logic yourself.
 
-For a full list of known gaps, see the gap register in
-`docs/design/` (create a gap-register document if absent).
+For the current SDK gap register and accepted boundaries, see
+[`docs/implementation-status.md`](implementation-status.md). EPC and
+untrusted-access additions are intentionally mechanism-only per
+[ADR 0018](adr/0018-epc-untrusted-access-sdk-boundary.md); downstream product
+operators own their own CRDs, Helm/RBAC policy, network attachments, XFRM/IPsec
+privileges, readiness thresholds, traffic-shift rules, and carrier-acceptance
+evidence.
 
 ---
 

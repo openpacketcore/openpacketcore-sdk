@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.openpacketcore.dev/rfc006/v1/packet-core-kernel-dataplane-evidence.schema.json",
+  "title": "OpenPacketCore RFC 006 packet-core kernel dataplane evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_id",
+    "interface_name",
+    "xfrm_state_count",
+    "xfrm_policy_count",
+    "routing_entries",
+    "iptables_rules",
+    "nftables_rules",
+    "observed_packets",
+    "dropped_packets",
+    "timestamp"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "rfc006/v1/packet-core-experimental"
+    },
+    "evidence_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "interface_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "xfrm_state_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "xfrm_policy_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "routing_entries": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "iptables_rules": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "nftables_rules": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "observed_packets": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "dropped_packets": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "counters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "value"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "value": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "xfrm_state_summary": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "opc-requirement-id"
+      }
+    },
+    "notes": {
+      "type": "string"
+    }
+  }
+}

@@ -18,7 +18,7 @@ serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 # serde_yaml 0.9 is marked deprecated on crates.io.  We retain it for now
 # because the maintained forks (yaml_serde, serde_yaml_ng) either require
-# a newer rustc than our workspace floor (1.78) or have not been validated
+# a newer rustc than our workspace floor (currently 1.88) or have not been validated
 # for our exact use case.  A tracked migration should happen once a fork
 # is confirmed stable and compatible.
 serde_yaml = "0.9"
@@ -26,9 +26,13 @@ serde_json = { workspace = true }
 time = { workspace = true, features = ["formatting", "parsing", "serde"] }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 opc-evidence = { path = "../opc-evidence", version = "0.2.0" }
+opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 opc-node-resources = { path = "../opc-node-resources", version = "0.2.0" }
+
+[dev-dependencies]
+opc-proto-gtpv2c = { path = "../opc-proto-gtpv2c", version = "0.2.0" }
 
 [lints]
 workspace = true

@@ -222,6 +222,32 @@ assertions:
 }
 
 #[test]
+fn local_runner_epc_malformed_response_updates_simulator_state() {
+    let yaml = r#"
+id: LOCAL-EPC-MALFORMED-001
+title: EPC malformed response updates simulator state
+schema_version: "0.1.0"
+requirements:
+  - REQ-3GPP-TS23502-R17-4.2.2-001
+topology:
+  nfs:
+    pgw: { simulator: pgw-s2b }
+steps:
+  - malformed_response:
+      target: pgw
+"#;
+    let scenario = Scenario::from_yaml(yaml).unwrap();
+    let clock = VirtualClock::new(Timestamp::now_utc());
+    let mut runner = LocalRunner::new(clock);
+    let evidence = runner.run(&scenario).unwrap();
+    assert_eq!(evidence.outcome, ScenarioOutcome::Fail);
+    assert_eq!(
+        runner.state.get("pgw.state").map(|s| s.as_str()),
+        Some("MALFORMED_REJECTED")
+    );
+}
+
+#[test]
 fn scenario_evidence_redacts_failure_summary() {
     let mut ev = ScenarioEvidence::new("AMF-REG-001", ScenarioOutcome::Fail);
     ev.requirements = vec!["REQ-3GPP-TS23502-R17-4.2.2-001".into()];

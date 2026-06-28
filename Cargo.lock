@@ -2051,6 +2051,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-ipsec-xfrm"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "opc-linux-xfrm-sys",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "opc-key"
 version = "0.2.0"
 dependencies = [
@@ -2091,6 +2103,13 @@ dependencies = [
 
 [[package]]
 name = "opc-libsctp-sys"
+version = "0.2.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "opc-linux-xfrm-sys"
 version = "0.2.0"
 dependencies = [
  "libc",
@@ -2226,6 +2245,7 @@ name = "opc-node-resources"
 version = "0.2.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2273,12 +2293,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-proto-diameter"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "opc-protocol",
+ "opc-testbed",
+]
+
+[[package]]
 name = "opc-proto-gtpu"
 version = "0.2.0"
 dependencies = [
  "bytes",
  "opc-protocol",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "opc-proto-gtpv2c"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "opc-protocol",
+]
+
+[[package]]
+name = "opc-proto-ikev2"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "opc-protocol",
 ]
 
 [[package]]
@@ -2327,6 +2372,7 @@ dependencies = [
  "hmac 0.12.1",
  "opc-data-governance",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "zeroize",
@@ -2472,11 +2518,11 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "tempfile",
  "time",
  "tokio",
  "tokio-rustls",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2559,6 +2605,8 @@ version = "0.2.0"
 dependencies = [
  "opc-evidence",
  "opc-node-resources",
+ "opc-proto-gtpv2c",
+ "opc-protocol",
  "opc-redaction",
  "opc-schema-validate",
  "opc-types",
@@ -3110,9 +3158,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
 dependencies = [
  "bytes",
  "getrandom 0.3.4",

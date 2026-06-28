@@ -7,11 +7,16 @@ flexibility.
 
 ## What the SDK Provides
 
-- **Rust crates** for protocol codecs (PFCP, NAS-5GS, GTP-U), session
-  management, configuration consensus, alarms, and runtime chassis.
+- **Rust crates** for protocol codecs (GTP-U, PFCP, NAS-5GS, NGAP v0,
+  experimental Diameter base/application dictionaries, the experimental
+  `opc-proto-gtpv2c` S2b subset, and the experimental `opc-proto-ikev2`
+  header/payload-chain scaffold), session management, configuration consensus,
+  alarms, and runtime chassis.
 - **Go packages** (`operator-sdk-go`) for Kubernetes operators: conditions,
-  bridge to Rust policy, drain orchestration, workload synthesis, and
-  metrics.
+  bridge to Rust policy, drain orchestration, workload synthesis, runtime-gate
+  helpers, Multus/SR-IOV attachment helpers, and metrics. Newly added
+  packet-core helper surfaces are experimental mechanism helpers, not product
+  CRDs or production controller claims.
 - **Reference operator** (`sdk-reference-operator`) demonstrating end-to-end
   reconciliation of a network function custom resource.
 

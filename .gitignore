@@ -36,6 +36,7 @@ logs/
 tmp/
 temp/
 .cache/
+.brehon/
 
 # Editor, IDE, and OS files
 .DS_Store

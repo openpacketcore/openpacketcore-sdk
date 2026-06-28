@@ -3,7 +3,9 @@ package workload
 import (
 	"fmt"
 	"sort"
+	"strings"
 
+	"openpacketcore.io/operator-sdk-go/cni"
 	"openpacketcore.io/operator-sdk-go/rollout"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -23,6 +25,13 @@ type RenderOptions struct {
 	OwnerReference *metav1.OwnerReference
 	// RolloutParams, when non-nil, configures the Deployment update strategy.
 	RolloutParams *rollout.Params
+	// MultusAttachments, when non-empty, injects the Multus networks annotation
+	// into the pod template. The product operator is responsible for resolving
+	// NAD existence and SR-IOV resource names before calling RenderDeployment.
+	MultusAttachments []cni.Attachment
+	// SRIOVResources is the aggregated SR-IOV extended resource map to add to
+	// the workload container. It is only used when MultusAttachments is non-empty.
+	SRIOVResources map[corev1.ResourceName]int64
 }
 
 // DefaultRenderOptions returns options with safe defaults.
@@ -35,6 +44,17 @@ func DefaultRenderOptions() RenderOptions {
 
 // RenderDeployment synthesizes a Deployment from the given NF spec.
 func RenderDeployment(spec NetworkFunctionSpec, opts RenderOptions) (*appsv1.Deployment, error) {
+	// Resolve the effective image before validation so that ValidateImageTag
+	// sees the same default image (openpacketcore/<name>:<version>) that the
+	// rendered container will use.
+	if opts.Image == "" {
+		opts.Image = fmt.Sprintf("openpacketcore/%s:%s", spec.Name, spec.Version)
+	}
+
+	if err := ValidateImageTag(spec, opts); err != nil {
+		return nil, err
+	}
+
 	labels := map[string]string{
 		"app":     spec.Name,
 		"version": spec.Version,
@@ -91,7 +111,35 @@ func RenderDeployment(spec NetworkFunctionSpec, opts RenderOptions) (*appsv1.Dep
 		dep.Spec.Strategy = strategy
 	}
 
+	attachments := multusAttachmentsForRender(spec, opts)
+	if len(attachments) > 0 {
+		if err := cni.InjectMultusAnnotations(dep, attachments, opts.SRIOVResources); err != nil {
+			return nil, fmt.Errorf("inject multus annotations: %w", err)
+		}
+	}
+
 	return dep, nil
+}
+
+func multusAttachmentsForRender(spec NetworkFunctionSpec, opts RenderOptions) []cni.Attachment {
+	// RenderOptions.MultusAttachments take precedence and are returned verbatim
+	// when provided. Otherwise fall back to the spec-level attachments.
+	if len(opts.MultusAttachments) > 0 {
+		return opts.MultusAttachments
+	}
+	if len(spec.MultusAttachments) == 0 {
+		return nil
+	}
+	attachments := make([]cni.Attachment, 0, len(spec.MultusAttachments))
+	for _, at := range spec.MultusAttachments {
+		attachments = append(attachments, cni.Attachment{
+			Name:          at.Name,
+			NetworkName:   at.NetworkName,
+			Namespace:     at.Namespace,
+			InterfaceName: at.InterfaceName,
+		})
+	}
+	return attachments
 }
 
 func buildPodSpec(spec NetworkFunctionSpec, opts RenderOptions, adminPort int32) (corev1.PodSpec, error) {
@@ -124,6 +172,10 @@ func buildPodSpec(spec NetworkFunctionSpec, opts RenderOptions, adminPort int32)
 	if err != nil {
 		return podSpec, err
 	}
+	container.Ports, err = BuildContainerPorts(spec, adminPort)
+	if err != nil {
+		return podSpec, fmt.Errorf("build container ports: %w", err)
+	}
 	podSpec.Containers = []corev1.Container{container}
 	podSpec.Volumes = volumes
 
@@ -152,9 +204,6 @@ func buildContainerAndVolumes(spec NetworkFunctionSpec, opts RenderOptions, admi
 
 	container.Name = "nf"
 	container.Image = opts.Image
-	if container.Image == "" {
-		container.Image = fmt.Sprintf("openpacketcore/%s:%s", spec.Name, spec.Version)
-	}
 
 	// Resources
 	res := corev1.ResourceRequirements{
@@ -350,4 +399,91 @@ func NeedsHostNetwork(profile *ResourceProfile) bool {
 func BuildDeploymentWithOwnership(spec NetworkFunctionSpec, opts RenderOptions, owner metav1.OwnerReference) (*appsv1.Deployment, error) {
 	opts.OwnerReference = &owner
 	return RenderDeployment(spec, opts)
+}
+
+// BuildContainerPorts returns the container ports for the workload, including
+// the admin port and any additional UDP/SCTP/TCP ports declared in the spec.
+// It returns an error if an additional port reuses the reserved name "admin"
+// or if two non-empty additional port names are identical. Empty names are
+// allowed because Kubernetes ContainerPort.Name is optional; they are appended
+// without participating in the uniqueness check.
+func BuildContainerPorts(spec NetworkFunctionSpec, adminPort int32) ([]corev1.ContainerPort, error) {
+	ports := []corev1.ContainerPort{
+		{Name: "admin", ContainerPort: adminPort, Protocol: corev1.ProtocolTCP},
+	}
+	seen := map[string]struct{}{"admin": {}}
+	for _, p := range spec.AdditionalPorts {
+		if p.Name == "admin" {
+			return nil, fmt.Errorf("additional port name %q is reserved for the admin port", p.Name)
+		}
+		if p.Name != "" {
+			if _, ok := seen[p.Name]; ok {
+				return nil, fmt.Errorf("duplicate additional port name %q", p.Name)
+			}
+			seen[p.Name] = struct{}{}
+		}
+		ports = append(ports, corev1.ContainerPort{
+			Name:          p.Name,
+			ContainerPort: p.Port,
+			Protocol:      ParsePortProtocol(p.Protocol),
+		})
+	}
+	return ports, nil
+}
+
+// ParsePortProtocol maps a protocol string to a corev1.Protocol. It accepts
+// "TCP", "UDP", and "SCTP" case-insensitively and defaults to TCP.
+func ParsePortProtocol(protocol string) corev1.Protocol {
+	switch strings.ToUpper(strings.TrimSpace(protocol)) {
+	case "UDP":
+		return corev1.ProtocolUDP
+	case "SCTP":
+		return corev1.ProtocolSCTP
+	default:
+		return corev1.ProtocolTCP
+	}
+}
+
+// ValidateImageTag returns an error when an immutable ImageTag is declared on
+// the spec but opts.Image uses a different tag. A nil error means the image is
+// either untagged or matches the declared tag.
+func ValidateImageTag(spec NetworkFunctionSpec, opts RenderOptions) error {
+	if spec.ImageTag == "" {
+		return nil
+	}
+	imageTag := imageTag(opts.Image)
+	if imageTag == "" {
+		return fmt.Errorf("image tag is required because spec.imageTag is immutable (%q)", spec.ImageTag)
+	}
+	if imageTag != spec.ImageTag {
+		return fmt.Errorf("image tag %q does not match immutable spec.imageTag %q", imageTag, spec.ImageTag)
+	}
+	return nil
+}
+
+func imageTag(image string) string {
+	// Strip digest suffix if present; tags live before the '@'.
+	if idx := strings.LastIndex(image, "@"); idx >= 0 {
+		image = image[:idx]
+	}
+	// The tag is the suffix after the last ':' in the final path component,
+	// which avoids misparsing registry host ports such as
+	// "registry:5000/openpacketcore/nf:1.2.3".
+	if idx := strings.LastIndex(image, "/"); idx >= 0 {
+		image = image[idx+1:]
+	}
+	idx := strings.LastIndex(image, ":")
+	if idx < 0 {
+		return ""
+	}
+	return image[idx+1:]
+}
+
+// ConfigPushObservedGenerationOK reports whether the current spec generation
+// has been observed by a successful config push. It is the generic operator
+// helper for the "config applied" readiness gate used by products that push
+// canonical configuration to the workload. It fails closed: an unset observed
+// generation (0) or a stale observed generation is not OK.
+func ConfigPushObservedGenerationOK(spec NetworkFunctionSpec, currentGeneration int64) bool {
+	return currentGeneration > 0 && spec.ConfigPushObservedGeneration >= currentGeneration
 }

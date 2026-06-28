@@ -1,0 +1,20 @@
+[package]
+name = "opc-proto-gtpv2c"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "GTPv2-C control-plane codec subset for OpenPacketCore S2b work"
+readme = "README.md"
+keywords = ["5g", "cnf", "gtpv2-c", "telecom", "packet-core"]
+categories = ["network-programming", "encoding"]
+publish = false
+
+[dependencies]
+opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
+bytes = { workspace = true }
+
+[lints]
+workspace = true
