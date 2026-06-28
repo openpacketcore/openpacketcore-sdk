@@ -14,7 +14,7 @@
   "properties": {
     "schema_version": {
       "type": "string",
-      "minLength": 1
+      "const": "rfc006/v1/packet-core-experimental"
     },
     "pack_id": {
       "type": "string",
@@ -49,7 +49,7 @@
           "fixture_provenance"
         ],
         "properties": {
-          "schema_version": { "type": "string", "minLength": 1 },
+          "schema_version": { "type": "string", "const": "rfc006/v1/packet-core-experimental" },
           "evidence_id": { "type": "string", "minLength": 1 },
           "protocol": { "type": "string", "minLength": 1 },
           "scenario": { "type": "string", "minLength": 1 },
@@ -89,7 +89,7 @@
           "timestamp"
         ],
         "properties": {
-          "schema_version": { "type": "string", "minLength": 1 },
+          "schema_version": { "type": "string", "const": "rfc006/v1/packet-core-experimental" },
           "evidence_id": { "type": "string", "minLength": 1 },
           "procedure": { "type": "string", "minLength": 1 },
           "result": { "type": "string", "enum": ["success", "failure", "partial"] },
@@ -139,7 +139,7 @@
           "timestamp"
         ],
         "properties": {
-          "schema_version": { "type": "string", "minLength": 1 },
+          "schema_version": { "type": "string", "const": "rfc006/v1/packet-core-experimental" },
           "evidence_id": { "type": "string", "minLength": 1 },
           "interface_name": { "type": "string", "minLength": 1 },
           "xfrm_state_count": { "type": "integer", "minimum": 0 },

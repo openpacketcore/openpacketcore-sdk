@@ -10,8 +10,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// DeploymentIsReady reports whether the supplied Deployment has rolled out the
-// desired number of replicas and they are all updated, ready, and available.
+// DeploymentIsReady reports whether the supplied Deployment has fully rolled
+// out the desired number of replicas and the current revision is converged.
+// Convergence requires the controller to have observed the current spec and
+// for updated, ready, available, and total replica counts to exactly equal the
+// desired count with no unavailable replicas. This prevents the helper from
+// reporting readiness during a rolling update while an old ReplicaSet or surge
+// pod is still present.
 // A nil deployment or a non-positive desired replica count is never ready,
 // because it cannot serve traffic.
 func DeploymentIsReady(deployment *appsv1.Deployment, desiredReplicas int32) bool {
@@ -19,10 +24,12 @@ func DeploymentIsReady(deployment *appsv1.Deployment, desiredReplicas int32) boo
 		return false
 	}
 	observedCurrent := deployment.Status.ObservedGeneration >= deployment.Generation
-	updatedCurrent := deployment.Status.UpdatedReplicas >= desiredReplicas
-	readyCurrent := deployment.Status.ReadyReplicas >= desiredReplicas
-	availableCurrent := deployment.Status.AvailableReplicas >= desiredReplicas
-	return observedCurrent && updatedCurrent && readyCurrent && availableCurrent
+	updatedExact := deployment.Status.UpdatedReplicas == desiredReplicas
+	readyExact := deployment.Status.ReadyReplicas == desiredReplicas
+	availableExact := deployment.Status.AvailableReplicas == desiredReplicas
+	totalExact := deployment.Status.Replicas == desiredReplicas
+	noUnavailable := deployment.Status.UnavailableReplicas == 0
+	return observedCurrent && updatedExact && readyExact && availableExact && totalExact && noUnavailable
 }
 
 // PodIsReady reports whether the pod is Running, has a pod IP, and its PodReady

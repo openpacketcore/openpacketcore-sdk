@@ -112,13 +112,63 @@ func TestDeploymentIsReady(t *testing.T) {
 			deployment: &appsv1.Deployment{
 				ObjectMeta: metav1.ObjectMeta{Generation: 3},
 				Status: appsv1.DeploymentStatus{
-					ObservedGeneration: 3,
-					UpdatedReplicas:    2,
-					ReadyReplicas:      2,
-					AvailableReplicas:  2,
+					ObservedGeneration:  3,
+					UpdatedReplicas:     2,
+					ReadyReplicas:       2,
+					AvailableReplicas:   2,
+					Replicas:            2,
+					UnavailableReplicas: 0,
 				},
 			},
 			want: true,
+		},
+		{
+			name:            "extra old replica during rollout is not ready",
+			desiredReplicas: 2,
+			deployment: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 3},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration:  3,
+					UpdatedReplicas:     2,
+					ReadyReplicas:       2,
+					AvailableReplicas:   2,
+					Replicas:            3,
+					UnavailableReplicas: 0,
+				},
+			},
+			want: false,
+		},
+		{
+			name:            "surge pod raises total above desired is not ready",
+			desiredReplicas: 2,
+			deployment: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 3},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration:  3,
+					UpdatedReplicas:     2,
+					ReadyReplicas:       2,
+					AvailableReplicas:   2,
+					Replicas:            3,
+					UnavailableReplicas: 0,
+				},
+			},
+			want: false,
+		},
+		{
+			name:            "unavailable replicas block readiness",
+			desiredReplicas: 2,
+			deployment: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 3},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration:  3,
+					UpdatedReplicas:     2,
+					ReadyReplicas:       2,
+					AvailableReplicas:   2,
+					Replicas:            2,
+					UnavailableReplicas: 1,
+				},
+			},
+			want: false,
 		},
 	}
 	for _, tt := range tests {
