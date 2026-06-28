@@ -8,7 +8,6 @@ package conditions
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -138,13 +137,14 @@ func GateCondition(cm *ConditionManager, gate GateName, status GateStatus, reaso
 }
 
 // GateStatusFromCondition returns the GateStatus that corresponds to the given
-// metav1.Condition. A True condition maps to Passing unless the Reason encodes
-// a Degraded gate (i.e. ends with "Degraded"), in which case it returns
-// GateDegraded. False maps to Failing; Unknown maps to Unknown.
+// metav1.Condition. A True condition maps to Passing unless its Reason exactly
+// matches the Degraded reason produced by GateReason(c.Type, GateDegraded),
+// in which case it returns GateDegraded. False maps to Failing; Unknown maps
+// to Unknown.
 func GateStatusFromCondition(c metav1.Condition) GateStatus {
 	switch c.Status {
 	case metav1.ConditionTrue:
-		if strings.HasSuffix(c.Reason, string(GateDegraded)) {
+		if c.Reason == string(c.Type)+string(GateDegraded) {
 			return GateDegraded
 		}
 		return GatePassing

@@ -271,10 +271,11 @@ func TestGateStatusFromCondition(t *testing.T) {
 		cond metav1.Condition
 		want GateStatus
 	}{
-		{"true passing", metav1.Condition{Status: metav1.ConditionTrue, Reason: "ReadyPassing"}, GatePassing},
-		{"true degraded", metav1.Condition{Status: metav1.ConditionTrue, Reason: "ReadyDegraded"}, GateDegraded},
-		{"false", metav1.Condition{Status: metav1.ConditionFalse}, GateFailing},
-		{"unknown", metav1.Condition{Status: metav1.ConditionUnknown}, GateUnknown},
+		{"true passing", metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "ReadyPassing"}, GatePassing},
+		{"true degraded", metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "ReadyDegraded"}, GateDegraded},
+		{"false", metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse}, GateFailing},
+		{"unknown", metav1.Condition{Type: "Ready", Status: metav1.ConditionUnknown}, GateUnknown},
+		{"custom reason suffix degraded", metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "CustomDegraded"}, GatePassing},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

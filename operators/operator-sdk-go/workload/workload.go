@@ -404,7 +404,9 @@ func BuildDeploymentWithOwnership(spec NetworkFunctionSpec, opts RenderOptions, 
 // BuildContainerPorts returns the container ports for the workload, including
 // the admin port and any additional UDP/SCTP/TCP ports declared in the spec.
 // It returns an error if an additional port reuses the reserved name "admin"
-// or if additional port names are not unique.
+// or if two non-empty additional port names are identical. Empty names are
+// allowed because Kubernetes ContainerPort.Name is optional; they are appended
+// without participating in the uniqueness check.
 func BuildContainerPorts(spec NetworkFunctionSpec, adminPort int32) ([]corev1.ContainerPort, error) {
 	ports := []corev1.ContainerPort{
 		{Name: "admin", ContainerPort: adminPort, Protocol: corev1.ProtocolTCP},
@@ -414,10 +416,12 @@ func BuildContainerPorts(spec NetworkFunctionSpec, adminPort int32) ([]corev1.Co
 		if p.Name == "admin" {
 			return nil, fmt.Errorf("additional port name %q is reserved for the admin port", p.Name)
 		}
-		if _, ok := seen[p.Name]; ok {
-			return nil, fmt.Errorf("duplicate additional port name %q", p.Name)
+		if p.Name != "" {
+			if _, ok := seen[p.Name]; ok {
+				return nil, fmt.Errorf("duplicate additional port name %q", p.Name)
+			}
+			seen[p.Name] = struct{}{}
 		}
-		seen[p.Name] = struct{}{}
 		ports = append(ports, corev1.ContainerPort{
 			Name:          p.Name,
 			ContainerPort: p.Port,

@@ -238,6 +238,25 @@ func TestBuildContainerPortsRejectsDuplicateNames(t *testing.T) {
 	}
 }
 
+func TestBuildContainerPortsAllowsEmptyNames(t *testing.T) {
+	spec := NetworkFunctionSpec{
+		Name:      "test-nf",
+		Namespace: "default",
+		Version:   "1.0.0",
+		AdditionalPorts: []PortSpec{
+			{Port: 3868, Protocol: "tcp"},
+			{Port: 3869, Protocol: "tcp"},
+		},
+	}
+	ports, err := BuildContainerPorts(spec, 8080)
+	if err != nil {
+		t.Fatalf("BuildContainerPorts failed: %v", err)
+	}
+	if len(ports) != 3 {
+		t.Fatalf("expected 3 ports (admin + 2 unnamed), got %d", len(ports))
+	}
+}
+
 func TestParsePortProtocol(t *testing.T) {
 	cases := []struct {
 		input string
