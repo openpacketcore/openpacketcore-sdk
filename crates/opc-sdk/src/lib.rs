@@ -20,9 +20,11 @@
 //! ## Protocol codec boundary
 //!
 //! The facade intentionally does not re-export experimental protocol crates
-//! such as `opc-proto-gtpv2c`, and the default feature set does not pull them
-//! in. CNFs that need the GTPv2-C S2b subset should depend on the protocol
-//! crate directly and follow its `CONFORMANCE.md` boundary.
+//! such as `opc-proto-gtpv2c`, `opc-proto-diameter`, or `opc-proto-ikev2`,
+//! and the default feature set does not pull them in. CNFs that need the
+//! GTPv2-C S2b subset, the Diameter base scaffold, or the IKEv2 scaffold
+//! should depend on the relevant protocol crate directly and follow its
+//! `CONFORMANCE.md` boundary.
 //!
 //! ## Architecture in five paragraphs
 //!

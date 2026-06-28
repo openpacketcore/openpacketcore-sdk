@@ -51,7 +51,7 @@ carrier acceptance evidence.
 | Simulator | Decode owner | Current interface |
 | --- | --- | --- |
 | PGW S2b | `opc-proto-gtpv2c` | `S2bMessageView` adapters over SDK-decoded S2b typed views. Tests decode spec-authored GTPv2-C S2b fixtures with `opc-proto-gtpv2c` before calling the simulator. |
-| Diameter peer | future `opc-proto-diameter` | `DiameterMessageView` metadata trait. Until the SDK Diameter codec lands, the simulator records already-decoded command metadata only and carries no raw Diameter parser. |
+| Diameter peer | `opc-proto-diameter` | `DiameterMessageView` metadata trait. The simulator records SDK-decoded command metadata only and carries no raw Diameter parser. |
 
 Both simulators expose `SdkDecodeProfile` values built from `opc-protocol`
 limits so test code can use consistent validation settings when invoking the
@@ -65,10 +65,11 @@ Simulator interface tests reuse the spec-authored S2b fixtures owned by
 provenance class, owning protocol crate, and redaction status for each packet
 used by the simulator tests.
 
-Diameter has no packet fixture in this skeleton because there is no SDK
-Diameter codec in this worktree. The manifest records the Diameter interface as
+Diameter packet fixtures remain owned by `opc-proto-diameter`, not by this
+testbed skeleton. The manifest records the Diameter interface as
 `no-packet-fixture-yet` and `sdk-protocol-crate-only`; adding raw Diameter bytes
-must wait for `opc-proto-diameter` and ADR 0015 fixture provenance.
+to `opc-testbed` must preserve ADR 0015 fixture provenance and keep the protocol
+crate as conformance owner.
 
 ## Fail-closed behavior
 
@@ -83,8 +84,8 @@ must wait for `opc-proto-diameter` and ADR 0015 fixture provenance.
 
 ## Future work
 
-- Add a production `opc-proto-diameter` adapter once the SDK Diameter crate and
-  conformance fixtures exist.
+- Add a reusable `opc-proto-diameter` adapter if the metadata bridge needs more
+  than local integration-test wrappers.
 - Add UE/IKE and charging CDF simulator skeletons only after their protocol
   crates or decoded-view boundaries exist.
 - Extend RFC 012 scenarios with protocol-specific packet steps only after the

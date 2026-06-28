@@ -35,6 +35,11 @@ Validated gates for this pass:
 - `cargo test --workspace`
 - `cargo test --workspace --all-features`
 
+> **Note:** The later `T-8c57ecee` final-hardening pass (see below) could not
+> re-run the full `cargo test --workspace` / `--all-features` suites in the
+> restricted worker pane because the sandbox denies AF_UNIX socket creation.
+> Those test gates are recorded as deferred for `T-8c57ecee`.
+
 The current branch has closed the P0 Rust SDK production-readiness blockers
 tracked in the gap registry below.
 It must not be described as universally carrier-production-ready until the
@@ -61,6 +66,66 @@ Rust `operator-lifecycle-cli` beside the Go manager, and run their own envtest,
 kind, and cluster end-to-end suites. (Note:
 `GAP-008-002`, `GAP-011-003` through `GAP-011-007`, and `GAP-012-001` through `GAP-012-004` are fully
 closed as SDK foundation gaps).
+
+---
+
+## Final hardening snapshot — T-8c57ecee (2026-06-28)
+
+This snapshot records the final EPC/untrusted-access SDK readiness pass after
+the concrete final-hardening tasks `T-0e9cac9a`, `T-0cc9d976`, and
+`T-0a1f3cdd` closed. The evidence ledger is
+[`epdg-sdk-final-hardening-triage.md`](refactoring/epdg-sdk-final-hardening-triage.md),
+and the operator-facing addendum is
+[`operator-readiness.md`](operator-readiness.md#epcuntrusted-access-final-hardening-addendum).
+
+The pass keeps the ADR 0018 boundary explicit:
+
+- `opc-proto-gtpv2c`, `opc-proto-diameter`, and `opc-proto-ikev2` are
+  experimental protocol crates with conformance notes, hostile-input tests, and
+  fuzz targets, not product transport/state-machine implementations.
+- `opc-testbed` exposes EPC/ePDG simulator skeletons and manifest provenance
+  for decoded messages; raw protocol bytes are still decoded by protocol crates
+  before simulator use.
+- `opc-evidence` packet-core packs are experimental evidence-formatting and
+  validation mechanisms, not carrier-readiness sign-off.
+- `operators/operator-sdk-go` packet-core additions are product-neutral helper
+  packages. Downstream CNF operators own CRDs, Helm/RBAC policy, Multus/XFRM
+  privilege wiring, readiness thresholds, traffic-shift policy, and product
+  release evidence.
+
+No final-hardening candidate remains open in the triage ledger; downstream
+ePDG adapter and carrier-acceptance work remains outside this SDK matrix.
+Final validation for this snapshot is **not complete**: the three gate classes
+below are deferred because the worker pane cannot provide AF_UNIX sockets, the
+required Go 1.26.4 toolchain, or a `cargo-deny`-compatible advisory database.
+They are explicitly supervisor-waived for this readiness snapshot only and must
+be satisfied before any production/carrier-acceptance claim.
+
+### Deferred/waived final-validation gates
+
+The following gates are **deferred (environment-limited), supervisor-waived**
+for this readiness snapshot. Evidence source: supervisor decision by
+`claude-supervisor` recorded for `T-8c57ecee`. The deferrals are due to
+environment limitations in the worker pane, not code defects.
+
+| Gate | Status | Evidence / limitation |
+|:---|:---|:---|
+| Workspace tests that create AF_UNIX sockets (e.g., `cargo test --workspace --all-features`) | Deferred (environment-limited), supervisor-waived | The sandbox denies AF_UNIX socket creation, so any test that binds a Unix-domain socket fails before asserting behavior. |
+| Go operator verification: `gofmt`, `go vet`, `go test`, and `govulncheck` under `operators/sdk-reference-operator` and `operators/operator-sdk-go` | Deferred (environment-limited), supervisor-waived | Go 1.26.4 is unavailable under the network-restricted `GOTOOLCHAIN` setting in this pane. |
+| `cargo deny check advisories` | Deferred (environment-limited), supervisor-waived | The installed `cargo-deny` 0.17.0 cannot parse a CVSS 4.0 entry in the cached advisory database (`RUSTSEC-2026-0146`), so the advisories check fails before scanning the local lockfile. `cargo audit --no-fetch` of the same lockfile passes. |
+
+These deferred gates must be re-run in a CI/dev environment that supports
+AF_UNIX socket creation, Go 1.26.4, and the required `cargo-deny`/advisory-db
+version before the initiative merges to `main` or before any
+production/carrier-acceptance readiness claim.
+
+The gates that passed in this pane and remain recorded as evidence are:
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+MSRV check (`cargo +1.88 check --workspace --all-targets --all-features`),
+`cargo audit --no-fetch`, `cargo deny check bans` / `licenses` / `sources`, docs
+consistency, Kustomize/Helm rendering, and the Rust-side operator-lifecycle CLI
+tests.
 
 ---
 
@@ -158,9 +223,9 @@ treated as complete.
 | 005-3 | All length and offset math is checked. | [`opc-protocol`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/) | [`checked_arithmetic.rs`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/tests/checked_arithmetic.rs) | **implemented** | `wire_len` uses checked arithmetic; overflow tests pass. |
 | 005-4 | Decoders reject hostile input without panic, hang, or unbounded allocation. | [`opc-protocol`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/), [`opc-proto-gtpu`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/) | [`decode_errors.rs`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/tests/decode_errors.rs), [`gtpu_tests.rs`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/tests/gtpu_tests.rs) | **implemented** | `DecodeContext` limits are enforced by the protocol traits and the GTP-U crate adds hostile/truncated/oversized/extension-depth regression tests plus fuzz targets ([GAP-005-002](#known-gaps)). |
 | 005-5 | Round-trip tests distinguish canonical and raw-preserving modes. | [`opc-protocol`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/) | [`roundtrip_docs.rs`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/tests/roundtrip_docs.rs) | **implemented** | Canonical and raw-preserving round-trip properties are tested. |
-| 005-6 | Fuzz targets and regression corpora exist for every protocol crate. | [`opc-protocol`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/), [`opc-proto-gtpu`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/), [`opc-proto-pfcp`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-pfcp/), [`opc-proto-nas`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-nas/), [`opc-proto-ngap`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ngap/), [`opc-proto-gtpv2c`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpv2c/), [`opc-proto-ikev2`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ikev2/) | [`crates/opc-proto-gtpu/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/fuzz/), [`crates/opc-proto-pfcp/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-pfcp/fuzz/), [`crates/opc-proto-nas/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-nas/fuzz/), [`crates/opc-proto-ngap/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ngap/fuzz/), [`crates/opc-proto-gtpv2c/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpv2c/fuzz/), [`crates/opc-proto-ikev2/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ikev2/fuzz/) | **implemented** | GTP-U, PFCP, NAS-5GS, NGAP v0, and the experimental `opc-proto-gtpv2c` S2b subset include protocol-specific fuzz targets plus fixture/corpus replay; the experimental `opc-proto-ikev2` scaffold adds initial fuzz targets and seed corpus within its documented scaffold scope ([GAP-005-002](#known-gaps), [GAP-PROTO-003](#known-gaps), [GAP-PROTO-005](#known-gaps), [GAP-PROTO-006](#known-gaps), [GAP-PROTO-007](#known-gaps), [GAP-PROTO-008](#known-gaps)). |
+| 005-6 | Fuzz targets and regression corpora exist for every protocol crate. | [`opc-protocol`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/), [`opc-proto-gtpu`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/), [`opc-proto-pfcp`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-pfcp/), [`opc-proto-nas`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-nas/), [`opc-proto-ngap`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ngap/), [`opc-proto-gtpv2c`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpv2c/), [`opc-proto-ikev2`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ikev2/), [`opc-proto-diameter`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-diameter/) | [`crates/opc-proto-gtpu/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/fuzz/), [`crates/opc-proto-pfcp/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-pfcp/fuzz/), [`crates/opc-proto-nas/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-nas/fuzz/), [`crates/opc-proto-ngap/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ngap/fuzz/), [`crates/opc-proto-gtpv2c/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpv2c/fuzz/), [`crates/opc-proto-ikev2/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ikev2/fuzz/), [`crates/opc-proto-diameter/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-diameter/fuzz/) | **implemented** | GTP-U, PFCP, NAS-5GS, NGAP v0, the experimental `opc-proto-gtpv2c` S2b subset, and the experimental `opc-proto-diameter` scaffold include protocol-specific fuzz targets plus fixture/corpus replay; the experimental `opc-proto-ikev2` scaffold adds initial fuzz targets and seed corpus within its documented scaffold scope ([GAP-005-002](#known-gaps), [GAP-PROTO-003](#known-gaps), [GAP-PROTO-005](#known-gaps), [GAP-PROTO-006](#known-gaps), [GAP-PROTO-007](#known-gaps), [GAP-PROTO-008](#known-gaps), [GAP-PROTO-009](#known-gaps)). |
 | 005-7 | Spec traceability tags feed RFC 006 evidence. | [`opc-protocol`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/), [`opc-proto-gtpu`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/) | [`decode_errors.rs`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/tests/decode_errors.rs), [`lib.rs`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/src/lib.rs) | **implemented** | `SpecRef` remains in the error model and `opc-proto-gtpu` parser code carries `@spec`, `@req`, and `@conformance` tags for TS 29.281 evidence extraction ([GAP-005-004](#known-gaps)). |
-| 005-8 | Protocol modules follow the standard layout for parallel implementation. | [`opc-protocol`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/), [`opc-proto-gtpu`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/), [`opc-proto-pfcp`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-pfcp/), [`opc-proto-nas`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-nas/), [`opc-proto-ngap`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ngap/), [`opc-proto-gtpv2c`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpv2c/), [`opc-proto-ikev2`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ikev2/) | [`crates/opc-proto-gtpu/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/CONFORMANCE.md), [`crates/opc-proto-pfcp/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-pfcp/CONFORMANCE.md), [`crates/opc-proto-nas/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-nas/CONFORMANCE.md), [`crates/opc-proto-ngap/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ngap/CONFORMANCE.md), [`crates/opc-proto-gtpv2c/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpv2c/CONFORMANCE.md), [`crates/opc-proto-ikev2/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ikev2/CONFORMANCE.md) | **implemented** | GTP-U, PFCP, NAS-5GS, NGAP v0, the experimental `opc-proto-gtpv2c` S2b subset, and the experimental `opc-proto-ikev2` scaffold follow the concrete protocol-crate layout with crate manifest, parser implementation, tests, fuzz targets, corpus, and conformance notes ([GAP-005-005](#known-gaps), [GAP-PROTO-003](#known-gaps), [GAP-PROTO-005](#known-gaps), [GAP-PROTO-006](#known-gaps), [GAP-PROTO-007](#known-gaps), [GAP-PROTO-008](#known-gaps)). |
+| 005-8 | Protocol modules follow the standard layout for parallel implementation. | [`opc-protocol`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/), [`opc-proto-gtpu`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/), [`opc-proto-pfcp`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-pfcp/), [`opc-proto-nas`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-nas/), [`opc-proto-ngap`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ngap/), [`opc-proto-gtpv2c`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpv2c/), [`opc-proto-ikev2`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ikev2/), [`opc-proto-diameter`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-diameter/) | [`crates/opc-proto-gtpu/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/CONFORMANCE.md), [`crates/opc-proto-pfcp/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-pfcp/CONFORMANCE.md), [`crates/opc-proto-nas/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-nas/CONFORMANCE.md), [`crates/opc-proto-ngap/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ngap/CONFORMANCE.md), [`crates/opc-proto-gtpv2c/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpv2c/CONFORMANCE.md), [`crates/opc-proto-ikev2/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ikev2/CONFORMANCE.md), [`crates/opc-proto-diameter/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-diameter/CONFORMANCE.md) | **implemented** | GTP-U, PFCP, NAS-5GS, NGAP v0, the experimental `opc-proto-gtpv2c` S2b subset, the experimental `opc-proto-diameter` scaffold, and the experimental `opc-proto-ikev2` scaffold follow the concrete protocol-crate layout with crate manifest, parser implementation, tests, fuzz targets, corpus, and conformance notes ([GAP-005-005](#known-gaps), [GAP-PROTO-003](#known-gaps), [GAP-PROTO-005](#known-gaps), [GAP-PROTO-006](#known-gaps), [GAP-PROTO-007](#known-gaps), [GAP-PROTO-008](#known-gaps), [GAP-PROTO-009](#known-gaps)). |
 
 ---
 
@@ -365,3 +430,4 @@ treated as complete.
 | GAP-PROTO-006 | 005 | NAS v2 codec: first-CNF body dispatch and NAS security hooks | `crates/opc-proto-nas` | `opc-proto-nas` | Closed (June 2026): Added IE-level decoding for Registration Request/Accept and Security Mode Command/Complete, named raw-preserving 5GMM/5GSM first-CNF body dispatch, optional-IE raw preservation, BCD unpacking for PLMN/routing indicator/IMEI/IMEISV, NAS COUNT/replay helpers, `opc-key` session key-handle validation, and caller-provided NAS integrity/ciphering hooks. In-tree null algorithms cover NIA0/NEA0; concrete NIA1/2/3 and NEA1/2/3 implementations and NAS procedure state machines remain external to the codec. |
 | GAP-PROTO-007 | 005 | GTPv2-C S2b typed subset | `crates/opc-proto-gtpv2c/CONFORMANCE.md` | `opc-proto-gtpv2c` | Partially closed (June 2026): `opc-proto-gtpv2c` ships an experimental S2b subset with raw-preserving GTPv2-C header/IE handling, typed Echo/Create/Modify/Delete/Update views, hostile-input tests, conformance notes, and fuzz targets. Remaining work includes expanded S2b procedure and IE coverage, mandatory-IE validation for every newly claimed message, independent capture provenance where used, and downstream product UDP/session policy outside the SDK boundary. |
 | GAP-PROTO-008 | 005 | IKEv2 codec scaffold | `crates/opc-proto-ikev2/CONFORMANCE.md` | `opc-proto-ikev2` | Partially closed (June 2026): `opc-proto-ikev2` ships an experimental IKEv2 fixed-header and generic payload-chain scaffold for unencrypted payloads, unknown payload preservation, protected-payload crypto-provider boundaries, hostile-input tests, conformance notes, and fuzz targets. Remaining work includes typed cleartext payload bodies, RFC 7383 fragmentation framing checks, independent fixture provenance where used, and downstream IKE SA/EAP-AKA/Child SA policy outside the SDK boundary. |
+| GAP-PROTO-009 | 005 | Diameter base scaffold (RFC 6733) | `crates/opc-proto-diameter/CONFORMANCE.md` | `opc-proto-diameter` | Partially closed (June 2026): `opc-proto-diameter` ships an experimental Diameter base-protocol scaffold with RFC 6733 header/AVP framing, raw-preserving message/AVP storage, AVP-region validation, dictionary metadata, feature-gated base peer procedure helpers for CER/CEA, DWR/DWA, and DPR/DPA, and skeleton dictionaries for selected 3GPP application work. Hostile-input tests, fixture/corpus replay, registered fuzz targets, and conformance notes are in place. Remaining work includes broader typed application helpers beyond the Rf/SWm skeletons, additional independently sourced fixture intake, and downstream product realm routing/transport/AAA behavior outside the SDK boundary. |

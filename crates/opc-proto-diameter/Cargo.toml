@@ -29,10 +29,18 @@ all-apps = ["app-gx", "app-rf", "app-s6a", "app-s6b", "app-swm", "app-swx"]
 bytes = { workspace = true }
 opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 
+[dev-dependencies]
+opc-testbed = { path = "../opc-testbed", version = "0.2.0" }
+
 [[test]]
 name = "app_dictionaries"
 path = "tests/app_dictionaries.rs"
 required-features = ["app-rf", "app-swm"]
+
+[[test]]
+name = "testbed_bridge"
+path = "tests/testbed_bridge.rs"
+required-features = ["peer"]
 
 [lints]
 workspace = true

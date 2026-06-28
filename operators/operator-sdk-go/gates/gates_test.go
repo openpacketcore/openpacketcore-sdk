@@ -145,9 +145,9 @@ func TestDeploymentIsReady(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Generation: 3},
 				Status: appsv1.DeploymentStatus{
 					ObservedGeneration:  3,
-					UpdatedReplicas:     2,
-					ReadyReplicas:       2,
-					AvailableReplicas:   2,
+					UpdatedReplicas:     3,
+					ReadyReplicas:       3,
+					AvailableReplicas:   3,
 					Replicas:            3,
 					UnavailableReplicas: 0,
 				},

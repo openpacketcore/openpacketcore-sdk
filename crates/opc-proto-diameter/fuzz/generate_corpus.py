@@ -18,6 +18,7 @@ mandatory AVPs, grouped depth bombs, bad padding, and reserved flag bits.
 import hashlib
 import os
 import struct
+import sys
 
 
 def write_corpus(directory: str, data: bytes, name: str) -> None:
@@ -390,5 +391,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    self_test_avp_flag_validation()
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] in ("self-test", "--self-test"):
+        self_test_avp_flag_validation()
+        print("AVP flag validation self-test passed")
+    else:
+        self_test_avp_flag_validation()
+        main()

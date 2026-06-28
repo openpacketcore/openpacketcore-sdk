@@ -47,10 +47,10 @@
     {
       "id": "diameter-peer-decoded-message",
       "protocol": "diameter",
-      "sdk_protocol_crate": "future opc-proto-diameter",
+      "sdk_protocol_crate": "opc-proto-diameter",
       "provenance": "no-packet-fixture-yet",
       "parser_policy": "sdk-protocol-crate-only",
-      "usage": "Diameter peer simulator metadata interface until the SDK Diameter codec lands",
+      "usage": "Diameter peer simulator metadata interface bridged to the SDK Diameter codec without a local parser",
       "redaction": "the simulator stores counters and booleans only; no Diameter Session-Id value is retained"
     }
   ]

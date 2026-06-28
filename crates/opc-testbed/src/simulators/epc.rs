@@ -48,8 +48,8 @@ impl SdkDecodeProfile {
         }
     }
 
-    /// Transport-neutral Diameter profile for future `opc-proto-diameter`
-    /// decoded views.
+    /// Transport-neutral Diameter profile for `opc-proto-diameter` decoded
+    /// views and compatible product adapters.
     ///
     /// This profile intentionally names only generic parser limits. The
     /// Diameter peer simulator does not parse bytes by itself.
@@ -460,9 +460,9 @@ impl DiameterApplication {
 
 /// SDK-decoded Diameter message view accepted by [`DiameterPeerSimulator`].
 ///
-/// This trait is intentionally header/metadata-only. A future
-/// `opc-proto-diameter` crate should parse RFC 6733/3GPP AVPs and expose an
-/// adapter; `opc-testbed` must not parse Diameter bytes locally.
+/// This trait is intentionally header/metadata-only. The experimental
+/// `opc-proto-diameter` crate owns RFC 6733/3GPP AVP parsing when raw bytes are
+/// involved; `opc-testbed` must not parse Diameter bytes locally.
 pub trait DiameterMessageView {
     /// Return the Diameter command-code.
     fn command_code(&self) -> u32;
