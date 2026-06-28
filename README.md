@@ -159,7 +159,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 ### Kubernetes Operators (`operators/`)
 
 * [`sdk-reference-operator`](operators/sdk-reference-operator/): A minimal Kubernetes `controller-runtime` operator in Go that consumes Rust SDK policy decisions (admission validation, conversion, and migration planning) through a schema-driven CLI boundary.
-* [`operator-sdk-go`](operators/operator-sdk-go/): Reusable Go packages (`conditions`, `bridge`, `drain`, `workload`, `opmetrics`, `testing`) for building CNF operators.
+* [`operator-sdk-go`](operators/operator-sdk-go/): Reusable Go packages (`conditions`, `bridge`, `drain`, `workload`, `cni`, `gates`, `rollout`, `opmetrics`, `testing`) for building CNF operators. Packet-core helper additions for runtime gates, UDP/SCTP ports, Multus/SR-IOV attachments, and drain integration are experimental mechanism helpers; product CRDs, Helm/RBAC, privileges, and readiness policy remain downstream.
 
 ### Reference Consumers (`examples/`)
 

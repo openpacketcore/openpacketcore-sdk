@@ -10,6 +10,22 @@ import (
 	"time"
 )
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func clientWithHandler(authToken string, handler http.HandlerFunc) *HTTPDrainClient {
+	c := NewHTTPDrainClient(authToken)
+	c.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
+		return recorder.Result(), nil
+	})
+	return c
+}
+
 func TestPhaseConstants(t *testing.T) {
 	_ = Phase(InProgress)
 	_ = Phase(Complete)
@@ -19,7 +35,7 @@ func TestPhaseConstants(t *testing.T) {
 
 func TestHTTPDrainClientStart(t *testing.T) {
 	var gotMethod string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c := clientWithHandler("test-token", func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		if r.URL.Path != "/debug/drain" {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -31,11 +47,9 @@ func TestHTTPDrainClientStart(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(DrainStatus{Phase: InProgress})
-	}))
-	defer srv.Close()
+	})
 
-	c := NewHTTPDrainClient("test-token")
-	if err := c.Start(context.Background(), srv.URL); err != nil {
+	if err := c.Start(context.Background(), "http://drain.local"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if gotMethod != http.MethodPost {
@@ -44,17 +58,15 @@ func TestHTTPDrainClientStart(t *testing.T) {
 }
 
 func TestHTTPDrainClientStatus(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c := clientWithHandler("", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		_ = json.NewEncoder(w).Encode(DrainStatus{Phase: Complete, SessionsRemaining: 0, StartedAt: "2026-06-11T00:00:00Z"})
-	}))
-	defer srv.Close()
+	})
 
-	c := NewHTTPDrainClient("")
-	status, err := c.Status(context.Background(), srv.URL)
+	status, err := c.Status(context.Background(), "http://drain.local")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -64,32 +76,28 @@ func TestHTTPDrainClientStatus(t *testing.T) {
 }
 
 func TestHTTPDrainClientStatusNonOK(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c := clientWithHandler("", func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
-	}))
-	defer srv.Close()
+	})
 
-	c := NewHTTPDrainClient("")
-	_, err := c.Status(context.Background(), srv.URL)
+	_, err := c.Status(context.Background(), "http://drain.local")
 	if err == nil {
 		t.Fatal("expected error")
 	}
 }
 
 func TestHTTPDrainClientTimeout(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(100 * time.Millisecond)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
 	c := NewHTTPDrainClient("")
+	c.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})
 	c.client.Timeout = 10 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 
-	_, err := c.Status(ctx, srv.URL)
+	_, err := c.Status(ctx, "http://drain.local")
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
