@@ -16,8 +16,8 @@ use crate::model::{
 /// One recorded call against the mock backend.
 ///
 /// These snapshots deliberately include all non-secret request fields plus the
-/// lengths of any key material, relying on [`KeyMaterial`]'s redacted `Debug`
-/// for sensitive bytes.
+/// lengths of any key material, relying on [`crate::model::KeyMaterial`]'s
+/// redacted `Debug` for sensitive bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MockOperation {
     /// SPI allocation.
