@@ -56,17 +56,29 @@ worker pane. The following gates passed:
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `cargo +1.88 check --workspace --all-targets --all-features`
 - `cargo audit --no-fetch`
-- `cargo deny check advisories` / `bans` / `licenses` / `sources`
+- `cargo deny check bans` / `licenses` / `sources`
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features`
 - Kustomize/Helm rendering checks for the reference operator
 
-The following required gates are explicitly waived for this snapshot by epic-lead
-approval and must be re-run in an unconstrained environment before `main`:
+Final validation for this snapshot is **not complete**: the following gate
+classes are deferred because the worker pane cannot provide AF_UNIX sockets, the
+required Go 1.26.4 toolchain, or a `cargo-deny`-compatible advisory database.
+They are **deferred (environment-limited), supervisor-waived** for this
+readiness snapshot. Evidence source: supervisor decision by `claude-supervisor`
+recorded for `T-8c57ecee`. The deferrals are due to environment limitations, not
+code defects, and must be satisfied before any production/carrier-acceptance
+claim.
 
 | Gate | Status | Evidence / limitation |
 |:---|:---|:---|
-| Workspace tests that create AF_UNIX sockets (e.g., `cargo test --workspace --all-features`) | Waived | The sandbox denies AF_UNIX socket creation. |
-| Go operator verification: `gofmt`, `go vet`, `go test`, and `govulncheck` under `operators/sdk-reference-operator` and `operators/operator-sdk-go` | Waived | Go 1.26.4 is unavailable under the network-restricted `GOTOOLCHAIN` setting. |
+| Workspace tests that create AF_UNIX sockets (e.g., `cargo test --workspace --all-features`) | Deferred (environment-limited), supervisor-waived | The sandbox denies AF_UNIX socket creation. |
+| Go operator verification: `gofmt`, `go vet`, `go test`, and `govulncheck` under `operators/sdk-reference-operator` and `operators/operator-sdk-go` | Deferred (environment-limited), supervisor-waived | Go 1.26.4 is unavailable under the network-restricted `GOTOOLCHAIN` setting. |
+| `cargo deny check advisories` | Deferred (environment-limited), supervisor-waived | The installed `cargo-deny` 0.17.0 cannot parse a CVSS 4.0 entry in the cached advisory database (`RUSTSEC-2026-0146`), so the advisories check fails before scanning the local lockfile. `cargo audit --no-fetch` of the same lockfile passes. |
+
+These deferred gates must be re-run in a CI/dev environment that supports
+AF_UNIX socket creation, Go 1.26.4, and the required `cargo-deny`/advisory-db
+version before the initiative merges to `main` or before any
+production/carrier-acceptance readiness claim.
 
 ## EPC/untrusted-access final hardening addendum
 
