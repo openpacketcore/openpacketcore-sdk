@@ -425,6 +425,9 @@ pub struct SriovProfile {
 /// Matches the design §13.2 set: `{macvlan, ipvlan, sriov, host-network, custom}`.
 /// Multus is attachment plumbing and is modeled separately (e.g. as an
 /// annotation or network-selection policy), not as a CNI type here.
+///
+/// The `Deserialize` implementation requires a self-describing format such as
+/// JSON; deserialization from binary formats is not currently supported.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum CniType {
     /// SR-IOV direct-assignment CNI.

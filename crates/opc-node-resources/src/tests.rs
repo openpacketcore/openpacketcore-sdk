@@ -3159,10 +3159,11 @@ fn cni_type_deserialization_rejects_empty_custom() {
 fn cni_type_deserialization_rejects_blank_string() {
     assert!(serde_json::from_str::<CniType>("\"\"").is_err());
     assert!(serde_json::from_str::<CniType>("\"   \"").is_err());
+    assert!(serde_json::from_str::<CniType>("\"\\t\\n\"").is_err());
 }
 
 #[test]
 fn cni_type_deserialization_accepts_valid_custom() {
     let parsed: CniType = serde_json::from_str(r#"{"custom":"my-cni"}"#).unwrap();
-    assert_eq!(parsed, CniType::Custom("my-cni".to_string()));
+    assert_eq!(parsed, CniType::try_custom("my-cni").unwrap());
 }
