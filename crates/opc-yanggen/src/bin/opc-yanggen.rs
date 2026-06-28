@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use opc_yanggen::{
     generation_input_from_yang_sources, schema_digest, validate_generation_input_yang_sources,
@@ -185,7 +185,7 @@ fn parse_common_flags(
     Ok(())
 }
 
-fn read_generation_input(path: &PathBuf) -> Result<GenerationInput, Diagnostic> {
+fn read_generation_input(path: &Path) -> Result<GenerationInput, Diagnostic> {
     let text = fs::read_to_string(path).map_err(|err| io_diagnostic(path, err))?;
     serde_json::from_str(&text).map_err(|err| {
         Diagnostic::new(
@@ -211,7 +211,7 @@ fn read_yang_sources(paths: &[PathBuf]) -> Result<Vec<YangSource>, Diagnostic> {
         .collect()
 }
 
-fn io_diagnostic(path: &PathBuf, err: io::Error) -> Diagnostic {
+fn io_diagnostic(path: &Path, err: io::Error) -> Diagnostic {
     Diagnostic::new(
         DiagnosticCode::YangSourceSyntaxError,
         format!("failed to read `{}`: {err}", path.display()),
