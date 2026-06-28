@@ -65,6 +65,8 @@ func (src *SdkManagedNetworkFunction) ConvertTo(dstRaw conversion.Hub) error {
 				}
 			}
 		}
+		dst.Spec.ResourceProfile.IpsecNetworkAttachments =
+			convertIpsecNetworkAttachmentsToHub(src.Spec.ResourceProfile.IpsecNetworkAttachments)
 	} else {
 		dst.Spec.ResourceProfile = nil
 	}
@@ -165,6 +167,8 @@ func (dst *SdkManagedNetworkFunction) ConvertFrom(srcRaw conversion.Hub) error {
 				}
 			}
 		}
+		dst.Spec.ResourceProfile.IpsecNetworkAttachments =
+			convertIpsecNetworkAttachmentsFromHub(src.Spec.ResourceProfile.IpsecNetworkAttachments)
 	} else {
 		dst.Spec.ResourceProfile = nil
 	}
@@ -206,6 +210,58 @@ func (dst *SdkManagedNetworkFunction) ConvertFrom(srcRaw conversion.Hub) error {
 	}
 
 	return nil
+}
+
+func convertIpsecNetworkAttachmentsToHub(in []IpsecNetworkAttachmentSpec) []v1beta1.IpsecNetworkAttachmentSpec {
+	if in == nil {
+		return nil
+	}
+	out := make([]v1beta1.IpsecNetworkAttachmentSpec, len(in))
+	for i, attachment := range in {
+		out[i] = v1beta1.IpsecNetworkAttachmentSpec{
+			InterfaceName:       attachment.InterfaceName,
+			Plane:               attachment.Plane,
+			CniType:             attachment.CniType,
+			StaticIPRequired:    attachment.StaticIPRequired,
+			StaticIP:            copyStringPtr(attachment.StaticIP),
+			MinimumMTU:          cloneUint16Ptr(attachment.MinimumMTU),
+			MTU:                 cloneUint16Ptr(attachment.MTU),
+			SourceRouteRequired: attachment.SourceRouteRequired,
+			SourceRoute:         copyStringPtr(attachment.SourceRoute),
+			VlanID:              cloneUint16Ptr(attachment.VlanID),
+		}
+	}
+	return out
+}
+
+func convertIpsecNetworkAttachmentsFromHub(in []v1beta1.IpsecNetworkAttachmentSpec) []IpsecNetworkAttachmentSpec {
+	if in == nil {
+		return nil
+	}
+	out := make([]IpsecNetworkAttachmentSpec, len(in))
+	for i, attachment := range in {
+		out[i] = IpsecNetworkAttachmentSpec{
+			InterfaceName:       attachment.InterfaceName,
+			Plane:               attachment.Plane,
+			CniType:             attachment.CniType,
+			StaticIPRequired:    attachment.StaticIPRequired,
+			StaticIP:            copyStringPtr(attachment.StaticIP),
+			MinimumMTU:          cloneUint16Ptr(attachment.MinimumMTU),
+			MTU:                 cloneUint16Ptr(attachment.MTU),
+			SourceRouteRequired: attachment.SourceRouteRequired,
+			SourceRoute:         copyStringPtr(attachment.SourceRoute),
+			VlanID:              cloneUint16Ptr(attachment.VlanID),
+		}
+	}
+	return out
+}
+
+func cloneUint16Ptr(in *uint16) *uint16 {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
 }
 
 func copyStringPtr(in *string) *string {

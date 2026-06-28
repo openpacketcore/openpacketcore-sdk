@@ -49,6 +49,12 @@ func (in *SdkManagedNetworkFunction) DeepCopyInto(out *SdkManagedNetworkFunction
 			out.Spec.ResourceProfile.SriovAllowedDeviceDrivers = make([]string, len(in.Spec.ResourceProfile.SriovAllowedDeviceDrivers))
 			copy(out.Spec.ResourceProfile.SriovAllowedDeviceDrivers, in.Spec.ResourceProfile.SriovAllowedDeviceDrivers)
 		}
+		if in.Spec.ResourceProfile.IpsecNetworkAttachments != nil {
+			out.Spec.ResourceProfile.IpsecNetworkAttachments = make([]IpsecNetworkAttachmentSpec, len(in.Spec.ResourceProfile.IpsecNetworkAttachments))
+			for i := range in.Spec.ResourceProfile.IpsecNetworkAttachments {
+				in.Spec.ResourceProfile.IpsecNetworkAttachments[i].DeepCopyInto(&out.Spec.ResourceProfile.IpsecNetworkAttachments[i])
+			}
+		}
 		if in.Spec.ResourceProfile.BpfArtifacts != nil {
 			out.Spec.ResourceProfile.BpfArtifacts = make([]BpfArtifact, len(in.Spec.ResourceProfile.BpfArtifacts))
 			for i := range in.Spec.ResourceProfile.BpfArtifacts {
@@ -105,6 +111,30 @@ func (in *BpfArtifact) DeepCopyInto(out *BpfArtifact) {
 	if in.EvidenceID != nil {
 		val := *in.EvidenceID
 		out.EvidenceID = &val
+	}
+}
+
+func (in *IpsecNetworkAttachmentSpec) DeepCopyInto(out *IpsecNetworkAttachmentSpec) {
+	*out = *in
+	if in.StaticIP != nil {
+		val := *in.StaticIP
+		out.StaticIP = &val
+	}
+	if in.MinimumMTU != nil {
+		val := *in.MinimumMTU
+		out.MinimumMTU = &val
+	}
+	if in.MTU != nil {
+		val := *in.MTU
+		out.MTU = &val
+	}
+	if in.SourceRoute != nil {
+		val := *in.SourceRoute
+		out.SourceRoute = &val
+	}
+	if in.VlanID != nil {
+		val := *in.VlanID
+		out.VlanID = &val
 	}
 }
 

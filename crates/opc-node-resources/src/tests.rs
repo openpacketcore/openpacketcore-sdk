@@ -68,10 +68,25 @@ fn production_ipsec_gateway_profile() -> ResourceProfile {
         DataPlaneProfile::IpsecGateway,
         Some("platform-ipsec-gateway-ev-1".to_string()),
     );
-    profile.ipsec_gateway = Some(IpsecGatewayProfile::standard(Some(
-        "platform-ipsec-gateway-ev-1".to_string(),
-    )));
+    let mut ipsec = IpsecGatewayProfile::standard(Some("platform-ipsec-gateway-ev-1".to_string()));
+    ipsec.network_attachments = vec![standard_ipsec_network_attachment("ens5f0")];
+    profile.ipsec_gateway = Some(ipsec);
     profile
+}
+
+fn standard_ipsec_network_attachment(interface_name: &str) -> IpsecNetworkAttachment {
+    IpsecNetworkAttachment {
+        interface_name: interface_name.to_string(),
+        plane: "untrusted-access".to_string(),
+        cni_type: CniType::Macvlan,
+        static_ip_required: false,
+        static_ip: None,
+        minimum_mtu: None,
+        mtu: Some(1500),
+        source_route_required: false,
+        source_route: None,
+        vlan_id: None,
+    }
 }
 
 fn capable_node() -> NodeCapabilityReport {
@@ -203,6 +218,13 @@ fn make_sriov_allowlist() -> SriovAllowlistPolicy {
 // ------------------------------------------------------------------------
 // XFRM/IPsec gateway profile validation
 // ------------------------------------------------------------------------
+
+#[test]
+fn ipsec_gateway_standard_profile_leaves_network_attachments_to_callers() {
+    let profile = IpsecGatewayProfile::standard(Some("platform-ipsec-gateway-ev-1".to_string()));
+
+    assert!(profile.network_attachments.is_empty());
+}
 
 #[test]
 fn ipsec_gateway_preflight_passes_with_xfrm_evidence() {

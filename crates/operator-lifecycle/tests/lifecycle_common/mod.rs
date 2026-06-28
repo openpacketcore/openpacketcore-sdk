@@ -10,9 +10,10 @@ pub use operator_lifecycle::{
     sanitize_denial_message, AdminAuthSpec, AdmissionRequest, CandidateMetadata,
     CompatibilityBlockReason, CompatibilityDecision, CompatibilityEvidence, CompatibilityFeature,
     CompatibilityMatrix, CompatibilityRule, ConditionSeverity, ConditionStatus,
-    ConfigApplyDecision, IdentitySpec, LifecyclePhase, LifecycleStatus, MigrationCompatibility,
-    NfReleaseDescriptor, OperatorReleaseDescriptor, PendingConfirmationState, ResourceProfileSpec,
-    StoredConfigMetadata, SupportedVersionRange, UpgradeAction,
+    ConfigApplyDecision, IdentitySpec, IpsecNetworkAttachmentSpec, LifecyclePhase, LifecycleStatus,
+    MigrationCompatibility, NfReleaseDescriptor, OperatorReleaseDescriptor,
+    PendingConfirmationState, ResourceProfileSpec, StoredConfigMetadata, SupportedVersionRange,
+    UpgradeAction,
 };
 pub use time::OffsetDateTime;
 
@@ -143,6 +144,7 @@ pub fn create_base_admission_request() -> AdmissionRequest {
             bpf_artifacts: vec![valid_bpf_artifact("ens5f0")],
             sriov_resource_name: Some("intel.com/ice_sriov".to_string()),
             sriov_allowed_device_drivers: vec!["ice".to_string()],
+            ipsec_network_attachments: vec![],
         }),
         node_capabilities: Some(valid_node_capability_report()),
         operator_release: None,

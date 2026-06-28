@@ -531,12 +531,12 @@ impl HardwarePreflight {
 
 fn build_hardware_preflight(config: &HardwareLabRunnerConfig) -> HardwarePreflight {
     use opc_node_resources::{
-        AfXdpProfile, BpfCapabilities, CpuLayout, CpuManagerPolicy, DataPlaneProfile, Environment,
-        EspAlgorithmId, HugepagePool, IpsecCapabilities, IpsecGatewayCapabilities,
-        IpsecGatewayProfile, KernelModuleId, KernelVersion, LinkStatePolicy, LinuxCapability,
-        NetworkFunctionKind, NicCapability, NodeCapabilityReport, NodeCpuCapabilities,
-        NodeMemoryCapabilities, PodSecurityExceptionModel, ResourceProfile, SriovAllowlistPolicy,
-        SriovProfile, TopologyManagerPolicy, XdpMode,
+        AfXdpProfile, BpfCapabilities, CniType, CpuLayout, CpuManagerPolicy, DataPlaneProfile,
+        Environment, EspAlgorithmId, HugepagePool, IpsecCapabilities, IpsecGatewayCapabilities,
+        IpsecGatewayProfile, IpsecNetworkAttachment, KernelModuleId, KernelVersion,
+        LinkStatePolicy, LinuxCapability, NetworkFunctionKind, NicCapability, NodeCapabilityReport,
+        NodeCpuCapabilities, NodeMemoryCapabilities, PodSecurityExceptionModel, ResourceProfile,
+        SriovAllowlistPolicy, SriovProfile, TopologyManagerPolicy, XdpMode,
     };
 
     let data_plane_profile = if config.sriov_xdp_expectations.contains("sriov") {
@@ -600,9 +600,24 @@ fn build_hardware_preflight(config: &HardwareLabRunnerConfig) -> HardwarePreflig
         });
     }
     if matches!(data_plane_profile, DataPlaneProfile::IpsecGateway) {
-        profile.ipsec_gateway = Some(IpsecGatewayProfile::standard(Some(
-            "hardware-lab-dry-run-ipsec-evidence".to_string(),
-        )));
+        let mut ipsec =
+            IpsecGatewayProfile::standard(Some("hardware-lab-dry-run-ipsec-evidence".to_string()));
+        ipsec.network_attachments = data_plane_interfaces
+            .iter()
+            .map(|interface_name| IpsecNetworkAttachment {
+                interface_name: interface_name.clone(),
+                plane: "ipsec-gateway".to_string(),
+                cni_type: CniType::Custom("testbed-declared".to_string()),
+                static_ip_required: false,
+                static_ip: None,
+                minimum_mtu: None,
+                mtu: None,
+                source_route_required: false,
+                source_route: None,
+                vlan_id: None,
+            })
+            .collect();
+        profile.ipsec_gateway = Some(ipsec);
     }
 
     let nic_names = if data_plane_interfaces.is_empty() {

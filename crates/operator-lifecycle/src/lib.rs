@@ -18,8 +18,9 @@ pub mod reconcile;
 
 // Re-export key types
 pub use admission::{
-    evaluate_admission, sanitize_denial_message, AdminAuthSpec, AdmissionRequest,
-    AdmissionResponse, AdmissionStatus, IdentitySpec, ResourceProfileSpec,
+    evaluate_admission, ipsec_gateway_profile_from_spec, sanitize_denial_message, AdminAuthSpec,
+    AdmissionRequest, AdmissionResponse, AdmissionStatus, IdentitySpec, IpsecNetworkAttachmentSpec,
+    ResourceProfileSpec,
 };
 pub use compatibility::{
     CompatibilityBlockReason, CompatibilityDecision, CompatibilityEvidence, CompatibilityFeature,

@@ -153,6 +153,7 @@ func (v *SdkManagedNetworkFunctionValidator) validate(ctx context.Context, crd *
 			PodSecurityEvidenceID:     rp.PodSecurityEvidenceID,
 			SriovResourceName:         rp.SriovResourceName,
 			SriovAllowedDeviceDrivers: rp.SriovAllowedDeviceDrivers,
+			IpsecNetworkAttachments:   sdkbridgeIpsecNetworkAttachments(rp.IpsecNetworkAttachments),
 		}
 		if rp.BpfArtifacts != nil {
 			bridgeReq.ResourceProfile.BpfArtifacts = make([]sdkbridge.BpfArtifact, len(rp.BpfArtifacts))
@@ -205,4 +206,42 @@ func (v *SdkManagedNetworkFunctionValidator) validate(ctx context.Context, crd *
 	}
 
 	return nil, nil
+}
+
+func sdkbridgeIpsecNetworkAttachments(in []v1beta1.IpsecNetworkAttachmentSpec) []sdkbridge.IpsecNetworkAttachmentSpec {
+	if in == nil {
+		return nil
+	}
+	out := make([]sdkbridge.IpsecNetworkAttachmentSpec, len(in))
+	for i, attachment := range in {
+		out[i] = sdkbridge.IpsecNetworkAttachmentSpec{
+			InterfaceName:       attachment.InterfaceName,
+			Plane:               attachment.Plane,
+			CniType:             attachment.CniType,
+			StaticIPRequired:    attachment.StaticIPRequired,
+			StaticIP:            cloneStringPtr(attachment.StaticIP),
+			MinimumMTU:          cloneUint16Ptr(attachment.MinimumMTU),
+			MTU:                 cloneUint16Ptr(attachment.MTU),
+			SourceRouteRequired: attachment.SourceRouteRequired,
+			SourceRoute:         cloneStringPtr(attachment.SourceRoute),
+			VlanID:              cloneUint16Ptr(attachment.VlanID),
+		}
+	}
+	return out
+}
+
+func cloneStringPtr(in *string) *string {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+func cloneUint16Ptr(in *uint16) *uint16 {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
 }

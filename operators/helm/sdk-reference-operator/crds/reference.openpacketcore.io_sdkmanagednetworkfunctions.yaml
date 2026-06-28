@@ -97,6 +97,35 @@ spec:
                     type: array
                     items:
                       type: string
+                  ipsecNetworkAttachments:
+                    type: array
+                    items:
+                      type: object
+                      required:
+                      - interfaceName
+                      - plane
+                      - cniType
+                      properties:
+                        interfaceName:
+                          type: string
+                        plane:
+                          type: string
+                        cniType:
+                          type: string
+                        staticIpRequired:
+                          type: boolean
+                        staticIp:
+                          type: string
+                        minimumMtu:
+                          type: integer
+                        mtu:
+                          type: integer
+                        sourceRouteRequired:
+                          type: boolean
+                        sourceRoute:
+                          type: string
+                        vlanId:
+                          type: integer
                   dataPlaneNumaNode:
                     type: integer
                   hugepageNumaNode:
@@ -297,6 +326,35 @@ spec:
                     type: array
                     items:
                       type: string
+                  ipsecNetworkAttachments:
+                    type: array
+                    items:
+                      type: object
+                      required:
+                      - interfaceName
+                      - plane
+                      - cniType
+                      properties:
+                        interfaceName:
+                          type: string
+                        plane:
+                          type: string
+                        cniType:
+                          type: string
+                        staticIpRequired:
+                          type: boolean
+                        staticIp:
+                          type: string
+                        minimumMtu:
+                          type: integer
+                        mtu:
+                          type: integer
+                        sourceRouteRequired:
+                          type: boolean
+                        sourceRoute:
+                          type: string
+                        vlanId:
+                          type: integer
                   dataPlaneNumaNode:
                     type: integer
                   hugepageNumaNode:

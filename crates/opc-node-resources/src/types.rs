@@ -820,6 +820,11 @@ pub struct IpsecGatewayProfile {
 
 impl IpsecGatewayProfile {
     /// Returns a conservative production IPsec gateway profile.
+    ///
+    /// Network attachments are intentionally left empty. Interface names,
+    /// functional planes, CNI types, MTU requirements, static IP assignment, and
+    /// source-route policy are deployment-owned inputs and must be declared by
+    /// the caller before validation.
     pub fn standard(evidence_id: Option<String>) -> Self {
         Self {
             minimum_kernel: KernelVersion::new(5, 15, 0),
@@ -844,18 +849,7 @@ impl IpsecGatewayProfile {
                 EspAlgorithmId::from("aes-cbc"),
                 EspAlgorithmId::from("hmac-sha256"),
             ]),
-            network_attachments: vec![IpsecNetworkAttachment {
-                interface_name: "ens5f0".to_string(),
-                plane: "nwu".to_string(),
-                cni_type: CniType::Macvlan,
-                static_ip_required: false,
-                static_ip: None,
-                minimum_mtu: None,
-                mtu: Some(1500),
-                source_route_required: false,
-                source_route: None,
-                vlan_id: None,
-            }],
+            network_attachments: Vec::new(),
             allow_userspace_esp_fallback: false,
             evidence_id,
         }

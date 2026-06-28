@@ -190,3 +190,161 @@ fn test_preflight_matching_contract_version() {
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(parsed["contractVersion"], 1);
 }
+
+#[test]
+fn test_preflight_ipsec_gateway_requires_explicit_network_attachments() {
+    let input = r#"{
+        "expectedContractVersion": 1,
+        "resource_profile": {
+            "nf_kind": "n3iwf",
+            "data_plane_profile": "IpsecGateway",
+            "numa_policy": "Require",
+            "generic_xdp_fallback_allowed": false,
+            "isolated_cores": [2, 3],
+            "require_exclusive_cores": true,
+            "data_plane_interfaces": ["ens5f0"],
+            "data_plane_numa_node": 0,
+            "hugepage_numa_node": 0,
+            "pod_security_evidence_id": "platform-ipsec-gateway-ev-1"
+        },
+        "node_capabilities": {
+            "kernel": {"major": 6, "minor": 8, "patch": 0},
+            "bpf": {
+                "cap_bpf": true,
+                "xdp_supported": true,
+                "btf_available": true,
+                "cap_sys_admin_required": false,
+                "available_xdp_modes": ["Native"]
+            },
+            "cpu": {
+                "manager_policy": "Static",
+                "isolated_cores": [2, 3],
+                "numa_nodes": 1,
+                "cpu_ids": [0, 1, 2, 3],
+                "reserved_cores": [0, 1],
+                "topology_manager_policy": "SingleNumaNode",
+                "cpu_numa_map": {"0": 0, "1": 0, "2": 0, "3": 0}
+            },
+            "memory": {
+                "hugepages_2mi": 1024,
+                "hugepages_1gi": 4,
+                "hugepage_pools": [
+                    {"numa_node": 0, "size": "2Mi", "total": 512, "free": 512}
+                ]
+            },
+            "nics": [
+                {"name": "ens5f0", "driver": "ice", "sriov_vfs": 4, "xdp_modes": ["Native"], "queues": 4, "numa_node": 0}
+            ],
+            "ipsec": {
+                "xfrm_netlink_available": true,
+                "xfrm_user_policy_available": true,
+                "esp_supported": true,
+                "udp_500_bind_allowed": true,
+                "udp_4500_bind_allowed": true,
+                "sctp_supported": true,
+                "available_kernel_modules": ["xfrm_user", "esp4"],
+                "supported_esp_algorithms": ["aes-cbc", "hmac-sha256"]
+            },
+            "ipsec_gateway": {
+                "xfrm_user": true,
+                "xfrm_state": true,
+                "xfrm_policy": true,
+                "netns_scoped_operation": true,
+                "route_rule_prerequisites": true,
+                "evidence_id": "node-ipsec-gateway-ev-1"
+            }
+        }
+    }"#;
+
+    let (stdout, code) = run_json("preflight", input);
+    assert_eq!(code, 0, "expected exit 0, got {code}. stdout: {stdout}");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(parsed["contractVersion"], 1);
+    assert!(!parsed["passed"].as_bool().unwrap());
+    assert!(parsed["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message
+            .as_str()
+            .unwrap()
+            .contains("at least one IPsec network attachment is required")));
+}
+
+#[test]
+fn test_preflight_ipsec_gateway_passes_with_explicit_network_attachment() {
+    let input = r#"{
+        "expectedContractVersion": 1,
+        "resource_profile": {
+            "nf_kind": "n3iwf",
+            "data_plane_profile": "IpsecGateway",
+            "numa_policy": "Require",
+            "generic_xdp_fallback_allowed": false,
+            "isolated_cores": [2, 3],
+            "require_exclusive_cores": true,
+            "data_plane_interfaces": ["ens5f0"],
+            "data_plane_numa_node": 0,
+            "hugepage_numa_node": 0,
+            "pod_security_evidence_id": "platform-ipsec-gateway-ev-1",
+            "ipsec_network_attachments": [{
+                "interface_name": "ens5f0",
+                "plane": "untrusted-access",
+                "cni_type": "macvlan",
+                "mtu": 1500
+            }]
+        },
+        "node_capabilities": {
+            "kernel": {"major": 6, "minor": 8, "patch": 0},
+            "bpf": {
+                "cap_bpf": true,
+                "xdp_supported": true,
+                "btf_available": true,
+                "cap_sys_admin_required": false,
+                "available_xdp_modes": ["Native"]
+            },
+            "cpu": {
+                "manager_policy": "Static",
+                "isolated_cores": [2, 3],
+                "numa_nodes": 1,
+                "cpu_ids": [0, 1, 2, 3],
+                "reserved_cores": [0, 1],
+                "topology_manager_policy": "SingleNumaNode",
+                "cpu_numa_map": {"0": 0, "1": 0, "2": 0, "3": 0}
+            },
+            "memory": {
+                "hugepages_2mi": 1024,
+                "hugepages_1gi": 4,
+                "hugepage_pools": [
+                    {"numa_node": 0, "size": "2Mi", "total": 512, "free": 512}
+                ]
+            },
+            "nics": [
+                {"name": "ens5f0", "driver": "ice", "sriov_vfs": 4, "xdp_modes": ["Native"], "queues": 4, "numa_node": 0}
+            ],
+            "ipsec": {
+                "xfrm_netlink_available": true,
+                "xfrm_user_policy_available": true,
+                "esp_supported": true,
+                "udp_500_bind_allowed": true,
+                "udp_4500_bind_allowed": true,
+                "sctp_supported": true,
+                "available_kernel_modules": ["xfrm_user", "esp4"],
+                "supported_esp_algorithms": ["aes-cbc", "hmac-sha256"]
+            },
+            "ipsec_gateway": {
+                "xfrm_user": true,
+                "xfrm_state": true,
+                "xfrm_policy": true,
+                "netns_scoped_operation": true,
+                "route_rule_prerequisites": true,
+                "evidence_id": "node-ipsec-gateway-ev-1"
+            }
+        }
+    }"#;
+
+    let (stdout, code) = run_json("preflight", input);
+    assert_eq!(code, 0, "expected exit 0, got {code}. stdout: {stdout}");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(parsed["contractVersion"], 1);
+    assert!(parsed["passed"].as_bool().unwrap(), "stdout: {stdout}");
+}
