@@ -322,7 +322,10 @@ fn packet_core_schema_versions_match_constant() {
     let standalone_schemas = [
         ("protocol", PACKET_CORE_PROTOCOL_EVIDENCE_SCHEMA),
         ("attach", PACKET_CORE_ATTACH_EVIDENCE_SCHEMA),
-        ("kernel_dataplane", PACKET_CORE_KERNEL_DATAPLANE_EVIDENCE_SCHEMA),
+        (
+            "kernel_dataplane",
+            PACKET_CORE_KERNEL_DATAPLANE_EVIDENCE_SCHEMA,
+        ),
     ];
     for (label, raw) in standalone_schemas {
         let schema: serde_json::Value = serde_json::from_str(raw).unwrap();

@@ -644,6 +644,7 @@ fn epc_epdg_simulator_fixture_manifest_records_protocol_provenance() {
         .expect("manifest interfaces are an array");
     assert!(interfaces.iter().any(
         |interface| interface["id"] == "diameter-peer-decoded-message"
+            && interface["sdk_protocol_crate"] == "opc-proto-diameter"
             && interface["parser_policy"] == "sdk-protocol-crate-only"
     ));
 }

@@ -20,10 +20,10 @@ Scenario DSL, virtual time, assertions, fixture provenance, and simulator framew
   fidelity = `stateful-mock` (experimental); not procedure-faithful, not
   conformance, and not a production PGW/ePDG control plane.
 - `simulators::epc::DiameterPeerSimulator` accepts decoded Diameter metadata
-  only; it intentionally carries no local Diameter parser until an SDK
-  `opc-proto-diameter` crate exists. RFC 012 fidelity = `stateful-mock`
-  (experimental); not procedure-faithful, not conformance, and not a production
-  AAA/HSS/CDF peer.
+  from the experimental `opc-proto-diameter` crate or compatible product
+  adapters; it intentionally carries no local Diameter parser. RFC 012 fidelity
+  = `stateful-mock` (experimental); not procedure-faithful, not conformance,
+  and not a production AAA/HSS/CDF peer.
 
 ## Quick start
 

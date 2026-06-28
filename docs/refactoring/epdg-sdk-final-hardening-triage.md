@@ -27,6 +27,9 @@ and the phase gate notes.
 | IKEv2 scaffold conformance defaults and fuzz workflow coverage | `T-3fc6bb76`; `.github/workflows/fuzz.yml` includes `opc-proto-ikev2` and `opc-proto-gtpv2c` | Converted and closed. Remaining typed-payload/fragmentation/fixture-provenance work is documented as experimental future scope. |
 | EPC/ePDG simulator malformed-response runner path | `T-8eeb94b6` | Converted and closed. No final-hardening task needed. |
 | Deep worktree Unix-socket path failures in tests | Phase 0 seam steward notes and `T-d42e0d6c` | Converted and closed. No final-hardening task needed. |
+| Phase-4 Diameter simulator still described `opc-proto-diameter` as a future crate after Phase 2 had landed it | `T-e29a136b` introduced `opc-proto-diameter`; `T-8468bea7`/`T-7f59a2fe` introduced the EPC/ePDG testbed simulator skeleton and manifest | Resolved in `T-0a1f3cdd`: `opc-testbed` docs, simulator comments, and the simulator manifest now name the existing experimental `opc-proto-diameter` crate while preserving the parser-free testbed boundary, and an `opc-proto-diameter` integration test bridges a peer message into `DiameterPeerSimulator`. |
+| GTPv2-C S2b helper retained the scaffold-era `is_scaffolded_s2b_message_type` alias after the canonical typed subset helper existed | `T-980a0abd` Phase 1 S2b typed subset; current repo `crates/opc-proto-gtpv2c/src/s2b.rs` exposed both helper names | Resolved in `T-0a1f3cdd`: removed the transitional alias and re-export; callers use the canonical `is_s2b_message_type` helper. |
+| `opc-testbed` dependency comment still referenced the old 1.78 workspace floor after ADR 0014/CI established MSRV 1.88 | ADR 0014, root `Cargo.toml` `rust-version = "1.88"`, `.github/workflows/ci.yml` MSRV job | Resolved in `T-0a1f3cdd`: updated the comment to the current 1.88 floor. |
 | Downstream ePDG adapter/product work | `docs/refactoring/epdg-sdk-m4-closeout.md` | Explicitly deferred outside this SDK plan by ADR 0018 boundary. Do not convert into final-hardening scope. |
 | Protocol-status documentation drift for Diameter and IKEv2 | Current repo: `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `.github/workflows/fuzz.yml`, and `.github/workflows/ci.yml` include `opc-proto-diameter`, but `docs/implementation-status.md` RFC 005 rows 005-6/005-8 and the `opc-sdk` facade docs (`crates/opc-sdk/src/lib.rs`, `crates/opc-sdk/README.md`) summarize the new direct-dependency protocol set without `opc-proto-diameter` and the experimental `opc-proto-ikev2` | Owned by concrete final-hardening task `T-0cc9d976` ("Docs sync: reflect opc-proto-diameter and opc-proto-ikev2 in implementation-status and opc-sdk facade docs"), approved 3/3 and merged into the final-hardening branch. Actioned/closed; not at supervisor discretion. The IKEv2 facade-doc omission was covered by the same task. |
 
@@ -38,17 +41,19 @@ and the phase gate notes.
 - `T-0cc9d976` ("Docs sync: reflect opc-proto-diameter and opc-proto-ikev2 in
   implementation-status and opc-sdk facade docs") is a concrete final-hardening
   task, approved 3/3 and merged into the final-hardening branch.
-- `T-0a1f3cdd` — "Resolve deferred cross-epic seams" (seeded final-hardening
-  task; sequenced after triage).
+- `T-0a1f3cdd` — "Resolve deferred cross-epic seams" resolved the remaining
+  concrete seam pass: Diameter testbed future-crate wording/manifest drift,
+  the GTPv2-C scaffold-era S2b alias, and the stale `opc-testbed` MSRV comment.
 - `T-8c57ecee` — "Final validation and operator readiness pass" (seeded
   final-hardening gate; runs last).
-- These two seeded tasks are remaining sequencing work, not un-triaged deferred
-  candidates. No broad rewrite candidate was identified. Downstream
-  adapter/product work is intentionally outside the SDK final-hardening epic.
+- The seeded seam task records the concrete cleanup above and the validation
+  pass remains last; neither is an un-triaged deferred candidate. No broad
+  rewrite candidate was identified. Downstream adapter/product work is
+  intentionally outside the SDK final-hardening epic.
 
 ## Acceptance conclusion
 
 Every deferred cross-epic cleanup candidate identified in this triage is either
-a concrete final-hardening task (`T-0cc9d976` and `T-0e9cac9a`, both approved
-and merged into the final-hardening branch) or explicitly waived with rationale
-in the ledger above. No candidate is left open.
+a concrete final-hardening task (`T-0cc9d976`, `T-0e9cac9a`, and `T-0a1f3cdd`)
+or explicitly waived with rationale in the ledger above. No candidate is left
+open.

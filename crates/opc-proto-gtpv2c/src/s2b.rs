@@ -127,14 +127,6 @@ pub const fn is_s2b_message_type(message_type: u8) -> bool {
     MessageType::from_u8(message_type).is_s2b()
 }
 
-/// Return `true` when `message_type` belongs to the S2b procedure set for this crate.
-///
-/// This compatibility alias retains the scaffold-era function name while the
-/// crate grows typed S2b views.
-pub const fn is_scaffolded_s2b_message_type(message_type: u8) -> bool {
-    is_s2b_message_type(message_type)
-}
-
 fn procedure_and_direction(message_type: MessageType) -> Option<(Procedure, MessageDirection)> {
     match message_type {
         MessageType::EchoRequest => Some((Procedure::Echo, MessageDirection::Request)),
@@ -669,7 +661,7 @@ mod tests {
             UPDATE_BEARER_REQUEST
         );
         assert_eq!(Procedure::Echo.response_type(), ECHO_RESPONSE);
-        assert!(is_scaffolded_s2b_message_type(DELETE_SESSION_RESPONSE));
+        assert!(is_s2b_message_type(DELETE_SESSION_RESPONSE));
         assert!(is_s2b_message_type(UPDATE_BEARER_RESPONSE));
         assert!(!is_s2b_message_type(3));
     }

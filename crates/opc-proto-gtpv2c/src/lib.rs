@@ -43,8 +43,8 @@ pub use ie::{
 };
 pub use message::{Message, OwnedMessage};
 pub use s2b::{
-    is_s2b_message_type, is_scaffolded_s2b_message_type, MessageDirection, Procedure, S2bMessage,
-    S2bProcedureMessage, CREATE_SESSION_REQUEST, CREATE_SESSION_RESPONSE, DELETE_SESSION_REQUEST,
+    is_s2b_message_type, MessageDirection, Procedure, S2bMessage, S2bProcedureMessage,
+    CREATE_SESSION_REQUEST, CREATE_SESSION_RESPONSE, DELETE_SESSION_REQUEST,
     DELETE_SESSION_RESPONSE, ECHO_REQUEST, ECHO_RESPONSE, MODIFY_BEARER_REQUEST,
     MODIFY_BEARER_RESPONSE, UPDATE_BEARER_REQUEST, UPDATE_BEARER_RESPONSE,
 };
