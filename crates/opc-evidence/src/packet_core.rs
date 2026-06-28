@@ -388,14 +388,7 @@ fn has_unredacted_spi_value(lower: &str) -> bool {
         {
             continue;
         }
-        let rest = &lower[after_end..].trim_start();
-        // Strip an optional separator (=, :, or -).
-        let rest = rest
-            .strip_prefix('=')
-            .or_else(|| rest.strip_prefix(':'))
-            .or_else(|| rest.strip_prefix('-'))
-            .unwrap_or(rest)
-            .trim_start();
+        let rest = strip_redaction_separator(&lower[after_end..]);
         if rest.is_empty() || starts_with_redaction_placeholder(rest) {
             continue;
         }
@@ -454,11 +447,21 @@ fn marker_occurrence_is_redacted(
         }
     }
 
-    // Adjacent to a redaction placeholder with an optional '=' separator.
-    let after = &lower[end..];
-    let after = after.trim_start();
-    let after = after.strip_prefix('=').unwrap_or(after);
-    starts_with_redaction_placeholder(after)
+    // Adjacent to a redaction placeholder with an optional separator.
+    starts_with_redaction_placeholder(strip_redaction_separator(&lower[end..]))
+}
+
+/// Strips leading whitespace and an optional redaction separator (`=`, `:`, or
+/// `-`) from `s`. Shared by marker and SPI redaction checks so both treat
+/// `key=<placeholder>`, `key: <placeholder>`, and `key-<placeholder>` as
+/// redacted consistently.
+fn strip_redaction_separator(s: &str) -> &str {
+    let s = s.trim_start();
+    s.strip_prefix('=')
+        .or_else(|| s.strip_prefix(':'))
+        .or_else(|| s.strip_prefix('-'))
+        .unwrap_or(s)
+        .trim_start()
 }
 
 fn starts_with_redaction_placeholder(s: &str) -> bool {
@@ -477,8 +480,11 @@ fn has_ip_address(s: &str) -> bool {
 }
 
 fn has_ipv4_address(s: &str) -> bool {
-    // Candidate tokens contain only digits and dots.
+    // Candidate tokens contain only digits and dots. A trailing sentence
+    // punctuation dot (e.g. "peer 203.0.113.10.") is stripped so the IPv4
+    // candidate is still recognized.
     for token in s.split(|c: char| !c.is_ascii_digit() && c != '.') {
+        let token = token.trim_matches('.');
         if looks_like_ipv4(token) {
             return true;
         }
@@ -506,8 +512,34 @@ fn looks_like_ipv4(token: &str) -> bool {
 }
 
 fn has_ipv6_address(s: &str) -> bool {
-    // Candidate tokens contain only hex digits and colons.
-    for token in s.split(|c: char| !c.is_ascii_hexdigit() && c != ':') {
+    // Extract maximal runs of hex digits and colons. Skip runs that are
+    // immediately adjacent to ASCII letters on either side, so fragments like
+    // `d::` torn out of C++ scope tokens (`std::vector`) are not treated as
+    // IPv6 addresses while genuine compressed forms (`fe80::`, `a::`) remain
+    // caught when bounded by separators or string ends.
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        while i < chars.len() && !(chars[i].1.is_ascii_hexdigit() || chars[i].1 == ':') {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        let start = i;
+        while i < chars.len() && (chars[i].1.is_ascii_hexdigit() || chars[i].1 == ':') {
+            i += 1;
+        }
+        let end = i;
+
+        let prev_is_letter = start > 0 && chars[start - 1].1.is_ascii_alphabetic();
+        let next_is_letter = end < chars.len() && chars[end].1.is_ascii_alphabetic();
+        if prev_is_letter || next_is_letter {
+            continue;
+        }
+
+        let token_end_byte = chars[end - 1].0 + chars[end - 1].1.len_utf8();
+        let token = &s[chars[start].0..token_end_byte];
         if looks_like_ipv6(token) {
             return true;
         }
@@ -543,12 +575,13 @@ fn looks_like_ipv6(token: &str) -> bool {
             });
         }
 
-        // For 0 or 1 explicit groups, require the explicit groups to be purely
-        // decimal digits. This catches `::1`, `::`, and `1::` while avoiding
-        // C++ tokens such as `std::`.
+        // For 0 or 1 explicit groups, require the explicit groups to be valid
+        // IPv6 groups (1-4 hex digits). This catches `::1`, `::`, `1::`, and
+        // `fe80::` while avoiding C++ scope tokens such as `std::` (the letters
+        // 's' and 't' are not hex digits).
         return explicit_groups
             .iter()
-            .all(|g| !g.is_empty() && g.len() <= 4 && g.chars().all(|c| c.is_ascii_digit()));
+            .all(|g| !g.is_empty() && g.len() <= 4 && g.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     // Uncompressed form: exactly 8 groups separated by 7 colons.
@@ -684,6 +717,12 @@ mod tests {
         assert!(has_raw_sensitive_identifier("spi=<spi-redacted> mode=tunnel").is_none());
         assert!(has_raw_sensitive_identifier("spi <spi-redacted> mode=tunnel").is_none());
         assert!(has_raw_sensitive_identifier("imsi=<imsi-redacted>").is_none());
+        // Consistent separator handling for colon and dash (regression).
+        assert!(has_raw_sensitive_identifier("imsi: <imsi-redacted>").is_none());
+        assert!(has_raw_sensitive_identifier("imsi-<imsi-redacted>").is_none());
+        assert!(has_raw_sensitive_identifier("session-id: <session-redacted>").is_none());
+        assert!(has_raw_sensitive_identifier("spi: <spi-redacted>").is_none());
+        assert!(has_raw_sensitive_identifier("spi-<spi-redacted>").is_none());
         // A short marker inside a placeholder must not flag the surrounding word.
         assert!(has_raw_sensitive_identifier("snail <nai-redacted>").is_none());
     }
@@ -797,6 +836,9 @@ mod tests {
         // Leading zeros are flagged as likely raw addresses.
         assert!(has_raw_sensitive_identifier("192.168.001.1").is_some());
         assert!(has_raw_sensitive_identifier("10.0.0.01").is_some());
+        // A trailing sentence punctuation dot does not hide the address (regression).
+        assert!(has_raw_sensitive_identifier("peer 203.0.113.10.").is_some());
+        assert!(has_raw_sensitive_identifier("...192.168.1.1...").is_some());
         // Invalid IPv4 shapes are not flagged.
         assert!(has_raw_sensitive_identifier("1.2.3").is_none());
         assert!(has_raw_sensitive_identifier("256.0.0.1").is_none());
@@ -810,10 +852,17 @@ mod tests {
         // Loopback / unspecified compressed forms are caught.
         assert!(has_raw_sensitive_identifier("::1").is_some());
         assert!(has_raw_sensitive_identifier("::").is_some());
+        // Single-hex-group compressed forms are caught (regression).
+        assert!(has_raw_sensitive_identifier("fe80::").is_some());
+        assert!(has_raw_sensitive_identifier("a::").is_some());
+        assert!(has_raw_sensitive_identifier("dead::").is_some());
         // MAC addresses and ordinary time/ratio text are not flagged.
         assert!(has_raw_sensitive_identifier("00:1a:2b:3c:4d:5e").is_none());
         assert!(has_raw_sensitive_identifier("12:34:56").is_none());
         assert!(has_raw_sensitive_identifier("std::vector").is_none());
+        // C++ scope tokens with a single leading word are not flagged.
+        assert!(has_raw_sensitive_identifier("std::").is_none());
+        assert!(has_raw_sensitive_identifier("absl::string_view").is_none());
     }
 
     #[test]
