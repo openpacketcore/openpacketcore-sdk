@@ -64,6 +64,51 @@ closed as SDK foundation gaps).
 
 ---
 
+## Final hardening snapshot — T-8c57ecee (2026-06-28)
+
+This snapshot records the final EPC/untrusted-access SDK readiness pass after
+the concrete final-hardening tasks `T-0e9cac9a`, `T-0cc9d976`, and
+`T-0a1f3cdd` closed. The evidence ledger is
+[`epdg-sdk-final-hardening-triage.md`](refactoring/epdg-sdk-final-hardening-triage.md),
+and the operator-facing addendum is
+[`operator-readiness.md`](operator-readiness.md#epcuntrusted-access-final-hardening-addendum).
+
+The pass keeps the ADR 0018 boundary explicit:
+
+- `opc-proto-gtpv2c`, `opc-proto-diameter`, and `opc-proto-ikev2` are
+  experimental protocol crates with conformance notes, hostile-input tests, and
+  fuzz targets, not product transport/state-machine implementations.
+- `opc-testbed` exposes EPC/ePDG simulator skeletons and manifest provenance
+  for decoded messages; raw protocol bytes are still decoded by protocol crates
+  before simulator use.
+- `opc-evidence` packet-core packs are experimental evidence-formatting and
+  validation mechanisms, not carrier-readiness sign-off.
+- `operators/operator-sdk-go` packet-core additions are product-neutral helper
+  packages. Downstream CNF operators own CRDs, Helm/RBAC policy, Multus/XFRM
+  privilege wiring, readiness thresholds, traffic-shift policy, and product
+  release evidence.
+
+No final-hardening candidate remains open in the triage ledger; downstream
+ePDG adapter and carrier-acceptance work remains outside this SDK matrix.
+
+### Deferred/waived final-validation gates
+
+The following required gates could not be executed in the worker pane used for
+`T-8c57ecee` and are explicitly waived for this readiness snapshot by epic-lead
+approval. They must be re-run in an unconstrained environment before the
+initiative merges to `main`:
+
+| Gate | Status | Evidence / limitation |
+|:---|:---|:---|
+| Workspace tests that create AF_UNIX sockets (e.g., `cargo test --workspace --all-features`) | Waived | The sandbox denies AF_UNIX socket creation, so any test that binds a Unix-domain socket fails before asserting behavior. |
+| Go operator verification: `gofmt`, `go vet`, `go test`, and `govulncheck` under `operators/sdk-reference-operator` and `operators/operator-sdk-go` | Waived | The required Go toolchain (1.26.4) is unavailable under the network-restricted `GOTOOLCHAIN` setting in this pane. |
+
+All other final-validation gates (`cargo fmt`, `cargo clippy`, MSRV check,
+`cargo audit`, `cargo deny`, docs consistency, Kustomize/Helm rendering, and the
+Rust-side operator-lifecycle CLI tests) passed in this pane.
+
+---
+
 ## Phase 5 gate summary
 
 This gate confirms that the SDK foundation composes into a first NF migration

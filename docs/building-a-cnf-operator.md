@@ -275,8 +275,13 @@ The SDK is intentionally narrow. You must bring your own:
 - **Custom resource conversion webhooks** — if you version your CRD, you must
   write and deploy conversion logic yourself.
 
-For a full list of known gaps, see the gap register in
-`docs/design/` (create a gap-register document if absent).
+For the current SDK gap register and accepted boundaries, see
+[`docs/implementation-status.md`](implementation-status.md). EPC and
+untrusted-access additions are intentionally mechanism-only per
+[ADR 0018](adr/0018-epc-untrusted-access-sdk-boundary.md); downstream product
+operators own their own CRDs, Helm/RBAC policy, network attachments, XFRM/IPsec
+privileges, readiness thresholds, traffic-shift rules, and carrier-acceptance
+evidence.
 
 ---
 

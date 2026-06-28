@@ -2,9 +2,12 @@
 
 This note is the operator-facing handoff for the foundation hardening pass
 `T-9be95f92` on May 30, 2026, updated on June 6, 2026 for the follow-on
-session-store, runtime drain, and ConfigBus authorization seams. It summarizes what the current
-SDK foundation can support, what was validated, and what must not be claimed as
-implemented, since the Go operator remains a reference-only harness and production-grade controllers are the responsibility of downstream CNF teams.
+session-store, runtime drain, and ConfigBus authorization seams, and on June 28,
+2026 for the final EPC/untrusted-access SDK hardening pass `T-8c57ecee`. It
+summarizes what the current SDK foundation can support, what was validated, and
+what must not be claimed as implemented, since the Go operator remains a
+reference-only harness and production-grade controllers are the responsibility
+of downstream CNF teams.
 Durable architecture decisions for the completed hardening work are recorded in
 [`docs/adr/`](adr/).
 
@@ -42,6 +45,48 @@ cargo test --workspace --all-features
 ```
 
 All five commands passed for the June 2026 cleanup baseline.
+
+### Final hardening validation status — `T-8c57ecee`
+
+The final EPC/untrusted-access pass re-ran the core Rust hygiene gates in the
+worker pane. The following gates passed:
+
+- `cargo fmt --all --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo +1.88 check --workspace --all-targets --all-features`
+- `cargo audit --no-fetch`
+- `cargo deny check advisories` / `bans` / `licenses` / `sources`
+- `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features`
+- Kustomize/Helm rendering checks for the reference operator
+
+The following required gates are explicitly waived for this snapshot by epic-lead
+approval and must be re-run in an unconstrained environment before `main`:
+
+| Gate | Status | Evidence / limitation |
+|:---|:---|:---|
+| Workspace tests that create AF_UNIX sockets (e.g., `cargo test --workspace --all-features`) | Waived | The sandbox denies AF_UNIX socket creation. |
+| Go operator verification: `gofmt`, `go vet`, `go test`, and `govulncheck` under `operators/sdk-reference-operator` and `operators/operator-sdk-go` | Waived | Go 1.26.4 is unavailable under the network-restricted `GOTOOLCHAIN` setting. |
+
+## EPC/untrusted-access final hardening addendum
+
+The final EPC/untrusted-access pass is recorded in
+[`docs/refactoring/epdg-sdk-final-hardening-triage.md`](refactoring/epdg-sdk-final-hardening-triage.md)
+and follows the ADR 0018 mechanism/policy boundary. Operators may consume the
+new packet-core surfaces as reusable SDK mechanisms, but must not treat them as
+a product ePDG, EPC core, or carrier-readiness claim.
+
+| Surface | Operator-facing use | Boundary |
+|:---|:---|:---|
+| Experimental protocol crates | `opc-proto-gtpv2c`, `opc-proto-diameter`, and `opc-proto-ikev2` provide bounded codec scaffolds, conformance notes, hostile-input checks, and fuzz targets that downstream product tests can call before entering simulator or operator policy paths. | The crates do not provide UDP peer lifecycle, realm routing, AAA/HSS/CDF behavior, IKE SA/EAP-AKA/Child SA policy, or carrier acceptance evidence. They are not default `opc-sdk` facade exports. |
+| EPC/ePDG testbed simulators | `opc-testbed` exposes PGW S2b and Diameter peer simulator skeletons plus manifest provenance so downstream tests can bridge decoded protocol messages into deterministic SDK scenarios. | Raw protocol bytes must be decoded by protocol crates first. Product ePDG attach orchestration, APN/PLMN/realm policy, charging, LI, and deployment defaults remain downstream. |
+| Packet-core evidence packs | `opc-evidence` validates experimental packet-core evidence schemas with schema-version drift guards and redaction checks for IP, IMSI/SUPI-style identifiers, realm/NAI markers, keys, SPIs, and paths. | Packet-core packs require explicit experimental marking and are evidence formatting/validation mechanisms only; carrier-readiness sign-off remains a downstream release decision. |
+| Go operator helpers | `operators/operator-sdk-go` includes product-neutral helpers for runtime gates, UDP/SCTP ports, Multus/SR-IOV annotations, rollout/drain checks, and fake-client tests. | Product CRDs, Helm/RBAC values, Multus `NetworkAttachmentDefinition` objects, XFRM/IPsec privileges, readiness thresholds, and traffic-shift policy stay outside the SDK helper package. |
+
+For downstream operator authors, the practical rule is unchanged: use the Rust
+policy CLI and Go helper packages as auditable building blocks, then add
+product-specific CRDs, deployment privileges, network attachments, integration
+tests, and release evidence in the downstream CNF operator repository.
 
 ## Current hardening status: session-store HA closed
 
