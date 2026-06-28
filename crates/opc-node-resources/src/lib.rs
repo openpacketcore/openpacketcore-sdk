@@ -37,12 +37,12 @@ pub mod validation;
 pub use types::{
     AfXdpProfile, BpfArtifact, BpfCapabilities, CpuId, CpuLayout, CpuManagerPolicy, CpuPolicy,
     DataPlanePreflightReport, DataPlaneProfile, Environment, FallbackMode, FallbackStatus,
-    HostPathMount, HugepagePool, IpamMode, KernelVersion, LabFallbackPolicy, LinkStatePolicy,
-    LinuxCapability, NetworkFunctionKind, NicCapability, NodeCapabilityReport, NodeCpuCapabilities,
-    NodeMemoryCapabilities, NumaComponent, NumaNodeId, NumaPolicy, PodSecurityExceptionModel,
-    PreflightCheckResult, ResourceProfile, SeccompProfile, SriovAllowlistPolicy, SriovProfile,
-    TopologyManagerPolicy, ValidationContext, ValidationError, ValidationReport, ValidationWarning,
-    XdpMode,
+    HostPathMount, HugepagePool, IpamMode, IpsecGatewayCapabilities, IpsecGatewayProfile,
+    KernelVersion, LabFallbackPolicy, LinkStatePolicy, LinuxCapability, NetworkFunctionKind,
+    NicCapability, NodeCapabilityReport, NodeCpuCapabilities, NodeMemoryCapabilities,
+    NumaComponent, NumaNodeId, NumaPolicy, PodSecurityExceptionModel, PreflightCheckResult,
+    ResourceProfile, SeccompProfile, SriovAllowlistPolicy, SriovProfile, TopologyManagerPolicy,
+    ValidationContext, ValidationError, ValidationReport, ValidationWarning, XdpMode,
 };
 
 pub use validation::{run_data_plane_preflight, validate_resource_profile};

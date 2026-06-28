@@ -58,6 +58,22 @@ fn production_af_xdp_profile() -> ResourceProfile {
     profile
 }
 
+fn production_ipsec_gateway_profile() -> ResourceProfile {
+    let mut profile = ResourceProfile::new(
+        NetworkFunctionKind::Custom("n3iwf".to_string()),
+        DataPlaneProfile::IpsecGateway,
+        Environment::Production,
+    );
+    profile.pod_security = PodSecurityExceptionModel::minimal_required(
+        DataPlaneProfile::IpsecGateway,
+        Some("platform-ipsec-gateway-ev-1".to_string()),
+    );
+    profile.ipsec_gateway = Some(IpsecGatewayProfile::standard(Some(
+        "platform-ipsec-gateway-ev-1".to_string(),
+    )));
+    profile
+}
+
 fn capable_node() -> NodeCapabilityReport {
     NodeCapabilityReport {
         kernel: KernelVersion::new(6, 8, 0),
@@ -124,6 +140,14 @@ fn capable_node() -> NodeCapabilityReport {
             queues: 32,
             numa_node: Some(0),
         }],
+        ipsec_gateway: Some(IpsecGatewayCapabilities {
+            xfrm_user: true,
+            xfrm_state: true,
+            xfrm_policy: true,
+            netns_scoped_operation: true,
+            route_rule_prerequisites: true,
+            evidence_id: Some("platform-ipsec-gateway-ev-1".to_string()),
+        }),
     }
 }
 
@@ -158,6 +182,121 @@ fn make_sriov_allowlist() -> SriovAllowlistPolicy {
             BTreeSet::from(["intel.com/ice_sriov".to_string()]),
         )]),
     }
+}
+
+// ------------------------------------------------------------------------
+// XFRM/IPsec gateway profile validation
+// ------------------------------------------------------------------------
+
+#[test]
+fn ipsec_gateway_preflight_passes_with_xfrm_evidence() {
+    let profile = production_ipsec_gateway_profile();
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+    assert!(report.is_eligible(), "{report:#?}");
+
+    let preflight = run_data_plane_preflight(&profile, &ctx);
+    assert!(preflight.passed, "{preflight:#?}");
+    assert!(preflight
+        .checks
+        .iter()
+        .any(|check| check.name == "XFRM_IPsec_Gateway" && check.passed));
+    assert!(preflight
+        .evidence_ids
+        .contains(&"platform-ipsec-gateway-ev-1".to_string()));
+}
+
+#[test]
+fn ipsec_gateway_missing_xfrm_evidence_blocks_readiness() {
+    let profile = production_ipsec_gateway_profile();
+    let mut node = capable_node();
+    node.ipsec_gateway = None;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+    assert!(report
+        .errors
+        .contains(&ValidationError::IpsecGatewayCapabilitiesMissing));
+
+    let preflight = run_data_plane_preflight(&profile, &ctx);
+    assert!(!preflight.passed);
+    assert!(preflight.blocks_readiness);
+    assert!(preflight
+        .messages
+        .contains(&"node missing IPsec gateway XFRM capability evidence".to_string()));
+}
+
+#[test]
+fn ipsec_gateway_missing_policy_support_is_reported_safely() {
+    let profile = production_ipsec_gateway_profile();
+    let mut node = capable_node();
+    node.ipsec_gateway
+        .as_mut()
+        .expect("capabilities")
+        .xfrm_policy = false;
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+    assert!(report
+        .errors
+        .contains(&ValidationError::MissingIpsecGatewayFeature {
+            feature: "xfrm_policy".to_string(),
+        }));
+    assert!(report
+        .errors
+        .iter()
+        .map(ToString::to_string)
+        .all(|message| !message.contains("/proc") && !message.contains("/sys")));
+}
+
+#[test]
+fn ipsec_gateway_requires_minimal_linux_capabilities() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile
+        .pod_security
+        .added_capabilities
+        .remove(&LinuxCapability::CapNetRaw);
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+    assert!(report.errors.contains(&ValidationError::MissingCapability {
+        capability: LinuxCapability::CapNetRaw,
+    }));
+}
+
+#[test]
+fn ipsec_gateway_rejects_unsupported_pod_capability() {
+    let mut profile = production_ipsec_gateway_profile();
+    profile
+        .pod_security
+        .added_capabilities
+        .insert(LinuxCapability::CapSysAdmin);
+    let node = capable_node();
+    let cpu_layout = standard_cpu_layout();
+    let interfaces = vec!["ens5f0".to_string()];
+    let ctx = make_context(&node, &cpu_layout, &interfaces, Some(0));
+
+    let report = validate_resource_profile(&profile, &ctx);
+    assert!(report
+        .errors
+        .contains(&ValidationError::ProductionCapSysAdminForbidden));
+    assert!(report
+        .errors
+        .contains(&ValidationError::CapabilityNotAllowed {
+            capability: LinuxCapability::CapSysAdmin,
+            profile: DataPlaneProfile::IpsecGateway,
+        }));
 }
 
 // ------------------------------------------------------------------------
@@ -494,6 +633,7 @@ fn lab_node_without_xdp_prerequisites_activates_software_packet_fallback() {
             queues: 32,
             numa_node: Some(0),
         }],
+        ipsec_gateway: None,
     };
 
     let cpu_layout = standard_cpu_layout();

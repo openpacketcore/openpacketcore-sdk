@@ -5,6 +5,7 @@
 
 pub mod bundle;
 pub mod data_governance;
+pub mod dataplane;
 pub mod error;
 pub mod evidence;
 pub mod extract;
@@ -24,6 +25,11 @@ pub use bundle::{
     EvidenceBundle, MockSigner, MockVerifier,
 };
 pub use data_governance::DataGovernanceEvidenceReport;
+pub use dataplane::{
+    assert_packet_continuity_claim_allowed, assert_traffic_readiness_claim_allowed,
+    DataplaneBearerSummary, DataplaneEvidenceError, DataplaneSessionSummary, DataplaneSnapshot,
+    DataplaneSnapshotAsserter,
+};
 pub use error::EvidenceError;
 pub use evidence::EvidenceRecord;
 pub use extract::{scan_directory, scan_file, ExtractedTag, ExtractionError};

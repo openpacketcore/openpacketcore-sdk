@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opc_session_store::{
-    Clock, FakeSessionBackend, FencedSessionReplica, QuorumSessionStore, TokioVirtualClock,
+    Clock, FakeSessionBackend, FencedSessionReplica, QuorumSessionStore, RestoreBlockReason,
+    RestoreBlockReasonCode, TokioVirtualClock,
 };
 use opc_types::Timestamp;
 
@@ -133,5 +134,55 @@ impl ChaosTestkit {
         if replica_id < self.clocks.len() {
             self.clocks[replica_id].set_skew(skew, negative);
         }
+    }
+}
+
+/// Fluent assertions for session-store restart and failover restore evidence.
+pub struct RestoreEvidenceAsserter<'a> {
+    block_reasons: &'a [RestoreBlockReason],
+}
+
+impl<'a> RestoreEvidenceAsserter<'a> {
+    /// Create an asserter over restore block reasons.
+    pub fn new(block_reasons: &'a [RestoreBlockReason]) -> Self {
+        Self { block_reasons }
+    }
+
+    /// Assert that stale owner/fence writes were rejected during restore.
+    pub fn has_stale_owner_rejection(self) -> Self {
+        assert!(
+            self.block_reasons
+                .iter()
+                .any(|reason| reason.code == RestoreBlockReasonCode::StaleOwnerRejected),
+            "expected stale owner rejection in restore evidence, found: {:?}",
+            self.block_reasons
+        );
+        self
+    }
+
+    /// Assert that restore evidence contains a traffic-blocking gate.
+    pub fn blocks_traffic_until_restore_complete(self) -> Self {
+        assert!(
+            self.block_reasons
+                .iter()
+                .any(RestoreBlockReason::blocks_traffic),
+            "expected traffic-blocking restore gate, found: {:?}",
+            self.block_reasons
+        );
+        self
+    }
+
+    /// Assert that all restore block messages are marked as traffic safe text.
+    pub fn has_redaction_safe_messages(self) -> Self {
+        assert!(
+            self.block_reasons.iter().all(|reason| {
+                !reason.message.contains("192.0.2.")
+                    && !reason.message.contains(".db")
+                    && !reason.message.contains("/var/")
+            }),
+            "expected redaction-safe restore messages, found: {:?}",
+            self.block_reasons
+        );
+        self
     }
 }
