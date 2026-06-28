@@ -5,7 +5,9 @@ untrusted-access SDK work stream. It is a planning and provenance aid only: no
 ePDG product policy, deployment default, attach orchestration, lawful-intercept
 business rule, charging policy, YANG model, CRD, or production-readiness claim is
 moved into the SDK by this document. The Phase 0 exit review is
-recorded in the [M0 gate readiness check](epdg-sdk-m0-gate-readiness.md).
+recorded in the [M0 gate readiness check](epdg-sdk-m0-gate-readiness.md). The
+Phase 4 P2/P3 integration closeout and downstream adapter boundary are recorded
+in the [M4 follow-up closeout](epdg-sdk-m4-closeout.md).
 
 ## Import roots and source-use rule
 

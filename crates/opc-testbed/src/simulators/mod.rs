@@ -5,11 +5,17 @@
 //! used for early scenario development and unit testing of the framework.
 
 pub mod amf;
+pub mod epc;
 pub mod fake;
 pub mod smf;
 pub mod upf;
 
 pub use amf::{AmfSimulator, AmfState};
+pub use epc::{
+    DiameterApplication, DiameterMessageView, DiameterPeerEvent, DiameterPeerSimulator,
+    DiameterPeerState, PeerMessageDirection, PgwS2bEvent, PgwS2bSimulator, PgwS2bState,
+    S2bMessageView, S2bProcedure, SdkDecodeProfile,
+};
 pub use fake::{FakeSimulator, Fidelity};
 pub use smf::{SmfSimulator, SmfState};
 pub use upf::{UpfSimulator, UpfState};
@@ -23,6 +29,8 @@ pub enum Simulator {
     Amf(AmfSimulator),
     Smf(SmfSimulator),
     Upf(UpfSimulator),
+    PgwS2b(PgwS2bSimulator),
+    DiameterPeer(DiameterPeerSimulator),
 }
 
 impl Simulator {
@@ -32,6 +40,8 @@ impl Simulator {
             Some("amf") => Ok(Simulator::Amf(AmfSimulator::new(name))),
             Some("smf") => Ok(Simulator::Smf(SmfSimulator::new(name))),
             Some("upf") => Ok(Simulator::Upf(UpfSimulator::new(name))),
+            Some("pgw-s2b") => Ok(Simulator::PgwS2b(PgwS2bSimulator::new(name))),
+            Some("diameter-peer") => Ok(Simulator::DiameterPeer(DiameterPeerSimulator::new(name))),
             Some(other) => Err(crate::TestbedError::Simulator(format!(
                 "unsupported simulator '{other}' for '{name}'"
             ))),
@@ -47,6 +57,8 @@ impl Simulator {
             Simulator::Amf(ref sim) => sim.get_state(key),
             Simulator::Smf(ref sim) => sim.get_state(key),
             Simulator::Upf(ref sim) => sim.get_state(key),
+            Simulator::PgwS2b(ref sim) => sim.get_state(key),
+            Simulator::DiameterPeer(ref sim) => sim.get_state(key),
         }
     }
 
@@ -62,6 +74,8 @@ impl Simulator {
             Simulator::Amf(ref sim) => sim.get_all_state(),
             Simulator::Smf(ref sim) => sim.get_all_state(),
             Simulator::Upf(ref sim) => sim.get_all_state(),
+            Simulator::PgwS2b(ref sim) => sim.get_all_state(),
+            Simulator::DiameterPeer(ref sim) => sim.get_all_state(),
         }
     }
 
@@ -83,6 +97,40 @@ impl Simulator {
             Simulator::Amf(ref mut sim) => sim.handle_step(step),
             Simulator::Smf(ref mut sim) => sim.handle_step(step),
             Simulator::Upf(ref mut sim) => sim.handle_step(step),
+            Simulator::PgwS2b(ref mut sim) => match step {
+                Step::PeerUnavailable { .. } | Step::DependencyTimeout { .. } => {
+                    sim.mark_peer_unavailable();
+                    Ok(())
+                }
+                Step::ProcessRestart { .. } => {
+                    sim.restart();
+                    Ok(())
+                }
+                Step::MalformedResponse { .. } => {
+                    sim.record_decode_failure("malformed S2b response injected")
+                }
+                Step::SendNgap { .. } => Err(crate::TestbedError::Simulator(
+                    "PGW S2b simulator requires SDK-decoded S2b messages; the NGAP step DSL does not carry S2b bytes".into(),
+                )),
+                _ => Ok(()),
+            },
+            Simulator::DiameterPeer(ref mut sim) => match step {
+                Step::PeerUnavailable { .. } | Step::DependencyTimeout { .. } => {
+                    sim.mark_peer_unavailable();
+                    Ok(())
+                }
+                Step::ProcessRestart { .. } => {
+                    sim.restart();
+                    Ok(())
+                }
+                Step::MalformedResponse { .. } => {
+                    sim.record_decode_failure("malformed Diameter response injected")
+                }
+                Step::SendNgap { .. } => Err(crate::TestbedError::Simulator(
+                    "Diameter peer simulator requires SDK-decoded Diameter messages; the NGAP step DSL does not carry Diameter bytes".into(),
+                )),
+                _ => Ok(()),
+            },
         }
     }
 }
