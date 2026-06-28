@@ -198,7 +198,7 @@ impl PacketCoreEvidencePack {
         }
 
         let value = serde_json::to_value(self).map_err(|e| {
-            EvidenceError::InvalidTag(format!("failed to serialize evidence pack: {e}"))
+            EvidenceError::RedactionViolation(format!("failed to serialize evidence pack: {e}"))
         })?;
         if let Some(err) = validate_value_redaction(&value, "<root>") {
             return Err(EvidenceError::RedactionViolation(err));
@@ -275,7 +275,7 @@ fn is_sha256_digest(s: &str) -> bool {
 ///   as `notes` and `payload_summary` may trip the check by design.
 /// * Key-material markers (`BEGIN`, `PRIVATE KEY`, `SECRET`, ...).
 /// * LI identifier markers (`liid`, `x1`, `x2`, `x3`).
-/// * Raw SPI values (`spi=...`).
+/// * Raw SPI values (`spi=...` or `spi ...`).
 /// * Raw IPv4/IPv6 addresses.
 pub fn has_raw_sensitive_identifier(s: &str) -> Option<&'static str> {
     let lower = s.to_ascii_lowercase();
@@ -296,7 +296,6 @@ pub fn has_raw_sensitive_identifier(s: &str) -> Option<&'static str> {
         "x1-trace",
         "x2-trace",
         "x3-trace",
-        "spi=",
     ];
     const WORD_BOUNDARY_MARKERS: &[&str] = &["supi", "gpsi", "pei", "nai"];
     for marker in SUBSTRING_MARKERS {
@@ -305,9 +304,15 @@ pub fn has_raw_sensitive_identifier(s: &str) -> Option<&'static str> {
         }
     }
     for marker in WORD_BOUNDARY_MARKERS {
-        if has_word_boundary_match(&lower, marker) && !marker_is_redacted(&lower, marker) {
+        if has_unredacted_word_boundary_marker(&lower, marker) {
             return Some("contains sensitive identifier marker");
         }
+    }
+
+    // SPI is handled separately because it commonly appears as a label followed
+    // by a value (`spi=0x...` or `spi 0x...`). Standalone `spi` is not flagged.
+    if has_unredacted_spi_value(&lower) {
+        return Some("contains sensitive identifier marker");
     }
 
     // 2. NAI-like (contains '@' between non-trivial parts).
@@ -346,16 +351,57 @@ pub fn has_raw_sensitive_identifier(s: &str) -> Option<&'static str> {
     None
 }
 
-/// Returns true when `lower` contains `marker` as a whole token, i.e. bounded
-/// by the start/end of the string or by a non-alphanumeric character.
-fn has_word_boundary_match(lower: &str, marker: &str) -> bool {
-    lower.match_indices(marker).any(|(idx, _)| {
+/// Returns true when `lower` contains an unredacted occurrence of `marker` as
+/// a whole token, i.e. bounded by the start/end of the string or by a
+/// non-alphanumeric character, and not inside a redaction placeholder.
+fn has_unredacted_word_boundary_marker(lower: &str, marker: &str) -> bool {
+    let ranges = redaction_placeholder_ranges(lower);
+    for (idx, matched) in lower.match_indices(marker) {
         let before = idx == 0 || !lower.as_bytes()[idx - 1].is_ascii_alphanumeric();
-        let after_end = idx + marker.len();
+        let after_end = idx + matched.len();
         let after =
             after_end == lower.len() || !lower.as_bytes()[after_end].is_ascii_alphanumeric();
-        before && after
-    })
+        if before && after && !marker_occurrence_is_redacted(lower, matched, idx, &ranges) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true when `lower` contains an SPI token followed by a separator and
+/// a raw (non-placeholder) value. Standalone `spi` and SPI inside or followed
+/// by a redaction placeholder are not flagged.
+fn has_unredacted_spi_value(lower: &str) -> bool {
+    let ranges = redaction_placeholder_ranges(lower);
+    for (idx, _) in lower.match_indices("spi") {
+        let before = idx == 0 || !lower.as_bytes()[idx - 1].is_ascii_alphanumeric();
+        let after_end = idx + 3;
+        let after =
+            after_end == lower.len() || !lower.as_bytes()[after_end].is_ascii_alphanumeric();
+        if !before || !after {
+            continue;
+        }
+        // Inside a redaction placeholder anywhere in the string.
+        if ranges
+            .iter()
+            .any(|&(pstart, pend)| idx >= pstart && after_end <= pend)
+        {
+            continue;
+        }
+        let rest = &lower[after_end..].trim_start();
+        // Strip an optional separator (=, :, or -).
+        let rest = rest
+            .strip_prefix('=')
+            .or_else(|| rest.strip_prefix(':'))
+            .or_else(|| rest.strip_prefix('-'))
+            .unwrap_or(rest)
+            .trim_start();
+        if rest.is_empty() || starts_with_redaction_placeholder(rest) {
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 /// Returns the byte ranges of all redaction placeholders in `lower`.
@@ -455,9 +501,6 @@ fn looks_like_ipv4(token: &str) -> bool {
         if !o.chars().all(|c| c.is_ascii_digit()) {
             return false;
         }
-        if o.len() > 1 && o.starts_with('0') {
-            return false;
-        }
         o.parse::<u8>().is_ok()
     })
 }
@@ -488,18 +531,24 @@ fn looks_like_ipv6(token: &str) -> bool {
             return false;
         }
         let explicit_groups: Vec<&str> = token.split(':').filter(|g| !g.is_empty()).collect();
-        // Require at least two explicit groups to avoid matching tokens such as
-        // `std::` in ordinary prose.
-        if explicit_groups.len() < 2 {
-            return false;
-        }
         // :: replaces at least one group, so explicit groups must be <= 7.
         if explicit_groups.len() > 7 {
             return false;
         }
+
+        // Two or more explicit groups are unambiguously IPv6-shaped.
+        if explicit_groups.len() >= 2 {
+            return explicit_groups.iter().all(|g| {
+                !g.is_empty() && g.len() <= 4 && g.chars().all(|c| c.is_ascii_hexdigit())
+            });
+        }
+
+        // For 0 or 1 explicit groups, require the explicit groups to be purely
+        // decimal digits. This catches `::1`, `::`, and `1::` while avoiding
+        // C++ tokens such as `std::`.
         return explicit_groups
             .iter()
-            .all(|g| !g.is_empty() && g.len() <= 4 && g.chars().all(|c| c.is_ascii_hexdigit()));
+            .all(|g| !g.is_empty() && g.len() <= 4 && g.chars().all(|c| c.is_ascii_digit()));
     }
 
     // Uncompressed form: exactly 8 groups separated by 7 colons.
@@ -633,7 +682,10 @@ mod tests {
         assert!(has_raw_sensitive_identifier("no sensitive content").is_none());
         assert!(has_raw_sensitive_identifier("<spi-redacted>").is_none());
         assert!(has_raw_sensitive_identifier("spi=<spi-redacted> mode=tunnel").is_none());
+        assert!(has_raw_sensitive_identifier("spi <spi-redacted> mode=tunnel").is_none());
         assert!(has_raw_sensitive_identifier("imsi=<imsi-redacted>").is_none());
+        // A short marker inside a placeholder must not flag the surrounding word.
+        assert!(has_raw_sensitive_identifier("snail <nai-redacted>").is_none());
     }
 
     #[test]
@@ -641,6 +693,10 @@ mod tests {
         assert!(has_raw_sensitive_identifier("spi=12345678").is_some());
         assert!(has_raw_sensitive_identifier("spi=0x12345678").is_some());
         assert!(has_raw_sensitive_identifier("xfrm spi=0xdeadbeef").is_some());
+        assert!(has_raw_sensitive_identifier("proto esp spi 0xdeadbeef").is_some());
+        // Standalone SPI is just a label, not a sensitive value.
+        assert!(has_raw_sensitive_identifier("spi").is_none());
+        assert!(has_raw_sensitive_identifier("proto esp spi").is_none());
     }
 
     #[test]
@@ -738,6 +794,9 @@ mod tests {
         assert!(has_raw_sensitive_identifier("10.0.0.1").is_some());
         // Version-like numbers are flagged by design (fail-closed).
         assert!(has_raw_sensitive_identifier("1.2.3.4").is_some());
+        // Leading zeros are flagged as likely raw addresses.
+        assert!(has_raw_sensitive_identifier("192.168.001.1").is_some());
+        assert!(has_raw_sensitive_identifier("10.0.0.01").is_some());
         // Invalid IPv4 shapes are not flagged.
         assert!(has_raw_sensitive_identifier("1.2.3").is_none());
         assert!(has_raw_sensitive_identifier("256.0.0.1").is_none());
@@ -748,6 +807,9 @@ mod tests {
         assert!(has_raw_sensitive_identifier("2001:db8::1").is_some());
         assert!(has_raw_sensitive_identifier("fe80::1:2:3:4:5:6").is_some());
         assert!(has_raw_sensitive_identifier("2001:0db8:0000:0000:0000:ff00:0042:8329").is_some());
+        // Loopback / unspecified compressed forms are caught.
+        assert!(has_raw_sensitive_identifier("::1").is_some());
+        assert!(has_raw_sensitive_identifier("::").is_some());
         // MAC addresses and ordinary time/ratio text are not flagged.
         assert!(has_raw_sensitive_identifier("00:1a:2b:3c:4d:5e").is_none());
         assert!(has_raw_sensitive_identifier("12:34:56").is_none());

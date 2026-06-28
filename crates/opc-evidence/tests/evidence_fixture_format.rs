@@ -179,3 +179,27 @@ fn format_validator_accepts_packet_core_timestamp_fields() {
     let good = r#"{"generated_at": "2026-05-19T17:25:13Z", "captured_at": "2026-05-19T17:25:13+00:00", "timestamp": "2026-05-19T17:25:13.123Z"}"#;
     assert!(validate_fixture_formats(good).is_ok());
 }
+
+#[test]
+fn format_validator_rejects_invalid_generated_at() {
+    let bad = r#"{"generated_at": "2026-05-19T17:25:13"}"#;
+    let err = validate_fixture_formats(bad).unwrap_err();
+    assert!(err.contains("generated_at"));
+    assert!(err.contains("date-time"));
+}
+
+#[test]
+fn format_validator_rejects_invalid_captured_at() {
+    let bad = r#"{"captured_at": "not-a-datetime"}"#;
+    let err = validate_fixture_formats(bad).unwrap_err();
+    assert!(err.contains("captured_at"));
+    assert!(err.contains("date-time"));
+}
+
+#[test]
+fn format_validator_rejects_invalid_timestamp() {
+    let bad = r#"{"timestamp": "2026-05-19 17:25:13Z"}"#;
+    let err = validate_fixture_formats(bad).unwrap_err();
+    assert!(err.contains("timestamp"));
+    assert!(err.contains("date-time"));
+}
