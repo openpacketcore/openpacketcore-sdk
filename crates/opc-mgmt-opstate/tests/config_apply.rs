@@ -1,5 +1,8 @@
-use opc_config_model::{ApplyPlan, ApplyPlanChange, ChangeImpact, ChangeImpactClass, YangPath};
-use opc_mgmt_opstate::{ConfigApplyPlanState, ConfigWorkflowCompletion};
+use opc_config_model::{
+    ApplyPlan, ApplyPlanChange, ApplyPlanWarning, ChangeImpact, ChangeImpactClass, CommitError,
+    CommitErrorCode, CommitResult, CommitStatus, YangPath,
+};
+use opc_mgmt_opstate::{ConfigApplyPlanState, ConfigCandidateStatus, ConfigWorkflowCompletion};
 use opc_types::{ConfigVersion, TxId};
 
 fn plan(class: ChangeImpactClass, reason_code: &str) -> ApplyPlan {
@@ -58,6 +61,7 @@ fn empty_state_omits_unknown_fields() {
     assert!(json.get("active-tx-id").is_none());
     assert!(json.get("traffic-block-reason-code").is_none());
     assert!(json.get("active-revision-label").is_none());
+    assert!(json.get("candidate-status").is_none());
     assert!(json.get("workflow-completion").is_none());
 }
 
@@ -210,4 +214,184 @@ fn all_supplied_workflow_completion_keys_must_match() {
     assert_eq!(json["traffic-blocked-until-workflow"], true);
     assert_eq!(json["traffic-block-reason-code"], "drain_required");
     assert!(json.get("workflow-completion").is_none());
+}
+
+#[test]
+fn pending_candidate_status_projects_warning_metadata_without_messages() {
+    let mut candidate_plan = plan(ChangeImpactClass::Warm, "hostname_changed");
+    candidate_plan.warnings.push(ApplyPlanWarning {
+        code: " operator_review ".to_string(),
+        path: Some(YangPath::new("/system/hostname").expect("path")),
+        message: "raw warning body /Users/operator/private.yaml".to_string(),
+    });
+
+    let state = ConfigApplyPlanState::new().with_pending_candidate(
+        ConfigCandidateStatus::pending_revision_label(" rev-candidate ")
+            .with_apply_plan_metadata(&candidate_plan),
+    );
+    let json = state.to_json_value();
+
+    assert_eq!(json["candidate-status"]["state"], "pending");
+    assert_eq!(json["candidate-status"]["revision-label"], "rev-candidate");
+    assert_eq!(json["candidate-status"]["warning-count"], 1);
+    assert_eq!(
+        json["candidate-status"]["warning-codes"][0],
+        "operator_review"
+    );
+    assert_eq!(json["candidate-status"]["apply-plan-class"], "warm");
+    assert!(json["candidate-status"].get("error-codes").is_none());
+    assert!(!json["candidate-status"]
+        .to_string()
+        .contains("/Users/operator/private.yaml"));
+}
+
+#[test]
+fn rejected_candidate_status_projects_redaction_safe_commit_metadata() {
+    let mut rejected_plan = plan(ChangeImpactClass::ForbiddenLive, "requires_maintenance");
+    rejected_plan.warnings.push(ApplyPlanWarning {
+        code: "operator_review".to_string(),
+        path: None,
+        message: "warning body should stay out".to_string(),
+    });
+    rejected_plan = rejected_plan.normalize();
+    let error = CommitError::apply_plan_rejected(rejected_plan.clone());
+
+    let state = ConfigApplyPlanState::new()
+        .with_rejected_candidate_error(
+            ConfigCandidateStatus::pending_revision_label("rev-bad"),
+            &error,
+        )
+        .with_last_rejected_apply_plan(rejected_plan);
+    let json = state.to_json_value();
+
+    assert_eq!(json["candidate-status"]["state"], "rejected");
+    assert_eq!(json["candidate-status"]["revision-label"], "rev-bad");
+    assert_eq!(
+        json["candidate-status"]["rejection-code"],
+        "apply_plan_rejected"
+    );
+    assert_eq!(
+        json["candidate-status"]["management-status"],
+        "FAILED_PRECONDITION"
+    );
+    assert_eq!(
+        json["candidate-status"]["netconf-error-type"],
+        "application"
+    );
+    assert_eq!(
+        json["candidate-status"]["netconf-error-tag"],
+        "operation-failed"
+    );
+    assert_eq!(json["candidate-status"]["warning-count"], 1);
+    assert_eq!(
+        json["candidate-status"]["warning-codes"][0],
+        "operator_review"
+    );
+    assert_eq!(
+        json["candidate-status"]["apply-plan-class"],
+        "forbidden-live"
+    );
+    assert_eq!(
+        json["candidate-status"]["error-codes"][0],
+        "apply_plan_rejected"
+    );
+    assert_eq!(
+        json["candidate-status"]["error-codes"][1],
+        "forbidden_live_requires_maintenance_workflow"
+    );
+    assert_eq!(json["last-rejected-apply-plan"]["class"], "forbidden-live");
+}
+
+#[test]
+fn candidate_rejection_status_does_not_copy_error_message() {
+    let error = CommitError::new(
+        CommitErrorCode::SemanticValidationFailed,
+        "raw /Users/operator/private.yaml should stay out",
+    );
+
+    let state = ConfigApplyPlanState::new().with_rejected_candidate_error(
+        ConfigCandidateStatus::pending_revision_label("rev-bad"),
+        &error,
+    );
+    let json = state.to_json_value();
+
+    assert_eq!(
+        json["candidate-status"]["error-codes"][0],
+        "semantic_validation_failed"
+    );
+    assert_eq!(
+        json["candidate-status"]["management-status"],
+        "INVALID_ARGUMENT"
+    );
+    assert!(!json["candidate-status"]
+        .to_string()
+        .contains("/Users/operator/private.yaml"));
+}
+
+#[test]
+fn commit_result_with_new_version_clears_rejected_candidate_metadata() {
+    let rejected = CommitError::new(
+        CommitErrorCode::SemanticValidationFailed,
+        "semantic failure",
+    );
+    let tx_id = TxId::new();
+    let state = ConfigApplyPlanState::new()
+        .with_rejected_candidate_error(
+            ConfigCandidateStatus::pending_revision_label("rev-bad"),
+            &rejected,
+        )
+        .with_last_rejected_apply_plan(plan(ChangeImpactClass::ForbiddenLive, "bad_candidate"))
+        .with_commit_result(&CommitResult {
+            tx_id,
+            base_version: ConfigVersion::new(3),
+            new_version: Some(ConfigVersion::new(4)),
+            status: CommitStatus::Committed,
+            changed_paths: Vec::new(),
+            apply_plan: Some(plan(ChangeImpactClass::Hot, "config_changed")),
+        });
+
+    let json = state.to_json_value();
+
+    assert_eq!(json["active-config-version"], 4);
+    assert_eq!(json["active-tx-id"], tx_id.to_string());
+    assert!(json.get("candidate-status").is_none());
+    assert!(json.get("last-rejected-apply-plan").is_none());
+    assert_eq!(json["last-accepted-apply-plan"]["class"], "hot");
+}
+
+#[test]
+fn validate_only_result_does_not_mutate_running_status() {
+    let state = ConfigApplyPlanState::new()
+        .with_active_config(Some(ConfigVersion::new(3)), Some(TxId::new()))
+        .with_pending_candidate(ConfigCandidateStatus::pending_revision_label("rev-next"))
+        .with_commit_result(&CommitResult {
+            tx_id: TxId::new(),
+            base_version: ConfigVersion::new(3),
+            new_version: None,
+            status: CommitStatus::Validated,
+            changed_paths: Vec::new(),
+            apply_plan: Some(plan(ChangeImpactClass::Warm, "validated_only")),
+        });
+
+    let json = state.to_json_value();
+
+    assert_eq!(json["active-config-version"], 3);
+    assert_eq!(json["candidate-status"]["state"], "pending");
+    assert_eq!(json["candidate-status"]["revision-label"], "rev-next");
+    assert!(json.get("last-accepted-apply-plan").is_none());
+}
+
+#[test]
+fn unkeyed_rejection_is_not_reported_as_candidate_status() {
+    let error = CommitError::new(
+        CommitErrorCode::RollbackUnavailable,
+        "rollback is unavailable",
+    );
+
+    let state = ConfigApplyPlanState::new()
+        .with_rejected_candidate(ConfigCandidateStatus::default().with_rejection(&error));
+
+    let json = state.to_json_value();
+
+    assert!(json.get("candidate-status").is_none());
 }

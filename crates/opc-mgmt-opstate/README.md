@@ -30,4 +30,6 @@ active traffic block reason derived from an admitted drain/restart plan. When an
 external drain/restart workflow completes, `ConfigWorkflowCompletion` records a
 matching config version, transaction id, or product revision label so clients can
 distinguish an apply plan that never required workflow from one whose required
-workflow has completed.
+workflow has completed. `ConfigCandidateStatus` carries pending/rejected
+candidate identity, warning counts/codes, and stable commit rejection metadata
+without raw candidate payloads or free-form error messages.

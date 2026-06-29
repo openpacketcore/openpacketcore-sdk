@@ -1,6 +1,9 @@
 //! Generic operational-state projection helpers for config apply plans.
 
-use opc_config_model::{ApplyPlan, ChangeImpactClass, ConfigWorkflowRequirement, YangPath};
+use opc_config_model::{
+    ApplyPlan, ChangeImpactClass, CommitError, CommitResult, ConfigWorkflowRequirement, YangPath,
+};
+use opc_mgmt_errors::{commit_error_to_netconf, commit_error_to_status};
 use opc_types::{ConfigVersion, TxId};
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +29,9 @@ pub struct ConfigApplyPlanState {
     /// transaction identity is not enough for the product's status model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_revision_label: Option<String>,
+    /// Pending or rejected candidate metadata, if the product has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_status: Option<ConfigCandidateStatus>,
     /// Completed workflow metadata for the active running config, if an
     /// accepted workflow-required plan has completed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -36,6 +42,204 @@ pub struct ConfigApplyPlanState {
     /// Machine-readable reason for the active traffic block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_block_reason_code: Option<String>,
+}
+
+/// Product-neutral state for candidate config metadata.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigCandidateState {
+    /// Candidate exists but has not replaced running config.
+    #[default]
+    Pending,
+    /// Candidate was rejected before replacing running config.
+    Rejected,
+}
+
+/// Redaction-safe metadata for a pending or rejected config candidate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ConfigCandidateStatus {
+    /// Candidate state.
+    pub state: ConfigCandidateState,
+    /// Candidate base or target running config version, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_version: Option<ConfigVersion>,
+    /// Candidate transaction id, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_id: Option<TxId>,
+    /// Product-supplied candidate revision label, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_label: Option<String>,
+    /// Count of apply-plan warnings without copying warning messages.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub warning_count: usize,
+    /// Stable warning codes from the candidate apply plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warning_codes: Vec<String>,
+    /// Stable error codes from the commit rejection and apply plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub error_codes: Vec<String>,
+    /// Primary SDK commit rejection code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_code: Option<String>,
+    /// gNMI-aligned management status for the rejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub management_status: Option<String>,
+    /// NETCONF `<rpc-error>` error-type for the rejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub netconf_error_type: Option<String>,
+    /// NETCONF `<rpc-error>` error-tag for the rejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub netconf_error_tag: Option<String>,
+    /// Strongest impact class from the rejected or validated apply plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_plan_class: Option<ChangeImpactClass>,
+}
+
+impl ConfigCandidateStatus {
+    /// Build pending candidate metadata keyed by running config version.
+    pub const fn pending_config_version(config_version: ConfigVersion) -> Self {
+        Self {
+            state: ConfigCandidateState::Pending,
+            config_version: Some(config_version),
+            tx_id: None,
+            revision_label: None,
+            warning_count: 0,
+            warning_codes: Vec::new(),
+            error_codes: Vec::new(),
+            rejection_code: None,
+            management_status: None,
+            netconf_error_type: None,
+            netconf_error_tag: None,
+            apply_plan_class: None,
+        }
+    }
+
+    /// Build pending candidate metadata keyed by candidate transaction id.
+    pub const fn pending_tx_id(tx_id: TxId) -> Self {
+        Self {
+            state: ConfigCandidateState::Pending,
+            config_version: None,
+            tx_id: Some(tx_id),
+            revision_label: None,
+            warning_count: 0,
+            warning_codes: Vec::new(),
+            error_codes: Vec::new(),
+            rejection_code: None,
+            management_status: None,
+            netconf_error_type: None,
+            netconf_error_tag: None,
+            apply_plan_class: None,
+        }
+    }
+
+    /// Build pending candidate metadata keyed by product-supplied revision label.
+    pub fn pending_revision_label(revision_label: impl Into<String>) -> Self {
+        Self {
+            revision_label: normalize_revision_label(revision_label),
+            ..Self::default()
+        }
+    }
+
+    /// Build rejected candidate metadata keyed by running config version.
+    pub fn rejected_config_version(config_version: ConfigVersion, error: &CommitError) -> Self {
+        Self::pending_config_version(config_version).with_rejection(error)
+    }
+
+    /// Build rejected candidate metadata keyed by candidate transaction id.
+    pub fn rejected_tx_id(tx_id: TxId, error: &CommitError) -> Self {
+        Self::pending_tx_id(tx_id).with_rejection(error)
+    }
+
+    /// Build rejected candidate metadata keyed by product-supplied revision label.
+    pub fn rejected_revision_label(revision_label: impl Into<String>, error: &CommitError) -> Self {
+        Self::pending_revision_label(revision_label).with_rejection(error)
+    }
+
+    /// Add a running config version to this candidate identity.
+    #[must_use]
+    pub const fn with_config_version(mut self, config_version: ConfigVersion) -> Self {
+        self.config_version = Some(config_version);
+        self
+    }
+
+    /// Add a candidate transaction id to this candidate identity.
+    #[must_use]
+    pub const fn with_tx_id(mut self, tx_id: TxId) -> Self {
+        self.tx_id = Some(tx_id);
+        self
+    }
+
+    /// Add a product-supplied revision label to this candidate identity.
+    #[must_use]
+    pub fn with_revision_label(mut self, revision_label: impl Into<String>) -> Self {
+        self.revision_label = normalize_revision_label(revision_label);
+        self
+    }
+
+    /// Add warning metadata from an apply plan without copying warning messages.
+    #[must_use]
+    pub fn with_apply_plan_metadata(mut self, plan: &ApplyPlan) -> Self {
+        self.warning_count = plan.warnings.len();
+        self.warning_codes = plan
+            .warnings
+            .iter()
+            .filter_map(|warning| normalize_status_code(&warning.code))
+            .collect();
+        normalize_status_codes(&mut self.warning_codes);
+        self.apply_plan_class = Some(plan.strongest_class());
+        self
+    }
+
+    /// Add rejection metadata from an SDK commit error without copying the error
+    /// message or raw config payload.
+    #[must_use]
+    pub fn with_rejection(mut self, error: &CommitError) -> Self {
+        self.state = ConfigCandidateState::Rejected;
+        let rejection_code = error.code.as_str();
+        self.rejection_code = Some(rejection_code.to_string());
+        self.error_codes.push(rejection_code.to_string());
+
+        let management_status = commit_error_to_status(error.code);
+        self.management_status = Some(management_status.as_str().to_string());
+
+        let netconf_error = commit_error_to_netconf(error.code);
+        self.netconf_error_type = Some(netconf_error.error_type.as_str().to_string());
+        self.netconf_error_tag = Some(netconf_error.tag.as_str().to_string());
+
+        if let Some(plan) = error.apply_plan.as_deref() {
+            self = self.with_apply_plan_metadata(plan);
+            self.error_codes.extend(
+                plan.hard_errors
+                    .iter()
+                    .filter_map(|hard_error| normalize_status_code(&hard_error.code)),
+            );
+        }
+
+        normalize_status_codes(&mut self.error_codes);
+        self
+    }
+
+    /// Whether this candidate carries any usable identity key.
+    pub const fn has_identity(&self) -> bool {
+        self.config_version.is_some() || self.tx_id.is_some() || self.revision_label.is_some()
+    }
+
+    fn into_pending(mut self) -> Self {
+        self.state = ConfigCandidateState::Pending;
+        self.error_codes.clear();
+        self.rejection_code = None;
+        self.management_status = None;
+        self.netconf_error_type = None;
+        self.netconf_error_tag = None;
+        self
+    }
+
+    fn into_rejected(mut self) -> Self {
+        self.state = ConfigCandidateState::Rejected;
+        normalize_status_codes(&mut self.error_codes);
+        self
+    }
 }
 
 /// Completion identity and metadata for an accepted config workflow.
@@ -165,6 +369,61 @@ impl ConfigApplyPlanState {
         self
     }
 
+    /// Applies a successful SDK commit result to this projection.
+    ///
+    /// Results that publish a new running config update active version/tx-id,
+    /// clear rejected candidate metadata, and attach the accepted apply plan
+    /// when one is available. Validate-only results intentionally leave running
+    /// status unchanged.
+    pub fn with_commit_result(mut self, result: &CommitResult) -> Self {
+        let Some(new_version) = result.new_version else {
+            return self;
+        };
+
+        self.active_config_version = Some(new_version);
+        self.active_tx_id = Some(result.tx_id);
+        self.candidate_status = None;
+        self.last_rejected_apply_plan = None;
+
+        if let Some(plan) = result.apply_plan.clone() {
+            self = self.with_last_accepted_apply_plan(plan);
+        }
+
+        self
+    }
+
+    /// Attaches pending candidate metadata. Unkeyed candidate metadata is
+    /// ignored so rollback/control-action errors are not mistaken for app
+    /// candidate status.
+    pub fn with_pending_candidate(mut self, candidate: ConfigCandidateStatus) -> Self {
+        let candidate = candidate.into_pending();
+        if candidate.has_identity() {
+            self.candidate_status = Some(candidate);
+        }
+        self
+    }
+
+    /// Attaches rejected candidate metadata. Unkeyed candidate metadata is
+    /// ignored so rollback/control-action errors are not mistaken for app
+    /// candidate status.
+    pub fn with_rejected_candidate(mut self, candidate: ConfigCandidateStatus) -> Self {
+        let candidate = candidate.into_rejected();
+        if candidate.has_identity() {
+            self.candidate_status = Some(candidate);
+        }
+        self
+    }
+
+    /// Attaches rejected candidate metadata from a candidate identity and SDK
+    /// commit error.
+    pub fn with_rejected_candidate_error(
+        self,
+        candidate: ConfigCandidateStatus,
+        error: &CommitError,
+    ) -> Self {
+        self.with_rejected_candidate(candidate.with_rejection(error))
+    }
+
     /// Records completion for an accepted external workflow.
     ///
     /// Completion only clears the active traffic block when the supplied
@@ -272,4 +531,28 @@ fn normalize_revision_label(revision_label: impl Into<String>) -> Option<String>
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn normalize_status_code(code: &str) -> Option<String> {
+    let trimmed = code.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn normalize_status_codes(codes: &mut Vec<String>) {
+    codes.retain(|code| !code.trim().is_empty());
+    for code in codes.iter_mut() {
+        if code.len() != code.trim().len() {
+            *code = code.trim().to_string();
+        }
+    }
+    codes.sort();
+    codes.dedup();
+}
+
+const fn is_zero(value: &usize) -> bool {
+    *value == 0
 }

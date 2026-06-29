@@ -2155,6 +2155,7 @@ name = "opc-mgmt-opstate"
 version = "0.2.0"
 dependencies = [
  "opc-config-model",
+ "opc-mgmt-errors",
  "opc-types",
  "serde",
  "serde_json",
