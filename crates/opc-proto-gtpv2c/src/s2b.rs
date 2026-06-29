@@ -20,9 +20,10 @@ use opc_protocol::{
 use crate::header::Header;
 pub use crate::header::MessageType;
 use crate::ie::{
-    decode_typed_ie_sequence, TypedIe, TypedIeValue, IE_TYPE_APN, IE_TYPE_BEARER_CONTEXT,
-    IE_TYPE_CAUSE, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_PAA, IE_TYPE_PDN_TYPE,
-    IE_TYPE_RAT_TYPE, IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE, IE_TYPE_SERVING_NETWORK,
+    decode_typed_ie_sequence, CauseValue, EpsBearerId, FullyQualifiedTeid, TypedIe, TypedIeValue,
+    IE_TYPE_APN, IE_TYPE_BEARER_CONTEXT, IE_TYPE_CAUSE, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI,
+    IE_TYPE_PAA, IE_TYPE_PDN_TYPE, IE_TYPE_RAT_TYPE, IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE,
+    IE_TYPE_SERVING_NETWORK,
 };
 use crate::Message;
 
@@ -55,6 +56,99 @@ pub const UPDATE_BEARER_REQUEST: u8 = 97;
 
 /// Update Bearer Response message type used by the S2b Update Session view.
 pub const UPDATE_BEARER_RESPONSE: u8 = 98;
+
+/// Accepted Create Session Response projection.
+///
+/// This projection is intentionally strict: it is only returned for Cause 16
+/// (`RequestAccepted`) and includes the accepted-bearer fields that products
+/// need to derive an established bearer context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSessionAcceptedResponseSummary {
+    /// TEID carried in the Create Session Response common header.
+    pub response_teid: u32,
+    /// GTPv2-C sequence number from the Create Session Response header.
+    pub sequence_number: u32,
+    /// Cause value from the Cause IE.
+    pub cause: CauseValue,
+    /// Top-level Sender F-TEID at instance 0.
+    pub sender_f_teid: FullyQualifiedTeid,
+    /// Linked bearer EBI from the first Bearer Context IE.
+    pub bearer_ebi: EpsBearerId,
+}
+
+/// Rejected Create Session Response projection.
+///
+/// Rejected responses do not require accepted-bearer-only fields such as
+/// Sender F-TEID or Bearer Context EBI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSessionRejectedResponseSummary {
+    /// TEID carried in the Create Session Response common header.
+    pub response_teid: u32,
+    /// GTPv2-C sequence number from the Create Session Response header.
+    pub sequence_number: u32,
+    /// Cause value from the Cause IE.
+    pub cause: CauseValue,
+}
+
+/// Create Session Response projection split by bearer-establishment outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateSessionResponseSummary {
+    /// Cause 16 response with accepted-bearer fields present.
+    Accepted(CreateSessionAcceptedResponseSummary),
+    /// Non-Cause-16 response with Cause, response TEID, and sequence only.
+    Rejected(CreateSessionRejectedResponseSummary),
+}
+
+/// Stable redaction-safe error returned while projecting a Create Session Response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateSessionResponseSummaryError {
+    /// Message bytes could not be decoded into a single typed GTPv2-C response.
+    MalformedResponse,
+    /// Decoded message was not an S2b Create Session Response.
+    NotCreateSessionResponse,
+    /// Create Session Response did not include a Cause IE.
+    MissingCause,
+    /// Create Session Response did not carry a response-header TEID.
+    MissingResponseTeid,
+    /// Accepted Create Session Response did not include Sender F-TEID instance 0.
+    AcceptedResponseMissingSenderFTeid,
+    /// Accepted Create Session Response did not include a Bearer Context IE.
+    AcceptedResponseMissingBearerContext,
+    /// Accepted Create Session Response Bearer Context did not include an EBI IE.
+    AcceptedResponseMissingBearerEbi,
+}
+
+impl CreateSessionResponseSummaryError {
+    /// Return the stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MalformedResponse => "s2b_create_session_response_malformed",
+            Self::NotCreateSessionResponse => {
+                "s2b_create_session_response_not_create_session_response"
+            }
+            Self::MissingCause => "s2b_create_session_response_missing_cause",
+            Self::MissingResponseTeid => "s2b_create_session_response_missing_teid",
+            Self::AcceptedResponseMissingSenderFTeid => {
+                "s2b_create_session_response_missing_sender_f_teid"
+            }
+            Self::AcceptedResponseMissingBearerContext => {
+                "s2b_create_session_response_missing_bearer_context"
+            }
+            Self::AcceptedResponseMissingBearerEbi => {
+                "s2b_create_session_response_missing_bearer_ebi"
+            }
+        }
+    }
+}
+
+impl fmt::Display for CreateSessionResponseSummaryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for CreateSessionResponseSummaryError {}
 
 fn spec_ref() -> SpecRef {
     SpecRef::new("3gpp", "TS29274", "S2b")
@@ -192,6 +286,19 @@ impl<'a> S2bProcedureMessage<'a> {
     /// Return `true` if a top-level IE with `ie_type` is present.
     pub fn has_ie(&self, ie_type: u8) -> bool {
         contains_ie(&self.ies, ie_type)
+    }
+
+    /// Project this view as an accepted or rejected Create Session Response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CreateSessionResponseSummaryError`] when the view is not a
+    /// Create Session Response, lacks Cause/response TEID, or represents an
+    /// accepted response without accepted-bearer fields.
+    pub fn create_session_response_summary(
+        &self,
+    ) -> Result<CreateSessionResponseSummary, CreateSessionResponseSummaryError> {
+        project_create_session_response(self)
     }
 
     fn encoded_raw_ies(&self, ctx: EncodeContext) -> Result<BytesMut, EncodeError> {
@@ -414,6 +521,22 @@ impl<'a> S2bMessage<'a> {
         }
     }
 
+    /// Project this message as an accepted or rejected Create Session Response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CreateSessionResponseSummaryError`] when this is not a Create
+    /// Session Response, lacks Cause/response TEID, or represents an accepted
+    /// response without accepted-bearer fields.
+    pub fn create_session_response_summary(
+        &self,
+    ) -> Result<CreateSessionResponseSummary, CreateSessionResponseSummaryError> {
+        let Self::CreateSessionResponse(view) = self else {
+            return Err(CreateSessionResponseSummaryError::NotCreateSessionResponse);
+        };
+        view.create_session_response_summary()
+    }
+
     /// Return this message's typed GTPv2-C message type, including unknown raw fallbacks.
     pub fn message_type(&self) -> MessageType {
         match self {
@@ -430,6 +553,31 @@ impl<'a> S2bMessage<'a> {
             Self::Raw(message) => message.message_type(),
         }
     }
+}
+
+/// Decode and project one S2b Create Session Response datagram.
+///
+/// This helper preserves decode limits from `ctx` but performs the final
+/// Create Session Response checks through [`CreateSessionResponseSummaryError`]
+/// so callers receive stable error codes for missing Cause, missing response
+/// TEID, and accepted responses with incomplete accepted-bearer fields.
+///
+/// # Errors
+///
+/// Returns [`CreateSessionResponseSummaryError`] when bytes are malformed,
+/// contain trailing data after the message, decode to another message type, or
+/// fail Create Session Response projection.
+pub fn decode_create_session_response_summary(
+    input: &[u8],
+    ctx: DecodeContext,
+) -> Result<CreateSessionResponseSummary, CreateSessionResponseSummaryError> {
+    let projection_ctx = create_session_response_projection_context(ctx);
+    let (tail, message) = S2bMessage::decode(input, projection_ctx)
+        .map_err(|_| CreateSessionResponseSummaryError::MalformedResponse)?;
+    if !tail.is_empty() {
+        return Err(CreateSessionResponseSummaryError::MalformedResponse);
+    }
+    message.create_session_response_summary()
 }
 
 impl<'a> BorrowDecode<'a> for S2bMessage<'a> {
@@ -476,6 +624,13 @@ impl Encode for S2bMessage<'_> {
     }
 }
 
+fn create_session_response_projection_context(mut ctx: DecodeContext) -> DecodeContext {
+    if ctx.validation_level == ValidationLevel::ProcedureAware {
+        ctx.validation_level = ValidationLevel::Strict;
+    }
+    ctx
+}
+
 fn contains_ie(ies: &[TypedIe<'_>], ie_type: u8) -> bool {
     ies.iter().any(|ie| ie.ie_type() == ie_type)
 }
@@ -490,6 +645,90 @@ fn contains_bearer_context_with_ebi(ies: &[TypedIe<'_>]) -> bool {
         TypedIeValue::BearerContext(context) => contains_ie(&context.members, IE_TYPE_EBI),
         _ => false,
     })
+}
+
+fn find_cause_value(ies: &[TypedIe<'_>]) -> Option<CauseValue> {
+    ies.iter().find_map(|ie| match &ie.value {
+        TypedIeValue::Cause(cause) => Some(cause.value),
+        _ => None,
+    })
+}
+
+fn find_sender_f_teid(ies: &[TypedIe<'_>]) -> Option<FullyQualifiedTeid> {
+    ies.iter().find_map(|ie| match &ie.value {
+        TypedIeValue::FullyQualifiedTeid(f_teid)
+            if ie.ie_type() == IE_TYPE_F_TEID && ie.instance == 0 =>
+        {
+            Some(f_teid.clone())
+        }
+        _ => None,
+    })
+}
+
+fn find_bearer_context_ebi(
+    ies: &[TypedIe<'_>],
+) -> Result<EpsBearerId, CreateSessionResponseSummaryError> {
+    let Some(context) = ies.iter().find_map(|ie| match &ie.value {
+        TypedIeValue::BearerContext(context) if ie.ie_type() == IE_TYPE_BEARER_CONTEXT => {
+            Some(context)
+        }
+        _ => None,
+    }) else {
+        return Err(CreateSessionResponseSummaryError::AcceptedResponseMissingBearerContext);
+    };
+
+    context
+        .members
+        .iter()
+        .find_map(|ie| match &ie.value {
+            TypedIeValue::EpsBearerId(ebi) if ie.ie_type() == IE_TYPE_EBI => Some(*ebi),
+            _ => None,
+        })
+        .ok_or(CreateSessionResponseSummaryError::AcceptedResponseMissingBearerEbi)
+}
+
+fn is_accepted_create_session_cause(cause: CauseValue) -> bool {
+    cause == CauseValue::RequestAccepted
+}
+
+fn project_create_session_response(
+    view: &S2bProcedureMessage<'_>,
+) -> Result<CreateSessionResponseSummary, CreateSessionResponseSummaryError> {
+    if view.procedure != Procedure::CreateSession || view.direction != MessageDirection::Response {
+        return Err(CreateSessionResponseSummaryError::NotCreateSessionResponse);
+    }
+
+    let response_teid = view
+        .header
+        .teid
+        .ok_or(CreateSessionResponseSummaryError::MissingResponseTeid)?;
+    let sequence_number = view.header.sequence_number;
+    let cause =
+        find_cause_value(&view.ies).ok_or(CreateSessionResponseSummaryError::MissingCause)?;
+
+    if is_accepted_create_session_cause(cause) {
+        let sender_f_teid = find_sender_f_teid(&view.ies)
+            .ok_or(CreateSessionResponseSummaryError::AcceptedResponseMissingSenderFTeid)?;
+        let bearer_ebi = find_bearer_context_ebi(&view.ies)?;
+
+        Ok(CreateSessionResponseSummary::Accepted(
+            CreateSessionAcceptedResponseSummary {
+                response_teid,
+                sequence_number,
+                cause,
+                sender_f_teid,
+                bearer_ebi,
+            },
+        ))
+    } else {
+        Ok(CreateSessionResponseSummary::Rejected(
+            CreateSessionRejectedResponseSummary {
+                response_teid,
+                sequence_number,
+                cause,
+            },
+        ))
+    }
 }
 
 fn missing_ie_error(reason: &'static str) -> DecodeError {
@@ -592,11 +831,11 @@ fn validate_required_ies(
             }
         }
         (Procedure::CreateSession, MessageDirection::Response) => {
-            require_ie(
-                &view.ies,
-                IE_TYPE_CAUSE,
-                "Create Session Response requires Cause IE",
-            )?;
+            let cause = find_cause_value(&view.ies)
+                .ok_or_else(|| missing_ie_error("Create Session Response requires Cause IE"))?;
+            if !is_accepted_create_session_cause(cause) {
+                return Ok(());
+            }
             require_ie_instance(
                 &view.ies,
                 IE_TYPE_F_TEID,
@@ -607,7 +846,14 @@ fn validate_required_ies(
                 &view.ies,
                 IE_TYPE_BEARER_CONTEXT,
                 "Create Session Response requires Bearer Context IE",
-            )
+            )?;
+            if contains_bearer_context_with_ebi(&view.ies) {
+                Ok(())
+            } else {
+                Err(missing_ie_error(
+                    "Create Session Response Bearer Context requires EBI IE",
+                ))
+            }
         }
         (Procedure::ModifyBearer, MessageDirection::Request) => require_ie(
             &view.ies,
