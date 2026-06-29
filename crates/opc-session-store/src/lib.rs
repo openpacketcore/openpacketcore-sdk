@@ -56,7 +56,7 @@ pub use model::{
     FenceToken, Generation, HandoverPhase, HandoverTxId, OwnerId, SessionKey, SessionKeyType,
     StateClass, StateType,
 };
-pub use owned_session::OwnedSession;
+pub use owned_session::{OwnedSession, OwnedSessionMutationContext, OwnedSessionMutationError};
 pub use payload_codec::{
     decode_json_payload, decode_session_payload_envelope, encode_json_payload,
     encode_session_payload_envelope, validate_session_payload_size,
