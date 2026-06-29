@@ -1,0 +1,15 @@
+[package]
+name = "opc-peer-discovery"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Transport-neutral peer discovery, resolver injection, and deterministic selection helpers for packet-core CNFs"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

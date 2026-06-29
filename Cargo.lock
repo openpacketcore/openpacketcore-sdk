@@ -2252,6 +2252,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-peer-discovery"
+version = "0.2.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "opc-persist"
 version = "0.2.0"
 dependencies = [
