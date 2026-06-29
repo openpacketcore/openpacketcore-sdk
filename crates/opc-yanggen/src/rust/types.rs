@@ -31,7 +31,7 @@ fn get_raw_type_internal(
     visited.insert(node.path.clone());
     match &node.type_ref {
         Some(TypeRef::Boolean) => quote! { bool },
-        Some(TypeRef::String) => quote! { String },
+        Some(TypeRef::String) | Some(TypeRef::Enumeration { .. }) => quote! { String },
         Some(TypeRef::Uint16) => quote! { u16 },
         Some(TypeRef::Uint32) => quote! { u32 },
         Some(TypeRef::Int64) => quote! { YangInt64 },
@@ -353,7 +353,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             }
                             let elem_ty = match resolved_elem_ty {
                                 Some(TypeRef::Boolean) => quote! { bool },
-                                Some(TypeRef::String) => quote! { String },
+                                Some(TypeRef::String) | Some(TypeRef::Enumeration { .. }) => {
+                                    quote! { String }
+                                }
                                 Some(TypeRef::Uint16) => quote! { u16 },
                                 Some(TypeRef::Uint32) => quote! { u32 },
                                 Some(TypeRef::Int64) => quote! { YangInt64 },

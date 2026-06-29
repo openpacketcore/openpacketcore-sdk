@@ -30,7 +30,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         use opc_gnmi_server::{
             GnmiError, GnmiPatchApplicator, NormalizedSet, NormalizedValue,
         };
-        use opc_mgmt_schema::{LeafType, NodeKind, NodeMeta};
+        use opc_mgmt_schema::{EnumValueMeta, LeafType, NodeKind, NodeMeta, NumericRangeIntervalMeta};
         use serde_json::{Number, Value};
 
         /// Generated gNMI Set applicator for this schema.
@@ -95,13 +95,13 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     let leaf_type = node
                         .leaf_type
                         .ok_or_else(|| GnmiError::invalid("gNMI Set leaf has no schema type"))?;
-                    leaf_patch_value(leaf_type, &parsed)
+                    leaf_patch_value(leaf_type, registry.numeric_range(path), &parsed)
                 }
                 NodeKind::LeafList => {
                     let leaf_type = node
                         .leaf_type
                         .ok_or_else(|| GnmiError::invalid("gNMI Set leaf-list has no schema type"))?;
-                    leaf_list_patch_value(leaf_type, &parsed)
+                    leaf_list_patch_value(leaf_type, registry.numeric_range(path), &parsed)
                 }
                 NodeKind::Container => object_patch_value(&parsed),
                 NodeKind::List => list_patch_value(node, &parsed),
@@ -128,28 +128,51 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 .map_err(|_| GnmiError::invalid("gNMI Set value is not valid JSON"))
         }
 
-        fn leaf_list_patch_value(leaf_type: LeafType, value: &Value) -> Result<String, GnmiError> {
+        fn leaf_list_patch_value(
+            leaf_type: LeafType,
+            numeric_range: &[NumericRangeIntervalMeta],
+            value: &Value,
+        ) -> Result<String, GnmiError> {
             if let Some(values) = value.as_array() {
                 let normalized = values
                     .iter()
-                    .map(|value| leaf_json_value(leaf_type, value))
+                    .map(|value| leaf_json_value(leaf_type, numeric_range, value))
                     .collect::<Result<Vec<_>, _>>()?;
                 serde_json::to_string(&normalized)
                     .map_err(|_| GnmiError::invalid("gNMI Set value is not valid JSON"))
             } else {
-                leaf_patch_value(leaf_type, value)
+                leaf_patch_value(leaf_type, numeric_range, value)
             }
         }
 
-        fn leaf_json_value(leaf_type: LeafType, value: &Value) -> Result<Value, GnmiError> {
+        fn leaf_json_value(
+            leaf_type: LeafType,
+            numeric_range: &[NumericRangeIntervalMeta],
+            value: &Value,
+        ) -> Result<Value, GnmiError> {
             match leaf_type {
                 LeafType::Boolean => Ok(Value::Bool(bool_value(value)?)),
                 LeafType::String | LeafType::IdentityRef { .. } | LeafType::LeafRef { .. } => {
                     Ok(Value::String(string_value(value)?.to_string()))
                 }
-                LeafType::Uint16 => Ok(Value::Number(Number::from(uint16_value(value)?))),
-                LeafType::Uint32 => Ok(Value::Number(Number::from(uint32_value(value)?))),
-                LeafType::Int64 => Ok(Value::String(int64_value(value)?.to_string())),
+                LeafType::Enumeration { values } => {
+                    Ok(Value::String(enum_string_value(values, value)?.to_string()))
+                }
+                LeafType::Uint16 => {
+                    let parsed = uint16_value(value)?;
+                    validate_numeric_range(i64::from(parsed), numeric_range)?;
+                    Ok(Value::Number(Number::from(parsed)))
+                }
+                LeafType::Uint32 => {
+                    let parsed = uint32_value(value)?;
+                    validate_numeric_range(i64::from(parsed), numeric_range)?;
+                    Ok(Value::Number(Number::from(parsed)))
+                }
+                LeafType::Int64 => {
+                    let parsed = int64_value(value)?;
+                    validate_numeric_range(parsed, numeric_range)?;
+                    Ok(Value::String(parsed.to_string()))
+                }
                 LeafType::Decimal64 => Ok(Value::String(decimal64_value(value)?.to_string())),
                 LeafType::Empty => Ok(Value::Array(vec![Value::Null])),
                 LeafType::Custom { .. } => Err(GnmiError::unimplemented(
@@ -161,15 +184,34 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             }
         }
 
-        fn leaf_patch_value(leaf_type: LeafType, value: &Value) -> Result<String, GnmiError> {
+        fn leaf_patch_value(
+            leaf_type: LeafType,
+            numeric_range: &[NumericRangeIntervalMeta],
+            value: &Value,
+        ) -> Result<String, GnmiError> {
             match leaf_type {
                 LeafType::Boolean => Ok(bool_value(value)?.to_string()),
                 LeafType::String | LeafType::IdentityRef { .. } | LeafType::LeafRef { .. } => {
                     Ok(string_value(value)?.to_string())
                 }
-                LeafType::Uint16 => Ok(uint16_value(value)?.to_string()),
-                LeafType::Uint32 => Ok(uint32_value(value)?.to_string()),
-                LeafType::Int64 => Ok(int64_value(value)?.to_string()),
+                LeafType::Enumeration { values } => {
+                    Ok(enum_string_value(values, value)?.to_string())
+                }
+                LeafType::Uint16 => {
+                    let parsed = uint16_value(value)?;
+                    validate_numeric_range(i64::from(parsed), numeric_range)?;
+                    Ok(parsed.to_string())
+                }
+                LeafType::Uint32 => {
+                    let parsed = uint32_value(value)?;
+                    validate_numeric_range(i64::from(parsed), numeric_range)?;
+                    Ok(parsed.to_string())
+                }
+                LeafType::Int64 => {
+                    let parsed = int64_value(value)?;
+                    validate_numeric_range(parsed, numeric_range)?;
+                    Ok(parsed.to_string())
+                }
                 LeafType::Decimal64 => Ok(decimal64_value(value)?.to_string()),
                 LeafType::Empty => {
                     if value.is_null()
@@ -201,6 +243,18 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 .ok_or_else(|| GnmiError::invalid("gNMI string leaf value must be a JSON string"))
         }
 
+        fn enum_string_value<'a>(
+            values: &[EnumValueMeta],
+            value: &'a Value,
+        ) -> Result<&'a str, GnmiError> {
+            let raw = string_value(value)?;
+            if values.iter().any(|allowed| allowed.name == raw) {
+                Ok(raw)
+            } else {
+                Err(GnmiError::invalid("gNMI enumeration leaf value is not allowed"))
+            }
+        }
+
         fn uint16_value(value: &Value) -> Result<u16, GnmiError> {
             let raw = value
                 .as_u64()
@@ -224,6 +278,21 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             string_value(value)?
                 .parse::<i64>()
                 .map_err(|_| GnmiError::invalid("gNMI int64 leaf value is invalid"))
+        }
+
+        fn validate_numeric_range(
+            value: i64,
+            numeric_range: &[NumericRangeIntervalMeta],
+        ) -> Result<(), GnmiError> {
+            if numeric_range.is_empty()
+                || numeric_range
+                    .iter()
+                    .any(|interval| interval.min <= value && value <= interval.max)
+            {
+                Ok(())
+            } else {
+                Err(GnmiError::invalid("gNMI numeric leaf value is outside YANG range"))
+            }
         }
 
         fn decimal64_value(value: &Value) -> Result<f64, GnmiError> {

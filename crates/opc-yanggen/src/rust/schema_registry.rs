@@ -61,7 +61,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     let mut sorted_nodes: Vec<&SchemaNode> = input.nodes.iter().collect();
     sorted_nodes.sort_by(|a, b| a.path.cmp(&b.path));
     let mut node_inits = Vec::with_capacity(sorted_nodes.len());
+    let mut range_inits = Vec::new();
     for node in sorted_nodes {
+        if !node.numeric_range.is_empty() {
+            range_inits.push(numeric_range_tokens(node));
+        }
         node_inits.push(node_meta_tokens(node)?);
     }
 
@@ -123,6 +127,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         };
 
         static NODES: &[NodeMeta] = &[ #(#node_inits),* ];
+        static NUMERIC_RANGES: &[opc_mgmt_schema::NodeNumericRangeMeta] = &[ #(#range_inits),* ];
         static MODELS: &[ModelData] = &[ #(#model_inits),* ];
         static ORIGINS: &[OriginEntry] = &[ #(#origin_inits),* ];
         static DISCOVERY: &[DiscoveryMetadata] = &[ #(#discovery_inits),* ];
@@ -148,6 +153,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             }
             fn discovery_metadata(&self) -> &'static [DiscoveryMetadata] {
                 DISCOVERY
+            }
+            fn numeric_ranges(&self) -> &'static [opc_mgmt_schema::NodeNumericRangeMeta] {
+                NUMERIC_RANGES
             }
             fn schema_source(
                 &self,
@@ -185,6 +193,30 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     };
 
     Ok(tokens.to_string())
+}
+
+fn numeric_range_tokens(node: &SchemaNode) -> TokenStream {
+    let path = &node.path;
+    let intervals: Vec<TokenStream> = node
+        .numeric_range
+        .iter()
+        .map(|interval| {
+            let min = interval.min;
+            let max = interval.max;
+            quote! {
+                opc_mgmt_schema::NumericRangeIntervalMeta {
+                    min: #min,
+                    max: #max,
+                }
+            }
+        })
+        .collect();
+    quote! {
+        opc_mgmt_schema::NodeNumericRangeMeta {
+            path: #path,
+            intervals: &[ #(#intervals),* ],
+        }
+    }
 }
 
 fn node_meta_tokens(node: &SchemaNode) -> Result<TokenStream, RustGenerationError> {
@@ -301,6 +333,29 @@ fn leaf_type_tokens(t: &TypeRef) -> TokenStream {
     match t {
         TypeRef::Boolean => quote! { opc_mgmt_schema::LeafType::Boolean },
         TypeRef::String => quote! { opc_mgmt_schema::LeafType::String },
+        TypeRef::Enumeration { values } => {
+            let value_tokens: Vec<TokenStream> = values
+                .iter()
+                .map(|value| {
+                    let name = &value.name;
+                    let description = match &value.description {
+                        Some(description) => quote! { Some(#description) },
+                        None => quote! { None },
+                    };
+                    quote! {
+                        opc_mgmt_schema::EnumValueMeta {
+                            name: #name,
+                            description: #description,
+                        }
+                    }
+                })
+                .collect();
+            quote! {
+                opc_mgmt_schema::LeafType::Enumeration {
+                    values: &[ #(#value_tokens),* ],
+                }
+            }
+        }
         TypeRef::Uint16 => quote! { opc_mgmt_schema::LeafType::Uint16 },
         TypeRef::Uint32 => quote! { opc_mgmt_schema::LeafType::Uint32 },
         TypeRef::Int64 => quote! { opc_mgmt_schema::LeafType::Int64 },

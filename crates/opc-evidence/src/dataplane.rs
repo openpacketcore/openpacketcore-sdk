@@ -4,6 +4,7 @@
 //! do not perform live forwarding checks or convert intent into readiness.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -101,6 +102,46 @@ impl DataplaneSnapshot {
         )
     }
 
+    /// Project missing or false traffic-readiness proof into stable blocker codes.
+    ///
+    /// Reasons are returned in SDK priority order: forwarding proof first,
+    /// kernel reconciliation second, and packet continuity last. Both `None`
+    /// and `Some(false)` are treated as not proven.
+    #[must_use]
+    pub fn traffic_readiness_blockers(&self) -> Vec<DataplaneTrafficBlockReasonCode> {
+        let mut blockers = Vec::with_capacity(3);
+        if self.forwarding_proven != Some(true) {
+            blockers.push(DataplaneTrafficBlockReasonCode::ForwardingNotProven);
+        }
+        if self.kernel_state_reconciled != Some(true) {
+            blockers.push(DataplaneTrafficBlockReasonCode::KernelStateNotReconciled);
+        }
+        if self.packet_continuity_proven != Some(true) {
+            blockers.push(DataplaneTrafficBlockReasonCode::PacketContinuityNotProven);
+        }
+        blockers
+    }
+
+    /// Return the highest-priority traffic-readiness blocker, if any.
+    #[must_use]
+    pub fn first_traffic_readiness_blocker(&self) -> Option<DataplaneTrafficBlockReasonCode> {
+        if self.forwarding_proven != Some(true) {
+            Some(DataplaneTrafficBlockReasonCode::ForwardingNotProven)
+        } else if self.kernel_state_reconciled != Some(true) {
+            Some(DataplaneTrafficBlockReasonCode::KernelStateNotReconciled)
+        } else if self.packet_continuity_proven != Some(true) {
+            Some(DataplaneTrafficBlockReasonCode::PacketContinuityNotProven)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the snapshot has any traffic-readiness proof blocker.
+    #[must_use]
+    pub fn blocks_traffic_readiness(&self) -> bool {
+        self.first_traffic_readiness_blocker().is_some()
+    }
+
     /// Validate that evidence is strong enough for a packet-continuity claim.
     pub fn validate_packet_continuity_claim(&self) -> Result<(), DataplaneEvidenceError> {
         validate_proof_field(
@@ -137,6 +178,60 @@ impl DataplaneSnapshot {
     }
 }
 
+/// Stable machine-readable reason for blocking traffic-readiness claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataplaneTrafficBlockReasonCode {
+    /// Live forwarding has not been proven.
+    ForwardingNotProven,
+    /// Kernel or fast-path state has not been reconciled with intended state.
+    KernelStateNotReconciled,
+    /// Packet continuity has not been proven.
+    PacketContinuityNotProven,
+}
+
+impl DataplaneTrafficBlockReasonCode {
+    /// Return the stable snake_case reason code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ForwardingNotProven => "forwarding_not_proven",
+            Self::KernelStateNotReconciled => "kernel_state_not_reconciled",
+            Self::PacketContinuityNotProven => "packet_continuity_not_proven",
+        }
+    }
+
+    /// Return the proof field that produced this blocker.
+    #[must_use]
+    pub const fn proof_field(self) -> &'static str {
+        match self {
+            Self::ForwardingNotProven => "forwarding_proven",
+            Self::KernelStateNotReconciled => "kernel_state_reconciled",
+            Self::PacketContinuityNotProven => "packet_continuity_proven",
+        }
+    }
+
+    /// Return a redaction-safe operator message for this blocker.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::ForwardingNotProven => "traffic readiness blocked: forwarding is not proven",
+            Self::KernelStateNotReconciled => {
+                "traffic readiness blocked: kernel state is not reconciled"
+            }
+            Self::PacketContinuityNotProven => {
+                "traffic readiness blocked: packet continuity is not proven"
+            }
+        }
+    }
+}
+
+impl fmt::Display for DataplaneTrafficBlockReasonCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Error returned when dataplane evidence cannot support a claim.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DataplaneEvidenceError {
@@ -156,6 +251,18 @@ pub enum DataplaneEvidenceError {
         /// False field.
         field: &'static str,
     },
+}
+
+impl DataplaneEvidenceError {
+    /// Return the traffic blocker reason associated with this proof failure.
+    #[must_use]
+    pub fn traffic_block_reason_code(&self) -> Option<DataplaneTrafficBlockReasonCode> {
+        match self {
+            Self::MissingProofField { field, .. } | Self::FalseProofField { field, .. } => {
+                traffic_block_reason_for_field(field)
+            }
+        }
+    }
 }
 
 /// Fluent assertions for dataplane snapshot evidence.
@@ -205,5 +312,18 @@ fn validate_proof_field(
         Some(true) => Ok(()),
         Some(false) => Err(DataplaneEvidenceError::FalseProofField { claim, field }),
         None => Err(DataplaneEvidenceError::MissingProofField { claim, field }),
+    }
+}
+
+fn traffic_block_reason_for_field(field: &str) -> Option<DataplaneTrafficBlockReasonCode> {
+    match field {
+        "forwarding_proven" => Some(DataplaneTrafficBlockReasonCode::ForwardingNotProven),
+        "kernel_state_reconciled" => {
+            Some(DataplaneTrafficBlockReasonCode::KernelStateNotReconciled)
+        }
+        "packet_continuity_proven" => {
+            Some(DataplaneTrafficBlockReasonCode::PacketContinuityNotProven)
+        }
+        _ => None,
     }
 }

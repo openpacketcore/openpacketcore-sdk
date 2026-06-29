@@ -1,13 +1,15 @@
 use bytes::{Bytes, BytesMut};
 use opc_proto_ikev2::{
-    CryptoProvider, Header, HeaderFlags, Message, PayloadChain, PayloadType,
-    ProtectedPayloadContext, ProtectedPayloadKind, RawPayload, EXCHANGE_TYPE_IKE_SA_INIT,
+    open_protected_payloads, CryptoProvider, Header, HeaderFlags, Message, OpenedProtectedPayload,
+    PayloadChain, PayloadType, ProtectedPayloadContext, ProtectedPayloadKind,
+    ProtectedPayloadOpenError, RawPayload, EXCHANGE_TYPE_IKE_SA_INIT, GENERIC_PAYLOAD_HEADER_LEN,
     HEADER_LEN,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, Encode, EncodeContext, OwnedDecode, ToOwnedPdu,
     ValidationLevel,
 };
+use std::{cell::Cell, fmt};
 
 fn sa_nonce_message() -> [u8; HEADER_LEN + 16] {
     [
@@ -56,6 +58,41 @@ fn sa_nonce_message() -> [u8; HEADER_LEN + 16] {
         0x33, // RFC 7296 §3.2 octet 42: Hand-authored Nonce body byte 2.
         0x44, // RFC 7296 §3.2 octet 43: Hand-authored Nonce body byte 3.
     ]
+}
+
+fn protected_message_bytes(first_inner_payload: PayloadType, protected_body: &[u8]) -> Vec<u8> {
+    let payload_len = match GENERIC_PAYLOAD_HEADER_LEN.checked_add(protected_body.len()) {
+        Some(value) => value,
+        None => panic!("test protected payload length overflow"),
+    };
+    let payload_len_u16 = match u16::try_from(payload_len) {
+        Ok(value) => value,
+        Err(error) => panic!("test protected payload length invalid: {error}"),
+    };
+    let mut payload = Vec::with_capacity(payload_len);
+    payload.push(first_inner_payload.as_u8());
+    payload.push(0);
+    payload.extend_from_slice(&payload_len_u16.to_be_bytes());
+    payload.extend_from_slice(protected_body);
+
+    let header = Header::new(
+        0x0102_0304_0506_0708,
+        0x1112_1314_1516_1718,
+        PayloadType::Encrypted,
+        EXCHANGE_TYPE_IKE_SA_INIT,
+        HeaderFlags::from_bits(true, false, false),
+        3,
+    );
+    let message = Message {
+        header,
+        payloads: PayloadChain::new(PayloadType::Encrypted, &payload),
+        tail: &[],
+    };
+    let mut encoded = BytesMut::new();
+    match message.encode(&mut encoded, EncodeContext::default()) {
+        Ok(()) => encoded.to_vec(),
+        Err(error) => panic!("test protected message encode failed: {error}"),
+    }
 }
 
 #[test]
@@ -226,6 +263,64 @@ impl CryptoProvider for EchoProvider {
     }
 }
 
+#[derive(Debug)]
+struct FakeCryptoError(&'static str);
+
+impl fmt::Display for FakeCryptoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+struct RecordingProvider<'a> {
+    calls: Cell<usize>,
+    expected_message: &'a [u8],
+}
+
+impl<'a> RecordingProvider<'a> {
+    fn new(expected_message: &'a [u8]) -> Self {
+        Self {
+            calls: Cell::new(0),
+            expected_message,
+        }
+    }
+}
+
+impl CryptoProvider for RecordingProvider<'_> {
+    type Error = FakeCryptoError;
+
+    fn open_payload(
+        &self,
+        context: ProtectedPayloadContext<'_>,
+        protected_body: &[u8],
+    ) -> Result<Bytes, Self::Error> {
+        self.calls.set(self.calls.get() + 1);
+        assert_eq!(context.kind, ProtectedPayloadKind::Encrypted);
+        assert_eq!(
+            context.first_inner_payload,
+            PayloadType::ExtensibleAuthentication
+        );
+        assert_eq!(context.header.message_id, 3);
+        assert_eq!(context.message_bytes, self.expected_message);
+        assert_eq!(protected_body, b"protected-secret");
+        Ok(Bytes::from_static(b"opened-cleartext-secret"))
+    }
+}
+
+struct FailingProvider;
+
+impl CryptoProvider for FailingProvider {
+    type Error = FakeCryptoError;
+
+    fn open_payload(
+        &self,
+        _context: ProtectedPayloadContext<'_>,
+        _protected_body: &[u8],
+    ) -> Result<Bytes, Self::Error> {
+        Err(FakeCryptoError("redacted-open-failed"))
+    }
+}
+
 #[test]
 fn crypto_provider_boundary_is_caller_supplied() {
     let header = Header::new(
@@ -245,6 +340,115 @@ fn crypto_provider_boundary_is_caller_supplied() {
     };
     let opened = provider.open_payload(context, &[0xaa, 0xbb]);
     assert!(matches!(opened, Ok(bytes) if bytes.as_ref() == [0xaa, 0xbb]));
+}
+
+#[test]
+fn open_protected_payloads_delegates_with_exact_outer_message_bytes() {
+    let encoded =
+        protected_message_bytes(PayloadType::ExtensibleAuthentication, b"protected-secret");
+    let (_tail, message) = match Message::decode(&encoded, DecodeContext::default()) {
+        Ok(value) => value,
+        Err(error) => panic!("message decode failed: {error:?}"),
+    };
+    let provider = RecordingProvider::new(&encoded);
+
+    let opened =
+        match open_protected_payloads(&message, &encoded, DecodeContext::default(), &provider) {
+            Ok(value) => value,
+            Err(error) => panic!("protected payload open failed: {error:?}"),
+        };
+
+    assert_eq!(provider.calls.get(), 1);
+    assert_eq!(
+        opened,
+        vec![OpenedProtectedPayload {
+            kind: ProtectedPayloadKind::Encrypted,
+            offset: 0,
+            protected_body_len: b"protected-secret".len(),
+            first_inner_payload: PayloadType::ExtensibleAuthentication,
+            cleartext: Bytes::from_static(b"opened-cleartext-secret"),
+        }]
+    );
+    let debug = format!("{opened:?}");
+    assert!(!debug.contains("protected-secret"));
+    assert!(!debug.contains("opened-cleartext-secret"));
+    assert!(debug.contains("cleartext_len"));
+}
+
+#[test]
+fn open_protected_payloads_projects_provider_failure_without_body_leakage() {
+    let encoded =
+        protected_message_bytes(PayloadType::ExtensibleAuthentication, b"protected-secret");
+    let (_tail, message) = match Message::decode(&encoded, DecodeContext::default()) {
+        Ok(value) => value,
+        Err(error) => panic!("message decode failed: {error:?}"),
+    };
+
+    let error = match open_protected_payloads(
+        &message,
+        &encoded,
+        DecodeContext::default(),
+        &FailingProvider,
+    ) {
+        Ok(value) => panic!("provider failure unexpectedly opened payloads: {value:?}"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.as_str(), "ike_protected_payload_provider_rejected");
+    match &error {
+        ProtectedPayloadOpenError::ProviderRejected(failure) => {
+            assert_eq!(failure.kind, ProtectedPayloadKind::Encrypted);
+            assert_eq!(failure.offset, 0);
+            assert_eq!(failure.protected_body_len, b"protected-secret".len());
+            assert_eq!(
+                failure.first_inner_payload,
+                PayloadType::ExtensibleAuthentication
+            );
+            assert_eq!(failure.provider_error, "redacted-open-failed");
+        }
+        other => panic!("unexpected protected payload open error: {other:?}"),
+    }
+    let debug = format!("{error:?}");
+    assert!(!debug.contains("protected-secret"));
+}
+
+#[test]
+fn open_protected_payloads_rejects_non_matching_outer_message_bytes() {
+    let encoded =
+        protected_message_bytes(PayloadType::ExtensibleAuthentication, b"protected-secret");
+    let (_tail, message) = match Message::decode(&encoded, DecodeContext::default()) {
+        Ok(value) => value,
+        Err(error) => panic!("message decode failed: {error:?}"),
+    };
+    let provider = RecordingProvider::new(&encoded);
+    let short = &encoded[..encoded.len() - 1];
+
+    let error = match open_protected_payloads(&message, short, DecodeContext::default(), &provider)
+    {
+        Ok(value) => panic!("short message bytes unexpectedly opened payloads: {value:?}"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.as_str(),
+        "ike_protected_payload_message_bytes_length_mismatch"
+    );
+    assert_eq!(provider.calls.get(), 0);
+
+    let mut mismatched = encoded.clone();
+    match mismatched.get_mut(HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN) {
+        Some(byte) => *byte ^= 0xff,
+        None => panic!("test protected payload body byte missing"),
+    }
+    let error =
+        match open_protected_payloads(&message, &mismatched, DecodeContext::default(), &provider) {
+            Ok(value) => panic!("mismatched message bytes unexpectedly opened payloads: {value:?}"),
+            Err(error) => error,
+        };
+    assert_eq!(
+        error.as_str(),
+        "ike_protected_payload_message_payload_mismatch"
+    );
+    assert_eq!(provider.calls.get(), 0);
 }
 
 #[test]

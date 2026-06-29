@@ -52,6 +52,15 @@
       "parser_policy": "sdk-protocol-crate-only",
       "usage": "Diameter peer simulator metadata interface bridged to the SDK Diameter codec without a local parser",
       "redaction": "the simulator stores counters and booleans only; no Diameter Session-Id value is retained"
+    },
+    {
+      "id": "upf-user-plane-decoded-message",
+      "protocol": "gtpu-gpdu+esp-continuity+xfrm-dataplane-evidence",
+      "sdk_protocol_crate": "opc-proto-gtpu/opc-ipsec-xfrm",
+      "provenance": "decoded-metadata-interface",
+      "parser_policy": "sdk-protocol-crate-only",
+      "usage": "UPF simulator metadata interface bridged to SDK-decoded GTP-U GPDU and ESP/XFRM continuity evidence without a local parser",
+      "redaction": "the simulator stores counters, TEID/SPI, extension presence, continuity labels, and hashed session evidence keys only"
     }
   ]
 }

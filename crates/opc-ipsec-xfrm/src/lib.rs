@@ -11,13 +11,22 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+pub mod composite;
 pub mod error;
+pub mod linux;
 pub mod mock;
 pub mod model;
 pub mod unsupported;
 
 pub use backend::XfrmBackend;
+pub use composite::{
+    install_sa_policy_with_rollback, rekey_sa_policy, remove_policy_sa, XfrmCompositeInstallError,
+    XfrmCompositeInstallRequest, XfrmCompositeOperation, XfrmCompositeOutcome,
+    XFRM_COMPOSITE_INSTALL_ORDER, XFRM_COMPOSITE_INSTALL_ROLLBACK_ORDER,
+    XFRM_COMPOSITE_REKEY_ORDER, XFRM_COMPOSITE_REMOVE_ORDER,
+};
 pub use error::XfrmError;
+pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
 pub use mock::{MockOperation, MockXfrmBackend};
 pub use model::{
     Algorithm, AllocateSpiRequest, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest,

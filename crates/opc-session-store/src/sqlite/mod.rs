@@ -27,6 +27,7 @@ use crate::{
     lease::{LeaseGuard, SessionLeaseManager},
     model::{OwnerId, SessionKey},
     record::StoredSessionRecord,
+    restore::{RestoreScanPage, RestoreScanRequest},
 };
 
 pub(crate) mod lease;
@@ -355,6 +356,15 @@ impl SessionBackend for SqliteSessionBackend {
             results.push(res);
         }
         Ok(results)
+    }
+
+    async fn scan_restore_records(
+        &self,
+        request: RestoreScanRequest,
+    ) -> Result<RestoreScanPage, StoreError> {
+        let conn = self.conn.lock().await;
+        let now = self.clock.now_utc();
+        ops::scan_restore_records_sync(&conn, request, now)
     }
 
     async fn max_replication_sequence(&self) -> Result<u64, StoreError> {

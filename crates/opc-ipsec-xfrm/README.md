@@ -9,6 +9,8 @@ This crate provides:
   and removing Security Associations and Security Policies.
 - `MockXfrmBackend`: a deterministic in-memory test double that records every
   operation and supports injected failures.
+- `LinuxXfrmBackend`: a safe production backend that encodes SDK SA/SPD
+  requests into Linux `NETLINK_XFRM` messages through `opc-linux-xfrm-sys`.
 - `UnsupportedXfrmBackend`: a backend that reports `UnsupportedPlatform` on all
   mutating operations for non-Linux or intentionally disabled builds.
 - Redaction-safe model types such as `KeyMaterial`, whose `Debug` and `Display`
@@ -16,6 +18,6 @@ This crate provides:
 - `XfrmError`: an error enum with payload-free labels safe for logs and support
   bundles.
 
-Raw Linux netlink work is intentionally kept in `opc-linux-xfrm-sys`. This crate
-does not implement IKE, ESP processing, SA/SPD policy, namespace management, or
-product deployment defaults.
+Raw Linux netlink socket work is intentionally kept in `opc-linux-xfrm-sys`.
+This crate does not implement IKE, ESP processing, SA/SPD policy, namespace
+management, or product deployment defaults.

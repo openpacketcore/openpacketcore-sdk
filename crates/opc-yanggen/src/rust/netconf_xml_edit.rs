@@ -555,6 +555,8 @@ fn parse_leaf_value_expr(
 ) -> Result<TokenStream, RustGenerationError> {
     let path = &node.path;
     let resolved = resolved_type(node, nodes_by_path);
+    let unsigned_range_check = numeric_range_check_expr(node, quote! { i64::from(parsed) }, path);
+    let int64_range_check = numeric_range_check_expr(node, quote! { parsed.0 }, path);
     let expr = match resolved {
         Some(TypeRef::Boolean) => quote! {
             let parsed = match _v.trim() {
@@ -565,12 +567,15 @@ fn parse_leaf_value_expr(
         },
         Some(TypeRef::Uint16) => quote! {
             let parsed = _v.trim().parse::<u16>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
+            #unsigned_range_check
         },
         Some(TypeRef::Uint32) => quote! {
             let parsed = _v.trim().parse::<u32>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
+            #unsigned_range_check
         },
         Some(TypeRef::Int64) => quote! {
             let parsed = YangInt64(_v.trim().parse::<i64>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?);
+            #int64_range_check
         },
         Some(TypeRef::Decimal64) => quote! {
             let parsed = YangDecimal64(_v.trim().parse::<f64>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?);
@@ -586,6 +591,15 @@ fn parse_leaf_value_expr(
         | Some(TypeRef::LeafRef { .. }) => quote! {
             let parsed = _v.to_string();
         },
+        Some(TypeRef::Enumeration { values }) => {
+            let allowed: Vec<&String> = values.iter().map(|value| &value.name).collect();
+            quote! {
+                let parsed = _v.to_string();
+                if ![ #(#allowed),* ].contains(&parsed.as_str()) {
+                    return Err(NetconfEditError::InvalidValue { path: #path });
+                }
+            }
+        }
         Some(TypeRef::Custom { .. }) | None => {
             return Err(RustGenerationError::new(format!(
                 "netconf_xml_edit: unsupported leaf type at {}",
@@ -594,6 +608,25 @@ fn parse_leaf_value_expr(
         }
     };
     Ok(expr)
+}
+
+fn numeric_range_check_expr(node: &SchemaNode, value_expr: TokenStream, path: &str) -> TokenStream {
+    if node.numeric_range.is_empty() {
+        return TokenStream::new();
+    }
+
+    let checks = node.numeric_range.iter().map(|interval| {
+        let min = interval.min;
+        let max = interval.max;
+        quote! { (#min <= numeric_value && numeric_value <= #max) }
+    });
+
+    quote! {
+        let numeric_value: i64 = #value_expr;
+        if !(#(#checks)||*) {
+            return Err(NetconfEditError::InvalidValue { path: #path });
+        }
+    }
 }
 
 fn resolved_type<'a>(
@@ -663,7 +696,7 @@ fn raw_type_internal(
     visited.insert(node.path.clone());
     match resolved_type(node, nodes_by_path) {
         Some(TypeRef::Boolean) => quote! { bool },
-        Some(TypeRef::String) => quote! { String },
+        Some(TypeRef::String) | Some(TypeRef::Enumeration { .. }) => quote! { String },
         Some(TypeRef::Uint16) => quote! { u16 },
         Some(TypeRef::Uint32) => quote! { u32 },
         Some(TypeRef::Int64) => quote! { YangInt64 },

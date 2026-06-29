@@ -7,9 +7,180 @@
 use std::collections::BTreeMap;
 
 use opc_redaction::{redact_text, RedactionSummary};
+use opc_types::{NetworkFunctionKind, TenantId};
 use serde::{Deserialize, Serialize};
 
-use crate::{hex::encode_lower, StateClass, StoredSessionRecord};
+use crate::{
+    hex::encode_lower, OwnerId, SessionKeyType, StateClass, StateType, StoreError,
+    StoredSessionRecord,
+};
+
+/// Default maximum restore scan page size.
+pub const RESTORE_SCAN_DEFAULT_PAGE_SIZE: usize = 256;
+
+/// Hard maximum restore scan page size.
+pub const RESTORE_SCAN_MAX_PAGE_SIZE: usize = 1024;
+
+/// Opaque cursor for paged restore scans.
+///
+/// The current SDK cursor is an offset into the backend's deterministic live
+/// record ordering. It intentionally carries no session key bytes or product
+/// payload identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RestoreScanCursor {
+    offset: usize,
+}
+
+impl RestoreScanCursor {
+    /// Build a cursor from a backend-supplied offset.
+    pub const fn from_offset(offset: usize) -> Self {
+        Self { offset }
+    }
+
+    /// Return the offset represented by this cursor.
+    pub const fn offset(self) -> usize {
+        self.offset
+    }
+}
+
+/// Typed scope for backend-neutral restore scans.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RestoreScanScope {
+    /// Optional tenant filter.
+    pub tenant: Option<TenantId>,
+    /// Optional network-function kind filter.
+    pub nf_kind: Option<NetworkFunctionKind>,
+    /// Optional session-key type filter.
+    pub key_type: Option<SessionKeyType>,
+    /// Optional state-class filter.
+    pub state_class: Option<StateClass>,
+    /// Optional state-type filter.
+    pub state_type: Option<StateType>,
+    /// Optional record-owner filter.
+    pub owner: Option<OwnerId>,
+}
+
+impl RestoreScanScope {
+    /// Scope that matches every live record.
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// Whether this scope includes `record`.
+    pub fn matches_record(&self, record: &StoredSessionRecord) -> bool {
+        self.tenant
+            .as_ref()
+            .is_none_or(|tenant| tenant == &record.key.tenant)
+            && self
+                .nf_kind
+                .as_ref()
+                .is_none_or(|nf_kind| nf_kind == &record.key.nf_kind)
+            && self
+                .key_type
+                .as_ref()
+                .is_none_or(|key_type| key_type == &record.key.key_type)
+            && self
+                .state_class
+                .is_none_or(|state_class| state_class == record.state_class)
+            && self
+                .state_type
+                .as_ref()
+                .is_none_or(|state_type| state_type == &record.state_type)
+            && self
+                .owner
+                .as_ref()
+                .is_none_or(|owner| owner == &record.owner)
+    }
+}
+
+/// Restore scan request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreScanRequest {
+    /// Scope to scan.
+    pub scope: RestoreScanScope,
+    /// Cursor returned by a previous page, or `None` for the first page.
+    pub cursor: Option<RestoreScanCursor>,
+    /// Maximum records to return in this page.
+    pub limit: usize,
+}
+
+impl RestoreScanRequest {
+    /// Build a first-page request for all live records.
+    pub const fn all(limit: usize) -> Self {
+        Self {
+            scope: RestoreScanScope {
+                tenant: None,
+                nf_kind: None,
+                key_type: None,
+                state_class: None,
+                state_type: None,
+                owner: None,
+            },
+            cursor: None,
+            limit,
+        }
+    }
+
+    /// Validate page-size bounds.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if self.limit == 0 {
+            return Err(StoreError::InvalidRestoreScanRequest(
+                "restore scan limit must be greater than zero".to_string(),
+            ));
+        }
+        if self.limit > RESTORE_SCAN_MAX_PAGE_SIZE {
+            return Err(StoreError::RestoreScanPageTooLarge {
+                requested: self.limit,
+                max: RESTORE_SCAN_MAX_PAGE_SIZE,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Default for RestoreScanRequest {
+    fn default() -> Self {
+        Self::all(RESTORE_SCAN_DEFAULT_PAGE_SIZE)
+    }
+}
+
+/// One page of a backend restore scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreScanPage {
+    /// Live records returned in this page.
+    pub records: Vec<StoredSessionRecord>,
+    /// Number of records returned in this page.
+    pub loaded_count: usize,
+    /// Live records excluded by the supplied scope while building this page.
+    pub excluded_count: usize,
+    /// Cursor for the next page, or `None` when the scan is complete.
+    pub next_cursor: Option<RestoreScanCursor>,
+    /// Whether this page completed the scan.
+    pub complete: bool,
+}
+
+impl RestoreScanPage {
+    /// Build a page from records and pagination metadata.
+    pub fn new(
+        records: Vec<StoredSessionRecord>,
+        excluded_count: usize,
+        next_cursor: Option<RestoreScanCursor>,
+    ) -> Self {
+        let loaded_count = records.len();
+        Self {
+            records,
+            loaded_count,
+            excluded_count,
+            next_cursor,
+            complete: next_cursor.is_none(),
+        }
+    }
+
+    /// Header-only restore summary for this page.
+    pub fn record_summary(&self) -> RestoreRecordSummary {
+        RestoreRecordSummary::from_records(&self.records, self.excluded_count)
+    }
+}
 
 /// Generic restore progress stage for startup and failover evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

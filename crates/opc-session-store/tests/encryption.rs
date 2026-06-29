@@ -7,9 +7,10 @@ use opc_key::{
 };
 use opc_session_store::{
     BackendCapabilities, CompareAndSet, CompareAndSetResult, EncryptedSessionPayload,
-    EncryptingSessionBackend, FakeSessionBackend, FenceToken, Generation, OwnerId, SessionBackend,
-    SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult,
-    SessionPayloadEncoding, StateClass, StateType, StoreError, StoredSessionRecord,
+    EncryptingSessionBackend, FakeSessionBackend, FenceToken, Generation, OwnerId,
+    RestoreScanRequest, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    SessionOpResult, SessionPayloadEncoding, StateClass, StateType, StoreError,
+    StoredSessionRecord,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use std::{sync::Arc, time::Duration};
@@ -200,6 +201,22 @@ async fn encrypting_session_backend_round_trips_compare_and_set_get_and_batch_re
         }
         other => panic!("unexpected batch CAS result: {other:?}"),
     }
+
+    let scan_page = backend
+        .scan_restore_records(RestoreScanRequest::all(16))
+        .await
+        .expect("restore scan");
+    assert_eq!(scan_page.loaded_count, 1);
+    assert_eq!(scan_page.records[0].payload.as_bytes(), &batch_payload);
+
+    let inner_scan_page = inner
+        .scan_restore_records(RestoreScanRequest::all(16))
+        .await
+        .expect("inner restore scan");
+    assert_ne!(
+        inner_scan_page.records[0].payload.as_bytes(),
+        &batch_payload
+    );
 }
 
 #[tokio::test]

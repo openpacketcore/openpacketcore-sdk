@@ -30,6 +30,7 @@ mod hex;
 pub mod lease;
 pub mod model;
 pub mod owned_session;
+pub mod payload_codec;
 pub mod quorum;
 pub mod record;
 pub mod restore;
@@ -41,8 +42,10 @@ pub use backend::{
     SessionBackend, SessionOp, SessionOpResult,
 };
 pub use capability::{
-    assert_backend_suitable_for_profile, assert_suitable_for, validate_backend_for_profile,
-    BackendCapabilities, SessionStateProfile,
+    assert_backend_suitable_for_profile, assert_suitable_for,
+    evaluate_session_store_ha_compatibility, validate_backend_for_profile,
+    AppHaDurabilityRequirement, BackendCapabilities, SessionStateProfile,
+    SessionStoreHaCompatibility, SessionStorePlatformProfile,
 };
 pub use clock::{Clock, SystemClock, TokioVirtualClock};
 pub use error::{CapabilityError, LeaseError, StoreError};
@@ -53,12 +56,20 @@ pub use model::{
     FenceToken, Generation, HandoverPhase, HandoverTxId, OwnerId, SessionKey, SessionKeyType,
     StateClass, StateType,
 };
-pub use owned_session::OwnedSession;
+pub use owned_session::{OwnedSession, OwnedSessionMutationContext, OwnedSessionMutationError};
+pub use payload_codec::{
+    decode_json_payload, decode_session_payload_envelope, encode_json_payload,
+    encode_session_payload_envelope, validate_session_payload_size,
+    validate_session_payload_size_for_backend, SessionPayloadCodecError, SessionPayloadEnvelope,
+    SessionPayloadFormat, SessionPayloadVersion, SESSION_PAYLOAD_JSON_CONTENT_TYPE,
+};
 pub use quorum::{FencedSessionReplica, QuorumSessionStore, SessionStoreBackend};
 pub use record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 pub use restore::{
     summarize_restore_records, OwnerFenceMetadata, RestoreBlockReason, RestoreBlockReasonCode,
-    RestoreRecordSummary, RestoreStage, StoredRecordHeaderSummary,
+    RestoreRecordSummary, RestoreScanCursor, RestoreScanPage, RestoreScanRequest, RestoreScanScope,
+    RestoreStage, StoredRecordHeaderSummary, RESTORE_SCAN_DEFAULT_PAGE_SIZE,
+    RESTORE_SCAN_MAX_PAGE_SIZE,
 };
 pub use sqlite::SqliteSessionBackend;
 pub use store::SessionStore;

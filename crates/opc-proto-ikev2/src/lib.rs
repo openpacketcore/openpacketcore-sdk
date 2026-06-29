@@ -19,20 +19,56 @@
 use opc_protocol::ValidationLevel;
 
 pub mod crypto;
+pub mod exchange;
 pub mod header;
 pub mod message;
+pub mod nat_traversal;
+pub mod notify;
 pub mod payload;
+pub mod sa_init;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
 
-pub use crypto::{CryptoProvider, ProtectedPayloadContext, ProtectedPayloadKind};
+pub use crypto::{
+    open_protected_payloads, CryptoProvider, OpenedProtectedPayload, ProtectedPayloadContext,
+    ProtectedPayloadKind, ProtectedPayloadOpenError, ProtectedPayloadOpenFailure,
+};
+pub use exchange::{
+    Ikev2ExchangeBoundaryState, Ikev2ExchangeDecision, Ikev2ExchangeInvalidReason,
+    Ikev2ExchangeKind, Ikev2ExchangeProjection, Ikev2ExchangeRequest, Ikev2ExchangeRequestKey,
+    Ikev2ExchangeSnapshot, Ikev2ExchangeTracker, Ikev2ResponderSpi,
+};
 pub use header::{
     decode_header, encode_header, Header, HeaderFlags, EXCHANGE_TYPE_CREATE_CHILD_SA,
     EXCHANGE_TYPE_IKE_AUTH, EXCHANGE_TYPE_IKE_SA_INIT, EXCHANGE_TYPE_INFORMATIONAL, HEADER_LEN,
     IKEV2_MAJOR_VERSION, IKEV2_MINOR_VERSION, IKEV2_VERSION_OCTET,
 };
 pub use message::{Message, OwnedMessage};
+pub use nat_traversal::{
+    classify_ike_nat_traversal_datagram, classify_ike_nat_traversal_datagram_with_context,
+    NatTraversalClassification, NatTraversalEspCandidate, NatTraversalIkeDecodeErrorCode,
+    NatTraversalIkeMessage, NatTraversalIkeTransport, NatTraversalKeepalive, NatTraversalRejection,
+    IKE_NAT_TRAVERSAL_UDP_PORT, IKE_UDP_PORT, NAT_TRAVERSAL_KEEPALIVE,
+};
+pub use notify::{
+    build_ike_sa_init_cookie_response, extract_ike_sa_init_cookie_notify, Ikev2CookieNotify,
+    Ikev2CookieNotifyBuildError, Ikev2CookieNotifyExtractError, Ikev2NotifyPayload,
+    Ikev2NotifyPayloadError, IKEV2_NOTIFY_COOKIE, IKEV2_NOTIFY_COOKIE2,
+    IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+};
 pub use payload::{
     validate_payload_chain, PayloadChain, PayloadType, RawPayload, RawPayloadIterator,
     GENERIC_PAYLOAD_HEADER_LEN,
+};
+pub use sa_init::{
+    build_ike_sa_init_response, decode_ike_sa_init_request_payloads, Ikev2KeyExchangePayload,
+    Ikev2KeyExchangePayloadBuild, Ikev2KeyExchangePayloadError, Ikev2NoncePayload,
+    Ikev2NoncePayloadBuild, Ikev2NoncePayloadError, Ikev2NotifyPayloadBuild, Ikev2SaInitBuildError,
+    Ikev2SaInitPayloadError, Ikev2SaInitPayloads, Ikev2SaInitResponsePayloads, Ikev2SaPayload,
+    Ikev2SaPayloadBuild, Ikev2SaPayloadError, Ikev2SaProposal, Ikev2SaProposalBuild,
+    Ikev2SaTransform, Ikev2SaTransformBuild, Ikev2TransformAttribute, Ikev2TransformAttributeBuild,
+    Ikev2TransformAttributeBuildValue, Ikev2TransformAttributeValue, Ikev2VendorIdPayload,
+    Ikev2VendorIdPayloadError,
 };
 
 pub(crate) const fn is_strict(level: ValidationLevel) -> bool {

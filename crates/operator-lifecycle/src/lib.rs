@@ -38,7 +38,9 @@ pub use phase::{
 pub use reconcile::{
     lifecycle_condition_intent, reject_app_config_fields, AlarmConditionIntent, AlarmEventIntent,
     AppConfigMetadata, BootstrapRef, BootstrapRefKind, CnfImageIntent, CnfWorkloadIntent,
-    ConflictRetryIntent, ManagementExposureIntent, NetworkAttachmentIntent, NetworkAttachmentKind,
-    PlacementIntent, ReconcileIntentError, ReplicaIntent, SessionStoreRef, StatusPatchIntent,
-    TrafficStatusIntent, UpgradeDrainPolicy,
+    ConflictRetryIntent, ManagementExposureIntent, ManagementIdentityIntent, ManagementMaterialRef,
+    ManagementMtlsIdentityIntent, ManagementNorthboundIntent, ManagementPortIntent,
+    NetconfSshIdentityIntent, NetworkAttachmentIntent, NetworkAttachmentKind, PlacementIntent,
+    ReconcileIntentError, ReplicaIntent, SessionStoreRef, StatusPatchIntent, TrafficStatusIntent,
+    UpgradeDrainPolicy,
 };

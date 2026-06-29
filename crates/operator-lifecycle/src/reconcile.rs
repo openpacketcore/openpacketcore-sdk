@@ -73,6 +73,201 @@ pub struct ManagementExposureIntent {
     pub admin: bool,
     /// Stable service names or endpoint aliases.
     pub service_names: Vec<String>,
+    /// Management listener identity material references.
+    #[serde(default)]
+    pub identity: ManagementIdentityIntent,
+    /// Northbound management protocol transport intent.
+    #[serde(default)]
+    pub northbound: ManagementNorthboundIntent,
+}
+
+impl ManagementExposureIntent {
+    /// Validate management exposure and identity references.
+    pub fn validate(&self) -> Result<(), ReconcileIntentError> {
+        for service_name in &self.service_names {
+            validate_non_empty("management service name", service_name)?;
+        }
+        self.identity.validate()?;
+        self.northbound.validate(&self.identity)
+    }
+}
+
+/// Platform-owned management listener identity material.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ManagementIdentityIntent {
+    /// mTLS/SPIFFE SVID and trust bundle references.
+    #[serde(default)]
+    pub mtls: Option<ManagementMtlsIdentityIntent>,
+    /// NETCONF-over-SSH host key and authorized client key references.
+    #[serde(default)]
+    pub netconf_ssh: Option<NetconfSshIdentityIntent>,
+}
+
+impl ManagementIdentityIntent {
+    /// Validate identity references without requiring any protocol to be exposed.
+    pub fn validate(&self) -> Result<(), ReconcileIntentError> {
+        if let Some(mtls) = &self.mtls {
+            mtls.validate()?;
+        }
+        if let Some(netconf_ssh) = &self.netconf_ssh {
+            netconf_ssh.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// mTLS/SPIFFE identity references for management listeners.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagementMtlsIdentityIntent {
+    /// Secret reference containing SVID/certificate material.
+    pub svid_ref: ManagementMaterialRef,
+    /// Trust bundle reference used to authenticate clients.
+    pub trust_bundle_ref: ManagementMaterialRef,
+}
+
+impl ManagementMtlsIdentityIntent {
+    fn validate(&self) -> Result<(), ReconcileIntentError> {
+        self.svid_ref.validate("management mtls svid ref")?;
+        self.trust_bundle_ref
+            .validate("management mtls trust bundle ref")
+    }
+}
+
+/// NETCONF-over-SSH identity references.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetconfSshIdentityIntent {
+    /// Host private-key material reference.
+    pub host_key_ref: ManagementMaterialRef,
+    /// Authorized client public-key material reference.
+    pub authorized_keys_ref: ManagementMaterialRef,
+}
+
+impl NetconfSshIdentityIntent {
+    fn validate(&self) -> Result<(), ReconcileIntentError> {
+        self.host_key_ref
+            .validate("management netconf ssh host key ref")?;
+        self.authorized_keys_ref
+            .validate("management netconf ssh authorized keys ref")
+    }
+}
+
+/// Reference to platform-owned management identity material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagementMaterialRef {
+    /// Reference name.
+    pub name: String,
+    /// Reference kind.
+    pub kind: BootstrapRefKind,
+}
+
+impl ManagementMaterialRef {
+    /// Build a Secret reference.
+    pub fn secret(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: BootstrapRefKind::Secret,
+        }
+    }
+
+    /// Build a ConfigMap reference.
+    pub fn config_map(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: BootstrapRefKind::ConfigMap,
+        }
+    }
+
+    fn validate(&self, field: &str) -> Result<(), ReconcileIntentError> {
+        validate_non_empty(field, &self.name)
+    }
+}
+
+/// Northbound management protocol exposure intent.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ManagementNorthboundIntent {
+    /// gNMI-over-mTLS listener.
+    #[serde(default)]
+    pub gnmi_tls: Option<ManagementPortIntent>,
+    /// NETCONF-over-TLS listener.
+    #[serde(default)]
+    pub netconf_tls: Option<ManagementPortIntent>,
+    /// NETCONF-over-SSH listener.
+    #[serde(default)]
+    pub netconf_ssh: Option<ManagementPortIntent>,
+}
+
+impl ManagementNorthboundIntent {
+    /// Validate enabled northbound listeners against required identity material.
+    pub fn validate(
+        &self,
+        identity: &ManagementIdentityIntent,
+    ) -> Result<(), ReconcileIntentError> {
+        if (self.gnmi_tls.is_some() || self.netconf_tls.is_some()) && identity.mtls.is_none() {
+            return Err(ReconcileIntentError::InvalidIntent(
+                "management TLS exposure requires mTLS identity refs".to_string(),
+            ));
+        }
+        if self.netconf_ssh.is_some() && identity.netconf_ssh.is_none() {
+            return Err(ReconcileIntentError::InvalidIntent(
+                "NETCONF SSH exposure requires host key and authorized key refs".to_string(),
+            ));
+        }
+
+        let mut seen_names = BTreeMap::<&str, u16>::new();
+        let mut seen_ports = BTreeMap::<u16, &str>::new();
+        for (protocol, port) in [
+            ("gnmi-tls", self.gnmi_tls.as_ref()),
+            ("netconf-tls", self.netconf_tls.as_ref()),
+            ("netconf-ssh", self.netconf_ssh.as_ref()),
+        ] {
+            let Some(port) = port else {
+                continue;
+            };
+            port.validate(protocol)?;
+            if let Some(existing_port) = seen_names.insert(port.name.as_str(), port.port) {
+                return Err(ReconcileIntentError::InvalidIntent(format!(
+                    "management port name '{}' reused for ports {} and {}",
+                    port.name, existing_port, port.port
+                )));
+            }
+            if let Some(existing_name) = seen_ports.insert(port.port, port.name.as_str()) {
+                return Err(ReconcileIntentError::InvalidIntent(format!(
+                    "management port {} reused by '{}' and '{}'",
+                    port.port, existing_name, port.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One northbound management listener port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagementPortIntent {
+    /// Stable Kubernetes/service port name.
+    pub name: String,
+    /// TCP port number.
+    pub port: u16,
+}
+
+impl ManagementPortIntent {
+    /// Construct a management port intent.
+    pub fn new(name: impl Into<String>, port: u16) -> Self {
+        Self {
+            name: name.into(),
+            port,
+        }
+    }
+
+    fn validate(&self, protocol: &str) -> Result<(), ReconcileIntentError> {
+        validate_non_empty("management port name", &self.name)?;
+        if self.port == 0 {
+            return Err(ReconcileIntentError::InvalidIntent(format!(
+                "{protocol} management port must be non-zero"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Supported platform bootstrap reference classes.
@@ -192,6 +387,7 @@ impl CnfWorkloadIntent {
         for bootstrap_ref in &self.bootstrap_refs {
             validate_non_empty("bootstrap ref name", &bootstrap_ref.name)?;
         }
+        self.management.validate()?;
         if let Some(session_store) = &self.session_store {
             validate_non_empty(
                 "session store backend profile",

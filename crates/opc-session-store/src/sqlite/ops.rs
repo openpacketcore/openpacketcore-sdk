@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use opc_types::Timestamp;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::str::FromStr;
@@ -10,6 +11,7 @@ use crate::{
     lease::LeaseGuard,
     model::{FenceToken, Generation, OwnerId, SessionKey, StateClass, StateType},
     record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord},
+    restore::{RestoreScanCursor, RestoreScanPage, RestoreScanRequest},
 };
 
 pub(crate) fn format_rfc3339_normalized(ts: Timestamp) -> String {
@@ -265,6 +267,189 @@ pub(crate) fn get_sync(
         Ok(None)
     } else {
         Ok(Some(record))
+    }
+}
+
+pub(crate) fn scan_restore_records_sync(
+    conn: &Connection,
+    request: RestoreScanRequest,
+    now: Timestamp,
+) -> Result<RestoreScanPage, StoreError> {
+    request.validate()?;
+    prune_sync(conn, now)?;
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT tenant, nf_kind, key_type, stable_id, generation, owner, fence,
+                   state_class, state_type, expires_at, payload, encoding
+            FROM session_records
+            ORDER BY tenant ASC, nf_kind ASC, key_type ASC, stable_id ASC,
+                     state_class ASC, state_type ASC, owner ASC, generation ASC
+            "#,
+        )
+        .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Vec<u8>>(10)?,
+                row.get::<_, i64>(11)?,
+            ))
+        })
+        .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+
+    let mut matching = Vec::new();
+    let mut excluded_count = 0;
+    for row in rows {
+        let (
+            tenant_str,
+            nf_kind_str,
+            key_type_str,
+            stable_id,
+            generation,
+            owner_str,
+            fence,
+            state_class_str,
+            state_type_str,
+            expires_at_str,
+            payload_bytes,
+            encoding,
+        ) = row.map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+
+        let record = stored_record_from_row(
+            tenant_str,
+            nf_kind_str,
+            key_type_str,
+            stable_id,
+            generation,
+            owner_str,
+            fence,
+            state_class_str,
+            state_type_str,
+            expires_at_str,
+            payload_bytes,
+            encoding,
+        )?;
+        if record.is_expired_at(now) {
+            continue;
+        }
+        if request.scope.matches_record(&record) {
+            matching.push(record);
+        } else {
+            excluded_count += 1;
+        }
+    }
+
+    let start = request
+        .cursor
+        .map(RestoreScanCursor::offset)
+        .unwrap_or(0)
+        .min(matching.len());
+    let end = start.saturating_add(request.limit).min(matching.len());
+    let next_cursor = (end < matching.len()).then(|| RestoreScanCursor::from_offset(end));
+    let records = matching[start..end].to_vec();
+
+    Ok(RestoreScanPage::new(records, excluded_count, next_cursor))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stored_record_from_row(
+    tenant_str: String,
+    nf_kind_str: String,
+    key_type_str: String,
+    stable_id: Vec<u8>,
+    generation: i64,
+    owner_str: String,
+    fence: i64,
+    state_class_str: String,
+    state_type_str: String,
+    expires_at_str: Option<String>,
+    payload_bytes: Vec<u8>,
+    encoding: i64,
+) -> Result<StoredSessionRecord, StoreError> {
+    let tenant = opc_types::TenantId::new(tenant_str)
+        .map_err(|err| StoreError::Serialization(err.to_string()))?;
+    let nf_kind = opc_types::NetworkFunctionKind::new(nf_kind_str)
+        .map_err(|err| StoreError::Serialization(err.to_string()))?;
+    let key_type =
+        crate::SessionKeyType::from_str(&key_type_str).map_err(StoreError::Serialization)?;
+    let owner = OwnerId::new(owner_str).map_err(StoreError::Serialization)?;
+    let state_class = state_class_from_str(&state_class_str)?;
+    let state_type = StateType::new(state_type_str).map_err(StoreError::Serialization)?;
+    let expires_at = match &expires_at_str {
+        Some(s) => Some(
+            opc_types::Timestamp::from_str(s.as_str())
+                .map_err(|e| StoreError::Serialization(e.to_string()))?,
+        ),
+        None => None,
+    };
+    let payload = payload_from_row(payload_bytes, encoding)?;
+
+    Ok(StoredSessionRecord {
+        key: SessionKey {
+            tenant,
+            nf_kind,
+            key_type,
+            stable_id: Bytes::from(stable_id),
+        },
+        generation: Generation::new(generation as u64),
+        owner,
+        fence: FenceToken::new(fence as u64),
+        state_class,
+        state_type,
+        expires_at,
+        payload,
+    })
+}
+
+fn state_class_from_str(value: &str) -> Result<StateClass, StoreError> {
+    match value {
+        "authoritative-session" => Ok(StateClass::AuthoritativeSession),
+        "dataplane-lookup" => Ok(StateClass::DataplaneLookup),
+        "replicated-dr" => Ok(StateClass::ReplicatedDr),
+        "telemetry-derived" => Ok(StateClass::TelemetryDerived),
+        "ephemeral-procedure" => Ok(StateClass::EphemeralProcedure),
+        _ => Err(StoreError::Serialization(format!(
+            "unknown state class: {value}"
+        ))),
+    }
+}
+
+fn payload_from_row(
+    payload_bytes: Vec<u8>,
+    encoding: i64,
+) -> Result<EncryptedSessionPayload, StoreError> {
+    match encoding {
+        0 => Ok(EncryptedSessionPayload::from_vec_with_encoding(
+            payload_bytes,
+            SessionPayloadEncoding::Plaintext,
+        )),
+        1 => Ok(EncryptedSessionPayload::from_vec_with_encoding(
+            payload_bytes,
+            SessionPayloadEncoding::LegacyPlaintext,
+        )),
+        2 => Ok(EncryptedSessionPayload::from_vec_with_encoding(
+            payload_bytes,
+            SessionPayloadEncoding::EnvelopeV1,
+        )),
+        3 => Ok(EncryptedSessionPayload::from_vec_with_encoding(
+            payload_bytes,
+            SessionPayloadEncoding::Unclassified,
+        )),
+        _ => Err(StoreError::Serialization(format!(
+            "unknown payload encoding: {encoding}"
+        ))),
     }
 }
 

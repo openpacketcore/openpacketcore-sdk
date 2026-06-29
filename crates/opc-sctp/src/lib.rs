@@ -24,6 +24,19 @@ use tokio::io::unix::AsyncFd;
 /// NGAP SCTP payload protocol identifier, per 3GPP N2 usage.
 pub const NGAP_PPID: PayloadProtocolIdentifier = PayloadProtocolIdentifier::new(60);
 
+/// Diameter SCTP payload protocol identifier for clear-text SCTP DATA chunks.
+///
+/// RFC 6733 assigns PPID 46 to Diameter over SCTP without DTLS.
+pub const DIAMETER_SCTP_PPID: PayloadProtocolIdentifier = PayloadProtocolIdentifier::new(46);
+
+/// Diameter SCTP payload protocol identifier for DTLS/SCTP DATA chunks.
+///
+/// RFC 6733 assigns PPID 47 to Diameter over protected DTLS/SCTP.
+pub const DIAMETER_DTLS_SCTP_PPID: PayloadProtocolIdentifier = PayloadProtocolIdentifier::new(47);
+
+/// Default SCTP stream used by the Diameter SCTP helper.
+pub const DIAMETER_DEFAULT_STREAM_ID: u16 = 0;
+
 /// Host-order SCTP payload protocol identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PayloadProtocolIdentifier(u32);
@@ -250,6 +263,397 @@ impl OutboundMessage {
             ppid,
             order: DeliveryOrder::Ordered,
             assoc_id: 0,
+        }
+    }
+}
+
+/// Security profile for Diameter over SCTP metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiameterSctpSecurity {
+    /// Diameter carried directly in SCTP DATA chunks.
+    ClearText,
+    /// Diameter carried in protected DTLS/SCTP DATA chunks.
+    Dtls,
+}
+
+impl DiameterSctpSecurity {
+    /// Return the PPID required for this Diameter SCTP security profile.
+    #[must_use]
+    pub const fn ppid(self) -> PayloadProtocolIdentifier {
+        match self {
+            Self::ClearText => DIAMETER_SCTP_PPID,
+            Self::Dtls => DIAMETER_DTLS_SCTP_PPID,
+        }
+    }
+}
+
+/// Diameter SCTP peer transport intent for one resolved remote address.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DiameterSctpPeer {
+    /// Resolved remote Diameter peer address.
+    pub remote_addr: SocketAddr,
+    /// Optional local bind address.
+    pub local_addr: Option<SocketAddr>,
+    /// Diameter SCTP security profile.
+    pub security: DiameterSctpSecurity,
+    /// Maximum SCTP user payload accepted for one Diameter message.
+    pub max_message_bytes: usize,
+}
+
+impl fmt::Debug for DiameterSctpPeer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DiameterSctpPeer")
+            .field("remote_addr", &"<redacted>")
+            .field("local_addr", &self.local_addr.map(|_| "<redacted>"))
+            .field("security", &self.security)
+            .field("max_message_bytes", &self.max_message_bytes)
+            .finish()
+    }
+}
+
+impl DiameterSctpPeer {
+    /// Create a clear-text Diameter SCTP peer intent for one remote address.
+    #[must_use]
+    pub fn new(remote_addr: SocketAddr) -> Self {
+        let default_config = SctpConnectConfig::new(remote_addr);
+        Self {
+            remote_addr,
+            local_addr: None,
+            security: DiameterSctpSecurity::ClearText,
+            max_message_bytes: default_config.max_message_bytes,
+        }
+    }
+
+    /// Return a copy that binds the SCTP association from one local address.
+    #[must_use]
+    pub fn with_local_addr(mut self, local_addr: SocketAddr) -> Self {
+        self.local_addr = Some(local_addr);
+        self
+    }
+
+    /// Return a copy that uses the requested Diameter SCTP security profile.
+    #[must_use]
+    pub fn with_security(mut self, security: DiameterSctpSecurity) -> Self {
+        self.security = security;
+        self
+    }
+
+    /// Return a copy that uses the requested maximum message size.
+    #[must_use]
+    pub fn with_max_message_bytes(mut self, max_message_bytes: usize) -> Self {
+        self.max_message_bytes = max_message_bytes;
+        self
+    }
+
+    /// Build and validate the SDK SCTP client association configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiameterSctpError`] when the projected SCTP config violates
+    /// the capability profile, including unsupported multihoming or invalid
+    /// address-family combinations.
+    pub fn sctp_connect_config(&self) -> Result<SctpConnectConfig, DiameterSctpError> {
+        let mut config = SctpConnectConfig::new(self.remote_addr);
+        if let Some(local_addr) = self.local_addr {
+            config.local_addrs.push(local_addr);
+        }
+        config.max_message_bytes = self.max_message_bytes;
+        config.validate().map_err(DiameterSctpError::from)?;
+        Ok(config)
+    }
+
+    /// Wrap an encoded Diameter message with outbound SCTP metadata.
+    #[must_use]
+    pub fn outbound_message(&self, payload: Bytes) -> OutboundMessage {
+        OutboundMessage::ordered(payload, DIAMETER_DEFAULT_STREAM_ID, self.security.ppid())
+    }
+
+    /// Validate inbound SCTP metadata before Diameter payload decode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiameterSctpError`] when SCTP delivered a notification, a
+    /// truncated payload, or a message tagged with the wrong Diameter PPID.
+    pub fn validate_inbound_message(
+        &self,
+        message: &InboundMessage,
+    ) -> Result<(), DiameterSctpError> {
+        if message.notification {
+            return Err(DiameterSctpError::Notification);
+        }
+        if message.truncated {
+            return Err(DiameterSctpError::Truncated);
+        }
+        let expected = self.security.ppid();
+        if message.ppid != expected {
+            return Err(DiameterSctpError::WrongPpid {
+                expected: expected.get(),
+                actual: message.ppid.get(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Return inbound payload bytes after SCTP metadata validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiameterSctpError`] for the same metadata failures as
+    /// [`Self::validate_inbound_message`].
+    pub fn inbound_payload<'a>(
+        &self,
+        message: &'a InboundMessage,
+    ) -> Result<&'a Bytes, DiameterSctpError> {
+        self.validate_inbound_message(message)?;
+        Ok(&message.payload)
+    }
+
+    /// Open a live SDK SCTP association to this Diameter peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiameterSctpError`] when config validation fails or the
+    /// association cannot be opened on the current platform/runtime.
+    pub async fn connect_association(&self) -> Result<DiameterSctpAssociation, DiameterSctpError> {
+        let config = self.sctp_connect_config()?;
+        let association = SctpAssociation::connect(config)
+            .await
+            .map_err(DiameterSctpError::connect)?;
+        Ok(DiameterSctpAssociation {
+            peer: self.clone(),
+            association,
+        })
+    }
+}
+
+/// Live Diameter SCTP association opened by SDK SCTP.
+#[derive(Debug)]
+pub struct DiameterSctpAssociation {
+    peer: DiameterSctpPeer,
+    association: SctpAssociation,
+}
+
+impl DiameterSctpAssociation {
+    /// Return the configured Diameter SCTP peer intent.
+    #[must_use]
+    pub const fn peer(&self) -> &DiameterSctpPeer {
+        &self.peer
+    }
+
+    /// Send one encoded Diameter payload with the peer's required PPID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiameterSctpError`] when the SDK SCTP send fails.
+    pub async fn send_diameter_payload(&self, payload: Bytes) -> Result<usize, DiameterSctpError> {
+        self.association
+            .send(self.peer.outbound_message(payload))
+            .await
+            .map_err(DiameterSctpError::send)
+    }
+
+    /// Receive one Diameter payload after SCTP metadata validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiameterSctpError`] when receive fails or the SCTP metadata is
+    /// not valid for this peer's Diameter security profile.
+    pub async fn recv_diameter_payload(&self) -> Result<Bytes, DiameterSctpError> {
+        let message = self
+            .association
+            .recv()
+            .await
+            .map_err(DiameterSctpError::recv)?;
+        self.peer.validate_inbound_message(&message)?;
+        Ok(message.payload)
+    }
+
+    /// Return SDK SCTP association health.
+    #[must_use]
+    pub fn health(&self) -> SctpHealth {
+        self.association.health()
+    }
+
+    /// Return SDK SCTP association metrics.
+    #[must_use]
+    pub fn metrics(&self) -> SctpMetricsSnapshot {
+        self.association.metrics()
+    }
+}
+
+/// Redaction-safe outcome for one Diameter SCTP connect attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiameterSctpConnectOutcome {
+    /// SDK opened a live SCTP association.
+    Connected,
+    /// SDK reports SCTP is unavailable on this platform.
+    UnsupportedPlatform,
+    /// SDK rejected or failed the connect attempt.
+    Failed,
+}
+
+impl DiameterSctpConnectOutcome {
+    /// Stable machine name for this outcome.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::UnsupportedPlatform => "unsupported_platform",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Redaction-safe projection for one Diameter SCTP connect attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiameterSctpConnectProjection {
+    /// Connect attempt outcome.
+    pub outcome: DiameterSctpConnectOutcome,
+    /// Whether a live SCTP association was opened.
+    pub connected: bool,
+    /// Whether the attempt failed because SCTP is unsupported on this host.
+    pub unsupported_platform: bool,
+    /// Stable error code for failed attempts.
+    pub error_code: Option<&'static str>,
+}
+
+impl DiameterSctpConnectProjection {
+    /// Build a projection for a successful connect attempt.
+    #[must_use]
+    pub const fn connected() -> Self {
+        Self {
+            outcome: DiameterSctpConnectOutcome::Connected,
+            connected: true,
+            unsupported_platform: false,
+            error_code: None,
+        }
+    }
+
+    /// Build a projection for a failed precondition or runtime attempt.
+    #[must_use]
+    pub const fn failed(error_code: &'static str) -> Self {
+        Self {
+            outcome: DiameterSctpConnectOutcome::Failed,
+            connected: false,
+            unsupported_platform: false,
+            error_code: Some(error_code),
+        }
+    }
+
+    /// Build a projection from a failed connect attempt.
+    #[must_use]
+    pub fn from_error(error: &DiameterSctpError) -> Self {
+        let unsupported_platform = error.is_unsupported_platform();
+        Self {
+            outcome: if unsupported_platform {
+                DiameterSctpConnectOutcome::UnsupportedPlatform
+            } else {
+                DiameterSctpConnectOutcome::Failed
+            },
+            connected: false,
+            unsupported_platform,
+            error_code: Some(error.as_str()),
+        }
+    }
+}
+
+/// Error type for Diameter SCTP transport intent and metadata validation.
+#[derive(Debug)]
+pub enum DiameterSctpError {
+    /// SDK SCTP config validation failed.
+    SctpConfig(SctpError),
+    /// SDK SCTP connect failed.
+    SctpConnect(SctpError),
+    /// SDK SCTP send failed.
+    SctpSend(SctpError),
+    /// SDK SCTP receive failed.
+    SctpRecv(SctpError),
+    /// SCTP delivered a notification instead of a Diameter payload.
+    Notification,
+    /// SCTP reported payload truncation.
+    Truncated,
+    /// SCTP PPID did not match the selected Diameter security profile.
+    WrongPpid {
+        /// Expected PPID.
+        expected: u32,
+        /// Observed PPID.
+        actual: u32,
+    },
+}
+
+impl DiameterSctpError {
+    fn connect(error: SctpError) -> Self {
+        Self::SctpConnect(error)
+    }
+
+    fn send(error: SctpError) -> Self {
+        Self::SctpSend(error)
+    }
+
+    fn recv(error: SctpError) -> Self {
+        Self::SctpRecv(error)
+    }
+
+    /// Stable machine-readable error code for evidence and status projection.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::SctpConfig(_) => "diameter_sctp_config_error",
+            Self::SctpConnect(SctpError::UnsupportedPlatform) => {
+                "diameter_sctp_unsupported_platform"
+            }
+            Self::SctpConnect(_) => "diameter_sctp_connect_error",
+            Self::SctpSend(_) => "diameter_sctp_send_error",
+            Self::SctpRecv(_) => "diameter_sctp_recv_error",
+            Self::Notification => "diameter_sctp_notification",
+            Self::Truncated => "diameter_sctp_truncated_payload",
+            Self::WrongPpid { .. } => "diameter_sctp_wrong_ppid",
+        }
+    }
+
+    /// Return whether the connect failed because SCTP is unsupported.
+    #[must_use]
+    pub const fn is_unsupported_platform(&self) -> bool {
+        matches!(self, Self::SctpConnect(SctpError::UnsupportedPlatform))
+    }
+}
+
+impl From<SctpError> for DiameterSctpError {
+    fn from(error: SctpError) -> Self {
+        Self::SctpConfig(error)
+    }
+}
+
+impl fmt::Display for DiameterSctpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SctpConfig(error) => write!(f, "diameter_sctp_config_error: {error}"),
+            Self::SctpConnect(SctpError::UnsupportedPlatform) => {
+                f.write_str("diameter_sctp_unsupported_platform")
+            }
+            Self::SctpConnect(error) => write!(f, "diameter_sctp_connect_error: {error}"),
+            Self::SctpSend(error) => write!(f, "diameter_sctp_send_error: {error}"),
+            Self::SctpRecv(error) => write!(f, "diameter_sctp_recv_error: {error}"),
+            Self::Notification => f.write_str("diameter_sctp_notification"),
+            Self::Truncated => f.write_str("diameter_sctp_truncated_payload"),
+            Self::WrongPpid { expected, actual } => {
+                write!(
+                    f,
+                    "diameter_sctp_wrong_ppid: expected {expected}, actual {actual}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for DiameterSctpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SctpConfig(error)
+            | Self::SctpConnect(error)
+            | Self::SctpSend(error)
+            | Self::SctpRecv(error) => Some(error),
+            Self::Notification | Self::Truncated | Self::WrongPpid { .. } => None,
         }
     }
 }
@@ -941,6 +1345,22 @@ mod platform {
 mod tests {
     use super::*;
 
+    fn diameter_peer() -> DiameterSctpPeer {
+        DiameterSctpPeer::new("127.0.0.1:3868".parse().unwrap())
+    }
+
+    fn diameter_inbound(ppid: PayloadProtocolIdentifier) -> InboundMessage {
+        InboundMessage {
+            payload: Bytes::from_static(b"diameter"),
+            stream_id: DIAMETER_DEFAULT_STREAM_ID,
+            ppid,
+            order: DeliveryOrder::Ordered,
+            assoc_id: 7,
+            notification: false,
+            truncated: false,
+        }
+    }
+
     #[test]
     fn ngap_ppid_network_order_round_trip() {
         let network = NGAP_PPID.to_network_order();
@@ -949,6 +1369,199 @@ mod tests {
             NGAP_PPID
         );
         assert_eq!(NGAP_PPID.get(), 60);
+    }
+
+    #[test]
+    fn diameter_ppids_match_rfc_6733_values() {
+        assert_eq!(DIAMETER_SCTP_PPID.get(), 46);
+        assert_eq!(DIAMETER_DTLS_SCTP_PPID.get(), 47);
+        assert_eq!(DiameterSctpSecurity::ClearText.ppid(), DIAMETER_SCTP_PPID);
+        assert_eq!(DiameterSctpSecurity::Dtls.ppid(), DIAMETER_DTLS_SCTP_PPID);
+
+        let network = DIAMETER_SCTP_PPID.to_network_order();
+        assert_eq!(
+            PayloadProtocolIdentifier::from_network_order(network),
+            DIAMETER_SCTP_PPID
+        );
+    }
+
+    #[test]
+    fn diameter_peer_projects_sctp_connect_config() {
+        let peer = diameter_peer()
+            .with_local_addr("127.0.0.1:0".parse().unwrap())
+            .with_max_message_bytes(4096);
+
+        let config = peer.sctp_connect_config().unwrap();
+
+        assert_eq!(config.remote_addrs, vec![peer.remote_addr]);
+        assert_eq!(config.local_addrs, vec![peer.local_addr.unwrap()]);
+        assert_eq!(config.max_message_bytes, 4096);
+        assert!(config.nodelay);
+    }
+
+    #[test]
+    fn diameter_peer_rejects_invalid_sctp_config() {
+        let peer = diameter_peer().with_local_addr("[::1]:0".parse().unwrap());
+
+        let error = peer.sctp_connect_config().unwrap_err();
+
+        assert!(matches!(error, DiameterSctpError::SctpConfig(_)));
+        assert_eq!(error.as_str(), "diameter_sctp_config_error");
+        assert_eq!(
+            DiameterSctpConnectProjection::from_error(&error),
+            DiameterSctpConnectProjection {
+                outcome: DiameterSctpConnectOutcome::Failed,
+                connected: false,
+                unsupported_platform: false,
+                error_code: Some("diameter_sctp_config_error"),
+            }
+        );
+    }
+
+    #[test]
+    fn diameter_peer_rejects_zero_max_message_bytes() {
+        let peer = diameter_peer().with_max_message_bytes(0);
+
+        let error = peer.sctp_connect_config().unwrap_err();
+
+        assert!(matches!(error, DiameterSctpError::SctpConfig(_)));
+        assert_eq!(error.as_str(), "diameter_sctp_config_error");
+    }
+
+    #[tokio::test]
+    async fn diameter_connect_rejects_invalid_config_before_socket_open() {
+        let peer = diameter_peer().with_local_addr("[::1]:0".parse().unwrap());
+
+        let error = peer.connect_association().await.unwrap_err();
+
+        assert!(matches!(error, DiameterSctpError::SctpConfig(_)));
+        assert_eq!(error.as_str(), "diameter_sctp_config_error");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn diameter_connect_reports_unsupported_platform_on_non_linux() {
+        let error = diameter_peer().connect_association().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            DiameterSctpError::SctpConnect(SctpError::UnsupportedPlatform)
+        ));
+        assert_eq!(error.as_str(), "diameter_sctp_unsupported_platform");
+
+        let projection = DiameterSctpConnectProjection::from_error(&error);
+        assert_eq!(
+            projection.outcome,
+            DiameterSctpConnectOutcome::UnsupportedPlatform
+        );
+        assert!(!projection.connected);
+        assert!(projection.unsupported_platform);
+        assert_eq!(
+            projection.error_code,
+            Some("diameter_sctp_unsupported_platform")
+        );
+    }
+
+    #[test]
+    fn diameter_outbound_message_uses_selected_ppid() {
+        let clear = diameter_peer().outbound_message(Bytes::from_static(b"diameter"));
+        assert_eq!(clear.stream_id, DIAMETER_DEFAULT_STREAM_ID);
+        assert_eq!(clear.ppid, DIAMETER_SCTP_PPID);
+        assert_eq!(clear.order, DeliveryOrder::Ordered);
+
+        let protected = diameter_peer()
+            .with_security(DiameterSctpSecurity::Dtls)
+            .outbound_message(Bytes::from_static(b"diameter"));
+        assert_eq!(protected.ppid, DIAMETER_DTLS_SCTP_PPID);
+    }
+
+    #[test]
+    fn diameter_inbound_validation_rejects_non_payload_conditions() {
+        let peer = diameter_peer();
+
+        let mut notification = diameter_inbound(DIAMETER_SCTP_PPID);
+        notification.notification = true;
+        let error = peer.validate_inbound_message(&notification).unwrap_err();
+        assert_eq!(error.as_str(), "diameter_sctp_notification");
+
+        let mut truncated = diameter_inbound(DIAMETER_SCTP_PPID);
+        truncated.truncated = true;
+        let error = peer.validate_inbound_message(&truncated).unwrap_err();
+        assert_eq!(error.as_str(), "diameter_sctp_truncated_payload");
+    }
+
+    #[test]
+    fn diameter_inbound_validation_checks_selected_ppid() {
+        let peer = diameter_peer();
+        let message = diameter_inbound(DIAMETER_SCTP_PPID);
+
+        let payload = peer.inbound_payload(&message).unwrap();
+
+        assert_eq!(payload, &Bytes::from_static(b"diameter"));
+
+        let error = peer
+            .validate_inbound_message(&diameter_inbound(DIAMETER_DTLS_SCTP_PPID))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DiameterSctpError::WrongPpid {
+                expected: 46,
+                actual: 47
+            }
+        ));
+        assert_eq!(error.as_str(), "diameter_sctp_wrong_ppid");
+    }
+
+    #[test]
+    fn diameter_connect_projection_classifies_success_and_failures() {
+        let connected = DiameterSctpConnectProjection::connected();
+        assert_eq!(connected.outcome, DiameterSctpConnectOutcome::Connected);
+        assert_eq!(connected.outcome.as_str(), "connected");
+        assert!(connected.connected);
+        assert!(!connected.unsupported_platform);
+        assert_eq!(connected.error_code, None);
+
+        let failed = DiameterSctpConnectProjection::failed("diameter_peer_unresolved");
+        assert_eq!(failed.outcome, DiameterSctpConnectOutcome::Failed);
+        assert_eq!(failed.outcome.as_str(), "failed");
+        assert!(!failed.connected);
+        assert!(!failed.unsupported_platform);
+        assert_eq!(failed.error_code, Some("diameter_peer_unresolved"));
+
+        let unsupported = DiameterSctpError::SctpConnect(SctpError::UnsupportedPlatform);
+        let projection = DiameterSctpConnectProjection::from_error(&unsupported);
+        assert_eq!(
+            projection.outcome,
+            DiameterSctpConnectOutcome::UnsupportedPlatform
+        );
+        assert_eq!(projection.outcome.as_str(), "unsupported_platform");
+        assert!(!projection.connected);
+        assert!(projection.unsupported_platform);
+        assert_eq!(
+            projection.error_code,
+            Some("diameter_sctp_unsupported_platform")
+        );
+
+        let failed = DiameterSctpError::SctpSend(SctpError::UnsupportedFeature {
+            feature: "test-only",
+        });
+        let projection = DiameterSctpConnectProjection::from_error(&failed);
+        assert_eq!(projection.outcome, DiameterSctpConnectOutcome::Failed);
+        assert!(!projection.connected);
+        assert!(!projection.unsupported_platform);
+        assert_eq!(projection.error_code, Some("diameter_sctp_send_error"));
+    }
+
+    #[test]
+    fn diameter_peer_debug_redacts_socket_addresses() {
+        let peer = diameter_peer().with_local_addr("127.0.0.1:0".parse().unwrap());
+
+        let debug = format!("{peer:?}");
+
+        assert!(debug.contains("DiameterSctpPeer"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("127.0.0.1"));
+        assert!(!debug.contains("3868"));
     }
 
     #[test]

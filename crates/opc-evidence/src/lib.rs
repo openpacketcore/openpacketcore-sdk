@@ -29,7 +29,7 @@ pub use data_governance::DataGovernanceEvidenceReport;
 pub use dataplane::{
     assert_packet_continuity_claim_allowed, assert_traffic_readiness_claim_allowed,
     DataplaneBearerSummary, DataplaneEvidenceError, DataplaneSessionSummary, DataplaneSnapshot,
-    DataplaneSnapshotAsserter,
+    DataplaneSnapshotAsserter, DataplaneTrafficBlockReasonCode,
 };
 pub use error::EvidenceError;
 pub use evidence::EvidenceRecord;

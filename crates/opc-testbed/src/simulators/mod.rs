@@ -18,7 +18,10 @@ pub use epc::{
 };
 pub use fake::{FakeSimulator, Fidelity};
 pub use smf::{SmfSimulator, SmfState};
-pub use upf::{UpfSimulator, UpfState};
+pub use upf::{
+    UpfSimulator, UpfState, UpfUserPlaneEvent, UserPlaneContinuityState, UserPlaneMessageKind,
+    UserPlaneMessageView, UPF_USER_PLANE_DECODE_PROFILE,
+};
 
 use crate::scenario::{NfSpec, Step};
 use std::collections::HashMap;

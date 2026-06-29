@@ -13,9 +13,97 @@ use tokio::task::JoinHandle;
 
 use crate::error::LeaseError;
 use crate::lease::{LeaseGuard, SessionLeaseManager};
-use crate::model::{OwnerId, SessionKey};
+use crate::model::{FenceToken, Generation, OwnerId, SessionKey};
+use crate::record::StoredSessionRecord;
 use crate::store::SessionStore;
-use crate::SessionBackend;
+use crate::{CompareAndSet, CompareAndSetResult, SessionBackend, StoreError};
+
+/// Error returned by [`OwnedSession`] fenced mutation helpers.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OwnedSessionMutationError {
+    /// The successor generation would overflow `u64`.
+    #[error("owned session generation overflow")]
+    GenerationOverflow,
+    /// The caller-built record does not match the owned session key, owner,
+    /// fence, or successor generation.
+    #[error("owned session record does not match lease context: {0}")]
+    InvalidRecord(&'static str),
+    /// The lease expired before the mutation reached the backend.
+    #[error("owned session lease lost")]
+    LeaseLost,
+    /// A newer owner/fence has superseded this owned session.
+    #[error("owned session stale fence")]
+    StaleFence,
+    /// Backend or quorum was unavailable.
+    #[error("owned session backend unavailable")]
+    BackendUnavailable,
+    /// Payload exceeded the backend limit.
+    #[error("owned session payload too large: actual {actual} exceeds maximum {max}")]
+    PayloadTooLarge {
+        /// Rejected payload size.
+        actual: usize,
+        /// Backend maximum payload size.
+        max: usize,
+    },
+    /// Backend rejected the mutation for another stable reason.
+    #[error("owned session store rejected mutation: {code}")]
+    StoreRejected {
+        /// Stable SDK error code.
+        code: &'static str,
+    },
+}
+
+impl OwnedSessionMutationError {
+    /// Stable machine-readable error code.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::GenerationOverflow => "generation-overflow",
+            Self::InvalidRecord(_) => "invalid-record",
+            Self::LeaseLost => "lease-lost",
+            Self::StaleFence => "stale-fence",
+            Self::BackendUnavailable => "backend-unavailable",
+            Self::PayloadTooLarge { .. } => "payload-too-large",
+            Self::StoreRejected { code } => code,
+        }
+    }
+}
+
+/// Current lease context supplied to [`OwnedSession::compare_and_set_with`].
+#[derive(Debug, Clone, Copy)]
+pub struct OwnedSessionMutationContext<'a> {
+    key: &'a SessionKey,
+    owner: &'a OwnerId,
+    fence: FenceToken,
+    expected_generation: Option<Generation>,
+    successor_generation: Generation,
+}
+
+impl<'a> OwnedSessionMutationContext<'a> {
+    /// Session key owned by the handle.
+    pub const fn key(&self) -> &'a SessionKey {
+        self.key
+    }
+
+    /// Owner identity held by the handle.
+    pub const fn owner(&self) -> &'a OwnerId {
+        self.owner
+    }
+
+    /// Current fence token from the renewed lease guard.
+    pub const fn fence(&self) -> FenceToken {
+        self.fence
+    }
+
+    /// CAS expectation supplied by the caller.
+    pub const fn expected_generation(&self) -> Option<Generation> {
+        self.expected_generation
+    }
+
+    /// Generation the new record must carry.
+    pub const fn successor_generation(&self) -> Generation {
+        self.successor_generation
+    }
+}
 
 /// A single-owner session handle with automatic lease renewal.
 ///
@@ -149,6 +237,81 @@ impl<B: SessionBackend + SessionLeaseManager + 'static> OwnedSession<B> {
         &self.lease
     }
 
+    /// Fenced compare-and-set using a complete caller-built record.
+    ///
+    /// The helper validates that `new_record` matches the owned session key,
+    /// owner, current fence, and successor generation before submitting one
+    /// SDK CAS operation. CAS conflicts are returned as
+    /// [`CompareAndSetResult::Conflict`] so callers can re-read and retry with
+    /// product payload logic outside this helper.
+    pub async fn compare_and_set_record(
+        &self,
+        expected_generation: Option<Generation>,
+        new_record: StoredSessionRecord,
+    ) -> Result<CompareAndSetResult, OwnedSessionMutationError> {
+        let lease = self.lease.lock().await.clone();
+        let successor_generation = successor_generation(expected_generation)?;
+        validate_owned_record(
+            &self.key,
+            &self.owner,
+            &lease,
+            successor_generation,
+            &new_record,
+        )?;
+        self.store
+            .compare_and_set(CompareAndSet {
+                key: self.key.clone(),
+                lease,
+                expected_generation,
+                new_record,
+            })
+            .await
+            .map_err(OwnedSessionMutationError::from_store_error)
+    }
+
+    /// Build and write a fenced record from the current owned lease context.
+    ///
+    /// This is the preferred helper for product-owned payloads: the SDK
+    /// selects the successor generation and supplies the current key, owner,
+    /// and fence; the caller only builds the full record body.
+    pub async fn compare_and_set_with<F>(
+        &self,
+        expected_generation: Option<Generation>,
+        build: F,
+    ) -> Result<CompareAndSetResult, OwnedSessionMutationError>
+    where
+        F: FnOnce(
+            OwnedSessionMutationContext<'_>,
+        ) -> Result<StoredSessionRecord, OwnedSessionMutationError>,
+    {
+        let lease = self.lease.lock().await.clone();
+        let successor_generation = successor_generation(expected_generation)?;
+        let context = OwnedSessionMutationContext {
+            key: &self.key,
+            owner: &self.owner,
+            fence: lease.fence(),
+            expected_generation,
+            successor_generation,
+        };
+        let new_record = build(context)?;
+        validate_owned_record(
+            &self.key,
+            &self.owner,
+            &lease,
+            successor_generation,
+            &new_record,
+        )?;
+        self.store
+            .compare_and_set(CompareAndSet {
+                key: self.key.clone(),
+                lease,
+                expected_generation,
+                new_record,
+            })
+            .await
+            .map_err(OwnedSessionMutationError::from_store_error)
+    }
+
     /// Explicitly release the lease and stop the renewal task.
     ///
     /// After this call the lease is returned to the backend and the owner is
@@ -158,6 +321,77 @@ impl<B: SessionBackend + SessionLeaseManager + 'static> OwnedSession<B> {
         self.renewal_handle.abort();
         let lease = self.lease.lock().await;
         self.store.release(lease.clone()).await
+    }
+}
+
+fn successor_generation(
+    expected_generation: Option<Generation>,
+) -> Result<Generation, OwnedSessionMutationError> {
+    match expected_generation {
+        Some(generation) => generation
+            .next()
+            .ok_or(OwnedSessionMutationError::GenerationOverflow),
+        None => Ok(Generation::new(1)),
+    }
+}
+
+fn validate_owned_record(
+    key: &SessionKey,
+    owner: &OwnerId,
+    lease: &LeaseGuard,
+    successor_generation: Generation,
+    record: &StoredSessionRecord,
+) -> Result<(), OwnedSessionMutationError> {
+    if record.key != *key {
+        return Err(OwnedSessionMutationError::InvalidRecord(
+            "record key does not match owned session",
+        ));
+    }
+    if record.owner != *owner {
+        return Err(OwnedSessionMutationError::InvalidRecord(
+            "record owner does not match owned session",
+        ));
+    }
+    if record.fence != lease.fence() {
+        return Err(OwnedSessionMutationError::InvalidRecord(
+            "record fence does not match current lease",
+        ));
+    }
+    if record.generation != successor_generation {
+        return Err(OwnedSessionMutationError::InvalidRecord(
+            "record generation is not the expected successor",
+        ));
+    }
+    Ok(())
+}
+
+impl OwnedSessionMutationError {
+    fn from_store_error(error: StoreError) -> Self {
+        match error {
+            StoreError::LeaseExpired => Self::LeaseLost,
+            StoreError::StaleFence => Self::StaleFence,
+            StoreError::BackendUnavailable(_) => Self::BackendUnavailable,
+            StoreError::PayloadTooLarge { actual, max } => Self::PayloadTooLarge { actual, max },
+            StoreError::InvalidKey(_) => Self::InvalidRecord("backend rejected record shape"),
+            StoreError::NotFound => Self::StoreRejected { code: "not-found" },
+            StoreError::CasConflict => Self::StoreRejected {
+                code: "cas-conflict",
+            },
+            StoreError::CapabilityNotSupported(_) => Self::StoreRejected {
+                code: "capability-not-supported",
+            },
+            StoreError::LeaseHeld => Self::StoreRejected { code: "lease-held" },
+            StoreError::Crypto(_) => Self::StoreRejected { code: "crypto" },
+            StoreError::Serialization(_) => Self::StoreRejected {
+                code: "serialization",
+            },
+            StoreError::InvalidRestoreScanRequest(_) => Self::StoreRejected {
+                code: "invalid-restore-scan-request",
+            },
+            StoreError::RestoreScanPageTooLarge { .. } => Self::StoreRejected {
+                code: "restore-scan-page-too-large",
+            },
+        }
     }
 }
 
@@ -195,7 +429,7 @@ async fn run_renewal_loop<B: SessionBackend + SessionLeaseManager + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{SessionKeyType, StateClass, StateType};
+    use crate::model::{Generation, SessionKeyType, StateClass, StateType};
     use crate::record::{EncryptedSessionPayload, StoredSessionRecord};
     use bytes::Bytes;
     use opc_types::{NetworkFunctionKind, TenantId};
@@ -206,6 +440,22 @@ mod tests {
             nf_kind: NetworkFunctionKind::from_static("smf"),
             key_type: SessionKeyType::PduSession,
             stable_id: Bytes::from_static(b"seid-1"),
+        }
+    }
+
+    fn record_from_context(
+        context: OwnedSessionMutationContext<'_>,
+        payload: &'static [u8],
+    ) -> StoredSessionRecord {
+        StoredSessionRecord {
+            key: context.key().clone(),
+            generation: context.successor_generation(),
+            owner: context.owner().clone(),
+            fence: context.fence(),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("pdu-session"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(Bytes::from_static(payload)),
         }
     }
 
@@ -255,5 +505,168 @@ mod tests {
         drop(lease_guard);
 
         session.release().await.expect("release");
+    }
+
+    #[tokio::test]
+    async fn owned_session_compare_and_set_with_writes_successor_records() {
+        let store = SessionStore::new(crate::FakeSessionBackend::new());
+        let owner = OwnerId::new("smf-01").expect("valid owner");
+        let key = test_key();
+        let (session, _failures) = OwnedSession::acquire(
+            store.clone(),
+            key.clone(),
+            owner,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("acquire");
+
+        let first = session
+            .compare_and_set_with(None, |context| {
+                Ok(record_from_context(context, b"payload-1"))
+            })
+            .await
+            .expect("first write");
+        assert_eq!(first, CompareAndSetResult::Success);
+
+        let second = session
+            .compare_and_set_with(Some(Generation::new(1)), |context| {
+                assert_eq!(context.expected_generation(), Some(Generation::new(1)));
+                Ok(record_from_context(context, b"payload-2"))
+            })
+            .await
+            .expect("second write");
+        assert_eq!(second, CompareAndSetResult::Success);
+
+        let stored = store.get(&key).await.expect("get").expect("record");
+        assert_eq!(stored.generation, Generation::new(2));
+        assert_eq!(stored.payload.as_bytes(), b"payload-2");
+
+        session.release().await.expect("release");
+    }
+
+    #[tokio::test]
+    async fn owned_session_compare_and_set_returns_conflict_without_error() {
+        let store = SessionStore::new(crate::FakeSessionBackend::new());
+        let owner = OwnerId::new("smf-01").expect("valid owner");
+        let key = test_key();
+        let (session, _failures) = OwnedSession::acquire(
+            store,
+            key,
+            owner,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("acquire");
+
+        assert_eq!(
+            session
+                .compare_and_set_with(None, |context| {
+                    Ok(record_from_context(context, b"payload-1"))
+                })
+                .await
+                .expect("first write"),
+            CompareAndSetResult::Success
+        );
+
+        let conflict = session
+            .compare_and_set_with(None, |context| {
+                Ok(record_from_context(context, b"payload-conflict"))
+            })
+            .await
+            .expect("conflict result");
+
+        match conflict {
+            CompareAndSetResult::Success => panic!("expected conflict"),
+            CompareAndSetResult::Conflict { current } => {
+                assert_eq!(current.expect("current").payload.as_bytes(), b"payload-1");
+            }
+        }
+
+        session.release().await.expect("release");
+    }
+
+    #[tokio::test]
+    async fn owned_session_compare_and_set_rejects_malformed_record() {
+        let store = SessionStore::new(crate::FakeSessionBackend::new());
+        let owner = OwnerId::new("smf-01").expect("valid owner");
+        let key = test_key();
+        let (session, _failures) = OwnedSession::acquire(
+            store,
+            key,
+            owner,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("acquire");
+
+        let err = session
+            .compare_and_set_with(None, |context| {
+                let mut record = record_from_context(context, b"payload");
+                record.generation = Generation::new(99);
+                Ok(record)
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), "invalid-record");
+        assert!(!format!("{err:?}").contains("payload"));
+
+        session.release().await.expect("release");
+    }
+
+    #[tokio::test]
+    async fn owned_session_compare_and_set_reports_generation_overflow() {
+        let store = SessionStore::new(crate::FakeSessionBackend::new());
+        let owner = OwnerId::new("smf-01").expect("valid owner");
+        let key = test_key();
+        let (session, _failures) = OwnedSession::acquire(
+            store,
+            key,
+            owner,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("acquire");
+
+        let err = session
+            .compare_and_set_with(Some(Generation::new(u64::MAX)), |context| {
+                Ok(record_from_context(context, b"unreachable"))
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, OwnedSessionMutationError::GenerationOverflow);
+
+        session.release().await.expect("release");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owned_session_compare_and_set_reports_lost_lease() {
+        let store = SessionStore::new(crate::FakeSessionBackend::new());
+        let owner = OwnerId::new("smf-01").expect("valid owner");
+        let key = test_key();
+        let (session, _failures) = OwnedSession::acquire(
+            store,
+            key,
+            owner,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("acquire");
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        let err = session
+            .compare_and_set_with(None, |context| Ok(record_from_context(context, b"payload")))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), "lease-lost");
     }
 }

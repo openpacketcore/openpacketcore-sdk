@@ -71,6 +71,19 @@ pub enum StoreError {
         /// The backend's `max_value_bytes` limit that was exceeded.
         max: usize,
     },
+    /// Restore scan request is malformed, for example a zero page size. The
+    /// message is SDK-controlled and must not include raw session keys or
+    /// product payload fields.
+    #[error("invalid restore scan request: {0}")]
+    InvalidRestoreScanRequest(String),
+    /// Restore scan page size exceeds the SDK maximum. Nothing was read.
+    #[error("restore scan page too large: requested {requested} exceeds maximum {max}")]
+    RestoreScanPageTooLarge {
+        /// Requested page size.
+        requested: usize,
+        /// Maximum supported page size.
+        max: usize,
+    },
 }
 
 /// Error type for lease operations.

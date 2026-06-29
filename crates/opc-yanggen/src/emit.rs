@@ -1,7 +1,7 @@
 use crate::ir::{
     AllocationStrategy, BooleanOp, CompareOp, ConstraintBinding, ConstraintExpr, FunctionName,
-    Literal, ModuleLockfile, PathAnchor, SchemaModule, SchemaNode, SchemaNodeKind, StackBudget,
-    StackScope, StackShape, TypeRef, UnsupportedFeature,
+    Literal, ModuleLockfile, NumericRangeInterval, PathAnchor, SchemaModule, SchemaNode,
+    SchemaNodeKind, StackBudget, StackScope, StackShape, TypeRef, UnsupportedFeature,
 };
 use crate::lower::MAX_CONSTRAINT_EXPR_DEPTH;
 use serde::{Deserialize, Serialize};
@@ -201,7 +201,7 @@ pub fn schema_digest_from_canonical(canonical: &CanonicalInput) -> String {
         .nodes
         .iter()
         .map(|n| {
-            serde_json::json!({
+            let mut node = serde_json::json!({
                 "path": n.path,
                 "module": n.module,
                 "kind": n.kind,
@@ -214,7 +214,11 @@ pub fn schema_digest_from_canonical(canonical: &CanonicalInput) -> String {
                 "ordered_by": n.ordered_by,
                 "data_class": n.data_class,
                 "unique_constraints": n.unique_constraints,
-            })
+            });
+            if !n.numeric_range.is_empty() {
+                node["numeric_range"] = serde_json::json!(n.numeric_range);
+            }
+            node
         })
         .collect();
 
@@ -562,6 +566,25 @@ pub fn emit_fixture(input: &GenerationInput) -> String {
     emit_fixture_from_canonical(&canonical)
 }
 
+fn numeric_type_str(type_name: &str, intervals: &[NumericRangeInterval]) -> String {
+    if intervals.is_empty() {
+        return type_name.to_string();
+    }
+
+    let range = intervals
+        .iter()
+        .map(|interval| {
+            if interval.min == interval.max {
+                interval.min.to_string()
+            } else {
+                format!("{}..{}", interval.min, interval.max)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    format!("{type_name}(range={range})")
+}
+
 /// Emit a deterministic schema fixture string from a pre-sorted [`CanonicalInput`].
 ///
 /// Use this instead of [`emit_fixture`] to avoid redundant clone-and-sort overhead
@@ -624,9 +647,17 @@ pub fn emit_fixture_from_canonical(canonical: &CanonicalInput) -> String {
             None => "none".to_string(),
             Some(TypeRef::Boolean) => "boolean".to_string(),
             Some(TypeRef::String) => "string".to_string(),
-            Some(TypeRef::Uint16) => "uint16".to_string(),
-            Some(TypeRef::Uint32) => "uint32".to_string(),
-            Some(TypeRef::Int64) => "int64".to_string(),
+            Some(TypeRef::Enumeration { values }) => {
+                let names = values
+                    .iter()
+                    .map(|value| value.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("enumeration(values={names})")
+            }
+            Some(TypeRef::Uint16) => numeric_type_str("uint16", &node.numeric_range),
+            Some(TypeRef::Uint32) => numeric_type_str("uint32", &node.numeric_range),
+            Some(TypeRef::Int64) => numeric_type_str("int64", &node.numeric_range),
             Some(TypeRef::Decimal64) => "decimal64".to_string(),
             Some(TypeRef::Empty) => "empty".to_string(),
             Some(TypeRef::IdentityRef { base }) => format!("identityref(base={base})"),

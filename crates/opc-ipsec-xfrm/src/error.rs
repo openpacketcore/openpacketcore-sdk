@@ -48,6 +48,9 @@ pub enum XfrmError {
     /// The requested SA or policy was not found.
     #[error("XFRM state not found")]
     NotFound,
+    /// The requested SA or policy already exists.
+    #[error("XFRM state already exists")]
+    AlreadyExists,
     /// The backend is in a state that prevents the operation.
     #[error("XFRM backend unavailable")]
     Unavailable,
@@ -132,5 +135,11 @@ mod tests {
         assert!(!debug.contains("subscriber"));
         assert!(!debug.contains("123456789012345"));
         assert!(!debug.contains("0x12345678"));
+    }
+
+    #[test]
+    fn already_exists_display_is_safe() {
+        let err = XfrmError::AlreadyExists;
+        assert_eq!(err.to_string(), "XFRM state already exists");
     }
 }

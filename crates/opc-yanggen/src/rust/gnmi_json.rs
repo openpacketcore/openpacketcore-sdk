@@ -602,7 +602,7 @@ fn resolved_type<'a>(
 fn leaf_base_type(node: &SchemaNode, nodes_by_path: &HashMap<String, &SchemaNode>) -> TokenStream {
     match resolved_type(node, nodes_by_path) {
         Some(TypeRef::Boolean) => quote! { bool },
-        Some(TypeRef::String) => quote! { String },
+        Some(TypeRef::String) | Some(TypeRef::Enumeration { .. }) => quote! { String },
         Some(TypeRef::Uint16) => quote! { u16 },
         Some(TypeRef::Uint32) => quote! { u32 },
         Some(TypeRef::Int64) => quote! { super::types::YangInt64 },
@@ -652,6 +652,7 @@ fn scalar_to_string_expr(
     match resolved_type(node, nodes_by_path) {
         Some(TypeRef::Boolean)
         | Some(TypeRef::String)
+        | Some(TypeRef::Enumeration { .. })
         | Some(TypeRef::Uint16)
         | Some(TypeRef::Uint32) => quote! { #value_ident.to_string() },
         Some(TypeRef::Int64) | Some(TypeRef::Decimal64) => quote! { #value_ident.0.to_string() },
@@ -722,7 +723,7 @@ fn leaf_list_element_type(
     }
     match ty {
         Some(TypeRef::Boolean) => quote! { bool },
-        Some(TypeRef::String) => quote! { String },
+        Some(TypeRef::String) | Some(TypeRef::Enumeration { .. }) => quote! { String },
         Some(TypeRef::Uint16) => quote! { u16 },
         Some(TypeRef::Uint32) => quote! { u32 },
         Some(TypeRef::Int64) => quote! { super::types::YangInt64 },

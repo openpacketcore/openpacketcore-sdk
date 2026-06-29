@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use opc_evidence::{
     assert_packet_continuity_claim_allowed, assert_traffic_readiness_claim_allowed,
     DataplaneBearerSummary, DataplaneEvidenceError, DataplaneSessionSummary, DataplaneSnapshot,
-    DataplaneSnapshotAsserter,
+    DataplaneSnapshotAsserter, DataplaneTrafficBlockReasonCode,
 };
 
 fn proven_snapshot() -> DataplaneSnapshot {
@@ -58,6 +58,9 @@ fn dataplane_snapshot_allows_claims_only_with_explicit_proofs() {
 
     assert_traffic_readiness_claim_allowed(&snapshot);
     assert_packet_continuity_claim_allowed(&snapshot);
+    assert!(!snapshot.blocks_traffic_readiness());
+    assert!(snapshot.traffic_readiness_blockers().is_empty());
+    assert_eq!(snapshot.first_traffic_readiness_blocker(), None);
     DataplaneSnapshotAsserter::new(&snapshot)
         .traffic_readiness_claim_allowed()
         .packet_continuity_claim_allowed();
@@ -68,13 +71,20 @@ fn dataplane_snapshot_rejects_absent_traffic_proof() {
     let mut snapshot = proven_snapshot();
     snapshot.forwarding_proven = None;
 
+    let err = snapshot
+        .validate_traffic_readiness_claim()
+        .expect_err("missing forwarding proof should reject traffic readiness");
     assert!(matches!(
-        snapshot.validate_traffic_readiness_claim(),
-        Err(DataplaneEvidenceError::MissingProofField {
+        err,
+        DataplaneEvidenceError::MissingProofField {
             field: "forwarding_proven",
             ..
-        })
+        }
     ));
+    assert_eq!(
+        err.traffic_block_reason_code(),
+        Some(DataplaneTrafficBlockReasonCode::ForwardingNotProven)
+    );
 }
 
 #[test]
@@ -89,6 +99,47 @@ fn dataplane_snapshot_rejects_false_continuity_proof() {
             ..
         })
     ));
+}
+
+#[test]
+fn dataplane_snapshot_projects_traffic_blockers_in_stable_priority_order() {
+    let mut snapshot = proven_snapshot();
+    snapshot.forwarding_proven = None;
+    snapshot.kernel_state_reconciled = Some(false);
+    snapshot.packet_continuity_proven = None;
+
+    assert!(snapshot.blocks_traffic_readiness());
+    assert_eq!(
+        snapshot.first_traffic_readiness_blocker(),
+        Some(DataplaneTrafficBlockReasonCode::ForwardingNotProven)
+    );
+    assert_eq!(
+        snapshot.traffic_readiness_blockers(),
+        vec![
+            DataplaneTrafficBlockReasonCode::ForwardingNotProven,
+            DataplaneTrafficBlockReasonCode::KernelStateNotReconciled,
+            DataplaneTrafficBlockReasonCode::PacketContinuityNotProven,
+        ]
+    );
+}
+
+#[test]
+fn dataplane_traffic_block_reason_codes_are_stable_and_redaction_safe() {
+    let code = DataplaneTrafficBlockReasonCode::KernelStateNotReconciled;
+
+    assert_eq!(code.as_str(), "kernel_state_not_reconciled");
+    assert_eq!(code.to_string(), "kernel_state_not_reconciled");
+    assert_eq!(code.proof_field(), "kernel_state_reconciled");
+    assert_eq!(
+        code.message(),
+        "traffic readiness blocked: kernel state is not reconciled"
+    );
+    assert_eq!(
+        serde_json::to_value(code).expect("serialize reason code"),
+        serde_json::json!("kernel_state_not_reconciled")
+    );
+    assert!(!code.message().contains("session-a"));
+    assert!(!code.message().contains("bearer-1"));
 }
 
 #[test]

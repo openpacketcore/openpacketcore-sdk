@@ -44,7 +44,24 @@ const BEARER_CONTEXT_IE: &[u8] = &[
 ];
 
 const CAUSE_IE: &[u8] = &[0x02, 0x00, 0x02, 0x00, 0x10, 0x00];
+const REJECTED_CAUSE_IE: &[u8] = &[IE_TYPE_CAUSE, 0x00, 0x02, 0x00, 0x46, 0x00];
 const EBI_IE: &[u8] = &[0x49, 0x00, 0x01, 0x00, 0x05];
+const SENDER_F_TEID_IE: &[u8] = &[
+    IE_TYPE_F_TEID,
+    0x00,
+    0x09,
+    0x00,
+    0x8b,
+    0x55,
+    0x66,
+    0x77,
+    0x88,
+    0xc0,
+    0x00,
+    0x02,
+    0x01,
+];
+const EMPTY_BEARER_CONTEXT_IE: &[u8] = &[IE_TYPE_BEARER_CONTEXT, 0x00, 0x00, 0x00];
 
 fn decode_s2b(bytes: &[u8]) -> S2bMessage<'_> {
     match S2bMessage::decode(bytes, procedure_context()) {
@@ -607,6 +624,161 @@ fn create_session_response_with_fteid_instance(fteid_instance: u8) -> Vec<u8> {
     message.extend_from_slice(&header);
     message.extend_from_slice(&body);
     message
+}
+
+fn create_session_response_with_projection_ies(
+    teid: Option<u32>,
+    sequence_number: u32,
+    ies: &[&[u8]],
+) -> Vec<u8> {
+    let mut message = Vec::new();
+    message.push(if teid.is_some() { 0x48 } else { 0x40 });
+    message.push(s2b::CREATE_SESSION_RESPONSE);
+    message.extend_from_slice(&[0x00, 0x00]);
+    if let Some(teid) = teid {
+        message.extend_from_slice(&teid.to_be_bytes());
+    }
+    message.push(((sequence_number >> 16) & 0xff) as u8);
+    message.push(((sequence_number >> 8) & 0xff) as u8);
+    message.push((sequence_number & 0xff) as u8);
+    message.push(0x00);
+    for ie in ies {
+        message.extend_from_slice(ie);
+    }
+
+    let length = match u16::try_from(message.len() - 4) {
+        Ok(length) => length,
+        Err(error) => panic!("projection response fixture too long: {error:?}"),
+    };
+    message[2..4].copy_from_slice(&length.to_be_bytes());
+    message
+}
+
+#[test]
+fn create_session_rejected_response_summary_allows_cause_only() {
+    let response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0020_00ab,
+        &[REJECTED_CAUSE_IE],
+    );
+
+    let decoded = decode_s2b(&response);
+    let summary = match decoded.create_session_response_summary() {
+        Ok(summary) => summary,
+        Err(error) => panic!("rejected response summary failed: {error:?}"),
+    };
+    match &summary {
+        s2b::CreateSessionResponseSummary::Rejected(rejected) => {
+            assert_eq!(rejected.response_teid, 0x0102_0304);
+            assert_eq!(rejected.sequence_number, 0x0020_00ab);
+            assert_eq!(rejected.cause, CauseValue::MandatoryIeMissing);
+        }
+        other => panic!("expected rejected summary, got {other:?}"),
+    }
+
+    let direct = match s2b::decode_create_session_response_summary(&response, procedure_context()) {
+        Ok(summary) => summary,
+        Err(error) => panic!("direct rejected response projection failed: {error:?}"),
+    };
+    assert_eq!(direct, summary);
+}
+
+#[test]
+fn create_session_accepted_response_summary_requires_bearer_fields() {
+    let accepted = create_session_response_with_fteid_instance(0);
+    let summary = match s2b::decode_create_session_response_summary(&accepted, procedure_context())
+    {
+        Ok(summary) => summary,
+        Err(error) => panic!("accepted response summary failed: {error:?}"),
+    };
+    match summary {
+        s2b::CreateSessionResponseSummary::Accepted(accepted) => {
+            assert_eq!(accepted.response_teid, 0x0102_0304);
+            assert_eq!(accepted.sequence_number, 0x0000_2000);
+            assert_eq!(accepted.cause, CauseValue::RequestAccepted);
+            assert_eq!(accepted.sender_f_teid.teid, 0x5566_7788);
+            assert_eq!(accepted.bearer_ebi.value, 5);
+        }
+        other => panic!("expected accepted summary, got {other:?}"),
+    }
+
+    let missing_sender = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[CAUSE_IE, BEARER_CONTEXT_IE],
+    );
+    assert!(S2bMessage::decode(&missing_sender, procedure_context()).is_err());
+    assert_eq!(
+        s2b::decode_create_session_response_summary(&missing_sender, procedure_context()),
+        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingSenderFTeid)
+    );
+
+    let missing_bearer = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[CAUSE_IE, SENDER_F_TEID_IE],
+    );
+    assert!(S2bMessage::decode(&missing_bearer, procedure_context()).is_err());
+    assert_eq!(
+        s2b::decode_create_session_response_summary(&missing_bearer, procedure_context()),
+        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingBearerContext)
+    );
+
+    let missing_ebi = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[CAUSE_IE, SENDER_F_TEID_IE, EMPTY_BEARER_CONTEXT_IE],
+    );
+    assert!(S2bMessage::decode(&missing_ebi, procedure_context()).is_err());
+    assert_eq!(
+        s2b::decode_create_session_response_summary(&missing_ebi, procedure_context()),
+        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingBearerEbi)
+    );
+}
+
+#[test]
+fn create_session_response_summary_returns_stable_error_codes() {
+    let missing_cause =
+        create_session_response_with_projection_ies(Some(0x0102_0304), 0x0000_2000, &[]);
+    let error =
+        match s2b::decode_create_session_response_summary(&missing_cause, procedure_context()) {
+            Ok(summary) => panic!("missing Cause unexpectedly projected: {summary:?}"),
+            Err(error) => error,
+        };
+    assert_eq!(error, s2b::CreateSessionResponseSummaryError::MissingCause);
+    assert_eq!(error.as_str(), "s2b_create_session_response_missing_cause");
+    assert_eq!(error.to_string(), error.as_str());
+
+    let missing_teid =
+        create_session_response_with_projection_ies(None, 0x0000_2000, &[REJECTED_CAUSE_IE]);
+    let error =
+        match s2b::decode_create_session_response_summary(&missing_teid, procedure_context()) {
+            Ok(summary) => panic!("missing TEID unexpectedly projected: {summary:?}"),
+            Err(error) => error,
+        };
+    assert_eq!(
+        error,
+        s2b::CreateSessionResponseSummaryError::MissingResponseTeid
+    );
+    assert_eq!(error.as_str(), "s2b_create_session_response_missing_teid");
+    assert_eq!(error.to_string(), error.as_str());
+
+    let malformed_cause = [IE_TYPE_CAUSE, 0x00, 0x02, 0x00, 0x46];
+    let malformed = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[&malformed_cause],
+    );
+    let error = match s2b::decode_create_session_response_summary(&malformed, procedure_context()) {
+        Ok(summary) => panic!("malformed response unexpectedly projected: {summary:?}"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        s2b::CreateSessionResponseSummaryError::MalformedResponse
+    );
+    assert_eq!(error.as_str(), "s2b_create_session_response_malformed");
+    assert_eq!(error.to_string(), error.as_str());
 }
 
 #[test]

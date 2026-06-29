@@ -5,13 +5,12 @@
 //! and `/debug/config-version` with production token authorization and path/error redaction.
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 
-use crate::metrics::METRICS;
+use crate::metrics::AdminMetricsRecorder;
 use crate::profile::RuntimeMode;
 use crate::RuntimeHandle;
 
@@ -138,16 +137,15 @@ async fn handle_client(
     mode: RuntimeMode,
     auth_token: Option<String>,
 ) -> Result<(), std::io::Error> {
+    let admin_metrics = AdminMetricsRecorder::global();
     let mut req = Vec::with_capacity(1024);
     let mut buf = [0u8; 1024];
     loop {
         let n = match timeout(ADMIN_REQUEST_TIMEOUT, stream.read(&mut buf)).await {
             Ok(read_res) => read_res?,
             Err(_) => {
-                METRICS
-                    .admin_malformed_requests_total
-                    .fetch_add(1, Ordering::Relaxed);
-                record_admin_request("unknown", 408);
+                admin_metrics.record_malformed_request();
+                admin_metrics.record_request("unknown", 408);
                 stream
                     .write_all(
                         b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\nRequest Timeout",
@@ -161,10 +159,8 @@ async fn handle_client(
         }
         req.extend_from_slice(&buf[..n]);
         if req.len() > MAX_ADMIN_REQUEST_BYTES {
-            METRICS
-                .admin_malformed_requests_total
-                .fetch_add(1, Ordering::Relaxed);
-            record_admin_request("unknown", 431);
+            admin_metrics.record_malformed_request();
+            admin_metrics.record_request("unknown", 431);
             stream
                 .write_all(
                     b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\nRequest Header Fields Too Large",
@@ -184,10 +180,8 @@ async fn handle_client(
     let req_str = match std::str::from_utf8(&req) {
         Ok(s) => s,
         Err(_) => {
-            METRICS
-                .admin_malformed_requests_total
-                .fetch_add(1, Ordering::Relaxed);
-            record_admin_request("unknown", 400);
+            admin_metrics.record_malformed_request();
+            admin_metrics.record_request("unknown", 400);
             stream
                 .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nBad Request")
                 .await?;
@@ -197,10 +191,8 @@ async fn handle_client(
 
     let mut lines = req_str.lines();
     let Some(req_line) = lines.next() else {
-        METRICS
-            .admin_malformed_requests_total
-            .fetch_add(1, Ordering::Relaxed);
-        record_admin_request("unknown", 400);
+        admin_metrics.record_malformed_request();
+        admin_metrics.record_request("unknown", 400);
         stream
             .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nBad Request")
             .await?;
@@ -209,10 +201,8 @@ async fn handle_client(
 
     let parts: Vec<&str> = req_line.split_whitespace().collect();
     if parts.len() != 3 || !parts[2].starts_with("HTTP/1.") {
-        METRICS
-            .admin_malformed_requests_total
-            .fetch_add(1, Ordering::Relaxed);
-        record_admin_request("unknown", 400);
+        admin_metrics.record_malformed_request();
+        admin_metrics.record_request("unknown", 400);
         stream
             .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nBad Request")
             .await?;
@@ -224,7 +214,7 @@ async fn handle_client(
     let route = admin_route_label(path);
 
     if method != "GET" && !(method == "POST" && path == "/debug/drain") {
-        record_admin_request(route, 405);
+        admin_metrics.record_request(route, 405);
         stream
             .write_all(
                 b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\nMethod Not Allowed",
@@ -262,10 +252,8 @@ async fn handle_client(
     }
 
     if !authorized {
-        METRICS
-            .admin_auth_failures_total
-            .fetch_add(1, Ordering::Relaxed);
-        record_admin_request(route, 401);
+        admin_metrics.record_auth_failure();
+        admin_metrics.record_request(route, 401);
         stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nUnauthorized").await?;
         return Ok(());
     }
@@ -496,17 +484,8 @@ async fn handle_client(
         .duration_since(start_time)
         .as_secs_f64();
     if let Ok(status_code) = result {
-        record_admin_request(route, status_code);
-        match route {
-            "livez" => METRICS.admin_latency_livez.observe(elapsed),
-            "readyz" => METRICS.admin_latency_readyz.observe(elapsed),
-            "startupz" => METRICS.admin_latency_startupz.observe(elapsed),
-            "metrics" => METRICS.admin_latency_metrics.observe(elapsed),
-            "debug_runtime" => METRICS.admin_latency_debug_runtime.observe(elapsed),
-            "debug_tasks" => METRICS.admin_latency_debug_tasks.observe(elapsed),
-            "debug_config_version" => METRICS.admin_latency_debug_config_version.observe(elapsed),
-            _ => {}
-        }
+        admin_metrics.record_request(route, status_code);
+        admin_metrics.observe_route_latency(route, elapsed);
     }
 
     Ok(())
@@ -524,14 +503,6 @@ fn admin_route_label(path: &str) -> &'static str {
         "/debug/drain" => "debug_drain",
         _ => "unknown",
     }
-}
-
-fn record_admin_request(route: &str, status: u16) {
-    let mut reqs = METRICS.admin_requests_total.lock().unwrap();
-    let count = reqs
-        .entry((route.to_string(), status.to_string()))
-        .or_insert(0);
-    *count += 1;
 }
 
 async fn write_json_response<T: Serialize>(
@@ -603,9 +574,7 @@ fn redact_sensitive_debug_string(value: &str, redact_colon: bool) -> String {
         || looks_like_ipv4_contains(&lower)
         || has_8_digits(&lower)
     {
-        METRICS
-            .admin_redaction_events_total
-            .fetch_add(1, Ordering::Relaxed);
+        AdminMetricsRecorder::global().record_redaction_event();
         "<redacted>".to_string()
     } else {
         value.to_string()

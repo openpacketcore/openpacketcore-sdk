@@ -32,6 +32,7 @@ opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 opc-node-resources = { path = "../opc-node-resources", version = "0.2.0" }
 
 [dev-dependencies]
+opc-proto-gtpu = { path = "../opc-proto-gtpu", version = "0.2.0" }
 opc-proto-gtpv2c = { path = "../opc-proto-gtpv2c", version = "0.2.0" }
 
 [lints]

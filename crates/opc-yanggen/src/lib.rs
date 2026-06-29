@@ -16,10 +16,11 @@ pub use crate::emit::{
     GenerationInput, PreScanResult, MAX_CANONICALIZATION_NODES,
 };
 pub use crate::ir::{
-    AllocationStrategy, BooleanOp, CompareOp, ConstraintBinding, ConstraintExpr, FunctionCall,
-    FunctionName, Literal, LockedModule, ModuleImport, ModuleLockfile, PathAnchor, PathExpr,
-    RawConstraintExpr, SchemaIr, SchemaModule, SchemaNode, SchemaNodeKind, StackBudget, StackScope,
-    StackShape, TypeRef, UnsupportedFeature, UnsupportedFeatureKind,
+    AllocationStrategy, BooleanOp, CompareOp, ConstraintBinding, ConstraintExpr, EnumValue,
+    FunctionCall, FunctionName, Literal, LockedModule, ModuleImport, ModuleLockfile,
+    NumericRangeInterval, PathAnchor, PathExpr, RawConstraintExpr, SchemaIr, SchemaModule,
+    SchemaNode, SchemaNodeKind, StackBudget, StackScope, StackShape, TypeRef, UnsupportedFeature,
+    UnsupportedFeatureKind,
 };
 pub use crate::lower::{lower_constraint, MAX_CONSTRAINT_EXPR_DEPTH};
 pub use crate::source::{

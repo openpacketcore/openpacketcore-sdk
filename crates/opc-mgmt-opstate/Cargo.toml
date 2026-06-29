@@ -14,6 +14,7 @@ categories = ["network-programming"]
 
 [dependencies]
 opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
+opc-mgmt-errors = { path = "../opc-mgmt-errors", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
