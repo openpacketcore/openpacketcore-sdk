@@ -43,10 +43,13 @@ pub use ie::{
 };
 pub use message::{Message, OwnedMessage};
 pub use s2b::{
-    decode_create_session_response_summary, is_s2b_message_type,
+    decode_create_session_response_summary, decode_echo_message_evidence, is_s2b_message_type,
     CreateSessionAcceptedResponseSummary, CreateSessionRejectedResponseSummary,
-    CreateSessionResponseSummary, CreateSessionResponseSummaryError, MessageDirection, Procedure,
-    S2bMessage, S2bProcedureMessage, CREATE_SESSION_REQUEST, CREATE_SESSION_RESPONSE,
+    CreateSessionResponseSummary, CreateSessionResponseSummaryError, EchoMessageEvidence,
+    EchoMessageEvidenceError, Gtpv2cEchoPeer, Gtpv2cEchoPeerBlocker, Gtpv2cEchoPeerError,
+    Gtpv2cEchoPeerEvent, Gtpv2cEchoPeerPolicy, Gtpv2cEchoPeerProjection, Gtpv2cEchoPeerReadiness,
+    Gtpv2cEchoPeerSnapshot, Gtpv2cEchoPeerState, Gtpv2cEchoPeerTransition, MessageDirection,
+    Procedure, S2bMessage, S2bProcedureMessage, CREATE_SESSION_REQUEST, CREATE_SESSION_RESPONSE,
     DELETE_SESSION_REQUEST, DELETE_SESSION_RESPONSE, ECHO_REQUEST, ECHO_RESPONSE,
     MODIFY_BEARER_REQUEST, MODIFY_BEARER_RESPONSE, UPDATE_BEARER_REQUEST, UPDATE_BEARER_RESPONSE,
 };

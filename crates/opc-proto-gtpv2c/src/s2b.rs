@@ -150,6 +150,700 @@ impl fmt::Display for CreateSessionResponseSummaryError {
 
 impl std::error::Error for CreateSessionResponseSummaryError {}
 
+/// Decoded Echo Request/Response evidence used by GTPv2-C peer control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EchoMessageEvidence {
+    /// Echo request/response direction.
+    pub direction: MessageDirection,
+    /// 24-bit GTPv2-C sequence number.
+    pub sequence_number: u32,
+    /// Recovery restart counter from the mandatory Recovery IE.
+    pub restart_counter: u8,
+}
+
+impl EchoMessageEvidence {
+    /// Project a typed S2b procedure view into Echo evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EchoMessageEvidenceError`] when the view is not an Echo
+    /// message or does not contain a typed Recovery IE.
+    pub fn from_view(view: &S2bProcedureMessage<'_>) -> Result<Self, EchoMessageEvidenceError> {
+        if view.procedure != Procedure::Echo {
+            return Err(EchoMessageEvidenceError::NotEchoMessage);
+        }
+        let restart_counter = find_recovery_restart_counter(&view.ies)
+            .ok_or(EchoMessageEvidenceError::MissingRecovery)?;
+        Ok(Self {
+            direction: view.direction,
+            sequence_number: view.header.sequence_number,
+            restart_counter,
+        })
+    }
+}
+
+/// Stable redaction-safe error returned while extracting Echo evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchoMessageEvidenceError {
+    /// Message bytes could not be decoded into a typed S2b message.
+    MalformedMessage,
+    /// Message bytes contained trailing data after the decoded message.
+    TrailingBytes,
+    /// Decoded message was not an Echo Request or Echo Response.
+    NotEchoMessage,
+    /// Echo message did not contain a typed Recovery IE.
+    MissingRecovery,
+}
+
+impl EchoMessageEvidenceError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MalformedMessage => "gtpv2c_echo_message_malformed",
+            Self::TrailingBytes => "gtpv2c_echo_message_trailing_bytes",
+            Self::NotEchoMessage => "gtpv2c_echo_message_not_echo",
+            Self::MissingRecovery => "gtpv2c_echo_message_missing_recovery",
+        }
+    }
+}
+
+impl fmt::Display for EchoMessageEvidenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for EchoMessageEvidenceError {}
+
+/// Decode one S2b Echo message and extract Recovery evidence.
+///
+/// # Errors
+///
+/// Returns [`EchoMessageEvidenceError`] when bytes are malformed, contain
+/// trailing data after the message, decode to another message type, or lack a
+/// typed Recovery IE.
+pub fn decode_echo_message_evidence(
+    input: &[u8],
+    ctx: DecodeContext,
+) -> Result<EchoMessageEvidence, EchoMessageEvidenceError> {
+    let (tail, message) =
+        S2bMessage::decode(input, ctx).map_err(|_| EchoMessageEvidenceError::MalformedMessage)?;
+    if !tail.is_empty() {
+        return Err(EchoMessageEvidenceError::TrailingBytes);
+    }
+    let view = message
+        .as_view()
+        .ok_or(EchoMessageEvidenceError::NotEchoMessage)?;
+    EchoMessageEvidence::from_view(view)
+}
+
+/// Policy for the GTPv2-C Echo peer state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gtpv2cEchoPeerPolicy {
+    /// Consecutive missing Echo Response threshold. Values below one are
+    /// treated as one by the state machine.
+    pub missed_response_threshold: usize,
+    /// Whether a changed peer Recovery restart counter blocks traffic until
+    /// the caller explicitly marks restart reconciliation complete.
+    pub require_restart_reconciliation: bool,
+}
+
+impl Default for Gtpv2cEchoPeerPolicy {
+    fn default() -> Self {
+        Self {
+            missed_response_threshold: 3,
+            require_restart_reconciliation: true,
+        }
+    }
+}
+
+impl Gtpv2cEchoPeerPolicy {
+    /// Return a copy with a custom missing-response threshold.
+    #[must_use]
+    pub fn with_missed_response_threshold(mut self, threshold: usize) -> Self {
+        self.missed_response_threshold = threshold.max(1);
+        self
+    }
+
+    /// Return a copy that treats restart-counter changes as reachable but not
+    /// traffic-blocking.
+    #[must_use]
+    pub const fn without_restart_reconciliation(mut self) -> Self {
+        self.require_restart_reconciliation = false;
+        self
+    }
+}
+
+/// Transport-neutral GTPv2-C Echo peer-control state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Gtpv2cEchoPeerState {
+    /// No Echo evidence has been observed.
+    Idle,
+    /// Echo Request was sent and Echo Response is pending.
+    AwaitingResponse,
+    /// Peer is reachable and continuity evidence is safe.
+    Reachable,
+    /// Peer liveness evidence is weak but has not failed the threshold.
+    Degraded,
+    /// Peer failed the Echo liveness threshold.
+    Failed,
+    /// Peer Recovery restart counter changed and reconciliation is required.
+    ReconciliationRequired,
+}
+
+impl Gtpv2cEchoPeerState {
+    /// Stable machine name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::AwaitingResponse => "awaiting_response",
+            Self::Reachable => "reachable",
+            Self::Degraded => "degraded",
+            Self::Failed => "failed",
+            Self::ReconciliationRequired => "reconciliation_required",
+        }
+    }
+}
+
+/// Transport-neutral GTPv2-C Echo peer-control event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Gtpv2cEchoPeerEvent {
+    /// Echo Request was sent.
+    EchoRequestSent,
+    /// Echo Request was received.
+    EchoRequestReceived,
+    /// Echo Response was accepted.
+    EchoResponseAccepted,
+    /// Echo Response sequence did not match the outstanding request.
+    EchoResponseSequenceMismatch,
+    /// Echo Response was missing for the outstanding request.
+    EchoResponseMissing,
+    /// Peer Recovery restart counter changed.
+    PeerRestartObserved,
+    /// Caller marked restart reconciliation complete.
+    RestartReconciled,
+    /// Caller failed the peer explicitly.
+    Failure,
+}
+
+impl Gtpv2cEchoPeerEvent {
+    /// Stable machine name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EchoRequestSent => "echo_request_sent",
+            Self::EchoRequestReceived => "echo_request_received",
+            Self::EchoResponseAccepted => "echo_response_accepted",
+            Self::EchoResponseSequenceMismatch => "echo_response_sequence_mismatch",
+            Self::EchoResponseMissing => "echo_response_missing",
+            Self::PeerRestartObserved => "peer_restart_observed",
+            Self::RestartReconciled => "restart_reconciled",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+/// Stable redaction-safe blocker emitted by the Echo peer helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Gtpv2cEchoPeerBlocker {
+    /// Echo Response has not arrived for the outstanding request.
+    EchoResponsePending,
+    /// Echo Response was missing for the outstanding request.
+    EchoResponseMissing,
+    /// Echo Response sequence did not match the outstanding request.
+    EchoResponseSequenceMismatch,
+    /// Peer Recovery restart counter changed.
+    PeerRestartCounterChanged,
+    /// Peer failed the liveness threshold.
+    PeerUnreachable,
+    /// Caller must reconcile sessions after a peer restart.
+    RestartReconciliationRequired,
+}
+
+impl Gtpv2cEchoPeerBlocker {
+    /// Stable machine-readable blocker code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EchoResponsePending => "gtpv2c_echo_response_pending",
+            Self::EchoResponseMissing => "gtpv2c_echo_response_missing",
+            Self::EchoResponseSequenceMismatch => "gtpv2c_echo_response_sequence_mismatch",
+            Self::PeerRestartCounterChanged => "gtpv2c_peer_restart_counter_changed",
+            Self::PeerUnreachable => "gtpv2c_peer_unreachable",
+            Self::RestartReconciliationRequired => "gtpv2c_restart_reconciliation_required",
+        }
+    }
+}
+
+/// Redaction-safe readiness projection for one Echo peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gtpv2cEchoPeerReadiness {
+    /// Current peer-control state.
+    pub state: Gtpv2cEchoPeerState,
+    /// Whether peer liveness is currently proven.
+    pub reachable: bool,
+    /// Whether a response is pending.
+    pub awaiting_response: bool,
+    /// Whether liveness is degraded but not failed.
+    pub degraded: bool,
+    /// Whether the peer failed the liveness threshold.
+    pub failed: bool,
+    /// Whether restart reconciliation is required.
+    pub restart_reconciliation_required: bool,
+    /// Whether product traffic can safely use this peer.
+    pub traffic_ready: bool,
+    /// Stable blockers in evaluation order.
+    pub blockers: Vec<Gtpv2cEchoPeerBlocker>,
+}
+
+/// Projection from one Echo observation into peer liveness and continuity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gtpv2cEchoPeerProjection {
+    /// Whether an Echo Response was observed for the current exchange.
+    pub response_observed: bool,
+    /// Whether the peer is reachable.
+    pub peer_reachable: bool,
+    /// Whether the Recovery restart counter changed from the previous value.
+    pub restart_counter_changed: bool,
+    /// Whether existing session continuity is safe.
+    pub continuity_safe: bool,
+    /// Last observed peer Recovery restart counter.
+    pub restart_counter: Option<u8>,
+    /// Current in-flight sequence number, if any.
+    pub in_flight_sequence_number: Option<u32>,
+    /// Consecutive missed Echo Responses.
+    pub missed_responses: usize,
+    /// Stable blockers in evaluation order.
+    pub blockers: Vec<Gtpv2cEchoPeerBlocker>,
+}
+
+/// One emitted transition from the Echo peer helper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gtpv2cEchoPeerTransition {
+    /// Event that caused the transition.
+    pub event: Gtpv2cEchoPeerEvent,
+    /// State before the event.
+    pub previous_state: Gtpv2cEchoPeerState,
+    /// State after the event.
+    pub state: Gtpv2cEchoPeerState,
+    /// Readiness after the event.
+    pub readiness: Gtpv2cEchoPeerReadiness,
+    /// Observation projection after the event.
+    pub projection: Gtpv2cEchoPeerProjection,
+}
+
+/// Redaction-safe snapshot of the Echo peer helper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gtpv2cEchoPeerSnapshot {
+    /// Current peer-control state.
+    pub state: Gtpv2cEchoPeerState,
+    /// Current readiness projection.
+    pub readiness: Gtpv2cEchoPeerReadiness,
+    /// Last observed peer Recovery restart counter.
+    pub last_restart_counter: Option<u8>,
+    /// Current in-flight sequence number, if any.
+    pub in_flight_sequence_number: Option<u32>,
+    /// Echo Requests sent by this helper.
+    pub echo_requests_sent: usize,
+    /// Echo Requests received by this helper.
+    pub echo_requests_received: usize,
+    /// Echo Responses accepted by this helper.
+    pub echo_responses_observed: usize,
+    /// Echo Responses rejected due to sequence mismatch.
+    pub echo_response_sequence_mismatches: usize,
+    /// Consecutive missed Echo Responses.
+    pub missed_responses: usize,
+    /// Peer Recovery restart-counter changes observed.
+    pub restart_counter_changes: usize,
+}
+
+/// GTPv2-C Echo peer state-machine error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gtpv2cEchoPeerError {
+    /// Operation is not valid in the current state.
+    InvalidTransition {
+        /// Operation attempted.
+        operation: &'static str,
+        /// Current state.
+        state: Gtpv2cEchoPeerState,
+    },
+    /// Echo evidence had the wrong request/response direction.
+    UnexpectedDirection {
+        /// Expected direction.
+        expected: MessageDirection,
+        /// Actual direction.
+        actual: MessageDirection,
+    },
+}
+
+impl Gtpv2cEchoPeerError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidTransition { .. } => "gtpv2c_echo_peer_invalid_transition",
+            Self::UnexpectedDirection { .. } => "gtpv2c_echo_peer_unexpected_direction",
+        }
+    }
+}
+
+impl fmt::Display for Gtpv2cEchoPeerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTransition { operation, state } => write!(
+                f,
+                "gtpv2c_echo_peer_invalid_transition: operation {operation}, state {}",
+                state.as_str()
+            ),
+            Self::UnexpectedDirection { expected, actual } => write!(
+                f,
+                "gtpv2c_echo_peer_unexpected_direction: expected {}, actual {}",
+                expected.as_str(),
+                actual.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Gtpv2cEchoPeerError {}
+
+/// Transport-neutral GTPv2-C Echo peer-control state machine.
+#[derive(Debug, Clone)]
+pub struct Gtpv2cEchoPeer {
+    policy: Gtpv2cEchoPeerPolicy,
+    state: Gtpv2cEchoPeerState,
+    last_restart_counter: Option<u8>,
+    in_flight_sequence_number: Option<u32>,
+    missed_responses: usize,
+    echo_requests_sent: usize,
+    echo_requests_received: usize,
+    echo_responses_observed: usize,
+    echo_response_sequence_mismatches: usize,
+    restart_counter_changes: usize,
+    last_blockers: Vec<Gtpv2cEchoPeerBlocker>,
+}
+
+impl Gtpv2cEchoPeer {
+    /// Create an Echo peer helper with default policy.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_policy(Gtpv2cEchoPeerPolicy::default())
+    }
+
+    /// Create an Echo peer helper with explicit policy.
+    #[must_use]
+    pub fn with_policy(policy: Gtpv2cEchoPeerPolicy) -> Self {
+        Self {
+            policy,
+            state: Gtpv2cEchoPeerState::Idle,
+            last_restart_counter: None,
+            in_flight_sequence_number: None,
+            missed_responses: 0,
+            echo_requests_sent: 0,
+            echo_requests_received: 0,
+            echo_responses_observed: 0,
+            echo_response_sequence_mismatches: 0,
+            restart_counter_changes: 0,
+            last_blockers: Vec::new(),
+        }
+    }
+
+    /// Return the current state.
+    #[must_use]
+    pub const fn state(&self) -> Gtpv2cEchoPeerState {
+        self.state
+    }
+
+    /// Return the peer policy.
+    #[must_use]
+    pub const fn policy(&self) -> Gtpv2cEchoPeerPolicy {
+        self.policy
+    }
+
+    /// Mark an Echo Request as sent.
+    #[must_use]
+    pub fn echo_request_sent(&mut self, sequence_number: u32) -> Gtpv2cEchoPeerTransition {
+        let previous = self.state;
+        self.echo_requests_sent = self.echo_requests_sent.saturating_add(1);
+        self.in_flight_sequence_number = Some(sequence_number);
+        self.state = Gtpv2cEchoPeerState::AwaitingResponse;
+        self.last_blockers = vec![Gtpv2cEchoPeerBlocker::EchoResponsePending];
+        self.transition(Gtpv2cEchoPeerEvent::EchoRequestSent, previous, false, false)
+    }
+
+    /// Observe a decoded Echo Request from the peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Gtpv2cEchoPeerError`] when the evidence is not an Echo
+    /// Request.
+    pub fn observe_echo_request(
+        &mut self,
+        evidence: EchoMessageEvidence,
+    ) -> Result<Gtpv2cEchoPeerTransition, Gtpv2cEchoPeerError> {
+        if evidence.direction != MessageDirection::Request {
+            return Err(Gtpv2cEchoPeerError::UnexpectedDirection {
+                expected: MessageDirection::Request,
+                actual: evidence.direction,
+            });
+        }
+        let previous = self.state;
+        self.echo_requests_received = self.echo_requests_received.saturating_add(1);
+        let restart_counter_changed = self.observe_restart_counter(evidence.restart_counter);
+        let event = if restart_counter_changed {
+            Gtpv2cEchoPeerEvent::PeerRestartObserved
+        } else {
+            Gtpv2cEchoPeerEvent::EchoRequestReceived
+        };
+        if restart_counter_changed && self.policy.require_restart_reconciliation {
+            self.state = Gtpv2cEchoPeerState::ReconciliationRequired;
+            self.last_blockers = vec![
+                Gtpv2cEchoPeerBlocker::PeerRestartCounterChanged,
+                Gtpv2cEchoPeerBlocker::RestartReconciliationRequired,
+            ];
+        }
+        Ok(self.transition(event, previous, false, restart_counter_changed))
+    }
+
+    /// Observe a decoded Echo Response from the peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Gtpv2cEchoPeerError`] when the evidence is not an Echo
+    /// Response or when no Echo Request is in flight.
+    pub fn observe_echo_response(
+        &mut self,
+        evidence: EchoMessageEvidence,
+    ) -> Result<Gtpv2cEchoPeerTransition, Gtpv2cEchoPeerError> {
+        if evidence.direction != MessageDirection::Response {
+            return Err(Gtpv2cEchoPeerError::UnexpectedDirection {
+                expected: MessageDirection::Response,
+                actual: evidence.direction,
+            });
+        }
+        let Some(expected_sequence) = self.in_flight_sequence_number else {
+            return Err(Gtpv2cEchoPeerError::InvalidTransition {
+                operation: "observe_echo_response",
+                state: self.state,
+            });
+        };
+        let previous = self.state;
+        if evidence.sequence_number != expected_sequence {
+            self.echo_response_sequence_mismatches =
+                self.echo_response_sequence_mismatches.saturating_add(1);
+            self.state = Gtpv2cEchoPeerState::Degraded;
+            self.last_blockers = vec![Gtpv2cEchoPeerBlocker::EchoResponseSequenceMismatch];
+            return Ok(self.transition(
+                Gtpv2cEchoPeerEvent::EchoResponseSequenceMismatch,
+                previous,
+                false,
+                false,
+            ));
+        }
+
+        self.echo_responses_observed = self.echo_responses_observed.saturating_add(1);
+        self.in_flight_sequence_number = None;
+        self.missed_responses = 0;
+        let restart_counter_changed = self.observe_restart_counter(evidence.restart_counter);
+        if restart_counter_changed && self.policy.require_restart_reconciliation {
+            self.state = Gtpv2cEchoPeerState::ReconciliationRequired;
+            self.last_blockers = vec![
+                Gtpv2cEchoPeerBlocker::PeerRestartCounterChanged,
+                Gtpv2cEchoPeerBlocker::RestartReconciliationRequired,
+            ];
+            return Ok(self.transition(
+                Gtpv2cEchoPeerEvent::PeerRestartObserved,
+                previous,
+                true,
+                true,
+            ));
+        }
+
+        self.state = Gtpv2cEchoPeerState::Reachable;
+        self.last_blockers.clear();
+        Ok(self.transition(
+            Gtpv2cEchoPeerEvent::EchoResponseAccepted,
+            previous,
+            true,
+            restart_counter_changed,
+        ))
+    }
+
+    /// Record one missing Echo Response timer event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Gtpv2cEchoPeerError`] when no Echo Request is in flight.
+    pub fn echo_response_missing(
+        &mut self,
+    ) -> Result<Gtpv2cEchoPeerTransition, Gtpv2cEchoPeerError> {
+        if self.in_flight_sequence_number.is_none() {
+            return Err(Gtpv2cEchoPeerError::InvalidTransition {
+                operation: "echo_response_missing",
+                state: self.state,
+            });
+        }
+        let previous = self.state;
+        self.missed_responses = self.missed_responses.saturating_add(1);
+        self.in_flight_sequence_number = None;
+        let threshold = self.policy.missed_response_threshold.max(1);
+        if self.missed_responses >= threshold {
+            self.state = Gtpv2cEchoPeerState::Failed;
+            self.last_blockers = vec![
+                Gtpv2cEchoPeerBlocker::EchoResponseMissing,
+                Gtpv2cEchoPeerBlocker::PeerUnreachable,
+            ];
+        } else {
+            self.state = Gtpv2cEchoPeerState::Degraded;
+            self.last_blockers = vec![Gtpv2cEchoPeerBlocker::EchoResponseMissing];
+        }
+        Ok(self.transition(
+            Gtpv2cEchoPeerEvent::EchoResponseMissing,
+            previous,
+            false,
+            false,
+        ))
+    }
+
+    /// Mark restart reconciliation complete after a restart-counter change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Gtpv2cEchoPeerError`] when the peer is not waiting for
+    /// restart reconciliation.
+    pub fn restart_reconciled(&mut self) -> Result<Gtpv2cEchoPeerTransition, Gtpv2cEchoPeerError> {
+        if self.state != Gtpv2cEchoPeerState::ReconciliationRequired {
+            return Err(Gtpv2cEchoPeerError::InvalidTransition {
+                operation: "restart_reconciled",
+                state: self.state,
+            });
+        }
+        let previous = self.state;
+        self.state = Gtpv2cEchoPeerState::Reachable;
+        self.last_blockers.clear();
+        Ok(self.transition(
+            Gtpv2cEchoPeerEvent::RestartReconciled,
+            previous,
+            false,
+            false,
+        ))
+    }
+
+    /// Fail the peer as unreachable.
+    #[must_use]
+    pub fn fail_unreachable(&mut self) -> Gtpv2cEchoPeerTransition {
+        let previous = self.state;
+        self.state = Gtpv2cEchoPeerState::Failed;
+        self.in_flight_sequence_number = None;
+        self.last_blockers = vec![Gtpv2cEchoPeerBlocker::PeerUnreachable];
+        self.transition(Gtpv2cEchoPeerEvent::Failure, previous, false, false)
+    }
+
+    /// Return the current redaction-safe readiness projection.
+    #[must_use]
+    pub fn readiness(&self) -> Gtpv2cEchoPeerReadiness {
+        let blockers = self.readiness_blockers();
+        Gtpv2cEchoPeerReadiness {
+            state: self.state,
+            reachable: self.state == Gtpv2cEchoPeerState::Reachable,
+            awaiting_response: self.state == Gtpv2cEchoPeerState::AwaitingResponse,
+            degraded: self.state == Gtpv2cEchoPeerState::Degraded,
+            failed: self.state == Gtpv2cEchoPeerState::Failed,
+            restart_reconciliation_required: self.state
+                == Gtpv2cEchoPeerState::ReconciliationRequired,
+            traffic_ready: self.state == Gtpv2cEchoPeerState::Reachable,
+            blockers,
+        }
+    }
+
+    /// Return a redaction-safe snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> Gtpv2cEchoPeerSnapshot {
+        Gtpv2cEchoPeerSnapshot {
+            state: self.state,
+            readiness: self.readiness(),
+            last_restart_counter: self.last_restart_counter,
+            in_flight_sequence_number: self.in_flight_sequence_number,
+            echo_requests_sent: self.echo_requests_sent,
+            echo_requests_received: self.echo_requests_received,
+            echo_responses_observed: self.echo_responses_observed,
+            echo_response_sequence_mismatches: self.echo_response_sequence_mismatches,
+            missed_responses: self.missed_responses,
+            restart_counter_changes: self.restart_counter_changes,
+        }
+    }
+
+    fn observe_restart_counter(&mut self, restart_counter: u8) -> bool {
+        let changed = self
+            .last_restart_counter
+            .map(|previous| previous != restart_counter)
+            .unwrap_or(false);
+        if changed {
+            self.restart_counter_changes = self.restart_counter_changes.saturating_add(1);
+        }
+        self.last_restart_counter = Some(restart_counter);
+        changed
+    }
+
+    fn transition(
+        &self,
+        event: Gtpv2cEchoPeerEvent,
+        previous_state: Gtpv2cEchoPeerState,
+        response_observed: bool,
+        restart_counter_changed: bool,
+    ) -> Gtpv2cEchoPeerTransition {
+        Gtpv2cEchoPeerTransition {
+            event,
+            previous_state,
+            state: self.state,
+            readiness: self.readiness(),
+            projection: self.projection(response_observed, restart_counter_changed),
+        }
+    }
+
+    fn projection(
+        &self,
+        response_observed: bool,
+        restart_counter_changed: bool,
+    ) -> Gtpv2cEchoPeerProjection {
+        let blockers = self.readiness_blockers();
+        Gtpv2cEchoPeerProjection {
+            response_observed,
+            peer_reachable: self.state == Gtpv2cEchoPeerState::Reachable,
+            restart_counter_changed,
+            continuity_safe: self.state == Gtpv2cEchoPeerState::Reachable,
+            restart_counter: self.last_restart_counter,
+            in_flight_sequence_number: self.in_flight_sequence_number,
+            missed_responses: self.missed_responses,
+            blockers,
+        }
+    }
+
+    fn readiness_blockers(&self) -> Vec<Gtpv2cEchoPeerBlocker> {
+        match self.state {
+            Gtpv2cEchoPeerState::Idle | Gtpv2cEchoPeerState::Reachable => Vec::new(),
+            Gtpv2cEchoPeerState::AwaitingResponse => {
+                vec![Gtpv2cEchoPeerBlocker::EchoResponsePending]
+            }
+            Gtpv2cEchoPeerState::Degraded | Gtpv2cEchoPeerState::Failed => {
+                self.last_blockers.clone()
+            }
+            Gtpv2cEchoPeerState::ReconciliationRequired => vec![
+                Gtpv2cEchoPeerBlocker::PeerRestartCounterChanged,
+                Gtpv2cEchoPeerBlocker::RestartReconciliationRequired,
+            ],
+        }
+    }
+}
+
+impl Default for Gtpv2cEchoPeer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn spec_ref() -> SpecRef {
     SpecRef::new("3gpp", "TS29274", "S2b")
 }
@@ -165,6 +859,17 @@ pub enum MessageDirection {
     Request,
     /// Response message.
     Response,
+}
+
+impl MessageDirection {
+    /// Stable machine name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Response => "response",
+        }
+    }
 }
 
 /// S2b procedure markers with typed support in this crate.
@@ -654,6 +1359,13 @@ fn find_cause_value(ies: &[TypedIe<'_>]) -> Option<CauseValue> {
     })
 }
 
+fn find_recovery_restart_counter(ies: &[TypedIe<'_>]) -> Option<u8> {
+    ies.iter().find_map(|ie| match &ie.value {
+        TypedIeValue::Recovery(recovery) => Some(recovery.restart_counter),
+        _ => None,
+    })
+}
+
 fn find_sender_f_teid(ies: &[TypedIe<'_>]) -> Option<FullyQualifiedTeid> {
     ies.iter().find_map(|ie| match &ie.value {
         TypedIeValue::FullyQualifiedTeid(f_teid)
@@ -891,6 +1603,243 @@ fn validate_required_ies(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ie::Recovery;
+    use opc_protocol::{DecodeContext, Encode, EncodeContext};
+
+    fn echo_view(
+        direction: MessageDirection,
+        sequence_number: u32,
+        restart_counter: u8,
+    ) -> S2bProcedureMessage<'static> {
+        let message_type = match direction {
+            MessageDirection::Request => ECHO_REQUEST,
+            MessageDirection::Response => ECHO_RESPONSE,
+        };
+        S2bProcedureMessage {
+            header: Header::without_teid(message_type, sequence_number),
+            procedure: Procedure::Echo,
+            direction,
+            ies: vec![TypedIe {
+                instance: 0,
+                value: TypedIeValue::Recovery(Recovery { restart_counter }),
+            }],
+            raw_ies: &[],
+            tail: &[],
+        }
+    }
+
+    fn echo_evidence(
+        direction: MessageDirection,
+        sequence_number: u32,
+        restart_counter: u8,
+    ) -> EchoMessageEvidence {
+        EchoMessageEvidence {
+            direction,
+            sequence_number,
+            restart_counter,
+        }
+    }
+
+    fn encode_view(view: &S2bProcedureMessage<'_>) -> Vec<u8> {
+        let mut encoded = BytesMut::new();
+        if let Err(error) = view.encode(&mut encoded, EncodeContext::default()) {
+            panic!("Echo view encode failed: {error}");
+        }
+        encoded.to_vec()
+    }
+
+    #[test]
+    fn echo_message_evidence_extracts_recovery() {
+        let view = echo_view(MessageDirection::Response, 0x0001_0203, 9);
+
+        let evidence = match EchoMessageEvidence::from_view(&view) {
+            Ok(evidence) => evidence,
+            Err(error) => panic!("Echo evidence projection failed: {error}"),
+        };
+
+        assert_eq!(evidence.direction, MessageDirection::Response);
+        assert_eq!(evidence.direction.as_str(), "response");
+        assert_eq!(evidence.sequence_number, 0x0001_0203);
+        assert_eq!(evidence.restart_counter, 9);
+
+        let encoded = encode_view(&view);
+        let decoded = match decode_echo_message_evidence(&encoded, DecodeContext::default()) {
+            Ok(evidence) => evidence,
+            Err(error) => panic!("Echo evidence decode failed: {error}"),
+        };
+        assert_eq!(decoded, evidence);
+        assert_eq!(
+            EchoMessageEvidenceError::MissingRecovery.as_str(),
+            "gtpv2c_echo_message_missing_recovery"
+        );
+    }
+
+    #[test]
+    fn echo_peer_accepts_matching_response() {
+        let mut peer = Gtpv2cEchoPeer::new();
+
+        let transition = peer.echo_request_sent(0x0102_0304);
+
+        assert_eq!(transition.event, Gtpv2cEchoPeerEvent::EchoRequestSent);
+        assert_eq!(transition.state, Gtpv2cEchoPeerState::AwaitingResponse);
+        assert_eq!(
+            transition.readiness.blockers,
+            vec![Gtpv2cEchoPeerBlocker::EchoResponsePending]
+        );
+
+        let transition = match peer.observe_echo_response(echo_evidence(
+            MessageDirection::Response,
+            0x0102_0304,
+            7,
+        )) {
+            Ok(transition) => transition,
+            Err(error) => panic!("Echo response transition failed: {error}"),
+        };
+
+        assert_eq!(transition.event, Gtpv2cEchoPeerEvent::EchoResponseAccepted);
+        assert_eq!(transition.state, Gtpv2cEchoPeerState::Reachable);
+        assert!(transition.readiness.traffic_ready);
+        assert!(transition.projection.response_observed);
+        assert!(transition.projection.peer_reachable);
+        assert!(transition.projection.continuity_safe);
+        assert_eq!(transition.projection.restart_counter, Some(7));
+        assert_eq!(transition.projection.in_flight_sequence_number, None);
+
+        let snapshot = peer.snapshot();
+        assert_eq!(snapshot.echo_requests_sent, 1);
+        assert_eq!(snapshot.echo_responses_observed, 1);
+        assert_eq!(snapshot.last_restart_counter, Some(7));
+    }
+
+    #[test]
+    fn echo_peer_restart_counter_requires_reconciliation() {
+        let mut peer = Gtpv2cEchoPeer::new();
+        let _transition = peer.echo_request_sent(1);
+        match peer.observe_echo_response(echo_evidence(MessageDirection::Response, 1, 9)) {
+            Ok(_transition) => {}
+            Err(error) => panic!("initial Echo response transition failed: {error}"),
+        }
+
+        let _transition = peer.echo_request_sent(2);
+        let transition =
+            match peer.observe_echo_response(echo_evidence(MessageDirection::Response, 2, 10)) {
+                Ok(transition) => transition,
+                Err(error) => panic!("restart Echo response transition failed: {error}"),
+            };
+
+        assert_eq!(transition.event, Gtpv2cEchoPeerEvent::PeerRestartObserved);
+        assert_eq!(
+            transition.state,
+            Gtpv2cEchoPeerState::ReconciliationRequired
+        );
+        assert!(!transition.readiness.traffic_ready);
+        assert!(transition.projection.restart_counter_changed);
+        assert!(!transition.projection.continuity_safe);
+        assert_eq!(
+            transition.readiness.blockers,
+            vec![
+                Gtpv2cEchoPeerBlocker::PeerRestartCounterChanged,
+                Gtpv2cEchoPeerBlocker::RestartReconciliationRequired,
+            ]
+        );
+
+        let transition = match peer.restart_reconciled() {
+            Ok(transition) => transition,
+            Err(error) => panic!("restart reconciliation transition failed: {error}"),
+        };
+        assert_eq!(transition.event, Gtpv2cEchoPeerEvent::RestartReconciled);
+        assert_eq!(transition.state, Gtpv2cEchoPeerState::Reachable);
+        assert!(transition.readiness.traffic_ready);
+        assert_eq!(peer.snapshot().restart_counter_changes, 1);
+    }
+
+    #[test]
+    fn echo_peer_missing_response_degrades_then_fails() {
+        let policy = Gtpv2cEchoPeerPolicy::default().with_missed_response_threshold(2);
+        let mut peer = Gtpv2cEchoPeer::with_policy(policy);
+        let _transition = peer.echo_request_sent(1);
+
+        let transition = match peer.echo_response_missing() {
+            Ok(transition) => transition,
+            Err(error) => panic!("missing Echo response transition failed: {error}"),
+        };
+
+        assert_eq!(transition.event, Gtpv2cEchoPeerEvent::EchoResponseMissing);
+        assert_eq!(transition.state, Gtpv2cEchoPeerState::Degraded);
+        assert_eq!(
+            transition.readiness.blockers,
+            vec![Gtpv2cEchoPeerBlocker::EchoResponseMissing]
+        );
+        assert_eq!(transition.projection.missed_responses, 1);
+
+        let _transition = peer.echo_request_sent(2);
+        let transition = match peer.echo_response_missing() {
+            Ok(transition) => transition,
+            Err(error) => panic!("second missing Echo response transition failed: {error}"),
+        };
+
+        assert_eq!(transition.state, Gtpv2cEchoPeerState::Failed);
+        assert!(transition.readiness.failed);
+        assert_eq!(
+            transition.readiness.blockers,
+            vec![
+                Gtpv2cEchoPeerBlocker::EchoResponseMissing,
+                Gtpv2cEchoPeerBlocker::PeerUnreachable,
+            ]
+        );
+        assert_eq!(peer.snapshot().missed_responses, 2);
+    }
+
+    #[test]
+    fn echo_peer_sequence_mismatch_and_errors_are_stable() {
+        let mut peer = Gtpv2cEchoPeer::new();
+        let _transition = peer.echo_request_sent(7);
+
+        let transition =
+            match peer.observe_echo_response(echo_evidence(MessageDirection::Response, 8, 1)) {
+                Ok(transition) => transition,
+                Err(error) => panic!("mismatch Echo response transition failed: {error}"),
+            };
+
+        assert_eq!(
+            transition.event,
+            Gtpv2cEchoPeerEvent::EchoResponseSequenceMismatch
+        );
+        assert_eq!(transition.state, Gtpv2cEchoPeerState::Degraded);
+        assert_eq!(
+            transition.readiness.blockers,
+            vec![Gtpv2cEchoPeerBlocker::EchoResponseSequenceMismatch]
+        );
+        assert_eq!(peer.snapshot().echo_response_sequence_mismatches, 1);
+
+        let error = match peer.observe_echo_response(echo_evidence(MessageDirection::Request, 7, 1))
+        {
+            Ok(transition) => panic!("unexpected transition: {transition:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error.as_str(), "gtpv2c_echo_peer_unexpected_direction");
+        assert_eq!(
+            format!("{error}"),
+            "gtpv2c_echo_peer_unexpected_direction: expected response, actual request"
+        );
+
+        let mut peer = Gtpv2cEchoPeer::new();
+        let error =
+            match peer.observe_echo_response(echo_evidence(MessageDirection::Response, 1, 1)) {
+                Ok(transition) => panic!("unexpected transition: {transition:?}"),
+                Err(error) => error,
+            };
+        assert_eq!(error.as_str(), "gtpv2c_echo_peer_invalid_transition");
+        assert_eq!(
+            Gtpv2cEchoPeerBlocker::RestartReconciliationRequired.as_str(),
+            "gtpv2c_restart_reconciliation_required"
+        );
+        assert_eq!(
+            Gtpv2cEchoPeerEvent::EchoResponseMissing.as_str(),
+            "echo_response_missing"
+        );
+        assert_eq!(Gtpv2cEchoPeerState::Failed.as_str(), "failed");
+    }
 
     #[test]
     fn procedure_maps_request_and_response_types() {
