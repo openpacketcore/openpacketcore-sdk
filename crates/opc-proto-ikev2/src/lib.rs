@@ -23,6 +23,7 @@ pub mod exchange;
 pub mod header;
 pub mod message;
 pub mod nat_traversal;
+pub mod notify;
 pub mod payload;
 
 pub use crypto::{
@@ -45,6 +46,12 @@ pub use nat_traversal::{
     NatTraversalClassification, NatTraversalEspCandidate, NatTraversalIkeDecodeErrorCode,
     NatTraversalIkeMessage, NatTraversalIkeTransport, NatTraversalKeepalive, NatTraversalRejection,
     IKE_NAT_TRAVERSAL_UDP_PORT, IKE_UDP_PORT, NAT_TRAVERSAL_KEEPALIVE,
+};
+pub use notify::{
+    build_ike_sa_init_cookie_response, extract_ike_sa_init_cookie_notify, Ikev2CookieNotify,
+    Ikev2CookieNotifyBuildError, Ikev2CookieNotifyExtractError, Ikev2NotifyPayload,
+    Ikev2NotifyPayloadError, IKEV2_NOTIFY_COOKIE, IKEV2_NOTIFY_COOKIE2,
+    IKEV2_NOTIFY_PROTOCOL_ID_NONE,
 };
 pub use payload::{
     validate_payload_chain, PayloadChain, PayloadType, RawPayload, RawPayloadIterator,
