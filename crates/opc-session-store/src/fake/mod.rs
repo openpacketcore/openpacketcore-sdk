@@ -26,6 +26,7 @@ use crate::{
     lease::{LeaseGuard, SessionLeaseManager},
     model::{FenceToken, OwnerId, SessionKey},
     record::StoredSessionRecord,
+    restore::{RestoreScanCursor, RestoreScanPage, RestoreScanRequest},
 };
 
 /// In-memory session backend and lease manager for deterministic tests.
@@ -660,6 +661,42 @@ impl SessionBackend for FakeSessionBackend {
         Ok(results)
     }
 
+    async fn scan_restore_records(
+        &self,
+        request: RestoreScanRequest,
+    ) -> Result<RestoreScanPage, StoreError> {
+        request.validate()?;
+
+        let mut state = self.inner.lock().await;
+        let now = self.clock.now_utc();
+        Self::prune_state(&mut state, now);
+
+        let mut matching = Vec::new();
+        let mut excluded_count = 0;
+        for record in state.records.values() {
+            if record.is_expired_at(now) {
+                continue;
+            }
+            if request.scope.matches_record(record) {
+                matching.push(record.clone());
+            } else {
+                excluded_count += 1;
+            }
+        }
+        matching.sort_by(compare_restore_records);
+
+        let start = request
+            .cursor
+            .map(RestoreScanCursor::offset)
+            .unwrap_or(0)
+            .min(matching.len());
+        let end = start.saturating_add(request.limit).min(matching.len());
+        let next_cursor = (end < matching.len()).then(|| RestoreScanCursor::from_offset(end));
+        let records = matching[start..end].to_vec();
+
+        Ok(RestoreScanPage::new(records, excluded_count, next_cursor))
+    }
+
     async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
         let state = self.inner.lock().await;
         Ok(state
@@ -773,6 +810,28 @@ impl SessionBackend for FakeSessionBackend {
         let state = self.inner.lock().await;
         Ok((state.next_fence, state.next_credential_id))
     }
+}
+
+fn compare_restore_records(
+    left: &StoredSessionRecord,
+    right: &StoredSessionRecord,
+) -> std::cmp::Ordering {
+    left.key
+        .tenant
+        .as_str()
+        .cmp(right.key.tenant.as_str())
+        .then_with(|| left.key.nf_kind.as_str().cmp(right.key.nf_kind.as_str()))
+        .then_with(|| left.key.key_type.cmp(&right.key.key_type))
+        .then_with(|| {
+            left.key
+                .stable_id
+                .as_ref()
+                .cmp(right.key.stable_id.as_ref())
+        })
+        .then_with(|| left.state_class.cmp(&right.state_class))
+        .then_with(|| left.state_type.cmp(&right.state_type))
+        .then_with(|| left.owner.cmp(&right.owner))
+        .then_with(|| left.generation.cmp(&right.generation))
 }
 
 struct WatchStream {

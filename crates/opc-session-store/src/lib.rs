@@ -67,7 +67,9 @@ pub use quorum::{FencedSessionReplica, QuorumSessionStore, SessionStoreBackend};
 pub use record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 pub use restore::{
     summarize_restore_records, OwnerFenceMetadata, RestoreBlockReason, RestoreBlockReasonCode,
-    RestoreRecordSummary, RestoreStage, StoredRecordHeaderSummary,
+    RestoreRecordSummary, RestoreScanCursor, RestoreScanPage, RestoreScanRequest, RestoreScanScope,
+    RestoreStage, StoredRecordHeaderSummary, RESTORE_SCAN_DEFAULT_PAGE_SIZE,
+    RESTORE_SCAN_MAX_PAGE_SIZE,
 };
 pub use sqlite::SqliteSessionBackend;
 pub use store::SessionStore;

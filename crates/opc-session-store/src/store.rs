@@ -19,6 +19,7 @@ use crate::error::{LeaseError, StoreError};
 use crate::lease::{LeaseGuard, SessionLeaseManager};
 use crate::model::{OwnerId, SessionKey};
 use crate::record::StoredSessionRecord;
+use crate::restore::{RestoreScanPage, RestoreScanRequest};
 
 /// A single handle that owns one backend and exposes both storage and lease
 /// operations.
@@ -111,6 +112,13 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
         self.backend.batch(ops).await
+    }
+
+    async fn scan_restore_records(
+        &self,
+        request: RestoreScanRequest,
+    ) -> Result<RestoreScanPage, StoreError> {
+        self.backend.scan_restore_records(request).await
     }
 
     async fn assert_suitable_for(

@@ -20,6 +20,7 @@ use crate::{
     lease::{LeaseGuard, SessionLeaseManager},
     model::{FenceToken, Generation, OwnerId, SessionKey},
     record::{EncryptedSessionPayload, StoredSessionRecord},
+    restore::{RestoreScanPage, RestoreScanRequest},
 };
 
 /// Atomic compare-and-set operation.
@@ -263,6 +264,19 @@ pub trait SessionBackend: Send + Sync {
     /// Execute a batch of operations. The batch is processed sequentially; partial
     /// failure is represented by individual [`SessionOpResult`] variants.
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError>;
+
+    /// Scan live session records for startup/failover restore.
+    ///
+    /// Implementations must apply the same expiry/pruning behavior as
+    /// [`Self::get`] and return records in deterministic order for stable
+    /// pagination. Backends that do not provide restore scans must keep this
+    /// default fail-closed implementation.
+    async fn scan_restore_records(
+        &self,
+        _request: RestoreScanRequest,
+    ) -> Result<RestoreScanPage, StoreError> {
+        Err(StoreError::CapabilityNotSupported("restore_scan".into()))
+    }
 
     /// Check if this backend is suitable for a specific session state profile.
     async fn assert_suitable_for(
@@ -717,6 +731,20 @@ where
                 })
             })
             .collect()
+    }
+
+    async fn scan_restore_records(
+        &self,
+        request: RestoreScanRequest,
+    ) -> Result<RestoreScanPage, StoreError> {
+        let mut page = self.inner.scan_restore_records(request).await?;
+        let mut decrypted = Vec::with_capacity(page.records.len());
+        for record in page.records {
+            decrypted.push(self.decrypt_record(record).await?);
+        }
+        page.records = decrypted;
+        page.loaded_count = page.records.len();
+        Ok(page)
     }
 
     async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
