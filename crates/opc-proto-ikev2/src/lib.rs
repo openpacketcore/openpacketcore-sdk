@@ -25,6 +25,7 @@ pub mod message;
 pub mod nat_traversal;
 pub mod notify;
 pub mod payload;
+pub mod sa_init;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
@@ -58,6 +59,16 @@ pub use notify::{
 pub use payload::{
     validate_payload_chain, PayloadChain, PayloadType, RawPayload, RawPayloadIterator,
     GENERIC_PAYLOAD_HEADER_LEN,
+};
+pub use sa_init::{
+    build_ike_sa_init_response, decode_ike_sa_init_request_payloads, Ikev2KeyExchangePayload,
+    Ikev2KeyExchangePayloadBuild, Ikev2KeyExchangePayloadError, Ikev2NoncePayload,
+    Ikev2NoncePayloadBuild, Ikev2NoncePayloadError, Ikev2NotifyPayloadBuild, Ikev2SaInitBuildError,
+    Ikev2SaInitPayloadError, Ikev2SaInitPayloads, Ikev2SaInitResponsePayloads, Ikev2SaPayload,
+    Ikev2SaPayloadBuild, Ikev2SaPayloadError, Ikev2SaProposal, Ikev2SaProposalBuild,
+    Ikev2SaTransform, Ikev2SaTransformBuild, Ikev2TransformAttribute, Ikev2TransformAttributeBuild,
+    Ikev2TransformAttributeBuildValue, Ikev2TransformAttributeValue, Ikev2VendorIdPayload,
+    Ikev2VendorIdPayloadError,
 };
 
 pub(crate) const fn is_strict(level: ValidationLevel) -> bool {
