@@ -105,6 +105,12 @@ pub struct EnumValue {
     pub description: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NumericRangeInterval {
+    pub min: i64,
+    pub max: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaNode {
     pub path: String,
@@ -112,6 +118,8 @@ pub struct SchemaNode {
     pub kind: SchemaNodeKind,
     pub config: bool,
     pub type_ref: Option<TypeRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub numeric_range: Vec<NumericRangeInterval>,
     pub key_leaves: Vec<String>,
     pub child_paths: Vec<String>,
     pub source: YangSourceLocation,
@@ -135,6 +143,7 @@ impl Default for SchemaNode {
             kind: SchemaNodeKind::Container,
             config: false,
             type_ref: None,
+            numeric_range: Vec::new(),
             key_leaves: Vec::new(),
             child_paths: Vec::new(),
             source: YangSourceLocation::default(),

@@ -3,8 +3,8 @@ mod common;
 use opc_yanggen::rust::generate_rust;
 use opc_yanggen::{
     CanonicalInput, CompareOp, ConstraintBinding, ConstraintExpr, EnumValue, GenerationInput,
-    Literal, PathAnchor, PathExpr, SchemaModule, SchemaNode, SchemaNodeKind, StackBudget, TypeRef,
-    YangSourceLocation,
+    Literal, NumericRangeInterval, PathAnchor, PathExpr, SchemaModule, SchemaNode, SchemaNodeKind,
+    StackBudget, TypeRef, YangSourceLocation,
 };
 use std::fs;
 use std::process::Command;
@@ -23,6 +23,7 @@ fn create_test_input() -> CanonicalInput {
             child_paths: vec![
                 "/test:system/enabled".to_string(),
                 "/test:system/mode".to_string(),
+                "/test:system/checkpoint-interval-ms".to_string(),
                 "/test:system/secret-key".to_string(),
             ],
             source: source.clone(),
@@ -56,6 +57,21 @@ fn create_test_input() -> CanonicalInput {
                     },
                 ],
             }),
+            key_leaves: vec![],
+            child_paths: vec![],
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/test:system/checkpoint-interval-ms".to_string(),
+            module: "test".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::Uint32),
+            numeric_range: vec![NumericRangeInterval {
+                min: 1,
+                max: i64::from(u32::MAX),
+            }],
             key_leaves: vec![],
             child_paths: vec![],
             source: source.clone(),
@@ -167,6 +183,7 @@ fn test_generated_code_features() {
         let sys = System {
             enabled: LeafPresence::Explicit(true),
             mode: LeafPresence::Explicit("standalone".to_string()),
+            checkpoint_interval_ms: LeafPresence::Explicit(1000),
             secret_key: SecretLeaf::new(LeafPresence::Explicit("supersecret".to_string())),
         };
         // Verify JSON representation
@@ -174,12 +191,14 @@ fn test_generated_code_features() {
         assert_eq!(serialized, json!({
             "test:enabled": true,
             "test:mode": "standalone",
+            "test:checkpoint-interval-ms": 1000,
             "test:secret-key": "supersecret"
         }));
         
         let deserialized: System = serde_json::from_value(serialized).unwrap();
         assert_eq!(deserialized.enabled, LeafPresence::Explicit(true));
         assert_eq!(deserialized.mode, LeafPresence::Explicit("standalone".to_string()));
+        assert_eq!(deserialized.checkpoint_interval_ms, LeafPresence::Explicit(1000));
         assert_eq!(deserialized.secret_key.into_inner().into_option().unwrap(), "supersecret");
     }
     
@@ -202,6 +221,10 @@ fn test_generated_code_features() {
             generated_test::patch::ConfigDelta::Update(
                 opc_config_model::YangPath::new("/test:system/mode").unwrap(),
                 "active-standby".to_string()
+            ),
+            generated_test::patch::ConfigDelta::Update(
+                opc_config_model::YangPath::new("/test:system/checkpoint-interval-ms").unwrap(),
+                "100".to_string()
             )
         ];
         
@@ -209,6 +232,7 @@ fn test_generated_code_features() {
         assert!(res.is_ok());
         assert_eq!(sys.enabled, LeafPresence::Explicit(true));
         assert_eq!(sys.mode, LeafPresence::Explicit("active-standby".to_string()));
+        assert_eq!(sys.checkpoint_interval_ms, LeafPresence::Explicit(100));
 
         let invalid = vec![
             generated_test::patch::ConfigDelta::Update(
@@ -258,6 +282,36 @@ fn test_generated_code_features() {
     }
 
     #[test]
+    fn test_gnmi_set_rejects_out_of_range_numeric_value() {
+        use opc_gnmi_server::{
+            Encoding, GnmiError, GnmiPatchApplicator, NormalizedSet, NormalizedValue,
+        };
+
+        let value = NormalizedValue::new(
+            Encoding::JsonIetf,
+            "0",
+            &opc_mgmt_limits::MgmtLimits::default(),
+        )
+        .unwrap();
+        let set = NormalizedSet {
+            updates: vec![(
+                opc_config_model::YangPath::new("/test:system/checkpoint-interval-ms").unwrap(),
+                value,
+            )],
+            ..Default::default()
+        };
+
+        let err = generated_test::gnmi_set::patcher()
+            .apply_set(&System::default(), &set)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GnmiError::InvalidArgument { detail }
+                if detail == "gNMI numeric leaf value is outside YANG range"
+        ));
+    }
+
+    #[test]
     fn test_netconf_edit_rejects_invalid_enum_value() {
         use opc_mgmt_schema::{
             EditConfigNode, EditOperation, NetconfEditError, NetconfXmlEditApplicator,
@@ -285,6 +339,38 @@ fn test_generated_code_features() {
             err,
             NetconfEditError::InvalidValue {
                 path: "/test:system/mode"
+            }
+        ));
+    }
+
+    #[test]
+    fn test_netconf_edit_rejects_out_of_range_numeric_value() {
+        use opc_mgmt_schema::{
+            EditConfigNode, EditOperation, NetconfEditError, NetconfXmlEditApplicator,
+        };
+        use std::collections::BTreeMap;
+
+        let edit = EditConfigNode {
+            schema_path: "/test:system",
+            operation: EditOperation::Merge,
+            value: None,
+            children: vec![EditConfigNode {
+                schema_path: "/test:system/checkpoint-interval-ms",
+                operation: EditOperation::Merge,
+                value: Some("0".to_string()),
+                children: Vec::new(),
+                list_keys: BTreeMap::new(),
+            }],
+            list_keys: BTreeMap::new(),
+        };
+
+        let err = generated_test::netconf_xml_edit::applicator()
+            .apply_edit_config(&System::default(), &edit)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            NetconfEditError::InvalidValue {
+                path: "/test:system/checkpoint-interval-ms"
             }
         ));
     }
@@ -369,6 +455,10 @@ fn test_generated_code_features() {
         }
         assert_eq!(reg.leaf_type("/test:system/secret-key"), Some(LeafType::String));
         assert_eq!(reg.leaf_type("/test:system"), None);
+        let checkpoint_range = reg.numeric_range("/test:system/checkpoint-interval-ms");
+        assert_eq!(checkpoint_range.len(), 1);
+        assert_eq!(checkpoint_range[0].min, 1);
+        assert_eq!(checkpoint_range[0].max, i64::from(u32::MAX));
 
         // Data class for the sensitive leaf, and it MUST agree with the
         // generated metadata resolver (the registry is not a side schema).

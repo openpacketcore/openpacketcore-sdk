@@ -82,6 +82,24 @@ pub struct EnumValueMeta {
     pub description: Option<&'static str>,
 }
 
+/// One inclusive YANG integer range interval for a leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NumericRangeIntervalMeta {
+    /// Inclusive lower bound after resolving YANG `min`.
+    pub min: i64,
+    /// Inclusive upper bound after resolving YANG `max`.
+    pub max: i64,
+}
+
+/// Range metadata associated with one schema node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeNumericRangeMeta {
+    /// Canonical absolute schema path for the ranged leaf.
+    pub path: &'static str,
+    /// Inclusive intervals accepted by the YANG `range` statement.
+    pub intervals: &'static [NumericRangeIntervalMeta],
+}
+
 /// The five datastore NACM actions (RFC 8341), mirroring the same-named variants
 /// of `opc_nacm::NacmAction`. The server maps to `opc_nacm::NacmAction` at its
 /// boundary; this crate stays free of the `opc-nacm` dependency.
@@ -284,6 +302,7 @@ const RW_ACTIONS: &[NacmAction] = &[
 ];
 const RO_ACTIONS: &[NacmAction] = &[NacmAction::Read];
 const NO_ACTIONS: &[NacmAction] = &[];
+const NO_NUMERIC_RANGE: &[NumericRangeIntervalMeta] = &[];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedSchemaPath {
@@ -502,6 +521,14 @@ pub trait SchemaRegistry: Send + Sync {
         &[]
     }
 
+    /// Numeric YANG `range` metadata keyed by schema-node path.
+    ///
+    /// The default empty table preserves compatibility for registries generated
+    /// before range metadata was introduced.
+    fn numeric_ranges(&self) -> &'static [NodeNumericRangeMeta] {
+        &[]
+    }
+
     /// Retrieves raw YANG source text for a module identified by name and optional
     /// revision. Only the `yang` format is required; other formats may be rejected
     /// as unsupported.
@@ -562,6 +589,20 @@ pub trait SchemaRegistry: Send + Sync {
     /// The leaf value type for a leaf/leaf-list node.
     fn leaf_type(&self, schema_path: &str) -> Option<LeafType> {
         self.node(schema_path).and_then(|n| n.leaf_type)
+    }
+
+    /// Inclusive numeric range intervals for an integer leaf.
+    ///
+    /// Returns an empty slice when the leaf has no range constraint, the path is
+    /// unknown, or the node is not a ranged integer leaf.
+    fn numeric_range(&self, schema_path: &str) -> &'static [NumericRangeIntervalMeta] {
+        let Some(node) = self.node(schema_path) else {
+            return NO_NUMERIC_RANGE;
+        };
+        self.numeric_ranges()
+            .iter()
+            .find(|range| range.path == node.path)
+            .map_or(NO_NUMERIC_RANGE, |range| range.intervals)
     }
 
     /// The redaction data class for a node's values.

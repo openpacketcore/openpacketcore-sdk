@@ -251,6 +251,26 @@ fn validate_supported_node(
         }
     }
 
+    if !node.numeric_range.is_empty() {
+        if !matches!(
+            node.type_ref.as_ref(),
+            Some(TypeRef::Uint16 | TypeRef::Uint32 | TypeRef::Int64)
+        ) {
+            return Err(RustGenerationError::new(format!(
+                "numeric range metadata at {} requires an integer leaf type",
+                node.path
+            )));
+        }
+        for interval in &node.numeric_range {
+            if interval.min > interval.max {
+                return Err(RustGenerationError::new(format!(
+                    "numeric range metadata at {} has a lower bound greater than upper bound",
+                    node.path
+                )));
+            }
+        }
+    }
+
     for child_path in &node.child_paths {
         if !input.nodes.iter().any(|child| &child.path == child_path) {
             return Err(RustGenerationError::new(format!(

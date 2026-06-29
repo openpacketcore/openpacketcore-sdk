@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::diagnostic::{Diagnostic, DiagnosticCode, YangSourceLocation};
 use crate::emit::{fnv1a64, schema_digest, GenerationInput};
 use crate::ir::{
-    EnumValue, LockedModule, ModuleConformance, ModuleImport, ModuleLockfile, SchemaModule,
-    SchemaNode, SchemaNodeKind, StackBudget, TypeRef,
+    EnumValue, LockedModule, ModuleConformance, ModuleImport, ModuleLockfile, NumericRangeInterval,
+    SchemaModule, SchemaNode, SchemaNodeKind, StackBudget, TypeRef,
 };
 
 /// In-memory YANG source module used by ingestion and consistency validation.
@@ -338,6 +338,12 @@ fn compare_node(input: &SchemaNode, parsed: &SchemaNode) -> Result<(), Diagnosti
     )?;
     compare_vec(
         &input.source,
+        "numeric range",
+        &input.numeric_range,
+        &parsed.numeric_range,
+    )?;
+    compare_vec(
+        &input.source,
         "list key leaves",
         &input.key_leaves,
         &parsed.key_leaves,
@@ -655,7 +661,11 @@ fn parse_data_node(
                 node.unique_constraints
                     .push(split_yang_words(required_argument(child, "unique")?));
             }
-            "type" => node.type_ref = Some(parse_type_ref(child)?),
+            "type" => {
+                let parsed_type = parse_type_ref(child)?;
+                node.type_ref = Some(parsed_type.type_ref);
+                node.numeric_range = parsed_type.numeric_range;
+            }
             "container" | "list" | "leaf" | "leaf-list" | "choice" | "case" => {
                 let child_nodes =
                     parse_data_node(child, module_name, module_prefix, Some(&path), config)?;
@@ -697,33 +707,168 @@ fn parse_data_node(
     Ok(nodes)
 }
 
-fn parse_type_ref(statement: &Statement) -> Result<TypeRef, Diagnostic> {
+struct ParsedTypeRef {
+    type_ref: TypeRef,
+    numeric_range: Vec<NumericRangeInterval>,
+}
+
+fn parse_type_ref(statement: &Statement) -> Result<ParsedTypeRef, Diagnostic> {
     let type_name = required_argument(statement, "type")?;
     match type_name {
-        "boolean" => ensure_type_children_supported(statement, &[]).map(|()| TypeRef::Boolean),
-        "string" => ensure_type_children_supported(statement, &[]).map(|()| TypeRef::String),
-        "enumeration" => parse_enumeration_type(statement),
-        "uint16" => ensure_type_children_supported(statement, &[]).map(|()| TypeRef::Uint16),
-        "uint32" => ensure_type_children_supported(statement, &[]).map(|()| TypeRef::Uint32),
-        "int64" => ensure_type_children_supported(statement, &[]).map(|()| TypeRef::Int64),
+        "boolean" => parse_plain_type(statement, TypeRef::Boolean),
+        "string" => parse_plain_type(statement, TypeRef::String),
+        "enumeration" => parse_enumeration_type(statement).map(|type_ref| ParsedTypeRef {
+            type_ref,
+            numeric_range: Vec::new(),
+        }),
+        "uint16" => parse_integer_type(statement, TypeRef::Uint16, 0, i64::from(u16::MAX)),
+        "uint32" => parse_integer_type(statement, TypeRef::Uint32, 0, i64::from(u32::MAX)),
+        "int64" => parse_integer_type(statement, TypeRef::Int64, i64::MIN, i64::MAX),
         "decimal64" => {
             ensure_type_children_supported(statement, &["fraction-digits"])?;
-            Ok(TypeRef::Decimal64)
+            Ok(ParsedTypeRef {
+                type_ref: TypeRef::Decimal64,
+                numeric_range: Vec::new(),
+            })
         }
-        "empty" => ensure_type_children_supported(statement, &[]).map(|()| TypeRef::Empty),
+        "empty" => parse_plain_type(statement, TypeRef::Empty),
         "identityref" => {
             let base = required_child_argument(statement, "base")?;
             ensure_type_children_supported(statement, &["base"])?;
-            Ok(TypeRef::IdentityRef { base })
+            Ok(ParsedTypeRef {
+                type_ref: TypeRef::IdentityRef { base },
+                numeric_range: Vec::new(),
+            })
         }
         "leafref" => {
             let target_path = required_child_argument(statement, "path")?;
             ensure_type_children_supported(statement, &["path", "require-instance"])?;
-            Ok(TypeRef::LeafRef { target_path })
+            Ok(ParsedTypeRef {
+                type_ref: TypeRef::LeafRef { target_path },
+                numeric_range: Vec::new(),
+            })
         }
-        other => ensure_type_children_supported(statement, &[])
-            .map(|()| TypeRef::Custom { name: other.into() }),
+        other => ensure_type_children_supported(statement, &[]).map(|()| ParsedTypeRef {
+            type_ref: TypeRef::Custom { name: other.into() },
+            numeric_range: Vec::new(),
+        }),
     }
+}
+
+fn parse_plain_type(statement: &Statement, type_ref: TypeRef) -> Result<ParsedTypeRef, Diagnostic> {
+    ensure_type_children_supported(statement, &[])?;
+    Ok(ParsedTypeRef {
+        type_ref,
+        numeric_range: Vec::new(),
+    })
+}
+
+fn parse_integer_type(
+    statement: &Statement,
+    type_ref: TypeRef,
+    base_min: i64,
+    base_max: i64,
+) -> Result<ParsedTypeRef, Diagnostic> {
+    ensure_type_children_supported(statement, &["range"])?;
+    Ok(ParsedTypeRef {
+        type_ref,
+        numeric_range: parse_optional_numeric_range(statement, base_min, base_max)?,
+    })
+}
+
+fn parse_optional_numeric_range(
+    statement: &Statement,
+    base_min: i64,
+    base_max: i64,
+) -> Result<Vec<NumericRangeInterval>, Diagnostic> {
+    let mut parsed_range = None;
+    for child in &statement.children {
+        if child.keyword != "range" {
+            continue;
+        }
+        if parsed_range.is_some() {
+            return Err(Diagnostic::new(
+                DiagnosticCode::YangSourceSyntaxError,
+                "integer type declares more than one range statement",
+                Some(child.source.clone()),
+                Some("combine the intervals into one range statement separated by '|'"),
+            ));
+        }
+        parsed_range = Some(parse_numeric_range(child, base_min, base_max)?);
+    }
+    Ok(parsed_range.unwrap_or_default())
+}
+
+fn parse_numeric_range(
+    statement: &Statement,
+    base_min: i64,
+    base_max: i64,
+) -> Result<Vec<NumericRangeInterval>, Diagnostic> {
+    for child in &statement.children {
+        match child.keyword.as_str() {
+            "description" | "reference" | "error-message" | "error-app-tag" => {}
+            other => return Err(unsupported(child, other)),
+        }
+    }
+
+    let raw = required_argument(statement, "range")?;
+    let mut intervals = Vec::new();
+    for part in raw.split('|') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            return Err(invalid_range(statement, "range interval must not be empty"));
+        }
+        let (min_raw, max_raw) = trimmed
+            .split_once("..")
+            .map_or((trimmed, trimmed), |(min, max)| (min.trim(), max.trim()));
+        let min = parse_numeric_range_bound(statement, min_raw, base_min, base_max)?;
+        let max = parse_numeric_range_bound(statement, max_raw, base_min, base_max)?;
+        if min > max {
+            return Err(invalid_range(
+                statement,
+                "range lower bound must not exceed upper bound",
+            ));
+        }
+        if min < base_min || max > base_max {
+            return Err(invalid_range(
+                statement,
+                "range interval exceeds the base integer type bounds",
+            ));
+        }
+        intervals.push(NumericRangeInterval { min, max });
+    }
+    if intervals.is_empty() {
+        return Err(invalid_range(
+            statement,
+            "range must contain at least one interval",
+        ));
+    }
+    Ok(intervals)
+}
+
+fn parse_numeric_range_bound(
+    statement: &Statement,
+    raw: &str,
+    base_min: i64,
+    base_max: i64,
+) -> Result<i64, Diagnostic> {
+    match raw {
+        "min" => Ok(base_min),
+        "max" => Ok(base_max),
+        "" => Err(invalid_range(statement, "range bound must not be empty")),
+        value => value.parse::<i64>().map_err(|_| {
+            invalid_range(statement, "range bound must be an integer, 'min', or 'max'")
+        }),
+    }
+}
+
+fn invalid_range(statement: &Statement, message: &'static str) -> Diagnostic {
+    Diagnostic::new(
+        DiagnosticCode::YangSourceSyntaxError,
+        message,
+        Some(statement.source.clone()),
+        Some("use YANG integer range syntax such as \"1..max\" or \"0..10 | 20\""),
+    )
 }
 
 fn parse_enumeration_type(statement: &Statement) -> Result<TypeRef, Diagnostic> {
@@ -850,7 +995,7 @@ fn semantic_module_checksum(module: &SchemaModule, nodes: &[SchemaNode]) -> Stri
         .iter()
         .filter(|node| node.module == module.name)
         .map(|node| {
-            serde_json::json!({
+            let mut node_json = serde_json::json!({
                 "path": node.path,
                 "kind": node.kind,
                 "config": node.config,
@@ -862,7 +1007,11 @@ fn semantic_module_checksum(module: &SchemaModule, nodes: &[SchemaNode]) -> Stri
                 "ordered_by": node.ordered_by,
                 "data_class": node.data_class,
                 "unique_constraints": node.unique_constraints,
-            })
+            });
+            if !node.numeric_range.is_empty() {
+                node_json["numeric_range"] = serde_json::json!(node.numeric_range);
+            }
+            node_json
         })
         .collect::<Vec<_>>();
     let material = serde_json::json!({
