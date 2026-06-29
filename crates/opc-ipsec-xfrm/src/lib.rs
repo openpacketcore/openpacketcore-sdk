@@ -13,6 +13,7 @@
 pub mod backend;
 pub mod composite;
 pub mod error;
+pub mod linux;
 pub mod mock;
 pub mod model;
 pub mod unsupported;
@@ -25,6 +26,7 @@ pub use composite::{
     XFRM_COMPOSITE_REKEY_ORDER, XFRM_COMPOSITE_REMOVE_ORDER,
 };
 pub use error::XfrmError;
+pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
 pub use mock::{MockOperation, MockXfrmBackend};
 pub use model::{
     Algorithm, AllocateSpiRequest, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest,

@@ -83,6 +83,15 @@ pub const NLM_F_CREATE: u16 = 0x0400;
 /// Netlink append flag.
 pub const NLM_F_APPEND: u16 = 0x0800;
 
+/// Netlink no-op control message.
+pub const NLMSG_NOOP: u16 = 0x1;
+/// Netlink error or acknowledge control message.
+pub const NLMSG_ERROR: u16 = 0x2;
+/// Netlink multipart completion control message.
+pub const NLMSG_DONE: u16 = 0x3;
+/// Netlink overrun control message.
+pub const NLMSG_OVERRUN: u16 = 0x4;
+
 /// Base XFRM netlink message number.
 pub const XFRM_MSG_BASE: u16 = 0x10;
 /// Add a new Security Association.
@@ -151,7 +160,7 @@ pub const XFRMA_IF_ID: u16 = 31;
 
 /// Netlink message header layout used by XFRM requests and responses.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct NetlinkMessageHeader {
     /// Total message length including this header.
     pub length: u32,
@@ -329,6 +338,20 @@ pub struct XfrmUserSaInfo {
     pub flags: u8,
 }
 
+/// Linux `struct xfrm_usersa_id` used by SA delete/query requests.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct XfrmUserSaId {
+    /// Destination address.
+    pub destination: XfrmAddress,
+    /// Security Parameter Index in network byte order.
+    pub spi_network_order: u32,
+    /// Address family.
+    pub family: u16,
+    /// Transform protocol, for example `IPPROTO_ESP`.
+    pub proto: u8,
+}
+
 /// Linux `struct xfrm_userpolicy_info`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -351,6 +374,28 @@ pub struct XfrmUserPolicyInfo {
     pub flags: u8,
     /// Sharing mode.
     pub share: u8,
+}
+
+/// Linux `struct xfrm_userpolicy_id` used by policy delete/query requests.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct XfrmUserPolicyId {
+    /// Packet selector.
+    pub selector: XfrmSelector,
+    /// Kernel policy index, or zero when matching by selector and direction.
+    pub index: u32,
+    /// Direction such as [`XFRM_POLICY_OUT`].
+    pub direction: u8,
+}
+
+/// Linux `struct nlmsgerr` prefix used by netlink ACK/error responses.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct NetlinkErrorMessage {
+    /// Negative errno on failure, or zero for success.
+    pub error: i32,
+    /// Header of the request being acknowledged.
+    pub message: NetlinkMessageHeader,
 }
 
 /// Linux `struct xfrm_user_tmpl`.
@@ -484,6 +529,10 @@ mod tests {
         assert_eq!(NLM_F_EXCL, 0x0200);
         assert_eq!(NLM_F_CREATE, 0x0400);
         assert_eq!(NLM_F_APPEND, 0x0800);
+        assert_eq!(NLMSG_NOOP, 0x1);
+        assert_eq!(NLMSG_ERROR, 0x2);
+        assert_eq!(NLMSG_DONE, 0x3);
+        assert_eq!(NLMSG_OVERRUN, 0x4);
         assert_eq!(XFRM_MSG_BASE, 0x10);
         assert_eq!(XFRM_MSG_NEWSA, 0x10);
         assert_eq!(XFRM_MSG_DELSA, 0x11);
@@ -563,9 +612,17 @@ mod tests {
         assert_eq!(offset_of!(XfrmUserSaInfo, id), 56);
         assert_eq!(offset_of!(XfrmUserSaInfo, lifetime_config), 96);
         assert_eq!(offset_of!(XfrmUserSaInfo, family), 212);
+        assert_eq!(size_of::<XfrmUserSaId>(), 24);
+        assert_eq!(offset_of!(XfrmUserSaId, family), 20);
+        assert_eq!(offset_of!(XfrmUserSaId, proto), 22);
         assert_eq!(size_of::<XfrmUserPolicyInfo>(), 168);
         assert_eq!(offset_of!(XfrmUserPolicyInfo, priority), 152);
         assert_eq!(offset_of!(XfrmUserPolicyInfo, direction), 160);
+        assert_eq!(size_of::<XfrmUserPolicyId>(), 64);
+        assert_eq!(offset_of!(XfrmUserPolicyId, index), 56);
+        assert_eq!(offset_of!(XfrmUserPolicyId, direction), 60);
+        assert_eq!(size_of::<NetlinkErrorMessage>(), 20);
+        assert_eq!(offset_of!(NetlinkErrorMessage, message), 4);
         assert_eq!(size_of::<XfrmUserTemplate>(), 64);
         assert_eq!(offset_of!(XfrmUserTemplate, source_address), 28);
         assert_eq!(offset_of!(XfrmUserTemplate, auth_algorithms), 52);
