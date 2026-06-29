@@ -844,6 +844,612 @@ impl Default for Gtpv2cEchoPeer {
     }
 }
 
+/// Caller-owned redaction-safe peer token for GTPv2-C transaction correlation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Gtpv2cPeerToken(u64);
+
+impl Gtpv2cPeerToken {
+    /// Create a peer token from a caller-owned non-sensitive value.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Return the token value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// GTPv2-C client transaction state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Gtpv2cClientTransactionState {
+    /// Request has not been sent.
+    SendNotAttempted,
+    /// Local send failed before socket-layer delivery.
+    SendFailedBeforeDelivery,
+    /// Request was accepted by the socket layer and response is pending.
+    SentWaitingResponse,
+    /// A matching response was observed.
+    ResponseObserved,
+    /// Response timeout policy reached a terminal failure.
+    TerminalTimeout,
+}
+
+impl Gtpv2cClientTransactionState {
+    /// Stable machine name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SendNotAttempted => "send_not_attempted",
+            Self::SendFailedBeforeDelivery => "send_failed_before_delivery",
+            Self::SentWaitingResponse => "sent_waiting_response",
+            Self::ResponseObserved => "response_observed",
+            Self::TerminalTimeout => "terminal_timeout",
+        }
+    }
+}
+
+/// Stable decision emitted by the GTPv2-C client transaction helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Gtpv2cClientTransactionDecision {
+    /// Request has not been sent.
+    SendNotAttempted,
+    /// Local send failed before socket-layer delivery.
+    SendFailedBeforeDelivery,
+    /// Request was accepted by the socket layer and response is pending.
+    SentWaitingResponse,
+    /// Timeout permits retransmission to the same peer.
+    SafeRetransmitSamePeer,
+    /// Peer failover is unsafe after socket-layer delivery.
+    UnsafePeerFailover,
+    /// Response matched the pending transaction.
+    ResponseMatched,
+    /// Response duplicated a previously matched transaction.
+    DuplicateResponse,
+    /// Response arrived after terminal timeout or without pending state.
+    LateResponse,
+    /// Response did not match transaction correlation fields.
+    ResponseMismatched,
+    /// Timeout policy reached a terminal failure.
+    TerminalTimeout,
+}
+
+impl Gtpv2cClientTransactionDecision {
+    /// Stable machine-readable decision code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SendNotAttempted => "send_not_attempted",
+            Self::SendFailedBeforeDelivery => "send_failed_before_delivery",
+            Self::SentWaitingResponse => "sent_waiting_response",
+            Self::SafeRetransmitSamePeer => "safe_retransmit_same_peer",
+            Self::UnsafePeerFailover => "unsafe_peer_failover",
+            Self::ResponseMatched => "response_matched",
+            Self::DuplicateResponse => "duplicate_response",
+            Self::LateResponse => "late_response",
+            Self::ResponseMismatched => "response_mismatched",
+            Self::TerminalTimeout => "terminal_timeout",
+        }
+    }
+}
+
+/// Correlation mismatch found while classifying a GTPv2-C response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Gtpv2cClientTransactionMismatch {
+    /// Procedure did not match the request.
+    Procedure,
+    /// Direction was not a response.
+    Direction,
+    /// Message type was not the expected response type.
+    MessageType,
+    /// Sequence number did not match the request.
+    SequenceNumber,
+    /// Response TEID did not match the expected local control TEID.
+    ResponseTeid,
+    /// Peer token did not match the request peer.
+    Peer,
+}
+
+impl Gtpv2cClientTransactionMismatch {
+    /// Stable machine-readable mismatch code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Procedure => "gtpv2c_transaction_procedure_mismatch",
+            Self::Direction => "gtpv2c_transaction_direction_mismatch",
+            Self::MessageType => "gtpv2c_transaction_message_type_mismatch",
+            Self::SequenceNumber => "gtpv2c_transaction_sequence_mismatch",
+            Self::ResponseTeid => "gtpv2c_transaction_response_teid_mismatch",
+            Self::Peer => "gtpv2c_transaction_peer_mismatch",
+        }
+    }
+}
+
+/// Redaction-safe key for one GTPv2-C client transaction.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Gtpv2cClientTransactionKey {
+    /// S2b procedure.
+    pub procedure: Procedure,
+    /// Request sequence number.
+    pub sequence_number: u32,
+    /// Request header TEID, when present.
+    pub request_teid: Option<u32>,
+    /// Expected response header TEID.
+    pub expected_response_teid: Option<u32>,
+    /// Redaction-safe peer token.
+    pub peer: Gtpv2cPeerToken,
+}
+
+impl fmt::Debug for Gtpv2cClientTransactionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Gtpv2cClientTransactionKey")
+            .field("procedure", &self.procedure)
+            .field("sequence_number", &self.sequence_number)
+            .field("request_teid_present", &self.request_teid.is_some())
+            .field(
+                "expected_response_teid_present",
+                &self.expected_response_teid.is_some(),
+            )
+            .field("peer", &self.peer)
+            .finish()
+    }
+}
+
+/// Metadata-only GTPv2-C request plan for client transaction tracking.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Gtpv2cClientTransactionPlan {
+    /// Correlation key.
+    pub key: Gtpv2cClientTransactionKey,
+    /// Request message type.
+    pub request_message_type: MessageType,
+    /// Expected response message type.
+    pub response_message_type: MessageType,
+    /// Encoded request length in octets.
+    pub encoded_request_len: usize,
+}
+
+impl fmt::Debug for Gtpv2cClientTransactionPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Gtpv2cClientTransactionPlan")
+            .field("key", &self.key)
+            .field("request_message_type", &self.request_message_type)
+            .field("response_message_type", &self.response_message_type)
+            .field("encoded_request_len", &self.encoded_request_len)
+            .finish()
+    }
+}
+
+impl Gtpv2cClientTransactionPlan {
+    /// Build a transaction plan from a typed request view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Gtpv2cClientTransactionPlanError`] when the view is not a
+    /// supported client request procedure.
+    pub fn from_request_view(
+        view: &S2bProcedureMessage<'_>,
+        peer: Gtpv2cPeerToken,
+        expected_response_teid: Option<u32>,
+        encoded_request_len: usize,
+    ) -> Result<Self, Gtpv2cClientTransactionPlanError> {
+        if view.direction != MessageDirection::Request {
+            return Err(Gtpv2cClientTransactionPlanError::NotRequest);
+        }
+        if !is_client_transaction_procedure(view.procedure) {
+            return Err(Gtpv2cClientTransactionPlanError::UnsupportedProcedure);
+        }
+        Ok(Self {
+            key: Gtpv2cClientTransactionKey {
+                procedure: view.procedure,
+                sequence_number: view.header.sequence_number,
+                request_teid: view.header.teid,
+                expected_response_teid,
+                peer,
+            },
+            request_message_type: view.message_type(),
+            response_message_type: view.procedure.response_message_type(),
+            encoded_request_len,
+        })
+    }
+
+    /// Build a transaction plan by decoding caller-owned request bytes.
+    ///
+    /// Raw request bytes are not retained by the returned plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Gtpv2cClientTransactionPlanError`] when bytes are malformed,
+    /// contain trailing data, decode to a raw fallback, or are not a supported
+    /// client request procedure.
+    pub fn from_encoded_request(
+        input: &[u8],
+        peer: Gtpv2cPeerToken,
+        expected_response_teid: Option<u32>,
+        ctx: DecodeContext,
+    ) -> Result<Self, Gtpv2cClientTransactionPlanError> {
+        let (tail, message) = S2bMessage::decode(input, ctx)
+            .map_err(|_| Gtpv2cClientTransactionPlanError::MalformedRequest)?;
+        if !tail.is_empty() {
+            return Err(Gtpv2cClientTransactionPlanError::TrailingBytes);
+        }
+        let view = message
+            .as_view()
+            .ok_or(Gtpv2cClientTransactionPlanError::RawFallback)?;
+        Self::from_request_view(view, peer, expected_response_teid, input.len())
+    }
+}
+
+/// Stable redaction-safe error returned while building a transaction plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gtpv2cClientTransactionPlanError {
+    /// Request bytes could not be decoded.
+    MalformedRequest,
+    /// Request bytes contained trailing data after the decoded message.
+    TrailingBytes,
+    /// Decoded message fell back to a raw unsupported message.
+    RawFallback,
+    /// Decoded or typed view was not a request.
+    NotRequest,
+    /// Procedure is outside the client transaction helper scope.
+    UnsupportedProcedure,
+}
+
+impl Gtpv2cClientTransactionPlanError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MalformedRequest => "gtpv2c_transaction_request_malformed",
+            Self::TrailingBytes => "gtpv2c_transaction_request_trailing_bytes",
+            Self::RawFallback => "gtpv2c_transaction_request_raw_fallback",
+            Self::NotRequest => "gtpv2c_transaction_not_request",
+            Self::UnsupportedProcedure => "gtpv2c_transaction_unsupported_procedure",
+        }
+    }
+}
+
+impl fmt::Display for Gtpv2cClientTransactionPlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for Gtpv2cClientTransactionPlanError {}
+
+/// Decoded GTPv2-C response evidence used for client transaction correlation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Gtpv2cClientResponseEvidence {
+    /// S2b procedure.
+    pub procedure: Procedure,
+    /// Request/response direction.
+    pub direction: MessageDirection,
+    /// Response message type.
+    pub message_type: MessageType,
+    /// Response sequence number.
+    pub sequence_number: u32,
+    /// Response header TEID.
+    pub response_teid: Option<u32>,
+    /// Redaction-safe peer token.
+    pub peer: Gtpv2cPeerToken,
+}
+
+impl fmt::Debug for Gtpv2cClientResponseEvidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Gtpv2cClientResponseEvidence")
+            .field("procedure", &self.procedure)
+            .field("direction", &self.direction)
+            .field("message_type", &self.message_type)
+            .field("sequence_number", &self.sequence_number)
+            .field("response_teid_present", &self.response_teid.is_some())
+            .field("peer", &self.peer)
+            .finish()
+    }
+}
+
+impl Gtpv2cClientResponseEvidence {
+    /// Build response evidence from a typed S2b procedure view.
+    #[must_use]
+    pub fn from_view(view: &S2bProcedureMessage<'_>, peer: Gtpv2cPeerToken) -> Self {
+        Self {
+            procedure: view.procedure,
+            direction: view.direction,
+            message_type: view.message_type(),
+            sequence_number: view.header.sequence_number,
+            response_teid: view.header.teid,
+            peer,
+        }
+    }
+}
+
+/// Timer policy for one GTPv2-C client transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gtpv2cClientTransactionPolicy {
+    /// Number of response timeouts before terminal failure.
+    pub max_response_timeouts: usize,
+}
+
+impl Default for Gtpv2cClientTransactionPolicy {
+    fn default() -> Self {
+        Self {
+            max_response_timeouts: 1,
+        }
+    }
+}
+
+impl Gtpv2cClientTransactionPolicy {
+    /// Return a copy with a custom response-timeout threshold.
+    #[must_use]
+    pub fn with_max_response_timeouts(mut self, max_response_timeouts: usize) -> Self {
+        self.max_response_timeouts = max_response_timeouts.max(1);
+        self
+    }
+}
+
+/// Redaction-safe projection from a client transaction event.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Gtpv2cClientTransactionProjection {
+    /// Transaction decision.
+    pub decision: Gtpv2cClientTransactionDecision,
+    /// Transaction state after the event.
+    pub state: Gtpv2cClientTransactionState,
+    /// Correlation key.
+    pub key: Gtpv2cClientTransactionKey,
+    /// Whether a response matched the transaction.
+    pub response_matched: bool,
+    /// Whether retransmission to the same peer is safe.
+    pub safe_retransmit_same_peer: bool,
+    /// Whether failover to a different peer is safe.
+    pub peer_failover_safe: bool,
+    /// Whether this transaction is terminal.
+    pub terminal: bool,
+    /// Send attempts accepted by the caller as delivered to socket layer.
+    pub send_attempts: usize,
+    /// Response timeouts observed.
+    pub response_timeouts: usize,
+    /// Correlation mismatch, if any.
+    pub mismatch: Option<Gtpv2cClientTransactionMismatch>,
+}
+
+impl fmt::Debug for Gtpv2cClientTransactionProjection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Gtpv2cClientTransactionProjection")
+            .field("decision", &self.decision)
+            .field("state", &self.state)
+            .field("key", &self.key)
+            .field("response_matched", &self.response_matched)
+            .field("safe_retransmit_same_peer", &self.safe_retransmit_same_peer)
+            .field("peer_failover_safe", &self.peer_failover_safe)
+            .field("terminal", &self.terminal)
+            .field("send_attempts", &self.send_attempts)
+            .field("response_timeouts", &self.response_timeouts)
+            .field("mismatch", &self.mismatch)
+            .finish()
+    }
+}
+
+/// Redaction-safe snapshot of a GTPv2-C client transaction.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Gtpv2cClientTransactionSnapshot {
+    /// Transaction request plan.
+    pub plan: Gtpv2cClientTransactionPlan,
+    /// Current transaction state.
+    pub state: Gtpv2cClientTransactionState,
+    /// Send attempts accepted by the caller as delivered to socket layer.
+    pub send_attempts: usize,
+    /// Response timeouts observed.
+    pub response_timeouts: usize,
+    /// Last emitted decision.
+    pub last_decision: Gtpv2cClientTransactionDecision,
+}
+
+impl fmt::Debug for Gtpv2cClientTransactionSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Gtpv2cClientTransactionSnapshot")
+            .field("plan", &self.plan)
+            .field("state", &self.state)
+            .field("send_attempts", &self.send_attempts)
+            .field("response_timeouts", &self.response_timeouts)
+            .field("last_decision", &self.last_decision)
+            .finish()
+    }
+}
+
+/// Transport-neutral GTPv2-C client transaction helper.
+#[derive(Debug, Clone)]
+pub struct Gtpv2cClientTransaction {
+    plan: Gtpv2cClientTransactionPlan,
+    policy: Gtpv2cClientTransactionPolicy,
+    state: Gtpv2cClientTransactionState,
+    send_attempts: usize,
+    response_timeouts: usize,
+    last_decision: Gtpv2cClientTransactionDecision,
+}
+
+impl Gtpv2cClientTransaction {
+    /// Create a transaction helper with default timeout policy.
+    #[must_use]
+    pub fn new(plan: Gtpv2cClientTransactionPlan) -> Self {
+        Self::with_policy(plan, Gtpv2cClientTransactionPolicy::default())
+    }
+
+    /// Create a transaction helper with explicit timeout policy.
+    #[must_use]
+    pub fn with_policy(
+        plan: Gtpv2cClientTransactionPlan,
+        policy: Gtpv2cClientTransactionPolicy,
+    ) -> Self {
+        Self {
+            plan,
+            policy,
+            state: Gtpv2cClientTransactionState::SendNotAttempted,
+            send_attempts: 0,
+            response_timeouts: 0,
+            last_decision: Gtpv2cClientTransactionDecision::SendNotAttempted,
+        }
+    }
+
+    /// Return the request plan.
+    #[must_use]
+    pub const fn plan(&self) -> &Gtpv2cClientTransactionPlan {
+        &self.plan
+    }
+
+    /// Return the current state.
+    #[must_use]
+    pub const fn state(&self) -> Gtpv2cClientTransactionState {
+        self.state
+    }
+
+    /// Project the initial not-sent state.
+    #[must_use]
+    pub fn send_not_attempted(&mut self) -> Gtpv2cClientTransactionProjection {
+        self.state = Gtpv2cClientTransactionState::SendNotAttempted;
+        self.project(Gtpv2cClientTransactionDecision::SendNotAttempted, None)
+    }
+
+    /// Record a local send failure before socket-layer delivery.
+    #[must_use]
+    pub fn send_failed_before_delivery(&mut self) -> Gtpv2cClientTransactionProjection {
+        self.state = Gtpv2cClientTransactionState::SendFailedBeforeDelivery;
+        self.project(
+            Gtpv2cClientTransactionDecision::SendFailedBeforeDelivery,
+            None,
+        )
+    }
+
+    /// Record a send accepted by the socket layer.
+    #[must_use]
+    pub fn sent_waiting_response(&mut self) -> Gtpv2cClientTransactionProjection {
+        self.state = Gtpv2cClientTransactionState::SentWaitingResponse;
+        self.send_attempts = self.send_attempts.saturating_add(1);
+        self.project(Gtpv2cClientTransactionDecision::SentWaitingResponse, None)
+    }
+
+    /// Classify a response timeout.
+    #[must_use]
+    pub fn response_timeout(&mut self) -> Gtpv2cClientTransactionProjection {
+        self.response_timeouts = self.response_timeouts.saturating_add(1);
+        if self.response_timeouts >= self.policy.max_response_timeouts.max(1) {
+            self.state = Gtpv2cClientTransactionState::TerminalTimeout;
+            self.project(Gtpv2cClientTransactionDecision::TerminalTimeout, None)
+        } else {
+            self.project(
+                Gtpv2cClientTransactionDecision::SafeRetransmitSamePeer,
+                None,
+            )
+        }
+    }
+
+    /// Project a peer failover request after socket-layer delivery.
+    #[must_use]
+    pub fn unsafe_peer_failover(&mut self) -> Gtpv2cClientTransactionProjection {
+        self.project(Gtpv2cClientTransactionDecision::UnsafePeerFailover, None)
+    }
+
+    /// Observe decoded response evidence and classify correlation.
+    #[must_use]
+    pub fn observe_response(
+        &mut self,
+        response: Gtpv2cClientResponseEvidence,
+    ) -> Gtpv2cClientTransactionProjection {
+        if self.state == Gtpv2cClientTransactionState::TerminalTimeout {
+            return self.project(Gtpv2cClientTransactionDecision::LateResponse, None);
+        }
+        if self.state == Gtpv2cClientTransactionState::ResponseObserved {
+            return self.project(Gtpv2cClientTransactionDecision::DuplicateResponse, None);
+        }
+        if self.state != Gtpv2cClientTransactionState::SentWaitingResponse {
+            return self.project(Gtpv2cClientTransactionDecision::LateResponse, None);
+        }
+        if let Some(mismatch) = self.match_response(response) {
+            return self.project(
+                Gtpv2cClientTransactionDecision::ResponseMismatched,
+                Some(mismatch),
+            );
+        }
+        self.state = Gtpv2cClientTransactionState::ResponseObserved;
+        self.project(Gtpv2cClientTransactionDecision::ResponseMatched, None)
+    }
+
+    /// Return a redaction-safe snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> Gtpv2cClientTransactionSnapshot {
+        Gtpv2cClientTransactionSnapshot {
+            plan: self.plan.clone(),
+            state: self.state,
+            send_attempts: self.send_attempts,
+            response_timeouts: self.response_timeouts,
+            last_decision: self.last_decision,
+        }
+    }
+
+    fn match_response(
+        &self,
+        response: Gtpv2cClientResponseEvidence,
+    ) -> Option<Gtpv2cClientTransactionMismatch> {
+        if response.procedure != self.plan.key.procedure {
+            return Some(Gtpv2cClientTransactionMismatch::Procedure);
+        }
+        if response.direction != MessageDirection::Response {
+            return Some(Gtpv2cClientTransactionMismatch::Direction);
+        }
+        if response.message_type != self.plan.response_message_type {
+            return Some(Gtpv2cClientTransactionMismatch::MessageType);
+        }
+        if response.sequence_number != self.plan.key.sequence_number {
+            return Some(Gtpv2cClientTransactionMismatch::SequenceNumber);
+        }
+        if response.response_teid != self.plan.key.expected_response_teid {
+            return Some(Gtpv2cClientTransactionMismatch::ResponseTeid);
+        }
+        if response.peer != self.plan.key.peer {
+            return Some(Gtpv2cClientTransactionMismatch::Peer);
+        }
+        None
+    }
+
+    fn project(
+        &mut self,
+        decision: Gtpv2cClientTransactionDecision,
+        mismatch: Option<Gtpv2cClientTransactionMismatch>,
+    ) -> Gtpv2cClientTransactionProjection {
+        self.last_decision = decision;
+        Gtpv2cClientTransactionProjection {
+            decision,
+            state: self.state,
+            key: self.plan.key,
+            response_matched: decision == Gtpv2cClientTransactionDecision::ResponseMatched,
+            safe_retransmit_same_peer: decision
+                == Gtpv2cClientTransactionDecision::SafeRetransmitSamePeer,
+            peer_failover_safe: matches!(
+                decision,
+                Gtpv2cClientTransactionDecision::SendNotAttempted
+                    | Gtpv2cClientTransactionDecision::SendFailedBeforeDelivery
+            ),
+            terminal: matches!(
+                self.state,
+                Gtpv2cClientTransactionState::ResponseObserved
+                    | Gtpv2cClientTransactionState::TerminalTimeout
+            ),
+            send_attempts: self.send_attempts,
+            response_timeouts: self.response_timeouts,
+            mismatch,
+        }
+    }
+}
+
+fn is_client_transaction_procedure(procedure: Procedure) -> bool {
+    matches!(
+        procedure,
+        Procedure::CreateSession
+            | Procedure::DeleteSession
+            | Procedure::ModifyBearer
+            | Procedure::UpdateSession
+    )
+}
+
 fn spec_ref() -> SpecRef {
     SpecRef::new("3gpp", "TS29274", "S2b")
 }
@@ -1648,6 +2254,54 @@ mod tests {
         encoded.to_vec()
     }
 
+    fn transaction_request_view(
+        procedure: Procedure,
+        sequence_number: u32,
+        request_teid: Option<u32>,
+    ) -> S2bProcedureMessage<'static> {
+        let header = match request_teid {
+            Some(teid) => Header::with_teid(procedure.request_type(), teid, sequence_number),
+            None => Header::without_teid(procedure.request_type(), sequence_number),
+        };
+        S2bProcedureMessage {
+            header,
+            procedure,
+            direction: MessageDirection::Request,
+            ies: Vec::new(),
+            raw_ies: &[],
+            tail: &[],
+        }
+    }
+
+    fn transaction_response_evidence(
+        procedure: Procedure,
+        sequence_number: u32,
+        response_teid: Option<u32>,
+        peer: Gtpv2cPeerToken,
+    ) -> Gtpv2cClientResponseEvidence {
+        Gtpv2cClientResponseEvidence {
+            procedure,
+            direction: MessageDirection::Response,
+            message_type: procedure.response_message_type(),
+            sequence_number,
+            response_teid,
+            peer,
+        }
+    }
+
+    fn transaction_plan() -> Gtpv2cClientTransactionPlan {
+        let request = transaction_request_view(Procedure::CreateSession, 0x1234, None);
+        match Gtpv2cClientTransactionPlan::from_request_view(
+            &request,
+            Gtpv2cPeerToken::new(7),
+            Some(0x0102_0304),
+            88,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => panic!("transaction plan failed: {error}"),
+        }
+    }
+
     #[test]
     fn echo_message_evidence_extracts_recovery() {
         let view = echo_view(MessageDirection::Response, 0x0001_0203, 9);
@@ -1839,6 +2493,195 @@ mod tests {
             "echo_response_missing"
         );
         assert_eq!(Gtpv2cEchoPeerState::Failed.as_str(), "failed");
+    }
+
+    #[test]
+    fn transaction_plan_decodes_request_and_redacts_debug() {
+        let request = transaction_request_view(Procedure::DeleteSession, 0x2222, Some(0x1122_3344));
+        let encoded = encode_view(&request);
+        let peer = Gtpv2cPeerToken::new(99);
+
+        let plan = match Gtpv2cClientTransactionPlan::from_encoded_request(
+            &encoded,
+            peer,
+            Some(0x5566_7788),
+            DecodeContext::default(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => panic!("encoded transaction plan failed: {error}"),
+        };
+
+        assert_eq!(plan.key.procedure, Procedure::DeleteSession);
+        assert_eq!(plan.key.sequence_number, 0x2222);
+        assert_eq!(plan.key.request_teid, Some(0x1122_3344));
+        assert_eq!(plan.key.expected_response_teid, Some(0x5566_7788));
+        assert_eq!(plan.key.peer.get(), 99);
+        assert_eq!(
+            plan.response_message_type,
+            MessageType::DeleteSessionResponse
+        );
+
+        let debug = format!("{plan:?}");
+        assert!(debug.contains("request_teid_present"));
+        assert!(!debug.contains("287454020"));
+        assert!(!debug.contains("1432778632"));
+
+        let response_view = S2bProcedureMessage {
+            direction: MessageDirection::Response,
+            ..request.clone()
+        };
+        let error = match Gtpv2cClientTransactionPlan::from_request_view(
+            &response_view,
+            peer,
+            Some(1),
+            8,
+        ) {
+            Ok(plan) => panic!("unexpected transaction plan: {plan:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error.as_str(), "gtpv2c_transaction_not_request");
+
+        let echo = echo_view(MessageDirection::Request, 1, 1);
+        let error = match Gtpv2cClientTransactionPlan::from_request_view(&echo, peer, None, 8) {
+            Ok(plan) => panic!("unexpected Echo transaction plan: {plan:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error.as_str(), "gtpv2c_transaction_unsupported_procedure");
+    }
+
+    #[test]
+    fn transaction_projects_send_timeout_and_failover_decisions() {
+        let plan = transaction_plan();
+        let policy = Gtpv2cClientTransactionPolicy::default().with_max_response_timeouts(2);
+        let mut transaction = Gtpv2cClientTransaction::with_policy(plan, policy);
+
+        let projection = transaction.send_not_attempted();
+        assert_eq!(
+            projection.decision,
+            Gtpv2cClientTransactionDecision::SendNotAttempted
+        );
+        assert!(projection.peer_failover_safe);
+        assert_eq!(
+            projection.state,
+            Gtpv2cClientTransactionState::SendNotAttempted
+        );
+
+        let projection = transaction.send_failed_before_delivery();
+        assert_eq!(
+            projection.decision,
+            Gtpv2cClientTransactionDecision::SendFailedBeforeDelivery
+        );
+        assert!(projection.peer_failover_safe);
+        assert!(!projection.terminal);
+
+        let projection = transaction.sent_waiting_response();
+        assert_eq!(
+            projection.decision,
+            Gtpv2cClientTransactionDecision::SentWaitingResponse
+        );
+        assert_eq!(
+            projection.state,
+            Gtpv2cClientTransactionState::SentWaitingResponse
+        );
+        assert_eq!(projection.send_attempts, 1);
+
+        let projection = transaction.response_timeout();
+        assert_eq!(
+            projection.decision,
+            Gtpv2cClientTransactionDecision::SafeRetransmitSamePeer
+        );
+        assert!(projection.safe_retransmit_same_peer);
+        assert!(!projection.peer_failover_safe);
+        assert!(!projection.terminal);
+
+        let projection = transaction.unsafe_peer_failover();
+        assert_eq!(
+            projection.decision,
+            Gtpv2cClientTransactionDecision::UnsafePeerFailover
+        );
+        assert!(!projection.peer_failover_safe);
+
+        let projection = transaction.response_timeout();
+        assert_eq!(
+            projection.decision,
+            Gtpv2cClientTransactionDecision::TerminalTimeout
+        );
+        assert_eq!(
+            projection.state,
+            Gtpv2cClientTransactionState::TerminalTimeout
+        );
+        assert!(projection.terminal);
+        assert_eq!(
+            Gtpv2cClientTransactionDecision::UnsafePeerFailover.as_str(),
+            "unsafe_peer_failover"
+        );
+        assert_eq!(
+            Gtpv2cClientTransactionState::SentWaitingResponse.as_str(),
+            "sent_waiting_response"
+        );
+    }
+
+    #[test]
+    fn transaction_classifies_matched_duplicate_late_and_mismatched_responses() {
+        let plan = transaction_plan();
+        let mut transaction = Gtpv2cClientTransaction::new(plan.clone());
+        let _projection = transaction.sent_waiting_response();
+        let response = transaction_response_evidence(
+            Procedure::CreateSession,
+            0x1234,
+            Some(0x0102_0304),
+            Gtpv2cPeerToken::new(7),
+        );
+
+        let projection = transaction.observe_response(response);
+
+        assert_eq!(
+            projection.decision,
+            Gtpv2cClientTransactionDecision::ResponseMatched
+        );
+        assert!(projection.response_matched);
+        assert!(projection.terminal);
+        assert_eq!(
+            projection.state,
+            Gtpv2cClientTransactionState::ResponseObserved
+        );
+
+        let projection = transaction.observe_response(response);
+        assert_eq!(
+            projection.decision,
+            Gtpv2cClientTransactionDecision::DuplicateResponse
+        );
+
+        let mut timed_out = Gtpv2cClientTransaction::new(plan.clone());
+        let _projection = timed_out.sent_waiting_response();
+        let _projection = timed_out.response_timeout();
+        let projection = timed_out.observe_response(response);
+        assert_eq!(
+            projection.decision,
+            Gtpv2cClientTransactionDecision::LateResponse
+        );
+
+        let mut mismatched = Gtpv2cClientTransaction::new(plan);
+        let _projection = mismatched.sent_waiting_response();
+        let wrong_sequence = transaction_response_evidence(
+            Procedure::CreateSession,
+            0x1235,
+            Some(0x0102_0304),
+            Gtpv2cPeerToken::new(7),
+        );
+        let projection = mismatched.observe_response(wrong_sequence);
+        assert_eq!(
+            projection.decision,
+            Gtpv2cClientTransactionDecision::ResponseMismatched
+        );
+        assert_eq!(
+            projection.mismatch,
+            Some(Gtpv2cClientTransactionMismatch::SequenceNumber)
+        );
+        assert_eq!(
+            Gtpv2cClientTransactionMismatch::ResponseTeid.as_str(),
+            "gtpv2c_transaction_response_teid_mismatch"
+        );
     }
 
     #[test]
