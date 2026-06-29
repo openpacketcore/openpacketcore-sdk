@@ -30,7 +30,9 @@ use tokio::sync::mpsc;
 pub mod config_apply;
 
 pub use config_apply::{
-    ConfigApplyPlanState, ConfigCandidateState, ConfigCandidateStatus, ConfigWorkflowCompletion,
+    ConfigApplyPlanState, ConfigCandidateState, ConfigCandidateStatus,
+    ConfigWorkflowActionConflictReason, ConfigWorkflowActionResult, ConfigWorkflowActionStatus,
+    ConfigWorkflowActionTarget, ConfigWorkflowCompletion,
 };
 
 const DEFAULT_OPERATIONAL_EVENT_QUEUE_CAPACITY: usize = 1;

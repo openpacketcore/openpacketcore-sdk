@@ -33,3 +33,7 @@ distinguish an apply plan that never required workflow from one whose required
 workflow has completed. `ConfigCandidateStatus` carries pending/rejected
 candidate identity, warning counts/codes, and stable commit rejection metadata
 without raw candidate payloads or free-form error messages.
+`ConfigWorkflowActionTarget` and `ConfigWorkflowActionResult` define the shared
+management action contract for completing an active config workflow, including
+stable conflict reasons for no running config, target mismatch, and no workflow
+required.

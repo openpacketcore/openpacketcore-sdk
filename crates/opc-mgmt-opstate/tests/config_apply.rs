@@ -2,7 +2,10 @@ use opc_config_model::{
     ApplyPlan, ApplyPlanChange, ApplyPlanWarning, ChangeImpact, ChangeImpactClass, CommitError,
     CommitErrorCode, CommitResult, CommitStatus, YangPath,
 };
-use opc_mgmt_opstate::{ConfigApplyPlanState, ConfigCandidateStatus, ConfigWorkflowCompletion};
+use opc_mgmt_opstate::{
+    ConfigApplyPlanState, ConfigCandidateStatus, ConfigWorkflowActionConflictReason,
+    ConfigWorkflowActionStatus, ConfigWorkflowActionTarget, ConfigWorkflowCompletion,
+};
 use opc_types::{ConfigVersion, TxId};
 
 fn plan(class: ChangeImpactClass, reason_code: &str) -> ApplyPlan {
@@ -214,6 +217,144 @@ fn all_supplied_workflow_completion_keys_must_match() {
     assert_eq!(json["traffic-blocked-until-workflow"], true);
     assert_eq!(json["traffic-block-reason-code"], "drain_required");
     assert!(json.get("workflow-completion").is_none());
+}
+
+#[test]
+fn workflow_action_completion_by_revision_updates_state_and_result() {
+    let (state, result) = ConfigApplyPlanState::new()
+        .with_active_revision_label(" rev-drain ")
+        .with_last_accepted_apply_plan(plan(ChangeImpactClass::DrainRequired, "drain_required"))
+        .complete_workflow_action(ConfigWorkflowActionTarget::for_revision_label("rev-drain"));
+    let result_json = serde_json::to_value(&result).expect("result json");
+    let state_json = state.to_json_value();
+
+    assert!(result.is_completed());
+    assert_eq!(result.status, ConfigWorkflowActionStatus::Completed);
+    assert!(result.reason.is_none());
+    assert_eq!(result_json["status"], "completed");
+    assert!(result_json.get("reason").is_none());
+    assert_eq!(result_json["requested"]["revision-label"], "rev-drain");
+    assert_eq!(result_json["running"]["revision-label"], "rev-drain");
+    assert_eq!(result_json["completion"]["revision-label"], "rev-drain");
+    assert_eq!(
+        result_json["completion"]["workflow-reason-code"],
+        "drain_required"
+    );
+    assert_eq!(state_json["traffic-blocked-until-workflow"], false);
+    assert!(state_json.get("traffic-block-reason-code").is_none());
+    assert_eq!(
+        state_json["workflow-completion"]["revision-label"],
+        "rev-drain"
+    );
+    assert_eq!(
+        state_json["last-accepted-apply-plan"]["class"],
+        "drain-required"
+    );
+}
+
+#[test]
+fn workflow_action_rejects_no_running_config_without_mutating_state() {
+    let initial = ConfigApplyPlanState::new()
+        .with_last_accepted_apply_plan(plan(ChangeImpactClass::DrainRequired, "drain_required"));
+    let (state, result) = initial
+        .clone()
+        .complete_workflow_action(ConfigWorkflowActionTarget::for_revision_label("rev-drain"));
+    let result_json = serde_json::to_value(&result).expect("result json");
+
+    assert_eq!(state, initial);
+    assert!(!result.is_completed());
+    assert_eq!(result.status, ConfigWorkflowActionStatus::Rejected);
+    assert_eq!(
+        result.reason,
+        Some(ConfigWorkflowActionConflictReason::NoRunningConfig)
+    );
+    assert_eq!(result_json["status"], "rejected");
+    assert_eq!(result_json["reason"], "no-running-config");
+    assert!(result_json.get("running").is_none());
+}
+
+#[test]
+fn workflow_action_rejects_revision_mismatch_before_workflow_check() {
+    let initial = ConfigApplyPlanState::new()
+        .with_active_revision_label("rev-active")
+        .with_last_accepted_apply_plan(plan(ChangeImpactClass::Hot, "hostname_changed"));
+    let (state, result) = initial
+        .clone()
+        .complete_workflow_action(ConfigWorkflowActionTarget::for_revision_label("rev-stale"));
+    let result_json = serde_json::to_value(&result).expect("result json");
+
+    assert_eq!(state, initial);
+    assert_eq!(
+        result.reason,
+        Some(ConfigWorkflowActionConflictReason::RevisionMismatch)
+    );
+    assert_eq!(result_json["reason"], "revision-mismatch");
+    assert_eq!(result_json["running"]["revision-label"], "rev-active");
+    assert_eq!(result_json["requested"]["revision-label"], "rev-stale");
+    assert!(result_json.get("completion").is_none());
+}
+
+#[test]
+fn workflow_action_rejects_no_workflow_required() {
+    let initial = ConfigApplyPlanState::new()
+        .with_active_revision_label("rev-hot")
+        .with_last_accepted_apply_plan(plan(ChangeImpactClass::Hot, "hostname_changed"));
+    let (state, result) = initial
+        .clone()
+        .complete_workflow_action(ConfigWorkflowActionTarget::for_revision_label("rev-hot"));
+    let result_json = serde_json::to_value(&result).expect("result json");
+
+    assert_eq!(state, initial);
+    assert_eq!(
+        result.reason,
+        Some(ConfigWorkflowActionConflictReason::NoWorkflowRequired)
+    );
+    assert_eq!(result_json["reason"], "no-workflow-required");
+    assert_eq!(result_json["running"]["revision-label"], "rev-hot");
+    assert!(result_json.get("completion").is_none());
+}
+
+#[test]
+fn workflow_action_rejects_repeated_completion_as_no_workflow_required() {
+    let (completed_state, completed_result) = ConfigApplyPlanState::new()
+        .with_active_revision_label("rev-drain")
+        .with_last_accepted_apply_plan(plan(ChangeImpactClass::DrainRequired, "drain_required"))
+        .complete_workflow_action(ConfigWorkflowActionTarget::for_revision_label("rev-drain"));
+
+    assert!(completed_result.is_completed());
+
+    let (state, repeated_result) = completed_state
+        .clone()
+        .complete_workflow_action(ConfigWorkflowActionTarget::for_revision_label("rev-drain"));
+
+    assert_eq!(state, completed_state);
+    assert_eq!(
+        repeated_result.reason,
+        Some(ConfigWorkflowActionConflictReason::NoWorkflowRequired)
+    );
+}
+
+#[test]
+fn workflow_action_requires_all_supplied_keys_to_match() {
+    let active_tx_id = TxId::new();
+    let stale_tx_id = TxId::new();
+    let initial = ConfigApplyPlanState::new()
+        .with_active_config(Some(ConfigVersion::new(5)), Some(active_tx_id))
+        .with_last_accepted_apply_plan(plan(ChangeImpactClass::DrainRequired, "drain_required"));
+    let (state, result) = initial.clone().complete_workflow_action(
+        ConfigWorkflowActionTarget::for_config_version(ConfigVersion::new(5))
+            .with_tx_id(stale_tx_id),
+    );
+    let result_json = serde_json::to_value(&result).expect("result json");
+
+    assert_eq!(state, initial);
+    assert_eq!(
+        result.reason,
+        Some(ConfigWorkflowActionConflictReason::RevisionMismatch)
+    );
+    assert_eq!(result_json["running"]["config-version"], 5);
+    assert_eq!(result_json["running"]["tx-id"], active_tx_id.to_string());
+    assert_eq!(result_json["requested"]["tx-id"], stale_tx_id.to_string());
 }
 
 #[test]

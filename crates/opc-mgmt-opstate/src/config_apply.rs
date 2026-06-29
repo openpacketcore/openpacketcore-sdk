@@ -263,6 +263,84 @@ pub struct ConfigWorkflowCompletion {
     pub workflow_reason_code: Option<String>,
 }
 
+/// Running config identity targeted by a config-workflow action.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ConfigWorkflowActionTarget {
+    /// Target running config version, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_version: Option<ConfigVersion>,
+    /// Target running config transaction id, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_id: Option<TxId>,
+    /// Product-supplied target revision label, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_label: Option<String>,
+}
+
+/// Stable result status for a config-workflow action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigWorkflowActionStatus {
+    /// The required workflow marker was completed for the active running
+    /// config.
+    Completed,
+    /// The action was rejected with a machine-readable conflict reason.
+    Rejected,
+}
+
+impl ConfigWorkflowActionStatus {
+    /// Stable machine-readable status code.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// Stable conflict reason for a rejected config-workflow action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigWorkflowActionConflictReason {
+    /// No running config identity is known.
+    NoRunningConfig,
+    /// The requested target does not match the active running config.
+    RevisionMismatch,
+    /// The active running config has no incomplete required workflow.
+    NoWorkflowRequired,
+}
+
+impl ConfigWorkflowActionConflictReason {
+    /// Stable machine-readable conflict code.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRunningConfig => "no-running-config",
+            Self::RevisionMismatch => "revision-mismatch",
+            Self::NoWorkflowRequired => "no-workflow-required",
+        }
+    }
+}
+
+/// Redaction-safe result of a config-workflow action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ConfigWorkflowActionResult {
+    /// Action status.
+    pub status: ConfigWorkflowActionStatus,
+    /// Rejection reason when [`Self::status`] is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ConfigWorkflowActionConflictReason>,
+    /// Caller-requested workflow target.
+    pub requested: ConfigWorkflowActionTarget,
+    /// Active running config identity observed while evaluating the action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running: Option<ConfigWorkflowActionTarget>,
+    /// Completion metadata recorded on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<ConfigWorkflowCompletion>,
+}
+
 impl ConfigWorkflowCompletion {
     /// Build completion metadata keyed by running config version.
     pub const fn for_config_version(config_version: ConfigVersion) -> Self {
@@ -324,6 +402,107 @@ impl ConfigWorkflowCompletion {
         self.workflow_class = Some(requirement.class);
         self.workflow_reason_code = Some(requirement.reason_code);
         self
+    }
+}
+
+impl ConfigWorkflowActionTarget {
+    /// Build an action target keyed by running config version.
+    pub const fn for_config_version(config_version: ConfigVersion) -> Self {
+        Self {
+            config_version: Some(config_version),
+            tx_id: None,
+            revision_label: None,
+        }
+    }
+
+    /// Build an action target keyed by running config transaction id.
+    pub const fn for_tx_id(tx_id: TxId) -> Self {
+        Self {
+            config_version: None,
+            tx_id: Some(tx_id),
+            revision_label: None,
+        }
+    }
+
+    /// Build an action target keyed by product-supplied revision label.
+    pub fn for_revision_label(revision_label: impl Into<String>) -> Self {
+        Self {
+            revision_label: normalize_revision_label(revision_label),
+            ..Self::default()
+        }
+    }
+
+    /// Add a running config version to this action target.
+    #[must_use]
+    pub const fn with_config_version(mut self, config_version: ConfigVersion) -> Self {
+        self.config_version = Some(config_version);
+        self
+    }
+
+    /// Add a running config transaction id to this action target.
+    #[must_use]
+    pub const fn with_tx_id(mut self, tx_id: TxId) -> Self {
+        self.tx_id = Some(tx_id);
+        self
+    }
+
+    /// Add a product-supplied revision label to this action target.
+    #[must_use]
+    pub fn with_revision_label(mut self, revision_label: impl Into<String>) -> Self {
+        self.revision_label = normalize_revision_label(revision_label);
+        self
+    }
+
+    /// Whether this target carries any usable identity key.
+    pub const fn has_identity(&self) -> bool {
+        self.config_version.is_some() || self.tx_id.is_some() || self.revision_label.is_some()
+    }
+}
+
+impl From<ConfigWorkflowActionTarget> for ConfigWorkflowCompletion {
+    fn from(target: ConfigWorkflowActionTarget) -> Self {
+        Self {
+            config_version: target.config_version,
+            tx_id: target.tx_id,
+            revision_label: target.revision_label,
+            workflow_class: None,
+            workflow_reason_code: None,
+        }
+    }
+}
+
+impl ConfigWorkflowActionResult {
+    fn completed(
+        requested: ConfigWorkflowActionTarget,
+        running: ConfigWorkflowActionTarget,
+        completion: ConfigWorkflowCompletion,
+    ) -> Self {
+        Self {
+            status: ConfigWorkflowActionStatus::Completed,
+            reason: None,
+            requested,
+            running: Some(running),
+            completion: Some(completion),
+        }
+    }
+
+    fn rejected(
+        reason: ConfigWorkflowActionConflictReason,
+        requested: ConfigWorkflowActionTarget,
+        running: Option<ConfigWorkflowActionTarget>,
+    ) -> Self {
+        Self {
+            status: ConfigWorkflowActionStatus::Rejected,
+            reason: Some(reason),
+            requested,
+            running,
+            completion: None,
+        }
+    }
+
+    /// Whether the action completed.
+    pub const fn is_completed(&self) -> bool {
+        matches!(self.status, ConfigWorkflowActionStatus::Completed)
     }
 }
 
@@ -424,6 +603,55 @@ impl ConfigApplyPlanState {
         self.with_rejected_candidate(candidate.with_rejection(error))
     }
 
+    /// Applies a config-workflow completion action to this projection.
+    ///
+    /// The returned state is updated only when the action completes. Rejected
+    /// actions return the original state plus a redaction-safe conflict result
+    /// that northbound adapters can map to HTTP, gNMI, NETCONF, or YANG action
+    /// responses.
+    #[must_use]
+    pub fn complete_workflow_action(
+        mut self,
+        target: ConfigWorkflowActionTarget,
+    ) -> (Self, ConfigWorkflowActionResult) {
+        let requested = target;
+        let Some(running) = self.active_workflow_target() else {
+            let result = ConfigWorkflowActionResult::rejected(
+                ConfigWorkflowActionConflictReason::NoRunningConfig,
+                requested,
+                None,
+            );
+            return (self, result);
+        };
+
+        if !self.action_target_matches_active_config(&requested) {
+            let result = ConfigWorkflowActionResult::rejected(
+                ConfigWorkflowActionConflictReason::RevisionMismatch,
+                requested,
+                Some(running),
+            );
+            return (self, result);
+        }
+
+        let Some(requirement) = self.workflow_requirement() else {
+            let result = ConfigWorkflowActionResult::rejected(
+                ConfigWorkflowActionConflictReason::NoWorkflowRequired,
+                requested,
+                Some(running),
+            );
+            return (self, result);
+        };
+
+        let completion =
+            ConfigWorkflowCompletion::from(requested.clone()).with_requirement(requirement);
+        self.traffic_blocked_until_workflow = false;
+        self.traffic_block_reason_code = None;
+        self.workflow_completion = Some(completion.clone());
+
+        let result = ConfigWorkflowActionResult::completed(requested, running, completion);
+        (self, result)
+    }
+
     /// Records completion for an accepted external workflow.
     ///
     /// Completion only clears the active traffic block when the supplied
@@ -466,13 +694,30 @@ impl ConfigApplyPlanState {
     }
 
     fn completion_matches_active_config(&self, completion: &ConfigWorkflowCompletion) -> bool {
-        if !completion.has_identity() {
-            return false;
-        }
+        self.identity_matches_active_config(
+            completion.config_version,
+            completion.tx_id,
+            completion.revision_label.as_deref(),
+        )
+    }
 
+    fn action_target_matches_active_config(&self, target: &ConfigWorkflowActionTarget) -> bool {
+        self.identity_matches_active_config(
+            target.config_version,
+            target.tx_id,
+            target.revision_label.as_deref(),
+        )
+    }
+
+    fn identity_matches_active_config(
+        &self,
+        config_version: Option<ConfigVersion>,
+        tx_id: Option<TxId>,
+        revision_label: Option<&str>,
+    ) -> bool {
         let mut matched_any_known_key = false;
 
-        if let Some(config_version) = completion.config_version {
+        if let Some(config_version) = config_version {
             if let Some(active_config_version) = self.active_config_version {
                 if config_version != active_config_version {
                     return false;
@@ -481,7 +726,7 @@ impl ConfigApplyPlanState {
             }
         }
 
-        if let Some(tx_id) = completion.tx_id {
+        if let Some(tx_id) = tx_id {
             if let Some(active_tx_id) = self.active_tx_id {
                 if tx_id != active_tx_id {
                     return false;
@@ -490,7 +735,7 @@ impl ConfigApplyPlanState {
             }
         }
 
-        if let Some(revision_label) = completion.revision_label.as_deref() {
+        if let Some(revision_label) = revision_label {
             if let Some(active_revision_label) = self.active_revision_label.as_deref() {
                 if revision_label != active_revision_label {
                     return false;
@@ -500,6 +745,19 @@ impl ConfigApplyPlanState {
         }
 
         matched_any_known_key
+    }
+
+    fn active_workflow_target(&self) -> Option<ConfigWorkflowActionTarget> {
+        let target = ConfigWorkflowActionTarget {
+            config_version: self.active_config_version,
+            tx_id: self.active_tx_id,
+            revision_label: self.active_revision_label.clone(),
+        };
+        if target.has_identity() {
+            Some(target)
+        } else {
+            None
+        }
     }
 
     /// Converts this state into an RFC 7951-compatible JSON value.
