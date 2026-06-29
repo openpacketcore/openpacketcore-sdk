@@ -9,6 +9,7 @@
 //! @spec IETF RFC6733 5.5
 //! @req REQ-IETF-RFC6733-PEER-001
 
+use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str;
 
@@ -532,6 +533,1049 @@ impl CapabilityNegotiation {
             RESULT_CODE_DIAMETER_SUCCESS
         } else {
             RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION
+        }
+    }
+}
+
+/// Product-neutral policy used to decide whether negotiated Diameter peer
+/// capabilities are sufficient for a live peer session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSessionPolicy {
+    /// Application identifiers accepted by product policy. When empty, any
+    /// common non-relay application is accepted.
+    pub accepted_application_ids: Vec<ApplicationId>,
+    /// Inband-Security-Id values accepted by product policy. When empty, any
+    /// in-band security intersection is accepted.
+    pub accepted_inband_security_ids: Vec<u32>,
+    /// Whether the Diameter Relay Application can satisfy common-application
+    /// readiness when no accepted application identifier is configured.
+    pub allow_relay_application: bool,
+    /// Consecutive missed watchdog threshold. Values below one are treated as
+    /// one by the state machine.
+    pub watchdog_miss_threshold: usize,
+}
+
+impl Default for PeerSessionPolicy {
+    fn default() -> Self {
+        Self {
+            accepted_application_ids: Vec::new(),
+            accepted_inband_security_ids: Vec::new(),
+            allow_relay_application: true,
+            watchdog_miss_threshold: 3,
+        }
+    }
+}
+
+impl PeerSessionPolicy {
+    /// Return a policy that accepts any common Diameter application.
+    #[must_use]
+    pub fn any_common_application() -> Self {
+        Self::default()
+    }
+
+    /// Return a copy that accepts the supplied application identifier.
+    #[must_use]
+    pub fn accept_application(mut self, application_id: ApplicationId) -> Self {
+        self.accepted_application_ids.push(application_id);
+        self
+    }
+
+    /// Return a copy that accepts the supplied Inband-Security-Id value.
+    #[must_use]
+    pub fn accept_inband_security(mut self, security_id: u32) -> Self {
+        self.accepted_inband_security_ids.push(security_id);
+        self
+    }
+
+    /// Return a copy that does not allow relay-only readiness.
+    #[must_use]
+    pub fn without_relay_application(mut self) -> Self {
+        self.allow_relay_application = false;
+        self
+    }
+
+    /// Return a copy with a custom missed-watchdog threshold.
+    #[must_use]
+    pub fn with_watchdog_miss_threshold(mut self, threshold: usize) -> Self {
+        self.watchdog_miss_threshold = threshold.max(1);
+        self
+    }
+}
+
+/// Transport-neutral Diameter peer session state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PeerSessionState {
+    /// No peer-control evidence has been observed.
+    Idle,
+    /// A CER was sent or received and capability readiness is pending.
+    CapabilitiesPending,
+    /// Capabilities are negotiated and no liveness probe is outstanding.
+    Negotiated,
+    /// A DWR was sent and a matching liveness answer is pending.
+    WatchdogProbing,
+    /// The peer is negotiated but recent liveness evidence is weak.
+    Degraded,
+    /// The peer requested disconnect and local drain is in progress.
+    Draining,
+    /// A local DPR was sent and DPA is pending.
+    Disconnecting,
+    /// The session failed closed.
+    Failed,
+    /// The caller should attempt a reconnect.
+    Reconnecting,
+    /// The caller should wait before reconnecting.
+    Backoff,
+}
+
+impl PeerSessionState {
+    /// Stable machine name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::CapabilitiesPending => "capabilities_pending",
+            Self::Negotiated => "negotiated",
+            Self::WatchdogProbing => "watchdog_probing",
+            Self::Degraded => "degraded",
+            Self::Draining => "draining",
+            Self::Disconnecting => "disconnecting",
+            Self::Failed => "failed",
+            Self::Reconnecting => "reconnecting",
+            Self::Backoff => "backoff",
+        }
+    }
+}
+
+/// Transport-neutral Diameter peer session event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PeerSessionEvent {
+    /// A CER was sent.
+    CapabilitiesRequestSent,
+    /// A CER was received.
+    CapabilitiesRequestReceived,
+    /// A CEA was accepted.
+    CapabilitiesAnswerAccepted,
+    /// A CEA was rejected by result code or policy.
+    CapabilitiesAnswerRejected,
+    /// A protocol-error CEA was observed.
+    CapabilitiesProtocolError,
+    /// A DWR was sent.
+    WatchdogRequestSent,
+    /// A DWR was received.
+    WatchdogRequestReceived,
+    /// A DWA was accepted.
+    WatchdogAnswerAccepted,
+    /// A DWA was rejected by result code.
+    WatchdogAnswerRejected,
+    /// A watchdog answer was missed.
+    WatchdogMissed,
+    /// A DPR was sent.
+    DisconnectRequestSent,
+    /// A DPR was received.
+    DisconnectRequestReceived,
+    /// A DPA was sent.
+    DisconnectAnswerSent,
+    /// A DPA was received.
+    DisconnectAnswerReceived,
+    /// A reconnect was requested.
+    ReconnectScheduled,
+    /// A reconnect backoff was entered.
+    BackoffEntered,
+    /// A reconnect backoff elapsed.
+    BackoffElapsed,
+    /// The session failed for an external reason.
+    Failure,
+}
+
+impl PeerSessionEvent {
+    /// Stable machine name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CapabilitiesRequestSent => "capabilities_request_sent",
+            Self::CapabilitiesRequestReceived => "capabilities_request_received",
+            Self::CapabilitiesAnswerAccepted => "capabilities_answer_accepted",
+            Self::CapabilitiesAnswerRejected => "capabilities_answer_rejected",
+            Self::CapabilitiesProtocolError => "capabilities_protocol_error",
+            Self::WatchdogRequestSent => "watchdog_request_sent",
+            Self::WatchdogRequestReceived => "watchdog_request_received",
+            Self::WatchdogAnswerAccepted => "watchdog_answer_accepted",
+            Self::WatchdogAnswerRejected => "watchdog_answer_rejected",
+            Self::WatchdogMissed => "watchdog_missed",
+            Self::DisconnectRequestSent => "disconnect_request_sent",
+            Self::DisconnectRequestReceived => "disconnect_request_received",
+            Self::DisconnectAnswerSent => "disconnect_answer_sent",
+            Self::DisconnectAnswerReceived => "disconnect_answer_received",
+            Self::ReconnectScheduled => "reconnect_scheduled",
+            Self::BackoffEntered => "backoff_entered",
+            Self::BackoffElapsed => "backoff_elapsed",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+/// Stable redaction-safe blocker emitted by the Diameter peer session helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PeerSessionBlocker {
+    /// Capability exchange has not completed.
+    CapabilitiesExchangePending,
+    /// CEA Result-Code was not success.
+    CapabilitiesResultNotSuccess,
+    /// CEA was a protocol-error answer.
+    CapabilitiesProtocolError,
+    /// No common Diameter application was negotiated.
+    NoCommonApplication,
+    /// No accepted application identifier was negotiated.
+    AcceptedApplicationMissing,
+    /// No accepted Inband-Security-Id value was negotiated.
+    AcceptedInbandSecurityMissing,
+    /// A DWA is pending.
+    WatchdogAnswerPending,
+    /// DWA Result-Code was not success.
+    WatchdogResultNotSuccess,
+    /// A watchdog answer was missed but the threshold has not been exceeded.
+    WatchdogMissed,
+    /// Missed watchdog threshold was exceeded.
+    WatchdogMissThresholdExceeded,
+    /// Disconnect drain is in progress.
+    DisconnectInProgress,
+    /// The peer requested disconnect.
+    PeerRequestedDisconnect,
+    /// DPA Result-Code was not success.
+    DisconnectResultNotSuccess,
+    /// Reconnect backoff is active.
+    ReconnectBackoff,
+    /// The session failed closed.
+    SessionFailed,
+}
+
+impl PeerSessionBlocker {
+    /// Stable machine-readable blocker code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CapabilitiesExchangePending => "diameter_peer_capabilities_pending",
+            Self::CapabilitiesResultNotSuccess => "diameter_peer_capabilities_result_not_success",
+            Self::CapabilitiesProtocolError => "diameter_peer_capabilities_protocol_error",
+            Self::NoCommonApplication => "diameter_peer_no_common_application",
+            Self::AcceptedApplicationMissing => "diameter_peer_accepted_application_missing",
+            Self::AcceptedInbandSecurityMissing => "diameter_peer_accepted_inband_security_missing",
+            Self::WatchdogAnswerPending => "diameter_peer_watchdog_answer_pending",
+            Self::WatchdogResultNotSuccess => "diameter_peer_watchdog_result_not_success",
+            Self::WatchdogMissed => "diameter_peer_watchdog_missed",
+            Self::WatchdogMissThresholdExceeded => "diameter_peer_watchdog_miss_threshold_exceeded",
+            Self::DisconnectInProgress => "diameter_peer_disconnect_in_progress",
+            Self::PeerRequestedDisconnect => "diameter_peer_disconnect_requested",
+            Self::DisconnectResultNotSuccess => "diameter_peer_disconnect_result_not_success",
+            Self::ReconnectBackoff => "diameter_peer_reconnect_backoff",
+            Self::SessionFailed => "diameter_peer_session_failed",
+        }
+    }
+}
+
+/// Redaction-safe readiness projection for a Diameter peer session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSessionReadiness {
+    /// Current session state.
+    pub state: PeerSessionState,
+    /// Whether capability negotiation is complete and no probe is outstanding.
+    pub negotiated: bool,
+    /// Whether a watchdog probe is outstanding.
+    pub probing: bool,
+    /// Whether the session is degraded but not failed.
+    pub degraded: bool,
+    /// Whether the session failed closed.
+    pub failed: bool,
+    /// Whether disconnect drain is in progress.
+    pub draining: bool,
+    /// Whether reconnect work is required or delayed by backoff.
+    pub reconnecting: bool,
+    /// Whether the peer is ready for product traffic.
+    pub traffic_ready: bool,
+    /// Stable blockers in evaluation order.
+    pub blockers: Vec<PeerSessionBlocker>,
+}
+
+/// Projection of a CEA or received CER into generic session readiness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSessionCapabilityProjection {
+    /// Result-Code used for this projection.
+    pub result_code: u32,
+    /// Whether any accepted common application exists.
+    pub has_common_application: bool,
+    /// Whether relay application negotiation contributed readiness.
+    pub relay_application_common: bool,
+    /// Whether configured accepted application policy passed.
+    pub accepted_application_common: bool,
+    /// Whether configured accepted in-band security policy passed.
+    pub accepted_inband_security_common: bool,
+    /// Whether diagnostic AVPs were present in the CEA.
+    pub diagnostics_present: bool,
+    /// Whether the capability evidence is accepted.
+    pub accepted: bool,
+    /// Stable blockers in evaluation order.
+    pub blockers: Vec<PeerSessionBlocker>,
+}
+
+/// Projection of DWA liveness evidence into generic session readiness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSessionWatchdogProjection {
+    /// DWA Result-Code, when a DWA was observed.
+    pub result_code: Option<u32>,
+    /// Optional peer Origin-State-Id from DWA or DWR evidence.
+    pub origin_state_id: Option<u32>,
+    /// Whether diagnostic AVPs were present in the DWA.
+    pub diagnostics_present: bool,
+    /// Consecutive missed watchdog answers.
+    pub missed_watchdogs: usize,
+    /// Whether the liveness evidence is accepted.
+    pub alive: bool,
+    /// Stable blockers in evaluation order.
+    pub blockers: Vec<PeerSessionBlocker>,
+}
+
+/// Projection of DPR/DPA drain evidence into generic session readiness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSessionDisconnectProjection {
+    /// DPA Result-Code, when a DPA was observed or sent.
+    pub result_code: Option<u32>,
+    /// Whether the peer initiated the disconnect.
+    pub peer_requested: bool,
+    /// Whether the disconnect was acknowledged with success.
+    pub acknowledged: bool,
+    /// Whether reconnect should be scheduled after drain.
+    pub reconnect_intent: bool,
+    /// Stable blockers in evaluation order.
+    pub blockers: Vec<PeerSessionBlocker>,
+}
+
+/// One emitted transition from the Diameter peer session helper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSessionTransition {
+    /// Event that caused the transition.
+    pub event: PeerSessionEvent,
+    /// State before the event.
+    pub previous_state: PeerSessionState,
+    /// State after the event.
+    pub state: PeerSessionState,
+    /// Readiness after the event.
+    pub readiness: PeerSessionReadiness,
+}
+
+/// Redaction-safe snapshot of a Diameter peer session helper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSessionSnapshot {
+    /// Current session state.
+    pub state: PeerSessionState,
+    /// Current readiness projection.
+    pub readiness: PeerSessionReadiness,
+    /// CER messages sent by this session.
+    pub capabilities_requests_sent: usize,
+    /// CER messages received by this session.
+    pub capabilities_requests_received: usize,
+    /// CEA messages observed by this session.
+    pub capabilities_answers_observed: usize,
+    /// Protocol-error CEA messages observed by this session.
+    pub capabilities_protocol_errors_observed: usize,
+    /// DWR messages sent by this session.
+    pub watchdog_requests_sent: usize,
+    /// DWR messages received by this session.
+    pub watchdog_requests_received: usize,
+    /// DWA messages observed by this session.
+    pub watchdog_answers_observed: usize,
+    /// Consecutive missed DWA events.
+    pub missed_watchdogs: usize,
+    /// DPR messages sent by this session.
+    pub disconnect_requests_sent: usize,
+    /// DPR messages received by this session.
+    pub disconnect_requests_received: usize,
+    /// DPA messages observed or sent by this session.
+    pub disconnect_answers_observed: usize,
+    /// Reconnect intents emitted by this session.
+    pub reconnects_scheduled: usize,
+    /// Backoff entries emitted by this session.
+    pub backoffs_entered: usize,
+}
+
+/// Diameter peer session state-machine error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerSessionError {
+    /// Operation is not valid in the current state.
+    InvalidTransition {
+        /// Operation attempted.
+        operation: &'static str,
+        /// Current state.
+        state: PeerSessionState,
+    },
+}
+
+impl PeerSessionError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::InvalidTransition { .. } => "diameter_peer_session_invalid_transition",
+        }
+    }
+}
+
+impl fmt::Display for PeerSessionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTransition { operation, state } => write!(
+                f,
+                "diameter_peer_session_invalid_transition: operation {operation}, state {}",
+                state.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PeerSessionError {}
+
+/// Transport-neutral Diameter peer session state machine.
+#[derive(Clone)]
+pub struct PeerSession {
+    local_capabilities: PeerCapabilities,
+    policy: PeerSessionPolicy,
+    state: PeerSessionState,
+    remote_capabilities: Option<PeerCapabilities>,
+    last_capability_projection: Option<PeerSessionCapabilityProjection>,
+    last_watchdog_projection: Option<PeerSessionWatchdogProjection>,
+    last_disconnect_projection: Option<PeerSessionDisconnectProjection>,
+    last_blockers: Vec<PeerSessionBlocker>,
+    capabilities_requests_sent: usize,
+    capabilities_requests_received: usize,
+    capabilities_answers_observed: usize,
+    capabilities_protocol_errors_observed: usize,
+    watchdog_requests_sent: usize,
+    watchdog_requests_received: usize,
+    watchdog_answers_observed: usize,
+    missed_watchdogs: usize,
+    disconnect_requests_sent: usize,
+    disconnect_requests_received: usize,
+    disconnect_answers_observed: usize,
+    reconnects_scheduled: usize,
+    backoffs_entered: usize,
+}
+
+impl fmt::Debug for PeerSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerSession")
+            .field("state", &self.state)
+            .field("policy", &self.policy)
+            .field(
+                "has_remote_capabilities",
+                &self.remote_capabilities.is_some(),
+            )
+            .field(
+                "capabilities_requests_sent",
+                &self.capabilities_requests_sent,
+            )
+            .field(
+                "capabilities_requests_received",
+                &self.capabilities_requests_received,
+            )
+            .field(
+                "capabilities_answers_observed",
+                &self.capabilities_answers_observed,
+            )
+            .field("watchdog_requests_sent", &self.watchdog_requests_sent)
+            .field("watchdog_answers_observed", &self.watchdog_answers_observed)
+            .field("missed_watchdogs", &self.missed_watchdogs)
+            .field("disconnect_requests_sent", &self.disconnect_requests_sent)
+            .field(
+                "disconnect_requests_received",
+                &self.disconnect_requests_received,
+            )
+            .field("reconnects_scheduled", &self.reconnects_scheduled)
+            .field("backoffs_entered", &self.backoffs_entered)
+            .finish()
+    }
+}
+
+impl PeerSession {
+    /// Create a session that accepts any common Diameter application.
+    #[must_use]
+    pub fn new(local_capabilities: PeerCapabilities) -> Self {
+        Self::with_policy(local_capabilities, PeerSessionPolicy::default())
+    }
+
+    /// Create a session with an explicit readiness policy.
+    #[must_use]
+    pub fn with_policy(local_capabilities: PeerCapabilities, policy: PeerSessionPolicy) -> Self {
+        Self {
+            local_capabilities,
+            policy,
+            state: PeerSessionState::Idle,
+            remote_capabilities: None,
+            last_capability_projection: None,
+            last_watchdog_projection: None,
+            last_disconnect_projection: None,
+            last_blockers: Vec::new(),
+            capabilities_requests_sent: 0,
+            capabilities_requests_received: 0,
+            capabilities_answers_observed: 0,
+            capabilities_protocol_errors_observed: 0,
+            watchdog_requests_sent: 0,
+            watchdog_requests_received: 0,
+            watchdog_answers_observed: 0,
+            missed_watchdogs: 0,
+            disconnect_requests_sent: 0,
+            disconnect_requests_received: 0,
+            disconnect_answers_observed: 0,
+            reconnects_scheduled: 0,
+            backoffs_entered: 0,
+        }
+    }
+
+    /// Return the current state.
+    #[must_use]
+    pub const fn state(&self) -> PeerSessionState {
+        self.state
+    }
+
+    /// Return the session readiness policy.
+    #[must_use]
+    pub const fn policy(&self) -> &PeerSessionPolicy {
+        &self.policy
+    }
+
+    /// Return the last capability projection, if one exists.
+    #[must_use]
+    pub const fn last_capability_projection(&self) -> Option<&PeerSessionCapabilityProjection> {
+        self.last_capability_projection.as_ref()
+    }
+
+    /// Return the last watchdog projection, if one exists.
+    #[must_use]
+    pub const fn last_watchdog_projection(&self) -> Option<&PeerSessionWatchdogProjection> {
+        self.last_watchdog_projection.as_ref()
+    }
+
+    /// Return the last disconnect projection, if one exists.
+    #[must_use]
+    pub const fn last_disconnect_projection(&self) -> Option<&PeerSessionDisconnectProjection> {
+        self.last_disconnect_projection.as_ref()
+    }
+
+    /// Project a CEA without mutating session state.
+    #[must_use]
+    pub fn project_capabilities_answer(
+        &self,
+        answer: &CapabilitiesExchangeAnswer,
+    ) -> PeerSessionCapabilityProjection {
+        self.project_capabilities(
+            answer.result_code,
+            &answer.capabilities,
+            !answer.diagnostics.is_empty(),
+        )
+    }
+
+    /// Project a protocol-error CEA without mutating session state.
+    #[must_use]
+    pub fn project_capabilities_protocol_error_answer(
+        &self,
+        answer: &CapabilitiesExchangeErrorAnswer,
+    ) -> PeerSessionCapabilityProjection {
+        let mut blockers = vec![
+            PeerSessionBlocker::CapabilitiesProtocolError,
+            PeerSessionBlocker::CapabilitiesResultNotSuccess,
+            PeerSessionBlocker::NoCommonApplication,
+        ];
+        if !self.policy.accepted_application_ids.is_empty() {
+            blockers.push(PeerSessionBlocker::AcceptedApplicationMissing);
+        }
+        if !self.policy.accepted_inband_security_ids.is_empty() {
+            blockers.push(PeerSessionBlocker::AcceptedInbandSecurityMissing);
+        }
+        PeerSessionCapabilityProjection {
+            result_code: answer.result_code,
+            has_common_application: false,
+            relay_application_common: false,
+            accepted_application_common: false,
+            accepted_inband_security_common: false,
+            diagnostics_present: !answer.diagnostics.is_empty(),
+            accepted: false,
+            blockers,
+        }
+    }
+
+    /// Mark a CER as sent.
+    #[must_use]
+    pub fn capabilities_request_sent(&mut self) -> PeerSessionTransition {
+        let previous = self.state;
+        self.capabilities_requests_sent = self.capabilities_requests_sent.saturating_add(1);
+        self.state = PeerSessionState::CapabilitiesPending;
+        self.remote_capabilities = None;
+        self.last_capability_projection = None;
+        self.last_watchdog_projection = None;
+        self.last_disconnect_projection = None;
+        self.last_blockers.clear();
+        self.missed_watchdogs = 0;
+        self.transition(PeerSessionEvent::CapabilitiesRequestSent, previous)
+    }
+
+    /// Observe a decoded CER from the peer.
+    #[must_use]
+    pub fn capabilities_request_received(
+        &mut self,
+        remote: PeerCapabilities,
+    ) -> PeerSessionTransition {
+        let previous = self.state;
+        self.capabilities_requests_received = self.capabilities_requests_received.saturating_add(1);
+        let negotiated = negotiate_capabilities(&self.local_capabilities, &remote);
+        let result_code = negotiated.cea_result_code();
+        let projection = self.project_capabilities(result_code, &remote, false);
+        self.remote_capabilities = Some(remote);
+        self.apply_capability_projection(projection);
+        self.transition(PeerSessionEvent::CapabilitiesRequestReceived, previous)
+    }
+
+    /// Observe a decoded CEA from the peer.
+    #[must_use]
+    pub fn observe_capabilities_answer(
+        &mut self,
+        answer: &CapabilitiesExchangeAnswer,
+    ) -> PeerSessionTransition {
+        let previous = self.state;
+        self.capabilities_answers_observed = self.capabilities_answers_observed.saturating_add(1);
+        self.remote_capabilities = Some(answer.capabilities.clone());
+        let projection = self.project_capabilities_answer(answer);
+        let accepted = projection.accepted;
+        self.apply_capability_projection(projection);
+        self.transition(
+            if accepted {
+                PeerSessionEvent::CapabilitiesAnswerAccepted
+            } else {
+                PeerSessionEvent::CapabilitiesAnswerRejected
+            },
+            previous,
+        )
+    }
+
+    /// Observe a decoded protocol-error CEA from the peer.
+    #[must_use]
+    pub fn observe_capabilities_protocol_error_answer(
+        &mut self,
+        answer: &CapabilitiesExchangeErrorAnswer,
+    ) -> PeerSessionTransition {
+        let previous = self.state;
+        self.capabilities_protocol_errors_observed =
+            self.capabilities_protocol_errors_observed.saturating_add(1);
+        let projection = self.project_capabilities_protocol_error_answer(answer);
+        self.apply_capability_projection(projection);
+        self.transition(PeerSessionEvent::CapabilitiesProtocolError, previous)
+    }
+
+    /// Mark a DWR as sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionError`] when capability negotiation has not
+    /// completed or the session is draining, reconnecting, or failed.
+    pub fn watchdog_request_sent(&mut self) -> Result<PeerSessionTransition, PeerSessionError> {
+        if !matches!(
+            self.state,
+            PeerSessionState::Negotiated | PeerSessionState::Degraded
+        ) {
+            return Err(PeerSessionError::InvalidTransition {
+                operation: "watchdog_request_sent",
+                state: self.state,
+            });
+        }
+        let previous = self.state;
+        self.watchdog_requests_sent = self.watchdog_requests_sent.saturating_add(1);
+        self.state = PeerSessionState::WatchdogProbing;
+        self.last_blockers = vec![PeerSessionBlocker::WatchdogAnswerPending];
+        self.last_watchdog_projection = Some(PeerSessionWatchdogProjection {
+            result_code: None,
+            origin_state_id: None,
+            diagnostics_present: false,
+            missed_watchdogs: self.missed_watchdogs,
+            alive: false,
+            blockers: self.last_blockers.clone(),
+        });
+        Ok(self.transition(PeerSessionEvent::WatchdogRequestSent, previous))
+    }
+
+    /// Observe a decoded DWR from the peer.
+    #[must_use]
+    pub fn observe_watchdog_request(
+        &mut self,
+        request: &DeviceWatchdogRequest,
+    ) -> PeerSessionTransition {
+        let previous = self.state;
+        self.watchdog_requests_received = self.watchdog_requests_received.saturating_add(1);
+        self.last_watchdog_projection = Some(PeerSessionWatchdogProjection {
+            result_code: None,
+            origin_state_id: request.origin_state_id,
+            diagnostics_present: false,
+            missed_watchdogs: self.missed_watchdogs,
+            alive: !matches!(self.state, PeerSessionState::Failed),
+            blockers: self.readiness_blockers(),
+        });
+        self.transition(PeerSessionEvent::WatchdogRequestReceived, previous)
+    }
+
+    /// Observe a decoded DWA from the peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionError`] when no negotiated session or outstanding
+    /// watchdog probe exists.
+    pub fn observe_watchdog_answer(
+        &mut self,
+        answer: &DeviceWatchdogAnswer,
+    ) -> Result<PeerSessionTransition, PeerSessionError> {
+        if !matches!(
+            self.state,
+            PeerSessionState::WatchdogProbing
+                | PeerSessionState::Degraded
+                | PeerSessionState::Negotiated
+        ) {
+            return Err(PeerSessionError::InvalidTransition {
+                operation: "observe_watchdog_answer",
+                state: self.state,
+            });
+        }
+        let previous = self.state;
+        self.watchdog_answers_observed = self.watchdog_answers_observed.saturating_add(1);
+        let mut blockers = Vec::new();
+        if answer.result_code != RESULT_CODE_DIAMETER_SUCCESS {
+            blockers.push(PeerSessionBlocker::WatchdogResultNotSuccess);
+        }
+        let alive = blockers.is_empty();
+        self.missed_watchdogs = if alive { 0 } else { self.missed_watchdogs };
+        self.state = if alive {
+            PeerSessionState::Negotiated
+        } else {
+            PeerSessionState::Degraded
+        };
+        self.last_blockers = blockers.clone();
+        self.last_watchdog_projection = Some(PeerSessionWatchdogProjection {
+            result_code: Some(answer.result_code),
+            origin_state_id: answer.origin_state_id,
+            diagnostics_present: !answer.diagnostics.is_empty(),
+            missed_watchdogs: self.missed_watchdogs,
+            alive,
+            blockers,
+        });
+        Ok(self.transition(
+            if alive {
+                PeerSessionEvent::WatchdogAnswerAccepted
+            } else {
+                PeerSessionEvent::WatchdogAnswerRejected
+            },
+            previous,
+        ))
+    }
+
+    /// Record one missed watchdog answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionError`] when no negotiated session or outstanding
+    /// watchdog probe exists.
+    pub fn watchdog_missed(&mut self) -> Result<PeerSessionTransition, PeerSessionError> {
+        if !matches!(
+            self.state,
+            PeerSessionState::WatchdogProbing
+                | PeerSessionState::Degraded
+                | PeerSessionState::Negotiated
+        ) {
+            return Err(PeerSessionError::InvalidTransition {
+                operation: "watchdog_missed",
+                state: self.state,
+            });
+        }
+        let previous = self.state;
+        self.missed_watchdogs = self.missed_watchdogs.saturating_add(1);
+        let threshold = self.policy.watchdog_miss_threshold.max(1);
+        let threshold_exceeded = self.missed_watchdogs >= threshold;
+        let blocker = if threshold_exceeded {
+            PeerSessionBlocker::WatchdogMissThresholdExceeded
+        } else {
+            PeerSessionBlocker::WatchdogMissed
+        };
+        self.state = if threshold_exceeded {
+            PeerSessionState::Failed
+        } else {
+            PeerSessionState::Degraded
+        };
+        self.last_blockers = vec![blocker];
+        self.last_watchdog_projection = Some(PeerSessionWatchdogProjection {
+            result_code: None,
+            origin_state_id: None,
+            diagnostics_present: false,
+            missed_watchdogs: self.missed_watchdogs,
+            alive: false,
+            blockers: self.last_blockers.clone(),
+        });
+        Ok(self.transition(PeerSessionEvent::WatchdogMissed, previous))
+    }
+
+    /// Mark a local DPR as sent.
+    #[must_use]
+    pub fn disconnect_request_sent(&mut self, _cause: DisconnectCause) -> PeerSessionTransition {
+        let previous = self.state;
+        self.disconnect_requests_sent = self.disconnect_requests_sent.saturating_add(1);
+        self.state = PeerSessionState::Disconnecting;
+        self.last_blockers = vec![PeerSessionBlocker::DisconnectInProgress];
+        self.last_disconnect_projection = Some(PeerSessionDisconnectProjection {
+            result_code: None,
+            peer_requested: false,
+            acknowledged: false,
+            reconnect_intent: false,
+            blockers: self.last_blockers.clone(),
+        });
+        self.transition(PeerSessionEvent::DisconnectRequestSent, previous)
+    }
+
+    /// Observe a decoded DPR from the peer.
+    #[must_use]
+    pub fn observe_disconnect_request(
+        &mut self,
+        _request: &DisconnectPeerRequest,
+    ) -> PeerSessionTransition {
+        let previous = self.state;
+        self.disconnect_requests_received = self.disconnect_requests_received.saturating_add(1);
+        self.state = PeerSessionState::Draining;
+        self.last_blockers = vec![
+            PeerSessionBlocker::PeerRequestedDisconnect,
+            PeerSessionBlocker::DisconnectInProgress,
+        ];
+        self.last_disconnect_projection = Some(PeerSessionDisconnectProjection {
+            result_code: None,
+            peer_requested: true,
+            acknowledged: false,
+            reconnect_intent: false,
+            blockers: self.last_blockers.clone(),
+        });
+        self.transition(PeerSessionEvent::DisconnectRequestReceived, previous)
+    }
+
+    /// Mark a local DPA as sent in response to a peer DPR.
+    #[must_use]
+    pub fn disconnect_answer_sent(
+        &mut self,
+        answer: &DisconnectPeerAnswer,
+    ) -> PeerSessionTransition {
+        let previous = self.state;
+        self.disconnect_answers_observed = self.disconnect_answers_observed.saturating_add(1);
+        self.apply_disconnect_answer(answer, true);
+        self.transition(PeerSessionEvent::DisconnectAnswerSent, previous)
+    }
+
+    /// Observe a decoded DPA from the peer.
+    #[must_use]
+    pub fn observe_disconnect_answer(
+        &mut self,
+        answer: &DisconnectPeerAnswer,
+    ) -> PeerSessionTransition {
+        let previous = self.state;
+        self.disconnect_answers_observed = self.disconnect_answers_observed.saturating_add(1);
+        self.apply_disconnect_answer(answer, false);
+        self.transition(PeerSessionEvent::DisconnectAnswerReceived, previous)
+    }
+
+    /// Move to reconnecting state.
+    #[must_use]
+    pub fn schedule_reconnect(&mut self) -> PeerSessionTransition {
+        let previous = self.state;
+        self.reconnects_scheduled = self.reconnects_scheduled.saturating_add(1);
+        self.state = PeerSessionState::Reconnecting;
+        self.last_blockers.clear();
+        self.transition(PeerSessionEvent::ReconnectScheduled, previous)
+    }
+
+    /// Move to reconnect backoff state.
+    #[must_use]
+    pub fn enter_backoff(&mut self) -> PeerSessionTransition {
+        let previous = self.state;
+        self.backoffs_entered = self.backoffs_entered.saturating_add(1);
+        self.state = PeerSessionState::Backoff;
+        self.last_blockers = vec![PeerSessionBlocker::ReconnectBackoff];
+        self.transition(PeerSessionEvent::BackoffEntered, previous)
+    }
+
+    /// Mark reconnect backoff elapsed.
+    #[must_use]
+    pub fn backoff_elapsed(&mut self) -> PeerSessionTransition {
+        let previous = self.state;
+        self.reconnects_scheduled = self.reconnects_scheduled.saturating_add(1);
+        self.state = PeerSessionState::Reconnecting;
+        self.last_blockers.clear();
+        self.transition(PeerSessionEvent::BackoffElapsed, previous)
+    }
+
+    /// Fail the session closed with a stable blocker.
+    #[must_use]
+    pub fn fail(&mut self, blocker: PeerSessionBlocker) -> PeerSessionTransition {
+        let previous = self.state;
+        self.state = PeerSessionState::Failed;
+        self.last_blockers = vec![blocker];
+        self.transition(PeerSessionEvent::Failure, previous)
+    }
+
+    /// Return the current redaction-safe readiness projection.
+    #[must_use]
+    pub fn readiness(&self) -> PeerSessionReadiness {
+        let blockers = self.readiness_blockers();
+        PeerSessionReadiness {
+            state: self.state,
+            negotiated: self.state == PeerSessionState::Negotiated,
+            probing: self.state == PeerSessionState::WatchdogProbing,
+            degraded: self.state == PeerSessionState::Degraded,
+            failed: self.state == PeerSessionState::Failed,
+            draining: matches!(
+                self.state,
+                PeerSessionState::Draining | PeerSessionState::Disconnecting
+            ),
+            reconnecting: matches!(
+                self.state,
+                PeerSessionState::Reconnecting | PeerSessionState::Backoff
+            ),
+            traffic_ready: self.state == PeerSessionState::Negotiated,
+            blockers,
+        }
+    }
+
+    /// Return a redaction-safe snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> PeerSessionSnapshot {
+        PeerSessionSnapshot {
+            state: self.state,
+            readiness: self.readiness(),
+            capabilities_requests_sent: self.capabilities_requests_sent,
+            capabilities_requests_received: self.capabilities_requests_received,
+            capabilities_answers_observed: self.capabilities_answers_observed,
+            capabilities_protocol_errors_observed: self.capabilities_protocol_errors_observed,
+            watchdog_requests_sent: self.watchdog_requests_sent,
+            watchdog_requests_received: self.watchdog_requests_received,
+            watchdog_answers_observed: self.watchdog_answers_observed,
+            missed_watchdogs: self.missed_watchdogs,
+            disconnect_requests_sent: self.disconnect_requests_sent,
+            disconnect_requests_received: self.disconnect_requests_received,
+            disconnect_answers_observed: self.disconnect_answers_observed,
+            reconnects_scheduled: self.reconnects_scheduled,
+            backoffs_entered: self.backoffs_entered,
+        }
+    }
+
+    fn project_capabilities(
+        &self,
+        result_code: u32,
+        remote: &PeerCapabilities,
+        diagnostics_present: bool,
+    ) -> PeerSessionCapabilityProjection {
+        let negotiated = negotiate_capabilities(&self.local_capabilities, remote);
+        let common_non_relay_application = !negotiated.application_ids.is_empty();
+        let has_common_application = common_non_relay_application
+            || (self.policy.allow_relay_application && negotiated.relay_application);
+        let accepted_application_common = self.policy.accepted_application_ids.is_empty()
+            || self
+                .policy
+                .accepted_application_ids
+                .iter()
+                .any(|application_id| negotiated.application_ids.contains(application_id));
+        let accepted_inband_security_common = self.policy.accepted_inband_security_ids.is_empty()
+            || self
+                .policy
+                .accepted_inband_security_ids
+                .iter()
+                .any(|security_id| negotiated.inband_security_ids.contains(security_id));
+        let mut blockers = Vec::new();
+        if result_code != RESULT_CODE_DIAMETER_SUCCESS {
+            blockers.push(PeerSessionBlocker::CapabilitiesResultNotSuccess);
+        }
+        if !has_common_application {
+            blockers.push(PeerSessionBlocker::NoCommonApplication);
+        }
+        if !accepted_application_common {
+            blockers.push(PeerSessionBlocker::AcceptedApplicationMissing);
+        }
+        if !accepted_inband_security_common {
+            blockers.push(PeerSessionBlocker::AcceptedInbandSecurityMissing);
+        }
+        PeerSessionCapabilityProjection {
+            result_code,
+            has_common_application,
+            relay_application_common: negotiated.relay_application,
+            accepted_application_common,
+            accepted_inband_security_common,
+            diagnostics_present,
+            accepted: blockers.is_empty(),
+            blockers,
+        }
+    }
+
+    fn apply_capability_projection(&mut self, projection: PeerSessionCapabilityProjection) {
+        self.missed_watchdogs = 0;
+        self.last_watchdog_projection = None;
+        self.last_disconnect_projection = None;
+        self.last_blockers = projection.blockers.clone();
+        self.state = if projection.accepted {
+            PeerSessionState::Negotiated
+        } else {
+            PeerSessionState::Failed
+        };
+        self.last_capability_projection = Some(projection);
+    }
+
+    fn apply_disconnect_answer(&mut self, answer: &DisconnectPeerAnswer, peer_requested: bool) {
+        let mut blockers = Vec::new();
+        if answer.result_code != RESULT_CODE_DIAMETER_SUCCESS {
+            blockers.push(PeerSessionBlocker::DisconnectResultNotSuccess);
+        }
+        let acknowledged = blockers.is_empty();
+        self.state = if acknowledged {
+            PeerSessionState::Reconnecting
+        } else {
+            PeerSessionState::Failed
+        };
+        self.last_blockers = blockers.clone();
+        self.last_disconnect_projection = Some(PeerSessionDisconnectProjection {
+            result_code: Some(answer.result_code),
+            peer_requested,
+            acknowledged,
+            reconnect_intent: acknowledged,
+            blockers,
+        });
+    }
+
+    fn transition(
+        &self,
+        event: PeerSessionEvent,
+        previous_state: PeerSessionState,
+    ) -> PeerSessionTransition {
+        PeerSessionTransition {
+            event,
+            previous_state,
+            state: self.state,
+            readiness: self.readiness(),
+        }
+    }
+
+    fn readiness_blockers(&self) -> Vec<PeerSessionBlocker> {
+        match self.state {
+            PeerSessionState::Idle | PeerSessionState::CapabilitiesPending => {
+                vec![PeerSessionBlocker::CapabilitiesExchangePending]
+            }
+            PeerSessionState::Negotiated => Vec::new(),
+            PeerSessionState::WatchdogProbing => vec![PeerSessionBlocker::WatchdogAnswerPending],
+            PeerSessionState::Degraded | PeerSessionState::Failed => {
+                if self.last_blockers.is_empty() {
+                    vec![PeerSessionBlocker::SessionFailed]
+                } else {
+                    self.last_blockers.clone()
+                }
+            }
+            PeerSessionState::Draining | PeerSessionState::Disconnecting => {
+                vec![PeerSessionBlocker::DisconnectInProgress]
+            }
+            PeerSessionState::Reconnecting => Vec::new(),
+            PeerSessionState::Backoff => vec![PeerSessionBlocker::ReconnectBackoff],
         }
     }
 }
@@ -2081,6 +3125,272 @@ mod tests {
             cea_result_code(&local, &remote),
             RESULT_CODE_DIAMETER_SUCCESS
         );
+    }
+
+    fn negotiated_session() -> PeerSession {
+        let local = sample_capabilities();
+        let remote = sample_capabilities();
+        let policy = PeerSessionPolicy::default()
+            .accept_application(ApplicationId::new(16_777_251))
+            .accept_inband_security(INBAND_SECURITY_ID_NO_INBAND_SECURITY)
+            .with_watchdog_miss_threshold(2);
+        let mut session = PeerSession::with_policy(local, policy);
+        let _transition = session.capabilities_request_sent();
+        let answer = CapabilitiesExchangeAnswer {
+            result_code: RESULT_CODE_DIAMETER_SUCCESS,
+            capabilities: remote,
+            diagnostics: AnswerDiagnostics::default(),
+        };
+        let _transition = session.observe_capabilities_answer(&answer);
+        session
+    }
+
+    #[test]
+    fn peer_session_accepts_capabilities_and_watchdog_liveness() {
+        let mut session = negotiated_session();
+
+        assert_eq!(session.state(), PeerSessionState::Negotiated);
+        let readiness = session.readiness();
+        assert!(readiness.negotiated);
+        assert!(readiness.traffic_ready);
+        assert!(readiness.blockers.is_empty());
+        match session.last_capability_projection() {
+            Some(projection) => {
+                assert!(projection.accepted);
+                assert!(projection.accepted_application_common);
+                assert!(projection.accepted_inband_security_common);
+            }
+            None => panic!("capability projection missing"),
+        }
+
+        let transition = match session.watchdog_request_sent() {
+            Ok(transition) => transition,
+            Err(error) => panic!("watchdog request transition failed: {error}"),
+        };
+        assert_eq!(transition.event, PeerSessionEvent::WatchdogRequestSent);
+        assert_eq!(transition.state, PeerSessionState::WatchdogProbing);
+        assert_eq!(
+            transition.readiness.blockers,
+            vec![PeerSessionBlocker::WatchdogAnswerPending]
+        );
+
+        let answer = DeviceWatchdogAnswer {
+            result_code: RESULT_CODE_DIAMETER_SUCCESS,
+            identity: PeerIdentity::new("aaa-peer.example.net", "example.net"),
+            origin_state_id: Some(9),
+            diagnostics: AnswerDiagnostics::default(),
+        };
+        let transition = match session.observe_watchdog_answer(&answer) {
+            Ok(transition) => transition,
+            Err(error) => panic!("watchdog answer transition failed: {error}"),
+        };
+        assert_eq!(transition.event, PeerSessionEvent::WatchdogAnswerAccepted);
+        assert_eq!(transition.state, PeerSessionState::Negotiated);
+        assert!(transition.readiness.traffic_ready);
+        match session.last_watchdog_projection() {
+            Some(projection) => {
+                assert!(projection.alive);
+                assert_eq!(projection.origin_state_id, Some(9));
+                assert_eq!(projection.missed_watchdogs, 0);
+            }
+            None => panic!("watchdog projection missing"),
+        }
+
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.capabilities_requests_sent, 1);
+        assert_eq!(snapshot.capabilities_answers_observed, 1);
+        assert_eq!(snapshot.watchdog_requests_sent, 1);
+        assert_eq!(snapshot.watchdog_answers_observed, 1);
+    }
+
+    #[test]
+    fn peer_session_rejects_protocol_errors_and_policy_misses() {
+        let local = sample_capabilities();
+        let mut remote = sample_capabilities();
+        remote.auth_application_ids.clear();
+        remote.acct_application_ids.clear();
+        remote.vendor_specific_applications.clear();
+        remote.inband_security_ids.clear();
+        let policy = PeerSessionPolicy::default()
+            .without_relay_application()
+            .accept_application(ApplicationId::new(16_777_251))
+            .accept_inband_security(INBAND_SECURITY_ID_NO_INBAND_SECURITY);
+        let mut session = PeerSession::with_policy(local.clone(), policy.clone());
+        let answer = CapabilitiesExchangeAnswer {
+            result_code: RESULT_CODE_DIAMETER_SUCCESS,
+            capabilities: remote,
+            diagnostics: AnswerDiagnostics::default(),
+        };
+
+        let transition = session.observe_capabilities_answer(&answer);
+
+        assert_eq!(
+            transition.event,
+            PeerSessionEvent::CapabilitiesAnswerRejected
+        );
+        assert_eq!(transition.state, PeerSessionState::Failed);
+        assert_eq!(
+            transition.readiness.blockers,
+            vec![
+                PeerSessionBlocker::NoCommonApplication,
+                PeerSessionBlocker::AcceptedApplicationMissing,
+                PeerSessionBlocker::AcceptedInbandSecurityMissing,
+            ]
+        );
+        match session.last_capability_projection() {
+            Some(projection) => {
+                assert!(!projection.accepted);
+                assert_eq!(projection.result_code, RESULT_CODE_DIAMETER_SUCCESS);
+            }
+            None => panic!("capability projection missing"),
+        }
+
+        let mut session = PeerSession::with_policy(local, policy);
+        let error_answer = CapabilitiesExchangeErrorAnswer {
+            result_code: RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED,
+            identity: PeerIdentity::new("aaa-error.example.net", "example.net"),
+            diagnostics: AnswerDiagnostics::default(),
+        };
+        let transition = session.observe_capabilities_protocol_error_answer(&error_answer);
+        assert_eq!(
+            transition.event,
+            PeerSessionEvent::CapabilitiesProtocolError
+        );
+        assert_eq!(transition.state, PeerSessionState::Failed);
+        assert_eq!(
+            transition.readiness.blockers,
+            vec![
+                PeerSessionBlocker::CapabilitiesProtocolError,
+                PeerSessionBlocker::CapabilitiesResultNotSuccess,
+                PeerSessionBlocker::NoCommonApplication,
+                PeerSessionBlocker::AcceptedApplicationMissing,
+                PeerSessionBlocker::AcceptedInbandSecurityMissing,
+            ]
+        );
+    }
+
+    #[test]
+    fn peer_session_watchdog_misses_degrade_then_fail() {
+        let mut session = negotiated_session();
+        match session.watchdog_request_sent() {
+            Ok(_transition) => {}
+            Err(error) => panic!("watchdog request transition failed: {error}"),
+        }
+
+        let transition = match session.watchdog_missed() {
+            Ok(transition) => transition,
+            Err(error) => panic!("watchdog miss transition failed: {error}"),
+        };
+
+        assert_eq!(transition.state, PeerSessionState::Degraded);
+        assert!(transition.readiness.degraded);
+        assert_eq!(
+            transition.readiness.blockers,
+            vec![PeerSessionBlocker::WatchdogMissed]
+        );
+
+        match session.watchdog_request_sent() {
+            Ok(_transition) => {}
+            Err(error) => panic!("second watchdog request transition failed: {error}"),
+        }
+        let transition = match session.watchdog_missed() {
+            Ok(transition) => transition,
+            Err(error) => panic!("second watchdog miss transition failed: {error}"),
+        };
+
+        assert_eq!(transition.state, PeerSessionState::Failed);
+        assert!(transition.readiness.failed);
+        assert_eq!(
+            transition.readiness.blockers,
+            vec![PeerSessionBlocker::WatchdogMissThresholdExceeded]
+        );
+        assert_eq!(session.snapshot().missed_watchdogs, 2);
+    }
+
+    #[test]
+    fn peer_session_disconnect_and_reconnect_projection() {
+        let mut session = negotiated_session();
+        let request = DisconnectPeerRequest {
+            identity: PeerIdentity::new("aaa-peer.example.net", "example.net"),
+            disconnect_cause: DisconnectCause::Busy,
+            origin_state_id: Some(11),
+        };
+
+        let transition = session.observe_disconnect_request(&request);
+
+        assert_eq!(
+            transition.event,
+            PeerSessionEvent::DisconnectRequestReceived
+        );
+        assert_eq!(transition.state, PeerSessionState::Draining);
+        assert!(transition.readiness.draining);
+        match session.last_disconnect_projection() {
+            Some(projection) => {
+                assert!(projection.peer_requested);
+                assert!(!projection.acknowledged);
+            }
+            None => panic!("disconnect projection missing"),
+        }
+
+        let answer = DisconnectPeerAnswer {
+            result_code: RESULT_CODE_DIAMETER_SUCCESS,
+            identity: PeerIdentity::new("aaa-local.example.net", "example.net"),
+            origin_state_id: Some(12),
+            diagnostics: AnswerDiagnostics::default(),
+        };
+        let transition = session.disconnect_answer_sent(&answer);
+        assert_eq!(transition.event, PeerSessionEvent::DisconnectAnswerSent);
+        assert_eq!(transition.state, PeerSessionState::Reconnecting);
+        assert!(transition.readiness.reconnecting);
+        match session.last_disconnect_projection() {
+            Some(projection) => {
+                assert!(projection.acknowledged);
+                assert!(projection.reconnect_intent);
+            }
+            None => panic!("disconnect projection missing"),
+        }
+
+        let transition = session.enter_backoff();
+        assert_eq!(transition.state, PeerSessionState::Backoff);
+        assert_eq!(
+            transition.readiness.blockers,
+            vec![PeerSessionBlocker::ReconnectBackoff]
+        );
+        let transition = session.backoff_elapsed();
+        assert_eq!(transition.state, PeerSessionState::Reconnecting);
+        assert!(transition.readiness.blockers.is_empty());
+        assert_eq!(session.snapshot().backoffs_entered, 1);
+        assert_eq!(session.snapshot().reconnects_scheduled, 1);
+    }
+
+    #[test]
+    fn peer_session_invalid_transition_and_debug_are_redaction_safe() {
+        let mut session = PeerSession::new(sample_capabilities());
+
+        let error = match session.watchdog_request_sent() {
+            Ok(transition) => panic!("unexpected transition: {transition:?}"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.as_str(), "diameter_peer_session_invalid_transition");
+        assert_eq!(
+            format!("{error}"),
+            "diameter_peer_session_invalid_transition: operation watchdog_request_sent, state idle"
+        );
+        assert_eq!(PeerSessionState::Backoff.as_str(), "backoff");
+        assert_eq!(
+            PeerSessionEvent::CapabilitiesAnswerAccepted.as_str(),
+            "capabilities_answer_accepted"
+        );
+        assert_eq!(
+            PeerSessionBlocker::WatchdogMissThresholdExceeded.as_str(),
+            "diameter_peer_watchdog_miss_threshold_exceeded"
+        );
+
+        let debug = format!("{session:?}");
+        assert!(debug.contains("PeerSession"));
+        assert!(!debug.contains("aaa1.example.net"));
+        assert!(!debug.contains("192.0.2.10"));
     }
 
     #[test]
