@@ -30,6 +30,7 @@ mod hex;
 pub mod lease;
 pub mod model;
 pub mod owned_session;
+pub mod payload_codec;
 pub mod quorum;
 pub mod record;
 pub mod restore;
@@ -54,6 +55,12 @@ pub use model::{
     StateClass, StateType,
 };
 pub use owned_session::OwnedSession;
+pub use payload_codec::{
+    decode_json_payload, decode_session_payload_envelope, encode_json_payload,
+    encode_session_payload_envelope, validate_session_payload_size,
+    validate_session_payload_size_for_backend, SessionPayloadCodecError, SessionPayloadEnvelope,
+    SessionPayloadFormat, SessionPayloadVersion, SESSION_PAYLOAD_JSON_CONTENT_TYPE,
+};
 pub use quorum::{FencedSessionReplica, QuorumSessionStore, SessionStoreBackend};
 pub use record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 pub use restore::{
