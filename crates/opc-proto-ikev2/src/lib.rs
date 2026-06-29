@@ -19,6 +19,7 @@
 use opc_protocol::ValidationLevel;
 
 pub mod crypto;
+pub mod exchange;
 pub mod header;
 pub mod message;
 pub mod nat_traversal;
@@ -27,6 +28,11 @@ pub mod payload;
 pub use crypto::{
     open_protected_payloads, CryptoProvider, OpenedProtectedPayload, ProtectedPayloadContext,
     ProtectedPayloadKind, ProtectedPayloadOpenError, ProtectedPayloadOpenFailure,
+};
+pub use exchange::{
+    Ikev2ExchangeBoundaryState, Ikev2ExchangeDecision, Ikev2ExchangeInvalidReason,
+    Ikev2ExchangeKind, Ikev2ExchangeProjection, Ikev2ExchangeRequest, Ikev2ExchangeRequestKey,
+    Ikev2ExchangeSnapshot, Ikev2ExchangeTracker, Ikev2ResponderSpi,
 };
 pub use header::{
     decode_header, encode_header, Header, HeaderFlags, EXCHANGE_TYPE_CREATE_CHILD_SA,
