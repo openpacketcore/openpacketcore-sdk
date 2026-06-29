@@ -21,6 +21,7 @@ use opc_protocol::ValidationLevel;
 pub mod crypto;
 pub mod header;
 pub mod message;
+pub mod nat_traversal;
 pub mod payload;
 
 pub use crypto::{CryptoProvider, ProtectedPayloadContext, ProtectedPayloadKind};
@@ -30,6 +31,12 @@ pub use header::{
     IKEV2_MAJOR_VERSION, IKEV2_MINOR_VERSION, IKEV2_VERSION_OCTET,
 };
 pub use message::{Message, OwnedMessage};
+pub use nat_traversal::{
+    classify_ike_nat_traversal_datagram, classify_ike_nat_traversal_datagram_with_context,
+    NatTraversalClassification, NatTraversalEspCandidate, NatTraversalIkeDecodeErrorCode,
+    NatTraversalIkeMessage, NatTraversalIkeTransport, NatTraversalKeepalive, NatTraversalRejection,
+    IKE_NAT_TRAVERSAL_UDP_PORT, IKE_UDP_PORT, NAT_TRAVERSAL_KEEPALIVE,
+};
 pub use payload::{
     validate_payload_chain, PayloadChain, PayloadType, RawPayload, RawPayloadIterator,
     GENERIC_PAYLOAD_HEADER_LEN,
