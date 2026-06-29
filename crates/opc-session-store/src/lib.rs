@@ -42,8 +42,10 @@ pub use backend::{
     SessionBackend, SessionOp, SessionOpResult,
 };
 pub use capability::{
-    assert_backend_suitable_for_profile, assert_suitable_for, validate_backend_for_profile,
-    BackendCapabilities, SessionStateProfile,
+    assert_backend_suitable_for_profile, assert_suitable_for,
+    evaluate_session_store_ha_compatibility, validate_backend_for_profile,
+    AppHaDurabilityRequirement, BackendCapabilities, SessionStateProfile,
+    SessionStoreHaCompatibility, SessionStorePlatformProfile,
 };
 pub use clock::{Clock, SystemClock, TokioVirtualClock};
 pub use error::{CapabilityError, LeaseError, StoreError};

@@ -89,6 +89,165 @@ pub enum SessionStateProfile {
     ReplicatedDisasterRecovery,
 }
 
+/// Platform-advertised session-store HA capability profile.
+///
+/// This is intentionally smaller than [`BackendCapabilities`]: it represents
+/// the operator/platform profile selected for a workload, not every low-level
+/// storage feature. Products should map their CRD/backend strings through
+/// [`SessionStorePlatformProfile::from_backend_profile_name`] before checking
+/// whether app HA state may claim traffic readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionStorePlatformProfile {
+    /// One authoritative replica. Suitable for lab, dev, or explicitly
+    /// accepted single-replica deployments, but not for active/standby traffic
+    /// readiness claims.
+    SingleReplica,
+    /// Quorum replicated session-store profile with ordered durable mutation
+    /// semantics.
+    Quorum,
+    /// The platform profile name is not recognized by this SDK contract.
+    Unknown,
+}
+
+impl SessionStorePlatformProfile {
+    /// Parse an operator/platform backend-profile string into the SDK HA
+    /// compatibility vocabulary.
+    ///
+    /// Unknown inputs collapse to [`Self::Unknown`] without retaining the raw
+    /// text, so status paths can fail closed without leaking platform object
+    /// names or deployment-specific labels.
+    pub fn from_backend_profile_name(profile: &str) -> Self {
+        let canonical = profile.trim().to_lowercase().replace(['_', ' '], "-");
+        match canonical.as_str() {
+            "single-replica"
+            | "single-replica-session-store"
+            | "single-node"
+            | "standalone"
+            | "local"
+            | "sqlite"
+            | "sqlite-session-store" => Self::SingleReplica,
+            "quorum"
+            | "quorum-session-store"
+            | "quorumsessionstore"
+            | "replicated-quorum"
+            | "ordered-replication-log" => Self::Quorum,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Stable profile code for status, metrics, or evidence.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleReplica => "single-replica",
+            Self::Quorum => "quorum",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// App-declared HA durability requirement for traffic-readiness claims.
+///
+/// Products map local HA profile names into this SDK-owned vocabulary. The SDK
+/// does not decide product HA policy; it only evaluates whether the selected
+/// platform session-store profile can support the durability requirement the
+/// product has already chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "kebab-case")]
+pub enum AppHaDurabilityRequirement {
+    /// The app may claim traffic readiness on a known single-replica store.
+    SingleReplicaAllowed,
+    /// Active/standby app HA requires a quorum session store before traffic
+    /// readiness can be claimed.
+    ActiveStandby,
+}
+
+impl AppHaDurabilityRequirement {
+    /// Stable requirement code for status, metrics, or evidence.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleReplicaAllowed => "single-replica-allowed",
+            Self::ActiveStandby => "active-standby",
+        }
+    }
+}
+
+/// Compatibility outcome between app HA intent and platform session-store
+/// profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionStoreHaCompatibility {
+    /// The platform profile satisfies the app HA durability requirement.
+    Compatible,
+    /// The platform profile is unknown, so readiness must fail closed until the
+    /// product/operator maps it to a known SDK capability profile.
+    UnknownPlatformProfile,
+    /// Active/standby app HA was selected but the platform session-store
+    /// profile is only single-replica.
+    ActiveStandbyRequiresQuorum,
+}
+
+impl SessionStoreHaCompatibility {
+    /// Whether this outcome allows traffic readiness to be claimed.
+    pub const fn is_compatible(self) -> bool {
+        matches!(self, Self::Compatible)
+    }
+
+    /// Whether this outcome should block traffic readiness/status claims.
+    pub const fn blocks_traffic(self) -> bool {
+        !self.is_compatible()
+    }
+
+    /// Stable machine-readable reason code.
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::Compatible => "compatible",
+            Self::UnknownPlatformProfile => "unknown-platform-profile",
+            Self::ActiveStandbyRequiresQuorum => "active-standby-requires-quorum",
+        }
+    }
+
+    /// Redaction-safe operator/status message.
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Compatible => "session-store profile is compatible with app HA requirement",
+            Self::UnknownPlatformProfile => {
+                "session-store platform profile is unknown to the SDK compatibility contract"
+            }
+            Self::ActiveStandbyRequiresQuorum => {
+                "active-standby HA requires a quorum session-store profile before traffic readiness"
+            }
+        }
+    }
+}
+
+/// Evaluate whether a platform session-store HA profile satisfies an app HA
+/// durability requirement.
+///
+/// Incompatibility is a traffic-readiness/status outcome, not a platform
+/// reconcile failure: callers should keep deployment reconciliation valid while
+/// blocking traffic claims with [`SessionStoreHaCompatibility::reason_code`].
+pub const fn evaluate_session_store_ha_compatibility(
+    requirement: AppHaDurabilityRequirement,
+    platform_profile: SessionStorePlatformProfile,
+) -> SessionStoreHaCompatibility {
+    match platform_profile {
+        SessionStorePlatformProfile::Unknown => SessionStoreHaCompatibility::UnknownPlatformProfile,
+        SessionStorePlatformProfile::Quorum => SessionStoreHaCompatibility::Compatible,
+        SessionStorePlatformProfile::SingleReplica => match requirement {
+            AppHaDurabilityRequirement::SingleReplicaAllowed => {
+                SessionStoreHaCompatibility::Compatible
+            }
+            AppHaDurabilityRequirement::ActiveStandby => {
+                SessionStoreHaCompatibility::ActiveStandbyRequiresQuorum
+            }
+        },
+    }
+}
+
 impl std::fmt::Display for SessionStateProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -361,5 +520,109 @@ mod tests {
 
         let round_trip: SessionStateProfile = serde_json::from_str(&json).unwrap();
         assert_eq!(round_trip, profile);
+    }
+
+    #[test]
+    fn session_store_platform_profile_parses_known_aliases() {
+        let single_replica_aliases = [
+            "single-replica",
+            "single_replica",
+            "single node",
+            "standalone",
+            "local",
+            "sqlite",
+            "sqlite-session-store",
+        ];
+        for alias in single_replica_aliases {
+            assert_eq!(
+                SessionStorePlatformProfile::from_backend_profile_name(alias),
+                SessionStorePlatformProfile::SingleReplica,
+                "alias: {alias}"
+            );
+        }
+
+        let quorum_aliases = [
+            "quorum",
+            "quorum-session-store",
+            "quorumsessionstore",
+            "replicated quorum",
+            "ordered_replication_log",
+        ];
+        for alias in quorum_aliases {
+            assert_eq!(
+                SessionStorePlatformProfile::from_backend_profile_name(alias),
+                SessionStorePlatformProfile::Quorum,
+                "alias: {alias}"
+            );
+        }
+
+        assert_eq!(
+            SessionStorePlatformProfile::from_backend_profile_name("carrier-specific"),
+            SessionStorePlatformProfile::Unknown
+        );
+    }
+
+    #[test]
+    fn session_store_ha_compatibility_blocks_active_standby_on_single_replica() {
+        let outcome = evaluate_session_store_ha_compatibility(
+            AppHaDurabilityRequirement::ActiveStandby,
+            SessionStorePlatformProfile::SingleReplica,
+        );
+
+        assert_eq!(
+            outcome,
+            SessionStoreHaCompatibility::ActiveStandbyRequiresQuorum
+        );
+        assert!(outcome.blocks_traffic());
+        assert_eq!(outcome.reason_code(), "active-standby-requires-quorum");
+        assert!(
+            !format!("{outcome:?}").contains("supi"),
+            "debug output must stay free of product payload identifiers"
+        );
+    }
+
+    #[test]
+    fn session_store_ha_compatibility_allows_known_compatible_profiles() {
+        assert_eq!(
+            evaluate_session_store_ha_compatibility(
+                AppHaDurabilityRequirement::ActiveStandby,
+                SessionStorePlatformProfile::Quorum,
+            ),
+            SessionStoreHaCompatibility::Compatible
+        );
+        assert_eq!(
+            evaluate_session_store_ha_compatibility(
+                AppHaDurabilityRequirement::SingleReplicaAllowed,
+                SessionStorePlatformProfile::SingleReplica,
+            ),
+            SessionStoreHaCompatibility::Compatible
+        );
+        assert!(!SessionStoreHaCompatibility::Compatible.blocks_traffic());
+    }
+
+    #[test]
+    fn session_store_ha_compatibility_fails_closed_for_unknown_platform_profile() {
+        let outcome = evaluate_session_store_ha_compatibility(
+            AppHaDurabilityRequirement::SingleReplicaAllowed,
+            SessionStorePlatformProfile::from_backend_profile_name("platform-prod-a"),
+        );
+
+        assert_eq!(outcome, SessionStoreHaCompatibility::UnknownPlatformProfile);
+        assert!(outcome.blocks_traffic());
+        assert_eq!(outcome.reason_code(), "unknown-platform-profile");
+        assert!(!outcome.message().contains("platform-prod-a"));
+    }
+
+    #[test]
+    fn session_store_ha_compatibility_serde_uses_stable_codes() {
+        let profile = serde_json::to_string(&SessionStorePlatformProfile::SingleReplica).unwrap();
+        assert_eq!(profile, "\"single-replica\"");
+        let requirement =
+            serde_json::to_string(&AppHaDurabilityRequirement::ActiveStandby).unwrap();
+        assert_eq!(requirement, "\"active-standby\"");
+        let outcome =
+            serde_json::to_string(&SessionStoreHaCompatibility::ActiveStandbyRequiresQuorum)
+                .unwrap();
+        assert_eq!(outcome, "\"active-standby-requires-quorum\"");
     }
 }
