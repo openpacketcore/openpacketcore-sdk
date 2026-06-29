@@ -6,8 +6,9 @@
 
 use crate::TelcoIdentifier;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 const MAX_LABEL_VALUE_LEN: usize = 64;
 
@@ -178,6 +179,150 @@ pub struct LatencyHistogram {
     pub buckets: [AtomicU64; 11],
 }
 
+/// SDK-owned recorder for admin HTTP metric families.
+///
+/// This wrapper keeps products and runtime code away from the registry field
+/// layout while preserving the existing Prometheus family names exported by
+/// [`export_prometheus_text`].
+pub struct AdminMetricsRecorder<'a> {
+    metrics: &'a SdkMetrics,
+}
+
+impl AdminMetricsRecorder<'static> {
+    /// Create a recorder backed by the global SDK metrics registry.
+    #[must_use]
+    pub fn global() -> Self {
+        Self::new(&METRICS)
+    }
+}
+
+impl<'a> AdminMetricsRecorder<'a> {
+    /// Create a recorder backed by the supplied metrics registry.
+    #[must_use]
+    pub const fn new(metrics: &'a SdkMetrics) -> Self {
+        Self { metrics }
+    }
+
+    /// Record one admin HTTP request for `route` and HTTP `status`.
+    ///
+    /// Known SDK admin paths such as `/readyz` are normalized to the stable
+    /// route labels already used by the exporter. Unknown route names are
+    /// sanitized through [`metrics_label_safe`] before they are stored.
+    pub fn record_request(&self, route: &str, status: u16) {
+        let route = admin_route_label_safe(route);
+        let status = admin_status_label_safe(status);
+        let mut reqs = lock_or_recover(&self.metrics.admin_requests_total);
+        let count = reqs.entry((route, status)).or_insert(0);
+        *count += 1;
+    }
+
+    /// Record one malformed admin request.
+    pub fn record_malformed_request(&self) {
+        self.metrics
+            .admin_malformed_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one admin authentication failure.
+    pub fn record_auth_failure(&self) {
+        self.metrics
+            .admin_auth_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one admin response redaction event.
+    pub fn record_redaction_event(&self) {
+        self.metrics
+            .admin_redaction_events_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one admin route latency observation in seconds.
+    ///
+    /// Negative and non-finite values are ignored. Known SDK admin routes use
+    /// the existing fixed histograms; other sanitized route labels are stored
+    /// in a dynamic route histogram map exported under the same metric family.
+    pub fn observe_route_latency(&self, route: &str, latency_seconds: f64) {
+        if !latency_seconds.is_finite() || latency_seconds < 0.0 {
+            return;
+        }
+
+        let route = admin_route_label_safe(route);
+        match route.as_str() {
+            "livez" => self.metrics.admin_latency_livez.observe(latency_seconds),
+            "readyz" => self.metrics.admin_latency_readyz.observe(latency_seconds),
+            "startupz" => self.metrics.admin_latency_startupz.observe(latency_seconds),
+            "metrics" => self.metrics.admin_latency_metrics.observe(latency_seconds),
+            "debug_runtime" => self
+                .metrics
+                .admin_latency_debug_runtime
+                .observe(latency_seconds),
+            "debug_tasks" => self
+                .metrics
+                .admin_latency_debug_tasks
+                .observe(latency_seconds),
+            "debug_config_version" => self
+                .metrics
+                .admin_latency_debug_config_version
+                .observe(latency_seconds),
+            _ => {
+                let mut latencies = lock_or_recover(&self.metrics.admin_request_latency_seconds);
+                latencies.entry(route).or_default().observe(latency_seconds);
+            }
+        }
+    }
+}
+
+impl Default for AdminMetricsRecorder<'static> {
+    fn default() -> Self {
+        Self::global()
+    }
+}
+
+impl fmt::Debug for AdminMetricsRecorder<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdminMetricsRecorder")
+            .finish_non_exhaustive()
+    }
+}
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Normalize and sanitize an admin route label for metrics.
+#[must_use]
+pub fn admin_route_label_safe(route: &str) -> String {
+    let route = route.trim();
+    let normalized = match route {
+        "" => "unknown",
+        "/livez" | "livez" => "livez",
+        "/readyz" | "readyz" => "readyz",
+        "/startupz" | "startupz" => "startupz",
+        "/metrics" | "metrics" => "metrics",
+        "/debug/runtime" | "debug_runtime" => "debug_runtime",
+        "/debug/tasks" | "debug_tasks" => "debug_tasks",
+        "/debug/config-version" | "debug_config_version" => "debug_config_version",
+        "/debug/drain" | "debug_drain" => "debug_drain",
+        "unknown" => "unknown",
+        other => return metrics_label_safe(other),
+    };
+    metrics_label_safe(normalized)
+}
+
+/// Normalize and sanitize an admin HTTP status label for metrics.
+#[must_use]
+pub fn admin_status_label_safe(status: u16) -> String {
+    if (100..=599).contains(&status) {
+        metrics_label_safe(&status.to_string())
+    } else {
+        "invalid".to_string()
+    }
+}
+
 impl Default for LatencyHistogram {
     fn default() -> Self {
         Self::new()
@@ -308,6 +453,7 @@ pub struct SdkMetrics {
     pub admin_latency_debug_runtime: LatencyHistogram,
     pub admin_latency_debug_tasks: LatencyHistogram,
     pub admin_latency_debug_config_version: LatencyHistogram,
+    pub admin_request_latency_seconds: Mutex<HashMap<String, LatencyHistogram>>,
 
     // === SBI Metrics ===
     pub sbi_requests_total: Mutex<HashMap<(String, String, String, String), u64>>,
@@ -425,6 +571,7 @@ impl SdkMetrics {
             admin_latency_debug_runtime: LatencyHistogram::new(),
             admin_latency_debug_tasks: LatencyHistogram::new(),
             admin_latency_debug_config_version: LatencyHistogram::new(),
+            admin_request_latency_seconds: Mutex::new(HashMap::new()),
 
             // === SBI Metrics ===
             sbi_requests_total: Mutex::new(HashMap::new()),
@@ -560,6 +707,9 @@ impl SdkMetrics {
         self.admin_latency_debug_runtime.reset();
         self.admin_latency_debug_tasks.reset();
         self.admin_latency_debug_config_version.reset();
+        if let Ok(mut m) = self.admin_request_latency_seconds.lock() {
+            m.clear();
+        }
 
         if let Ok(mut m) = self.sbi_requests_total.lock() {
             m.clear();
@@ -1359,6 +1509,19 @@ pub fn export_prometheus_text() -> String {
         &METRICS.admin_latency_debug_config_version,
         &[("route", "debug_config_version")],
     );
+    if let Ok(map) = METRICS.admin_request_latency_seconds.lock() {
+        let mut sorted: Vec<_> = map.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (route, hist) in sorted {
+            let safe_route = metrics_label_safe(route);
+            write_histogram_samples(
+                &mut out,
+                "opc_admin_request_latency_seconds",
+                hist,
+                &[("route", &safe_route)],
+            );
+        }
+    }
 
     // === SBI Metrics ===
     out.push_str("# HELP opc_sbi_requests_total Total count of SBI requests by nf, service, operation, and outcome\n");
@@ -1751,6 +1914,15 @@ mod tests {
     #[test]
     fn test_metric_registration_and_export() {
         METRICS.reset_all();
+        let admin = AdminMetricsRecorder::global();
+        admin.record_request("/readyz", 200);
+        admin.record_request("spiffe://example.org/leak", 999);
+        admin.record_auth_failure();
+        admin.record_malformed_request();
+        admin.record_redaction_event();
+        admin.observe_route_latency("/readyz", 0.025);
+        admin.observe_route_latency("product_status", 0.01);
+        admin.observe_route_latency("product_status", -1.0);
         METRICS
             .config_bus_pending_commits
             .store(3, Ordering::Relaxed);
@@ -1813,6 +1985,17 @@ mod tests {
         assert!(!exported.contains("{ }"));
         assert!(exported.contains("opc_persist_leader_term 10\n"));
         assert!(exported.contains("opc_runtime_budget_exhausted_total 2\n"));
+        assert!(exported.contains("opc_admin_requests_total{route=\"readyz\",status=\"200\"} 1\n"));
+        assert!(exported
+            .contains("opc_admin_requests_total{route=\"redacted\",status=\"invalid\"} 1\n"));
+        assert!(exported.contains("opc_admin_auth_failures_total 1\n"));
+        assert!(exported.contains("opc_admin_malformed_requests_total 1\n"));
+        assert!(exported.contains("opc_admin_redaction_events_total 1\n"));
+        assert!(exported.contains(
+            "opc_admin_request_latency_seconds_bucket{route=\"readyz\",le=\"0.025\"} 1\n"
+        ));
+        assert!(exported
+            .contains("opc_admin_request_latency_seconds_count{route=\"product_status\"} 1\n"));
         assert!(exported.contains("opc_persist_peer_replication_lag{peer=\"1\"} 42\n"));
         assert!(exported
             .contains("opc_alarm_active_count{severity=\"critical\",cause=\"cpu_high\"} 1\n"));
@@ -1849,5 +2032,55 @@ mod tests {
         assert!(!after.contains("opc_gnmi_sessions_active{transport=\"gnmi-tls\""));
         assert!(!after.contains("opc_gnmi_listener_events_total{transport=\"gnmi-tls\""));
         assert!(!after.contains("opc_netconf_sessions_active{transport=\"netconf-tls\""));
+        assert!(!after.contains("opc_admin_requests_total{route=\"readyz\""));
+        assert!(!after.contains("opc_admin_request_latency_seconds_count{route=\"product_status\""));
+    }
+
+    #[test]
+    fn admin_metrics_recorder_sanitizes_without_exporter_dependency() {
+        let metrics = SdkMetrics::new();
+        let recorder = AdminMetricsRecorder::new(&metrics);
+
+        recorder.record_request("/debug/config-version", 200);
+        recorder.record_request("imsi-001010123456789", 42);
+        recorder.record_malformed_request();
+        recorder.record_auth_failure();
+        recorder.record_redaction_event();
+        recorder.observe_route_latency("/debug/drain", 0.01);
+        recorder.observe_route_latency("custom-route", f64::NAN);
+
+        let reqs = metrics.admin_requests_total.lock().unwrap();
+        assert_eq!(
+            reqs.get(&("debug_config_version".to_string(), "200".to_string())),
+            Some(&1)
+        );
+        assert_eq!(
+            reqs.get(&("redacted".to_string(), "invalid".to_string())),
+            Some(&1)
+        );
+        drop(reqs);
+
+        assert_eq!(
+            metrics
+                .admin_malformed_requests_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.admin_auth_failures_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.admin_redaction_events_total.load(Ordering::Relaxed),
+            1
+        );
+
+        let dynamic_latency = metrics.admin_request_latency_seconds.lock().unwrap();
+        let debug_drain = dynamic_latency
+            .get("debug_drain")
+            .expect("debug drain latency");
+        assert_eq!(debug_drain.count.load(Ordering::Relaxed), 1);
+        assert!(!dynamic_latency.contains_key("custom-route"));
+
+        let debug = format!("{recorder:?}");
+        assert!(!debug.contains("imsi"));
+        assert!(!debug.contains("debug_config_version"));
     }
 }
