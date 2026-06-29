@@ -33,6 +33,7 @@
 //! Owned by [RFC 008: CNF Runtime Chassis and Resource Governance](../../docs/rfc/008-cnf-runtime-chassis.md).
 
 pub mod admin;
+pub mod admission;
 pub mod bootstrap;
 pub mod health;
 pub mod metrics;
@@ -49,6 +50,10 @@ pub mod runtime;
 mod tests;
 
 pub use admin::ConfigVersionMetadata;
+pub use admission::{
+    SourceAdmissionDecision, SourceTokenBucket, SourceTokenBucketPolicy,
+    SourceTokenBucketPolicyError,
+};
 pub use bootstrap::BootstrapError;
 pub use health::{
     known_gates, GateImpact, GateName, GateStatus, HealthGate, HealthGateSet, HealthModel,
