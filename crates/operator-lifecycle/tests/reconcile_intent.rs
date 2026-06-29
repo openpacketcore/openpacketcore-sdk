@@ -1,7 +1,9 @@
 use operator_lifecycle::{
     lifecycle_condition_intent, reject_app_config_fields, BootstrapRef, BootstrapRefKind,
     CnfImageIntent, CnfWorkloadIntent, ConditionSeverity, ConditionStatus,
-    ManagementExposureIntent, NetworkAttachmentIntent, NetworkAttachmentKind, PlacementIntent,
+    ManagementExposureIntent, ManagementIdentityIntent, ManagementMaterialRef,
+    ManagementMtlsIdentityIntent, ManagementNorthboundIntent, ManagementPortIntent,
+    NetconfSshIdentityIntent, NetworkAttachmentIntent, NetworkAttachmentKind, PlacementIntent,
     ReconcileIntentError, ReplicaIntent, SessionStoreRef, StatusPatchIntent, TrafficStatusIntent,
     UpgradeDrainPolicy,
 };
@@ -29,6 +31,8 @@ fn valid_workload_intent() -> CnfWorkloadIntent {
             metrics: true,
             admin: true,
             service_names: vec!["upf-management".to_string()],
+            identity: ManagementIdentityIntent::default(),
+            northbound: ManagementNorthboundIntent::default(),
         },
         bootstrap_refs: vec![BootstrapRef {
             name: "bootstrap-secret".to_string(),
@@ -41,6 +45,87 @@ fn valid_workload_intent() -> CnfWorkloadIntent {
         }),
         upgrade_drain: UpgradeDrainPolicy::default(),
     }
+}
+
+#[test]
+fn management_tls_exposure_requires_mtls_identity_refs() {
+    let mut intent = valid_workload_intent();
+    intent.management.northbound.gnmi_tls = Some(ManagementPortIntent::new("gnmi-tls", 57400));
+
+    assert!(matches!(
+        intent.validate(),
+        Err(ReconcileIntentError::InvalidIntent(message))
+            if message.contains("requires mTLS identity refs")
+    ));
+
+    intent.management.identity.mtls = Some(ManagementMtlsIdentityIntent {
+        svid_ref: ManagementMaterialRef::secret("mgmt-svid"),
+        trust_bundle_ref: ManagementMaterialRef::config_map("mgmt-trust-bundle"),
+    });
+
+    assert!(intent.validate().is_ok());
+}
+
+#[test]
+fn management_netconf_ssh_requires_host_and_authorized_key_refs() {
+    let mut intent = valid_workload_intent();
+    intent.management.northbound.netconf_ssh = Some(ManagementPortIntent::new("netconf-ssh", 830));
+
+    assert!(matches!(
+        intent.validate(),
+        Err(ReconcileIntentError::InvalidIntent(message))
+            if message.contains("NETCONF SSH exposure requires")
+    ));
+
+    intent.management.identity.netconf_ssh = Some(NetconfSshIdentityIntent {
+        host_key_ref: ManagementMaterialRef::secret("netconf-host-key"),
+        authorized_keys_ref: ManagementMaterialRef::config_map("netconf-authorized-keys"),
+    });
+
+    assert!(intent.validate().is_ok());
+}
+
+#[test]
+fn management_northbound_rejects_zero_and_colliding_ports() {
+    let mut intent = valid_workload_intent();
+    intent.management.identity.mtls = Some(ManagementMtlsIdentityIntent {
+        svid_ref: ManagementMaterialRef::secret("mgmt-svid"),
+        trust_bundle_ref: ManagementMaterialRef::config_map("mgmt-trust-bundle"),
+    });
+    intent.management.northbound.gnmi_tls = Some(ManagementPortIntent::new("gnmi-tls", 0));
+
+    assert!(matches!(
+        intent.validate(),
+        Err(ReconcileIntentError::InvalidIntent(message))
+            if message.contains("must be non-zero")
+    ));
+
+    intent.management.northbound.gnmi_tls = Some(ManagementPortIntent::new("northbound", 57400));
+    intent.management.northbound.netconf_tls = Some(ManagementPortIntent::new("northbound", 6513));
+
+    assert!(matches!(
+        intent.validate(),
+        Err(ReconcileIntentError::InvalidIntent(message))
+            if message.contains("port name")
+    ));
+}
+
+#[test]
+fn management_exposure_deserializes_legacy_shape_with_default_identity() {
+    let decoded: ManagementExposureIntent = match serde_json::from_value(serde_json::json!({
+        "health": true,
+        "metrics": true,
+        "admin": false,
+        "service_names": ["upf-management"]
+    })) {
+        Ok(value) => value,
+        Err(error) => panic!("legacy management exposure decode failed: {error}"),
+    };
+
+    assert!(decoded.health);
+    assert!(decoded.identity.mtls.is_none());
+    assert!(decoded.northbound.gnmi_tls.is_none());
+    assert!(decoded.validate().is_ok());
 }
 
 #[test]
