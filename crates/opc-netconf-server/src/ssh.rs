@@ -5,7 +5,9 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fs;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +18,7 @@ use opc_mgmt_authz::PolicySource;
 use opc_mgmt_limits::LimitsError;
 use opc_runtime::ShutdownToken;
 use opc_types::TenantId;
-use russh::keys::{Certificate, PrivateKey, PublicKey};
+use russh::keys::{self, Certificate, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Session};
 use russh::{Channel, ChannelId, Disconnect, MethodKind, MethodSet, SshId};
 use thiserror::Error;
@@ -39,6 +41,207 @@ pub type SshAuthorizedKey = PublicKey;
 
 const NETCONF_SUBSYSTEM: &str = "netconf";
 const CALL_HOME_BACKOFF_JITTER_DIVISOR: u128 = 4;
+
+/// SSH key material loaded from deployment-managed files.
+#[derive(Clone)]
+pub struct SshListenerKeyMaterial {
+    /// Provisioned SSH host keys.
+    pub host_keys: Vec<SshHostKey>,
+    /// Exact public keys allowed to authenticate to this listener.
+    pub authorized_keys: Vec<SshAuthorizedKey>,
+}
+
+impl std::fmt::Debug for SshListenerKeyMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshListenerKeyMaterial")
+            .field(
+                "host_keys",
+                &format_args!("{} key(s)", self.host_keys.len()),
+            )
+            .field(
+                "authorized_keys",
+                &format_args!("{} key(s)", self.authorized_keys.len()),
+            )
+            .finish()
+    }
+}
+
+/// Redaction-safe SSH key file loader error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SshKeyFileLoadError {
+    /// No host-key path was provided.
+    #[error("netconf_ssh_host_key_path_missing")]
+    HostKeyPathMissing,
+    /// A host-key file could not be read.
+    #[error("netconf_ssh_host_key_read_error")]
+    HostKeyRead {
+        /// Zero-based host-key file index.
+        index: usize,
+    },
+    /// A host-key file contained no key material.
+    #[error("netconf_ssh_host_key_empty")]
+    HostKeyEmpty {
+        /// Zero-based host-key file index.
+        index: usize,
+    },
+    /// A host-key file contained unsupported, encrypted, or malformed key material.
+    #[error("netconf_ssh_host_key_invalid")]
+    HostKeyInvalid {
+        /// Zero-based host-key file index.
+        index: usize,
+    },
+    /// Authorized-keys file could not be read.
+    #[error("netconf_ssh_authorized_keys_read_error")]
+    AuthorizedKeysRead,
+    /// Authorized-keys file contained no bytes or only whitespace.
+    #[error("netconf_ssh_authorized_keys_empty")]
+    AuthorizedKeysEmpty,
+    /// Authorized-keys file contained only comments or blank lines.
+    #[error("netconf_ssh_authorized_keys_no_records")]
+    AuthorizedKeysNoRecords,
+    /// Authorized-keys file contained an invalid public-key record.
+    #[error("netconf_ssh_authorized_key_invalid")]
+    AuthorizedKeyInvalid {
+        /// One-based line number of the invalid record.
+        line: usize,
+    },
+    /// Authorized-keys file repeated a public key already loaded from an earlier line.
+    #[error("netconf_ssh_authorized_key_duplicate")]
+    AuthorizedKeyDuplicate {
+        /// One-based line number of the duplicate record.
+        line: usize,
+    },
+}
+
+impl SshKeyFileLoadError {
+    /// Return the stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HostKeyPathMissing => "netconf_ssh_host_key_path_missing",
+            Self::HostKeyRead { .. } => "netconf_ssh_host_key_read_error",
+            Self::HostKeyEmpty { .. } => "netconf_ssh_host_key_empty",
+            Self::HostKeyInvalid { .. } => "netconf_ssh_host_key_invalid",
+            Self::AuthorizedKeysRead => "netconf_ssh_authorized_keys_read_error",
+            Self::AuthorizedKeysEmpty => "netconf_ssh_authorized_keys_empty",
+            Self::AuthorizedKeysNoRecords => "netconf_ssh_authorized_keys_no_records",
+            Self::AuthorizedKeyInvalid { .. } => "netconf_ssh_authorized_key_invalid",
+            Self::AuthorizedKeyDuplicate { .. } => "netconf_ssh_authorized_key_duplicate",
+        }
+    }
+}
+
+/// Load NETCONF SSH listener key material from deployment-managed files.
+///
+/// Host-key files must contain unencrypted private keys supported by `russh`.
+/// The authorized-keys file accepts ordinary OpenSSH public-key records, skips
+/// blank/comment lines, and preserves exact public-key authorization semantics
+/// used by [`SshListenerConfig`].
+///
+/// # Errors
+///
+/// Returns [`SshKeyFileLoadError`] when a file cannot be read, contains no
+/// usable records, has unsupported key material, or repeats an authorized key.
+pub fn load_ssh_listener_key_files<H, P>(
+    host_key_paths: H,
+    authorized_keys_path: P,
+) -> Result<SshListenerKeyMaterial, SshKeyFileLoadError>
+where
+    H: IntoIterator,
+    H::Item: AsRef<Path>,
+    P: AsRef<Path>,
+{
+    let mut host_keys = Vec::new();
+    let mut saw_host_path = false;
+    for (index, path) in host_key_paths.into_iter().enumerate() {
+        saw_host_path = true;
+        host_keys.push(load_host_key_file(path.as_ref(), index)?);
+    }
+    if !saw_host_path {
+        return Err(SshKeyFileLoadError::HostKeyPathMissing);
+    }
+
+    let authorized_keys = load_authorized_keys_file(authorized_keys_path.as_ref())?;
+    Ok(SshListenerKeyMaterial {
+        host_keys,
+        authorized_keys,
+    })
+}
+
+fn load_host_key_file(path: &Path, index: usize) -> Result<SshHostKey, SshKeyFileLoadError> {
+    let contents =
+        fs::read_to_string(path).map_err(|_| SshKeyFileLoadError::HostKeyRead { index })?;
+    if contents.trim().is_empty() {
+        return Err(SshKeyFileLoadError::HostKeyEmpty { index });
+    }
+    keys::decode_secret_key(&contents, None)
+        .map_err(|_| SshKeyFileLoadError::HostKeyInvalid { index })
+}
+
+fn load_authorized_keys_file(path: &Path) -> Result<Vec<SshAuthorizedKey>, SshKeyFileLoadError> {
+    let contents = fs::read_to_string(path).map_err(|_| SshKeyFileLoadError::AuthorizedKeysRead)?;
+    if contents.trim().is_empty() {
+        return Err(SshKeyFileLoadError::AuthorizedKeysEmpty);
+    }
+
+    let mut authorized_keys = Vec::new();
+    let mut saw_record = false;
+    for (line_index, line) in contents.lines().enumerate() {
+        let line_number = line_index.saturating_add(1);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        saw_record = true;
+        let key = parse_authorized_key_record(trimmed, line_number)?;
+        if authorized_keys
+            .iter()
+            .any(|existing: &SshAuthorizedKey| existing.key_data() == key.key_data())
+        {
+            return Err(SshKeyFileLoadError::AuthorizedKeyDuplicate { line: line_number });
+        }
+        authorized_keys.push(key);
+    }
+
+    if saw_record {
+        Ok(authorized_keys)
+    } else {
+        Err(SshKeyFileLoadError::AuthorizedKeysNoRecords)
+    }
+}
+
+fn parse_authorized_key_record(
+    record: &str,
+    line: usize,
+) -> Result<SshAuthorizedKey, SshKeyFileLoadError> {
+    let tokens: Vec<&str> = record.split_whitespace().collect();
+    let Some(key_blob) = authorized_key_blob(&tokens) else {
+        return Err(SshKeyFileLoadError::AuthorizedKeyInvalid { line });
+    };
+    keys::parse_public_key_base64(key_blob)
+        .map_err(|_| SshKeyFileLoadError::AuthorizedKeyInvalid { line })
+}
+
+fn authorized_key_blob<'a>(tokens: &'a [&str]) -> Option<&'a str> {
+    if tokens.len() == 1 {
+        return tokens.first().copied();
+    }
+
+    tokens
+        .windows(2)
+        .find_map(|window| is_public_key_algorithm(window[0]).then_some(window[1]))
+        .or_else(|| tokens.first().copied())
+}
+
+fn is_public_key_algorithm(token: &str) -> bool {
+    token == "ssh-ed25519"
+        || token == "ssh-rsa"
+        || token == "rsa-sha2-256"
+        || token == "rsa-sha2-512"
+        || token.starts_with("ecdsa-sha2-")
+        || token.starts_with("sk-")
+}
 
 /// Runtime configuration for the NETCONF-over-SSH listener.
 #[derive(Clone)]
@@ -836,6 +1039,26 @@ fn reject_publickey() -> Auth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn ed25519_key() -> PrivateKey {
+        PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519).expect("SSH key")
+    }
+
+    fn write_host_key(dir: &Path, name: &str, key: &PrivateKey) -> PathBuf {
+        let path = dir.join(name);
+        let encoded = key
+            .to_openssh(keys::ssh_key::LineEnding::LF)
+            .expect("OpenSSH private key");
+        fs::write(&path, encoded.as_bytes()).expect("write host key");
+        path
+    }
+
+    fn write_authorized_keys(dir: &Path, contents: &str) -> PathBuf {
+        let path = dir.join("authorized_keys");
+        fs::write(&path, contents).expect("write authorized keys");
+        path
+    }
 
     #[test]
     fn config_debug_redacts_host_key_material() {
@@ -852,5 +1075,105 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("1 key(s)"));
         assert!(!debug.contains("OPENSSH"));
+    }
+
+    #[test]
+    fn ssh_key_file_loader_reads_host_and_authorized_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host_key = ed25519_key();
+        let user_key = ed25519_key();
+        let host_path = write_host_key(dir.path(), "ssh_host_ed25519_key", &host_key);
+        let public_text = user_key.public_key().to_openssh().expect("public key");
+        let public_blob = public_text
+            .split_whitespace()
+            .nth(1)
+            .expect("public key blob");
+        let authorized_path = write_authorized_keys(
+            dir.path(),
+            &format!("# comment\n\nfrom=\"127.0.0.1\" {public_text} operator\n"),
+        );
+
+        let material = load_ssh_listener_key_files([host_path], &authorized_path)
+            .expect("loaded key material");
+        assert_eq!(material.host_keys.len(), 1);
+        assert_eq!(material.authorized_keys.len(), 1);
+        assert_eq!(
+            material.authorized_keys[0].key_data(),
+            user_key.public_key().key_data()
+        );
+
+        let config = SshListenerConfig::new(
+            TenantId::from_static("tenant-a"),
+            material.host_keys.clone(),
+            material.authorized_keys.clone(),
+        );
+        assert_eq!(config.host_keys.len(), 1);
+        assert_eq!(config.authorized_keys.len(), 1);
+
+        let debug = format!("{material:?}");
+        assert!(debug.contains("1 key(s)"));
+        assert!(!debug.contains(public_blob));
+        assert!(!debug.contains("OPENSSH"));
+    }
+
+    #[test]
+    fn ssh_key_file_loader_rejects_empty_and_comments_only_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_key = ed25519_key();
+        let public_text = user_key.public_key().to_openssh().expect("public key");
+        let authorized_path = write_authorized_keys(dir.path(), &public_text);
+
+        let missing_host =
+            load_ssh_listener_key_files(std::iter::empty::<&Path>(), &authorized_path)
+                .expect_err("missing host path");
+        assert_eq!(missing_host, SshKeyFileLoadError::HostKeyPathMissing);
+        assert_eq!(missing_host.as_str(), "netconf_ssh_host_key_path_missing");
+        assert_eq!(missing_host.to_string(), missing_host.as_str());
+
+        let empty_host = dir.path().join("empty_host_key");
+        fs::write(&empty_host, "\n").expect("write empty host key");
+        let error =
+            load_ssh_listener_key_files([&empty_host], &authorized_path).expect_err("empty host");
+        assert_eq!(error, SshKeyFileLoadError::HostKeyEmpty { index: 0 });
+        assert_eq!(error.as_str(), "netconf_ssh_host_key_empty");
+        assert_eq!(error.to_string(), error.as_str());
+
+        let host_key = ed25519_key();
+        let host_path = write_host_key(dir.path(), "host_key", &host_key);
+        let comments_only = write_authorized_keys(dir.path(), "# operator key\n\n  # disabled\n");
+        let error = load_ssh_listener_key_files([host_path], comments_only)
+            .expect_err("comments only authorized keys");
+        assert_eq!(error, SshKeyFileLoadError::AuthorizedKeysNoRecords);
+        assert_eq!(error.as_str(), "netconf_ssh_authorized_keys_no_records");
+        assert_eq!(error.to_string(), error.as_str());
+    }
+
+    #[test]
+    fn ssh_key_file_loader_rejects_invalid_and_duplicate_authorized_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host_key = ed25519_key();
+        let host_path = write_host_key(dir.path(), "host_key", &host_key);
+
+        let invalid_authorized =
+            write_authorized_keys(dir.path(), "# comment\nssh-ed25519 not-base64\n");
+        let error = load_ssh_listener_key_files([&host_path], invalid_authorized)
+            .expect_err("invalid authorized key");
+        assert_eq!(error, SshKeyFileLoadError::AuthorizedKeyInvalid { line: 2 });
+        assert_eq!(error.as_str(), "netconf_ssh_authorized_key_invalid");
+        assert_eq!(error.to_string(), error.as_str());
+        assert!(!format!("{error:?}").contains("not-base64"));
+
+        let user_key = ed25519_key();
+        let public_text = user_key.public_key().to_openssh().expect("public key");
+        let duplicate_authorized =
+            write_authorized_keys(dir.path(), &format!("{public_text}\n{public_text}\n"));
+        let error = load_ssh_listener_key_files([host_path], duplicate_authorized)
+            .expect_err("duplicate authorized key");
+        assert_eq!(
+            error,
+            SshKeyFileLoadError::AuthorizedKeyDuplicate { line: 2 }
+        );
+        assert_eq!(error.as_str(), "netconf_ssh_authorized_key_duplicate");
+        assert_eq!(error.to_string(), error.as_str());
     }
 }

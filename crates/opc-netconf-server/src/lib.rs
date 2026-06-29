@@ -232,8 +232,9 @@ pub use session::{
 };
 pub use session_registry::SessionRegistry;
 pub use ssh::{
-    run_read_only_ssh_call_home, run_read_only_ssh_listener, SshAuthorizedKey, SshCallHomeConfig,
-    SshCallHomeError, SshCallHomeResult, SshHostKey, SshListenerConfig, SshListenerError,
+    load_ssh_listener_key_files, run_read_only_ssh_call_home, run_read_only_ssh_listener,
+    SshAuthorizedKey, SshCallHomeConfig, SshCallHomeError, SshCallHomeResult, SshHostKey,
+    SshKeyFileLoadError, SshListenerConfig, SshListenerError, SshListenerKeyMaterial,
     SshListenerResult,
 };
 pub use supervision::{

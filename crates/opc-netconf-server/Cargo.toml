@@ -41,6 +41,7 @@ opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
 opc-tls = { path = "../opc-tls", version = "0.2.0" }
 rand = { workspace = true }
 rcgen = { workspace = true }
+tempfile = "3"
 time = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 
