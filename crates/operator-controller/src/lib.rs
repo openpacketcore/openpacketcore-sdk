@@ -14,3 +14,4 @@ pub mod conversion;
 pub mod drain;
 pub mod migration;
 pub mod multicluster;
+pub mod status_patch;
