@@ -2326,6 +2326,7 @@ name = "opc-proto-ikev2"
 version = "0.2.0"
 dependencies = [
  "bytes",
+ "opc-proto-ikev2",
  "opc-protocol",
 ]
 

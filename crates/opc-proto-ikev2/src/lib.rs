@@ -25,6 +25,8 @@ pub mod message;
 pub mod nat_traversal;
 pub mod notify;
 pub mod payload;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
 
 pub use crypto::{
     open_protected_payloads, CryptoProvider, OpenedProtectedPayload, ProtectedPayloadContext,
