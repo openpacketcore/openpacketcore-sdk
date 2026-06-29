@@ -24,7 +24,10 @@ pub mod message;
 pub mod nat_traversal;
 pub mod payload;
 
-pub use crypto::{CryptoProvider, ProtectedPayloadContext, ProtectedPayloadKind};
+pub use crypto::{
+    open_protected_payloads, CryptoProvider, OpenedProtectedPayload, ProtectedPayloadContext,
+    ProtectedPayloadKind, ProtectedPayloadOpenError, ProtectedPayloadOpenFailure,
+};
 pub use header::{
     decode_header, encode_header, Header, HeaderFlags, EXCHANGE_TYPE_CREATE_CHILD_SA,
     EXCHANGE_TYPE_IKE_AUTH, EXCHANGE_TYPE_IKE_SA_INIT, EXCHANGE_TYPE_INFORMATIONAL, HEADER_LEN,
