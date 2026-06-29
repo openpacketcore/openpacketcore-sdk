@@ -8,6 +8,8 @@
 //! @req REQ-3GPP-TS29281-R18-5.1-001
 //! @conformance full
 
+use std::{error::Error, fmt};
+
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, Encode, EncodeContext,
@@ -22,6 +24,9 @@ fn validation_strictness(level: ValidationLevel) -> u8 {
         ValidationLevel::ProcedureAware => 3,
     }
 }
+
+/// GTP-U extension header type for the 5G PDU Session Container.
+pub const GTPU_EXT_PDU_SESSION_CONTAINER: u8 = 0x85;
 
 /// GTP-U Header fields (TS 29.281 Section 5.1).
 ///
@@ -234,7 +239,7 @@ impl PduSessionContainer {
     /// @conformance full
     pub fn decode(ext: &GtpuExtensionHeader<'_>) -> Result<Self, DecodeError> {
         let spec_ref = SpecRef::new("3gpp", "TS29281", "5.2.2.7");
-        if ext.ext_type != 0x85 {
+        if ext.ext_type != GTPU_EXT_PDU_SESSION_CONTAINER {
             return Err(DecodeError::new(
                 DecodeErrorCode::Structural {
                     reason: "extension type is not PDU Session Container",
@@ -340,6 +345,312 @@ impl PduSessionContainer {
         }
         content
     }
+}
+
+/// Stable reason for a malformed GTP-U extension chain.
+///
+/// @spec 3GPP TS29281 R18 5.2.1
+/// @req REQ-3GPP-TS29281-R18-5.2.1-005
+/// @conformance full
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GtpuExtensionChainMalformedReason {
+    /// Extension header bytes ended before a complete header was available.
+    Truncated,
+    /// Extension header length units were zero.
+    LengthUnitsZero,
+    /// Extension header length computation overflowed.
+    LengthOverflow,
+    /// Bytes remained after the terminal Next Extension Header type.
+    TrailingBytes,
+}
+
+impl GtpuExtensionChainMalformedReason {
+    /// Stable machine-readable reason code.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Truncated => "gtpu_extension_chain_truncated",
+            Self::LengthUnitsZero => "gtpu_extension_chain_length_units_zero",
+            Self::LengthOverflow => "gtpu_extension_chain_length_overflow",
+            Self::TrailingBytes => "gtpu_extension_chain_trailing_bytes",
+        }
+    }
+}
+
+/// Error returned while summarizing or building a GTP-U extension chain.
+///
+/// @spec 3GPP TS29281 R18 5.2.1
+/// @req REQ-3GPP-TS29281-R18-5.2.1-006
+/// @conformance full
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GtpuExtensionChainError {
+    /// Raw extension header bytes were present without a non-zero first type.
+    MissingFirstExtensionType,
+    /// A first extension type was supplied without any raw extension bytes.
+    FirstExtensionTypeWithoutHeaders,
+    /// Raw extension header bytes were structurally malformed.
+    MalformedRawChain {
+        /// Stable malformed-chain reason.
+        reason: GtpuExtensionChainMalformedReason,
+    },
+    /// More than one PDU Session Container extension was present.
+    DuplicatePduSessionContainer,
+    /// Encoding a typed extension exceeded GTP-U extension header length fields.
+    ExtensionLengthOverflow,
+    /// Re-decoding a just-built typed extension failed.
+    BuiltChainInvalid,
+}
+
+impl GtpuExtensionChainError {
+    /// Stable machine-readable error code.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::MissingFirstExtensionType => "gtpu_extension_chain_missing_first_type",
+            Self::FirstExtensionTypeWithoutHeaders => {
+                "gtpu_extension_chain_first_type_without_headers"
+            }
+            Self::MalformedRawChain { .. } => "gtpu_extension_chain_malformed_raw",
+            Self::DuplicatePduSessionContainer => {
+                "gtpu_extension_chain_duplicate_pdu_session_container"
+            }
+            Self::ExtensionLengthOverflow => "gtpu_extension_chain_length_overflow",
+            Self::BuiltChainInvalid => "gtpu_extension_chain_built_chain_invalid",
+        }
+    }
+}
+
+impl fmt::Display for GtpuExtensionChainError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MalformedRawChain { reason } => {
+                write!(f, "{}: {}", self.as_str(), reason.as_str())
+            }
+            _ => f.write_str(self.as_str()),
+        }
+    }
+}
+
+impl Error for GtpuExtensionChainError {}
+
+/// SDK-owned summary of a GTP-U extension header chain.
+///
+/// `Debug` reports raw byte length instead of raw extension bytes.
+///
+/// @spec 3GPP TS29281 R18 5.2.1
+/// @req REQ-3GPP-TS29281-R18-5.2.1-007
+/// @conformance full
+#[derive(Clone, PartialEq, Eq)]
+pub struct GtpuExtensionChain {
+    /// First extension header type from the GTP-U optional header.
+    pub first_extension_type: Option<u8>,
+    /// Raw extension header bytes.
+    pub raw_headers: Bytes,
+    /// Number of extension headers parsed from the raw chain.
+    pub header_count: usize,
+    /// Parsed PDU Session Container, when exactly one is present.
+    pub pdu_session_container: Option<PduSessionContainer>,
+}
+
+impl fmt::Debug for GtpuExtensionChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GtpuExtensionChain")
+            .field("first_extension_type", &self.first_extension_type)
+            .field("raw_headers_len", &self.raw_headers.len())
+            .field("header_count", &self.header_count)
+            .field("pdu_session_container", &self.pdu_session_container)
+            .finish()
+    }
+}
+
+impl GtpuExtensionChain {
+    /// Build an empty extension-chain summary.
+    pub fn none() -> Self {
+        Self {
+            first_extension_type: None,
+            raw_headers: Bytes::new(),
+            header_count: 0,
+            pdu_session_container: None,
+        }
+    }
+
+    /// Return true when an extension header chain is present.
+    pub fn has_headers(&self) -> bool {
+        self.first_extension_type.is_some() || !self.raw_headers.is_empty()
+    }
+
+    /// Build and validate a summary from raw extension-header bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GtpuExtensionChainError`] when the first type and raw bytes are
+    /// inconsistent, the raw chain is malformed, or duplicate singleton typed
+    /// extensions are present.
+    pub fn from_raw(
+        first_extension_type: Option<u8>,
+        raw_headers: Bytes,
+    ) -> Result<Self, GtpuExtensionChainError> {
+        summarize_extension_chain(first_extension_type, raw_headers)
+    }
+
+    /// Build a summary from a decoded borrowed GTP-U message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GtpuExtensionChainError`] when the decoded raw extension bytes
+    /// are malformed or inconsistent.
+    pub fn from_message(message: &GtpuMessage<'_>) -> Result<Self, GtpuExtensionChainError> {
+        Self::from_raw(
+            message.header.next_ext_type,
+            Bytes::copy_from_slice(message.raw_extension_headers),
+        )
+    }
+
+    /// Build a summary from a decoded owned GTP-U message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GtpuExtensionChainError`] when the decoded raw extension bytes
+    /// are malformed or inconsistent.
+    pub fn from_owned_message(message: &OwnedGtpuMessage) -> Result<Self, GtpuExtensionChainError> {
+        Self::from_raw(
+            message.header.next_ext_type,
+            message.raw_extension_headers.clone(),
+        )
+    }
+
+    /// Build a raw extension chain containing one PDU Session Container.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GtpuExtensionChainError`] if the typed extension cannot be
+    /// encoded into GTP-U extension-header length fields.
+    pub fn from_pdu_session_container(
+        container: PduSessionContainer,
+    ) -> Result<Self, GtpuExtensionChainError> {
+        let content = container.encode();
+        let raw_headers = encode_extension_header(content.as_slice(), 0).map(Bytes::from)?;
+        let chain = Self::from_raw(Some(GTPU_EXT_PDU_SESSION_CONTAINER), raw_headers)?;
+        if chain.pdu_session_container == Some(container) {
+            Ok(chain)
+        } else {
+            Err(GtpuExtensionChainError::BuiltChainInvalid)
+        }
+    }
+
+    /// Re-parse and compare this summary with its raw extension bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GtpuExtensionChainError`] when the raw bytes no longer match
+    /// this summary.
+    pub fn validate_consistency(&self) -> Result<(), GtpuExtensionChainError> {
+        let observed = Self::from_raw(self.first_extension_type, self.raw_headers.clone())?;
+        if &observed == self {
+            Ok(())
+        } else {
+            Err(GtpuExtensionChainError::BuiltChainInvalid)
+        }
+    }
+}
+
+fn summarize_extension_chain(
+    first_extension_type: Option<u8>,
+    raw_headers: Bytes,
+) -> Result<GtpuExtensionChain, GtpuExtensionChainError> {
+    if raw_headers.is_empty() {
+        if first_extension_type.is_some() {
+            return Err(GtpuExtensionChainError::FirstExtensionTypeWithoutHeaders);
+        }
+        return Ok(GtpuExtensionChain::none());
+    }
+
+    let first = first_extension_type.ok_or(GtpuExtensionChainError::MissingFirstExtensionType)?;
+    if first == 0 {
+        return Err(GtpuExtensionChainError::MissingFirstExtensionType);
+    }
+
+    let mut next_ext_type = first;
+    let mut offset = 0usize;
+    let mut header_count = 0usize;
+    let mut pdu_session_container = None;
+    while next_ext_type != 0 {
+        if offset >= raw_headers.len() {
+            return Err(malformed(GtpuExtensionChainMalformedReason::Truncated));
+        }
+        let ext_len_units = usize::from(raw_headers[offset]);
+        if ext_len_units == 0 {
+            return Err(malformed(
+                GtpuExtensionChainMalformedReason::LengthUnitsZero,
+            ));
+        }
+        let ext_len_bytes = ext_len_units
+            .checked_mul(4)
+            .ok_or_else(|| malformed(GtpuExtensionChainMalformedReason::LengthOverflow))?;
+        let end = offset
+            .checked_add(ext_len_bytes)
+            .ok_or_else(|| malformed(GtpuExtensionChainMalformedReason::LengthOverflow))?;
+        if end > raw_headers.len() {
+            return Err(malformed(GtpuExtensionChainMalformedReason::Truncated));
+        }
+
+        let content = &raw_headers[offset + 1..end - 1];
+        let extension = GtpuExtensionHeader {
+            ext_type: next_ext_type,
+            content,
+            next_ext_type: raw_headers[end - 1],
+        };
+        header_count = header_count.saturating_add(1);
+        if extension.ext_type == GTPU_EXT_PDU_SESSION_CONTAINER {
+            if pdu_session_container.is_some() {
+                return Err(GtpuExtensionChainError::DuplicatePduSessionContainer);
+            }
+            let container = PduSessionContainer::decode(&extension)
+                .map_err(|_| malformed(GtpuExtensionChainMalformedReason::Truncated))?;
+            pdu_session_container = Some(container);
+        }
+
+        offset = end;
+        next_ext_type = extension.next_ext_type;
+    }
+
+    if offset != raw_headers.len() {
+        return Err(malformed(GtpuExtensionChainMalformedReason::TrailingBytes));
+    }
+
+    Ok(GtpuExtensionChain {
+        first_extension_type,
+        raw_headers,
+        header_count,
+        pdu_session_container,
+    })
+}
+
+fn malformed(reason: GtpuExtensionChainMalformedReason) -> GtpuExtensionChainError {
+    GtpuExtensionChainError::MalformedRawChain { reason }
+}
+
+fn encode_extension_header(
+    content: &[u8],
+    next_ext_type: u8,
+) -> Result<Vec<u8>, GtpuExtensionChainError> {
+    let len = content
+        .len()
+        .checked_add(2)
+        .ok_or(GtpuExtensionChainError::ExtensionLengthOverflow)?;
+    if len % 4 != 0 {
+        return Err(GtpuExtensionChainError::ExtensionLengthOverflow);
+    }
+    let units = len / 4;
+    let units_u8 =
+        u8::try_from(units).map_err(|_| GtpuExtensionChainError::ExtensionLengthOverflow)?;
+    if units_u8 == 0 {
+        return Err(GtpuExtensionChainError::ExtensionLengthOverflow);
+    }
+
+    let mut raw = Vec::with_capacity(len);
+    raw.push(units_u8);
+    raw.extend_from_slice(content);
+    raw.push(next_ext_type);
+    Ok(raw)
 }
 
 impl<'a> BorrowDecode<'a> for GtpuMessage<'a> {

@@ -1,5 +1,8 @@
 use bytes::{Bytes, BytesMut};
-use opc_proto_gtpu::{GtpuHeader, GtpuMessage, OwnedGtpuMessage, PduSessionContainer};
+use opc_proto_gtpu::{
+    GtpuExtensionChain, GtpuExtensionChainError, GtpuExtensionChainMalformedReason, GtpuHeader,
+    GtpuMessage, OwnedGtpuMessage, PduSessionContainer, GTPU_EXT_PDU_SESSION_CONTAINER,
+};
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, Encode, EncodeContext, OwnedDecode,
     ValidationLevel,
@@ -122,6 +125,127 @@ fn test_pdu_session_container_with_ppi() {
     // Roundtrip encode
     let encoded = psc.encode();
     assert_eq!(encoded, ext_content);
+}
+
+#[test]
+fn extension_chain_summary_decodes_pdu_session_container_and_redacts_raw_debug() {
+    let raw_headers = Bytes::from_static(&[0x01, 0x00, 0x09, 0x00]);
+
+    let chain = match GtpuExtensionChain::from_raw(
+        Some(GTPU_EXT_PDU_SESSION_CONTAINER),
+        raw_headers.clone(),
+    ) {
+        Ok(value) => value,
+        Err(error) => panic!("extension chain summary failed: {error:?}"),
+    };
+
+    assert_eq!(
+        chain.first_extension_type,
+        Some(GTPU_EXT_PDU_SESSION_CONTAINER)
+    );
+    assert_eq!(chain.raw_headers, raw_headers);
+    assert_eq!(chain.header_count, 1);
+    assert_eq!(
+        chain.pdu_session_container,
+        Some(PduSessionContainer {
+            pdu_type: 0,
+            qfi: 9,
+            ppi: None,
+            rqi: false,
+        })
+    );
+    assert!(chain.has_headers());
+    assert!(chain.validate_consistency().is_ok());
+
+    let debug = format!("{chain:?}");
+    assert!(debug.contains("raw_headers_len"));
+    assert!(!debug.contains("09, 00"));
+}
+
+#[test]
+fn extension_chain_builder_emits_raw_headers_and_first_type() {
+    let container = PduSessionContainer {
+        pdu_type: 0,
+        qfi: 12,
+        ppi: Some(5),
+        rqi: true,
+    };
+
+    let chain = match GtpuExtensionChain::from_pdu_session_container(container.clone()) {
+        Ok(value) => value,
+        Err(error) => panic!("extension chain build failed: {error:?}"),
+    };
+
+    assert_eq!(
+        chain.first_extension_type,
+        Some(GTPU_EXT_PDU_SESSION_CONTAINER)
+    );
+    assert_eq!(chain.header_count, 1);
+    assert_eq!(chain.pdu_session_container, Some(container));
+    assert_eq!(chain.raw_headers.as_ref()[0], 2);
+    assert_eq!(chain.raw_headers.as_ref()[chain.raw_headers.len() - 1], 0);
+
+    let reparsed =
+        match GtpuExtensionChain::from_raw(chain.first_extension_type, chain.raw_headers.clone()) {
+            Ok(value) => value,
+            Err(error) => panic!("built extension chain did not reparse: {error:?}"),
+        };
+    assert_eq!(reparsed, chain);
+}
+
+#[test]
+fn extension_chain_rejects_missing_inconsistent_duplicate_and_trailing_headers() {
+    let missing = match GtpuExtensionChain::from_raw(None, Bytes::from_static(&[0x01, 0, 9, 0])) {
+        Ok(value) => panic!("missing first extension type unexpectedly parsed: {value:?}"),
+        Err(error) => error,
+    };
+    assert_eq!(missing, GtpuExtensionChainError::MissingFirstExtensionType);
+    assert_eq!(missing.as_str(), "gtpu_extension_chain_missing_first_type");
+
+    let inconsistent =
+        match GtpuExtensionChain::from_raw(Some(GTPU_EXT_PDU_SESSION_CONTAINER), Bytes::new()) {
+            Ok(value) => panic!("first type without headers unexpectedly parsed: {value:?}"),
+            Err(error) => error,
+        };
+    assert_eq!(
+        inconsistent,
+        GtpuExtensionChainError::FirstExtensionTypeWithoutHeaders
+    );
+
+    let duplicate_raw = Bytes::from_static(&[
+        0x01,
+        0x00,
+        0x09,
+        GTPU_EXT_PDU_SESSION_CONTAINER,
+        0x01,
+        0x00,
+        0x0a,
+        0x00,
+    ]);
+    let duplicate =
+        match GtpuExtensionChain::from_raw(Some(GTPU_EXT_PDU_SESSION_CONTAINER), duplicate_raw) {
+            Ok(value) => panic!("duplicate PDU Session Container unexpectedly parsed: {value:?}"),
+            Err(error) => error,
+        };
+    assert_eq!(
+        duplicate,
+        GtpuExtensionChainError::DuplicatePduSessionContainer
+    );
+
+    let trailing = match GtpuExtensionChain::from_raw(
+        Some(GTPU_EXT_PDU_SESSION_CONTAINER),
+        Bytes::from_static(&[0x01, 0x00, 0x09, 0x00, 0xff]),
+    ) {
+        Ok(value) => panic!("trailing extension bytes unexpectedly parsed: {value:?}"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        trailing,
+        GtpuExtensionChainError::MalformedRawChain {
+            reason: GtpuExtensionChainMalformedReason::TrailingBytes,
+        }
+    );
+    assert_eq!(trailing.as_str(), "gtpu_extension_chain_malformed_raw");
 }
 
 #[test]
