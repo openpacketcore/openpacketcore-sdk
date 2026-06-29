@@ -1,19 +1,96 @@
 mod testbed_common;
+use opc_proto_gtpu::GtpuMessage;
 use opc_proto_gtpv2c::{
     MessageDirection as Gtpv2cDirection, MessageType as Gtpv2cMessageType,
     Procedure as Gtpv2cProcedure, S2bMessage,
 };
+use opc_protocol::{BorrowDecode, DecodeContext};
 use opc_testbed::simulators::amf::{AmfSimulator, AmfState};
 use opc_testbed::simulators::epc::{
     DiameterApplication, DiameterMessageView, DiameterPeerSimulator, DiameterPeerState,
     PeerMessageDirection, PgwS2bSimulator, PgwS2bState, S2bMessageView, S2bProcedure,
 };
 use opc_testbed::simulators::smf::{SmfSimulator, SmfState};
-use opc_testbed::simulators::upf::{UpfSimulator, UpfState};
+use opc_testbed::simulators::upf::{
+    UpfSimulator, UpfState, UserPlaneContinuityState, UserPlaneMessageKind, UserPlaneMessageView,
+};
 use opc_testbed::simulators::Simulator;
 use testbed_common::*;
 
 struct Gtpv2cS2bView<'a>(S2bMessage<'a>);
+
+struct GtpuUserPlaneView<'a> {
+    message: GtpuMessage<'a>,
+    session: &'a str,
+}
+
+impl UserPlaneMessageView for GtpuUserPlaneView<'_> {
+    fn kind(&self) -> UserPlaneMessageKind {
+        UserPlaneMessageKind::GtpuGpdu
+    }
+
+    fn session_identity(&self) -> Option<&str> {
+        Some(self.session)
+    }
+
+    fn teid(&self) -> Option<u32> {
+        Some(self.message.header.teid)
+    }
+
+    fn spi(&self) -> Option<u32> {
+        None
+    }
+
+    fn has_extension_headers(&self) -> bool {
+        self.message.header.next_ext_type.is_some()
+            || !self.message.raw_extension_headers.is_empty()
+    }
+
+    fn continuity_state(&self) -> UserPlaneContinuityState {
+        UserPlaneContinuityState::Established
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UserPlaneEvidenceView<'a> {
+    kind: UserPlaneMessageKind,
+    session: Option<&'a str>,
+    teid: Option<u32>,
+    spi: Option<u32>,
+    extension_headers: bool,
+    continuity: UserPlaneContinuityState,
+    malformed: Option<&'static str>,
+}
+
+impl UserPlaneMessageView for UserPlaneEvidenceView<'_> {
+    fn kind(&self) -> UserPlaneMessageKind {
+        self.kind
+    }
+
+    fn session_identity(&self) -> Option<&str> {
+        self.session
+    }
+
+    fn teid(&self) -> Option<u32> {
+        self.teid
+    }
+
+    fn spi(&self) -> Option<u32> {
+        self.spi
+    }
+
+    fn has_extension_headers(&self) -> bool {
+        self.extension_headers
+    }
+
+    fn continuity_state(&self) -> UserPlaneContinuityState {
+        self.continuity
+    }
+
+    fn malformed_reason(&self) -> Option<&'static str> {
+        self.malformed
+    }
+}
 
 impl S2bMessageView for Gtpv2cS2bView<'_> {
     fn procedure(&self) -> S2bProcedure {
@@ -333,6 +410,113 @@ fn upf_simulator_dataplane_preflight_failure() {
 }
 
 #[test]
+fn upf_simulator_records_sdk_decoded_gtpu_gpdu() {
+    let raw = vec![
+        0x36, // Version=1, PT=1, E=1, S=1, PN=0
+        0xff, // G-PDU
+        0x00, 0x08, // Length = 8 (4 optional fields + 4 extension header bytes)
+        0x11, 0x22, 0x33, 0x44, // TEID
+        0x00, 0x05, // Sequence number
+        0x00, // N-PDU number
+        0x85, // PDU Session Container
+        0x01, // Extension length units
+        0x00, 0x09, // PDU Session Container content
+        0x00, // No next extension
+    ];
+    let (tail, message) =
+        GtpuMessage::decode(&raw, DecodeContext::default()).expect("GTP-U decodes");
+    assert!(tail.is_empty());
+    let view = GtpuUserPlaneView {
+        message,
+        session: "imsi-001010000000001",
+    };
+
+    let mut sim = UpfSimulator::new("upf-test");
+    let event = sim
+        .handle_sdk_message(&view)
+        .expect("UPF accepts SDK-decoded GTP-U metadata");
+
+    assert_eq!(event.kind, UserPlaneMessageKind::GtpuGpdu);
+    assert_eq!(event.teid, Some(0x1122_3344));
+    assert!(event.extension_headers_present);
+    assert_eq!(
+        event.continuity_state,
+        UserPlaneContinuityState::Established
+    );
+    assert_eq!(sim.state, UpfState::Associated);
+    assert_eq!(sim.accepted_packets, 1);
+    assert_eq!(sim.extension_header_packets, 1);
+    assert_eq!(sim.flow_counter, 1);
+    assert_eq!(
+        sim.get_state("last_message_kind").as_deref(),
+        Some("GTPU_GPDU")
+    );
+    assert_eq!(sim.get_state("last_teid").as_deref(), Some("287454020"));
+    assert_eq!(
+        sim.get_state("sdk_protocol_profile").as_deref(),
+        Some("opc-protocol+gtpu-esp-user-plane-decoded")
+    );
+    let state_key = sim
+        .get_state("last_session_key")
+        .expect("session evidence key");
+    assert!(state_key.starts_with("session:"));
+    assert!(!state_key.contains("imsi"));
+    assert_eq!(Some(state_key), event.session_key);
+}
+
+#[test]
+fn upf_simulator_records_esp_continuity_and_malformed_counts() {
+    let mut sim = UpfSimulator::new("upf-test");
+    let restored = UserPlaneEvidenceView {
+        kind: UserPlaneMessageKind::EspContinuity,
+        session: Some("ue-session-42"),
+        teid: None,
+        spi: Some(0x0102_0304),
+        extension_headers: false,
+        continuity: UserPlaneContinuityState::Restored,
+        malformed: None,
+    };
+
+    let event = sim
+        .handle_sdk_message(&restored)
+        .expect("UPF accepts ESP continuity evidence");
+    assert_eq!(event.spi, Some(0x0102_0304));
+    assert_eq!(event.continuity_state, UserPlaneContinuityState::Restored);
+    assert_eq!(sim.get_state("last_spi").as_deref(), Some("16909060"));
+    assert_eq!(
+        sim.get_state("continuity_state").as_deref(),
+        Some("RESTORED")
+    );
+    assert_eq!(sim.accepted_packets, 1);
+
+    let malformed = UserPlaneEvidenceView {
+        malformed: Some("esp-authentication-failed"),
+        continuity: UserPlaneContinuityState::Interrupted,
+        ..restored
+    };
+    let err = sim
+        .handle_sdk_message(&malformed)
+        .expect_err("malformed ESP evidence is rejected");
+    assert!(err.to_string().contains("esp-authentication-failed"));
+    assert_eq!(sim.state, UpfState::MalformedRejected);
+    assert_eq!(sim.malformed_packets, 1);
+    assert!(!sim.dataplane_ready);
+
+    sim.record_decode_failure("gtpu-truncated")
+        .expect_err("explicit decode failure records malformed packet");
+    assert_eq!(sim.malformed_packets, 2);
+
+    sim.handle_step(&Step::ProcessRestart {
+        target: "upf-test".to_string(),
+    })
+    .expect("restart");
+    assert_eq!(sim.state, UpfState::Idle);
+    assert_eq!(sim.accepted_packets, 0);
+    assert_eq!(sim.malformed_packets, 0);
+    assert_eq!(sim.continuity_state, UserPlaneContinuityState::Unknown);
+}
+
+#[test]
 fn pgw_s2b_simulator_accepts_sdk_gtpv2c_decoded_messages() {
     let mut sim = PgwS2bSimulator::new("pgw-s2b");
     let echo = decode_s2b_fixture(
@@ -645,6 +829,11 @@ fn epc_epdg_simulator_fixture_manifest_records_protocol_provenance() {
     assert!(interfaces.iter().any(
         |interface| interface["id"] == "diameter-peer-decoded-message"
             && interface["sdk_protocol_crate"] == "opc-proto-diameter"
+            && interface["parser_policy"] == "sdk-protocol-crate-only"
+    ));
+    assert!(interfaces.iter().any(
+        |interface| interface["id"] == "upf-user-plane-decoded-message"
+            && interface["sdk_protocol_crate"] == "opc-proto-gtpu/opc-ipsec-xfrm"
             && interface["parser_policy"] == "sdk-protocol-crate-only"
     ));
 }
