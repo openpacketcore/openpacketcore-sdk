@@ -26,4 +26,8 @@ The `config_apply` helper module provides a generic projection DTO for accepted
 and rejected config apply plans. Products supply their own YANG placement, then
 use `ConfigApplyPlanState` to emit validated RFC 7951 JSON with the last
 accepted plan, last rejected plan, known active version/transaction id, and any
-active traffic block reason derived from an admitted drain/restart plan.
+active traffic block reason derived from an admitted drain/restart plan. When an
+external drain/restart workflow completes, `ConfigWorkflowCompletion` records a
+matching config version, transaction id, or product revision label so clients can
+distinguish an apply plan that never required workflow from one whose required
+workflow has completed.
