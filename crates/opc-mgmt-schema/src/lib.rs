@@ -41,6 +41,11 @@ pub enum LeafType {
     Boolean,
     /// `string` (and the textual fallback for enumerations/identityref bases)
     String,
+    /// YANG `enumeration`, stored as its wire string value.
+    Enumeration {
+        /// Allowed enumeration values.
+        values: &'static [EnumValueMeta],
+    },
     /// `uint16`
     Uint16,
     /// `uint32`
@@ -66,6 +71,15 @@ pub enum LeafType {
         /// The YANG typedef name.
         name: &'static str,
     },
+}
+
+/// Metadata for one allowed YANG enumeration value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnumValueMeta {
+    /// Wire value.
+    pub name: &'static str,
+    /// Optional YANG description text.
+    pub description: Option<&'static str>,
 }
 
 /// The five datastore NACM actions (RFC 8341), mirroring the same-named variants

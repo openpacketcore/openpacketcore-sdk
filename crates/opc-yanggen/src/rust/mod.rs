@@ -217,6 +217,7 @@ fn validate_supported_node(
             Some(
                 TypeRef::Boolean
                 | TypeRef::String
+                | TypeRef::Enumeration { .. }
                 | TypeRef::Uint16
                 | TypeRef::Uint32
                 | TypeRef::Int64

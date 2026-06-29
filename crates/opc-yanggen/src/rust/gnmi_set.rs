@@ -30,7 +30,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         use opc_gnmi_server::{
             GnmiError, GnmiPatchApplicator, NormalizedSet, NormalizedValue,
         };
-        use opc_mgmt_schema::{LeafType, NodeKind, NodeMeta};
+        use opc_mgmt_schema::{EnumValueMeta, LeafType, NodeKind, NodeMeta};
         use serde_json::{Number, Value};
 
         /// Generated gNMI Set applicator for this schema.
@@ -147,6 +147,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 LeafType::String | LeafType::IdentityRef { .. } | LeafType::LeafRef { .. } => {
                     Ok(Value::String(string_value(value)?.to_string()))
                 }
+                LeafType::Enumeration { values } => {
+                    Ok(Value::String(enum_string_value(values, value)?.to_string()))
+                }
                 LeafType::Uint16 => Ok(Value::Number(Number::from(uint16_value(value)?))),
                 LeafType::Uint32 => Ok(Value::Number(Number::from(uint32_value(value)?))),
                 LeafType::Int64 => Ok(Value::String(int64_value(value)?.to_string())),
@@ -166,6 +169,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                 LeafType::Boolean => Ok(bool_value(value)?.to_string()),
                 LeafType::String | LeafType::IdentityRef { .. } | LeafType::LeafRef { .. } => {
                     Ok(string_value(value)?.to_string())
+                }
+                LeafType::Enumeration { values } => {
+                    Ok(enum_string_value(values, value)?.to_string())
                 }
                 LeafType::Uint16 => Ok(uint16_value(value)?.to_string()),
                 LeafType::Uint32 => Ok(uint32_value(value)?.to_string()),
@@ -199,6 +205,18 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             value
                 .as_str()
                 .ok_or_else(|| GnmiError::invalid("gNMI string leaf value must be a JSON string"))
+        }
+
+        fn enum_string_value<'a>(
+            values: &[EnumValueMeta],
+            value: &'a Value,
+        ) -> Result<&'a str, GnmiError> {
+            let raw = string_value(value)?;
+            if values.iter().any(|allowed| allowed.name == raw) {
+                Ok(raw)
+            } else {
+                Err(GnmiError::invalid("gNMI enumeration leaf value is not allowed"))
+            }
         }
 
         fn uint16_value(value: &Value) -> Result<u16, GnmiError> {

@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::diagnostic::{Diagnostic, DiagnosticCode, YangSourceLocation};
 use crate::emit::{fnv1a64, schema_digest, GenerationInput};
 use crate::ir::{
-    LockedModule, ModuleConformance, ModuleImport, ModuleLockfile, SchemaModule, SchemaNode,
-    SchemaNodeKind, StackBudget, TypeRef,
+    EnumValue, LockedModule, ModuleConformance, ModuleImport, ModuleLockfile, SchemaModule,
+    SchemaNode, SchemaNodeKind, StackBudget, TypeRef,
 };
 
 /// In-memory YANG source module used by ingestion and consistency validation.
@@ -702,6 +702,7 @@ fn parse_type_ref(statement: &Statement) -> Result<TypeRef, Diagnostic> {
     match type_name {
         "boolean" => ensure_type_children_supported(statement, &[]).map(|()| TypeRef::Boolean),
         "string" => ensure_type_children_supported(statement, &[]).map(|()| TypeRef::String),
+        "enumeration" => parse_enumeration_type(statement),
         "uint16" => ensure_type_children_supported(statement, &[]).map(|()| TypeRef::Uint16),
         "uint32" => ensure_type_children_supported(statement, &[]).map(|()| TypeRef::Uint32),
         "int64" => ensure_type_children_supported(statement, &[]).map(|()| TypeRef::Int64),
@@ -723,6 +724,40 @@ fn parse_type_ref(statement: &Statement) -> Result<TypeRef, Diagnostic> {
         other => ensure_type_children_supported(statement, &[])
             .map(|()| TypeRef::Custom { name: other.into() }),
     }
+}
+
+fn parse_enumeration_type(statement: &Statement) -> Result<TypeRef, Diagnostic> {
+    let mut values = Vec::new();
+    for child in &statement.children {
+        match child.keyword.as_str() {
+            "enum" => {
+                let name = required_argument(child, "enum")?.to_string();
+                let mut description = None;
+                for enum_child in &child.children {
+                    match enum_child.keyword.as_str() {
+                        "description" => {
+                            description =
+                                Some(required_argument(enum_child, "description")?.to_string());
+                        }
+                        "reference" | "status" => {}
+                        other => return Err(unsupported(enum_child, other)),
+                    }
+                }
+                values.push(EnumValue { name, description });
+            }
+            "description" | "reference" | "status" | "units" => {}
+            other => return Err(unsupported(child, other)),
+        }
+    }
+    if values.is_empty() {
+        return Err(Diagnostic::new(
+            DiagnosticCode::YangSourceSyntaxError,
+            "enumeration type requires at least one enum value",
+            Some(statement.source.clone()),
+            Some("add one or more enum statements"),
+        ));
+    }
+    Ok(TypeRef::Enumeration { values })
 }
 
 fn ensure_type_children_supported(

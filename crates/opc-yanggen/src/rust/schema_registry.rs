@@ -301,6 +301,29 @@ fn leaf_type_tokens(t: &TypeRef) -> TokenStream {
     match t {
         TypeRef::Boolean => quote! { opc_mgmt_schema::LeafType::Boolean },
         TypeRef::String => quote! { opc_mgmt_schema::LeafType::String },
+        TypeRef::Enumeration { values } => {
+            let value_tokens: Vec<TokenStream> = values
+                .iter()
+                .map(|value| {
+                    let name = &value.name;
+                    let description = match &value.description {
+                        Some(description) => quote! { Some(#description) },
+                        None => quote! { None },
+                    };
+                    quote! {
+                        opc_mgmt_schema::EnumValueMeta {
+                            name: #name,
+                            description: #description,
+                        }
+                    }
+                })
+                .collect();
+            quote! {
+                opc_mgmt_schema::LeafType::Enumeration {
+                    values: &[ #(#value_tokens),* ],
+                }
+            }
+        }
         TypeRef::Uint16 => quote! { opc_mgmt_schema::LeafType::Uint16 },
         TypeRef::Uint32 => quote! { opc_mgmt_schema::LeafType::Uint32 },
         TypeRef::Int64 => quote! { opc_mgmt_schema::LeafType::Int64 },

@@ -586,6 +586,15 @@ fn parse_leaf_value_expr(
         | Some(TypeRef::LeafRef { .. }) => quote! {
             let parsed = _v.to_string();
         },
+        Some(TypeRef::Enumeration { values }) => {
+            let allowed: Vec<&String> = values.iter().map(|value| &value.name).collect();
+            quote! {
+                let parsed = _v.to_string();
+                if ![ #(#allowed),* ].contains(&parsed.as_str()) {
+                    return Err(NetconfEditError::InvalidValue { path: #path });
+                }
+            }
+        }
         Some(TypeRef::Custom { .. }) | None => {
             return Err(RustGenerationError::new(format!(
                 "netconf_xml_edit: unsupported leaf type at {}",
@@ -663,7 +672,7 @@ fn raw_type_internal(
     visited.insert(node.path.clone());
     match resolved_type(node, nodes_by_path) {
         Some(TypeRef::Boolean) => quote! { bool },
-        Some(TypeRef::String) => quote! { String },
+        Some(TypeRef::String) | Some(TypeRef::Enumeration { .. }) => quote! { String },
         Some(TypeRef::Uint16) => quote! { u16 },
         Some(TypeRef::Uint32) => quote! { u32 },
         Some(TypeRef::Int64) => quote! { YangInt64 },

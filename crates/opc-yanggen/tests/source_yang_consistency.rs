@@ -3,7 +3,7 @@ use std::process::Command;
 
 use opc_yanggen::{
     generation_input_from_yang_sources, schema_digest, validate_generation_input_yang_sources,
-    DiagnosticCode, GenerationInput, SchemaNodeKind, YangSource,
+    DiagnosticCode, GenerationInput, SchemaNodeKind, TypeRef, YangSource,
 };
 use tempfile::tempdir;
 
@@ -112,6 +112,29 @@ module opc-test {
 }
 "#;
 
+const ENUM_YANG: &str = r#"
+module opc-test {
+  yang-version 1.1;
+  namespace "urn:opc:test";
+  prefix test;
+
+  revision 2026-06-28 {
+    description "Initial test model.";
+  }
+
+  container system {
+    leaf mode {
+      type enumeration {
+        enum standalone {
+          description "Single-node mode.";
+        }
+        enum active-standby;
+      }
+    }
+  }
+}
+"#;
+
 fn source(text: &str) -> YangSource {
     YangSource::new("opc-test.yang", text)
 }
@@ -165,6 +188,28 @@ fn source_yang_ingests_and_validates_successfully() {
         .find(|node| node.path == "/test:system/secret")
         .expect("secret leaf should be present");
     assert_eq!(secret.data_class.as_deref(), Some("security-secret"));
+}
+
+#[test]
+fn source_yang_ingests_enumeration_type_metadata() {
+    let input = generation_input_from_yang_sources("test-profile", &[source(ENUM_YANG)])
+        .expect("enum YANG should ingest");
+
+    let mode = input
+        .nodes
+        .iter()
+        .find(|node| node.path == "/test:system/mode")
+        .expect("mode leaf should be present");
+
+    match &mode.type_ref {
+        Some(TypeRef::Enumeration { values }) => {
+            assert_eq!(values.len(), 2);
+            assert_eq!(values[0].name, "standalone");
+            assert_eq!(values[0].description.as_deref(), Some("Single-node mode."));
+            assert_eq!(values[1].name, "active-standby");
+        }
+        other => panic!("unexpected mode type: {other:?}"),
+    }
 }
 
 #[test]

@@ -75,6 +75,16 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         Some(TypeRef::Empty) => quote! {
                             let parsed = YangEmpty;
                         },
+                        Some(TypeRef::Enumeration { values }) => {
+                            let allowed: Vec<&String> =
+                                values.iter().map(|value| &value.name).collect();
+                            quote! {
+                                let parsed = _v.to_string();
+                                if ![ #(#allowed),* ].contains(&parsed.as_str()) {
+                                    return Err(config_error("invalid-value", "unsupported enumeration value"));
+                                }
+                            }
+                        }
                         _ => quote! {
                             let parsed = _v.to_string();
                         },
@@ -369,6 +379,16 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 Some(TypeRef::Empty) => quote! {
                                     let parsed_elem = YangEmpty;
                                 },
+                                Some(TypeRef::Enumeration { values }) => {
+                                    let allowed: Vec<&String> =
+                                        values.iter().map(|value| &value.name).collect();
+                                    quote! {
+                                        let parsed_elem = v.to_string();
+                                        if ![ #(#allowed),* ].contains(&parsed_elem.as_str()) {
+                                            return Err(config_error("invalid-value", "unsupported enumeration value"));
+                                        }
+                                    }
+                                }
                                 _ => quote! {
                                     let parsed_elem = v.to_string();
                                 },

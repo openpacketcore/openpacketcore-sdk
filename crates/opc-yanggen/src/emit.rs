@@ -624,6 +624,14 @@ pub fn emit_fixture_from_canonical(canonical: &CanonicalInput) -> String {
             None => "none".to_string(),
             Some(TypeRef::Boolean) => "boolean".to_string(),
             Some(TypeRef::String) => "string".to_string(),
+            Some(TypeRef::Enumeration { values }) => {
+                let names = values
+                    .iter()
+                    .map(|value| value.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("enumeration(values={names})")
+            }
             Some(TypeRef::Uint16) => "uint16".to_string(),
             Some(TypeRef::Uint32) => "uint32".to_string(),
             Some(TypeRef::Int64) => "int64".to_string(),

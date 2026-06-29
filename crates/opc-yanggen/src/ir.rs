@@ -87,6 +87,7 @@ pub enum SchemaNodeKind {
 pub enum TypeRef {
     Boolean,
     String,
+    Enumeration { values: Vec<EnumValue> },
     Uint16,
     Uint32,
     Int64,
@@ -95,6 +96,13 @@ pub enum TypeRef {
     IdentityRef { base: String },
     LeafRef { target_path: String },
     Custom { name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct EnumValue {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
