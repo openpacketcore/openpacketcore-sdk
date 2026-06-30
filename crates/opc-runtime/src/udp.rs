@@ -248,7 +248,7 @@ fn is_concrete_ip(ip: IpAddr) -> bool {
 mod platform {
     use std::{
         io,
-        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+        net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
         os::fd::AsRawFd,
     };
 
