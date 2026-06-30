@@ -6,6 +6,9 @@ Kubernetes production-readiness lifecycle foundation, config-apply, admission, a
 
 **Production-ready**
 
+Lifecycle conditions serialize as Kubernetes-style JSON: condition field names
+are camelCase, and `lastTransitionTime` is an RFC3339 string.
+
 ## Reference
 
 [RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/009-operator-lifecycle-upgrade.md)

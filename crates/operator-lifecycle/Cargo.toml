@@ -17,7 +17,7 @@ categories = ["network-programming"]
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-time = { workspace = true, features = ["serde"] }
+time = { workspace = true, features = ["serde", "serde-well-known"] }
 uuid = { workspace = true }
 semver = "1.0"
 opc-types = { path = "../opc-types", version = "0.2.0" }

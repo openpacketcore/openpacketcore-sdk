@@ -1,13 +1,20 @@
 use operator_lifecycle::{
     lifecycle_condition_intent, reject_app_config_fields, BootstrapRef, BootstrapRefKind,
-    CnfImageIntent, CnfWorkloadIntent, ConditionSeverity, ConditionStatus,
+    CnfImageIntent, CnfWorkloadIntent, ConditionSeverity, ConditionStatus, LifecycleCondition,
     ManagementExposureIntent, ManagementIdentityIntent, ManagementMaterialRef,
     ManagementMtlsIdentityIntent, ManagementNorthboundIntent, ManagementPortIntent,
     NetconfSshIdentityIntent, NetworkAttachmentIntent, NetworkAttachmentKind, PlacementIntent,
     ReconcileIntentError, ReplicaIntent, SessionStoreRef, StatusPatchIntent, TrafficStatusIntent,
     UpgradeDrainPolicy,
 };
-use time::OffsetDateTime;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+fn fixed_transition_time() -> OffsetDateTime {
+    match OffsetDateTime::parse("2026-06-30T12:34:56Z", &Rfc3339) {
+        Ok(value) => value,
+        Err(error) => panic!("fixed timestamp should parse: {error}"),
+    }
+}
 
 fn valid_workload_intent() -> CnfWorkloadIntent {
     CnfWorkloadIntent {
@@ -169,6 +176,101 @@ fn status_patch_intent_keeps_lifecycle_and_traffic_text_safe() {
     .with_lifecycle_condition(condition);
     assert!(patch.validate().is_ok());
     assert!(!patch.traffic.traffic_ready);
+}
+
+#[test]
+fn lifecycle_condition_json_uses_kubernetes_rfc3339_shape() {
+    let condition = lifecycle_condition_intent(
+        "Ready",
+        ConditionStatus::False,
+        "RestoreBlocked",
+        "blocked by peer 192.0.2.10 and path /var/lib/opc/session.db",
+        7,
+        ConditionSeverity::Warning,
+        fixed_transition_time(),
+    );
+
+    let value = match serde_json::to_value(&condition) {
+        Ok(value) => value,
+        Err(error) => panic!("condition should serialize: {error}"),
+    };
+
+    assert_eq!(value["type"], "Ready");
+    assert_eq!(value["status"], "False");
+    assert_eq!(value["observedGeneration"], 7);
+    assert_eq!(value["lastTransitionTime"], "2026-06-30T12:34:56Z");
+    assert_eq!(value["redactionSafeText"], true);
+    assert!(value["lastTransitionTime"].is_string());
+    assert!(!value["lastTransitionTime"].is_array());
+    assert!(value.get("observed_generation").is_none());
+    assert!(value.get("last_transition_time").is_none());
+    assert!(value.get("redaction_safe_text").is_none());
+    assert!(value["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("[REDACTED_IPV4]")));
+    assert!(value["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("[REDACTED_DB_FILE]")));
+}
+
+#[test]
+fn lifecycle_condition_deserializes_legacy_timestamp_shape() {
+    let condition: LifecycleCondition = match serde_json::from_value(serde_json::json!({
+        "type": "Ready",
+        "status": "True",
+        "reason": "Running",
+        "message": "workload is running",
+        "observed_generation": 7,
+        "last_transition_time": [2026, 181, 12, 34, 56, 0, 0, 0, 0],
+        "severity": "info",
+        "redaction_safe_text": true
+    })) {
+        Ok(value) => value,
+        Err(error) => panic!("legacy condition should deserialize: {error}"),
+    };
+
+    assert_eq!(condition.observed_generation, 7);
+    assert_eq!(condition.last_transition_time, fixed_transition_time());
+
+    let value = match serde_json::to_value(&condition) {
+        Ok(value) => value,
+        Err(error) => panic!("condition should reserialize: {error}"),
+    };
+    assert_eq!(value["lastTransitionTime"], "2026-06-30T12:34:56Z");
+    assert!(!value["lastTransitionTime"].is_array());
+}
+
+#[test]
+fn status_patch_intent_condition_json_is_kubernetes_compatible() {
+    let condition = lifecycle_condition_intent(
+        "Ready",
+        ConditionStatus::False,
+        "RestoreBlocked",
+        "blocked by peer 192.0.2.10 and path /var/lib/opc/session.db",
+        7,
+        ConditionSeverity::Warning,
+        fixed_transition_time(),
+    );
+
+    let patch = StatusPatchIntent::new(
+        7,
+        TrafficStatusIntent::blocked("RestoreBlocked", "session restore gate is active"),
+    )
+    .with_lifecycle_condition(condition);
+    let value = match serde_json::to_value(&patch) {
+        Ok(value) => value,
+        Err(error) => panic!("status patch should serialize: {error}"),
+    };
+    let condition = &value["lifecycle_conditions"][0];
+
+    assert_eq!(condition["type"], "Ready");
+    assert_eq!(condition["observedGeneration"], 7);
+    assert_eq!(condition["lastTransitionTime"], "2026-06-30T12:34:56Z");
+    assert_eq!(condition["redactionSafeText"], true);
+    assert!(condition["lastTransitionTime"].is_string());
+    assert!(!condition["lastTransitionTime"].is_array());
+    assert!(condition.get("last_transition_time").is_none());
+    assert!(patch.validate().is_ok());
 }
 
 #[test]

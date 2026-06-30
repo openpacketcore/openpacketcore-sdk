@@ -1,6 +1,53 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+mod k8s_condition_time {
+    use serde::{de, Deserialize, Deserializer, Serializer};
+    use time::{format_description::well_known::Rfc3339, Date, OffsetDateTime, UtcOffset};
+
+    pub fn serialize<S>(value: &OffsetDateTime, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        time::serde::rfc3339::serialize(value, serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<OffsetDateTime, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match OffsetDateTimeWire::deserialize(deserializer)? {
+            OffsetDateTimeWire::Rfc3339(value) => {
+                OffsetDateTime::parse(&value, &Rfc3339).map_err(de::Error::custom)
+            }
+            OffsetDateTimeWire::LegacyTuple((
+                year,
+                ordinal,
+                hour,
+                minute,
+                second,
+                nanosecond,
+                offset_hours,
+                offset_minutes,
+                offset_seconds,
+            )) => Date::from_ordinal_date(year, ordinal)
+                .and_then(|date| date.with_hms_nano(hour, minute, second, nanosecond))
+                .and_then(|datetime| {
+                    UtcOffset::from_hms(offset_hours, offset_minutes, offset_seconds)
+                        .map(|offset| datetime.assume_offset(offset))
+                })
+                .map_err(de::Error::custom),
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OffsetDateTimeWire {
+        Rfc3339(String),
+        LegacyTuple((i32, u16, u8, u8, u8, u32, i8, i8, i8)),
+    }
+}
+
 /// Operator-facing lifecycle phases from GAP-009-002.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -90,7 +137,7 @@ pub struct LifecycleCondition {
     #[serde(alias = "observed_generation")]
     pub observed_generation: i64,
     /// Time when the condition status last transitioned.
-    #[serde(alias = "last_transition_time")]
+    #[serde(alias = "last_transition_time", with = "k8s_condition_time")]
     pub last_transition_time: OffsetDateTime,
     /// Severity level of the condition.
     pub severity: ConditionSeverity,
