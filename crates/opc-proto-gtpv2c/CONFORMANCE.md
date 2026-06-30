@@ -4,13 +4,91 @@
 
 - **Specification family:** 3GPP TS 29.274 (GTPv2-C), Release 18 naming.
 - **Crate status:** experimental S2b-focused typed subset with a raw-preserving
-  message/IE shell.
+  message/IE shell; S2b Production Profile v1 graduation is in progress.
 - **Implemented evidence:** common-header structural parsing, raw TLIV IE
   boundary validation, raw-preserving encode/decode, provenance-labeled fixture
   corpus replay, malformed-input replay, typed S2b IE examples, and typed S2b
   views for Echo plus Create/Modify/Delete/Update Session-oriented procedures.
   The transport-neutral Echo peer helper also tracks Recovery restart counters
   and rejects new Echo exchanges while restart reconciliation is required.
+
+## S2b Production Profile v1 — Target Boundary
+
+S2b Production Profile v1 is the first production-readiness target for
+`opc-proto-gtpv2c`. The profile is a **codec, typed-view, validation, and
+transport-neutral helper profile** for ePDG/PGW S2b integration. It does not
+claim to implement a PGW, ePDG, UDP transport, retransmission loop, bearer
+policy engine, APN/DNN authorization service, charging policy, roaming policy,
+or carrier-accepted control-plane product.
+
+### Profile-owned procedures
+
+The profile owns typed decode, encode, construction, and procedure-aware
+validation for these S2b procedure messages:
+
+| Procedure | Message types | Profile requirement |
+|:---|:---|:---|
+| Echo | Request (1), Response (2) | Recovery IE decode/encode, no-TEID header shape, sequence preservation, restart-counter evidence. |
+| Create Session | Request (32), Response (33) | S2b request/response mandatory IE validation, response Cause classification, Sender F-TEID and bearer-context projection. |
+| Modify Bearer / S2b Modify Session | Request (34), Response (35) | Bearer Context request validation and Cause-bearing response validation. |
+| Delete Session | Request (36), Response (37) | Linked EPS Bearer ID request validation and Cause-bearing response validation. |
+| Update Bearer / S2b Update Session | Request (97), Response (98) | Bearer Context request validation and Cause-bearing response validation. |
+
+### Profile-owned IE families
+
+The profile owns the typed IE families required by the S2b messages above:
+
+- Node and liveness IEs: Recovery.
+- Subscriber/session IEs: IMSI, APN, PDN Type, PAA, Selection Mode, RAT Type,
+  Serving Network, MEI, MSISDN.
+- Tunnel and bearer IEs: Sender F-TEID, Bearer Context, EPS Bearer ID, Bearer
+  QoS, Charging ID, AMBR, APN Restriction.
+- Response and policy containers: Cause, Indication, PCO, APCO.
+- Unknown, private, and unsupported future IEs remain raw-preserved and are not
+  interpreted as product policy.
+
+### Required semantic validation
+
+Profile-v1 validation must separate structural decode failures from S2b profile
+failures and must cover at least these rules:
+
+- Echo messages must be no-TEID messages and must include Recovery.
+- Create Session Request must include IMSI, RAT Type, Serving Network, Sender
+  F-TEID, APN, Selection Mode, PDN Type, PAA, and Bearer Context with nested
+  EBI.
+- Create Session Response must include Cause, Sender F-TEID, and Bearer Context
+  for accepted responses; rejected responses may expose Cause-only summaries.
+- Modify Bearer and Update Bearer requests must include Bearer Context.
+- Delete Session Request must include linked EPS Bearer ID.
+- Procedure responses must include Cause where the profile claims response
+  semantics.
+- F-TEID and PAA typed validation must reject ambiguous malformed address
+  shapes instead of silently canonicalizing them.
+- Duplicate singleton IEs must be rejected according to the selected
+  `DecodeContext::duplicate_ie_policy`.
+
+### Compatibility and API guarantees
+
+- The raw `Message` and `OwnedMessage` layers remain byte-preserving for
+  unknown and vendor-specific IEs.
+- Typed builders added for this profile must not construct messages missing
+  mandatory profile-owned IEs.
+- Procedure-aware validation APIs and stable projection/error codes must remain
+  additive under semver once this profile is marked production-ready.
+- Product code must continue to enforce APN/DNN policy, bearer policy, roaming
+  policy, charging policy, persistence, and transport behavior outside this
+  crate.
+
+### Graduation blockers
+
+The profile must not be marked production-ready until all of the following land:
+
+- Public typed/profile constructors for the profile-owned messages above.
+- Constructor-driven integration fixtures proving typed construction → encode →
+  decode → procedure-aware validation without manual raw byte assembly.
+- Runnable example code for downstream SDK users.
+- Negative fixtures for mandatory-IE and malformed profile-critical IE
+  rejection.
 
 ## Covered in this subset
 
