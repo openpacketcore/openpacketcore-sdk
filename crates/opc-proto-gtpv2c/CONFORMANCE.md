@@ -9,6 +9,8 @@
   boundary validation, raw-preserving encode/decode, provenance-labeled fixture
   corpus replay, malformed-input replay, typed S2b IE examples, and typed S2b
   views for Echo plus Create/Modify/Delete/Update Session-oriented procedures.
+  The transport-neutral Echo peer helper also tracks Recovery restart counters
+  and rejects new Echo exchanges while restart reconciliation is required.
 
 ## Covered in this subset
 
@@ -69,7 +71,19 @@
      Context; Delete request linked EBI; and response Cause IEs.
    - Non-S2b message types fall back to the raw `Message` shell.
 
-5. **OpenPacketCore protocol framework fit**
+5. **Echo peer helper**
+   - `Gtpv2cEchoPeer` tracks Echo request/response liveness, sequence mismatch,
+     missed-response degradation/failure, peer Recovery restart-counter changes,
+     and redaction-safe readiness blockers.
+   - With `Gtpv2cEchoPeerPolicy::require_restart_reconciliation = true`, a
+     changed Recovery restart counter enters `ReconciliationRequired` and
+     `echo_request_sent` returns
+     `Gtpv2cEchoPeerError::RestartReconciliationRequired` until the caller
+     completes product reconciliation via `restart_reconciled()`.
+   - With restart reconciliation disabled, restart-counter changes remain
+     observable but do not fence Echo traffic.
+
+6. **OpenPacketCore protocol framework fit**
    - `Message<'_>` implements `BorrowDecode`, `Encode`, and `ToOwnedPdu`.
    - `OwnedMessage` implements `OwnedDecode` and `Encode`.
    - `MessageType` provides a public typed message-type enum with
@@ -81,7 +95,7 @@
    - `Debug` output for S2b typed message views redacts IMSI/MEI/MSISDN digits
      and summarizes raw IE buffers by length.
 
-6. **Fixture and corpus replay**
+7. **Fixture and corpus replay**
    - `tests/fixtures/spec/` contains the ADR 0015 conformance fixtures for the
      S2b subset. The accompanying `tests/fixtures/README.md` records
      octet-level comments for each spec-authored fixture.
@@ -100,7 +114,7 @@
      IE iteration, raw-preserving encode, and truncation/adversarial no-panic
      checks.
 
-7. **Fuzz shell**
+8. **Fuzz shell**
    - `fuzz/Cargo.toml`, `fuzz/fuzz_targets/decode_message.rs`,
      `fuzz/fuzz_targets/decode_s2b.rs`, and
      `fuzz/fuzz_targets/roundtrip.rs` compile decode, typed S2b, owned-decode,
@@ -131,7 +145,7 @@
   matrix beyond the typed subset listed above.
 - Conditional IE, cross-message state-machine, peer-role, charging, QoS policy,
   or bearer lifecycle semantic validation beyond the ProcedureAware mandatory
-  subset claimed here.
+  subset and transport-neutral Echo/client-transaction helpers claimed here.
 - GTPv1-C, GTP-U, Diameter, S1AP, PMIP, or a production ePDG/PGW control plane.
 - Claims of carrier acceptance or interoperability beyond this experimental
   S2b typed subset.

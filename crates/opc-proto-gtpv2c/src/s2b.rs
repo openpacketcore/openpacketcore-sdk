@@ -469,6 +469,8 @@ pub enum Gtpv2cEchoPeerError {
         /// Current state.
         state: Gtpv2cEchoPeerState,
     },
+    /// Echo traffic is blocked until restart reconciliation completes.
+    RestartReconciliationRequired,
     /// Echo evidence had the wrong request/response direction.
     UnexpectedDirection {
         /// Expected direction.
@@ -484,6 +486,9 @@ impl Gtpv2cEchoPeerError {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidTransition { .. } => "gtpv2c_echo_peer_invalid_transition",
+            Self::RestartReconciliationRequired => {
+                "gtpv2c_echo_peer_restart_reconciliation_required"
+            }
             Self::UnexpectedDirection { .. } => "gtpv2c_echo_peer_unexpected_direction",
         }
     }
@@ -497,6 +502,9 @@ impl fmt::Display for Gtpv2cEchoPeerError {
                 "gtpv2c_echo_peer_invalid_transition: operation {operation}, state {}",
                 state.as_str()
             ),
+            Self::RestartReconciliationRequired => {
+                f.write_str("gtpv2c_echo_peer_restart_reconciliation_required")
+            }
             Self::UnexpectedDirection { expected, actual } => write!(
                 f,
                 "gtpv2c_echo_peer_unexpected_direction: expected {}, actual {}",
@@ -563,14 +571,27 @@ impl Gtpv2cEchoPeer {
     }
 
     /// Mark an Echo Request as sent.
-    #[must_use]
-    pub fn echo_request_sent(&mut self, sequence_number: u32) -> Gtpv2cEchoPeerTransition {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Gtpv2cEchoPeerError::RestartReconciliationRequired`] when the
+    /// peer is fenced by a restart-counter change and policy requires explicit
+    /// reconciliation before new Echo traffic.
+    pub fn echo_request_sent(
+        &mut self,
+        sequence_number: u32,
+    ) -> Result<Gtpv2cEchoPeerTransition, Gtpv2cEchoPeerError> {
+        if self.state == Gtpv2cEchoPeerState::ReconciliationRequired
+            && self.policy.require_restart_reconciliation
+        {
+            return Err(Gtpv2cEchoPeerError::RestartReconciliationRequired);
+        }
         let previous = self.state;
         self.echo_requests_sent = self.echo_requests_sent.saturating_add(1);
         self.in_flight_sequence_number = Some(sequence_number);
         self.state = Gtpv2cEchoPeerState::AwaitingResponse;
         self.last_blockers = vec![Gtpv2cEchoPeerBlocker::EchoResponsePending];
-        self.transition(Gtpv2cEchoPeerEvent::EchoRequestSent, previous, false, false)
+        Ok(self.transition(Gtpv2cEchoPeerEvent::EchoRequestSent, previous, false, false))
     }
 
     /// Observe a decoded Echo Request from the peer.
@@ -2302,6 +2323,16 @@ mod tests {
         }
     }
 
+    fn send_echo_request(
+        peer: &mut Gtpv2cEchoPeer,
+        sequence_number: u32,
+    ) -> Gtpv2cEchoPeerTransition {
+        match peer.echo_request_sent(sequence_number) {
+            Ok(transition) => transition,
+            Err(error) => panic!("Echo request transition failed: {error}"),
+        }
+    }
+
     #[test]
     fn echo_message_evidence_extracts_recovery() {
         let view = echo_view(MessageDirection::Response, 0x0001_0203, 9);
@@ -2332,7 +2363,7 @@ mod tests {
     fn echo_peer_accepts_matching_response() {
         let mut peer = Gtpv2cEchoPeer::new();
 
-        let transition = peer.echo_request_sent(0x0102_0304);
+        let transition = send_echo_request(&mut peer, 0x0102_0304);
 
         assert_eq!(transition.event, Gtpv2cEchoPeerEvent::EchoRequestSent);
         assert_eq!(transition.state, Gtpv2cEchoPeerState::AwaitingResponse);
@@ -2368,13 +2399,13 @@ mod tests {
     #[test]
     fn echo_peer_restart_counter_requires_reconciliation() {
         let mut peer = Gtpv2cEchoPeer::new();
-        let _transition = peer.echo_request_sent(1);
+        let _transition = send_echo_request(&mut peer, 1);
         match peer.observe_echo_response(echo_evidence(MessageDirection::Response, 1, 9)) {
             Ok(_transition) => {}
             Err(error) => panic!("initial Echo response transition failed: {error}"),
         }
 
-        let _transition = peer.echo_request_sent(2);
+        let _transition = send_echo_request(&mut peer, 2);
         let transition =
             match peer.observe_echo_response(echo_evidence(MessageDirection::Response, 2, 10)) {
                 Ok(transition) => transition,
@@ -2397,6 +2428,27 @@ mod tests {
             ]
         );
 
+        let rejected = match peer.echo_request_sent(3) {
+            Ok(transition) => panic!("unexpected Echo request transition: {transition:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(rejected, Gtpv2cEchoPeerError::RestartReconciliationRequired);
+        assert_eq!(
+            rejected.as_str(),
+            "gtpv2c_echo_peer_restart_reconciliation_required"
+        );
+        assert_eq!(
+            rejected.to_string(),
+            "gtpv2c_echo_peer_restart_reconciliation_required"
+        );
+        for rendered in [format!("{rejected:?}"), format!("{rejected}")] {
+            assert!(!rendered.contains('3'));
+            assert!(!rendered.contains("10"));
+            assert!(!rendered.contains('['));
+        }
+        assert_eq!(peer.state(), Gtpv2cEchoPeerState::ReconciliationRequired);
+        assert_eq!(peer.snapshot().echo_requests_sent, 2);
+
         let transition = match peer.restart_reconciled() {
             Ok(transition) => transition,
             Err(error) => panic!("restart reconciliation transition failed: {error}"),
@@ -2405,13 +2457,47 @@ mod tests {
         assert_eq!(transition.state, Gtpv2cEchoPeerState::Reachable);
         assert!(transition.readiness.traffic_ready);
         assert_eq!(peer.snapshot().restart_counter_changes, 1);
+
+        let transition = send_echo_request(&mut peer, 3);
+        assert_eq!(transition.event, Gtpv2cEchoPeerEvent::EchoRequestSent);
+        assert_eq!(transition.state, Gtpv2cEchoPeerState::AwaitingResponse);
+    }
+
+    #[test]
+    fn echo_peer_disabled_restart_reconciliation_preserves_echo_flow() {
+        let policy = Gtpv2cEchoPeerPolicy::default().without_restart_reconciliation();
+        let mut peer = Gtpv2cEchoPeer::with_policy(policy);
+
+        let _transition = send_echo_request(&mut peer, 1);
+        match peer.observe_echo_response(echo_evidence(MessageDirection::Response, 1, 9)) {
+            Ok(_transition) => {}
+            Err(error) => panic!("initial Echo response transition failed: {error}"),
+        }
+
+        let _transition = send_echo_request(&mut peer, 2);
+        let transition =
+            match peer.observe_echo_response(echo_evidence(MessageDirection::Response, 2, 10)) {
+                Ok(transition) => transition,
+                Err(error) => panic!("restart Echo response transition failed: {error}"),
+            };
+
+        assert_eq!(transition.event, Gtpv2cEchoPeerEvent::EchoResponseAccepted);
+        assert_eq!(transition.state, Gtpv2cEchoPeerState::Reachable);
+        assert!(transition.readiness.traffic_ready);
+        assert!(transition.projection.restart_counter_changed);
+        assert!(transition.projection.continuity_safe);
+        assert_eq!(peer.snapshot().restart_counter_changes, 1);
+
+        let transition = send_echo_request(&mut peer, 3);
+        assert_eq!(transition.previous_state, Gtpv2cEchoPeerState::Reachable);
+        assert_eq!(transition.state, Gtpv2cEchoPeerState::AwaitingResponse);
     }
 
     #[test]
     fn echo_peer_missing_response_degrades_then_fails() {
         let policy = Gtpv2cEchoPeerPolicy::default().with_missed_response_threshold(2);
         let mut peer = Gtpv2cEchoPeer::with_policy(policy);
-        let _transition = peer.echo_request_sent(1);
+        let _transition = send_echo_request(&mut peer, 1);
 
         let transition = match peer.echo_response_missing() {
             Ok(transition) => transition,
@@ -2426,7 +2512,7 @@ mod tests {
         );
         assert_eq!(transition.projection.missed_responses, 1);
 
-        let _transition = peer.echo_request_sent(2);
+        let _transition = send_echo_request(&mut peer, 2);
         let transition = match peer.echo_response_missing() {
             Ok(transition) => transition,
             Err(error) => panic!("second missing Echo response transition failed: {error}"),
@@ -2447,7 +2533,7 @@ mod tests {
     #[test]
     fn echo_peer_sequence_mismatch_and_errors_are_stable() {
         let mut peer = Gtpv2cEchoPeer::new();
-        let _transition = peer.echo_request_sent(7);
+        let _transition = send_echo_request(&mut peer, 7);
 
         let transition =
             match peer.observe_echo_response(echo_evidence(MessageDirection::Response, 8, 1)) {
