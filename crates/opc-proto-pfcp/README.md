@@ -51,6 +51,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Typed IE access goes through `opc_proto_pfcp::ie::TypedIe::decode` over the
 raw `InformationElement` layer; see the crate documentation for the full API.
 
+For the Production Profile v1 constructor and semantic-validation path, see
+`examples/production_profile_v1.rs` and `tests/production_profile_v1.rs`. Those
+fixtures construct Association Setup and Session Establishment messages through
+typed APIs, encode/decode them, and validate the decoded messages without manual
+raw IE construction.
+
 ## Reference
 
 - 3GPP TS 29.244 — Packet Forwarding Control Plane protocol (N4/Sxa/Sxb)
