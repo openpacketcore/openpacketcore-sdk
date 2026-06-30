@@ -178,6 +178,9 @@ jobs:
       - name: Run Go tests
         run: go test ./...
 
+      - name: Check downstream import contract
+        run: ./scripts/check-downstream-import.sh
+
   manifests:
     name: Kubernetes manifests
     runs-on: ubuntu-latest

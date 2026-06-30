@@ -32,7 +32,7 @@ For the full rationale see [ADR 0007](adr/0007-operator-lifecycle-rust-policy-co
 
 You will need:
 
-- Go 1.26+
+- Go 1.26.4+
 - kubebuilder / controller-runtime
 - The `operator-sdk-go` module
 
@@ -41,8 +41,12 @@ You will need:
 ```bash
 mkdir my-nf-operator && cd my-nf-operator
 go mod init openpacketcore.io/my-nf-operator
-go get openpacketcore.io/operator-sdk-go@sometag
+go get openpacketcore.io/operator-sdk-go@v0.2.0
 ```
+
+Use tagged SDK module releases in committed product modules. Local `replace`
+directives are acceptable only for temporary checkout development; use a
+`go.work` workspace for local SDK integration tests where possible.
 
 ### 2.2 Minimal Main Entrypoint
 
