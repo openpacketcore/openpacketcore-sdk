@@ -2335,8 +2335,15 @@ name = "opc-proto-ikev2"
 version = "0.2.0"
 dependencies = [
  "bytes",
+ "crypto-bigint",
+ "hmac 0.12.1",
  "opc-proto-ikev2",
  "opc-protocol",
+ "p256",
+ "p384",
+ "p521",
+ "sha2 0.10.9",
+ "zeroize",
 ]
 
 [[package]]
