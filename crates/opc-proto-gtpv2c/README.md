@@ -25,13 +25,15 @@ Current scope is intentionally narrow:
 - cargo-fuzz decode, typed S2b, and raw-preserving round-trip targets.
 
 The Production Profile v1 target is a codec, typed-view, validation, and
-transport-neutral helper profile for ePDG/PGW S2b integration. It is not marked
-production-ready until the missing public constructors, constructor-driven
-fixtures, runnable example, and negative profile fixtures land. It does **not**
-provide a complete GTPv2-C implementation, full S2b semantic state-machine
-validation beyond the documented Echo and client-transaction helpers, carrier
-acceptance evidence, or a production ePDG/PGW control-plane stack. See
-[CONFORMANCE.md](CONFORMANCE.md) for the precise evidence boundary.
+transport-neutral helper profile for ePDG/PGW S2b integration. Public profile
+constructors currently cover Echo and Create Session. The profile is not marked
+production-ready until the remaining profile-owned constructors,
+constructor-driven fixtures, runnable example, and negative profile fixtures
+land. It does **not** provide a complete GTPv2-C implementation, full S2b
+semantic state-machine validation beyond the documented Echo and
+client-transaction helpers, carrier acceptance evidence, or a production
+ePDG/PGW control-plane stack. See [CONFORMANCE.md](CONFORMANCE.md) for the
+precise evidence boundary.
 
 ## Minimal use
 

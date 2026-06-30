@@ -1639,6 +1639,26 @@ impl fmt::Debug for TypedIe<'_> {
     }
 }
 
+/// Encode a sequence of typed GTPv2-C IEs into a raw IE region.
+///
+/// # Errors
+///
+/// Returns [`EncodeError`] when any member IE cannot be represented in its
+/// canonical wire format.
+///
+/// @spec 3GPP TS29274 R18 8.2
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-005
+pub fn encode_typed_ie_sequence(
+    ies: &[TypedIe<'_>],
+    dst: &mut BytesMut,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    for ie in ies {
+        ie.encode(dst, ctx)?;
+    }
+    Ok(())
+}
+
 /// Decode a sequence of GTPv2-C IEs into typed values with raw fallback.
 ///
 /// @spec 3GPP TS29274 R18 8.2
