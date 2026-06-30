@@ -1,7 +1,7 @@
 # opc-proto-pfcp
 
-PFCP codec (3GPP TS 29.244) for the N4 reference point — **experimental,
-with Production Profile v1 graduation in progress**.
+PFCP codec (3GPP TS 29.244) for the N4 reference point, with **Production
+Profile v1** available for the documented N4 codec and validation boundary.
 
 ## Status
 
