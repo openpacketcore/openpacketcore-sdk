@@ -29,6 +29,7 @@ opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-runtime = { path = "../opc-runtime", version = "0.2.0" }
 quick-xml = { version = "0.40.1", default-features = false }
 russh = { version = "0.61.2", default-features = false, features = ["ring"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }

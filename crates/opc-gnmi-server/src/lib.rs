@@ -38,6 +38,7 @@ pub mod proto;
 pub mod proto_adapter;
 pub mod service;
 pub mod set;
+pub mod smoke;
 pub mod subscribe;
 pub mod supervision;
 pub mod transport;
@@ -77,6 +78,11 @@ pub use proto_adapter::{
 };
 pub use service::{AuthenticatedGnmiPrincipal, GnmiService};
 pub use set::{NormalizedSet, SetOperation};
+pub use smoke::{
+    run_gnmi_smoke, GnmiSmokeCapabilitySummary, GnmiSmokeClientConfig, GnmiSmokeDataType,
+    GnmiSmokeEncoding, GnmiSmokeError, GnmiSmokeErrorCode, GnmiSmokeGetOutcome,
+    GnmiSmokeGetRequest, GnmiSmokeGetStatus, GnmiSmokeModelSummary, GnmiSmokeTranscript,
+};
 pub use supervision::{spawn_gnmi_tls_listener, SupervisedGnmiTlsListenerConfig};
 pub use transport::{
     principal_from_identity_state, principal_from_identity_watch, principal_from_tls_stream,
