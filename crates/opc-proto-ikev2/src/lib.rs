@@ -7,10 +7,10 @@
 //! This crate intentionally covers only the transport-neutral IKEv2 wire
 //! mechanism that is safe to expose as an SDK primitive today: fixed-header
 //! decode/encode, raw-preserving generic payload-chain walking for unencrypted
-//! payloads, protected-payload boundary metadata, and caller-owned crypto
-//! provider traits. It does not implement an IKE SA state machine, EAP-AKA,
-//! key derivation, retransmission policy, cookie policy, Child SA installation,
-//! or any 3GPP ePDG profile decisions.
+//! payloads, protected-payload boundary metadata, caller-owned crypto provider
+//! traits, and narrow IKE_SA_INIT key-agreement/key-derivation material. It
+//! does not implement an IKE SA state machine, EAP-AKA, retransmission policy,
+//! cookie policy, Child SA installation, or any 3GPP ePDG profile decisions.
 //!
 //! @spec IETF RFC7296
 //! @req REQ-IETF-RFC7296-IKEV2-SCAFFOLD-001
@@ -26,6 +26,7 @@ pub mod nat_traversal;
 pub mod notify;
 pub mod payload;
 pub mod sa_init;
+pub mod sa_init_crypto;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
@@ -69,6 +70,11 @@ pub use sa_init::{
     Ikev2SaTransform, Ikev2SaTransformBuild, Ikev2TransformAttribute, Ikev2TransformAttributeBuild,
     Ikev2TransformAttributeBuildValue, Ikev2TransformAttributeValue, Ikev2VendorIdPayload,
     Ikev2VendorIdPayloadError,
+};
+pub use sa_init_crypto::{
+    derive_ike_sa_init_key_material, Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey,
+    Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
+    Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
 };
 
 pub(crate) const fn is_strict(level: ValidationLevel) -> bool {
