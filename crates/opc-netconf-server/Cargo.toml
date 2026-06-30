@@ -12,6 +12,9 @@ documentation = "https://docs.rs/opc-netconf-server"
 keywords = ["5g", "cnf", "netconf", "yang", "management"]
 categories = ["network-programming", "parser-implementations"]
 
+[features]
+testkit = ["dep:rand"]
+
 [dependencies]
 opc-config-bus = { path = "../opc-config-bus", version = "0.2.0" }
 opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
@@ -28,6 +31,7 @@ opc-types = { path = "../opc-types", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-runtime = { path = "../opc-runtime", version = "0.2.0" }
 quick-xml = { version = "0.40.1", default-features = false }
+rand = { workspace = true, optional = true }
 russh = { version = "0.61.2", default-features = false, features = ["ring"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -1039,6 +1039,10 @@ fn reject_publickey() -> Auth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{
+        assert_ssh_listener_debug_redacted, write_truncated_authorized_key,
+        write_truncated_host_key, NetconfSshTestKeyFixture,
+    };
     use std::path::PathBuf;
 
     fn ed25519_key() -> PrivateKey {
@@ -1114,6 +1118,54 @@ mod tests {
         assert!(debug.contains("1 key(s)"));
         assert!(!debug.contains(public_blob));
         assert!(!debug.contains("OPENSSH"));
+    }
+
+    #[test]
+    fn ssh_testkit_fixture_writes_loadable_redaction_safe_key_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = NetconfSshTestKeyFixture::generate().expect("test SSH key fixture");
+        let files = fixture
+            .write_key_files(dir.path())
+            .expect("write key files");
+
+        let material =
+            load_ssh_listener_key_files([&files.host_key_path], &files.authorized_keys_path)
+                .expect("load generated key files");
+        assert_eq!(material.host_keys.len(), 1);
+        assert_eq!(material.authorized_keys.len(), 1);
+        assert_eq!(
+            material.authorized_keys[0].key_data(),
+            fixture.listener_key_material().authorized_keys[0].key_data()
+        );
+
+        let config = fixture.listener_config(TenantId::from_static("tenant-a"));
+        assert_eq!(config.host_keys.len(), 1);
+        assert_eq!(config.authorized_keys.len(), 1);
+        assert_ssh_listener_debug_redacted(&material, &fixture);
+        assert_ssh_listener_debug_redacted(&config, &fixture);
+        assert_ssh_listener_debug_redacted(&files, &fixture);
+
+        let truncated_host_key_path = dir.path().join("truncated_host_key");
+        write_truncated_host_key(&truncated_host_key_path).expect("write truncated host key");
+        let error =
+            load_ssh_listener_key_files([&truncated_host_key_path], &files.authorized_keys_path)
+                .expect_err("truncated host key");
+        assert_eq!(error, SshKeyFileLoadError::HostKeyInvalid { index: 0 });
+        assert_eq!(error.as_str(), "netconf_ssh_host_key_invalid");
+        assert_eq!(error.to_string(), error.as_str());
+        assert!(!format!("{error:?}").contains("OPENSSH"));
+        assert!(!format!("{error}").contains("OPENSSH"));
+
+        let truncated_authorized_path = dir.path().join("truncated_authorized_keys");
+        write_truncated_authorized_key(&truncated_authorized_path, &fixture)
+            .expect("write truncated authorized key");
+        let error = load_ssh_listener_key_files([&files.host_key_path], &truncated_authorized_path)
+            .expect_err("truncated authorized key");
+        assert_eq!(error, SshKeyFileLoadError::AuthorizedKeyInvalid { line: 1 });
+        assert_eq!(error.as_str(), "netconf_ssh_authorized_key_invalid");
+        assert_eq!(error.to_string(), error.as_str());
+        assert!(!format!("{error:?}").contains("OPENSSH"));
+        assert!(!format!("{error}").contains("OPENSSH"));
     }
 
     #[test]

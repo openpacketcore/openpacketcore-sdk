@@ -5492,6 +5492,7 @@ mod tests {
         spawn_read_only_ssh_call_home, spawn_read_only_ssh_listener, spawn_read_only_tls_listener,
         SupervisedSshCallHomeConfig, SupervisedSshListenerConfig, SupervisedTlsListenerConfig,
     };
+    use crate::testkit::NetconfSshTestKeyFixture;
     use crate::xml::WithDefaultsMode;
 
     #[derive(Clone)]
@@ -6774,6 +6775,18 @@ mod tests {
             vec![host_key],
             vec![user_key.public_key().clone()],
         );
+        config.session = SessionConfig {
+            limits: MgmtLimits::default(),
+            frame_timeout: Duration::from_secs(5),
+        };
+        config.drain_timeout = Duration::from_secs(5);
+        config.auth_rejection_time = Duration::from_millis(1);
+        config.auth_rejection_time_initial = Some(Duration::from_millis(1));
+        config
+    }
+
+    fn ssh_listener_testkit_config(fixture: &NetconfSshTestKeyFixture) -> SshListenerConfig {
+        let mut config = fixture.listener_config(TenantId::from_static("tenant-a"));
         config.session = SessionConfig {
             limits: MgmtLimits::default(),
             frame_timeout: Duration::from_secs(5),
@@ -9092,15 +9105,14 @@ mod tests {
 
     #[tokio::test]
     async fn ssh_listener_validates_transport_keys_and_session_bounds() {
-        let host_key = ssh_private_key();
-        let user_key = ssh_private_key();
+        let fixture = NetconfSshTestKeyFixture::generate().expect("SSH test key fixture");
 
         let (tls_server, _observed, _audit) = server_fixture().await;
         let wrong_transport = run_read_only_ssh_listener(
             Arc::new(tls_server),
             TcpListener::bind("127.0.0.1:0").await.expect("bind"),
             ShutdownToken::new(),
-            ssh_listener_test_config(host_key.clone(), &user_key),
+            ssh_listener_testkit_config(&fixture),
         )
         .await;
         assert!(matches!(
@@ -9117,7 +9129,7 @@ mod tests {
         .await;
         let ssh_server = Arc::new(ssh_server);
 
-        let mut missing_host = ssh_listener_test_config(host_key.clone(), &user_key);
+        let mut missing_host = ssh_listener_testkit_config(&fixture);
         missing_host.host_keys.clear();
         let result = run_read_only_ssh_listener(
             Arc::clone(&ssh_server),
@@ -9128,7 +9140,7 @@ mod tests {
         .await;
         assert!(matches!(result, Err(SshListenerError::MissingHostKey)));
 
-        let mut missing_authorized_key = ssh_listener_test_config(host_key.clone(), &user_key);
+        let mut missing_authorized_key = ssh_listener_testkit_config(&fixture);
         missing_authorized_key.authorized_keys.clear();
         let result = run_read_only_ssh_listener(
             Arc::clone(&ssh_server),
@@ -9142,7 +9154,7 @@ mod tests {
             Err(SshListenerError::MissingAuthorizedKey)
         ));
 
-        let mut invalid_auth_attempt_limit = ssh_listener_test_config(host_key.clone(), &user_key);
+        let mut invalid_auth_attempt_limit = ssh_listener_testkit_config(&fixture);
         invalid_auth_attempt_limit.max_auth_attempts = 0;
         let result = run_read_only_ssh_listener(
             Arc::clone(&ssh_server),
@@ -9156,7 +9168,7 @@ mod tests {
             Err(SshListenerError::InvalidAuthAttemptLimit)
         ));
 
-        let mut invalid_session_id = ssh_listener_test_config(host_key, &user_key);
+        let mut invalid_session_id = ssh_listener_testkit_config(&fixture);
         invalid_session_id.first_session_id = 0;
         let result = run_read_only_ssh_listener(
             ssh_server,

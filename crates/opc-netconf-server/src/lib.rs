@@ -200,6 +200,8 @@ mod session_registry;
 pub mod smoke;
 pub mod ssh;
 pub mod supervision;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
 pub mod transport;
 pub mod xml;
 

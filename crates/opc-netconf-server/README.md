@@ -29,6 +29,9 @@ The current slice is capability-gated and capability-honest:
   registry-aware NETCONF session execution. Verified SSH usernames are mapped
   through `opc-mgmt-principal` into grant-free `TrustedPrincipal` values stamped
   `AuthStrength::SshPublicKey`.
+- Optional `testkit` Cargo feature exposing redaction-safe NETCONF-over-SSH
+  listener key fixtures for downstream integration tests without checked-in
+  private keys.
 - NETCONF-over-SSH Call Home loop that dials configured NMS endpoints
   round-robin with bounded reconnect backoff and deterministic jitter, then runs
   the same SSH server/auth/subsystem/session path over the outbound TCP stream.
