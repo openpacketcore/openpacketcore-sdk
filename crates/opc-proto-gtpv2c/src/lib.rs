@@ -30,7 +30,7 @@ pub mod s2b;
 
 pub use header::{decode_header, encode_header, Header, MessageType, GTPV2C_VERSION};
 pub use ie::{
-    decode_typed_ie_sequence, validate_ie_region, AccessPointName,
+    decode_typed_ie_sequence, encode_typed_ie_sequence, validate_ie_region, AccessPointName,
     AdditionalProtocolConfigurationOptions, AggregateMaximumBitRate, ApnRestriction, BearerContext,
     BearerQos, Cause, CauseValue, ChargingId, EpsBearerId, FullyQualifiedTeid, Indication,
     OwnedRawIe, PdnAddressAllocation, PdnType, PdnTypeValue, PlmnId, ProtocolConfigurationOptions,
@@ -44,6 +44,8 @@ pub use ie::{
 pub use message::{Message, OwnedMessage};
 pub use s2b::{
     decode_create_session_response_summary, decode_echo_message_evidence, is_s2b_message_type,
+    s2b_create_session_accepted_response, s2b_create_session_rejected_response,
+    s2b_create_session_request, s2b_echo_request, s2b_echo_response,
     CreateSessionAcceptedResponseSummary, CreateSessionRejectedResponseSummary,
     CreateSessionResponseSummary, CreateSessionResponseSummaryError, EchoMessageEvidence,
     EchoMessageEvidenceError, Gtpv2cClientResponseEvidence, Gtpv2cClientTransaction,
@@ -53,8 +55,9 @@ pub use s2b::{
     Gtpv2cClientTransactionState, Gtpv2cEchoPeer, Gtpv2cEchoPeerBlocker, Gtpv2cEchoPeerError,
     Gtpv2cEchoPeerEvent, Gtpv2cEchoPeerPolicy, Gtpv2cEchoPeerProjection, Gtpv2cEchoPeerReadiness,
     Gtpv2cEchoPeerSnapshot, Gtpv2cEchoPeerState, Gtpv2cEchoPeerTransition, Gtpv2cPeerToken,
-    MessageDirection, Procedure, S2bMessage, S2bProcedureMessage, CREATE_SESSION_REQUEST,
-    CREATE_SESSION_RESPONSE, DELETE_SESSION_REQUEST, DELETE_SESSION_RESPONSE, ECHO_REQUEST,
-    ECHO_RESPONSE, MODIFY_BEARER_REQUEST, MODIFY_BEARER_RESPONSE, UPDATE_BEARER_REQUEST,
-    UPDATE_BEARER_RESPONSE,
+    MessageDirection, Procedure, S2bCreateSessionAcceptedResponse,
+    S2bCreateSessionRejectedResponse, S2bCreateSessionRequest, S2bMessage, S2bProcedureMessage,
+    S2bProfileBuildError, S2bProfileBuildResult, CREATE_SESSION_REQUEST, CREATE_SESSION_RESPONSE,
+    DELETE_SESSION_REQUEST, DELETE_SESSION_RESPONSE, ECHO_REQUEST, ECHO_RESPONSE,
+    MODIFY_BEARER_REQUEST, MODIFY_BEARER_RESPONSE, UPDATE_BEARER_REQUEST, UPDATE_BEARER_RESPONSE,
 };

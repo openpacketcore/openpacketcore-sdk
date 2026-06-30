@@ -13,19 +13,21 @@ use core::fmt;
 
 use bytes::BytesMut;
 use opc_protocol::{
-    BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, Encode, EncodeContext,
-    EncodeError, EncodeErrorCode, SpecRef, ValidationLevel,
+    BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, DuplicateIePolicy,
+    Encode, EncodeContext, EncodeError, EncodeErrorCode, SpecRef, ValidationLevel,
 };
 
 use crate::header::Header;
 pub use crate::header::MessageType;
 use crate::ie::{
-    decode_typed_ie_sequence, CauseValue, EpsBearerId, FullyQualifiedTeid, TypedIe, TypedIeValue,
-    IE_TYPE_APN, IE_TYPE_BEARER_CONTEXT, IE_TYPE_CAUSE, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI,
-    IE_TYPE_PAA, IE_TYPE_PDN_TYPE, IE_TYPE_RAT_TYPE, IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE,
+    decode_typed_ie_sequence, encode_typed_ie_sequence, AccessPointName, BearerContext, Cause,
+    CauseValue, EpsBearerId, FullyQualifiedTeid, PdnAddressAllocation, PdnType, RatType, Recovery,
+    SelectionMode, ServingNetwork, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APN,
+    IE_TYPE_BEARER_CONTEXT, IE_TYPE_CAUSE, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_PAA,
+    IE_TYPE_PDN_TYPE, IE_TYPE_RAT_TYPE, IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE,
     IE_TYPE_SERVING_NETWORK,
 };
-use crate::Message;
+use crate::{Message, OwnedMessage};
 
 /// Echo Request message type.
 pub const ECHO_REQUEST: u8 = 1;
@@ -56,6 +58,262 @@ pub const UPDATE_BEARER_REQUEST: u8 = 97;
 
 /// Update Bearer Response message type used by the S2b Update Session view.
 pub const UPDATE_BEARER_RESPONSE: u8 = 98;
+
+/// Result type for S2b Production Profile v1 constructors.
+pub type S2bProfileBuildResult<T> = Result<T, S2bProfileBuildError>;
+
+/// Error returned when an S2b Production Profile v1 constructor cannot build a
+/// profile-valid message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum S2bProfileBuildError {
+    /// Typed IE or message encoding failed.
+    Encode(EncodeError),
+    /// The constructed message failed procedure-aware profile validation.
+    Validate(DecodeError),
+}
+
+impl fmt::Display for S2bProfileBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Encode(source) => write!(formatter, "S2b profile encode failed: {source}"),
+            Self::Validate(source) => {
+                write!(formatter, "S2b profile validation failed: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for S2bProfileBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Encode(source) => Some(source),
+            Self::Validate(source) => Some(source),
+        }
+    }
+}
+
+impl From<EncodeError> for S2bProfileBuildError {
+    fn from(source: EncodeError) -> Self {
+        Self::Encode(source)
+    }
+}
+
+impl From<DecodeError> for S2bProfileBuildError {
+    fn from(source: DecodeError) -> Self {
+        Self::Validate(source)
+    }
+}
+
+/// Input for building an S2b Production Profile v1 Create Session Request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S2bCreateSessionRequest<'a> {
+    /// GTPv2-C sequence number.
+    pub sequence_number: u32,
+    /// IMSI IE.
+    pub imsi: TbcdDigits,
+    /// RAT Type IE.
+    pub rat_type: RatType,
+    /// Serving Network IE.
+    pub serving_network: ServingNetwork,
+    /// Sender F-TEID IE; encoded at instance 0.
+    pub sender_f_teid: FullyQualifiedTeid,
+    /// APN IE.
+    pub apn: AccessPointName,
+    /// Selection Mode IE.
+    pub selection_mode: SelectionMode,
+    /// PDN Type IE.
+    pub pdn_type: PdnType,
+    /// PDN Address Allocation IE.
+    pub paa: PdnAddressAllocation,
+    /// Bearer Context IE containing at least an EBI member.
+    pub bearer_context: BearerContext<'a>,
+    /// Additional typed IEs to append after the mandatory profile-owned IEs.
+    pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+/// Input for building an accepted S2b Production Profile v1 Create Session Response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S2bCreateSessionAcceptedResponse<'a> {
+    /// GTPv2-C sequence number.
+    pub sequence_number: u32,
+    /// TEID carried in the response common header.
+    pub response_teid: u32,
+    /// Sender F-TEID IE; encoded at instance 0.
+    pub sender_f_teid: FullyQualifiedTeid,
+    /// Bearer Context IE containing the accepted bearer EBI.
+    pub bearer_context: BearerContext<'a>,
+    /// Additional typed IEs to append after Cause, Sender F-TEID, and Bearer Context.
+    pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+/// Input for building a rejected S2b Production Profile v1 Create Session Response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S2bCreateSessionRejectedResponse<'a> {
+    /// GTPv2-C sequence number.
+    pub sequence_number: u32,
+    /// TEID carried in the response common header.
+    pub response_teid: u32,
+    /// Non-accepted Cause value.
+    pub cause: CauseValue,
+    /// Additional typed IEs to append after Cause.
+    pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+/// Build an S2b Production Profile v1 Echo Request.
+///
+/// # Errors
+///
+/// Returns [`S2bProfileBuildError`] when the Recovery IE cannot encode or the
+/// constructed message fails procedure-aware validation.
+pub fn s2b_echo_request(
+    sequence_number: u32,
+    recovery: Recovery,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    build_s2b_profile_message(
+        Header::without_teid(ECHO_REQUEST, sequence_number),
+        vec![typed_ie(0, TypedIeValue::Recovery(recovery))],
+    )
+}
+
+/// Build an S2b Production Profile v1 Echo Response.
+///
+/// # Errors
+///
+/// Returns [`S2bProfileBuildError`] when the Recovery IE cannot encode or the
+/// constructed message fails procedure-aware validation.
+pub fn s2b_echo_response(
+    sequence_number: u32,
+    recovery: Recovery,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    build_s2b_profile_message(
+        Header::without_teid(ECHO_RESPONSE, sequence_number),
+        vec![typed_ie(0, TypedIeValue::Recovery(recovery))],
+    )
+}
+
+/// Build an S2b Production Profile v1 Create Session Request.
+///
+/// # Errors
+///
+/// Returns [`S2bProfileBuildError`] when any typed IE cannot encode or the
+/// constructed message fails procedure-aware validation.
+pub fn s2b_create_session_request(
+    request: S2bCreateSessionRequest<'_>,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    let mut ies = vec![
+        typed_ie(0, TypedIeValue::Imsi(request.imsi)),
+        typed_ie(0, TypedIeValue::RatType(request.rat_type)),
+        typed_ie(0, TypedIeValue::ServingNetwork(request.serving_network)),
+        typed_ie(0, TypedIeValue::FullyQualifiedTeid(request.sender_f_teid)),
+        typed_ie(0, TypedIeValue::AccessPointName(request.apn)),
+        typed_ie(0, TypedIeValue::SelectionMode(request.selection_mode)),
+        typed_ie(0, TypedIeValue::PdnType(request.pdn_type)),
+        typed_ie(0, TypedIeValue::PdnAddressAllocation(request.paa)),
+        typed_ie(0, TypedIeValue::BearerContext(request.bearer_context)),
+    ];
+    ies.extend(request.additional_ies);
+    build_s2b_profile_message(
+        Header::without_teid(CREATE_SESSION_REQUEST, request.sequence_number),
+        ies,
+    )
+}
+
+/// Build an accepted S2b Production Profile v1 Create Session Response.
+///
+/// # Errors
+///
+/// Returns [`S2bProfileBuildError`] when any typed IE cannot encode or the
+/// constructed accepted response fails procedure-aware validation.
+pub fn s2b_create_session_accepted_response(
+    response: S2bCreateSessionAcceptedResponse<'_>,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    let mut ies = vec![
+        typed_ie(0, TypedIeValue::Cause(accepted_cause())),
+        typed_ie(0, TypedIeValue::FullyQualifiedTeid(response.sender_f_teid)),
+        typed_ie(0, TypedIeValue::BearerContext(response.bearer_context)),
+    ];
+    ies.extend(response.additional_ies);
+    build_s2b_profile_message(
+        Header::with_teid(
+            CREATE_SESSION_RESPONSE,
+            response.response_teid,
+            response.sequence_number,
+        ),
+        ies,
+    )
+}
+
+/// Build a rejected S2b Production Profile v1 Create Session Response.
+///
+/// # Errors
+///
+/// Returns [`S2bProfileBuildError`] when Cause cannot encode or the rejected
+/// response fails procedure-aware validation.
+pub fn s2b_create_session_rejected_response(
+    response: S2bCreateSessionRejectedResponse<'_>,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    let mut ies = vec![typed_ie(0, TypedIeValue::Cause(cause(response.cause)))];
+    ies.extend(response.additional_ies);
+    build_s2b_profile_message(
+        Header::with_teid(
+            CREATE_SESSION_RESPONSE,
+            response.response_teid,
+            response.sequence_number,
+        ),
+        ies,
+    )
+}
+
+fn typed_ie<'a>(instance: u8, value: TypedIeValue<'a>) -> TypedIe<'a> {
+    TypedIe { instance, value }
+}
+
+fn cause(value: CauseValue) -> Cause {
+    Cause {
+        value,
+        flags_octet: 0,
+        offending_ie: Vec::new(),
+    }
+}
+
+fn accepted_cause() -> Cause {
+    cause(CauseValue::RequestAccepted)
+}
+
+fn profile_decode_context() -> DecodeContext {
+    DecodeContext {
+        duplicate_ie_policy: DuplicateIePolicy::Reject,
+        validation_level: ValidationLevel::ProcedureAware,
+        ..DecodeContext::default()
+    }
+}
+
+fn build_s2b_profile_message<'a>(
+    header: Header,
+    ies: Vec<TypedIe<'a>>,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    let encode_context = EncodeContext::default();
+    let mut raw_ies = BytesMut::new();
+    encode_typed_ie_sequence(&ies, &mut raw_ies, encode_context)?;
+    let message = OwnedMessage {
+        header,
+        raw_ies: raw_ies.freeze(),
+    };
+    message.wire_len(encode_context)?;
+    validate_built_s2b_profile_message(&message)?;
+    Ok(message)
+}
+
+fn validate_built_s2b_profile_message(message: &OwnedMessage) -> Result<(), DecodeError> {
+    let view = S2bMessage::from_message(message.as_borrowed(), profile_decode_context())?;
+    if view.as_view().is_some() {
+        Ok(())
+    } else {
+        Err(missing_ie_error(
+            "S2b profile constructor produced a non-S2b message",
+        ))
+    }
+}
 
 /// Accepted Create Session Response projection.
 ///
