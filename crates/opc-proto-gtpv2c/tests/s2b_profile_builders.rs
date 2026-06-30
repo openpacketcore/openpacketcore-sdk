@@ -1,12 +1,16 @@
 use bytes::BytesMut;
 use opc_proto_gtpv2c::{
     decode_echo_message_evidence, s2b_create_session_accepted_response,
-    s2b_create_session_rejected_response, s2b_create_session_request, s2b_echo_request,
-    s2b_echo_response, AccessPointName, BearerContext, CauseValue, EpsBearerId, FullyQualifiedTeid,
+    s2b_create_session_rejected_response, s2b_create_session_request, s2b_delete_session_request,
+    s2b_delete_session_response, s2b_echo_request, s2b_echo_response, s2b_modify_bearer_request,
+    s2b_modify_bearer_response, s2b_update_bearer_request, s2b_update_bearer_response,
+    AccessPointName, BearerContext, Cause, CauseValue, EpsBearerId, FullyQualifiedTeid,
     MessageDirection, PdnAddressAllocation, PdnType, PdnTypeValue, PlmnId, RatType, RatTypeValue,
     Recovery, S2bCreateSessionAcceptedResponse, S2bCreateSessionRejectedResponse,
-    S2bCreateSessionRequest, S2bMessage, S2bProfileBuildError, SelectionMode, SelectionModeValue,
-    ServingNetwork, TbcdDigits, TypedIe, TypedIeValue,
+    S2bCreateSessionRequest, S2bDeleteSessionRequest, S2bDeleteSessionResponse, S2bMessage,
+    S2bModifyBearerRequest, S2bModifyBearerResponse, S2bProfileBuildError, S2bUpdateBearerRequest,
+    S2bUpdateBearerResponse, SelectionMode, SelectionModeValue, ServingNetwork, TbcdDigits,
+    TypedIe, TypedIeValue,
 };
 use opc_protocol::{DecodeContext, DecodeErrorCode, Encode, EncodeContext, ValidationLevel};
 
@@ -78,6 +82,28 @@ fn create_session_request_input() -> S2bCreateSessionRequest<'static> {
         bearer_context: bearer_context(5),
         additional_ies: Vec::new(),
     }
+}
+
+fn accepted_cause_ie() -> TypedIe<'static> {
+    TypedIe {
+        instance: 0,
+        value: TypedIeValue::Cause(Cause {
+            value: CauseValue::RequestAccepted,
+            flags_octet: 0,
+            offending_ie: Vec::new(),
+        }),
+    }
+}
+
+fn with_decoded_profile_message(
+    message: &opc_proto_gtpv2c::OwnedMessage,
+    inspect: impl FnOnce(S2bMessage<'_>),
+) {
+    let encoded = encode(message);
+    let (tail, decoded) = S2bMessage::decode(&encoded, procedure_context())
+        .expect("profile message decodes procedure-aware");
+    assert!(tail.is_empty());
+    inspect(decoded);
 }
 
 #[test]
@@ -173,6 +199,102 @@ fn create_session_request_builder_rejects_duplicate_profile_singletons() {
     });
 
     let error = s2b_create_session_request(request).expect_err("duplicate IMSI is rejected");
+    match error {
+        S2bProfileBuildError::Validate(source) => {
+            assert_eq!(source.code(), &DecodeErrorCode::DuplicateIe);
+        }
+        S2bProfileBuildError::Encode(source) => {
+            panic!("expected validation error, got encode error: {source}");
+        }
+    }
+}
+
+#[test]
+fn lifecycle_request_builders_roundtrip_without_raw_byte_assembly() {
+    let modify = s2b_modify_bearer_request(S2bModifyBearerRequest {
+        sequence_number: 0x010206,
+        teid: 0x0102_0304,
+        bearer_context: bearer_context(7),
+        additional_ies: Vec::new(),
+    })
+    .expect("modify bearer request builds");
+    with_decoded_profile_message(&modify, |decoded| {
+        assert!(matches!(decoded, S2bMessage::ModifySessionRequest(_)));
+        assert_eq!(
+            decoded.as_view().expect("typed view").header.teid,
+            Some(0x0102_0304)
+        );
+    });
+
+    let delete = s2b_delete_session_request(S2bDeleteSessionRequest {
+        sequence_number: 0x010207,
+        teid: 0x0102_0304,
+        linked_ebi: EpsBearerId { value: 5 },
+        additional_ies: Vec::new(),
+    })
+    .expect("delete session request builds");
+    with_decoded_profile_message(&delete, |decoded| {
+        assert!(matches!(decoded, S2bMessage::DeleteSessionRequest(_)));
+    });
+
+    let update = s2b_update_bearer_request(S2bUpdateBearerRequest {
+        sequence_number: 0x010208,
+        teid: 0x0102_0304,
+        bearer_context: bearer_context(8),
+        additional_ies: Vec::new(),
+    })
+    .expect("update bearer request builds");
+    with_decoded_profile_message(&update, |decoded| {
+        assert!(matches!(decoded, S2bMessage::UpdateSessionRequest(_)));
+    });
+}
+
+#[test]
+fn lifecycle_response_builders_roundtrip_without_raw_byte_assembly() {
+    let modify = s2b_modify_bearer_response(S2bModifyBearerResponse {
+        sequence_number: 0x010209,
+        teid: 0x0102_0304,
+        cause: CauseValue::RequestAccepted,
+        additional_ies: Vec::new(),
+    })
+    .expect("modify bearer response builds");
+    with_decoded_profile_message(&modify, |decoded| {
+        assert!(matches!(decoded, S2bMessage::ModifySessionResponse(_)));
+    });
+
+    let delete = s2b_delete_session_response(S2bDeleteSessionResponse {
+        sequence_number: 0x01020a,
+        teid: 0x0102_0304,
+        cause: CauseValue::RequestAccepted,
+        additional_ies: Vec::new(),
+    })
+    .expect("delete session response builds");
+    with_decoded_profile_message(&delete, |decoded| {
+        assert!(matches!(decoded, S2bMessage::DeleteSessionResponse(_)));
+    });
+
+    let update = s2b_update_bearer_response(S2bUpdateBearerResponse {
+        sequence_number: 0x01020b,
+        teid: 0x0102_0304,
+        cause: CauseValue::RequestAccepted,
+        additional_ies: Vec::new(),
+    })
+    .expect("update bearer response builds");
+    with_decoded_profile_message(&update, |decoded| {
+        assert!(matches!(decoded, S2bMessage::UpdateSessionResponse(_)));
+    });
+}
+
+#[test]
+fn lifecycle_response_builder_rejects_duplicate_cause() {
+    let error = s2b_update_bearer_response(S2bUpdateBearerResponse {
+        sequence_number: 0x01020c,
+        teid: 0x0102_0304,
+        cause: CauseValue::RequestAccepted,
+        additional_ies: vec![accepted_cause_ie()],
+    })
+    .expect_err("duplicate Cause is rejected");
+
     match error {
         S2bProfileBuildError::Validate(source) => {
             assert_eq!(source.code(), &DecodeErrorCode::DuplicateIe);

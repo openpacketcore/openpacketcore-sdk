@@ -11,8 +11,8 @@
   views for Echo plus Create/Modify/Delete/Update Session-oriented procedures.
   The transport-neutral Echo peer helper also tracks Recovery restart counters
   and rejects new Echo exchanges while restart reconciliation is required.
-  Public profile constructors currently cover Echo Request/Response and Create
-  Session Request plus accepted/rejected Create Session Response shapes.
+  Public profile constructors cover Echo, Create Session, Modify Bearer,
+  Delete Session, and Update Bearer profile-owned request/response shapes.
 
 ## S2b Production Profile v1 — Target Boundary
 
@@ -85,13 +85,10 @@ failures and must cover at least these rules:
 
 The profile must not be marked production-ready until all of the following land:
 
-- Public typed/profile constructors for the remaining Modify Bearer, Delete
-  Session, and Update Bearer profile-owned messages.
-- Constructor-driven integration fixtures proving typed construction → encode →
-  decode → procedure-aware validation without manual raw byte assembly.
+- Constructor-driven examples showing typed construction → encode → decode →
+  procedure-aware validation without manual raw byte assembly.
 - Runnable example code for downstream SDK users.
-- Negative fixtures for mandatory-IE and malformed profile-critical IE
-  rejection.
+- Additional negative fixtures for malformed profile-critical IE rejection.
 
 ## Covered in this subset
 
