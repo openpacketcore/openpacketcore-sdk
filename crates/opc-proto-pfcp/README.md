@@ -1,6 +1,7 @@
 # opc-proto-pfcp
 
-PFCP codec (3GPP TS 29.244) for the N4 reference point — **experimental**.
+PFCP codec (3GPP TS 29.244) for the N4 reference point — **experimental,
+with Production Profile v1 graduation in progress**.
 
 ## Status
 
@@ -22,7 +23,13 @@ PFCP codec (3GPP TS 29.244) for the N4 reference point — **experimental**.
 
 Conformance is proven against hand-authored spec-byte fixtures citing
 TS 29.244 section numbers — see [CONFORMANCE.md](CONFORMANCE.md) for the
-exact coverage and codec boundary.
+exact coverage, Production Profile v1 target, and codec boundary.
+
+The production profile is scoped to N4 codec construction, typed decode/encode,
+and semantic validation for Heartbeat, Association Setup/Release, Session
+Establishment/Modification/Deletion, and Session Report procedures. It does not
+claim PFCP UDP transport, SMF/UPF business logic, node selection, persistence,
+charging policy, or high-availability control-plane behavior.
 
 ## Quick start
 

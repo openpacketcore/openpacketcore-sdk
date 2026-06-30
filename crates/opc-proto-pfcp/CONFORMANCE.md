@@ -7,7 +7,101 @@ This document defines the conformance of the `opc-proto-pfcp` crate against
 
 - **Document**: 3GPP TS 29.244
 - **Release**: Release 18 (R18)
-- **Status**: v2 — session-management subset complete and published
+- **Status**: v2 — session-management codec subset complete and published;
+  production-profile graduation in progress
+
+## Production Profile v1 — N4 Codec and Validation
+
+`opc-proto-pfcp` graduates when this profile is implemented and verified. The
+profile is intentionally a **codec and validation profile** for SMF/UPF N4
+integration. It does not claim to implement an SMF, UPF, PFCP transport stack,
+node selection, local policy, charging, persistence, or high-availability
+control-plane behavior.
+
+### Profile-owned procedures
+
+The production profile owns typed decode, encode, construction, and semantic
+validation for these PFCP procedures:
+
+| Procedure | Message types | Profile requirement |
+|:---|:---|:---|
+| Heartbeat | Request (1), Response (2) | Recovery Time Stamp decode/encode and correlation-friendly sequence preservation. |
+| Association Setup | Request (5), Response (6) | Node ID, Recovery Time Stamp, Cause on response, and Offending IE on rejection paths. |
+| Association Release | Request (9), Response (10) | Cause on response and graceful unsupported-IE handling. |
+| Session Establishment | Request (50), Response (51) | F-SEID and Create PDR/FAR/QER/URR groups with cross-reference validation. |
+| Session Modification | Request (52), Response (53) | Update/Remove/Create PDR/FAR/QER/URR groups with cross-reference validation. |
+| Session Deletion | Request (54), Response (55) | SEID-bearing request/response validation and Cause on response. |
+| Session Report | Request (56), Response (57) | Report Type, Usage Report groups, UR-SEQN, and Cause on response. |
+
+### Profile-owned IE families
+
+The production profile owns the IE families needed for N4 session-management
+flows:
+
+- Node and recovery IEs: Node ID, Recovery Time Stamp, Cause, Offending IE.
+- Session identity IEs: F-SEID, SEID-bearing message header validation.
+- Rule identity IEs: PDR ID, FAR ID, QER ID, URR ID, Remove PDR/FAR/QER/URR.
+- Packet detection IEs: Create/Update PDR, PDI, Precedence, Source Interface,
+  F-TEID, Network Instance, UE IP Address, QFI, Outer Header Removal.
+- Forwarding IEs: Create/Update FAR, Forwarding Parameters, Apply Action,
+  Destination Interface, Outer Header Creation.
+- QoS IEs: Create/Update QER, Gate Status, MBR, GBR, QFI.
+- Usage-reporting IEs: Create/Update URR, Measurement Method, Reporting
+  Triggers, Volume/Time Threshold, Volume/Time Quota, Monitoring Time, Usage
+  Report Trigger, Volume Measurement, Duration Measurement, UR-SEQN, Report
+  Type, Usage Report.
+
+### Required semantic validation
+
+Profile-v1 validation must separate structural decode failures from semantic
+profile failures and must cover at least these rules:
+
+- Message header SEID presence must match the procedure class.
+- Heartbeat messages must not require SEID and must preserve sequence numbers.
+- Association Setup Request must include Node ID and Recovery Time Stamp.
+- Association Setup Response must include Node ID, Recovery Time Stamp, and
+  Cause; rejection responses should expose Offending IE when present.
+- Session Establishment Request must include CP F-SEID and at least one Create
+  PDR and Create FAR.
+- Create/Update PDR must include PDR ID, Precedence, and PDI.
+- PDI must include Source Interface and at least one traffic-match primitive
+  from the profile-owned packet-detection set.
+- Create/Update FAR must include FAR ID and Apply Action; forwarding action
+  must include Forwarding Parameters with Destination Interface.
+- PDR references to FAR/QER/URR IDs must resolve to rule IDs present in the
+  same message when those references create or update local rule graph state.
+- Session Modification Request must contain at least one create/update/remove
+  rule operation.
+- Session Deletion Request/Response must be SEID-bearing.
+- Session Report Request must include Report Type and include Usage Report when
+  the report type requires it.
+- Duplicate singleton IEs must be rejected by the semantic validator unless the
+  TS 29.244 profile explicitly allows multiplicity.
+- Unknown non-mandatory IEs must be preserved by the raw layer; unsupported or
+  malformed profile-critical IEs must produce typed validation errors.
+
+### Compatibility and API guarantees
+
+- The raw `InformationElement` layer remains byte-preserving for unknown and
+  vendor-specific IEs.
+- The typed layer may canonicalize spare bits and discard future extension
+  octets as documented below; callers needing byte-exact forwarding must use
+  the raw layer.
+- Builder APIs added for this profile must not construct messages missing
+  mandatory profile-owned IEs.
+- Semantic validation APIs must be additive and stable under semver once this
+  profile is marked production-ready.
+
+### Explicit non-goals
+
+- PFCP UDP transport, retransmission timers, peer liveness management, and
+  request/response transaction orchestration.
+- SMF/UPF business logic, node selection, rule persistence, charging policy,
+  traffic steering policy, or product-specific admission decisions.
+- PFD Management, Subscriber Management, and non-N4/Sxa/Sxb procedures outside
+  the profile-owned list.
+- Full typed coverage for every TS 29.244 IE outside the session-management
+  profile.
 
 ## Supported Features
 
@@ -141,6 +235,17 @@ preallocate from a wire-declared length. Three layers guard them:
   corpus, registered in `.github/workflows/fuzz.yml` and run weekly.
 - **Verification** — a deep `cargo-fuzz` pass over the decoder completed ~41M
   executions with no crash, leak, or OOM.
+
+## Remaining Graduation Work
+
+- Add profile-level builder APIs for Heartbeat, Association Setup/Release,
+  Session Establishment/Modification/Deletion, and Session Report messages.
+- Add a semantic validation API that enforces the Production Profile v1 rules
+  above without requiring callers to manually inspect raw IEs.
+- Add profile fixtures showing construction, validation, encode, decode, and
+  malformed-input rejection for each profile-owned procedure family.
+- Update this status from "graduation in progress" to "production-ready" only
+  when the implementation and fixtures satisfy the profile.
 
 ## Codec Boundary (v1+)
 
