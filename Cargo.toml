@@ -29,6 +29,7 @@ num_cpus = "1.16"
 # release on the new traits yet; partial bumps create duplicate digest versions.
 sha2 = "0.10"
 rand = "0.10"
+aes-gcm = { version = "0.11.0-rc.4", default-features = false, features = ["aes", "alloc"] }
 aes-gcm-siv = "0.11"
 hkdf = "0.12"
 subtle = "2.6"

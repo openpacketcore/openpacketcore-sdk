@@ -336,6 +336,7 @@ fn crypto_provider_boundary_is_caller_supplied() {
         header: &header,
         kind: ProtectedPayloadKind::Encrypted,
         first_inner_payload: PayloadType::SecurityAssociation,
+        payload_offset: 0,
         message_bytes: &[],
     };
     let opened = provider.open_payload(context, &[0xaa, 0xbb]);

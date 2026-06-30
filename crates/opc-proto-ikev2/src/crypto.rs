@@ -41,6 +41,12 @@ pub struct ProtectedPayloadContext<'a> {
     /// The generic protected-payload header's Next Payload value, which is the
     /// first inner payload type after successful decryption and padding checks.
     pub first_inner_payload: PayloadType,
+    /// Byte offset of the protected generic payload from the payload region.
+    ///
+    /// Providers use this with [`crate::HEADER_LEN`] and
+    /// [`crate::GENERIC_PAYLOAD_HEADER_LEN`] to reconstruct RFC 5282
+    /// authenticated associated data exactly.
+    pub payload_offset: usize,
     /// Complete outer IKEv2 message bytes, for providers whose integrity check
     /// covers header or associated-data fields.
     pub message_bytes: &'a [u8],
@@ -52,6 +58,7 @@ impl fmt::Debug for ProtectedPayloadContext<'_> {
             .field("header", self.header)
             .field("kind", &self.kind)
             .field("first_inner_payload", &self.first_inner_payload)
+            .field("payload_offset", &self.payload_offset)
             .field("message_bytes_len", &self.message_bytes.len())
             .finish()
     }
@@ -244,6 +251,7 @@ where
             header: &message.header,
             kind,
             first_inner_payload: payload.next_payload,
+            payload_offset: payload.offset,
             message_bytes,
         };
         let cleartext = provider

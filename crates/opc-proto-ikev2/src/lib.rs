@@ -8,7 +8,8 @@
 //! mechanism that is safe to expose as an SDK primitive today: fixed-header
 //! decode/encode, raw-preserving generic payload-chain walking for unencrypted
 //! payloads, protected-payload boundary metadata, caller-owned crypto provider
-//! traits, and narrow IKE_SA_INIT key-agreement/key-derivation material. It
+//! traits, narrow IKE_SA_INIT key-agreement/key-derivation material, and a
+//! caller-keyed SA_INIT AES-GCM protected-payload opener. It
 //! does not implement an IKE SA state machine, EAP-AKA, retransmission policy,
 //! cookie policy, Child SA installation, or any 3GPP ePDG profile decisions.
 //!
@@ -25,6 +26,7 @@ pub mod message;
 pub mod nat_traversal;
 pub mod notify;
 pub mod payload;
+pub mod protected_payload_crypto;
 pub mod sa_init;
 pub mod sa_init_crypto;
 #[cfg(any(test, feature = "testkit"))]
@@ -60,6 +62,11 @@ pub use notify::{
 pub use payload::{
     validate_payload_chain, PayloadChain, PayloadType, RawPayload, RawPayloadIterator,
     GENERIC_PAYLOAD_HEADER_LEN,
+};
+pub use protected_payload_crypto::{
+    decrypt_ikev2_sa_init_protected_payload, Ikev2ProtectedPayloadCryptoError,
+    Ikev2ProtectedPayloadCryptoErrorCode, Ikev2ProtectedPayloadDirection,
+    Ikev2SaInitProtectedPayloadProvider,
 };
 pub use sa_init::{
     build_ike_sa_init_response, decode_ike_sa_init_request_payloads, Ikev2KeyExchangePayload,

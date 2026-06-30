@@ -12,7 +12,7 @@ claim.
 | Fixed IKE header (`RFC 7296` §3.1) | Experimental structural coverage | `src/header.rs`; `tests/header.rs` decodes and raw-preserving re-encodes a hand-authored IKEv2 header, rejects bad major versions, short lengths, truncation, and strict reserved flag bits. |
 | Generic payload header and chain (`RFC 7296` §3.2) | Experimental structural coverage for unencrypted payloads | `src/payload.rs`; `tests/payload_chain.rs` walks a hand-authored SA -> Nonce chain, validates length fields, count limits, truncation, strict reserved bits, and byte-exact raw re-encode through `Message`. |
 | Unknown payload preservation | Experimental structural coverage | Unknown non-critical payloads remain raw-preserved; unknown critical payloads fail closed by default as required by RFC 7296 §2.2. |
-| Protected payload boundary (`SK`, `SKF`) | Boundary only | `src/crypto.rs` and `tests/payload_chain.rs` expose `ProtectedPayloadContext` and `CryptoProvider`; the codec classifies both `SK` and `SKF`, treats protected bodies as opaque, and does not decrypt, authenticate, or parse inner payloads. |
+| Protected payload boundary (`SK`, `SKF`) | Boundary plus AES-GCM `SK` opener | `src/crypto.rs` and `tests/payload_chain.rs` expose `ProtectedPayloadContext` and `CryptoProvider`; the codec classifies both `SK` and `SKF`, treats protected bodies as opaque, and never parses ciphertext as cleartext. `src/protected_payload_crypto.rs` and `tests/protected_payload_crypto.rs` provide a caller-keyed RFC 5282 AES-GCM-16 `SK` opener for already-derived SA_INIT key material. |
 | Hostile input safety | Initial regression coverage | `tests/malformed.rs` replays prefixes and malformed shapes through borrowed, owned, and iterator paths to assert structured errors without panic. |
 | Fuzz target registration | Scheduled smoke coverage | `fuzz/fuzz_targets/decode_message.rs` and `roundtrip.rs` are registered in `.github/workflows/fuzz.yml` so the crate receives the same scheduled fuzz-list and smoke-run coverage as the other protocol crates. |
 | `opc-protocol` integration | Implemented for scaffold | `Message` and `OwnedMessage` implement `BorrowDecode`, `OwnedDecode`, `Encode`, and `ToOwnedPdu`; errors use structured `opc-protocol` types and `SpecRef` references. |
@@ -30,10 +30,11 @@ changing the product boundary:
    CP, EAP, and traffic selectors as each body is claimed. Each addition must
    include octet-level fixture comments and byte-exact decode -> encode tests.
 3. **Protected payload opening boundary:** use caller-supplied `CryptoProvider`
-   implementations to authenticate/decrypt `SK`/`SKF`, strip padding, and then
-   feed the returned cleartext bytes back into the generic payload-chain parser.
-   The SDK crate must not choose algorithms, keys, retransmission behavior,
-   EAP-AKA procedure, Child SA installation, or 3GPP profile policy.
+   implementations or the SDK's SA_INIT AES-GCM `SK` opener to
+   authenticate/decrypt protected payloads, strip padding, and then feed the
+   returned cleartext bytes back into the generic payload-chain parser. The SDK
+   crate must not own IKE SA state, choose peer policy, choose retransmission
+   behavior, run EAP-AKA, install Child SAs, or enforce 3GPP profile policy.
 4. **Fragmentation framing:** add RFC 7383 `SKF` fragment-number/total-fragments
    structural checks and fixtures before claiming fragmentation conformance.
 5. **Fuzz/corpus expansion:** promote the current fuzz target and malformed
@@ -46,8 +47,9 @@ changing the product boundary:
   message correlation beyond structural Message ID parsing.
 - EAP-AKA, 3GPP ePDG profile enforcement, subscriber/session lifecycle, Child SA
   installation, XFRM/IPsec programming, or key-management policy.
-- Concrete cryptographic algorithms, key derivation, padding policy, integrity
-  verification, or null-crypto defaults.
+- Cryptographic algorithms beyond the supported SA_INIT AES-GCM-16 `SK`
+  opener, `SKF` decryption/reassembly, null-crypto defaults, or caller key
+  lifecycle policy.
 - Claims of interoperability with strongSwan, libreswan, carrier ePDG systems,
   or any production deployment.
 

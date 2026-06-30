@@ -17,6 +17,7 @@ publish = false
 testkit = []
 
 [dependencies]
+aes-gcm = { workspace = true }
 bytes = { workspace = true }
 crypto-bigint = { version = "0.7.5", features = ["getrandom", "zeroize"] }
 hmac = { workspace = true }

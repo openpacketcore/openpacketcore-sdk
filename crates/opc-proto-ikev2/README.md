@@ -10,9 +10,11 @@ Current scope is intentionally narrow:
 - unknown non-critical payload preservation, while unknown critical payloads
   always fail closed per RFC 7296;
 - protected-payload boundary metadata for `SK` and `SKF` payloads without
-  decrypting or choosing algorithms; and
-- a caller-supplied `CryptoProvider` trait boundary for downstream SA state,
-  authentication, decryption, padding removal, and key policy.
+  parsing ciphertext as cleartext;
+- a caller-supplied `CryptoProvider` trait boundary for downstream SA state and
+  key policy; and
+- an SA_INIT-derived AES-GCM-16 `SK` payload opener for callers that already
+  selected an IKE SA profile, derived key material, and packet direction.
 
 It does **not** provide an IKE SA state machine, EAP-AKA procedure, cookie or
 retransmission policy, 3GPP ePDG profile validation, Child SA installation,
@@ -44,5 +46,6 @@ assert_eq!(message.payloads().count(), 1);
 ```bash
 cargo check -p opc-proto-ikev2 --all-targets --all-features
 cargo test -p opc-proto-ikev2 --all-features
+cargo clippy -p opc-proto-ikev2 --all-targets -- -D warnings
 (cd crates/opc-proto-ikev2 && cargo +nightly fuzz list)
 ```
