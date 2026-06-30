@@ -7,15 +7,17 @@ This document defines the conformance of the `opc-proto-pfcp` crate against
 
 - **Document**: 3GPP TS 29.244
 - **Release**: Release 18 (R18)
-- **Status**: v2 — session-management codec subset complete and published;
-  production-profile graduation in progress
+- **Status**: v3 — session-management codec subset complete and published;
+  Production Profile v1 is implemented for the N4 codec and validation boundary
+  defined below
 
 ## Production Profile v1 — N4 Codec and Validation
 
-`opc-proto-pfcp` graduates when this profile is implemented and verified. The
-profile is intentionally a **codec and validation profile** for SMF/UPF N4
-integration. It does not claim to implement an SMF, UPF, PFCP transport stack,
-node selection, local policy, charging, persistence, or high-availability
+`opc-proto-pfcp` Production Profile v1 is intentionally a **codec and
+validation profile** for SMF/UPF N4 integration. It includes typed construction,
+decode, encode, and semantic validation for the profile-owned procedures below.
+It does not claim to implement an SMF, UPF, PFCP transport stack, node
+selection, local policy, charging, persistence, or high-availability
 control-plane behavior.
 
 ### Profile-owned procedures
@@ -236,16 +238,25 @@ preallocate from a wire-declared length. Three layers guard them:
 - **Verification** — a deep `cargo-fuzz` pass over the decoder completed ~41M
   executions with no crash, leak, or OOM.
 
-## Remaining Graduation Work
+## Production Profile v1 Evidence
 
-- Add profile-level builder APIs for Heartbeat, Association Setup/Release,
+- Profile-level builder APIs cover Heartbeat, Association Setup/Release,
   Session Establishment/Modification/Deletion, and Session Report messages.
-- Add a semantic validation API that enforces the Production Profile v1 rules
-  above without requiring callers to manually inspect raw IEs.
-- Add profile fixtures showing construction, validation, encode, decode, and
-  malformed-input rejection for each profile-owned procedure family.
-- Update this status from "graduation in progress" to "production-ready" only
-  when the implementation and fixtures satisfy the profile.
+- `validate_production_v1` enforces the semantic rules above without requiring
+  callers to manually inspect raw IEs.
+- Unit tests cover the profile builders and validation failures for rule-graph,
+  duplicate-singleton, and Session Report mandatory-IE errors.
+- `tests/production_profile_v1.rs` shows typed construction, validation,
+  encode, decode, and decoded-message revalidation without manual raw IE
+  construction.
+- `examples/production_profile_v1.rs` is the runnable profile-v1 integration
+  example for downstream SDK users.
+
+## Remaining Production Boundary
+
+The profile is production-ready only for the N4 codec and validation boundary
+documented above. The following are outside the production claim unless a future
+profile explicitly adds them.
 
 ## Codec Boundary (v1+)
 
