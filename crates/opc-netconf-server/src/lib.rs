@@ -197,6 +197,7 @@ pub mod operations;
 pub mod server;
 pub mod session;
 mod session_registry;
+pub mod smoke;
 pub mod ssh;
 pub mod supervision;
 pub mod transport;
@@ -231,6 +232,12 @@ pub use session::{
     SessionFraming, SessionResult,
 };
 pub use session_registry::SessionRegistry;
+pub use smoke::{
+    run_netconf_tls_smoke, NetconfSmokeError, NetconfSmokeErrorCode, NetconfSmokeFramingPreference,
+    NetconfSmokeFramingUsed, NetconfSmokeHelloSummary, NetconfSmokeRpc, NetconfSmokeRpcOutcome,
+    NetconfSmokeRpcStatus, NetconfSmokeRpcSummary, NetconfSmokeTranscript,
+    NetconfTlsSmokeClientConfig,
+};
 pub use ssh::{
     load_ssh_listener_key_files, run_read_only_ssh_call_home, run_read_only_ssh_listener,
     SshAuthorizedKey, SshCallHomeConfig, SshCallHomeError, SshCallHomeResult, SshHostKey,

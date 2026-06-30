@@ -29,11 +29,13 @@ opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-runtime = { path = "../opc-runtime", version = "0.2.0" }
 prost = { version = "0.13.5", default-features = true }
 prost-types = { version = "0.13.5", default-features = true }
+hyper-util = { version = "0.1.20", features = ["client", "tokio"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
 tokio-rustls = { workspace = true }
-tonic = { version = "0.13.1", default-features = false, features = ["codegen", "prost", "router", "server"] }
+tonic = { version = "0.13.1", default-features = false, features = ["channel", "codegen", "prost", "router", "server"] }
 tracing = { workspace = true }
 
 [build-dependencies]
@@ -44,7 +46,6 @@ tonic-build = { version = "0.13.1", default-features = false, features = ["prost
 async-trait = { workspace = true }
 bytes = { workspace = true }
 http-body-util = "0.1"
-hyper-util = { version = "0.1.20", features = ["client", "tokio"] }
 opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
 opc-tls = { path = "../opc-tls", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
