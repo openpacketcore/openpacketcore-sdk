@@ -13,6 +13,7 @@ claim.
 | Generic payload header and chain (`RFC 7296` §3.2) | Experimental structural coverage for unencrypted payloads | `src/payload.rs`; `tests/payload_chain.rs` walks a hand-authored SA -> Nonce chain, validates length fields, count limits, truncation, strict reserved bits, and byte-exact raw re-encode through `Message`. |
 | Unknown payload preservation | Experimental structural coverage | Unknown non-critical payloads remain raw-preserved; unknown critical payloads fail closed by default as required by RFC 7296 §2.2. |
 | Protected payload boundary (`SK`, `SKF`) | Boundary plus AES-GCM `SK` opener | `src/crypto.rs` and `tests/payload_chain.rs` expose `ProtectedPayloadContext` and `CryptoProvider`; the codec classifies both `SK` and `SKF`, treats protected bodies as opaque, and never parses ciphertext as cleartext. `src/protected_payload_crypto.rs` and `tests/protected_payload_crypto.rs` provide a caller-keyed RFC 5282 AES-GCM-16 `SK` opener for already-derived SA_INIT key material. |
+| NAT detection Notify semantics (`RFC 7296` §2.23) | Boundary semantic coverage | `src/nat_detection.rs` and `tests/nat_detection.rs` compute NAT-D SHA-1 hashes, collect multiple source hashes plus one destination hash from typed Notify payloads, and evaluate no-NAT/source-NAT/destination-NAT/both/unknown outcomes from caller-supplied observed UDP endpoints. |
 | Hostile input safety | Initial regression coverage | `tests/malformed.rs` replays prefixes and malformed shapes through borrowed, owned, and iterator paths to assert structured errors without panic. |
 | Fuzz target registration | Scheduled smoke coverage | `fuzz/fuzz_targets/decode_message.rs` and `roundtrip.rs` are registered in `.github/workflows/fuzz.yml` so the crate receives the same scheduled fuzz-list and smoke-run coverage as the other protocol crates. |
 | `opc-protocol` integration | Implemented for scaffold | `Message` and `OwnedMessage` implement `BorrowDecode`, `OwnedDecode`, `Encode`, and `ToOwnedPdu`; errors use structured `opc-protocol` types and `SpecRef` references. |
@@ -43,8 +44,9 @@ changing the product boundary:
 
 ## Explicitly out of scope
 
-- IKE SA state machines, retransmission timers, cookies, peer policy, NAT-T, or
-  message correlation beyond structural Message ID parsing.
+- IKE SA state machines, retransmission timers, cookie policy, peer policy,
+  NAT traversal policy beyond NAT-T datagram classification and NAT-D semantic
+  evaluation, or message correlation beyond structural Message ID parsing.
 - EAP-AKA, 3GPP ePDG profile enforcement, subscriber/session lifecycle, Child SA
   installation, XFRM/IPsec programming, or key-management policy.
 - Cryptographic algorithms beyond the supported SA_INIT AES-GCM-16 `SK`

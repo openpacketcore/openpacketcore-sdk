@@ -14,13 +14,15 @@ Current scope is intentionally narrow:
 - a caller-supplied `CryptoProvider` trait boundary for downstream SA state and
   key policy; and
 - an SA_INIT-derived AES-GCM-16 `SK` payload opener for callers that already
-  selected an IKE SA profile, derived key material, and packet direction.
+  selected an IKE SA profile, derived key material, and packet direction; and
+- RFC 7296 NAT-D hash computation and semantic evaluation from typed Notify
+  payloads and caller-supplied observed UDP endpoints.
 
 It does **not** provide an IKE SA state machine, EAP-AKA procedure, cookie or
-retransmission policy, 3GPP ePDG profile validation, Child SA installation,
-XFRM/IPsec programming, carrier acceptance evidence, or a production ePDG
-control-plane stack. See [CONFORMANCE.md](CONFORMANCE.md) for the precise
-evidence boundary and payload-chain parser plan.
+retransmission policy, NAT traversal policy, 3GPP ePDG profile validation,
+Child SA installation, XFRM/IPsec programming, carrier acceptance evidence, or a
+production ePDG control-plane stack. See [CONFORMANCE.md](CONFORMANCE.md) for
+the precise evidence boundary and payload-chain parser plan.
 
 ## Minimal use
 

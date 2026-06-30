@@ -25,6 +25,7 @@ opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 p256 = { version = "0.14.0-rc.10", default-features = false, features = ["ecdh", "std"] }
 p384 = { version = "0.14.0-rc.10", default-features = false, features = ["ecdh", "std"] }
 p521 = { version = "0.14.0-rc.10", default-features = false, features = ["ecdh", "std"] }
+sha1 = { workspace = true }
 sha2 = { workspace = true }
 zeroize = { workspace = true }
 

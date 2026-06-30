@@ -22,6 +22,20 @@ use crate::{
 /// @conformance boundary-only
 pub const IKEV2_NOTIFY_COOKIE: u16 = 16_390;
 
+/// IKEv2 Notify Message Type for NAT_DETECTION_SOURCE_IP.
+///
+/// @spec IETF RFC7296 2.23; IANA IKEv2 Notify Message Status Types
+/// @req REQ-IETF-RFC7296-NATD-CONST-001
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP: u16 = 16_388;
+
+/// IKEv2 Notify Message Type for NAT_DETECTION_DESTINATION_IP.
+///
+/// @spec IETF RFC7296 2.23; IANA IKEv2 Notify Message Status Types
+/// @req REQ-IETF-RFC7296-NATD-CONST-002
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP: u16 = 16_389;
+
 /// IKEv2 Notify Message Type for COOKIE2.
 ///
 /// @spec IETF RFC4555; IANA IKEv2 Notify Message Status Types
@@ -102,6 +116,21 @@ impl<'a> Ikev2NotifyPayload<'a> {
     /// Return true when this is a COOKIE Notify payload.
     pub const fn is_cookie(self) -> bool {
         self.notify_message_type == IKEV2_NOTIFY_COOKIE
+    }
+
+    /// Return true when this is a NAT_DETECTION_SOURCE_IP Notify payload.
+    pub const fn is_nat_detection_source_ip(self) -> bool {
+        self.notify_message_type == IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP
+    }
+
+    /// Return true when this is a NAT_DETECTION_DESTINATION_IP Notify payload.
+    pub const fn is_nat_detection_destination_ip(self) -> bool {
+        self.notify_message_type == IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP
+    }
+
+    /// Return true when this is either NAT-D Notify payload type.
+    pub const fn is_nat_detection(self) -> bool {
+        self.is_nat_detection_source_ip() || self.is_nat_detection_destination_ip()
     }
 
     /// Return true when this is a COOKIE2 Notify payload.

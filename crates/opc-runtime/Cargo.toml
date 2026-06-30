@@ -27,6 +27,7 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 num_cpus = { workspace = true }
 futures-util = "0.3"
+nix = { workspace = true, features = ["net", "uio"] }
 opc-alarm = { path = "../opc-alarm", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 

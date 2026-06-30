@@ -55,6 +55,14 @@ Gate semantics are fail-closed: an unknown status is treated as non-passing.
 readiness. When no gates are registered, cheap `/readyz` probe output is
 unchanged.
 
+## UDP destination metadata
+
+`bind_udp_socket_with_destination_metadata` returns a Tokio UDP listener wrapper
+whose receive result includes payload length, source endpoint, and local
+destination endpoint metadata. Linux listeners use packet-info ancillary data
+when available; other platforms and non-packet-info paths fall back to concrete
+`local_addr()` evidence and report an unavailable status for wildcard binds.
+
 ## License
 
 This crate is licensed under the [Apache License, Version 2.0](../../LICENSE).

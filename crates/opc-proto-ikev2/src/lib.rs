@@ -23,6 +23,7 @@ pub mod crypto;
 pub mod exchange;
 pub mod header;
 pub mod message;
+pub mod nat_detection;
 pub mod nat_traversal;
 pub mod notify;
 pub mod payload;
@@ -47,6 +48,11 @@ pub use header::{
     IKEV2_MAJOR_VERSION, IKEV2_MINOR_VERSION, IKEV2_VERSION_OCTET,
 };
 pub use message::{Message, OwnedMessage};
+pub use nat_detection::{
+    evaluate_ikev2_nat_detection, ikev2_nat_detection_hash, Ikev2NatDetectionEndpointStatus,
+    Ikev2NatDetectionEvaluation, Ikev2NatDetectionObservedEndpoint, Ikev2NatDetectionOutcome,
+    Ikev2NatDetectionPayloadError, Ikev2NatDetectionPayloads, IKEV2_NAT_DETECTION_HASH_LEN,
+};
 pub use nat_traversal::{
     classify_ike_nat_traversal_datagram, classify_ike_nat_traversal_datagram_with_context,
     NatTraversalClassification, NatTraversalEspCandidate, NatTraversalIkeDecodeErrorCode,
@@ -57,6 +63,7 @@ pub use notify::{
     build_ike_sa_init_cookie_response, extract_ike_sa_init_cookie_notify, Ikev2CookieNotify,
     Ikev2CookieNotifyBuildError, Ikev2CookieNotifyExtractError, Ikev2NotifyPayload,
     Ikev2NotifyPayloadError, IKEV2_NOTIFY_COOKIE, IKEV2_NOTIFY_COOKIE2,
+    IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP, IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP,
     IKEV2_NOTIFY_PROTOCOL_ID_NONE,
 };
 pub use payload::{

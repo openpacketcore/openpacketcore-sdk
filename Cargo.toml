@@ -28,6 +28,7 @@ num_cpus = "1.16"
 # to the 0.11 trait line together with aes-gcm-siv, which has no stable
 # release on the new traits yet; partial bumps create duplicate digest versions.
 sha2 = "0.10"
+sha1 = "0.11"
 rand = "0.10"
 aes-gcm = { version = "0.11.0-rc.4", default-features = false, features = ["aes", "alloc"] }
 aes-gcm-siv = "0.11"
@@ -40,6 +41,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 rustls-pki-types = { version = "1.8", features = ["std"] }
 x509-parser = { version = "0.16" }
 rcgen = { version = "0.13" }
+nix = { version = "0.31.3", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

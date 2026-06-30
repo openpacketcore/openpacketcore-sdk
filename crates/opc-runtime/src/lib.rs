@@ -42,6 +42,7 @@ pub mod shutdown;
 pub mod supervisor;
 pub mod task;
 pub mod testkit;
+pub mod udp;
 
 pub mod builder;
 pub mod runtime;
@@ -67,6 +68,11 @@ pub use task::{
     TaskName, TaskSpec,
 };
 pub use testkit::{fake_clock, Clock, FakeClock, RealClock, Timestamp};
+pub use udp::{
+    bind_udp_socket_with_destination_metadata, recv_udp_datagram_with_destination,
+    UdpDestinationMetadataSocket, UdpDestinationMetadataSupport, UdpLocalDestination,
+    UdpLocalDestinationStatus, UdpLocalDestinationUnavailableReason, UdpReceivedDatagram,
+};
 
 pub use builder::{Builder, StartupPhases, TryInitFn};
 pub use runtime::{run, run_with_hooks, try_run, try_run_with_hooks, RuntimeHandle, RuntimePhase};
