@@ -9,6 +9,7 @@
 //! @conformance v0 — see CONFORMANCE.md
 
 pub mod ie;
+pub mod profile;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
@@ -584,6 +585,15 @@ impl<'a> BorrowDecode<'a> for Message<'a> {
 }
 
 impl Message<'_> {
+    /// Validate this message against PFCP Production Profile v1.
+    ///
+    /// This performs semantic profile checks after structural decode: SEID
+    /// presence, mandatory IE presence, singleton duplicate rejection, grouped
+    /// IE rule shape, and profile-owned rule references.
+    pub fn validate_production_v1(&self, ctx: DecodeContext) -> profile::ProfileResult<()> {
+        profile::validate_production_v1(&self.header, &self.ies, ctx)
+    }
+
     fn encoded_lens(&self) -> Result<(usize, u16), EncodeError> {
         let spec_ref = SpecRef::new("3gpp", "TS29244", "7.4.1");
         let ie_len: usize = self.ies.iter().try_fold(0usize, |acc, ie| {
@@ -654,6 +664,45 @@ impl OwnedMessage {
             tail: &[],
         }
     }
+
+    /// Validate this owned message against PFCP Production Profile v1.
+    pub fn validate_production_v1(&self, ctx: DecodeContext) -> profile::ProfileResult<()> {
+        self.as_borrowed().validate_production_v1(ctx)
+    }
+}
+
+fn production_header(message_type: MessageType, seq: u32, seid: Option<u64>) -> Header {
+    Header {
+        version: 1,
+        spare: 0,
+        fo: false,
+        mp: false,
+        s: seid.is_some(),
+        message_type: message_type as u8,
+        length: 0,
+        seid,
+        sequence_number: seq,
+        message_priority: None,
+        spare_octet: 0,
+    }
+}
+
+fn build_production_v1_message(
+    message_type: MessageType,
+    seq: u32,
+    seid: Option<u64>,
+    typed_ies: Vec<ie::TypedIe>,
+) -> profile::ProfileBuildResult<OwnedMessage> {
+    let ies = typed_ies
+        .iter()
+        .map(InformationElement::from_typed)
+        .collect::<Result<Vec<_>, _>>()?;
+    let message = OwnedMessage {
+        header: production_header(message_type, seq, seid),
+        ies,
+    };
+    message.validate_production_v1(DecodeContext::default())?;
+    Ok(message)
 }
 
 impl OwnedDecode for OwnedMessage {
@@ -727,6 +776,194 @@ pub fn heartbeat_response(seq: u32) -> OwnedMessage {
         },
         ies: Vec::new(),
     }
+}
+
+/// Build a Production Profile v1 Heartbeat Request message.
+pub fn heartbeat_request_with_recovery(
+    seq: u32,
+    recovery_time_stamp: ie::RecoveryTimeStamp,
+) -> profile::ProfileBuildResult<OwnedMessage> {
+    build_production_v1_message(
+        MessageType::HeartbeatRequest,
+        seq,
+        None,
+        vec![ie::TypedIe::RecoveryTimeStamp(recovery_time_stamp)],
+    )
+}
+
+/// Build a Production Profile v1 Heartbeat Response message.
+pub fn heartbeat_response_with_recovery(
+    seq: u32,
+    recovery_time_stamp: ie::RecoveryTimeStamp,
+) -> profile::ProfileBuildResult<OwnedMessage> {
+    build_production_v1_message(
+        MessageType::HeartbeatResponse,
+        seq,
+        None,
+        vec![ie::TypedIe::RecoveryTimeStamp(recovery_time_stamp)],
+    )
+}
+
+/// Build a Production Profile v1 Association Setup Request message.
+pub fn association_setup_request(
+    seq: u32,
+    node_id: ie::NodeId,
+    recovery_time_stamp: ie::RecoveryTimeStamp,
+) -> profile::ProfileBuildResult<OwnedMessage> {
+    build_production_v1_message(
+        MessageType::AssociationSetupRequest,
+        seq,
+        None,
+        vec![
+            ie::TypedIe::NodeId(node_id),
+            ie::TypedIe::RecoveryTimeStamp(recovery_time_stamp),
+        ],
+    )
+}
+
+/// Build a Production Profile v1 Association Setup Response message.
+pub fn association_setup_response(
+    seq: u32,
+    node_id: ie::NodeId,
+    recovery_time_stamp: ie::RecoveryTimeStamp,
+    cause: ie::Cause,
+) -> profile::ProfileBuildResult<OwnedMessage> {
+    build_production_v1_message(
+        MessageType::AssociationSetupResponse,
+        seq,
+        None,
+        vec![
+            ie::TypedIe::NodeId(node_id),
+            ie::TypedIe::RecoveryTimeStamp(recovery_time_stamp),
+            ie::TypedIe::Cause(cause),
+        ],
+    )
+}
+
+/// Build a Production Profile v1 Association Release Request message.
+pub fn association_release_request(seq: u32) -> profile::ProfileBuildResult<OwnedMessage> {
+    build_production_v1_message(
+        MessageType::AssociationReleaseRequest,
+        seq,
+        None,
+        Vec::new(),
+    )
+}
+
+/// Build a Production Profile v1 Association Release Response message.
+pub fn association_release_response(
+    seq: u32,
+    cause: ie::Cause,
+) -> profile::ProfileBuildResult<OwnedMessage> {
+    build_production_v1_message(
+        MessageType::AssociationReleaseResponse,
+        seq,
+        None,
+        vec![ie::TypedIe::Cause(cause)],
+    )
+}
+
+/// Build a Production Profile v1 Session Establishment Request message.
+pub fn session_establishment_request(
+    seq: u32,
+    seid: u64,
+    cp_fseid: ie::FSeid,
+    create_pdr: ie::CreatePdr,
+    create_far: ie::CreateFar,
+) -> profile::ProfileBuildResult<OwnedMessage> {
+    build_production_v1_message(
+        MessageType::SessionEstablishmentRequest,
+        seq,
+        Some(seid),
+        vec![
+            ie::TypedIe::FSeid(cp_fseid),
+            ie::TypedIe::CreatePdr(create_pdr),
+            ie::TypedIe::CreateFar(create_far),
+        ],
+    )
+}
+
+/// Build a Production Profile v1 Session Establishment Response message.
+pub fn session_establishment_response(
+    seq: u32,
+    seid: u64,
+    cause: ie::Cause,
+) -> profile::ProfileBuildResult<OwnedMessage> {
+    build_production_v1_message(
+        MessageType::SessionEstablishmentResponse,
+        seq,
+        Some(seid),
+        vec![ie::TypedIe::Cause(cause)],
+    )
+}
+
+/// Build a Production Profile v1 Session Modification Request message.
+pub fn session_modification_request_with_operations(
+    seq: u32,
+    seid: u64,
+    operations: Vec<ie::TypedIe>,
+) -> profile::ProfileBuildResult<OwnedMessage> {
+    build_production_v1_message(
+        MessageType::SessionModificationRequest,
+        seq,
+        Some(seid),
+        operations,
+    )
+}
+
+/// Build a Production Profile v1 Session Modification Response message.
+pub fn session_modification_response(
+    seq: u32,
+    seid: u64,
+    cause: ie::Cause,
+) -> profile::ProfileBuildResult<OwnedMessage> {
+    build_production_v1_message(
+        MessageType::SessionModificationResponse,
+        seq,
+        Some(seid),
+        vec![ie::TypedIe::Cause(cause)],
+    )
+}
+
+/// Build a Production Profile v1 Session Deletion Request message.
+pub fn session_deletion_request(seq: u32, seid: u64) -> profile::ProfileBuildResult<OwnedMessage> {
+    build_production_v1_message(
+        MessageType::SessionDeletionRequest,
+        seq,
+        Some(seid),
+        Vec::new(),
+    )
+}
+
+/// Build a Production Profile v1 Session Deletion Response message.
+pub fn session_deletion_response(
+    seq: u32,
+    seid: u64,
+    cause: ie::Cause,
+) -> profile::ProfileBuildResult<OwnedMessage> {
+    build_production_v1_message(
+        MessageType::SessionDeletionResponse,
+        seq,
+        Some(seid),
+        vec![ie::TypedIe::Cause(cause)],
+    )
+}
+
+/// Build a Production Profile v1 Session Report Request message.
+pub fn session_report_request_with_report_type(
+    seq: u32,
+    seid: u64,
+    report_type: ie::ReportType,
+    usage_reports: Vec<ie::UsageReport>,
+) -> profile::ProfileBuildResult<OwnedMessage> {
+    let mut typed_ies = vec![ie::TypedIe::ReportType(report_type)];
+    typed_ies.extend(usage_reports.into_iter().map(ie::TypedIe::UsageReport));
+    build_production_v1_message(
+        MessageType::SessionReportRequest,
+        seq,
+        Some(seid),
+        typed_ies,
+    )
 }
 
 /// Build a Session Modification Request message.
@@ -811,6 +1048,11 @@ pub fn session_report_response(seq: u32, seid: u64) -> OwnedMessage {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use crate::ie::{
+        ApplyAction, Cause, CauseValue, CreateFar, CreatePdr, DestinationInterface, FSeid, FarId,
+        ForwardingParameters, NetworkInstance, NodeId, NodeIdType, Pdi, PdrId, Precedence,
+        RecoveryTimeStamp, ReportType, SourceInterface, TypedIe,
+    };
 
     fn encode_owned(msg: &OwnedMessage) -> Bytes {
         let mut buf = BytesMut::new();
@@ -828,6 +1070,83 @@ mod tests {
             bytes,
             "round-trip not byte-exact"
         );
+    }
+
+    fn recovery_time_stamp() -> RecoveryTimeStamp {
+        RecoveryTimeStamp { seconds: 42 }
+    }
+
+    fn accepted_cause() -> Cause {
+        Cause {
+            value: CauseValue::RequestAccepted,
+        }
+    }
+
+    fn node_id() -> NodeId {
+        NodeId {
+            node_id_type: NodeIdType::Fqdn,
+            value: b"upf.local".to_vec(),
+        }
+    }
+
+    fn cp_fseid() -> FSeid {
+        FSeid {
+            v4: true,
+            v6: false,
+            seid: 1,
+            ipv4: Some([127, 0, 0, 1]),
+            ipv6: None,
+        }
+    }
+
+    fn forwarding_action() -> ApplyAction {
+        ApplyAction {
+            drop: false,
+            forward: true,
+            buffer: false,
+            notify_cp: false,
+            duplicate: false,
+            ip_masquerade: false,
+            ip_masquerade_decap: false,
+            dfrt: false,
+            edrt: false,
+            bdpn: false,
+            ddpn: false,
+            spare: 0,
+        }
+    }
+
+    fn create_pdr_with_far(far_id: u32) -> CreatePdr {
+        CreatePdr {
+            members: vec![
+                TypedIe::PdrId(PdrId { value: 1 }),
+                TypedIe::Precedence(Precedence { value: 1 }),
+                TypedIe::Pdi(Pdi {
+                    members: vec![
+                        TypedIe::SourceInterface(SourceInterface { value: 0, spare: 0 }),
+                        TypedIe::NetworkInstance(NetworkInstance {
+                            value: b"internet".to_vec(),
+                        }),
+                    ],
+                }),
+                TypedIe::FarId(FarId { value: far_id }),
+            ],
+        }
+    }
+
+    fn create_far(far_id: u32) -> CreateFar {
+        CreateFar {
+            members: vec![
+                TypedIe::FarId(FarId { value: far_id }),
+                TypedIe::ApplyAction(forwarding_action()),
+                TypedIe::ForwardingParameters(ForwardingParameters {
+                    members: vec![TypedIe::DestinationInterface(DestinationInterface {
+                        value: 0,
+                        spare: 0,
+                    })],
+                }),
+            ],
+        }
     }
 
     #[test]
@@ -856,6 +1175,118 @@ mod tests {
         assert_eq!(decoded.header.sequence_number, 99);
         assert!(decoded.ies.is_empty());
         assert_eq!(encode_owned(&decoded), bytes);
+    }
+
+    #[test]
+    fn test_production_heartbeat_builder_validates() {
+        let msg = heartbeat_request_with_recovery(42, recovery_time_stamp()).unwrap();
+        assert_eq!(msg.header.message_type, MessageType::HeartbeatRequest as u8);
+        msg.validate_production_v1(DecodeContext::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_production_association_setup_builder_validates() {
+        let msg = association_setup_request(42, node_id(), recovery_time_stamp()).unwrap();
+        assert_eq!(
+            msg.header.message_type,
+            MessageType::AssociationSetupRequest as u8
+        );
+        msg.validate_production_v1(DecodeContext::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_production_association_setup_response_builder_validates() {
+        let msg =
+            association_setup_response(42, node_id(), recovery_time_stamp(), accepted_cause())
+                .unwrap();
+        assert_eq!(
+            msg.header.message_type,
+            MessageType::AssociationSetupResponse as u8
+        );
+        msg.validate_production_v1(DecodeContext::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_production_session_establishment_builder_validates() {
+        let msg = session_establishment_request(
+            42,
+            10,
+            cp_fseid(),
+            create_pdr_with_far(7),
+            create_far(7),
+        )
+        .unwrap();
+        assert_eq!(
+            msg.header.message_type,
+            MessageType::SessionEstablishmentRequest as u8
+        );
+        msg.validate_production_v1(DecodeContext::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_production_validation_rejects_missing_far_reference() {
+        let msg = session_establishment_request(
+            42,
+            10,
+            cp_fseid(),
+            create_pdr_with_far(7),
+            create_far(8),
+        );
+
+        assert!(matches!(
+            msg,
+            Err(profile::ProfileBuildError::Validate {
+                source: profile::ProfileValidationError::MissingRuleReference {
+                    reference: "FAR",
+                    id: 7,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn test_production_validation_rejects_duplicate_fseid() {
+        let msg = OwnedMessage {
+            header: production_header(MessageType::SessionEstablishmentRequest, 42, Some(10)),
+            ies: vec![
+                InformationElement::from_typed(&TypedIe::FSeid(cp_fseid())).unwrap(),
+                InformationElement::from_typed(&TypedIe::FSeid(cp_fseid())).unwrap(),
+                InformationElement::from_typed(&TypedIe::CreatePdr(create_pdr_with_far(7)))
+                    .unwrap(),
+                InformationElement::from_typed(&TypedIe::CreateFar(create_far(7))).unwrap(),
+            ],
+        };
+
+        assert!(matches!(
+            msg.validate_production_v1(DecodeContext::default()),
+            Err(profile::ProfileValidationError::DuplicateIe { ie: "F-SEID", .. })
+        ));
+    }
+
+    #[test]
+    fn test_production_session_report_requires_usage_report() {
+        let report_type = ReportType {
+            downlink_data_report: false,
+            usage_report: true,
+            error_indication_report: false,
+            user_plane_inactivity_report: false,
+            tsc_management_info_report: false,
+            session_report: false,
+            up_initiated_session_request: false,
+        };
+
+        let msg = session_report_request_with_report_type(42, 10, report_type, Vec::new());
+        assert!(matches!(
+            msg,
+            Err(profile::ProfileBuildError::Validate {
+                source: profile::ProfileValidationError::MissingUsageReport
+            })
+        ));
     }
 
     #[test]
