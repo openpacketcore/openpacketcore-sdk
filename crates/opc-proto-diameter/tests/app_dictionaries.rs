@@ -243,6 +243,116 @@ fn swm_answer_result_category_is_classified() {
     assert_eq!(answer.result_category(), SwmResultCategory::Success);
 }
 
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_answer_eap_material_predicate_requires_non_empty_material() {
+    let mut answer = sample_swm_answer();
+    assert!(answer.carries_eap_material());
+
+    answer.eap_payload = Some(Vec::new().into());
+    answer.eap_reissued_payload = None;
+    answer.eap_master_session_key = None;
+    assert!(!answer.carries_eap_material());
+
+    answer.eap_reissued_payload = Some(vec![0x01].into());
+    assert!(answer.carries_eap_material());
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_der_rejects_invalid_eap_request_semantics_in_builder() {
+    let mut request = sample_swm_request();
+    request.auth_request_type = AuthRequestType::Other(1);
+    assert!(
+        apps::swm::build_swm_diameter_eap_request(&request, 1, 2, EncodeContext::default())
+            .is_err()
+    );
+
+    request = sample_swm_request();
+    request.eap_payload = Vec::new().into();
+    assert!(
+        apps::swm::build_swm_diameter_eap_request(&request, 1, 2, EncodeContext::default())
+            .is_err()
+    );
+
+    request = sample_swm_request();
+    request.state_avps = vec![Vec::new()];
+    assert!(
+        apps::swm::build_swm_diameter_eap_request(&request, 1, 2, EncodeContext::default())
+            .is_err()
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_der_rejects_invalid_eap_request_semantics_in_parser() {
+    let message = build_raw_swm_der_with(
+        Some(apps::swm::APPLICATION_ID.get()),
+        1,
+        &[0x02, 0x17, 0x00, 0x04],
+    );
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    assert!(apps::swm::parse_swm_diameter_eap_request(&decoded, DecodeContext::default()).is_err());
+
+    let message = build_raw_swm_der_with(Some(apps::swm::APPLICATION_ID.get()), 3, &[]);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    assert!(apps::swm::parse_swm_diameter_eap_request(&decoded, DecodeContext::default()).is_err());
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_rejects_success_without_eap_material() {
+    let mut answer = sample_swm_answer();
+    answer.eap_payload = None;
+    answer.eap_reissued_payload = None;
+    answer.eap_master_session_key = None;
+    assert!(
+        apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default()).is_err()
+    );
+
+    let message = build_raw_swm_dea(Some(apps::swm::APPLICATION_ID.get()));
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    assert!(apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::default()).is_err());
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_allows_failure_without_eap_material() {
+    let mut answer = sample_swm_answer();
+    answer.result_code = 5001;
+    answer.eap_payload = None;
+    answer.eap_reissued_payload = None;
+    answer.eap_master_session_key = None;
+    assert!(
+        apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default()).is_ok()
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_rejects_invalid_optional_material() {
+    let mut answer = sample_swm_answer();
+    answer.eap_payload = Some(Vec::new().into());
+    assert!(
+        apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default()).is_err()
+    );
+
+    answer = sample_swm_answer();
+    answer.auth_request_type = AuthRequestType::Other(1);
+    assert!(
+        apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default()).is_err()
+    );
+
+    answer = sample_swm_answer();
+    answer.state_avps = vec![Vec::new()];
+    assert!(
+        apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default()).is_err()
+    );
+}
+
 #[cfg(feature = "app-rf")]
 fn sample_rf_request(record_type: AccountingRecordType, record_number: u32) -> RfAccountingRequest {
     RfAccountingRequest {
@@ -474,6 +584,19 @@ fn build_raw_rf_aca(acct_application_id: Option<u32>, extras: &[BytesMut]) -> Ow
 
 #[cfg(feature = "app-swm")]
 fn build_raw_swm_der(auth_application_id: Option<u32>) -> OwnedMessage {
+    build_raw_swm_der_with(
+        auth_application_id,
+        3,
+        &[0x02, 0x17, 0x00, 0x08, 0x32, 0x01, 0x02, 0x03],
+    )
+}
+
+#[cfg(feature = "app-swm")]
+fn build_raw_swm_der_with(
+    auth_application_id: Option<u32>,
+    auth_request_type: u32,
+    eap_payload: &[u8],
+) -> OwnedMessage {
     let mut raw_avps = BytesMut::new();
     raw_avps.extend_from_slice(&encode_raw_avp(base::AVP_SESSION_ID, true, b"sess;swm;001"));
     if let Some(id) = auth_application_id {
@@ -501,12 +624,12 @@ fn build_raw_swm_der(auth_application_id: Option<u32>) -> OwnedMessage {
     raw_avps.extend_from_slice(&encode_raw_avp(
         apps::swm::AVP_AUTH_REQUEST_TYPE,
         true,
-        &3u32.to_be_bytes(),
+        &auth_request_type.to_be_bytes(),
     ));
     raw_avps.extend_from_slice(&encode_raw_avp(
         apps::swm::AVP_EAP_PAYLOAD,
         true,
-        &[0x02, 0x17, 0x00, 0x08, 0x32, 0x01, 0x02, 0x03],
+        eap_payload,
     ));
     OwnedMessage {
         header: Header::new(

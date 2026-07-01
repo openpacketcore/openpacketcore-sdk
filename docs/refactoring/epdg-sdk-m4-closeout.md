@@ -10,8 +10,9 @@ The Phase 4 P2/P3 additions are accepted only as SDK mechanisms:
 
 | Surface | SDK artifact | Experimental boundary |
 | --- | --- | --- |
-| IKEv2 codec scaffold | `crates/opc-proto-ikev2` | `README.md` and `CONFORMANCE.md` describe header and generic payload-chain coverage only; IKE SA state machines, EAP-AKA, Child SA installation, and profile policy remain downstream product work. |
-| EPC/ePDG simulator skeletons | `crates/opc-testbed` plus `docs/design/epc-epdg-testbed-simulators.md` | The PGW S2b and Diameter peer simulator interfaces are RFC 012 `stateful-mock` skeletons; raw protocol bytes must be decoded by SDK protocol crates first. |
+| IKEv2 codec scaffold | `crates/opc-proto-ikev2` | `README.md` and `CONFORMANCE.md` describe header, payload-chain, IKE_AUTH helper, Child SA intent, and RFC 7383 SKF structural coverage; IKE SA state machines, EAP-AKA, Child SA lifecycle policy, and profile policy remain downstream product work. |
+| XFRM/IPsec request bridge | `crates/opc-ipsec-xfrm` | The optional `ikev2` feature maps validated ESP Child SA negotiation intent into bidirectional XFRM SA/policy install requests. It does not derive keys, allocate product policy, choose namespaces/privileges, or claim traffic readiness. |
+| EPC/ePDG simulator skeletons | `crates/opc-testbed` plus `docs/design/epc-epdg-testbed-simulators.md` | The PGW S2b and Diameter peer simulator interfaces are RFC 012 `stateful-mock` skeletons; raw protocol bytes must be decoded by SDK protocol crates first. The SDK composition harness is a regression guard, not attach orchestration. |
 | Packet-core evidence packs | `crates/opc-evidence` and RFC 006 §10.3 | Packet-core pack schemas are marked experimental and require `experimental: true`; downstream smoke artifacts mapped into the format are not SDK certification claims. |
 | Generic operator helpers | `operators/operator-sdk-go` | Runtime-gate names, Multus/SR-IOV helpers, UDP/SCTP port helpers, rollout/drain helpers, and fake-client utilities are product-neutral helpers. Product CRDs, Helm values, privileges, and readiness policy stay outside the helper package. |
 
@@ -40,8 +41,9 @@ product adapter work, not by expanding the SDK roadmap or claiming product
 readiness here:
 
 1. Compose `opc-proto-ikev2` with a product IKE SA state machine, EAP-AKA,
-   cookie/retransmit policy, Child SA installation, key-derivation choices, and
-   3GPP ePDG profile validation.
+   cookie/retransmit policy, Child SA lifecycle controller, key-derivation
+   choices, the `opc-ipsec-xfrm` request bridge, and 3GPP ePDG profile
+   validation.
 2. Adapt ePDG attach orchestration to the SDK-owned GTPv2-C, Diameter metadata,
    IKEv2, testbed, and evidence mechanisms without moving APN, PLMN, realm,
    AAA/HSS/CDF, charging, or subscriber-session policy into the SDK.

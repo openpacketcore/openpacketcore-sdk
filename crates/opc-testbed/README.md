@@ -24,6 +24,12 @@ Scenario DSL, virtual time, assertions, fixture provenance, and simulator framew
   adapters; it intentionally carries no local Diameter parser. RFC 012 fidelity
   = `stateful-mock` (experimental); not procedure-faithful, not conformance,
   and not a production AAA/HSS/CDF peer.
+- `tests/epdg_sdk_composition.rs` composes the current SDK-owned ePDG building
+  blocks in one regression path: S2b fixture decode, SWm DER build/parse,
+  Diameter peer metadata recording, IKEv2 Child SA to XFRM request mapping,
+  mock XFRM composite install, and packet-core evidence redaction validation.
+  This is a composition guard, not downstream attach orchestration or carrier
+  acceptance evidence.
 
 ## Quick start
 

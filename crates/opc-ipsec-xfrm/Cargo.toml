@@ -13,8 +13,13 @@ keywords = ["5g", "ipsec", "xfrm", "linux", "packet-core"]
 categories = ["network-programming", "os::linux-apis"]
 publish = false
 
+[features]
+default = []
+ikev2 = ["dep:opc-proto-ikev2"]
+
 [dependencies]
 opc-linux-xfrm-sys = { path = "../opc-linux-xfrm-sys", version = "0.2.0" }
+opc-proto-ikev2 = { path = "../opc-proto-ikev2", version = "0.2.0", optional = true }
 async-trait = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }

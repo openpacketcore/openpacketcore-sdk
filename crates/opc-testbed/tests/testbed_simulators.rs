@@ -661,6 +661,19 @@ fn diameter_peer_simulator_records_sdk_decoded_interface_messages() {
         sim.get_state("sdk_protocol_profile").as_deref(),
         Some("opc-protocol+diameter-transport-neutral")
     );
+
+    let swm = FakeDiameterFrame {
+        command_code: 268,
+        application_id: 16_777_264,
+        direction: PeerMessageDirection::Request,
+        has_session_id: true,
+    };
+    let event = sim
+        .handle_sdk_message(&swm)
+        .expect("Diameter peer accepts SDK-decoded SWm metadata");
+    assert_eq!(event.application, DiameterApplication::Swm);
+    assert_eq!(sim.get_state("last_application").as_deref(), Some("SWM"));
+    assert_eq!(sim.session_messages, 2);
 }
 
 #[test]
@@ -680,6 +693,10 @@ fn diameter_application_ids_include_rf_accounting_mapping() {
     assert_eq!(
         DiameterApplication::from_application_id(16_777_251),
         DiameterApplication::S6a
+    );
+    assert_eq!(
+        DiameterApplication::from_application_id(16_777_264),
+        DiameterApplication::Swm
     );
 }
 

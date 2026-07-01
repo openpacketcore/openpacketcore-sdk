@@ -17,7 +17,13 @@ This crate provides:
   implementations never emit raw key bytes.
 - `XfrmError`: an error enum with payload-free labels safe for logs and support
   bundles.
+- Optional `ikev2` feature: a validated mapper from
+  `opc-proto-ikev2` Child SA negotiation intent to bidirectional XFRM SA and
+  policy install requests. The mapper is intentionally exact: it rejects
+  non-ESP protocol IDs, malformed or zero SPIs, unrepresentable traffic-selector
+  ranges, mismatched address families, missing directional keys, and zero replay
+  windows instead of approximating product policy.
 
 Raw Linux netlink socket work is intentionally kept in `opc-linux-xfrm-sys`.
 This crate does not implement IKE, ESP processing, SA/SPD policy, namespace
-management, or product deployment defaults.
+management, product deployment defaults, or traffic-readiness decisions.

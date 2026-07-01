@@ -11,6 +11,8 @@ Current scope is intentionally narrow:
   always fail closed per RFC 7296;
 - protected-payload boundary metadata for `SK` and `SKF` payloads without
   parsing ciphertext as cleartext;
+- RFC 7383 `SKF` fragment-number/total-fragments structural helpers plus
+  bounded reassembly for already-decrypted fragment cleartext;
 - a caller-supplied `CryptoProvider` trait boundary for downstream SA state and
   key policy;
 - an SA_INIT-derived AES-GCM-16 `SK` payload opener for callers that already
@@ -28,9 +30,9 @@ Current scope is intentionally narrow:
 
 It does **not** provide an IKE SA state machine, EAP-AKA procedure, cookie or
 retransmission policy, NAT traversal policy, 3GPP ePDG profile validation,
-Child SA installation, XFRM/IPsec programming, carrier acceptance evidence, or
-a production ePDG control-plane stack. See [CONFORMANCE.md](CONFORMANCE.md) for
-the precise evidence boundary.
+Child SA lifecycle management, XFRM/IPsec programming, carrier acceptance
+evidence, or a production ePDG control-plane stack. See
+[CONFORMANCE.md](CONFORMANCE.md) for the precise evidence boundary.
 
 ## Minimal use
 
