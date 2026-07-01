@@ -21,6 +21,8 @@ pub struct NetconfSshTestKeyFixture {
     host_key: SshHostKey,
     authorized_key: SshAuthorizedKey,
     host_private_key_openssh: String,
+    host_public_key_openssh: String,
+    client_private_key_openssh: String,
     authorized_public_key_openssh: String,
 }
 
@@ -40,6 +42,14 @@ impl NetconfSshTestKeyFixture {
             .to_openssh(keys::ssh_key::LineEnding::LF)
             .map_err(|_| NetconfSshTestKeyFixtureError::HostKeyEncode)?
             .to_string();
+        let host_public_key_openssh = host_key
+            .public_key()
+            .to_openssh()
+            .map_err(|_| NetconfSshTestKeyFixtureError::HostPublicKeyEncode)?;
+        let client_private_key_openssh = client_key
+            .to_openssh(keys::ssh_key::LineEnding::LF)
+            .map_err(|_| NetconfSshTestKeyFixtureError::ClientKeyEncode)?
+            .to_string();
         let authorized_public_key_openssh = client_key
             .public_key()
             .to_openssh()
@@ -49,6 +59,8 @@ impl NetconfSshTestKeyFixture {
             host_key,
             authorized_key: client_key.public_key().clone(),
             host_private_key_openssh,
+            host_public_key_openssh,
+            client_private_key_openssh,
             authorized_public_key_openssh,
         })
     }
@@ -69,10 +81,26 @@ impl NetconfSshTestKeyFixture {
         SshListenerConfig::new(tenant, material.host_keys, material.authorized_keys)
     }
 
+    /// Return the host public key record that clients should trust.
+    #[must_use]
+    pub fn host_public_key_openssh(&self) -> &str {
+        &self.host_public_key_openssh
+    }
+
     /// Return the authorized public key record suitable for `authorized_keys`.
     #[must_use]
     pub fn authorized_public_key_openssh(&self) -> &str {
         &self.authorized_public_key_openssh
+    }
+
+    /// Return the client private key matching [`Self::authorized_public_key_openssh`].
+    ///
+    /// This is intended only for live smoke clients and tests. The fixture's
+    /// `Debug` implementation and assertion helpers keep private bytes out of
+    /// diagnostics.
+    #[must_use]
+    pub fn client_private_key_openssh(&self) -> &str {
+        &self.client_private_key_openssh
     }
 
     /// Write host and authorized-key files into `dir`.
@@ -105,7 +133,10 @@ impl NetconfSshTestKeyFixture {
     }
 
     fn private_key_markers(&self) -> [&str; 2] {
-        [&self.host_private_key_openssh, "OPENSSH PRIVATE KEY"]
+        [
+            &self.host_private_key_openssh,
+            &self.client_private_key_openssh,
+        ]
     }
 }
 
@@ -149,9 +180,15 @@ pub enum NetconfSshTestKeyFixtureError {
     /// Client key generation failed.
     #[error("netconf_ssh_testkit_client_key_generate")]
     ClientKeyGenerate,
+    /// Client private key OpenSSH encoding failed.
+    #[error("netconf_ssh_testkit_client_key_encode")]
+    ClientKeyEncode,
     /// Host private key OpenSSH encoding failed.
     #[error("netconf_ssh_testkit_host_key_encode")]
     HostKeyEncode,
+    /// Host public key OpenSSH encoding failed.
+    #[error("netconf_ssh_testkit_host_public_key_encode")]
+    HostPublicKeyEncode,
     /// Client public key OpenSSH encoding failed.
     #[error("netconf_ssh_testkit_client_public_key_encode")]
     ClientPublicKeyEncode,
@@ -170,7 +207,9 @@ impl NetconfSshTestKeyFixtureError {
         match self {
             Self::HostKeyGenerate => "netconf_ssh_testkit_host_key_generate",
             Self::ClientKeyGenerate => "netconf_ssh_testkit_client_key_generate",
+            Self::ClientKeyEncode => "netconf_ssh_testkit_client_key_encode",
             Self::HostKeyEncode => "netconf_ssh_testkit_host_key_encode",
+            Self::HostPublicKeyEncode => "netconf_ssh_testkit_host_public_key_encode",
             Self::ClientPublicKeyEncode => "netconf_ssh_testkit_client_public_key_encode",
             Self::HostKeyWrite => "netconf_ssh_testkit_host_key_write",
             Self::AuthorizedKeysWrite => "netconf_ssh_testkit_authorized_keys_write",

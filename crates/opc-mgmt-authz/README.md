@@ -1,14 +1,14 @@
 # opc-mgmt-authz
 
 NACM authorization facade for OpenPacketCore management-plane reads,
-subscriptions, and management RPC/action execution checks.
+subscriptions, config writes, and management RPC/action execution checks.
 
 `opc-config-bus` enforces NACM on the **write** path (`ConfigAuthorizer`), but a
 running-config snapshot read is raw and unfiltered. The gNMI `Get`/`Subscribe`
 and NETCONF `<get>`/`<get-config>` paths must therefore authorize **reads**
 themselves, default-deny, and omit subtrees the caller may not see.
 
-Both authorizers reject served-operation module sets with ambiguous prefixes at
+The authorizers reject served module sets with ambiguous prefixes at
 construction time. `opc-nacm` would otherwise preserve the ambiguity and make
 each later parse fail; surfacing that as a startup/schema error is clearer and
 still fail-closed.
@@ -33,9 +33,18 @@ plus `opc-redaction` to mask secret values on the paths that are allowed. NACM
 here is schema-node scoped (the SDK NACM model collapses list instances), so this
 facade does not perform per-instance read authorization.
 
-Write-side authorization (mapping `ConfigOperation`/changed paths to NACM
-actions, including gNMI `update`-that-creates -> `create`) is a separate
-`ConfigAuthorizer` adapter, not part of this read facade.
+`ConfigWriteAuthorizer`:
+
+- implements the `opc-config-bus` `ConfigAuthorizer` admission hook;
+- maps `ConfigOperation` values to NACM write actions (`update`, `replace`, or
+  `delete`);
+- resolves each config-bus changed path through the generated schema registry
+  before evaluating NACM;
+- allows empty changed-path batches for no-op/pre-authorized rollback admission;
+- denies unknown or unparseable paths with a fixed invalid marker so list key
+  values are not echoed; and
+- returns payload-free policy-store errors so servers can fail closed without
+  leaking storage details.
 
 `ExecAuthorizer`:
 

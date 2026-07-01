@@ -1078,7 +1078,7 @@ fn decode_transform_attributes<'a>(
     Ok(attributes)
 }
 
-fn encode_sa_payload_build(
+pub(crate) fn encode_sa_payload_build(
     payload: &Ikev2SaPayloadBuild,
 ) -> Result<Vec<u8>, Ikev2SaInitBuildError> {
     if payload.proposals.is_empty() {
