@@ -16,6 +16,8 @@ Current scope is intentionally narrow:
 - typed S2b message views for Echo plus Create/Modify/Delete/Update
   Session-oriented flows, with ProcedureAware mandatory-IE checks for the
   claimed examples;
+- public profile constructors for Echo, Create Session, Modify Bearer, Delete
+  Session, and Update Bearer profile-owned request/response shapes;
 - a transport-neutral Echo peer helper that tracks liveness, Recovery restart
   counters, and restart-reconciliation fencing before new Echo exchanges;
 - provenance-labeled fixture replay that separates spec-authored conformance
@@ -26,14 +28,14 @@ Current scope is intentionally narrow:
 
 The Production Profile v1 target is a codec, typed-view, validation, and
 transport-neutral helper profile for ePDG/PGW S2b integration. Public profile
-constructors currently cover Echo and Create Session. The profile is not marked
-production-ready until the remaining profile-owned constructors,
-constructor-driven fixtures, runnable example, and negative profile fixtures
-land. It does **not** provide a complete GTPv2-C implementation, full S2b
-semantic state-machine validation beyond the documented Echo and
-client-transaction helpers, carrier acceptance evidence, or a production
-ePDG/PGW control-plane stack. See [CONFORMANCE.md](CONFORMANCE.md) for the
-precise evidence boundary.
+constructors cover Echo, Create Session, Modify Bearer, Delete Session, and
+Update Bearer profile-owned request/response shapes. The profile is not marked
+production-ready until the constructor-driven downstream example and remaining
+malformed profile-critical negative fixtures land. It does **not** provide a
+complete GTPv2-C implementation, full S2b semantic state-machine validation
+beyond the documented Echo and client-transaction helpers, carrier acceptance
+evidence, or a production ePDG/PGW control-plane stack. See
+[CONFORMANCE.md](CONFORMANCE.md) for the precise evidence boundary.
 
 ## Minimal use
 

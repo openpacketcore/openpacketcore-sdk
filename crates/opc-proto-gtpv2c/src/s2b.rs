@@ -159,6 +159,84 @@ pub struct S2bCreateSessionRejectedResponse<'a> {
     pub additional_ies: Vec<TypedIe<'a>>,
 }
 
+/// Input for building an S2b Production Profile v1 Modify Bearer Request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S2bModifyBearerRequest<'a> {
+    /// GTPv2-C sequence number.
+    pub sequence_number: u32,
+    /// TEID carried in the request common header.
+    pub teid: u32,
+    /// Bearer Context IE.
+    pub bearer_context: BearerContext<'a>,
+    /// Additional typed IEs to append after Bearer Context.
+    pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+/// Input for building an S2b Production Profile v1 Modify Bearer Response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S2bModifyBearerResponse<'a> {
+    /// GTPv2-C sequence number.
+    pub sequence_number: u32,
+    /// TEID carried in the response common header.
+    pub teid: u32,
+    /// Cause value.
+    pub cause: CauseValue,
+    /// Additional typed IEs to append after Cause.
+    pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+/// Input for building an S2b Production Profile v1 Delete Session Request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S2bDeleteSessionRequest<'a> {
+    /// GTPv2-C sequence number.
+    pub sequence_number: u32,
+    /// TEID carried in the request common header.
+    pub teid: u32,
+    /// Linked EPS Bearer ID IE.
+    pub linked_ebi: EpsBearerId,
+    /// Additional typed IEs to append after linked EBI.
+    pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+/// Input for building an S2b Production Profile v1 Delete Session Response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S2bDeleteSessionResponse<'a> {
+    /// GTPv2-C sequence number.
+    pub sequence_number: u32,
+    /// TEID carried in the response common header.
+    pub teid: u32,
+    /// Cause value.
+    pub cause: CauseValue,
+    /// Additional typed IEs to append after Cause.
+    pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+/// Input for building an S2b Production Profile v1 Update Bearer Request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S2bUpdateBearerRequest<'a> {
+    /// GTPv2-C sequence number.
+    pub sequence_number: u32,
+    /// TEID carried in the request common header.
+    pub teid: u32,
+    /// Bearer Context IE.
+    pub bearer_context: BearerContext<'a>,
+    /// Additional typed IEs to append after Bearer Context.
+    pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+/// Input for building an S2b Production Profile v1 Update Bearer Response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S2bUpdateBearerResponse<'a> {
+    /// GTPv2-C sequence number.
+    pub sequence_number: u32,
+    /// TEID carried in the response common header.
+    pub teid: u32,
+    /// Cause value.
+    pub cause: CauseValue,
+    /// Additional typed IEs to append after Cause.
+    pub additional_ies: Vec<TypedIe<'a>>,
+}
+
 /// Build an S2b Production Profile v1 Echo Request.
 ///
 /// # Errors
@@ -262,6 +340,141 @@ pub fn s2b_create_session_rejected_response(
         ),
         ies,
     )
+}
+
+/// Build an S2b Production Profile v1 Modify Bearer Request.
+///
+/// # Errors
+///
+/// Returns [`S2bProfileBuildError`] when Bearer Context cannot encode or the
+/// constructed request fails procedure-aware validation.
+pub fn s2b_modify_bearer_request(
+    request: S2bModifyBearerRequest<'_>,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    build_bearer_context_request(
+        MODIFY_BEARER_REQUEST,
+        request.sequence_number,
+        request.teid,
+        request.bearer_context,
+        request.additional_ies,
+    )
+}
+
+/// Build an S2b Production Profile v1 Modify Bearer Response.
+///
+/// # Errors
+///
+/// Returns [`S2bProfileBuildError`] when Cause cannot encode or the response
+/// fails procedure-aware validation.
+pub fn s2b_modify_bearer_response(
+    response: S2bModifyBearerResponse<'_>,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    build_cause_response(
+        MODIFY_BEARER_RESPONSE,
+        response.sequence_number,
+        response.teid,
+        response.cause,
+        response.additional_ies,
+    )
+}
+
+/// Build an S2b Production Profile v1 Delete Session Request.
+///
+/// # Errors
+///
+/// Returns [`S2bProfileBuildError`] when linked EBI cannot encode or the
+/// constructed request fails procedure-aware validation.
+pub fn s2b_delete_session_request(
+    request: S2bDeleteSessionRequest<'_>,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    let mut ies = vec![typed_ie(0, TypedIeValue::EpsBearerId(request.linked_ebi))];
+    ies.extend(request.additional_ies);
+    build_s2b_profile_message(
+        Header::with_teid(
+            DELETE_SESSION_REQUEST,
+            request.teid,
+            request.sequence_number,
+        ),
+        ies,
+    )
+}
+
+/// Build an S2b Production Profile v1 Delete Session Response.
+///
+/// # Errors
+///
+/// Returns [`S2bProfileBuildError`] when Cause cannot encode or the response
+/// fails procedure-aware validation.
+pub fn s2b_delete_session_response(
+    response: S2bDeleteSessionResponse<'_>,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    build_cause_response(
+        DELETE_SESSION_RESPONSE,
+        response.sequence_number,
+        response.teid,
+        response.cause,
+        response.additional_ies,
+    )
+}
+
+/// Build an S2b Production Profile v1 Update Bearer Request.
+///
+/// # Errors
+///
+/// Returns [`S2bProfileBuildError`] when Bearer Context cannot encode or the
+/// constructed request fails procedure-aware validation.
+pub fn s2b_update_bearer_request(
+    request: S2bUpdateBearerRequest<'_>,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    build_bearer_context_request(
+        UPDATE_BEARER_REQUEST,
+        request.sequence_number,
+        request.teid,
+        request.bearer_context,
+        request.additional_ies,
+    )
+}
+
+/// Build an S2b Production Profile v1 Update Bearer Response.
+///
+/// # Errors
+///
+/// Returns [`S2bProfileBuildError`] when Cause cannot encode or the response
+/// fails procedure-aware validation.
+pub fn s2b_update_bearer_response(
+    response: S2bUpdateBearerResponse<'_>,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    build_cause_response(
+        UPDATE_BEARER_RESPONSE,
+        response.sequence_number,
+        response.teid,
+        response.cause,
+        response.additional_ies,
+    )
+}
+
+fn build_bearer_context_request<'a>(
+    message_type: u8,
+    sequence_number: u32,
+    teid: u32,
+    bearer_context: BearerContext<'a>,
+    additional_ies: Vec<TypedIe<'a>>,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    let mut ies = vec![typed_ie(0, TypedIeValue::BearerContext(bearer_context))];
+    ies.extend(additional_ies);
+    build_s2b_profile_message(Header::with_teid(message_type, teid, sequence_number), ies)
+}
+
+fn build_cause_response<'a>(
+    message_type: u8,
+    sequence_number: u32,
+    teid: u32,
+    cause_value: CauseValue,
+    additional_ies: Vec<TypedIe<'a>>,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    let mut ies = vec![typed_ie(0, TypedIeValue::Cause(cause(cause_value)))];
+    ies.extend(additional_ies);
+    build_s2b_profile_message(Header::with_teid(message_type, teid, sequence_number), ies)
 }
 
 fn typed_ie<'a>(instance: u8, value: TypedIeValue<'a>) -> TypedIe<'a> {
