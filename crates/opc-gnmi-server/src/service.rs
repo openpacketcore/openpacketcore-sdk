@@ -2628,7 +2628,9 @@ mod tests {
             events[0].schema_paths,
             vec![schema_node_path("/sys:system/sys:uptime")]
         );
-        assert!(!format!("{:?}", events).contains("123"));
+        let event_debug = format!("{events:?}");
+        assert!(!event_debug.contains("\"123\""));
+        assert!(!event_debug.contains("[49, 50, 51]"));
     }
 
     #[tokio::test]
