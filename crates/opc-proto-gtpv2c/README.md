@@ -30,8 +30,8 @@ The Production Profile v1 target is a codec, typed-view, validation, and
 transport-neutral helper profile for ePDG/PGW S2b integration. Public profile
 constructors cover Echo, Create Session, Modify Bearer, Delete Session, and
 Update Bearer profile-owned request/response shapes. The profile is not marked
-production-ready until the constructor-driven downstream example and remaining
-malformed profile-critical negative fixtures land. It does **not** provide a
+production-ready until the remaining malformed profile-critical negative
+fixtures land. It does **not** provide a
 complete GTPv2-C implementation, full S2b semantic state-machine validation
 beyond the documented Echo and client-transaction helpers, carrier acceptance
 evidence, or a production ePDG/PGW control-plane stack. See
@@ -58,5 +58,11 @@ cargo test -p opc-proto-gtpv2c --all-features ie_raw
 cargo test -p opc-proto-gtpv2c --all-features malformed
 cargo test -p opc-proto-gtpv2c --all-features --test corpus_replay
 cargo test -p opc-proto-gtpv2c --all-features --test s2b_typed
+cargo run -p opc-proto-gtpv2c --example production_profile_v1
 (cd crates/opc-proto-gtpv2c && cargo +nightly fuzz list)
 ```
+
+For the Production Profile v1 constructor and ProcedureAware validation path,
+see `examples/production_profile_v1.rs`. It constructs Echo, Create Session,
+Modify Bearer, Delete Session, and Update Bearer S2b messages through typed
+APIs, then encodes and decodes them without manual raw byte assembly.
