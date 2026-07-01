@@ -21,7 +21,8 @@ Current scope is intentionally narrow:
 - a transport-neutral Echo peer helper that tracks liveness, Recovery restart
   counters, and restart-reconciliation fencing before new Echo exchanges;
 - provenance-labeled fixture replay that separates spec-authored conformance
-  bytes from parity-only ePDG regression seeds and synthetic malformed inputs;
+  bytes, independent-capture intake, parity-only ePDG regression seeds, and
+  synthetic malformed inputs;
 - a public `MessageType` enum with `Unknown(u8)` fallback plus raw fallback for
   unsupported/private IEs; and
 - cargo-fuzz decode, typed S2b, and raw-preserving round-trip targets.
@@ -32,7 +33,8 @@ constructors cover Echo, Create Session, Modify Bearer, Delete Session, and
 Update Bearer profile-owned request/response shapes. It does **not** provide a
 complete GTPv2-C implementation, full S2b semantic state-machine validation
 beyond the documented Echo and client-transaction helpers, carrier acceptance
-evidence, or a production ePDG/PGW control-plane stack. See
+evidence, independent-peer interoperability evidence, or a production ePDG/PGW
+control-plane stack. See
 [CONFORMANCE.md](CONFORMANCE.md) for the precise production profile boundary.
 
 ## Minimal use

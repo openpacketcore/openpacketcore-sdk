@@ -7,9 +7,9 @@
   shell and S2b Production Profile v1 available for the documented boundary.
 - **Implemented evidence:** common-header structural parsing, raw TLIV IE
   boundary validation, raw-preserving encode/decode, provenance-labeled fixture
-  corpus replay, malformed-input replay, profile-critical negative fixture
-  replay, typed S2b IE examples, and typed S2b views for Echo plus
-  Create/Modify/Delete/Update Session-oriented procedures.
+  corpus replay, independent-capture intake checks, malformed-input replay,
+  profile-critical negative fixture replay, typed S2b IE examples, and typed S2b
+  views for Echo plus Create/Modify/Delete/Update Session-oriented procedures.
   The transport-neutral Echo peer helper also tracks Recovery restart counters
   and rejects new Echo exchanges while restart reconciliation is required.
   Public profile constructors cover Echo, Create Session, Modify Bearer,
@@ -22,7 +22,7 @@ S2b Production Profile v1 is the first production-ready boundary for
 transport-neutral helper profile** for ePDG/PGW S2b integration. It does not
 claim to implement a PGW, ePDG, UDP transport, retransmission loop, bearer
 policy engine, APN/DNN authorization service, charging policy, roaming policy,
-or carrier-accepted control-plane product.
+independent-peer interoperability, or carrier-accepted control-plane product.
 
 ### Profile-owned procedures
 
@@ -176,10 +176,10 @@ and fuzz-seed mirror evidence before claiming additional production coverage.
    - `tests/fixtures/spec/` contains the ADR 0015 conformance fixtures for the
      S2b subset. The accompanying `tests/fixtures/README.md` records
      octet-level comments for each spec-authored fixture.
-   - `tests/fixtures/independent/` is intentionally empty except for a README;
-     no independent GTPv2-C capture is claimed until capture provenance,
-     license/permission, implementation version, redaction status, and expected
-     re-encode behavior are documented.
+   - `tests/fixtures/independent/` has a metadata-enforced intake harness but is
+     intentionally empty except for a README; no independent GTPv2-C capture is
+     claimed until capture provenance, license/permission, implementation
+     version, redaction status, and expected re-encode behavior are documented.
    - `tests/fixtures/epdg-parity/` contains parity/regression bytes only. These
      inputs exercise raw/private IE preservation but are not counted as
      conformance evidence.
@@ -224,8 +224,8 @@ and fuzz-seed mirror evidence before claiming additional production coverage.
   or bearer lifecycle semantic validation beyond the ProcedureAware mandatory
   subset and transport-neutral Echo/client-transaction helpers claimed here.
 - GTPv1-C, GTP-U, Diameter, S1AP, PMIP, or a production ePDG/PGW control plane.
-- Claims of carrier acceptance or interoperability beyond this experimental
-  S2b typed subset.
+- Claims of carrier acceptance or interoperability beyond this production
+  profile boundary until independent, licensed captures exist.
 
 ## Canonicalization policy
 
@@ -257,9 +257,10 @@ The committed fixture corpus is split by provenance class:
     Modify/Delete/Update Session-oriented views and ProcedureAware mandatory
     checks.
 
-- **Independent-capture fixtures** would live in `tests/fixtures/independent/`.
-  None are committed yet, so this crate makes no independent-peer
-  interoperability claim.
+- **Independent-capture fixtures** live in `tests/fixtures/independent/` once
+  available. The replay harness requires a finalized metadata sidecar before any
+  `.bin` capture can land. None are committed yet, so this crate makes no
+  independent-peer interoperability claim.
 - **ePDG parity fixtures** live in `tests/fixtures/epdg-parity/`. They are
   regression seeds for raw/private IE and piggybacking preservation only. They
   are not spec-authored, not independently captured, and must not be cited as
