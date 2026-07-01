@@ -336,7 +336,7 @@ fn fixture_corpus_is_split_by_provenance() {
     }
     assert_eq!(fixture_files(FixtureClass::Spec).len(), 10);
     assert!(fixture_files(FixtureClass::EpdgParity).len() >= 3);
-    assert!(fixture_files(FixtureClass::Malformed).len() >= 9);
+    assert!(fixture_files(FixtureClass::Malformed).len() >= 16);
     assert!(
         root.join("independent/README.md").is_file(),
         "independent capture gap must remain documented"
@@ -486,6 +486,20 @@ fn assert_typed_ie_region_error(
     );
 }
 
+fn assert_s2b_profile_error(
+    path: &Path,
+    data: &[u8],
+    expected: fn(&DecodeErrorCode) -> bool,
+    expectation: &str,
+) {
+    assert_error_code(
+        path,
+        S2bMessage::decode(data, procedure_context()).map(|(_tail, _message)| ()),
+        expected,
+        expectation,
+    );
+}
+
 fn fixture_file_name(path: &Path) -> &str {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         panic!("fixture path has no UTF-8 file name: {}", path.display());
@@ -564,6 +578,52 @@ fn assert_malformed_fixture_rejection(path: &Path, data: &[u8]) {
                 "low-limit grouped IE recursion-depth rejection",
             );
         }
+        "profile_echo_request_missing_recovery.bin" => assert_s2b_profile_error(
+            path,
+            data,
+            |code| matches!(code, DecodeErrorCode::Structural { .. }),
+            "ProcedureAware Echo Request Recovery rejection",
+        ),
+        "profile_create_session_request_missing_paa.bin" => assert_s2b_profile_error(
+            path,
+            data,
+            |code| matches!(code, DecodeErrorCode::Structural { .. }),
+            "ProcedureAware Create Session Request PAA rejection",
+        ),
+        "profile_create_session_request_bearer_context_missing_ebi.bin" => {
+            assert_s2b_profile_error(
+                path,
+                data,
+                |code| matches!(code, DecodeErrorCode::Structural { .. }),
+                "ProcedureAware Create Session Request Bearer Context EBI rejection",
+            );
+        }
+        "profile_create_session_request_sender_fteid_no_address.bin" => assert_s2b_profile_error(
+            path,
+            data,
+            |code| matches!(code, DecodeErrorCode::Structural { .. }),
+            "ProcedureAware Create Session Request malformed Sender F-TEID rejection",
+        ),
+        "profile_create_session_request_paa_non_ip_trailing.bin" => assert_s2b_profile_error(
+            path,
+            data,
+            |code| matches!(code, DecodeErrorCode::InvalidLength { .. }),
+            "ProcedureAware Create Session Request malformed PAA rejection",
+        ),
+        "profile_create_session_response_accepted_missing_sender_fteid.bin" => {
+            assert_s2b_profile_error(
+                path,
+                data,
+                |code| matches!(code, DecodeErrorCode::Structural { .. }),
+                "ProcedureAware accepted Create Session Response Sender F-TEID rejection",
+            );
+        }
+        "profile_update_bearer_response_missing_cause.bin" => assert_s2b_profile_error(
+            path,
+            data,
+            |code| matches!(code, DecodeErrorCode::Structural { .. }),
+            "ProcedureAware Update Bearer Response Cause rejection",
+        ),
         name => panic!("unclassified malformed fixture {name}: {}", path.display()),
     }
 }
