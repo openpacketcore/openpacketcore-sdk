@@ -3,12 +3,13 @@
 ## Scope
 
 - **Specification family:** 3GPP TS 29.274 (GTPv2-C), Release 18 naming.
-- **Crate status:** experimental S2b-focused typed subset with a raw-preserving
-  message/IE shell; S2b Production Profile v1 graduation is in progress.
+- **Crate status:** S2b-focused typed subset with a raw-preserving message/IE
+  shell and S2b Production Profile v1 available for the documented boundary.
 - **Implemented evidence:** common-header structural parsing, raw TLIV IE
   boundary validation, raw-preserving encode/decode, provenance-labeled fixture
-  corpus replay, malformed-input replay, typed S2b IE examples, and typed S2b
-  views for Echo plus Create/Modify/Delete/Update Session-oriented procedures.
+  corpus replay, malformed-input replay, profile-critical negative fixture
+  replay, typed S2b IE examples, and typed S2b views for Echo plus
+  Create/Modify/Delete/Update Session-oriented procedures.
   The transport-neutral Echo peer helper also tracks Recovery restart counters
   and rejects new Echo exchanges while restart reconciliation is required.
   Public profile constructors cover Echo, Create Session, Modify Bearer,
@@ -16,7 +17,7 @@
 
 ## S2b Production Profile v1 — Target Boundary
 
-S2b Production Profile v1 is the first production-readiness target for
+S2b Production Profile v1 is the first production-ready boundary for
 `opc-proto-gtpv2c`. The profile is a **codec, typed-view, validation, and
 transport-neutral helper profile** for ePDG/PGW S2b integration. It does not
 claim to implement a PGW, ePDG, UDP transport, retransmission loop, bearer
@@ -81,11 +82,12 @@ failures and must cover at least these rules:
   policy, charging policy, persistence, and transport behavior outside this
   crate.
 
-### Graduation blockers
+### Graduation status
 
-The profile must not be marked production-ready until all of the following land:
-
-- Additional negative fixtures for malformed profile-critical IE rejection.
+No open graduation blockers remain for the documented S2b Production Profile v1
+boundary. Future expansion of this boundary must add the same constructor,
+ProcedureAware validation, positive fixture, malformed negative fixture, example,
+and fuzz-seed mirror evidence before claiming additional production coverage.
 
 ## Covered in this subset
 
@@ -279,8 +281,8 @@ The committed fixture corpus is split by provenance class:
 Header, raw IE, malformed-input, corpus-replay, and S2b integration tests under
 `tests/` exercise raw-preserving spare-bit round trips, multi-IE unknown TLIV
 preservation, truncation/count-limit errors, prefix/malformed input no-panic
-regressions, typed decode → encode fixtures, and missing-mandatory-IE
-rejection.
+regressions, typed decode → encode fixtures, missing-mandatory-IE rejection, and
+malformed profile-critical F-TEID/PAA rejection.
 
 `examples/production_profile_v1.rs` exercises the downstream constructor path
 for Echo, Create Session, Modify Bearer, Delete Session, and Update Bearer S2b

@@ -207,12 +207,16 @@ captured and are not counted as ADR 0015 conformance evidence.
 ## `malformed/` fixtures
 
 The malformed corpus contains synthetic hostile inputs for truncation, declared
-length overrun, strict spare-bit rejection, low-limit IE count-limit paths, and
-grouped IE recursion-depth limits. `too_many_small_ies.bin` intentionally
-contains two small IEs and is replayed with `DecodeContext::max_ies = 1` so
-both whole-message and decoded raw-IE region validation reject on
-`IeCountExceeded`. `nested_bearer_context_depth_limit.bin` is a valid
-Modify Bearer Request shell whose top-level Bearer Context contains another
-Bearer Context; replay with `DecodeContext::max_depth = 1` must reject on
-`DepthExceeded`. Decode may return any structured `DecodeError` outside those
-per-fixture assertions, but must never panic.
+length overrun, strict spare-bit rejection, low-limit IE count-limit paths,
+grouped IE recursion-depth limits, and S2b profile-critical negative cases.
+`too_many_small_ies.bin` intentionally contains two small IEs and is replayed
+with `DecodeContext::max_ies = 1` so both whole-message and decoded raw-IE
+region validation reject on `IeCountExceeded`.
+`nested_bearer_context_depth_limit.bin` is a valid Modify Bearer Request shell
+whose top-level Bearer Context contains another Bearer Context; replay with
+`DecodeContext::max_depth = 1` must reject on `DepthExceeded`.
+`profile_*.bin` fixtures are syntactically bounded S2b messages that fail
+ProcedureAware profile checks for missing Recovery, PAA, Bearer Context/EBI,
+Sender F-TEID, Cause, or malformed F-TEID/PAA values. Decode may return any
+structured `DecodeError` outside those per-fixture assertions, but must never
+panic.

@@ -1,8 +1,8 @@
 # opc-proto-gtpv2c
 
-`opc-proto-gtpv2c` is the OpenPacketCore GTPv2-C crate for an experimental,
-S2b-focused typed subset with **S2b Production Profile v1 graduation in
-progress**.
+`opc-proto-gtpv2c` is the OpenPacketCore GTPv2-C crate for an S2b-focused typed
+subset with **S2b Production Profile v1** available for the documented codec,
+typed-view, validation, and transport-neutral helper boundary.
 
 Current scope is intentionally narrow:
 
@@ -26,16 +26,14 @@ Current scope is intentionally narrow:
   unsupported/private IEs; and
 - cargo-fuzz decode, typed S2b, and raw-preserving round-trip targets.
 
-The Production Profile v1 target is a codec, typed-view, validation, and
+The Production Profile v1 boundary is a codec, typed-view, validation, and
 transport-neutral helper profile for ePDG/PGW S2b integration. Public profile
 constructors cover Echo, Create Session, Modify Bearer, Delete Session, and
-Update Bearer profile-owned request/response shapes. The profile is not marked
-production-ready until the remaining malformed profile-critical negative
-fixtures land. It does **not** provide a
+Update Bearer profile-owned request/response shapes. It does **not** provide a
 complete GTPv2-C implementation, full S2b semantic state-machine validation
 beyond the documented Echo and client-transaction helpers, carrier acceptance
 evidence, or a production ePDG/PGW control-plane stack. See
-[CONFORMANCE.md](CONFORMANCE.md) for the precise evidence boundary.
+[CONFORMANCE.md](CONFORMANCE.md) for the precise production profile boundary.
 
 ## Minimal use
 
