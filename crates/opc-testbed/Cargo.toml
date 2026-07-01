@@ -32,8 +32,12 @@ opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 opc-node-resources = { path = "../opc-node-resources", version = "0.2.0" }
 
 [dev-dependencies]
+opc-ipsec-xfrm = { path = "../opc-ipsec-xfrm", version = "0.2.0", features = ["ikev2"] }
+opc-proto-diameter = { path = "../opc-proto-diameter", version = "0.2.0", features = ["app-swm"] }
+opc-proto-ikev2 = { path = "../opc-proto-ikev2", version = "0.2.0" }
 opc-proto-gtpu = { path = "../opc-proto-gtpu", version = "0.2.0" }
 opc-proto-gtpv2c = { path = "../opc-proto-gtpv2c", version = "0.2.0" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

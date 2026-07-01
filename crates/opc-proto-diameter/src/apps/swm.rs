@@ -149,6 +149,11 @@ impl AuthRequestType {
             Self::Other(value)
         }
     }
+
+    /// Return true for AUTHORIZE_AUTHENTICATE.
+    pub const fn is_authorize_authenticate(self) -> bool {
+        matches!(self, Self::AuthorizeAuthenticate)
+    }
 }
 
 /// Coarse Diameter result-code family mapping for SWm answers.
@@ -298,9 +303,43 @@ impl SwmDiameterEapRequest {
                 "DER",
             ));
         }
+        if let Some(destination_host) = self.destination_host.as_ref() {
+            if destination_host.as_ref().is_empty() {
+                return Err(encode_structural_error(
+                    "SWm DER Destination-Host must not be empty when present",
+                    "DER",
+                ));
+            }
+        }
+        if let Some(user_name) = self.user_name.as_ref() {
+            if user_name.as_ref().is_empty() {
+                return Err(encode_structural_error(
+                    "SWm DER User-Name must not be empty when present",
+                    "DER",
+                ));
+            }
+        }
         if self.auth_application_id != APPLICATION_ID.get() {
             return Err(encode_structural_error(
                 "SWm DER Auth-Application-Id must be the SWm application id",
+                "DER",
+            ));
+        }
+        if !self.auth_request_type.is_authorize_authenticate() {
+            return Err(encode_structural_error(
+                "SWm DER Auth-Request-Type must be AUTHORIZE_AUTHENTICATE",
+                "DER",
+            ));
+        }
+        if self.eap_payload.as_ref().is_empty() {
+            return Err(encode_structural_error(
+                "SWm DER EAP-Payload must not be empty",
+                "DER",
+            ));
+        }
+        if self.state_avps.iter().any(Vec::is_empty) {
+            return Err(encode_structural_error(
+                "SWm DER State AVPs must not be empty",
                 "DER",
             ));
         }
@@ -328,9 +367,53 @@ impl SwmDiameterEapAnswer {
                 "DEA",
             ));
         }
+        if let Some(user_name) = self.user_name.as_ref() {
+            if user_name.as_ref().is_empty() {
+                return Err(encode_structural_error(
+                    "SWm DEA User-Name must not be empty when present",
+                    "DEA",
+                ));
+            }
+        }
         if self.auth_application_id != APPLICATION_ID.get() {
             return Err(encode_structural_error(
                 "SWm DEA Auth-Application-Id must be the SWm application id",
+                "DEA",
+            ));
+        }
+        if !self.auth_request_type.is_authorize_authenticate() {
+            return Err(encode_structural_error(
+                "SWm DEA Auth-Request-Type must be AUTHORIZE_AUTHENTICATE",
+                "DEA",
+            ));
+        }
+        if option_redacted_bytes_is_empty(&self.eap_payload) {
+            return Err(encode_structural_error(
+                "SWm DEA EAP-Payload must not be empty when present",
+                "DEA",
+            ));
+        }
+        if option_redacted_bytes_is_empty(&self.eap_reissued_payload) {
+            return Err(encode_structural_error(
+                "SWm DEA EAP-Reissued-Payload must not be empty when present",
+                "DEA",
+            ));
+        }
+        if option_redacted_bytes_is_empty(&self.eap_master_session_key) {
+            return Err(encode_structural_error(
+                "SWm DEA EAP-Master-Session-Key must not be empty when present",
+                "DEA",
+            ));
+        }
+        if self.state_avps.iter().any(Vec::is_empty) {
+            return Err(encode_structural_error(
+                "SWm DEA State AVPs must not be empty",
+                "DEA",
+            ));
+        }
+        if self.result_category() == SwmResultCategory::Success && !self.carries_eap_material() {
+            return Err(encode_structural_error(
+                "SWm DEA success must carry EAP or MSK material",
                 "DEA",
             ));
         }
@@ -340,6 +423,14 @@ impl SwmDiameterEapAnswer {
     /// Return the result-code family category.
     pub fn result_category(&self) -> SwmResultCategory {
         SwmResultCategory::from_result_code(self.result_code)
+    }
+
+    /// Return true when the answer carries EAP challenge/reissued payload or
+    /// master session key material.
+    pub fn carries_eap_material(&self) -> bool {
+        option_redacted_bytes_has_material(&self.eap_payload)
+            || option_redacted_bytes_has_material(&self.eap_reissued_payload)
+            || option_redacted_bytes_has_material(&self.eap_master_session_key)
     }
 }
 
@@ -535,7 +626,7 @@ pub fn parse_swm_diameter_eap_request(
         )
         .with_spec_ref(SpecRef::new("3gpp", "TS29273", "DER")));
     }
-    Ok(SwmDiameterEapRequest {
+    let request = SwmDiameterEapRequest {
         session_id: builder_helpers::require_field(
             session_id,
             "SWm DER requires Session-Id",
@@ -570,7 +661,9 @@ pub fn parse_swm_diameter_eap_request(
             "DER",
         )?,
         state_avps,
-    })
+    };
+    validate_decoded_request(&request)?;
+    Ok(request)
 }
 
 /// Build a SWm Diameter-EAP-Answer message.
@@ -793,7 +886,7 @@ pub fn parse_swm_diameter_eap_answer(
         )
         .with_spec_ref(SpecRef::new("3gpp", "TS29273", "DEA")));
     }
-    Ok(SwmDiameterEapAnswer {
+    let answer = SwmDiameterEapAnswer {
         session_id: builder_helpers::require_field(
             session_id,
             "SWm DEA requires Session-Id",
@@ -826,10 +919,162 @@ pub fn parse_swm_diameter_eap_answer(
         error_message,
         state_avps,
         eap_master_session_key,
-    })
+    };
+    validate_decoded_answer(&answer)?;
+    Ok(answer)
 }
 
 fn encode_structural_error(reason: &'static str, section: &'static str) -> EncodeError {
     EncodeError::new(EncodeErrorCode::Structural { reason })
         .with_spec_ref(SpecRef::new("3gpp", "TS29273", section))
+}
+
+fn validate_decoded_request(request: &SwmDiameterEapRequest) -> Result<(), DecodeError> {
+    if request.session_id.as_ref().is_empty() {
+        return Err(decode_structural_error(
+            "SWm DER Session-Id must not be empty",
+            "DER",
+        ));
+    }
+    if request.origin_host.as_ref().is_empty() {
+        return Err(decode_structural_error(
+            "SWm DER Origin-Host must not be empty",
+            "DER",
+        ));
+    }
+    if request.origin_realm.as_ref().is_empty() {
+        return Err(decode_structural_error(
+            "SWm DER Origin-Realm must not be empty",
+            "DER",
+        ));
+    }
+    if request.destination_realm.as_ref().is_empty() {
+        return Err(decode_structural_error(
+            "SWm DER Destination-Realm must not be empty",
+            "DER",
+        ));
+    }
+    if let Some(destination_host) = request.destination_host.as_ref() {
+        if destination_host.as_ref().is_empty() {
+            return Err(decode_structural_error(
+                "SWm DER Destination-Host must not be empty when present",
+                "DER",
+            ));
+        }
+    }
+    if let Some(user_name) = request.user_name.as_ref() {
+        if user_name.as_ref().is_empty() {
+            return Err(decode_structural_error(
+                "SWm DER User-Name must not be empty when present",
+                "DER",
+            ));
+        }
+    }
+    if !request.auth_request_type.is_authorize_authenticate() {
+        return Err(decode_structural_error(
+            "SWm DER Auth-Request-Type must be AUTHORIZE_AUTHENTICATE",
+            "DER",
+        ));
+    }
+    if request.eap_payload.as_ref().is_empty() {
+        return Err(decode_structural_error(
+            "SWm DER EAP-Payload must not be empty",
+            "DER",
+        ));
+    }
+    if request.state_avps.iter().any(Vec::is_empty) {
+        return Err(decode_structural_error(
+            "SWm DER State AVPs must not be empty",
+            "DER",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_decoded_answer(answer: &SwmDiameterEapAnswer) -> Result<(), DecodeError> {
+    if answer.session_id.as_ref().is_empty() {
+        return Err(decode_structural_error(
+            "SWm DEA Session-Id must not be empty",
+            "DEA",
+        ));
+    }
+    if answer.origin_host.as_ref().is_empty() {
+        return Err(decode_structural_error(
+            "SWm DEA Origin-Host must not be empty",
+            "DEA",
+        ));
+    }
+    if answer.origin_realm.as_ref().is_empty() {
+        return Err(decode_structural_error(
+            "SWm DEA Origin-Realm must not be empty",
+            "DEA",
+        ));
+    }
+    if let Some(user_name) = answer.user_name.as_ref() {
+        if user_name.as_ref().is_empty() {
+            return Err(decode_structural_error(
+                "SWm DEA User-Name must not be empty when present",
+                "DEA",
+            ));
+        }
+    }
+    if !answer.auth_request_type.is_authorize_authenticate() {
+        return Err(decode_structural_error(
+            "SWm DEA Auth-Request-Type must be AUTHORIZE_AUTHENTICATE",
+            "DEA",
+        ));
+    }
+    if option_redacted_bytes_is_empty(&answer.eap_payload) {
+        return Err(decode_structural_error(
+            "SWm DEA EAP-Payload must not be empty when present",
+            "DEA",
+        ));
+    }
+    if option_redacted_bytes_is_empty(&answer.eap_reissued_payload) {
+        return Err(decode_structural_error(
+            "SWm DEA EAP-Reissued-Payload must not be empty when present",
+            "DEA",
+        ));
+    }
+    if option_redacted_bytes_is_empty(&answer.eap_master_session_key) {
+        return Err(decode_structural_error(
+            "SWm DEA EAP-Master-Session-Key must not be empty when present",
+            "DEA",
+        ));
+    }
+    if answer.state_avps.iter().any(Vec::is_empty) {
+        return Err(decode_structural_error(
+            "SWm DEA State AVPs must not be empty",
+            "DEA",
+        ));
+    }
+    if answer.result_category() == SwmResultCategory::Success && !answer.carries_eap_material() {
+        return Err(decode_structural_error(
+            "SWm DEA success must carry EAP or MSK material",
+            "DEA",
+        ));
+    }
+    Ok(())
+}
+
+fn option_redacted_bytes_is_empty(value: &Option<Redacted<Vec<u8>>>) -> bool {
+    value
+        .as_ref()
+        .map(|bytes| bytes.as_ref().is_empty())
+        .unwrap_or(false)
+}
+
+fn option_redacted_bytes_has_material(value: &Option<Redacted<Vec<u8>>>) -> bool {
+    value
+        .as_ref()
+        .map(|bytes| !bytes.as_ref().is_empty())
+        .unwrap_or(false)
+}
+
+fn decode_structural_error(reason: &'static str, section: &'static str) -> DecodeError {
+    DecodeError::new(
+        DecodeErrorCode::Structural { reason },
+        crate::DIAMETER_HEADER_LEN,
+    )
+    .with_spec_ref(SpecRef::new("3gpp", "TS29273", section))
 }

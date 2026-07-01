@@ -81,6 +81,15 @@ AVPs, data types, flag rules) is present; typed builders/parsers are limited to
 | `app-s6b` | 3GPP S6b (id 16_777_272) | — | dictionary only |
 | `app-swx` | 3GPP SWx (id 16_777_265) | — | dictionary only |
 
+The SWm typed helpers validate the ePDG-required Diameter-EAP subset at both
+encode and parse boundaries: `Auth-Request-Type` must be
+`AUTHORIZE_AUTHENTICATE`, DER `EAP-Payload` must be present and nonempty,
+optional EAP/State material must not be empty when present, and a success DEA
+must carry EAP challenge/reissued payload or MSK material. These checks are
+mechanical message-shape validation only; AAA challenge selection, subscriber
+authorization, realm routing, transport state, and EAP-AKA policy remain
+downstream product work.
+
 ### 6. Redaction
 
 Sensitive typed fields are wrapped in `Redacted<T>`. `Debug` and `Display`
@@ -185,7 +194,8 @@ The following are outside the current crate scope:
 - Typed helpers for `app-gx`, `app-s6a`, `app-s6b`, `app-swx`.
 - Full message-specific semantic validation (e.g., mandatory-AVP presence for
   every command) beyond what the Rf/SWm typed helpers enforce.
-- Complete 3GPP Rf/SWm/Gx/S6a/S6b/SWx application coverage.
+- Complete 3GPP Rf/SWm/Gx/S6a/S6b/SWx application coverage beyond the current
+  Rf accounting and SWm Diameter-EAP typed subsets.
 - Transport operations, TCP/SCTP transport, TLS/TLS-PSK handling, realm routing,
   peer topology, watchdog thresholds, failover state machines, AAA/HSS/CDF
   behavior, charging decisions, and deployment readiness policy.

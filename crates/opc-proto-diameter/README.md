@@ -18,7 +18,9 @@ currently provides:
   (`Error-Message`/raw `Failed-AVP` values), protocol-error E-bit derivation,
   minimal CEA protocol-error answers, and transport-neutral peer
   capability/result-code helpers with Relay Application Id handling; and
-- feature-gated skeleton dictionaries for selected 3GPP application work.
+- feature-gated typed helpers for Rf accounting and the SWm Diameter-EAP
+  DER/DEA subset, plus skeleton dictionaries for selected 3GPP application
+  work.
 
 It intentionally does **not** provide realm routing, AAA/HSS/CDF behavior,
 watchdog threshold policy, peer transport operation, charging decisions, or any
@@ -34,22 +36,22 @@ claim that a downstream EPC/ePDG product is carrier-ready.
 | `app-rf` | no | Initial 3GPP Rf accounting application dictionary slot. |
 | `app-s6a` | no | Initial 3GPP S6a/S6d application dictionary slot. |
 | `app-s6b` | no | Initial 3GPP S6b application dictionary slot. |
-| `app-swm` | no | Initial 3GPP SWm application dictionary slot. |
+| `app-swm` | no | 3GPP SWm dictionary plus typed Diameter-EAP DER/DEA builders/parsers with ePDG-subset semantic validation. |
 | `app-swx` | no | Initial 3GPP SWx application dictionary slot. |
 | `all-apps` | no | Enables every `app-*` skeleton feature. |
 
 The crate is `publish = false` while its release boundary remains
 experimental. Fixture provenance, registered fuzz targets, and the current
 conformance scope are documented in [`CONFORMANCE.md`](CONFORMANCE.md);
-remaining publication gaps include broader typed application support,
-additional independently sourced fixture intake, and downstream product
-integration evidence.
+remaining publication gaps include broader typed application support, additional
+independently sourced fixture intake, and downstream product integration
+evidence.
 
 ## Boundary
 
 This crate owns reusable protocol mechanisms only: wire framing, parser limits,
 raw preservation, dictionary metadata, base peer procedure message construction,
-capability intersection/result-code selection, and test helper building blocks.
-Products that consume it remain responsible for peer selection, realm policy,
-transport lifecycle, subscriber behavior, charging policy, watchdog thresholds,
-and deployment readiness.
+capability intersection/result-code selection, Rf/SWm typed message helpers, and
+test helper building blocks. Products that consume it remain responsible for
+peer selection, realm policy, transport lifecycle, subscriber behavior, charging
+policy, watchdog thresholds, AAA/HSS/CDF policy, and deployment readiness.

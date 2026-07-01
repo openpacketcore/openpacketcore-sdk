@@ -13,6 +13,8 @@
 pub mod backend;
 pub mod composite;
 pub mod error;
+#[cfg(feature = "ikev2")]
+pub mod ikev2;
 pub mod linux;
 pub mod mock;
 pub mod model;
@@ -26,6 +28,11 @@ pub use composite::{
     XFRM_COMPOSITE_REKEY_ORDER, XFRM_COMPOSITE_REMOVE_ORDER,
 };
 pub use error::XfrmError;
+#[cfg(feature = "ikev2")]
+pub use ikev2::{
+    build_xfrm_requests_from_ikev2_child_sa, Ikev2ChildSaXfrmError, Ikev2ChildSaXfrmKeys,
+    Ikev2ChildSaXfrmRequest, Ikev2ChildSaXfrmRequests, IKEV2_SECURITY_PROTOCOL_ID_ESP, IPPROTO_ESP,
+};
 pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
 pub use mock::{MockOperation, MockXfrmBackend};
 pub use model::{

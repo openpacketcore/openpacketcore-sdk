@@ -413,6 +413,7 @@ const DIAMETER_APP_BASE: u32 = 0;
 const DIAMETER_APP_3GPP_RF_ACCOUNTING: u32 = 3;
 const DIAMETER_APP_3GPP_GX: u32 = 16_777_238;
 const DIAMETER_APP_3GPP_S6A_S6D: u32 = 16_777_251;
+const DIAMETER_APP_3GPP_SWM: u32 = 16_777_264;
 const DIAMETER_CC_CAPABILITIES_EXCHANGE: u32 = 257;
 const DIAMETER_CC_DEVICE_WATCHDOG: u32 = 280;
 const DIAMETER_CC_DISCONNECT_PEER: u32 = 282;
@@ -431,6 +432,8 @@ pub enum DiameterApplication {
     /// 3GPP TS 32.299 defines the Rf charging interface on the Diameter
     /// accounting application; RFC 6733/IANA assign that application-id as 3.
     Rf,
+    /// 3GPP SWm Diameter-EAP application family.
+    Swm,
     /// Unknown or future Diameter application ID.
     Unknown(u32),
 }
@@ -443,6 +446,7 @@ impl DiameterApplication {
             DIAMETER_APP_3GPP_RF_ACCOUNTING => Self::Rf,
             DIAMETER_APP_3GPP_S6A_S6D => Self::S6a,
             DIAMETER_APP_3GPP_GX => Self::Gx,
+            DIAMETER_APP_3GPP_SWM => Self::Swm,
             other => Self::Unknown(other),
         }
     }
@@ -453,6 +457,7 @@ impl DiameterApplication {
             Self::S6a => "S6A",
             Self::Gx => "GX",
             Self::Rf => "RF",
+            Self::Swm => "SWM",
             Self::Unknown(_) => "UNKNOWN",
         }
     }

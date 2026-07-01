@@ -2066,6 +2066,7 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "opc-linux-xfrm-sys",
+ "opc-proto-ikev2",
  "subtle",
  "thiserror 2.0.18",
  "tokio",
@@ -2640,9 +2641,12 @@ name = "opc-testbed"
 version = "0.2.0"
 dependencies = [
  "opc-evidence",
+ "opc-ipsec-xfrm",
  "opc-node-resources",
+ "opc-proto-diameter",
  "opc-proto-gtpu",
  "opc-proto-gtpv2c",
+ "opc-proto-ikev2",
  "opc-protocol",
  "opc-redaction",
  "opc-schema-validate",
@@ -2652,6 +2656,7 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.18",
  "time",
+ "tokio",
 ]
 
 [[package]]

@@ -24,6 +24,7 @@ use opc_protocol::ValidationLevel;
 
 pub mod crypto;
 pub mod exchange;
+pub mod fragmentation;
 pub mod header;
 pub mod ike_auth;
 pub mod message;
@@ -45,6 +46,12 @@ pub use exchange::{
     Ikev2ExchangeBoundaryState, Ikev2ExchangeDecision, Ikev2ExchangeInvalidReason,
     Ikev2ExchangeKind, Ikev2ExchangeProjection, Ikev2ExchangeRequest, Ikev2ExchangeRequestKey,
     Ikev2ExchangeSnapshot, Ikev2ExchangeTracker, Ikev2ResponderSpi,
+};
+pub use fragmentation::{
+    build_ikev2_encrypted_fragment_payload_body, reassemble_decrypted_ikev2_fragments,
+    Ikev2DecryptedFragment, Ikev2EncryptedFragmentPayload, Ikev2EncryptedFragmentPayloadBuild,
+    Ikev2FragmentationError, Ikev2ReassembledFragmentedPayloads,
+    IKEV2_ENCRYPTED_FRAGMENT_FIXED_BODY_LEN, IKEV2_FRAGMENTATION_SUPPORTED_NOTIFY_TYPE,
 };
 pub use header::{
     decode_header, encode_header, Header, HeaderFlags, EXCHANGE_TYPE_CREATE_CHILD_SA,
