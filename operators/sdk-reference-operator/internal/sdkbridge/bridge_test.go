@@ -9,7 +9,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
+	opsdkbridge "openpacketcore.io/operator-sdk-go/bridge"
 	"openpacketcore.io/sdk-reference-operator/internal/testutil"
 )
 
@@ -199,6 +201,95 @@ func TestBridgeExecutionErrorDoesNotLeakCliPath(t *testing.T) {
 	}
 	if got := err.Error(); got != "SDK policy CLI execution failed" {
 		t.Fatalf("Expected sanitized execution error, got %q", got)
+	}
+}
+
+func TestCallCLIWrapsStructuredErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		kind opsdkbridge.ErrorKind
+	}{
+		{
+			name: "cli error",
+			body: `echo '{"contractVersion":1,"error":"policy denied"}'
+exit 2`,
+			kind: opsdkbridge.ErrKindCLIError,
+		},
+		{
+			name: "malformed json",
+			body: `echo 'not-json'
+exit 0`,
+			kind: opsdkbridge.ErrKindMalformedJSON,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockScript := `#!/bin/sh
+if [ "$1" = "version" ]; then
+  echo '{"contractVersion":1,"crateVersion":"0.1.0"}'
+  exit 0
+fi
+cat > /dev/null
+` + tt.body + `
+`
+			tmpDir := t.TempDir()
+			mockPath := filepath.Join(tmpDir, "mock-lifecycle-cli")
+			if err := os.WriteFile(mockPath, []byte(mockScript), 0o755); err != nil {
+				t.Fatalf("failed to write mock CLI: %v", err)
+			}
+
+			bridge := &Bridge{CliPath: mockPath}
+			var resp AdmissionResponse
+			err := bridge.CallCLI(context.Background(), "admission", AdmissionRequest{}, &resp)
+			if err == nil {
+				t.Fatalf("expected error")
+			}
+
+			var target *opsdkbridge.Error
+			if !errors.As(err, &target) {
+				t.Fatalf("expected wrapped bridge error, got %v", err)
+			}
+			if target.Kind != tt.kind {
+				t.Fatalf("expected bridge error kind %v, got %v", tt.kind, target.Kind)
+			}
+		})
+	}
+}
+
+func TestCallCLITimeoutWrapped(t *testing.T) {
+	mockScript := `#!/bin/sh
+if [ "$1" = "version" ]; then
+  echo '{"contractVersion":1,"crateVersion":"0.1.0"}'
+  exit 0
+fi
+cat > /dev/null
+sleep 1
+echo '{"uid":"test","allowed":true}'
+`
+	tmpDir := t.TempDir()
+	mockPath := filepath.Join(tmpDir, "mock-lifecycle-cli")
+	if err := os.WriteFile(mockPath, []byte(mockScript), 0o755); err != nil {
+		t.Fatalf("failed to write mock CLI: %v", err)
+	}
+
+	bridge := &Bridge{CliPath: mockPath}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	var resp AdmissionResponse
+	err := bridge.CallCLI(ctx, "admission", AdmissionRequest{}, &resp)
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+
+	var target *opsdkbridge.Error
+	if !errors.As(err, &target) {
+		t.Fatalf("expected wrapped bridge error, got %v", err)
+	}
+	if target.Kind != opsdkbridge.ErrKindTimeout {
+		t.Fatalf("expected bridge error kind %v, got %v", opsdkbridge.ErrKindTimeout, target.Kind)
 	}
 }
 
