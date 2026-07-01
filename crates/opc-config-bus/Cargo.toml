@@ -31,7 +31,7 @@ sha2 = { workspace = true }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
 
 [lints]
 workspace = true

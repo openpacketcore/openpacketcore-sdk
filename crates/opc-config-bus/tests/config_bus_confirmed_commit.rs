@@ -376,6 +376,63 @@ async fn commit_confirmed_expiry_rollback_restores_previous() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn expiry_rollback_fires_on_virtual_clock() {
+    let store = Arc::new(MockManagedDatastore::new());
+    store
+        .seed(StoredConfig::new(
+            opc_types::TxId::new(),
+            ConfigVersion::new(1),
+            principal(),
+            RequestSource::Northbound,
+            TestConfig::new("initial"),
+        ))
+        .await;
+
+    let bus = ConfigBus::restore_or_new_dev_only(TestConfig::new("fallback"), Arc::clone(&store))
+        .await
+        .expect("startup succeeds");
+    let subscriber = bus.subscribe(SubscriberLagPolicy::DropOldest, 5);
+
+    bus.submit(
+        CommitRequest::new(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            CommitMode::CommitConfirmed {
+                timeout: Duration::from_secs(5),
+            },
+            Instant::now() + Duration::from_secs(1),
+            Some(TestConfig::new("tentative")),
+            vec![changed_path()],
+        )
+        .with_base_version(bus.version()),
+    )
+    .await
+    .expect("commit-confirmed succeeds");
+
+    match subscriber.recv().await.expect("event published") {
+        ConfigEvent::Change(change) => {
+            assert_eq!(change.version, ConfigVersion::new(2));
+            assert_eq!(change.current.name, "tentative");
+        }
+        _ => panic!("expected change event"),
+    }
+
+    match subscriber.recv().await.expect("rollback event published") {
+        ConfigEvent::Change(change) => {
+            assert_eq!(change.version, ConfigVersion::new(3));
+            assert_eq!(change.current.name, "initial");
+        }
+        _ => panic!("expected change event"),
+    }
+
+    assert_eq!(bus.load().name, "initial");
+    assert_eq!(bus.version(), ConfigVersion::new(3));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_confirmed_expiry_rollback_failure_fences_and_alarms() {
     let alarms = SharedAlarmManager::default();
