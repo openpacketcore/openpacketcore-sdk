@@ -65,13 +65,14 @@ func TestSetCreatesCondition(t *testing.T) {
 
 func TestSetUpdatesCondition(t *testing.T) {
 	cm := NewConditionManager(1)
+	t0 := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	cm.now = func() time.Time { return t0 }
 	if err := cm.Set(Ready, metav1.ConditionTrue, "Ready", "all good", 1); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	first := *cm.Get(Ready)
 
-	// Allow a moment to ensure time changes.
-	time.Sleep(5 * time.Millisecond)
+	cm.now = func() time.Time { return t0.Add(time.Minute) }
 
 	if err := cm.Set(Ready, metav1.ConditionFalse, "NotReady", "something broke", 2); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -94,12 +95,14 @@ func TestSetUpdatesCondition(t *testing.T) {
 
 func TestSetNoOpPreservesTimestamp(t *testing.T) {
 	cm := NewConditionManager(1)
+	t0 := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	cm.now = func() time.Time { return t0 }
 	if err := cm.Set(Ready, metav1.ConditionTrue, "Ready", "all good", 1); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	first := *cm.Get(Ready)
 
-	time.Sleep(5 * time.Millisecond)
+	cm.now = func() time.Time { return t0.Add(time.Minute) }
 
 	// Same status: timestamp must NOT change.
 	if err := cm.Set(Ready, metav1.ConditionTrue, "StillReady", "still good", 2); err != nil {
