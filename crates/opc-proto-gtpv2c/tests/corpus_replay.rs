@@ -13,6 +13,7 @@ use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, Encode, EncodeContext, OwnedDecode,
     ValidationLevel,
 };
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +26,20 @@ enum FixtureClass {
 
 const FUZZ_TARGETS: &[&str] = &["decode_message", "decode_s2b", "roundtrip"];
 const FUZZ_SEED_PROVENANCE_DIRS: &[&str] = &["spec", "epdg-parity", "malformed"];
+const INDEPENDENT_EMPTY_README_MARKER: &str = "No independent GTPv2-C capture is committed yet.";
+const INDEPENDENT_METADATA_REQUIRED_KEYS: &[&str] = &[
+    "capture_kind",
+    "independent_implementation",
+    "implementation_version",
+    "capture_permission",
+    "redaction_review",
+    "redacted_fields",
+    "synthetic_replacements",
+    "expected_message",
+    "expected_raw_preserving_reencode",
+    "fuzz_seed_policy",
+    "reviewer",
+];
 
 fn procedure_context() -> DecodeContext {
     DecodeContext {
@@ -266,6 +281,114 @@ fn assert_spec_s2b_roundtrip(path: &Path, data: &[u8]) {
     }
 }
 
+fn metadata_path_for_capture(path: &Path) -> PathBuf {
+    path.with_extension("metadata")
+}
+
+fn independent_metadata_fields(path: &Path) -> BTreeMap<String, String> {
+    let metadata_path = metadata_path_for_capture(path);
+    let content = match std::fs::read_to_string(&metadata_path) {
+        Ok(content) => content,
+        Err(error) => panic!(
+            "{} is missing independent-capture metadata sidecar {}: {error}",
+            path.display(),
+            metadata_path.display()
+        ),
+    };
+
+    let mut fields = BTreeMap::new();
+    for (line_index, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            panic!(
+                "{} metadata line {} must use `key: value` form",
+                metadata_path.display(),
+                line_index + 1
+            );
+        };
+        let key = key.trim();
+        let value = value.trim();
+        assert!(
+            !key.is_empty() && !value.is_empty(),
+            "{} metadata line {} has an empty key or value",
+            metadata_path.display(),
+            line_index + 1
+        );
+        fields.insert(key.to_string(), value.to_string());
+    }
+    fields
+}
+
+fn assert_independent_capture_metadata(path: &Path) {
+    let fields = independent_metadata_fields(path);
+    for required in INDEPENDENT_METADATA_REQUIRED_KEYS {
+        let Some(value) = fields.get(*required) else {
+            panic!(
+                "{} independent-capture metadata is missing required key `{required}`",
+                path.display()
+            );
+        };
+        let lower_value = value.to_ascii_lowercase();
+        assert!(
+            !matches!(lower_value.as_str(), "todo" | "tbd" | "pending" | "unknown"),
+            "{} independent-capture metadata key `{required}` must be finalized before commit",
+            path.display()
+        );
+    }
+    assert_eq!(
+        fields
+            .get("expected_raw_preserving_reencode")
+            .map(String::as_str),
+        Some("byte_exact"),
+        "{} independent capture must document byte-exact raw-preserving re-encode behavior",
+        path.display()
+    );
+}
+
+fn assert_independent_s2b_roundtrip(path: &Path, data: &[u8]) {
+    assert_raw_preserving_message_roundtrip(path, data);
+    let (tail, message) = match S2bMessage::decode(data, procedure_context()) {
+        Ok(decoded) => decoded,
+        Err(error) => panic!(
+            "{} did not decode as a ProcedureAware independent S2b capture: {error:?}",
+            path.display()
+        ),
+    };
+    assert!(
+        tail.is_empty(),
+        "{} independent S2b capture must contain exactly one datagram",
+        path.display()
+    );
+    assert!(
+        message.as_view().is_some(),
+        "{} independent S2b capture decoded as raw fallback instead of typed view",
+        path.display()
+    );
+
+    let mut raw_preserving = BytesMut::new();
+    match message.encode(
+        &mut raw_preserving,
+        EncodeContext {
+            raw_preserving: true,
+            ..EncodeContext::default()
+        },
+    ) {
+        Ok(()) => assert_eq!(
+            raw_preserving.as_ref(),
+            data,
+            "{} raw-preserving S2b encode changed independent capture bytes",
+            path.display()
+        ),
+        Err(error) => panic!(
+            "{} raw-preserving S2b encode failed for independent capture: {error:?}",
+            path.display()
+        ),
+    }
+}
+
 fn exercise_decode_surfaces(data: &[u8]) {
     let decoded_message = Message::decode(data, DecodeContext::default());
 
@@ -391,6 +514,28 @@ fn spec_fixture_corpus_roundtrips_byte_exact() {
     for (path, data) in fixtures {
         assert_raw_preserving_message_roundtrip(&path, &data);
         assert_spec_s2b_roundtrip(&path, &data);
+    }
+}
+
+#[test]
+fn independent_capture_corpus_has_metadata_or_declared_gap() {
+    let fixtures = fixture_files(FixtureClass::Independent);
+    if fixtures.is_empty() {
+        let readme_path = fixture_root().join("independent/README.md");
+        let readme = match std::fs::read_to_string(&readme_path) {
+            Ok(readme) => readme,
+            Err(error) => panic!("failed to read {}: {error}", readme_path.display()),
+        };
+        assert!(
+            readme.contains(INDEPENDENT_EMPTY_README_MARKER),
+            "empty independent-capture corpus must keep the no-capture gap explicit"
+        );
+        return;
+    }
+
+    for (path, data) in fixtures {
+        assert_independent_capture_metadata(&path);
+        assert_independent_s2b_roundtrip(&path, &data);
     }
 }
 

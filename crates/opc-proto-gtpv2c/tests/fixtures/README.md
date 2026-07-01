@@ -3,10 +3,10 @@
 This corpus follows ADR 0015 and the ePDG fixture-provenance intake checklist.
 Only files in `spec/` are conformance evidence. Files in `epdg-parity/` are
 SDK-authored parity/regression seeds for raw/private IE behavior and are **not**
-counted as wire-format conformance proof. `independent/` is intentionally empty
-until an independently captured GTPv2-C packet includes source, license,
-redaction, and capture metadata. `malformed/` contains hostile synthetic inputs
-that must never panic a decode path.
+counted as wire-format conformance proof. `independent/` has an enforced intake
+harness but remains empty until an independently captured GTPv2-C packet includes
+source, license/permission, redaction, and capture metadata. `malformed/`
+contains hostile synthetic inputs that must never panic a decode path.
 
 All subscriber identifiers are synthetic examples from documentation ranges or
 non-real test digits. No key material, deployment secrets, LI identifiers, or
@@ -203,6 +203,17 @@ captured and are not counted as ADR 0015 conformance evidence.
   non-zero IE spare bits, used to prove raw-preserving TLIV forwarding.
 - `piggybacking_header_unknown_ie.bin` — piggybacking flag preservation with an
   unknown/private IE.
+
+## `independent/` fixtures
+
+Independent captures are public, sanitized, one-datagram S2b captures from an
+implementation not authored by this repository. The corpus replay harness accepts
+future `.bin` captures only when each has a sibling `.metadata` file documenting
+capture kind, independent implementation/version, commit permission, redaction
+review, redacted fields, synthetic replacements, expected S2b message,
+byte-exact raw-preserving re-encode behavior, fuzz-seed policy, and reviewer.
+The harness currently keeps the no-capture gap explicit instead of pretending
+interoperability evidence exists.
 
 ## `malformed/` fixtures
 
