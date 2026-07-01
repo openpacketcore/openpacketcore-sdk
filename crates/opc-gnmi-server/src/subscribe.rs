@@ -732,6 +732,39 @@ impl SubscribePlan {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_interval_below_floor_is_rejected() {
+        let err = enforce_min_interval(Duration::from_nanos(1), Duration::from_millis(100))
+            .expect_err("interval below floor rejected");
+        assert!(matches!(
+            err,
+            GnmiError::InvalidArgument { ref detail }
+                if detail.contains("below server minimum")
+        ));
+        assert!(
+            enforce_min_interval(Duration::from_millis(100), Duration::from_millis(100)).is_ok()
+        );
+    }
+
+    #[test]
+    fn heartbeat_interval_below_floor_is_rejected() {
+        let err = enforce_min_interval(Duration::from_nanos(1), Duration::from_millis(100))
+            .expect_err("interval below floor rejected");
+        assert!(matches!(
+            err,
+            GnmiError::InvalidArgument { ref detail }
+                if detail.contains("below server minimum")
+        ));
+        assert!(
+            enforce_min_interval(Duration::from_millis(100), Duration::from_millis(100)).is_ok()
+        );
+    }
+}
+
 fn subscribe_audit_paths<C, B>(
     server: &GnmiServer<C, B>,
     list: &gnmi::SubscriptionList,
@@ -782,6 +815,13 @@ struct StreamPlan {
     suppress_redundant: bool,
 }
 
+fn enforce_min_interval(interval: Duration, floor: Duration) -> Result<Duration, GnmiError> {
+    if interval < floor {
+        return Err(GnmiError::invalid("gNMI interval below server minimum"));
+    }
+    Ok(interval)
+}
+
 fn stream_plan<C, B>(
     server: &GnmiServer<C, B>,
     list: &gnmi::SubscriptionList,
@@ -806,7 +846,9 @@ where
                 }
                 sample_interval = Some(min_duration(
                     sample_interval,
-                    nanos(subscription.sample_interval)?,
+                    nanos(subscription.sample_interval).and_then(|duration| {
+                        enforce_min_interval(duration, server.limits().min_sample_interval)
+                    })?,
                 ));
             }
             Ok(gnmi::SubscriptionMode::TargetDefined) => {
@@ -827,7 +869,9 @@ where
             }
             heartbeat_interval = Some(min_duration(
                 heartbeat_interval,
-                nanos(subscription.heartbeat_interval)?,
+                nanos(subscription.heartbeat_interval).and_then(|duration| {
+                    enforce_min_interval(duration, server.limits().min_sample_interval)
+                })?,
             ));
         }
     }

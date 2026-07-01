@@ -1715,7 +1715,7 @@ mod tests {
             subscription: vec![gnmi::Subscription {
                 path: Some(path),
                 mode: subscription_mode as i32,
-                sample_interval: 1_000_000,
+                sample_interval: 100_000_000,
                 suppress_redundant: false,
                 heartbeat_interval: 0,
             }],
@@ -4208,7 +4208,7 @@ mod tests {
         list.subscription.push(gnmi::Subscription {
             path: Some(uptime_path()),
             mode: gnmi::SubscriptionMode::OnChange as i32,
-            sample_interval: 1_000_000,
+            sample_interval: 100_000_000,
             suppress_redundant: false,
             heartbeat_interval: 0,
         });
