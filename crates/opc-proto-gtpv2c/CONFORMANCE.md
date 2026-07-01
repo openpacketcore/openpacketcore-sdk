@@ -85,9 +85,6 @@ failures and must cover at least these rules:
 
 The profile must not be marked production-ready until all of the following land:
 
-- Constructor-driven examples showing typed construction → encode → decode →
-  procedure-aware validation without manual raw byte assembly.
-- Runnable example code for downstream SDK users.
 - Additional negative fixtures for malformed profile-critical IE rejection.
 
 ## Covered in this subset
@@ -284,6 +281,11 @@ Header, raw IE, malformed-input, corpus-replay, and S2b integration tests under
 preservation, truncation/count-limit errors, prefix/malformed input no-panic
 regressions, typed decode → encode fixtures, and missing-mandatory-IE
 rejection.
+
+`examples/production_profile_v1.rs` exercises the downstream constructor path
+for Echo, Create Session, Modify Bearer, Delete Session, and Update Bearer S2b
+messages by performing typed construction → encode → decode → ProcedureAware
+validation without manual raw byte assembly.
 
 Future typed S2b expansion must add spec-authored fixtures for every newly
 claimed message and IE, with octet-level comments and byte-exact decode → encode
