@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 func TestReconcileApplyReady(t *testing.T) {
@@ -549,7 +550,10 @@ func TestReconcileDeletionTriggersDrain(t *testing.T) {
 	if !drainCalled {
 		t.Errorf("Expected drain to be called during deletion")
 	}
-	if containsString(finalizersAfterUpdate, drainFinalizer) {
+	updated := &apiv1beta1.SdkManagedNetworkFunction{
+		ObjectMeta: metav1.ObjectMeta{Finalizers: finalizersAfterUpdate},
+	}
+	if controllerutil.ContainsFinalizer(updated, drainFinalizer) {
 		t.Errorf("Expected finalizer %s to be removed after drain", drainFinalizer)
 	}
 }
@@ -616,7 +620,10 @@ func TestReconcileDrainTimeoutReleasesFinalizer(t *testing.T) {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	if containsString(finalizersAfterUpdate, drainFinalizer) {
+	updated := &apiv1beta1.SdkManagedNetworkFunction{
+		ObjectMeta: metav1.ObjectMeta{Finalizers: finalizersAfterUpdate},
+	}
+	if controllerutil.ContainsFinalizer(updated, drainFinalizer) {
 		t.Errorf("Expected finalizer %s to be removed even on drain timeout", drainFinalizer)
 	}
 }
@@ -677,7 +684,7 @@ func reconcileDrainFailureKeepsFinalizer(t *testing.T, name string, drainer *dra
 	if err := fakeClient.Get(context.TODO(), types.NamespacedName{Name: name, Namespace: "default"}, &got); err != nil {
 		t.Fatalf("Failed to get object: %v", err)
 	}
-	if !containsString(got.Finalizers, drainFinalizer) {
+	if !controllerutil.ContainsFinalizer(&got, drainFinalizer) {
 		t.Errorf("finalizer %s must be retained while drain is incomplete", drainFinalizer)
 	}
 }
@@ -781,7 +788,10 @@ func TestReconcileWorkloadSynthesisOptInCreatesDeployment(t *testing.T) {
 	}
 
 	if len(dep.OwnerReferences) == 0 {
-		t.Errorf("Expected Deployment to have owner reference")
+		t.Fatalf("Expected Deployment to have owner reference")
+	}
+	if dep.OwnerReferences[0].BlockOwnerDeletion == nil || !*dep.OwnerReferences[0].BlockOwnerDeletion {
+		t.Fatalf("Expected Deployment owner reference to block owner deletion")
 	}
 }
 
