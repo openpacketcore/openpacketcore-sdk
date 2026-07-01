@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	"openpacketcore.io/operator-sdk-go/conditions"
 	"openpacketcore.io/operator-sdk-go/drain"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -681,11 +683,32 @@ func reconcileDrainFailureKeepsFinalizer(t *testing.T, name string, drainer *dra
 }
 
 func TestReconcileDrainStartErrorKeepsFinalizer(t *testing.T) {
-	reconcileDrainFailureKeepsFinalizer(t, "drain-start-error-cnf", &drain.FakeOrchestrator{
+	startErr := errors.New("drain agent unreachable")
+	drainer := &drain.FakeOrchestrator{
 		StartFunc: func(ctx context.Context, target string) error {
-			return errors.New("drain agent unreachable")
+			return startErr
 		},
-	})
+	}
+	reconcileDrainFailureKeepsFinalizer(t, "drain-start-error-cnf", drainer)
+
+	reconciler := &SdkManagedNetworkFunctionReconciler{Drainer: drainer}
+	crd := &apiv1beta1.SdkManagedNetworkFunction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "drain-start-error-cnf",
+			Generation: 1,
+		},
+	}
+	cm := conditions.NewConditionManager(crd.Generation)
+	err := reconciler.runDrain(context.Background(), crd, cm)
+	if err == nil {
+		t.Fatalf("expected drain start error")
+	}
+	if !strings.Contains(err.Error(), "starting drain for") {
+		t.Fatalf("expected start context in error, got %q", err.Error())
+	}
+	if !errors.Is(err, startErr) {
+		t.Fatalf("expected wrapped start error, got %v", err)
+	}
 }
 
 func TestReconcileDrainFailedPhaseKeepsFinalizer(t *testing.T) {

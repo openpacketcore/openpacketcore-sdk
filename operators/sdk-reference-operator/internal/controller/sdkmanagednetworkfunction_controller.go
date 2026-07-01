@@ -480,12 +480,12 @@ func (r *SdkManagedNetworkFunctionReconciler) runDrain(ctx context.Context, crd 
 	target := fmt.Sprintf("http://%s:8080", crd.Name) // simplistic target
 	if err := r.Drainer.Start(ctx, target); err != nil {
 		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainStartFailed", err.Error(), crd.Generation)
-		return err
+		return fmt.Errorf("starting drain for %s: %w", target, err)
 	}
 	status, err := r.Drainer.Status(ctx, target)
 	if err != nil {
 		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainStatusFailed", err.Error(), crd.Generation)
-		return err
+		return fmt.Errorf("querying drain status for %s: %w", target, err)
 	}
 	switch status.Phase {
 	case drain.Complete:
