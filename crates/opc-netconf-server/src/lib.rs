@@ -235,9 +235,10 @@ pub use session::{
 };
 pub use session_registry::SessionRegistry;
 pub use smoke::{
-    run_netconf_tls_smoke, NetconfSmokeError, NetconfSmokeErrorCode, NetconfSmokeFramingPreference,
-    NetconfSmokeFramingUsed, NetconfSmokeHelloSummary, NetconfSmokeRpc, NetconfSmokeRpcOutcome,
-    NetconfSmokeRpcStatus, NetconfSmokeRpcSummary, NetconfSmokeTranscript,
+    run_netconf_ssh_smoke, run_netconf_tls_smoke, NetconfSmokeError, NetconfSmokeErrorCode,
+    NetconfSmokeFramingPreference, NetconfSmokeFramingUsed, NetconfSmokeHelloSummary,
+    NetconfSmokeRpc, NetconfSmokeRpcOutcome, NetconfSmokeRpcStatus, NetconfSmokeRpcSummary,
+    NetconfSmokeTranscript, NetconfSshSmokeClientConfig, NetconfSshSmokeTranscript,
     NetconfTlsSmokeClientConfig,
 };
 pub use ssh::{

@@ -6,13 +6,15 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Read-side NACM authorization facade for the OpenPacketCore management plane (gNMI/NETCONF Get/Subscribe)"
+description = "NACM authorization facades for OpenPacketCore management-plane reads, writes, subscriptions, and RPC/action exec"
 readme = "README.md"
 documentation = "https://docs.rs/opc-mgmt-authz"
 keywords = ["5g", "cnf", "nacm", "gnmi", "netconf"]
 categories = ["network-programming", "authentication"]
 
 [dependencies]
+async-trait = { workspace = true }
+opc-config-bus = { path = "../opc-config-bus", version = "0.2.0" }
 opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
 opc-mgmt-schema = { path = "../opc-mgmt-schema", version = "0.2.0" }
 opc-nacm = { path = "../opc-nacm", version = "0.2.0" }

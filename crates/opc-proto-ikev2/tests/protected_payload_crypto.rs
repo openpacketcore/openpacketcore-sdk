@@ -5,11 +5,12 @@ use aes_gcm::{
 use bytes::BytesMut;
 use opc_proto_ikev2::{
     decrypt_ikev2_sa_init_protected_payload, derive_ike_sa_init_key_material,
-    open_protected_payloads, Header, HeaderFlags, Ikev2DhGroup, Ikev2EncryptionAlgorithm,
-    Ikev2PrfAlgorithm, Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadDirection,
-    Ikev2SaInitCryptoProfile, Ikev2SaInitProtectedPayloadProvider, Message, PayloadChain,
-    PayloadType, ProtectedPayloadContext, ProtectedPayloadKind, ProtectedPayloadOpenError,
-    EXCHANGE_TYPE_IKE_AUTH, GENERIC_PAYLOAD_HEADER_LEN, HEADER_LEN,
+    open_protected_payloads, seal_ikev2_sa_init_protected_payload, Header, HeaderFlags,
+    Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2PrfAlgorithm, Ikev2ProtectedPayloadCryptoError,
+    Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoProfile, Ikev2SaInitProtectedPayloadProvider,
+    Message, PayloadChain, PayloadType, ProtectedPayloadContext, ProtectedPayloadKind,
+    ProtectedPayloadOpenError, ProtectedPayloadSealContext, EXCHANGE_TYPE_IKE_AUTH,
+    GENERIC_PAYLOAD_HEADER_LEN, HEADER_LEN,
 };
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
 
@@ -104,6 +105,49 @@ fn encrypted_message_with_plaintext(
     };
     protected_body[..AES_GCM_EXPLICIT_IV_LEN].copy_from_slice(&explicit_iv);
     protected_body[AES_GCM_EXPLICIT_IV_LEN..].copy_from_slice(&ciphertext_and_tag);
+    encoded
+}
+
+fn sealed_message(
+    profile: Ikev2SaInitCryptoProfile,
+    key_material: &opc_proto_ikev2::Ikev2SaInitKeyMaterial,
+    direction: Ikev2ProtectedPayloadDirection,
+    inner_payload: &[u8],
+    padding_len: u8,
+    explicit_iv: [u8; AES_GCM_EXPLICIT_IV_LEN],
+) -> Vec<u8> {
+    let protected_body_len = AES_GCM_EXPLICIT_IV_LEN
+        + inner_payload.len()
+        + usize::from(padding_len)
+        + 1
+        + AES_GCM_ICV_LEN;
+    let mut encoded =
+        placeholder_message(protected_body_len, PayloadType::ExtensibleAuthentication);
+    let protected_body_offset = HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN;
+    let prefix = &encoded[..protected_body_offset];
+    let protected_body = match seal_ikev2_sa_init_protected_payload(
+        profile,
+        key_material,
+        direction,
+        ProtectedPayloadSealContext {
+            kind: ProtectedPayloadKind::Encrypted,
+            message_prefix: prefix,
+        },
+        inner_payload,
+        padding_len,
+        explicit_iv,
+    ) {
+        Ok(body) => body,
+        Err(error) => panic!("test protected payload seal failed: {error:?}"),
+    };
+    assert_eq!(protected_body.len(), protected_body_len);
+
+    let body_end = protected_body_offset + protected_body_len;
+    let target = match encoded.get_mut(protected_body_offset..body_end) {
+        Some(body) => body,
+        None => panic!("test protected body range missing"),
+    };
+    target.copy_from_slice(&protected_body);
     encoded
 }
 
@@ -381,6 +425,80 @@ fn opens_responder_to_initiator_aes_gcm_256_payload() {
 
     assert_eq!(opened.len(), 1);
     assert_eq!(opened[0].cleartext.as_ref(), INNER_PAYLOAD);
+}
+
+#[test]
+fn seals_responder_to_initiator_payload_that_public_opener_accepts() {
+    let profile = profile_256();
+    let material = key_material(profile);
+    let encoded = sealed_message(
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+        INNER_PAYLOAD,
+        2,
+        EXPLICIT_IV_R2I,
+    );
+
+    let opened = match open_with_provider(
+        &encoded,
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+    ) {
+        Ok(opened) => opened,
+        Err(error) => panic!("sealed protected payload open failed: {error:?}"),
+    };
+
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened[0].cleartext.as_ref(), INNER_PAYLOAD);
+}
+
+#[test]
+fn sealing_rejects_invalid_aad_prefix_and_unsupported_kind() {
+    let profile = profile_128();
+    let material = key_material(profile);
+    let short_prefix = [0u8; HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN - 1];
+
+    let invalid_aad = match seal_ikev2_sa_init_protected_payload(
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+        ProtectedPayloadSealContext {
+            kind: ProtectedPayloadKind::Encrypted,
+            message_prefix: &short_prefix,
+        },
+        INNER_PAYLOAD,
+        0,
+        EXPLICIT_IV_R2I,
+    ) {
+        Ok(_) => panic!("short AAD prefix must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        invalid_aad.as_str(),
+        "ike_protected_payload_crypto_invalid_aad"
+    );
+
+    let unsupported_kind = match seal_ikev2_sa_init_protected_payload(
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+        ProtectedPayloadSealContext {
+            kind: ProtectedPayloadKind::EncryptedFragment,
+            message_prefix: &[0u8; HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN],
+        },
+        INNER_PAYLOAD,
+        0,
+        EXPLICIT_IV_R2I,
+    ) {
+        Ok(_) => panic!("SKF sealing must fail until implemented"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        unsupported_kind.as_str(),
+        "ike_protected_payload_crypto_unsupported_kind"
+    );
 }
 
 #[test]

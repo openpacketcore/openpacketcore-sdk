@@ -27,6 +27,7 @@ p384 = { version = "0.14.0-rc.10", default-features = false, features = ["ecdh",
 p521 = { version = "0.14.0-rc.10", default-features = false, features = ["ecdh", "std"] }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
+subtle = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]

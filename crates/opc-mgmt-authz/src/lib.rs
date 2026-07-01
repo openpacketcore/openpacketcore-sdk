@@ -16,16 +16,19 @@
 //! NACM in this SDK is schema-node scoped (it collapses list instances), so this
 //! facade authorizes at the schema-node level, not per list instance.
 //!
-//! The crate also exposes [`ExecAuthorizer`] for management RPC/action
-//! execution checks such as future NETCONF `<kill-session>`. This is deliberately
-//! separate from [`ReadAuthorizer`] so read paths cannot accidentally exercise
-//! write/exec NACM actions.
+//! The crate also exposes [`ConfigWriteAuthorizer`] for config-bus commit
+//! admission and [`ExecAuthorizer`] for management RPC/action execution checks
+//! such as future NETCONF `<kill-session>`. These facades are deliberately
+//! separate so read paths cannot accidentally exercise write/exec NACM actions.
 
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
 
+use async_trait::async_trait;
+use opc_config_bus::{AuthorizationContext, AuthorizationError, ConfigAuthorizer};
 use opc_config_model::TrustedPrincipal;
+use opc_config_model::{ConfigOperation, YangPath as ConfigYangPath};
 use opc_mgmt_schema::{ModelData, SchemaRegistry};
 use opc_nacm::{ModuleRegistry, NacmAction, NacmEvaluator, NacmPolicy, YangPath};
 use thiserror::Error;
@@ -98,6 +101,18 @@ pub struct PathDecision {
     /// input paths use a fixed marker so key values are not echoed.
     pub path: String,
     /// Whether the principal may perform the requested read action on it.
+    pub allowed: bool,
+}
+
+/// The authorization outcome for one changed config path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WritePathDecision {
+    /// The predicate-free schema path that was evaluated. Invalid/unresolvable
+    /// input paths use a fixed marker so key values are not echoed.
+    pub path: String,
+    /// NACM write action selected from the config-bus operation.
+    pub action: NacmAction,
+    /// Whether the principal may perform the requested write action on it.
     pub allowed: bool,
 }
 
@@ -190,6 +205,135 @@ impl<'r, P: PolicySource> ReadAuthorizer<'r, P> {
     }
 }
 
+/// NACM authorizer for config-bus commit admission.
+///
+/// The config bus remains the write enforcement point: it computes
+/// authoritative changed paths from the candidate diff, then calls this
+/// `ConfigAuthorizer` before persistence or publication. This adapter maps the
+/// high-level config operation to a NACM write action and requires every
+/// changed path to be allowed by the tenant's active policy. Empty path batches
+/// are allowed so no-op commits and pre-authorized rollback admission can
+/// proceed to the later computed-path authorization pass.
+pub struct ConfigWriteAuthorizer<'r, P: PolicySource> {
+    registry: &'r dyn SchemaRegistry,
+    modules: ModuleRegistry,
+    source: P,
+}
+
+impl<'r, P: PolicySource> ConfigWriteAuthorizer<'r, P> {
+    /// Builds a config-bus write authorizer over the generated schema registry
+    /// and the tenant policy source.
+    pub fn new(registry: &'r dyn SchemaRegistry, source: P) -> Result<Self, AuthzError> {
+        let modules = module_registry_from_models(registry.served_models())?;
+        Ok(Self {
+            registry,
+            modules,
+            source,
+        })
+    }
+
+    /// Returns the schema registry this authorizer was built over.
+    pub fn registry(&self) -> &'r dyn SchemaRegistry {
+        self.registry
+    }
+
+    /// Returns the policy source used by this authorizer.
+    pub fn policy_source(&self) -> &P {
+        &self.source
+    }
+
+    /// Authorizes one config-bus write context and returns per-path decisions.
+    ///
+    /// Returns `Err` only if the policy source is unavailable. Unknown schema
+    /// paths, unparseable generated paths, and missing policy rules are returned
+    /// as denied decisions so callers can fail closed without echoing sensitive
+    /// key predicates.
+    pub fn authorize_context(
+        &self,
+        ctx: &AuthorizationContext,
+    ) -> Result<Vec<WritePathDecision>, AuthzError> {
+        self.authorize_paths(
+            &ctx.principal,
+            ctx.operation,
+            ctx.changed_paths.iter().collect::<Vec<_>>().as_slice(),
+        )
+    }
+
+    /// Authorizes the supplied changed paths for the principal and operation.
+    pub fn authorize_paths(
+        &self,
+        principal: &TrustedPrincipal,
+        operation: ConfigOperation,
+        paths: &[&ConfigYangPath],
+    ) -> Result<Vec<WritePathDecision>, AuthzError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let policy = self.source.active_policy(principal.tenant.as_str())?;
+        let nacm_action = write_action_for_operation(operation);
+        let mut evaluator = NacmEvaluator::new();
+
+        let decisions = paths
+            .iter()
+            .map(|path| {
+                let Some(node) = self.registry.node(path.as_str()) else {
+                    return WritePathDecision {
+                        path: INVALID_SCHEMA_PATH.to_string(),
+                        action: nacm_action,
+                        allowed: false,
+                    };
+                };
+                let schema_path = node.path.to_string();
+                let allowed = match YangPath::parse(node.path, &self.modules) {
+                    Ok(parsed) => evaluator
+                        .evaluate(&policy, &parsed, nacm_action)
+                        .is_allowed(),
+                    Err(_) => false,
+                };
+                WritePathDecision {
+                    path: schema_path,
+                    action: nacm_action,
+                    allowed,
+                }
+            })
+            .collect();
+        Ok(decisions)
+    }
+
+    /// Convenience single-path check.
+    pub fn may_write(
+        &self,
+        principal: &TrustedPrincipal,
+        operation: ConfigOperation,
+        path: &ConfigYangPath,
+    ) -> Result<bool, AuthzError> {
+        Ok(self
+            .authorize_paths(principal, operation, &[path])?
+            .first()
+            .map(|decision| decision.allowed)
+            .unwrap_or(false))
+    }
+}
+
+#[async_trait]
+impl<P> ConfigAuthorizer for ConfigWriteAuthorizer<'_, P>
+where
+    P: PolicySource,
+{
+    async fn authorize(&self, ctx: &AuthorizationContext) -> Result<(), AuthorizationError> {
+        let decisions = self
+            .authorize_context(ctx)
+            .map_err(|_| AuthorizationError::new("NACM write policy unavailable"))?;
+
+        if decisions.iter().all(|decision| decision.allowed) {
+            return Ok(());
+        }
+
+        Err(AuthorizationError::new("NACM write authorization denied"))
+    }
+}
+
 /// NACM authorizer for management RPC/action execution.
 ///
 /// Callers provide the YANG modules that define the operations they plan to
@@ -239,6 +383,15 @@ impl<P: PolicySource> ExecAuthorizer<P> {
     }
 }
 
+fn write_action_for_operation(operation: ConfigOperation) -> NacmAction {
+    match operation {
+        ConfigOperation::Replace => NacmAction::Replace,
+        ConfigOperation::Patch => NacmAction::Update,
+        ConfigOperation::Delete => NacmAction::Delete,
+        ConfigOperation::Rollback => NacmAction::Replace,
+    }
+}
+
 fn module_registry_from_models(models: &[ModelData]) -> Result<ModuleRegistry, AuthzError> {
     let mut modules = ModuleRegistry::new();
     let mut prefix_owners = BTreeMap::new();
@@ -261,7 +414,7 @@ fn module_registry_from_models(models: &[ModelData]) -> Result<ModuleRegistry, A
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opc_config_model::{TrustedPrincipal, WorkloadIdentity};
+    use opc_config_model::{ConfigOperation, TrustedPrincipal, WorkloadIdentity};
     use opc_mgmt_schema::{DataClass, LeafType, ModelData, NodeKind, NodeMeta, OriginEntry};
     use opc_nacm::{NacmPolicy, NacmRule, PolicyVersion, YangPathPattern};
     use opc_types::TenantId;
@@ -405,6 +558,20 @@ mod tests {
                 YangPathPattern::parse(pattern, &modules).expect("pattern"),
             ))
             .build()
+    }
+
+    fn allow_write(action: NacmAction, pattern: &str) -> NacmPolicy {
+        let modules = module_registry();
+        NacmPolicy::builder(PolicyVersion::new(1))
+            .add_rule(NacmRule::allow(
+                action,
+                YangPathPattern::parse(pattern, &modules).expect("pattern"),
+            ))
+            .build()
+    }
+
+    fn config_path(path: &str) -> ConfigYangPath {
+        ConfigYangPath::new(path).expect("config path")
     }
 
     #[test]
@@ -560,6 +727,143 @@ mod tests {
         assert!(!authz
             .may(&principal(), ReadAction::Read, "/sys:system/sys:secret")
             .expect("may"));
+    }
+
+    #[test]
+    fn config_write_authorizer_allows_matching_changed_path() {
+        let authz = ConfigWriteAuthorizer::new(
+            &TestReg,
+            FixedPolicy(allow_write(NacmAction::Update, "/sys:system/sys:hostname")),
+        )
+        .expect("write authorizer");
+
+        let path = config_path("/sys:system/sys:hostname");
+        let decisions = authz
+            .authorize_paths(&principal(), ConfigOperation::Patch, &[&path])
+            .expect("authorize write");
+
+        assert_eq!(
+            decisions,
+            vec![WritePathDecision {
+                path: "/sys:system/sys:hostname".to_string(),
+                action: NacmAction::Update,
+                allowed: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn config_write_authorizer_canonicalizes_bare_paths() {
+        let authz = ConfigWriteAuthorizer::new(
+            &TestReg,
+            FixedPolicy(allow_write(NacmAction::Update, "/sys:system/sys:hostname")),
+        )
+        .expect("write authorizer");
+
+        let path = config_path("/system/hostname");
+
+        assert!(authz
+            .may_write(&principal(), ConfigOperation::Patch, &path)
+            .expect("may write"));
+    }
+
+    #[test]
+    fn config_write_authorizer_denies_unknown_path_without_echoing_keys() {
+        let authz = ConfigWriteAuthorizer::new(
+            &TestReg,
+            FixedPolicy(allow_write(NacmAction::Update, "/**")),
+        )
+        .expect("write authorizer");
+        let path = config_path("/sys:system/sys:missing[sys:name='secret-supi']");
+
+        let decisions = authz
+            .authorize_paths(&principal(), ConfigOperation::Patch, &[&path])
+            .expect("authorize write");
+
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].path, INVALID_SCHEMA_PATH);
+        assert!(!decisions[0].path.contains("secret-supi"));
+        assert!(!decisions[0].allowed);
+    }
+
+    #[test]
+    fn config_write_authorizer_default_denies_empty_policy() {
+        let authz = ConfigWriteAuthorizer::new(
+            &TestReg,
+            FixedPolicy(NacmPolicy::empty(PolicyVersion::new(1))),
+        )
+        .expect("write authorizer");
+        let path = config_path("/sys:system/sys:hostname");
+
+        assert!(!authz
+            .may_write(&principal(), ConfigOperation::Patch, &path)
+            .expect("may write"));
+    }
+
+    #[test]
+    fn config_write_actions_are_distinct_from_read_and_each_other() {
+        let read_only = ConfigWriteAuthorizer::new(
+            &TestReg,
+            FixedPolicy(allow_read("/sys:system/sys:hostname")),
+        )
+        .expect("write authorizer");
+        let delete_only = ConfigWriteAuthorizer::new(
+            &TestReg,
+            FixedPolicy(allow_write(NacmAction::Delete, "/sys:system/sys:hostname")),
+        )
+        .expect("write authorizer");
+        let path = config_path("/sys:system/sys:hostname");
+
+        assert!(!read_only
+            .may_write(&principal(), ConfigOperation::Patch, &path)
+            .expect("read rule must not grant write"));
+        assert!(!delete_only
+            .may_write(&principal(), ConfigOperation::Patch, &path)
+            .expect("delete rule must not grant update"));
+        assert!(delete_only
+            .may_write(&principal(), ConfigOperation::Delete, &path)
+            .expect("delete rule grants delete"));
+    }
+
+    #[test]
+    fn config_write_authorizer_allows_empty_changed_path_batches() {
+        let authz = ConfigWriteAuthorizer::new(
+            &TestReg,
+            FixedPolicy(NacmPolicy::empty(PolicyVersion::new(1))),
+        )
+        .expect("write authorizer");
+
+        let decisions = authz
+            .authorize_paths(&principal(), ConfigOperation::Patch, &[])
+            .expect("empty batches are no-op authorization");
+
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn config_write_authorizer_surfaces_policy_unavailable_without_backend_detail() {
+        let authz = ConfigWriteAuthorizer::new(&TestReg, BrokenPolicy).expect("write authorizer");
+        let path = config_path("/sys:system/sys:hostname");
+
+        let err = authz
+            .authorize_paths(&principal(), ConfigOperation::Patch, &[&path])
+            .expect_err("policy source unavailable");
+
+        assert_eq!(err, AuthzError::PolicyUnavailable);
+        assert_eq!(err.to_string(), "policy source unavailable");
+    }
+
+    #[test]
+    fn config_write_authorizer_implements_config_bus_authorizer() {
+        fn assert_config_authorizer<T: ConfigAuthorizer>(_value: &T) {}
+
+        let authz = ConfigWriteAuthorizer::new(
+            &TestReg,
+            FixedPolicy(allow_write(NacmAction::Update, "/sys:system/**")),
+        )
+        .expect("write authorizer");
+
+        assert_config_authorizer(&authz);
     }
 
     #[test]

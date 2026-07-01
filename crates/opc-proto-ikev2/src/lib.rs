@@ -8,10 +8,13 @@
 //! mechanism that is safe to expose as an SDK primitive today: fixed-header
 //! decode/encode, raw-preserving generic payload-chain walking for unencrypted
 //! payloads, protected-payload boundary metadata, caller-owned crypto provider
-//! traits, narrow IKE_SA_INIT key-agreement/key-derivation material, and a
-//! caller-keyed SA_INIT AES-GCM protected-payload opener. It
-//! does not implement an IKE SA state machine, EAP-AKA, retransmission policy,
-//! cookie policy, Child SA installation, or any 3GPP ePDG profile decisions.
+//! traits, narrow IKE_SA_INIT key-agreement/key-derivation material,
+//! caller-keyed SA_INIT AES-GCM protected-payload open/seal helpers, typed
+//! IKE_AUTH cleartext payload helpers, transcript-bound shared-key AUTH MIC
+//! verification, and product-neutral Child SA negotiation intent. It does not
+//! implement an IKE SA state machine, EAP-AKA, retransmission policy, cookie
+//! policy, Child SA installation, XFRM programming, or any 3GPP ePDG profile
+//! decisions.
 //!
 //! @spec IETF RFC7296
 //! @req REQ-IETF-RFC7296-IKEV2-SCAFFOLD-001
@@ -22,6 +25,7 @@ use opc_protocol::ValidationLevel;
 pub mod crypto;
 pub mod exchange;
 pub mod header;
+pub mod ike_auth;
 pub mod message;
 pub mod nat_detection;
 pub mod nat_traversal;
@@ -47,6 +51,23 @@ pub use header::{
     EXCHANGE_TYPE_IKE_AUTH, EXCHANGE_TYPE_IKE_SA_INIT, EXCHANGE_TYPE_INFORMATIONAL, HEADER_LEN,
     IKEV2_MAJOR_VERSION, IKEV2_MINOR_VERSION, IKEV2_VERSION_OCTET,
 };
+pub use ike_auth::{
+    build_child_sa_response_payloads, build_ike_auth_authentication_payload,
+    build_ike_auth_cleartext_payload_chain, build_ike_auth_configuration_payload,
+    build_ike_auth_identification_payload, build_ike_auth_sa_payload,
+    build_ike_auth_traffic_selector_payload, compute_ike_auth_shared_key_mic,
+    decode_ike_auth_cleartext_payloads, negotiate_child_sa, verify_ike_auth_shared_key_mic,
+    Ikev2AuthenticationPayload, Ikev2AuthenticationPayloadBuild, Ikev2ChildSaNegotiation,
+    Ikev2ChildSaNegotiationError, Ikev2ChildSaNegotiationPolicy, Ikev2ChildSaResponsePayloads,
+    Ikev2ChildSaTransformRequirement, Ikev2ConfigurationAttribute,
+    Ikev2ConfigurationAttributeBuild, Ikev2ConfigurationPayload, Ikev2ConfigurationPayloadBuild,
+    Ikev2DeletePayload, Ikev2EapPayload, Ikev2IdentificationPayload,
+    Ikev2IdentificationPayloadBuild, Ikev2IkeAuthBuildError, Ikev2IkeAuthCleartextPayloads,
+    Ikev2IkeAuthPayloadBuild, Ikev2IkeAuthPayloadError, Ikev2IkeAuthPeer, Ikev2IkeAuthSignedOctets,
+    Ikev2IkeAuthVerificationError, Ikev2TrafficSelector, Ikev2TrafficSelectorBuild,
+    Ikev2TrafficSelectorPayload, Ikev2TrafficSelectorPayloadBuild,
+    IKEV2_AUTH_METHOD_SHARED_KEY_MIC, IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
+};
 pub use message::{Message, OwnedMessage};
 pub use nat_detection::{
     evaluate_ikev2_nat_detection, ikev2_nat_detection_hash, Ikev2NatDetectionEndpointStatus,
@@ -71,9 +92,10 @@ pub use payload::{
     GENERIC_PAYLOAD_HEADER_LEN,
 };
 pub use protected_payload_crypto::{
-    decrypt_ikev2_sa_init_protected_payload, Ikev2ProtectedPayloadCryptoError,
-    Ikev2ProtectedPayloadCryptoErrorCode, Ikev2ProtectedPayloadDirection,
-    Ikev2SaInitProtectedPayloadProvider,
+    decrypt_ikev2_sa_init_protected_payload, seal_ikev2_sa_init_protected_payload,
+    Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadCryptoErrorCode,
+    Ikev2ProtectedPayloadDirection, Ikev2SaInitProtectedPayloadProvider,
+    ProtectedPayloadSealContext, IKEV2_AES_GCM_EXPLICIT_IV_LEN,
 };
 pub use sa_init::{
     build_ike_sa_init_response, decode_ike_sa_init_request_payloads, Ikev2KeyExchangePayload,

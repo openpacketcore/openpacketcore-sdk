@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +13,9 @@ use opc_identity::{parse_certs_pem, parse_key_pem};
 use opc_mgmt_limits::{LimitsError, MgmtLimits};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+use russh::client;
+use russh::keys::{self, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
+use russh::{ChannelMsg, Disconnect, SshId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -45,6 +49,41 @@ pub struct NetconfTlsSmokeClientConfig {
     pub timeout: Duration,
     /// Client framing capability to advertise after the base 1.0 hello frame.
     pub framing: NetconfSmokeFramingPreference,
+}
+
+/// Connection and SSH material for one live NETCONF-over-SSH smoke run.
+pub struct NetconfSshSmokeClientConfig {
+    /// Listener address, usually a port-forwarded `127.0.0.1:<port>`.
+    pub addr: SocketAddr,
+    /// SSH username presented during public-key authentication.
+    pub username: String,
+    /// OpenSSH-encoded client private key.
+    pub client_private_key_openssh: Vec<u8>,
+    /// Trusted server host public key as an OpenSSH public-key line or raw key blob.
+    pub trusted_host_key_openssh: Vec<u8>,
+    /// Per TCP/SSH/frame operation timeout.
+    pub timeout: Duration,
+    /// Client framing capability to advertise after the base 1.0 hello frame.
+    pub framing: NetconfSmokeFramingPreference,
+}
+
+impl fmt::Debug for NetconfSshSmokeClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NetconfSshSmokeClientConfig")
+            .field("addr", &self.addr)
+            .field("username", &self.username)
+            .field(
+                "client_private_key_openssh",
+                &RedactedPem(self.client_private_key_openssh.len()),
+            )
+            .field(
+                "trusted_host_key_openssh",
+                &RedactedPem(self.trusted_host_key_openssh.len()),
+            )
+            .field("timeout", &self.timeout)
+            .field("framing", &self.framing)
+            .finish()
+    }
 }
 
 impl fmt::Debug for NetconfTlsSmokeClientConfig {
@@ -105,6 +144,21 @@ pub struct NetconfSmokeTranscript {
     pub addr: SocketAddr,
     /// TLS server name used by the client.
     pub server_name: String,
+    /// Server hello summary.
+    pub server_hello: NetconfSmokeHelloSummary,
+    /// Post-hello framing used for RPCs.
+    pub framing: NetconfSmokeFramingUsed,
+    /// Per-RPC outcomes, in caller-supplied order.
+    pub rpcs: Vec<NetconfSmokeRpcOutcome>,
+}
+
+/// Redaction-safe evidence transcript for one NETCONF-over-SSH smoke run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetconfSshSmokeTranscript {
+    /// Target address.
+    pub addr: SocketAddr,
+    /// SSH username used by the client.
+    pub username: String,
     /// Server hello summary.
     pub server_hello: NetconfSmokeHelloSummary,
     /// Post-hello framing used for RPCs.
@@ -174,6 +228,14 @@ pub enum NetconfSmokeErrorCode {
     TcpConnectFailed,
     /// TLS handshake failed, including server or client certificate rejection.
     TlsAuthenticationRejected,
+    /// SSH key material or client config was invalid.
+    SshConfig,
+    /// SSH server host key did not match caller trust material.
+    SshHostKeyMismatch,
+    /// SSH public-key authentication was rejected.
+    SshAuthenticationRejected,
+    /// SSH session channel or `netconf` subsystem request was rejected.
+    SshSubsystemRejected,
     /// A bounded operation timed out.
     Timeout,
     /// Server hello XML was malformed or missing capabilities.
@@ -194,6 +256,10 @@ impl NetconfSmokeErrorCode {
             Self::TlsConfig => "tls_config",
             Self::TcpConnectFailed => "tcp_connect_failed",
             Self::TlsAuthenticationRejected => "tls_authentication_rejected",
+            Self::SshConfig => "ssh_config",
+            Self::SshHostKeyMismatch => "ssh_host_key_mismatch",
+            Self::SshAuthenticationRejected => "ssh_authentication_rejected",
+            Self::SshSubsystemRejected => "ssh_subsystem_rejected",
             Self::Timeout => "timeout",
             Self::ServerHelloInvalid => "server_hello_invalid",
             Self::ServerHelloMissingBaseCapability => "server_hello_missing_base_capability",
@@ -218,6 +284,18 @@ pub enum NetconfSmokeError {
     /// TLS handshake failed, including server or client certificate rejection.
     #[error("NETCONF smoke TLS authentication failed")]
     TlsAuthenticationRejected,
+    /// SSH key material or client config was invalid.
+    #[error("NETCONF smoke SSH client config is invalid")]
+    SshConfig,
+    /// SSH server host key did not match caller trust material.
+    #[error("NETCONF smoke SSH host key mismatch")]
+    SshHostKeyMismatch,
+    /// SSH public-key authentication was rejected.
+    #[error("NETCONF smoke SSH authentication rejected")]
+    SshAuthenticationRejected,
+    /// SSH session channel or `netconf` subsystem request was rejected.
+    #[error("NETCONF smoke SSH subsystem rejected")]
+    SshSubsystemRejected,
     /// A bounded operation timed out.
     #[error("NETCONF smoke operation timed out")]
     Timeout,
@@ -243,6 +321,10 @@ impl NetconfSmokeError {
             Self::TlsConfig => NetconfSmokeErrorCode::TlsConfig,
             Self::TcpConnectFailed => NetconfSmokeErrorCode::TcpConnectFailed,
             Self::TlsAuthenticationRejected => NetconfSmokeErrorCode::TlsAuthenticationRejected,
+            Self::SshConfig => NetconfSmokeErrorCode::SshConfig,
+            Self::SshHostKeyMismatch => NetconfSmokeErrorCode::SshHostKeyMismatch,
+            Self::SshAuthenticationRejected => NetconfSmokeErrorCode::SshAuthenticationRejected,
+            Self::SshSubsystemRejected => NetconfSmokeErrorCode::SshSubsystemRejected,
             Self::Timeout => NetconfSmokeErrorCode::Timeout,
             Self::ServerHelloInvalid => NetconfSmokeErrorCode::ServerHelloInvalid,
             Self::ServerHelloMissingBaseCapability => {
@@ -261,39 +343,89 @@ pub async fn run_netconf_tls_smoke(
 ) -> Result<NetconfSmokeTranscript, NetconfSmokeError> {
     validate_config(&config)?;
     let rpcs = collect_rpcs(rpcs)?;
-    let limits = MgmtLimits::default();
     let mut stream = connect_tls(&config).await?;
+    let (hello_summary, framing, outcomes) =
+        run_netconf_smoke_exchange(&mut stream, config.timeout, config.framing, rpcs, true).await?;
 
-    let server_hello_bytes = match read_message(
-        &mut stream,
-        NetconfSmokeFramingUsed::Base10,
-        &limits,
+    Ok(NetconfSmokeTranscript {
+        addr: config.addr,
+        server_name: bounded_string(&config.server_name),
+        server_hello: hello_summary,
+        framing,
+        rpcs: outcomes,
+    })
+}
+
+/// Runs a live NETCONF-over-SSH smoke probe against an already-running listener.
+pub async fn run_netconf_ssh_smoke(
+    config: NetconfSshSmokeClientConfig,
+    rpcs: impl IntoIterator<Item = NetconfSmokeRpc>,
+) -> Result<NetconfSshSmokeTranscript, NetconfSmokeError> {
+    validate_ssh_config(&config)?;
+    let rpcs = collect_rpcs(rpcs)?;
+    let (session, mut stream) = connect_ssh_subsystem(&config).await?;
+    let (hello_summary, framing, outcomes) =
+        run_netconf_smoke_exchange(&mut stream, config.timeout, config.framing, rpcs, false)
+            .await?;
+    drop(stream);
+    let _ = tokio::time::timeout(
         config.timeout,
+        session.disconnect(Disconnect::ByApplication, "netconf smoke complete", "en"),
     )
-    .await
-    {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) | Err(NetconfSmokeError::FramingFailure) => {
-            return Err(NetconfSmokeError::TlsAuthenticationRejected);
-        }
-        Err(err) => return Err(err),
-    };
+    .await;
+
+    Ok(NetconfSshSmokeTranscript {
+        addr: config.addr,
+        username: bounded_string(&config.username),
+        server_hello: hello_summary,
+        framing,
+        rpcs: outcomes,
+    })
+}
+
+async fn run_netconf_smoke_exchange<S>(
+    stream: &mut S,
+    timeout: Duration,
+    preference: NetconfSmokeFramingPreference,
+    rpcs: Vec<NetconfSmokeRpc>,
+    tls_no_hello_is_auth_failure: bool,
+) -> Result<
+    (
+        NetconfSmokeHelloSummary,
+        NetconfSmokeFramingUsed,
+        Vec<NetconfSmokeRpcOutcome>,
+    ),
+    NetconfSmokeError,
+>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let limits = MgmtLimits::default();
+    let server_hello_bytes =
+        match read_message(stream, NetconfSmokeFramingUsed::Base10, &limits, timeout).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) | Err(NetconfSmokeError::FramingFailure) if tls_no_hello_is_auth_failure => {
+                return Err(NetconfSmokeError::TlsAuthenticationRejected);
+            }
+            Ok(None) => return Err(NetconfSmokeError::FramingFailure),
+            Err(err) => return Err(err),
+        };
     let server_hello_xml = std::str::from_utf8(&server_hello_bytes)
         .map_err(|_| NetconfSmokeError::ServerHelloInvalid)?;
     let server_capabilities = parse_server_hello_capabilities(server_hello_xml, &limits)?;
-    validate_server_capabilities(&server_capabilities, config.framing)?;
+    validate_server_capabilities(&server_capabilities, preference)?;
     let hello_summary = summarize_hello(&server_capabilities);
 
-    let client_hello = client_hello_xml(config.framing);
+    let client_hello = client_hello_xml(preference);
     write_message(
-        &mut stream,
+        stream,
         NetconfSmokeFramingUsed::Base10,
         client_hello.as_bytes(),
         &limits,
-        config.timeout,
+        timeout,
     )
     .await?;
-    let framing = framing_used(config.framing);
+    let framing = framing_used(preference);
 
     let mut outcomes = Vec::with_capacity(rpcs.len());
     for rpc in rpcs {
@@ -302,15 +434,8 @@ pub async fn run_netconf_tls_smoke(
         limits
             .check_request_bytes(envelope.len())
             .map_err(map_limit_error)?;
-        write_message(
-            &mut stream,
-            framing,
-            envelope.as_bytes(),
-            &limits,
-            config.timeout,
-        )
-        .await?;
-        let reply_bytes = read_message(&mut stream, framing, &limits, config.timeout)
+        write_message(stream, framing, envelope.as_bytes(), &limits, timeout).await?;
+        let reply_bytes = read_message(stream, framing, &limits, timeout)
             .await?
             .ok_or(NetconfSmokeError::FramingFailure)?;
         let status = std::str::from_utf8(&reply_bytes)
@@ -324,13 +449,7 @@ pub async fn run_netconf_tls_smoke(
         });
     }
 
-    Ok(NetconfSmokeTranscript {
-        addr: config.addr,
-        server_name: bounded_string(&config.server_name),
-        server_hello: hello_summary,
-        framing,
-        rpcs: outcomes,
-    })
+    Ok((hello_summary, framing, outcomes))
 }
 
 fn validate_config(config: &NetconfTlsSmokeClientConfig) -> Result<(), NetconfSmokeError> {
@@ -338,6 +457,17 @@ fn validate_config(config: &NetconfTlsSmokeClientConfig) -> Result<(), NetconfSm
         || config.client_cert_pem.is_empty()
         || config.client_key_pem.is_empty()
         || config.trust_roots_pem.is_empty()
+        || config.timeout.is_zero()
+    {
+        return Err(NetconfSmokeError::InvalidConfig);
+    }
+    Ok(())
+}
+
+fn validate_ssh_config(config: &NetconfSshSmokeClientConfig) -> Result<(), NetconfSmokeError> {
+    if config.username.is_empty()
+        || config.client_private_key_openssh.is_empty()
+        || config.trusted_host_key_openssh.is_empty()
         || config.timeout.is_zero()
     {
         return Err(NetconfSmokeError::InvalidConfig);
@@ -377,6 +507,163 @@ async fn connect_tls(
         .await
         .map_err(|_| NetconfSmokeError::Timeout)?
         .map_err(|_| NetconfSmokeError::TlsAuthenticationRejected)
+}
+
+async fn connect_ssh_subsystem(
+    config: &NetconfSshSmokeClientConfig,
+) -> Result<
+    (
+        client::Handle<SshSmokeClientHandler>,
+        impl AsyncRead + AsyncWrite + Unpin,
+    ),
+    NetconfSmokeError,
+> {
+    let private_key = parse_ssh_private_key(&config.client_private_key_openssh)?;
+    let trusted_host_key = parse_ssh_public_key(&config.trusted_host_key_openssh)?;
+    let checked = Arc::new(AtomicBool::new(false));
+    let matched = Arc::new(AtomicBool::new(false));
+    let handler = SshSmokeClientHandler {
+        trusted_host_key,
+        checked: Arc::clone(&checked),
+        matched: Arc::clone(&matched),
+    };
+
+    let client_config = client::Config {
+        inactivity_timeout: Some(config.timeout),
+        keepalive_interval: None,
+        nodelay: true,
+        client_id: SshId::Standard(std::borrow::Cow::Borrowed(
+            "SSH-2.0-openpacketcore-netconf-smoke",
+        )),
+        ..Default::default()
+    };
+    let mut session = tokio::time::timeout(
+        config.timeout,
+        client::connect(Arc::new(client_config), config.addr, handler),
+    )
+    .await
+    .map_err(|_| NetconfSmokeError::Timeout)?
+    .map_err(|_| {
+        if checked.load(Ordering::SeqCst) && !matched.load(Ordering::SeqCst) {
+            NetconfSmokeError::SshHostKeyMismatch
+        } else {
+            NetconfSmokeError::TcpConnectFailed
+        }
+    })?;
+
+    let rsa_hash = tokio::time::timeout(config.timeout, session.best_supported_rsa_hash())
+        .await
+        .map_err(|_| NetconfSmokeError::Timeout)?
+        .map_err(|_| NetconfSmokeError::SshAuthenticationRejected)?
+        .flatten();
+    let signing_key = PrivateKeyWithHashAlg::new(Arc::new(private_key), rsa_hash);
+    let auth = tokio::time::timeout(
+        config.timeout,
+        session.authenticate_publickey(config.username.clone(), signing_key),
+    )
+    .await
+    .map_err(|_| NetconfSmokeError::Timeout)?
+    .map_err(|_| NetconfSmokeError::SshAuthenticationRejected)?;
+    if !auth.success() {
+        return Err(NetconfSmokeError::SshAuthenticationRejected);
+    }
+
+    let mut channel = tokio::time::timeout(config.timeout, session.channel_open_session())
+        .await
+        .map_err(|_| NetconfSmokeError::Timeout)?
+        .map_err(|_| NetconfSmokeError::SshSubsystemRejected)?;
+    tokio::time::timeout(config.timeout, channel.request_subsystem(true, "netconf"))
+        .await
+        .map_err(|_| NetconfSmokeError::Timeout)?
+        .map_err(|_| NetconfSmokeError::SshSubsystemRejected)?;
+    wait_for_subsystem_success(&mut channel, config.timeout).await?;
+
+    Ok((session, channel.into_stream()))
+}
+
+struct SshSmokeClientHandler {
+    trusted_host_key: PublicKey,
+    checked: Arc<AtomicBool>,
+    matched: Arc<AtomicBool>,
+}
+
+impl client::Handler for SshSmokeClientHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &keys::ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        self.checked.store(true, Ordering::SeqCst);
+        let matched = server_public_key.key_data() == self.trusted_host_key.key_data();
+        self.matched.store(matched, Ordering::SeqCst);
+        Ok(matched)
+    }
+}
+
+async fn wait_for_subsystem_success<S>(
+    channel: &mut russh::Channel<S>,
+    timeout: Duration,
+) -> Result<(), NetconfSmokeError>
+where
+    S: From<(russh::ChannelId, ChannelMsg)> + Send + Sync + 'static,
+{
+    loop {
+        let msg = tokio::time::timeout(timeout, channel.wait())
+            .await
+            .map_err(|_| NetconfSmokeError::Timeout)?;
+        match msg {
+            Some(ChannelMsg::Success) => return Ok(()),
+            Some(ChannelMsg::Failure | ChannelMsg::Close | ChannelMsg::Eof) | None => {
+                return Err(NetconfSmokeError::SshSubsystemRejected);
+            }
+            Some(ChannelMsg::Data { .. } | ChannelMsg::ExtendedData { .. }) => {
+                return Err(NetconfSmokeError::SshSubsystemRejected);
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+fn parse_ssh_private_key(material: &[u8]) -> Result<PrivateKey, NetconfSmokeError> {
+    let text = std::str::from_utf8(material).map_err(|_| NetconfSmokeError::SshConfig)?;
+    keys::decode_secret_key(text, None).map_err(|_| NetconfSmokeError::SshConfig)
+}
+
+fn parse_ssh_public_key(material: &[u8]) -> Result<PublicKey, NetconfSmokeError> {
+    let text = std::str::from_utf8(material).map_err(|_| NetconfSmokeError::SshConfig)?;
+    let Some(record) = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+    else {
+        return Err(NetconfSmokeError::SshConfig);
+    };
+    let tokens = record.split_whitespace().collect::<Vec<_>>();
+    let Some(blob) = public_key_blob(&tokens) else {
+        return Err(NetconfSmokeError::SshConfig);
+    };
+    keys::parse_public_key_base64(blob).map_err(|_| NetconfSmokeError::SshConfig)
+}
+
+fn public_key_blob<'a>(tokens: &'a [&str]) -> Option<&'a str> {
+    if tokens.len() == 1 {
+        return tokens.first().copied();
+    }
+
+    tokens
+        .windows(2)
+        .find_map(|window| is_public_key_algorithm(window[0]).then_some(window[1]))
+        .or_else(|| tokens.first().copied())
+}
+
+fn is_public_key_algorithm(token: &str) -> bool {
+    token == "ssh-ed25519"
+        || token == "ssh-rsa"
+        || token == "rsa-sha2-256"
+        || token == "rsa-sha2-512"
+        || token.starts_with("ecdsa-sha2-")
+        || token.starts_with("sk-")
 }
 
 fn build_client_config(
@@ -857,9 +1144,10 @@ mod tests {
     use tokio::sync::watch;
 
     use super::*;
+    use crate::testkit::NetconfSshTestKeyFixture;
     use crate::{
-        run_read_only_tls_listener, BindingError, NetconfConfigBinding, ReadOnlyNetconfServer,
-        ReadSelection, SessionConfig, TlsListenerConfig,
+        run_read_only_ssh_listener, run_read_only_tls_listener, BindingError, NetconfConfigBinding,
+        ReadOnlyNetconfServer, ReadSelection, SessionConfig, TlsListenerConfig,
     };
 
     const CERT_PEM: &[u8] =
@@ -1090,6 +1378,12 @@ mod tests {
 
     async fn test_server() -> ReadOnlyNetconfServer<DemoConfig, TestBinding, FixedPolicy, NoopAudit>
     {
+        test_server_with_transport(TransportType::NetconfTls).await
+    }
+
+    async fn test_server_with_transport(
+        transport: TransportType,
+    ) -> ReadOnlyNetconfServer<DemoConfig, TestBinding, FixedPolicy, NoopAudit> {
         let bus = Arc::new(
             ConfigBus::new_dev_only(
                 DemoConfig {
@@ -1104,7 +1398,7 @@ mod tests {
             TestBinding { bus },
             FixedPolicy(read_policy()),
             NoopAudit,
-            TransportType::NetconfTls,
+            transport,
         )
         .expect("server")
     }
@@ -1259,6 +1553,20 @@ mod tests {
         }
     }
 
+    fn ssh_smoke_config(
+        addr: SocketAddr,
+        fixture: &NetconfSshTestKeyFixture,
+    ) -> NetconfSshSmokeClientConfig {
+        NetconfSshSmokeClientConfig {
+            addr,
+            username: "operator".to_string(),
+            client_private_key_openssh: fixture.client_private_key_openssh().as_bytes().to_vec(),
+            trusted_host_key_openssh: fixture.host_public_key_openssh().as_bytes().to_vec(),
+            timeout: Duration::from_secs(3),
+            framing: NetconfSmokeFramingPreference::Base11,
+        }
+    }
+
     async fn spawn_listener(
         material: &MtlsMaterial,
     ) -> (
@@ -1292,6 +1600,142 @@ mod tests {
             .expect("listener result")
         });
         (addr, shutdown, task)
+    }
+
+    async fn spawn_ssh_listener(
+        fixture: &NetconfSshTestKeyFixture,
+    ) -> (
+        SocketAddr,
+        ShutdownToken,
+        tokio::task::JoinHandle<Result<crate::SshListenerResult, crate::SshListenerError>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = ShutdownToken::new();
+        let task_shutdown = shutdown.clone();
+        let mut listener_config = fixture.listener_config(opc_types::TenantId::from_static("test"));
+        listener_config.session = SessionConfig {
+            frame_timeout: Duration::from_secs(3),
+            ..SessionConfig::default()
+        };
+        listener_config.drain_timeout = Duration::from_secs(3);
+        listener_config.max_auth_attempts = 2;
+        let task = tokio::spawn(async move {
+            run_read_only_ssh_listener(
+                Arc::new(test_server_with_transport(TransportType::NetconfSsh).await),
+                listener,
+                task_shutdown,
+                listener_config,
+            )
+            .await
+        });
+        (addr, shutdown, task)
+    }
+
+    #[tokio::test]
+    async fn live_ssh_smoke_runs_hello_get_config_and_rpc_error() {
+        let fixture = NetconfSshTestKeyFixture::generate().expect("ssh fixture");
+        let (addr, shutdown, listener_task) = spawn_ssh_listener(&fixture).await;
+
+        let transcript = run_netconf_ssh_smoke(
+            ssh_smoke_config(addr, &fixture),
+            [
+                NetconfSmokeRpc {
+                    message_id: "201".to_string(),
+                    body: "<get-config><source><running/></source></get-config>".to_string(),
+                },
+                NetconfSmokeRpc {
+                    message_id: "202".to_string(),
+                    body: "<unknown/>".to_string(),
+                },
+                NetconfSmokeRpc {
+                    message_id: "203".to_string(),
+                    body: "<close-session/>".to_string(),
+                },
+            ],
+        )
+        .await
+        .expect("ssh smoke transcript");
+
+        assert_eq!(transcript.username, "operator");
+        assert!(transcript
+            .server_hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == NETCONF_BASE_1_1));
+        assert_eq!(transcript.framing, NetconfSmokeFramingUsed::Base11);
+        assert!(matches!(
+            transcript.rpcs[0].status,
+            NetconfSmokeRpcStatus::Success { .. }
+        ));
+        assert_eq!(transcript.rpcs[0].operation, "get-config");
+        assert!(matches!(
+            &transcript.rpcs[1].status,
+            NetconfSmokeRpcStatus::RpcError { error_tag, .. }
+                if error_tag.as_deref() == Some("unknown-namespace")
+                    || error_tag.as_deref() == Some("operation-not-supported")
+        ));
+        assert_eq!(transcript.rpcs[2].operation, "close-session");
+        assert!(!format!("{transcript:?}").contains("OPENSSH PRIVATE KEY"));
+
+        shutdown.request_shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(5), listener_task)
+            .await
+            .expect("listener timeout")
+            .expect("listener join")
+            .expect("listener result");
+        assert_eq!(result.accepted_sessions, 1);
+        assert_eq!(result.completed_sessions, 1);
+    }
+
+    #[tokio::test]
+    async fn live_ssh_smoke_reports_wrong_client_key_rejection() {
+        let fixture = NetconfSshTestKeyFixture::generate().expect("ssh fixture");
+        let wrong_client = NetconfSshTestKeyFixture::generate().expect("wrong ssh fixture");
+        let (addr, shutdown, listener_task) = spawn_ssh_listener(&fixture).await;
+        let mut config = ssh_smoke_config(addr, &fixture);
+        config.client_private_key_openssh = wrong_client
+            .client_private_key_openssh()
+            .as_bytes()
+            .to_vec();
+
+        let err = run_netconf_ssh_smoke(config, [])
+            .await
+            .expect_err("auth rejected");
+
+        assert_eq!(err.code(), NetconfSmokeErrorCode::SshAuthenticationRejected);
+        assert!(!format!("{err:?}").contains("OPENSSH PRIVATE KEY"));
+
+        shutdown.request_shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(5), listener_task)
+            .await
+            .expect("listener timeout")
+            .expect("listener join")
+            .expect("listener result");
+        assert_eq!(result.completed_sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn live_ssh_smoke_reports_host_key_mismatch() {
+        let fixture = NetconfSshTestKeyFixture::generate().expect("ssh fixture");
+        let wrong_host = NetconfSshTestKeyFixture::generate().expect("wrong ssh fixture");
+        let (addr, shutdown, listener_task) = spawn_ssh_listener(&fixture).await;
+        let mut config = ssh_smoke_config(addr, &fixture);
+        config.trusted_host_key_openssh = wrong_host.host_public_key_openssh().as_bytes().to_vec();
+
+        let err = run_netconf_ssh_smoke(config, [])
+            .await
+            .expect_err("host key mismatch");
+
+        assert_eq!(err.code(), NetconfSmokeErrorCode::SshHostKeyMismatch);
+
+        shutdown.request_shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(5), listener_task)
+            .await
+            .expect("listener timeout")
+            .expect("listener join")
+            .expect("listener result");
+        assert_eq!(result.completed_sessions, 0);
     }
 
     #[tokio::test]

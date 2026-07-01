@@ -12,17 +12,25 @@ Current scope is intentionally narrow:
 - protected-payload boundary metadata for `SK` and `SKF` payloads without
   parsing ciphertext as cleartext;
 - a caller-supplied `CryptoProvider` trait boundary for downstream SA state and
-  key policy; and
+  key policy;
 - an SA_INIT-derived AES-GCM-16 `SK` payload opener for callers that already
-  selected an IKE SA profile, derived key material, and packet direction; and
+  selected an IKE SA profile, derived key material, and packet direction;
+- a matching SA_INIT-derived AES-GCM-16 `SK` sealing helper for caller-built
+  responder payloads;
+- typed IKE_AUTH cleartext payload views/builders for IDi/IDr, AUTH, EAP, CP,
+  SA, TSi/TSr, Notify, and Delete payload chains;
+- transcript-bound shared-key AUTH MIC computation and verification for
+  EAP/AAA-supplied keying material; and
+- product-neutral Child SA proposal/traffic-selector selection intent plus
+  response SA/TS payload builders; and
 - RFC 7296 NAT-D hash computation and semantic evaluation from typed Notify
   payloads and caller-supplied observed UDP endpoints.
 
 It does **not** provide an IKE SA state machine, EAP-AKA procedure, cookie or
 retransmission policy, NAT traversal policy, 3GPP ePDG profile validation,
-Child SA installation, XFRM/IPsec programming, carrier acceptance evidence, or a
-production ePDG control-plane stack. See [CONFORMANCE.md](CONFORMANCE.md) for
-the precise evidence boundary and payload-chain parser plan.
+Child SA installation, XFRM/IPsec programming, carrier acceptance evidence, or
+a production ePDG control-plane stack. See [CONFORMANCE.md](CONFORMANCE.md) for
+the precise evidence boundary.
 
 ## Minimal use
 

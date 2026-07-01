@@ -1,4 +1,4 @@
-//! IKEv2 protected-payload decryption helpers for SA_INIT-derived keys.
+//! IKEv2 protected-payload decryption and sealing helpers for SA_INIT-derived keys.
 //!
 //! @spec IETF RFC5282 3; IETF RFC7296 3.14
 //! @req REQ-IETF-RFC5282-AES-GCM-PROTECTED-PAYLOAD-001
@@ -23,6 +23,9 @@ const AES_GCM_EXPLICIT_IV_LEN: usize = 8;
 const AES_GCM_ICV_LEN: usize = 16;
 const AES_128_KEY_LEN: usize = 16;
 const AES_256_KEY_LEN: usize = 32;
+
+/// RFC 5282 AES-GCM explicit IV length used in IKEv2 `SK` payload bodies.
+pub const IKEV2_AES_GCM_EXPLICIT_IV_LEN: usize = AES_GCM_EXPLICIT_IV_LEN;
 
 /// Direction of an IKEv2 protected message on an established IKE SA.
 ///
@@ -135,6 +138,33 @@ pub enum Ikev2ProtectedPayloadCryptoError {
         /// Pad length octet value.
         pad_len: usize,
     },
+}
+
+/// Exact AAD context for sealing one IKEv2 protected payload body.
+///
+/// `message_prefix` must be the final outer IKE message bytes from the IKE
+/// header through the protected payload generic header, excluding only the
+/// protected body that this helper returns. For an `SK` payload with no
+/// cleartext prefix, that is the 28-byte IKE header plus the 4-byte `SK`
+/// generic payload header. If there are unencrypted payloads before `SK`, they
+/// must be included too. This keeps the AEAD AAD binding byte-exact while still
+/// leaving full message construction and retransmission policy to the caller.
+#[derive(Clone, Copy)]
+pub struct ProtectedPayloadSealContext<'a> {
+    /// Protected payload kind to seal. Only `SK`/Encrypted is currently
+    /// supported.
+    pub kind: ProtectedPayloadKind,
+    /// Exact outer message prefix authenticated as AES-GCM AAD.
+    pub message_prefix: &'a [u8],
+}
+
+impl fmt::Debug for ProtectedPayloadSealContext<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProtectedPayloadSealContext")
+            .field("kind", &self.kind)
+            .field("message_prefix_len", &self.message_prefix.len())
+            .finish()
+    }
 }
 
 impl Ikev2ProtectedPayloadCryptoError {
@@ -310,6 +340,55 @@ pub fn decrypt_ikev2_sa_init_protected_payload(
     strip_ike_padding(plaintext)
 }
 
+/// Authenticate and encrypt one IKEv2 `SK` payload body with SA_INIT keys.
+///
+/// The returned bytes are the protected payload body:
+/// explicit IV || ciphertext || authentication tag. The caller remains
+/// responsible for constructing the outer IKE header and generic payload header
+/// whose exact bytes are supplied in [`ProtectedPayloadSealContext`].
+///
+/// `cleartext_payloads` is the complete inner cleartext payload chain beginning
+/// with the payload type named by the outer `SK` generic header. This helper
+/// appends `padding_len` zero padding octets plus the required IKE Pad Length
+/// octet before encryption.
+///
+/// # Errors
+///
+/// Returns [`Ikev2ProtectedPayloadCryptoError`] when the profile, keys, payload
+/// kind, or AAD prefix is invalid for sealing.
+pub fn seal_ikev2_sa_init_protected_payload(
+    profile: Ikev2SaInitCryptoProfile,
+    key_material: &Ikev2SaInitKeyMaterial,
+    direction: Ikev2ProtectedPayloadDirection,
+    context: ProtectedPayloadSealContext<'_>,
+    cleartext_payloads: &[u8],
+    padding_len: u8,
+    explicit_iv: [u8; IKEV2_AES_GCM_EXPLICIT_IV_LEN],
+) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError> {
+    if context.kind != ProtectedPayloadKind::Encrypted {
+        return Err(
+            Ikev2ProtectedPayloadCryptoError::UnsupportedProtectedPayloadKind {
+                kind: context.kind,
+            },
+        );
+    }
+    if context.message_prefix.len() < HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN {
+        return Err(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData);
+    }
+    validate_profile(profile)?;
+
+    let keys = select_keys(profile, key_material, direction)?;
+    let plaintext = padded_ike_plaintext(cleartext_payloads, padding_len);
+    let sealed = encrypt_aes_gcm(
+        profile.encryption(),
+        keys,
+        context.message_prefix,
+        &plaintext,
+        explicit_iv,
+    )?;
+    Ok(Bytes::from(sealed))
+}
+
 struct SelectedProtectedPayloadKeys<'a> {
     encryption_key: &'a [u8],
     salt: &'a [u8],
@@ -482,6 +561,76 @@ fn decrypt_aes_gcm(
                 .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)
         }
     }
+}
+
+fn encrypt_aes_gcm(
+    encryption: Ikev2EncryptionAlgorithm,
+    keys: SelectedProtectedPayloadKeys<'_>,
+    aad: &[u8],
+    plaintext: &[u8],
+    explicit_iv: [u8; IKEV2_AES_GCM_EXPLICIT_IV_LEN],
+) -> Result<Vec<u8>, Ikev2ProtectedPayloadCryptoError> {
+    let mut nonce = [0_u8; AES_GCM_SALT_LEN + AES_GCM_EXPLICIT_IV_LEN];
+    nonce[..AES_GCM_SALT_LEN].copy_from_slice(keys.salt);
+    nonce[AES_GCM_SALT_LEN..].copy_from_slice(&explicit_iv);
+
+    let payload = Payload {
+        msg: plaintext,
+        aad,
+    };
+    let ciphertext_and_tag = match encryption {
+        Ikev2EncryptionAlgorithm::AesGcm16_128 => {
+            validate_key_len(
+                "AES-GCM-128 key",
+                AES_128_KEY_LEN,
+                keys.encryption_key.len(),
+            )?;
+            let key = <&Key<Aes128Gcm>>::try_from(keys.encryption_key).map_err(|_| {
+                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+                    name: "AES-GCM-128 key",
+                    expected: AES_128_KEY_LEN,
+                    actual: keys.encryption_key.len(),
+                }
+            })?;
+            let nonce = <&Nonce<Aes128Gcm>>::try_from(nonce.as_slice())
+                .map_err(|_| Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+            Aes128Gcm::new(key)
+                .encrypt(nonce, payload)
+                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)?
+        }
+        Ikev2EncryptionAlgorithm::AesGcm16_256 => {
+            validate_key_len(
+                "AES-GCM-256 key",
+                AES_256_KEY_LEN,
+                keys.encryption_key.len(),
+            )?;
+            let key = <&Key<Aes256Gcm>>::try_from(keys.encryption_key).map_err(|_| {
+                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+                    name: "AES-GCM-256 key",
+                    expected: AES_256_KEY_LEN,
+                    actual: keys.encryption_key.len(),
+                }
+            })?;
+            let nonce = <&Nonce<Aes256Gcm>>::try_from(nonce.as_slice())
+                .map_err(|_| Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+            Aes256Gcm::new(key)
+                .encrypt(nonce, payload)
+                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)?
+        }
+    };
+
+    let mut protected_body = Vec::with_capacity(AES_GCM_EXPLICIT_IV_LEN + ciphertext_and_tag.len());
+    protected_body.extend_from_slice(&explicit_iv);
+    protected_body.extend_from_slice(&ciphertext_and_tag);
+    Ok(protected_body)
+}
+
+fn padded_ike_plaintext(cleartext_payloads: &[u8], padding_len: u8) -> Vec<u8> {
+    let mut plaintext = Vec::with_capacity(cleartext_payloads.len() + usize::from(padding_len) + 1);
+    plaintext.extend_from_slice(cleartext_payloads);
+    plaintext.resize(plaintext.len() + usize::from(padding_len), 0);
+    plaintext.push(padding_len);
+    plaintext
 }
 
 fn strip_ike_padding(plaintext: Vec<u8>) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError> {
