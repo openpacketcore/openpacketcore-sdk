@@ -207,6 +207,10 @@ jobs:
         run: golangci-lint run ./...
 
       - name: Run Go tests
+        env:
+          # The race runtime needs cgo on linux (cmd/go/internal/work/init.go);
+          # only this step overrides the job's pure-Go build posture.
+          CGO_ENABLED: "1"
         run: go test -race ./...
 
   go-sdk:
@@ -243,6 +247,10 @@ jobs:
         run: golangci-lint run ./...
 
       - name: Run Go tests
+        env:
+          # The race runtime needs cgo on linux (cmd/go/internal/work/init.go);
+          # only this step overrides the job's pure-Go build posture.
+          CGO_ENABLED: "1"
         run: go test -race ./...
 
       - name: Check downstream import contract
