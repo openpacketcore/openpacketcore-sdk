@@ -59,6 +59,26 @@ jobs:
       - name: Run consensus e2e tests (serial)
         run: cargo test --locked -p opc-persist --all-features --quiet -- --test-threads=1
 
+  feature-powerset:
+    name: opc-sdk feature powerset
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@v2.82.7
+        with:
+          tool: cargo-hack@0.6.45
+          fallback: none
+
+      - name: Check opc-sdk feature powerset
+        run: cargo hack check -p opc-sdk --feature-powerset --depth 2 --locked
+
   generated-drift:
     name: Generated code drift
     runs-on: ubuntu-latest
