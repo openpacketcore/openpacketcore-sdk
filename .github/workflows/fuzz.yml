@@ -67,7 +67,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     concurrency:
-      group: fuzz-smoke-${{ github.ref }}
+      group: fuzz-smoke-${{ github.ref }}-${{ matrix.crate }}
       cancel-in-progress: true
     strategy:
       matrix:
