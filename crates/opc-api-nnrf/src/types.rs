@@ -240,9 +240,9 @@ pub struct PlmnSnssai {
     /// Optional `nid` attribute per TS 29.510.
     pub nid: Option<String>,
     /// Mandatory `plmnId` attribute per TS 29.510.
-    pub plmn_id: opc_types::PlmnId,
+    pub plmn_id: crate::serde_3gpp::NnrfPlmnId,
     /// Mandatory `sNssaiList` attribute per TS 29.510.
-    pub s_nssai_list: Vec<opc_types::Snssai>,
+    pub s_nssai_list: Vec<crate::serde_3gpp::NnrfSnssai>,
 }
 
 /// Condition (list of attributes in the NF Profile) to determine whether a
@@ -273,9 +273,9 @@ pub struct NfProfile {
     /// Optional `allowedNfTypes` attribute per TS 29.510.
     pub allowed_nf_types: Option<Vec<NfType>>,
     /// Optional `allowedNssais` attribute per TS 29.510.
-    pub allowed_nssais: Option<Vec<opc_types::Snssai>>,
+    pub allowed_nssais: Option<Vec<crate::serde_3gpp::NnrfSnssai>>,
     /// Optional `allowedPlmns` attribute per TS 29.510.
-    pub allowed_plmns: Option<Vec<opc_types::PlmnId>>,
+    pub allowed_plmns: Option<Vec<crate::serde_3gpp::NnrfPlmnId>>,
     /// A map (list of key-value pairs) where a valid JSON pointer Id serves as
     /// key
     pub allowed_rule_set: Option<std::collections::HashMap<String, String>>,
@@ -427,13 +427,13 @@ pub struct NfProfile {
     /// Optional `perPlmnSnssaiList` attribute per TS 29.510.
     pub per_plmn_snssai_list: Option<Vec<PlmnSnssai>>,
     /// Optional `plmnList` attribute per TS 29.510.
-    pub plmn_list: Option<Vec<opc_types::PlmnId>>,
+    pub plmn_list: Option<Vec<crate::serde_3gpp::NnrfPlmnId>>,
     /// Optional `priority` attribute per TS 29.510.
     pub priority: Option<u16>,
     /// Optional `recoveryTime` attribute per TS 29.510.
     pub recovery_time: Option<String>,
     /// Optional `sNssais` attribute per TS 29.510.
-    pub s_nssais: Option<Vec<opc_types::Snssai>>,
+    pub s_nssais: Option<Vec<crate::serde_3gpp::NnrfSnssai>>,
     /// Optional `scpDomains` attribute per TS 29.510.
     pub scp_domains: Option<Vec<String>>,
     /// Optional `scpInfo` attribute per TS 29.510.
@@ -500,7 +500,7 @@ pub struct NfService {
     /// Optional `allowedNfTypes` attribute per TS 29.510.
     pub allowed_nf_types: Option<Vec<NfType>>,
     /// Optional `allowedNssais` attribute per TS 29.510.
-    pub allowed_nssais: Option<Vec<opc_types::Snssai>>,
+    pub allowed_nssais: Option<Vec<crate::serde_3gpp::NnrfSnssai>>,
     /// A map (list of key-value pairs) where NF Instance Id serves as key
     pub allowed_operations_per_nf_instance: Option<std::collections::HashMap<String, Vec<String>>>,
     /// Optional `allowedOperationsPerNfInstanceOverrides` attribute per TS
@@ -509,7 +509,7 @@ pub struct NfService {
     /// A map (list of key-value pairs) where NF Type serves as key
     pub allowed_operations_per_nf_type: Option<std::collections::HashMap<String, Vec<String>>>,
     /// Optional `allowedPlmns` attribute per TS 29.510.
-    pub allowed_plmns: Option<Vec<opc_types::PlmnId>>,
+    pub allowed_plmns: Option<Vec<crate::serde_3gpp::NnrfPlmnId>>,
     /// A map (list of key-value pairs) where a valid JSON pointer Id serves as
     /// key
     pub allowed_scopes_rule_set: Option<std::collections::HashMap<String, String>>,
@@ -552,7 +552,7 @@ pub struct NfService {
     /// Optional `recoveryTime` attribute per TS 29.510.
     pub recovery_time: Option<String>,
     /// Optional `sNssais` attribute per TS 29.510.
-    pub s_nssais: Option<Vec<opc_types::Snssai>>,
+    pub s_nssais: Option<Vec<crate::serde_3gpp::NnrfSnssai>>,
     /// Mandatory `scheme` attribute per TS 29.510.
     pub scheme: String,
     /// Optional `selectionConditions` attribute per TS 29.510.
@@ -599,7 +599,7 @@ pub struct SubscriptionData {
     /// Optional `onboardingCapability` attribute per TS 29.510.
     pub onboarding_capability: Option<bool>,
     /// Optional `plmnId` attribute per TS 29.510.
-    pub plmn_id: Option<opc_types::PlmnId>,
+    pub plmn_id: Option<crate::serde_3gpp::NnrfPlmnId>,
     /// Optional `preferredLocality` attribute per TS 29.510.
     pub preferred_locality: Option<String>,
     /// Optional `reqNfFqdn` attribute per TS 29.510.
@@ -613,11 +613,11 @@ pub struct SubscriptionData {
     /// Optional `reqPerPlmnSnssais` attribute per TS 29.510.
     pub req_per_plmn_snssais: Option<Vec<PlmnSnssai>>,
     /// Optional `reqPlmnList` attribute per TS 29.510.
-    pub req_plmn_list: Option<Vec<opc_types::PlmnId>>,
+    pub req_plmn_list: Option<Vec<crate::serde_3gpp::NnrfPlmnId>>,
     /// Optional `reqSnpnList` attribute per TS 29.510.
     pub req_snpn_list: Option<Vec<String>>,
     /// Optional `reqSnssais` attribute per TS 29.510.
-    pub req_snssais: Option<Vec<opc_types::Snssai>>,
+    pub req_snssais: Option<Vec<crate::serde_3gpp::NnrfSnssai>>,
     /// Optional `requesterFeatures` attribute per TS 29.510.
     pub requester_features: serde_json::Value,
     /// Optional `servingScope` attribute per TS 29.510.
