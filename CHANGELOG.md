@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   typed Session Modification Request (Update FAR + Remove PDR) and the fake UPF
   send a typed Session Report Request (Usage Report with Report Type and
   volume/duration measurements), with field and wire-byte assertions.
+- `opc-mgmt-limits`: `MgmtLimits::min_sample_interval` (default 100 ms), the
+  server-side floor for gNMI SAMPLE `sample_interval` and `heartbeat_interval`.
+- `operator-sdk-go`: `bridge.ErrorKind` implements `fmt.Stringer`, so wrapped
+  bridge errors log a named kind instead of a bare integer.
+- CI: Go race-detector and golangci-lint gates, a generated-code drift check
+  for the NGAP/NNRF bindings, an `opc-sdk` depth-2 feature-powerset check, a
+  pinned checksum-verified gitleaks secret scan, a PR smoke-fuzz lane
+  (60 s/target) alongside the scheduled run raised to 600 s/target, and
+  committed fuzz corpora for the GTP-U, NAS, Diameter, and IKEv2 targets.
 
 ### Changed
 - `opc-proto-pfcp` graduated from experimental to publishable
@@ -59,6 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-session-net`: bound server-side frame reads with a configurable idle
   timeout so a stalled peer is reaped instead of exhausting connection slots
   (slowloris).
+- `opc-gnmi-server`: Subscribe rejects SAMPLE `sample_interval` and
+  `heartbeat_interval` below `MgmtLimits::min_sample_interval`; previously any
+  nonzero interval was accepted, so a single 1 ns subscription drove the whole
+  stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
 - `opc-persist`: a committed `MarkConfirmed`/`CreateRollbackPoint` whose target
@@ -79,7 +92,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completed or timed-out drain releases it, so sessions are not cut.
 - `opc-api-nnrf`: `PlmnId` and S-NSSAI are generated with TS 29.571 object-form
   serde (`{mcc,mnc}` / `{sst,sd}`) so the types interoperate with conformant
-  NRF peers.
+  NRF peers. The committed generated types now match the generator output
+  (`NfProfile`, `NfService`, and `SubscriptionData` PLMN/S-NSSAI fields use the
+  object-form wrappers), and CI regenerates both NNRF and NGAP bindings to
+  fail on any future drift.
+- `opc-config-bus`: the commit-confirmed rollback deadline is armed on the
+  monotonic tokio clock instead of the wall clock, so an NTP step no longer
+  stretches or shortens the safety-rollback window; the durable marker still
+  records wall-clock time for restart re-arm.
+- `sdk-reference-operator`: bridge and drain call errors now preserve the
+  underlying cause chain (`errors.As`/`errors.Is` recover the typed bridge
+  error) while keeping the CLI path out of messages, and child Deployment
+  owner references set `BlockOwnerDeletion` so foreground cascade deletion
+  waits on the child.
 
 ## [0.2.0] — 2026-06-12
 
