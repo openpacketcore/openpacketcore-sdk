@@ -10,17 +10,17 @@ publish = false
 description = "Realistic AMF-lite control-plane vertical slice integration proving OpenPacketCore SDK seams"
 
 [dependencies]
-opc-alarm = { path = "../opc-alarm" }
-opc-config-bus = { path = "../opc-config-bus" }
-opc-config-model = { path = "../opc-config-model" }
-opc-runtime = { path = "../opc-runtime" }
-opc-session-store = { path = "../opc-session-store" }
-opc-types = { path = "../opc-types" }
-opc-nacm = { path = "../opc-nacm" }
-opc-persist = { path = "../opc-persist" }
-opc-key = { path = "../opc-key" }
-opc-crypto = { path = "../opc-crypto" }
-opc-redaction = { path = "../opc-redaction" }
+opc-alarm = { path = "../opc-alarm", version = "0.2.0" }
+opc-config-bus = { path = "../opc-config-bus", version = "0.2.0" }
+opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
+opc-runtime = { path = "../opc-runtime", version = "0.2.0" }
+opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
+opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
+opc-persist = { path = "../opc-persist", version = "0.2.0" }
+opc-key = { path = "../opc-key", version = "0.2.0" }
+opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
+opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -33,8 +33,8 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
-opc-security-testkit = { path = "../opc-security-testkit" }
-opc-session-testkit = { path = "../opc-session-testkit" }
+opc-security-testkit = { path = "../opc-security-testkit", version = "0.2.0" }
+opc-session-testkit = { path = "../opc-session-testkit", version = "0.2.0" }
 tempfile = "3"
 rcgen = { workspace = true }
 rustls = { workspace = true }
