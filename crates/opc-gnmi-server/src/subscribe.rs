@@ -743,31 +743,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sample_interval_below_floor_is_rejected() {
-        let err = enforce_min_interval(Duration::from_nanos(1), Duration::from_millis(100))
+    fn enforce_min_interval_boundary() {
+        let floor = Duration::from_millis(100);
+        let err = enforce_min_interval(Duration::from_nanos(1), floor)
             .expect_err("interval below floor rejected");
         assert!(matches!(
             err,
             GnmiError::InvalidArgument { ref detail }
                 if detail.contains("below server minimum")
         ));
-        assert!(
-            enforce_min_interval(Duration::from_millis(100), Duration::from_millis(100)).is_ok()
-        );
-    }
-
-    #[test]
-    fn heartbeat_interval_below_floor_is_rejected() {
-        let err = enforce_min_interval(Duration::from_nanos(1), Duration::from_millis(100))
-            .expect_err("interval below floor rejected");
-        assert!(matches!(
-            err,
-            GnmiError::InvalidArgument { ref detail }
-                if detail.contains("below server minimum")
-        ));
-        assert!(
-            enforce_min_interval(Duration::from_millis(100), Duration::from_millis(100)).is_ok()
-        );
+        assert!(enforce_min_interval(floor, floor).is_ok());
+        assert!(enforce_min_interval(Duration::from_millis(101), floor).is_ok());
     }
 }
 

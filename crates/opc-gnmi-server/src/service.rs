@@ -4732,6 +4732,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscribe_plan_enforces_interval_floor_end_to_end() {
+        let service =
+            authenticated_service_with_policy(allow_all_read_and_subscribe_policy()).await;
+
+        // A 1 ns SAMPLE interval is nonzero (passing the legacy check) but
+        // below MgmtLimits::min_sample_interval, so stream_plan must reject it.
+        let mut sample_below_floor = subscribe_list(
+            gnmi::subscription_list::Mode::Stream,
+            hostname_path(),
+            gnmi::SubscriptionMode::Sample,
+        );
+        sample_below_floor.subscription[0].sample_interval = 1;
+        let sample_err =
+            SubscribePlan::from_subscription_list(service.server(), sample_below_floor)
+                .unwrap_err();
+        assert_eq!(sample_err.status().as_str(), "INVALID_ARGUMENT");
+        assert!(matches!(
+            sample_err,
+            GnmiError::InvalidArgument { ref detail }
+                if detail.contains("below server minimum")
+        ));
+
+        // The heartbeat arm is enforced independently of the sample arm: keep
+        // the sample interval valid and drive only the heartbeat below floor.
+        let mut heartbeat_below_floor = subscribe_list(
+            gnmi::subscription_list::Mode::Stream,
+            hostname_path(),
+            gnmi::SubscriptionMode::Sample,
+        );
+        heartbeat_below_floor.subscription[0].suppress_redundant = true;
+        heartbeat_below_floor.subscription[0].heartbeat_interval = 1;
+        let heartbeat_err =
+            SubscribePlan::from_subscription_list(service.server(), heartbeat_below_floor)
+                .unwrap_err();
+        assert_eq!(heartbeat_err.status().as_str(), "INVALID_ARGUMENT");
+        assert!(matches!(
+            heartbeat_err,
+            GnmiError::InvalidArgument { ref detail }
+                if detail.contains("below server minimum")
+        ));
+
+        let mut at_floor = subscribe_list(
+            gnmi::subscription_list::Mode::Stream,
+            hostname_path(),
+            gnmi::SubscriptionMode::Sample,
+        );
+        at_floor.subscription[0].suppress_redundant = true;
+        at_floor.subscription[0].heartbeat_interval = 100_000_000;
+        assert!(SubscribePlan::from_subscription_list(service.server(), at_floor).is_ok());
+    }
+
+    #[tokio::test]
     async fn unauthenticated_get_set_and_subscribe_are_rejected() {
         let service = service().await;
 
