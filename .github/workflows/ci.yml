@@ -142,11 +142,20 @@ jobs:
           go-version-file: operators/sdk-reference-operator/go.mod
           cache-dependency-path: operators/sdk-reference-operator/go.sum
 
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
       - name: Check Go formatting
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
 
       - name: Run Go vet
         run: go vet ./...
+
+      - name: Run golangci-lint
+        run: golangci-lint run ./...
 
       - name: Run Go tests
         run: go test -race ./...
@@ -169,11 +178,20 @@ jobs:
           go-version-file: operators/operator-sdk-go/go.mod
           cache-dependency-path: operators/operator-sdk-go/go.sum
 
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
       - name: Check Go formatting
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
 
       - name: Run Go vet
         run: go vet ./...
+
+      - name: Run golangci-lint
+        run: golangci-lint run ./...
 
       - name: Run Go tests
         run: go test -race ./...

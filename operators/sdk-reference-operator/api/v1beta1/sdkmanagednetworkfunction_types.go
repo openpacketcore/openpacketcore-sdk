@@ -106,7 +106,3 @@ type SdkManagedNetworkFunctionList struct {
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []SdkManagedNetworkFunction `json:"items"`
 }
-
-func init() {
-	SchemeBuilder.Register(&SdkManagedNetworkFunction{}, &SdkManagedNetworkFunctionList{})
-}

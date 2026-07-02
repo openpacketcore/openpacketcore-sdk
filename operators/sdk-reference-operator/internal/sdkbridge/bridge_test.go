@@ -402,7 +402,9 @@ func TestBridgeContractMismatchFromCLIExitCode(t *testing.T) {
 	// Wrap request with wrong expectedContractVersion directly via CallCLI.
 	inputBytes, _ := json.Marshal(req)
 	var wrapped map[string]interface{}
-	json.Unmarshal(inputBytes, &wrapped)
+	if err := json.Unmarshal(inputBytes, &wrapped); err != nil {
+		t.Fatalf("failed to wrap request: %v", err)
+	}
 	wrapped["expectedContractVersion"] = 999
 	wrongBytes, _ := json.Marshal(wrapped)
 

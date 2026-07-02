@@ -131,32 +131,6 @@ func (b *Bridge) EvaluatePreflight(ctx context.Context, req *PreflightRequest) (
 	return &resp, nil
 }
 
-// validateAndStripContractVersion is retained for backward compatibility with
-// direct stdout consumers, but is no longer the primary parsing path.
-func validateAndStripContractVersion(data []byte) ([]byte, error) {
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		return data, nil
-	}
-
-	if raw, ok := envelope["contractVersion"]; ok {
-		var cv uint32
-		if err := json.Unmarshal(raw, &cv); err != nil {
-			return nil, fmt.Errorf("SDK policy CLI returned invalid contract version: %w", err)
-		}
-		if cv != ExpectedContractVersion {
-			return nil, ErrContractMismatch
-		}
-	}
-
-	delete(envelope, "contractVersion")
-	stripped, err := json.Marshal(envelope)
-	if err != nil {
-		return nil, fmt.Errorf("failed to re-marshal response after stripping contract version: %w", err)
-	}
-	return stripped, nil
-}
-
 // Legacy helper for tests that need to wrap input manually.
 func WrapInputWithContractVersion(input []byte) ([]byte, error) {
 	var wrapped map[string]interface{}

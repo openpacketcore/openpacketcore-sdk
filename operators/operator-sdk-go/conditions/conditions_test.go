@@ -88,7 +88,7 @@ func TestSetUpdatesCondition(t *testing.T) {
 	if second.ObservedGeneration != 2 {
 		t.Errorf("expected generation 2, got %d", second.ObservedGeneration)
 	}
-	if !second.LastTransitionTime.Time.After(first.LastTransitionTime.Time) {
+	if !second.LastTransitionTime.After(first.LastTransitionTime.Time) {
 		t.Errorf("expected LastTransitionTime to advance on status change")
 	}
 }

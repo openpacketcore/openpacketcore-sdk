@@ -409,7 +409,7 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 		if err != nil {
 			logger.Error(err, "Drain orchestration failed")
 		}
-		if res.Requeue || res.RequeueAfter > 0 {
+		if res.RequeueAfter > 0 {
 			r.syncConditions(crd, cm)
 			if updateErr := r.Client.Status().Update(ctx, crd); updateErr != nil {
 				return ctrl.Result{}, updateErr
