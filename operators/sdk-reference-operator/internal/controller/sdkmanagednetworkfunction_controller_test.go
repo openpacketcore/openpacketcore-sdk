@@ -718,6 +718,33 @@ func TestReconcileDrainStartErrorKeepsFinalizer(t *testing.T) {
 	}
 }
 
+func TestReconcileDrainStatusErrorWrapsContext(t *testing.T) {
+	statusErr := errors.New("drain agent status unreachable")
+	drainer := &drain.FakeOrchestrator{
+		StatusFunc: func(ctx context.Context, target string) (drain.DrainStatus, error) {
+			return drain.DrainStatus{}, statusErr
+		},
+	}
+	reconciler := &SdkManagedNetworkFunctionReconciler{Drainer: drainer}
+	crd := &apiv1beta1.SdkManagedNetworkFunction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "drain-status-error-cnf",
+			Generation: 1,
+		},
+	}
+	cm := conditions.NewConditionManager(crd.Generation)
+	err := reconciler.runDrain(context.Background(), crd, cm)
+	if err == nil {
+		t.Fatalf("expected drain status error")
+	}
+	if !strings.Contains(err.Error(), "querying drain status for") {
+		t.Fatalf("expected status context in error, got %q", err.Error())
+	}
+	if !errors.Is(err, statusErr) {
+		t.Fatalf("expected wrapped status error, got %v", err)
+	}
+}
+
 func TestReconcileDrainFailedPhaseKeepsFinalizer(t *testing.T) {
 	reconcileDrainFailureKeepsFinalizer(t, "drain-failed-cnf", &drain.FakeOrchestrator{
 		StartFunc: func(ctx context.Context, target string) error {
