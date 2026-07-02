@@ -327,3 +327,23 @@ echo "{\"contractVersion\":1,\"input\":$INPUT}"
 		t.Errorf("unexpected contract version: %v", payload["expectedContractVersion"])
 	}
 }
+
+func TestErrorKindString(t *testing.T) {
+	tests := []struct {
+		kind ErrorKind
+		want string
+	}{
+		{ErrKindBinaryMissing, "binary-missing"},
+		{ErrKindContractMismatch, "contract-mismatch"},
+		{ErrKindTimeout, "timeout"},
+		{ErrKindCLIError, "cli-error"},
+		{ErrKindMalformedJSON, "malformed-json"},
+		{ErrKindUnknown, "unknown"},
+		{ErrorKind(42), "unknown"},
+	}
+	for _, tt := range tests {
+		if got := tt.kind.String(); got != tt.want {
+			t.Errorf("ErrorKind(%d).String() = %q, want %q", int(tt.kind), got, tt.want)
+		}
+	}
+}

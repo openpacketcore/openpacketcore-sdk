@@ -35,6 +35,25 @@ const (
 	ErrKindUnknown
 )
 
+// String renders the kind as a stable log token so wrapped errors and
+// structured logs show a name instead of a bare integer.
+func (k ErrorKind) String() string {
+	switch k {
+	case ErrKindBinaryMissing:
+		return "binary-missing"
+	case ErrKindContractMismatch:
+		return "contract-mismatch"
+	case ErrKindTimeout:
+		return "timeout"
+	case ErrKindCLIError:
+		return "cli-error"
+	case ErrKindMalformedJSON:
+		return "malformed-json"
+	default:
+		return "unknown"
+	}
+}
+
 // Error is a typed bridge error. Use errors.As to inspect the Kind.
 type Error struct {
 	Kind    ErrorKind
