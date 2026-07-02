@@ -1191,3 +1191,123 @@ impl Encode for OwnedGtpuMessage {
         borrowed.encode(dst, ctx)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::GtpuMessage;
+    use bytes::BytesMut;
+    use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext, ValidationLevel};
+    use quickcheck::{Arbitrary, Gen, TestResult};
+
+    #[derive(Clone, Debug)]
+    struct ValidGtpuBytes(Vec<u8>);
+
+    impl ValidGtpuBytes {
+        fn as_slice(&self) -> &[u8] {
+            self.0.as_slice()
+        }
+    }
+
+    impl Arbitrary for ValidGtpuBytes {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let mut payload = Vec::<u8>::arbitrary(g);
+            payload.truncate(u16::MAX as usize - 4);
+
+            let sequence_number_flag = bool::arbitrary(g);
+            let npdu_number_flag = bool::arbitrary(g);
+            let has_optional_fields = sequence_number_flag || npdu_number_flag;
+            let optional_fields_len = if has_optional_fields { 4usize } else { 0usize };
+            let length = (optional_fields_len + payload.len()) as u16;
+
+            let mut flags = 0x30;
+            if sequence_number_flag {
+                flags |= 0x02;
+            }
+            if npdu_number_flag {
+                flags |= 0x01;
+            }
+
+            let mut bytes = Vec::with_capacity(8 + optional_fields_len + payload.len());
+            bytes.push(flags);
+            bytes.push(u8::arbitrary(g));
+            bytes.extend_from_slice(&length.to_be_bytes());
+            bytes.extend_from_slice(&u32::arbitrary(g).to_be_bytes());
+
+            if has_optional_fields {
+                bytes.extend_from_slice(&u16::arbitrary(g).to_be_bytes());
+                bytes.push(u8::arbitrary(g));
+                bytes.push(0);
+            }
+
+            bytes.extend_from_slice(&payload);
+            Self(bytes)
+        }
+    }
+
+    quickcheck::quickcheck! {
+        /// Property: any successfully decoded GTP-U message preserves
+        /// the fuzz target's raw and canonical round-trip invariants.
+        fn prop_decode_roundtrip_byte_exact(bytes: ValidGtpuBytes) -> TestResult {
+            assert_fuzz_roundtrip_invariant(bytes.as_slice())
+        }
+    }
+
+    fn assert_fuzz_roundtrip_invariant(data: &[u8]) -> TestResult {
+        // 1. Raw-preserving roundtrip check:
+        // Any successfully decoded GTP-U message must encode back to the exact same bytes in raw-preserving mode.
+        let ctx = DecodeContext {
+            validation_level: ValidationLevel::Structural,
+            ..DecodeContext::default()
+        };
+
+        let (tail, msg) = match GtpuMessage::decode(data, ctx) {
+            Ok(decoded) => decoded,
+            Err(_) => return TestResult::discard(),
+        };
+
+        let parsed_len = data.len() - tail.len();
+        let original_parsed_bytes = &data[..parsed_len];
+
+        let mut buf = BytesMut::new();
+        let raw_ctx = EncodeContext {
+            raw_preserving: true,
+            ..EncodeContext::default()
+        };
+
+        if msg.encode(&mut buf, raw_ctx).is_ok() {
+            assert_eq!(
+                buf.as_ref(),
+                original_parsed_bytes,
+                "Raw-preserving roundtrip failed: encode(decode(input)) != input"
+            );
+        }
+
+        // 2. Canonical roundtrip check:
+        // Any canonically encoded message must decode to a model that, when encoded again, produces identical bytes.
+        let mut canonical_buf = BytesMut::new();
+        let canonical_ctx = EncodeContext::default();
+
+        if msg.encode(&mut canonical_buf, canonical_ctx).is_ok() {
+            let decode_ctx = DecodeContext::default();
+            if let Ok((tail_can, msg_can)) = GtpuMessage::decode(&canonical_buf, decode_ctx) {
+                assert!(
+                    tail_can.is_empty(),
+                    "Canonical encoding left unconsumed tail bytes after decoding"
+                );
+
+                let mut canonical_buf_2 = BytesMut::new();
+                if let Err(error) = msg_can.encode(&mut canonical_buf_2, canonical_ctx) {
+                    panic!("Failed to encode canonical message a second time: {error:?}");
+                }
+
+                assert_eq!(
+                    canonical_buf.as_ref(),
+                    canonical_buf_2.as_ref(),
+                    "Canonical roundtrip failed: encode(decode(encode(model))) != encode(model)"
+                );
+            }
+        }
+
+        TestResult::passed()
+    }
+}

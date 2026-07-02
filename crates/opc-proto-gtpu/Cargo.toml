@@ -18,5 +18,8 @@ opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+quickcheck = "1"
+
 [lints]
 workspace = true

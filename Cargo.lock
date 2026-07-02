@@ -2332,6 +2332,7 @@ version = "0.2.0"
 dependencies = [
  "bytes",
  "opc-protocol",
+ "quickcheck",
  "thiserror 2.0.18",
 ]
 
