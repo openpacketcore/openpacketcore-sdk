@@ -30,3 +30,6 @@ opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

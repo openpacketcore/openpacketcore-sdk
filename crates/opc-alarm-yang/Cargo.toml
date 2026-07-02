@@ -18,3 +18,6 @@ opc-alarm = { path = "../opc-alarm", version = "0.2.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 time = { workspace = true, features = ["formatting"] }
+
+[lints]
+workspace = true

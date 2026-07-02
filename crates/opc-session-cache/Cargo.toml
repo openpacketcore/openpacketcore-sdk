@@ -26,3 +26,6 @@ opc-session-testkit = { path = "../opc-session-testkit" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 bytes = { workspace = true }
 zeroize = { workspace = true }
+
+[lints]
+workspace = true

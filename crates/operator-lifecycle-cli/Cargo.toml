@@ -19,3 +19,6 @@ opc-node-resources = { path = "../opc-node-resources" }
 opc-runtime = { path = "../opc-runtime" }
 operator-lifecycle = { path = "../operator-lifecycle" }
 operator-controller = { path = "../operator-controller" }
+
+[lints]
+workspace = true
