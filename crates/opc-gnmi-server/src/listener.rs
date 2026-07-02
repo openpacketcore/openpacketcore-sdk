@@ -392,6 +392,8 @@ impl AsyncWrite for AuthenticatedTlsStream {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use std::collections::HashSet;
     use std::future::Future;
     use std::net::SocketAddr;

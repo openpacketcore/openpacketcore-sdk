@@ -407,7 +407,7 @@ pub const fn code_from_status(status: opc_mgmt_errors::MgmtStatus) -> tonic::Cod
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
+#[allow(deprecated, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};

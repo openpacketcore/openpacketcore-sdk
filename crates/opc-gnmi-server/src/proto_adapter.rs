@@ -103,7 +103,7 @@ fn non_empty(value: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
+#[allow(deprecated, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

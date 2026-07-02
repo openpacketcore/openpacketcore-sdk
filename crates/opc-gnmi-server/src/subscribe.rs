@@ -608,6 +608,10 @@ async fn send_sync(
     Ok(())
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "prost encode_length_delimited into a Vec is infallible (buffer grows)"
+)]
 fn fingerprint_responses(responses: &[gnmi::SubscribeResponse]) -> Vec<u8> {
     let mut out = Vec::new();
     for response in responses {
@@ -734,6 +738,8 @@ impl SubscribePlan {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
 
     #[test]

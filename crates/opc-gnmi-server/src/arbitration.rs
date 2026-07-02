@@ -326,6 +326,8 @@ impl From<&TrustedPrincipal> for LogicalPrincipal {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
     use opc_config_model::{TrustedPrincipal, WorkloadIdentity};
     use opc_types::TenantId;
