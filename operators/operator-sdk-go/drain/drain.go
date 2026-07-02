@@ -69,13 +69,10 @@ func (c *HTTPDrainClient) Start(ctx context.Context, target string) error {
 	if err != nil {
 		return fmt.Errorf("drain start request failed: %w", err)
 	}
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		defer func() { _ = resp.Body.Close() }()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return fmt.Errorf("drain start returned %d: %s", resp.StatusCode, string(body))
-	}
-	if err := resp.Body.Close(); err != nil {
-		return fmt.Errorf("close drain start response body: %w", err)
 	}
 	return nil
 }
@@ -93,18 +90,14 @@ func (c *HTTPDrainClient) Status(ctx context.Context, target string) (DrainStatu
 	if err != nil {
 		return DrainStatus{}, fmt.Errorf("drain status request failed: %w", err)
 	}
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		defer func() { _ = resp.Body.Close() }()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return DrainStatus{}, fmt.Errorf("drain status returned %d: %s", resp.StatusCode, string(body))
 	}
 	var status DrainStatus
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-		_ = resp.Body.Close()
 		return DrainStatus{}, fmt.Errorf("decode drain status: %w", err)
-	}
-	if err := resp.Body.Close(); err != nil {
-		return DrainStatus{}, fmt.Errorf("close drain status response body: %w", err)
 	}
 	return status, nil
 }
