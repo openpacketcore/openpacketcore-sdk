@@ -51,6 +51,15 @@ def run_compiler(asn_dir: Path, output: Path) -> None:
     )
 
 
+def run_rustfmt(output: Path) -> None:
+    rustfmt = shutil.which("rustfmt")
+    if rustfmt is None:
+        print("error: rustfmt not found; install the Rust rustfmt component", file=sys.stderr)
+        sys.exit(1)
+
+    subprocess.run([rustfmt, str(output)], check=True)
+
+
 def patch_generated(source: Path) -> str:
     text = source.read_text()
 
@@ -100,12 +109,14 @@ def main() -> int:
 
         print("Running rasn-compiler ...")
         run_compiler(asn_dir, raw_output)
+        run_rustfmt(raw_output)
 
         print("Patching generated imports ...")
         patched = patch_generated(raw_output)
 
         print(f"Writing {output} ...")
         output.write_text(patched)
+        run_rustfmt(output)
 
     print("Done.")
     return 0

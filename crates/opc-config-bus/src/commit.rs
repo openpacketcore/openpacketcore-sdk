@@ -291,10 +291,16 @@ async fn worker_loop<C: OpcConfig>(
     impact_classifier: Arc<dyn ConfigImpactClassifier<C>>,
     initial_pending_deadline: Option<Timestamp>,
 ) {
-    let mut pending_deadline: Option<Timestamp> = initial_pending_deadline;
+    let mut pending_fire_at: Option<tokio::time::Instant> = initial_pending_deadline.map(|ts| {
+        let now = Timestamp::now_utc();
+        let remaining: std::time::Duration = (*ts.as_offset_datetime() - *now.as_offset_datetime())
+            .try_into()
+            .unwrap_or_default();
+        tokio::time::Instant::now() + remaining
+    });
 
     loop {
-        let current_deadline = pending_deadline;
+        let current_fire_at = pending_fire_at;
 
         tokio::select! {
             submission_opt = rx.recv() => {
@@ -303,7 +309,7 @@ async fn worker_loop<C: OpcConfig>(
                 };
 
                 let req_mode = submission.request.mode.clone();
-                let has_pending = pending_deadline.is_some();
+                let has_pending = pending_fire_at.is_some();
 
                 let result = AssertUnwindSafe(process_commit(
                     submission.request,
@@ -328,13 +334,12 @@ async fn worker_loop<C: OpcConfig>(
                 if result.is_ok() {
                     match req_mode {
                         CommitMode::CommitConfirmed { timeout } => {
-                            let deadline = Timestamp::from_offset_datetime(time::OffsetDateTime::now_utc() + timeout);
-                            pending_deadline = Some(deadline);
+                            pending_fire_at = Some(tokio::time::Instant::now() + timeout);
                         }
                         CommitMode::Commit
                         | CommitMode::CancelConfirmed
                         | CommitMode::Rollback { .. } => {
-                            pending_deadline = None;
+                            pending_fire_at = None;
                         }
                         _ => {}
                     }
@@ -344,15 +349,10 @@ async fn worker_loop<C: OpcConfig>(
                 let _ = submission.reply.send(result);
             }
             _ = async {
-                if let Some(deadline) = current_deadline {
-                    let now = Timestamp::now_utc();
-                    if deadline > now {
-                        let diff = *deadline.as_offset_datetime() - *now.as_offset_datetime();
-                        let std_duration: std::time::Duration = diff.try_into().unwrap_or(std::time::Duration::from_secs(0));
-                        tokio::time::sleep(std_duration).await;
-                    }
+                if let Some(fire_at) = current_fire_at {
+                    tokio::time::sleep_until(fire_at).await;
                 }
-            }, if current_deadline.is_some() => {
+            }, if current_fire_at.is_some() => {
                 tracing::warn!("commit-confirmed deadline expired; rolling back");
                 crate::metrics::record_commit_confirmed_deadline_expiry();
                 let current_snap = snapshot.current_snapshot();
@@ -430,7 +430,7 @@ async fn worker_loop<C: OpcConfig>(
                     Ok::<(), StoreError>(())
                 }.await;
 
-                pending_deadline = None;
+                pending_fire_at = None;
 
                 if let Err(err) = rollback_res {
                     crate::metrics::record_rollback_failure();

@@ -3,7 +3,7 @@ all-features = true
 
 [advisories]
 version = 2
-yanked = "warn"
+yanked = "deny"
 
 [licenses]
 version = 2
@@ -39,7 +39,7 @@ ignore = true
 
 [bans]
 multiple-versions = "warn"
-wildcards = "allow"
+wildcards = "deny"
 
 [sources]
 unknown-registry = "deny"

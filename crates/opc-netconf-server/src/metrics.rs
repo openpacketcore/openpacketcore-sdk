@@ -217,6 +217,8 @@ fn safe_label(label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use std::time::Duration;
 
     use opc_mgmt_errors::NetconfErrorTag;

@@ -279,6 +279,8 @@ fn record_worker_result(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
     use crate::session_registry::NETCONF_MAX_SESSION_ID;
 

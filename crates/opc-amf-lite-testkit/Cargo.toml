@@ -10,14 +10,14 @@ publish = false
 description = "Reusable test fixtures and builders for opc-amf-lite"
 
 [dependencies]
-opc-alarm = { path = "../opc-alarm" }
-opc-alarm-testkit = { path = "../opc-alarm-testkit" }
-opc-config-bus = { path = "../opc-config-bus" }
-opc-session-store = { path = "../opc-session-store" }
-opc-runtime = { path = "../opc-runtime" }
-opc-nacm = { path = "../opc-nacm" }
-opc-testbed = { path = "../opc-testbed" }
-opc-types = { path = "../opc-types" }
+opc-alarm = { path = "../opc-alarm", version = "0.2.0" }
+opc-alarm-testkit = { path = "../opc-alarm-testkit", version = "0.2.0" }
+opc-config-bus = { path = "../opc-config-bus", version = "0.2.0" }
+opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
+opc-runtime = { path = "../opc-runtime", version = "0.2.0" }
+opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
+opc-testbed = { path = "../opc-testbed", version = "0.2.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
 
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

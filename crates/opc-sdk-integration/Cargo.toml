@@ -10,12 +10,12 @@ publish = false
 description = "Toy OpenPacketCore NF integration crate wiring runtime, config bus, alarms, and testbed evidence"
 
 [dependencies]
-opc-alarm = { path = "../opc-alarm" }
-opc-config-bus = { path = "../opc-config-bus" }
-opc-config-model = { path = "../opc-config-model" }
-opc-runtime = { path = "../opc-runtime" }
-opc-testbed = { path = "../opc-testbed" }
-opc-types = { path = "../opc-types" }
+opc-alarm = { path = "../opc-alarm", version = "0.2.0" }
+opc-config-bus = { path = "../opc-config-bus", version = "0.2.0" }
+opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
+opc-runtime = { path = "../opc-runtime", version = "0.2.0" }
+opc-testbed = { path = "../opc-testbed", version = "0.2.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -23,19 +23,19 @@ time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
-opc-alarm-testkit = { path = "../opc-alarm-testkit" }
+opc-alarm-testkit = { path = "../opc-alarm-testkit", version = "0.2.0" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
-opc-crypto = { path = "../opc-crypto" }
-opc-evidence = { path = "../opc-evidence" }
-opc-key = { path = "../opc-key" }
-opc-nacm = { path = "../opc-nacm" }
-opc-session-store = { path = "../opc-session-store" }
-opc-persist = { path = "../opc-persist", features = ["dangerous-test-hooks"] }
-opc-redaction = { path = "../opc-redaction" }
-opc-data-governance = { path = "../opc-data-governance" }
-opc-privacy = { path = "../opc-privacy" }
-opc-export = { path = "../opc-export" }
+opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
+opc-evidence = { path = "../opc-evidence", version = "0.2.0" }
+opc-key = { path = "../opc-key", version = "0.2.0" }
+opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
+opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
+opc-persist = { path = "../opc-persist", version = "0.2.0", features = ["dangerous-test-hooks"] }
+opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
+opc-data-governance = { path = "../opc-data-governance", version = "0.2.0" }
+opc-privacy = { path = "../opc-privacy", version = "0.2.0" }
+opc-export = { path = "../opc-export", version = "0.2.0" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 

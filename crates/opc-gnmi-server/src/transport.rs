@@ -66,6 +66,8 @@ pub fn principal_from_identity_state(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use opc_config_model::{AuthStrength, WorkloadIdentity as ConfigWorkloadIdentity};
     use opc_identity::{
         parse_certs_pem, parse_key_pem, IdentityReloadError, IdentityState, SvidDocument,

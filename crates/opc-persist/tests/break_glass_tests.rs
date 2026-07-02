@@ -2,6 +2,9 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::Mutex as TokioMutex;
 
+mod common;
+use common::wait_until_async;
+
 use opc_alarm::{Severity, SharedAlarmManager};
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing};
 use opc_nacm::{ModuleRegistry, NacmAction, NacmPolicy, NacmRule, PolicyVersion, YangPathPattern};
@@ -464,8 +467,28 @@ async fn test_break_glass_expiry() {
     assert_eq!(session.status, BreakGlassStatus::Active);
     assert_eq!(alarm_manager.active_count(), 1);
 
-    // Sleep for 2 seconds to let it expire
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    wait_until_async(
+        "break-glass session to expire and resolve alarm",
+        std::time::Duration::from_secs(10),
+        || {
+            let service = &service;
+            let alarm_manager = alarm_manager.clone();
+            let session_id = session.id.clone();
+            async move {
+                if service.clean_expired(tenant).await.is_err() {
+                    return false;
+                }
+                match service.get_session(tenant, &session_id).await {
+                    Ok(session) => {
+                        session.status == BreakGlassStatus::Expired
+                            && alarm_manager.active_count() == 0
+                    }
+                    Err(_) => false,
+                }
+            }
+        },
+    )
+    .await;
 
     // Trigger access, which should clean expired sessions
     let _session_status = service.get_session(tenant, &session.id).await.unwrap();

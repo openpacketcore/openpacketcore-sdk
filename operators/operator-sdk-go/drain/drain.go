@@ -69,7 +69,7 @@ func (c *HTTPDrainClient) Start(ctx context.Context, target string) error {
 	if err != nil {
 		return fmt.Errorf("drain start request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return fmt.Errorf("drain start returned %d: %s", resp.StatusCode, string(body))
@@ -90,7 +90,7 @@ func (c *HTTPDrainClient) Status(ctx context.Context, target string) (DrainStatu
 	if err != nil {
 		return DrainStatus{}, fmt.Errorf("drain status request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return DrainStatus{}, fmt.Errorf("drain status returned %d: %s", resp.StatusCode, string(body))

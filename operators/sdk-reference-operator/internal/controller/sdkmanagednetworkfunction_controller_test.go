@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	"openpacketcore.io/operator-sdk-go/conditions"
 	"openpacketcore.io/operator-sdk-go/drain"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -22,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 func TestReconcileApplyReady(t *testing.T) {
@@ -547,7 +550,10 @@ func TestReconcileDeletionTriggersDrain(t *testing.T) {
 	if !drainCalled {
 		t.Errorf("Expected drain to be called during deletion")
 	}
-	if containsString(finalizersAfterUpdate, drainFinalizer) {
+	updated := &apiv1beta1.SdkManagedNetworkFunction{
+		ObjectMeta: metav1.ObjectMeta{Finalizers: finalizersAfterUpdate},
+	}
+	if controllerutil.ContainsFinalizer(updated, drainFinalizer) {
 		t.Errorf("Expected finalizer %s to be removed after drain", drainFinalizer)
 	}
 }
@@ -614,7 +620,10 @@ func TestReconcileDrainTimeoutReleasesFinalizer(t *testing.T) {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	if containsString(finalizersAfterUpdate, drainFinalizer) {
+	updated := &apiv1beta1.SdkManagedNetworkFunction{
+		ObjectMeta: metav1.ObjectMeta{Finalizers: finalizersAfterUpdate},
+	}
+	if controllerutil.ContainsFinalizer(updated, drainFinalizer) {
 		t.Errorf("Expected finalizer %s to be removed even on drain timeout", drainFinalizer)
 	}
 }
@@ -675,17 +684,65 @@ func reconcileDrainFailureKeepsFinalizer(t *testing.T, name string, drainer *dra
 	if err := fakeClient.Get(context.TODO(), types.NamespacedName{Name: name, Namespace: "default"}, &got); err != nil {
 		t.Fatalf("Failed to get object: %v", err)
 	}
-	if !containsString(got.Finalizers, drainFinalizer) {
+	if !controllerutil.ContainsFinalizer(&got, drainFinalizer) {
 		t.Errorf("finalizer %s must be retained while drain is incomplete", drainFinalizer)
 	}
 }
 
 func TestReconcileDrainStartErrorKeepsFinalizer(t *testing.T) {
-	reconcileDrainFailureKeepsFinalizer(t, "drain-start-error-cnf", &drain.FakeOrchestrator{
+	startErr := errors.New("drain agent unreachable")
+	drainer := &drain.FakeOrchestrator{
 		StartFunc: func(ctx context.Context, target string) error {
-			return errors.New("drain agent unreachable")
+			return startErr
 		},
-	})
+	}
+	reconcileDrainFailureKeepsFinalizer(t, "drain-start-error-cnf", drainer)
+
+	reconciler := &SdkManagedNetworkFunctionReconciler{Drainer: drainer}
+	crd := &apiv1beta1.SdkManagedNetworkFunction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "drain-start-error-cnf",
+			Generation: 1,
+		},
+	}
+	cm := conditions.NewConditionManager(crd.Generation)
+	err := reconciler.runDrain(context.Background(), crd, cm)
+	if err == nil {
+		t.Fatalf("expected drain start error")
+	}
+	if !strings.Contains(err.Error(), "starting drain for") {
+		t.Fatalf("expected start context in error, got %q", err.Error())
+	}
+	if !errors.Is(err, startErr) {
+		t.Fatalf("expected wrapped start error, got %v", err)
+	}
+}
+
+func TestReconcileDrainStatusErrorWrapsContext(t *testing.T) {
+	statusErr := errors.New("drain agent status unreachable")
+	drainer := &drain.FakeOrchestrator{
+		StatusFunc: func(ctx context.Context, target string) (drain.DrainStatus, error) {
+			return drain.DrainStatus{}, statusErr
+		},
+	}
+	reconciler := &SdkManagedNetworkFunctionReconciler{Drainer: drainer}
+	crd := &apiv1beta1.SdkManagedNetworkFunction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "drain-status-error-cnf",
+			Generation: 1,
+		},
+	}
+	cm := conditions.NewConditionManager(crd.Generation)
+	err := reconciler.runDrain(context.Background(), crd, cm)
+	if err == nil {
+		t.Fatalf("expected drain status error")
+	}
+	if !strings.Contains(err.Error(), "querying drain status for") {
+		t.Fatalf("expected status context in error, got %q", err.Error())
+	}
+	if !errors.Is(err, statusErr) {
+		t.Fatalf("expected wrapped status error, got %v", err)
+	}
 }
 
 func TestReconcileDrainFailedPhaseKeepsFinalizer(t *testing.T) {
@@ -758,7 +815,10 @@ func TestReconcileWorkloadSynthesisOptInCreatesDeployment(t *testing.T) {
 	}
 
 	if len(dep.OwnerReferences) == 0 {
-		t.Errorf("Expected Deployment to have owner reference")
+		t.Fatalf("Expected Deployment to have owner reference")
+	}
+	if dep.OwnerReferences[0].BlockOwnerDeletion == nil || !*dep.OwnerReferences[0].BlockOwnerDeletion {
+		t.Fatalf("Expected Deployment owner reference to block owner deletion")
 	}
 }
 

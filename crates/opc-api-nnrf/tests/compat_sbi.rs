@@ -47,6 +47,30 @@ fn sbi_value_to_generated(mut value: Value) -> Value {
     if let Some(Value::String(status)) = obj.get_mut("nfStatus") {
         *status = status.to_uppercase().replace(' ', "_");
     }
+    if let Some(Value::Array(plmns)) = obj.get_mut("plmnList") {
+        for plmn in plmns {
+            if let Value::String(raw) = plmn {
+                let (mcc, mnc) = raw.split_once('-').expect("compact PLMN uses MCC-MNC");
+                *plmn = serde_json::json!({ "mcc": mcc, "mnc": mnc });
+            }
+        }
+    }
+    if let Some(Value::Array(snssais)) = obj.get_mut("sNssais") {
+        for snssai in snssais {
+            if let Value::String(raw) = snssai {
+                let raw = raw.strip_prefix("sst=").unwrap_or(raw);
+                let (sst, sd) = raw
+                    .split_once(",sd=")
+                    .or_else(|| raw.split_once('-'))
+                    .map_or((raw, None), |(sst, sd)| (sst, Some(sd)));
+                let sst = sst.parse::<u8>().expect("compact S-NSSAI uses numeric SST");
+                *snssai = match sd {
+                    Some(sd) => serde_json::json!({ "sst": sst, "sd": sd }),
+                    None => serde_json::json!({ "sst": sst }),
+                };
+            }
+        }
+    }
 
     Value::Object(obj.clone())
 }
@@ -80,8 +104,18 @@ fn sbi_nf_profile_deserializes_into_generated_type() {
     assert_eq!(generated.nf_status, NfStatus::Registered);
     assert_eq!(generated.ipv4_addresses, Some(sbi.ipv4_addresses));
     assert_eq!(generated.fqdn, sbi.fqdn);
-    assert_eq!(generated.plmn_list, Some(sbi.plmn_list));
-    assert_eq!(generated.s_nssais, Some(sbi.s_nssais));
+    assert_eq!(
+        generated
+            .plmn_list
+            .map(|plmns| plmns.into_iter().map(Into::into).collect::<Vec<PlmnId>>()),
+        Some(sbi.plmn_list)
+    );
+    assert_eq!(
+        generated
+            .s_nssais
+            .map(|snssais| snssais.into_iter().map(Into::into).collect::<Vec<Snssai>>()),
+        Some(sbi.s_nssais)
+    );
     assert_eq!(
         generated.nf_services,
         Some(

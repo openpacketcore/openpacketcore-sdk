@@ -23,6 +23,7 @@ import (
 	"openpacketcore.io/sdk-reference-operator/internal/sdkbridge"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -83,7 +84,7 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 
 	// Finalizer handling
 	if !crd.DeletionTimestamp.IsZero() {
-		if r.Drainer != nil && containsString(crd.Finalizers, drainFinalizer) {
+		if r.Drainer != nil && controllerutil.ContainsFinalizer(crd, drainFinalizer) {
 			if err := r.runDrain(ctx, crd, cm); err != nil {
 				// Drain has not reached a terminal state (it failed to start,
 				// failed, or is still in progress). Keep the finalizer and
@@ -98,15 +99,15 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 				return ctrl.Result{RequeueAfter: drainRetryInterval}, nil
 			}
 		}
-		crd.Finalizers = removeString(crd.Finalizers, drainFinalizer)
+		controllerutil.RemoveFinalizer(crd, drainFinalizer)
 		if err := r.Client.Update(ctx, crd); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
 	}
 
-	if !containsString(crd.Finalizers, drainFinalizer) {
-		crd.Finalizers = append(crd.Finalizers, drainFinalizer)
+	if !controllerutil.ContainsFinalizer(crd, drainFinalizer) {
+		controllerutil.AddFinalizer(crd, drainFinalizer)
 		if err := r.Client.Update(ctx, crd); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -408,7 +409,7 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 		if err != nil {
 			logger.Error(err, "Drain orchestration failed")
 		}
-		if res.Requeue || res.RequeueAfter > 0 {
+		if res.RequeueAfter > 0 {
 			r.syncConditions(crd, cm)
 			if updateErr := r.Client.Status().Update(ctx, crd); updateErr != nil {
 				return ctrl.Result{}, updateErr
@@ -480,12 +481,12 @@ func (r *SdkManagedNetworkFunctionReconciler) runDrain(ctx context.Context, crd 
 	target := fmt.Sprintf("http://%s:8080", crd.Name) // simplistic target
 	if err := r.Drainer.Start(ctx, target); err != nil {
 		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainStartFailed", err.Error(), crd.Generation)
-		return err
+		return fmt.Errorf("starting drain for %s: %w", target, err)
 	}
 	status, err := r.Drainer.Status(ctx, target)
 	if err != nil {
 		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainStatusFailed", err.Error(), crd.Generation)
-		return err
+		return fmt.Errorf("querying drain status for %s: %w", target, err)
 	}
 	switch status.Phase {
 	case drain.Complete:
@@ -618,6 +619,10 @@ func (r *SdkManagedNetworkFunctionReconciler) reconcileWorkload(ctx context.Cont
 		Name:       crd.Name,
 		UID:        crd.UID,
 		Controller: func() *bool { b := true; return &b }(),
+		BlockOwnerDeletion: func() *bool {
+			b := true
+			return &b
+		}(),
 	}
 
 	dep, err := workload.BuildDeploymentWithOwnership(wSpec, opts, owner)
@@ -667,23 +672,4 @@ func (r *SdkManagedNetworkFunctionReconciler) SetupWithManager(mgr ctrl.Manager)
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1beta1.SdkManagedNetworkFunction{}).
 		Complete(r)
-}
-
-func containsString(slice []string, s string) bool {
-	for _, item := range slice {
-		if item == s {
-			return true
-		}
-	}
-	return false
-}
-
-func removeString(slice []string, s string) []string {
-	result := make([]string, 0, len(slice))
-	for _, item := range slice {
-		if item != s {
-			result = append(result, item)
-		}
-	}
-	return result
 }

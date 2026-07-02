@@ -31,7 +31,7 @@ tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 
 [dev-dependencies]
-opc-types = { path = "../opc-types" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros", "test-util"] }
 bytes = { workspace = true }
 futures-util = "0.3"

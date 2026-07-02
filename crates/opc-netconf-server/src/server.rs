@@ -1152,6 +1152,10 @@ where
         ))
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "static NETCONF audit reason codes are valid by construction"
+    )]
     fn handle_create_subscription(
         &self,
         request: &XmlCreateSubscriptionRequest,
@@ -5394,6 +5398,10 @@ fn audit_operation_for_unsupported(operation: UnsupportedOperation) -> AuditOper
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "static schema paths are valid by construction"
+)]
 fn schema_node_path(path: &'static str) -> SchemaNodePath {
     SchemaNodePath::new(path).expect("static NETCONF schema path")
 }
@@ -5410,16 +5418,26 @@ fn notification_capacity(limits: &MgmtLimits) -> usize {
         .clamp(1, MAX_NOTIFICATION_EVENT_CAPACITY)
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "static NETCONF audit reason codes are valid by construction"
+)]
 fn audit_denied(reason: &'static str) -> AuditOutcome {
     AuditOutcome::denied(reason).expect("static NETCONF audit reason code")
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "static NETCONF audit reason codes are valid by construction"
+)]
 fn audit_failed(reason: &'static str) -> AuditOutcome {
     AuditOutcome::failed(reason).expect("static NETCONF audit reason code")
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use std::collections::HashSet;
     use std::net::SocketAddr;
     use std::num::NonZeroU32;

@@ -118,7 +118,7 @@ async fn test_recording_and_tracing_sinks() {
     tracing_sink.send(alarm).await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_bounded_alarm_sink_queue_full() {
     // To reliably fill a queue of capacity 1, we can wrap a blocking/stub sink.
 
@@ -157,7 +157,7 @@ async fn test_bounded_alarm_sink_queue_full() {
     barrier.wait().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_bounded_alarm_sink_retry_exhaustion() {
     struct FailingSink {
         calls: Arc<Mutex<usize>>,
@@ -195,7 +195,7 @@ async fn test_bounded_alarm_sink_retry_exhaustion() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_bounded_alarm_sink_redacts_retry_error() {
     struct SensitiveFailingSink;
     #[async_trait]
@@ -227,7 +227,7 @@ async fn test_bounded_alarm_sink_redacts_retry_error() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_bounded_alarm_sink_zero_capacity_is_safe() {
     let rec_sink = RecordingSink::new();
     let rec_view = rec_sink.clone();
@@ -239,7 +239,7 @@ async fn test_bounded_alarm_sink_zero_capacity_is_safe() {
     assert_eq!(rec_view.get_alarms().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_bounded_alarm_sink_shutdown() {
     let rec_sink = RecordingSink::new();
     let rec_view = rec_sink.clone();

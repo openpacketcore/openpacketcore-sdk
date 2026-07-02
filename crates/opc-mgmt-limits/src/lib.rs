@@ -28,6 +28,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 /// A bound that was exceeded, or a misconfigured (zero) limit.
@@ -119,6 +121,8 @@ pub struct MgmtLimits {
     /// Maximum total number of location-path segments evaluated across all union
     /// arms in one XPath filter expression.
     pub max_xpath_filter_segments: usize,
+    /// Floor for gNMI SAMPLE sample_interval and heartbeat_interval; requests below this are rejected.
+    pub min_sample_interval: std::time::Duration,
 }
 
 impl Default for MgmtLimits {
@@ -143,6 +147,7 @@ impl Default for MgmtLimits {
             max_xpath_filter_bytes: 4096,
             max_xpath_filter_unions: 32,
             max_xpath_filter_segments: 256,
+            min_sample_interval: Duration::from_millis(100),
         }
     }
 }
@@ -152,7 +157,7 @@ impl MgmtLimits {
     /// is never "unbounded"), and a single value/queue may not be larger than a
     /// whole message would allow, which would make the per-value bound dead.
     pub fn validate(&self) -> Result<(), LimitsError> {
-        let fields: [(&'static str, usize); 15] = [
+        let fields: [(&'static str, usize); 16] = [
             ("request_bytes", self.max_request_bytes),
             (
                 "frame_chunks_per_message",
@@ -183,6 +188,10 @@ impl MgmtLimits {
             ("xpath_filter_bytes", self.max_xpath_filter_bytes),
             ("xpath_filter_unions", self.max_xpath_filter_unions),
             ("xpath_filter_segments", self.max_xpath_filter_segments),
+            (
+                "min_sample_interval_ms",
+                usize::try_from(self.min_sample_interval.as_millis()).unwrap_or(usize::MAX),
+            ),
         ];
         for (name, value) in fields {
             if value == 0 {
@@ -319,6 +328,7 @@ impl MgmtLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn default_limits_are_valid_and_nonzero() {
@@ -327,6 +337,14 @@ mod tests {
         assert!(limits.max_request_bytes > 0);
         assert!(limits.max_frame_chunks_per_message > 0);
         assert!(limits.max_value_bytes <= limits.max_request_bytes);
+    }
+
+    #[test]
+    fn min_sample_interval_default_is_100ms() {
+        assert_eq!(
+            MgmtLimits::default().min_sample_interval,
+            Duration::from_millis(100)
+        );
     }
 
     #[test]
@@ -433,6 +451,7 @@ mod tests {
             max_xpath_filter_bytes: 10,
             max_xpath_filter_unions: 2,
             max_xpath_filter_segments: 3,
+            min_sample_interval: Duration::from_millis(100),
         };
 
         // At the limit is allowed; one past is rejected with the named limit.

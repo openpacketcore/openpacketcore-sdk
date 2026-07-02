@@ -25,7 +25,7 @@ opc-data-governance = { path = "../opc-data-governance", version = "0.2.0" }
 
 [dev-dependencies]
 serde_json = "1.0"
-opc-schema-validate = { path = "../opc-schema-validate" }
+opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
 tempfile = "3"
 
 [lints]

@@ -23,12 +23,21 @@ func writeScript(t *testing.T, dir, name, content string) string {
 func TestNewClientMissingBinary(t *testing.T) {
 	// Ensure no candidates match by running from a temp directory.
 	t.Setenv("OPERATOR_LIFECYCLE_CLI_PATH", "")
-	origWd, _ := os.Getwd()
-	defer os.Chdir(origWd)
+	origWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(origWd); err != nil {
+			t.Fatalf("failed to restore working directory: %v", err)
+		}
+	}()
 	tmpDir := t.TempDir()
-	os.Chdir(tmpDir)
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to switch to temp directory: %v", err)
+	}
 
-	_, err := NewClient("")
+	_, err = NewClient("")
 	if err == nil {
 		t.Fatal("expected error for missing binary")
 	}
@@ -316,5 +325,25 @@ echo "{\"contractVersion\":1,\"input\":$INPUT}"
 	}
 	if payload["expectedContractVersion"] != float64(ExpectedContractVersion) {
 		t.Errorf("unexpected contract version: %v", payload["expectedContractVersion"])
+	}
+}
+
+func TestErrorKindString(t *testing.T) {
+	tests := []struct {
+		kind ErrorKind
+		want string
+	}{
+		{ErrKindBinaryMissing, "binary-missing"},
+		{ErrKindContractMismatch, "contract-mismatch"},
+		{ErrKindTimeout, "timeout"},
+		{ErrKindCLIError, "cli-error"},
+		{ErrKindMalformedJSON, "malformed-json"},
+		{ErrKindUnknown, "unknown"},
+		{ErrorKind(42), "unknown"},
+	}
+	for _, tt := range tests {
+		if got := tt.kind.String(); got != tt.want {
+			t.Errorf("ErrorKind(%d).String() = %q, want %q", int(tt.kind), got, tt.want)
+		}
 	}
 }

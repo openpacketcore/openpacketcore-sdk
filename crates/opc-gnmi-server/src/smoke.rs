@@ -676,6 +676,8 @@ fn bounded_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use std::collections::HashSet;
 
     use opc_config_bus::{ConfigBus, MockManagedDatastore};

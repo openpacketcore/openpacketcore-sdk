@@ -3,6 +3,9 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::Mutex as TokioMutex;
 
+mod common;
+use common::{wait_until, wait_until_async};
+
 use opc_alarm::SharedAlarmManager;
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing};
 use opc_nacm::{ModuleRegistry, NacmAction, NacmPolicy, NacmRule, PolicyVersion, YangPathPattern};
@@ -10,7 +13,7 @@ use opc_persist::{
     AuditKey, BreakGlassAlarmNotifier, BreakGlassRequest, BreakGlassService, BreakGlassStatus,
     SecurityPolicyService, SqliteBackend, SqliteSecurityPolicyService,
 };
-use opc_types::TenantId;
+use opc_types::{TenantId, Timestamp};
 
 static TEST_MUTEX: TokioMutex<()> = TokioMutex::const_new(());
 
@@ -448,8 +451,19 @@ async fn test_survival_across_restart() {
             .unwrap();
         assert_eq!(session_b.status, BreakGlassStatus::Active);
 
-        // Let session B expire
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        wait_until(
+            "session B expiry timestamp",
+            std::time::Duration::from_secs(10),
+            || {
+                session_b.expires_at.as_ref().is_some_and(|expires_at| {
+                    matches!(
+                        expires_at.parse::<Timestamp>(),
+                        Ok(expires_at) if Timestamp::now_utc() >= expires_at
+                    )
+                })
+            },
+        )
+        .await;
 
         (session_a.id, session_b.id)
     };
@@ -607,8 +621,27 @@ async fn test_revocation_and_expiry_under_stress() {
         t.await.unwrap();
     }
 
-    // Wait for the 10 expire targets to expire
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    wait_until_async(
+        "all expire-target break-glass sessions to expire",
+        std::time::Duration::from_secs(10),
+        || {
+            let service = Arc::clone(&service);
+            let session_ids_to_expire = session_ids_to_expire.clone();
+            async move {
+                if service.clean_expired(tenant).await.is_err() {
+                    return false;
+                }
+                for id in &session_ids_to_expire {
+                    match service.get_session(tenant, id).await {
+                        Ok(session) if session.status == BreakGlassStatus::Expired => {}
+                        _ => return false,
+                    }
+                }
+                true
+            }
+        },
+    )
+    .await;
 
     // Call clean_expired
     service.clean_expired(tenant).await.unwrap();

@@ -376,6 +376,8 @@ fn write_leaf<W: Write>(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use opc_mgmt_schema::{
         DiscoveryMetadata, ModelData, ModuleConformance, ModuleImport, SchemaRegistry,
         SchemaSourceError,

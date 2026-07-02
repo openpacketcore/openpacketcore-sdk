@@ -67,6 +67,7 @@ func (b *Bridge) CallCLI(ctx context.Context, subcommand string, input interface
 		if err != nil {
 			var berr *bridge.Error
 			if errors.As(err, &berr) && berr.Kind == bridge.ErrKindBinaryMissing {
+				// deliberately not wrapped: berr may embed the CLI path (see TestBridgeExecutionErrorDoesNotLeakCliPath)
 				return fmt.Errorf("SDK policy CLI execution failed")
 			}
 			return err
@@ -83,18 +84,19 @@ func (b *Bridge) CallCLI(ctx context.Context, subcommand string, input interface
 		case bridge.ErrKindContractMismatch:
 			return ErrContractMismatch
 		case bridge.ErrKindBinaryMissing:
+			// deliberately not wrapped: berr may embed the CLI path (see TestBridgeExecutionErrorDoesNotLeakCliPath)
 			return fmt.Errorf("SDK policy CLI execution failed")
 		case bridge.ErrKindTimeout:
-			return fmt.Errorf("SDK policy CLI call timed out")
+			return fmt.Errorf("SDK policy CLI call timed out: %w", berr)
 		case bridge.ErrKindCLIError:
-			return fmt.Errorf("SDK policy CLI error: %s", berr.Message)
+			return fmt.Errorf("SDK policy CLI error: %w", berr)
 		case bridge.ErrKindMalformedJSON:
-			return fmt.Errorf("SDK policy CLI returned invalid JSON")
+			return fmt.Errorf("SDK policy CLI returned invalid JSON: %w", berr)
 		default:
-			return fmt.Errorf("SDK policy CLI execution failed")
+			return fmt.Errorf("SDK policy CLI execution failed (kind=%v): %w", berr.Kind, berr)
 		}
 	}
-	return fmt.Errorf("SDK policy CLI execution failed")
+	return fmt.Errorf("SDK policy CLI execution failed: %w", err)
 }
 
 func (b *Bridge) EvaluateAdmission(ctx context.Context, req *AdmissionRequest) (*AdmissionResponse, error) {
@@ -127,32 +129,6 @@ func (b *Bridge) EvaluatePreflight(ctx context.Context, req *PreflightRequest) (
 		return nil, err
 	}
 	return &resp, nil
-}
-
-// validateAndStripContractVersion is retained for backward compatibility with
-// direct stdout consumers, but is no longer the primary parsing path.
-func validateAndStripContractVersion(data []byte) ([]byte, error) {
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		return data, nil
-	}
-
-	if raw, ok := envelope["contractVersion"]; ok {
-		var cv uint32
-		if err := json.Unmarshal(raw, &cv); err != nil {
-			return nil, fmt.Errorf("SDK policy CLI returned invalid contract version: %w", err)
-		}
-		if cv != ExpectedContractVersion {
-			return nil, ErrContractMismatch
-		}
-	}
-
-	delete(envelope, "contractVersion")
-	stripped, err := json.Marshal(envelope)
-	if err != nil {
-		return nil, fmt.Errorf("failed to re-marshal response after stripping contract version: %w", err)
-	}
-	return stripped, nil
 }
 
 // Legacy helper for tests that need to wrap input manually.

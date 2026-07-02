@@ -180,6 +180,7 @@ func GateMessage(gate GateName, status GateStatus) string {
 type ConditionManager struct {
 	conditions         []metav1.Condition
 	observedGeneration int64
+	now                func() time.Time // test clock; nil means time.Now
 }
 
 // NewConditionManager creates a manager for the given observedGeneration.
@@ -201,7 +202,11 @@ func (cm *ConditionManager) Set(ct ConditionType, status metav1.ConditionStatus,
 	if generation < cm.observedGeneration {
 		return ErrStaleGeneration{TargetGeneration: generation, ObservedGeneration: cm.observedGeneration}
 	}
-	now := metav1.NewTime(time.Now().UTC())
+	nowFn := cm.now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	now := metav1.NewTime(nowFn().UTC())
 	for i := range cm.conditions {
 		if cm.conditions[i].Type == string(ct) {
 			if cm.conditions[i].Status != status {

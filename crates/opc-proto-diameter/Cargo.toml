@@ -31,6 +31,7 @@ opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 
 [dev-dependencies]
 opc-testbed = { path = "../opc-testbed", version = "0.2.0" }
+quickcheck = "1"
 
 [[test]]
 name = "app_dictionaries"

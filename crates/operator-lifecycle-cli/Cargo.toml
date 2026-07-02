@@ -13,9 +13,12 @@ description = "CLI interface exposing Rust SDK lifecycle contracts to Go control
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 time = { workspace = true, features = ["serde"] }
-opc-alarm = { path = "../opc-alarm" }
-opc-types = { path = "../opc-types" }
-opc-node-resources = { path = "../opc-node-resources" }
-opc-runtime = { path = "../opc-runtime" }
-operator-lifecycle = { path = "../operator-lifecycle" }
-operator-controller = { path = "../operator-controller" }
+opc-alarm = { path = "../opc-alarm", version = "0.2.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
+opc-node-resources = { path = "../opc-node-resources", version = "0.2.0" }
+opc-runtime = { path = "../opc-runtime", version = "0.2.0" }
+operator-lifecycle = { path = "../operator-lifecycle", version = "0.2.0" }
+operator-controller = { path = "../operator-controller", version = "0.2.0" }
+
+[lints]
+workspace = true

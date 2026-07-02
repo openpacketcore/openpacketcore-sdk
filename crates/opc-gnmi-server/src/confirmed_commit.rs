@@ -224,6 +224,8 @@ fn timeout_from_nanos(nanos: u64) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
 
     fn registered(payload: CommitConfirmedExtension) -> gnmi_ext::Extension {

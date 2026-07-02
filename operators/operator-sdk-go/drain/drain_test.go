@@ -3,9 +3,12 @@ package drain
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -83,6 +86,41 @@ func TestHTTPDrainClientStatusNonOK(t *testing.T) {
 	_, err := c.Status(context.Background(), "http://drain.local")
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+type errorCloseBody struct {
+	io.Reader
+}
+
+func (errorCloseBody) Close() error { return errors.New("close failed") }
+
+func clientWithErrorCloseBody(payload string) *HTTPDrainClient {
+	c := NewHTTPDrainClient("")
+	c.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       errorCloseBody{strings.NewReader(payload)},
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})
+	return c
+}
+
+func TestHTTPDrainClientIgnoresBodyCloseError(t *testing.T) {
+	c := clientWithErrorCloseBody(`{"phase":"Complete"}`)
+
+	if err := c.Start(context.Background(), "http://drain.local"); err != nil {
+		t.Fatalf("Start must ignore response body close errors, got %v", err)
+	}
+
+	status, err := c.Status(context.Background(), "http://drain.local")
+	if err != nil {
+		t.Fatalf("Status must ignore response body close errors, got %v", err)
+	}
+	if status.Phase != Complete {
+		t.Errorf("expected Complete, got %s", status.Phase)
 	}
 }
 
