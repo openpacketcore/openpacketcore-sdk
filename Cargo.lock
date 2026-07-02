@@ -2324,6 +2324,7 @@ dependencies = [
  "bytes",
  "opc-protocol",
  "opc-testbed",
+ "quickcheck",
 ]
 
 [[package]]

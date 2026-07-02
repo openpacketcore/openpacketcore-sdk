@@ -1107,6 +1107,136 @@ fn align4(value: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use bytes::BufMut;
+    use quickcheck::{Arbitrary, Gen, TestResult};
+
+    #[derive(Clone, Debug)]
+    struct ValidDiameterMessageBytes(Vec<u8>);
+
+    impl ValidDiameterMessageBytes {
+        fn as_slice(&self) -> &[u8] {
+            self.0.as_slice()
+        }
+    }
+
+    impl Arbitrary for ValidDiameterMessageBytes {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let avp_count = (u8::arbitrary(g) % 4) as usize;
+            let mut raw_avps = BytesMut::new();
+
+            for avp_index in 0..avp_count {
+                let vendor_specific = bool::arbitrary(g);
+                let mut value = Vec::<u8>::arbitrary(g);
+                value.truncate(256);
+
+                let code = (u32::arbitrary(g) & 0xFFFF_FF00) | avp_index as u32;
+                let vendor_id = if vendor_specific {
+                    Some(u32::arbitrary(g))
+                } else {
+                    None
+                };
+                let mut flags = 0;
+                if vendor_specific {
+                    flags |= AvpFlags::VENDOR;
+                }
+                if bool::arbitrary(g) {
+                    flags |= AvpFlags::MANDATORY;
+                }
+                if bool::arbitrary(g) {
+                    flags |= AvpFlags::PROTECTED;
+                }
+
+                let header_len = if vendor_specific {
+                    AVP_VENDOR_HEADER_LEN
+                } else {
+                    AVP_HEADER_LEN
+                };
+                let avp_len = (header_len + value.len()) as u32;
+                raw_avps.put_u32(code);
+                raw_avps.put_u8(flags);
+                put_u24(&mut raw_avps, avp_len);
+                if let Some(vendor_id) = vendor_id {
+                    raw_avps.put_u32(vendor_id);
+                }
+                raw_avps.put_slice(&value);
+
+                let padding_len = (4 - (avp_len as usize % 4)) % 4;
+                raw_avps.put_bytes(0, padding_len);
+            }
+
+            let command_flags = u8::arbitrary(g)
+                & (CommandFlags::REQUEST
+                    | CommandFlags::PROXIABLE
+                    | CommandFlags::ERROR
+                    | CommandFlags::POTENTIALLY_RETRANSMITTED);
+            let header = Header::new(
+                CommandFlags::from_bits(command_flags),
+                CommandCode::new(u32::arbitrary(g) & MAX_U24),
+                ApplicationId::new(u32::arbitrary(g)),
+                u32::arbitrary(g),
+                u32::arbitrary(g),
+            )
+            .with_length((DIAMETER_HEADER_LEN + raw_avps.len()) as u32);
+
+            let mut encoded = BytesMut::new();
+            if let Err(error) = header.encode(&mut encoded, EncodeContext::default()) {
+                panic!("generated Diameter header encode failed: {error}");
+            }
+            encoded.put_slice(&raw_avps);
+            Self(encoded.to_vec())
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RawAvpView {
+        code: AvpCode,
+        flags: AvpFlags,
+        vendor_id: Option<VendorId>,
+        value: Vec<u8>,
+    }
+
+    quickcheck::quickcheck! {
+        fn prop_message_decode_roundtrip(bytes: ValidDiameterMessageBytes) -> TestResult {
+            let decode_ctx = DecodeContext::default();
+            let (_tail, message) = match Message::decode(bytes.as_slice(), decode_ctx) {
+                Ok(decoded) => decoded,
+                Err(_) => return TestResult::discard(),
+            };
+
+            let mut encoded = BytesMut::new();
+            if let Err(error) = message.encode(&mut encoded, EncodeContext::default()) {
+                panic!("Diameter message encode failed: {error}");
+            }
+
+            let (encoded_tail, roundtripped) = match Message::decode(&encoded, decode_ctx) {
+                Ok(decoded) => decoded,
+                Err(error) => panic!("roundtripped Diameter message decode failed: {error}"),
+            };
+            assert!(encoded_tail.is_empty());
+            assert_eq!(roundtripped.header, message.header);
+            assert_eq!(
+                raw_avp_views(&roundtripped, decode_ctx),
+                raw_avp_views(&message, decode_ctx)
+            );
+
+            TestResult::passed()
+        }
+    }
+
+    fn raw_avp_views(message: &Message<'_>, ctx: DecodeContext) -> Vec<RawAvpView> {
+        let mut views = Vec::new();
+        for avp in message.avps(ctx) {
+            match avp {
+                Ok(avp) => views.push(RawAvpView {
+                    code: avp.header.code,
+                    flags: avp.header.flags,
+                    vendor_id: avp.header.vendor_id,
+                    value: avp.value.to_vec(),
+                }),
+                Err(error) => panic!("raw AVP iteration failed: {error}"),
+            }
+        }
+        views
+    }
 
     fn encode_message(raw_avps: &[u8], tail: &[u8]) -> BytesMut {
         let header = Header::new(
