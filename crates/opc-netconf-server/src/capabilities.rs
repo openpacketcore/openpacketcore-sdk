@@ -223,6 +223,8 @@ fn render_hello(capabilities: &[String], session_id: Option<NonZeroU32>) -> Stri
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
 
     #[test]

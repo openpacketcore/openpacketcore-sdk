@@ -2648,6 +2648,10 @@ impl ParserState {
         None
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "root presence checked three lines above"
+    )]
     fn finish(mut self) -> Result<ParsedMessage, XmlError> {
         if self.root.is_none() {
             return Err(XmlError::Empty);
@@ -3397,6 +3401,8 @@ fn finish_cancel_commit(cancel: PartialCancelCommit) -> Result<CancelCommitReque
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use opc_mgmt_errors::{NetconfErrorTag, NetconfErrorType};
     use opc_mgmt_limits::MgmtLimits;
 

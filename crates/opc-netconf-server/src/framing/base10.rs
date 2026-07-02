@@ -42,6 +42,8 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use opc_mgmt_limits::MgmtLimits;
 
     use super::*;

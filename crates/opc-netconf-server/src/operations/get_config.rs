@@ -54,6 +54,10 @@ where
 }
 
 /// Handles a parsed `<get-config>` request.
+#[expect(
+    clippy::expect_used,
+    reason = "presence established by the datastore-support check in the same function"
+)]
 pub fn handle_get_config<C, B, P, A>(
     binding: &B,
     ctx: GetConfigContext<'_, C, P, A>,
@@ -476,6 +480,10 @@ fn audit_success<A: AuditSink>(
     )
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "static NETCONF audit reason codes are valid by construction"
+)]
 fn audit_failure<A: AuditSink>(
     audit: &A,
     request_id: RequestId,
@@ -496,6 +504,10 @@ fn audit_failure<A: AuditSink>(
     )
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "static schema paths are valid by construction"
+)]
 fn schema_paths(paths: &[&'static str]) -> Vec<SchemaNodePath> {
     paths
         .iter()

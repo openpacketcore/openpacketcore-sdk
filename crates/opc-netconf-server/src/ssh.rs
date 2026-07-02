@@ -1038,6 +1038,8 @@ fn reject_publickey() -> Auth {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
     use crate::testkit::{
         assert_ssh_listener_debug_redacted, write_truncated_authorized_key,

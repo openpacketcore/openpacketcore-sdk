@@ -265,6 +265,8 @@ pub fn write_truncated_authorized_key<P: AsRef<Path>>(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
 
     #[test]

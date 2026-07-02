@@ -87,6 +87,8 @@ pub fn decode_message(frame: &[u8], limits: &MgmtLimits) -> Result<Vec<u8>, Fram
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use opc_mgmt_limits::MgmtLimits;
 
     use super::*;

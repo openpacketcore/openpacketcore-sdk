@@ -1486,6 +1486,8 @@ fn is_descendant_or_self(candidate: &str, ancestor: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use std::collections::BTreeMap;
 
     use opc_mgmt_schema::{DataClass, LeafType, ModelData, NodeKind, NodeMeta, OriginEntry};

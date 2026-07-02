@@ -671,6 +671,10 @@ fn audit_success<A: AuditSink>(
     )
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "static NETCONF audit reason codes are valid by construction"
+)]
 fn audit_failure<A: AuditSink>(
     audit: &A,
     request_id: RequestId,
@@ -691,6 +695,10 @@ fn audit_failure<A: AuditSink>(
     )
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "static schema paths are valid by construction"
+)]
 fn schema_paths(paths: &[&'static str]) -> Vec<SchemaNodePath> {
     paths
         .iter()

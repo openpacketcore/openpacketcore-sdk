@@ -23,6 +23,10 @@ use crate::xml::EditDefaultOperation;
 /// `default_operation` is the RFC 6241 `<default-operation>` from the request.
 /// Per-node `nc:operation` attributes override it. The returned tree contains
 /// exactly one top-level data node (the schema root container).
+#[expect(
+    clippy::expect_used,
+    reason = "stack non-emptiness checked at the End-event guard"
+)]
 pub(crate) fn parse_edit_config_xml(
     config_xml: &str,
     registry: &'static dyn SchemaRegistry,
@@ -130,6 +134,10 @@ struct Frame {
 
 /// Starts a new element frame. For the `<config>` wrapper this returns a synthetic
 /// frame with an empty schema path.
+#[expect(
+    clippy::expect_used,
+    reason = "empty-stack case returns early at the top of push_element; schema_path was just resolved from the same static registry"
+)]
 fn push_element(
     start: &BytesStart<'_>,
     stack: &mut [Frame],
@@ -260,6 +268,10 @@ fn resolve_start(
 /// bounded config fragment may omit the base NETCONF namespace because it was
 /// inherited from `<rpc>`; this helper treats a bare `<config>` as base-NS and
 /// also accepts the RFC 8526 NMDA wrapper namespace.
+#[expect(
+    clippy::expect_used,
+    reason = "scope.default is set when None immediately above"
+)]
 fn resolve_config_start(
     start: &BytesStart<'_>,
     decoder: quick_xml::encoding::Decoder,
@@ -461,6 +473,8 @@ fn last_segment(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
     use opc_mgmt_schema::{DataClass, LeafType, ModelData, NodeMeta, OriginEntry, SchemaRegistry};
 
