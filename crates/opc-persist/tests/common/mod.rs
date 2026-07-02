@@ -147,6 +147,43 @@ pub async fn wait_for_port(port: u16) {
     panic!("Port {port} did not become available in time");
 }
 
+/// Polls `check` every 100ms until it returns true or `deadline` elapses.
+/// Panics with `what` on timeout. For e2e conditions on real subprocesses.
+pub async fn wait_until<F: FnMut() -> bool>(
+    what: &str,
+    deadline: std::time::Duration,
+    mut check: F,
+) {
+    let start = std::time::Instant::now();
+    loop {
+        if check() {
+            return;
+        }
+        if start.elapsed() > deadline {
+            panic!("timed out after {deadline:?} waiting for {what}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Async variant of [`wait_until`] for checks that must read test state through async APIs.
+pub async fn wait_until_async<F, Fut>(what: &str, deadline: std::time::Duration, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let start = std::time::Instant::now();
+    loop {
+        if check().await {
+            return;
+        }
+        if start.elapsed() > deadline {
+            panic!("timed out after {deadline:?} waiting for {what}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// Process-global serializer for multi-node cluster tests.
 ///
 /// Spawning several 3–4 node clusters concurrently (the libtest default of
