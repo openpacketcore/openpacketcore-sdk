@@ -1,6 +1,10 @@
 name: Fuzz
 
 on:
+  pull_request:
+    paths:
+      - "crates/opc-proto-*/**"
+      - "crates/opc-protocol/**"
   schedule:
     - cron: "17 3 * * 0"
   workflow_dispatch:
@@ -14,7 +18,8 @@ env:
 
 jobs:
   fuzz:
-    name: Fuzz smoke test
+    name: Scheduled fuzz
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -42,12 +47,12 @@ jobs:
         working-directory: crates/${{ matrix.crate }}
         run: cargo +nightly fuzz list
 
-      - name: Run fuzz targets (120s each)
+      - name: Run fuzz targets (600s each)
         working-directory: crates/${{ matrix.crate }}
         run: |
           for target in $(cargo +nightly fuzz list); do
             echo "=== Fuzzing $target ==="
-            cargo +nightly fuzz run "$target" -- -max_total_time=120
+            cargo +nightly fuzz run "$target" -- -max_total_time=600
           done
 
       - name: Upload fuzz artifacts on failure
@@ -55,4 +60,52 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts-${{ matrix.crate }}
-          path: crates/${{ matrix.crate }}/fuzz/artifacts/
+          path: crates/${{ matrix.crate }}/fuzz/artifacts/**
+
+  fuzz-smoke:
+    name: PR fuzz smoke
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fuzz-smoke-${{ github.ref }}
+      cancel-in-progress: true
+    strategy:
+      matrix:
+        crate:
+          - opc-protocol
+          - opc-proto-gtpu
+          - opc-proto-pfcp
+          - opc-proto-nas
+          - opc-proto-ngap
+          - opc-proto-gtpv2c
+          - opc-proto-ikev2
+          # Keep the Diameter CONFORMANCE.md scheduled-fuzz statement aligned.
+          - opc-proto-diameter
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: List fuzz targets
+        working-directory: crates/${{ matrix.crate }}
+        run: cargo +nightly fuzz list
+
+      - name: Run fuzz targets (60s each)
+        working-directory: crates/${{ matrix.crate }}
+        run: |
+          for target in $(cargo +nightly fuzz list); do
+            echo "=== Fuzzing $target ==="
+            cargo +nightly fuzz run "$target" -- -max_total_time=60
+          done
+
+      - name: Upload fuzz artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-smoke-artifacts-${{ matrix.crate }}
+          path: crates/${{ matrix.crate }}/fuzz/artifacts/**
