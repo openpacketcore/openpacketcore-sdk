@@ -136,7 +136,7 @@ async fn test_expired_svid_rejected() {
 }
 
 #[tokio::test]
-async fn test_removed_trust_bundle_revokes_handshake() {
+async fn test_removed_trust_bundle_rejects_reload_and_retains_last_good() {
     let socket_path = short_unix_socket_path("spire");
 
     let td = "example.internal";
@@ -188,9 +188,15 @@ async fn test_removed_trust_bundle_revokes_handshake() {
         panic!("Should have failed SVID load because trust domain became unknown");
     }
 
-    // Verify SvidWatcher state has been updated (or remained None/unchanged)
-    let state = watcher.subscribe().borrow().clone();
-    assert!(state.is_none() || !state.unwrap().trust_bundles.contains(&trust_domain));
+    // Invalid rotations keep the last good identity until a valid update arrives
+    // or the retained SVID expires.
+    let state = watcher
+        .subscribe()
+        .borrow()
+        .clone()
+        .expect("last-good identity is retained");
+    assert_eq!(state.identity.spiffe_id.as_str(), spiffe_id);
+    assert!(state.trust_bundles.contains(&trust_domain));
 }
 
 #[tokio::test]
