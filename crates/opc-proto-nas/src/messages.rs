@@ -75,6 +75,33 @@ impl RegistrationResult {
     }
 }
 
+/// Flag bits carried in the 5GS registration result IE above the access result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistrationResultFlags {
+    /// Raw flag bits from the registration-result octet, excluding bits 1-3
+    /// used by [`RegistrationResult`].
+    pub raw_upper_bits: u8,
+    /// `true` when SMS over NAS transport is allowed.
+    pub sms_allowed: bool,
+    /// `true` when network slice-specific authentication and authorization is
+    /// indicated by the registration result.
+    pub nssaa_to_be_performed: bool,
+    /// `true` when the UE is registered for emergency services.
+    pub emergency_registered: bool,
+}
+
+impl RegistrationResultFlags {
+    /// Project flag bits out of the raw 5GS registration result octet.
+    pub const fn from_octet(octet: u8) -> Self {
+        Self {
+            raw_upper_bits: octet & !0x07,
+            sms_allowed: octet & 0x08 != 0,
+            nssaa_to_be_performed: octet & 0x10 != 0,
+            emergency_registered: octet & 0x20 != 0,
+        }
+    }
+}
+
 /// Selected NAS security algorithms (TS 24.501 §9.11.3.34).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectedNasSecurityAlgorithms {
@@ -764,6 +791,8 @@ impl Encode for RegistrationRequest {
 pub struct RegistrationAccept {
     /// 5GS registration result.
     pub registration_result: RegistrationResult,
+    /// Flag bits carried alongside the registration result value.
+    pub registration_result_flags: RegistrationResultFlags,
     /// Original LV bytes for the registration result.
     pub raw_registration_result_lv: Bytes,
     /// Optional IEs in message order, raw-preserved.
@@ -799,17 +828,20 @@ impl RegistrationAccept {
         }
 
         let raw_registration_result_lv = Bytes::copy_from_slice(&input[0..result_end]);
-        let registration_result =
-            RegistrationResult::from_u8(input[result_len]).ok_or_else(|| {
+        let registration_result_octet = input[result_len];
+        let registration_result = RegistrationResult::from_u8(registration_result_octet)
+            .ok_or_else(|| {
                 DecodeError::new(
                     DecodeErrorCode::InvalidEnumValue {
                         field: "5gs_registration_result",
-                        value: u64::from(input[result_len]),
+                        value: u64::from(registration_result_octet),
                     },
                     result_len,
                 )
                 .with_spec_ref(message_spec_ref("9.11.3.6"))
             })?;
+        let registration_result_flags =
+            RegistrationResultFlags::from_octet(registration_result_octet);
 
         let (_, optional_ies) = decode_optional_ies(&input[result_end..], ctx)?;
 
@@ -817,6 +849,7 @@ impl RegistrationAccept {
             &[],
             Self {
                 registration_result,
+                registration_result_flags,
                 raw_registration_result_lv,
                 optional_ies,
             },
@@ -1259,7 +1292,24 @@ mod tests {
         let body: &[u8] = &[0x01, 0x01]; // LV length=1, value=1 (3GPP access)
         let (_, acc) = RegistrationAccept::decode_body(body, DecodeContext::default()).unwrap();
         assert_eq!(acc.registration_result, RegistrationResult::Access3gpp);
+        assert_eq!(acc.registration_result_flags.raw_upper_bits, 0);
+        assert!(!acc.registration_result_flags.sms_allowed);
+        assert!(!acc.registration_result_flags.nssaa_to_be_performed);
+        assert!(!acc.registration_result_flags.emergency_registered);
         assert!(acc.optional_ies.is_empty());
+        round_trip_body::<RegistrationAccept>(body);
+    }
+
+    #[test]
+    fn registration_accept_preserves_result_flag_bits_in_typed_view() {
+        let body: &[u8] = &[0x01, 0x39]; // access=3GPP, flags bits 4/5/6 set.
+        let (_, acc) = RegistrationAccept::decode_body(body, DecodeContext::default()).unwrap();
+
+        assert_eq!(acc.registration_result, RegistrationResult::Access3gpp);
+        assert_eq!(acc.registration_result_flags.raw_upper_bits, 0x38);
+        assert!(acc.registration_result_flags.sms_allowed);
+        assert!(acc.registration_result_flags.nssaa_to_be_performed);
+        assert!(acc.registration_result_flags.emergency_registered);
         round_trip_body::<RegistrationAccept>(body);
     }
 

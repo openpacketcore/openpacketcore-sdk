@@ -200,6 +200,44 @@ fn protected_length_helpers_match_sealed_body_for_supported_profiles() {
     }
 }
 
+#[test]
+fn same_aes_gcm_key_and_explicit_iv_produces_identical_sealed_body() {
+    let profile = profile_128();
+    let material = key_material(profile);
+    let encoded = placeholder_message(
+        ikev2_aes_gcm_protected_body_len(INNER_PAYLOAD.len(), 0).unwrap(),
+        PayloadType::ExtensibleAuthentication,
+    );
+    let prefix = &encoded[..HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN];
+    let context = ProtectedPayloadSealContext {
+        kind: ProtectedPayloadKind::Encrypted,
+        message_prefix: prefix,
+    };
+
+    let first = seal_ikev2_sa_init_protected_payload(
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+        context,
+        INNER_PAYLOAD,
+        0,
+        EXPLICIT_IV_I2R,
+    )
+    .expect("first seal succeeds");
+    let second = seal_ikev2_sa_init_protected_payload(
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+        context,
+        INNER_PAYLOAD,
+        0,
+        EXPLICIT_IV_I2R,
+    )
+    .expect("second seal succeeds");
+
+    assert_eq!(first, second);
+}
+
 fn encrypted_message_after_notify(
     profile: Ikev2SaInitCryptoProfile,
     key_material: &opc_proto_ikev2::Ikev2SaInitKeyMaterial,

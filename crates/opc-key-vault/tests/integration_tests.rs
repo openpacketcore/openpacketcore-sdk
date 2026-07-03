@@ -90,6 +90,11 @@ fn tenant() -> TenantId {
     TenantId::new("tenant-a").expect("valid tenant")
 }
 
+fn mock_provider(mock: &MockVault, token: &str) -> VaultKeyProvider {
+    VaultKeyProvider::new(mock.url.clone(), token.into(), "transit".into())
+        .dangerous_allow_insecure_http()
+}
+
 /// A fixed Transit-wrapped data-key blob the mock hands out; the provider
 /// treats it as opaque, so any bytes work as long as datakey and decrypt
 /// responses agree.
@@ -124,7 +129,7 @@ async fn success_round_trip() {
     }]));
 
     let mock = MockVault::new(responses).await;
-    let provider = VaultKeyProvider::new(mock.url.clone(), "token".into(), "transit".into());
+    let provider = mock_provider(&mock, "token");
 
     let handle = provider
         .get_active_key(KeyPurpose::Config, &tenant())
@@ -178,7 +183,7 @@ async fn auth_failure_403() {
     }]));
 
     let mock = MockVault::new(responses).await;
-    let provider = VaultKeyProvider::new(mock.url.clone(), "bad-token".into(), "transit".into());
+    let provider = mock_provider(&mock, "bad-token");
 
     let err = provider
         .get_active_key(KeyPurpose::Config, &tenant())
@@ -189,6 +194,25 @@ async fn auth_failure_403() {
 }
 
 #[tokio::test]
+async fn plain_http_requires_explicit_opt_in() {
+    let responses = Arc::new(Mutex::new(vec![MockResponse {
+        status: 200,
+        body: datakey_response(&[0xab; 32]),
+    }]));
+
+    let mock = MockVault::new(responses).await;
+    let provider = VaultKeyProvider::new(mock.url.clone(), "token".into(), "transit".into());
+
+    let err = provider
+        .get_active_key(KeyPurpose::Config, &tenant())
+        .await
+        .expect_err("plain HTTP should fail before sending the token");
+
+    assert_eq!(err, KeyError::Unavailable);
+    assert!(mock.request_paths().await.is_empty());
+}
+
+#[tokio::test]
 async fn server_error_500() {
     let responses = Arc::new(Mutex::new(vec![MockResponse {
         status: 500,
@@ -196,7 +220,7 @@ async fn server_error_500() {
     }]));
 
     let mock = MockVault::new(responses).await;
-    let provider = VaultKeyProvider::new(mock.url.clone(), "token".into(), "transit".into());
+    let provider = mock_provider(&mock, "token");
 
     let err = provider
         .get_active_key(KeyPurpose::Config, &tenant())
@@ -214,7 +238,7 @@ async fn malformed_json_response() {
     }]));
 
     let mock = MockVault::new(responses).await;
-    let provider = VaultKeyProvider::new(mock.url.clone(), "token".into(), "transit".into());
+    let provider = mock_provider(&mock, "token");
 
     let err = provider
         .get_active_key(KeyPurpose::Config, &tenant())
@@ -242,7 +266,7 @@ async fn get_key_by_id_recovers_same_material() {
     ]));
 
     let mock = MockVault::new(responses).await;
-    let provider = VaultKeyProvider::new(mock.url.clone(), "token".into(), "transit".into());
+    let provider = mock_provider(&mock, "token");
 
     let active = provider
         .get_active_key(KeyPurpose::Config, &tenant())
@@ -275,7 +299,7 @@ async fn get_key_by_id_recovers_same_material() {
 async fn get_key_by_id_rejects_foreign_ids() {
     let responses = Arc::new(Mutex::new(vec![]));
     let mock = MockVault::new(responses).await;
-    let provider = VaultKeyProvider::new(mock.url.clone(), "token".into(), "transit".into());
+    let provider = mock_provider(&mock, "token");
 
     let key_id = opc_key::KeyId::new("tenant-a_config").unwrap();
     let err = provider
@@ -302,7 +326,7 @@ async fn rotate_key_rotates_and_returns_fresh_id() {
     ]));
 
     let mock = MockVault::new(responses).await;
-    let provider = VaultKeyProvider::new(mock.url.clone(), "token".into(), "transit".into());
+    let provider = mock_provider(&mock, "token");
 
     let key_id = provider
         .rotate_key(KeyPurpose::Session, &tenant())
@@ -325,7 +349,7 @@ async fn rotate_key_failure_maps_to_rotation_failed() {
     }]));
 
     let mock = MockVault::new(responses).await;
-    let provider = VaultKeyProvider::new(mock.url.clone(), "token".into(), "transit".into());
+    let provider = mock_provider(&mock, "token");
 
     let err = provider
         .rotate_key(KeyPurpose::Session, &tenant())
@@ -352,7 +376,7 @@ async fn golden_envelope_round_trip() {
     ]));
 
     let mock = MockVault::new(responses).await;
-    let provider = VaultKeyProvider::new(mock.url.clone(), "token".into(), "transit".into());
+    let provider = mock_provider(&mock, "token");
 
     let aad = opc_key::EnvelopeAad::config(
         tenant(),

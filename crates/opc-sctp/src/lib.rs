@@ -8,7 +8,7 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -20,6 +20,9 @@ use thiserror::Error;
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use tokio::io::unix::AsyncFd;
+
+#[cfg(target_os = "linux")]
+const SCTP_RECV_CHUNK_BYTES: usize = 64 * 1024;
 
 /// NGAP SCTP payload protocol identifier, per 3GPP N2 usage.
 pub const NGAP_PPID: PayloadProtocolIdentifier = PayloadProtocolIdentifier::new(60);
@@ -706,6 +709,23 @@ pub enum SctpError {
         #[source]
         source: io::Error,
     },
+    /// The peer closed the association or socket.
+    #[error("SCTP association is closed")]
+    Closed,
+    /// The kernel accepted only part of a message send.
+    #[error("SCTP short send: expected {expected} bytes, sent {actual}")]
+    ShortSend {
+        /// Expected payload byte count.
+        expected: usize,
+        /// Actual byte count accepted by the kernel.
+        actual: usize,
+    },
+    /// A received SCTP message exceeded the configured receive cap.
+    #[error("SCTP message exceeded max_message_bytes ({max_message_bytes})")]
+    MessageTooLarge {
+        /// Configured receive cap.
+        max_message_bytes: usize,
+    },
 }
 
 /// SCTP metric snapshot.
@@ -1026,6 +1046,7 @@ mod platform {
         fd: AsyncFd<OwnedFd>,
         max_message_bytes: usize,
         metrics: SctpMetrics,
+        closed: AtomicBool,
     }
 
     pub fn bind_endpoint(config: SctpEndpointConfig) -> Result<Endpoint, SctpError> {
@@ -1034,15 +1055,14 @@ mod platform {
             .map_err(|source| io_err("socket", source))?;
         configure_fd(fd.as_fd(), config.init, config.nodelay)?;
         opc_libsctp_sys::bind(fd.as_fd(), &local).map_err(|source| io_err("bind", source))?;
-        if config.mode == SctpMode::OneToOne {
-            opc_libsctp_sys::listen(fd.as_fd(), 128).map_err(|source| io_err("listen", source))?;
-        }
+        opc_libsctp_sys::listen(fd.as_fd(), 128).map_err(|source| io_err("listen", source))?;
         let async_fd = AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))?;
         Ok(Endpoint {
             socket: Arc::new(SctpSocket {
                 fd: async_fd,
                 max_message_bytes: config.max_message_bytes,
                 metrics: SctpMetrics::default(),
+                closed: AtomicBool::new(false),
             }),
             mode: config.mode,
         })
@@ -1063,6 +1083,7 @@ mod platform {
             fd: async_fd,
             max_message_bytes: config.max_message_bytes,
             metrics: SctpMetrics::default(),
+            closed: AtomicBool::new(false),
         });
         if status == opc_libsctp_sys::ConnectStatus::InProgress {
             wait_connected(&socket).await?;
@@ -1098,11 +1119,14 @@ mod platform {
                                 fd: async_fd,
                                 max_message_bytes: self.socket.max_message_bytes,
                                 metrics: self.socket.metrics.clone(),
+                                closed: AtomicBool::new(false),
                             }),
                             mode: SctpMode::OneToOne,
                         });
                     }
+                    Ok(Err(source)) if source.kind() == io::ErrorKind::Interrupted => continue,
                     Ok(Err(source)) => {
+                        self.socket.mark_closed();
                         self.socket.metrics.record_io_error();
                         return Err(io_err("accept", source));
                     }
@@ -1134,7 +1158,7 @@ mod platform {
         pub fn health(&self) -> SctpHealth {
             SctpHealth {
                 platform_supported: true,
-                socket_open: true,
+                socket_open: self.socket.is_open(),
                 mode: self.mode,
             }
         }
@@ -1156,7 +1180,7 @@ mod platform {
         pub fn health(&self) -> SctpHealth {
             SctpHealth {
                 platform_supported: true,
-                socket_open: true,
+                socket_open: self.socket.is_open(),
                 mode: self.mode,
             }
         }
@@ -1179,11 +1203,21 @@ mod platform {
                     opc_libsctp_sys::send_msg(inner.get_ref().as_fd(), &message.payload, info)
                 }) {
                     Ok(Ok(bytes)) => {
+                        if bytes != message.payload.len() {
+                            self.mark_closed();
+                            self.metrics.record_io_error();
+                            return Err(SctpError::ShortSend {
+                                expected: message.payload.len(),
+                                actual: bytes,
+                            });
+                        }
                         self.metrics.record_tx(bytes);
                         tracing::trace!(bytes, stream_id = message.stream_id, ppid = %message.ppid, "sctp message sent");
                         return Ok(bytes);
                     }
+                    Ok(Err(source)) if source.kind() == io::ErrorKind::Interrupted => continue,
                     Ok(Err(source)) => {
+                        self.mark_closed();
                         self.metrics.record_io_error();
                         return Err(io_err("send", source));
                     }
@@ -1193,7 +1227,78 @@ mod platform {
         }
 
         async fn recv(&self) -> Result<InboundMessage, SctpError> {
-            let mut buffer = BytesMut::zeroed(self.max_message_bytes);
+            let mut payload = BytesMut::new();
+            let mut first_received = None;
+            let mut payload_truncated = false;
+            let mut control_truncated = false;
+            loop {
+                let remaining = self.max_message_bytes.saturating_sub(payload.len());
+                if remaining == 0 {
+                    self.mark_closed();
+                    self.metrics.record_io_error();
+                    return Err(SctpError::MessageTooLarge {
+                        max_message_bytes: self.max_message_bytes,
+                    });
+                }
+                let chunk_len = remaining.min(SCTP_RECV_CHUNK_BYTES);
+                let mut buffer = BytesMut::zeroed(chunk_len);
+                let received = self.recv_chunk(&mut buffer).await?;
+                if received.bytes == 0 && !received.flags.notification {
+                    self.mark_closed();
+                    self.metrics.record_io_error();
+                    return Err(SctpError::Closed);
+                }
+                buffer.truncate(received.bytes);
+
+                if received.flags.notification {
+                    self.metrics.record_rx(received.bytes);
+                    let message = map_recv(received, buffer);
+                    tracing::trace!(
+                        bytes = message.payload.len(),
+                        stream_id = message.stream_id,
+                        ppid = %message.ppid,
+                        notification = message.notification,
+                        "sctp notification received"
+                    );
+                    return Ok(message);
+                }
+
+                let first = first_received.get_or_insert(received);
+                payload_truncated |= received.flags.payload_truncated;
+                control_truncated |= received.flags.control_truncated;
+                payload.extend_from_slice(&buffer);
+
+                if received.flags.end_of_record {
+                    let mut complete = *first;
+                    complete.bytes = payload.len();
+                    complete.flags.end_of_record = true;
+                    complete.flags.payload_truncated = payload_truncated;
+                    complete.flags.control_truncated = control_truncated;
+                    self.metrics.record_rx(payload.len());
+                    let message = map_recv(complete, payload);
+                    tracing::trace!(
+                        bytes = message.payload.len(),
+                        stream_id = message.stream_id,
+                        ppid = %message.ppid,
+                        notification = message.notification,
+                        "sctp message received"
+                    );
+                    return Ok(message);
+                }
+                if payload.len() >= self.max_message_bytes {
+                    self.mark_closed();
+                    self.metrics.record_io_error();
+                    return Err(SctpError::MessageTooLarge {
+                        max_message_bytes: self.max_message_bytes,
+                    });
+                }
+            }
+        }
+
+        async fn recv_chunk(
+            &self,
+            buffer: &mut BytesMut,
+        ) -> Result<opc_libsctp_sys::Received, SctpError> {
             loop {
                 let mut guard = self
                     .fd
@@ -1201,28 +1306,26 @@ mod platform {
                     .await
                     .map_err(|source| io_err("recv_ready", source))?;
                 match guard
-                    .try_io(|inner| opc_libsctp_sys::recv_msg(inner.get_ref().as_fd(), &mut buffer))
+                    .try_io(|inner| opc_libsctp_sys::recv_msg(inner.get_ref().as_fd(), buffer))
                 {
-                    Ok(Ok(received)) => {
-                        buffer.truncate(received.bytes);
-                        self.metrics.record_rx(received.bytes);
-                        let message = map_recv(received, buffer);
-                        tracing::trace!(
-                            bytes = message.payload.len(),
-                            stream_id = message.stream_id,
-                            ppid = %message.ppid,
-                            notification = message.notification,
-                            "sctp message received"
-                        );
-                        return Ok(message);
-                    }
+                    Ok(Ok(received)) => return Ok(received),
+                    Ok(Err(source)) if source.kind() == io::ErrorKind::Interrupted => continue,
                     Ok(Err(source)) => {
+                        self.mark_closed();
                         self.metrics.record_io_error();
                         return Err(io_err("recv", source));
                     }
                     Err(_would_block) => continue,
                 }
             }
+        }
+
+        fn is_open(&self) -> bool {
+            !self.closed.load(Ordering::Relaxed)
+        }
+
+        fn mark_closed(&self) {
+            self.closed.store(true, Ordering::Relaxed);
         }
     }
 
@@ -1252,10 +1355,13 @@ mod platform {
             match guard.try_io(|inner| opc_libsctp_sys::socket_error(inner.get_ref().as_fd())) {
                 Ok(Ok(None)) => return Ok(()),
                 Ok(Ok(Some(source))) => {
+                    socket.mark_closed();
                     socket.metrics.record_io_error();
                     return Err(io_err("connect", source));
                 }
+                Ok(Err(source)) if source.kind() == io::ErrorKind::Interrupted => continue,
                 Ok(Err(source)) => {
+                    socket.mark_closed();
                     socket.metrics.record_io_error();
                     return Err(io_err("connect", source));
                 }

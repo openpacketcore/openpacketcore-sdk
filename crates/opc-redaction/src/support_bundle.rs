@@ -636,6 +636,11 @@ fn classify_token(
         return Some("[REDACTED_JWT]".to_string());
     }
 
+    if looks_like_bare_secret(trimmed) {
+        summary.secrets += 1;
+        return Some("[REDACTED_SECURITY_SECRET]".to_string());
+    }
+
     // E. Paths & DB files
     if trimmed.ends_with(".db") || trimmed.ends_with(".sqlite") {
         summary.paths_and_files += 1;
@@ -663,6 +668,46 @@ fn classify_token(
     }
 
     None
+}
+
+fn looks_like_bare_secret(token: &str) -> bool {
+    looks_like_sensitive_hex(token) || looks_like_sensitive_base64(token)
+}
+
+fn looks_like_sensitive_hex(token: &str) -> bool {
+    matches!(token.len(), 8 | 16 | 32 | 40 | 64)
+        && token.as_bytes().iter().all(u8::is_ascii_hexdigit)
+}
+
+fn looks_like_sensitive_base64(token: &str) -> bool {
+    if token.len() < 32 || !token.len().is_multiple_of(4) {
+        return false;
+    }
+
+    let bytes = token.as_bytes();
+    let mut padding_started = false;
+    let mut has_upper = false;
+    let mut has_lower = false;
+    let mut has_digit = false;
+    let mut has_symbol = false;
+
+    for &byte in bytes {
+        match byte {
+            b'A'..=b'Z' if !padding_started => has_upper = true,
+            b'a'..=b'z' if !padding_started => has_lower = true,
+            b'0'..=b'9' if !padding_started => has_digit = true,
+            b'+' | b'/' | b'-' | b'_' if !padding_started => has_symbol = true,
+            b'=' => padding_started = true,
+            _ => return false,
+        }
+    }
+
+    let padding = bytes.iter().rev().take_while(|&&byte| byte == b'=').count();
+    if padding > 2 {
+        return false;
+    }
+
+    has_symbol || (has_upper && has_lower && has_digit)
 }
 
 /// Returns true when `token` begins with a known telco marker followed by an
@@ -1257,6 +1302,41 @@ mod tests {
         assert_eq!(summary.spiffe_ids, 1);
         assert_eq!(summary.secrets, 1);
         assert_eq!(summary.paths_and_files, 2); // /var/lib/opc/users.db and users.db
+    }
+
+    #[test]
+    fn test_redact_text_bare_high_entropy_secrets() {
+        let mut summary = RedactionSummary::default();
+        let log = concat!(
+            "derived kek ",
+            "3f2a111111111111111111111111111111111111111111111111111111111111",
+            " and wrapped token q83KLcP0uVwF+7aTq83KLcP0uVwF+7aTq83KLcP0uVw="
+        );
+
+        let redacted = redact_text(log, &mut summary);
+
+        assert!(
+            !redacted.contains("3f2a111111111111111111111111111111111111111111111111111111111111")
+        );
+        assert!(!redacted.contains("q83KLcP0uVwF+7aTq83KLcP0uVwF+7aTq83KLcP0uVw="));
+        assert_eq!(redacted.matches("[REDACTED_SECURITY_SECRET]").count(), 2);
+        assert_eq!(summary.secrets, 2);
+    }
+
+    #[test]
+    fn test_redact_support_bundle_bare_high_entropy_secret() {
+        let entries = vec![DiagnosticEntry::Log(
+            "derived kek 3f2a111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+        )];
+
+        let bundle = redact_support_bundle(&entries, BundleMode::Production)
+            .expect("support bundle redacts bare high-entropy secret");
+
+        assert!(bundle.entries[0]
+            .content
+            .contains("[REDACTED_SECURITY_SECRET]"));
+        assert_eq!(bundle.redaction_summary.secrets, 1);
     }
 
     #[test]

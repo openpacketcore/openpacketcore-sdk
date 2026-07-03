@@ -4,14 +4,15 @@
 //! primitives for mTLS identity.
 
 use opc_types::{InstanceId, NfKind, SpiffeId, TenantId, Timestamp};
-use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, UnixTime};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use x509_parser::prelude::*;
+use zeroize::{Zeroize, Zeroizing};
 
 pub mod file_svid;
 pub use file_svid::FileSvidSource;
@@ -22,6 +23,8 @@ pub enum IdentityReloadError {
     SocketUnavailable,
     #[error("Expired SVID")]
     ExpiredSvid,
+    #[error("SVID is not yet valid")]
+    NotYetValidSvid,
     #[error("Malformed SPIFFE ID")]
     MalformedSpiffeId,
     #[error("Invalid trust domain")]
@@ -36,6 +39,10 @@ pub enum IdentityReloadError {
     InvalidNfKind,
     #[error("Invalid instance")]
     InvalidInstance,
+    #[error("SVID certificate chain does not validate against the trust bundle")]
+    InvalidCertificateChain,
+    #[error("SVID private key does not match the leaf certificate")]
+    PrivateKeyMismatch,
     #[error("internal I/O reload error")]
     IoError,
 }
@@ -216,16 +223,20 @@ impl WorkloadIdentity {
         let (_, x509) = X509Certificate::from_der(cert_der)
             .map_err(|_| IdentityReloadError::MalformedSpiffeId)?;
 
-        let not_after = x509.validity().not_after;
-        let expires_secs = not_after.timestamp() as u64;
-        let dt = ::time::OffsetDateTime::from_unix_timestamp(expires_secs as i64)
-            .map_err(|_| IdentityReloadError::MalformedSpiffeId)?;
-        let expires_at = Timestamp::from_offset_datetime(dt);
+        let not_before_secs = x509.validity().not_before.timestamp();
+        let not_after_secs = x509.validity().not_after.timestamp();
+        let now_secs = Timestamp::now_utc().as_offset_datetime().unix_timestamp();
 
-        let now_secs = Timestamp::now_utc().as_offset_datetime().unix_timestamp() as u64;
-        if expires_secs < now_secs {
+        if not_after_secs <= now_secs {
             return Err(IdentityReloadError::ExpiredSvid);
         }
+        if not_before_secs > now_secs {
+            return Err(IdentityReloadError::NotYetValidSvid);
+        }
+
+        let dt = ::time::OffsetDateTime::from_unix_timestamp(not_after_secs)
+            .map_err(|_| IdentityReloadError::MalformedSpiffeId)?;
+        let expires_at = Timestamp::from_offset_datetime(dt);
 
         let mut spiffe_id_str = None;
         for ext in x509.extensions() {
@@ -295,10 +306,135 @@ pub struct IdentityState {
     pub trust_bundles: TrustBundleSet,
 }
 
+impl IdentityState {
+    pub fn is_expired(&self) -> bool {
+        self.identity.expires_at <= Timestamp::now_utc()
+    }
+}
+
+pub fn build_identity_state(
+    cert_chain: Vec<CertificateDer<'static>>,
+    private_key: PrivateKeyDer<'static>,
+    trust_bundles: TrustBundleSet,
+) -> Result<IdentityState, IdentityReloadError> {
+    let leaf_der = cert_chain
+        .first()
+        .ok_or(IdentityReloadError::MalformedSpiffeId)?;
+    let identity = WorkloadIdentity::from_cert_der(leaf_der.as_ref(), &trust_bundles)?;
+
+    validate_leaf_chains_to_bundle(&identity, &cert_chain, &trust_bundles)?;
+    validate_private_key_matches_leaf(&cert_chain, &private_key)?;
+
+    let svid = SvidDocument {
+        spiffe_id: identity.spiffe_id.clone(),
+        cert_chain,
+        private_key,
+        expires_at: identity.expires_at,
+    };
+
+    Ok(IdentityState {
+        identity,
+        svid,
+        trust_bundles,
+    })
+}
+
+fn validate_leaf_chains_to_bundle(
+    identity: &WorkloadIdentity,
+    cert_chain: &[CertificateDer<'static>],
+    trust_bundles: &TrustBundleSet,
+) -> Result<(), IdentityReloadError> {
+    let bundle = trust_bundles
+        .get(&identity.trust_domain)
+        .ok_or(IdentityReloadError::UnknownTrustDomain)?;
+    let mut root_store = rustls::RootCertStore::empty();
+    let (valid_roots, _invalid_roots) =
+        root_store.add_parsable_certificates(bundle.certificates.iter().cloned());
+    if valid_roots == 0 {
+        return Err(IdentityReloadError::InvalidCertificateChain);
+    }
+
+    let leaf = cert_chain
+        .first()
+        .ok_or(IdentityReloadError::MalformedSpiffeId)?;
+    let parsed = rustls::server::ParsedCertificate::try_from(leaf)
+        .map_err(|_| IdentityReloadError::InvalidCertificateChain)?;
+    let provider = rustls::crypto::ring::default_provider();
+
+    rustls::client::verify_server_cert_signed_by_trust_anchor(
+        &parsed,
+        &root_store,
+        &cert_chain[1..],
+        UnixTime::now(),
+        provider.signature_verification_algorithms.all,
+    )
+    .map_err(|_| IdentityReloadError::InvalidCertificateChain)
+}
+
+fn validate_private_key_matches_leaf(
+    cert_chain: &[CertificateDer<'static>],
+    private_key: &PrivateKeyDer<'static>,
+) -> Result<(), IdentityReloadError> {
+    let provider = rustls::crypto::ring::default_provider();
+    let signing_key = provider
+        .key_provider
+        .load_private_key(private_key.clone_key())
+        .map_err(|_| IdentityReloadError::PrivateKeyMismatch)?;
+    let certified_key = rustls::sign::CertifiedKey::new(cert_chain.to_vec(), signing_key);
+
+    certified_key
+        .keys_match()
+        .map_err(|_| IdentityReloadError::PrivateKeyMismatch)
+}
+
+pub(crate) fn spawn_expiry_monitor(
+    state_tx: watch::Sender<Option<IdentityState>>,
+    event_tx: broadcast::Sender<IdentityReloadEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut state_rx = state_tx.subscribe();
+        loop {
+            let sleep_for = expiry_monitor_sleep_duration(state_rx.borrow().as_ref());
+            tokio::select! {
+                changed = state_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                () = tokio::time::sleep(sleep_for) => {
+                    if state_tx.borrow().as_ref().is_some_and(IdentityState::is_expired) {
+                        state_tx.send_replace(None);
+                        let _ = event_tx.send(IdentityReloadEvent::Failure {
+                            error: IdentityReloadError::ExpiredSvid.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn expiry_monitor_sleep_duration(state: Option<&IdentityState>) -> Duration {
+    const MAX_SLEEP: Duration = Duration::from_secs(60);
+    let Some(state) = state else {
+        return MAX_SLEEP;
+    };
+
+    let expires_at = *state.identity.expires_at.as_offset_datetime();
+    let now = ::time::OffsetDateTime::now_utc();
+    if expires_at <= now {
+        return Duration::ZERO;
+    }
+
+    let until_expiry = (expires_at - now).try_into().unwrap_or(Duration::ZERO);
+    until_expiry.min(MAX_SLEEP)
+}
+
 pub struct SvidWatcher {
     state_rx: watch::Receiver<Option<IdentityState>>,
     event_tx: tokio::sync::broadcast::Sender<IdentityReloadEvent>,
     _task_handle: tokio::task::JoinHandle<()>,
+    _expiry_task_handle: tokio::task::JoinHandle<()>,
 }
 
 impl SvidWatcher {
@@ -308,12 +444,12 @@ impl SvidWatcher {
 
         let path = socket_path.as_ref().to_path_buf();
         let event_tx_clone = event_tx.clone();
+        let expiry_task_handle = spawn_expiry_monitor(state_tx.clone(), event_tx.clone());
 
         let task_handle = tokio::spawn(async move {
-            let mut active_bundles = initial_bundles;
             tracing::debug!(
                 "SvidWatcher started with {} initial trust bundles",
-                active_bundles.bundles.len()
+                initial_bundles.bundles.len()
             );
 
             loop {
@@ -350,12 +486,17 @@ impl SvidWatcher {
                             }
 
                             let msg: SvidUpdateMsg = match serde_json::from_slice(&buf) {
-                                Ok(m) => m,
+                                Ok(m) => {
+                                    buf.zeroize();
+                                    m
+                                }
                                 Err(e) => {
+                                    buf.zeroize();
                                     tracing::error!("Failed to parse SVID JSON: {}", e);
                                     continue;
                                 }
                             };
+                            let private_key_pem = Zeroizing::new(msg.private_key_pem);
 
                             let mut updated_bundles = TrustBundleSet::new();
                             let mut bundle_parse_err = false;
@@ -400,7 +541,7 @@ impl SvidWatcher {
                                 }
                             };
 
-                            let private_key = match parse_key_pem(&msg.private_key_pem) {
+                            let private_key = match parse_key_pem(&private_key_pem) {
                                 Ok(k) => k,
                                 Err(e) => {
                                     tracing::error!("Failed to parse private key: {}", e);
@@ -411,35 +552,13 @@ impl SvidWatcher {
                                 }
                             };
 
-                            let leaf_der = match cert_chain.first() {
-                                Some(d) => d,
-                                None => {
-                                    tracing::error!("Empty cert chain");
-                                    continue;
-                                }
-                            };
-
-                            // Replace active bundles with the updated list
-                            active_bundles = updated_bundles;
-
-                            match WorkloadIdentity::from_cert_der(
-                                leaf_der.as_ref(),
-                                &active_bundles,
+                            match build_identity_state(
+                                cert_chain,
+                                private_key,
+                                updated_bundles.clone(),
                             ) {
-                                Ok(identity) => {
-                                    let svid = SvidDocument {
-                                        spiffe_id: identity.spiffe_id.clone(),
-                                        cert_chain,
-                                        private_key,
-                                        expires_at: identity.expires_at,
-                                    };
-
-                                    let state = IdentityState {
-                                        identity: identity.clone(),
-                                        svid,
-                                        trust_bundles: active_bundles.clone(),
-                                    };
-
+                                Ok(state) => {
+                                    let identity = state.identity.clone();
                                     state_tx.send_replace(Some(state));
 
                                     let _ = event_tx_clone.send(IdentityReloadEvent::Success {
@@ -455,7 +574,6 @@ impl SvidWatcher {
                                         "Failed to validate reload workload identity: {:?}",
                                         e
                                     );
-                                    state_tx.send_replace(None);
                                     let _ = event_tx_clone.send(IdentityReloadEvent::Failure {
                                         error: e.to_string(),
                                     });
@@ -479,6 +597,7 @@ impl SvidWatcher {
             state_rx,
             event_tx,
             _task_handle: task_handle,
+            _expiry_task_handle: expiry_task_handle,
         }
     }
 
@@ -494,16 +613,14 @@ impl SvidWatcher {
         &self,
         timeout: Duration,
     ) -> Result<IdentityState, IdentityReloadError> {
-        let rx = self.subscribe();
-        let start = std::time::Instant::now();
+        let mut rx = self.subscribe();
         loop {
             if let Some(state) = rx.borrow().clone() {
                 return Ok(state);
             }
-            if start.elapsed() >= timeout {
+            if tokio::time::timeout(timeout, rx.changed()).await.is_err() {
                 return Err(IdentityReloadError::SocketUnavailable);
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 }

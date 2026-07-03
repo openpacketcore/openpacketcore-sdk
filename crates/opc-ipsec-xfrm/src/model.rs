@@ -83,6 +83,40 @@ pub struct XfrmId {
     pub protocol: u8,
 }
 
+/// UDP encapsulation type for ESP-in-UDP NAT traversal.
+pub const UDP_ENCAP_ESPINUDP: u16 = 2;
+
+/// Optional UDP encapsulation template for ESP-in-UDP NAT traversal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UdpEncap {
+    /// Encapsulation type, for example [`UDP_ENCAP_ESPINUDP`].
+    pub encap_type: u16,
+    /// UDP source port in host byte order.
+    pub source_port: u16,
+    /// UDP destination port in host byte order.
+    pub destination_port: u16,
+}
+
+impl UdpEncap {
+    /// Build an RFC 3948 ESP-in-UDP encapsulation template.
+    pub const fn esp_in_udp(source_port: u16, destination_port: u16) -> Self {
+        Self {
+            encap_type: UDP_ENCAP_ESPINUDP,
+            source_port,
+            destination_port,
+        }
+    }
+}
+
+/// Optional Linux XFRM packet mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct XfrmMark {
+    /// Mark value.
+    pub value: u32,
+    /// Mark mask.
+    pub mask: u32,
+}
+
 /// XFRM mode.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -272,6 +306,12 @@ pub struct SaParameters {
     pub lifetime: LifetimeConfig,
     /// Replay window size.
     pub replay_window: u8,
+    /// Optional UDP encapsulation template for NAT-T.
+    pub encap: Option<UdpEncap>,
+    /// Optional packet mark.
+    pub mark: Option<XfrmMark>,
+    /// Optional XFRM interface identifier.
+    pub if_id: Option<u32>,
 }
 
 /// Parameters needed to install or update a Security Policy.
@@ -287,6 +327,10 @@ pub struct PolicyParameters {
     pub priority: u32,
     /// Templates describing SAs that satisfy the policy.
     pub templates: Vec<XfrmTemplate>,
+    /// Optional packet mark.
+    pub mark: Option<XfrmMark>,
+    /// Optional XFRM interface identifier.
+    pub if_id: Option<u32>,
 }
 
 /// Template describing an SA that may satisfy a policy.

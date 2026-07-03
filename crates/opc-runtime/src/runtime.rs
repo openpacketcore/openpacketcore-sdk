@@ -24,11 +24,11 @@ use crate::task::RuntimeError;
 use crate::testkit::Clock;
 
 #[derive(Debug)]
-pub(crate) struct SignalHandlerGuard {
+pub(crate) struct BackgroundTaskGuard {
     pub(crate) handle: tokio::task::JoinHandle<()>,
 }
 
-impl Drop for SignalHandlerGuard {
+impl Drop for BackgroundTaskGuard {
     fn drop(&mut self) {
         self.handle.abort();
     }
@@ -130,7 +130,9 @@ pub struct RuntimeHandle {
     /// Registered drain hooks.
     pub(crate) drain_hooks: Vec<Arc<dyn DrainHook>>,
     /// Background signal listener task handle.
-    pub(crate) signal_handle: Option<Arc<SignalHandlerGuard>>,
+    pub(crate) signal_handle: Option<Arc<BackgroundTaskGuard>>,
+    /// Background heartbeat monitor task handle.
+    pub(crate) heartbeat_monitor_handle: Option<Arc<BackgroundTaskGuard>>,
     /// Idempotency guard for drain hook execution.
     pub(crate) drains_executed: Arc<AtomicBool>,
     /// Number of externally-owned runtime handles.
@@ -173,6 +175,10 @@ impl Clone for RuntimeHandle {
             clock: self.clock.clone(),
             drain_hooks: self.drain_hooks.clone(),
             signal_handle: self.signal_handle.clone().filter(|_| self.counts_owner),
+            heartbeat_monitor_handle: self
+                .heartbeat_monitor_handle
+                .clone()
+                .filter(|_| self.counts_owner),
             drains_executed: self.drains_executed.clone(),
             owner_count: self.owner_count.clone(),
             owner_drop_tx: self.owner_drop_tx.clone(),
@@ -492,6 +498,7 @@ impl RuntimeHandle {
             clock: self.clock.clone(),
             drain_hooks: self.drain_hooks.clone(),
             signal_handle: None,
+            heartbeat_monitor_handle: None,
             drains_executed: self.drains_executed.clone(),
             owner_count: self.owner_count.clone(),
             owner_drop_tx: self.owner_drop_tx.clone(),

@@ -19,7 +19,7 @@
 use bytes::{Bytes, BytesMut};
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, Encode, EncodeContext,
-    EncodeError, EncodeErrorCode, OwnedDecode,
+    EncodeError, EncodeErrorCode, OwnedDecode, UnknownIePolicy, ValidationLevel,
 };
 
 mod generated;
@@ -166,6 +166,7 @@ pub fn decode(buf: &[u8], ctx: DecodeContext) -> Result<Pdu, DecodeError> {
             let message = decode_message(
                 Outcome::Initiating,
                 im.procedure_code.0,
+                im.criticality,
                 im.value.as_bytes(),
                 ctx,
             )?;
@@ -182,6 +183,7 @@ pub fn decode(buf: &[u8], ctx: DecodeContext) -> Result<Pdu, DecodeError> {
             let message = decode_message(
                 Outcome::Successful,
                 so.procedure_code.0,
+                so.criticality,
                 so.value.as_bytes(),
                 ctx,
             )?;
@@ -198,6 +200,7 @@ pub fn decode(buf: &[u8], ctx: DecodeContext) -> Result<Pdu, DecodeError> {
             let message = decode_message(
                 Outcome::Unsuccessful,
                 uo.procedure_code.0,
+                uo.criticality,
                 uo.value.as_bytes(),
                 ctx,
             )?;
@@ -227,6 +230,7 @@ enum Outcome {
 fn decode_message(
     outcome: Outcome,
     procedure_code: u8,
+    criticality: Criticality,
     value: &[u8],
     ctx: DecodeContext,
 ) -> Result<Message, DecodeError> {
@@ -239,6 +243,7 @@ fn decode_message(
             let msg: $ty = rasn::aper::decode(value).map_err(|_| {
                 DecodeError::new(DecodeErrorCode::Structural { reason: $reason }, 0)
             })?;
+            enforce_ie_count(msg.protocol_ies.0.len(), ctx)?;
             Ok(Message::$variant(msg))
         }};
     }
@@ -320,7 +325,37 @@ fn decode_message(
         (Outcome::Initiating, PROCEDURE_CODE_PAGING) => {
             decode_as!(messages::Paging, Paging, "paging")
         }
+        _ if reject_unknown_message(ctx) => Err(unknown_message_error(criticality)),
         _ => Ok(Message::Unknown(Bytes::copy_from_slice(value))),
+    }
+}
+
+fn enforce_ie_count(count: usize, ctx: DecodeContext) -> Result<(), DecodeError> {
+    if count > ctx.max_ies {
+        Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, 0))
+    } else {
+        Ok(())
+    }
+}
+
+const fn reject_unknown_message(ctx: DecodeContext) -> bool {
+    matches!(ctx.unknown_ie_policy, UnknownIePolicy::Reject)
+        || matches!(
+            ctx.validation_level,
+            ValidationLevel::Strict | ValidationLevel::ProcedureAware
+        )
+}
+
+fn unknown_message_error(criticality: Criticality) -> DecodeError {
+    if criticality == Criticality::reject {
+        DecodeError::new(DecodeErrorCode::UnknownCriticalIe, 0)
+    } else {
+        DecodeError::new(
+            DecodeErrorCode::Structural {
+                reason: "unknown ngap procedure",
+            },
+            0,
+        )
     }
 }
 
@@ -600,6 +635,35 @@ mod tests {
             err.code(),
             DecodeErrorCode::Structural { reason } if reason.contains("ngsetup response")
         ));
+    }
+
+    #[test]
+    fn typed_decode_enforces_protocol_ie_count_limit() {
+        let bytes = ngsetup_request_fixture();
+        assert!(decode(&bytes, DecodeContext::default()).is_ok());
+
+        let ctx = DecodeContext {
+            max_ies: 3,
+            ..DecodeContext::default()
+        };
+        let err = decode(&bytes, ctx).unwrap_err();
+        assert_eq!(err.code(), &DecodeErrorCode::IeCountExceeded);
+    }
+
+    #[test]
+    fn strict_decode_rejects_unknown_reject_criticality_procedure() {
+        let bytes = empty_ie_pdu(FixtureOutcome::Initiating, 200, Criticality::reject);
+        let default = decode(&bytes, DecodeContext::default()).unwrap();
+        match default.kind {
+            PduKind::Initiating {
+                message: Message::Unknown(body),
+                ..
+            } => assert_eq!(body.as_ref(), &[0x00, 0x00, 0x00]),
+            other => panic!("expected unknown initiating message, got {other:?}"),
+        }
+
+        let err = decode(&bytes, DecodeContext::conservative()).unwrap_err();
+        assert_eq!(err.code(), &DecodeErrorCode::UnknownCriticalIe);
     }
 
     #[test]

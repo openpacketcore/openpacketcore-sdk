@@ -785,6 +785,34 @@ fn test_grouped_ie_depth_exceeded() {
     );
 }
 
+#[test]
+fn test_grouped_ie_member_count_exceeded() {
+    let source_interface: &[u8] = &[
+        0x00, 0x14, // IE type 20 (Source Interface)
+        0x00, 0x01, // length 1
+        0x00, // Access
+    ];
+
+    let mut grouped_value = BytesMut::new();
+    grouped_value.extend_from_slice(source_interface);
+    grouped_value.extend_from_slice(source_interface);
+
+    let mut grouped = BytesMut::new();
+    grouped.put_u16(1); // Create PDR grouped IE
+    grouped.put_u16(grouped_value.len() as u16);
+    grouped.extend_from_slice(&grouped_value);
+
+    let ctx = DecodeContext {
+        max_ies: 1,
+        ..DecodeContext::default()
+    };
+    let err = match TypedIe::decode(&grouped, ctx, 0) {
+        Ok(_) => panic!("member count must exceed max_ies"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code(), &DecodeErrorCode::IeCountExceeded);
+}
+
 // ---------------------------------------------------------------------------
 // Negative tests: truncation, overflow
 // ---------------------------------------------------------------------------

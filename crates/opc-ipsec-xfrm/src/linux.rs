@@ -4,23 +4,25 @@ use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use opc_linux_xfrm_sys::{
     align_to_netlink, open_netlink_socket, receive_message, send_message, NLMSG_DONE, NLMSG_ERROR,
     NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST, XFRMA_ALG_AEAD,
-    XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT, XFRMA_TMPL, XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY,
-    XFRM_MSG_DELSA, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA,
-    XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT,
+    XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT, XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_MARK, XFRMA_TMPL,
+    XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA,
+    XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK, XFRM_POLICY_FWD,
+    XFRM_POLICY_IN, XFRM_POLICY_OUT,
 };
+use zeroize::Zeroizing;
 
 use crate::{
     AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, IpAddress, LifetimeConfig,
     PolicyParameters, RekeyPolicyRequest, RekeySaRequest, RemovePolicyRequest, RemoveSaRequest,
-    SaParameters, SpiAllocation, XfrmAction, XfrmBackend, XfrmBackendKind, XfrmCapability,
-    XfrmDirection, XfrmError, XfrmId, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
+    SaParameters, SpiAllocation, UdpEncap, XfrmAction, XfrmBackend, XfrmBackendKind,
+    XfrmCapability, XfrmDirection, XfrmError, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmSelector,
+    XfrmTemplate,
 };
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -40,11 +42,17 @@ const XFRM_ALG_NAME_LEN: usize = 64;
 const XFRM_ALGO_HEADER_LEN: usize = 68;
 const XFRM_ALGO_AUTH_HEADER_LEN: usize = 72;
 const XFRM_ALGO_AEAD_HEADER_LEN: usize = 72;
+const XFRM_MARK_LEN: usize = 8;
+const XFRM_ENCAP_TEMPLATE_LEN: usize = 24;
 const XFRM_SPI_OFFSET_IN_SA_INFO: usize = XFRM_SELECTOR_LEN + XFRM_ADDRESS_LEN;
 
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 const XFRM_INF: u64 = u64::MAX;
+const ENOENT: i32 = 2;
+const ESRCH: i32 = 3;
+
+type SensitiveBuffer = Zeroizing<Vec<u8>>;
 
 /// Runtime behavior for the safe Linux XFRM backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +157,7 @@ impl LinuxXfrmBackend {
         operation: &'static str,
         message_type: u16,
         flags: u16,
-        body: Vec<u8>,
+        body: SensitiveBuffer,
     ) -> Result<Option<Vec<u8>>, XfrmError> {
         let sequence = self.next_sequence();
         let request = encode_netlink_message(message_type, flags, sequence, &body)?;
@@ -158,14 +166,34 @@ impl LinuxXfrmBackend {
             .transact(operation, &request, sequence, self.inner.config)
     }
 
-    fn run_ack(
+    async fn transact_blocking(
         &self,
         operation: &'static str,
         message_type: u16,
         flags: u16,
-        body: Vec<u8>,
+        body: SensitiveBuffer,
+    ) -> Result<Option<Vec<u8>>, XfrmError> {
+        let backend = self.clone();
+        tokio::task::spawn_blocking(move || backend.transact(operation, message_type, flags, body))
+            .await
+            .map_err(|_| {
+                XfrmError::io(
+                    operation,
+                    io::Error::new(io::ErrorKind::Interrupted, "xfrm blocking task failed"),
+                )
+            })?
+    }
+
+    async fn run_ack(
+        &self,
+        operation: &'static str,
+        message_type: u16,
+        flags: u16,
+        body: SensitiveBuffer,
     ) -> Result<(), XfrmError> {
-        let _ = self.transact(operation, message_type, flags, body)?;
+        let _ = self
+            .transact_blocking(operation, message_type, flags, body)
+            .await?;
         Ok(())
     }
 }
@@ -176,12 +204,13 @@ impl XfrmBackend for LinuxXfrmBackend {
         validate_spi_range(request.min_spi, request.max_spi)?;
         let body = encode_alloc_spi_request(request)?;
         let response = self
-            .transact(
+            .transact_blocking(
                 "allocspi",
                 XFRM_MSG_ALLOCSPI,
                 NLM_F_REQUEST | NLM_F_ACK,
                 body,
-            )?
+            )
+            .await?
             .ok_or_else(|| XfrmError::io("allocspi", invalid_data("missing allocspi response")))?;
         let spi = parse_allocated_spi(&response)?;
         Ok(SpiAllocation {
@@ -199,6 +228,7 @@ impl XfrmBackend for LinuxXfrmBackend {
             NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
             body,
         )
+        .await
     }
 
     async fn rekey_sa(&self, request: RekeySaRequest) -> Result<(), XfrmError> {
@@ -209,11 +239,13 @@ impl XfrmBackend for LinuxXfrmBackend {
             NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE,
             body,
         )
+        .await
     }
 
     async fn remove_sa(&self, request: RemoveSaRequest) -> Result<(), XfrmError> {
         let body = encode_sa_id(request.destination, request.protocol, request.spi)?;
         self.run_ack("remove_sa", XFRM_MSG_DELSA, NLM_F_REQUEST | NLM_F_ACK, body)
+            .await
     }
 
     async fn install_policy(&self, request: InstallPolicyRequest) -> Result<(), XfrmError> {
@@ -224,6 +256,7 @@ impl XfrmBackend for LinuxXfrmBackend {
             NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
             body,
         )
+        .await
     }
 
     async fn rekey_policy(&self, request: RekeyPolicyRequest) -> Result<(), XfrmError> {
@@ -234,6 +267,7 @@ impl XfrmBackend for LinuxXfrmBackend {
             NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE,
             body,
         )
+        .await
     }
 
     async fn remove_policy(&self, request: RemovePolicyRequest) -> Result<(), XfrmError> {
@@ -244,6 +278,7 @@ impl XfrmBackend for LinuxXfrmBackend {
             NLM_F_REQUEST | NLM_F_ACK,
             body,
         )
+        .await
     }
 
     async fn probe(&self) -> Result<XfrmProbe, XfrmError> {
@@ -297,14 +332,11 @@ impl LinuxXfrmTransport for NetlinkXfrmTransport {
                 Err(error) => return Err(XfrmError::io("netlink_receive", error)),
             }
             if !config.retry_delay.is_zero() {
-                thread::sleep(config.retry_delay);
+                std::thread::sleep(config.retry_delay);
             }
         }
 
-        Err(XfrmError::io(
-            operation,
-            io::Error::new(io::ErrorKind::TimedOut, "netlink ACK timed out"),
-        ))
+        Err(XfrmError::StateIndeterminate { operation })
     }
 
     fn probe(&self, _config: LinuxXfrmBackendConfig) -> XfrmProbe {
@@ -353,19 +385,23 @@ fn map_open_error(operation: &'static str, error: io::Error) -> XfrmError {
     }
 }
 
+fn sensitive_buffer_with_capacity(capacity: usize) -> SensitiveBuffer {
+    Zeroizing::new(Vec::with_capacity(capacity))
+}
+
 fn encode_netlink_message(
     message_type: u16,
     flags: u16,
     sequence: u32,
     body: &[u8],
-) -> Result<Vec<u8>, XfrmError> {
+) -> Result<SensitiveBuffer, XfrmError> {
     let length = NETLINK_HEADER_LEN
         .checked_add(body.len())
         .ok_or_else(|| XfrmError::invalid_config("netlink.length", "message length overflow"))?;
     let length_u32 = u32::try_from(length)
         .map_err(|_| XfrmError::invalid_config("netlink.length", "message length overflow"))?;
 
-    let mut out = Vec::with_capacity(length);
+    let mut out = sensitive_buffer_with_capacity(length);
     push_u32_ne(&mut out, length_u32);
     push_u16_ne(&mut out, message_type);
     push_u16_ne(&mut out, flags);
@@ -429,6 +465,9 @@ fn parse_netlink_error(body: &[u8]) -> Result<Option<Vec<u8>>, XfrmError> {
         ));
     }
     let errno = error.saturating_abs();
+    if matches!(errno, ENOENT | ESRCH) {
+        return Err(XfrmError::NotFound);
+    }
     let io_error = io::Error::from_raw_os_error(errno);
     match io_error.kind() {
         io::ErrorKind::AlreadyExists => Err(XfrmError::AlreadyExists),
@@ -440,7 +479,7 @@ fn parse_netlink_error(body: &[u8]) -> Result<Option<Vec<u8>>, XfrmError> {
     }
 }
 
-fn encode_alloc_spi_request(request: AllocateSpiRequest) -> Result<Vec<u8>, XfrmError> {
+fn encode_alloc_spi_request(request: AllocateSpiRequest) -> Result<SensitiveBuffer, XfrmError> {
     let sa = SaParameters {
         selector: XfrmSelector::new(request.destination, request.destination, request.protocol),
         id: XfrmId {
@@ -455,6 +494,9 @@ fn encode_alloc_spi_request(request: AllocateSpiRequest) -> Result<Vec<u8>, Xfrm
         mode: XfrmMode::Tunnel,
         lifetime: LifetimeConfig::default(),
         replay_window: 0,
+        encap: None,
+        mark: None,
+        if_id: None,
     };
 
     let mut out = encode_sa_info_inner(&sa, true)?;
@@ -465,17 +507,17 @@ fn encode_alloc_spi_request(request: AllocateSpiRequest) -> Result<Vec<u8>, Xfrm
     Ok(out)
 }
 
-fn encode_sa_info(parameters: &SaParameters) -> Result<Vec<u8>, XfrmError> {
+fn encode_sa_info(parameters: &SaParameters) -> Result<SensitiveBuffer, XfrmError> {
     encode_sa_info_inner(parameters, false)
 }
 
 fn encode_sa_info_inner(
     parameters: &SaParameters,
     allow_zero_spi: bool,
-) -> Result<Vec<u8>, XfrmError> {
+) -> Result<SensitiveBuffer, XfrmError> {
     validate_sa_parameters(parameters, allow_zero_spi)?;
     let family = address_family(parameters.id.destination);
-    let mut out = Vec::with_capacity(XFRM_USER_SA_INFO_LEN + 256);
+    let mut out = sensitive_buffer_with_capacity(XFRM_USER_SA_INFO_LEN + 256);
     encode_selector(&mut out, &parameters.selector)?;
     encode_xfrm_id(
         &mut out,
@@ -485,8 +527,10 @@ fn encode_sa_info_inner(
     );
     encode_address(&mut out, parameters.source_address);
     encode_lifetime_config(&mut out, parameters.lifetime);
-    out.resize(out.len() + XFRM_LIFETIME_CURRENT_LEN, 0);
-    out.resize(out.len() + XFRM_STATS_LEN, 0);
+    let len = out.len();
+    out.resize(len + XFRM_LIFETIME_CURRENT_LEN, 0);
+    let len = out.len();
+    out.resize(len + XFRM_STATS_LEN, 0);
     push_u32_ne(&mut out, 0);
     push_u32_ne(&mut out, 0);
     push_u16_ne(&mut out, family);
@@ -499,31 +543,39 @@ fn encode_sa_info_inner(
         append_attr(
             &mut out,
             XFRMA_ALG_AUTH_TRUNC,
-            &encode_auth_algorithm(&auth.name, key.as_bytes(), auth.truncation_len_bits)?,
+            encode_auth_algorithm(&auth.name, key.as_bytes(), auth.truncation_len_bits)?.as_slice(),
         )?;
     }
     if let Some((algorithm, key)) = &parameters.crypt {
         append_attr(
             &mut out,
             XFRMA_ALG_CRYPT,
-            &encode_algorithm(&algorithm.name, key.as_bytes())?,
+            encode_algorithm(&algorithm.name, key.as_bytes())?.as_slice(),
         )?;
     }
     if let Some((aead, key)) = &parameters.aead {
         append_attr(
             &mut out,
             XFRMA_ALG_AEAD,
-            &encode_aead_algorithm(&aead.name, key.as_bytes(), aead.icv_len_bits)?,
+            encode_aead_algorithm(&aead.name, key.as_bytes(), aead.icv_len_bits)?.as_slice(),
         )?;
     }
+    if let Some(encap) = parameters.encap {
+        append_attr(&mut out, XFRMA_ENCAP, encode_udp_encap(encap).as_slice())?;
+    }
+    append_common_attrs(&mut out, parameters.mark, parameters.if_id)?;
     Ok(out)
 }
 
-fn encode_sa_id(destination: IpAddress, protocol: u8, spi: u32) -> Result<Vec<u8>, XfrmError> {
+fn encode_sa_id(
+    destination: IpAddress,
+    protocol: u8,
+    spi: u32,
+) -> Result<SensitiveBuffer, XfrmError> {
     if spi == 0 {
         return Err(XfrmError::invalid_config("spi", "spi must be nonzero"));
     }
-    let mut out = Vec::with_capacity(XFRM_USER_SA_ID_LEN);
+    let mut out = sensitive_buffer_with_capacity(XFRM_USER_SA_ID_LEN);
     encode_address(&mut out, destination);
     push_u32_be(&mut out, spi);
     push_u16_ne(&mut out, address_family(destination));
@@ -532,16 +584,17 @@ fn encode_sa_id(destination: IpAddress, protocol: u8, spi: u32) -> Result<Vec<u8
     Ok(out)
 }
 
-fn encode_policy_info(parameters: &PolicyParameters) -> Result<Vec<u8>, XfrmError> {
+fn encode_policy_info(parameters: &PolicyParameters) -> Result<SensitiveBuffer, XfrmError> {
     validate_policy_parameters(parameters)?;
-    let mut out = Vec::with_capacity(
+    let mut out = sensitive_buffer_with_capacity(
         XFRM_USER_POLICY_INFO_LEN
             + ROUTE_ATTRIBUTE_HEADER_LEN
             + parameters.templates.len() * XFRM_USER_TEMPLATE_LEN,
     );
     encode_selector(&mut out, &parameters.selector)?;
     encode_lifetime_config(&mut out, LifetimeConfig::default());
-    out.resize(out.len() + XFRM_LIFETIME_CURRENT_LEN, 0);
+    let len = out.len();
+    out.resize(len + XFRM_LIFETIME_CURRENT_LEN, 0);
     push_u32_ne(&mut out, parameters.priority);
     push_u32_ne(&mut out, 0);
     push_u8(&mut out, encode_direction(parameters.direction));
@@ -558,15 +611,16 @@ fn encode_policy_info(parameters: &PolicyParameters) -> Result<Vec<u8>, XfrmErro
         }
         append_attr(&mut out, XFRMA_TMPL, &templates)?;
     }
+    append_common_attrs(&mut out, parameters.mark, parameters.if_id)?;
     Ok(out)
 }
 
 fn encode_policy_id(
     selector: &XfrmSelector,
     direction: XfrmDirection,
-) -> Result<Vec<u8>, XfrmError> {
+) -> Result<SensitiveBuffer, XfrmError> {
     validate_selector_family(selector)?;
-    let mut out = Vec::with_capacity(XFRM_USER_POLICY_ID_LEN);
+    let mut out = sensitive_buffer_with_capacity(XFRM_USER_POLICY_ID_LEN);
     encode_selector(&mut out, selector)?;
     push_u32_ne(&mut out, 0);
     push_u8(&mut out, encode_direction(direction));
@@ -655,9 +709,9 @@ fn limit_or_infinite(value: u64) -> u64 {
     }
 }
 
-fn encode_algorithm(name: &str, key: &[u8]) -> Result<Vec<u8>, XfrmError> {
+fn encode_algorithm(name: &str, key: &[u8]) -> Result<SensitiveBuffer, XfrmError> {
     validate_key_material(key)?;
-    let mut out = Vec::with_capacity(XFRM_ALGO_HEADER_LEN + key.len());
+    let mut out = sensitive_buffer_with_capacity(XFRM_ALGO_HEADER_LEN + key.len());
     out.extend_from_slice(&encode_algorithm_name(name)?);
     push_u32_ne(&mut out, key_len_bits(key)?);
     out.extend_from_slice(key);
@@ -668,7 +722,7 @@ fn encode_auth_algorithm(
     name: &str,
     key: &[u8],
     truncation_len_bits: u32,
-) -> Result<Vec<u8>, XfrmError> {
+) -> Result<SensitiveBuffer, XfrmError> {
     validate_key_material(key)?;
     if truncation_len_bits == 0 {
         return Err(XfrmError::invalid_config(
@@ -676,7 +730,7 @@ fn encode_auth_algorithm(
             "truncation length must be nonzero",
         ));
     }
-    let mut out = Vec::with_capacity(XFRM_ALGO_AUTH_HEADER_LEN + key.len());
+    let mut out = sensitive_buffer_with_capacity(XFRM_ALGO_AUTH_HEADER_LEN + key.len());
     out.extend_from_slice(&encode_algorithm_name(name)?);
     push_u32_ne(&mut out, key_len_bits(key)?);
     push_u32_ne(&mut out, truncation_len_bits);
@@ -684,7 +738,11 @@ fn encode_auth_algorithm(
     Ok(out)
 }
 
-fn encode_aead_algorithm(name: &str, key: &[u8], icv_len_bits: u32) -> Result<Vec<u8>, XfrmError> {
+fn encode_aead_algorithm(
+    name: &str,
+    key: &[u8],
+    icv_len_bits: u32,
+) -> Result<SensitiveBuffer, XfrmError> {
     validate_key_material(key)?;
     if icv_len_bits == 0 {
         return Err(XfrmError::invalid_config(
@@ -692,12 +750,42 @@ fn encode_aead_algorithm(name: &str, key: &[u8], icv_len_bits: u32) -> Result<Ve
             "icv length must be nonzero",
         ));
     }
-    let mut out = Vec::with_capacity(XFRM_ALGO_AEAD_HEADER_LEN + key.len());
+    let mut out = sensitive_buffer_with_capacity(XFRM_ALGO_AEAD_HEADER_LEN + key.len());
     out.extend_from_slice(&encode_algorithm_name(name)?);
     push_u32_ne(&mut out, key_len_bits(key)?);
     push_u32_ne(&mut out, icv_len_bits);
     out.extend_from_slice(key);
     Ok(out)
+}
+
+fn encode_udp_encap(encap: UdpEncap) -> SensitiveBuffer {
+    let mut out = sensitive_buffer_with_capacity(XFRM_ENCAP_TEMPLATE_LEN);
+    push_u16_ne(&mut out, encap.encap_type);
+    push_u16_be(&mut out, encap.source_port);
+    push_u16_be(&mut out, encap.destination_port);
+    out.resize(XFRM_ENCAP_TEMPLATE_LEN, 0);
+    out
+}
+
+fn encode_mark(mark: XfrmMark) -> [u8; XFRM_MARK_LEN] {
+    let mut out = [0_u8; XFRM_MARK_LEN];
+    out[..4].copy_from_slice(&mark.value.to_ne_bytes());
+    out[4..].copy_from_slice(&mark.mask.to_ne_bytes());
+    out
+}
+
+fn append_common_attrs(
+    out: &mut Vec<u8>,
+    mark: Option<XfrmMark>,
+    if_id: Option<u32>,
+) -> Result<(), XfrmError> {
+    if let Some(mark) = mark {
+        append_attr(out, XFRMA_MARK, &encode_mark(mark))?;
+    }
+    if let Some(if_id) = if_id {
+        append_attr(out, XFRMA_IF_ID, &if_id.to_ne_bytes())?;
+    }
+    Ok(())
 }
 
 fn append_attr(out: &mut Vec<u8>, attr_type: u16, payload: &[u8]) -> Result<(), XfrmError> {
@@ -762,11 +850,31 @@ fn validate_sa_parameters(
             "protocol must be nonzero",
         ));
     }
+    if parameters.replay_window > 32 {
+        return Err(XfrmError::invalid_config(
+            "replay_window",
+            "replay window >32 requires ESN support",
+        ));
+    }
     if parameters.aead.is_some() && (parameters.auth.is_some() || parameters.crypt.is_some()) {
         return Err(XfrmError::invalid_config(
             "aead",
             "aead is mutually exclusive with auth/crypt",
         ));
+    }
+    if let Some(encap) = parameters.encap {
+        if encap.encap_type == 0 {
+            return Err(XfrmError::invalid_config(
+                "encap.encap_type",
+                "encapsulation type must be nonzero",
+            ));
+        }
+        if encap.source_port == 0 || encap.destination_port == 0 {
+            return Err(XfrmError::invalid_config(
+                "encap.port",
+                "UDP encapsulation ports must be nonzero",
+            ));
+        }
     }
     if let Some((algorithm, _)) = &parameters.crypt {
         if is_known_aead_algorithm(&algorithm.name) {
@@ -1059,6 +1167,35 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct SlowTransport {
+        delay: Duration,
+    }
+
+    impl LinuxXfrmTransport for SlowTransport {
+        fn transact(
+            &self,
+            _operation: &'static str,
+            _request: &[u8],
+            _expected_sequence: u32,
+            _config: LinuxXfrmBackendConfig,
+        ) -> Result<Option<Vec<u8>>, XfrmError> {
+            std::thread::sleep(self.delay);
+            Ok(None)
+        }
+
+        fn probe(&self, _config: LinuxXfrmBackendConfig) -> XfrmProbe {
+            XfrmProbe {
+                kind: XfrmBackendKind::LinuxKernel,
+                platform_supported: true,
+                kernel_reachable: true,
+                net_admin_capable: true,
+                algorithms: XfrmCapability::Available,
+                details: Some("slow test transport"),
+            }
+        }
+    }
+
     fn ipv4(a: u8, b: u8, c: u8, d: u8) -> IpAddress {
         IpAddress::Ipv4([a, b, c, d])
     }
@@ -1085,6 +1222,9 @@ mod tests {
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),
             replay_window: 32,
+            encap: None,
+            mark: None,
+            if_id: None,
         }
     }
 
@@ -1099,17 +1239,24 @@ mod tests {
                 source_address: ipv4(10, 0, 0, 1),
                 mode: XfrmMode::Tunnel,
             }],
+            mark: None,
+            if_id: None,
         }
     }
 
     fn ack(sequence: u32) -> Vec<u8> {
         let mut body = Vec::new();
         push_i32_ne(&mut body, 0);
-        encode_netlink_message(NLMSG_ERROR, 0, sequence, &body).unwrap()
+        encode_netlink_message(NLMSG_ERROR, 0, sequence, &body)
+            .unwrap()
+            .to_vec()
     }
 
     fn route_attr_payload(body: &[u8], attr_type: u16) -> Option<&[u8]> {
-        let mut offset = XFRM_USER_SA_INFO_LEN;
+        route_attr_payload_from(body, XFRM_USER_SA_INFO_LEN, attr_type)
+    }
+
+    fn route_attr_payload_from(body: &[u8], mut offset: usize, attr_type: u16) -> Option<&[u8]> {
         while offset + ROUTE_ATTRIBUTE_HEADER_LEN <= body.len() {
             let len = usize::from(u16::from_ne_bytes([body[offset], body[offset + 1]]));
             let found_type = u16::from_ne_bytes([body[offset + 2], body[offset + 3]]);
@@ -1125,9 +1272,12 @@ mod tests {
         None
     }
 
+    fn assert_sensitive_buffer(_buffer: &SensitiveBuffer) {}
+
     #[test]
     fn encodes_sa_install_with_auth_and_crypt_attrs() {
         let body = encode_sa_info(&sa_parameters()).unwrap();
+        assert_sensitive_buffer(&body);
 
         assert_eq!(&body[0..4], &[10, 0, 0, 2]);
         assert_eq!(&body[16..20], &[10, 0, 0, 1]);
@@ -1157,6 +1307,7 @@ mod tests {
         ));
 
         let body = encode_sa_info(&params).unwrap();
+        assert_sensitive_buffer(&body);
         let payload = route_attr_payload(&body, XFRMA_ALG_AEAD).expect("aead attr");
 
         assert_eq!(payload.len(), XFRM_ALGO_AEAD_HEADER_LEN + 36);
@@ -1185,6 +1336,52 @@ mod tests {
         assert_eq!(&payload[XFRM_ALGO_AEAD_HEADER_LEN..], &[0xcd; 36]);
         assert!(route_attr_payload(&body, XFRMA_ALG_CRYPT).is_none());
         assert_eq!(body.len() % 4, 0);
+    }
+
+    #[test]
+    fn encodes_sa_install_with_udp_encap_mark_and_if_id_attrs() {
+        let mut params = sa_parameters();
+        params.encap = Some(UdpEncap::esp_in_udp(4500, 4500));
+        params.mark = Some(XfrmMark {
+            value: 0x1234_5678,
+            mask: 0xffff_0000,
+        });
+        params.if_id = Some(7);
+
+        let body = encode_sa_info(&params).unwrap();
+        let encap = route_attr_payload(&body, XFRMA_ENCAP).expect("encap attr");
+        let mark = route_attr_payload(&body, XFRMA_MARK).expect("mark attr");
+        let if_id = route_attr_payload(&body, XFRMA_IF_ID).expect("if_id attr");
+
+        assert_eq!(encap.len(), XFRM_ENCAP_TEMPLATE_LEN);
+        assert_eq!(
+            u16::from_ne_bytes([encap[0], encap[1]]),
+            crate::model::UDP_ENCAP_ESPINUDP
+        );
+        assert_eq!(u16::from_be_bytes([encap[2], encap[3]]), 4500);
+        assert_eq!(u16::from_be_bytes([encap[4], encap[5]]), 4500);
+        assert_eq!(&encap[8..], &[0_u8; 16]);
+        assert_eq!(mark, &encode_mark(params.mark.unwrap()));
+        assert_eq!(if_id, &7_u32.to_ne_bytes());
+    }
+
+    #[test]
+    fn encodes_policy_with_mark_and_if_id_attrs() {
+        let mut params = policy_parameters();
+        params.mark = Some(XfrmMark {
+            value: 0x0000_0042,
+            mask: 0xffff_ffff,
+        });
+        params.if_id = Some(9);
+
+        let body = encode_policy_info(&params).unwrap();
+        let mark = route_attr_payload_from(&body, XFRM_USER_POLICY_INFO_LEN, XFRMA_MARK)
+            .expect("policy mark attr");
+        let if_id = route_attr_payload_from(&body, XFRM_USER_POLICY_INFO_LEN, XFRMA_IF_ID)
+            .expect("policy if_id attr");
+
+        assert_eq!(mark, &encode_mark(params.mark.unwrap()));
+        assert_eq!(if_id, &9_u32.to_ne_bytes());
     }
 
     #[test]
@@ -1248,6 +1445,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_replay_window_above_legacy_bitmap_limit() {
+        let mut params = sa_parameters();
+        params.replay_window = 33;
+
+        let error = encode_sa_info(&params).unwrap_err();
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "replay_window",
+                reason: "replay window >32 requires ESN support"
+            }
+        ));
+    }
+
+    #[test]
     fn encodes_policy_with_template_attr() {
         let body = encode_policy_info(&policy_parameters()).unwrap();
 
@@ -1304,6 +1517,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn backend_transaction_does_not_block_current_thread_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let backend = LinuxXfrmBackend::with_transport(SlowTransport {
+                delay: Duration::from_millis(100),
+            });
+            let install_backend = backend.clone();
+
+            let install = tokio::spawn(async move {
+                install_backend
+                    .install_sa(InstallSaRequest {
+                        parameters: sa_parameters(),
+                    })
+                    .await
+            });
+
+            let tick = tokio::time::timeout(
+                Duration::from_millis(50),
+                tokio::time::sleep(Duration::from_millis(10)),
+            )
+            .await;
+            assert!(tick.is_ok(), "runtime ticker was stalled by XFRM transact");
+
+            install.await.unwrap().unwrap();
+        });
+    }
+
     #[tokio::test]
     async fn allocate_spi_parses_kernel_response_spi() {
         let mut response = vec![0_u8; XFRM_USER_SA_INFO_LEN];
@@ -1334,6 +1579,14 @@ mod tests {
         let error = parse_netlink_response(&message, 9).unwrap_err();
 
         assert!(matches!(error, XfrmError::AlreadyExists));
+
+        let mut body = Vec::new();
+        push_i32_ne(&mut body, -ESRCH);
+        let message = encode_netlink_message(NLMSG_ERROR, 0, 10, &body).unwrap();
+
+        let error = parse_netlink_response(&message, 10).unwrap_err();
+
+        assert!(matches!(error, XfrmError::NotFound));
     }
 
     #[test]
@@ -1357,6 +1610,17 @@ mod tests {
         let display = error.to_string();
         assert!(!debug.contains("cd"));
         assert!(!display.contains("cd"));
+    }
+
+    #[test]
+    fn algorithm_encoders_return_zeroizing_buffers() {
+        let crypt = encode_algorithm("aes-cbc", &[0xcd; 16]).unwrap();
+        let auth = encode_auth_algorithm("hmac-sha256", &[0xab; 32], 96).unwrap();
+        let aead = encode_aead_algorithm("rfc4106(gcm(aes))", &[0xef; 36], 128).unwrap();
+
+        assert_sensitive_buffer(&crypt);
+        assert_sensitive_buffer(&auth);
+        assert_sensitive_buffer(&aead);
     }
 
     #[test]

@@ -34,8 +34,9 @@ pub use bcd::{unpack_imei, unpack_plmn, unpack_routing_indicator, BcdError, Plmn
 pub use identity::{GutiView, IdentityType, IdentityView, MobileIdentity, SuciView};
 pub use messages::{
     decode_mm_message_body, decode_sm_message_body, MmMessageBody, NasKeySetIdentifier, OptionalIe,
-    RawMessageBody, RegistrationAccept, RegistrationRequest, RegistrationResult, RegistrationType,
-    SecurityModeCommand, SecurityModeComplete, SelectedNasSecurityAlgorithms, SmMessageBody,
+    RawMessageBody, RegistrationAccept, RegistrationRequest, RegistrationResult,
+    RegistrationResultFlags, RegistrationType, SecurityModeCommand, SecurityModeComplete,
+    SelectedNasSecurityAlgorithms, SmMessageBody,
 };
 pub use security::{
     NasCipheringAlgorithm, NasCount, NasIntegrityAlgorithm, NasReplayWindow, NasSecurityAlgorithms,

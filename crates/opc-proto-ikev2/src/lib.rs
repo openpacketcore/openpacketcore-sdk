@@ -46,6 +46,7 @@ pub use exchange::{
     Ikev2ExchangeBoundaryState, Ikev2ExchangeDecision, Ikev2ExchangeInvalidReason,
     Ikev2ExchangeKind, Ikev2ExchangeProjection, Ikev2ExchangeRequest, Ikev2ExchangeRequestKey,
     Ikev2ExchangeSnapshot, Ikev2ExchangeTracker, Ikev2ResponderSpi,
+    IKEV2_EXCHANGE_RETRANSMISSION_WINDOW,
 };
 pub use fragmentation::{
     build_ikev2_encrypted_fragment_payload_body, reassemble_decrypted_ikev2_fragments,

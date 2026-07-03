@@ -2,6 +2,10 @@ use crate::supervisor::metrics::raise_fatal_task_alarm;
 use crate::supervisor::{FatalTaskFailure, Supervisor};
 use crate::task::{Criticality, TaskError, TaskName};
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+const HEARTBEAT_MONITOR_MIN_INTERVAL: Duration = Duration::from_millis(10);
+const HEARTBEAT_MONITOR_MAX_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) async fn record_heartbeat_impl(supervisor: &Supervisor, name: &TaskName) {
     let mut t = supervisor.tasks.write().await;
@@ -79,4 +83,46 @@ pub(crate) async fn check_heartbeats_impl(supervisor: &Supervisor) {
     if !expired.is_empty() {
         supervisor.notify_state_change();
     }
+}
+
+pub(crate) async fn monitor_heartbeats_impl(supervisor: Supervisor) {
+    let mut state_rx = supervisor.subscribe_state_changes();
+
+    loop {
+        if supervisor.shutdown.is_shutdown_requested() {
+            return;
+        }
+
+        let interval = heartbeat_monitor_interval(&supervisor).await;
+        tokio::select! {
+            _ = supervisor.clock.sleep(interval) => {
+                supervisor.check_heartbeats().await;
+            }
+            changed = state_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn heartbeat_monitor_interval(supervisor: &Supervisor) -> Duration {
+    supervisor
+        .tasks
+        .read()
+        .await
+        .values()
+        .filter_map(|state| state.metadata.heartbeat_timeout)
+        .min()
+        .map(|timeout| {
+            timeout
+                .checked_div(2)
+                .unwrap_or(HEARTBEAT_MONITOR_MIN_INTERVAL)
+                .clamp(
+                    HEARTBEAT_MONITOR_MIN_INTERVAL,
+                    HEARTBEAT_MONITOR_MAX_INTERVAL,
+                )
+        })
+        .unwrap_or(HEARTBEAT_MONITOR_MAX_INTERVAL)
 }

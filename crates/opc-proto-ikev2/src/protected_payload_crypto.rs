@@ -395,6 +395,14 @@ pub fn decrypt_ikev2_sa_init_protected_payload(
 ///
 /// Returns [`Ikev2ProtectedPayloadCryptoError`] when the profile, keys, payload
 /// kind, or AAD prefix is invalid for sealing.
+///
+/// # Security
+///
+/// `explicit_iv` is the AES-GCM explicit nonce field from RFC 5282 section 4.
+/// Callers must ensure it is never reused with the same direction key and salt.
+/// Reusing an AES-GCM nonce under one IKE SA can disclose plaintext relations
+/// and permit tag forgery. Production callers should allocate this value from a
+/// monotonic per-direction counter stored with the IKE SA state.
 pub fn seal_ikev2_sa_init_protected_payload(
     profile: Ikev2SaInitCryptoProfile,
     key_material: &Ikev2SaInitKeyMaterial,

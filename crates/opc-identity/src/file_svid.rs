@@ -1,6 +1,7 @@
 use crate::{
-    parse_certs_pem, parse_key_pem, IdentityReloadError, IdentityReloadEvent, IdentityState,
-    TrustBundle, TrustBundleSet, TrustDomain, WorkloadIdentity,
+    build_identity_state, parse_certs_pem, parse_key_pem, spawn_expiry_monitor,
+    IdentityReloadError, IdentityReloadEvent, IdentityState, TrustBundle, TrustBundleSet,
+    TrustDomain,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -8,10 +9,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 use x509_parser::prelude::*;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone)]
 struct FileSnapshot {
-    mtime: std::time::SystemTime,
     hash: String,
 }
 
@@ -25,6 +26,7 @@ pub struct FileSvidSource {
     state_rx: watch::Receiver<Option<IdentityState>>,
     event_tx: broadcast::Sender<IdentityReloadEvent>,
     _task_handle: tokio::task::JoinHandle<()>,
+    _expiry_task_handle: tokio::task::JoinHandle<()>,
 }
 
 impl FileSvidSource {
@@ -45,6 +47,7 @@ impl FileSvidSource {
         let (state_tx, state_rx) = watch::channel(None);
         let (event_tx, _) = broadcast::channel(32);
         let event_tx_clone = event_tx.clone();
+        let expiry_task_handle = spawn_expiry_monitor(state_tx.clone(), event_tx.clone());
 
         let task_handle = tokio::spawn(async move {
             let mut snapshots: HashMap<PathBuf, FileSnapshot> = HashMap::new();
@@ -104,6 +107,7 @@ impl FileSvidSource {
             state_rx,
             event_tx,
             _task_handle: task_handle,
+            _expiry_task_handle: expiry_task_handle,
         }
     }
 
@@ -119,36 +123,27 @@ impl FileSvidSource {
         &self,
         timeout: Duration,
     ) -> Result<IdentityState, IdentityReloadError> {
-        let rx = self.subscribe();
-        let start = std::time::Instant::now();
+        let mut rx = self.subscribe();
         loop {
             if let Some(state) = rx.borrow().clone() {
                 return Ok(state);
             }
-            if start.elapsed() >= timeout {
+            if tokio::time::timeout(timeout, rx.changed()).await.is_err() {
                 return Err(IdentityReloadError::IoError);
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 }
 
 async fn snapshot_file(path: &Path, previous: Option<&FileSnapshot>) -> Option<FileSnapshot> {
-    let meta = tokio::fs::metadata(path).await.ok()?;
-    let mtime = meta.modified().ok()?;
-
-    if let Some(prev) = previous {
-        if prev.mtime == mtime {
-            return Some(FileSnapshot {
-                mtime,
-                hash: prev.hash.clone(),
-            });
-        }
-    }
-
     let content = tokio::fs::read(path).await.ok()?;
     let hash = format!("{:x}", Sha256::digest(&content));
-    Some(FileSnapshot { mtime, hash })
+    if let Some(prev) = previous {
+        if prev.hash == hash {
+            return Some(prev.clone());
+        }
+    }
+    Some(FileSnapshot { hash })
 }
 
 fn has_content_changed(
@@ -175,9 +170,11 @@ async fn reload_identity(
     let cert_pem = tokio::fs::read_to_string(cert_path)
         .await
         .map_err(|e| format!("failed to read cert file: {e}"))?;
-    let key_pem = tokio::fs::read_to_string(key_path)
-        .await
-        .map_err(|e| format!("failed to read key file: {e}"))?;
+    let key_pem = Zeroizing::new(
+        tokio::fs::read_to_string(key_path)
+            .await
+            .map_err(|e| format!("failed to read key file: {e}"))?,
+    );
 
     let cert_chain =
         parse_certs_pem(&cert_pem).map_err(|e| format!("failed to parse SVID certificate: {e}"))?;
@@ -208,21 +205,8 @@ async fn reload_identity(
         certificates: all_bundle_certs,
     });
 
-    let identity = WorkloadIdentity::from_cert_der(leaf_der.as_ref(), &trust_bundles)
-        .map_err(|e| format!("failed to validate workload identity: {e}"))?;
-
-    let svid = crate::SvidDocument {
-        spiffe_id: identity.spiffe_id.clone(),
-        cert_chain,
-        private_key,
-        expires_at: identity.expires_at,
-    };
-
-    Ok(IdentityState {
-        identity,
-        svid,
-        trust_bundles,
-    })
+    build_identity_state(cert_chain, private_key, trust_bundles)
+        .map_err(|e| format!("failed to validate workload identity: {e}"))
 }
 
 fn extract_trust_domain_from_cert(cert_der: &[u8]) -> Result<TrustDomain, String> {
@@ -273,6 +257,33 @@ mod tests {
         let ca_key = KeyPair::generate().unwrap();
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
+        let (wl_cert, wl_key) = generate_workload_cert(spiffe_id, &ca_cert, &ca_key);
+
+        (ca_cert, ca_key, wl_cert, wl_key)
+    }
+
+    fn generate_workload_cert(
+        spiffe_id: &str,
+        ca_cert: &rcgen::Certificate,
+        ca_key: &KeyPair,
+    ) -> (rcgen::Certificate, KeyPair) {
+        let now = ::time::OffsetDateTime::now_utc();
+        generate_workload_cert_with_validity(
+            spiffe_id,
+            ca_cert,
+            ca_key,
+            now - ::time::Duration::days(1),
+            now + ::time::Duration::days(1),
+        )
+    }
+
+    fn generate_workload_cert_with_validity(
+        spiffe_id: &str,
+        ca_cert: &rcgen::Certificate,
+        ca_key: &KeyPair,
+        not_before: ::time::OffsetDateTime,
+        not_after: ::time::OffsetDateTime,
+    ) -> (rcgen::Certificate, KeyPair) {
         let mut wl_params = CertificateParams::default();
         wl_params
             .distinguished_name
@@ -281,14 +292,29 @@ mod tests {
             .subject_alt_names
             .push(SanType::URI(rcgen::Ia5String::try_from(spiffe_id).unwrap()));
 
-        let now = ::time::OffsetDateTime::now_utc();
-        wl_params.not_before = now - ::time::Duration::days(1);
-        wl_params.not_after = now + ::time::Duration::days(1);
+        wl_params.not_before = not_before;
+        wl_params.not_after = not_after;
 
         let wl_key = KeyPair::generate().unwrap();
-        let wl_cert = wl_params.signed_by(&wl_key, &ca_cert, &ca_key).unwrap();
+        let wl_cert = wl_params.signed_by(&wl_key, ca_cert, ca_key).unwrap();
 
-        (ca_cert, ca_key, wl_cert, wl_key)
+        (wl_cert, wl_key)
+    }
+
+    async fn wait_for_failure_event(
+        event_rx: &mut broadcast::Receiver<IdentityReloadEvent>,
+    ) -> IdentityReloadEvent {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(event) = event_rx.recv().await {
+                    if matches!(event, IdentityReloadEvent::Failure { .. }) {
+                        return event;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("should receive failure event")
     }
 
     fn write_pem_files(
@@ -415,6 +441,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_initial_load_rejects_expired_svid() {
+        let dir = std::env::temp_dir().join(format!(
+            "opc-identity-file-svid-expired-{}",
+            std::process::id()
+        ));
+        let spiffe = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/0";
+        let (ca_cert, ca_key, _wl_cert, _wl_key) = generate_test_certs(spiffe);
+        let now = ::time::OffsetDateTime::now_utc();
+        let (wl_cert, wl_key) = generate_workload_cert_with_validity(
+            spiffe,
+            &ca_cert,
+            &ca_key,
+            now - ::time::Duration::days(2),
+            now - ::time::Duration::days(1),
+        );
+
+        let (cert_path, key_path, bundle_path) = write_pem_files(
+            &dir,
+            &(wl_cert.pem() + &ca_cert.pem()),
+            &wl_key.serialize_pem(),
+            &ca_cert.pem(),
+        );
+
+        let source = FileSvidSource::new(
+            &cert_path,
+            &key_path,
+            vec![&bundle_path],
+            Some(Duration::from_millis(100)),
+        );
+        let mut event_rx = source.subscribe_events();
+
+        let event = wait_for_failure_event(&mut event_rx).await;
+        assert!(
+            matches!(event, IdentityReloadEvent::Failure { ref error } if error.contains("Expired SVID")),
+            "expected expired-SVID failure, got {event:?}"
+        );
+        assert!(source
+            .wait_for_initial_identity(Duration::from_millis(100))
+            .await
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_initial_load_rejects_not_yet_valid_svid() {
+        let dir = std::env::temp_dir().join(format!(
+            "opc-identity-file-svid-not-yet-valid-{}",
+            std::process::id()
+        ));
+        let spiffe = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/0";
+        let (ca_cert, ca_key, _wl_cert, _wl_key) = generate_test_certs(spiffe);
+        let now = ::time::OffsetDateTime::now_utc();
+        let (wl_cert, wl_key) = generate_workload_cert_with_validity(
+            spiffe,
+            &ca_cert,
+            &ca_key,
+            now + ::time::Duration::days(1),
+            now + ::time::Duration::days(2),
+        );
+
+        let (cert_path, key_path, bundle_path) = write_pem_files(
+            &dir,
+            &(wl_cert.pem() + &ca_cert.pem()),
+            &wl_key.serialize_pem(),
+            &ca_cert.pem(),
+        );
+
+        let source = FileSvidSource::new(
+            &cert_path,
+            &key_path,
+            vec![&bundle_path],
+            Some(Duration::from_millis(100)),
+        );
+        let mut event_rx = source.subscribe_events();
+
+        let event = wait_for_failure_event(&mut event_rx).await;
+        assert!(
+            matches!(event, IdentityReloadEvent::Failure { ref error } if error.contains("not yet valid")),
+            "expected not-yet-valid failure, got {event:?}"
+        );
+        assert!(source
+            .wait_for_initial_identity(Duration::from_millis(100))
+            .await
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_rotation_rejects_leaf_not_signed_by_bundle_and_retains_last_good() {
+        let dir = std::env::temp_dir().join(format!(
+            "opc-identity-file-svid-wrong-ca-{}",
+            std::process::id()
+        ));
+        let spiffe1 = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/0";
+        let (ca_cert1, _ca_key1, wl_cert1, wl_key1) = generate_test_certs(spiffe1);
+
+        let (cert_path, key_path, bundle_path) = write_pem_files(
+            &dir,
+            &(wl_cert1.pem() + &ca_cert1.pem()),
+            &wl_key1.serialize_pem(),
+            &ca_cert1.pem(),
+        );
+
+        let source = FileSvidSource::new(
+            &cert_path,
+            &key_path,
+            vec![&bundle_path],
+            Some(Duration::from_millis(100)),
+        );
+
+        let state = source
+            .wait_for_initial_identity(Duration::from_secs(5))
+            .await
+            .expect("should load initial identity");
+        let initial_spiffe = state.identity.spiffe_id.clone();
+        let mut event_rx = source.subscribe_events();
+
+        let spiffe2 = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/1";
+        let (ca_cert2, _ca_key2, wl_cert2, wl_key2) = generate_test_certs(spiffe2);
+
+        let mut f = fs::File::create(&cert_path).unwrap();
+        f.write_all((wl_cert2.pem() + &ca_cert2.pem()).as_bytes())
+            .unwrap();
+        let mut f = fs::File::create(&key_path).unwrap();
+        f.write_all(wl_key2.serialize_pem().as_bytes()).unwrap();
+
+        let event = wait_for_failure_event(&mut event_rx).await;
+        assert!(
+            matches!(event, IdentityReloadEvent::Failure { ref error } if error.contains("certificate chain")),
+            "expected certificate-chain failure, got {event:?}"
+        );
+
+        let rx = source.subscribe();
+        let current = rx
+            .borrow()
+            .clone()
+            .expect("last-good identity should be retained");
+        assert_eq!(current.identity.spiffe_id, initial_spiffe);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_rotation_rejects_torn_cert_key_pair_and_retains_last_good() {
+        let dir = std::env::temp_dir().join(format!(
+            "opc-identity-file-svid-torn-pair-{}",
+            std::process::id()
+        ));
+        let spiffe1 = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/0";
+        let (ca_cert, ca_key, wl_cert1, wl_key1) = generate_test_certs(spiffe1);
+
+        let (cert_path, key_path, bundle_path) = write_pem_files(
+            &dir,
+            &(wl_cert1.pem() + &ca_cert.pem()),
+            &wl_key1.serialize_pem(),
+            &ca_cert.pem(),
+        );
+
+        let source = FileSvidSource::new(
+            &cert_path,
+            &key_path,
+            vec![&bundle_path],
+            Some(Duration::from_millis(100)),
+        );
+
+        let state = source
+            .wait_for_initial_identity(Duration::from_secs(5))
+            .await
+            .expect("should load initial identity");
+        let initial_spiffe = state.identity.spiffe_id.clone();
+        let mut event_rx = source.subscribe_events();
+
+        let spiffe2 = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/1";
+        let (wl_cert2, _wl_key2) = generate_workload_cert(spiffe2, &ca_cert, &ca_key);
+
+        let mut f = fs::File::create(&cert_path).unwrap();
+        f.write_all((wl_cert2.pem() + &ca_cert.pem()).as_bytes())
+            .unwrap();
+        let mut f = fs::File::create(&key_path).unwrap();
+        f.write_all(wl_key1.serialize_pem().as_bytes()).unwrap();
+
+        let event = wait_for_failure_event(&mut event_rx).await;
+        assert!(
+            matches!(event, IdentityReloadEvent::Failure { ref error } if error.contains("private key")),
+            "expected private-key mismatch failure, got {event:?}"
+        );
+
+        let rx = source.subscribe();
+        let current = rx
+            .borrow()
+            .clone()
+            .expect("last-good identity should be retained");
+        assert_eq!(current.identity.spiffe_id, initial_spiffe);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn test_malformed_pem_fail_closed() {
         let dir = std::env::temp_dir().join(format!(
             "opc-identity-file-svid-fail-closed-{}",
@@ -450,17 +676,7 @@ mod tests {
         f.write_all(b"not a valid pem").unwrap();
 
         // Wait for a failure event.
-        let event = timeout(Duration::from_secs(5), async {
-            loop {
-                if let Ok(event) = event_rx.recv().await {
-                    if matches!(event, IdentityReloadEvent::Failure { .. }) {
-                        return event;
-                    }
-                }
-            }
-        })
-        .await
-        .expect("should receive failure event");
+        let event = wait_for_failure_event(&mut event_rx).await;
 
         assert!(
             matches!(event, IdentityReloadEvent::Failure { ref error } if error.contains("failed to parse") || error.contains("empty cert chain")),

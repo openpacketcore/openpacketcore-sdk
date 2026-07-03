@@ -3815,6 +3815,60 @@ mod tests {
     }
 
     #[test]
+    fn typed_parser_policy_accepts_or_rejects_unknown_non_mandatory_avp() {
+        let identity = PeerIdentity::new("aaa4.example.net", "example.net");
+        let mut raw_avps = BytesMut::new();
+        if let Err(error) = append_identity_avps(&mut raw_avps, &identity, EncodeContext::default())
+        {
+            panic!("identity AVP build failed: {error}");
+        }
+        if let Err(error) = append_avp(
+            &mut raw_avps,
+            AvpHeader::ietf(AvpCode::new(9_999), false),
+            b"x",
+            EncodeContext::default(),
+        ) {
+            panic!("unknown AVP build failed: {error}");
+        }
+        let built = match build_message(
+            peer_request_flags(PeerProcedure::DeviceWatchdog),
+            COMMAND_DEVICE_WATCHDOG,
+            raw_avps,
+            1,
+            2,
+            EncodeContext::default(),
+            "5.5.1",
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("message build failed: {error}"),
+        };
+        let encoded = encode_owned(&built);
+        let message = decode_message(&encoded);
+
+        for policy in [UnknownIePolicy::Drop, UnknownIePolicy::Preserve] {
+            let ctx = DecodeContext {
+                unknown_ie_policy: policy,
+                ..DecodeContext::default()
+            };
+            let parsed = parse_device_watchdog_request(&message, ctx);
+            assert!(
+                parsed.is_ok(),
+                "typed parser must accept non-mandatory unknown AVP under {policy:?}, got {parsed:?}"
+            );
+        }
+
+        let reject = DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Reject,
+            ..DecodeContext::default()
+        };
+        let rejected = parse_device_watchdog_request(&message, reject);
+        assert!(matches!(
+            rejected,
+            Err(error) if matches!(error.code(), DecodeErrorCode::UnknownCriticalIe)
+        ));
+    }
+
+    #[test]
     fn parser_rejects_depth_limit_for_vendor_specific_application_id() {
         let capabilities = sample_capabilities();
         let built = match build_capabilities_exchange_request(

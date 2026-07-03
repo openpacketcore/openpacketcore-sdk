@@ -87,9 +87,10 @@ pub fn accept(fd: BorrowedFd<'_>) -> io::Result<(OwnedFd, SocketAddr)> {
     if accepted < 0 {
         Err(io::Error::last_os_error())
     } else {
-        let addr = raw_to_socket_addr(&storage, len)?;
         // SAFETY: `accepted` is a fresh descriptor returned by `accept4` above.
-        Ok((unsafe { OwnedFd::from_raw_fd(accepted) }, addr))
+        let accepted = unsafe { OwnedFd::from_raw_fd(accepted) };
+        let addr = raw_to_socket_addr(&storage, len)?;
+        Ok((accepted, addr))
     }
 }
 
@@ -108,7 +109,7 @@ pub fn connect(fd: BorrowedFd<'_>, addr: &SocketAddr) -> io::Result<ConnectStatu
         return Ok(ConnectStatus::Connected);
     }
     let err = io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::EINPROGRESS) {
+    if err.raw_os_error() == Some(libc::EINPROGRESS) || err.kind() == io::ErrorKind::Interrupted {
         Ok(ConnectStatus::InProgress)
     } else {
         Err(err)

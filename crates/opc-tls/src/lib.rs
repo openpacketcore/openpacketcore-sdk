@@ -96,6 +96,9 @@ impl rustls::client::ResolvesClientCert for ReloadingClientCertResolver {
         _sigschemes: &[rustls::SignatureScheme],
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let state = self.state_rx.borrow().clone()?;
+        if state.is_expired() {
+            return None;
+        }
         let certs = state.svid.cert_chain;
         let key = state.svid.private_key.clone_key();
 
@@ -108,7 +111,10 @@ impl rustls::client::ResolvesClientCert for ReloadingClientCertResolver {
     }
 
     fn has_certs(&self) -> bool {
-        self.state_rx.borrow().is_some()
+        self.state_rx
+            .borrow()
+            .as_ref()
+            .is_some_and(|state| !state.is_expired())
     }
 }
 
@@ -129,6 +135,9 @@ impl rustls::server::ResolvesServerCert for ReloadingServerCertResolver {
         _client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let state = self.state_rx.borrow().clone()?;
+        if state.is_expired() {
+            return None;
+        }
         let certs = state.svid.cert_chain;
         let key = state.svid.private_key.clone_key();
 
@@ -167,6 +176,11 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
                 rustls::CertificateError::ApplicationVerificationFailure,
             )
         })?;
+        if state.is_expired() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ));
+        }
 
         let id = WorkloadIdentity::from_cert_der(end_entity.as_ref(), &state.trust_bundles)
             .map_err(|_| {
@@ -269,6 +283,11 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
                 rustls::CertificateError::ApplicationVerificationFailure,
             )
         })?;
+        if state.is_expired() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ));
+        }
 
         let id = WorkloadIdentity::from_cert_der(end_entity.as_ref(), &state.trust_bundles)
             .map_err(|_| {
@@ -340,6 +359,7 @@ pub struct TlsConfigBuilder {
     state_rx: watch::Receiver<Option<IdentityState>>,
     policy: PeerPolicy,
     compat_mode: bool,
+    allow_unconstrained_peer_policy: bool,
 }
 
 impl TlsConfigBuilder {
@@ -348,11 +368,23 @@ impl TlsConfigBuilder {
             state_rx,
             policy: PeerPolicy::default(),
             compat_mode: false,
+            allow_unconstrained_peer_policy: false,
         }
     }
 
     pub fn with_policy(mut self, policy: PeerPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Explicitly authorize any peer whose certificate chains to a trusted
+    /// bundle.
+    ///
+    /// This is intentionally separate from [`TlsConfigBuilder::new`] so callers
+    /// must opt in to authentication-only behavior instead of getting it by
+    /// omission.
+    pub fn allow_any_trusted_peer(mut self) -> Self {
+        self.allow_unconstrained_peer_policy = true;
         self
     }
 
@@ -362,6 +394,8 @@ impl TlsConfigBuilder {
     }
 
     pub fn build_client_config(self) -> Result<rustls::ClientConfig, rustls::Error> {
+        self.validate_peer_policy()?;
+
         static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
         INIT_CRYPTO.call_once(|| {
             rustls::crypto::ring::default_provider()
@@ -391,6 +425,8 @@ impl TlsConfigBuilder {
     }
 
     pub fn build_server_config(self) -> Result<rustls::ServerConfig, rustls::Error> {
+        self.validate_peer_policy()?;
+
         static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
         INIT_CRYPTO.call_once(|| {
             rustls::crypto::ring::default_provider()
@@ -414,6 +450,17 @@ impl TlsConfigBuilder {
             .with_cert_resolver(resolver);
 
         Ok(server_config)
+    }
+
+    fn validate_peer_policy(&self) -> Result<(), rustls::Error> {
+        if self.policy.is_unconstrained() && !self.allow_unconstrained_peer_policy {
+            return Err(rustls::Error::General(
+                "unconstrained SPIFFE peer policy requires explicit allow_any_trusted_peer() opt-in"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -493,5 +540,27 @@ mod policy_tests {
             allowed_instances: Some(HashSet::from([InstanceId::new("amf-01").unwrap()])),
         };
         assert!(policy.check(&id).is_ok());
+    }
+
+    #[test]
+    fn builder_rejects_unconstrained_policy_without_explicit_opt_in() {
+        let (_tx, rx) = watch::channel(None);
+        let err = TlsConfigBuilder::new(rx)
+            .build_server_config()
+            .expect_err("default unconstrained policy must fail closed");
+
+        assert!(err
+            .to_string()
+            .contains("requires explicit allow_any_trusted_peer() opt-in"));
+    }
+
+    #[test]
+    fn builder_accepts_unconstrained_policy_with_explicit_opt_in() {
+        let (_tx, rx) = watch::channel(None);
+        let result = TlsConfigBuilder::new(rx)
+            .allow_any_trusted_peer()
+            .build_server_config();
+
+        assert!(result.is_ok());
     }
 }

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use opc_types::TenantId;
-use sha2::{Digest, Sha256};
+use rand::{rngs::SysRng, TryRng};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use zeroize::Zeroizing;
@@ -171,10 +171,10 @@ impl KeyProvider for MemoryKeyProvider {
         let next_counter = next_rotation_counter(&inner, purpose, tenant, &old_handle.key_id);
         insert_rotation_counter(&mut inner, purpose, tenant, next_counter);
 
-        let mut hasher = Sha256::new();
-        hasher.update(old_handle.material.bytes.as_slice());
-        hasher.update(next_counter.to_be_bytes());
-        let next_secret = Zeroizing::new(<[u8; AES_256_GCM_SIV_KEY_LEN]>::from(hasher.finalize()));
+        let mut next_secret = Zeroizing::new([0_u8; AES_256_GCM_SIV_KEY_LEN]);
+        SysRng
+            .try_fill_bytes(next_secret.as_mut())
+            .map_err(|_| KeyError::Unavailable)?;
         let next_key_id = KeyId::new(format!(
             "{}-r{}",
             stable_rotation_base(&old_handle.key_id),

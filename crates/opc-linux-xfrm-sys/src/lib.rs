@@ -60,8 +60,11 @@ pub fn send_message(socket: &NetlinkSocket, payload: &[u8]) -> io::Result<usize>
 /// `recv` is called with `flags=0`. To avoid silent truncation, this wrapper
 /// passes `MSG_TRUNC` and returns an [`io::Error`] of kind
 /// [`io::ErrorKind::InvalidData`] if the real datagram length exceeds
-/// `buffer.len()`. Callers should size buffers to the largest expected XFRM
-/// message or be prepared to retry with a larger buffer.
+/// `buffer.len()`.
+///
+/// A truncation error is terminal for that datagram: `MSG_TRUNC` still consumes
+/// the message. Callers should size buffers to the largest expected XFRM
+/// response and treat truncation as an indeterminate operation result.
 pub fn receive_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<usize> {
     platform::receive_message(&socket.inner, buffer)
 }

@@ -42,6 +42,25 @@ fn session_aad() -> EnvelopeAad {
     )
 }
 
+fn config_aad_with_store_kind(store_kind: &str) -> EnvelopeAad {
+    EnvelopeAad::config(
+        tenant(),
+        7,
+        ConfigAad::new(
+            TxId::from_str("11111111-1111-4111-8111-111111111111").expect("tx id"),
+            None,
+            Timestamp::from_str("2026-05-28T08:20:00Z").expect("timestamp"),
+            "spiffe://core.example/tenant/tenant-a/ns/core/sa/config-writer/nf/amf/instance/amf-01",
+            SchemaDigest::from_str(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("schema digest"),
+            store_kind,
+        )
+        .expect("valid config aad"),
+    )
+}
+
 #[test]
 fn config_aad_serialization_is_stable() {
     let aad = config_aad();
@@ -64,6 +83,19 @@ fn session_aad_serialization_is_stable() {
         String::from_utf8(serialized).expect("utf8"),
         "{\"tenant\":\"tenant-a\",\"purpose\":\"session\",\"version\":5,\"key_id\":\"session-active-2026-01\",\"metadata\":{\"kind\":\"session\",\"nf_kind\":\"amf\",\"session_key_digest\":\"sub-a1f5f3d9\",\"state_type\":\"amf-registration-context\",\"generation\":42,\"fence\":7,\"backend_namespace\":\"regional-cache-a\"}}"
     );
+}
+
+#[test]
+fn config_kdf_context_separates_variable_length_fields() {
+    let first = config_aad_with_store_kind("ab");
+    let second = config_aad_with_store_kind("a");
+    let first_key_id = KeyId::new("c").expect("key id");
+    let second_key_id = KeyId::new("bc").expect("key id");
+
+    let (_first_salt, first_info) = first.kdf_context(&first_key_id).expect("kdf context");
+    let (_second_salt, second_info) = second.kdf_context(&second_key_id).expect("kdf context");
+
+    assert_ne!(first_info, second_info);
 }
 
 #[test]
@@ -193,6 +225,50 @@ async fn memory_provider_rotation_keeps_a_stable_base_key_id() {
 
     assert_eq!(rotated_once.as_str(), "session-active-2026-01-r1");
     assert_eq!(rotated_twice.as_str(), "session-active-2026-01-r2");
+}
+
+#[tokio::test]
+async fn memory_provider_rotation_uses_fresh_random_secret_material() {
+    let first = MemoryKeyProvider::new();
+    let second = MemoryKeyProvider::new();
+    let key_id = KeyId::new("session-active-2026-01").expect("key id");
+    let secret = Zeroizing::new([0x55; AES_256_GCM_SIV_KEY_LEN]);
+
+    first
+        .insert_active_key(
+            key_id.clone(),
+            KeyPurpose::Session,
+            tenant(),
+            secret.clone(),
+        )
+        .expect("insert first active key");
+    second
+        .insert_active_key(key_id, KeyPurpose::Session, tenant(), secret)
+        .expect("insert second active key");
+
+    let first_rotated_id = first
+        .rotate_key(KeyPurpose::Session, &tenant())
+        .await
+        .expect("rotate first provider");
+    let second_rotated_id = second
+        .rotate_key(KeyPurpose::Session, &tenant())
+        .await
+        .expect("rotate second provider");
+
+    let first_rotated = first
+        .get_key_by_id(&first_rotated_id)
+        .await
+        .expect("first rotated key");
+    let second_rotated = second
+        .get_key_by_id(&second_rotated_id)
+        .await
+        .expect("second rotated key");
+
+    assert_eq!(first_rotated_id, second_rotated_id);
+    assert_ne!(
+        first_rotated.material.bytes.as_slice(),
+        second_rotated.material.bytes.as_slice()
+    );
 }
 
 #[test]

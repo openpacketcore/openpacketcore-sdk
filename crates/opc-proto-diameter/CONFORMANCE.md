@@ -63,8 +63,11 @@ Peer helpers include:
   awareness.
 - Result-code family classification and E-bit derivation per RFC 6733 §7.2.
 - Optional answer diagnostics (`Error-Message`, raw `Failed-AVP` values).
-- Unknown AVP handling: mandatory unknown AVPs are rejected; non-mandatory
-  unknown AVPs are handled per `UnknownIePolicy` (`Drop`, `Preserve`, `Reject`).
+- Unknown AVP handling in typed peer/application parsers: mandatory unknown
+  AVPs are rejected; `Reject` also rejects non-mandatory unknown AVPs. `Drop`
+  and `Preserve` both accept non-mandatory unknown AVPs, but typed projections
+  do not retain those opaque AVPs. Use the raw AVP iterators for lossless
+  preserve/forward behavior.
 
 ### 5. Application dictionaries
 

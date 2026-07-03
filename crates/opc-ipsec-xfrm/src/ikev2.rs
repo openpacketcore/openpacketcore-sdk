@@ -381,6 +381,9 @@ pub fn build_xfrm_requests_from_ikev2_child_sa(
             mode: request.mode,
             lifetime: request.lifetime,
             replay_window: request.replay_window,
+            encap: None,
+            mark: None,
+            if_id: None,
         },
     };
     let outbound_sa = InstallSaRequest {
@@ -394,6 +397,9 @@ pub fn build_xfrm_requests_from_ikev2_child_sa(
             mode: request.mode,
             lifetime: request.lifetime,
             replay_window: request.replay_window,
+            encap: None,
+            mark: None,
+            if_id: None,
         },
     };
     let inbound_policy = InstallPolicyRequest {
@@ -407,6 +413,8 @@ pub fn build_xfrm_requests_from_ikev2_child_sa(
                 source_address: request.remote_tunnel_address,
                 mode: request.mode,
             }],
+            mark: None,
+            if_id: None,
         },
     };
     let outbound_policy = InstallPolicyRequest {
@@ -420,6 +428,8 @@ pub fn build_xfrm_requests_from_ikev2_child_sa(
                 source_address: request.local_tunnel_address,
                 mode: request.mode,
             }],
+            mark: None,
+            if_id: None,
         },
     };
 

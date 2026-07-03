@@ -11,6 +11,7 @@
 
 use crate::auth::{SbiAuth, SbiAuthContext, SbiAuthError, SbiAuthRequest, SbiPeer};
 use crate::headers::BearerToken;
+use crate::lock_or_recover;
 use crate::redact::sanitize_error_message;
 use async_trait::async_trait;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
@@ -94,7 +95,7 @@ impl JwksCache {
         let now = Instant::now();
         // 1. Check if cached and still fresh
         {
-            let lock = self.cached.lock().unwrap();
+            let lock = lock_or_recover(&self.cached);
             if let Some((ref jwks, expiry)) = *lock {
                 if now < expiry {
                     if let Some(key) = find_key_in_jwks(jwks, kid) {
@@ -109,13 +110,10 @@ impl JwksCache {
             Ok(jwks) => jwks,
             Err(e) => {
                 // Fail-closed refresh: invalidate completely if refresh fails
-                let mut lock = self.cached.lock().unwrap();
+                let mut lock = lock_or_recover(&self.cached);
                 *lock = None;
                 // Increment refresh failure metric
-                opc_redaction::metrics::METRICS
-                    .sbi_oauth_validation_total
-                    .lock()
-                    .unwrap()
+                lock_or_recover(&opc_redaction::metrics::METRICS.sbi_oauth_validation_total)
                     .entry(("error".to_string(), "jwks_refresh_failure".to_string()))
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
@@ -130,7 +128,7 @@ impl JwksCache {
             .ok_or_else(|| "signature key not found in refreshed JWKS".to_string())?;
 
         // Update cache
-        let mut lock = self.cached.lock().unwrap();
+        let mut lock = lock_or_recover(&self.cached);
         *lock = Some((jwks, now + self.ttl));
         Ok(key)
     }
@@ -241,10 +239,7 @@ impl SbiAuth for SbiJwtValidator {
                 snssai: None,
             };
             // Increment allow metric
-            opc_redaction::metrics::METRICS
-                .sbi_oauth_validation_total
-                .lock()
-                .unwrap()
+            lock_or_recover(&opc_redaction::metrics::METRICS.sbi_oauth_validation_total)
                 .entry(("allow".to_string(), "bypass_dev".to_string()))
                 .and_modify(|c| *c += 1)
                 .or_insert(1);
@@ -284,10 +279,7 @@ impl SbiAuth for SbiJwtValidator {
         let token_data =
             decode::<SvidClaims>(token.expose(), &decoding_key, &validation).map_err(|_| {
                 // Increment deny metric
-                opc_redaction::metrics::METRICS
-                    .sbi_oauth_validation_total
-                    .lock()
-                    .unwrap()
+                lock_or_recover(&opc_redaction::metrics::METRICS.sbi_oauth_validation_total)
                     .entry(("deny".to_string(), "validation_failed".to_string()))
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
@@ -339,10 +331,7 @@ impl SbiAuth for SbiJwtValidator {
                     && request.peer.nf_type.as_ref().map(|t| t.as_str()) == Some(nf_type.as_str())
                     && peer_instance.as_str() == nf_instance_id.as_str();
                 if !bound {
-                    opc_redaction::metrics::METRICS
-                        .sbi_oauth_validation_total
-                        .lock()
-                        .unwrap()
+                    lock_or_recover(&opc_redaction::metrics::METRICS.sbi_oauth_validation_total)
                         .entry(("deny".to_string(), "token_binding_mismatch".to_string()))
                         .and_modify(|c| *c += 1)
                         .or_insert(1);
@@ -353,10 +342,7 @@ impl SbiAuth for SbiJwtValidator {
                 // No transport peer identity. In production the binding cannot
                 // be verified, so fail closed; in dev/test (no mTLS) allow it.
                 if self.production_mode {
-                    opc_redaction::metrics::METRICS
-                        .sbi_oauth_validation_total
-                        .lock()
-                        .unwrap()
+                    lock_or_recover(&opc_redaction::metrics::METRICS.sbi_oauth_validation_total)
                         .entry(("deny".to_string(), "missing_peer_binding".to_string()))
                         .and_modify(|c| *c += 1)
                         .or_insert(1);
@@ -389,10 +375,7 @@ impl SbiAuth for SbiJwtValidator {
         //    operation just because the signature is valid.
         if let Some(required) = required_scope_for_path(&request.path) {
             if !scopes.iter().any(|s| s == required) {
-                opc_redaction::metrics::METRICS
-                    .sbi_oauth_validation_total
-                    .lock()
-                    .unwrap()
+                lock_or_recover(&opc_redaction::metrics::METRICS.sbi_oauth_validation_total)
                     .entry(("deny".to_string(), "insufficient_scope".to_string()))
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
@@ -403,10 +386,7 @@ impl SbiAuth for SbiJwtValidator {
         }
 
         // Increment allow metric
-        opc_redaction::metrics::METRICS
-            .sbi_oauth_validation_total
-            .lock()
-            .unwrap()
+        lock_or_recover(&opc_redaction::metrics::METRICS.sbi_oauth_validation_total)
             .entry(("allow".to_string(), "success".to_string()))
             .and_modify(|c| *c += 1)
             .or_insert(1);
@@ -485,6 +465,11 @@ pub trait TokenProvider: Send + Sync {
     async fn get_token(&self, scopes: &[String]) -> Result<BearerToken, String>;
 }
 
+#[derive(Debug, Deserialize)]
+struct TokenExpiryClaims {
+    exp: Option<u64>,
+}
+
 /// Bounded client credentials token cache
 pub struct ClientTokenCache {
     provider: Arc<dyn TokenProvider>,
@@ -503,10 +488,9 @@ impl ClientTokenCache {
     /// Create a cache with explicit bounds.
     ///
     /// `max_entries` caps how many distinct (sorted, deduplicated) scope
-    /// sets are cached; `max_token_ttl` is how long an acquired token is
-    /// served before being treated as expired — the cache does not inspect
-    /// the token's own `exp`, so keep this at or below the issuer's actual
-    /// token lifetime. Values are clamped to at least 1 entry / 1 second.
+    /// sets are cached; `max_token_ttl` caps how long an acquired token is
+    /// served even when the JWT `exp` claim is farther out. Values are
+    /// clamped to at least 1 entry / 1 second.
     pub fn new_with_bounds(
         provider: Arc<dyn TokenProvider>,
         max_entries: usize,
@@ -526,9 +510,10 @@ impl ClientTokenCache {
     /// characters, no whitespace) then sorted and deduplicated so order
     /// does not fragment the cache. A cached token is reused only while
     /// more than 30 seconds of its TTL remain, refreshing proactively
-    /// before expiry. When the cache is full an arbitrary entry is evicted
-    /// to admit the new one. Provider failures are returned as-is; nothing
-    /// stale is served.
+    /// before expiry. If the acquired token has a JWT `exp` claim, the
+    /// effective cache expiry is `min(now + max_token_ttl, exp)`. When the
+    /// cache is full the earliest-expiring entry is evicted to admit the new
+    /// one. Provider failures are returned as-is; nothing stale is served.
     pub async fn get_token(&self, scopes: &[String]) -> Result<BearerToken, String> {
         if scopes.is_empty() || scopes.len() > 32 {
             return Err("invalid token scope set".to_string());
@@ -546,7 +531,7 @@ impl ClientTokenCache {
         let now = Instant::now();
         // Check cache with a 30-second buffer
         {
-            let lock = self.cached.lock().unwrap();
+            let lock = lock_or_recover(&self.cached);
             if let Some((token, expiry)) = lock.get(&scopes_sorted) {
                 if now + Duration::from_secs(30) < *expiry {
                     return Ok(token.clone());
@@ -556,17 +541,38 @@ impl ClientTokenCache {
 
         // Fetch new token
         let token = self.provider.get_token(scopes).await?;
-        let expiry = now + self.max_token_ttl;
+        let expiry = token_cache_expiry(&token, now, self.max_token_ttl);
 
-        let mut lock = self.cached.lock().unwrap();
+        let mut lock = lock_or_recover(&self.cached);
         if lock.len() >= self.max_entries {
-            if let Some(first_key) = lock.keys().next().cloned() {
-                lock.remove(&first_key);
+            if let Some(oldest_key) = lock
+                .iter()
+                .min_by_key(|(_, (_, expiry))| *expiry)
+                .map(|(key, _)| key.clone())
+            {
+                lock.remove(&oldest_key);
             }
         }
         lock.insert(scopes_sorted, (token.clone(), expiry));
         Ok(token)
     }
+}
+
+fn token_cache_expiry(token: &BearerToken, now: Instant, max_token_ttl: Duration) -> Instant {
+    let max_expiry = now + max_token_ttl;
+    let Ok(token_data) =
+        jsonwebtoken::dangerous::insecure_decode::<TokenExpiryClaims>(token.expose())
+    else {
+        return max_expiry;
+    };
+    let Some(exp) = token_data.claims.exp else {
+        return max_expiry;
+    };
+    let current = jsonwebtoken::get_current_timestamp();
+    if exp <= current {
+        return now;
+    }
+    now + Duration::from_secs(exp - current).min(max_token_ttl)
 }
 
 #[cfg(test)]
@@ -577,6 +583,7 @@ mod tests {
         generate_test_token_with_nbf_offset, test_private_key_pem, MockJwksResolver, TokenFixtures,
         TEST_KID, TEST_MODULUS_N,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     const AUD: &str = "amf-audience";
@@ -621,6 +628,43 @@ mod tests {
             true,
             false,
         )
+    }
+
+    struct CountingTokenProvider {
+        calls: Arc<AtomicUsize>,
+        expire_in_secs: i64,
+    }
+
+    #[async_trait::async_trait]
+    impl TokenProvider for CountingTokenProvider {
+        async fn get_token(&self, _scopes: &[String]) -> Result<BearerToken, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let token = generate_test_token_with_nbf_offset(
+                SUB,
+                AUD,
+                ISS,
+                Some("nnrf-nfm".to_string()),
+                self.expire_in_secs,
+                -10,
+            );
+            BearerToken::new(token).map_err(|error| error.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn client_token_cache_uses_jwt_exp_refresh_window() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingTokenProvider {
+            calls: calls.clone(),
+            expire_in_secs: 20,
+        });
+        let cache = ClientTokenCache::new_with_bounds(provider, 8, Duration::from_secs(300));
+        let scopes = vec!["nnrf-nfm".to_string()];
+
+        let _ = cache.get_token(&scopes).await.unwrap();
+        let _ = cache.get_token(&scopes).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

@@ -318,6 +318,11 @@ impl Supervisor {
         heartbeat::check_heartbeats_impl(self).await;
     }
 
+    /// Start a background heartbeat monitor independent of readiness polling.
+    pub(crate) fn start_heartbeat_monitor(&self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(heartbeat::monitor_heartbeats_impl(self.clone()))
+    }
+
     /// Get aggregated readiness for health probes.
     pub async fn readiness(&self) -> Readiness {
         self.check_heartbeats().await;

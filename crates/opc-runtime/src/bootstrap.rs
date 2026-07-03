@@ -1,6 +1,7 @@
 //! Bootstrap — CLI/env/profile loading per RFC 008 section 13.
 
 use crate::profile::{RuntimeMode, RuntimeProfile};
+use std::io;
 use std::sync::{Mutex, Once, OnceLock};
 use thiserror::Error;
 
@@ -154,9 +155,12 @@ impl BootstrapConfig {
         }
 
         if let Some(instance_id) = get_var("INSTANCE_ID") {
-            if let Ok(uuid) = instance_id.parse() {
-                config.profile.instance_id = uuid;
-            }
+            config.profile.instance_id = instance_id.parse().map_err(|err| {
+                env_parse_error(
+                    "INSTANCE_ID",
+                    format!("must be a UUID; got {instance_id:?}: {err}"),
+                )
+            })?;
         }
 
         if let Some(mode) = get_var("RUNTIME_MODE") {
@@ -166,7 +170,12 @@ impl BootstrapConfig {
                 "production" => RuntimeMode::Production,
                 "conformance" => RuntimeMode::Conformance,
                 "perf" => RuntimeMode::Perf,
-                _ => RuntimeMode::Production,
+                _ => {
+                    return Err(env_parse_error(
+                        "RUNTIME_MODE",
+                        format!("unsupported mode {mode:?}"),
+                    ));
+                }
             };
         }
 
@@ -206,6 +215,13 @@ impl BootstrapConfig {
         }
         Ok(())
     }
+}
+
+fn env_parse_error(var: &'static str, message: String) -> BootstrapError {
+    BootstrapError::Env(Box::new(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{var} {message}"),
+    )))
 }
 
 /// Install the panic hook with redaction per RFC 008 section 12.1.
@@ -404,13 +420,8 @@ mod tests {
         let config_invalid_uuid = BootstrapConfig::from_env_with(|key| match key {
             "INSTANCE_ID" => Some("not-a-uuid".to_string()),
             _ => None,
-        })
-        .unwrap();
-        assert_ne!(
-            config_invalid_uuid.profile.instance_id.to_string(),
-            "not-a-uuid"
-        );
-        assert!(!config_invalid_uuid.profile.instance_id.is_nil());
+        });
+        assert!(matches!(config_invalid_uuid, Err(BootstrapError::Env(_))));
 
         let config_remote = BootstrapConfig::from_env_with(|key| match key {
             "CONFIG_SOURCE" => Some("https://bootstrap.example.net/config".to_string()),
@@ -446,9 +457,8 @@ mod tests {
         let config_unrecognized = BootstrapConfig::from_env_with(|key| match key {
             "RUNTIME_MODE" => Some("invalid-mode-name".to_string()),
             _ => None,
-        })
-        .unwrap();
-        assert_eq!(config_unrecognized.profile.mode, RuntimeMode::Production);
+        });
+        assert!(matches!(config_unrecognized, Err(BootstrapError::Env(_))));
     }
 
     #[test]

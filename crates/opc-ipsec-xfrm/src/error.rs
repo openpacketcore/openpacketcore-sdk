@@ -45,6 +45,13 @@ pub enum XfrmError {
         /// Captured I/O error kind.
         kind: io::ErrorKind,
     },
+    /// A request was sent, but the ACK was not observed, so kernel state may
+    /// already have changed.
+    #[error("XFRM {operation} outcome is indeterminate")]
+    StateIndeterminate {
+        /// Stable operation label.
+        operation: &'static str,
+    },
     /// The requested SA or policy was not found.
     #[error("XFRM state not found")]
     NotFound,
@@ -115,6 +122,15 @@ mod tests {
         let source = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
         let err = XfrmError::io("netlink_send", source);
         assert_eq!(err.io_kind(), Some(io::ErrorKind::PermissionDenied));
+    }
+
+    #[test]
+    fn state_indeterminate_display_is_safe() {
+        let err = XfrmError::StateIndeterminate {
+            operation: "install_sa",
+        };
+
+        assert_eq!(err.to_string(), "XFRM install_sa outcome is indeterminate");
     }
 
     #[test]

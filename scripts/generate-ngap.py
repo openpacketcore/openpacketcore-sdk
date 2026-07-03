@@ -9,6 +9,7 @@ Requires `rasn_compiler_cli` (cargo install rasn-compiler --features cli).
 """
 
 import argparse
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -28,14 +29,35 @@ ASN_FILES = [
     "NGAP-PDU-Descriptions.asn",
 ]
 PINNED_WIRESHARK_SHA = "d296f939b42891994714939384adc3deaef3f180"
+EXPECTED_ASN_SHA256 = {
+    "NGAP-CommonDataTypes.asn": "03b1692171ec9f3c999a444eae6f82e4b10f9c02d8d81b5765dd67dbe6ce1b6c",
+    "NGAP-Constants.asn": "bcd1e18bd11a40e805c25c4b54a8b7cd2fa963e452d690f2afb6219d8d202d2f",
+    "NGAP-Containers.asn": "69a44bef80e3f720b6e89d5c8f97507b5a062bb5da7de19e8cfc8a5710766a48",
+    "NGAP-IEs.asn": "b9b0e24422c1c23dbbe7495fda56dd10b0f79e43bd86350319091e15b6ced90b",
+    "NGAP-PDU-Contents.asn": "0d620cbd5fec5ba2c54a222e1b4a483cdeb5fad549ac0aaf71ae69a8b29c0d5a",
+    "NGAP-PDU-Descriptions.asn": "9d37156b97c412468420b2682761f4ebd216d30c972a334eb70e66385413ef82",
+}
+
+
+def verify_asn(name: str, data: bytes) -> None:
+    expected = EXPECTED_ASN_SHA256.get(name)
+    if expected is None:
+        raise SystemExit(f"error: missing expected SHA-256 for {name}")
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected:
+        raise SystemExit(
+            f"error: hash mismatch for {name}: expected {expected}, got {actual}"
+        )
 
 
 def fetch_asn(sha: str, out_dir: Path) -> None:
     for name in ASN_FILES:
         url = f"{WIRESHARK_BASE.format(sha=sha)}/{name}"
         dest = out_dir / name
-        with urllib.request.urlopen(url) as resp, dest.open("wb") as f:
-            f.write(resp.read())
+        with urllib.request.urlopen(url) as resp:
+            data = resp.read()
+        verify_asn(name, data)
+        dest.write_bytes(data)
 
 
 def run_compiler(asn_dir: Path, output: Path) -> None:
@@ -65,18 +87,28 @@ def patch_generated(source: Path) -> str:
 
     # rasn-compiler 0.16 omits PrivateIEID and ProtocolExtensionID imports in
     # ngap_pdu_contents and ngap_ies. Add them so the generated bindings compile.
-    text = text.replace(
+    text = replace_required(
+        text,
         "use super::ngap_common_data_types::{Criticality, Presence, ProtocolIEID};",
         "use super::ngap_common_data_types::{Criticality, Presence, PrivateIEID, ProtocolIEID};",
+        "ngap_pdu_contents PrivateIEID import",
     )
-    text = text.replace(
+    text = replace_required(
+        text,
         "use super::ngap_common_data_types::{\n        Criticality, ProcedureCode, ProtocolIEID, TriggeringMessage,\n    };",
         "use super::ngap_common_data_types::{\n        Criticality, Presence, PrivateIEID, ProcedureCode, ProtocolExtensionID, ProtocolIEID,\n        TriggeringMessage,\n    };",
+        "ngap_ies private/protocol extension imports",
     )
 
     # Allow clippy and missing-docs lints in generated code.
     text = '#![allow(clippy::all, missing_docs)]\n\n' + text
     return text
+
+
+def replace_required(text: str, old: str, new: str, label: str) -> str:
+    if old not in text:
+        raise SystemExit(f"error: generated patch did not match: {label}")
+    return text.replace(old, new)
 
 
 def main() -> int:

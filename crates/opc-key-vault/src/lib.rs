@@ -38,6 +38,7 @@ pub struct VaultKeyProvider {
     base_url: Arc<Url>,
     token: Arc<String>,
     mount_path: Arc<String>,
+    allow_insecure_http: bool,
 }
 
 #[derive(Deserialize)]
@@ -62,13 +63,28 @@ impl VaultKeyProvider {
     /// `base_url` must point to the Vault API root (e.g. `https://vault:8200`).
     /// `token` is the Vault token used as `X-Vault-Token`.
     /// `mount_path` is the Transit mount path (e.g. `transit`).
+    ///
+    /// Non-HTTPS URLs are rejected before any token-bearing request is sent.
+    /// Tests using local HTTP mocks must opt in with
+    /// [`VaultKeyProvider::dangerous_allow_insecure_http`].
     pub fn new(base_url: impl Into<Url>, token: String, mount_path: String) -> Self {
         Self {
             client: reqwest::Client::new(),
             base_url: Arc::new(base_url.into()),
             token: Arc::new(token),
             mount_path: Arc::new(mount_path),
+            allow_insecure_http: false,
         }
+    }
+
+    /// Permit cleartext HTTP requests.
+    ///
+    /// This is intended only for local mock Vault servers in tests. Production
+    /// deployments should use HTTPS so `X-Vault-Token` is not exposed on the
+    /// network.
+    pub fn dangerous_allow_insecure_http(mut self) -> Self {
+        self.allow_insecure_http = true;
+        self
     }
 
     /// Authenticate using the Kubernetes auth method.
@@ -76,6 +92,10 @@ impl VaultKeyProvider {
     /// Replaces the stored token with the client token returned by Vault.
     #[cfg(feature = "k8s-auth")]
     pub async fn with_kubernetes_auth(mut self, role: &str, jwt: &str) -> Result<Self, VaultError> {
+        if !self.base_url_is_secure() {
+            return Err(VaultError::InvalidUrl);
+        }
+
         let url = self
             .base_url
             .join("v1/auth/kubernetes/login")
@@ -115,6 +135,19 @@ impl VaultKeyProvider {
         Ok(self)
     }
 
+    fn base_url_is_secure(&self) -> bool {
+        self.base_url.scheme() == "https" || self.allow_insecure_http
+    }
+
+    fn ensure_secure_base_url(&self) -> Result<(), KeyError> {
+        if self.base_url_is_secure() {
+            return Ok(());
+        }
+
+        error!("vault base URL must use https unless insecure HTTP is explicitly enabled");
+        Err(KeyError::Unavailable)
+    }
+
     fn key_name(purpose: KeyPurpose, tenant: &TenantId) -> String {
         format!("{}_{}", tenant.as_str(), purpose.as_str())
     }
@@ -124,6 +157,8 @@ impl VaultKeyProvider {
         path: &str,
         body: &B,
     ) -> Result<T, KeyError> {
+        self.ensure_secure_base_url()?;
+
         let url = self.base_url.join(path).map_err(|_| {
             error!("invalid vault request path");
             KeyError::Unavailable
@@ -178,7 +213,8 @@ impl VaultKeyProvider {
             )
             .await?;
 
-        let material = decode_material(&body.data.plaintext)?;
+        let plaintext = Zeroizing::new(body.data.plaintext);
+        let material = decode_material(&plaintext)?;
         let key_id = wrapped_key_id(&key_name, &body.data.ciphertext)?;
         Ok((key_id, material))
     }
@@ -200,7 +236,8 @@ impl VaultKeyProvider {
             )
             .await?;
 
-        decode_material(&body.data.plaintext)
+        let plaintext = Zeroizing::new(body.data.plaintext);
+        decode_material(&plaintext)
     }
 }
 
@@ -323,6 +360,9 @@ impl KeyProvider for VaultKeyProvider {
 
     #[instrument(level = "debug", skip(self), fields(tenant = %tenant, purpose = %purpose))]
     async fn rotate_key(&self, purpose: KeyPurpose, tenant: &TenantId) -> Result<KeyId, KeyError> {
+        self.ensure_secure_base_url()
+            .map_err(|_| KeyError::RotationFailed)?;
+
         let key_name = Self::key_name(purpose, tenant);
 
         // Rotate the wrapping key in Transit, then mint a fresh data key under
@@ -366,6 +406,21 @@ mod tests {
         assert_eq!(name, "tenant-a_config");
         assert_eq!(purpose, KeyPurpose::Config);
         assert_eq!(tenant.as_str(), "tenant-a");
+        assert_eq!(recovered, ciphertext);
+    }
+
+    #[test]
+    fn wrapped_key_id_accepts_long_tenant_names() {
+        let wrapped = [0x5a_u8; 60];
+        let ciphertext = format!("vault:v3:{}", B64_STD.encode(wrapped));
+        let tenant = "very-long-enterprise-tenant-name-emea-prod";
+        let key_name = format!("{tenant}_config");
+        let key_id = wrapped_key_id(&key_name, &ciphertext).expect("long vault key id");
+
+        assert!(key_id.as_str().len() > 128);
+        let (_name, _purpose, parsed_tenant, recovered) =
+            parse_wrapped_key_id(&key_id).expect("parse long vault key id");
+        assert_eq!(parsed_tenant.as_str(), tenant);
         assert_eq!(recovered, ciphertext);
     }
 
