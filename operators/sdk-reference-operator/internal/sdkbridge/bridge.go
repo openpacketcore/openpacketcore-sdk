@@ -26,14 +26,7 @@ type Bridge struct {
 func NewBridge() (*Bridge, error) {
 	cliPath := os.Getenv("OPERATOR_LIFECYCLE_CLI_PATH")
 	if cliPath == "" {
-		candidates := []string{
-			"operator-lifecycle-cli",
-			"../../target/debug/operator-lifecycle-cli",
-			"../../../target/debug/operator-lifecycle-cli",
-			"../../../../target/debug/operator-lifecycle-cli",
-			"target/debug/operator-lifecycle-cli",
-		}
-		for _, cand := range candidates {
+		for _, cand := range lifecycleCliCandidates() {
 			path := cand
 			if cand != "operator-lifecycle-cli" {
 				if abs, err := filepath.Abs(path); err == nil {
@@ -55,6 +48,19 @@ func NewBridge() (*Bridge, error) {
 		return nil, err
 	}
 	return &Bridge{CliPath: cliPath, client: c}, nil
+}
+
+func lifecycleCliCandidates() []string {
+	candidates := []string{"operator-lifecycle-cli"}
+	if targetDir := os.Getenv("CARGO_TARGET_DIR"); targetDir != "" {
+		candidates = append(candidates, filepath.Join(targetDir, "debug", "operator-lifecycle-cli"))
+	}
+	return append(candidates,
+		"../../target/debug/operator-lifecycle-cli",
+		"../../../target/debug/operator-lifecycle-cli",
+		"../../../../target/debug/operator-lifecycle-cli",
+		"target/debug/operator-lifecycle-cli",
+	)
 }
 
 // CallCLI executes the Rust CLI for a given subcommand, feeding input and reading output.

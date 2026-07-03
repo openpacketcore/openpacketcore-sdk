@@ -614,9 +614,10 @@ fn parse_data_node(
     inherited_config: bool,
 ) -> Result<Vec<SchemaNode>, Diagnostic> {
     let name = required_argument(statement, statement.keyword.as_str())?;
+    let qualified_name = format!("{module_prefix}:{name}");
     let path = match parent_path {
-        Some(parent) => format!("{parent}/{name}"),
-        None => format!("/{module_prefix}:{name}"),
+        Some(parent) => format!("{parent}/{qualified_name}"),
+        None => format!("/{qualified_name}"),
     };
     let kind = match statement.keyword.as_str() {
         "container" => SchemaNodeKind::Container,

@@ -831,24 +831,25 @@ fn module_registry() -> ModuleRegistry {
 
 fn allow_all_read_subscribe_policy() -> NacmPolicy {
     let modules = module_registry();
-    NacmPolicy::builder(opc_nacm::PolicyVersion::new(1))
-        .add_rule(NacmRule::allow(
-            NacmAction::Read,
-            YangPathPattern::parse("/ex:system", &modules).expect("read root"),
-        ))
-        .add_rule(NacmRule::allow(
-            NacmAction::Read,
-            YangPathPattern::parse("/ex:system/**", &modules).expect("read subtree"),
-        ))
-        .add_rule(NacmRule::allow(
-            NacmAction::Subscribe,
-            YangPathPattern::parse("/ex:system", &modules).expect("subscribe root"),
-        ))
-        .add_rule(NacmRule::allow(
-            NacmAction::Subscribe,
-            YangPathPattern::parse("/ex:system/**", &modules).expect("subscribe subtree"),
-        ))
-        .build()
+    let mut builder = NacmPolicy::builder(opc_nacm::PolicyVersion::new(1));
+    for action in [
+        NacmAction::Read,
+        NacmAction::Subscribe,
+        NacmAction::Update,
+        NacmAction::Replace,
+        NacmAction::Delete,
+    ] {
+        builder = builder
+            .add_rule(NacmRule::allow(
+                action,
+                YangPathPattern::parse("/ex:system", &modules).expect("root"),
+            ))
+            .add_rule(NacmRule::allow(
+                action,
+                YangPathPattern::parse("/ex:system/**", &modules).expect("subtree"),
+            ));
+    }
+    builder.build()
 }
 
 fn deny_hostname_read_subscribe_policy() -> NacmPolicy {

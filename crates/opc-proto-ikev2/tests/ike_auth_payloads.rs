@@ -3,7 +3,8 @@ use opc_proto_ikev2::{
     build_ike_auth_cleartext_payload_chain, build_ike_auth_configuration_payload,
     build_ike_auth_identification_payload, build_ike_auth_sa_payload,
     build_ike_auth_traffic_selector_payload, compute_ike_auth_shared_key_mic,
-    decode_ike_auth_cleartext_payloads, derive_ike_sa_init_key_material, negotiate_child_sa,
+    decode_ike_auth_cleartext_payloads, derive_ike_sa_init_key_material,
+    ike_auth_shared_key_authentication_payload_body_len, negotiate_child_sa,
     verify_ike_auth_shared_key_mic, Ikev2AuthenticationPayloadBuild, Ikev2ChildSaNegotiationError,
     Ikev2ChildSaNegotiationPolicy, Ikev2ChildSaTransformRequirement,
     Ikev2ConfigurationAttributeBuild, Ikev2ConfigurationPayloadBuild, Ikev2DhGroup,
@@ -101,6 +102,28 @@ fn key_material() -> Ikev2SaInitKeyMaterial {
         None,
     )
     .expect("key material")
+}
+
+#[test]
+fn shared_key_auth_payload_length_helper_matches_builder() {
+    for profile in [
+        profile(),
+        Ikev2SaInitCryptoProfile::new(
+            Ikev2PrfAlgorithm::HmacSha2_384,
+            Ikev2DhGroup::Ecp384,
+            Ikev2EncryptionAlgorithm::AesGcm16_256,
+        ),
+    ] {
+        let auth_body = build_ike_auth_authentication_payload(&Ikev2AuthenticationPayloadBuild {
+            auth_method: IKEV2_AUTH_METHOD_SHARED_KEY_MIC,
+            auth_data: vec![0u8; profile.prf().output_len()],
+        })
+        .expect("AUTH build");
+        assert_eq!(
+            ike_auth_shared_key_authentication_payload_body_len(profile),
+            auth_body.len()
+        );
+    }
 }
 
 #[test]

@@ -53,6 +53,12 @@ pub enum MockOperation {
         crypt_algo: Option<String>,
         /// Encryption key length in bytes.
         crypt_key_len: usize,
+        /// AEAD algorithm name, if present.
+        aead_algo: Option<String>,
+        /// AEAD ICV length in bits, if present.
+        aead_icv_len_bits: Option<u32>,
+        /// AEAD key length in bytes.
+        aead_key_len: usize,
         /// XFRM mode.
         mode: XfrmMode,
         /// Lifetime limits.
@@ -82,6 +88,12 @@ pub enum MockOperation {
         crypt_algo: Option<String>,
         /// Encryption key length in bytes.
         crypt_key_len: usize,
+        /// AEAD algorithm name, if present.
+        aead_algo: Option<String>,
+        /// AEAD ICV length in bits, if present.
+        aead_icv_len_bits: Option<u32>,
+        /// AEAD key length in bytes.
+        aead_key_len: usize,
         /// XFRM mode.
         mode: XfrmMode,
         /// Lifetime limits.
@@ -316,6 +328,22 @@ impl XfrmBackend for MockXfrmBackend {
                 .as_ref()
                 .map(|(_, k)| k.len())
                 .unwrap_or(0),
+            aead_algo: request
+                .parameters
+                .aead
+                .as_ref()
+                .map(|(a, _)| a.name.clone()),
+            aead_icv_len_bits: request
+                .parameters
+                .aead
+                .as_ref()
+                .map(|(a, _)| a.icv_len_bits),
+            aead_key_len: request
+                .parameters
+                .aead
+                .as_ref()
+                .map(|(_, k)| k.len())
+                .unwrap_or(0),
             mode: request.parameters.mode,
             lifetime: request.parameters.lifetime,
             replay_window: request.parameters.replay_window,
@@ -359,6 +387,22 @@ impl XfrmBackend for MockXfrmBackend {
             crypt_key_len: request
                 .parameters
                 .crypt
+                .as_ref()
+                .map(|(_, k)| k.len())
+                .unwrap_or(0),
+            aead_algo: request
+                .parameters
+                .aead
+                .as_ref()
+                .map(|(a, _)| a.name.clone()),
+            aead_icv_len_bits: request
+                .parameters
+                .aead
+                .as_ref()
+                .map(|(a, _)| a.icv_len_bits),
+            aead_key_len: request
+                .parameters
+                .aead
                 .as_ref()
                 .map(|(_, k)| k.len())
                 .unwrap_or(0),
@@ -443,9 +487,9 @@ impl XfrmBackend for MockXfrmBackend {
 mod tests {
     use super::*;
     use crate::model::{
-        Algorithm, AuthAlgorithm, IpAddress, KeyMaterial, LifetimeConfig, PolicyParameters,
-        SaParameters, XfrmAction, XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmMode,
-        XfrmSelector, XfrmTemplate,
+        AeadAlgorithm, Algorithm, AuthAlgorithm, IpAddress, KeyMaterial, LifetimeConfig,
+        PolicyParameters, SaParameters, XfrmAction, XfrmBackendKind, XfrmCapability, XfrmDirection,
+        XfrmId, XfrmMode, XfrmSelector, XfrmTemplate,
     };
 
     fn ipv4(a: u8, b: u8, c: u8, d: u8) -> IpAddress {
@@ -470,6 +514,7 @@ mod tests {
                 KeyMaterial::new(vec![0xab; 32]),
             )),
             crypt: Some((Algorithm::new("aes-cbc"), KeyMaterial::new(vec![0xcd; 32]))),
+            aead: None,
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),
             replay_window: 32,
@@ -533,6 +578,9 @@ mod tests {
             auth_key_len: 32,
             crypt_algo: Some("aes-cbc".to_string()),
             crypt_key_len: 32,
+            aead_algo: None,
+            aead_icv_len_bits: None,
+            aead_key_len: 0,
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),
             replay_window: 32,
@@ -551,10 +599,54 @@ mod tests {
             auth_key_len: 32,
             crypt_algo: Some("aes-cbc".to_string()),
             crypt_key_len: 32,
+            aead_algo: None,
+            aead_icv_len_bits: None,
+            aead_key_len: 0,
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),
             replay_window: 32,
         }
+    }
+
+    #[tokio::test]
+    async fn mock_install_sa_records_aead_summary_without_key_bytes() {
+        let backend = MockXfrmBackend::new();
+        let mut params = sample_sa_parameters();
+        params.auth = None;
+        params.crypt = None;
+        params.aead = Some((
+            AeadAlgorithm::new("rfc4106(gcm(aes))", 128),
+            KeyMaterial::new(vec![0xcd; 36]),
+        ));
+
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: params.clone(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend.operations(),
+            vec![MockOperation::InstallSa {
+                selector: params.selector,
+                source_address: params.source_address,
+                destination: params.id.destination,
+                spi: params.id.spi,
+                protocol: params.id.protocol,
+                auth_algo: None,
+                auth_truncation_len_bits: None,
+                auth_key_len: 0,
+                crypt_algo: None,
+                crypt_key_len: 0,
+                aead_algo: Some("rfc4106(gcm(aes))".to_string()),
+                aead_icv_len_bits: Some(128),
+                aead_key_len: 36,
+                mode: XfrmMode::Tunnel,
+                lifetime: LifetimeConfig::default(),
+                replay_window: 32,
+            }]
+        );
     }
 
     #[tokio::test]

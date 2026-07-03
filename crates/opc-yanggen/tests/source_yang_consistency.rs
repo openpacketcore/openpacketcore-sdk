@@ -189,7 +189,7 @@ fn source_yang_ingests_and_validates_successfully() {
     let peer = input
         .nodes
         .iter()
-        .find(|node| node.path == "/test:system/peer")
+        .find(|node| node.path == "/test:system/test:peer")
         .expect("peer list should be present");
     assert_eq!(peer.kind, SchemaNodeKind::List);
     assert_eq!(peer.key_leaves, vec!["name"]);
@@ -198,14 +198,14 @@ fn source_yang_ingests_and_validates_successfully() {
     let uptime = input
         .nodes
         .iter()
-        .find(|node| node.path == "/test:system/state/uptime")
+        .find(|node| node.path == "/test:system/test:state/test:uptime")
         .expect("state leaf should be present");
     assert!(!uptime.config);
 
     let secret = input
         .nodes
         .iter()
-        .find(|node| node.path == "/test:system/secret")
+        .find(|node| node.path == "/test:system/test:secret")
         .expect("secret leaf should be present");
     assert_eq!(secret.data_class.as_deref(), Some("security-secret"));
 }
@@ -218,7 +218,7 @@ fn source_yang_ingests_enumeration_type_metadata() {
     let mode = input
         .nodes
         .iter()
-        .find(|node| node.path == "/test:system/mode")
+        .find(|node| node.path == "/test:system/test:mode")
         .expect("mode leaf should be present");
 
     match &mode.type_ref {
@@ -243,7 +243,7 @@ fn source_yang_ingests_numeric_range_metadata() {
     let checkpoint = input
         .nodes
         .iter()
-        .find(|node| node.path == "/test:system/checkpoint-interval-ms")
+        .find(|node| node.path == "/test:system/test:checkpoint-interval-ms")
         .expect("ranged leaf should be present");
 
     assert!(matches!(
@@ -262,7 +262,7 @@ fn source_yang_numeric_range_mismatch_rejects() {
     let checkpoint = input
         .nodes
         .iter_mut()
-        .find(|node| node.path == "/test:system/checkpoint-interval-ms")
+        .find(|node| node.path == "/test:system/test:checkpoint-interval-ms")
         .expect("ranged leaf should be present");
     checkpoint.numeric_range[0].min = 2;
 
@@ -295,7 +295,7 @@ fn missing_node_rejects() {
     let mut input = base_input();
     input
         .nodes
-        .retain(|node| node.path != "/test:system/peer/port");
+        .retain(|node| node.path != "/test:system/test:peer/test:port");
 
     assert_source_mismatch(&input);
 }
@@ -306,7 +306,7 @@ fn list_key_mismatch_rejects() {
     let peer = input
         .nodes
         .iter_mut()
-        .find(|node| node.path == "/test:system/peer")
+        .find(|node| node.path == "/test:system/test:peer")
         .expect("peer list should be present");
     peer.key_leaves = vec!["port".to_string()];
 
@@ -323,7 +323,7 @@ fn child_path_mismatch_rejects() {
         .expect("system container should be present");
     system
         .child_paths
-        .retain(|path| path != "/test:system/secret");
+        .retain(|path| path != "/test:system/test:secret");
 
     assert_source_mismatch(&input);
 }

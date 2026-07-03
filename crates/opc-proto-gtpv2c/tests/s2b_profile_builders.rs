@@ -10,7 +10,7 @@ use opc_proto_gtpv2c::{
     S2bCreateSessionRequest, S2bDeleteSessionRequest, S2bDeleteSessionResponse, S2bMessage,
     S2bModifyBearerRequest, S2bModifyBearerResponse, S2bProfileBuildError, S2bUpdateBearerRequest,
     S2bUpdateBearerResponse, SelectionMode, SelectionModeValue, ServingNetwork, TbcdDigits,
-    TypedIe, TypedIeValue,
+    TypedIe, TypedIeValue, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_protocol::{DecodeContext, DecodeErrorCode, Encode, EncodeContext, ValidationLevel};
 
@@ -54,6 +54,26 @@ fn bearer_context(ebi: u8) -> BearerContext<'static> {
             instance: 0,
             value: TypedIeValue::EpsBearerId(EpsBearerId { value: ebi }),
         }],
+    }
+}
+
+fn accepted_bearer_context(ebi: u8, teid: u32) -> BearerContext<'static> {
+    BearerContext {
+        members: vec![
+            TypedIe {
+                instance: 0,
+                value: TypedIeValue::EpsBearerId(EpsBearerId { value: ebi }),
+            },
+            TypedIe {
+                instance: 0,
+                value: TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid {
+                    interface_type: INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+                    teid,
+                    ipv4: Some([198, 51, 100, 9]),
+                    ipv6: None,
+                }),
+            },
+        ],
     }
 }
 
@@ -148,7 +168,7 @@ fn create_session_response_builders_project_stable_summaries() {
         sequence_number: 0x010204,
         response_teid: 0x5566_7788,
         sender_f_teid: sender_f_teid(0x2030_4050),
-        bearer_context: bearer_context(6),
+        bearer_context: accepted_bearer_context(6, 0x1122_3344),
         additional_ies: Vec::new(),
     })
     .expect("accepted response builds");
@@ -166,6 +186,12 @@ fn create_session_response_builders_project_stable_summaries() {
     };
     assert_eq!(accepted_summary.response_teid, 0x5566_7788);
     assert_eq!(accepted_summary.bearer_ebi.value, 6);
+    assert_eq!(
+        accepted_summary.bearer_user_plane_f_teid.interface_type,
+        INTERFACE_TYPE_S2B_U_PGW_GTP_U
+    );
+    assert_eq!(accepted_summary.bearer_user_plane_f_teid.teid, 0x1122_3344);
+    assert_eq!(accepted_summary.paa, None);
 
     let rejected = s2b_create_session_rejected_response(S2bCreateSessionRejectedResponse {
         sequence_number: 0x010205,

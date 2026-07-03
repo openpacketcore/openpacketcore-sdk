@@ -35,10 +35,10 @@ Validated gates for this pass:
 - `cargo test --workspace`
 - `cargo test --workspace --all-features`
 
-> **Note:** The later `T-8c57ecee` final-hardening pass (see below) could not
-> re-run the full `cargo test --workspace` / `--all-features` suites in the
-> restricted worker pane because the sandbox denies AF_UNIX socket creation.
-> Those test gates are recorded as deferred for `T-8c57ecee`.
+> **Note:** The later `T-8c57ecee` final-hardening pass (see below) re-ran the
+> workspace all-features tests as
+> `cargo test --workspace --exclude opc-persist --all-features -- --test-threads=4`
+> plus `cargo test -p opc-persist --all-features -- --test-threads=1`.
 
 The current branch has closed the P0 Rust SDK production-readiness blockers
 tracked in the gap registry below.
@@ -95,37 +95,40 @@ The pass keeps the ADR 0018 boundary explicit:
 
 No final-hardening candidate remains open in the triage ledger; downstream
 ePDG adapter and carrier-acceptance work remains outside this SDK matrix.
-Final validation for this snapshot is **not complete**: the three gate classes
-below are deferred because the worker pane cannot provide AF_UNIX sockets, the
-required Go 1.26.4 toolchain, or a `cargo-deny`-compatible advisory database.
-They are explicitly supervisor-waived for this readiness snapshot only and must
-be satisfied before any production/carrier-acceptance claim.
+Final validation for this snapshot is **not complete**: the remaining deferred
+gate below is blocked by a `cargo-deny` advisory database/tooling compatibility
+issue. It is explicitly supervisor-waived for this readiness snapshot only and
+must be satisfied before any production/carrier-acceptance claim.
 
 ### Deferred/waived final-validation gates
 
 The following gates are **deferred (environment-limited), supervisor-waived**
 for this readiness snapshot. Evidence source: supervisor decision by
-`claude-supervisor` recorded for `T-8c57ecee`. The deferrals are due to
+`claude-supervisor` recorded for `T-8c57ecee`. The deferral is due to
 environment limitations in the worker pane, not code defects.
+
+Go operator verification was re-run on July 3, 2026 with Go 1.26.4 for both
+`operators/sdk-reference-operator` and `operators/operator-sdk-go`: `gofmt -l`,
+`go vet ./...`, `go test ./...`, `go test -race ./...`, and `govulncheck ./...`
+passed. The reusable Go SDK downstream-import smoke also passed through the
+local `go.work` fixture.
 
 | Gate | Status | Evidence / limitation |
 |:---|:---|:---|
-| Workspace tests that create AF_UNIX sockets (e.g., `cargo test --workspace --all-features`) | Deferred (environment-limited), supervisor-waived | The sandbox denies AF_UNIX socket creation, so any test that binds a Unix-domain socket fails before asserting behavior. |
-| Go operator verification: `gofmt`, `go vet`, `go test`, and `govulncheck` under `operators/sdk-reference-operator` and `operators/operator-sdk-go` | Deferred (environment-limited), supervisor-waived | Go 1.26.4 is unavailable under the network-restricted `GOTOOLCHAIN` setting in this pane. |
 | `cargo deny check advisories` | Deferred (environment-limited), supervisor-waived | The installed `cargo-deny` 0.17.0 cannot parse a CVSS 4.0 entry in the cached advisory database (`RUSTSEC-2026-0146`), so the advisories check fails before scanning the local lockfile. `cargo audit --no-fetch` of the same lockfile passes. |
 
-These deferred gates must be re-run in a CI/dev environment that supports
-AF_UNIX socket creation, Go 1.26.4, and the required `cargo-deny`/advisory-db
-version before the initiative merges to `main` or before any
-production/carrier-acceptance readiness claim.
+This deferred gate must be re-run in a CI/dev environment with the required
+`cargo-deny`/advisory-db version before the initiative merges to `main` or
+before any production/carrier-acceptance readiness claim.
 
 The gates that passed in this pane and remain recorded as evidence are:
 `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
 MSRV check (`cargo +1.88 check --workspace --all-targets --all-features`),
-`cargo audit --no-fetch`, `cargo deny check bans` / `licenses` / `sources`, docs
-consistency, Kustomize/Helm rendering, and the Rust-side operator-lifecycle CLI
-tests.
+`cargo audit --no-fetch`, `cargo deny check bans` / `licenses` / `sources`,
+split workspace all-features tests, docs consistency, Kustomize/Helm rendering,
+Rust-side operator-lifecycle CLI tests, and the Go operator verification listed
+above.
 
 ---
 

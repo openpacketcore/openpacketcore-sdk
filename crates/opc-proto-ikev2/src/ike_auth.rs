@@ -774,6 +774,17 @@ pub fn build_ike_auth_authentication_payload(
     Ok(out)
 }
 
+/// Returns the IKE_AUTH shared-key AUTH payload body length for `profile`.
+///
+/// This is a keying-material-free sizing helper for callers that must construct
+/// an outer `SK` associated-data prefix before sealing. It is exactly the fixed
+/// AUTH body header plus the negotiated PRF output length.
+pub const fn ike_auth_shared_key_authentication_payload_body_len(
+    profile: Ikev2SaInitCryptoProfile,
+) -> usize {
+    AUTH_FIXED_BODY_LEN + profile.prf().output_len()
+}
+
 /// Compute AUTH data for IKEv2 Shared Key Message Integrity Code.
 ///
 /// This is the generic mechanism used by EAP-authenticated IKE_AUTH when the

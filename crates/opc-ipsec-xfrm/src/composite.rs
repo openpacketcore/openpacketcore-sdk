@@ -421,6 +421,7 @@ mod tests {
             source_address: ipv4(10, 0, 0, 1),
             auth: None,
             crypt: None,
+            aead: None,
             mode: XfrmMode::Tunnel,
             lifetime: Default::default(),
             replay_window: 32,
