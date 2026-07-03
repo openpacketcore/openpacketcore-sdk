@@ -7,6 +7,8 @@
 //! or HTTP/1.1-capable configurations.
 
 use crate::client::circuit_breaker::CircuitBreakers;
+use crate::headers::{RetryAfter, HEADER_RETRY_AFTER};
+use crate::lock_or_recover;
 use crate::redact::{safe_metric_label, sanitize_error_message};
 use crate::retry::{RetryOutcome, RetryPolicy};
 use bytes::Bytes;
@@ -70,7 +72,7 @@ impl SbiClient {
         // 1. Circuit Breaker Guard
         let cb = self.circuit_breakers.get(host, &service_name);
         {
-            let mut cb_lock = cb.lock().unwrap();
+            let mut cb_lock = lock_or_recover(&cb);
             if !cb_lock.allow_request(Instant::now()) {
                 // Return consistent 503
                 return Err("Circuit breaker is open".to_string());
@@ -90,24 +92,19 @@ impl SbiClient {
             let duration = start.elapsed();
 
             // Record duration metrics
-            opc_redaction::metrics::METRICS
-                .sbi_request_duration_seconds
-                .lock()
-                .unwrap()
+            lock_or_recover(&opc_redaction::metrics::METRICS.sbi_request_duration_seconds)
                 .entry((service_name.clone(), method_label.clone()))
                 .or_default()
                 .observe(duration.as_secs_f64());
 
+            let mut retry_after = None;
             let outcome = match &res {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        cb.lock().unwrap().record_success(host, &service_name);
+                        lock_or_recover(&cb).record_success(host, &service_name);
                         // Record success metrics
-                        opc_redaction::metrics::METRICS
-                            .sbi_requests_total
-                            .lock()
-                            .unwrap()
+                        lock_or_recover(&opc_redaction::metrics::METRICS.sbi_requests_total)
                             .entry((
                                 "client".to_string(),
                                 service_name.clone(),
@@ -118,26 +115,19 @@ impl SbiClient {
                             .or_insert(1);
                         return Ok(resp.clone());
                     } else {
+                        retry_after = retry_after_delay(resp);
                         RetryOutcome::Status(status)
                     }
                 }
                 Err(_) => RetryOutcome::TransportError,
             };
 
-            // Record failure to circuit breaker
-            cb.lock()
-                .unwrap()
-                .record_failure(host, &service_name, Instant::now());
-
             // Record failure metrics
             let outcome_str = match &outcome {
                 RetryOutcome::Status(s) => s.as_str().to_string(),
                 RetryOutcome::TransportError => "transport_error".to_string(),
             };
-            opc_redaction::metrics::METRICS
-                .sbi_requests_total
-                .lock()
-                .unwrap()
+            lock_or_recover(&opc_redaction::metrics::METRICS.sbi_requests_total)
                 .entry((
                     "client".to_string(),
                     service_name.clone(),
@@ -150,9 +140,13 @@ impl SbiClient {
             let dummy_req = Request::from_parts(parts.clone(), ());
             if self.retry_policy.should_retry(&dummy_req, attempt, outcome) {
                 attempt += 1;
-                let delay = self.retry_policy.backoff_delay(attempt);
+                let mut delay = self.retry_policy.backoff_delay(attempt);
+                if let Some(retry_after) = retry_after {
+                    delay = delay.max(retry_after);
+                }
                 tokio::time::sleep(delay).await;
             } else {
+                lock_or_recover(&cb).record_failure(host, &service_name, Instant::now());
                 return res.map_err(|e| {
                     format!(
                         "request failed after retries: {}",
@@ -205,7 +199,7 @@ impl SbiClient {
         host: &str,
     ) -> Result<hyper::client::conn::http2::SendRequest<Full<Bytes>>, String> {
         {
-            let pool = self.pool.lock().unwrap();
+            let pool = lock_or_recover(&self.pool);
             if let Some(send_req) = pool.get(addr) {
                 if send_req.is_ready() {
                     return Ok(send_req.clone());
@@ -264,7 +258,7 @@ impl SbiClient {
         };
 
         {
-            let mut pool = self.pool.lock().unwrap();
+            let mut pool = lock_or_recover(&self.pool);
             if pool.len() >= self.max_pool_entries {
                 if let Some(first_key) = pool.keys().next().cloned() {
                     pool.remove(&first_key);
@@ -274,6 +268,16 @@ impl SbiClient {
         }
         Ok(send_req)
     }
+}
+
+fn retry_after_delay<B>(response: &Response<B>) -> Option<Duration> {
+    response
+        .headers()
+        .get(HEADER_RETRY_AFTER)?
+        .to_str()
+        .ok()
+        .and_then(|value| RetryAfter::parse(value).ok())
+        .and_then(|retry_after| retry_after.as_duration())
 }
 
 /// Builder for SbiClient
@@ -438,5 +442,24 @@ impl SbiClientBuilder {
             max_pool_entries: self.max_pool_entries,
             pool: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_after_delay_uses_delta_seconds_header() {
+        let response = match Response::builder()
+            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+            .header(HEADER_RETRY_AFTER, "2")
+            .body(())
+        {
+            Ok(response) => response,
+            Err(err) => panic!("failed to build retry-after response: {err}"),
+        };
+
+        assert_eq!(retry_after_delay(&response), Some(Duration::from_secs(2)));
     }
 }

@@ -59,18 +59,25 @@ struct KmsResponse {
 }
 
 fn decode_hex_32(hex: &str) -> Result<[u8; 32], KeyError> {
-    if hex.len() != 64 {
+    if hex.len() != 64 || !hex.is_ascii() {
         return Err(KeyError::Unavailable);
     }
     let mut bytes = [0u8; 32];
-    for i in 0..32 {
-        let high =
-            u8::from_str_radix(&hex[2 * i..2 * i + 1], 16).map_err(|_| KeyError::Unavailable)?;
-        let low = u8::from_str_radix(&hex[2 * i + 1..2 * i + 2], 16)
-            .map_err(|_| KeyError::Unavailable)?;
+    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let high = decode_hex_nibble(chunk[0])?;
+        let low = decode_hex_nibble(chunk[1])?;
         bytes[i] = (high << 4) | low;
     }
     Ok(bytes)
+}
+
+fn decode_hex_nibble(byte: u8) -> Result<u8, KeyError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(KeyError::Unavailable),
+    }
 }
 
 pub struct KmsKeyProvider {
@@ -243,5 +250,36 @@ impl KeyProvider for KmsKeyProvider {
         let resp = self.call_kms(req).await?;
         let key_id_str = resp.key_id.ok_or(KeyError::NotFound)?;
         KeyId::new(key_id_str)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_hex_32_accepts_valid_ascii_hex() {
+        let decoded =
+            decode_hex_32("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .expect("valid key bytes");
+
+        assert_eq!(decoded[0], 0x00);
+        assert_eq!(decoded[15], 0x0f);
+        assert_eq!(decoded[31], 0x1f);
+    }
+
+    #[test]
+    fn decode_hex_32_rejects_non_ascii_without_panic() {
+        let malformed = "ä".repeat(32);
+
+        assert_eq!(decode_hex_32(&malformed), Err(KeyError::Unavailable));
+    }
+
+    #[test]
+    fn decode_hex_32_rejects_non_hex_ascii() {
+        assert_eq!(
+            decode_hex_32("zz0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e"),
+            Err(KeyError::Unavailable)
+        );
     }
 }

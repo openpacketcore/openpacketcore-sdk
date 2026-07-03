@@ -40,9 +40,9 @@ pub use mock::{MockOperation, MockXfrmBackend};
 pub use model::{
     AeadAlgorithm, Algorithm, AllocateSpiRequest, AuthAlgorithm, InstallPolicyRequest,
     InstallSaRequest, IpAddress, KeyMaterial, LifetimeConfig, PolicyParameters, RekeyPolicyRequest,
-    RekeySaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters, SpiAllocation, XfrmAction,
-    XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmMode, XfrmProbe, XfrmSelector,
-    XfrmTemplate,
+    RekeySaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters, SpiAllocation, UdpEncap,
+    XfrmAction, XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmMark, XfrmMode,
+    XfrmProbe, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP,
 };
 pub use unsupported::UnsupportedXfrmBackend;
 
@@ -83,6 +83,9 @@ mod integration_tests {
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),
             replay_window: 32,
+            encap: None,
+            mark: None,
+            if_id: None,
         }
     }
 
@@ -101,6 +104,8 @@ mod integration_tests {
                 source_address: ipv4(10, 0, 0, 1),
                 mode: XfrmMode::Tunnel,
             }],
+            mark: None,
+            if_id: None,
         }
     }
 

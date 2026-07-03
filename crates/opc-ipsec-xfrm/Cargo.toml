@@ -24,6 +24,7 @@ async-trait = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

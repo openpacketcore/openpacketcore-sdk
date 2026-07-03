@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::lock_or_recover;
 use crate::redact::safe_metric_label;
 
 /// State of a circuit breaker's three-state machine.
@@ -141,10 +142,7 @@ impl CircuitBreaker {
     }
 
     fn update_metrics(&self, peer: &str, service: &str, state_str: &str) {
-        opc_redaction::metrics::METRICS
-            .sbi_circuit_state
-            .lock()
-            .unwrap()
+        lock_or_recover(&opc_redaction::metrics::METRICS.sbi_circuit_state)
             .entry((
                 safe_metric_label(peer),
                 safe_metric_label(service),
@@ -181,7 +179,7 @@ impl CircuitBreakers {
     /// are never evicted, so callers should key by bounded identifiers
     /// (host names and service names), not per-request data.
     pub fn get(&self, peer: &str, service: &str) -> Arc<Mutex<CircuitBreaker>> {
-        let mut lock = self.breakers.lock().unwrap();
+        let mut lock = lock_or_recover(&self.breakers);
         let key = (peer.to_string(), service.to_string());
         lock.entry(key)
             .or_insert_with(|| {

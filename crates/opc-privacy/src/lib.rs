@@ -5,6 +5,10 @@
 use opc_data_governance::{DataClass, IdentifierType};
 use serde::{Deserialize, Serialize};
 
+/// No cohort smaller than this may be released: a cohort of one re-identifies
+/// its subject even when configured k-anonymity enforcement is relaxed.
+const ABSOLUTE_MIN_COHORT: usize = 2;
+
 /// Privacy minimization policy defining the k-anonymity constraints.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MinimizationPolicy {
@@ -87,11 +91,8 @@ impl MinimizationPolicy {
     /// the singleton floor.
     pub fn validate_cohorts(&self, cohorts: &[CohortRecord]) -> Result<(), MinimizationError> {
         self.validate()?;
-        /// No cohort smaller than this may be released, regardless of policy
-        /// flags — a cohort of one re-identifies its subject.
-        const ABSOLUTE_MIN_COHORT: usize = 2;
         let floor = if self.enforce_k_anonymity {
-            self.min_cohort_size
+            self.min_cohort_size.max(ABSOLUTE_MIN_COHORT)
         } else {
             ABSOLUTE_MIN_COHORT
         };
@@ -205,6 +206,31 @@ mod tests {
         );
 
         // A cohort of two or more is allowed once k-anonymity is not enforced.
+        let pair = vec![CohortRecord {
+            keys: vec!["age:20-30".to_string()],
+            count: 2,
+        }];
+        assert!(policy.validate_cohorts(&pair).is_ok());
+    }
+
+    #[test]
+    fn test_k_anonymity_enforcement_cannot_release_singletons() {
+        let policy = MinimizationPolicy {
+            policy_id: "analytics-v1".to_string(),
+            min_cohort_size: 1,
+            enforce_k_anonymity: true,
+            allowed_classes: vec![DataClass::AnalyticsSensitive, DataClass::Public],
+        };
+
+        let singleton = vec![CohortRecord {
+            keys: vec!["age:20-30".to_string()],
+            count: 1,
+        }];
+        assert_eq!(
+            policy.validate_cohorts(&singleton),
+            Err(MinimizationError::CohortTooSmall(1, 2))
+        );
+
         let pair = vec![CohortRecord {
             keys: vec!["age:20-30".to_string()],
             count: 2,

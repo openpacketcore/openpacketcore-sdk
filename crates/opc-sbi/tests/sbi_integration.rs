@@ -1,7 +1,8 @@
 use http::StatusCode;
 use opc_sbi::{
     auth::{ClientTokenCache, SbiAuth, SbiAuthRequest, SbiJwtValidator, TokenProvider},
-    client::builder::SbiClientBuilder,
+    client::{builder::SbiClientBuilder, CircuitState},
+    retry::{Jitter, RetryPolicy},
     server::builder::SbiServerBuilder,
     testkit::{generate_test_token, MockConsumer, MockJwksResolver, MockProducer, TokenFixtures},
 };
@@ -140,6 +141,46 @@ async fn test_client_circuit_breaker_flow() {
     let result = consumer.send_get(&url, HashMap::new()).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("Circuit breaker is open"));
+}
+
+#[tokio::test]
+async fn test_client_records_one_breaker_failure_per_logical_send() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let breakers = Arc::new(opc_sbi::client::circuit_breaker::CircuitBreakers::new(
+        2,
+        Duration::from_secs(10),
+        1,
+    ));
+    let retry_policy = RetryPolicy::new(
+        3,
+        Duration::from_millis(1),
+        Duration::from_millis(1),
+        Jitter::None,
+    );
+    let client = SbiClientBuilder::new()
+        .with_http2_only(false)
+        .with_connect_timeout(Duration::from_millis(20))
+        .with_request_timeout(Duration::from_millis(20))
+        .with_retry_policy(retry_policy)
+        .with_circuit_breakers(breakers.clone())
+        .build()
+        .unwrap();
+    let uri = format!("http://{addr}/nnrf-disc/v1/nf-instances");
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(uri)
+        .body(Vec::new())
+        .unwrap();
+
+    let result = client.send(request).await;
+    assert!(result.is_err());
+
+    let breaker = breakers.get("127.0.0.1", "nnrf-disc");
+    let state = breaker.lock().unwrap().state();
+    assert_eq!(state, CircuitState::Closed);
 }
 
 #[tokio::test]

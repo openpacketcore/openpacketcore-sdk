@@ -10,6 +10,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::{Mutex, MutexGuard};
+
 pub mod auth;
 pub mod client;
 pub mod headers;
@@ -43,3 +45,10 @@ pub use nrf::{NrfDrainHook, NrfRuntimeBuilderExt};
 pub use problem::{CauseCode, CauseCodeError, InvalidParam, ProblemDetails};
 pub use retry::{Jitter, RetryOutcome, RetryPolicy, RetryPolicyParseError};
 pub use server::{SbiExtractor, SbiExtractorData, SbiServerBuilder, ServerMiddlewareShell};
+
+pub(crate) fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}

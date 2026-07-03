@@ -646,6 +646,50 @@ async fn test_task_restarts_across_expired_window() {
 }
 
 #[tokio::test]
+async fn heartbeat_monitor_detects_timeout_without_readiness_poll() {
+    let profile = make_profile();
+    let shutdown = ShutdownToken::new();
+    let clock = Arc::new(FakeClock::new());
+    let supervisor = Supervisor::new_with_clock(profile, shutdown.clone(), clock.clone());
+    let monitor = supervisor.start_heartbeat_monitor();
+
+    tokio::task::yield_now().await;
+
+    let name = TaskName::new("hung-fatal-task");
+    supervisor
+        .spawn_internal(
+            name.clone(),
+            TaskKind::ProtocolWorker,
+            Criticality::Fatal,
+            RestartPolicy::no_restart(),
+            Some(Duration::from_millis(50)),
+            || Box::pin(async { std::future::pending::<Result<(), TaskError>>().await }) as _,
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..120 {
+        if shutdown.is_shutdown_requested() {
+            break;
+        }
+        clock.advance(Duration::from_millis(25));
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        shutdown.is_shutdown_requested(),
+        "background heartbeat monitor must trigger fatal shutdown"
+    );
+    let fatal = supervisor.fatal_task_failure().await;
+    assert!(
+        fatal.as_ref().is_some_and(|(task, _)| task == &name),
+        "fatal failure should identify the hung task: {fatal:?}"
+    );
+
+    monitor.abort();
+}
+
+#[tokio::test]
 async fn test_best_effort_clean_exit_no_restart_no_failure() {
     let profile = make_profile();
     let shutdown = ShutdownToken::new();

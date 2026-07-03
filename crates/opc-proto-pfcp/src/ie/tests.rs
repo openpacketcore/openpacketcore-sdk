@@ -8,7 +8,7 @@
 //! decode → encode round-trip, including unknown IEs.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use opc_protocol::{DecodeContext, EncodeContext};
+use opc_protocol::{DecodeContext, DecodeErrorCode, EncodeContext, UnknownIePolicy};
 
 use crate::ie::{CauseValue, NodeIdType, TypedIe};
 
@@ -669,6 +669,23 @@ fn test_unknown_ie_raw_preservation() {
     assert_typed_roundtrip(bytes);
 }
 
+#[test]
+fn test_unknown_ie_reject_policy_fails_closed() {
+    let bytes: &[u8] = &[
+        0xFF, 0xFF, // unknown IE type 65535
+        0x00, 0x04, // length 4
+        0xDE, 0xAD, 0xBE, 0xEF, // value
+    ];
+    let ctx = DecodeContext {
+        unknown_ie_policy: UnknownIePolicy::Reject,
+        ..DecodeContext::default()
+    };
+
+    let err = TypedIe::decode(bytes, ctx, 0).unwrap_err();
+
+    assert_eq!(err.code(), &DecodeErrorCode::UnknownCriticalIe);
+}
+
 /// A vendor-specific IE must be preserved as `TypedIe::Raw` with enterprise
 /// ID intact.
 #[test]
@@ -766,6 +783,34 @@ fn test_grouped_ie_depth_exceeded() {
         result.is_err(),
         "deeply nested grouped IE must exceed max_depth"
     );
+}
+
+#[test]
+fn test_grouped_ie_member_count_exceeded() {
+    let source_interface: &[u8] = &[
+        0x00, 0x14, // IE type 20 (Source Interface)
+        0x00, 0x01, // length 1
+        0x00, // Access
+    ];
+
+    let mut grouped_value = BytesMut::new();
+    grouped_value.extend_from_slice(source_interface);
+    grouped_value.extend_from_slice(source_interface);
+
+    let mut grouped = BytesMut::new();
+    grouped.put_u16(1); // Create PDR grouped IE
+    grouped.put_u16(grouped_value.len() as u16);
+    grouped.extend_from_slice(&grouped_value);
+
+    let ctx = DecodeContext {
+        max_ies: 1,
+        ..DecodeContext::default()
+    };
+    let err = match TypedIe::decode(&grouped, ctx, 0) {
+        Ok(_) => panic!("member count must exceed max_ies"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code(), &DecodeErrorCode::IeCountExceeded);
 }
 
 // ---------------------------------------------------------------------------

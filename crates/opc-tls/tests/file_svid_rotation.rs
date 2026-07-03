@@ -103,12 +103,26 @@ async fn test_file_svid_source_rotates_tls_identity() {
         Some(Duration::from_millis(100)),
     );
 
+    timeout(Duration::from_secs(5), async {
+        let rx = source.subscribe();
+        loop {
+            if rx.borrow().is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("initial identity should be observed within timeout");
+
     let state_rx = source.subscribe();
 
     let client_config = TlsConfigBuilder::new(state_rx.clone())
+        .allow_any_trusted_peer()
         .build_client_config()
         .unwrap();
     let server_config = TlsConfigBuilder::new(state_rx)
+        .allow_any_trusted_peer()
         .build_server_config()
         .unwrap();
 
@@ -123,31 +137,41 @@ async fn test_file_svid_source_rotates_tls_identity() {
     // Overwrite the original files so FileSvidSource picks up the change.
     fs::copy(&cert_path2, &cert_path).unwrap();
     fs::copy(&key_path2, &key_path).unwrap();
-    fs::copy(&bundle_path2, &bundle_path).unwrap();
+    if bundle_path2 != bundle_path {
+        fs::copy(&bundle_path2, &bundle_path).unwrap();
+    }
 
     // Wait for the rotation to be observed.
-    let updated = timeout(Duration::from_secs(5), async {
-        let rx = source.subscribe();
-        loop {
-            if let Some(state) = rx.borrow().clone() {
-                if state.identity.spiffe_id.as_str() == spiffe2 {
-                    return state;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut event_rx = source.subscribe_events();
+    let rx = source.subscribe();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut last_event = None;
+    let updated = loop {
+        while let Ok(event) = event_rx.try_recv() {
+            last_event = Some(event);
         }
-    })
-    .await
-    .expect("rotation should be observed within timeout");
+        if let Some(state) = rx.borrow().clone() {
+            if state.identity.spiffe_id.as_str() == spiffe2 {
+                break state;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rotation should be observed within timeout; last event: {last_event:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
 
     assert_eq!(updated.identity.spiffe_id.as_str(), spiffe2);
 
     // Perform a second handshake; the new certs must be usable.
     let state_rx2 = source.subscribe();
     let client_config2 = TlsConfigBuilder::new(state_rx2.clone())
+        .allow_any_trusted_peer()
         .build_client_config()
         .unwrap();
     let server_config2 = TlsConfigBuilder::new(state_rx2)
+        .allow_any_trusted_peer()
         .build_server_config()
         .unwrap();
 

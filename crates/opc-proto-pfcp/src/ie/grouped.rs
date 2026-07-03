@@ -8,7 +8,9 @@
 //! @spec 3GPP TS29244 R18 7.5.2
 
 use bytes::BytesMut;
-use opc_protocol::{DecodeContext, DecodeError, EncodeContext, EncodeError};
+use opc_protocol::{
+    DecodeContext, DecodeError, DecodeErrorCode, EncodeContext, EncodeError, SpecRef,
+};
 
 use crate::ie::{GroupedIe, TypedIe};
 
@@ -383,8 +385,16 @@ fn decode_typed_ie_sequence(
 ) -> Result<Vec<TypedIe>, DecodeError> {
     let mut ies = Vec::new();
     let mut offset = 0usize;
+    let mut ie_count = 0usize;
 
     while offset < input.len() {
+        ie_count = ie_count.saturating_add(1);
+        if ie_count > ctx.max_ies {
+            let spec_ref = SpecRef::new("3gpp", "TS29244", "8.1.1");
+            return Err(
+                DecodeError::new(DecodeErrorCode::IeCountExceeded, offset).with_spec_ref(spec_ref)
+            );
+        }
         let (remaining, ie) = TypedIe::decode(&input[offset..], ctx, depth)?;
         ies.push(ie);
         offset = input.len() - remaining.len();

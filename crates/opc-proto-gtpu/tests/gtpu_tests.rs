@@ -5,7 +5,7 @@ use opc_proto_gtpu::{
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, Encode, EncodeContext, OwnedDecode,
-    ValidationLevel,
+    UnknownIePolicy, ValidationLevel,
 };
 
 // Helper to construct a basic valid packet
@@ -98,6 +98,30 @@ fn test_decode_with_extension_headers() {
     assert_eq!(psc.qfi, 9);
     assert_eq!(psc.ppi, None);
     assert!(!psc.rqi);
+}
+
+#[test]
+fn unknown_extension_header_reject_policy_fails_closed() {
+    let raw = vec![
+        0x36, // Version=1, PT=1, E=1, S=1, PN=0
+        0xFF, // G-PDU
+        0x00, 0x08, // Length = 8 (4 optional fields + 4 extension header bytes)
+        0x11, 0x22, 0x33, 0x44, // TEID
+        0x00, 0x05, // Seq = 5
+        0x00, // NPDU
+        0x84, // unsupported Next Ext
+        0x01, // Extension Length Units = 1 (4 octets)
+        0xAA, 0xBB, // Opaque extension content
+        0x00, // Next Extension Header = 0 (ends)
+    ];
+    let ctx = DecodeContext {
+        unknown_ie_policy: UnknownIePolicy::Reject,
+        ..DecodeContext::default()
+    };
+
+    let err = GtpuMessage::decode(&raw, ctx).unwrap_err();
+
+    assert_eq!(err.code(), &DecodeErrorCode::UnknownCriticalIe);
 }
 
 #[test]

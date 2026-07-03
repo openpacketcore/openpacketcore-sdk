@@ -2,7 +2,7 @@ use opc_proto_ikev2::{
     Header, HeaderFlags, Ikev2ExchangeBoundaryState, Ikev2ExchangeDecision,
     Ikev2ExchangeInvalidReason, Ikev2ExchangeRequest, Ikev2ExchangeTracker, PayloadType,
     EXCHANGE_TYPE_CREATE_CHILD_SA, EXCHANGE_TYPE_IKE_AUTH, EXCHANGE_TYPE_IKE_SA_INIT,
-    EXCHANGE_TYPE_INFORMATIONAL,
+    EXCHANGE_TYPE_INFORMATIONAL, IKEV2_EXCHANGE_RETRANSMISSION_WINDOW,
 };
 
 fn request_header(exchange_type: u8, responder_spi: u64, message_id: u32) -> Header {
@@ -184,4 +184,28 @@ fn exchange_tracker_rejects_non_request_and_bad_initial_boundaries() {
         sa_init_bad_spi.invalid_reason,
         Some(Ikev2ExchangeInvalidReason::SaInitResponderSpiNonZero)
     );
+}
+
+#[test]
+fn exchange_tracker_retains_bounded_retransmission_window() {
+    let responder_spi = 0x8877_6655_4433_2211;
+    let mut tracker = Ikev2ExchangeTracker::new();
+    tracker.observe_header(&request_header(EXCHANGE_TYPE_IKE_SA_INIT, 0, 0));
+
+    for message_id in 1..=100 {
+        let projection = tracker.observe_header(&request_header(
+            EXCHANGE_TYPE_INFORMATIONAL,
+            responder_spi,
+            message_id,
+        ));
+        assert!(projection.sequence_valid);
+        assert!(projection.observed_request_count <= IKEV2_EXCHANGE_RETRANSMISSION_WINDOW);
+    }
+
+    let snapshot = tracker.snapshot();
+    assert_eq!(
+        snapshot.observed_request_count,
+        IKEV2_EXCHANGE_RETRANSMISSION_WINDOW
+    );
+    assert_eq!(snapshot.highest_message_id, Some(100));
 }

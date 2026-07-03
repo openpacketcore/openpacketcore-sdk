@@ -176,7 +176,7 @@ pub fn bind(fd: BorrowedFd<'_>, addr: &SocketAddr) -> io::Result<()> {
     platform::bind(fd, addr)
 }
 
-/// Start listening on a one-to-one SCTP socket.
+/// Start listening on an SCTP socket that accepts inbound associations.
 pub fn listen(fd: BorrowedFd<'_>, backlog: i32) -> io::Result<()> {
     platform::listen(fd, backlog)
 }

@@ -4,8 +4,10 @@ use std::fmt;
 
 use crate::errors::KeyError;
 
-const CONFIG_KDF_LABEL: &[u8] = b"openpacketcore/config/v1";
+const CONFIG_KDF_LABEL: &[u8] = b"openpacketcore/config/v2";
 const SESSION_KDF_LABEL: &[u8] = b"openpacketcore/session/v1";
+const SHADOW_SECURITY_KDF_LABEL: &[u8] = b"openpacketcore/shadow-security/v2";
+const MAX_KEY_ID_LEN: usize = 512;
 
 /// Stable key identifier carried in each encrypted envelope.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -436,8 +438,8 @@ impl EnvelopeAad {
                 let mut info =
                     Vec::with_capacity(64 + config.store_kind.len() + key_id.as_str().len());
                 info.extend_from_slice(CONFIG_KDF_LABEL);
-                info.extend_from_slice(config.store_kind.as_bytes());
-                info.extend_from_slice(key_id.as_str().as_bytes());
+                append_kdf_field(&mut info, config.store_kind.as_bytes());
+                append_kdf_field(&mut info, key_id.as_str().as_bytes());
                 Ok((salt, info))
             }
             EnvelopeMetadata::Session(session) => {
@@ -470,12 +472,18 @@ impl EnvelopeAad {
                 salt.extend_from_slice(&shadow_security.version.to_be_bytes());
 
                 let mut info = Vec::new();
-                info.extend_from_slice(b"openpacketcore/shadow-security/v1");
-                info.extend_from_slice(key_id.as_str().as_bytes());
+                info.extend_from_slice(SHADOW_SECURITY_KDF_LABEL);
+                append_kdf_field(&mut info, key_id.as_str().as_bytes());
                 Ok((salt, info))
             }
         }
     }
+}
+
+fn append_kdf_field(out: &mut Vec<u8>, value: &[u8]) {
+    let len = u64::try_from(value.len()).unwrap_or(u64::MAX);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(value);
 }
 
 impl<'de> Deserialize<'de> for EnvelopeAad {
@@ -537,8 +545,8 @@ pub(crate) fn validate_key_id(value: &str) -> Result<(), KeyError> {
         return Err(KeyError::invalid_key_id("must not be empty"));
     }
 
-    if value.len() > 128 {
-        return Err(KeyError::invalid_key_id("must not exceed 128 characters"));
+    if value.len() > MAX_KEY_ID_LEN {
+        return Err(KeyError::invalid_key_id("must not exceed 512 characters"));
     }
 
     if !value

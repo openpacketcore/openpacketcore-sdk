@@ -112,8 +112,7 @@ LOCAL_PRIMITIVE_MAP: dict[str, str] = {
 def fetch_yaml(name: str, cache_dir: Path) -> Any:
     path = cache_dir / name
     if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
+        return parse_verified_yaml(name, path.read_bytes())
 
     url = BASE_URL + name
     import urllib.request
@@ -122,20 +121,27 @@ def fetch_yaml(name: str, cache_dir: Path) -> Any:
     with urllib.request.urlopen(url, timeout=30) as resp:
         data = resp.read()
 
-    # Verify hash if known (skip for CommonData if we haven't computed it yet).
-    actual = hashlib.sha256(data).hexdigest()
-    expected = EXPECTED_HASHES.get(name)
-    if expected and actual != expected:
-        print(
-            f"WARNING: hash mismatch for {name}: expected {expected}, got {actual}",
-            file=sys.stderr,
-        )
+    parsed = parse_verified_yaml(name, data)
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
         f.write(data)
 
-    return yaml.safe_load(data)
+    return parsed
+
+
+def parse_verified_yaml(name: str, data: bytes) -> Any:
+    expected = EXPECTED_HASHES.get(name)
+    if expected is None:
+        raise SystemExit(f"error: missing expected SHA-256 for {name}")
+
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected:
+        raise SystemExit(
+            f"error: hash mismatch for {name}: expected {expected}, got {actual}"
+        )
+
+    return yaml.safe_load(data.decode("utf-8"))
 
 
 def resolve_ref(ref_str: str, docs: dict) -> Any:

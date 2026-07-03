@@ -13,6 +13,13 @@ use crate::{
     message::Message,
 };
 
+/// Maximum number of recent request keys retained for retransmission detection.
+///
+/// IKEv2 permits only one in-flight request per direction, so this window is a
+/// defensive cap for long-lived trackers rather than a protocol throughput
+/// limit.
+pub const IKEV2_EXCHANGE_RETRANSMISSION_WINDOW: usize = 64;
+
 /// Redaction-safe responder SPI value used for exchange-state binding.
 ///
 /// The raw value is available to callers that own IKE SA state, but `Debug`
@@ -439,12 +446,22 @@ impl Ikev2ExchangeTracker {
             self.retransmission_count = self.retransmission_count.saturating_add(1);
             return self.project(Ikev2ExchangeDecision::Retransmission, None);
         }
+        self.bound_observed_requests();
 
         match request.exchange {
             Ikev2ExchangeKind::IkeSaInit => self.observe_sa_init(request),
             Ikev2ExchangeKind::IkeAuth
             | Ikev2ExchangeKind::CreateChildSa
             | Ikev2ExchangeKind::Informational => self.observe_post_sa_init(request),
+        }
+    }
+
+    fn bound_observed_requests(&mut self) {
+        while self.observed_requests.len() > IKEV2_EXCHANGE_RETRANSMISSION_WINDOW {
+            let Some(oldest) = self.observed_requests.iter().next().copied() else {
+                break;
+            };
+            self.observed_requests.remove(&oldest);
         }
     }
 

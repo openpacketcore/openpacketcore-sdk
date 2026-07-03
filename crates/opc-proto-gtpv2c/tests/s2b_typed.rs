@@ -8,7 +8,7 @@ use opc_proto_gtpv2c::{
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
-    EncodeErrorCode, ValidationLevel,
+    EncodeErrorCode, UnknownIePolicy, ValidationLevel,
 };
 
 fn procedure_context() -> DecodeContext {
@@ -262,6 +262,19 @@ fn create_session_request_exposes_mandatory_typed_ies_and_raw_fallback() {
         }
         other => panic!("unexpected raw fallback value: {other:?}"),
     }
+}
+
+#[test]
+fn unknown_typed_ie_reject_policy_fails_closed() {
+    let unknown_ie = [0xfe, 0x00, 0x01, 0x00, 0xaa];
+    let ctx = DecodeContext {
+        unknown_ie_policy: UnknownIePolicy::Reject,
+        ..DecodeContext::default()
+    };
+
+    let err = decode_typed_ie_sequence(&unknown_ie, ctx, 0).unwrap_err();
+
+    assert_eq!(err.code(), &DecodeErrorCode::UnknownCriticalIe);
 }
 
 #[test]

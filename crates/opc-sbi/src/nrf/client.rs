@@ -2,6 +2,7 @@
 //! NFDiscovery), the periodic heartbeat driver, and the cache-fronted
 //! discovery client with stale-if-error and production fail-closed rules.
 
+use crate::lock_or_recover;
 use crate::nrf::{
     CacheLookup, DiscoveryCache, DiscoveryQuery, DiscoveryResult, NfProfile, NrfDeregNotifier,
 };
@@ -11,6 +12,11 @@ use opc_types::NfInstanceId;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3600);
+const NRF_HEARTBEAT_NOT_FOUND: &str = "nrf_heartbeat_not_found";
 
 /// NRF service client operations
 #[async_trait]
@@ -95,6 +101,15 @@ struct NrfHeartbeatResponse {
     pub heartbeat_timer: Option<u32>,
 }
 
+fn clamp_heartbeat_interval(interval: Duration) -> Duration {
+    interval.clamp(MIN_HEARTBEAT_INTERVAL, MAX_HEARTBEAT_INTERVAL)
+}
+
+fn heartbeat_interval_from_timer(secs: Option<u32>) -> Duration {
+    secs.map(|secs| clamp_heartbeat_interval(Duration::from_secs(secs as u64)))
+        .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL)
+}
+
 #[async_trait]
 impl NrfOperations for NrfClient {
     async fn register(&self, profile: &NfProfile) -> Result<Duration, String> {
@@ -120,11 +135,9 @@ impl NrfOperations for NrfClient {
             // Parse heartbeat timer
             let body_bytes = response.into_body();
             if let Ok(res) = serde_json::from_slice::<NrfHeartbeatResponse>(&body_bytes) {
-                if let Some(secs) = res.heartbeat_timer {
-                    return Ok(Duration::from_secs(secs as u64));
-                }
+                return Ok(heartbeat_interval_from_timer(res.heartbeat_timer));
             }
-            Ok(Duration::from_secs(30))
+            Ok(DEFAULT_HEARTBEAT_INTERVAL)
         } else {
             Err(format!(
                 "NRF registration failed with status {}",
@@ -180,11 +193,11 @@ impl NrfOperations for NrfClient {
         if response.status().is_success() {
             let body_bytes = response.into_body();
             if let Ok(res) = serde_json::from_slice::<NrfHeartbeatResponse>(&body_bytes) {
-                if let Some(secs) = res.heartbeat_timer {
-                    return Ok(Duration::from_secs(secs as u64));
-                }
+                return Ok(heartbeat_interval_from_timer(res.heartbeat_timer));
             }
-            Ok(Duration::from_secs(30))
+            Ok(DEFAULT_HEARTBEAT_INTERVAL)
+        } else if response.status() == http::StatusCode::NOT_FOUND {
+            Err(NRF_HEARTBEAT_NOT_FOUND.to_string())
         } else {
             Err(format!(
                 "NRF heartbeat failed with status {}",
@@ -247,6 +260,7 @@ impl NrfOperations for NrfClient {
 pub struct HeartbeatDriver {
     nrf_client: Arc<dyn NrfOperations>,
     nf_instance_id: NfInstanceId,
+    nf_profile: Option<NfProfile>,
     default_interval: Duration,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     degraded_tx: tokio::sync::watch::Sender<bool>,
@@ -270,6 +284,26 @@ impl HeartbeatDriver {
         Self {
             nrf_client,
             nf_instance_id,
+            nf_profile: None,
+            default_interval,
+            shutdown_rx,
+            degraded_tx,
+        }
+    }
+
+    /// Assemble a driver that can re-register the NF if the NRF reports the
+    /// heartbeat target is no longer known.
+    pub fn new_with_profile(
+        nrf_client: Arc<dyn NrfOperations>,
+        nf_profile: NfProfile,
+        default_interval: Duration,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        degraded_tx: tokio::sync::watch::Sender<bool>,
+    ) -> Self {
+        Self {
+            nrf_client,
+            nf_instance_id: nf_profile.nf_instance_id.clone(),
+            nf_profile: Some(nf_profile),
             default_interval,
             shutdown_rx,
             degraded_tx,
@@ -287,55 +321,20 @@ impl HeartbeatDriver {
     /// killed. On shutdown it deregisters from the NRF best-effort before
     /// returning. Outcomes are counted in `sbi_nrf_heartbeat_total`.
     pub async fn run(mut self) {
-        let mut interval = self.default_interval;
+        let mut interval = clamp_heartbeat_interval(self.default_interval);
         let mut consecutive_failures = 0;
         let max_failures = 3;
 
         loop {
+            let shutdown = *self.shutdown_rx.borrow();
+            if shutdown {
+                let _ = self.nrf_client.deregister(&self.nf_instance_id).await;
+                break;
+            }
+
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {
-                    let mut backoff = Duration::from_secs(1);
-                    let mut success = false;
-
-                    for attempt in 1..=3 {
-                        match self.nrf_client.heartbeat(&self.nf_instance_id).await {
-                            Ok(new_interval) => {
-                                interval = new_interval;
-                                consecutive_failures = 0;
-                                let _ = self.degraded_tx.send(false);
-                                success = true;
-                                opc_redaction::metrics::METRICS
-                                    .sbi_nrf_heartbeat_total
-                                    .lock()
-                                    .unwrap()
-                                    .entry("success".to_string())
-                                    .and_modify(|c| *c += 1)
-                                    .or_insert(1);
-                                break;
-                            }
-                            Err(_) => {
-                                opc_redaction::metrics::METRICS
-                                    .sbi_nrf_heartbeat_total
-                                    .lock()
-                                    .unwrap()
-                                    .entry("failure".to_string())
-                                    .and_modify(|c| *c += 1)
-                                    .or_insert(1);
-
-                                if attempt < 3 {
-                                    tokio::time::sleep(backoff).await;
-                                    backoff = (backoff * 2).min(Duration::from_secs(5));
-                                }
-                            }
-                        }
-                    }
-
-                    if !success {
-                        consecutive_failures += 1;
-                        if consecutive_failures >= max_failures {
-                            let _ = self.degraded_tx.send(true);
-                        }
-                    }
+                _ = tokio::time::sleep(clamp_heartbeat_interval(interval)) => {
+                    self.run_heartbeat_tick(&mut interval, &mut consecutive_failures, max_failures).await;
                 }
                 _ = self.shutdown_rx.changed() => {
                     if *self.shutdown_rx.borrow() {
@@ -347,6 +346,78 @@ impl HeartbeatDriver {
             }
         }
     }
+
+    async fn run_heartbeat_tick(
+        &mut self,
+        interval: &mut Duration,
+        consecutive_failures: &mut u32,
+        max_failures: u32,
+    ) {
+        let mut backoff = Duration::from_secs(1);
+        let mut success = false;
+
+        for attempt in 1..=3 {
+            match self.nrf_client.heartbeat(&self.nf_instance_id).await {
+                Ok(new_interval) => {
+                    *interval = clamp_heartbeat_interval(new_interval);
+                    *consecutive_failures = 0;
+                    let _ = self.degraded_tx.send(false);
+                    success = true;
+                    record_heartbeat_metric("success");
+                    break;
+                }
+                Err(error) => {
+                    record_heartbeat_metric("failure");
+                    if is_heartbeat_not_found(&error) && self.try_reregister(interval).await {
+                        *consecutive_failures = 0;
+                        let _ = self.degraded_tx.send(false);
+                        success = true;
+                        break;
+                    }
+
+                    if attempt < 3 {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(5));
+                    }
+                }
+            }
+        }
+
+        if !success {
+            *consecutive_failures += 1;
+            if *consecutive_failures >= max_failures {
+                let _ = self.degraded_tx.send(true);
+            }
+        }
+    }
+
+    async fn try_reregister(&self, interval: &mut Duration) -> bool {
+        let Some(profile) = self.nf_profile.clone() else {
+            return false;
+        };
+        match self.nrf_client.register(&profile).await {
+            Ok(new_interval) => {
+                *interval = clamp_heartbeat_interval(new_interval);
+                record_heartbeat_metric("reregister_success");
+                true
+            }
+            Err(_) => {
+                record_heartbeat_metric("reregister_failure");
+                false
+            }
+        }
+    }
+}
+
+fn is_heartbeat_not_found(error: &str) -> bool {
+    error == NRF_HEARTBEAT_NOT_FOUND || error.to_ascii_lowercase().contains("not found")
+}
+
+fn record_heartbeat_metric(outcome: &'static str) {
+    lock_or_recover(&opc_redaction::metrics::METRICS.sbi_nrf_heartbeat_total)
+        .entry(outcome.to_string())
+        .and_modify(|c| *c += 1)
+        .or_insert(1);
 }
 
 /// Cached Discovery Client which performs discovery caching and enforces production boundaries
@@ -396,16 +467,13 @@ impl CachedDiscoveryClient {
         let key = query.to_cache_key();
 
         let lookup = {
-            let cache_lock = self.cache.lock().unwrap();
+            let cache_lock = lock_or_recover(&self.cache);
             cache_lock.lookup(&key)
         };
 
         match lookup {
             CacheLookup::Hit(profiles) => {
-                opc_redaction::metrics::METRICS
-                    .sbi_nrf_discovery_total
-                    .lock()
-                    .unwrap()
+                lock_or_recover(&opc_redaction::metrics::METRICS.sbi_nrf_discovery_total)
                     .entry("cache_hit".to_string())
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
@@ -421,25 +489,23 @@ impl CachedDiscoveryClient {
                     // Fail-closed for sensitive paths: do not silently use stale
                     match self.nrf_client.discover(query).await {
                         Ok(DiscoveryResult::Found(fresh_profiles)) => {
-                            let mut cache_lock = self.cache.lock().unwrap();
+                            let mut cache_lock = lock_or_recover(&self.cache);
                             cache_lock.insert(key, fresh_profiles.clone());
-                            opc_redaction::metrics::METRICS
-                                .sbi_nrf_discovery_total
-                                .lock()
-                                .unwrap()
-                                .entry("refresh_success".to_string())
-                                .and_modify(|c| *c += 1)
-                                .or_insert(1);
+                            lock_or_recover(
+                                &opc_redaction::metrics::METRICS.sbi_nrf_discovery_total,
+                            )
+                            .entry("refresh_success".to_string())
+                            .and_modify(|c| *c += 1)
+                            .or_insert(1);
                             Ok(fresh_profiles)
                         }
                         _ => {
-                            opc_redaction::metrics::METRICS
-                                .sbi_nrf_discovery_total
-                                .lock()
-                                .unwrap()
-                                .entry("fail_closed".to_string())
-                                .and_modify(|c| *c += 1)
-                                .or_insert(1);
+                            lock_or_recover(
+                                &opc_redaction::metrics::METRICS.sbi_nrf_discovery_total,
+                            )
+                            .entry("fail_closed".to_string())
+                            .and_modify(|c| *c += 1)
+                            .or_insert(1);
                             Err("NRF lookup failed for security-sensitive path (stale cache rejected in Production)".into())
                         }
                     }
@@ -447,25 +513,23 @@ impl CachedDiscoveryClient {
                     // Try to refresh, fall back to stale
                     match self.nrf_client.discover(query).await {
                         Ok(DiscoveryResult::Found(fresh_profiles)) => {
-                            let mut cache_lock = self.cache.lock().unwrap();
+                            let mut cache_lock = lock_or_recover(&self.cache);
                             cache_lock.insert(key, fresh_profiles.clone());
-                            opc_redaction::metrics::METRICS
-                                .sbi_nrf_discovery_total
-                                .lock()
-                                .unwrap()
-                                .entry("refresh_success".to_string())
-                                .and_modify(|c| *c += 1)
-                                .or_insert(1);
+                            lock_or_recover(
+                                &opc_redaction::metrics::METRICS.sbi_nrf_discovery_total,
+                            )
+                            .entry("refresh_success".to_string())
+                            .and_modify(|c| *c += 1)
+                            .or_insert(1);
                             Ok(fresh_profiles)
                         }
                         _ => {
-                            opc_redaction::metrics::METRICS
-                                .sbi_nrf_discovery_total
-                                .lock()
-                                .unwrap()
-                                .entry("stale_fallback".to_string())
-                                .and_modify(|c| *c += 1)
-                                .or_insert(1);
+                            lock_or_recover(
+                                &opc_redaction::metrics::METRICS.sbi_nrf_discovery_total,
+                            )
+                            .entry("stale_fallback".to_string())
+                            .and_modify(|c| *c += 1)
+                            .or_insert(1);
                             Ok(profiles)
                         }
                     }
@@ -474,32 +538,22 @@ impl CachedDiscoveryClient {
             CacheLookup::Negative => Err("Discovery cached negative result (NotFound)".into()),
             CacheLookup::Miss => match self.nrf_client.discover(query).await {
                 Ok(DiscoveryResult::Found(profiles)) => {
-                    let mut cache_lock = self.cache.lock().unwrap();
+                    let mut cache_lock = lock_or_recover(&self.cache);
                     cache_lock.insert(key, profiles.clone());
-                    opc_redaction::metrics::METRICS
-                        .sbi_nrf_discovery_total
-                        .lock()
-                        .unwrap()
+                    lock_or_recover(&opc_redaction::metrics::METRICS.sbi_nrf_discovery_total)
                         .entry("miss_found".to_string())
                         .and_modify(|c| *c += 1)
                         .or_insert(1);
-                    opc_redaction::metrics::METRICS
-                        .sbi_nrf_cache_entries
-                        .lock()
-                        .unwrap()
-                        .insert(
-                            safe_metric_label(query.target_nf_type.as_str()),
-                            cache_lock.len() as u64,
-                        );
+                    lock_or_recover(&opc_redaction::metrics::METRICS.sbi_nrf_cache_entries).insert(
+                        safe_metric_label(query.target_nf_type.as_str()),
+                        cache_lock.len() as u64,
+                    );
                     Ok(profiles)
                 }
                 Ok(DiscoveryResult::NotFound) => {
-                    let mut cache_lock = self.cache.lock().unwrap();
+                    let mut cache_lock = lock_or_recover(&self.cache);
                     cache_lock.insert_negative(key);
-                    opc_redaction::metrics::METRICS
-                        .sbi_nrf_discovery_total
-                        .lock()
-                        .unwrap()
+                    lock_or_recover(&opc_redaction::metrics::METRICS.sbi_nrf_discovery_total)
                         .entry("miss_not_found".to_string())
                         .and_modify(|c| *c += 1)
                         .or_insert(1);
@@ -526,4 +580,156 @@ fn percent_encode(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn heartbeat_timer_values_are_clamped() {
+        assert_eq!(
+            heartbeat_interval_from_timer(Some(0)),
+            MIN_HEARTBEAT_INTERVAL
+        );
+        assert_eq!(
+            heartbeat_interval_from_timer(Some(1)),
+            MIN_HEARTBEAT_INTERVAL
+        );
+        assert_eq!(
+            heartbeat_interval_from_timer(Some(30)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            heartbeat_interval_from_timer(Some(7200)),
+            MAX_HEARTBEAT_INTERVAL
+        );
+        assert_eq!(
+            heartbeat_interval_from_timer(None),
+            DEFAULT_HEARTBEAT_INTERVAL
+        );
+    }
+
+    #[test]
+    fn heartbeat_driver_interval_clamp_rejects_zero_and_huge_values() {
+        assert_eq!(
+            clamp_heartbeat_interval(Duration::ZERO),
+            MIN_HEARTBEAT_INTERVAL
+        );
+        assert_eq!(
+            clamp_heartbeat_interval(Duration::from_secs(u64::MAX)),
+            MAX_HEARTBEAT_INTERVAL
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeNrfOperations {
+        heartbeat_results: Mutex<Vec<Result<Duration, String>>>,
+        register_calls: AtomicUsize,
+        heartbeat_calls: AtomicUsize,
+        deregister_calls: AtomicUsize,
+    }
+
+    impl FakeNrfOperations {
+        fn with_heartbeat_results(results: Vec<Result<Duration, String>>) -> Self {
+            Self {
+                heartbeat_results: Mutex::new(results),
+                register_calls: AtomicUsize::new(0),
+                heartbeat_calls: AtomicUsize::new(0),
+                deregister_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NrfOperations for FakeNrfOperations {
+        async fn register(&self, _profile: &NfProfile) -> Result<Duration, String> {
+            self.register_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Duration::from_secs(7))
+        }
+
+        async fn deregister(&self, _instance_id: &NfInstanceId) -> Result<(), String> {
+            self.deregister_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn heartbeat(&self, _instance_id: &NfInstanceId) -> Result<Duration, String> {
+            self.heartbeat_calls.fetch_add(1, Ordering::SeqCst);
+            let mut results = lock_or_recover(&self.heartbeat_results);
+            if results.is_empty() {
+                Ok(Duration::from_secs(5))
+            } else {
+                results.remove(0)
+            }
+        }
+
+        async fn discover(&self, _query: &DiscoveryQuery) -> Result<DiscoveryResult, String> {
+            Ok(DiscoveryResult::NotFound)
+        }
+    }
+
+    fn test_profile(id: &str) -> NfProfile {
+        NfProfile {
+            nf_instance_id: NfInstanceId::new(id).unwrap(),
+            nf_type: opc_types::NfType::new("amf").unwrap(),
+            nf_status: crate::nrf::NfStatus::Registered,
+            ipv4_addresses: vec!["127.0.0.1".to_string()],
+            fqdn: None,
+            plmn_list: vec![opc_types::PlmnId::new("001", "01").unwrap()],
+            s_nssais: vec![opc_types::Snssai::new(1, Some("010203")).unwrap()],
+            nf_services: vec![],
+            priority: 10,
+            capacity: 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_tick_reregisters_after_not_found() {
+        let ops = Arc::new(FakeNrfOperations::with_heartbeat_results(vec![Err(
+            NRF_HEARTBEAT_NOT_FOUND.to_string(),
+        )]));
+        let profile = test_profile("amf-01");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (degraded_tx, degraded_rx) = tokio::sync::watch::channel(true);
+        let mut driver = HeartbeatDriver::new_with_profile(
+            ops.clone(),
+            profile,
+            Duration::from_secs(30),
+            shutdown_rx,
+            degraded_tx,
+        );
+        let mut interval = Duration::from_secs(30);
+        let mut consecutive_failures = 2;
+
+        driver
+            .run_heartbeat_tick(&mut interval, &mut consecutive_failures, 3)
+            .await;
+
+        assert_eq!(ops.heartbeat_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ops.register_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(consecutive_failures, 0);
+        assert_eq!(interval, Duration::from_secs(7));
+        assert!(!*degraded_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_driver_deregisters_when_shutdown_already_true() {
+        let ops = Arc::new(FakeNrfOperations::default());
+        let id = NfInstanceId::new("amf-01").unwrap();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(true);
+        let (degraded_tx, _degraded_rx) = tokio::sync::watch::channel(false);
+        let driver = HeartbeatDriver::new(
+            ops.clone(),
+            id,
+            Duration::from_secs(30),
+            shutdown_rx,
+            degraded_tx,
+        );
+
+        driver.run().await;
+
+        assert_eq!(ops.deregister_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ops.heartbeat_calls.load(Ordering::SeqCst), 0);
+    }
 }

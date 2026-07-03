@@ -81,7 +81,12 @@ pub struct DecodeContext {
     pub duplicate_ie_policy: DuplicateIePolicy,
     /// How strictly to validate fields and containers.
     pub validation_level: ValidationLevel,
-    /// Allocation budget for fast-path decode operations.
+    /// Allocation budget target for fast-path decode operations.
+    ///
+    /// Unlike `max_depth`, `max_ies`, and `max_message_len`, this is not a
+    /// generic runtime guard enforced by `opc-protocol`; individual protocol
+    /// decoders must document and test any allocation-budget enforcement they
+    /// provide.
     pub allocation_budget: AllocationBudget,
 }
 
@@ -158,12 +163,17 @@ impl EncodeContext {
     }
 }
 
-/// Allocation budget for protocol operations.
+/// Advisory allocation budget for protocol operations.
 ///
 /// Fast-path targets from RFC 005:
 /// - Fixed header decode: 0 heap allocations.
 /// - Routing-key partial decode: 0 heap allocations.
 /// - Full message decode: protocol-specific, bounded.
+///
+/// These fields describe target budgets for implementers and reviewers. They
+/// do not impose a cross-crate runtime limit by themselves; callers that need
+/// hard allocation controls must use protocol-specific enforcement or wrap the
+/// decoder with their own resource guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AllocationBudget {
     /// Target heap allocations for the fast-path decoder.

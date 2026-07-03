@@ -1288,20 +1288,16 @@ fn split_key_stream(
     let integrity_key_len = profile.integrity_key_len;
     let encryption_key_len = profile.encryption.key_material_len();
     let mut offset = 0;
-    let mut take = |len: usize| {
-        let next = offset + len;
-        let bytes = Zeroizing::new(key_stream[offset..next].to_vec());
-        offset = next;
-        bytes
-    };
+    let mut take =
+        |len: usize| take_key_stream(&key_stream, &mut offset, len, profile.prf.output_len());
 
-    let mut sk_d = take(prf_len);
-    let sk_ai = take(integrity_key_len);
-    let sk_ar = take(integrity_key_len);
-    let sk_ei = take(encryption_key_len);
-    let sk_er = take(encryption_key_len);
-    let mut sk_pi = take(prf_len);
-    let mut sk_pr = take(prf_len);
+    let mut sk_d = take(prf_len)?;
+    let sk_ai = take(integrity_key_len)?;
+    let sk_ar = take(integrity_key_len)?;
+    let sk_ei = take(encryption_key_len)?;
+    let sk_er = take(encryption_key_len)?;
+    let mut sk_pi = take(prf_len)?;
+    let mut sk_pr = take(prf_len)?;
 
     let ppk_applied = if let Some(ppk) = ppk {
         sk_d = prf_plus(profile.prf, ppk, &sk_d, prf_len)?;

@@ -29,7 +29,7 @@ use crate::metrics::{
     TRANSPORT_GNMI_TLS,
 };
 use crate::proto::gnmi;
-use crate::service::AuthenticatedGnmiPrincipal;
+use crate::service::AuthenticatedGnmiSession;
 use crate::transport::{principal_from_tls_stream, GnmiTlsPrincipalError};
 use crate::{GnmiConfigBinding, GnmiServer, GnmiService};
 
@@ -98,7 +98,7 @@ enum HandshakeError {
 ///
 /// The listener uses [`TlsBootstrap`] to stamp HTTP/2 ALPN and enforce
 /// production peer-policy rules, then injects an
-/// [`AuthenticatedGnmiPrincipal`] into every tonic request. RPC behavior is
+/// [`crate::AuthenticatedGnmiPrincipal`] into every tonic request. RPC behavior is
 /// implemented by [`GnmiService`]; the listener owns transport/authentication
 /// only.
 pub async fn run_gnmi_tls_listener<C, B>(
@@ -144,7 +144,9 @@ where
         record_listener_event(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Failure);
         return Err(err.into());
     }
-    let max_sessions = server.limits().max_sessions;
+    let limits = *server.limits();
+    let max_sessions = limits.max_sessions;
+    let max_subscriptions_per_session = limits.max_subscriptions_per_session;
     let tls_config = match tls
         .with_alpn([ALPN_H2.to_vec()])
         .build_server_config(identity_rx.clone())
@@ -170,6 +172,7 @@ where
             identity_rx,
             accept_shutdown,
             config,
+            max_subscriptions_per_session,
             semaphore,
             tx,
             accept_counters,
@@ -178,9 +181,13 @@ where
     });
 
     let service =
-        gnmi::g_nmi_server::GNmiServer::new(GnmiService::new_authenticated_shared(server));
+        gnmi::g_nmi_server::GNmiServer::new(GnmiService::new_authenticated_shared(server))
+            .max_decoding_message_size(limits.max_request_bytes);
     let incoming = ReceiverStream::new(rx);
+    let max_concurrent_streams = u32::try_from(max_subscriptions_per_session).unwrap_or(u32::MAX);
     let serve_result = tonic::transport::Server::builder()
+        .concurrency_limit_per_connection(max_subscriptions_per_session)
+        .max_concurrent_streams(Some(max_concurrent_streams))
         .add_service(service)
         .serve_with_incoming_shutdown(incoming, shutdown.shutdown_acknowledged())
         .await;
@@ -212,6 +219,7 @@ async fn accept_loop(
     identity_rx: watch::Receiver<Option<IdentityState>>,
     shutdown: ShutdownToken,
     config: GnmiListenerConfig,
+    max_subscriptions_per_session: usize,
     semaphore: Arc<Semaphore>,
     tx: mpsc::Sender<Result<AuthenticatedTlsStream, std::io::Error>>,
     counters: Arc<ListenerCounters>,
@@ -258,6 +266,7 @@ async fn accept_loop(
                         identity_rx,
                         stream,
                         permit,
+                        max_subscriptions_per_session,
                         config.handshake_timeout,
                     )
                     .await
@@ -299,6 +308,7 @@ async fn accept_authenticated_stream(
     identity_rx: watch::Receiver<Option<IdentityState>>,
     stream: TcpStream,
     permit: OwnedSemaphorePermit,
+    max_subscriptions_per_session: usize,
     timeout: Duration,
 ) -> Result<AuthenticatedTlsStream, HandshakeError> {
     let tls = tokio::time::timeout(timeout, acceptor.accept(stream))
@@ -308,7 +318,7 @@ async fn accept_authenticated_stream(
     let principal = principal_from_tls_stream(&tls, &identity_rx)?;
     Ok(AuthenticatedTlsStream {
         inner: tls,
-        principal: AuthenticatedGnmiPrincipal::new(principal),
+        session: AuthenticatedGnmiSession::new(principal, max_subscriptions_per_session),
         _permit: permit,
         _active_session: active_session(TRANSPORT_GNMI_TLS),
     })
@@ -349,16 +359,16 @@ impl ListenerCounters {
 
 struct AuthenticatedTlsStream {
     inner: TlsStream<TcpStream>,
-    principal: AuthenticatedGnmiPrincipal,
+    session: AuthenticatedGnmiSession,
     _permit: OwnedSemaphorePermit,
     _active_session: ActiveSessionGuard,
 }
 
 impl Connected for AuthenticatedTlsStream {
-    type ConnectInfo = AuthenticatedGnmiPrincipal;
+    type ConnectInfo = AuthenticatedGnmiSession;
 
     fn connect_info(&self) -> Self::ConnectInfo {
-        self.principal.clone()
+        self.session.clone()
     }
 }
 

@@ -14,14 +14,14 @@ use std::sync::Arc;
 use crate::admin::ConfigVersionMetadata;
 use crate::bootstrap::{BootstrapError, PanicHookMetadata};
 use crate::profile::{RuntimeMode, RuntimeProfile, SigintHandling};
-use crate::runtime::{RuntimeHandle, RuntimePhase};
+use crate::runtime::{BackgroundTaskGuard, RuntimeHandle, RuntimePhase};
 use crate::shutdown::{DrainHook, ShutdownToken};
 use crate::supervisor::Supervisor;
 use crate::task::RuntimeError;
 use crate::testkit::{Clock, RealClock};
 
 #[cfg(unix)]
-use crate::runtime::{SignalHandlerGuard, UnixSignalFactory, UnixSignalKind};
+use crate::runtime::{UnixSignalFactory, UnixSignalKind};
 
 /// Boxed one-shot initialization callback passed to `Builder::with_init`.
 ///
@@ -313,6 +313,9 @@ impl Builder {
             clock.clone(),
             alarm_manager.clone(),
         );
+        let heartbeat_monitor_handle = Arc::new(BackgroundTaskGuard {
+            handle: supervisor.start_heartbeat_monitor(),
+        });
         let mut readiness_rx = supervisor.subscribe_state_changes();
 
         // Install SIGTERM and optional SIGINT signal handlers under Unix.
@@ -388,7 +391,7 @@ impl Builder {
                 }
                 shutdown_clone.request_shutdown();
             });
-            Some(Arc::new(SignalHandlerGuard {
+            Some(Arc::new(BackgroundTaskGuard {
                 handle: join_handle,
             }))
         };
@@ -414,6 +417,7 @@ impl Builder {
             clock: clock.clone(),
             drain_hooks: self.drain_hooks.clone(),
             signal_handle,
+            heartbeat_monitor_handle: Some(heartbeat_monitor_handle),
             drains_executed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             owner_count,
             owner_drop_tx,

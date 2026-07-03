@@ -12,7 +12,7 @@ use core::fmt;
 use bytes::{BufMut, BytesMut};
 use opc_protocol::{
     DecodeContext, DecodeError, DecodeErrorCode, DuplicateIePolicy, EncodeContext, EncodeError,
-    EncodeErrorCode, SpecRef,
+    EncodeErrorCode, SpecRef, UnknownIePolicy,
 };
 
 use crate::ie::{RawIe, RawIeIterator, IE_HEADER_LEN};
@@ -1501,6 +1501,12 @@ impl<'a> TypedIe<'a> {
             IE_TYPE_APCO => TypedIeValue::AdditionalProtocolConfigurationOptions(
                 AdditionalProtocolConfigurationOptions::decode_value(raw.value, value_offset)?,
             ),
+            _ if matches!(ctx.unknown_ie_policy, UnknownIePolicy::Reject) => {
+                return Err(
+                    DecodeError::new(DecodeErrorCode::UnknownCriticalIe, base_offset)
+                        .with_spec_ref(spec_ref()),
+                );
+            }
             _ => TypedIeValue::Raw(raw.clone()),
         };
         Ok(Self {

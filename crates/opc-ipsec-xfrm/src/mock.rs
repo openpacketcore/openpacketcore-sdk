@@ -518,6 +518,9 @@ mod tests {
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),
             replay_window: 32,
+            encap: None,
+            mark: None,
+            if_id: None,
         }
     }
 
@@ -536,6 +539,8 @@ mod tests {
                 source_address: ipv4(10, 0, 0, 1),
                 mode: XfrmMode::Tunnel,
             }],
+            mark: None,
+            if_id: None,
         }
     }
 
