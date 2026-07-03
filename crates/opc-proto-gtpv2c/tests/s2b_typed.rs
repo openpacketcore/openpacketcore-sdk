@@ -69,6 +69,7 @@ const BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE: &[u8] = &[
 ];
 
 const CAUSE_IE: &[u8] = &[0x02, 0x00, 0x02, 0x00, 0x10, 0x00];
+const PARTIAL_ACCEPT_CAUSE_IE: &[u8] = &[IE_TYPE_CAUSE, 0x00, 0x02, 0x00, 0x11, 0x00];
 const REJECTED_CAUSE_IE: &[u8] = &[IE_TYPE_CAUSE, 0x00, 0x02, 0x00, 0x46, 0x00];
 const EBI_IE: &[u8] = &[0x49, 0x00, 0x01, 0x00, 0x05];
 const SENDER_F_TEID_IE: &[u8] = &[
@@ -767,6 +768,71 @@ fn create_session_accepted_response_summary_requires_bearer_fields() {
     assert_eq!(
         s2b::decode_create_session_response_summary(&missing_ebi, procedure_context()),
         Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingBearerEbi)
+    );
+}
+
+#[test]
+fn create_session_partial_accept_response_summary_projects_bearer_fields() {
+    let response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[
+            PARTIAL_ACCEPT_CAUSE_IE,
+            SENDER_F_TEID_IE,
+            BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE,
+        ],
+    );
+
+    let decoded = decode_s2b(&response);
+    let summary = match decoded.create_session_response_summary() {
+        Ok(summary) => summary,
+        Err(error) => panic!("partial accept response summary failed: {error:?}"),
+    };
+    match &summary {
+        s2b::CreateSessionResponseSummary::Accepted(accepted) => {
+            assert_eq!(accepted.response_teid, 0x0102_0304);
+            assert_eq!(accepted.sequence_number, 0x0000_2000);
+            assert_eq!(accepted.cause, CauseValue::RequestAcceptedPartially);
+            assert_eq!(accepted.sender_f_teid.teid, 0x5566_7788);
+            assert_eq!(accepted.bearer_ebi.value, 5);
+            assert_eq!(
+                accepted.bearer_user_plane_f_teid.interface_type,
+                INTERFACE_TYPE_S2B_U_PGW_GTP_U
+            );
+            assert_eq!(accepted.bearer_user_plane_f_teid.teid, 0x1122_3344);
+        }
+        other => panic!("expected accepted partial summary, got {other:?}"),
+    }
+
+    let direct = match s2b::decode_create_session_response_summary(&response, procedure_context()) {
+        Ok(summary) => summary,
+        Err(error) => panic!("direct partial accept projection failed: {error:?}"),
+    };
+    assert_eq!(direct, summary);
+}
+
+#[test]
+fn create_session_partial_accept_response_requires_accepted_fields() {
+    let cause_only = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[PARTIAL_ACCEPT_CAUSE_IE],
+    );
+    assert!(S2bMessage::decode(&cause_only, procedure_context()).is_err());
+    assert_eq!(
+        s2b::decode_create_session_response_summary(&cause_only, procedure_context()),
+        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingSenderFTeid)
+    );
+
+    let missing_bearer = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[PARTIAL_ACCEPT_CAUSE_IE, SENDER_F_TEID_IE],
+    );
+    assert!(S2bMessage::decode(&missing_bearer, procedure_context()).is_err());
+    assert_eq!(
+        s2b::decode_create_session_response_summary(&missing_bearer, procedure_context()),
+        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingBearerContext)
     );
 }
 

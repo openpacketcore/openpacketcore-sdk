@@ -60,7 +60,8 @@ failures and must cover at least these rules:
   F-TEID, APN, Selection Mode, PDN Type, PAA, and Bearer Context with nested
   EBI.
 - Create Session Response must include Cause, Sender F-TEID, and Bearer Context
-  for accepted responses; rejected responses may expose Cause-only summaries.
+  for accepted responses (Cause 16/17); rejected responses may expose
+  Cause-only summaries.
 - Modify Bearer and Update Bearer requests must include Bearer Context.
 - Delete Session Request must include linked EPS Bearer ID.
 - Procedure responses must include Cause where the profile claims response
