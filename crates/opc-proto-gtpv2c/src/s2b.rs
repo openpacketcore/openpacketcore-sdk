@@ -533,9 +533,11 @@ fn validate_built_s2b_profile_message(message: &OwnedMessage) -> Result<(), Deco
 
 /// Accepted Create Session Response projection.
 ///
-/// This projection is intentionally strict: it is only returned for Cause 16
-/// (`RequestAccepted`) and includes the accepted-bearer fields that products
-/// need to derive an established bearer context.
+/// This projection is intentionally strict: it is returned for TS 29.274
+/// accepted causes 16 (`RequestAccepted`) and 17
+/// (`RequestAcceptedPartially`) and includes the accepted-bearer fields that
+/// products need to derive an established bearer context. Consumers must
+/// inspect [`Self::cause`] to distinguish full and partial acceptance.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CreateSessionAcceptedResponseSummary {
     /// TEID carried in the Create Session Response common header.
@@ -608,9 +610,9 @@ pub struct CreateSessionRejectedResponseSummary {
 /// Create Session Response projection split by bearer-establishment outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateSessionResponseSummary {
-    /// Cause 16 response with accepted-bearer fields present.
+    /// Cause 16/17 response with accepted-bearer fields present.
     Accepted(CreateSessionAcceptedResponseSummary),
-    /// Non-Cause-16 response with Cause, response TEID, and sequence only.
+    /// Non-accepted response with Cause, response TEID, and sequence only.
     Rejected(CreateSessionRejectedResponseSummary),
 }
 
@@ -2613,7 +2615,10 @@ fn find_bearer_context_s2b_u_f_teid(
 }
 
 fn is_accepted_create_session_cause(cause: CauseValue) -> bool {
-    cause == CauseValue::RequestAccepted
+    matches!(
+        cause,
+        CauseValue::RequestAccepted | CauseValue::RequestAcceptedPartially
+    )
 }
 
 fn project_create_session_response(
