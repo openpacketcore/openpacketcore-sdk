@@ -29,6 +29,9 @@ jobs:
       - name: Build mdbook
         run: mdbook build
 
+      - name: Add Go vanity import pages
+        run: bash scripts/build-pages-vanity.sh
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v5
         with:
