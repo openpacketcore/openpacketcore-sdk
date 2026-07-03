@@ -107,14 +107,7 @@ func NewClient(binaryPath string, opts ...ClientOption) (*Client, error) {
 		binaryPath = os.Getenv("OPERATOR_LIFECYCLE_CLI_PATH")
 	}
 	if binaryPath == "" {
-		candidates := []string{
-			"operator-lifecycle-cli",
-			"../../target/debug/operator-lifecycle-cli",
-			"../../../target/debug/operator-lifecycle-cli",
-			"../../../../target/debug/operator-lifecycle-cli",
-			"target/debug/operator-lifecycle-cli",
-		}
-		for _, cand := range candidates {
+		for _, cand := range lifecycleCliCandidates() {
 			path := cand
 			if cand != "operator-lifecycle-cli" {
 				if abs, err := filepath.Abs(path); err == nil {
@@ -139,6 +132,19 @@ func NewClient(binaryPath string, opts ...ClientOption) (*Client, error) {
 		o(c)
 	}
 	return c, nil
+}
+
+func lifecycleCliCandidates() []string {
+	candidates := []string{"operator-lifecycle-cli"}
+	if targetDir := os.Getenv("CARGO_TARGET_DIR"); targetDir != "" {
+		candidates = append(candidates, filepath.Join(targetDir, "debug", "operator-lifecycle-cli"))
+	}
+	return append(candidates,
+		"../../target/debug/operator-lifecycle-cli",
+		"../../../target/debug/operator-lifecycle-cli",
+		"../../../../target/debug/operator-lifecycle-cli",
+		"target/debug/operator-lifecycle-cli",
+	)
 }
 
 // BinaryPath returns the resolved CLI binary path.

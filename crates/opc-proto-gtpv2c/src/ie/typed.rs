@@ -1014,7 +1014,7 @@ impl PdnType {
 ///
 /// @spec 3GPP TS29274 R18 8.14
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-PAA-001
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PdnAddressAllocation {
     /// PDN type encoded in the low three bits of the first value octet.
     pub pdn_type: PdnTypeValue,
@@ -1024,6 +1024,18 @@ pub struct PdnAddressAllocation {
     pub ipv6_prefix: Option<[u8; 16]>,
     /// IPv4 address, present for IPv4 and IPv4v6 PAA values.
     pub ipv4: Option<[u8; 4]>,
+}
+
+impl fmt::Debug for PdnAddressAllocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PdnAddressAllocation")
+            .field("pdn_type", &self.pdn_type)
+            .field("ipv6_prefix_length", &self.ipv6_prefix_length)
+            .field("ipv6_present", &self.ipv6_prefix.is_some())
+            .field("ipv4_present", &self.ipv4.is_some())
+            .finish()
+    }
 }
 
 impl PdnAddressAllocation {

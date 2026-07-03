@@ -3,7 +3,9 @@
 use std::{error::Error, fmt, time::Duration};
 
 use async_trait::async_trait;
-use operator_lifecycle::{ReconcileIntentError, StatusPatchIntent};
+use operator_lifecycle::{
+    ConflictRetryIntent, OwnedStatusProjection, ReconcileIntentError, StatusPatchIntent,
+};
 use serde_json::{json, Value};
 
 /// Snapshot of the Kubernetes resource status boundary before patching.
@@ -189,8 +191,38 @@ pub async fn execute_status_patch<C>(
 where
     C: StatusPatchClient + ?Sized,
 {
-    intent.validate().map_err(StatusPatchError::InvalidIntent)?;
-    let max_attempts = max_attempts(intent);
+    execute_owned_status_patch(client, intent).await
+}
+
+/// Execute a Kubernetes status merge-patch loop for any owned status projection.
+///
+/// The generated patch contains exactly one top-level key, `status`, whose
+/// value is `projection.owned_status()`. Kubernetes merge-patch semantics
+/// preserve status fields not listed by the projection.
+///
+/// # Errors
+///
+/// Returns [`StatusPatchError`] for invalid projections, invalid snapshots, and
+/// unrecoverable client errors. Resource-version conflicts are retried according
+/// to the projection and return [`StatusPatchOutcomeKind::ConflictExhausted`]
+/// when the retry budget is exhausted.
+pub async fn execute_owned_status_patch<C, P>(
+    client: &C,
+    projection: &P,
+) -> Result<StatusPatchOutcome, StatusPatchError>
+where
+    C: StatusPatchClient + ?Sized,
+    P: OwnedStatusProjection + ?Sized,
+{
+    projection
+        .validate()
+        .map_err(StatusPatchError::InvalidIntent)?;
+    let owned_status = projection.owned_status();
+    if !owned_status.is_object() {
+        return Err(StatusPatchError::Schema("owned status must be an object"));
+    }
+
+    let max_attempts = max_attempts(projection.conflict_retry());
     let mut attempts = 0_u8;
     let mut conflicts = 0_u8;
 
@@ -201,7 +233,7 @@ where
             .map_err(StatusPatchError::Client)?;
         validate_snapshot(&snapshot)?;
 
-        if intent.observed_generation < snapshot.generation {
+        if projection.observed_generation() < snapshot.generation {
             return Ok(StatusPatchOutcome::new(
                 StatusPatchOutcomeKind::StaleGeneration,
                 attempts,
@@ -210,8 +242,7 @@ where
             ));
         }
 
-        let owned_status = status_patch_owned_status(intent);
-        if current_owned_status_matches(&snapshot.status, &owned_status) {
+        if owned_status_subset_matches(&snapshot.status, &owned_status) {
             return Ok(StatusPatchOutcome::new(
                 StatusPatchOutcomeKind::NoOp,
                 attempts,
@@ -221,7 +252,7 @@ where
         }
 
         attempts = attempts.saturating_add(1);
-        let patch = json!({ "status": owned_status });
+        let patch = json!({ "status": owned_status.clone() });
         match client
             .patch_status(snapshot.resource_version.as_str(), &patch)
             .await
@@ -244,7 +275,7 @@ where
                         Some(snapshot.resource_version),
                     ));
                 }
-                sleep_before_retry(intent, attempts).await;
+                sleep_before_retry(projection.conflict_retry(), attempts).await;
             }
             Err(error) => return Err(StatusPatchError::Client(error)),
         }
@@ -256,26 +287,29 @@ where
 /// The returned value is suitable for a status subresource merge patch and does
 /// not include `spec` or metadata fields.
 pub fn status_merge_patch(intent: &StatusPatchIntent) -> Value {
-    json!({ "status": status_patch_owned_status(intent) })
+    owned_status_merge_patch(intent)
 }
 
-fn status_patch_owned_status(intent: &StatusPatchIntent) -> Value {
-    json!({
-        "observed_generation": intent.observed_generation,
-        "lifecycle_conditions": intent.lifecycle_conditions,
-        "alarm_conditions": intent.alarm_conditions,
-        "alarm_events": intent.alarm_events,
-        "app_config": intent.app_config,
-        "traffic": intent.traffic,
-    })
+/// Build the Kubernetes merge-patch body for any owned status projection.
+///
+/// The returned value is suitable for a status subresource merge patch and does
+/// not include `spec` or metadata fields.
+pub fn owned_status_merge_patch<P>(projection: &P) -> Value
+where
+    P: OwnedStatusProjection + ?Sized,
+{
+    json!({ "status": projection.owned_status() })
 }
 
-fn current_owned_status_matches(current: &Value, desired: &Value) -> bool {
-    desired.as_object().is_some_and(|desired| {
-        desired
-            .iter()
-            .all(|(key, value)| current.get(key).is_some_and(|current| current == value))
-    })
+fn owned_status_subset_matches(current: &Value, desired: &Value) -> bool {
+    match (current, desired) {
+        (Value::Object(current), Value::Object(desired)) => desired.iter().all(|(key, value)| {
+            current
+                .get(key)
+                .is_some_and(|current| owned_status_subset_matches(current, value))
+        }),
+        _ => current == desired,
+    }
 }
 
 fn validate_snapshot(snapshot: &StatusPatchResourceSnapshot) -> Result<(), StatusPatchError> {
@@ -291,16 +325,16 @@ fn validate_snapshot(snapshot: &StatusPatchResourceSnapshot) -> Result<(), Statu
     Ok(())
 }
 
-fn max_attempts(intent: &StatusPatchIntent) -> u8 {
-    if intent.conflict_retry.retry_on_conflict {
-        intent.conflict_retry.max_attempts.max(1)
+fn max_attempts(conflict_retry: &ConflictRetryIntent) -> u8 {
+    if conflict_retry.retry_on_conflict {
+        conflict_retry.max_attempts.max(1)
     } else {
         1
     }
 }
 
-async fn sleep_before_retry(intent: &StatusPatchIntent, attempts: u8) {
-    let base = intent.conflict_retry.initial_backoff_millis;
+async fn sleep_before_retry(conflict_retry: &ConflictRetryIntent, attempts: u8) {
+    let base = conflict_retry.initial_backoff_millis;
     if base == 0 {
         return;
     }

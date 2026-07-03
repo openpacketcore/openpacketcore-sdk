@@ -1,6 +1,7 @@
 use crate::phase::{ConditionSeverity, ConditionStatus, LifecycleCondition};
 use opc_alarm::{Alarm, ReadinessImpact};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 
@@ -541,6 +542,23 @@ pub struct StatusPatchIntent {
     pub conflict_retry: ConflictRetryIntent,
 }
 
+/// A reconciler-owned projection of the Kubernetes `status` subresource.
+///
+/// Implementors render exactly the JSON object they own under `status`. The
+/// controller executor merge-patches only these keys; unlisted `status` fields
+/// are preserved by Kubernetes JSON merge-patch semantics. Every leaf value
+/// must already be redaction-safe.
+pub trait OwnedStatusProjection {
+    /// Owned `status` object. Must be a JSON object.
+    fn owned_status(&self) -> Value;
+    /// Observed generation for stale-generation short-circuiting.
+    fn observed_generation(&self) -> i64;
+    /// Conflict retry and backoff policy for the patch loop.
+    fn conflict_retry(&self) -> &ConflictRetryIntent;
+    /// Validate before the controller performs any Kubernetes calls.
+    fn validate(&self) -> Result<(), ReconcileIntentError>;
+}
+
 impl StatusPatchIntent {
     /// Build a minimal status patch with no app config payload.
     pub fn new(observed_generation: i64, traffic: TrafficStatusIntent) -> Self {
@@ -587,6 +605,31 @@ impl StatusPatchIntent {
             ));
         }
         Ok(())
+    }
+}
+
+impl OwnedStatusProjection for StatusPatchIntent {
+    fn owned_status(&self) -> Value {
+        json!({
+            "observed_generation": self.observed_generation,
+            "lifecycle_conditions": self.lifecycle_conditions,
+            "alarm_conditions": self.alarm_conditions,
+            "alarm_events": self.alarm_events,
+            "app_config": self.app_config,
+            "traffic": self.traffic,
+        })
+    }
+
+    fn observed_generation(&self) -> i64 {
+        self.observed_generation
+    }
+
+    fn conflict_retry(&self) -> &ConflictRetryIntent {
+        &self.conflict_retry
+    }
+
+    fn validate(&self) -> Result<(), ReconcileIntentError> {
+        StatusPatchIntent::validate(self)
     }
 }
 

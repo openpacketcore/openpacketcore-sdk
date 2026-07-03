@@ -57,28 +57,32 @@ worker pane. The following gates passed:
 - `cargo +1.88 check --workspace --all-targets --all-features`
 - `cargo audit --no-fetch`
 - `cargo deny check bans` / `licenses` / `sources`
+- `cargo test --workspace --exclude opc-persist --all-features -- --test-threads=4`
+- `cargo test -p opc-persist --all-features -- --test-threads=1`
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features`
 - Kustomize/Helm rendering checks for the reference operator
 
-Final validation for this snapshot is **not complete**: the following gate
-classes are deferred because the worker pane cannot provide AF_UNIX sockets, the
-required Go 1.26.4 toolchain, or a `cargo-deny`-compatible advisory database.
-They are **deferred (environment-limited), supervisor-waived** for this
-readiness snapshot. Evidence source: supervisor decision by `claude-supervisor`
-recorded for `T-8c57ecee`. The deferrals are due to environment limitations, not
-code defects, and must be satisfied before any production/carrier-acceptance
-claim.
+Final validation for this snapshot is **not complete**: the remaining deferred
+gate below is blocked by a `cargo-deny` advisory database/tooling
+compatibility issue. It is **deferred (environment-limited),
+supervisor-waived** for this readiness snapshot. Evidence source: supervisor
+decision by `claude-supervisor` recorded for `T-8c57ecee`. The deferral is due
+to environment limitations, not code defects, and must be satisfied before any
+production/carrier-acceptance claim.
+
+Go operator verification was re-run on July 3, 2026 with Go 1.26.4 for both
+`operators/sdk-reference-operator` and `operators/operator-sdk-go`: `gofmt -l`,
+`go vet ./...`, `go test ./...`, `go test -race ./...`, and `govulncheck ./...`
+passed. The reusable Go SDK downstream-import smoke also passed through the
+local `go.work` fixture.
 
 | Gate | Status | Evidence / limitation |
 |:---|:---|:---|
-| Workspace tests that create AF_UNIX sockets (e.g., `cargo test --workspace --all-features`) | Deferred (environment-limited), supervisor-waived | The sandbox denies AF_UNIX socket creation. |
-| Go operator verification: `gofmt`, `go vet`, `go test`, and `govulncheck` under `operators/sdk-reference-operator` and `operators/operator-sdk-go` | Deferred (environment-limited), supervisor-waived | Go 1.26.4 is unavailable under the network-restricted `GOTOOLCHAIN` setting. |
 | `cargo deny check advisories` | Deferred (environment-limited), supervisor-waived | The installed `cargo-deny` 0.17.0 cannot parse a CVSS 4.0 entry in the cached advisory database (`RUSTSEC-2026-0146`), so the advisories check fails before scanning the local lockfile. `cargo audit --no-fetch` of the same lockfile passes. |
 
-These deferred gates must be re-run in a CI/dev environment that supports
-AF_UNIX socket creation, Go 1.26.4, and the required `cargo-deny`/advisory-db
-version before the initiative merges to `main` or before any
-production/carrier-acceptance readiness claim.
+This deferred gate must be re-run in a CI/dev environment with the required
+`cargo-deny`/advisory-db version before the initiative merges to `main` or
+before any production/carrier-acceptance readiness claim.
 
 ## EPC/untrusted-access final hardening addendum
 

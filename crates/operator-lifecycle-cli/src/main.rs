@@ -271,6 +271,18 @@ fn write_success<T: Serialize>(val: &T) {
     std::process::exit(0);
 }
 
+fn write_version() -> ! {
+    let resp = VersionResponse {
+        contract_version: CONTRACT_VERSION,
+        crate_version: env!("CARGO_PKG_VERSION"),
+    };
+    if let Err(e) = serde_json::to_writer(io::stdout(), &resp) {
+        write_error(&format!("Failed to serialize response: {e}"));
+    }
+    println!();
+    std::process::exit(0);
+}
+
 fn parse_request<T: serde::de::DeserializeOwned>(buffer: &str, command_name: &str) -> T {
     let mut value: serde_json::Value = match serde_json::from_str(buffer) {
         Ok(v) => v,
@@ -308,11 +320,7 @@ fn main() {
     let command = args[1].as_str();
 
     if command == "version" {
-        let resp = VersionResponse {
-            contract_version: CONTRACT_VERSION,
-            crate_version: env!("CARGO_PKG_VERSION"),
-        };
-        write_success(&resp);
+        write_version();
     }
 
     let mut buffer = String::new();

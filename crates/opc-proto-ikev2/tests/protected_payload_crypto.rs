@@ -5,8 +5,9 @@ use aes_gcm::{
 use bytes::BytesMut;
 use opc_proto_ikev2::{
     decrypt_ikev2_sa_init_protected_payload, derive_ike_sa_init_key_material,
-    open_protected_payloads, seal_ikev2_sa_init_protected_payload, Header, HeaderFlags,
-    Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2PrfAlgorithm, Ikev2ProtectedPayloadCryptoError,
+    ikev2_aes_gcm_protected_body_len, ikev2_aes_gcm_protected_payload_len, open_protected_payloads,
+    seal_ikev2_sa_init_protected_payload, Header, HeaderFlags, Ikev2DhGroup,
+    Ikev2EncryptionAlgorithm, Ikev2PrfAlgorithm, Ikev2ProtectedPayloadCryptoError,
     Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoProfile, Ikev2SaInitProtectedPayloadProvider,
     Message, PayloadChain, PayloadType, ProtectedPayloadContext, ProtectedPayloadKind,
     ProtectedPayloadOpenError, ProtectedPayloadSealContext, EXCHANGE_TYPE_IKE_AUTH,
@@ -149,6 +150,54 @@ fn sealed_message(
     };
     target.copy_from_slice(&protected_body);
     encoded
+}
+
+#[test]
+fn protected_length_helpers_match_sealed_body_for_supported_profiles() {
+    for (profile, direction, explicit_iv) in [
+        (
+            profile_128(),
+            Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+            EXPLICIT_IV_I2R,
+        ),
+        (
+            profile_256(),
+            Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+            EXPLICIT_IV_R2I,
+        ),
+    ] {
+        let material = key_material(profile);
+        for padding_len in [0_u8, 7] {
+            let expected_body_len =
+                ikev2_aes_gcm_protected_body_len(INNER_PAYLOAD.len(), padding_len)
+                    .expect("body length");
+            let expected_payload_len =
+                ikev2_aes_gcm_protected_payload_len(INNER_PAYLOAD.len(), padding_len)
+                    .expect("payload length");
+            let encoded =
+                placeholder_message(expected_body_len, PayloadType::ExtensibleAuthentication);
+            let prefix = &encoded[..HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN];
+            let protected_body = seal_ikev2_sa_init_protected_payload(
+                profile,
+                &material,
+                direction,
+                ProtectedPayloadSealContext {
+                    kind: ProtectedPayloadKind::Encrypted,
+                    message_prefix: prefix,
+                },
+                INNER_PAYLOAD,
+                padding_len,
+                explicit_iv,
+            )
+            .expect("seal protected body");
+
+            assert_eq!(protected_body.len(), expected_body_len);
+            assert_eq!(
+                expected_payload_len,
+                GENERIC_PAYLOAD_HEADER_LEN + protected_body.len()
+            );
+        }
+    }
 }
 
 fn encrypted_message_after_notify(
@@ -327,6 +376,7 @@ fn encrypt_ciphertext_and_tag(
                 Err(error) => panic!("test AES-GCM-256 encryption failed: {error}"),
             }
         }
+        unsupported => panic!("unsupported test encryption profile: {unsupported:?}"),
     }
 }
 

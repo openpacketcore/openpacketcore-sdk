@@ -151,6 +151,8 @@ pub const XFRMA_ENCAP: u16 = 4;
 pub const XFRMA_TMPL: u16 = 5;
 /// XFRM optional source address attribute.
 pub const XFRMA_SRCADDR: u16 = 13;
+/// XFRM optional combined-mode AEAD algorithm attribute.
+pub const XFRMA_ALG_AEAD: u16 = 18;
 /// XFRM optional authentication algorithm with truncation attribute.
 pub const XFRMA_ALG_AUTH_TRUNC: u16 = 20;
 /// XFRM optional packet mark attribute.
@@ -561,6 +563,7 @@ mod tests {
         assert_eq!(XFRMA_ENCAP, 4);
         assert_eq!(XFRMA_TMPL, 5);
         assert_eq!(XFRMA_SRCADDR, 13);
+        assert_eq!(XFRMA_ALG_AEAD, 18);
         assert_eq!(XFRMA_ALG_AUTH_TRUNC, 20);
         assert_eq!(XFRMA_MARK, 21);
         assert_eq!(XFRMA_IF_ID, 31);

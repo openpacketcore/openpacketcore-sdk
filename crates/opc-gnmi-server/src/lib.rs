@@ -80,9 +80,12 @@ pub use proto_adapter::{
 pub use service::{AuthenticatedGnmiPrincipal, GnmiService};
 pub use set::{NormalizedSet, SetOperation};
 pub use smoke::{
-    run_gnmi_smoke, GnmiSmokeCapabilitySummary, GnmiSmokeClientConfig, GnmiSmokeDataType,
-    GnmiSmokeEncoding, GnmiSmokeError, GnmiSmokeErrorCode, GnmiSmokeGetOutcome,
-    GnmiSmokeGetRequest, GnmiSmokeGetStatus, GnmiSmokeModelSummary, GnmiSmokeTranscript,
+    run_gnmi_mutating_smoke, run_gnmi_smoke, GnmiSmokeCapabilitySummary, GnmiSmokeClientConfig,
+    GnmiSmokeDataType, GnmiSmokeEncoding, GnmiSmokeError, GnmiSmokeErrorCode, GnmiSmokeGetOutcome,
+    GnmiSmokeGetRequest, GnmiSmokeGetStatus, GnmiSmokeLeafExpectation, GnmiSmokeLeafReadback,
+    GnmiSmokeModelSummary, GnmiSmokeMutationStep, GnmiSmokeMutationTranscript, GnmiSmokeReadback,
+    GnmiSmokeReadbackOutcome, GnmiSmokeSetExpectation, GnmiSmokeSetOp, GnmiSmokeSetOpKind,
+    GnmiSmokeSetOutcome, GnmiSmokeSetStatus, GnmiSmokeStepOutcome, GnmiSmokeTranscript,
 };
 pub use supervision::{spawn_gnmi_tls_listener, SupervisedGnmiTlsListenerConfig};
 pub use transport::{

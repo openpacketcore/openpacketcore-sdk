@@ -63,17 +63,18 @@ pub use ike_auth::{
     build_ike_auth_cleartext_payload_chain, build_ike_auth_configuration_payload,
     build_ike_auth_identification_payload, build_ike_auth_sa_payload,
     build_ike_auth_traffic_selector_payload, compute_ike_auth_shared_key_mic,
-    decode_ike_auth_cleartext_payloads, negotiate_child_sa, verify_ike_auth_shared_key_mic,
-    Ikev2AuthenticationPayload, Ikev2AuthenticationPayloadBuild, Ikev2ChildSaNegotiation,
-    Ikev2ChildSaNegotiationError, Ikev2ChildSaNegotiationPolicy, Ikev2ChildSaResponsePayloads,
-    Ikev2ChildSaTransformRequirement, Ikev2ConfigurationAttribute,
-    Ikev2ConfigurationAttributeBuild, Ikev2ConfigurationPayload, Ikev2ConfigurationPayloadBuild,
-    Ikev2DeletePayload, Ikev2EapPayload, Ikev2IdentificationPayload,
-    Ikev2IdentificationPayloadBuild, Ikev2IkeAuthBuildError, Ikev2IkeAuthCleartextPayloads,
-    Ikev2IkeAuthPayloadBuild, Ikev2IkeAuthPayloadError, Ikev2IkeAuthPeer, Ikev2IkeAuthSignedOctets,
-    Ikev2IkeAuthVerificationError, Ikev2TrafficSelector, Ikev2TrafficSelectorBuild,
-    Ikev2TrafficSelectorPayload, Ikev2TrafficSelectorPayloadBuild,
-    IKEV2_AUTH_METHOD_SHARED_KEY_MIC, IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
+    decode_ike_auth_cleartext_payloads, ike_auth_shared_key_authentication_payload_body_len,
+    negotiate_child_sa, verify_ike_auth_shared_key_mic, Ikev2AuthenticationPayload,
+    Ikev2AuthenticationPayloadBuild, Ikev2ChildSaNegotiation, Ikev2ChildSaNegotiationError,
+    Ikev2ChildSaNegotiationPolicy, Ikev2ChildSaResponsePayloads, Ikev2ChildSaTransformRequirement,
+    Ikev2ConfigurationAttribute, Ikev2ConfigurationAttributeBuild, Ikev2ConfigurationPayload,
+    Ikev2ConfigurationPayloadBuild, Ikev2DeletePayload, Ikev2EapPayload,
+    Ikev2IdentificationPayload, Ikev2IdentificationPayloadBuild, Ikev2IkeAuthBuildError,
+    Ikev2IkeAuthCleartextPayloads, Ikev2IkeAuthPayloadBuild, Ikev2IkeAuthPayloadError,
+    Ikev2IkeAuthPeer, Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError,
+    Ikev2TrafficSelector, Ikev2TrafficSelectorBuild, Ikev2TrafficSelectorPayload,
+    Ikev2TrafficSelectorPayloadBuild, IKEV2_AUTH_METHOD_SHARED_KEY_MIC, IKEV2_TS_IPV4_ADDR_RANGE,
+    IKEV2_TS_IPV6_ADDR_RANGE,
 };
 pub use message::{Message, OwnedMessage};
 pub use nat_detection::{
@@ -99,7 +100,8 @@ pub use payload::{
     GENERIC_PAYLOAD_HEADER_LEN,
 };
 pub use protected_payload_crypto::{
-    decrypt_ikev2_sa_init_protected_payload, seal_ikev2_sa_init_protected_payload,
+    decrypt_ikev2_sa_init_protected_payload, ikev2_aes_gcm_protected_body_len,
+    ikev2_aes_gcm_protected_payload_len, seal_ikev2_sa_init_protected_payload,
     Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadCryptoErrorCode,
     Ikev2ProtectedPayloadDirection, Ikev2SaInitProtectedPayloadProvider,
     ProtectedPayloadSealContext, IKEV2_AES_GCM_EXPLICIT_IV_LEN,
@@ -115,8 +117,9 @@ pub use sa_init::{
     Ikev2VendorIdPayloadError,
 };
 pub use sa_init_crypto::{
-    derive_ike_sa_init_key_material, Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey,
-    Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
+    derive_child_sa_key_material, derive_ike_sa_init_key_material, Ikev2ChildSaCryptoProfile,
+    Ikev2ChildSaKeyMaterial, Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey,
+    Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
     Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
 };
 

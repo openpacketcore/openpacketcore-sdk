@@ -31,10 +31,11 @@ use tonic::Request;
 
 use crate::get::yang_path_to_proto;
 use crate::proto::gnmi;
-use crate::proto_adapter::encoding_to_proto;
+use crate::proto_adapter::{encoding_to_proto, path_from_proto};
 use crate::Encoding;
 
 const MAX_SMOKE_GETS: usize = 16;
+const MAX_SMOKE_SETS: usize = 8;
 const MAX_MODELS_SUMMARY: usize = 64;
 const MAX_ENCODINGS_SUMMARY: usize = 32;
 const MAX_SUMMARY_STRING_BYTES: usize = 256;
@@ -202,6 +203,173 @@ pub struct GnmiSmokeGetOutcome {
     pub status: GnmiSmokeGetStatus,
 }
 
+/// One bounded gNMI Set operation for the mutating smoke helper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GnmiSmokeSetOp {
+    /// SDK-canonical path string.
+    pub path: String,
+    /// Set operation kind.
+    pub op: GnmiSmokeSetOpKind,
+    /// JSON value for non-delete operations. Must be absent for delete.
+    pub json_value: Option<String>,
+    /// JSON encoding to place in the generated `TypedValue`.
+    pub encoding: GnmiSmokeEncoding,
+    /// Expected Set RPC outcome.
+    pub expectation: GnmiSmokeSetExpectation,
+}
+
+/// gNMI Set operation kinds exposed by the smoke helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GnmiSmokeSetOpKind {
+    /// `update`.
+    Update,
+    /// `replace`.
+    Replace,
+    /// `union_replace`.
+    UnionReplace,
+    /// `delete`.
+    Delete,
+}
+
+impl GnmiSmokeSetOpKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Update => "update",
+            Self::Replace => "replace",
+            Self::UnionReplace => "union_replace",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// Expected Set RPC result for a mutating smoke step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GnmiSmokeSetExpectation {
+    /// The Set is expected to be accepted.
+    Accept,
+    /// The Set is expected to be rejected.
+    Reject,
+}
+
+impl GnmiSmokeSetExpectation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Reject => "reject",
+        }
+    }
+}
+
+/// A Set operation plus optional follow-up readbacks over the same channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GnmiSmokeMutationStep {
+    /// Set operation to send.
+    pub set: GnmiSmokeSetOp,
+    /// Follow-up readbacks to run after the expected Set outcome is observed.
+    #[serde(default)]
+    pub readbacks: Vec<GnmiSmokeReadback>,
+}
+
+/// One follow-up Get readback with an optional leaf expectation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GnmiSmokeReadback {
+    /// Get probe to run.
+    pub get: GnmiSmokeGetRequest,
+    /// Optional exact leaf expectation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expect_leaf: Option<GnmiSmokeLeafExpectation>,
+}
+
+/// Expected JSON value for one public leaf returned by a readback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GnmiSmokeLeafExpectation {
+    /// Canonical leaf path to compare.
+    pub leaf_path: String,
+    /// Expected compact JSON value.
+    pub expected_json: String,
+}
+
+/// Redaction-safe mutating smoke transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GnmiSmokeMutationTranscript {
+    /// Target address.
+    pub addr: SocketAddr,
+    /// TLS server name used by the client.
+    pub server_name: String,
+    /// Per-step outcomes, in caller-supplied order.
+    pub steps: Vec<GnmiSmokeStepOutcome>,
+}
+
+/// Per-step mutating smoke outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GnmiSmokeStepOutcome {
+    /// Set outcome.
+    pub set: GnmiSmokeSetOutcome,
+    /// Follow-up readback outcomes.
+    pub readbacks: Vec<GnmiSmokeReadbackOutcome>,
+}
+
+/// Redaction-safe Set outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GnmiSmokeSetOutcome {
+    /// Caller-supplied path string, bounded for evidence.
+    pub path: String,
+    /// Set operation label.
+    pub op: String,
+    /// Expected outcome label.
+    pub expectation: String,
+    /// Redaction-safe Set status.
+    pub status: GnmiSmokeSetStatus,
+}
+
+/// Redaction-safe gNMI `Set` status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GnmiSmokeSetStatus {
+    /// The Set RPC succeeded.
+    Accepted {
+        /// Number of per-operation response rows.
+        response_count: usize,
+        /// Stable `UpdateResult.Operation` labels.
+        ops: Vec<String>,
+    },
+    /// The Set RPC returned a gRPC status. Message text is intentionally omitted.
+    Rejected {
+        /// Stable gRPC status code label.
+        grpc_code: String,
+    },
+}
+
+/// Redaction-safe readback outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GnmiSmokeReadbackOutcome {
+    /// Caller-supplied Get path string.
+    pub path: String,
+    /// Data type requested.
+    pub data_type: String,
+    /// Encoding requested.
+    pub encoding: String,
+    /// Redaction-safe Get status.
+    pub status: GnmiSmokeGetStatus,
+    /// Optional leaf comparison outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leaf: Option<GnmiSmokeLeafReadback>,
+}
+
+/// Leaf value extracted for an explicit readback expectation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GnmiSmokeLeafReadback {
+    /// Canonical leaf path that was compared.
+    pub leaf_path: String,
+    /// Bounded compact JSON value observed, if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoded_json: Option<String>,
+    /// Whether the observed JSON matched the expectation.
+    pub matches_expected: bool,
+}
+
 /// Redaction-safe gNMI `Get` status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -244,6 +412,14 @@ pub enum GnmiSmokeErrorCode {
     CapabilityMismatch,
     /// Caller supplied too many smoke probes.
     RequestLimitExceeded,
+    /// Caller supplied an invalid Set JSON value.
+    InvalidSetValue,
+    /// A Set expected to be rejected was accepted.
+    UnexpectedSetAccepted,
+    /// A Set expected to be accepted was rejected.
+    UnexpectedSetRejected,
+    /// A readback value did not match its expectation.
+    ReadbackMismatch,
 }
 
 impl GnmiSmokeErrorCode {
@@ -259,6 +435,10 @@ impl GnmiSmokeErrorCode {
             Self::CapabilitiesFailed => "capabilities_failed",
             Self::CapabilityMismatch => "capability_mismatch",
             Self::RequestLimitExceeded => "request_limit_exceeded",
+            Self::InvalidSetValue => "invalid_set_value",
+            Self::UnexpectedSetAccepted => "unexpected_set_accepted",
+            Self::UnexpectedSetRejected => "unexpected_set_rejected",
+            Self::ReadbackMismatch => "readback_mismatch",
         }
     }
 }
@@ -293,6 +473,18 @@ pub enum GnmiSmokeError {
     /// Caller supplied too many smoke probes.
     #[error("gNMI smoke request limit exceeded")]
     RequestLimitExceeded,
+    /// Caller supplied an invalid Set JSON value.
+    #[error("gNMI smoke Set value is invalid")]
+    InvalidSetValue,
+    /// A Set expected to be rejected was accepted.
+    #[error("gNMI smoke Set was unexpectedly accepted")]
+    UnexpectedSetAccepted,
+    /// A Set expected to be accepted was rejected.
+    #[error("gNMI smoke Set was unexpectedly rejected")]
+    UnexpectedSetRejected,
+    /// A readback value did not match its expectation.
+    #[error("gNMI smoke readback mismatch")]
+    ReadbackMismatch,
 }
 
 impl GnmiSmokeError {
@@ -308,6 +500,10 @@ impl GnmiSmokeError {
             Self::CapabilitiesFailed => GnmiSmokeErrorCode::CapabilitiesFailed,
             Self::CapabilityMismatch => GnmiSmokeErrorCode::CapabilityMismatch,
             Self::RequestLimitExceeded => GnmiSmokeErrorCode::RequestLimitExceeded,
+            Self::InvalidSetValue => GnmiSmokeErrorCode::InvalidSetValue,
+            Self::UnexpectedSetAccepted => GnmiSmokeErrorCode::UnexpectedSetAccepted,
+            Self::UnexpectedSetRejected => GnmiSmokeErrorCode::UnexpectedSetRejected,
+            Self::ReadbackMismatch => GnmiSmokeErrorCode::ReadbackMismatch,
         }
     }
 }
@@ -336,6 +532,35 @@ pub async fn run_gnmi_smoke(
     })
 }
 
+/// Runs live gNMI Set operations and optional readbacks over mTLS.
+pub async fn run_gnmi_mutating_smoke(
+    config: GnmiSmokeClientConfig,
+    steps: impl IntoIterator<Item = GnmiSmokeMutationStep>,
+) -> Result<GnmiSmokeMutationTranscript, GnmiSmokeError> {
+    validate_config(&config)?;
+    let steps = collect_mutation_steps(steps)?;
+    probe_tls_connection(&config).await?;
+    let timeout = config.timeout;
+    let mut grpc = connect_channel(&config).await?;
+    let _capabilities = request_capabilities(&mut grpc, timeout).await?;
+
+    let mut outcomes = Vec::with_capacity(steps.len());
+    for step in steps {
+        let set = request_set(&mut grpc, step.set, timeout).await?;
+        let mut readbacks = Vec::with_capacity(step.readbacks.len());
+        for readback in step.readbacks {
+            readbacks.push(request_readback(&mut grpc, readback, timeout).await?);
+        }
+        outcomes.push(GnmiSmokeStepOutcome { set, readbacks });
+    }
+
+    Ok(GnmiSmokeMutationTranscript {
+        addr: config.addr,
+        server_name: bounded_string(&config.server_name),
+        steps: outcomes,
+    })
+}
+
 fn validate_config(config: &GnmiSmokeClientConfig) -> Result<(), GnmiSmokeError> {
     if config.server_name.is_empty()
         || config.client_cert_pem.is_empty()
@@ -356,6 +581,51 @@ fn collect_gets(
         return Err(GnmiSmokeError::RequestLimitExceeded);
     }
     Ok(gets)
+}
+
+fn collect_mutation_steps(
+    steps: impl IntoIterator<Item = GnmiSmokeMutationStep>,
+) -> Result<Vec<GnmiSmokeMutationStep>, GnmiSmokeError> {
+    let steps = steps.into_iter().collect::<Vec<_>>();
+    if steps.len() > MAX_SMOKE_SETS {
+        return Err(GnmiSmokeError::RequestLimitExceeded);
+    }
+    let readback_count = steps.iter().map(|step| step.readbacks.len()).sum::<usize>();
+    if readback_count > MAX_SMOKE_GETS {
+        return Err(GnmiSmokeError::RequestLimitExceeded);
+    }
+    for step in &steps {
+        validate_set_op(&step.set)?;
+        for readback in &step.readbacks {
+            validate_readback(readback)?;
+        }
+    }
+    Ok(steps)
+}
+
+fn validate_set_op(op: &GnmiSmokeSetOp) -> Result<(), GnmiSmokeError> {
+    let _path = gnmi_path_from_string(&op.path)?;
+    match (op.op, op.json_value.as_deref()) {
+        (GnmiSmokeSetOpKind::Delete, None) => Ok(()),
+        (GnmiSmokeSetOpKind::Delete, Some(_)) => Err(GnmiSmokeError::InvalidSetValue),
+        (_, Some(value)) => {
+            let _parsed: serde_json::Value =
+                serde_json::from_str(value).map_err(|_| GnmiSmokeError::InvalidSetValue)?;
+            Ok(())
+        }
+        (_, None) => Err(GnmiSmokeError::InvalidSetValue),
+    }
+}
+
+fn validate_readback(readback: &GnmiSmokeReadback) -> Result<(), GnmiSmokeError> {
+    let _path = gnmi_path_from_string(&readback.get.path)?;
+    if let Some(expectation) = &readback.expect_leaf {
+        let _path = gnmi_path_from_string(&expectation.leaf_path)?;
+        let parsed: serde_json::Value = serde_json::from_str(&expectation.expected_json)
+            .map_err(|_| GnmiSmokeError::InvalidConfig)?;
+        let _compact = serde_json::to_string(&parsed).map_err(|_| GnmiSmokeError::InvalidConfig)?;
+    }
+    Ok(())
 }
 
 async fn connect_channel(config: &GnmiSmokeClientConfig) -> Result<Grpc<Channel>, GnmiSmokeError> {
@@ -558,6 +828,15 @@ async fn request_get(
     request: GnmiSmokeGetRequest,
     timeout: Duration,
 ) -> Result<GnmiSmokeGetOutcome, GnmiSmokeError> {
+    let (outcome, _response) = request_get_with_response(grpc, request, timeout).await?;
+    Ok(outcome)
+}
+
+async fn request_get_with_response(
+    grpc: &mut Grpc<Channel>,
+    request: GnmiSmokeGetRequest,
+    timeout: Duration,
+) -> Result<(GnmiSmokeGetOutcome, Option<gnmi::GetResponse>), GnmiSmokeError> {
     let path = gnmi_path_from_string(&request.path)?;
     let data_type = request.data_type;
     let encoding = request.encoding;
@@ -584,6 +863,7 @@ async fn request_get(
     .await
     .map_err(|_| GnmiSmokeError::Timeout)??;
 
+    let mut successful_response = None;
     let status = match response {
         Ok(response) => {
             let response = response.into_inner();
@@ -598,6 +878,7 @@ async fn request_get(
                 .iter()
                 .map(|notification| notification.delete.len())
                 .sum();
+            successful_response = Some(response);
             GnmiSmokeGetStatus::Success {
                 notification_count,
                 update_count,
@@ -609,12 +890,212 @@ async fn request_get(
         },
     };
 
-    Ok(GnmiSmokeGetOutcome {
-        path: bounded_string(&request.path),
-        data_type: data_type.as_str().to_string(),
-        encoding: encoding.as_str().to_string(),
+    Ok((
+        GnmiSmokeGetOutcome {
+            path: bounded_string(&request.path),
+            data_type: data_type.as_str().to_string(),
+            encoding: encoding.as_str().to_string(),
+            status,
+        },
+        successful_response,
+    ))
+}
+
+async fn request_set(
+    grpc: &mut Grpc<Channel>,
+    op: GnmiSmokeSetOp,
+    timeout: Duration,
+) -> Result<GnmiSmokeSetOutcome, GnmiSmokeError> {
+    let request = set_request_from_op(&op)?;
+    let expectation = op.expectation;
+    let response = tokio::time::timeout(timeout, async {
+        grpc.ready()
+            .await
+            .map_err(|_| GnmiSmokeError::ChannelConnectFailed)?;
+        Ok::<_, GnmiSmokeError>(
+            grpc.unary(
+                Request::new(request),
+                PathAndQuery::from_static("/gnmi.gNMI/Set"),
+                ProstCodec::<gnmi::SetRequest, gnmi::SetResponse>::default(),
+            )
+            .await,
+        )
+    })
+    .await
+    .map_err(|_| GnmiSmokeError::Timeout)??;
+
+    let status = match response {
+        Ok(response) => {
+            let response = response.into_inner();
+            let ops = response
+                .response
+                .iter()
+                .map(|result| {
+                    gnmi::update_result::Operation::try_from(result.op)
+                        .map(|op| op.as_str_name().to_string())
+                        .unwrap_or_else(|_| "UNKNOWN".to_string())
+                })
+                .collect::<Vec<_>>();
+            GnmiSmokeSetStatus::Accepted {
+                response_count: response.response.len(),
+                ops,
+            }
+        }
+        Err(status) => GnmiSmokeSetStatus::Rejected {
+            grpc_code: status.code().to_string(),
+        },
+    };
+
+    match (expectation, &status) {
+        (GnmiSmokeSetExpectation::Accept, GnmiSmokeSetStatus::Accepted { .. })
+        | (GnmiSmokeSetExpectation::Reject, GnmiSmokeSetStatus::Rejected { .. }) => {}
+        (GnmiSmokeSetExpectation::Accept, GnmiSmokeSetStatus::Rejected { .. }) => {
+            return Err(GnmiSmokeError::UnexpectedSetRejected);
+        }
+        (GnmiSmokeSetExpectation::Reject, GnmiSmokeSetStatus::Accepted { .. }) => {
+            return Err(GnmiSmokeError::UnexpectedSetAccepted);
+        }
+    }
+
+    Ok(GnmiSmokeSetOutcome {
+        path: bounded_string(&op.path),
+        op: op.op.as_str().to_string(),
+        expectation: expectation.as_str().to_string(),
         status,
     })
+}
+
+fn set_request_from_op(op: &GnmiSmokeSetOp) -> Result<gnmi::SetRequest, GnmiSmokeError> {
+    let path = gnmi_path_from_string(&op.path)?;
+    let mut request = gnmi::SetRequest {
+        prefix: None,
+        delete: Vec::new(),
+        replace: Vec::new(),
+        update: Vec::new(),
+        union_replace: Vec::new(),
+        extension: Vec::new(),
+    };
+
+    match op.op {
+        GnmiSmokeSetOpKind::Delete => request.delete.push(path),
+        GnmiSmokeSetOpKind::Update => request.update.push(update_from_op(path, op)?),
+        GnmiSmokeSetOpKind::Replace => request.replace.push(update_from_op(path, op)?),
+        GnmiSmokeSetOpKind::UnionReplace => request.union_replace.push(update_from_op(path, op)?),
+    }
+
+    Ok(request)
+}
+
+fn update_from_op(path: gnmi::Path, op: &GnmiSmokeSetOp) -> Result<gnmi::Update, GnmiSmokeError> {
+    let value = op
+        .json_value
+        .as_deref()
+        .ok_or(GnmiSmokeError::InvalidSetValue)?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(value).map_err(|_| GnmiSmokeError::InvalidSetValue)?;
+    let compact = serde_json::to_vec(&parsed).map_err(|_| GnmiSmokeError::InvalidSetValue)?;
+    let typed = match op.encoding {
+        GnmiSmokeEncoding::JsonIetf => gnmi::typed_value::Value::JsonIetfVal(compact),
+        GnmiSmokeEncoding::Json => gnmi::typed_value::Value::JsonVal(compact),
+    };
+    Ok(gnmi::Update {
+        path: Some(path),
+        val: Some(gnmi::TypedValue { value: Some(typed) }),
+        duplicates: 0,
+        ..Default::default()
+    })
+}
+
+async fn request_readback(
+    grpc: &mut Grpc<Channel>,
+    readback: GnmiSmokeReadback,
+    timeout: Duration,
+) -> Result<GnmiSmokeReadbackOutcome, GnmiSmokeError> {
+    let expectation = readback.expect_leaf.clone();
+    let (outcome, response) = request_get_with_response(grpc, readback.get, timeout).await?;
+    let leaf = match expectation {
+        Some(expectation) => {
+            let expected = compact_json(&expectation.expected_json)?;
+            let decoded = response
+                .as_ref()
+                .and_then(|response| extract_leaf_json(response, &expectation.leaf_path));
+            let matches_expected = decoded.as_deref() == Some(expected.as_str());
+            let leaf = GnmiSmokeLeafReadback {
+                leaf_path: bounded_string(&expectation.leaf_path),
+                decoded_json: decoded.as_deref().map(bounded_string),
+                matches_expected,
+            };
+            if !matches_expected {
+                return Err(GnmiSmokeError::ReadbackMismatch);
+            }
+            Some(leaf)
+        }
+        None => None,
+    };
+
+    Ok(GnmiSmokeReadbackOutcome {
+        path: outcome.path,
+        data_type: outcome.data_type,
+        encoding: outcome.encoding,
+        status: outcome.status,
+        leaf,
+    })
+}
+
+fn compact_json(value: &str) -> Result<String, GnmiSmokeError> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(value).map_err(|_| GnmiSmokeError::InvalidConfig)?;
+    serde_json::to_string(&parsed).map_err(|_| GnmiSmokeError::InvalidConfig)
+}
+
+fn extract_leaf_json(response: &gnmi::GetResponse, leaf_path: &str) -> Option<String> {
+    response.notification.iter().find_map(|notification| {
+        notification.update.iter().find_map(|update| {
+            let path = update.path.as_ref()?;
+            if proto_path_to_string(path).as_deref() != Some(leaf_path) {
+                return None;
+            }
+            typed_json(update.val.as_ref()?)
+        })
+    })
+}
+
+fn typed_json(value: &gnmi::TypedValue) -> Option<String> {
+    match value.value.as_ref()? {
+        gnmi::typed_value::Value::JsonIetfVal(bytes) | gnmi::typed_value::Value::JsonVal(bytes) => {
+            let text = std::str::from_utf8(bytes).ok()?;
+            compact_json(text).ok()
+        }
+        gnmi::typed_value::Value::StringVal(value) => serde_json::to_string(value)
+            .ok()
+            .map(|json| bounded_string(&json)),
+        gnmi::typed_value::Value::BoolVal(value) => Some(value.to_string()),
+        gnmi::typed_value::Value::IntVal(value) => Some(value.to_string()),
+        gnmi::typed_value::Value::UintVal(value) => Some(value.to_string()),
+        gnmi::typed_value::Value::FloatVal(value) => Some(value.to_string()),
+        gnmi::typed_value::Value::DoubleVal(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn proto_path_to_string(path: &gnmi::Path) -> Option<String> {
+    let path = path_from_proto(path).ok()?;
+    if path.elems.is_empty() {
+        return Some("/".to_string());
+    }
+    let mut out = String::new();
+    for elem in path.elems {
+        out.push('/');
+        out.push_str(&elem.name);
+        for (key, value) in elem.keys {
+            out.push('[');
+            out.push_str(&key);
+            out.push_str("='");
+            out.push_str(&value.replace('\\', "\\\\").replace('\'', "\\'"));
+            out.push_str("']");
+        }
+    }
+    Some(out)
 }
 
 fn gnmi_path_from_string(path: &str) -> Result<gnmi::Path, GnmiSmokeError> {
@@ -689,8 +1170,11 @@ mod tests {
     use opc_mgmt_opstate::{
         OperationalError, OperationalRequest, OperationalResponse, OperationalStateProvider,
     };
-    use opc_mgmt_schema::{DataClass, ModelData, NodeKind, NodeMeta, OriginEntry, SchemaRegistry};
+    use opc_mgmt_schema::{
+        DataClass, LeafType, ModelData, NodeKind, NodeMeta, OriginEntry, SchemaRegistry,
+    };
     use opc_mgmt_transport::TlsBootstrap;
+    use opc_nacm::{ModuleRegistry, NacmAction, NacmPolicy, NacmRule, YangPathPattern};
     use opc_runtime::{RuntimeMode, ShutdownToken};
     use opc_tls::PeerPolicy;
     use opc_types::Timestamp;
@@ -700,8 +1184,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        run_gnmi_tls_listener, CapabilityProfile, ExtensionRegistry, GnmiError, GnmiListenerConfig,
-        GnmiPatchApplicator, GnmiServer, GnmiVersion, GNMI_VERSION,
+        run_gnmi_tls_listener, CapabilityProfile, ExtensionRegistry, GnmiError,
+        GnmiJsonProjectionError, GnmiJsonUpdate, GnmiListenerConfig, GnmiPatchApplicator,
+        GnmiServer, GnmiVersion, ReadSelection, GNMI_VERSION,
     };
 
     const CERT_PEM: &[u8] =
@@ -730,6 +1215,40 @@ mod tests {
     fn error_display_is_payload_free() {
         assert!(!GnmiSmokeError::TlsConfig.to_string().contains("secret-key"));
         assert_eq!(GnmiSmokeError::Timeout.code().as_str(), "timeout");
+        assert_eq!(
+            GnmiSmokeError::InvalidSetValue.code().as_str(),
+            "invalid_set_value"
+        );
+    }
+
+    #[test]
+    fn mutation_step_validation_rejects_bad_set_values_and_limits() {
+        let bad_json = collect_mutation_steps([GnmiSmokeMutationStep {
+            set: GnmiSmokeSetOp {
+                path: "/sys:system/sys:hostname".to_string(),
+                op: GnmiSmokeSetOpKind::Update,
+                json_value: Some("not-json".to_string()),
+                encoding: GnmiSmokeEncoding::JsonIetf,
+                expectation: GnmiSmokeSetExpectation::Accept,
+            },
+            readbacks: Vec::new(),
+        }])
+        .expect_err("invalid set JSON");
+        assert_eq!(bad_json.code(), GnmiSmokeErrorCode::InvalidSetValue);
+
+        let too_many =
+            collect_mutation_steps((0..=MAX_SMOKE_SETS).map(|_| GnmiSmokeMutationStep {
+                set: GnmiSmokeSetOp {
+                    path: "/sys:system/sys:hostname".to_string(),
+                    op: GnmiSmokeSetOpKind::Delete,
+                    json_value: None,
+                    encoding: GnmiSmokeEncoding::JsonIetf,
+                    expectation: GnmiSmokeSetExpectation::Reject,
+                },
+                readbacks: Vec::new(),
+            }))
+            .expect_err("too many sets");
+        assert_eq!(too_many.code(), GnmiSmokeErrorCode::RequestLimitExceeded);
     }
 
     #[test]
@@ -760,19 +1279,36 @@ mod tests {
         modules: &["demo-system"],
     }];
 
-    static NODES: &[NodeMeta] = &[NodeMeta {
-        path: "/sys:system",
-        module: "demo-system",
-        kind: NodeKind::Container,
-        config: true,
-        leaf_type: None,
-        key_leaves: &[],
-        data_class: DataClass::Public,
-        default: None,
-        has_default: false,
-        presence: false,
-        child_paths: &[],
-    }];
+    static SYSTEM_CHILD_PATHS: &[&str] = &["/sys:system/sys:hostname"];
+
+    static NODES: &[NodeMeta] = &[
+        NodeMeta {
+            path: "/sys:system",
+            module: "demo-system",
+            kind: NodeKind::Container,
+            config: true,
+            leaf_type: None,
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: SYSTEM_CHILD_PATHS,
+        },
+        NodeMeta {
+            path: "/sys:system/sys:hostname",
+            module: "demo-system",
+            kind: NodeKind::Leaf,
+            config: true,
+            leaf_type: Some(LeafType::String),
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[],
+        },
+    ];
 
     impl SchemaRegistry for TestRegistry {
         fn schema_digest(&self) -> &'static str {
@@ -792,11 +1328,11 @@ mod tests {
         }
     }
 
-    struct EmptyPolicy;
+    struct AllowPolicy;
 
-    impl PolicySource for EmptyPolicy {
+    impl PolicySource for AllowPolicy {
         fn active_policy(&self, _tenant: &str) -> Result<opc_nacm::NacmPolicy, AuthzError> {
-            Ok(opc_nacm::NacmPolicy::empty(opc_nacm::PolicyVersion::new(1)))
+            Ok(allow_policy())
         }
     }
 
@@ -811,21 +1347,97 @@ mod tests {
         }
     }
 
+    #[derive(Clone, PartialEq, Eq)]
+    struct SmokeConfig {
+        hostname: String,
+    }
+
+    impl opc_config_model::OpcConfig for SmokeConfig {
+        type Delta = ();
+
+        fn schema_digest(&self) -> opc_types::SchemaDigest {
+            opc_types::SchemaDigest::from_bytes([9u8; 32])
+        }
+
+        fn diff(&self, previous: &Self) -> Result<Vec<Self::Delta>, opc_config_model::ConfigError> {
+            if self == previous {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![()])
+            }
+        }
+
+        fn changed_paths(
+            &self,
+            previous: &Self,
+            _deltas: &[Self::Delta],
+        ) -> Result<Vec<YangPath>, opc_config_model::ConfigError> {
+            if self == previous {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![hostname_yang_path()])
+            }
+        }
+
+        fn apply_delta(
+            &mut self,
+            _delta: Self::Delta,
+        ) -> Result<(), opc_config_model::ConfigError> {
+            Ok(())
+        }
+
+        fn validate_syntax(&self) -> Result<(), opc_config_model::ValidationError> {
+            Ok(())
+        }
+
+        fn validate_semantics(
+            &self,
+            _ctx: &opc_config_model::ValidationContext<Self>,
+        ) -> Result<(), opc_config_model::ValidationError> {
+            Ok(())
+        }
+    }
+
     struct UnitPatcher;
 
-    impl GnmiPatchApplicator<()> for UnitPatcher {
-        fn apply_set(&self, _running: &(), _set: &crate::NormalizedSet) -> Result<(), GnmiError> {
-            Ok(())
+    impl GnmiPatchApplicator<SmokeConfig> for UnitPatcher {
+        fn apply_set(
+            &self,
+            running: &SmokeConfig,
+            set: &crate::NormalizedSet,
+        ) -> Result<SmokeConfig, GnmiError> {
+            let mut candidate = running.clone();
+            for path in &set.deletes {
+                if path == &hostname_yang_path() {
+                    candidate.hostname.clear();
+                }
+            }
+            for (path, value) in set
+                .replaces
+                .iter()
+                .chain(set.updates.iter())
+                .chain(set.union_replaces.iter())
+            {
+                if path == &hostname_yang_path() {
+                    let hostname: String = serde_json::from_str(value.json())
+                        .map_err(|_| GnmiError::invalid("invalid smoke hostname"))?;
+                    if hostname == "reject-secret" {
+                        return Err(GnmiError::invalid("invalid smoke hostname"));
+                    }
+                    candidate.hostname = hostname;
+                }
+            }
+            Ok(candidate)
         }
     }
 
     #[derive(Clone)]
     struct TestBinding {
-        bus: Arc<ConfigBus<()>>,
+        bus: Arc<ConfigBus<SmokeConfig>>,
     }
 
-    impl crate::GnmiConfigBinding<()> for TestBinding {
-        fn config_bus(&self) -> Arc<ConfigBus<()>> {
+    impl crate::GnmiConfigBinding<SmokeConfig> for TestBinding {
+        fn config_bus(&self) -> Arc<ConfigBus<SmokeConfig>> {
             Arc::clone(&self.bus)
         }
 
@@ -833,7 +1445,7 @@ mod tests {
             &TestRegistry
         }
 
-        fn patcher(&self) -> Arc<dyn GnmiPatchApplicator<()>> {
+        fn patcher(&self) -> Arc<dyn GnmiPatchApplicator<SmokeConfig>> {
             Arc::new(UnitPatcher)
         }
 
@@ -842,7 +1454,23 @@ mod tests {
         }
 
         fn policy_source(&self) -> Arc<dyn PolicySource> {
-            Arc::new(EmptyPolicy)
+            Arc::new(AllowPolicy)
+        }
+
+        fn render_running_json(
+            &self,
+            config: &SmokeConfig,
+            selection: ReadSelection<'_>,
+        ) -> Result<Vec<GnmiJsonUpdate>, GnmiJsonProjectionError> {
+            if selection.contains("/sys:system/sys:hostname") {
+                Ok(vec![GnmiJsonUpdate::new(
+                    hostname_yang_path(),
+                    serde_json::to_string(&config.hostname)
+                        .map_err(|_| GnmiJsonProjectionError::projection("hostname JSON"))?,
+                )?])
+            } else {
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -853,9 +1481,9 @@ mod tests {
         trust_roots_pem: Vec<u8>,
     }
 
-    async fn test_server() -> GnmiServer<(), TestBinding> {
+    async fn test_server() -> GnmiServer<SmokeConfig, TestBinding> {
         let bus = Arc::new(
-            ConfigBus::new_dev_only((), MockManagedDatastore::new())
+            ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
                 .await
                 .expect("bus"),
         );
@@ -868,6 +1496,41 @@ mod tests {
             ExtensionRegistry::default(),
         )
         .expect("server")
+    }
+
+    fn initial_config() -> SmokeConfig {
+        SmokeConfig {
+            hostname: "initial-host".to_string(),
+        }
+    }
+
+    fn hostname_yang_path() -> YangPath {
+        YangPath::new("/sys:system/sys:hostname").expect("static hostname path")
+    }
+
+    fn allow_policy() -> NacmPolicy {
+        let mut modules = ModuleRegistry::new();
+        modules
+            .register_module("demo-system", "sys")
+            .expect("demo module");
+        let mut builder = NacmPolicy::builder(opc_nacm::PolicyVersion::new(1));
+        for action in [
+            NacmAction::Read,
+            NacmAction::Update,
+            NacmAction::Replace,
+            NacmAction::Delete,
+        ] {
+            builder = builder
+                .add_rule(NacmRule::allow(
+                    action,
+                    YangPathPattern::parse("/sys:system", &modules).expect("root pattern"),
+                ))
+                .add_rule(NacmRule::allow(
+                    action,
+                    YangPathPattern::parse("/sys:system/**", &modules).expect("subtree pattern"),
+                ));
+        }
+        builder.build()
     }
 
     fn peer_policy() -> PeerPolicy {
@@ -1057,6 +1720,116 @@ mod tests {
             transcript.gets[0].status,
             GnmiSmokeGetStatus::Success { .. }
         ));
+
+        shutdown.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), listener_task)
+            .await
+            .expect("listener timeout")
+            .expect("listener join");
+    }
+
+    #[tokio::test]
+    async fn live_mtls_mutating_smoke_runs_set_and_readback() {
+        let material = mtls_material();
+        let (addr, shutdown, listener_task) = spawn_listener(&material).await;
+
+        let transcript = run_gnmi_mutating_smoke(
+            smoke_config(addr, &material),
+            [GnmiSmokeMutationStep {
+                set: GnmiSmokeSetOp {
+                    path: "/sys:system/sys:hostname".to_string(),
+                    op: GnmiSmokeSetOpKind::Update,
+                    json_value: Some(r#""mutated-host""#.to_string()),
+                    encoding: GnmiSmokeEncoding::JsonIetf,
+                    expectation: GnmiSmokeSetExpectation::Accept,
+                },
+                readbacks: vec![GnmiSmokeReadback {
+                    get: GnmiSmokeGetRequest {
+                        path: "/sys:system/sys:hostname".to_string(),
+                        data_type: GnmiSmokeDataType::Config,
+                        encoding: GnmiSmokeEncoding::JsonIetf,
+                    },
+                    expect_leaf: Some(GnmiSmokeLeafExpectation {
+                        leaf_path: "/sys:system/sys:hostname".to_string(),
+                        expected_json: r#""mutated-host""#.to_string(),
+                    }),
+                }],
+            }],
+        )
+        .await
+        .expect("mutating smoke transcript");
+
+        assert!(matches!(
+            transcript.steps[0].set.status,
+            GnmiSmokeSetStatus::Accepted {
+                response_count: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            transcript.steps[0].readbacks[0]
+                .leaf
+                .as_ref()
+                .expect("leaf")
+                .decoded_json
+                .as_deref(),
+            Some(r#""mutated-host""#)
+        );
+        assert!(!format!("{transcript:?}").contains("BEGIN"));
+
+        shutdown.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), listener_task)
+            .await
+            .expect("listener timeout")
+            .expect("listener join");
+    }
+
+    #[tokio::test]
+    async fn live_mtls_mutating_smoke_readback_proves_rejected_set_not_published() {
+        let material = mtls_material();
+        let (addr, shutdown, listener_task) = spawn_listener(&material).await;
+
+        let transcript = run_gnmi_mutating_smoke(
+            smoke_config(addr, &material),
+            [GnmiSmokeMutationStep {
+                set: GnmiSmokeSetOp {
+                    path: "/sys:system/sys:hostname".to_string(),
+                    op: GnmiSmokeSetOpKind::Update,
+                    json_value: Some(r#""reject-secret""#.to_string()),
+                    encoding: GnmiSmokeEncoding::JsonIetf,
+                    expectation: GnmiSmokeSetExpectation::Reject,
+                },
+                readbacks: vec![GnmiSmokeReadback {
+                    get: GnmiSmokeGetRequest {
+                        path: "/sys:system/sys:hostname".to_string(),
+                        data_type: GnmiSmokeDataType::Config,
+                        encoding: GnmiSmokeEncoding::JsonIetf,
+                    },
+                    expect_leaf: Some(GnmiSmokeLeafExpectation {
+                        leaf_path: "/sys:system/sys:hostname".to_string(),
+                        expected_json: r#""initial-host""#.to_string(),
+                    }),
+                }],
+            }],
+        )
+        .await
+        .expect("rejected mutating smoke transcript");
+
+        assert!(matches!(
+            transcript.steps[0].set.status,
+            GnmiSmokeSetStatus::Rejected { .. }
+        ));
+        let rendered = format!("{transcript:?}");
+        assert!(!rendered.contains("reject-secret"));
+        assert_eq!(
+            transcript.steps[0].readbacks[0]
+                .leaf
+                .as_ref()
+                .expect("leaf")
+                .decoded_json
+                .as_deref(),
+            Some(r#""initial-host""#)
+        );
 
         shutdown.request_shutdown();
         tokio::time::timeout(Duration::from_secs(5), listener_task)

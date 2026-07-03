@@ -27,6 +27,45 @@ const AES_256_KEY_LEN: usize = 32;
 /// RFC 5282 AES-GCM explicit IV length used in IKEv2 `SK` payload bodies.
 pub const IKEV2_AES_GCM_EXPLICIT_IV_LEN: usize = AES_GCM_EXPLICIT_IV_LEN;
 
+/// Returns the sealed AES-GCM protected body length for a cleartext chain.
+///
+/// The returned length is the `SK` body length:
+/// explicit IV || ciphertext(cleartext || zero padding || pad-length octet) ||
+/// authentication tag. It does not include the IKEv2 generic payload header.
+pub const fn ikev2_aes_gcm_protected_body_len(
+    cleartext_payloads_len: usize,
+    padding_len: u8,
+) -> Option<usize> {
+    let with_padding = match cleartext_payloads_len.checked_add(padding_len as usize) {
+        Some(value) => value,
+        None => return None,
+    };
+    let plaintext_len = match with_padding.checked_add(1) {
+        Some(value) => value,
+        None => return None,
+    };
+    let with_iv = match AES_GCM_EXPLICIT_IV_LEN.checked_add(plaintext_len) {
+        Some(value) => value,
+        None => return None,
+    };
+    with_iv.checked_add(AES_GCM_ICV_LEN)
+}
+
+/// Returns the IKEv2 generic `SK` payload length field value for AES-GCM.
+///
+/// This includes the 4-octet generic payload header plus the protected body
+/// length returned by [`ikev2_aes_gcm_protected_body_len`].
+pub const fn ikev2_aes_gcm_protected_payload_len(
+    cleartext_payloads_len: usize,
+    padding_len: u8,
+) -> Option<usize> {
+    let body_len = match ikev2_aes_gcm_protected_body_len(cleartext_payloads_len, padding_len) {
+        Some(value) => value,
+        None => return None,
+    };
+    GENERIC_PAYLOAD_HEADER_LEN.checked_add(body_len)
+}
+
 /// Direction of an IKEv2 protected message on an established IKE SA.
 ///
 /// The direction selects the initiator or responder encryption/authentication
@@ -560,6 +599,12 @@ fn decrypt_aes_gcm(
                 .decrypt(nonce, payload)
                 .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)
         }
+        unsupported => Err(
+            Ikev2ProtectedPayloadCryptoError::UnsupportedEncryptionProfile {
+                encryption: unsupported,
+                integrity_key_len: 0,
+            },
+        ),
     }
 }
 
@@ -616,6 +661,14 @@ fn encrypt_aes_gcm(
             Aes256Gcm::new(key)
                 .encrypt(nonce, payload)
                 .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)?
+        }
+        unsupported => {
+            return Err(
+                Ikev2ProtectedPayloadCryptoError::UnsupportedEncryptionProfile {
+                    encryption: unsupported,
+                    integrity_key_len: 0,
+                },
+            );
         }
     };
 

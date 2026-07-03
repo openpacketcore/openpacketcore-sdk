@@ -4,6 +4,7 @@ use opc_proto_gtpv2c::{
     S2bMessage, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT,
     IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID,
     IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_PCO, IE_TYPE_RECOVERY,
+    INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
@@ -41,6 +42,30 @@ const UPDATE_BEARER_RESPONSE_FIXTURE: &[u8] =
 const BEARER_CONTEXT_IE: &[u8] = &[
     0x5d, 0x00, 0x05, 0x00, // Bearer Context grouped IE header.
     0x49, 0x00, 0x01, 0x00, 0x05, // Nested EBI = 5.
+];
+const BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE: &[u8] = &[
+    0x5d,
+    0x00,
+    0x12,
+    0x00, // Bearer Context grouped IE header.
+    0x49,
+    0x00,
+    0x01,
+    0x00,
+    0x05, // Nested EBI = 5.
+    IE_TYPE_F_TEID,
+    0x00,
+    0x09,
+    0x00,
+    0xa1,
+    0x11,
+    0x22,
+    0x33,
+    0x44,
+    0xcb,
+    0x00,
+    0x71,
+    0x01, // Nested S2b-U PGW GTP-U F-TEID.
 ];
 
 const CAUSE_IE: &[u8] = &[0x02, 0x00, 0x02, 0x00, 0x10, 0x00];
@@ -534,10 +559,14 @@ fn debug_output_redacts_subscriber_identifiers_and_raw_ie_bytes() {
 /// `fteid_instance`. All other mandatory S2b IEs are present at instance 0.
 fn create_session_request_with_fteid_instance(fteid_instance: u8) -> Vec<u8> {
     let mut header = [
-        0x40,
+        0x48,
         s2b::CREATE_SESSION_REQUEST,
         0x00,
         0x00, // Length placeholder.
+        0x00,
+        0x00,
+        0x00,
+        0x00, // TEID is present and zero for Create Session Request.
         0x00,
         0x20, // Sequence number.
         0x00,
@@ -615,7 +644,7 @@ fn create_session_response_with_fteid_instance(fteid_instance: u8) -> Vec<u8> {
             0x02,
             0x01,
         ], // Sender F-TEID.
-        &[0x5d, 0x00, 0x05, 0x00, 0x49, 0x00, 0x01, 0x00, 0x05], // Bearer Context + EBI.
+        BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE,
     ];
     let body: Vec<u8> = ies.iter().copied().flatten().copied().collect();
     let length = u16::try_from(header.len() + body.len() - 4).unwrap();
@@ -698,6 +727,11 @@ fn create_session_accepted_response_summary_requires_bearer_fields() {
             assert_eq!(accepted.cause, CauseValue::RequestAccepted);
             assert_eq!(accepted.sender_f_teid.teid, 0x5566_7788);
             assert_eq!(accepted.bearer_ebi.value, 5);
+            assert_eq!(
+                accepted.bearer_user_plane_f_teid.interface_type,
+                INTERFACE_TYPE_S2B_U_PGW_GTP_U
+            );
+            assert_eq!(accepted.bearer_user_plane_f_teid.teid, 0x1122_3344);
         }
         other => panic!("expected accepted summary, got {other:?}"),
     }

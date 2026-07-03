@@ -8,7 +8,8 @@ use opc_config_model::{
     CommitError, CommitMode, CommitRequest, ConfigOperation, OpcConfig, RequestId, RequestSource,
     TransportType, TrustedPrincipal, YangPath,
 };
-use opc_mgmt_audit::{AuditOperation, AuditOutcome};
+use opc_mgmt_audit::{AuditOperation, AuditOutcome, AuditReasonCode};
+use opc_mgmt_authz::ConfigWriteAuthorizer;
 use opc_mgmt_errors::{commit_error_to_status, MgmtStatus};
 use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_schema::SchemaRegistry;
@@ -16,7 +17,9 @@ use opc_mgmt_schema::SchemaRegistry;
 use crate::audit::{outcome_for_error, record_audit, schema_paths_for_yang};
 use crate::confirmed_commit::{parse_set_commit_extension, SetCommitExtension};
 use crate::get::{now_nanos, yang_path_to_proto};
-use crate::metrics::{record_set_commit_latency, SetCommitMetric};
+use crate::metrics::{
+    record_nacm_denials, record_set_commit_latency, GnmiNacmAction, SetCommitMetric,
+};
 use crate::proto::gnmi;
 use crate::proto_adapter::{path_from_proto, typed_value_from_proto};
 use crate::{
@@ -208,8 +211,46 @@ where
     let operation = normalized.config_operation()?;
     let commit_metric = set_commit_metric(operation);
     let audit_operation = set_audit_operation(operation);
-    let audit_paths =
-        schema_paths_for_yang(server.binding().schema(), normalized.changed_paths_hint())?;
+    let changed_paths = normalized.changed_paths_hint();
+    let audit_paths = schema_paths_for_yang(server.binding().schema(), changed_paths.clone())?;
+
+    let policy_source = server.binding().policy_source();
+    let write_authorizer =
+        ConfigWriteAuthorizer::new(server.binding().schema(), policy_source.as_ref())
+            .map_err(|_| GnmiError::schema("gNMI Set write authorizer setup failed"))?;
+    let changed_path_refs = changed_paths.iter().collect::<Vec<_>>();
+    let decisions = match write_authorizer.authorize_paths(principal, operation, &changed_path_refs)
+    {
+        Ok(decisions) => decisions,
+        Err(_) => {
+            let err = GnmiError::unavailable("gNMI Set policy source unavailable");
+            audit_set_result(
+                server,
+                request_id,
+                principal,
+                audit_operation,
+                outcome_for_error(&err),
+                audit_paths,
+            )?;
+            return Err(err);
+        }
+    };
+    let denied_count = decisions
+        .iter()
+        .filter(|decision| !decision.allowed)
+        .count();
+    record_nacm_denials(GnmiNacmAction::Write, denied_count);
+    if denied_count > 0 {
+        audit_set_result(
+            server,
+            request_id,
+            principal,
+            audit_operation,
+            AuditOutcome::denied_code(AuditReasonCode::ACCESS_DENIED),
+            audit_paths,
+        )?;
+        return Err(GnmiError::PermissionDenied);
+    }
 
     let bus = server.binding().config_bus();
     let snapshot = bus.current_snapshot();
@@ -248,7 +289,7 @@ where
         mode,
         Instant::now() + Duration::from_secs(30),
         Some(candidate),
-        normalized.changed_paths_hint(),
+        changed_paths,
     )
     .with_base_version(snapshot.version);
 

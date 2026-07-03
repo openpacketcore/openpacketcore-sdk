@@ -23,6 +23,7 @@ func writeScript(t *testing.T, dir, name, content string) string {
 func TestNewClientMissingBinary(t *testing.T) {
 	// Ensure no candidates match by running from a temp directory.
 	t.Setenv("OPERATOR_LIFECYCLE_CLI_PATH", "")
+	t.Setenv("CARGO_TARGET_DIR", "")
 	origWd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("failed to get working directory: %v", err)
@@ -33,6 +34,7 @@ func TestNewClientMissingBinary(t *testing.T) {
 		}
 	}()
 	tmpDir := t.TempDir()
+	t.Setenv("PATH", tmpDir)
 	if err := os.Chdir(tmpDir); err != nil {
 		t.Fatalf("failed to switch to temp directory: %v", err)
 	}

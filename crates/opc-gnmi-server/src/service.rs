@@ -1077,7 +1077,7 @@ mod tests {
         let server = GnmiServer::new_with_arbitration_dev_only(
             TestBinding {
                 bus,
-                policy: Arc::new(FixedPolicy(allow_all_read_policy())),
+                policy: Arc::new(FixedPolicy(allow_all_read_write_policy())),
                 operational: Arc::new(TestOperationalState),
                 events: None,
                 patcher: unit_patcher(),
@@ -1121,17 +1121,34 @@ mod tests {
     }
 
     fn allow_all_read_policy() -> NacmPolicy {
+        allow_policy_for_actions(&[NacmAction::Read])
+    }
+
+    fn allow_all_read_write_policy() -> NacmPolicy {
+        allow_policy_for_actions(&[
+            NacmAction::Read,
+            NacmAction::Create,
+            NacmAction::Update,
+            NacmAction::Replace,
+            NacmAction::Delete,
+        ])
+    }
+
+    fn allow_policy_for_actions(actions: &[NacmAction]) -> NacmPolicy {
         let modules = module_registry();
-        NacmPolicy::builder(opc_nacm::PolicyVersion::new(1))
-            .add_rule(NacmRule::allow(
-                NacmAction::Read,
-                YangPathPattern::parse("/sys:system", &modules).expect("root pattern"),
-            ))
-            .add_rule(NacmRule::allow(
-                NacmAction::Read,
-                YangPathPattern::parse("/sys:system/**", &modules).expect("subtree pattern"),
-            ))
-            .build()
+        let mut builder = NacmPolicy::builder(opc_nacm::PolicyVersion::new(1));
+        for action in actions {
+            builder = builder
+                .add_rule(NacmRule::allow(
+                    *action,
+                    YangPathPattern::parse("/sys:system", &modules).expect("root pattern"),
+                ))
+                .add_rule(NacmRule::allow(
+                    *action,
+                    YangPathPattern::parse("/sys:system/**", &modules).expect("subtree pattern"),
+                ));
+        }
+        builder.build()
     }
 
     fn allow_all_subscribe_policy() -> NacmPolicy {
@@ -1212,7 +1229,7 @@ mod tests {
                 .expect("bus"),
         );
         authenticated_service_with_policy_bus_events_audit(
-            Arc::new(FixedPolicy(allow_all_read_policy())),
+            Arc::new(FixedPolicy(allow_all_read_write_policy())),
             bus,
             None,
             MgmtLimits::default(),
@@ -1409,7 +1426,7 @@ mod tests {
         audit: Arc<dyn AuditSink>,
     ) -> GnmiService<DemoConfig, TestBinding> {
         authenticated_service_with_policy_bus_events_audit_extensions_arbitration(
-            Arc::new(FixedPolicy(allow_all_read_policy())),
+            Arc::new(FixedPolicy(allow_all_read_write_policy())),
             Arc::new(
                 ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
                     .await
@@ -1680,6 +1697,16 @@ mod tests {
             .expect("metrics")
             .get(operation)
             .map(|hist| hist.count.load(Ordering::Relaxed))
+            .unwrap_or_default()
+    }
+
+    fn gnmi_nacm_denial_count(action: &str) -> u64 {
+        METRICS
+            .gnmi_nacm_denials_total
+            .lock()
+            .expect("metrics")
+            .get(action)
+            .copied()
             .unwrap_or_default()
     }
 
@@ -3002,7 +3029,7 @@ mod tests {
     async fn authenticated_set_master_arbitration_denials_do_not_leak_or_mutate() {
         let audit = CapturingAudit::default();
         let service = authenticated_service_with_policy_bus_events_audit_extensions_arbitration(
-            Arc::new(FixedPolicy(allow_all_read_policy())),
+            Arc::new(FixedPolicy(allow_all_read_write_policy())),
             Arc::new(
                 ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
                     .await
@@ -3596,7 +3623,7 @@ mod tests {
     async fn authenticated_set_success_is_audited_without_values_or_key_predicates() {
         let audit = CapturingAudit::default();
         let service = authenticated_service_with_policy_and_audit(
-            allow_all_read_policy(),
+            allow_all_read_write_policy(),
             Arc::new(audit.clone()),
         )
         .await;
@@ -3694,7 +3721,7 @@ mod tests {
         let server = GnmiServer::new_dev_only(
             TestBinding {
                 bus: Arc::clone(&bus),
-                policy: Arc::new(FixedPolicy(allow_all_read_policy())),
+                policy: Arc::new(FixedPolicy(allow_all_read_write_policy())),
                 operational: Arc::new(TestOperationalState),
                 events: None,
                 patcher: Arc::new(BlockingOncePatcher::new(started_tx, release_rx)),
@@ -3981,6 +4008,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_set_nacm_write_denial_is_generic_and_atomic() {
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_policy_and_audit(
+            allow_all_read_policy(),
+            Arc::new(audit.clone()),
+        )
+        .await;
+        let denials_before = gnmi_nacm_denial_count("write");
+
+        let status = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(hostname_path(), br#""secret-host""#.to_vec())],
+                union_replace: Vec::new(),
+                extension: Vec::new(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_eq!(status.message(), "gNMI access denied");
+        assert!(!status.message().contains("secret-host"));
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-1"
+        );
+        assert!(gnmi_nacm_denial_count("write") > denials_before);
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(
+            events[0].outcome,
+            audit_denied(AuditReasonCode::ACCESS_DENIED)
+        );
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path("/sys:system/sys:hostname")]
+        );
+        assert!(!format!("{:?}", events).contains("secret-host"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_set_nacm_policy_source_failure_fails_closed() {
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_policy_source_operational_audit(
+            Arc::new(BrokenPolicy),
+            Arc::new(TestOperationalState),
+            Arc::new(audit.clone()),
+        )
+        .await;
+
+        let status = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                prefix: None,
+                delete: Vec::new(),
+                replace: Vec::new(),
+                update: vec![json_update(
+                    hostname_path(),
+                    br#""policy-store-secret""#.to_vec(),
+                )],
+                union_replace: Vec::new(),
+                extension: Vec::new(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(status.message(), "gNMI service unavailable");
+        assert!(!status.message().contains("policy-store-secret"));
+        assert_eq!(
+            service
+                .server()
+                .binding()
+                .config_bus()
+                .current_snapshot()
+                .config
+                .hostname,
+            "amf-1"
+        );
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(
+            events[0].outcome,
+            audit_failed(AuditReasonCode::RESOURCE_DENIED)
+        );
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path("/sys:system/sys:hostname")]
+        );
+        assert!(!format!("{:?}", events).contains("policy-store-secret"));
+    }
+
+    #[tokio::test]
     async fn authenticated_set_rejects_unknown_extension_before_mutation_without_leak() {
         let audit = CapturingAudit::default();
         let service = authenticated_service_with_policy_and_audit(
@@ -4034,7 +4165,7 @@ mod tests {
     #[tokio::test]
     async fn authenticated_set_success_audit_failure_is_generic_after_commit() {
         let service = authenticated_service_with_policy_and_audit(
-            allow_all_read_policy(),
+            allow_all_read_write_policy(),
             Arc::new(FailingAudit),
         )
         .await;

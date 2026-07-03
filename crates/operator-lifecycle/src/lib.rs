@@ -40,7 +40,7 @@ pub use reconcile::{
     AppConfigMetadata, BootstrapRef, BootstrapRefKind, CnfImageIntent, CnfWorkloadIntent,
     ConflictRetryIntent, ManagementExposureIntent, ManagementIdentityIntent, ManagementMaterialRef,
     ManagementMtlsIdentityIntent, ManagementNorthboundIntent, ManagementPortIntent,
-    NetconfSshIdentityIntent, NetworkAttachmentIntent, NetworkAttachmentKind, PlacementIntent,
-    ReconcileIntentError, ReplicaIntent, SessionStoreRef, StatusPatchIntent, TrafficStatusIntent,
-    UpgradeDrainPolicy,
+    NetconfSshIdentityIntent, NetworkAttachmentIntent, NetworkAttachmentKind,
+    OwnedStatusProjection, PlacementIntent, ReconcileIntentError, ReplicaIntent, SessionStoreRef,
+    StatusPatchIntent, TrafficStatusIntent, UpgradeDrainPolicy,
 };

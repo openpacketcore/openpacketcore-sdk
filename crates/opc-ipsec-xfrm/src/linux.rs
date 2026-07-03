@@ -10,10 +10,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use opc_linux_xfrm_sys::{
     align_to_netlink, open_netlink_socket, receive_message, send_message, NLMSG_DONE, NLMSG_ERROR,
-    NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST, XFRMA_ALG_AUTH_TRUNC,
-    XFRMA_ALG_CRYPT, XFRMA_TMPL, XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA,
-    XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW,
-    XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT,
+    NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST, XFRMA_ALG_AEAD,
+    XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT, XFRMA_TMPL, XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY,
+    XFRM_MSG_DELSA, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA,
+    XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT,
 };
 
 use crate::{
@@ -39,6 +39,7 @@ const XFRM_USER_SPI_INFO_LEN: usize = 232;
 const XFRM_ALG_NAME_LEN: usize = 64;
 const XFRM_ALGO_HEADER_LEN: usize = 68;
 const XFRM_ALGO_AUTH_HEADER_LEN: usize = 72;
+const XFRM_ALGO_AEAD_HEADER_LEN: usize = 72;
 const XFRM_SPI_OFFSET_IN_SA_INFO: usize = XFRM_SELECTOR_LEN + XFRM_ADDRESS_LEN;
 
 const AF_INET: u16 = 2;
@@ -450,6 +451,7 @@ fn encode_alloc_spi_request(request: AllocateSpiRequest) -> Result<Vec<u8>, Xfrm
         source_address: request.destination,
         auth: None,
         crypt: None,
+        aead: None,
         mode: XfrmMode::Tunnel,
         lifetime: LifetimeConfig::default(),
         replay_window: 0,
@@ -505,6 +507,13 @@ fn encode_sa_info_inner(
             &mut out,
             XFRMA_ALG_CRYPT,
             &encode_algorithm(&algorithm.name, key.as_bytes())?,
+        )?;
+    }
+    if let Some((aead, key)) = &parameters.aead {
+        append_attr(
+            &mut out,
+            XFRMA_ALG_AEAD,
+            &encode_aead_algorithm(&aead.name, key.as_bytes(), aead.icv_len_bits)?,
         )?;
     }
     Ok(out)
@@ -675,6 +684,22 @@ fn encode_auth_algorithm(
     Ok(out)
 }
 
+fn encode_aead_algorithm(name: &str, key: &[u8], icv_len_bits: u32) -> Result<Vec<u8>, XfrmError> {
+    validate_key_material(key)?;
+    if icv_len_bits == 0 {
+        return Err(XfrmError::invalid_config(
+            "aead.icv_len_bits",
+            "icv length must be nonzero",
+        ));
+    }
+    let mut out = Vec::with_capacity(XFRM_ALGO_AEAD_HEADER_LEN + key.len());
+    out.extend_from_slice(&encode_algorithm_name(name)?);
+    push_u32_ne(&mut out, key_len_bits(key)?);
+    push_u32_ne(&mut out, icv_len_bits);
+    out.extend_from_slice(key);
+    Ok(out)
+}
+
 fn append_attr(out: &mut Vec<u8>, attr_type: u16, payload: &[u8]) -> Result<(), XfrmError> {
     let length = ROUTE_ATTRIBUTE_HEADER_LEN
         .checked_add(payload.len())
@@ -737,7 +762,28 @@ fn validate_sa_parameters(
             "protocol must be nonzero",
         ));
     }
+    if parameters.aead.is_some() && (parameters.auth.is_some() || parameters.crypt.is_some()) {
+        return Err(XfrmError::invalid_config(
+            "aead",
+            "aead is mutually exclusive with auth/crypt",
+        ));
+    }
+    if let Some((algorithm, _)) = &parameters.crypt {
+        if is_known_aead_algorithm(&algorithm.name) {
+            return Err(XfrmError::invalid_config(
+                "crypt",
+                "aead algorithm must use the aead slot",
+            ));
+        }
+    }
     Ok(())
+}
+
+fn is_known_aead_algorithm(name: &str) -> bool {
+    matches!(
+        name,
+        "rfc4106(gcm(aes))" | "rfc4543(gcm(aes))" | "rfc7539esp(chacha20,poly1305)"
+    )
 }
 
 fn validate_policy_parameters(parameters: &PolicyParameters) -> Result<(), XfrmError> {
@@ -962,7 +1008,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::{Algorithm, AuthAlgorithm, InstallSaRequest, KeyMaterial};
+    use crate::{AeadAlgorithm, Algorithm, AuthAlgorithm, InstallSaRequest, KeyMaterial};
 
     #[derive(Debug, Default, Clone)]
     struct CapturingTransport {
@@ -1035,6 +1081,7 @@ mod tests {
                 KeyMaterial::new(vec![0xab; 32]),
             )),
             crypt: Some((Algorithm::new("aes-cbc"), KeyMaterial::new(vec![0xcd; 16]))),
+            aead: None,
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),
             replay_window: 32,
@@ -1061,6 +1108,23 @@ mod tests {
         encode_netlink_message(NLMSG_ERROR, 0, sequence, &body).unwrap()
     }
 
+    fn route_attr_payload(body: &[u8], attr_type: u16) -> Option<&[u8]> {
+        let mut offset = XFRM_USER_SA_INFO_LEN;
+        while offset + ROUTE_ATTRIBUTE_HEADER_LEN <= body.len() {
+            let len = usize::from(u16::from_ne_bytes([body[offset], body[offset + 1]]));
+            let found_type = u16::from_ne_bytes([body[offset + 2], body[offset + 3]]);
+            if len < ROUTE_ATTRIBUTE_HEADER_LEN || offset + len > body.len() {
+                return None;
+            }
+            let payload = &body[offset + ROUTE_ATTRIBUTE_HEADER_LEN..offset + len];
+            if found_type == attr_type {
+                return Some(payload);
+            }
+            offset += align_to_netlink(len)?;
+        }
+        None
+    }
+
     #[test]
     fn encodes_sa_install_with_auth_and_crypt_attrs() {
         let body = encode_sa_info(&sa_parameters()).unwrap();
@@ -1080,6 +1144,107 @@ mod tests {
         assert!(body[XFRM_USER_SA_INFO_LEN..]
             .windows(7)
             .any(|w| w == b"aes-cbc"));
+    }
+
+    #[test]
+    fn encodes_sa_install_with_aead_attr() {
+        let mut params = sa_parameters();
+        params.auth = None;
+        params.crypt = None;
+        params.aead = Some((
+            AeadAlgorithm::new("rfc4106(gcm(aes))", 128),
+            KeyMaterial::new(vec![0xcd; 36]),
+        ));
+
+        let body = encode_sa_info(&params).unwrap();
+        let payload = route_attr_payload(&body, XFRMA_ALG_AEAD).expect("aead attr");
+
+        assert_eq!(payload.len(), XFRM_ALGO_AEAD_HEADER_LEN + 36);
+        assert_eq!(
+            &payload[..XFRM_ALG_NAME_LEN],
+            &encode_algorithm_name("rfc4106(gcm(aes))").unwrap()
+        );
+        assert_eq!(
+            u32::from_ne_bytes([
+                payload[XFRM_ALG_NAME_LEN],
+                payload[XFRM_ALG_NAME_LEN + 1],
+                payload[XFRM_ALG_NAME_LEN + 2],
+                payload[XFRM_ALG_NAME_LEN + 3],
+            ]),
+            36 * 8
+        );
+        assert_eq!(
+            u32::from_ne_bytes([
+                payload[XFRM_ALG_NAME_LEN + 4],
+                payload[XFRM_ALG_NAME_LEN + 5],
+                payload[XFRM_ALG_NAME_LEN + 6],
+                payload[XFRM_ALG_NAME_LEN + 7],
+            ]),
+            128
+        );
+        assert_eq!(&payload[XFRM_ALGO_AEAD_HEADER_LEN..], &[0xcd; 36]);
+        assert!(route_attr_payload(&body, XFRMA_ALG_CRYPT).is_none());
+        assert_eq!(body.len() % 4, 0);
+    }
+
+    #[test]
+    fn rejects_aead_name_in_crypt_slot() {
+        let mut params = sa_parameters();
+        params.auth = None;
+        params.crypt = Some((
+            Algorithm::new("rfc4106(gcm(aes))"),
+            KeyMaterial::new(vec![0xcd; 36]),
+        ));
+
+        let error = encode_sa_info(&params).unwrap_err();
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "crypt",
+                reason: "aead algorithm must use the aead slot"
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_mixed_aead_and_auth_or_crypt() {
+        let mut params = sa_parameters();
+        params.aead = Some((
+            AeadAlgorithm::new("rfc4106(gcm(aes))", 128),
+            KeyMaterial::new(vec![0xcd; 36]),
+        ));
+
+        let error = encode_sa_info(&params).unwrap_err();
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "aead",
+                reason: "aead is mutually exclusive with auth/crypt"
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_aead_icv_length() {
+        let mut params = sa_parameters();
+        params.auth = None;
+        params.crypt = None;
+        params.aead = Some((
+            AeadAlgorithm::new("rfc4106(gcm(aes))", 0),
+            KeyMaterial::new(vec![0xcd; 36]),
+        ));
+
+        let error = encode_sa_info(&params).unwrap_err();
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "aead.icv_len_bits",
+                reason: "icv length must be nonzero"
+            }
+        ));
     }
 
     #[test]

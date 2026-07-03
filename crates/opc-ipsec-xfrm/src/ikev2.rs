@@ -2,20 +2,22 @@
 //!
 //! This module converts product-neutral Child SA negotiation intent from
 //! `opc-proto-ikev2` into explicit XFRM SA and policy install requests. It does
-//! not negotiate IKE, derive key material, allocate SPIs, or choose subscriber
-//! policy.
+//! not negotiate IKE, allocate SPIs, or choose subscriber policy. The optional
+//! KEYMAT helper derives caller-supplied Child SA profiles into the same
+//! directional key type consumed by the mapper.
 
 use std::{error::Error, fmt};
 
 use opc_proto_ikev2::{
-    Ikev2ChildSaNegotiation, Ikev2TrafficSelectorBuild, IKEV2_TS_IPV4_ADDR_RANGE,
-    IKEV2_TS_IPV6_ADDR_RANGE,
+    derive_child_sa_key_material, Ikev2ChildSaCryptoProfile, Ikev2ChildSaNegotiation,
+    Ikev2EncryptionAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
+    Ikev2TrafficSelectorBuild, IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
 };
 
 use crate::{
-    Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
-    LifetimeConfig, PolicyParameters, SaParameters, XfrmAction, XfrmCompositeInstallRequest,
-    XfrmDirection, XfrmId, XfrmMode, XfrmSelector, XfrmTemplate,
+    AeadAlgorithm, Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress,
+    KeyMaterial, LifetimeConfig, PolicyParameters, SaParameters, XfrmAction,
+    XfrmCompositeInstallRequest, XfrmDirection, XfrmId, XfrmMode, XfrmSelector, XfrmTemplate,
 };
 
 /// IKEv2 Security Protocol ID for ESP proposals.
@@ -32,6 +34,8 @@ pub struct Ikev2ChildSaXfrmKeys {
     pub auth: Option<(AuthAlgorithm, KeyMaterial)>,
     /// Encryption or AEAD algorithm and key.
     pub crypt: Option<(Algorithm, KeyMaterial)>,
+    /// Combined-mode AEAD algorithm and key.
+    pub aead: Option<(AeadAlgorithm, KeyMaterial)>,
 }
 
 impl Ikev2ChildSaXfrmKeys {
@@ -40,12 +44,25 @@ impl Ikev2ChildSaXfrmKeys {
         auth: Option<(AuthAlgorithm, KeyMaterial)>,
         crypt: Option<(Algorithm, KeyMaterial)>,
     ) -> Self {
-        Self { auth, crypt }
+        Self {
+            auth,
+            crypt,
+            aead: None,
+        }
+    }
+
+    /// Create directional XFRM key material for a combined-mode AEAD SA.
+    pub fn aead(aead: (AeadAlgorithm, KeyMaterial)) -> Self {
+        Self {
+            auth: None,
+            crypt: None,
+            aead: Some(aead),
+        }
     }
 
     /// Return true when no authentication or encryption key material is present.
     pub fn is_empty(&self) -> bool {
-        self.auth.is_none() && self.crypt.is_none()
+        self.auth.is_none() && self.crypt.is_none() && self.aead.is_none()
     }
 }
 
@@ -87,6 +104,15 @@ pub struct Ikev2ChildSaXfrmRequests {
     pub outbound_policy: InstallPolicyRequest,
 }
 
+/// Directional XFRM key material derived from Child SA KEYMAT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ikev2ChildSaDirectionalXfrmKeys {
+    /// Inbound SA keys at the responder, using initiator-to-responder KEYMAT.
+    pub inbound: Ikev2ChildSaXfrmKeys,
+    /// Outbound SA keys at the responder, using responder-to-initiator KEYMAT.
+    pub outbound: Ikev2ChildSaXfrmKeys,
+}
+
 impl Ikev2ChildSaXfrmRequests {
     /// Return SA+policy composite install requests in inbound, outbound order.
     pub fn composite_installs(&self) -> [XfrmCompositeInstallRequest; 2] {
@@ -102,6 +128,41 @@ impl Ikev2ChildSaXfrmRequests {
         ]
     }
 }
+
+/// Error returned while deriving Child SA KEYMAT into XFRM key material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ikev2ChildSaKeyMaterialError {
+    /// Lower-level IKEv2 KEYMAT derivation failed.
+    KeyDerivation(Ikev2SaInitCryptoErrorCode),
+    /// The negotiated crypto profile has no SDK XFRM algorithm mapping.
+    UnsupportedAlgorithmMapping,
+}
+
+impl Ikev2ChildSaKeyMaterialError {
+    /// Stable machine-readable error code.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::KeyDerivation(_) => "ikev2_child_sa_keymat_derivation_failed",
+            Self::UnsupportedAlgorithmMapping => {
+                "ikev2_child_sa_keymat_unsupported_algorithm_mapping"
+            }
+        }
+    }
+}
+
+impl From<Ikev2SaInitCryptoError> for Ikev2ChildSaKeyMaterialError {
+    fn from(source: Ikev2SaInitCryptoError) -> Self {
+        Self::KeyDerivation(source.code())
+    }
+}
+
+impl fmt::Display for Ikev2ChildSaKeyMaterialError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Error for Ikev2ChildSaKeyMaterialError {}
 
 /// Validation failure while mapping a negotiated Child SA into XFRM requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +267,45 @@ impl fmt::Display for Ikev2ChildSaXfrmError {
 
 impl Error for Ikev2ChildSaXfrmError {}
 
+/// Derive Child SA KEYMAT and map it into bidirectional XFRM key material.
+///
+/// AES-GCM profiles map to [`Ikev2ChildSaXfrmKeys::aead`] with Linux
+/// `rfc4106(gcm(aes))` and a 128-bit ICV. AES-CBC profiles with supported
+/// HMAC-SHA2 integrity map to separate crypt/auth slots.
+///
+/// # Errors
+///
+/// Returns [`Ikev2ChildSaKeyMaterialError`] when KEYMAT derivation fails or the
+/// selected profile has no SDK XFRM algorithm-name mapping.
+pub fn derive_child_sa_xfrm_keys(
+    profile: Ikev2ChildSaCryptoProfile,
+    sk_d: &[u8],
+    initiator_nonce: &[u8],
+    responder_nonce: &[u8],
+    new_dh_shared_secret: Option<&[u8]>,
+) -> Result<Ikev2ChildSaDirectionalXfrmKeys, Ikev2ChildSaKeyMaterialError> {
+    let key_material = derive_child_sa_key_material(
+        profile,
+        sk_d,
+        initiator_nonce,
+        responder_nonce,
+        new_dh_shared_secret,
+    )?;
+
+    let inbound = child_sa_xfrm_keys_from_direction(
+        profile,
+        key_material.initiator_to_responder_encryption(),
+        key_material.initiator_to_responder_integrity(),
+    )?;
+    let outbound = child_sa_xfrm_keys_from_direction(
+        profile,
+        key_material.responder_to_initiator_encryption(),
+        key_material.responder_to_initiator_integrity(),
+    )?;
+
+    Ok(Ikev2ChildSaDirectionalXfrmKeys { inbound, outbound })
+}
+
 /// Build bidirectional XFRM SA and policy install requests for a Child SA.
 ///
 /// # Errors
@@ -277,6 +377,7 @@ pub fn build_xfrm_requests_from_ikev2_child_sa(
             source_address: request.remote_tunnel_address,
             auth: request.inbound.auth.clone(),
             crypt: request.inbound.crypt.clone(),
+            aead: request.inbound.aead.clone(),
             mode: request.mode,
             lifetime: request.lifetime,
             replay_window: request.replay_window,
@@ -289,6 +390,7 @@ pub fn build_xfrm_requests_from_ikev2_child_sa(
             source_address: request.local_tunnel_address,
             auth: request.outbound.auth.clone(),
             crypt: request.outbound.crypt.clone(),
+            aead: request.outbound.aead.clone(),
             mode: request.mode,
             lifetime: request.lifetime,
             replay_window: request.replay_window,
@@ -327,6 +429,47 @@ pub fn build_xfrm_requests_from_ikev2_child_sa(
         inbound_policy,
         outbound_policy,
     })
+}
+
+fn child_sa_xfrm_keys_from_direction(
+    profile: Ikev2ChildSaCryptoProfile,
+    encryption_key: &[u8],
+    integrity_key: &[u8],
+) -> Result<Ikev2ChildSaXfrmKeys, Ikev2ChildSaKeyMaterialError> {
+    if profile.encryption().is_aead() {
+        if !integrity_key.is_empty() {
+            return Err(Ikev2ChildSaKeyMaterialError::UnsupportedAlgorithmMapping);
+        }
+        let aead = match profile.encryption() {
+            Ikev2EncryptionAlgorithm::AesGcm16_128
+            | Ikev2EncryptionAlgorithm::AesGcm16_192
+            | Ikev2EncryptionAlgorithm::AesGcm16_256 => {
+                AeadAlgorithm::new("rfc4106(gcm(aes))", 128)
+            }
+            _ => return Err(Ikev2ChildSaKeyMaterialError::UnsupportedAlgorithmMapping),
+        };
+        return Ok(Ikev2ChildSaXfrmKeys::aead((
+            aead,
+            KeyMaterial::new(encryption_key.to_vec()),
+        )));
+    }
+
+    let crypt = match profile.encryption() {
+        Ikev2EncryptionAlgorithm::AesCbc128
+        | Ikev2EncryptionAlgorithm::AesCbc192
+        | Ikev2EncryptionAlgorithm::AesCbc256 => Algorithm::new("aes-cbc"),
+        _ => return Err(Ikev2ChildSaKeyMaterialError::UnsupportedAlgorithmMapping),
+    };
+    let Some(integrity) = profile.integrity() else {
+        return Err(Ikev2ChildSaKeyMaterialError::UnsupportedAlgorithmMapping);
+    };
+    Ok(Ikev2ChildSaXfrmKeys::new(
+        Some((
+            AuthAlgorithm::new(integrity.xfrm_name(), integrity.icv_len_bits()),
+            KeyMaterial::new(integrity_key.to_vec()),
+        )),
+        Some((crypt, KeyMaterial::new(encryption_key.to_vec()))),
+    ))
 }
 
 fn validate_request(request: &Ikev2ChildSaXfrmRequest) -> Result<(), Ikev2ChildSaXfrmError> {
@@ -441,7 +584,10 @@ fn same_address_family(left: IpAddress, right: IpAddress) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opc_proto_ikev2::Ikev2ChildSaNegotiation;
+    use opc_proto_ikev2::{
+        Ikev2ChildSaCryptoProfile, Ikev2ChildSaNegotiation, Ikev2EncryptionAlgorithm,
+        Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm, Ikev2SaInitCryptoErrorCode,
+    };
 
     fn ipv4(a: u8, b: u8, c: u8, d: u8) -> IpAddress {
         IpAddress::Ipv4([a, b, c, d])
@@ -458,17 +604,44 @@ mod tests {
         }
     }
 
+    fn hex_to_bytes(hex: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(hex.len() / 2);
+        let bytes = hex.as_bytes();
+        assert_eq!(bytes.len() % 2, 0);
+        let mut i = 0;
+        while i < bytes.len() {
+            let hi = hex_nibble(bytes[i]);
+            let lo = hex_nibble(bytes[i + 1]);
+            out.push((hi << 4) | lo);
+            i += 2;
+        }
+        out
+    }
+
+    fn hex_nibble(byte: u8) -> u8 {
+        match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => panic!("invalid hex digit"),
+        }
+    }
+
     fn keys(seed: u8) -> Ikev2ChildSaXfrmKeys {
         Ikev2ChildSaXfrmKeys::new(
             Some((
                 AuthAlgorithm::new("hmac-sha256", 128),
                 KeyMaterial::new(vec![seed; 32]),
             )),
-            Some((
-                Algorithm::new("rfc4106(gcm(aes))"),
-                KeyMaterial::new(vec![seed; 20]),
-            )),
+            Some((Algorithm::new("aes-cbc"), KeyMaterial::new(vec![seed; 20]))),
         )
+    }
+
+    fn aead_keys(seed: u8) -> Ikev2ChildSaXfrmKeys {
+        Ikev2ChildSaXfrmKeys::aead((
+            AeadAlgorithm::new("rfc4106(gcm(aes))", 128),
+            KeyMaterial::new(vec![seed; 36]),
+        ))
     }
 
     fn request() -> Ikev2ChildSaXfrmRequest {
@@ -635,6 +808,173 @@ mod tests {
             build_xfrm_requests_from_ikev2_child_sa(&input),
             Err(Ikev2ChildSaXfrmError::MissingOutboundKeyMaterial)
         ));
+    }
+
+    #[test]
+    fn maps_aead_directional_keys_to_sa_parameters() {
+        let mut input = request();
+        input.inbound = aead_keys(0xab);
+        input.outbound = aead_keys(0xcd);
+
+        let built = build_xfrm_requests_from_ikev2_child_sa(&input).expect("request builds");
+
+        assert!(built.inbound_sa.parameters.auth.is_none());
+        assert!(built.inbound_sa.parameters.crypt.is_none());
+        assert_eq!(
+            built.inbound_sa.parameters.aead.as_ref().map(|(a, k)| (
+                a.name.as_str(),
+                a.icv_len_bits,
+                k.len()
+            )),
+            Some(("rfc4106(gcm(aes))", 128, 36))
+        );
+        assert!(built.outbound_sa.parameters.auth.is_none());
+        assert!(built.outbound_sa.parameters.crypt.is_none());
+        assert_eq!(
+            built.outbound_sa.parameters.aead.as_ref().map(|(a, k)| (
+                a.name.as_str(),
+                a.icv_len_bits,
+                k.len()
+            )),
+            Some(("rfc4106(gcm(aes))", 128, 36))
+        );
+    }
+
+    #[test]
+    fn derives_child_sa_xfrm_keys_into_aead_slots_by_responder_direction() {
+        let profile = Ikev2ChildSaCryptoProfile::new_aead(
+            Ikev2PrfAlgorithm::HmacSha2_256,
+            Ikev2EncryptionAlgorithm::AesGcm16_256,
+        );
+        let keys =
+            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 16], &[0xb2; 16], None) {
+                Ok(keys) => keys,
+                Err(error) => panic!("child SA XFRM key derivation failed: {error:?}"),
+            };
+
+        assert!(keys.inbound.auth.is_none());
+        assert!(keys.inbound.crypt.is_none());
+        let inbound = match &keys.inbound.aead {
+            Some(value) => value,
+            None => panic!("missing inbound AEAD keys"),
+        };
+        assert_eq!(inbound.0.name, "rfc4106(gcm(aes))");
+        assert_eq!(inbound.0.icv_len_bits, 128);
+        assert_eq!(
+            inbound.1.as_bytes(),
+            hex_to_bytes(
+                "7ae50b9713ddfd346dbb3cfbe8b8d45a34c79925bedb4f4ae6a5ad6bc76d8ab578ea306c"
+            )
+        );
+
+        assert!(keys.outbound.auth.is_none());
+        assert!(keys.outbound.crypt.is_none());
+        let outbound = match &keys.outbound.aead {
+            Some(value) => value,
+            None => panic!("missing outbound AEAD keys"),
+        };
+        assert_eq!(
+            outbound.1.as_bytes(),
+            hex_to_bytes(
+                "e36f6fde3c1f71951c1fe8c6d7477a4a2adfe9b746fd3c6fd6be52da8c2afd17eeff3e2a"
+            )
+        );
+
+        let mut input = request();
+        input.inbound = keys.inbound;
+        input.outbound = keys.outbound;
+        let built = match build_xfrm_requests_from_ikev2_child_sa(&input) {
+            Ok(built) => built,
+            Err(error) => panic!("derived keys should build XFRM requests: {error:?}"),
+        };
+        assert_eq!(
+            built
+                .inbound_sa
+                .parameters
+                .aead
+                .as_ref()
+                .map(|(algorithm, key)| (
+                    algorithm.name.as_str(),
+                    algorithm.icv_len_bits,
+                    key.len()
+                )),
+            Some(("rfc4106(gcm(aes))", 128, 36))
+        );
+        assert_eq!(
+            built
+                .outbound_sa
+                .parameters
+                .aead
+                .as_ref()
+                .map(|(algorithm, key)| (
+                    algorithm.name.as_str(),
+                    algorithm.icv_len_bits,
+                    key.len()
+                )),
+            Some(("rfc4106(gcm(aes))", 128, 36))
+        );
+    }
+
+    #[test]
+    fn derives_child_sa_xfrm_keys_into_encrypt_then_mac_slots() {
+        let profile = Ikev2ChildSaCryptoProfile::new_encrypt_then_mac(
+            Ikev2PrfAlgorithm::HmacSha2_256,
+            Ikev2EncryptionAlgorithm::AesCbc256,
+            Ikev2IntegrityAlgorithm::HmacSha2_256_128,
+        );
+        let keys =
+            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 16], &[0xb2; 16], None) {
+                Ok(keys) => keys,
+                Err(error) => panic!("child SA XFRM key derivation failed: {error:?}"),
+            };
+
+        assert!(keys.inbound.aead.is_none());
+        let inbound_crypt = match &keys.inbound.crypt {
+            Some(value) => value,
+            None => panic!("missing inbound crypt keys"),
+        };
+        assert_eq!(inbound_crypt.0.name, "aes-cbc");
+        assert_eq!(
+            inbound_crypt.1.as_bytes(),
+            hex_to_bytes("7ae50b9713ddfd346dbb3cfbe8b8d45a34c79925bedb4f4ae6a5ad6bc76d8ab5")
+        );
+        let inbound_auth = match &keys.inbound.auth {
+            Some(value) => value,
+            None => panic!("missing inbound auth keys"),
+        };
+        assert_eq!(inbound_auth.0.name, "hmac-sha256");
+        assert_eq!(inbound_auth.0.truncation_len_bits, 128);
+        assert_eq!(inbound_auth.1.len(), 32);
+
+        let outbound_crypt = match &keys.outbound.crypt {
+            Some(value) => value,
+            None => panic!("missing outbound crypt keys"),
+        };
+        assert_eq!(
+            outbound_crypt.1.as_bytes(),
+            hex_to_bytes("8c2afd17eeff3e2a77f1c49d07cb5a9456546102f02fe52ee641dd4e3bc207ce")
+        );
+    }
+
+    #[test]
+    fn child_sa_xfrm_key_derivation_errors_are_stable_and_redacted() {
+        let profile = Ikev2ChildSaCryptoProfile::new_aead(
+            Ikev2PrfAlgorithm::HmacSha2_256,
+            Ikev2EncryptionAlgorithm::AesGcm16_128,
+        );
+        let error =
+            match derive_child_sa_xfrm_keys(profile, &[0x0f; 31], &[0xa1; 16], &[0xb2; 16], None) {
+                Ok(value) => panic!("invalid SK_d unexpectedly derived keys: {value:?}"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            error,
+            Ikev2ChildSaKeyMaterialError::KeyDerivation(
+                Ikev2SaInitCryptoErrorCode::InvalidKeyLength
+            )
+        );
+        assert_eq!(error.as_str(), "ikev2_child_sa_keymat_derivation_failed");
+        assert!(!format!("{error:?}").contains("0f0f"));
     }
 
     #[test]

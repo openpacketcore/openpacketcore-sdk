@@ -150,6 +150,25 @@ impl AuthAlgorithm {
     }
 }
 
+/// Combined-mode AEAD algorithm with Integrity Check Value length.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AeadAlgorithm {
+    /// Kernel algorithm name such as `rfc4106(gcm(aes))`.
+    pub name: String,
+    /// ICV length in bits, for example 128 for AES-GCM-16.
+    pub icv_len_bits: u32,
+}
+
+impl AeadAlgorithm {
+    /// Create a combined-mode AEAD algorithm.
+    pub fn new(name: impl Into<String>, icv_len_bits: u32) -> Self {
+        Self {
+            name: name.into(),
+            icv_len_bits,
+        }
+    }
+}
+
 /// Sensitive key material.
 ///
 /// The bytes are zeroized on drop. `Debug` and `Display` never emit the raw
@@ -243,6 +262,10 @@ pub struct SaParameters {
     pub auth: Option<(AuthAlgorithm, KeyMaterial)>,
     /// Encryption algorithm and key.
     pub crypt: Option<(Algorithm, KeyMaterial)>,
+    /// Combined-mode AEAD algorithm and key material.
+    ///
+    /// This is mutually exclusive with [`Self::auth`] and [`Self::crypt`].
+    pub aead: Option<(AeadAlgorithm, KeyMaterial)>,
     /// XFRM mode.
     pub mode: XfrmMode,
     /// Lifetime limits.

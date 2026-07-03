@@ -59,6 +59,9 @@ pub const UPDATE_BEARER_REQUEST: u8 = 97;
 /// Update Bearer Response message type used by the S2b Update Session view.
 pub const UPDATE_BEARER_RESPONSE: u8 = 98;
 
+/// GTPv2-C interface type for S2b-U PGW GTP-U.
+pub const INTERFACE_TYPE_S2B_U_PGW_GTP_U: u8 = 33;
+
 /// Result type for S2b Production Profile v1 constructors.
 pub type S2bProfileBuildResult<T> = Result<T, S2bProfileBuildError>;
 
@@ -291,7 +294,7 @@ pub fn s2b_create_session_request(
     ];
     ies.extend(request.additional_ies);
     build_s2b_profile_message(
-        Header::without_teid(CREATE_SESSION_REQUEST, request.sequence_number),
+        Header::with_teid(CREATE_SESSION_REQUEST, 0, request.sequence_number),
         ies,
     )
 }
@@ -533,7 +536,7 @@ fn validate_built_s2b_profile_message(message: &OwnedMessage) -> Result<(), Deco
 /// This projection is intentionally strict: it is only returned for Cause 16
 /// (`RequestAccepted`) and includes the accepted-bearer fields that products
 /// need to derive an established bearer context.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CreateSessionAcceptedResponseSummary {
     /// TEID carried in the Create Session Response common header.
     pub response_teid: u32,
@@ -545,6 +548,47 @@ pub struct CreateSessionAcceptedResponseSummary {
     pub sender_f_teid: FullyQualifiedTeid,
     /// Linked bearer EBI from the first Bearer Context IE.
     pub bearer_ebi: EpsBearerId,
+    /// PGW S2b-U user-plane F-TEID from the accepted Bearer Context.
+    pub bearer_user_plane_f_teid: FullyQualifiedTeid,
+    /// PGW-allocated PDN Address Allocation from top-level PAA IE instance 0.
+    pub paa: Option<PdnAddressAllocation>,
+}
+
+impl fmt::Debug for CreateSessionAcceptedResponseSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreateSessionAcceptedResponseSummary")
+            .field("response_teid_present", &true)
+            .field("sequence_number", &self.sequence_number)
+            .field("cause", &self.cause)
+            .field("sender_f_teid_present", &true)
+            .field("bearer_ebi", &self.bearer_ebi)
+            .field(
+                "bearer_user_plane_interface_type",
+                &self.bearer_user_plane_f_teid.interface_type,
+            )
+            .field(
+                "bearer_user_plane_ipv4_present",
+                &self.bearer_user_plane_f_teid.ipv4.is_some(),
+            )
+            .field(
+                "bearer_user_plane_ipv6_present",
+                &self.bearer_user_plane_f_teid.ipv6.is_some(),
+            )
+            .field("paa_pdn_type", &self.paa.as_ref().map(|paa| paa.pdn_type))
+            .field(
+                "paa_ipv4_present",
+                &self.paa.as_ref().is_some_and(|paa| paa.ipv4.is_some()),
+            )
+            .field(
+                "paa_ipv6_present",
+                &self
+                    .paa
+                    .as_ref()
+                    .is_some_and(|paa| paa.ipv6_prefix.is_some()),
+            )
+            .finish()
+    }
 }
 
 /// Rejected Create Session Response projection.
@@ -587,6 +631,14 @@ pub enum CreateSessionResponseSummaryError {
     AcceptedResponseMissingBearerContext,
     /// Accepted Create Session Response Bearer Context did not include an EBI IE.
     AcceptedResponseMissingBearerEbi,
+    /// Accepted Create Session Response carried a malformed top-level PAA IE.
+    AcceptedResponseMalformedPaa,
+    /// Accepted Create Session Response Bearer Context contained no F-TEID IE.
+    AcceptedResponseMissingBearerFTeid,
+    /// Accepted Create Session Response Bearer Context F-TEIDs were not S2b-U PGW.
+    AcceptedResponseBearerFTeidInterfaceMismatch,
+    /// Accepted Create Session Response S2b-U F-TEID carried no endpoint address.
+    AcceptedResponseMalformedBearerFTeid,
 }
 
 impl CreateSessionResponseSummaryError {
@@ -608,6 +660,16 @@ impl CreateSessionResponseSummaryError {
             }
             Self::AcceptedResponseMissingBearerEbi => {
                 "s2b_create_session_response_missing_bearer_ebi"
+            }
+            Self::AcceptedResponseMalformedPaa => "s2b_create_session_response_malformed_paa",
+            Self::AcceptedResponseMissingBearerFTeid => {
+                "s2b_create_session_response_missing_bearer_f_teid"
+            }
+            Self::AcceptedResponseBearerFTeidInterfaceMismatch => {
+                "s2b_create_session_response_bearer_f_teid_interface_mismatch"
+            }
+            Self::AcceptedResponseMalformedBearerFTeid => {
+                "s2b_create_session_response_malformed_bearer_f_teid"
             }
         }
     }
@@ -2497,6 +2559,59 @@ fn find_bearer_context_ebi(
         .ok_or(CreateSessionResponseSummaryError::AcceptedResponseMissingBearerEbi)
 }
 
+fn find_response_paa(
+    ies: &[TypedIe<'_>],
+) -> Result<Option<PdnAddressAllocation>, CreateSessionResponseSummaryError> {
+    let Some(ie) = ies
+        .iter()
+        .find(|ie| ie.ie_type() == IE_TYPE_PAA && ie.instance == 0)
+    else {
+        return Ok(None);
+    };
+    match &ie.value {
+        TypedIeValue::PdnAddressAllocation(paa) => Ok(Some(paa.clone())),
+        _ => Err(CreateSessionResponseSummaryError::AcceptedResponseMalformedPaa),
+    }
+}
+
+fn find_bearer_context_s2b_u_f_teid(
+    ies: &[TypedIe<'_>],
+) -> Result<FullyQualifiedTeid, CreateSessionResponseSummaryError> {
+    let Some(context) = ies.iter().find_map(|ie| match &ie.value {
+        TypedIeValue::BearerContext(context) if ie.ie_type() == IE_TYPE_BEARER_CONTEXT => {
+            Some(context)
+        }
+        _ => None,
+    }) else {
+        return Err(CreateSessionResponseSummaryError::AcceptedResponseMissingBearerContext);
+    };
+
+    let mut saw_f_teid = false;
+    for member in &context.members {
+        let TypedIeValue::FullyQualifiedTeid(f_teid) = &member.value else {
+            continue;
+        };
+        if member.ie_type() != IE_TYPE_F_TEID {
+            continue;
+        }
+        saw_f_teid = true;
+        if f_teid.interface_type == INTERFACE_TYPE_S2B_U_PGW_GTP_U {
+            if f_teid.ipv4.is_none() && f_teid.ipv6.is_none() {
+                return Err(
+                    CreateSessionResponseSummaryError::AcceptedResponseMalformedBearerFTeid,
+                );
+            }
+            return Ok(f_teid.clone());
+        }
+    }
+
+    if saw_f_teid {
+        Err(CreateSessionResponseSummaryError::AcceptedResponseBearerFTeidInterfaceMismatch)
+    } else {
+        Err(CreateSessionResponseSummaryError::AcceptedResponseMissingBearerFTeid)
+    }
+}
+
 fn is_accepted_create_session_cause(cause: CauseValue) -> bool {
     cause == CauseValue::RequestAccepted
 }
@@ -2520,6 +2635,8 @@ fn project_create_session_response(
         let sender_f_teid = find_sender_f_teid(&view.ies)
             .ok_or(CreateSessionResponseSummaryError::AcceptedResponseMissingSenderFTeid)?;
         let bearer_ebi = find_bearer_context_ebi(&view.ies)?;
+        let bearer_user_plane_f_teid = find_bearer_context_s2b_u_f_teid(&view.ies)?;
+        let paa = find_response_paa(&view.ies)?;
 
         Ok(CreateSessionResponseSummary::Accepted(
             CreateSessionAcceptedResponseSummary {
@@ -2528,6 +2645,8 @@ fn project_create_session_response(
                 cause,
                 sender_f_teid,
                 bearer_ebi,
+                bearer_user_plane_f_teid,
+                paa,
             },
         ))
     } else {
@@ -2586,6 +2705,11 @@ fn validate_required_ies(
             "Echo Response requires Recovery IE",
         ),
         (Procedure::CreateSession, MessageDirection::Request) => {
+            if !view.header.teid_flag || view.header.teid != Some(0) {
+                return Err(missing_ie_error(
+                    "Create Session Request must set TEID flag with TEID 0",
+                ));
+            }
             require_ie(
                 &view.ies,
                 IE_TYPE_IMSI,
@@ -2701,7 +2825,8 @@ fn validate_required_ies(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ie::Recovery;
+    use crate::header::{HEADER_LEN_WITHOUT_TEID, HEADER_LEN_WITH_TEID};
+    use crate::ie::{PdnTypeValue, PlmnId, RatTypeValue, Recovery, SelectionModeValue};
     use opc_protocol::{DecodeContext, Encode, EncodeContext};
 
     fn echo_view(
@@ -2744,6 +2869,80 @@ mod tests {
             panic!("Echo view encode failed: {error}");
         }
         encoded.to_vec()
+    }
+
+    fn encode_owned(message: &OwnedMessage) -> Vec<u8> {
+        let mut encoded = BytesMut::new();
+        if let Err(error) = message.encode(&mut encoded, EncodeContext::default()) {
+            panic!("message encode failed: {error}");
+        }
+        encoded.to_vec()
+    }
+
+    fn bearer_ebi(value: u8) -> TypedIe<'static> {
+        typed_ie(0, TypedIeValue::EpsBearerId(EpsBearerId { value }))
+    }
+
+    fn f_teid(interface_type: u8, teid: u32, ipv4: [u8; 4]) -> FullyQualifiedTeid {
+        FullyQualifiedTeid {
+            interface_type,
+            teid,
+            ipv4: Some(ipv4),
+            ipv6: None,
+        }
+    }
+
+    fn bearer_context(members: Vec<TypedIe<'static>>) -> BearerContext<'static> {
+        BearerContext { members }
+    }
+
+    fn response_paa(ipv4: [u8; 4]) -> PdnAddressAllocation {
+        PdnAddressAllocation {
+            pdn_type: PdnTypeValue::Ipv4,
+            ipv6_prefix_length: None,
+            ipv6_prefix: None,
+            ipv4: Some(ipv4),
+        }
+    }
+
+    fn accepted_response(
+        bearer_members: Vec<TypedIe<'static>>,
+        additional_ies: Vec<TypedIe<'static>>,
+    ) -> OwnedMessage {
+        match s2b_create_session_accepted_response(S2bCreateSessionAcceptedResponse {
+            sequence_number: 0x0001_0203,
+            response_teid: 0x0102_0304,
+            sender_f_teid: f_teid(32, 0x1111_2222, [192, 0, 2, 1]),
+            bearer_context: bearer_context(bearer_members),
+            additional_ies,
+        }) {
+            Ok(message) => message,
+            Err(error) => panic!("accepted response build failed: {error}"),
+        }
+    }
+
+    fn valid_create_session_request() -> S2bCreateSessionRequest<'static> {
+        S2bCreateSessionRequest {
+            sequence_number: 0x0000_0102,
+            imsi: TbcdDigits::new("001010123456789"),
+            rat_type: RatType {
+                value: RatTypeValue::Wlan,
+            },
+            serving_network: ServingNetwork {
+                plmn: PlmnId::new("001", "01"),
+            },
+            sender_f_teid: f_teid(30, 0x0102_0304, [198, 51, 100, 1]),
+            apn: AccessPointName::new(vec!["internet".to_string()]),
+            selection_mode: SelectionMode {
+                value: SelectionModeValue::MsOrNetworkProvidedSubscriptionVerified,
+            },
+            pdn_type: PdnType {
+                value: PdnTypeValue::Ipv4,
+            },
+            paa: response_paa([0, 0, 0, 0]),
+            bearer_context: bearer_context(vec![bearer_ebi(5)]),
+            additional_ies: Vec::new(),
+        }
     }
 
     fn transaction_request_view(
@@ -3259,5 +3458,260 @@ mod tests {
         assert!(is_s2b_message_type(DELETE_SESSION_RESPONSE));
         assert!(is_s2b_message_type(UPDATE_BEARER_RESPONSE));
         assert!(!is_s2b_message_type(3));
+    }
+
+    #[test]
+    fn create_session_request_builder_sets_teid_flag_with_zero_teid() {
+        let message = match s2b_create_session_request(valid_create_session_request()) {
+            Ok(message) => message,
+            Err(error) => panic!("Create Session Request build failed: {error}"),
+        };
+        assert!(message.header.teid_flag);
+        assert_eq!(message.header.teid, Some(0));
+        assert_eq!(message.header.wire_len(), HEADER_LEN_WITH_TEID);
+
+        let encoded = encode_owned(&message);
+        assert_eq!(encoded[0], 0x48);
+        assert_eq!(&encoded[4..8], &[0, 0, 0, 0]);
+
+        let echo = match s2b_echo_request(7, Recovery { restart_counter: 1 }) {
+            Ok(message) => message,
+            Err(error) => panic!("Echo Request build failed: {error}"),
+        };
+        let encoded_echo = encode_owned(&echo);
+        assert_eq!(encoded_echo[0], 0x40);
+        assert_eq!(echo.header.wire_len(), HEADER_LEN_WITHOUT_TEID);
+    }
+
+    #[test]
+    fn create_session_request_profile_rejects_t_zero_header() {
+        let mut message = match s2b_create_session_request(valid_create_session_request()) {
+            Ok(message) => message,
+            Err(error) => panic!("Create Session Request build failed: {error}"),
+        };
+        message.header = Header::without_teid(CREATE_SESSION_REQUEST, 0x0000_0102);
+
+        assert!(validate_built_s2b_profile_message(&message).is_err());
+    }
+
+    #[test]
+    fn accepted_create_session_summary_projects_paa_and_user_plane_f_teid() {
+        let paa = response_paa([203, 0, 113, 9]);
+        let message = accepted_response(
+            vec![
+                bearer_ebi(5),
+                typed_ie(
+                    0,
+                    TypedIeValue::FullyQualifiedTeid(f_teid(
+                        INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+                        0x1122_3344,
+                        [203, 0, 113, 1],
+                    )),
+                ),
+            ],
+            vec![typed_ie(0, TypedIeValue::PdnAddressAllocation(paa.clone()))],
+        );
+
+        let summary = match decode_create_session_response_summary(
+            &encode_owned(&message),
+            DecodeContext::default(),
+        ) {
+            Ok(summary) => summary,
+            Err(error) => panic!("summary decode failed: {error}"),
+        };
+
+        let CreateSessionResponseSummary::Accepted(accepted) = summary else {
+            panic!("expected accepted summary");
+        };
+        assert_eq!(accepted.paa, Some(paa));
+        assert_eq!(
+            accepted.bearer_user_plane_f_teid.interface_type,
+            INTERFACE_TYPE_S2B_U_PGW_GTP_U
+        );
+        assert_eq!(accepted.bearer_user_plane_f_teid.teid, 0x1122_3344);
+        assert_eq!(
+            accepted.bearer_user_plane_f_teid.ipv4,
+            Some([203, 0, 113, 1])
+        );
+
+        let debug = format!("{accepted:?}");
+        assert!(debug.contains("paa_ipv4_present: true"));
+        assert!(!debug.contains("[203, 0, 113, 9]"));
+        assert!(!debug.contains("[203, 0, 113, 1]"));
+        assert!(!debug.contains("287454020"));
+    }
+
+    #[test]
+    fn accepted_create_session_summary_treats_paa_as_optional_and_instance_zero_only() {
+        let message = accepted_response(
+            vec![
+                bearer_ebi(5),
+                typed_ie(
+                    0,
+                    TypedIeValue::FullyQualifiedTeid(f_teid(
+                        INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+                        0x1122_3344,
+                        [203, 0, 113, 1],
+                    )),
+                ),
+            ],
+            Vec::new(),
+        );
+        let summary = match decode_create_session_response_summary(
+            &encode_owned(&message),
+            DecodeContext::default(),
+        ) {
+            Ok(summary) => summary,
+            Err(error) => panic!("summary decode failed: {error}"),
+        };
+        let CreateSessionResponseSummary::Accepted(accepted) = summary else {
+            panic!("expected accepted summary");
+        };
+        assert_eq!(accepted.paa, None);
+
+        let message = accepted_response(
+            vec![
+                bearer_ebi(5),
+                typed_ie(
+                    0,
+                    TypedIeValue::FullyQualifiedTeid(f_teid(
+                        INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+                        0x1122_3344,
+                        [203, 0, 113, 1],
+                    )),
+                ),
+            ],
+            vec![typed_ie(
+                1,
+                TypedIeValue::PdnAddressAllocation(response_paa([203, 0, 113, 9])),
+            )],
+        );
+        let summary = match decode_create_session_response_summary(
+            &encode_owned(&message),
+            DecodeContext::default(),
+        ) {
+            Ok(summary) => summary,
+            Err(error) => panic!("summary decode failed: {error}"),
+        };
+        let CreateSessionResponseSummary::Accepted(accepted) = summary else {
+            panic!("expected accepted summary");
+        };
+        assert_eq!(accepted.paa, None);
+    }
+
+    #[test]
+    fn accepted_create_session_summary_rejects_missing_or_wrong_bearer_f_teid() {
+        let message = accepted_response(vec![bearer_ebi(5)], Vec::new());
+        let error = match decode_create_session_response_summary(
+            &encode_owned(&message),
+            DecodeContext::default(),
+        ) {
+            Ok(summary) => panic!("unexpected summary: {summary:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            CreateSessionResponseSummaryError::AcceptedResponseMissingBearerFTeid
+        );
+        assert_eq!(
+            error.as_str(),
+            "s2b_create_session_response_missing_bearer_f_teid"
+        );
+
+        let message = accepted_response(
+            vec![
+                bearer_ebi(5),
+                typed_ie(
+                    0,
+                    TypedIeValue::FullyQualifiedTeid(f_teid(32, 0x1122_3344, [203, 0, 113, 1])),
+                ),
+            ],
+            Vec::new(),
+        );
+        let error = match decode_create_session_response_summary(
+            &encode_owned(&message),
+            DecodeContext::default(),
+        ) {
+            Ok(summary) => panic!("unexpected summary: {summary:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            CreateSessionResponseSummaryError::AcceptedResponseBearerFTeidInterfaceMismatch
+        );
+        assert_eq!(
+            error.as_str(),
+            "s2b_create_session_response_bearer_f_teid_interface_mismatch"
+        );
+    }
+
+    #[test]
+    fn accepted_create_session_summary_rejects_malformed_typed_bearer_f_teid() {
+        let view = S2bProcedureMessage {
+            header: Header::with_teid(CREATE_SESSION_RESPONSE, 0x0102_0304, 0x0001_0203),
+            procedure: Procedure::CreateSession,
+            direction: MessageDirection::Response,
+            ies: vec![
+                typed_ie(0, TypedIeValue::Cause(accepted_cause())),
+                typed_ie(
+                    0,
+                    TypedIeValue::FullyQualifiedTeid(f_teid(32, 1, [192, 0, 2, 1])),
+                ),
+                typed_ie(
+                    0,
+                    TypedIeValue::BearerContext(bearer_context(vec![
+                        bearer_ebi(5),
+                        typed_ie(
+                            0,
+                            TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid {
+                                interface_type: INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+                                teid: 0x1122_3344,
+                                ipv4: None,
+                                ipv6: None,
+                            }),
+                        ),
+                    ])),
+                ),
+            ],
+            raw_ies: &[],
+            tail: &[],
+        };
+
+        let error = match project_create_session_response(&view) {
+            Ok(summary) => panic!("unexpected summary: {summary:?}"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            CreateSessionResponseSummaryError::AcceptedResponseMalformedBearerFTeid
+        );
+        assert_eq!(
+            error.as_str(),
+            "s2b_create_session_response_malformed_bearer_f_teid"
+        );
+    }
+
+    #[test]
+    fn rejected_create_session_summary_does_not_require_accepted_fields() {
+        let message = match s2b_create_session_rejected_response(S2bCreateSessionRejectedResponse {
+            sequence_number: 0x0001_0203,
+            response_teid: 0x0102_0304,
+            cause: CauseValue::MandatoryIeMissing,
+            additional_ies: Vec::new(),
+        }) {
+            Ok(message) => message,
+            Err(error) => panic!("rejected response build failed: {error}"),
+        };
+
+        let summary = match decode_create_session_response_summary(
+            &encode_owned(&message),
+            DecodeContext::default(),
+        ) {
+            Ok(summary) => summary,
+            Err(error) => panic!("summary decode failed: {error}"),
+        };
+
+        assert!(matches!(summary, CreateSessionResponseSummary::Rejected(_)));
     }
 }

@@ -30,16 +30,19 @@ pub use composite::{
 pub use error::XfrmError;
 #[cfg(feature = "ikev2")]
 pub use ikev2::{
-    build_xfrm_requests_from_ikev2_child_sa, Ikev2ChildSaXfrmError, Ikev2ChildSaXfrmKeys,
-    Ikev2ChildSaXfrmRequest, Ikev2ChildSaXfrmRequests, IKEV2_SECURITY_PROTOCOL_ID_ESP, IPPROTO_ESP,
+    build_xfrm_requests_from_ikev2_child_sa, derive_child_sa_xfrm_keys,
+    Ikev2ChildSaDirectionalXfrmKeys, Ikev2ChildSaKeyMaterialError, Ikev2ChildSaXfrmError,
+    Ikev2ChildSaXfrmKeys, Ikev2ChildSaXfrmRequest, Ikev2ChildSaXfrmRequests,
+    IKEV2_SECURITY_PROTOCOL_ID_ESP, IPPROTO_ESP,
 };
 pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
 pub use mock::{MockOperation, MockXfrmBackend};
 pub use model::{
-    Algorithm, AllocateSpiRequest, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest,
-    IpAddress, KeyMaterial, LifetimeConfig, PolicyParameters, RekeyPolicyRequest, RekeySaRequest,
-    RemovePolicyRequest, RemoveSaRequest, SaParameters, SpiAllocation, XfrmAction, XfrmBackendKind,
-    XfrmCapability, XfrmDirection, XfrmId, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
+    AeadAlgorithm, Algorithm, AllocateSpiRequest, AuthAlgorithm, InstallPolicyRequest,
+    InstallSaRequest, IpAddress, KeyMaterial, LifetimeConfig, PolicyParameters, RekeyPolicyRequest,
+    RekeySaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters, SpiAllocation, XfrmAction,
+    XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmMode, XfrmProbe, XfrmSelector,
+    XfrmTemplate,
 };
 pub use unsupported::UnsupportedXfrmBackend;
 
@@ -76,6 +79,7 @@ mod integration_tests {
                 KeyMaterial::new(vec![0xab; 32]),
             )),
             crypt: Some((Algorithm::new("aes-cbc"), KeyMaterial::new(vec![0xcd; 32]))),
+            aead: None,
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),
             replay_window: 32,
