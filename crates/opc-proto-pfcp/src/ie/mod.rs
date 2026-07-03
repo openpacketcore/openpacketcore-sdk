@@ -12,6 +12,7 @@
 use bytes::{Bytes, BytesMut};
 use opc_protocol::{
     DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, EncodeContext, EncodeError, SpecRef,
+    UnknownIePolicy,
 };
 
 use crate::InformationElement;
@@ -373,6 +374,10 @@ impl TypedIe {
                 offset,
                 spec_ref.clone(),
             )?),
+            _ if matches!(ctx.unknown_ie_policy, UnknownIePolicy::Reject) => {
+                return Err(DecodeError::new(DecodeErrorCode::UnknownCriticalIe, offset)
+                    .with_spec_ref(spec_ref));
+            }
             _ => Self::Raw(raw),
         };
 

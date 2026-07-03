@@ -8,7 +8,7 @@
 
 use bytes::Bytes;
 use opc_key::{KeyHandle, KeyPurpose};
-use std::fmt;
+use std::{fmt, sync::Mutex};
 
 use crate::{SecurityHeaderType, SecurityProtected};
 
@@ -143,12 +143,47 @@ impl NasReplayWindow {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NasDirectionState {
+    overflow: u16,
+    replay_window: NasReplayWindow,
+}
+
+impl NasDirectionState {
+    const fn new(overflow: u16) -> Self {
+        Self {
+            overflow,
+            replay_window: NasReplayWindow::new(),
+        }
+    }
+
+    fn candidate_count(&self, sequence_number: u8) -> Result<NasCount, NasSecurityError> {
+        if self
+            .replay_window
+            .highest()
+            .is_some_and(|highest| highest.sequence_number() == u8::MAX && sequence_number == 0)
+        {
+            return self
+                .overflow
+                .checked_add(1)
+                .map(|overflow| NasCount::new(overflow, sequence_number))
+                .ok_or(NasSecurityError::InvalidCount);
+        }
+        Ok(NasCount::new(self.overflow, sequence_number))
+    }
+
+    fn accept(&mut self, count: NasCount) -> Result<(), NasSecurityError> {
+        self.replay_window.accept(count)?;
+        self.overflow = count.overflow();
+        Ok(())
+    }
+}
+
 /// NAS security context selected by NAS procedures.
 ///
 /// The key handles come from the SDK key substrate. This crate validates that
 /// they live in the `session` key lane but does not perform key lookup or
 /// lifecycle management.
-#[derive(Clone)]
 pub struct NasSecurityContext {
     /// Selected integrity algorithm.
     pub integrity_algorithm: NasIntegrityAlgorithm,
@@ -158,19 +193,36 @@ pub struct NasSecurityContext {
     pub integrity_key: KeyHandle,
     /// Ciphering key handle.
     pub ciphering_key: KeyHandle,
-    uplink_overflow: u16,
-    downlink_overflow: u16,
+    uplink: Mutex<NasDirectionState>,
+    downlink: Mutex<NasDirectionState>,
+}
+
+impl Clone for NasSecurityContext {
+    fn clone(&self) -> Self {
+        Self {
+            integrity_algorithm: self.integrity_algorithm,
+            ciphering_algorithm: self.ciphering_algorithm,
+            integrity_key: self.integrity_key.clone(),
+            ciphering_key: self.ciphering_key.clone(),
+            uplink: Mutex::new(self.state_snapshot(NasSecurityDirection::Uplink)),
+            downlink: Mutex::new(self.state_snapshot(NasSecurityDirection::Downlink)),
+        }
+    }
 }
 
 impl fmt::Debug for NasSecurityContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let uplink = self.state_snapshot(NasSecurityDirection::Uplink);
+        let downlink = self.state_snapshot(NasSecurityDirection::Downlink);
         f.debug_struct("NasSecurityContext")
             .field("integrity_algorithm", &self.integrity_algorithm)
             .field("ciphering_algorithm", &self.ciphering_algorithm)
             .field("integrity_key", &self.integrity_key)
             .field("ciphering_key", &self.ciphering_key)
-            .field("uplink_overflow", &self.uplink_overflow)
-            .field("downlink_overflow", &self.downlink_overflow)
+            .field("uplink_overflow", &uplink.overflow)
+            .field("downlink_overflow", &downlink.overflow)
+            .field("uplink_replay_highest", &uplink.replay_window.highest())
+            .field("downlink_replay_highest", &downlink.replay_window.highest())
             .finish()
     }
 }
@@ -196,22 +248,29 @@ impl NasSecurityContext {
             ciphering_algorithm,
             integrity_key,
             ciphering_key,
-            uplink_overflow,
-            downlink_overflow,
+            uplink: Mutex::new(NasDirectionState::new(uplink_overflow)),
+            downlink: Mutex::new(NasDirectionState::new(downlink_overflow)),
         })
     }
 
     /// Derive a direction-specific COUNT from the current overflow and SQN.
-    pub const fn count_for(
-        &self,
-        direction: NasSecurityDirection,
-        sequence_number: u8,
-    ) -> NasCount {
+    pub fn count_for(&self, direction: NasSecurityDirection, sequence_number: u8) -> NasCount {
+        self.state_snapshot(direction)
+            .candidate_count(sequence_number)
+            .unwrap_or_else(|_| NasCount::new(u16::MAX, sequence_number))
+    }
+
+    fn state_for(&self, direction: NasSecurityDirection) -> &Mutex<NasDirectionState> {
         match direction {
-            NasSecurityDirection::Uplink => NasCount::new(self.uplink_overflow, sequence_number),
-            NasSecurityDirection::Downlink => {
-                NasCount::new(self.downlink_overflow, sequence_number)
-            }
+            NasSecurityDirection::Uplink => &self.uplink,
+            NasSecurityDirection::Downlink => &self.downlink,
+        }
+    }
+
+    fn state_snapshot(&self, direction: NasSecurityDirection) -> NasDirectionState {
+        match self.state_for(direction).lock() {
+            Ok(state) => state.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 
@@ -222,7 +281,13 @@ impl NasSecurityContext {
         direction: NasSecurityDirection,
         envelope: &SecurityProtected,
     ) -> Result<NasCount, NasSecurityError> {
-        let count = self.count_for(direction, envelope.sequence_number);
+        let count = {
+            let state = self
+                .state_for(direction)
+                .lock()
+                .map_err(|_| NasSecurityError::InvalidCount)?;
+            state.candidate_count(envelope.sequence_number)?
+        };
         let expected = algorithms.compute_mac(
             self.integrity_algorithm,
             &self.integrity_key,
@@ -233,6 +298,10 @@ impl NasSecurityContext {
         if !mac_eq(expected, envelope.mac) {
             return Err(NasSecurityError::IntegrityCheckFailed);
         }
+        self.state_for(direction)
+            .lock()
+            .map_err(|_| NasSecurityError::InvalidCount)?
+            .accept(count)?;
         Ok(count)
     }
 
@@ -503,6 +572,73 @@ mod tests {
         assert_eq!(protected.mac, [0; 4]);
         assert_eq!(protected.sequence_number, 0x45);
         assert_eq!(protected.payload, payload);
+    }
+
+    #[test]
+    fn verify_integrity_rejects_replayed_count() {
+        let ctx = context();
+        let algorithms = NullNasSecurityAlgorithms;
+        let envelope = SecurityProtected {
+            security_header_type: SecurityHeaderType::IntegrityProtected,
+            spare: 0,
+            mac: [0; 4],
+            sequence_number: 0x44,
+            payload: Bytes::from_static(b"payload"),
+        };
+
+        let count = ctx
+            .verify_integrity(&algorithms, NasSecurityDirection::Uplink, &envelope)
+            .unwrap();
+        assert_eq!(count, NasCount::new(7, 0x44));
+        assert_eq!(
+            ctx.verify_integrity(&algorithms, NasSecurityDirection::Uplink, &envelope)
+                .unwrap_err(),
+            NasSecurityError::ReplayRejected
+        );
+    }
+
+    #[test]
+    fn count_overflow_advances_on_sqn_wrap() {
+        let ctx = NasSecurityContext::new(
+            NasIntegrityAlgorithm::Nia0,
+            NasCipheringAlgorithm::Nea0,
+            session_key("nas-int", 0x11),
+            session_key("nas-ciph", 0x22),
+            0x1234,
+            0,
+        )
+        .unwrap();
+        let algorithms = NullNasSecurityAlgorithms;
+        let payload = Bytes::from_static(b"payload");
+        let before_wrap = SecurityProtected {
+            security_header_type: SecurityHeaderType::IntegrityProtected,
+            spare: 0,
+            mac: [0; 4],
+            sequence_number: 0xFF,
+            payload: payload.clone(),
+        };
+        let after_wrap = SecurityProtected {
+            security_header_type: SecurityHeaderType::IntegrityProtected,
+            spare: 0,
+            mac: [0; 4],
+            sequence_number: 0x00,
+            payload,
+        };
+
+        assert_eq!(
+            ctx.verify_integrity(&algorithms, NasSecurityDirection::Uplink, &before_wrap)
+                .unwrap(),
+            NasCount::new(0x1234, 0xFF)
+        );
+        assert_eq!(
+            ctx.verify_integrity(&algorithms, NasSecurityDirection::Uplink, &after_wrap)
+                .unwrap(),
+            NasCount::new(0x1235, 0x00)
+        );
+        assert_eq!(
+            ctx.count_for(NasSecurityDirection::Uplink, 0x01),
+            NasCount::new(0x1235, 0x01)
+        );
     }
 
     #[test]

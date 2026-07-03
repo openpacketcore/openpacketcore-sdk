@@ -4,6 +4,8 @@ use std::{pin::Pin, sync::Arc};
 
 use opc_config_model::{AuthStrength, OpcConfig, RequestId, TrustedPrincipal};
 use opc_mgmt_audit::AuditOperation;
+use opc_mgmt_limits::{LimitsError, MgmtLimits};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tonic::{Request, Response, Status};
 
 use crate::{
@@ -48,6 +50,30 @@ impl AuthenticatedGnmiPrincipal {
     }
 }
 
+/// Per-transport-session authentication and resource state attached by the TLS
+/// listener.
+#[derive(Debug, Clone)]
+pub(crate) struct AuthenticatedGnmiSession {
+    principal: AuthenticatedGnmiPrincipal,
+    subscribe_permits: Arc<Semaphore>,
+}
+
+impl AuthenticatedGnmiSession {
+    pub(crate) fn new(principal: TrustedPrincipal, max_subscriptions: usize) -> Self {
+        Self {
+            principal: AuthenticatedGnmiPrincipal::new(principal),
+            subscribe_permits: Arc::new(Semaphore::new(max_subscriptions)),
+        }
+    }
+
+    fn acquire_subscribe_permit(
+        &self,
+        limits: &MgmtLimits,
+    ) -> Result<OwnedSemaphorePermit, GnmiError> {
+        acquire_subscribe_permit(&self.subscribe_permits, limits)
+    }
+}
+
 /// Tonic service implementation over the protocol-neutral [`GnmiServer`]
 /// foundation.
 #[derive(Clone)]
@@ -58,6 +84,7 @@ where
 {
     server: Arc<GnmiServer<C, B>>,
     require_principal: bool,
+    direct_subscribe_permits: Arc<Semaphore>,
 }
 
 impl<C, B> GnmiService<C, B>
@@ -79,25 +106,25 @@ where
     /// and production CNFs must use [`Self::new`] or [`Self::new_authenticated`].
     #[cfg(test)]
     pub(crate) fn new_unauthenticated_dev_only(server: GnmiServer<C, B>) -> Self {
-        Self {
-            server: Arc::new(server),
-            require_principal: false,
-        }
+        Self::from_shared(Arc::new(server), false)
     }
 
     /// Wraps a validated gNMI foundation handle and requires every RPC to carry
     /// an authenticated principal extension supplied by the transport listener.
     pub fn new_authenticated(server: GnmiServer<C, B>) -> Self {
-        Self {
-            server: Arc::new(server),
-            require_principal: true,
-        }
+        Self::from_shared(Arc::new(server), true)
     }
 
     pub(crate) fn new_authenticated_shared(server: Arc<GnmiServer<C, B>>) -> Self {
+        Self::from_shared(server, true)
+    }
+
+    fn from_shared(server: Arc<GnmiServer<C, B>>, require_principal: bool) -> Self {
+        let max_subscriptions = server.limits().max_subscriptions_per_session;
         Self {
             server,
-            require_principal: true,
+            require_principal,
+            direct_subscribe_permits: Arc::new(Semaphore::new(max_subscriptions)),
         }
     }
 
@@ -119,13 +146,41 @@ where
         }
         Ok(())
     }
+
+    fn acquire_subscribe_permit<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<OwnedSemaphorePermit, GnmiError> {
+        if let Some(session) = request.extensions().get::<AuthenticatedGnmiSession>() {
+            return session.acquire_subscribe_permit(self.server.limits());
+        }
+        acquire_subscribe_permit(&self.direct_subscribe_permits, self.server.limits())
+    }
 }
 
 fn request_principal<T>(request: &Request<T>) -> Result<&AuthenticatedGnmiPrincipal, GnmiError> {
+    if let Some(session) = request.extensions().get::<AuthenticatedGnmiSession>() {
+        return Ok(&session.principal);
+    }
     request
         .extensions()
         .get::<AuthenticatedGnmiPrincipal>()
         .ok_or(GnmiError::Unauthenticated)
+}
+
+fn acquire_subscribe_permit(
+    permits: &Arc<Semaphore>,
+    limits: &MgmtLimits,
+) -> Result<OwnedSemaphorePermit, GnmiError> {
+    match Arc::clone(permits).try_acquire_owned() {
+        Ok(permit) => Ok(permit),
+        Err(TryAcquireError::NoPermits) => Err(GnmiError::from_limits(LimitsError::Exceeded {
+            limit: "subscriptions_per_session",
+            max: limits.max_subscriptions_per_session,
+            actual: limits.max_subscriptions_per_session.saturating_add(1),
+        })),
+        Err(TryAcquireError::Closed) => Err(GnmiError::unavailable("subscribe limiter closed")),
+    }
 }
 
 #[tonic::async_trait]
@@ -295,10 +350,18 @@ where
                 return Err(status_from_error(err));
             }
         };
+        let permit = match self.acquire_subscribe_permit(&request) {
+            Ok(permit) => permit,
+            Err(err) => {
+                record_rpc_error(GnmiOperation::Subscribe, err.status(), start.elapsed());
+                return Err(status_from_error(err));
+            }
+        };
         let capacity = subscribe_response_queue_capacity(self.server.limits());
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         let server = Arc::clone(&self.server);
         tokio::spawn(async move {
+            let _subscribe_permit = permit;
             if let Err(err) =
                 serve_subscribe_stream(server, principal, request.into_inner(), tx.clone()).await
             {
@@ -1107,6 +1170,61 @@ mod tests {
             )
             .with_auth_strength(AuthStrength::MutualTls),
         )
+    }
+
+    #[tokio::test]
+    async fn subscribe_permit_limit_uses_authenticated_session_scope() {
+        let limits = MgmtLimits {
+            max_subscriptions_per_session: 1,
+            ..MgmtLimits::default()
+        };
+        let service = authenticated_service_with_limits(limits).await;
+        let session = AuthenticatedGnmiSession::new(
+            authenticated_principal().principal().clone(),
+            limits.max_subscriptions_per_session,
+        );
+        let mut request = Request::new(());
+        request.extensions_mut().insert(session);
+
+        let held = service
+            .acquire_subscribe_permit(&request)
+            .expect("first subscription permit");
+        let err = service
+            .acquire_subscribe_permit(&request)
+            .expect_err("second subscription exceeds session limit");
+
+        assert_eq!(err.status().as_str(), "INVALID_ARGUMENT");
+        assert_eq!(
+            err.detail(),
+            Some("management-plane limit 'subscriptions_per_session' exceeded: 2 > 1")
+        );
+        drop(held);
+        assert!(service.acquire_subscribe_permit(&request).is_ok());
+    }
+
+    #[tokio::test]
+    async fn subscribe_permit_limit_applies_to_direct_service_calls() {
+        let limits = MgmtLimits {
+            max_subscriptions_per_session: 1,
+            ..MgmtLimits::default()
+        };
+        let service = authenticated_service_with_limits(limits).await;
+        let request = Request::new(());
+
+        let held = service
+            .acquire_subscribe_permit(&request)
+            .expect("first direct subscription permit");
+        let err = service
+            .acquire_subscribe_permit(&request)
+            .expect_err("second direct subscription exceeds fallback limit");
+
+        assert_eq!(err.status().as_str(), "INVALID_ARGUMENT");
+        assert_eq!(
+            err.detail(),
+            Some("management-plane limit 'subscriptions_per_session' exceeded: 2 > 1")
+        );
+        drop(held);
+        assert!(service.acquire_subscribe_permit(&request).is_ok());
     }
 
     fn module_registry() -> ModuleRegistry {

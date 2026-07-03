@@ -9,11 +9,21 @@
 //! @req REQ-3GPP-TS24501-R18-9.11.3.4-001
 //! @conformance v0
 
+use std::fmt;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{DecodeError, DecodeErrorCode, EncodeError, SpecRef};
 
 fn spec_ref() -> SpecRef {
     SpecRef::new("3gpp", "TS24501", "9.11.3.4")
+}
+
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 /// Type-of-identity values (bits 3–1 of the first content octet).
@@ -57,7 +67,7 @@ impl IdentityType {
 ///
 /// Layout per §9.11.3.4: type octet, MCC/MNC (3 octets BCD), AMF Region ID,
 /// AMF Set ID (10 bits) + AMF Pointer (6 bits), 5G-TMSI (4 octets).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GutiView {
     /// MCC/MNC as the raw 3-octet BCD encoding (TS 24.501 keeps the
     /// TS 23.003 digit packing; this crate does not unpack digits in v0).
@@ -72,8 +82,20 @@ pub struct GutiView {
     pub tmsi: u32,
 }
 
+impl fmt::Debug for GutiView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GutiView")
+            .field("plmn", &Redacted)
+            .field("amf_region_id", &Redacted)
+            .field("amf_set_id", &Redacted)
+            .field("amf_pointer", &Redacted)
+            .field("tmsi", &Redacted)
+            .finish()
+    }
+}
+
 /// Parsed view of a SUCI identity content.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum SuciView {
     /// SUPI format 0: IMSI-based SUCI.
     Imsi {
@@ -101,12 +123,36 @@ pub enum SuciView {
     },
 }
 
+impl fmt::Debug for SuciView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Imsi {
+                protection_scheme_id,
+                home_network_pki,
+                ..
+            } => f
+                .debug_struct("Imsi")
+                .field("plmn", &Redacted)
+                .field("routing_indicator", &Redacted)
+                .field("protection_scheme_id", protection_scheme_id)
+                .field("home_network_pki", home_network_pki)
+                .field("scheme_output", &Redacted)
+                .finish(),
+            Self::Nai { .. } => f.debug_struct("Nai").field("nai", &Redacted).finish(),
+            Self::Other { supi_format } => f
+                .debug_struct("Other")
+                .field("supi_format", supi_format)
+                .finish(),
+        }
+    }
+}
+
 /// A decoded 5GS mobile identity.
 ///
 /// The original content bytes are always retained in `raw`, and
 /// [`MobileIdentity::encode`] writes them back verbatim, so decode → encode
 /// is byte-exact regardless of how much structure v0 parses.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MobileIdentity {
     /// Type of identity from bits 3–1 of the first content octet.
     pub identity_type: IdentityType,
@@ -116,10 +162,20 @@ pub struct MobileIdentity {
     pub raw: Bytes,
 }
 
+impl fmt::Debug for MobileIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MobileIdentity")
+            .field("identity_type", &self.identity_type)
+            .field("view", &self.view)
+            .field("raw_len", &self.raw.len())
+            .finish()
+    }
+}
+
 /// Structured views by identity type. Types without a v0 structured parse
 /// (IMEI/IMEISV/5G-S-TMSI/MAC/EUI-64/no-identity) are length-checked only
 /// and exposed through [`MobileIdentity::raw`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum IdentityView {
     /// 5G-GUTI fields.
     Guti(GutiView),
@@ -129,13 +185,32 @@ pub enum IdentityView {
     Raw,
 }
 
+impl fmt::Debug for IdentityView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Guti(view) => f.debug_tuple("Guti").field(view).finish(),
+            Self::Suci(view) => f.debug_tuple("Suci").field(view).finish(),
+            Self::Raw => f.write_str("Raw"),
+        }
+    }
+}
+
 /// Minimum content lengths per identity type, used for structural
 /// validation before any field access.
-fn min_len(identity_type: IdentityType) -> usize {
+fn min_len(content: &[u8], identity_type: IdentityType) -> usize {
     match identity_type {
         IdentityType::NoIdentity => 1,
-        // type octet + PLMN(3) + routing(2) + scheme(1) + HN-PKI(1)
-        IdentityType::Suci => 8,
+        IdentityType::Suci => {
+            let supi_format = (content[0] >> 4) & 0x07;
+            match supi_format {
+                // IMSI SUCI: type octet + PLMN(3) + routing(2) + scheme(1) + HN-PKI(1)
+                0 => 8,
+                // NAI SUCI: type octet + at least one NAI octet.
+                1 => 2,
+                // Other formats are preserved without format-specific parsing.
+                _ => 1,
+            }
+        }
         // type octet + PLMN(3) + region(1) + set/pointer(2) + TMSI(4)
         IdentityType::Guti5g => 11,
         // type octet with first digit; at least one more BCD octet
@@ -165,7 +240,7 @@ impl MobileIdentity {
         }
 
         let identity_type = IdentityType::from_bits(content[0]);
-        if content.len() < min_len(identity_type) {
+        if content.len() < min_len(content, identity_type) {
             return Err(DecodeError::new(DecodeErrorCode::Truncated, 0).with_spec_ref(spec_ref()));
         }
 
@@ -239,10 +314,69 @@ impl MobileIdentity {
     /// (bit 4 of the first content octet). `None` for other types.
     pub fn odd_digit_indicator(&self) -> Option<bool> {
         match self.identity_type {
-            IdentityType::Imei | IdentityType::Imeisv | IdentityType::Suci => {
-                Some((self.raw[0] & 0x08) != 0)
+            IdentityType::Imei | IdentityType::Imeisv => {
+                self.raw.first().map(|octet| octet & 0x08 != 0)
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn mobile_identity_debug_redacts_suci_imsi_material() {
+        let id =
+            MobileIdentity::decode(&[0x01, 0x02, 0xF8, 0x39, 0x21, 0xF3, 0x00, 0x00, 0x13, 0x57])
+                .expect("valid SUCI");
+
+        let rendered = format!("{id:?}");
+        assert!(rendered.contains("scheme_output: <redacted>"));
+        assert!(!rendered.contains("13, 57"));
+        assert!(!rendered.contains("1357"));
+    }
+
+    #[test]
+    fn mobile_identity_debug_redacts_suci_nai_and_guti_material() {
+        let nai = MobileIdentity::decode(b"\x11alice@example.net").expect("valid NAI SUCI");
+        let rendered_nai = format!("{nai:?}");
+        assert!(rendered_nai.contains("nai: <redacted>"));
+        assert!(!rendered_nai.contains("alice"));
+        assert!(!rendered_nai.contains("example"));
+
+        let guti = MobileIdentity::decode(&[
+            0x02, 0x02, 0xF8, 0x39, 0x11, 0x01, 0x41, 0xDE, 0xAD, 0xBE, 0xEF,
+        ])
+        .expect("valid GUTI");
+        let rendered_guti = format!("{guti:?}");
+        assert!(rendered_guti.contains("tmsi: <redacted>"));
+        assert!(!rendered_guti.contains("DE"));
+        assert!(!rendered_guti.contains("3735928559"));
+    }
+
+    #[test]
+    fn short_nai_suci_is_accepted() {
+        let id = MobileIdentity::decode(b"\x11a@b.io").expect("short NAI SUCI");
+        match id.view {
+            IdentityView::Suci(SuciView::Nai { nai }) => assert_eq!(&nai[..], b"a@b.io"),
+            other => panic!("wrong view: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn odd_digit_indicator_is_imei_only_and_empty_raw_safe() {
+        let suci = MobileIdentity::decode(b"\x11a@b.io").expect("short NAI SUCI");
+        assert_eq!(suci.odd_digit_indicator(), None);
+
+        let empty_raw = MobileIdentity {
+            identity_type: IdentityType::Imei,
+            view: IdentityView::Raw,
+            raw: Bytes::new(),
+        };
+        assert_eq!(empty_raw.odd_digit_indicator(), None);
     }
 }

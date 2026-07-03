@@ -8,7 +8,7 @@
 //! decode → encode round-trip, including unknown IEs.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use opc_protocol::{DecodeContext, EncodeContext};
+use opc_protocol::{DecodeContext, DecodeErrorCode, EncodeContext, UnknownIePolicy};
 
 use crate::ie::{CauseValue, NodeIdType, TypedIe};
 
@@ -667,6 +667,23 @@ fn test_unknown_ie_raw_preservation() {
         other => panic!("expected Raw, got {other:?}"),
     }
     assert_typed_roundtrip(bytes);
+}
+
+#[test]
+fn test_unknown_ie_reject_policy_fails_closed() {
+    let bytes: &[u8] = &[
+        0xFF, 0xFF, // unknown IE type 65535
+        0x00, 0x04, // length 4
+        0xDE, 0xAD, 0xBE, 0xEF, // value
+    ];
+    let ctx = DecodeContext {
+        unknown_ie_policy: UnknownIePolicy::Reject,
+        ..DecodeContext::default()
+    };
+
+    let err = TypedIe::decode(bytes, ctx, 0).unwrap_err();
+
+    assert_eq!(err.code(), &DecodeErrorCode::UnknownCriticalIe);
 }
 
 /// A vendor-specific IE must be preserved as `TypedIe::Raw` with enterprise

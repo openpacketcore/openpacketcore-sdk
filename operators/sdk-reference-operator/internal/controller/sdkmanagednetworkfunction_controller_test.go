@@ -628,6 +628,79 @@ func TestReconcileDrainTimeoutReleasesFinalizer(t *testing.T) {
 	}
 }
 
+func TestOrchestrateDrainPersistsStartedAnnotation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = apiv1beta1.AddToScheme(scheme)
+
+	crd := &apiv1beta1.SdkManagedNetworkFunction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "draining-cnf",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: apiv1beta1.SdkManagedNetworkFunctionSpec{
+			RuntimeMode: "dev",
+			Version:     "1.0.0",
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(crd).
+		Build()
+
+	startCalls := 0
+	statusCalls := 0
+	reconciler := &SdkManagedNetworkFunctionReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+		Drainer: &drain.FakeOrchestrator{
+			StartFunc: func(ctx context.Context, target string) error {
+				startCalls++
+				return nil
+			},
+			StatusFunc: func(ctx context.Context, target string) (drain.DrainStatus, error) {
+				statusCalls++
+				return drain.DrainStatus{Phase: drain.InProgress, SessionsRemaining: 1}, nil
+			},
+		},
+	}
+
+	cm := conditions.NewConditionManager(crd.Generation)
+	res, err := reconciler.orchestrateDrain(context.TODO(), crd, cm)
+	if err != nil {
+		t.Fatalf("orchestrateDrain failed: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Fatalf("expected requeue after starting drain, got %+v", res)
+	}
+	if startCalls != 1 {
+		t.Fatalf("expected one drain start, got %d", startCalls)
+	}
+
+	persisted := &apiv1beta1.SdkManagedNetworkFunction{}
+	if err := fakeClient.Get(context.TODO(), types.NamespacedName{Name: "draining-cnf", Namespace: "default"}, persisted); err != nil {
+		t.Fatalf("failed to fetch persisted CR: %v", err)
+	}
+	if persisted.Annotations[drainStartedAtAnnotation] == "" {
+		t.Fatalf("expected %s annotation to be persisted", drainStartedAtAnnotation)
+	}
+
+	cm = conditions.NewConditionManager(persisted.Generation)
+	res, err = reconciler.orchestrateDrain(context.TODO(), persisted, cm)
+	if err != nil {
+		t.Fatalf("second orchestrateDrain failed: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Fatalf("expected requeue while drain remains in progress, got %+v", res)
+	}
+	if startCalls != 1 {
+		t.Fatalf("persisted annotation should prevent restart; got %d starts", startCalls)
+	}
+	if statusCalls != 1 {
+		t.Fatalf("expected second pass to poll status once, got %d", statusCalls)
+	}
+}
+
 // reconcileDrainFailureKeepsFinalizer drives a deletion whose drain does not
 // reach a terminal state and asserts the finalizer is retained and the
 // reconcile requeues — the object must not be deleted while sessions drain.

@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3600);
+
 /// NRF service client operations
 #[async_trait]
 pub trait NrfOperations: Send + Sync {
@@ -95,6 +99,15 @@ struct NrfHeartbeatResponse {
     pub heartbeat_timer: Option<u32>,
 }
 
+fn clamp_heartbeat_interval(interval: Duration) -> Duration {
+    interval.clamp(MIN_HEARTBEAT_INTERVAL, MAX_HEARTBEAT_INTERVAL)
+}
+
+fn heartbeat_interval_from_timer(secs: Option<u32>) -> Duration {
+    secs.map(|secs| clamp_heartbeat_interval(Duration::from_secs(secs as u64)))
+        .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL)
+}
+
 #[async_trait]
 impl NrfOperations for NrfClient {
     async fn register(&self, profile: &NfProfile) -> Result<Duration, String> {
@@ -120,11 +133,9 @@ impl NrfOperations for NrfClient {
             // Parse heartbeat timer
             let body_bytes = response.into_body();
             if let Ok(res) = serde_json::from_slice::<NrfHeartbeatResponse>(&body_bytes) {
-                if let Some(secs) = res.heartbeat_timer {
-                    return Ok(Duration::from_secs(secs as u64));
-                }
+                return Ok(heartbeat_interval_from_timer(res.heartbeat_timer));
             }
-            Ok(Duration::from_secs(30))
+            Ok(DEFAULT_HEARTBEAT_INTERVAL)
         } else {
             Err(format!(
                 "NRF registration failed with status {}",
@@ -180,11 +191,9 @@ impl NrfOperations for NrfClient {
         if response.status().is_success() {
             let body_bytes = response.into_body();
             if let Ok(res) = serde_json::from_slice::<NrfHeartbeatResponse>(&body_bytes) {
-                if let Some(secs) = res.heartbeat_timer {
-                    return Ok(Duration::from_secs(secs as u64));
-                }
+                return Ok(heartbeat_interval_from_timer(res.heartbeat_timer));
             }
-            Ok(Duration::from_secs(30))
+            Ok(DEFAULT_HEARTBEAT_INTERVAL)
         } else {
             Err(format!(
                 "NRF heartbeat failed with status {}",
@@ -287,20 +296,20 @@ impl HeartbeatDriver {
     /// killed. On shutdown it deregisters from the NRF best-effort before
     /// returning. Outcomes are counted in `sbi_nrf_heartbeat_total`.
     pub async fn run(mut self) {
-        let mut interval = self.default_interval;
+        let mut interval = clamp_heartbeat_interval(self.default_interval);
         let mut consecutive_failures = 0;
         let max_failures = 3;
 
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {
+                _ = tokio::time::sleep(clamp_heartbeat_interval(interval)) => {
                     let mut backoff = Duration::from_secs(1);
                     let mut success = false;
 
                     for attempt in 1..=3 {
                         match self.nrf_client.heartbeat(&self.nf_instance_id).await {
                             Ok(new_interval) => {
-                                interval = new_interval;
+                                interval = clamp_heartbeat_interval(new_interval);
                                 consecutive_failures = 0;
                                 let _ = self.degraded_tx.send(false);
                                 success = true;
@@ -526,4 +535,45 @@ fn percent_encode(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_timer_values_are_clamped() {
+        assert_eq!(
+            heartbeat_interval_from_timer(Some(0)),
+            MIN_HEARTBEAT_INTERVAL
+        );
+        assert_eq!(
+            heartbeat_interval_from_timer(Some(1)),
+            MIN_HEARTBEAT_INTERVAL
+        );
+        assert_eq!(
+            heartbeat_interval_from_timer(Some(30)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            heartbeat_interval_from_timer(Some(7200)),
+            MAX_HEARTBEAT_INTERVAL
+        );
+        assert_eq!(
+            heartbeat_interval_from_timer(None),
+            DEFAULT_HEARTBEAT_INTERVAL
+        );
+    }
+
+    #[test]
+    fn heartbeat_driver_interval_clamp_rejects_zero_and_huge_values() {
+        assert_eq!(
+            clamp_heartbeat_interval(Duration::ZERO),
+            MIN_HEARTBEAT_INTERVAL
+        );
+        assert_eq!(
+            clamp_heartbeat_interval(Duration::from_secs(u64::MAX)),
+            MAX_HEARTBEAT_INTERVAL
+        );
+    }
 }

@@ -13,7 +13,8 @@ use std::{error::Error, fmt};
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, Encode, EncodeContext,
-    EncodeError, EncodeErrorCode, OwnedDecode, SpecRef, ToOwnedPdu, ValidationLevel,
+    EncodeError, EncodeErrorCode, OwnedDecode, SpecRef, ToOwnedPdu, UnknownIePolicy,
+    ValidationLevel,
 };
 
 fn validation_strictness(level: ValidationLevel) -> u8 {
@@ -862,6 +863,16 @@ impl<'a> BorrowDecode<'a> for GtpuMessage<'a> {
                 };
 
                 let next_ext = packet_bytes[next_ext_offset];
+
+                if current_next_ext != GTPU_EXT_PDU_SESSION_CONTAINER
+                    && matches!(ctx.unknown_ie_policy, UnknownIePolicy::Reject)
+                {
+                    return Err(DecodeError::new(
+                        DecodeErrorCode::UnknownCriticalIe,
+                        current_offset,
+                    )
+                    .with_spec_ref(spec_ref));
+                }
 
                 // ProcedureAware semantic validation on known extension headers (PDU Session Container)
                 if ctx.validation_level == ValidationLevel::ProcedureAware

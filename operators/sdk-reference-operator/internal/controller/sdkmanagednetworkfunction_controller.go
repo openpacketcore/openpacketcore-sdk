@@ -28,10 +28,12 @@ import (
 )
 
 const drainFinalizer = "lifecycle.openpacketcore.io/drain"
+const drainStartedAtAnnotation = "openpacketcore.io/drain-started-at"
 
 // drainRetryInterval is how long to wait before retrying a drain that has not
 // yet reached a terminal state during deletion.
 const drainRetryInterval = 10 * time.Second
+const drainTimeout = 5 * time.Minute
 
 // SdkManagedNetworkFunctionReconciler reconciles SdkManagedNetworkFunction resources.
 type SdkManagedNetworkFunctionReconciler struct {
@@ -508,31 +510,34 @@ func (r *SdkManagedNetworkFunctionReconciler) runDrain(ctx context.Context, crd 
 
 func (r *SdkManagedNetworkFunctionReconciler) orchestrateDrain(ctx context.Context, crd *v1beta1.SdkManagedNetworkFunction, cm *conditions.ConditionManager) (ctrl.Result, error) {
 	target := fmt.Sprintf("http://%s:8080", crd.Name)
-	startedAtStr := crd.Annotations["openpacketcore.io/drain-started-at"]
+	startedAtStr := crd.Annotations[drainStartedAtAnnotation]
 	if startedAtStr == "" {
 		if err := r.Drainer.Start(ctx, target); err != nil {
 			_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainStartFailed", err.Error(), crd.Generation)
 			opmetrics.DrainTotal.WithLabelValues("SdkManagedNetworkFunction", "start_failed").Inc()
 			return ctrl.Result{}, err
 		}
-		if crd.Annotations == nil {
-			crd.Annotations = make(map[string]string)
+		startedAt := time.Now().UTC().Format(time.RFC3339)
+		if err := r.patchDrainStartedAtAnnotation(ctx, crd, startedAt); err != nil {
+			_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainStartPersistenceFailed", err.Error(), crd.Generation)
+			return ctrl.Result{RequeueAfter: drainRetryInterval}, err
 		}
-		crd.Annotations["openpacketcore.io/drain-started-at"] = time.Now().UTC().Format(time.RFC3339)
 		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainInProgress", "Drain started", crd.Generation)
 		if r.Recorder != nil {
 			r.Recorder.Eventf(crd, corev1.EventTypeNormal, "DrainStarted", "Drain started for %s", crd.Name)
 		}
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: drainRetryInterval}, nil
 	}
 
 	startedAt, err := time.Parse(time.RFC3339, startedAtStr)
 	if err != nil {
 		startedAt = time.Now().UTC()
 	}
-	if time.Since(startedAt) > 5*time.Minute {
+	if time.Since(startedAt) > drainTimeout {
 		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainTimedOut", "Drain exceeded 5m timeout", crd.Generation)
-		delete(crd.Annotations, "openpacketcore.io/drain-started-at")
+		if err := r.clearDrainStartedAtAnnotation(ctx, crd); err != nil {
+			return ctrl.Result{RequeueAfter: drainRetryInterval}, err
+		}
 		opmetrics.DrainTotal.WithLabelValues("SdkManagedNetworkFunction", "timeout").Inc()
 		if r.Recorder != nil {
 			r.Recorder.Eventf(crd, corev1.EventTypeWarning, "DrainTimedOut", "Drain exceeded 5m timeout for %s", crd.Name)
@@ -544,13 +549,15 @@ func (r *SdkManagedNetworkFunctionReconciler) orchestrateDrain(ctx context.Conte
 	if err != nil {
 		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainStatusFailed", err.Error(), crd.Generation)
 		opmetrics.DrainTotal.WithLabelValues("SdkManagedNetworkFunction", "status_failed").Inc()
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
+		return ctrl.Result{RequeueAfter: drainRetryInterval}, err
 	}
 
 	switch status.Phase {
 	case drain.Complete:
 		_ = cm.Set(conditions.DrainReady, metav1.ConditionTrue, "DrainComplete", "Drain completed successfully", crd.Generation)
-		delete(crd.Annotations, "openpacketcore.io/drain-started-at")
+		if err := r.clearDrainStartedAtAnnotation(ctx, crd); err != nil {
+			return ctrl.Result{RequeueAfter: drainRetryInterval}, err
+		}
 		opmetrics.DrainTotal.WithLabelValues("SdkManagedNetworkFunction", "complete").Inc()
 		if r.Recorder != nil {
 			r.Recorder.Eventf(crd, corev1.EventTypeNormal, "DrainComplete", "Drain completed for %s", crd.Name)
@@ -558,18 +565,63 @@ func (r *SdkManagedNetworkFunctionReconciler) orchestrateDrain(ctx context.Conte
 		return ctrl.Result{}, nil
 	case drain.InProgress:
 		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainInProgress", fmt.Sprintf("sessions remaining: %d", status.SessionsRemaining), crd.Generation)
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: drainRetryInterval}, nil
 	case drain.TimedOut, drain.Failed:
 		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainFailed", fmt.Sprintf("drain phase: %s", status.Phase), crd.Generation)
-		delete(crd.Annotations, "openpacketcore.io/drain-started-at")
+		if err := r.clearDrainStartedAtAnnotation(ctx, crd); err != nil {
+			return ctrl.Result{RequeueAfter: drainRetryInterval}, err
+		}
 		opmetrics.DrainTotal.WithLabelValues("SdkManagedNetworkFunction", string(status.Phase)).Inc()
 		if r.Recorder != nil {
 			r.Recorder.Eventf(crd, corev1.EventTypeWarning, "DrainFailed", "Drain failed for %s: phase=%s", crd.Name, status.Phase)
 		}
 		return ctrl.Result{}, nil
 	default:
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: drainRetryInterval}, nil
 	}
+}
+
+func (r *SdkManagedNetworkFunctionReconciler) patchDrainStartedAtAnnotation(ctx context.Context, crd *v1beta1.SdkManagedNetworkFunction, startedAt string) error {
+	if crd.Annotations == nil {
+		crd.Annotations = make(map[string]string)
+	}
+	crd.Annotations[drainStartedAtAnnotation] = startedAt
+
+	patchBytes, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{
+			"annotations": map[string]string{
+				drainStartedAtAnnotation: startedAt,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("encoding drain annotation patch: %w", err)
+	}
+	if err := r.Client.Patch(ctx, crd, client.RawPatch(types.MergePatchType, patchBytes)); err != nil {
+		return fmt.Errorf("persisting drain annotation: %w", err)
+	}
+	return nil
+}
+
+func (r *SdkManagedNetworkFunctionReconciler) clearDrainStartedAtAnnotation(ctx context.Context, crd *v1beta1.SdkManagedNetworkFunction) error {
+	if crd.Annotations != nil {
+		delete(crd.Annotations, drainStartedAtAnnotation)
+	}
+
+	patchBytes, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{
+			"annotations": map[string]any{
+				drainStartedAtAnnotation: nil,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("encoding drain annotation clear patch: %w", err)
+	}
+	if err := r.Client.Patch(ctx, crd, client.RawPatch(types.MergePatchType, patchBytes)); err != nil {
+		return fmt.Errorf("clearing drain annotation: %w", err)
+	}
+	return nil
 }
 
 func (r *SdkManagedNetworkFunctionReconciler) reconcileWorkload(ctx context.Context, crd *v1beta1.SdkManagedNetworkFunction) error {

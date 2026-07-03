@@ -5,10 +5,12 @@
 //! Security Mode Complete. Message bodies outside the typed subset are
 //! raw-preserved through named variants.
 
+use std::fmt;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
-    BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, Encode, EncodeContext,
-    EncodeError, OwnedDecode, SpecRef,
+    BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, DuplicateIePolicy,
+    Encode, EncodeContext, EncodeError, OwnedDecode, SpecRef, UnknownIePolicy, ValidationLevel,
 };
 
 use crate::{
@@ -451,39 +453,81 @@ enum OptionalIeFormat {
     Type6,
 }
 
-fn optional_ie_format(iei: u8) -> OptionalIeFormat {
-    match iei {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OptionalIeDescriptor {
+    format: OptionalIeFormat,
+    registered: bool,
+}
+
+fn optional_ie_descriptor(iei: u8) -> OptionalIeDescriptor {
+    let (format, registered) = match iei {
         // Known TLV-E IEs used by Registration Request/Accept.
-        0x72 | 0x75 | 0x77 | 0x78 | 0x79 | 0x7A | 0x7B | 0x7C => OptionalIeFormat::Type6,
+        0x72 | 0x75 | 0x77 | 0x78 | 0x79 | 0x7A | 0x7B | 0x7C => (OptionalIeFormat::Type6, true),
         // Known type-3 TV IEs (value length after the IEI octet).
-        0x52 => OptionalIeFormat::Type3(6), // Last visited registered TAI
+        0x52 => (OptionalIeFormat::Type3(6), true), // Last visited registered TAI
         // Known type-4 TLV IEs.
         0x10 | 0x11 | 0x15 | 0x17 | 0x18 | 0x21 | 0x25 | 0x26 | 0x27 | 0x2B | 0x2E | 0x2F
-        | 0x31 | 0x34 | 0x40 | 0x4A | 0x50 | 0x54 | 0x5D | 0x5E => OptionalIeFormat::Type4,
+        | 0x31 | 0x34 | 0x40 | 0x4A | 0x50 | 0x54 | 0x5D | 0x5E => (OptionalIeFormat::Type4, true),
         // Type-1 half-octet IEIs have the high nibble in the range A-F.
-        _ if (iei >> 4) >= 0x0A => OptionalIeFormat::Type1,
+        _ if (iei >> 4) >= 0x0A => (OptionalIeFormat::Type1, true),
         // Extended-length IEIs occupy the 0x70-0x7F range.
-        _ if (0x70..=0x7F).contains(&iei) => OptionalIeFormat::Type6,
-        // Default: assume type-4 TLV. Unknown type-1/type-3 IEs require a
-        // registry entry to round-trip correctly; this is documented in
-        // CONFORMANCE.md.
-        _ => OptionalIeFormat::Type4,
+        _ if (0x70..=0x7F).contains(&iei) => (OptionalIeFormat::Type6, true),
+        // Default: assume type-4 TLV only for contexts that explicitly allow
+        // unknown IE preservation/drop. Strict or reject contexts fail before
+        // this ambiguous length guess is used.
+        _ => (OptionalIeFormat::Type4, false),
+    };
+    OptionalIeDescriptor { format, registered }
+}
+
+fn optional_ie_duplicate_key(iei: u8, format: OptionalIeFormat) -> u8 {
+    if matches!(format, OptionalIeFormat::Type1) {
+        iei & 0xF0
+    } else {
+        iei
     }
 }
 
+fn rejects_unknown_optional_ie(ctx: DecodeContext) -> bool {
+    matches!(ctx.unknown_ie_policy, UnknownIePolicy::Reject)
+        || matches!(
+            ctx.validation_level,
+            ValidationLevel::Strict | ValidationLevel::ProcedureAware
+        )
+}
+
 fn decode_optional_ies(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Vec<OptionalIe>> {
-    let mut out = Vec::new();
+    let mut out: Vec<OptionalIe> = Vec::new();
     let mut rest = input;
     let mut offset = 0usize;
+    let mut ie_count = 0usize;
+    let mut seen = [false; 256];
 
     while !rest.is_empty() {
-        if out.len() >= ctx.max_ies {
+        if ie_count >= ctx.max_ies {
             return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
                 .with_spec_ref(spec_ref()));
         }
+        ie_count += 1;
         let iei = rest[0];
-        let format = optional_ie_format(iei);
-        let ie = match format {
+        let descriptor = optional_ie_descriptor(iei);
+        if !descriptor.registered && rejects_unknown_optional_ie(ctx) {
+            return Err(DecodeError::new(
+                DecodeErrorCode::Structural {
+                    reason: "unknown optional IE",
+                },
+                offset,
+            )
+            .with_spec_ref(spec_ref()));
+        }
+        let duplicate_key = optional_ie_duplicate_key(iei, descriptor.format);
+        let duplicate = seen[usize::from(duplicate_key)];
+        if duplicate && matches!(ctx.duplicate_ie_policy, DuplicateIePolicy::Reject) {
+            return Err(
+                DecodeError::new(DecodeErrorCode::DuplicateIe, offset).with_spec_ref(spec_ref())
+            );
+        }
+        let ie = match descriptor.format {
             OptionalIeFormat::Type1 => {
                 let raw = Bytes::copy_from_slice(&rest[..1]);
                 rest = &rest[1..];
@@ -541,6 +585,25 @@ fn decode_optional_ies(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Vec
                 OptionalIe { iei, value, raw }
             }
         };
+        if !descriptor.registered && matches!(ctx.unknown_ie_policy, UnknownIePolicy::Drop) {
+            continue;
+        }
+        if duplicate {
+            match ctx.duplicate_ie_policy {
+                DuplicateIePolicy::First => continue,
+                DuplicateIePolicy::Last => {
+                    if let Some(position) = out.iter().position(|existing| {
+                        let existing_descriptor = optional_ie_descriptor(existing.iei);
+                        optional_ie_duplicate_key(existing.iei, existing_descriptor.format)
+                            == duplicate_key
+                    }) {
+                        out.remove(position);
+                    }
+                }
+                DuplicateIePolicy::Reject => unreachable!("duplicate reject handled before parse"),
+            }
+        }
+        seen[usize::from(duplicate_key)] = true;
         out.push(ie);
     }
 
@@ -552,7 +615,7 @@ fn decode_optional_ies(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Vec
 /// The first octet carries the 5GS registration type (low nibble) and ngKSI
 /// (high nibble). The mandatory 5GS mobile identity follows as an LV-E
 /// (two-octet length + value). All remaining bytes are optional IEs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RegistrationRequest {
     /// 5GS registration type.
     pub registration_type: RegistrationType,
@@ -568,6 +631,20 @@ pub struct RegistrationRequest {
     pub raw_mobile_identity_lv: Bytes,
     /// Optional IEs in message order, raw-preserved.
     pub optional_ies: Vec<OptionalIe>,
+}
+
+impl fmt::Debug for RegistrationRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RegistrationRequest")
+            .field("registration_type", &self.registration_type)
+            .field("follow_on_request", &self.follow_on_request)
+            .field("ng_ksi", &self.ng_ksi)
+            .field("mobile_identity", &self.mobile_identity)
+            .field("raw_first_octet", &self.raw_first_octet)
+            .field("mobile_identity_lv_len", &self.raw_mobile_identity_lv.len())
+            .field("optional_ies_len", &self.optional_ies.len())
+            .finish()
+    }
 }
 
 impl RegistrationRequest {
@@ -1052,6 +1129,74 @@ mod tests {
     }
 
     #[test]
+    fn optional_ies_honor_unknown_ie_policy() {
+        let unknown_type4_guess = &[0x53, 0x01, 0xAA];
+
+        let preserve = DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Preserve,
+            ..DecodeContext::default()
+        };
+        let (_, preserved) = decode_optional_ies(unknown_type4_guess, preserve).unwrap();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0].iei, 0x53);
+        assert_eq!(&preserved[0].value[..], &[0xAA]);
+
+        let drop = DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Drop,
+            ..DecodeContext::default()
+        };
+        let (_, dropped) = decode_optional_ies(unknown_type4_guess, drop).unwrap();
+        assert!(dropped.is_empty());
+
+        let reject = DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Reject,
+            ..DecodeContext::default()
+        };
+        let err = decode_optional_ies(unknown_type4_guess, reject).unwrap_err();
+        assert!(matches!(
+            err.code(),
+            DecodeErrorCode::Structural {
+                reason: "unknown optional IE"
+            }
+        ));
+
+        let strict_preserve = DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Preserve,
+            validation_level: ValidationLevel::Strict,
+            ..DecodeContext::default()
+        };
+        assert!(decode_optional_ies(unknown_type4_guess, strict_preserve).is_err());
+    }
+
+    #[test]
+    fn optional_ies_honor_duplicate_ie_policy() {
+        let duplicate = &[0x2E, 0x01, 0xAA, 0x2E, 0x01, 0xBB];
+
+        let first = DecodeContext {
+            duplicate_ie_policy: DuplicateIePolicy::First,
+            ..DecodeContext::default()
+        };
+        let (_, first_ies) = decode_optional_ies(duplicate, first).unwrap();
+        assert_eq!(first_ies.len(), 1);
+        assert_eq!(&first_ies[0].value[..], &[0xAA]);
+
+        let last = DecodeContext {
+            duplicate_ie_policy: DuplicateIePolicy::Last,
+            ..DecodeContext::default()
+        };
+        let (_, last_ies) = decode_optional_ies(duplicate, last).unwrap();
+        assert_eq!(last_ies.len(), 1);
+        assert_eq!(&last_ies[0].value[..], &[0xBB]);
+
+        let reject = DecodeContext {
+            duplicate_ie_policy: DuplicateIePolicy::Reject,
+            ..DecodeContext::default()
+        };
+        let err = decode_optional_ies(duplicate, reject).unwrap_err();
+        assert_eq!(err.code(), &DecodeErrorCode::DuplicateIe);
+    }
+
+    #[test]
     fn registration_request_minimal() {
         // 0x01 -> ngKSI=0, registration type=initial, FOR=0.
         // Mobile identity: LV-E length 7, SUCI type 1, SUPI format 0, PLMN
@@ -1089,6 +1234,24 @@ mod tests {
         assert_eq!(&req.optional_ies[0].value[..], &[0x80, 0x00]);
         assert_eq!(req.optional_ies[1].iei, 0xB0);
         round_trip_body::<RegistrationRequest>(body);
+    }
+
+    #[test]
+    fn registration_request_debug_redacts_mobile_identity_and_raw_ies() {
+        let body: &[u8] = &[
+            0x01, 0x00, 0x0A, 0x01, 0x02, 0xF8, 0x39, 0x21, 0xF3, 0x00, 0x00, 0x13, 0x57, 0x2E,
+            0x02, 0x80, 0x00,
+        ];
+        let (_, req) = RegistrationRequest::decode_body(body, DecodeContext::default()).unwrap();
+
+        let rendered = format!("{req:?}");
+        assert!(rendered.contains("scheme_output: <redacted>"));
+        assert!(rendered.contains("mobile_identity_lv_len"));
+        assert!(rendered.contains("optional_ies_len"));
+        assert!(!rendered.contains("raw_mobile_identity_lv"));
+        assert!(!rendered.contains("optional_ies:"));
+        assert!(!rendered.contains("13, 57"));
+        assert!(!rendered.contains("128"));
     }
 
     #[test]

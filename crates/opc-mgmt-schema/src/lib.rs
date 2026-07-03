@@ -1139,7 +1139,8 @@ pub fn xml_escape_text(value: &str) -> String {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
-            _ => out.push(c),
+            _ if is_xml_char(c) => out.push(c),
+            _ => {}
         }
     }
     out
@@ -1154,10 +1155,16 @@ pub fn xml_escape_attr(value: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
-            _ => out.push(c),
+            '\'' => out.push_str("&apos;"),
+            _ if is_xml_char(c) => out.push(c),
+            _ => {}
         }
     }
     out
+}
+
+fn is_xml_char(c: char) -> bool {
+    matches!(c, '\u{9}' | '\u{A}' | '\u{D}' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
 }
 
 #[cfg(test)]
@@ -1596,9 +1603,11 @@ mod tests {
     fn xml_escaping_obeys_basic_rules() {
         assert_eq!(xml_escape_text("a & b < c > d"), "a &amp; b &lt; c &gt; d");
         assert_eq!(
-            xml_escape_attr(r#"value "quoted""#),
-            "value &quot;quoted&quot;"
+            xml_escape_attr(r#"value "quoted" and 'single'"#),
+            "value &quot;quoted&quot; and &apos;single&apos;"
         );
+        assert_eq!(xml_escape_text("ok\u{0}bad\u{1f}"), "okbad");
+        assert_eq!(xml_escape_attr("ok\u{0}bad\u{1f}"), "okbad");
     }
 
     #[test]

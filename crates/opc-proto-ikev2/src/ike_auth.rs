@@ -14,6 +14,7 @@ use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Sha384};
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 use crate::{
     notify::{Ikev2NotifyPayload, Ikev2NotifyPayloadError},
@@ -812,7 +813,8 @@ pub fn compute_ike_auth_shared_key_mic(
 
     let signed = build_signed_octets(profile.prf(), key_material, signed_octets)?;
     let auth_key = ike_auth_prf(profile.prf(), auth_keying_material, IKEV2_AUTH_KEY_PAD)?;
-    ike_auth_prf(profile.prf(), &auth_key, &signed)
+    let mic = ike_auth_prf(profile.prf(), &auth_key, &signed)?;
+    Ok(mic.to_vec())
 }
 
 /// Verify an AUTH payload using IKEv2 Shared Key Message Integrity Code.
@@ -1309,7 +1311,7 @@ fn build_signed_octets(
     prf: Ikev2PrfAlgorithm,
     key_material: &Ikev2SaInitKeyMaterial,
     signed_octets: Ikev2IkeAuthSignedOctets<'_>,
-) -> Result<Vec<u8>, Ikev2IkeAuthVerificationError> {
+) -> Result<Zeroizing<Vec<u8>>, Ikev2IkeAuthVerificationError> {
     let macked_id = ike_auth_prf(
         prf,
         signed_octets.peer.sk_p(key_material),
@@ -1321,7 +1323,7 @@ fn build_signed_octets(
         .checked_add(signed_octets.peer_nonce.len())
         .and_then(|value| value.checked_add(macked_id.len()))
         .ok_or(Ikev2IkeAuthVerificationError::LengthOverflow)?;
-    let mut out = Vec::with_capacity(len);
+    let mut out = Zeroizing::new(Vec::with_capacity(len));
     out.extend_from_slice(signed_octets.ike_sa_init_message);
     out.extend_from_slice(signed_octets.peer_nonce);
     out.extend_from_slice(&macked_id);
@@ -1332,7 +1334,7 @@ fn ike_auth_prf(
     algorithm: Ikev2PrfAlgorithm,
     key: &[u8],
     data: &[u8],
-) -> Result<Vec<u8>, Ikev2IkeAuthVerificationError> {
+) -> Result<Zeroizing<Vec<u8>>, Ikev2IkeAuthVerificationError> {
     if key.is_empty() {
         return Err(Ikev2IkeAuthVerificationError::PrfKeyEmpty);
     }
@@ -1341,13 +1343,13 @@ fn ike_auth_prf(
             let mut mac = Hmac::<Sha256>::new_from_slice(key)
                 .map_err(|_| Ikev2IkeAuthVerificationError::PrfKeyInvalid { len: key.len() })?;
             mac.update(data);
-            Ok(mac.finalize().into_bytes().to_vec())
+            Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
         }
         Ikev2PrfAlgorithm::HmacSha2_384 => {
             let mut mac = Hmac::<Sha384>::new_from_slice(key)
                 .map_err(|_| Ikev2IkeAuthVerificationError::PrfKeyInvalid { len: key.len() })?;
             mac.update(data);
-            Ok(mac.finalize().into_bytes().to_vec())
+            Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
         }
     }
 }
