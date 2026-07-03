@@ -98,7 +98,7 @@ enum HandshakeError {
 ///
 /// The listener uses [`TlsBootstrap`] to stamp HTTP/2 ALPN and enforce
 /// production peer-policy rules, then injects an
-/// [`AuthenticatedGnmiPrincipal`] into every tonic request. RPC behavior is
+/// [`crate::AuthenticatedGnmiPrincipal`] into every tonic request. RPC behavior is
 /// implemented by [`GnmiService`]; the listener owns transport/authentication
 /// only.
 pub async fn run_gnmi_tls_listener<C, B>(
