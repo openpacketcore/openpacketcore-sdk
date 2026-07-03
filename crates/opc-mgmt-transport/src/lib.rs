@@ -1,15 +1,17 @@
 //! Fail-closed mTLS bootstrap for the OpenPacketCore management plane.
 //!
-//! `opc-tls`'s `TlsConfigBuilder` builds a SPIFFE mTLS server config but ships an
-//! allow-all `PeerPolicy::default()` and sets no ALPN — correct library defaults,
-//! wrong production defaults. [`TlsBootstrap`] is the management-plane gate that
-//! makes the production posture explicit: in a fail-closed [`RuntimeMode`]
+//! `opc-tls`'s `TlsConfigBuilder` builds a SPIFFE mTLS server config and fails
+//! closed on an unconstrained `PeerPolicy::default()` unless the caller
+//! explicitly opts in. [`TlsBootstrap`] is the management-plane gate that makes
+//! the production posture explicit: in a fail-closed [`RuntimeMode`]
 //! (`Production`/`Conformance`) it refuses to build a server config from an
-//! unconstrained peer policy, and it always stamps the caller's ALPN set on the
-//! result after validating that each ALPN protocol id is non-empty and within
-//! the TLS wire limit. [`ensure_plaintext_permitted`] allows plaintext only in
-//! `Dev` or an explicit `Lab` profile, so `Perf` does not become a plaintext
-//! management mode just because it is not runtime fail-closed.
+//! unconstrained peer policy, and in non-fail-closed modes it performs the
+//! explicit dev/lab opt-in before delegating to `opc-tls`. It also stamps the
+//! caller's ALPN set on the result after validating that each ALPN protocol id
+//! is non-empty and within the TLS wire limit. [`ensure_plaintext_permitted`]
+//! allows plaintext only in `Dev` or an explicit `Lab` profile, so `Perf` does
+//! not become a plaintext management mode just because it is not runtime
+//! fail-closed.
 //!
 //! Chain verification and SVID handling remain in `opc-tls`/rustls; this crate
 //! only enforces management-plane policy and wiring.
@@ -94,14 +96,20 @@ impl TlsBootstrap {
         self,
         identity: watch::Receiver<Option<IdentityState>>,
     ) -> Result<ServerConfig, TransportError> {
-        if self.mode.fail_closed() && self.peer_policy.is_unconstrained() {
+        let unconstrained = self.peer_policy.is_unconstrained();
+        if self.mode.fail_closed() && unconstrained {
             return Err(TransportError::UnconstrainedPeerPolicy { mode: self.mode });
         }
         validate_alpn_protocols(&self.alpn_protocols)?;
 
-        let mut config = TlsConfigBuilder::new(identity)
+        let mut builder = TlsConfigBuilder::new(identity)
             .with_policy(self.peer_policy)
-            .with_compat_mode(self.compat_tls12)
+            .with_compat_mode(self.compat_tls12);
+        if unconstrained {
+            builder = builder.allow_any_trusted_peer();
+        }
+
+        let mut config = builder
             .build_server_config()
             .map_err(|err| TransportError::Tls(err.to_string()))?;
 
