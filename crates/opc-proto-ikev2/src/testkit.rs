@@ -14,6 +14,13 @@ use crate::{
     message::OwnedMessage,
     nat_traversal::{IKE_NAT_TRAVERSAL_UDP_PORT, IKE_UDP_PORT, NAT_TRAVERSAL_KEEPALIVE},
     payload::{PayloadType, GENERIC_PAYLOAD_HEADER_LEN},
+    sa_init::{
+        encode_ke_payload_build, encode_nonce_payload_build, encode_sa_payload_build,
+        Ikev2KeyExchangePayloadBuild, Ikev2NoncePayloadBuild, Ikev2SaInitBuildError,
+        Ikev2SaPayloadBuild, Ikev2SaProposalBuild, Ikev2SaTransformBuild,
+        Ikev2TransformAttributeBuild, Ikev2TransformAttributeBuildValue,
+    },
+    sa_init_crypto::Ikev2DhGroup,
 };
 
 const NON_ESP_MARKER: [u8; 4] = [0, 0, 0, 0];
@@ -143,6 +150,11 @@ pub enum Ikev2FixtureBuildError {
     },
     /// SDK encoding rejected the fixture message.
     EncodeFailed,
+    /// A typed SA/KE/Nonce fixture body failed typed-builder validation.
+    ///
+    /// The inner code is a stable, redaction-safe machine code; no payload
+    /// bytes are carried.
+    TypedPayload(Ikev2SaInitBuildError),
 }
 
 impl Ikev2FixtureBuildError {
@@ -152,6 +164,7 @@ impl Ikev2FixtureBuildError {
             Self::PayloadTooLong { .. } => "ikev2_fixture_payload_too_long",
             Self::MessageTooLong { .. } => "ikev2_fixture_message_too_long",
             Self::EncodeFailed => "ikev2_fixture_encode_failed",
+            Self::TypedPayload(_) => "ikev2_fixture_typed_payload_invalid",
         }
     }
 }
@@ -166,11 +179,21 @@ impl fmt::Display for Ikev2FixtureBuildError {
                 write!(f, "ikev2_fixture_message_too_long: len={len}")
             }
             Self::EncodeFailed => f.write_str("ikev2_fixture_encode_failed"),
+            Self::TypedPayload(error) => {
+                write!(f, "ikev2_fixture_typed_payload_invalid: {error}")
+            }
         }
     }
 }
 
-impl Error for Ikev2FixtureBuildError {}
+impl Error for Ikev2FixtureBuildError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::TypedPayload(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Build a raw generic payload chain from fixture payload bodies.
 ///
@@ -277,6 +300,179 @@ pub fn ike_sa_init_retransmission_datagram(
     ike_sa_init_request_datagram(transport, initiator_spi)
 }
 
+/// DH group used by the default typed SA_INIT request fixture (NIST P-256).
+const TYPED_FIXTURE_DH_GROUP: Ikev2DhGroup = Ikev2DhGroup::Ecp256;
+/// Nonce length for the default typed fixture, above the RFC 7296 16-octet min.
+const TYPED_FIXTURE_NONCE_LEN: usize = 32;
+
+// IKEv2 transform type and ID selectors for the default typed proposal
+// (RFC 7296 §3.3.2 and the IANA IKEv2 Transform registries). ENCR reuses the
+// AES-CBC transform and 256-bit key-length attribute of the crate's own passing
+// SA_INIT decode test; PRF/INTEG/DH round the proposal out to a decodable set.
+const TRANSFORM_TYPE_ENCR: u8 = 1;
+const TRANSFORM_TYPE_PRF: u8 = 2;
+const TRANSFORM_TYPE_INTEG: u8 = 3;
+const TRANSFORM_TYPE_DH: u8 = 4;
+const TRANSFORM_ID_ENCR_AES_CBC: u16 = 12;
+const TRANSFORM_ID_PRF_HMAC_SHA2_256: u16 = 5;
+const TRANSFORM_ID_AUTH_HMAC_SHA2_256_128: u16 = 12;
+const TRANSFORM_ATTR_KEY_LENGTH: u16 = 14;
+const AES_256_KEY_LENGTH_BITS: u16 = 256;
+
+/// Typed IKE_SA_INIT request fixture profile.
+///
+/// Unlike [`ike_sa_init_request_datagram`], whose SA/KE/Nonce bodies are opaque
+/// placeholders, this profile carries the crate's typed SA/KE/Nonce builders so
+/// the resulting fixture datagram decodes through
+/// [`decode_ike_sa_init_request_payloads`]. It is a deterministic test fixture,
+/// not a negotiation policy or transform-selection API.
+///
+/// The public fields are the override surface: replace them for custom
+/// proposals, a different KE group and public data, or custom nonce bytes.
+/// Invalid overrides surface as [`Ikev2FixtureBuildError::TypedPayload`] at
+/// build time and never panic.
+///
+/// `Debug` reports typed metadata and lengths only, never KE or nonce bytes.
+///
+/// [`decode_ike_sa_init_request_payloads`]: crate::decode_ike_sa_init_request_payloads
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ikev2TypedSaInitProfile {
+    /// SA payload proposals.
+    pub security_association: Ikev2SaPayloadBuild,
+    /// KE payload DH group and public data.
+    pub key_exchange: Ikev2KeyExchangePayloadBuild,
+    /// Nonce payload bytes.
+    pub nonce: Ikev2NoncePayloadBuild,
+}
+
+impl Ikev2TypedSaInitProfile {
+    /// Build the deterministic default typed SA_INIT request profile.
+    ///
+    /// Mirrors the crate's own passing SA_INIT decode test: an AES-CBC
+    /// encryption transform with a 256-bit key-length attribute (plus PRF,
+    /// INTEG, and DH transforms), DH group ECP-256, group-sized deterministic KE
+    /// public data, and a deterministic nonce above the RFC 7296 minimum. No RNG
+    /// is used.
+    #[must_use]
+    pub fn default_profile() -> Self {
+        Self {
+            security_association: Ikev2SaPayloadBuild {
+                proposals: vec![Ikev2SaProposalBuild {
+                    proposal_number: 1,
+                    protocol_id: 1,
+                    spi: Vec::new(),
+                    transforms: vec![
+                        Ikev2SaTransformBuild {
+                            transform_type: TRANSFORM_TYPE_ENCR,
+                            transform_id: TRANSFORM_ID_ENCR_AES_CBC,
+                            attributes: vec![Ikev2TransformAttributeBuild {
+                                attribute_type: TRANSFORM_ATTR_KEY_LENGTH,
+                                value: Ikev2TransformAttributeBuildValue::Tv(
+                                    AES_256_KEY_LENGTH_BITS,
+                                ),
+                            }],
+                        },
+                        Ikev2SaTransformBuild {
+                            transform_type: TRANSFORM_TYPE_PRF,
+                            transform_id: TRANSFORM_ID_PRF_HMAC_SHA2_256,
+                            attributes: Vec::new(),
+                        },
+                        Ikev2SaTransformBuild {
+                            transform_type: TRANSFORM_TYPE_INTEG,
+                            transform_id: TRANSFORM_ID_AUTH_HMAC_SHA2_256_128,
+                            attributes: Vec::new(),
+                        },
+                        Ikev2SaTransformBuild {
+                            transform_type: TRANSFORM_TYPE_DH,
+                            transform_id: TYPED_FIXTURE_DH_GROUP.transform_id(),
+                            attributes: Vec::new(),
+                        },
+                    ],
+                }],
+            },
+            key_exchange: Ikev2KeyExchangePayloadBuild {
+                dh_group: TYPED_FIXTURE_DH_GROUP.transform_id(),
+                key_exchange_data: deterministic_fixture_bytes(
+                    TYPED_FIXTURE_DH_GROUP.public_value_len(),
+                    0x40,
+                ),
+            },
+            nonce: Ikev2NoncePayloadBuild {
+                nonce: deterministic_fixture_bytes(TYPED_FIXTURE_NONCE_LEN, 0x80),
+            },
+        }
+    }
+}
+
+impl Default for Ikev2TypedSaInitProfile {
+    fn default() -> Self {
+        Self::default_profile()
+    }
+}
+
+/// Build a deterministic IKE_SA_INIT request fixture datagram whose SA, KE, and
+/// Nonce bodies are typed payloads that decode through
+/// [`decode_ike_sa_init_request_payloads`].
+///
+/// `transport` selects UDP/500 cleartext or UDP/4500 NAT-T framing; both reuse
+/// the same cleartext SA -> KE -> Nonce request chain, so no separate NAT-T
+/// builder is needed.
+///
+/// # Errors
+///
+/// Returns [`Ikev2FixtureBuildError::TypedPayload`] when a profile body fails
+/// typed-builder validation (for example a nonce below the RFC 7296 minimum or
+/// empty KE data), or the other [`Ikev2FixtureBuildError`] variants when fixture
+/// encoding exceeds IKEv2 length fields.
+///
+/// [`decode_ike_sa_init_request_payloads`]: crate::decode_ike_sa_init_request_payloads
+pub fn ike_sa_init_request_datagram_typed(
+    transport: Ikev2FixtureTransport,
+    initiator_spi: u64,
+    profile: &Ikev2TypedSaInitProfile,
+) -> Result<Bytes, Ikev2FixtureBuildError> {
+    let sa_body = encode_sa_payload_build(&profile.security_association)
+        .map_err(Ikev2FixtureBuildError::TypedPayload)?;
+    let ke_body = encode_ke_payload_build(&profile.key_exchange)
+        .map_err(Ikev2FixtureBuildError::TypedPayload)?;
+    let nonce_body =
+        encode_nonce_payload_build(&profile.nonce).map_err(Ikev2FixtureBuildError::TypedPayload)?;
+
+    let payloads = [
+        Ikev2FixturePayload::new(PayloadType::SecurityAssociation, &sa_body),
+        Ikev2FixturePayload::new(PayloadType::KeyExchange, &ke_body),
+        Ikev2FixturePayload::new(PayloadType::Nonce, &nonce_body),
+    ];
+    build_fixture_datagram(
+        transport,
+        Ikev2FixtureMessagePlan {
+            initiator_spi,
+            responder_spi: 0,
+            exchange_type: EXCHANGE_TYPE_IKE_SA_INIT,
+            flags: HeaderFlags::from_bits(true, false, false),
+            message_id: 0,
+            payloads: &payloads,
+        },
+    )
+}
+
+/// Build the deterministic IKE_SA_INIT request fixture datagram using the
+/// default typed profile.
+///
+/// # Errors
+///
+/// Returns [`Ikev2FixtureBuildError`] if fixture encoding fails.
+pub fn ike_sa_init_request_datagram_typed_default(
+    transport: Ikev2FixtureTransport,
+    initiator_spi: u64,
+) -> Result<Bytes, Ikev2FixtureBuildError> {
+    ike_sa_init_request_datagram_typed(
+        transport,
+        initiator_spi,
+        &Ikev2TypedSaInitProfile::default_profile(),
+    )
+}
+
 /// Build a deterministic IKE_SA_INIT response fixture datagram.
 ///
 /// # Errors
@@ -379,6 +575,12 @@ fn default_sa_init_payloads() -> [Ikev2FixturePayload<'static>; 3] {
         Ikev2FixturePayload::new(PayloadType::KeyExchange, b"fixture-ke"),
         Ikev2FixturePayload::new(PayloadType::Nonce, b"fixture-nonce"),
     ]
+}
+
+/// Deterministic fixture bytes: `seed` plus a wrapping octet index. No RNG, so
+/// fixture KE/nonce material is reproducible byte-for-byte across runs.
+fn deterministic_fixture_bytes(len: usize, seed: u8) -> Vec<u8> {
+    (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
 }
 
 fn append_generic_payload(

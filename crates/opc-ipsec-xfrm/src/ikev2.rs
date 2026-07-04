@@ -199,7 +199,7 @@ pub enum Ikev2ChildSaXfrmError {
         /// Address length in octets.
         len: usize,
     },
-    /// The traffic selector address range cannot be represented by this XFRM model.
+    /// The traffic selector address range is not expressible as a single prefix.
     TrafficSelectorAddressRangeUnsupported,
     /// The traffic selector port range cannot be represented by this XFRM model.
     TrafficSelectorPortRangeUnsupported {
@@ -308,6 +308,12 @@ pub fn derive_child_sa_xfrm_keys(
 
 /// Build bidirectional XFRM SA and policy install requests for a Child SA.
 ///
+/// A traffic selector address range is accepted when it collapses to a single
+/// address or spans exactly one aligned CIDR block; the block's prefix length
+/// flows into the XFRM selector, so a 3GPP route-all responder selector installs
+/// as a `/0` prefix. A range that is not expressible as a single prefix is
+/// rejected.
+///
 /// # Errors
 ///
 /// Returns [`Ikev2ChildSaXfrmError`] when the negotiation uses a protocol,
@@ -319,9 +325,9 @@ pub fn build_xfrm_requests_from_ikev2_child_sa(
     validate_request(request)?;
 
     let initiator_spi = initiator_spi_u32(&request.negotiation.initiator_spi)?;
-    let initiator_selector = selector_address(&request.negotiation.initiator_traffic_selector)?;
-    let responder_selector = selector_address(&request.negotiation.responder_traffic_selector)?;
-    if !same_address_family(initiator_selector, responder_selector) {
+    let initiator_selector = selector_prefix(&request.negotiation.initiator_traffic_selector)?;
+    let responder_selector = selector_prefix(&request.negotiation.responder_traffic_selector)?;
+    if !same_address_family(initiator_selector.0, responder_selector.0) {
         return Err(Ikev2ChildSaXfrmError::TrafficSelectorAddressFamilyMismatch);
     }
 
@@ -517,35 +523,108 @@ fn initiator_spi_u32(spi: &[u8]) -> Result<u32, Ikev2ChildSaXfrmError> {
     Ok(spi)
 }
 
-fn selector_address(
+/// Resolve one IKEv2 traffic selector into an XFRM base address and prefix
+/// length.
+///
+/// IKEv2 carries selectors as an inclusive address range, but XFRM represents a
+/// selector as a base address plus prefix length. A single-host range collapses
+/// to a full-length prefix; a range that spans exactly one aligned CIDR block
+/// collapses to that block's prefix. This is what lets the 3GPP route-all
+/// responder selector (`0.0.0.0`-`255.255.255.255` or `::`-`ffff:...:ffff`)
+/// install as a `/0` prefix.
+fn selector_prefix(
     selector: &Ikev2TrafficSelectorBuild,
-) -> Result<IpAddress, Ikev2ChildSaXfrmError> {
-    if selector.start_address != selector.end_address {
-        return Err(Ikev2ChildSaXfrmError::TrafficSelectorAddressRangeUnsupported);
-    }
-
+) -> Result<(IpAddress, u8), Ikev2ChildSaXfrmError> {
     match selector.ts_type {
         IKEV2_TS_IPV4_ADDR_RANGE => {
-            let bytes: [u8; 4] = selector.start_address.as_slice().try_into().map_err(|_| {
-                Ikev2ChildSaXfrmError::TrafficSelectorAddressLengthInvalid {
-                    ts_type: selector.ts_type,
-                    len: selector.start_address.len(),
-                }
-            })?;
-            Ok(IpAddress::Ipv4(bytes))
+            let start: [u8; 4] = selector_octets(selector, &selector.start_address)?;
+            let end: [u8; 4] = selector_octets(selector, &selector.end_address)?;
+            Ok((IpAddress::Ipv4(start), cidr_prefix_len(&start, &end)?))
         }
         IKEV2_TS_IPV6_ADDR_RANGE => {
-            let bytes: [u8; 16] = selector.start_address.as_slice().try_into().map_err(|_| {
-                Ikev2ChildSaXfrmError::TrafficSelectorAddressLengthInvalid {
-                    ts_type: selector.ts_type,
-                    len: selector.start_address.len(),
-                }
-            })?;
-            Ok(IpAddress::Ipv6(bytes))
+            let start: [u8; 16] = selector_octets(selector, &selector.start_address)?;
+            let end: [u8; 16] = selector_octets(selector, &selector.end_address)?;
+            Ok((IpAddress::Ipv6(start), cidr_prefix_len(&start, &end)?))
         }
         other => {
             Err(Ikev2ChildSaXfrmError::TrafficSelectorAddressTypeUnsupported { ts_type: other })
         }
+    }
+}
+
+fn selector_octets<const N: usize>(
+    selector: &Ikev2TrafficSelectorBuild,
+    address: &[u8],
+) -> Result<[u8; N], Ikev2ChildSaXfrmError> {
+    address.try_into().map_err(
+        |_| Ikev2ChildSaXfrmError::TrafficSelectorAddressLengthInvalid {
+            ts_type: selector.ts_type,
+            len: address.len(),
+        },
+    )
+}
+
+/// Return the prefix length whose CIDR block is exactly the inclusive range
+/// `start..=end`, or an error when the range is not a single aligned block.
+///
+/// `start` and `end` are the same length. `prefix` counts the leading bits on
+/// which the two bounds agree; the range is a single prefix only when every bit
+/// below that boundary is `0` in `start` (the network address) and `1` in `end`
+/// (the last address of the block). Unaligned and inverted (`start > end`)
+/// ranges fail one of those two conditions.
+fn cidr_prefix_len(start: &[u8], end: &[u8]) -> Result<u8, Ikev2ChildSaXfrmError> {
+    let prefix = leading_agreement_bits(start, end);
+    if host_bits_all(start, prefix, false) && host_bits_all(end, prefix, true) {
+        Ok(prefix)
+    } else {
+        Err(Ikev2ChildSaXfrmError::TrafficSelectorAddressRangeUnsupported)
+    }
+}
+
+/// Count the leading bits on which two equal-length byte strings agree.
+fn leading_agreement_bits(start: &[u8], end: &[u8]) -> u8 {
+    let mut bits: u8 = 0;
+    for (left, right) in start.iter().zip(end.iter()) {
+        let diff = left ^ right;
+        if diff == 0 {
+            bits += 8;
+        } else {
+            // A nonzero byte has 0..=7 leading zero bits, so the cast is exact.
+            bits += diff.leading_zeros() as u8;
+            break;
+        }
+    }
+    bits
+}
+
+/// True when every bit at position `prefix` or later in `addr` equals `bit`.
+///
+/// Bits are numbered from the most significant bit of the first byte; positions
+/// below `prefix` (the network portion) are ignored.
+fn host_bits_all(addr: &[u8], prefix: u8, bit: bool) -> bool {
+    let prefix = usize::from(prefix);
+    let fill: u8 = if bit { 0xff } else { 0x00 };
+    for (index, byte) in addr.iter().enumerate() {
+        let byte_start = index * 8;
+        let byte_end = byte_start + 8;
+        if byte_end <= prefix {
+            continue; // Byte lies entirely in the network portion.
+        }
+        let host_bits = byte_end - prefix.max(byte_start);
+        let mask = low_bit_mask(host_bits);
+        if (byte & mask) != (fill & mask) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Mask selecting the low `count` bits (`count` in `1..=8`).
+fn low_bit_mask(count: usize) -> u8 {
+    if count >= 8 {
+        0xff
+    } else {
+        (1u8 << count) - 1
     }
 }
 
@@ -572,15 +651,17 @@ fn selector_port(start: u16, end: u16) -> Result<u16, Ikev2ChildSaXfrmError> {
 }
 
 fn xfrm_selector(
-    source: IpAddress,
-    destination: IpAddress,
+    source: (IpAddress, u8),
+    destination: (IpAddress, u8),
     source_port: u16,
     destination_port: u16,
     protocol: u8,
 ) -> XfrmSelector {
-    let mut selector = XfrmSelector::new(source, destination, protocol);
+    let mut selector = XfrmSelector::new(source.0, destination.0, protocol);
     selector.source_port = source_port;
     selector.destination_port = destination_port;
+    selector.source_prefix_len = source.1;
+    selector.destination_prefix_len = destination.1;
     selector
 }
 
@@ -611,6 +692,22 @@ mod tests {
             end_port: u16::MAX,
             start_address: address.to_vec(),
             end_address: address.to_vec(),
+        }
+    }
+
+    fn range_selector(
+        ts_type: u8,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        protocol: u8,
+    ) -> Ikev2TrafficSelectorBuild {
+        Ikev2TrafficSelectorBuild {
+            ts_type,
+            ip_protocol_id: protocol,
+            start_port: 0,
+            end_port: u16::MAX,
+            start_address: start,
+            end_address: end,
         }
     }
 
@@ -764,13 +861,41 @@ mod tests {
 
     #[test]
     fn rejects_unrepresentable_traffic_selector_ranges() {
+        // 10.10.0.10..10.10.0.12 is not a single aligned CIDR block.
         let mut input = request();
-        input.negotiation.initiator_traffic_selector.end_address = vec![10, 10, 0, 11];
+        input.negotiation.initiator_traffic_selector.end_address = vec![10, 10, 0, 12];
         assert!(matches!(
             build_xfrm_requests_from_ikev2_child_sa(&input),
             Err(Ikev2ChildSaXfrmError::TrafficSelectorAddressRangeUnsupported)
         ));
 
+        // Start is not the network address of the block it would span.
+        input = request();
+        input.negotiation.responder_traffic_selector = range_selector(
+            IKEV2_TS_IPV4_ADDR_RANGE,
+            vec![10, 0, 0, 1],
+            vec![10, 0, 0, 255],
+            0,
+        );
+        assert!(matches!(
+            build_xfrm_requests_from_ikev2_child_sa(&input),
+            Err(Ikev2ChildSaXfrmError::TrafficSelectorAddressRangeUnsupported)
+        ));
+
+        // Inverted range (start > end) fails the host-bit conditions.
+        input = request();
+        input.negotiation.responder_traffic_selector = range_selector(
+            IKEV2_TS_IPV4_ADDR_RANGE,
+            vec![10, 0, 0, 11],
+            vec![10, 0, 0, 10],
+            0,
+        );
+        assert!(matches!(
+            build_xfrm_requests_from_ikev2_child_sa(&input),
+            Err(Ikev2ChildSaXfrmError::TrafficSelectorAddressRangeUnsupported)
+        ));
+
+        // Port ranges remain unrepresentable in the XFRM selector.
         input = request();
         input.negotiation.initiator_traffic_selector.start_port = 10;
         input.negotiation.initiator_traffic_selector.end_port = 20;
@@ -778,6 +903,179 @@ mod tests {
             build_xfrm_requests_from_ikev2_child_sa(&input),
             Err(Ikev2ChildSaXfrmError::TrafficSelectorPortRangeUnsupported { start: 10, end: 20 })
         ));
+    }
+
+    #[test]
+    fn accepts_route_all_ipv4_responder_selector() {
+        let mut input = request();
+        // Initiator keeps its single-host selector; the responder routes all
+        // IPv4 traffic, as a 3GPP ePDG APN-anchored SA does.
+        input.negotiation.responder_traffic_selector = range_selector(
+            IKEV2_TS_IPV4_ADDR_RANGE,
+            vec![0, 0, 0, 0],
+            vec![255, 255, 255, 255],
+            0,
+        );
+
+        let built = build_xfrm_requests_from_ikev2_child_sa(&input).expect("route-all builds");
+
+        let inbound = &built.inbound_sa.parameters.selector;
+        assert_eq!(inbound.source, ipv4(10, 10, 0, 10));
+        assert_eq!(inbound.source_prefix_len, 32);
+        assert_eq!(inbound.destination, ipv4(0, 0, 0, 0));
+        assert_eq!(inbound.destination_prefix_len, 0);
+        // Ports and protocol are untouched by the prefix handling.
+        assert_eq!(inbound.protocol, 17);
+        assert_eq!(inbound.source_port, 0);
+        assert_eq!(inbound.destination_port, 0);
+
+        let outbound = &built.outbound_sa.parameters.selector;
+        assert_eq!(outbound.source, ipv4(0, 0, 0, 0));
+        assert_eq!(outbound.source_prefix_len, 0);
+        assert_eq!(outbound.destination, ipv4(10, 10, 0, 10));
+        assert_eq!(outbound.destination_prefix_len, 32);
+
+        // The SA and policy for each direction share one selector.
+        assert_eq!(&built.inbound_policy.parameters.selector, inbound);
+        assert_eq!(&built.outbound_policy.parameters.selector, outbound);
+    }
+
+    #[test]
+    fn accepts_route_all_ipv6_responder_selector() {
+        let host = vec![0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let mut input = request();
+        input.negotiation.initiator_traffic_selector =
+            range_selector(IKEV2_TS_IPV6_ADDR_RANGE, host.clone(), host.clone(), 0);
+        input.negotiation.responder_traffic_selector =
+            range_selector(IKEV2_TS_IPV6_ADDR_RANGE, vec![0x00; 16], vec![0xff; 16], 0);
+
+        let built = build_xfrm_requests_from_ikev2_child_sa(&input).expect("ipv6 route-all builds");
+
+        let inbound = &built.inbound_sa.parameters.selector;
+        let host_bytes: [u8; 16] = host.as_slice().try_into().expect("16-byte host");
+        assert_eq!(inbound.source, IpAddress::Ipv6(host_bytes));
+        assert_eq!(inbound.source_prefix_len, 128);
+        assert_eq!(inbound.destination, IpAddress::Ipv6([0; 16]));
+        assert_eq!(inbound.destination_prefix_len, 0);
+    }
+
+    #[test]
+    fn accepts_mid_range_cidr_block() {
+        let mut input = request();
+        input.negotiation.responder_traffic_selector = range_selector(
+            IKEV2_TS_IPV4_ADDR_RANGE,
+            vec![10, 0, 0, 0],
+            vec![10, 0, 0, 255],
+            0,
+        );
+
+        let built = build_xfrm_requests_from_ikev2_child_sa(&input).expect("/24 builds");
+
+        let inbound = &built.inbound_sa.parameters.selector;
+        assert_eq!(inbound.destination, ipv4(10, 0, 0, 0));
+        assert_eq!(inbound.destination_prefix_len, 24);
+    }
+
+    #[test]
+    fn accepts_slash_31_cidr_block() {
+        // 10.10.0.10..10.10.0.11 is exactly 10.10.0.10/31.
+        let mut input = request();
+        input.negotiation.initiator_traffic_selector.end_address = vec![10, 10, 0, 11];
+
+        let built = build_xfrm_requests_from_ikev2_child_sa(&input).expect("/31 builds");
+
+        let inbound = &built.inbound_sa.parameters.selector;
+        assert_eq!(inbound.source, ipv4(10, 10, 0, 10));
+        assert_eq!(inbound.source_prefix_len, 31);
+    }
+
+    #[test]
+    fn rejects_end_address_length_mismatch() {
+        let mut input = request();
+        input.negotiation.initiator_traffic_selector.end_address = vec![10, 10, 0, 10, 0];
+        assert!(matches!(
+            build_xfrm_requests_from_ikev2_child_sa(&input),
+            Err(Ikev2ChildSaXfrmError::TrafficSelectorAddressLengthInvalid {
+                ts_type: IKEV2_TS_IPV4_ADDR_RANGE,
+                len: 5
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_ipv6_non_aligned_range() {
+        let host = vec![0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let mut input = request();
+        input.negotiation.initiator_traffic_selector =
+            range_selector(IKEV2_TS_IPV6_ADDR_RANGE, host.clone(), host, 0);
+        // All-zero start with an all-ones end except one cleared middle bit is
+        // not a single prefix: the end's suffix is not all ones.
+        let mut end = vec![0xff; 16];
+        end[8] = 0x7f;
+        input.negotiation.responder_traffic_selector =
+            range_selector(IKEV2_TS_IPV6_ADDR_RANGE, vec![0x00; 16], end, 0);
+        assert!(matches!(
+            build_xfrm_requests_from_ikev2_child_sa(&input),
+            Err(Ikev2ChildSaXfrmError::TrafficSelectorAddressRangeUnsupported)
+        ));
+    }
+
+    #[tokio::test]
+    async fn route_all_selector_prefixes_reach_mock_backend() {
+        use crate::{install_sa_policy_with_rollback, MockOperation, MockXfrmBackend};
+
+        let mut input = request();
+        input.negotiation.responder_traffic_selector = range_selector(
+            IKEV2_TS_IPV4_ADDR_RANGE,
+            vec![0, 0, 0, 0],
+            vec![255, 255, 255, 255],
+            0,
+        );
+        let built = build_xfrm_requests_from_ikev2_child_sa(&input).expect("route-all builds");
+
+        let backend = MockXfrmBackend::new();
+        for composite in built.composite_installs() {
+            let outcome = install_sa_policy_with_rollback(&backend, composite)
+                .await
+                .expect("mock install succeeds");
+            assert!(outcome.applied);
+        }
+
+        // Inbound direction first: InstallSa then InstallPolicy, then outbound.
+        let operations = backend.operations();
+        assert_eq!(operations.len(), 4);
+
+        let inbound_sa_prefixes = operations.iter().find_map(|op| match op {
+            MockOperation::InstallSa { selector, .. } => {
+                Some((selector.source_prefix_len, selector.destination_prefix_len))
+            }
+            _ => None,
+        });
+        assert_eq!(inbound_sa_prefixes, Some((32, 0)));
+
+        // The inbound policy carries the same prefixes as its SA.
+        let inbound_policy_prefixes = operations.iter().find_map(|op| match op {
+            MockOperation::InstallPolicy { selector, .. } => {
+                Some((selector.source_prefix_len, selector.destination_prefix_len))
+            }
+            _ => None,
+        });
+        assert_eq!(inbound_policy_prefixes, Some((32, 0)));
+
+        // The outbound direction mirrors the prefixes onto the other side.
+        let outbound_prefixes: Vec<(u8, u8)> = operations
+            .iter()
+            .filter_map(|op| match op {
+                MockOperation::InstallSa { selector, .. }
+                | MockOperation::InstallPolicy { selector, .. }
+                    if selector.source_prefix_len == 0 =>
+                {
+                    Some((selector.source_prefix_len, selector.destination_prefix_len))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outbound_prefixes, vec![(0, 32), (0, 32)]);
     }
 
     #[test]
