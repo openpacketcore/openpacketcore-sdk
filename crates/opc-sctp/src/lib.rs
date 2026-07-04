@@ -457,18 +457,31 @@ impl DiameterSctpAssociation {
 
     /// Receive one Diameter payload after SCTP metadata validation.
     ///
+    /// SCTP event notifications (COMM_UP, peer address change, sender-dry,
+    /// ...) interleave with data on the association and are skipped: they are
+    /// transport events, not Diameter payloads. Callers bound the read with
+    /// their own response timeout.
+    ///
     /// # Errors
     ///
     /// Returns [`DiameterSctpError`] when receive fails or the SCTP metadata is
     /// not valid for this peer's Diameter security profile.
     pub async fn recv_diameter_payload(&self) -> Result<Bytes, DiameterSctpError> {
-        let message = self
-            .association
-            .recv()
-            .await
-            .map_err(DiameterSctpError::recv)?;
-        self.peer.validate_inbound_message(&message)?;
-        Ok(message.payload)
+        loop {
+            let message = self
+                .association
+                .recv()
+                .await
+                .map_err(DiameterSctpError::recv)?;
+            if message.notification {
+                // A shutdown notification is followed by the association
+                // actually closing, so the next recv surfaces
+                // `SctpError::Closed` instead of spinning here.
+                continue;
+            }
+            self.peer.validate_inbound_message(&message)?;
+            return Ok(message.payload);
+        }
     }
 
     /// Return SDK SCTP association health.
@@ -1904,5 +1917,105 @@ mod tests {
         let received = recv_data(&accepted).await;
         assert_eq!(received.payload, Bytes::from_static(b"ngap"));
         assert_eq!(received.ppid, NGAP_PPID);
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn diameter_loopback(
+        server_addr: SocketAddr,
+    ) -> (SctpEndpoint, DiameterSctpAssociation, SctpAssociation) {
+        let server = SctpEndpoint::bind(SctpEndpointConfig::one_to_one(server_addr)).unwrap();
+        let client = DiameterSctpPeer::new(server_addr)
+            .connect_association()
+            .await
+            .unwrap();
+        let accepted = server.accept().await.unwrap();
+        (server, client, accepted)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP support"]
+    async fn loopback_recv_diameter_payload_skips_leading_notification() {
+        let server_addr: SocketAddr = "127.0.0.1:38416".parse().unwrap();
+        let (_server, client, accepted) = diameter_loopback(server_addr).await;
+
+        // The client's first inbound message is the COMM_UP association
+        // notification; the Diameter payload sent here arrives after it.
+        let payload = Bytes::from_static(b"diameter-cea");
+        accepted
+            .send(OutboundMessage::ordered(
+                payload.clone(),
+                DIAMETER_DEFAULT_STREAM_ID,
+                DIAMETER_SCTP_PPID,
+            ))
+            .await
+            .unwrap();
+
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_diameter_payload(),
+        )
+        .await
+        .expect("recv_diameter_payload timed out")
+        .unwrap();
+        assert_eq!(received, payload);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP support"]
+    async fn loopback_recv_diameter_payload_still_rejects_wrong_ppid() {
+        let server_addr: SocketAddr = "127.0.0.1:38417".parse().unwrap();
+        let (_server, client, accepted) = diameter_loopback(server_addr).await;
+
+        accepted
+            .send(OutboundMessage::ordered(
+                Bytes::from_static(b"diameter"),
+                DIAMETER_DEFAULT_STREAM_ID,
+                DIAMETER_DTLS_SCTP_PPID,
+            ))
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_diameter_payload(),
+        )
+        .await
+        .expect("recv_diameter_payload timed out")
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DiameterSctpError::WrongPpid {
+                expected: 46,
+                actual: 47
+            }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP support"]
+    async fn loopback_recv_diameter_payload_surfaces_close_after_shutdown() {
+        let server_addr: SocketAddr = "127.0.0.1:38418".parse().unwrap();
+        let (server, client, accepted) = diameter_loopback(server_addr).await;
+
+        // Close the peer side: the client sees the shutdown notification,
+        // skips it, and the next receive must report Closed, not spin.
+        drop(accepted);
+        drop(server);
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_diameter_payload(),
+        )
+        .await
+        .expect("recv_diameter_payload timed out")
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DiameterSctpError::SctpRecv(SctpError::Closed)
+        ));
+        assert_eq!(error.as_str(), "diameter_sctp_recv_error");
     }
 }
