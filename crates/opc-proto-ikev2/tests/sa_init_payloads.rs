@@ -193,7 +193,19 @@ fn builds_canonical_sa_init_response_chain() {
         Err(error) => panic!("SA_INIT response build failed: {error:?}"),
     };
 
-    assert!(response.header.flags.response());
+    assert!(
+        response.header.flags.response(),
+        "responder must set the Response flag"
+    );
+    assert!(
+        !response.header.flags.initiator(),
+        "responder must clear the Initiator flag (RFC 7296 §3.1)"
+    );
+    assert_eq!(
+        response.header.flags.canonical_raw(),
+        0x20,
+        "IKE_SA_INIT response flags octet must be R=1, I=0"
+    );
     assert_eq!(response.header.responder_spi, 0x1112_1314_1516_1718);
     assert_eq!(
         response.header.next_payload,
