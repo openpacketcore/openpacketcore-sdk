@@ -92,7 +92,10 @@ pub struct EventSubscriptions {
 impl Default for EventSubscriptions {
     fn default() -> Self {
         Self {
-            data_io: true,
+            // Off by default: `SCTP_RECVRCVINFO` already delivers per-message
+            // receive info, and subscribing the legacy `sctp_sndrcvinfo`
+            // ancillary as well doubles the cmsgs per DATA message.
+            data_io: false,
             association: true,
             address: true,
             send_failure: true,
@@ -239,7 +242,10 @@ mod tests {
     #[test]
     fn default_event_subscription_covers_lifecycle_events() {
         let events = EventSubscriptions::default();
-        assert!(events.data_io);
+        assert!(
+            !events.data_io,
+            "SCTP_RECVRCVINFO supersedes the legacy data_io ancillary"
+        );
         assert!(events.association);
         assert!(events.address);
         assert!(events.shutdown);

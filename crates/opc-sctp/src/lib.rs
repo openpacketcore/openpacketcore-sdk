@@ -678,6 +678,9 @@ pub struct InboundMessage {
     pub notification: bool,
     /// True when the caller buffer truncated payload.
     pub truncated: bool,
+    /// True when the kernel truncated ancillary control data. The payload is
+    /// intact, but SCTP metadata (stream/PPID/association) may be incomplete.
+    pub control_truncated: bool,
 }
 
 /// Error type for safe SCTP operations. Display text is payload-free.
@@ -1016,7 +1019,8 @@ fn map_recv(received: opc_libsctp_sys::Received, buffer: BytesMut) -> InboundMes
         order,
         assoc_id: info.assoc_id,
         notification: received.flags.notification,
-        truncated: received.flags.payload_truncated || received.flags.control_truncated,
+        truncated: received.flags.payload_truncated,
+        control_truncated: received.flags.control_truncated,
     }
 }
 
@@ -1464,6 +1468,7 @@ mod tests {
             assoc_id: 7,
             notification: false,
             truncated: false,
+            control_truncated: false,
         }
     }
 
@@ -1770,6 +1775,114 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    async fn recv_data(association: &SctpAssociation) -> InboundMessage {
+        loop {
+            let message = association.recv().await.unwrap();
+            if !message.notification {
+                return message;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP support"]
+    async fn loopback_data_message_reports_intact_metadata() {
+        let server_addr: SocketAddr = "127.0.0.1:38413".parse().unwrap();
+        let server = SctpEndpoint::bind(SctpEndpointConfig::one_to_one(server_addr)).unwrap();
+        let client = SctpAssociation::connect(SctpConnectConfig::new(server_addr))
+            .await
+            .unwrap();
+        let accepted = server.accept().await.unwrap();
+
+        let payload = Bytes::from(vec![0x5A_u8; 300]);
+        client
+            .send(OutboundMessage::ordered(
+                payload.clone(),
+                1,
+                DIAMETER_SCTP_PPID,
+            ))
+            .await
+            .unwrap();
+
+        let received = recv_data(&accepted).await;
+        assert_eq!(received.payload, payload);
+        assert!(!received.truncated);
+        assert!(!received.control_truncated);
+        assert_eq!(received.stream_id, 1);
+        assert_eq!(received.ppid, DIAMETER_SCTP_PPID);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP support"]
+    async fn loopback_multi_chunk_message_is_not_reported_truncated() {
+        let server_addr: SocketAddr = "127.0.0.1:38414".parse().unwrap();
+        let server = SctpEndpoint::bind(SctpEndpointConfig::one_to_one(server_addr)).unwrap();
+        let client = SctpAssociation::connect(SctpConnectConfig::new(server_addr))
+            .await
+            .unwrap();
+        let accepted = server.accept().await.unwrap();
+
+        // Larger than SCTP_RECV_CHUNK_BYTES so receive spans multiple chunks.
+        let payload = Bytes::from(vec![0xC3_u8; 100_000]);
+        client
+            .send(OutboundMessage::ordered(
+                payload.clone(),
+                2,
+                DIAMETER_SCTP_PPID,
+            ))
+            .await
+            .unwrap();
+
+        let received = recv_data(&accepted).await;
+        assert_eq!(received.payload.len(), payload.len());
+        assert_eq!(received.payload, payload);
+        assert!(!received.truncated);
+        assert!(!received.control_truncated);
+        assert_eq!(received.stream_id, 2);
+        assert_eq!(received.ppid, DIAMETER_SCTP_PPID);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP support"]
+    async fn loopback_oversized_message_still_fails_closed() {
+        let server_addr: SocketAddr = "127.0.0.1:38415".parse().unwrap();
+        let mut config = SctpEndpointConfig::one_to_one(server_addr);
+        config.max_message_bytes = 1024;
+        let server = SctpEndpoint::bind(config).unwrap();
+        let client = SctpAssociation::connect(SctpConnectConfig::new(server_addr))
+            .await
+            .unwrap();
+        let accepted = server.accept().await.unwrap();
+
+        client
+            .send(OutboundMessage::ordered(
+                Bytes::from(vec![0x7E_u8; 4096]),
+                0,
+                DIAMETER_SCTP_PPID,
+            ))
+            .await
+            .unwrap();
+
+        loop {
+            match accepted.recv().await {
+                Ok(message) if message.notification => continue,
+                Ok(message) => panic!(
+                    "oversized message was delivered ({} bytes)",
+                    message.payload.len()
+                ),
+                Err(SctpError::MessageTooLarge { max_message_bytes }) => {
+                    assert_eq!(max_message_bytes, 1024);
+                    break;
+                }
+                Err(error) => panic!("unexpected receive error: {error}"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires Linux kernel SCTP support"]
     async fn loopback_one_to_one_smoke() {
@@ -1788,7 +1901,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let received = accepted.recv().await.unwrap();
+        let received = recv_data(&accepted).await;
         assert_eq!(received.payload, Bytes::from_static(b"ngap"));
         assert_eq!(received.ppid, NGAP_PPID);
     }
