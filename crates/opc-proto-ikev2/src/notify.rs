@@ -43,6 +43,16 @@ pub const IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP: u16 = 16_389;
 /// @conformance boundary-only
 pub const IKEV2_NOTIFY_COOKIE2: u16 = 16_401;
 
+/// IKEv2 Notify Message Type for EAP_ONLY_AUTHENTICATION.
+///
+/// A peer includes this status notify in its IKE_AUTH request to signal that it
+/// accepts EAP-only mutual authentication, so the responder need not send a
+/// certificate and signature AUTH.
+///
+/// @spec IETF RFC5998; IANA IKEv2 Notify Message Status Types
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION: u16 = 16_417;
+
 /// Protocol ID used by IKE-level notifications with no protocol-specific SPI.
 pub const IKEV2_NOTIFY_PROTOCOL_ID_NONE: u8 = 0;
 
@@ -136,6 +146,11 @@ impl<'a> Ikev2NotifyPayload<'a> {
     /// Return true when this is a COOKIE2 Notify payload.
     pub const fn is_cookie2(self) -> bool {
         self.notify_message_type == IKEV2_NOTIFY_COOKIE2
+    }
+
+    /// Return true when this is an EAP_ONLY_AUTHENTICATION Notify payload.
+    pub const fn is_eap_only_authentication(self) -> bool {
+        self.notify_message_type == IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION
     }
 
     /// Return true when Protocol ID and SPI Size have the cookie-compatible shape.

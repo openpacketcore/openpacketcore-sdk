@@ -14,6 +14,12 @@ categories = ["network-programming", "encoding"]
 publish = false
 
 [features]
+# Enables RSA private-key signing for IKE_AUTH methods 1 and 14. Off by
+# default so standard builds perform no RSA private-key operations and stay
+# outside the practical scope of RUSTSEC-2023-0071 (Marvin timing
+# sidechannel); RSA *verification* of peers is always available. Prefer
+# ECDSA (P-256/P-384) responder certificates.
+rsa-signing = []
 testkit = []
 
 [dependencies]
@@ -22,12 +28,14 @@ bytes = { workspace = true }
 crypto-bigint = { version = "0.7.5", features = ["getrandom", "zeroize"] }
 hmac = { workspace = true }
 opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
-p256 = { version = "0.14.0-rc.10", default-features = false, features = ["ecdh", "std"] }
-p384 = { version = "0.14.0-rc.10", default-features = false, features = ["ecdh", "std"] }
+p256 = { version = "0.14.0-rc.10", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "std"] }
+p384 = { version = "0.14.0-rc.10", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "std"] }
 p521 = { version = "0.14.0-rc.10", default-features = false, features = ["ecdh", "std"] }
+rsa = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
+x509-parser = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]

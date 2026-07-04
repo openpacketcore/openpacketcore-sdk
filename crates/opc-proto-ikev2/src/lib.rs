@@ -11,7 +11,9 @@
 //! traits, narrow IKE_SA_INIT key-agreement/key-derivation material,
 //! caller-keyed SA_INIT AES-GCM protected-payload open/seal helpers, typed
 //! IKE_AUTH cleartext payload helpers, transcript-bound shared-key AUTH MIC
-//! verification, and product-neutral Child SA negotiation intent. It does not
+//! verification, transcript-bound signature AUTH (RFC 7296 method 1 and
+//! RFC 7427 method 14) against caller-trusted keys, and product-neutral Child
+//! SA negotiation intent. It does not
 //! implement an IKE SA state machine, EAP-AKA, retransmission policy, cookie
 //! policy, Child SA installation, XFRM programming, or any 3GPP ePDG profile
 //! decisions.
@@ -27,6 +29,7 @@ pub mod exchange;
 pub mod fragmentation;
 pub mod header;
 pub mod ike_auth;
+pub mod ike_auth_signature;
 pub mod message;
 pub mod nat_detection;
 pub mod nat_traversal;
@@ -61,12 +64,15 @@ pub use header::{
 };
 pub use ike_auth::{
     build_child_sa_response_payloads, build_ike_auth_authentication_payload,
+    build_ike_auth_certificate_payload, build_ike_auth_certreq_payload,
     build_ike_auth_cleartext_payload_chain, build_ike_auth_configuration_payload,
-    build_ike_auth_identification_payload, build_ike_auth_sa_payload,
-    build_ike_auth_traffic_selector_payload, compute_ike_auth_shared_key_mic,
-    decode_ike_auth_cleartext_payloads, ike_auth_shared_key_authentication_payload_body_len,
-    negotiate_child_sa, verify_ike_auth_shared_key_mic, Ikev2AuthenticationPayload,
-    Ikev2AuthenticationPayloadBuild, Ikev2ChildSaNegotiation, Ikev2ChildSaNegotiationError,
+    build_ike_auth_identification_payload, build_ike_auth_notify_payload,
+    build_ike_auth_sa_payload, build_ike_auth_traffic_selector_payload,
+    compute_ike_auth_shared_key_mic, decode_ike_auth_cleartext_payloads,
+    ike_auth_shared_key_authentication_payload_body_len, negotiate_child_sa,
+    verify_ike_auth_shared_key_mic, Ikev2AuthenticationPayload, Ikev2AuthenticationPayloadBuild,
+    Ikev2CertificatePayload, Ikev2CertificatePayloadBuild, Ikev2CertificateRequestPayload,
+    Ikev2CertificateRequestPayloadBuild, Ikev2ChildSaNegotiation, Ikev2ChildSaNegotiationError,
     Ikev2ChildSaNegotiationPolicy, Ikev2ChildSaResponsePayloads, Ikev2ChildSaTransformRequirement,
     Ikev2ConfigurationAttribute, Ikev2ConfigurationAttributeBuild, Ikev2ConfigurationPayload,
     Ikev2ConfigurationPayloadBuild, Ikev2DeletePayload, Ikev2EapPayload,
@@ -74,8 +80,15 @@ pub use ike_auth::{
     Ikev2IkeAuthCleartextPayloads, Ikev2IkeAuthPayloadBuild, Ikev2IkeAuthPayloadError,
     Ikev2IkeAuthPeer, Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError,
     Ikev2TrafficSelector, Ikev2TrafficSelectorBuild, Ikev2TrafficSelectorPayload,
-    Ikev2TrafficSelectorPayloadBuild, IKEV2_AUTH_METHOD_SHARED_KEY_MIC, IKEV2_TS_IPV4_ADDR_RANGE,
-    IKEV2_TS_IPV6_ADDR_RANGE,
+    Ikev2TrafficSelectorPayloadBuild, IKEV2_AUTH_METHOD_SHARED_KEY_MIC,
+    IKEV2_CERT_ENCODING_X509_SIGNATURE, IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
+};
+pub use ike_auth_signature::{
+    compute_ike_auth_signature, verify_ike_auth_signature, Ikev2SignatureAuthKey,
+    Ikev2SignatureAuthMethod, Ikev2SignatureKeyError, Ikev2SignaturePublicKey,
+    IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE,
+    RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256, RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384,
+    RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
 };
 pub use message::{Message, OwnedMessage};
 pub use nat_detection::{
@@ -93,8 +106,8 @@ pub use notify::{
     build_ike_sa_init_cookie_response, extract_ike_sa_init_cookie_notify, Ikev2CookieNotify,
     Ikev2CookieNotifyBuildError, Ikev2CookieNotifyExtractError, Ikev2NotifyPayload,
     Ikev2NotifyPayloadError, IKEV2_NOTIFY_COOKIE, IKEV2_NOTIFY_COOKIE2,
-    IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP, IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP,
-    IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+    IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION, IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP,
+    IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP, IKEV2_NOTIFY_PROTOCOL_ID_NONE,
 };
 pub use payload::{
     validate_payload_chain, PayloadChain, PayloadType, RawPayload, RawPayloadIterator,

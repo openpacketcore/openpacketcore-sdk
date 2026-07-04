@@ -20,9 +20,10 @@ use crate::{
     notify::{Ikev2NotifyPayload, Ikev2NotifyPayloadError},
     payload::{PayloadChain, PayloadType, RawPayload, GENERIC_PAYLOAD_HEADER_LEN},
     sa_init::{
-        encode_sa_payload_build, Ikev2SaInitBuildError, Ikev2SaPayload, Ikev2SaPayloadBuild,
-        Ikev2SaPayloadError, Ikev2SaProposal, Ikev2SaProposalBuild, Ikev2SaTransform,
-        Ikev2SaTransformBuild, Ikev2TransformAttributeBuild, Ikev2TransformAttributeBuildValue,
+        encode_notify_payload_build, encode_sa_payload_build, Ikev2NotifyPayloadBuild,
+        Ikev2SaInitBuildError, Ikev2SaPayload, Ikev2SaPayloadBuild, Ikev2SaPayloadError,
+        Ikev2SaProposal, Ikev2SaProposalBuild, Ikev2SaTransform, Ikev2SaTransformBuild,
+        Ikev2TransformAttributeBuild, Ikev2TransformAttributeBuildValue,
         Ikev2TransformAttributeValue,
     },
     sa_init_crypto::{Ikev2PrfAlgorithm, Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial},
@@ -30,6 +31,7 @@ use crate::{
 
 const ID_FIXED_BODY_LEN: usize = 4;
 const AUTH_FIXED_BODY_LEN: usize = 4;
+const CERT_FIXED_BODY_LEN: usize = 1;
 const CP_FIXED_BODY_LEN: usize = 4;
 const CP_ATTR_HEADER_LEN: usize = 4;
 const TS_FIXED_BODY_LEN: usize = 4;
@@ -47,6 +49,11 @@ const IKEV2_AUTH_KEY_PAD: &[u8] = b"Key Pad for IKEv2";
 
 /// IKEv2 AUTH Method 2, Shared Key Message Integrity Code.
 pub const IKEV2_AUTH_METHOD_SHARED_KEY_MIC: u8 = 2;
+
+/// IKEv2 Certificate Encoding 4, "X.509 Certificate - Signature".
+///
+/// @spec IETF RFC7296 3.6; IANA IKEv2 Certificate Encodings
+pub const IKEV2_CERT_ENCODING_X509_SIGNATURE: u8 = 4;
 
 /// Borrowed typed view of an IKEv2 IDi or IDr payload.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -156,6 +163,104 @@ impl fmt::Debug for Ikev2AuthenticationPayload<'_> {
         f.debug_struct("Ikev2AuthenticationPayload")
             .field("auth_method", &self.auth_method)
             .field("auth_data_len", &self.auth_data.len())
+            .finish()
+    }
+}
+
+/// Borrowed typed view of an IKEv2 CERT payload.
+///
+/// `Debug` reports only the certificate data length, never the bytes.
+///
+/// @spec IETF RFC7296 3.6
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Ikev2CertificatePayload<'a> {
+    /// Certificate Encoding.
+    pub cert_encoding: u8,
+    /// Certificate Data bytes.
+    pub cert_data: &'a [u8],
+}
+
+impl<'a> Ikev2CertificatePayload<'a> {
+    /// Decode CERT from a raw payload.
+    pub fn decode(raw: RawPayload<'a>) -> Result<Self, Ikev2IkeAuthPayloadError> {
+        if raw.payload_type != PayloadType::Certificate {
+            return Err(Ikev2IkeAuthPayloadError::UnexpectedPayloadType);
+        }
+        Self::decode_body(raw.body)
+    }
+
+    /// Decode CERT body bytes.
+    pub fn decode_body(body: &'a [u8]) -> Result<Self, Ikev2IkeAuthPayloadError> {
+        if body.len() < CERT_FIXED_BODY_LEN {
+            return Err(Ikev2IkeAuthPayloadError::CertificateTooShort);
+        }
+        if body[0] == 0 {
+            return Err(Ikev2IkeAuthPayloadError::InvalidCertificateEncoding);
+        }
+        let cert_data = &body[CERT_FIXED_BODY_LEN..];
+        if cert_data.is_empty() {
+            return Err(Ikev2IkeAuthPayloadError::CertificateDataEmpty);
+        }
+        Ok(Self {
+            cert_encoding: body[0],
+            cert_data,
+        })
+    }
+}
+
+impl fmt::Debug for Ikev2CertificatePayload<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ikev2CertificatePayload")
+            .field("cert_encoding", &self.cert_encoding)
+            .field("cert_data_len", &self.cert_data.len())
+            .finish()
+    }
+}
+
+/// Borrowed typed view of an IKEv2 CERTREQ payload.
+///
+/// The Certification Authority field may be empty; when present it carries
+/// concatenated SHA-1 hashes of trusted CA SubjectPublicKeyInfo values for
+/// encoding 4.
+///
+/// @spec IETF RFC7296 3.7
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Ikev2CertificateRequestPayload<'a> {
+    /// Certificate Encoding.
+    pub cert_encoding: u8,
+    /// Certification Authority bytes.
+    pub ca_data: &'a [u8],
+}
+
+impl<'a> Ikev2CertificateRequestPayload<'a> {
+    /// Decode CERTREQ from a raw payload.
+    pub fn decode(raw: RawPayload<'a>) -> Result<Self, Ikev2IkeAuthPayloadError> {
+        if raw.payload_type != PayloadType::CertificateRequest {
+            return Err(Ikev2IkeAuthPayloadError::UnexpectedPayloadType);
+        }
+        Self::decode_body(raw.body)
+    }
+
+    /// Decode CERTREQ body bytes.
+    pub fn decode_body(body: &'a [u8]) -> Result<Self, Ikev2IkeAuthPayloadError> {
+        if body.len() < CERT_FIXED_BODY_LEN {
+            return Err(Ikev2IkeAuthPayloadError::CertificateRequestTooShort);
+        }
+        if body[0] == 0 {
+            return Err(Ikev2IkeAuthPayloadError::InvalidCertificateEncoding);
+        }
+        Ok(Self {
+            cert_encoding: body[0],
+            ca_data: &body[CERT_FIXED_BODY_LEN..],
+        })
+    }
+}
+
+impl fmt::Debug for Ikev2CertificateRequestPayload<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ikev2CertificateRequestPayload")
+            .field("cert_encoding", &self.cert_encoding)
+            .field("ca_data_len", &self.ca_data.len())
             .finish()
     }
 }
@@ -470,6 +575,10 @@ pub struct Ikev2IkeAuthCleartextPayloads<'a> {
     pub identification_responders: Vec<Ikev2IdentificationPayload<'a>>,
     /// AUTH payloads.
     pub authentications: Vec<Ikev2AuthenticationPayload<'a>>,
+    /// CERT payloads in wire order.
+    pub certificates: Vec<Ikev2CertificatePayload<'a>>,
+    /// CERTREQ payloads in wire order.
+    pub certificate_requests: Vec<Ikev2CertificateRequestPayload<'a>>,
     /// EAP payloads.
     pub eap: Vec<Ikev2EapPayload<'a>>,
     /// CP payloads.
@@ -494,6 +603,8 @@ impl fmt::Debug for Ikev2IkeAuthCleartextPayloads<'_> {
             .field("idi_count", &self.identification_initiators.len())
             .field("idr_count", &self.identification_responders.len())
             .field("auth_count", &self.authentications.len())
+            .field("cert_count", &self.certificates.len())
+            .field("certreq_count", &self.certificate_requests.len())
             .field("eap_count", &self.eap.len())
             .field("cp_count", &self.configurations.len())
             .field("sa_count", &self.security_associations.len())
@@ -503,6 +614,17 @@ impl fmt::Debug for Ikev2IkeAuthCleartextPayloads<'_> {
             .field("delete_count", &self.deletes.len())
             .field("other_payload_count", &self.other_payload_count)
             .finish()
+    }
+}
+
+impl Ikev2IkeAuthCleartextPayloads<'_> {
+    /// Return true when the peer sent an RFC 5998 EAP_ONLY_AUTHENTICATION
+    /// status notify, signalling it accepts EAP-only mutual authentication and
+    /// the responder may omit CERT payloads and signature AUTH.
+    pub fn eap_only_authentication_requested(&self) -> bool {
+        self.notifies
+            .iter()
+            .any(|notify| notify.is_eap_only_authentication())
     }
 }
 
@@ -527,6 +649,12 @@ pub fn decode_ike_auth_cleartext_payloads(
             PayloadType::Authentication => out
                 .authentications
                 .push(Ikev2AuthenticationPayload::decode(payload)?),
+            PayloadType::Certificate => out
+                .certificates
+                .push(Ikev2CertificatePayload::decode(payload)?),
+            PayloadType::CertificateRequest => out
+                .certificate_requests
+                .push(Ikev2CertificateRequestPayload::decode(payload)?),
             PayloadType::ExtensibleAuthentication => {
                 out.eap.push(Ikev2EapPayload::decode(payload)?)
             }
@@ -602,6 +730,44 @@ impl fmt::Debug for Ikev2AuthenticationPayloadBuild {
         f.debug_struct("Ikev2AuthenticationPayloadBuild")
             .field("auth_method", &self.auth_method)
             .field("auth_data_len", &self.auth_data.len())
+            .finish()
+    }
+}
+
+/// Owned CERT payload builder input.
+///
+/// `Debug` reports only the certificate data length, never the bytes.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Ikev2CertificatePayloadBuild {
+    /// Certificate Encoding.
+    pub cert_encoding: u8,
+    /// Certificate Data bytes.
+    pub cert_data: Vec<u8>,
+}
+
+impl fmt::Debug for Ikev2CertificatePayloadBuild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ikev2CertificatePayloadBuild")
+            .field("cert_encoding", &self.cert_encoding)
+            .field("cert_data_len", &self.cert_data.len())
+            .finish()
+    }
+}
+
+/// Owned CERTREQ payload builder input.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Ikev2CertificateRequestPayloadBuild {
+    /// Certificate Encoding.
+    pub cert_encoding: u8,
+    /// Certification Authority bytes; may be empty.
+    pub ca_data: Vec<u8>,
+}
+
+impl fmt::Debug for Ikev2CertificateRequestPayloadBuild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ikev2CertificateRequestPayloadBuild")
+            .field("cert_encoding", &self.cert_encoding)
+            .field("ca_data_len", &self.ca_data.len())
             .finish()
     }
 }
@@ -773,6 +939,46 @@ pub fn build_ike_auth_authentication_payload(
     out.extend_from_slice(&[0, 0, 0]);
     out.extend_from_slice(&input.auth_data);
     Ok(out)
+}
+
+/// Build a CERT payload body.
+pub fn build_ike_auth_certificate_payload(
+    input: &Ikev2CertificatePayloadBuild,
+) -> Result<Vec<u8>, Ikev2IkeAuthBuildError> {
+    if input.cert_encoding == 0 {
+        return Err(Ikev2IkeAuthBuildError::InvalidCertificateEncoding);
+    }
+    if input.cert_data.is_empty() {
+        return Err(Ikev2IkeAuthBuildError::CertificateDataEmpty);
+    }
+    let mut out = Vec::with_capacity(CERT_FIXED_BODY_LEN + input.cert_data.len());
+    out.push(input.cert_encoding);
+    out.extend_from_slice(&input.cert_data);
+    Ok(out)
+}
+
+/// Build a CERTREQ payload body.
+///
+/// The Certification Authority field is caller-supplied opaque bytes; for
+/// encoding 4 it must be a concatenation of 20-octet SHA-1 hashes of trusted CA
+/// SubjectPublicKeyInfo values, and it may be empty.
+pub fn build_ike_auth_certreq_payload(
+    input: &Ikev2CertificateRequestPayloadBuild,
+) -> Result<Vec<u8>, Ikev2IkeAuthBuildError> {
+    if input.cert_encoding == 0 {
+        return Err(Ikev2IkeAuthBuildError::InvalidCertificateEncoding);
+    }
+    let mut out = Vec::with_capacity(CERT_FIXED_BODY_LEN + input.ca_data.len());
+    out.push(input.cert_encoding);
+    out.extend_from_slice(&input.ca_data);
+    Ok(out)
+}
+
+/// Build a Notify payload body for an IKE_AUTH cleartext chain.
+pub fn build_ike_auth_notify_payload(
+    input: &Ikev2NotifyPayloadBuild,
+) -> Result<Vec<u8>, Ikev2IkeAuthBuildError> {
+    encode_notify_payload_build(input).map_err(|_| Ikev2IkeAuthBuildError::NotifySpiTooLong)
 }
 
 /// Returns the IKE_AUTH shared-key AUTH payload body length for `profile`.
@@ -1278,7 +1484,7 @@ fn transform_build_from_view(transform: &Ikev2SaTransform<'_>) -> Ikev2SaTransfo
     }
 }
 
-fn validate_signed_octets(
+pub(crate) fn validate_signed_octets(
     signed_octets: Ikev2IkeAuthSignedOctets<'_>,
 ) -> Result<(), Ikev2IkeAuthVerificationError> {
     if signed_octets.ike_sa_init_message.is_empty() {
@@ -1307,7 +1513,7 @@ fn validate_signed_octets(
     Ok(())
 }
 
-fn build_signed_octets(
+pub(crate) fn build_signed_octets(
     prf: Ikev2PrfAlgorithm,
     key_material: &Ikev2SaInitKeyMaterial,
     signed_octets: Ikev2IkeAuthSignedOctets<'_>,
@@ -1375,6 +1581,14 @@ pub enum Ikev2IkeAuthPayloadError {
     InvalidAuthenticationMethod,
     /// AUTH data was empty.
     AuthenticationDataEmpty,
+    /// CERT body ended before the Certificate Encoding octet.
+    CertificateTooShort,
+    /// CERT or CERTREQ Certificate Encoding was zero.
+    InvalidCertificateEncoding,
+    /// CERT Certificate Data was empty.
+    CertificateDataEmpty,
+    /// CERTREQ body ended before the Certificate Encoding octet.
+    CertificateRequestTooShort,
     /// EAP packet was empty.
     EapPacketEmpty,
     /// CP body ended before the fixed header.
@@ -1430,6 +1644,10 @@ impl Ikev2IkeAuthPayloadError {
             Self::AuthenticationTooShort => "ike_auth_auth_too_short",
             Self::InvalidAuthenticationMethod => "ike_auth_auth_invalid_method",
             Self::AuthenticationDataEmpty => "ike_auth_auth_data_empty",
+            Self::CertificateTooShort => "ike_auth_cert_too_short",
+            Self::InvalidCertificateEncoding => "ike_auth_cert_invalid_encoding",
+            Self::CertificateDataEmpty => "ike_auth_cert_data_empty",
+            Self::CertificateRequestTooShort => "ike_auth_certreq_too_short",
             Self::EapPacketEmpty => "ike_auth_eap_packet_empty",
             Self::ConfigurationTooShort => "ike_auth_cp_too_short",
             Self::InvalidConfigurationType => "ike_auth_cp_invalid_type",
@@ -1489,6 +1707,12 @@ pub enum Ikev2IkeAuthBuildError {
     InvalidAuthenticationMethod,
     /// AUTH data was empty.
     AuthenticationDataEmpty,
+    /// CERT or CERTREQ Certificate Encoding was zero.
+    InvalidCertificateEncoding,
+    /// CERT Certificate Data was empty.
+    CertificateDataEmpty,
+    /// Notify SPI exceeded the one-octet SPI Size field.
+    NotifySpiTooLong,
     /// CP type was zero.
     InvalidConfigurationType,
     /// TS payload had no selectors.
@@ -1518,6 +1742,9 @@ impl Ikev2IkeAuthBuildError {
             Self::IdentificationDataEmpty => "ike_auth_build_id_data_empty",
             Self::InvalidAuthenticationMethod => "ike_auth_build_auth_invalid_method",
             Self::AuthenticationDataEmpty => "ike_auth_build_auth_data_empty",
+            Self::InvalidCertificateEncoding => "ike_auth_build_cert_invalid_encoding",
+            Self::CertificateDataEmpty => "ike_auth_build_cert_data_empty",
+            Self::NotifySpiTooLong => "ike_auth_build_notify_spi_too_long",
             Self::InvalidConfigurationType => "ike_auth_build_cp_invalid_type",
             Self::TrafficSelectorMissing => "ike_auth_build_ts_missing",
             Self::TrafficSelectorTypeUnsupported => "ike_auth_build_ts_type_unsupported",
@@ -1588,6 +1815,17 @@ pub enum Ikev2IkeAuthVerificationError {
     },
     /// AUTH data did not match the transcript-bound expected value.
     AuthenticationFailed,
+    /// Signature AUTH data framing was malformed (RFC 7427 length prefix,
+    /// AlgorithmIdentifier, or signature bytes).
+    SignatureEncodingInvalid,
+    /// Signature AlgorithmIdentifier is not supported by this verifier.
+    SignatureAlgorithmUnsupported,
+    /// Supplied key type does not match the AUTH method or signature algorithm.
+    SignatureKeyMismatch,
+    /// Producing the signature failed inside the signing backend.
+    SignatureComputationFailed,
+    /// Signature did not verify over the transcript-bound signed octets.
+    SignatureVerificationFailed,
 }
 
 impl Ikev2IkeAuthVerificationError {
@@ -1609,6 +1847,13 @@ impl Ikev2IkeAuthVerificationError {
             }
             Self::AuthenticationDataLength { .. } => "ike_auth_verify_auth_data_length",
             Self::AuthenticationFailed => "ike_auth_verify_authentication_failed",
+            Self::SignatureEncodingInvalid => "ike_auth_verify_signature_encoding_invalid",
+            Self::SignatureAlgorithmUnsupported => {
+                "ike_auth_verify_signature_algorithm_unsupported"
+            }
+            Self::SignatureKeyMismatch => "ike_auth_verify_signature_key_mismatch",
+            Self::SignatureComputationFailed => "ike_auth_verify_signature_computation_failed",
+            Self::SignatureVerificationFailed => "ike_auth_verify_signature_verification_failed",
         }
     }
 }

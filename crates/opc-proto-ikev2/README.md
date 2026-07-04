@@ -19,10 +19,19 @@ Current scope is intentionally narrow:
   selected an IKE SA profile, derived key material, and packet direction;
 - a matching SA_INIT-derived AES-GCM-16 `SK` sealing helper for caller-built
   responder payloads;
-- typed IKE_AUTH cleartext payload views/builders for IDi/IDr, AUTH, EAP, CP,
-  SA, TSi/TSr, Notify, and Delete payload chains;
+- typed IKE_AUTH cleartext payload views/builders for IDi/IDr, AUTH, CERT,
+  CERTREQ, EAP, CP, SA, TSi/TSr, Notify, and Delete payload chains;
 - transcript-bound shared-key AUTH MIC computation and verification for
-  EAP/AAA-supplied keying material; and
+  EAP/AAA-supplied keying material;
+- transcript-bound signature AUTH computation and verification for RSA Digital
+  Signature (method 1, SHA-256) and RFC 7427 Digital Signature (method 14,
+  RSA-SHA256 and ECDSA-P256/P384) against a caller-supplied pinned SPKI or the
+  SubjectPublicKeyInfo of a caller-trusted X.509 certificate, without any
+  certificate-chain validation. Signing is ECDSA-only by default; RSA
+  *signing* requires the opt-in `rsa-signing` feature so default builds
+  perform no RSA private-key operations (RUSTSEC-2023-0071 posture), while
+  RSA *verification* of peers is always available;
+- RFC 5998 `EAP_ONLY_AUTHENTICATION` notify decode and emission helpers; and
 - product-neutral Child SA proposal/traffic-selector selection intent plus
   response SA/TS payload builders; and
 - RFC 7296 NAT-D hash computation and semantic evaluation from typed Notify

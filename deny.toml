@@ -4,6 +4,17 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # Marvin Attack timing sidechannel in the `rsa` crate's private-key
+    # operations. No fixed release exists upstream. Default builds of
+    # opc-proto-ikev2 use the crate for RSA signature *verification* only
+    # (public-key operations, outside the advisory's scope); RSA private-key
+    # signing is compiled only behind the opt-in `rsa-signing` feature and
+    # ECDSA responder certificates are the recommended deployment. This scan
+    # runs --all-features, so the dependency is flagged regardless. Remove
+    # once `rsa` ships the constant-time rewrite (tracked for the 0.10 line).
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin: no fixed version; verify-only by default, signing opt-in via rsa-signing feature" },
+]
 
 [licenses]
 version = 2

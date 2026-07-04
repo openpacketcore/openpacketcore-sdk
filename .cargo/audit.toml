@@ -1,0 +1,12 @@
+# cargo-audit configuration for the `Rust advisory scan` CI job.
+
+[advisories]
+# Marvin Attack timing sidechannel in the `rsa` crate's private-key
+# operations (no fixed release upstream). Default builds of opc-proto-ikev2
+# use the crate for RSA signature *verification* only (public-key
+# operations, outside the advisory's scope); RSA private-key signing is
+# compiled only behind the opt-in `rsa-signing` feature and ECDSA responder
+# certificates are the recommended deployment. Mirror of the ignore entry
+# in deny.toml — keep the two in sync and drop both once `rsa` ships the
+# constant-time rewrite.
+ignore = ["RUSTSEC-2023-0071"]
