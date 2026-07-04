@@ -135,8 +135,19 @@ fn cookie_response_builder_encodes_canonical_notify_response() {
     assert_eq!(response.header.initiator_spi, request.initiator_spi);
     assert_eq!(response.header.responder_spi, 0);
     assert_eq!(response.header.exchange_type, EXCHANGE_TYPE_IKE_SA_INIT);
-    assert!(response.header.flags.initiator());
-    assert!(response.header.flags.response());
+    assert!(
+        !response.header.flags.initiator(),
+        "responder must clear the Initiator flag (RFC 7296 §3.1)"
+    );
+    assert!(
+        response.header.flags.response(),
+        "responder must set the Response flag"
+    );
+    assert_eq!(
+        response.header.flags.canonical_raw(),
+        0x20,
+        "cookie response flags octet must be R=1, I=0"
+    );
     assert_eq!(response.header.message_id, 0);
 
     let mut encoded = BytesMut::new();

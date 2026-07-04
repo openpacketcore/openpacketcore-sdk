@@ -362,7 +362,9 @@ pub fn build_ike_sa_init_cookie_response(
         0,
         PayloadType::Notify,
         EXCHANGE_TYPE_IKE_SA_INIT,
-        HeaderFlags::from_bits(request_header.flags.initiator(), true, false),
+        // RFC 7296 §3.1: the responder MUST clear the Initiator flag in its
+        // messages, so the cookie challenge never inherits the request's I bit.
+        HeaderFlags::from_bits(false, true, false),
         request_header.message_id,
     );
     header.length = total_len_u32;
