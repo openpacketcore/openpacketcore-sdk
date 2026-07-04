@@ -12,6 +12,14 @@
 //! must supply a key it already trusts (a pinned SPKI or a chain-validated
 //! end-entity certificate).
 //!
+//! Signing defaults to ECDSA only. RSA *signing* (method 1, and RSA under
+//! method 14) is compiled in only with the `rsa-signing` cargo feature, so a
+//! default build performs no RSA private-key operations and stays outside the
+//! practical scope of RUSTSEC-2023-0071 (Marvin timing sidechannel in the
+//! `rsa` crate). RSA *verification* of peer signatures uses public-key
+//! operations only and is always available. Deploy ECDSA (P-256/P-384)
+//! responder certificates unless a peer population forces RSA.
+//!
 //! @spec IETF RFC7296 2.15, 3.8; IETF RFC7427
 //! @req REQ-IETF-RFC7427-IKE-AUTH-SIGNATURE-001
 
@@ -19,10 +27,9 @@ use std::{error::Error, fmt};
 
 use p256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use p256::pkcs8::DecodePrivateKey as EcDecodePrivateKey;
-use rsa::{
-    pkcs8::{DecodePrivateKey as RsaDecodePrivateKey, DecodePublicKey},
-    Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey,
-};
+#[cfg(feature = "rsa-signing")]
+use rsa::{pkcs8::DecodePrivateKey as RsaDecodePrivateKey, RsaPrivateKey};
+use rsa::{pkcs8::DecodePublicKey, Pkcs1v15Sign, RsaPublicKey};
 use sha2::{Digest, Sha256, Sha384};
 use x509_parser::prelude::{FromDer, SubjectPublicKeyInfo, X509Certificate};
 
@@ -72,6 +79,9 @@ const OID_NAMED_CURVE_P384: &str = "1.3.132.0.34";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ikev2SignatureAuthMethod {
     /// Method 1, RSA Digital Signature (RSASSA-PKCS1-v1_5 with SHA-256).
+    ///
+    /// Signing with this method requires the `rsa-signing` cargo feature.
+    #[cfg(feature = "rsa-signing")]
     RsaDigitalSignature,
     /// Method 14, RFC 7427 Digital Signature.
     DigitalSignature,
@@ -81,6 +91,7 @@ impl Ikev2SignatureAuthMethod {
     /// Return the RFC 7296 AUTH Method octet.
     pub const fn as_u8(self) -> u8 {
         match self {
+            #[cfg(feature = "rsa-signing")]
             Self::RsaDigitalSignature => IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE,
             Self::DigitalSignature => IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
         }
@@ -88,6 +99,7 @@ impl Ikev2SignatureAuthMethod {
 }
 
 enum SignaturePrivateKey {
+    #[cfg(feature = "rsa-signing")]
     Rsa(Box<RsaPrivateKey>),
     EcdsaP256(Box<p256::ecdsa::SigningKey>),
     EcdsaP384(Box<p384::ecdsa::SigningKey>),
@@ -107,10 +119,15 @@ pub struct Ikev2SignatureAuthKey {
 impl Ikev2SignatureAuthKey {
     /// Load an RSA private key from PKCS#8 DER for method 1 or method 14.
     ///
+    /// Available only with the `rsa-signing` cargo feature; see the module
+    /// documentation for the RUSTSEC-2023-0071 trade-off. Prefer the ECDSA
+    /// constructors.
+    ///
     /// # Errors
     ///
     /// Returns [`Ikev2SignatureKeyError`] when the DER is not a valid PKCS#8
     /// RSA private key.
+    #[cfg(feature = "rsa-signing")]
     pub fn rsa_pkcs8_der(
         method: Ikev2SignatureAuthMethod,
         pkcs8_der: &[u8],
@@ -166,6 +183,7 @@ impl fmt::Debug for Ikev2SignatureAuthKey {
             .field(
                 "key_kind",
                 &match self.private_key {
+                    #[cfg(feature = "rsa-signing")]
                     SignaturePrivateKey::Rsa(_) => "rsa",
                     SignaturePrivateKey::EcdsaP256(_) => "ecdsa_p256",
                     SignaturePrivateKey::EcdsaP384(_) => "ecdsa_p384",
@@ -299,14 +317,17 @@ pub fn compute_ike_auth_signature(
     let signed = build_signed_octets(profile.prf(), key_material, signed_octets)?;
 
     match (key.method, &key.private_key) {
+        #[cfg(feature = "rsa-signing")]
         (Ikev2SignatureAuthMethod::RsaDigitalSignature, SignaturePrivateKey::Rsa(private)) => {
             rsa_pkcs1v15_sha256_sign(private, &signed)
         }
+        #[cfg(feature = "rsa-signing")]
         (Ikev2SignatureAuthMethod::RsaDigitalSignature, _) => {
             Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch)
         }
         (Ikev2SignatureAuthMethod::DigitalSignature, private_key) => {
             let (algorithm_identifier, signature): (&[u8], Vec<u8>) = match private_key {
+                #[cfg(feature = "rsa-signing")]
                 SignaturePrivateKey::Rsa(private) => (
                     &RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
                     rsa_pkcs1v15_sha256_sign(private, &signed)?,
@@ -443,6 +464,7 @@ fn split_rfc7427_auth_data(
     Ok(rest.split_at(algorithm_identifier_len))
 }
 
+#[cfg(feature = "rsa-signing")]
 fn rsa_pkcs1v15_sha256_sign(
     private: &RsaPrivateKey,
     signed_octets: &[u8],

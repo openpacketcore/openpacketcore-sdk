@@ -14,6 +14,12 @@ categories = ["network-programming", "encoding"]
 publish = false
 
 [features]
+# Enables RSA private-key signing for IKE_AUTH methods 1 and 14. Off by
+# default so standard builds perform no RSA private-key operations and stay
+# outside the practical scope of RUSTSEC-2023-0071 (Marvin timing
+# sidechannel); RSA *verification* of peers is always available. Prefer
+# ECDSA (P-256/P-384) responder certificates.
+rsa-signing = []
 testkit = []
 
 [dependencies]

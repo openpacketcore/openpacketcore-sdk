@@ -2,9 +2,11 @@
 
 [advisories]
 # Marvin Attack timing sidechannel in the `rsa` crate's private-key
-# operations (no fixed release upstream). Accepted for the IKEv2 signature
-# AUTH path in opc-proto-ikev2, which performs RSASSA-PKCS1-v1_5 signing
-# only and never the PKCS#1 v1.5 decryption the advisory centers on.
-# Mirror of the ignore entry in deny.toml — keep the two in sync and drop
-# both once `rsa` ships the constant-time rewrite.
+# operations (no fixed release upstream). Default builds of opc-proto-ikev2
+# use the crate for RSA signature *verification* only (public-key
+# operations, outside the advisory's scope); RSA private-key signing is
+# compiled only behind the opt-in `rsa-signing` feature and ECDSA responder
+# certificates are the recommended deployment. Mirror of the ignore entry
+# in deny.toml — keep the two in sync and drop both once `rsa` ships the
+# constant-time rewrite.
 ignore = ["RUSTSEC-2023-0071"]

@@ -1,8 +1,7 @@
 use opc_proto_ikev2::{
-    build_ike_auth_authentication_payload, build_ike_auth_identification_payload,
-    compute_ike_auth_signature, derive_ike_sa_init_key_material, verify_ike_auth_signature,
-    Ikev2AuthenticationPayload, Ikev2AuthenticationPayloadBuild, Ikev2DhGroup,
-    Ikev2EncryptionAlgorithm, Ikev2IdentificationPayloadBuild, Ikev2IkeAuthPeer,
+    build_ike_auth_identification_payload, compute_ike_auth_signature,
+    derive_ike_sa_init_key_material, verify_ike_auth_signature, Ikev2AuthenticationPayload,
+    Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2IdentificationPayloadBuild, Ikev2IkeAuthPeer,
     Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError, Ikev2PrfAlgorithm,
     Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial, Ikev2SignatureAuthKey,
     Ikev2SignatureAuthMethod, Ikev2SignatureKeyError, Ikev2SignaturePublicKey,
@@ -11,9 +10,7 @@ use opc_proto_ikev2::{
     RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384, RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
 };
 
-const RSA_PKCS8_DER: &[u8] = include_bytes!("data/rsa2048_pkcs8.der");
 const RSA_SPKI_DER: &[u8] = include_bytes!("data/rsa2048_spki.der");
-const RSA_CERT_DER: &[u8] = include_bytes!("data/rsa2048_cert.der");
 const P256_PKCS8_DER: &[u8] = include_bytes!("data/p256_pkcs8.der");
 const P256_SPKI_DER: &[u8] = include_bytes!("data/p256_spki.der");
 const P256_CERT_DER: &[u8] = include_bytes!("data/p256_cert.der");
@@ -70,81 +67,6 @@ fn auth_payload(auth_method: u8, auth_data: &[u8]) -> Ikev2AuthenticationPayload
         auth_method,
         auth_data,
     }
-}
-
-#[test]
-fn rsa_method_1_signature_round_trips() {
-    let identity = identity_payload_body();
-    let octets = signed_octets(SA_INIT_RESPONSE, PEER_NONCE, &identity);
-    let key = Ikev2SignatureAuthKey::rsa_pkcs8_der(
-        Ikev2SignatureAuthMethod::RsaDigitalSignature,
-        RSA_PKCS8_DER,
-    )
-    .expect("RSA key");
-    assert_eq!(
-        key.method().as_u8(),
-        IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE
-    );
-
-    let auth_data =
-        compute_ike_auth_signature(profile(), &key_material(), octets, &key).expect("sign");
-    assert_eq!(auth_data.len(), 256);
-
-    let auth_body = build_ike_auth_authentication_payload(&Ikev2AuthenticationPayloadBuild {
-        auth_method: key.method().as_u8(),
-        auth_data: auth_data.clone(),
-    })
-    .expect("AUTH body");
-    assert_eq!(auth_body[0], IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE);
-
-    let public = Ikev2SignaturePublicKey::from_spki_der(RSA_SPKI_DER).expect("RSA SPKI");
-    verify_ike_auth_signature(
-        profile(),
-        &key_material(),
-        octets,
-        &public,
-        &auth_payload(IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE, &auth_data),
-    )
-    .expect("method 1 verifies");
-}
-
-#[test]
-fn rsa_method_14_signature_round_trips_with_certificate_key() {
-    let identity = identity_payload_body();
-    let octets = signed_octets(SA_INIT_RESPONSE, PEER_NONCE, &identity);
-    let key = Ikev2SignatureAuthKey::rsa_pkcs8_der(
-        Ikev2SignatureAuthMethod::DigitalSignature,
-        RSA_PKCS8_DER,
-    )
-    .expect("RSA key");
-
-    let auth_data =
-        compute_ike_auth_signature(profile(), &key_material(), octets, &key).expect("sign");
-
-    // RFC 7427 framing: length octet, AlgorithmIdentifier DER, raw signature.
-    assert_eq!(
-        usize::from(auth_data[0]),
-        RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256.len()
-    );
-    assert_eq!(
-        &auth_data[1..1 + RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256.len()],
-        RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256
-    );
-    assert_eq!(
-        auth_data.len(),
-        1 + RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256.len() + 256
-    );
-
-    let public =
-        Ikev2SignaturePublicKey::from_x509_certificate_der(RSA_CERT_DER).expect("cert SPKI");
-    verify_ike_auth_signature(
-        profile(),
-        &key_material(),
-        octets,
-        &public,
-        &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &auth_data),
-    )
-    .expect("method 14 RSA verifies");
 }
 
 #[test]
@@ -208,17 +130,13 @@ fn ecdsa_p384_method_14_signature_round_trips() {
 fn tampered_transcript_fails_verification() {
     let identity = identity_payload_body();
     let octets = signed_octets(SA_INIT_RESPONSE, PEER_NONCE, &identity);
-    let key = Ikev2SignatureAuthKey::rsa_pkcs8_der(
-        Ikev2SignatureAuthMethod::DigitalSignature,
-        RSA_PKCS8_DER,
-    )
-    .expect("RSA key");
+    let key = Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(P256_PKCS8_DER).expect("P-256 key");
     let auth_data =
         compute_ike_auth_signature(profile(), &key_material(), octets, &key).expect("sign");
 
     let tampered_nonce = [0x67; 32];
     let tampered = signed_octets(SA_INIT_RESPONSE, &tampered_nonce, &identity);
-    let public = Ikev2SignaturePublicKey::from_spki_der(RSA_SPKI_DER).expect("RSA SPKI");
+    let public = Ikev2SignaturePublicKey::from_spki_der(P256_SPKI_DER).expect("P-256 SPKI");
     assert_eq!(
         verify_ike_auth_signature(
             profile(),
@@ -235,29 +153,25 @@ fn tampered_transcript_fails_verification() {
 fn wrong_key_type_fails_closed() {
     let identity = identity_payload_body();
     let octets = signed_octets(SA_INIT_RESPONSE, PEER_NONCE, &identity);
-    let key = Ikev2SignatureAuthKey::rsa_pkcs8_der(
-        Ikev2SignatureAuthMethod::DigitalSignature,
-        RSA_PKCS8_DER,
-    )
-    .expect("RSA key");
+    let key = Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(P256_PKCS8_DER).expect("P-256 key");
     let auth_data =
         compute_ike_auth_signature(profile(), &key_material(), octets, &key).expect("sign");
 
-    // RSA-signed AUTH data presented against an ECDSA trust anchor.
-    let ec_public = Ikev2SignaturePublicKey::from_spki_der(P256_SPKI_DER).expect("P-256 SPKI");
+    // ECDSA-signed AUTH data presented against an RSA trust anchor.
+    let rsa_public = Ikev2SignaturePublicKey::from_spki_der(RSA_SPKI_DER).expect("RSA SPKI");
     assert_eq!(
         verify_ike_auth_signature(
             profile(),
             &key_material(),
             octets,
-            &ec_public,
+            &rsa_public,
             &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &auth_data),
         ),
         Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch)
     );
 
     // Flipping a signature bit against the right key fails as a bad signature.
-    let rsa_public = Ikev2SignaturePublicKey::from_spki_der(RSA_SPKI_DER).expect("RSA SPKI");
+    let ec_public = Ikev2SignaturePublicKey::from_spki_der(P256_SPKI_DER).expect("P-256 SPKI");
     let mut corrupted = auth_data.clone();
     let last = corrupted.len() - 1;
     corrupted[last] ^= 0x01;
@@ -266,7 +180,7 @@ fn wrong_key_type_fails_closed() {
             profile(),
             &key_material(),
             octets,
-            &rsa_public,
+            &ec_public,
             &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &corrupted),
         ),
         Err(Ikev2IkeAuthVerificationError::SignatureVerificationFailed)
@@ -349,15 +263,15 @@ fn non_signature_auth_methods_are_rejected() {
 }
 
 #[test]
-fn method_1_requires_rsa_key() {
+fn method_1_payload_with_ec_key_fails_closed() {
     let identity = identity_payload_body();
     let octets = signed_octets(SA_INIT_RESPONSE, PEER_NONCE, &identity);
     let key = Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(P256_PKCS8_DER).expect("P-256 key");
     // EC constructors pin the method to Digital Signature (14).
     assert_eq!(key.method(), Ikev2SignatureAuthMethod::DigitalSignature);
 
-    // A method-1 payload signed by an EC key can only come from a mismatched
-    // verifier call; the verify side rejects it.
+    // A method-1 payload can only be verified against an RSA key; an ECDSA
+    // trust anchor fails closed.
     let public = Ikev2SignaturePublicKey::from_spki_der(P256_SPKI_DER).expect("P-256 SPKI");
     let auth_data =
         compute_ike_auth_signature(profile(), &key_material(), octets, &key).expect("sign");
@@ -376,14 +290,6 @@ fn method_1_requires_rsa_key() {
 #[test]
 fn key_parsing_fails_closed_on_garbage() {
     assert_eq!(
-        Ikev2SignatureAuthKey::rsa_pkcs8_der(
-            Ikev2SignatureAuthMethod::RsaDigitalSignature,
-            &[0u8; 16]
-        )
-        .expect_err("garbage RSA key"),
-        Ikev2SignatureKeyError::RsaPrivateKeyParse
-    );
-    assert_eq!(
         Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(&[0u8; 16]).expect_err("garbage EC key"),
         Ikev2SignatureKeyError::EcdsaPrivateKeyParse
     );
@@ -396,20 +302,16 @@ fn key_parsing_fails_closed_on_garbage() {
             .expect_err("garbage certificate"),
         Ikev2SignatureKeyError::CertificateParse
     );
-    // An RSA key handed to the EC parser fails as an EC parse error.
+    // A P-384 key handed to the P-256 parser fails as an EC parse error.
     assert_eq!(
-        Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(RSA_PKCS8_DER).expect_err("RSA into EC"),
+        Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(P384_PKCS8_DER).expect_err("P-384 into P-256"),
         Ikev2SignatureKeyError::EcdsaPrivateKeyParse
     );
 }
 
 #[test]
 fn debug_output_redacts_key_material() {
-    let key = Ikev2SignatureAuthKey::rsa_pkcs8_der(
-        Ikev2SignatureAuthMethod::DigitalSignature,
-        RSA_PKCS8_DER,
-    )
-    .expect("RSA key");
+    let key = Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(P256_PKCS8_DER).expect("P-256 key");
     let debug = format!("{key:?}");
     assert!(debug.contains("key_kind"));
     assert!(debug.len() < 128);
@@ -418,4 +320,122 @@ fn debug_output_redacts_key_material() {
     let debug = format!("{public:?}");
     assert!(debug.contains("ecdsa_p256"));
     assert!(debug.len() < 128);
+}
+
+/// RSA signing coverage, compiled only with the opt-in `rsa-signing` feature.
+#[cfg(feature = "rsa-signing")]
+mod rsa_signing {
+    use super::*;
+    use opc_proto_ikev2::{build_ike_auth_authentication_payload, Ikev2AuthenticationPayloadBuild};
+
+    const RSA_PKCS8_DER: &[u8] = include_bytes!("data/rsa2048_pkcs8.der");
+    const RSA_CERT_DER: &[u8] = include_bytes!("data/rsa2048_cert.der");
+
+    #[test]
+    fn rsa_method_1_signature_round_trips() {
+        let identity = identity_payload_body();
+        let octets = signed_octets(SA_INIT_RESPONSE, PEER_NONCE, &identity);
+        let key = Ikev2SignatureAuthKey::rsa_pkcs8_der(
+            Ikev2SignatureAuthMethod::RsaDigitalSignature,
+            RSA_PKCS8_DER,
+        )
+        .expect("RSA key");
+        assert_eq!(
+            key.method().as_u8(),
+            IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE
+        );
+
+        let auth_data =
+            compute_ike_auth_signature(profile(), &key_material(), octets, &key).expect("sign");
+        assert_eq!(auth_data.len(), 256);
+
+        let auth_body = build_ike_auth_authentication_payload(&Ikev2AuthenticationPayloadBuild {
+            auth_method: key.method().as_u8(),
+            auth_data: auth_data.clone(),
+        })
+        .expect("AUTH body");
+        assert_eq!(auth_body[0], IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE);
+
+        let public = Ikev2SignaturePublicKey::from_spki_der(RSA_SPKI_DER).expect("RSA SPKI");
+        verify_ike_auth_signature(
+            profile(),
+            &key_material(),
+            octets,
+            &public,
+            &auth_payload(IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE, &auth_data),
+        )
+        .expect("method 1 verifies");
+    }
+
+    #[test]
+    fn rsa_method_14_signature_round_trips_with_certificate_key() {
+        let identity = identity_payload_body();
+        let octets = signed_octets(SA_INIT_RESPONSE, PEER_NONCE, &identity);
+        let key = Ikev2SignatureAuthKey::rsa_pkcs8_der(
+            Ikev2SignatureAuthMethod::DigitalSignature,
+            RSA_PKCS8_DER,
+        )
+        .expect("RSA key");
+
+        let auth_data =
+            compute_ike_auth_signature(profile(), &key_material(), octets, &key).expect("sign");
+
+        // RFC 7427 framing: length octet, AlgorithmIdentifier DER, raw signature.
+        assert_eq!(
+            usize::from(auth_data[0]),
+            RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256.len()
+        );
+        assert_eq!(
+            &auth_data[1..1 + RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256.len()],
+            RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256
+        );
+        assert_eq!(
+            auth_data.len(),
+            1 + RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256.len() + 256
+        );
+
+        let public =
+            Ikev2SignaturePublicKey::from_x509_certificate_der(RSA_CERT_DER).expect("cert SPKI");
+        verify_ike_auth_signature(
+            profile(),
+            &key_material(),
+            octets,
+            &public,
+            &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &auth_data),
+        )
+        .expect("method 14 RSA verifies");
+    }
+
+    #[test]
+    fn rsa_key_parsing_fails_closed_on_garbage() {
+        assert_eq!(
+            Ikev2SignatureAuthKey::rsa_pkcs8_der(
+                Ikev2SignatureAuthMethod::RsaDigitalSignature,
+                &[0u8; 16]
+            )
+            .expect_err("garbage RSA key"),
+            Ikev2SignatureKeyError::RsaPrivateKeyParse
+        );
+        // An EC key handed to the RSA parser fails as an RSA parse error.
+        assert_eq!(
+            Ikev2SignatureAuthKey::rsa_pkcs8_der(
+                Ikev2SignatureAuthMethod::DigitalSignature,
+                P256_PKCS8_DER
+            )
+            .expect_err("EC into RSA"),
+            Ikev2SignatureKeyError::RsaPrivateKeyParse
+        );
+    }
+
+    #[test]
+    fn rsa_debug_output_redacts_key_material() {
+        let key = Ikev2SignatureAuthKey::rsa_pkcs8_der(
+            Ikev2SignatureAuthMethod::DigitalSignature,
+            RSA_PKCS8_DER,
+        )
+        .expect("RSA key");
+        let debug = format!("{key:?}");
+        assert!(debug.contains("key_kind"));
+        assert!(debug.len() < 128);
+    }
 }
