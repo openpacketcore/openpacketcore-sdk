@@ -233,9 +233,15 @@ pub fn recv_msg(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<Received> {
         iov_len: buffer.len(),
     };
     let control_len = {
-        // SAFETY: The argument is the size of the control-message payload type
-        // and the returned buffer size is used only for ancillary data allocation.
-        unsafe { libc::CMSG_SPACE(mem::size_of::<libc::sctp_rcvinfo>() as libc::c_uint) }
+        // SAFETY: The arguments are the sizes of the control-message payload
+        // types and the returned buffer size is used only for ancillary data
+        // allocation. Space for both the modern `sctp_rcvinfo` and the legacy
+        // `sctp_sndrcvinfo` keeps `recvmsg` from setting MSG_CTRUNC when a
+        // kernel or subscription delivers more than one receive-info cmsg.
+        unsafe {
+            libc::CMSG_SPACE(mem::size_of::<libc::sctp_rcvinfo>() as libc::c_uint)
+                + libc::CMSG_SPACE(mem::size_of::<libc::sctp_sndrcvinfo>() as libc::c_uint)
+        }
     };
     let mut control = vec![0_u8; control_len as usize];
     // SAFETY: Zeroed `msghdr` is initialized below before `recvmsg`.
@@ -254,28 +260,33 @@ pub fn recv_msg(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<Received> {
 
     let mut info = None;
     // SAFETY: `header` contains the control buffer just filled by `recvmsg`.
-    // This implementation only requests one `SCTP_RCVINFO` control message, so
-    // inspecting the first header is sufficient and avoids non-portable
-    // `CMSG_NXTHDR` availability differences in `libc`.
+    // `CMSG_FIRSTHDR`/`CMSG_NXTHDR` only yield headers within that buffer, so
+    // the walk stays in bounds; the level/type/length checks prove the cmsg
+    // payload holds an `sctp_rcvinfo` before it is read. The kernel may
+    // deliver other cmsgs (e.g. the legacy `sctp_sndrcvinfo`) first, so the
+    // walk must not assume `SCTP_RCVINFO` is the first header.
     unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&header);
-        if !cmsg.is_null()
-            && (*cmsg).cmsg_level == libc::IPPROTO_SCTP
-            && (*cmsg).cmsg_type == libc::SCTP_RCVINFO
-            && (*cmsg).cmsg_len
-                >= libc::CMSG_LEN(mem::size_of::<libc::sctp_rcvinfo>() as libc::c_uint) as _
-        {
-            let raw = ptr::read(libc::CMSG_DATA(cmsg).cast::<libc::sctp_rcvinfo>());
-            info = Some(RecvInfo {
-                stream_id: raw.rcv_sid,
-                ssn: raw.rcv_ssn,
-                flags: raw.rcv_flags,
-                ppid_network_order: raw.rcv_ppid,
-                tsn: raw.rcv_tsn,
-                cumulative_tsn: raw.rcv_cumtsn,
-                context: raw.rcv_context,
-                assoc_id: raw.rcv_assoc_id,
-            });
+        let mut cmsg = libc::CMSG_FIRSTHDR(&header);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::IPPROTO_SCTP
+                && (*cmsg).cmsg_type == libc::SCTP_RCVINFO
+                && (*cmsg).cmsg_len
+                    >= libc::CMSG_LEN(mem::size_of::<libc::sctp_rcvinfo>() as libc::c_uint) as _
+            {
+                let raw = ptr::read(libc::CMSG_DATA(cmsg).cast::<libc::sctp_rcvinfo>());
+                info = Some(RecvInfo {
+                    stream_id: raw.rcv_sid,
+                    ssn: raw.rcv_ssn,
+                    flags: raw.rcv_flags,
+                    ppid_network_order: raw.rcv_ppid,
+                    tsn: raw.rcv_tsn,
+                    cumulative_tsn: raw.rcv_cumtsn,
+                    context: raw.rcv_context,
+                    assoc_id: raw.rcv_assoc_id,
+                });
+                break;
+            }
+            cmsg = libc::CMSG_NXTHDR(&header, cmsg);
         }
     }
 
@@ -411,6 +422,53 @@ mod tests {
     use std::mem::{align_of, offset_of, size_of};
     use std::os::fd::AsFd;
 
+    const TEST_INIT: InitMsg = InitMsg {
+        outbound_streams: 8,
+        inbound_streams: 8,
+        max_attempts: 4,
+        max_init_timeout_ms: 1000,
+    };
+
+    fn wait_fd(fd: BorrowedFd<'_>, events: libc::c_short) {
+        let mut poll_fd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: `poll_fd` is a valid single-entry pollfd array for `poll`.
+        let rc = unsafe { libc::poll(&mut poll_fd, 1, 5000) };
+        assert!(rc > 0, "poll timed out waiting for fd readiness");
+    }
+
+    fn local_addr(fd: BorrowedFd<'_>) -> SocketAddr {
+        // SAFETY: Zeroed `sockaddr_storage` is a valid receive buffer.
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let mut len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: `storage` and `len` are valid writable buffers for `getsockname`.
+        let rc = unsafe {
+            libc::getsockname(
+                fd.as_raw_fd(),
+                (&mut storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr>(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockname failed");
+        raw_to_socket_addr(&storage, len).unwrap()
+    }
+
+    fn recv_data_message(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> Received {
+        for _ in 0..100 {
+            wait_fd(fd, libc::POLLIN);
+            match recv_msg(fd, buffer) {
+                Ok(received) if received.flags.notification => continue,
+                Ok(received) => return received,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => panic!("recv_msg failed: {error}"),
+            }
+        }
+        panic!("no SCTP DATA message received");
+    }
+
     #[test]
     fn libc_sctp_layouts_match_expected_linux_uapi_shape() {
         assert_eq!(size_of::<libc::sctp_initmsg>(), 8);
@@ -449,6 +507,57 @@ mod tests {
                 assert!(code == libc::EPROTONOSUPPORT || code == libc::EAFNOSUPPORT);
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires Linux kernel SCTP support"]
+    fn loopback_data_receive_keeps_control_data_intact() {
+        let listener = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne).unwrap();
+        set_initmsg(listener.as_fd(), TEST_INIT).unwrap();
+        set_recv_rcvinfo(listener.as_fd(), true).unwrap();
+        set_events(listener.as_fd(), EventSubscriptions::default()).unwrap();
+        bind(listener.as_fd(), &"127.0.0.1:0".parse().unwrap()).unwrap();
+        listen(listener.as_fd(), 8).unwrap();
+        let server_addr = local_addr(listener.as_fd());
+
+        let client = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne).unwrap();
+        set_initmsg(client.as_fd(), TEST_INIT).unwrap();
+        if connect(client.as_fd(), &server_addr).unwrap() == ConnectStatus::InProgress {
+            wait_fd(client.as_fd(), libc::POLLOUT);
+            assert!(socket_error(client.as_fd()).unwrap().is_none());
+        }
+
+        wait_fd(listener.as_fd(), libc::POLLIN);
+        let (accepted, _peer) = accept(listener.as_fd()).unwrap();
+
+        let payload = vec![0xAB_u8; 300];
+        let ppid_network_order = 46_u32.to_be();
+        let sent = send_msg(
+            client.as_fd(),
+            &payload,
+            SendInfo {
+                stream_id: 1,
+                flags: 0,
+                ppid_network_order,
+                context: 0,
+                assoc_id: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(sent, payload.len());
+
+        let mut buffer = vec![0_u8; 64 * 1024];
+        let received = recv_data_message(accepted.as_fd(), &mut buffer);
+        assert_eq!(received.bytes, payload.len());
+        assert!(received.flags.end_of_record);
+        assert!(!received.flags.payload_truncated);
+        assert!(
+            !received.flags.control_truncated,
+            "kernel truncated SCTP ancillary data (MSG_CTRUNC)"
+        );
+        let info = received.info.expect("SCTP_RCVINFO control message missing");
+        assert_eq!(info.stream_id, 1);
+        assert_eq!(info.ppid_network_order, ppid_network_order);
     }
 
     #[test]
