@@ -1212,7 +1212,7 @@ fn encode_nonce_payload_build(
     Ok(payload.nonce.clone())
 }
 
-fn encode_notify_payload_build(
+pub(crate) fn encode_notify_payload_build(
     payload: &Ikev2NotifyPayloadBuild,
 ) -> Result<Vec<u8>, Ikev2SaInitBuildError> {
     let spi_size =
