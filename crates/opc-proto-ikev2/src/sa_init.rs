@@ -1191,7 +1191,7 @@ fn encode_attribute_build(
     Ok(())
 }
 
-fn encode_ke_payload_build(
+pub(crate) fn encode_ke_payload_build(
     payload: &Ikev2KeyExchangePayloadBuild,
 ) -> Result<Vec<u8>, Ikev2SaInitBuildError> {
     if payload.dh_group == 0 {
@@ -1207,7 +1207,7 @@ fn encode_ke_payload_build(
     Ok(out)
 }
 
-fn encode_nonce_payload_build(
+pub(crate) fn encode_nonce_payload_build(
     payload: &Ikev2NoncePayloadBuild,
 ) -> Result<Vec<u8>, Ikev2SaInitBuildError> {
     validate_nonce_len_for_build(payload.nonce.len())?;
