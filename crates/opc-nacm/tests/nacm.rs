@@ -1,6 +1,6 @@
 use opc_nacm::{
-    ModuleRegistry, NacmAction, NacmEffect, NacmEvaluator, NacmPolicy, NacmRule, PolicyVersion,
-    YangPath, YangPathPattern,
+    ModuleRegistry, NacmAction, NacmEffect, NacmEvaluator, NacmPolicy, NacmRule, NacmRuleList,
+    PolicyVersion, YangPath, YangPathPattern,
 };
 use std::str::FromStr;
 
@@ -271,6 +271,128 @@ fn cache_capacity_is_bounded() {
     assert!(first_after_eviction.is_allowed());
     assert!(!first_after_eviction.cache_hit());
     assert_eq!(evaluator.cached_entries(), 1);
+}
+
+#[test]
+fn rule_list_applies_only_to_matching_principal_group() {
+    let registry = registry();
+    let path =
+        YangPath::parse("/if:interfaces/interface/config/name", &registry).expect("normalize path");
+    let pattern =
+        YangPathPattern::parse("/if:interfaces/interface/config/**", &registry).expect("pattern");
+    let policy = NacmPolicy::builder(PolicyVersion::new(1))
+        .add_rule_list(
+            NacmRuleList::new(
+                "telco-writers",
+                ["telco-admin"],
+                vec![NacmRule::allow(NacmAction::Update, pattern)],
+            )
+            .expect("rule list"),
+        )
+        .build();
+    let mut evaluator = NacmEvaluator::new();
+
+    let no_group = evaluator.evaluate_for_groups(&policy, &path, NacmAction::Update, &[]);
+    assert!(!no_group.is_allowed());
+    assert_eq!(no_group.matched_rule_index(), None);
+
+    let groups = vec!["telco-admin".to_string()];
+    let matching_group = evaluator.evaluate_for_groups(&policy, &path, NacmAction::Update, &groups);
+    assert!(matching_group.is_allowed());
+    assert_eq!(matching_group.matched_rule_index(), Some(0));
+}
+
+#[test]
+fn rule_list_order_is_first_match_within_matching_groups() {
+    let registry = registry();
+    let path =
+        YangPath::parse("/if:interfaces/interface/config/name", &registry).expect("normalize path");
+    let broad =
+        YangPathPattern::parse("/if:interfaces/interface/config/**", &registry).expect("broad");
+    let exact =
+        YangPathPattern::parse("/if:interfaces/interface/config/name", &registry).expect("exact");
+    let policy = NacmPolicy::builder(PolicyVersion::new(1))
+        .add_rule_list(
+            NacmRuleList::new(
+                "ops-deny",
+                ["ops"],
+                vec![NacmRule::deny(NacmAction::Read, broad)],
+            )
+            .expect("deny list"),
+        )
+        .add_rule_list(
+            NacmRuleList::new(
+                "ops-allow",
+                ["ops"],
+                vec![NacmRule::allow(NacmAction::Read, exact)],
+            )
+            .expect("allow list"),
+        )
+        .build();
+    let groups = vec!["ops".to_string()];
+
+    let decision =
+        NacmEvaluator::new().evaluate_for_groups(&policy, &path, NacmAction::Read, &groups);
+
+    assert_eq!(decision.effect(), NacmEffect::Deny);
+    assert_eq!(decision.matched_rule_index(), Some(0));
+}
+
+#[test]
+fn all_users_rule_list_matches_principals_without_groups() {
+    let registry = registry();
+    let path = YangPath::parse("/sys:system", &registry).expect("normalize path");
+    let policy = NacmPolicy::builder(PolicyVersion::new(1))
+        .add_rule_list(
+            NacmRuleList::all_users(
+                "everyone",
+                vec![NacmRule::allow(
+                    NacmAction::Read,
+                    YangPathPattern::parse("/sys:system", &registry).expect("pattern"),
+                )],
+            )
+            .expect("rule list"),
+        )
+        .build();
+
+    let decision = NacmEvaluator::new().evaluate_for_groups(&policy, &path, NacmAction::Read, &[]);
+
+    assert!(decision.is_allowed());
+}
+
+#[test]
+fn evaluator_cache_is_scoped_by_principal_groups() {
+    let registry = registry();
+    let path = YangPath::parse("/sys:system", &registry).expect("normalize path");
+    let policy = NacmPolicy::builder(PolicyVersion::new(1))
+        .add_rule_list(
+            NacmRuleList::new(
+                "admins",
+                ["admin"],
+                vec![NacmRule::allow(
+                    NacmAction::Read,
+                    YangPathPattern::parse("/sys:system", &registry).expect("pattern"),
+                )],
+            )
+            .expect("rule list"),
+        )
+        .build();
+    let admin_groups = vec!["admin".to_string()];
+    let guest_groups = vec!["guest".to_string()];
+    let mut evaluator = NacmEvaluator::new();
+
+    let admin = evaluator.evaluate_for_groups(&policy, &path, NacmAction::Read, &admin_groups);
+    assert!(admin.is_allowed());
+    assert!(!admin.cache_hit());
+
+    let guest = evaluator.evaluate_for_groups(&policy, &path, NacmAction::Read, &guest_groups);
+    assert!(!guest.is_allowed());
+    assert!(!guest.cache_hit());
+
+    let guest_cached =
+        evaluator.evaluate_for_groups(&policy, &path, NacmAction::Read, &guest_groups);
+    assert!(!guest_cached.is_allowed());
+    assert!(guest_cached.cache_hit());
 }
 
 #[test]

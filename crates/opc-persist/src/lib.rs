@@ -120,7 +120,7 @@ pub use quorum::{FencedReplica, QuorumConfigStore};
 pub use security_policy::TEST_COMMIT_FAIL;
 pub use security_policy::{
     ActivePolicyMetadata, PolicyHistoryEntry, SecurityPolicyError, SecurityPolicyService,
-    SerializablePolicy, SerializableRule, SqliteSecurityPolicyService,
+    SerializablePolicy, SerializableRule, SerializableRuleList, SqliteSecurityPolicyService,
 };
 pub use types::{
     extract_tenant, redact_entry, AuditKey, AuditOpType, AuditRecord, CommitRecord, CommitSource,

@@ -66,7 +66,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | [`opc-mgmt-schema`](crates/opc-mgmt-schema/) | Runtime schema-registry contract consumed by generated CNF models and northbound servers. | [RFC 002](docs/rfc/002-yang-projection.md) |
 | [`opc-mgmt-path`](crates/opc-mgmt-path/) | Registry-validated YANG path normalization shared by gNMI, NETCONF, NACM, config commits, and audit. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-mgmt-principal`](crates/opc-mgmt-principal/) | Converts transport-authenticated SPIFFE or SSH identities into grant-free config principals. | [RFC 001](docs/rfc/001-management-substrate.md) |
-| [`opc-mgmt-authz`](crates/opc-mgmt-authz/) | Shared NACM authorization facade for reads, subscriptions, and management RPC/action execution. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-authz`](crates/opc-mgmt-authz/) | Shared NACM authorization facade for reads, subscriptions, config writes, and management RPC/action execution. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-mgmt-audit`](crates/opc-mgmt-audit/) | Management operation audit event model and pluggable audit sink for allowed, failed, and denied requests. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-mgmt-errors`](crates/opc-mgmt-errors/) | Transport-neutral management status taxonomy and gNMI/NETCONF error mappings. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-mgmt-limits`](crates/opc-mgmt-limits/) | Shared fail-closed input limits for management protocol parsers and sessions. | [RFC 001](docs/rfc/001-management-substrate.md) |

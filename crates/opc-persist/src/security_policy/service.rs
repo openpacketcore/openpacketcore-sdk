@@ -8,8 +8,8 @@ use opc_nacm::{
 };
 
 use super::crypto::{
-    compile_serializable_policy, decrypt_policy, encrypt_policy, to_serializable_policy,
-    validate_principal_tenant_and_roles,
+    compile_serializable_policy, decrypt_policy, encrypt_policy, register_path_modules,
+    register_policy_modules, to_serializable_policy, validate_principal_tenant_and_roles,
 };
 #[cfg(any(test, feature = "dangerous-test-hooks"))]
 use super::TEST_COMMIT_FAIL;
@@ -99,7 +99,8 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
         tenant: &str,
         principal: &str,
     ) -> Result<String, SecurityPolicyError> {
-        let (validated_spiffe, roles) = validate_principal_tenant_and_roles(principal, tenant)?;
+        let (validated_spiffe, roles, groups) =
+            validate_principal_tenant_and_roles(principal, tenant)?;
 
         if !roles.iter().any(|r| r == "security-admin") {
             return Err(SecurityPolicyError::Unauthorized(format!(
@@ -115,15 +116,7 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
 
         let mut registry = ModuleRegistry::new();
         let _ = registry.register_module("security", "security");
-        for rule in active_policy.rules() {
-            for segment in rule.path().to_string().split('/') {
-                if let Some((prefix, _)) = segment.split_once(':') {
-                    if !prefix.is_empty() && prefix != "*" {
-                        let _ = registry.register_module(prefix, prefix);
-                    }
-                }
-            }
-        }
+        register_policy_modules(&mut registry, &active_policy);
 
         let path = YangPath::parse("/security:policy", &registry).map_err(|e| {
             tracing::error!(err = ?e, "Failed to parse YangPath /security:policy");
@@ -131,7 +124,12 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
         })?;
 
         let mut evaluator = NacmEvaluator::new();
-        let decision = evaluator.evaluate(&active_policy, &path, NacmAction::SecurityAdmin);
+        let decision = evaluator.evaluate_for_groups(
+            &active_policy,
+            &path,
+            NacmAction::SecurityAdmin,
+            &groups,
+        );
 
         if !decision.is_allowed() {
             let _ = self
@@ -330,7 +328,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
         tenant: &str,
         principal: &str,
     ) -> Result<(), SecurityPolicyError> {
-        let validated_spiffe = validate_principal_tenant_and_roles(principal, tenant)?.0;
+        let (validated_spiffe, _, groups) = validate_principal_tenant_and_roles(principal, tenant)?;
 
         let conn_mutex = self.backend.conn();
         let row = {
@@ -363,15 +361,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
 
         let mut registry = ModuleRegistry::new();
         let _ = registry.register_module("security", "security");
-        for rule in candidate_policy.rules() {
-            for segment in rule.path().to_string().split('/') {
-                if let Some((prefix, _)) = segment.split_once(':') {
-                    if !prefix.is_empty() && prefix != "*" {
-                        let _ = registry.register_module(prefix, prefix);
-                    }
-                }
-            }
-        }
+        register_policy_modules(&mut registry, &candidate_policy);
 
         let path = YangPath::parse("/security:policy", &registry).map_err(|e| {
             tracing::error!(err = ?e, "Failed to parse path /security:policy for validation");
@@ -379,7 +369,12 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
         })?;
 
         let mut evaluator = NacmEvaluator::new();
-        let decision = evaluator.evaluate(&candidate_policy, &path, NacmAction::SecurityAdmin);
+        let decision = evaluator.evaluate_for_groups(
+            &candidate_policy,
+            &path,
+            NacmAction::SecurityAdmin,
+            &groups,
+        );
 
         if !decision.is_allowed() {
             let reason = "Validation failed: lockout check failed, candidate policy denies security-admin role access to /security:policy".to_string();
@@ -449,7 +444,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
             }
         }
 
-        if let Err(e) = self.validate_policy(tenant, &validated_spiffe).await {
+        if let Err(e) = self.validate_policy(tenant, principal).await {
             let _ = self
                 .audit_event(
                     tenant,
@@ -576,6 +571,7 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
         action: NacmAction,
     ) -> Result<AuthorizationDecision, SecurityPolicyError> {
         let validated_spiffe = self.check_authorization(tenant, principal).await?;
+        let (_, _, groups) = validate_principal_tenant_and_roles(principal, tenant)?;
 
         let conn_mutex = self.backend.conn();
         let row = {
@@ -607,22 +603,8 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
         let candidate_policy = compile_serializable_policy(&serializable)?;
 
         let mut registry = ModuleRegistry::new();
-        for rule in candidate_policy.rules() {
-            for segment in rule.path().to_string().split('/') {
-                if let Some((prefix, _)) = segment.split_once(':') {
-                    if !prefix.is_empty() && prefix != "*" {
-                        let _ = registry.register_module(prefix, prefix);
-                    }
-                }
-            }
-        }
-        for segment in path.split('/') {
-            if let Some((prefix, _)) = segment.split_once(':') {
-                if !prefix.is_empty() && prefix != "*" {
-                    let _ = registry.register_module(prefix, prefix);
-                }
-            }
-        }
+        register_policy_modules(&mut registry, &candidate_policy);
+        register_path_modules(&mut registry, path);
 
         let yang_path = YangPath::parse(path, &registry).map_err(|e| {
             SecurityPolicyError::ValidationFailed(format!(
@@ -632,7 +614,8 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
         })?;
 
         let mut evaluator = NacmEvaluator::new();
-        let decision = evaluator.evaluate(&candidate_policy, &yang_path, action);
+        let decision =
+            evaluator.evaluate_for_groups(&candidate_policy, &yang_path, action, &groups);
 
         let details = format!(
             "Dry run evaluation on path {} action {} outcome {:?}",
@@ -761,21 +744,19 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
             let candidate_policy = compile_serializable_policy(&serializable)?;
             let mut registry = ModuleRegistry::new();
             let _ = registry.register_module("security", "security");
-            for rule in candidate_policy.rules() {
-                for segment in rule.path().to_string().split('/') {
-                    if let Some((prefix, _)) = segment.split_once(':') {
-                        if !prefix.is_empty() && prefix != "*" {
-                            let _ = registry.register_module(prefix, prefix);
-                        }
-                    }
-                }
-            }
+            let (_, _, groups) = validate_principal_tenant_and_roles(principal, tenant)?;
+            register_policy_modules(&mut registry, &candidate_policy);
             let path = YangPath::parse("/security:policy", &registry).map_err(|e| {
                 tracing::error!(err = ?e, "Failed to parse path /security:policy for rollback validation");
                 SecurityPolicyError::Internal
             })?;
             let mut evaluator = NacmEvaluator::new();
-            let decision = evaluator.evaluate(&candidate_policy, &path, NacmAction::SecurityAdmin);
+            let decision = evaluator.evaluate_for_groups(
+                &candidate_policy,
+                &path,
+                NacmAction::SecurityAdmin,
+                &groups,
+            );
             if !decision.is_allowed() {
                 let reason = format!("Rollback rejected: target policy version {version} denies security-admin role access to /security:policy");
                 return Err(SecurityPolicyError::ValidationFailed(reason));
