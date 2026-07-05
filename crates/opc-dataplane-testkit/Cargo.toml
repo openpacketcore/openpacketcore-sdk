@@ -1,0 +1,24 @@
+[package]
+name = "opc-dataplane-testkit"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Deterministic dataplane traffic and packet-continuity testkit for OpenPacketCore"
+
+[dependencies]
+bytes = { workspace = true }
+opc-evidence = { path = "../opc-evidence", version = "0.2.0" }
+opc-proto-gtpu = { path = "../opc-proto-gtpu", version = "0.2.0" }
+opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
