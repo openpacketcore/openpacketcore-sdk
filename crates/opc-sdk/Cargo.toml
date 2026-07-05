@@ -16,7 +16,7 @@ categories = ["network-programming"]
 default = ["runtime", "observability", "config", "session", "sbi", "alarm", "identity", "key", "types"]
 runtime = ["dep:opc-runtime"]
 observability = ["dep:opc-observability", "runtime", "opc-runtime/observability"]
-config = ["dep:opc-config-bus", "dep:opc-config-model"]
+config = ["dep:opc-config-bus", "dep:opc-config-model", "dep:opc-nacm-config"]
 session = ["dep:opc-session-store", "dep:opc-session-cache"]
 sbi = ["dep:opc-sbi"]
 alarm = ["dep:opc-alarm"]
@@ -31,6 +31,7 @@ opc-runtime = { path = "../opc-runtime", version = "0.2.0", optional = true }
 opc-observability = { path = "../opc-observability", version = "0.2.0", optional = true }
 opc-config-bus = { path = "../opc-config-bus", version = "0.2.0", optional = true }
 opc-config-model = { path = "../opc-config-model", version = "0.2.0", optional = true }
+opc-nacm-config = { path = "../opc-nacm-config", version = "0.2.0", optional = true }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0", optional = true }
 opc-session-cache = { path = "../opc-session-cache", version = "0.2.0", optional = true }
 opc-sbi = { path = "../opc-sbi", version = "0.2.0", optional = true }

@@ -62,6 +62,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | [`opc-config-model`](crates/opc-config-model/) | Shared config-model request, result, identity, and error types. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-persist`](crates/opc-persist/) | Tamper-evident SQLite datastores, consensus config store membership, and fail-closed storage fault injection hooks. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-nacm`](crates/opc-nacm/) | Normalized YANG path parsing and NACM authorization evaluation. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-nacm-config`](crates/opc-nacm-config/) | Typed `/nacm` datastore model with RFC 8341 group/rule-list validation, SPIFFE group selectors, signed-grant resolution, and policy compilation. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-yanggen`](crates/opc-yanggen/) | YANG-to-Rust type projection, RFC 7951 JSON serde, schema registry generation, NETCONF XML/gNMI JSON projections, and patch applicators. | [RFC 002](docs/rfc/002-yang-projection.md) |
 | [`opc-mgmt-schema`](crates/opc-mgmt-schema/) | Runtime schema-registry contract consumed by generated CNF models and northbound servers. | [RFC 002](docs/rfc/002-yang-projection.md) |
 | [`opc-mgmt-path`](crates/opc-mgmt-path/) | Registry-validated YANG path normalization shared by gNMI, NETCONF, NACM, config commits, and audit. | [RFC 001](docs/rfc/001-management-substrate.md) |

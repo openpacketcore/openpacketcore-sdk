@@ -8,10 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `opc-nacm`/`opc-mgmt-authz`/`opc-persist`/`opc-mgmt-principal`: RFC 8341-style
-  NACM rule-lists scoped to signed principal groups, principal-aware policy
-  selection, encrypted persistence round-trip support for rule-lists, and a
-  signed-grant source boundary for populating `TrustedPrincipal.groups`.
+- `opc-nacm`/`opc-nacm-config`/`opc-mgmt-authz`/`opc-persist`/
+  `opc-mgmt-principal`: RFC 8341-style NACM rule-lists scoped to signed
+  principal groups, principal-aware policy selection, a typed `/nacm` datastore
+  model with SPIFFE group selectors, encrypted persistence round-trip support
+  for rule-lists, and a signed-grant source boundary for populating
+  `TrustedPrincipal.groups`.
 - `opc-route-steering` and `opc-linux-route-sys`: experimental safe/mock/Linux
   route and rule steering backend with rtnetlink `RTM_NEWROUTE/DELROUTE` and
   `RTM_NEWRULE/DELRULE` support, redaction-safe errors, and probe coverage.

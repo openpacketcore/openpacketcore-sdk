@@ -21,3 +21,5 @@ from transport metadata or client-supplied request fields.
 
 The crate does not perform datastore persistence, principal mapping, transport
 authentication, per-list-instance authorization, or YANG schema discovery.
+Use `opc-nacm-config` for the typed `/nacm` datastore model, SPIFFE group
+selectors, schema metadata, signed-grant resolution, and policy compilation.
