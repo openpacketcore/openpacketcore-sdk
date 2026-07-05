@@ -1,0 +1,72 @@
+name: GTP-U privileged
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  privileged-gtpu:
+    name: Privileged Linux GTP-U
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install kernel tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y iproute2 kmod
+
+      - name: Check privileged GTP kernel support
+        run: |
+          set -euo pipefail
+          if ! sudo modprobe gtp; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+            sudo modprobe gtp
+          fi
+          lsmod | grep '^gtp'
+          sudo unshare -n -- ip link set lo up
+
+      - name: Build privileged GTP-U test
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
+          cargo test --locked -p opc-gtpu-dataplane --test linux_gtpu_privileged --no-run
+
+      - name: Run privileged GTP-U test in a fresh netns
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
+          sudo env \
+            "PATH=${PATH}" \
+            "CARGO_HOME=${CARGO_HOME}" \
+            "RUSTUP_HOME=${RUSTUP_HOME}" \
+            "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "OPC_GTPU_RUN_PRIVILEGED=1" \
+            unshare -n -- bash -euxo pipefail -c '
+              ip link set lo up
+              cargo test --locked -p opc-gtpu-dataplane --test linux_gtpu_privileged -- --ignored --nocapture
+            '

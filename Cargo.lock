@@ -2129,6 +2129,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-gtpu-dataplane"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "opc-linux-gtpu-sys",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "opc-identity"
 version = "0.2.0"
 dependencies = [
@@ -2202,6 +2212,13 @@ dependencies = [
 
 [[package]]
 name = "opc-libsctp-sys"
+version = "0.2.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "opc-linux-gtpu-sys"
 version = "0.2.0"
 dependencies = [
  "libc",
