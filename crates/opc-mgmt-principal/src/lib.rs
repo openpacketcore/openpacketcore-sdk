@@ -30,6 +30,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
+
 use opc_config_model::{
     AuthStrength, TrustedPrincipal, WorkloadIdentity as ConfigWorkloadIdentity,
 };
@@ -56,6 +58,145 @@ impl std::fmt::Display for PrincipalMappingError {
 }
 
 impl std::error::Error for PrincipalMappingError {}
+
+/// Payload-free failure resolving signed authorization grants.
+///
+/// Grant sources can contain policy-store paths, key metadata, or tenant
+/// internals. Keep those details in server-side logs and surface only this
+/// coarse error across the management-plane boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrantResolutionError;
+
+impl std::fmt::Display for GrantResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("signed principal grants unavailable")
+    }
+}
+
+impl std::error::Error for GrantResolutionError {}
+
+/// Roles and NACM groups resolved from signed authorization policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignedPrincipalGrants {
+    pub roles: Vec<String>,
+    pub groups: Vec<String>,
+}
+
+impl SignedPrincipalGrants {
+    pub fn new<R, G, RI, GI>(roles: R, groups: G) -> Self
+    where
+        R: IntoIterator<Item = RI>,
+        RI: Into<String>,
+        G: IntoIterator<Item = GI>,
+        GI: Into<String>,
+    {
+        Self {
+            roles: roles.into_iter().map(Into::into).collect(),
+            groups: groups.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
+/// Stable lookup key for signed grants.
+///
+/// The key is tenant-scoped and identity-scoped so grants for the same user name
+/// or SPIFFE ID cannot bleed across tenants.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PrincipalGrantKey {
+    tenant: String,
+    identity: String,
+}
+
+impl PrincipalGrantKey {
+    pub fn new(tenant: impl Into<String>, identity: impl Into<String>) -> Self {
+        Self {
+            tenant: tenant.into(),
+            identity: identity.into(),
+        }
+    }
+
+    pub fn from_principal(principal: &TrustedPrincipal) -> Self {
+        Self::new(
+            principal.tenant.as_str(),
+            identity_wire_key(&principal.identity),
+        )
+    }
+
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+}
+
+/// Source of signed roles/groups for a verified principal.
+pub trait SignedGrantSource {
+    fn signed_grants_for(
+        &self,
+        principal: &TrustedPrincipal,
+    ) -> Result<SignedPrincipalGrants, GrantResolutionError>;
+}
+
+impl<T> SignedGrantSource for &T
+where
+    T: SignedGrantSource + ?Sized,
+{
+    fn signed_grants_for(
+        &self,
+        principal: &TrustedPrincipal,
+    ) -> Result<SignedPrincipalGrants, GrantResolutionError> {
+        (*self).signed_grants_for(principal)
+    }
+}
+
+/// In-memory signed-grant source for tests, fixtures, and single-process
+/// adapters that have already loaded verified policy material.
+#[derive(Debug, Clone, Default)]
+pub struct InMemorySignedGrantStore {
+    grants: BTreeMap<PrincipalGrantKey, SignedPrincipalGrants>,
+}
+
+impl InMemorySignedGrantStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert_key(
+        &mut self,
+        key: PrincipalGrantKey,
+        grants: SignedPrincipalGrants,
+    ) -> &mut Self {
+        self.grants.insert(key, grants);
+        self
+    }
+
+    pub fn insert_principal(
+        &mut self,
+        principal: &TrustedPrincipal,
+        grants: SignedPrincipalGrants,
+    ) -> &mut Self {
+        self.insert_key(PrincipalGrantKey::from_principal(principal), grants)
+    }
+}
+
+impl SignedGrantSource for InMemorySignedGrantStore {
+    fn signed_grants_for(
+        &self,
+        principal: &TrustedPrincipal,
+    ) -> Result<SignedPrincipalGrants, GrantResolutionError> {
+        Ok(self
+            .grants
+            .get(&PrincipalGrantKey::from_principal(principal))
+            .cloned()
+            .unwrap_or_else(SignedPrincipalGrants::empty))
+    }
+}
 
 /// Converts a verified transport SPIFFE identity into a config-bus
 /// [`TrustedPrincipal`] with `AuthStrength::MutualTls` and **no** roles/groups.
@@ -134,6 +275,27 @@ where
     GI: Into<String>,
 {
     principal.with_roles(roles).with_groups(groups)
+}
+
+/// Resolves signed grants and attaches them to the already-authenticated
+/// principal.
+pub fn attach_signed_grants_from_source<S>(
+    principal: TrustedPrincipal,
+    source: &S,
+) -> Result<TrustedPrincipal, GrantResolutionError>
+where
+    S: SignedGrantSource + ?Sized,
+{
+    let grants = source.signed_grants_for(&principal)?;
+    Ok(with_signed_grants(principal, grants.roles, grants.groups))
+}
+
+fn identity_wire_key(identity: &ConfigWorkloadIdentity) -> String {
+    match identity {
+        ConfigWorkloadIdentity::Spiffe(spiffe) => format!("spiffe:{}", spiffe.as_str()),
+        ConfigWorkloadIdentity::User(user) => format!("user:{user}"),
+        ConfigWorkloadIdentity::Internal(name) => format!("internal:{name}"),
+    }
 }
 
 #[cfg(test)]
@@ -232,5 +394,71 @@ mod tests {
         assert_eq!(granted.identity, original.identity);
         assert_eq!(granted.tenant, original.tenant);
         assert_eq!(granted.auth_strength, original.auth_strength);
+    }
+
+    #[test]
+    fn in_memory_signed_grant_store_attaches_policy_groups() {
+        let principal = principal_for_workload(&sample_identity());
+        let mut source = InMemorySignedGrantStore::new();
+        source.insert_principal(
+            &principal,
+            SignedPrincipalGrants::new(["security-admin"], ["telco-writer"]),
+        );
+
+        let granted = attach_signed_grants_from_source(principal, &source).expect("grants");
+
+        assert_eq!(granted.roles, vec!["security-admin".to_string()]);
+        assert_eq!(granted.groups, vec!["telco-writer".to_string()]);
+    }
+
+    #[test]
+    fn signed_grants_are_tenant_and_identity_scoped() {
+        let principal = principal_for_workload(&sample_identity());
+        let other_tenant = TrustedPrincipal::new(
+            principal.identity.clone(),
+            TenantId::from_static("other-tenant"),
+        );
+        let mut source = InMemorySignedGrantStore::new();
+        source.insert_principal(
+            &principal,
+            SignedPrincipalGrants::new(["security-admin"], ["tenant-a-writers"]),
+        );
+
+        let granted =
+            attach_signed_grants_from_source(other_tenant, &source).expect("missing grants");
+
+        assert!(granted.roles.is_empty());
+        assert!(granted.groups.is_empty());
+    }
+
+    #[test]
+    fn missing_signed_grants_leave_principal_without_authority() {
+        let principal = principal_for_workload(&sample_identity());
+        let source = InMemorySignedGrantStore::new();
+
+        let granted = attach_signed_grants_from_source(principal, &source).expect("empty grants");
+
+        assert!(granted.roles.is_empty());
+        assert!(granted.groups.is_empty());
+    }
+
+    #[test]
+    fn signed_grant_source_errors_are_payload_free() {
+        struct FailingSource;
+        impl SignedGrantSource for FailingSource {
+            fn signed_grants_for(
+                &self,
+                _principal: &TrustedPrincipal,
+            ) -> Result<SignedPrincipalGrants, GrantResolutionError> {
+                Err(GrantResolutionError)
+            }
+        }
+
+        let principal = principal_for_workload(&sample_identity());
+        let err =
+            attach_signed_grants_from_source(principal, &FailingSource).expect_err("source error");
+
+        assert_eq!(err.to_string(), "signed principal grants unavailable");
+        assert!(!err.to_string().contains("db"));
     }
 }

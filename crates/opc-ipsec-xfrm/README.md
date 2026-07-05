@@ -5,8 +5,9 @@ OpenPacketCore.
 
 This crate provides:
 
-- `XfrmBackend`: an async trait for allocating SPIs and installing, rekeying,
-  and removing Security Associations and Security Policies.
+- `XfrmBackend`: an async trait for allocating SPIs, installing/querying/
+  rekeying/removing Security Associations, and installing/rekeying/removing
+  Security Policies.
 - `MockXfrmBackend`: a deterministic in-memory test double that records every
   operation and supports injected failures.
 - `LinuxXfrmBackend`: a safe production backend that encodes SDK SA/SPD
@@ -15,6 +16,9 @@ This crate provides:
   mutating operations for non-Linux or intentionally disabled builds.
 - Redaction-safe model types such as `KeyMaterial`, whose `Debug` and `Display`
   implementations never emit raw key bytes.
+- SA query and restore models for replay/sequence continuity: `query_sa`
+  returns `SaState` without key material, and `SaParameters::replay_state`
+  restores legacy or ESN replay counters/bitmaps on install/rekey.
 - `XfrmError`: an error enum with payload-free labels safe for logs and support
   bundles.
 - Optional `ikev2` feature: a validated mapper from

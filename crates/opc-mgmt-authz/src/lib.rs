@@ -3,10 +3,11 @@
 //! `opc-config-bus` enforces NACM on the write path, but reads from a published
 //! snapshot are raw. The gNMI `Get`/`Subscribe` and NETCONF `<get>`/`<get-config>`
 //! paths must authorize reads themselves, default-deny, and omit subtrees the
-//! caller may not see. [`ReadAuthorizer`] is that facade: it selects the tenant's
-//! active compiled NACM policy via a pluggable [`PolicySource`], maps each schema
-//! path to a normalized NACM path using a [`ModuleRegistry`] built from the schema
-//! registry's served models, and evaluates `read`/`subscribe` per path.
+//! caller may not see. [`ReadAuthorizer`] is that facade: it selects the active
+//! compiled NACM policy via a pluggable [`PolicySource`], maps each schema path
+//! to a normalized NACM path using a [`ModuleRegistry`] built from the schema
+//! registry's served models, and evaluates `read`/`subscribe` per path with the
+//! principal's signed NACM groups.
 //!
 //! Everything fails closed: a path that does not resolve through the schema
 //! registry denies; a tenant whose policy is empty default-denies (NACM has no
@@ -67,6 +68,19 @@ impl ReadAction {
 pub trait PolicySource: Send + Sync {
     /// Returns the active compiled NACM policy for `tenant`.
     fn active_policy(&self, tenant: &str) -> Result<NacmPolicy, AuthzError>;
+
+    /// Returns the active compiled NACM policy for a fully resolved principal.
+    ///
+    /// The default preserves the existing tenant-only behavior. Implementations
+    /// that store per-principal or per-group policy overlays can override this
+    /// method; authorizers always call this principal-aware entry point so
+    /// identity, roles, and signed groups remain available to the policy source.
+    fn active_policy_for_principal(
+        &self,
+        principal: &TrustedPrincipal,
+    ) -> Result<NacmPolicy, AuthzError> {
+        self.active_policy(principal.tenant.as_str())
+    }
 }
 
 impl<T> PolicySource for &T
@@ -75,6 +89,13 @@ where
 {
     fn active_policy(&self, tenant: &str) -> Result<NacmPolicy, AuthzError> {
         (*self).active_policy(tenant)
+    }
+
+    fn active_policy_for_principal(
+        &self,
+        principal: &TrustedPrincipal,
+    ) -> Result<NacmPolicy, AuthzError> {
+        (*self).active_policy_for_principal(principal)
     }
 }
 
@@ -158,7 +179,7 @@ impl<'r, P: PolicySource> ReadAuthorizer<'r, P> {
         action: ReadAction,
         paths: &[&str],
     ) -> Result<Vec<PathDecision>, AuthzError> {
-        let policy = self.source.active_policy(principal.tenant.as_str())?;
+        let policy = self.source.active_policy_for_principal(principal)?;
         let nacm_action = action.to_nacm();
         // A fresh evaluator per call: caches within this batch and stays `&self`
         // / Send-friendly for a concurrent server.
@@ -176,7 +197,7 @@ impl<'r, P: PolicySource> ReadAuthorizer<'r, P> {
                 let schema_path = node.path.to_string();
                 let allowed = match YangPath::parse(node.path, &self.modules) {
                     Ok(parsed) => evaluator
-                        .evaluate(&policy, &parsed, nacm_action)
+                        .evaluate_for_groups(&policy, &parsed, nacm_action, &principal.groups)
                         .is_allowed(),
                     // Unparseable / unknown-prefix canonical path: deny.
                     Err(_) => false,
@@ -270,7 +291,7 @@ impl<'r, P: PolicySource> ConfigWriteAuthorizer<'r, P> {
             return Ok(Vec::new());
         }
 
-        let policy = self.source.active_policy(principal.tenant.as_str())?;
+        let policy = self.source.active_policy_for_principal(principal)?;
         let nacm_action = write_action_for_operation(operation);
         let mut evaluator = NacmEvaluator::new();
 
@@ -287,7 +308,7 @@ impl<'r, P: PolicySource> ConfigWriteAuthorizer<'r, P> {
                 let schema_path = node.path.to_string();
                 let allowed = match YangPath::parse(node.path, &self.modules) {
                     Ok(parsed) => evaluator
-                        .evaluate(&policy, &parsed, nacm_action)
+                        .evaluate_for_groups(&policy, &parsed, nacm_action, &principal.groups)
                         .is_allowed(),
                     Err(_) => false,
                 };
@@ -372,13 +393,13 @@ impl<P: PolicySource> ExecAuthorizer<P> {
         principal: &TrustedPrincipal,
         operation_path: &str,
     ) -> Result<bool, AuthzError> {
-        let policy = self.source.active_policy(principal.tenant.as_str())?;
+        let policy = self.source.active_policy_for_principal(principal)?;
         let Ok(path) = YangPath::parse(operation_path, &self.modules) else {
             return Ok(false);
         };
         let mut evaluator = NacmEvaluator::new();
         Ok(evaluator
-            .evaluate(&policy, &path, NacmAction::Exec)
+            .evaluate_for_groups(&policy, &path, NacmAction::Exec, &principal.groups)
             .is_allowed())
     }
 }
@@ -416,7 +437,7 @@ mod tests {
     use super::*;
     use opc_config_model::{ConfigOperation, TrustedPrincipal, WorkloadIdentity};
     use opc_mgmt_schema::{DataClass, LeafType, ModelData, NodeKind, NodeMeta, OriginEntry};
-    use opc_nacm::{NacmPolicy, NacmRule, PolicyVersion, YangPathPattern};
+    use opc_nacm::{NacmPolicy, NacmRule, NacmRuleList, PolicyVersion, YangPathPattern};
     use opc_types::TenantId;
 
     struct TestReg;
@@ -523,11 +544,35 @@ mod tests {
         }
     }
 
+    /// A source that only grants policy through the principal-aware hook. Tests
+    /// using this source fail if an authorizer regresses to tenant-only lookup.
+    struct PrincipalAwarePolicy;
+    impl PolicySource for PrincipalAwarePolicy {
+        fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
+            Ok(NacmPolicy::empty(PolicyVersion::new(1)))
+        }
+
+        fn active_policy_for_principal(
+            &self,
+            principal: &TrustedPrincipal,
+        ) -> Result<NacmPolicy, AuthzError> {
+            if principal.groups.iter().any(|group| group == "selected") {
+                Ok(allow_write(NacmAction::Update, "/sys:system/sys:hostname"))
+            } else {
+                Ok(NacmPolicy::empty(PolicyVersion::new(1)))
+            }
+        }
+    }
+
     fn principal() -> TrustedPrincipal {
         TrustedPrincipal::new(
             WorkloadIdentity::Internal("tester".into()),
             TenantId::from_static("acme"),
         )
+    }
+
+    fn principal_with_groups(groups: impl IntoIterator<Item = &'static str>) -> TrustedPrincipal {
+        principal().with_groups(groups)
     }
 
     fn allow_read(pattern: &str) -> NacmPolicy {
@@ -557,6 +602,57 @@ mod tests {
                 NacmAction::Exec,
                 YangPathPattern::parse(pattern, &modules).expect("pattern"),
             ))
+            .build()
+    }
+
+    fn group_read(group: &'static str, pattern: &str) -> NacmPolicy {
+        let modules = module_registry();
+        NacmPolicy::builder(PolicyVersion::new(1))
+            .add_rule_list(
+                NacmRuleList::new(
+                    "readers",
+                    [group],
+                    vec![NacmRule::allow(
+                        NacmAction::Read,
+                        YangPathPattern::parse(pattern, &modules).expect("pattern"),
+                    )],
+                )
+                .expect("rule-list"),
+            )
+            .build()
+    }
+
+    fn group_write(group: &'static str, action: NacmAction, pattern: &str) -> NacmPolicy {
+        let modules = module_registry();
+        NacmPolicy::builder(PolicyVersion::new(1))
+            .add_rule_list(
+                NacmRuleList::new(
+                    "writers",
+                    [group],
+                    vec![NacmRule::allow(
+                        action,
+                        YangPathPattern::parse(pattern, &modules).expect("pattern"),
+                    )],
+                )
+                .expect("rule-list"),
+            )
+            .build()
+    }
+
+    fn group_exec(group: &'static str, pattern: &str) -> NacmPolicy {
+        let modules = netconf_module_registry();
+        NacmPolicy::builder(PolicyVersion::new(1))
+            .add_rule_list(
+                NacmRuleList::new(
+                    "operators",
+                    [group],
+                    vec![NacmRule::allow(
+                        NacmAction::Exec,
+                        YangPathPattern::parse(pattern, &modules).expect("pattern"),
+                    )],
+                )
+                .expect("rule-list"),
+            )
             .build()
     }
 
@@ -730,6 +826,26 @@ mod tests {
     }
 
     #[test]
+    fn read_authorizer_enforces_signed_group_rule_lists() {
+        let authz = ReadAuthorizer::new(
+            &TestReg,
+            FixedPolicy(group_read("telco-reader", "/sys:system/sys:hostname")),
+        )
+        .expect("authorizer");
+
+        assert!(!authz
+            .may(&principal(), ReadAction::Read, "/sys:system/sys:hostname")
+            .expect("principal without group must deny"));
+        assert!(authz
+            .may(
+                &principal_with_groups(["telco-reader"]),
+                ReadAction::Read,
+                "/sys:system/sys:hostname"
+            )
+            .expect("principal with group must allow"));
+    }
+
+    #[test]
     fn config_write_authorizer_allows_matching_changed_path() {
         let authz = ConfigWriteAuthorizer::new(
             &TestReg,
@@ -750,6 +866,49 @@ mod tests {
                 allowed: true,
             }]
         );
+    }
+
+    #[test]
+    fn config_write_authorizer_enforces_signed_group_rule_lists() {
+        let authz = ConfigWriteAuthorizer::new(
+            &TestReg,
+            FixedPolicy(group_write(
+                "telco-writer",
+                NacmAction::Update,
+                "/sys:system/sys:hostname",
+            )),
+        )
+        .expect("write authorizer");
+        let path = config_path("/sys:system/sys:hostname");
+
+        assert!(!authz
+            .may_write(&principal(), ConfigOperation::Patch, &path)
+            .expect("principal without group must deny"));
+        assert!(authz
+            .may_write(
+                &principal_with_groups(["telco-writer"]),
+                ConfigOperation::Patch,
+                &path
+            )
+            .expect("principal with group must allow"));
+    }
+
+    #[test]
+    fn config_write_authorizer_uses_principal_aware_policy_source() {
+        let authz =
+            ConfigWriteAuthorizer::new(&TestReg, PrincipalAwarePolicy).expect("write authorizer");
+        let path = config_path("/sys:system/sys:hostname");
+
+        assert!(!authz
+            .may_write(&principal(), ConfigOperation::Patch, &path)
+            .expect("principal without selected policy must deny"));
+        assert!(authz
+            .may_write(
+                &principal_with_groups(["selected"]),
+                ConfigOperation::Patch,
+                &path
+            )
+            .expect("principal-aware source must see signed groups"));
     }
 
     #[test]
@@ -908,6 +1067,22 @@ mod tests {
         assert!(!authz
             .may_exec(&principal(), "/nc:kill-session")
             .expect("may exec"));
+    }
+
+    #[test]
+    fn exec_authorizer_enforces_signed_group_rule_lists() {
+        let authz = ExecAuthorizer::new(
+            NETCONF_MODELS,
+            FixedPolicy(group_exec("netconf-ops", "/nc:kill-session")),
+        )
+        .expect("exec authorizer");
+
+        assert!(!authz
+            .may_exec(&principal(), "/nc:kill-session")
+            .expect("principal without group must deny"));
+        assert!(authz
+            .may_exec(&principal_with_groups(["netconf-ops"]), "/nc:kill-session")
+            .expect("principal with group must allow"));
     }
 
     #[test]

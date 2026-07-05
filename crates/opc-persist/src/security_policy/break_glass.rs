@@ -167,7 +167,7 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
         principal: &str,
         action: NacmAction,
     ) -> Result<String, SecurityPolicyError> {
-        let (validated_spiffe, _) = validate_principal_tenant_and_roles(principal, tenant)?;
+        let (validated_spiffe, _, groups) = validate_principal_tenant_and_roles(principal, tenant)?;
 
         let active_policy = match self.get_active_policy_compiled(tenant).await {
             Ok(p) => p,
@@ -183,7 +183,7 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
         })?;
 
         let mut evaluator = NacmEvaluator::new();
-        let decision = evaluator.evaluate(&active_policy, &path, action);
+        let decision = evaluator.evaluate_for_groups(&active_policy, &path, action, &groups);
 
         if !decision.is_allowed() {
             let details = format!("NACM check denied break-glass access for action {action:?}");
@@ -325,7 +325,7 @@ impl<P: KeyProvider + 'static> BreakGlassService for SqliteSecurityPolicyService
         approver: &str,
         session_id: &str,
     ) -> Result<BreakGlassSession, SecurityPolicyError> {
-        let (validated_approver, _) = validate_principal_tenant_and_roles(approver, tenant)?;
+        let (validated_approver, _, _) = validate_principal_tenant_and_roles(approver, tenant)?;
 
         let _ = self.clean_expired(tenant).await;
 
@@ -393,8 +393,8 @@ impl<P: KeyProvider + 'static> BreakGlassService for SqliteSecurityPolicyService
             ));
         }
 
-        let (parsed_spiffe, _) = validate_principal_tenant_and_roles(principal, tenant)?;
-        let (req_spiffe, _) =
+        let (parsed_spiffe, _, _) = validate_principal_tenant_and_roles(principal, tenant)?;
+        let (req_spiffe, _, _) =
             validate_principal_tenant_and_roles(&session.request.principal, tenant)?;
         if parsed_spiffe != req_spiffe {
             return Err(SecurityPolicyError::Unauthorized(

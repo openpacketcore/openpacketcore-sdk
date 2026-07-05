@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-nacm`/`opc-mgmt-authz`/`opc-persist`/`opc-mgmt-principal`: RFC 8341-style
+  NACM rule-lists scoped to signed principal groups, principal-aware policy
+  selection, encrypted persistence round-trip support for rule-lists, and a
+  signed-grant source boundary for populating `TrustedPrincipal.groups`.
+- `opc-route-steering` and `opc-linux-route-sys`: experimental safe/mock/Linux
+  route and rule steering backend with rtnetlink `RTM_NEWROUTE/DELROUTE` and
+  `RTM_NEWRULE/DELRULE` support, redaction-safe errors, and probe coverage.
+- `opc-ipsec-xfrm`: `query_sa` plus `SaState`/`SaReplayState` for replay and
+  sequence-counter continuity, including Linux `XFRM_MSG_GETSA` decode and
+  legacy/ESN replay restore attrs on SA install/rekey.
+- `opc-gtpu-dataplane`: `resolve_device(name)` to inspect/adopt an existing
+  Linux `gtp` netdevice by name without changing exclusive create behavior.
+- `opc-key`: `KeyPurpose::IpsecSa` for sealed IPsec SA traffic-key records.
 - `opc-proto-diameter` (experimental): RFC 6733 header/AVP framing, dictionary
   metadata, feature-gated base peer procedures (CER/CEA, DWR/DWA, DPR/DPA),
   registered fuzz targets, and initial Rf/SWm 3GPP application dictionaries;

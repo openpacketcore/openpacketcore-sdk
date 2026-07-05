@@ -327,6 +327,7 @@ fn parse_wrapped_key_id(
         "config" => KeyPurpose::Config,
         "shadow-security" => KeyPurpose::ShadowSecurity,
         "session" => KeyPurpose::Session,
+        "ipsec-sa" => KeyPurpose::IpsecSa,
         "audit" => KeyPurpose::Audit,
         "backup" => KeyPurpose::Backup,
         _ => {

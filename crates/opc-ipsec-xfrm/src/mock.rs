@@ -1,6 +1,6 @@
 //! Deterministic mock XFRM backend for tests and offline development.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -9,8 +9,9 @@ use crate::backend::XfrmBackend;
 use crate::error::XfrmError;
 use crate::model::{
     AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, IpAddress, LifetimeConfig,
-    RekeyPolicyRequest, RekeySaRequest, RemovePolicyRequest, RemoveSaRequest, SpiAllocation,
-    XfrmAction, XfrmDirection, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
+    LifetimeCurrent, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RemovePolicyRequest,
+    RemoveSaRequest, SaReplayState, SaState, SaStatistics, SpiAllocation, XfrmAction,
+    XfrmDirection, XfrmId, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
 };
 
 /// One recorded call against the mock backend.
@@ -64,7 +65,18 @@ pub enum MockOperation {
         /// Lifetime limits.
         lifetime: LifetimeConfig,
         /// Replay window size.
-        replay_window: u8,
+        replay_window: u32,
+        /// Whether restore/query replay state was supplied.
+        replay_state_present: bool,
+    },
+    /// SA query.
+    QuerySa {
+        /// Destination address.
+        destination: IpAddress,
+        /// SPI in host byte order.
+        spi: u32,
+        /// Transform protocol.
+        protocol: u8,
     },
     /// SA rekey.
     RekeySa {
@@ -99,7 +111,9 @@ pub enum MockOperation {
         /// Lifetime limits.
         lifetime: LifetimeConfig,
         /// Replay window size.
-        replay_window: u8,
+        replay_window: u32,
+        /// Whether restore/query replay state was supplied.
+        replay_state_present: bool,
     },
     /// SA removal.
     RemoveSa {
@@ -161,11 +175,13 @@ pub struct MockXfrmBackend {
 /// Allocated SPI identity used to allow the same SPI value to be reused for a
 /// different destination or protocol.
 type AllocatedSpiKey = (IpAddress, u8, u32);
+type SaKey = (IpAddress, u8, u32);
 
 #[derive(Debug)]
 struct MockState {
     operations: Vec<MockOperation>,
     allocated_spis: BTreeSet<AllocatedSpiKey>,
+    sas: BTreeMap<SaKey, SaState>,
     probe_result: XfrmProbe,
     failure: Option<XfrmError>,
 }
@@ -182,6 +198,7 @@ impl MockXfrmBackend {
             state: Arc::new(Mutex::new(MockState {
                 operations: Vec::new(),
                 allocated_spis: BTreeSet::new(),
+                sas: BTreeMap::new(),
                 probe_result,
                 failure: None,
             })),
@@ -238,6 +255,31 @@ impl MockXfrmBackend {
             return Err(error.clone());
         }
         Ok(())
+    }
+}
+
+fn sa_key(id: XfrmId) -> SaKey {
+    (id.destination, id.protocol, id.spi)
+}
+
+fn sa_state_from_parameters(parameters: &crate::model::SaParameters) -> SaState {
+    let replay_state = parameters
+        .replay_state
+        .clone()
+        .unwrap_or_else(|| SaReplayState::fresh(parameters.replay_window));
+    SaState {
+        selector: parameters.selector.clone(),
+        id: parameters.id,
+        source_address: parameters.source_address,
+        mode: parameters.mode,
+        replay_window: parameters.replay_window,
+        replay_state,
+        lifetime_config: parameters.lifetime,
+        lifetime_current: LifetimeCurrent::default(),
+        statistics: SaStatistics {
+            replay_window: parameters.replay_window,
+            ..SaStatistics::default()
+        },
     }
 }
 
@@ -347,8 +389,31 @@ impl XfrmBackend for MockXfrmBackend {
             mode: request.parameters.mode,
             lifetime: request.parameters.lifetime,
             replay_window: request.parameters.replay_window,
+            replay_state_present: request.parameters.replay_state.is_some(),
         });
+        state.sas.insert(
+            sa_key(request.parameters.id),
+            sa_state_from_parameters(&request.parameters),
+        );
         Ok(())
+    }
+
+    async fn query_sa(&self, request: QuerySaRequest) -> Result<SaState, XfrmError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        state.operations.push(MockOperation::QuerySa {
+            destination: request.destination,
+            spi: request.spi,
+            protocol: request.protocol,
+        });
+        state
+            .sas
+            .get(&(request.destination, request.protocol, request.spi))
+            .cloned()
+            .ok_or(XfrmError::NotFound)
     }
 
     async fn rekey_sa(&self, request: RekeySaRequest) -> Result<(), XfrmError> {
@@ -409,7 +474,12 @@ impl XfrmBackend for MockXfrmBackend {
             mode: request.parameters.mode,
             lifetime: request.parameters.lifetime,
             replay_window: request.parameters.replay_window,
+            replay_state_present: request.parameters.replay_state.is_some(),
         });
+        state.sas.insert(
+            sa_key(request.parameters.id),
+            sa_state_from_parameters(&request.parameters),
+        );
         Ok(())
     }
 
@@ -424,6 +494,10 @@ impl XfrmBackend for MockXfrmBackend {
             spi: request.spi,
             protocol: request.protocol,
         });
+        state
+            .sas
+            .remove(&(request.destination, request.protocol, request.spi))
+            .ok_or(XfrmError::NotFound)?;
         Ok(())
     }
 
@@ -518,6 +592,7 @@ mod tests {
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),
             replay_window: 32,
+            replay_state: None,
             encap: None,
             mark: None,
             if_id: None,
@@ -589,6 +664,7 @@ mod tests {
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),
             replay_window: 32,
+            replay_state_present: params.replay_state.is_some(),
         }
     }
 
@@ -610,6 +686,7 @@ mod tests {
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),
             replay_window: 32,
+            replay_state_present: params.replay_state.is_some(),
         }
     }
 
@@ -650,6 +727,7 @@ mod tests {
                 mode: XfrmMode::Tunnel,
                 lifetime: LifetimeConfig::default(),
                 replay_window: 32,
+                replay_state_present: false,
             }]
         );
     }
@@ -689,6 +767,12 @@ mod tests {
     #[tokio::test]
     async fn mock_remove_sa_records_operation() {
         let backend = MockXfrmBackend::new();
+        let params = sample_sa_parameters();
+        backend
+            .install_sa(InstallSaRequest { parameters: params })
+            .await
+            .unwrap();
+        backend.clear_operations();
         let request = RemoveSaRequest {
             destination: ipv4(10, 0, 0, 2),
             protocol: 50,
@@ -706,6 +790,80 @@ mod tests {
                 protocol: request.protocol,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn mock_query_sa_returns_restored_replay_state() {
+        let backend = MockXfrmBackend::new();
+        let mut params = sample_sa_parameters();
+        params.replay_window = 64;
+        params.replay_state = Some(SaReplayState {
+            esn: true,
+            outbound_sequence: 41,
+            inbound_sequence: 42,
+            outbound_sequence_hi: 3,
+            inbound_sequence_hi: 4,
+            replay_window: 64,
+            bitmap: vec![0x0102_0304, 0x0506_0708],
+        });
+
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: params.clone(),
+            })
+            .await
+            .unwrap();
+
+        let state = backend
+            .query_sa(QuerySaRequest {
+                destination: params.id.destination,
+                protocol: params.id.protocol,
+                spi: params.id.spi,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(state.id, params.id);
+        assert_eq!(state.replay_window, 64);
+        assert_eq!(state.replay_state, params.replay_state.unwrap());
+        assert!(matches!(
+            backend.operations().last(),
+            Some(MockOperation::QuerySa {
+                spi: 0x1234_5678,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn mock_query_sa_reports_not_found_after_remove() {
+        let backend = MockXfrmBackend::new();
+        let params = sample_sa_parameters();
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: params.clone(),
+            })
+            .await
+            .unwrap();
+        backend
+            .remove_sa(RemoveSaRequest {
+                destination: params.id.destination,
+                protocol: params.id.protocol,
+                spi: params.id.spi,
+            })
+            .await
+            .unwrap();
+
+        let error = backend
+            .query_sa(QuerySaRequest {
+                destination: params.id.destination,
+                protocol: params.id.protocol,
+                spi: params.id.spi,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, XfrmError::NotFound));
     }
 
     fn expected_install_policy(params: &PolicyParameters) -> MockOperation {
@@ -810,6 +968,13 @@ mod tests {
         assert!(backend.operations().is_empty());
 
         backend.clear_failure();
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: sample_sa_parameters(),
+            })
+            .await
+            .unwrap();
+        backend.clear_operations();
         backend.remove_sa(request).await.unwrap();
         assert_eq!(backend.operations().len(), 1);
     }

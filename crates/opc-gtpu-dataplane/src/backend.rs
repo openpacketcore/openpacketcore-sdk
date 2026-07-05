@@ -17,6 +17,9 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// Create a Linux `gtp` netdevice.
     async fn create_device(&self, request: CreateGtpDeviceRequest) -> Result<GtpDevice, GtpuError>;
 
+    /// Resolve an existing Linux `gtp` netdevice by interface name.
+    async fn resolve_device(&self, name: &str) -> Result<GtpDevice, GtpuError>;
+
     /// Remove a Linux `gtp` netdevice.
     async fn remove_device(&self, device: &GtpDevice) -> Result<(), GtpuError>;
 

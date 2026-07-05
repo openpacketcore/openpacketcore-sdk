@@ -59,9 +59,18 @@ pub struct SerializableRule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializableRuleList {
+    pub name: String,
+    pub groups: Vec<String>,
+    pub rules: Vec<SerializableRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializablePolicy {
     pub version: u64,
     pub rules: Vec<SerializableRule>,
+    #[serde(default)]
+    pub rule_lists: Vec<SerializableRuleList>,
 }
 
 #[async_trait]

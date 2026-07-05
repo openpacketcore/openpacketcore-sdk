@@ -95,8 +95,9 @@ impl BreakGlassApprovalTrait for DefaultBreakGlassApproval {
         approver: &str,
         policy: Option<&NacmPolicy>,
     ) -> Result<(), SecurityPolicyError> {
-        let (req_spiffe, _) = validate_principal_tenant_and_roles(requester, tenant)?;
-        let (app_spiffe, app_roles) = validate_principal_tenant_and_roles(approver, tenant)?;
+        let (req_spiffe, _, _) = validate_principal_tenant_and_roles(requester, tenant)?;
+        let (app_spiffe, app_roles, app_groups) =
+            validate_principal_tenant_and_roles(approver, tenant)?;
 
         if req_spiffe == app_spiffe {
             return Err(SecurityPolicyError::Unauthorized(
@@ -119,7 +120,12 @@ impl BreakGlassApprovalTrait for DefaultBreakGlassApproval {
             })?;
 
             let mut evaluator = NacmEvaluator::new();
-            let decision = evaluator.evaluate(active_policy, &path, NacmAction::Approve);
+            let decision = evaluator.evaluate_for_groups(
+                active_policy,
+                &path,
+                NacmAction::Approve,
+                &app_groups,
+            );
 
             if !decision.is_allowed() {
                 return Err(SecurityPolicyError::Unauthorized(

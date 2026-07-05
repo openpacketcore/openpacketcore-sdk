@@ -86,6 +86,20 @@ fn session_aad_serialization_is_stable() {
 }
 
 #[test]
+fn key_purpose_ipsec_sa_has_stable_wire_form() {
+    assert_eq!(KeyPurpose::IpsecSa.as_str(), "ipsec-sa");
+    assert_eq!(KeyPurpose::IpsecSa.to_string(), "ipsec-sa");
+    assert_eq!(
+        serde_json::to_string(&KeyPurpose::IpsecSa).expect("serialize purpose"),
+        "\"ipsec-sa\""
+    );
+    assert_eq!(
+        serde_json::from_str::<KeyPurpose>("\"ipsec-sa\"").expect("deserialize purpose"),
+        KeyPurpose::IpsecSa
+    );
+}
+
+#[test]
 fn config_kdf_context_separates_variable_length_fields() {
     let first = config_aad_with_store_kind("ab");
     let second = config_aad_with_store_kind("a");

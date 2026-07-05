@@ -30,7 +30,7 @@ The implementation in the `opc-persist` crate (`SecurityPolicyService` and `Sqli
 ## Security and Tenancy Controls
 
 1. **SPIFFE Tenant Verification**: Tenant identifiers are cryptographically extracted from the principal's validated SPIFFE ID (e.g. `spiffe://<td>/tenant/<tenant-id>/...`) and checked against the target tenant parameter. Mismatches are rejected with `Unauthorized`.
-2. **Access Control**: Mutations require the caller to possess the `"security-admin"` role and be authorized against the active NACM policy for `/security:policy` and `NacmAction::SecurityAdmin`.
+2. **Access Control**: Mutations require the caller to possess the `"security-admin"` role and be authorized against the active NACM policy for `/security:policy` and `NacmAction::SecurityAdmin`, including any RFC 8341-style rule-list scoping by signed principal groups.
 3. **Audit Trails**: Every lifecycle transition (stage, validation success/failure, dry-run, apply, rollback) is logged in structured JSON formats and appended to the HMAC-chained `security_policy_audit` table.
 4. **Encryption at Rest**: Staged, active, and historical policies are encrypted using `AES-256-GCM-SIV`. The AAD binds explicitly to the tenant name, version number, and `KeyPurpose::ShadowSecurity`.
 5. **Error Redaction**: Internal database paths, SQL commands, and key lane details are caught, trace-logged internally, and returned to clients as sanitized `SecurityPolicyError` variants to prevent information leaks.

@@ -2225,6 +2225,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-linux-route-sys"
+version = "0.2.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "opc-linux-xfrm-sys"
 version = "0.2.0"
 dependencies = [
@@ -2531,6 +2538,16 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "zeroize",
+]
+
+[[package]]
+name = "opc-route-steering"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "opc-linux-route-sys",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

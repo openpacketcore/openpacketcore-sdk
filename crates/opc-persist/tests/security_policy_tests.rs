@@ -4,7 +4,10 @@ use tempfile::tempdir;
 use tokio::sync::Mutex;
 
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing};
-use opc_nacm::{ModuleRegistry, NacmAction, NacmPolicy, NacmRule, PolicyVersion, YangPathPattern};
+use opc_nacm::{
+    ModuleRegistry, NacmAction, NacmEvaluator, NacmPolicy, NacmRule, NacmRuleList, PolicyVersion,
+    YangPath, YangPathPattern,
+};
 use opc_persist::{
     AuditKey, RollbackTarget, SecurityPolicyError, SecurityPolicyService, SqliteBackend,
     SqliteSecurityPolicyService, TEST_COMMIT_FAIL,
@@ -28,6 +31,19 @@ fn get_mismatched_tenant_principal() -> String {
         .to_string()
 }
 
+fn get_admin_principal_with_groups(groups: &[&str]) -> String {
+    serde_json::json!({
+        "principal": {
+            "identity": {
+                "Spiffe": get_admin_principal(),
+            },
+            "roles": ["security-admin"],
+            "groups": groups,
+        }
+    })
+    .to_string()
+}
+
 fn make_valid_policy(version: u64) -> NacmPolicy {
     let mut registry = ModuleRegistry::new();
     registry.register_module("security", "security").unwrap();
@@ -35,6 +51,16 @@ fn make_valid_policy(version: u64) -> NacmPolicy {
     let rule = NacmRule::allow(NacmAction::SecurityAdmin, path_pattern);
     NacmPolicy::builder(PolicyVersion::new(version))
         .add_rule(rule)
+        .build()
+}
+
+fn make_group_scoped_security_policy(version: u64, group: &'static str) -> NacmPolicy {
+    let mut registry = ModuleRegistry::new();
+    registry.register_module("security", "security").unwrap();
+    let path_pattern = YangPathPattern::parse("/security:policy", &registry).unwrap();
+    let rule = NacmRule::allow(NacmAction::SecurityAdmin, path_pattern);
+    NacmPolicy::builder(PolicyVersion::new(version))
+        .add_rule_list(NacmRuleList::new("security-admins", [group], vec![rule]).unwrap())
         .build()
 }
 
@@ -142,6 +168,57 @@ async fn test_apply_policy_success_and_cache_invalidation() {
 
     let active_policy = service.get_active_policy_compiled(tenant).await.unwrap();
     assert_eq!(active_policy.version().get(), 2);
+}
+
+#[tokio::test]
+async fn test_group_scoped_rule_lists_survive_policy_persistence() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (service, _temp_dir) = setup_service().await;
+    let tenant = "test-tenant";
+    let grouped_principal = get_admin_principal_with_groups(&["nacm-security-admins"]);
+    let ungrouped_principal = get_admin_principal_with_groups(&[]);
+
+    let policy = make_group_scoped_security_policy(1, "nacm-security-admins");
+    service
+        .stage_policy(tenant, &grouped_principal, policy)
+        .await
+        .unwrap();
+
+    let denied = service.validate_policy(tenant, &ungrouped_principal).await;
+    assert!(
+        matches!(denied, Err(SecurityPolicyError::ValidationFailed(_))),
+        "candidate policy must deny principals outside the scoped NACM group: {denied:?}"
+    );
+
+    service
+        .validate_policy(tenant, &grouped_principal)
+        .await
+        .expect("grouped principal validates lockout check");
+    service
+        .apply_policy(tenant, &grouped_principal)
+        .await
+        .expect("grouped principal applies policy");
+
+    let active_policy = service.get_active_policy_compiled(tenant).await.unwrap();
+    assert_eq!(active_policy.rules().len(), 0);
+    assert_eq!(active_policy.rule_lists().len(), 1);
+    assert_eq!(
+        active_policy.rule_lists()[0].groups(),
+        &["nacm-security-admins".to_string()][..]
+    );
+
+    let mut registry = ModuleRegistry::new();
+    registry.register_module("security", "security").unwrap();
+    let path = YangPath::parse("/security:policy", &registry).unwrap();
+    let mut evaluator = NacmEvaluator::new();
+    let groups = vec!["nacm-security-admins".to_string()];
+
+    assert!(evaluator
+        .evaluate_for_groups(&active_policy, &path, NacmAction::SecurityAdmin, &groups)
+        .is_allowed());
+    assert!(!evaluator
+        .evaluate_for_groups(&active_policy, &path, NacmAction::SecurityAdmin, &[])
+        .is_allowed());
 }
 
 #[tokio::test]

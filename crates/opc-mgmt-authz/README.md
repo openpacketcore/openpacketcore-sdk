@@ -13,16 +13,23 @@ construction time. `opc-nacm` would otherwise preserve the ambiguity and make
 each later parse fail; surfacing that as a startup/schema error is clearer and
 still fail-closed.
 
+Every authorizer calls `PolicySource::active_policy_for_principal`, then
+evaluates with the principal's signed NACM groups. The default policy-source
+implementation still loads by tenant for existing stores, but custom sources can
+select policy using the full verified principal. Missing or unresolvable groups
+do not match group-scoped rule-lists, so the default outcome remains deny.
+
 `ReadAuthorizer`:
 
 - builds a NACM `ModuleRegistry` once from the schema registry's served models;
-- selects the **tenant's** active compiled policy through a pluggable
+- selects the active compiled policy through a pluggable
   `PolicySource` (the CNF wires `opc-persist`'s
   `SqliteSecurityPolicyService::get_active_policy_compiled`, keeping this crate
   free of the persistence/rusqlite dependency);
 - first resolves every input through the generated schema registry, then maps
   the predicate-free schema path to a normalized NACM path and evaluates `read`
-  or `subscribe`, returning an allow/deny decision per path;
+  or `subscribe` against the principal's signed groups, returning an allow/deny
+  decision per path;
 - **fails closed**: an unparseable, unknown-prefix, or unknown-schema path denies;
   a tenant with no policy (an empty policy default-denies) denies; a genuinely
   unavailable policy store returns a payload-free `Err`, which the server maps to
@@ -39,7 +46,7 @@ facade does not perform per-instance read authorization.
 - maps `ConfigOperation` values to NACM write actions (`update`, `replace`, or
   `delete`);
 - resolves each config-bus changed path through the generated schema registry
-  before evaluating NACM;
+  before evaluating NACM against the principal's signed groups;
 - allows empty changed-path batches for no-op/pre-authorized rollback admission;
 - denies unknown or unparseable paths with a fixed invalid marker so list key
   values are not echoed; and
@@ -51,7 +58,7 @@ facade does not perform per-instance read authorization.
 - builds a NACM `ModuleRegistry` from the YANG modules that define management
   RPC/action nodes;
 - evaluates static operation paths such as `/nc:kill-session` with NACM
-  `exec`;
+  `exec` against the principal's signed groups;
 - denies invalid or unknown operation paths fail-closed;
 - returns the same payload-free policy-store error as `ReadAuthorizer`.
 

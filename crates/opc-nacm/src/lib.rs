@@ -51,5 +51,5 @@ pub use crate::path::{
 };
 pub use crate::policy::{
     AuthorizationDecision, NacmEffect, NacmEvaluator, NacmPolicy, NacmPolicyBuilder, NacmRule,
-    PolicyVersion,
+    NacmRuleList, PolicyVersion,
 };

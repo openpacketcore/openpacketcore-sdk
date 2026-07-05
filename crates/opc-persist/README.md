@@ -1,25 +1,29 @@
-# Opc Persist
+# opc-persist
 
-Tamper-evident SQLite datastores, consensus config store membership, and fail-closed storage fault injection hooks.
+SQLite-backed persistence, audit, consensus replication, and security-policy
+storage for the OpenPacketCore management substrate.
 
-## Status
+This crate provides:
 
-**Production-ready**
+- `SqliteBackend`: durable and in-memory SQLite storage with audit-key checks,
+  schema migration, WAL/preflight validation, and redaction-safe errors.
+- `ConfigStore` implementations for append-only config commits, rollback
+  points, confirmed-commit markers, and latest-state reads.
+- `SqliteSecurityPolicyService`: encrypted staging, validation, application,
+  rollback, metadata inspection, and audit for NACM security policies.
+- NACM policy serialization for flat rules and RFC 8341-style group-scoped
+  rule-lists, preserving `TrustedPrincipal.groups` evaluation after decrypting
+  and recompiling stored policy.
+- Break-glass session storage and approval checks backed by active NACM policy.
+- Consensus types and TCP replication support for quorum-backed config storage.
+- Mock and fault-injection stores used by SDK tests and downstream adapters.
 
-## Reference
+Security-policy mutation remains fail-closed: callers must match the target
+tenant, carry the `security-admin` role, and pass the active NACM
+`security-admin` check on `/security:policy`. Group-scoped NACM rule-lists are
+evaluated with groups resolved from signed principal policy, not transport
+metadata.
 
-[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/001-management-substrate.md)
-
-## Quick start
-
-```rust,no_run
-use opc_persist::...;
-
-fn main() {
-    // See the crate documentation for full API usage.
-}
-```
-
-## License
-
-This crate is licensed under the [Apache License, Version 2.0](../../LICENSE).
+The crate does not implement northbound gNMI, NETCONF, or gNSI transport
+servers. Those layers adapt their verified principals and requests into the
+storage and policy services exposed here.

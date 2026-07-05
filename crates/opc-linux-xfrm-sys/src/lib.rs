@@ -152,6 +152,8 @@ pub const XFRMA_ALG_COMP: u16 = 3;
 pub const XFRMA_ENCAP: u16 = 4;
 /// XFRM optional policy template attribute.
 pub const XFRMA_TMPL: u16 = 5;
+/// XFRM legacy replay sequence/bitmap attribute.
+pub const XFRMA_REPLAY_VAL: u16 = 10;
 /// XFRM optional source address attribute.
 pub const XFRMA_SRCADDR: u16 = 13;
 /// XFRM optional combined-mode AEAD algorithm attribute.
@@ -160,8 +162,13 @@ pub const XFRMA_ALG_AEAD: u16 = 18;
 pub const XFRMA_ALG_AUTH_TRUNC: u16 = 20;
 /// XFRM optional packet mark attribute.
 pub const XFRMA_MARK: u16 = 21;
+/// XFRM ESN replay sequence/bitmap attribute.
+pub const XFRMA_REPLAY_ESN_VAL: u16 = 23;
 /// XFRM optional interface identifier attribute.
 pub const XFRMA_IF_ID: u16 = 31;
+
+/// XFRM state uses Extended Sequence Numbers.
+pub const XFRM_STATE_ESN: u8 = 0x80;
 
 /// Netlink message header layout used by XFRM requests and responses.
 #[repr(C)]
@@ -565,11 +572,14 @@ mod tests {
         assert_eq!(XFRMA_ALG_COMP, 3);
         assert_eq!(XFRMA_ENCAP, 4);
         assert_eq!(XFRMA_TMPL, 5);
+        assert_eq!(XFRMA_REPLAY_VAL, 10);
         assert_eq!(XFRMA_SRCADDR, 13);
         assert_eq!(XFRMA_ALG_AEAD, 18);
         assert_eq!(XFRMA_ALG_AUTH_TRUNC, 20);
         assert_eq!(XFRMA_MARK, 21);
+        assert_eq!(XFRMA_REPLAY_ESN_VAL, 23);
         assert_eq!(XFRMA_IF_ID, 31);
+        assert_eq!(XFRM_STATE_ESN, 0x80);
     }
 
     #[test]

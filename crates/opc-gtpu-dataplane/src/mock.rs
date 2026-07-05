@@ -1,5 +1,6 @@
 //! Deterministic mock GTP-U dataplane backend for tests and offline development.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +19,11 @@ pub enum MockOperation {
     CreateDevice {
         /// Request snapshot.
         request: CreateGtpDeviceRequest,
+    },
+    /// Device resolve by interface name.
+    ResolveDevice {
+        /// Interface name.
+        name: String,
     },
     /// Device removal.
     RemoveDevice {
@@ -45,6 +51,9 @@ impl fmt::Debug for MockOperation {
                 .debug_struct("CreateDevice")
                 .field("request", request)
                 .finish(),
+            Self::ResolveDevice { name } => {
+                f.debug_struct("ResolveDevice").field("name", name).finish()
+            }
             Self::RemoveDevice { device } => f
                 .debug_struct("RemoveDevice")
                 .field("device", device)
@@ -74,6 +83,7 @@ struct MockState {
     probe_result: GtpuProbe,
     failure: Option<GtpuError>,
     next_ifindex: u32,
+    devices: BTreeMap<String, GtpDevice>,
 }
 
 impl MockGtpuDataplaneBackend {
@@ -92,6 +102,7 @@ impl MockGtpuDataplaneBackend {
                 probe_result,
                 failure: None,
                 next_ifindex: 1,
+                devices: BTreeMap::new(),
             })),
         }
     }
@@ -170,15 +181,38 @@ impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
                 "name must be nonempty",
             ));
         }
+        if state.devices.contains_key(&request.name) {
+            return Err(GtpuError::AlreadyExists);
+        }
         let ifindex = state.next_ifindex;
         state.next_ifindex = state.next_ifindex.saturating_add(1).max(1);
         state.operations.push(MockOperation::CreateDevice {
             request: request.clone(),
         });
-        Ok(GtpDevice {
+        let device = GtpDevice {
             name: request.name,
             ifindex,
-        })
+        };
+        state.devices.insert(device.name.clone(), device.clone());
+        Ok(device)
+    }
+
+    async fn resolve_device(&self, name: &str) -> Result<GtpDevice, GtpuError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        if name.is_empty() {
+            return Err(GtpuError::invalid_config(
+                "device.name",
+                "name must be nonempty",
+            ));
+        }
+        state.operations.push(MockOperation::ResolveDevice {
+            name: name.to_string(),
+        });
+        state.devices.get(name).cloned().ok_or(GtpuError::NotFound)
     }
 
     async fn remove_device(&self, device: &GtpDevice) -> Result<(), GtpuError> {
@@ -190,6 +224,10 @@ impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
         state.operations.push(MockOperation::RemoveDevice {
             device: device.clone(),
         });
+        state
+            .devices
+            .remove(&device.name)
+            .ok_or(GtpuError::NotFound)?;
         Ok(())
     }
 
@@ -271,10 +309,62 @@ mod tests {
         assert_eq!(
             backend.operations(),
             vec![
-                MockOperation::CreateDevice { request },
+                MockOperation::CreateDevice {
+                    request: request.clone()
+                },
                 MockOperation::RemoveDevice { device }
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn mock_resolves_existing_device_by_name() {
+        let backend = MockGtpuDataplaneBackend::new();
+        let request = CreateGtpDeviceRequest::new("gtp0");
+        let device = backend.create_device(request.clone()).await.unwrap();
+
+        let resolved = backend.resolve_device("gtp0").await.unwrap();
+
+        assert_eq!(resolved, device);
+        assert_eq!(
+            backend.operations(),
+            vec![
+                MockOperation::CreateDevice { request },
+                MockOperation::ResolveDevice {
+                    name: "gtp0".to_string()
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_resolve_reports_not_found_after_remove() {
+        let backend = MockGtpuDataplaneBackend::new();
+        let device = backend
+            .create_device(CreateGtpDeviceRequest::new("gtp0"))
+            .await
+            .unwrap();
+        backend.remove_device(&device).await.unwrap();
+
+        let error = backend.resolve_device("gtp0").await.unwrap_err();
+
+        assert!(matches!(error, GtpuError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn mock_create_duplicate_device_reports_already_exists() {
+        let backend = MockGtpuDataplaneBackend::new();
+        backend
+            .create_device(CreateGtpDeviceRequest::new("gtp0"))
+            .await
+            .unwrap();
+
+        let error = backend
+            .create_device(CreateGtpDeviceRequest::new("gtp0"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, GtpuError::AlreadyExists));
     }
 
     #[tokio::test]

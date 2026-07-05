@@ -5,8 +5,8 @@ redaction-safe errors for OpenPacketCore.
 
 This crate provides:
 
-- `GtpuDataplaneBackend`: an async trait for creating/removing Linux `gtp`
-  devices and installing/removing PDP contexts.
+- `GtpuDataplaneBackend`: an async trait for creating/resolving/removing Linux
+  `gtp` devices and installing/removing PDP contexts.
 - `MockGtpuDataplaneBackend`: a deterministic in-memory test double that
   records operations and supports injected failures.
 - `LinuxGtpuDataplaneBackend`: a safe production backend that encodes SDK
@@ -19,6 +19,9 @@ This crate provides:
   for logs and support bundles.
 - `GtpuProbe`: a capability probe covering route/generic netlink reachability,
   `gtp` family presence, effective `CAP_NET_ADMIN`, and UDP bind readiness.
+- `resolve_device(name)`: a restore/adoption path for finding an existing
+  `gtp` netdevice's ifindex without changing `create_device`'s exclusive-create
+  semantics.
 
 Raw Linux socket work is intentionally kept in `opc-linux-gtpu-sys`. This crate
 does not implement GTP-U packet encoding/decoding, GTP-C, PFCP, route steering,
