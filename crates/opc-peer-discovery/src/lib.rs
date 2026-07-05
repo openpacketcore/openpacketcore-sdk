@@ -13,6 +13,12 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+mod cache;
+mod resolve;
+
+pub use cache::{CachedPeers, PeerAddressCache};
+pub use resolve::{AddressLookup, AddressLookupError, AddressPeerResolver, StdAddressLookup};
+
 /// Stable SDK profile label for this discovery contract.
 pub const TELCO_PEER_DISCOVERY_PROFILE: &str = "opc-peer-discovery+transport-neutral-v1";
 
