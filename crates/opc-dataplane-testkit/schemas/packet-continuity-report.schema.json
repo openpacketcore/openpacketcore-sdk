@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.openpacketcore.dev/opc-dataplane-testkit/v1/packet-continuity-report.schema.json",
+  "title": "OpenPacketCore dataplane packet-continuity report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "flow_id",
+    "window_start_ns",
+    "window_end_ns",
+    "sent_packets",
+    "received_packets",
+    "lost_packets",
+    "duplicate_packets",
+    "out_of_order_packets",
+    "gtpu_error_indications",
+    "max_consecutive_lost_packets",
+    "max_gap_duration_ns",
+    "budget",
+    "forwarding_proven",
+    "packet_continuity_proven"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "opc-dataplane-testkit/v1/packet-continuity-report"
+    },
+    "flow_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "window_start_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "window_end_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sent_packets": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "received_packets": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "lost_packets": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "duplicate_packets": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "out_of_order_packets": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "gtpu_error_indications": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_consecutive_lost_packets": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_gap_duration_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "latency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min_ns", "max_ns", "avg_ns"],
+      "properties": {
+        "min_ns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_ns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "avg_ns": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_lost_packets",
+        "max_consecutive_lost_packets",
+        "outage_budget_ns"
+      ],
+      "properties": {
+        "max_lost_packets": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_consecutive_lost_packets": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "outage_budget_ns": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "forwarding_proven": {
+      "type": "boolean"
+    },
+    "packet_continuity_proven": {
+      "type": "boolean"
+    }
+  }
+}

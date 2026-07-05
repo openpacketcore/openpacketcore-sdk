@@ -2049,6 +2049,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-dataplane-testkit"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "opc-evidence",
+ "opc-proto-gtpu",
+ "opc-protocol",
+ "opc-schema-validate",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "opc-evidence"
 version = "0.2.0"
 dependencies = [
