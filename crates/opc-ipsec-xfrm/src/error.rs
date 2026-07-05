@@ -11,10 +11,11 @@ use thiserror::Error;
 /// Error type for safe XFRM backend operations.
 ///
 /// The type is `Clone` so mock/test backends can reuse injected failures. I/O
-/// errors are captured only as their [`io::ErrorKind`] plus a stable operation
-/// label; the original OS error string is intentionally discarded so that
-/// `Debug` and `Display` never leak addresses, SPIs, subscriber context, or key
-/// material.
+/// errors are captured only as their [`io::ErrorKind`], the raw OS error code
+/// (when present), and a stable operation label; the original OS error string
+/// is intentionally discarded so that `Debug` and `Display` never leak
+/// addresses, SPIs, subscriber context, or key material. The errno integer
+/// itself carries no payload data and is redaction-safe.
 #[non_exhaustive]
 #[derive(Debug, Clone, Error)]
 pub enum XfrmError {
@@ -38,12 +39,16 @@ pub enum XfrmError {
         reason: &'static str,
     },
     /// Kernel or socket I/O failed.
-    #[error("XFRM {operation} failed")]
+    #[error("XFRM {operation} failed{}", .raw_os_error.map(|code| format!(" (os error {code})")).unwrap_or_default())]
     Io {
         /// Stable operation label.
         operation: &'static str,
         /// Captured I/O error kind.
         kind: io::ErrorKind,
+        /// Raw OS error code (errno), when the source carried one. The
+        /// integer is redaction-safe: it never encodes addresses, SPIs, or
+        /// key material.
+        raw_os_error: Option<i32>,
     },
     /// A request was sent, but the ACK was not observed, so kernel state may
     /// already have changed.
@@ -71,12 +76,14 @@ impl XfrmError {
 
     /// Build an `Io` error with a stable operation label.
     ///
-    /// The original OS error message is discarded; only [`io::ErrorKind`] is
-    /// retained to keep `Debug` output safe for logs and support bundles.
+    /// The original OS error message is discarded; only [`io::ErrorKind`] and
+    /// the raw OS error code (a redaction-safe integer) are retained to keep
+    /// `Debug` output safe for logs and support bundles.
     pub fn io(operation: &'static str, source: io::Error) -> Self {
         Self::Io {
             operation,
             kind: source.kind(),
+            raw_os_error: source.raw_os_error(),
         }
     }
 
@@ -84,6 +91,15 @@ impl XfrmError {
     pub fn io_kind(&self) -> Option<io::ErrorKind> {
         match self {
             Self::Io { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// Return the raw OS error code (errno) when this is an `Io` variant that
+    /// captured one.
+    pub fn raw_os_error(&self) -> Option<i32> {
+        match self {
+            Self::Io { raw_os_error, .. } => *raw_os_error,
             _ => None,
         }
     }
@@ -122,6 +138,30 @@ mod tests {
         let source = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
         let err = XfrmError::io("netlink_send", source);
         assert_eq!(err.io_kind(), Some(io::ErrorKind::PermissionDenied));
+    }
+
+    #[test]
+    fn io_error_captures_raw_os_error() {
+        let source = io::Error::from_raw_os_error(97);
+        let err = XfrmError::io("netlink_ack", source);
+        assert_eq!(err.raw_os_error(), Some(97));
+        let display = err.to_string();
+        assert!(display.contains("netlink_ack"));
+        assert!(display.contains("os error 97"));
+    }
+
+    #[test]
+    fn io_error_without_raw_os_error_omits_code() {
+        let source = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let err = XfrmError::io("netlink_send", source);
+        assert_eq!(err.raw_os_error(), None);
+        assert_eq!(err.to_string(), "XFRM netlink_send failed");
+    }
+
+    #[test]
+    fn non_io_variants_have_no_raw_os_error() {
+        assert_eq!(XfrmError::NotFound.raw_os_error(), None);
+        assert_eq!(XfrmError::UnsupportedPlatform.raw_os_error(), None);
     }
 
     #[test]
