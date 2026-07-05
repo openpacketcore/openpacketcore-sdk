@@ -172,14 +172,21 @@ pub struct RuntimeProfile {
     pub max_queued_bytes: usize,
     /// Shutdown grace period.
     ///
-    /// It is recommended that `shutdown_grace <= drain_timeout / 2` to prevent
-    /// the observation window and drain hooks from consuming the entire
-    /// `drain_timeout` budget and starving task graceful draining.
+    /// Maximum duration drain hooks may run. This does not control how long
+    /// the runtime waits for external readiness observers; use
+    /// [`Self::readiness_observation_window`] for that.
     pub shutdown_grace: Duration,
     /// Drain timeout.
     ///
     /// The maximum total duration allowed for the entire runtime shutdown sequence.
     pub drain_timeout: Duration,
+    /// Readiness observation window after the runtime enters draining.
+    ///
+    /// Non-Conformance graceful shutdowns wait this long after drain hooks
+    /// complete so external routers and readiness probes can observe
+    /// readiness=false before supervised task drain begins. The runtime caps
+    /// the actual sleep by the remaining [`Self::drain_timeout`] budget.
+    pub readiness_observation_window: Duration,
     /// SIGINT handling policy.
     pub sigint_handling: SigintHandling,
     /// Whether an NRF deregistration/drain hook must be registered.
@@ -200,6 +207,7 @@ impl Default for RuntimeProfile {
             max_queued_bytes: 64 * 1024 * 1024, // 64 MiB
             shutdown_grace: Duration::from_secs(30),
             drain_timeout: Duration::from_secs(60),
+            readiness_observation_window: Duration::from_millis(500),
             sigint_handling: SigintHandling::default(),
             requires_nrf_drain_hook: false,
             budget: None,

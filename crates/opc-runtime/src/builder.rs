@@ -216,11 +216,17 @@ impl Builder {
             }
         }
 
-        if self.profile.shutdown_grace > self.profile.drain_timeout / 2 {
+        if self.profile.shutdown_grace
+            > self
+                .profile
+                .drain_timeout
+                .saturating_sub(self.profile.readiness_observation_window)
+        {
             tracing::warn!(
                 shutdown_grace = ?self.profile.shutdown_grace,
                 drain_timeout = ?self.profile.drain_timeout,
-                "Mis-tuned runtime shutdown/drain budgets: shutdown_grace is recommended to be <= drain_timeout / 2 to avoid task drain starvation."
+                readiness_observation_window = ?self.profile.readiness_observation_window,
+                "Mis-tuned runtime shutdown/drain budgets: shutdown_grace plus readiness_observation_window can consume the entire drain_timeout and starve task graceful draining."
             );
         }
 
