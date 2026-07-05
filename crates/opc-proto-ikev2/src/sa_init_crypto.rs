@@ -364,12 +364,12 @@ impl Ikev2IntegrityAlgorithm {
         }
     }
 
-    /// Kernel algorithm name safe to copy into XFRM auth requests.
+    /// Exact Linux kernel XFRM algorithm name safe to copy into auth requests.
     pub const fn xfrm_name(self) -> &'static str {
         match self {
-            Self::HmacSha2_256_128 => "hmac-sha256",
-            Self::HmacSha2_384_192 => "hmac-sha384",
-            Self::HmacSha2_512_256 => "hmac-sha512",
+            Self::HmacSha2_256_128 => "hmac(sha256)",
+            Self::HmacSha2_384_192 => "hmac(sha384)",
+            Self::HmacSha2_512_256 => "hmac(sha512)",
         }
     }
 
@@ -1828,6 +1828,22 @@ mod tests {
         assert_eq!(
             must_ok(Ikev2IntegrityAlgorithm::from_transform_id(12)),
             Ikev2IntegrityAlgorithm::HmacSha2_256_128
+        );
+    }
+
+    #[test]
+    fn integrity_xfrm_names_use_linux_kernel_templates() {
+        assert_eq!(
+            Ikev2IntegrityAlgorithm::HmacSha2_256_128.xfrm_name(),
+            "hmac(sha256)"
+        );
+        assert_eq!(
+            Ikev2IntegrityAlgorithm::HmacSha2_384_192.xfrm_name(),
+            "hmac(sha384)"
+        );
+        assert_eq!(
+            Ikev2IntegrityAlgorithm::HmacSha2_512_256.xfrm_name(),
+            "hmac(sha512)"
         );
     }
 

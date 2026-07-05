@@ -22,7 +22,7 @@ use crate::{
     PolicyParameters, RekeyPolicyRequest, RekeySaRequest, RemovePolicyRequest, RemoveSaRequest,
     SaParameters, SpiAllocation, UdpEncap, XfrmAction, XfrmBackend, XfrmBackendKind,
     XfrmCapability, XfrmDirection, XfrmError, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmSelector,
-    XfrmTemplate,
+    XfrmTemplate, XFRM_AEAD_RFC4106_GCM_AES,
 };
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -890,7 +890,7 @@ fn validate_sa_parameters(
 fn is_known_aead_algorithm(name: &str) -> bool {
     matches!(
         name,
-        "rfc4106(gcm(aes))" | "rfc4543(gcm(aes))" | "rfc7539esp(chacha20,poly1305)"
+        XFRM_AEAD_RFC4106_GCM_AES | "rfc4543(gcm(aes))" | "rfc7539esp(chacha20,poly1305)"
     )
 }
 
@@ -1116,7 +1116,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::{AeadAlgorithm, Algorithm, AuthAlgorithm, InstallSaRequest, KeyMaterial};
+    use crate::{
+        AeadAlgorithm, Algorithm, AuthAlgorithm, InstallSaRequest, KeyMaterial,
+        XFRM_AUTH_HMAC_SHA256, XFRM_ENCR_CBC_AES,
+    };
 
     #[derive(Debug, Default, Clone)]
     struct CapturingTransport {
@@ -1214,10 +1217,10 @@ mod tests {
             },
             source_address: ipv4(10, 0, 0, 1),
             auth: Some((
-                AuthAlgorithm::new("hmac-sha256", 96),
+                AuthAlgorithm::hmac_sha256(96),
                 KeyMaterial::new(vec![0xab; 32]),
             )),
-            crypt: Some((Algorithm::new("aes-cbc"), KeyMaterial::new(vec![0xcd; 16]))),
+            crypt: Some((Algorithm::cbc_aes(), KeyMaterial::new(vec![0xcd; 16]))),
             aead: None,
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),
@@ -1289,11 +1292,11 @@ mod tests {
         assert_eq!(body[215], 32);
         assert!(body.len() > XFRM_USER_SA_INFO_LEN);
         assert!(body[XFRM_USER_SA_INFO_LEN..]
-            .windows(11)
-            .any(|w| w == b"hmac-sha256"));
+            .windows(XFRM_AUTH_HMAC_SHA256.len())
+            .any(|w| w == XFRM_AUTH_HMAC_SHA256.as_bytes()));
         assert!(body[XFRM_USER_SA_INFO_LEN..]
-            .windows(7)
-            .any(|w| w == b"aes-cbc"));
+            .windows(XFRM_ENCR_CBC_AES.len())
+            .any(|w| w == XFRM_ENCR_CBC_AES.as_bytes()));
     }
 
     #[test]
@@ -1302,7 +1305,7 @@ mod tests {
         params.auth = None;
         params.crypt = None;
         params.aead = Some((
-            AeadAlgorithm::new("rfc4106(gcm(aes))", 128),
+            AeadAlgorithm::rfc4106_gcm_aes(128),
             KeyMaterial::new(vec![0xcd; 36]),
         ));
 
@@ -1313,7 +1316,7 @@ mod tests {
         assert_eq!(payload.len(), XFRM_ALGO_AEAD_HEADER_LEN + 36);
         assert_eq!(
             &payload[..XFRM_ALG_NAME_LEN],
-            &encode_algorithm_name("rfc4106(gcm(aes))").unwrap()
+            &encode_algorithm_name(XFRM_AEAD_RFC4106_GCM_AES).unwrap()
         );
         assert_eq!(
             u32::from_ne_bytes([
@@ -1389,7 +1392,7 @@ mod tests {
         let mut params = sa_parameters();
         params.auth = None;
         params.crypt = Some((
-            Algorithm::new("rfc4106(gcm(aes))"),
+            Algorithm::new(XFRM_AEAD_RFC4106_GCM_AES),
             KeyMaterial::new(vec![0xcd; 36]),
         ));
 
@@ -1408,7 +1411,7 @@ mod tests {
     fn rejects_mixed_aead_and_auth_or_crypt() {
         let mut params = sa_parameters();
         params.aead = Some((
-            AeadAlgorithm::new("rfc4106(gcm(aes))", 128),
+            AeadAlgorithm::rfc4106_gcm_aes(128),
             KeyMaterial::new(vec![0xcd; 36]),
         ));
 
@@ -1429,7 +1432,7 @@ mod tests {
         params.auth = None;
         params.crypt = None;
         params.aead = Some((
-            AeadAlgorithm::new("rfc4106(gcm(aes))", 0),
+            AeadAlgorithm::rfc4106_gcm_aes(0),
             KeyMaterial::new(vec![0xcd; 36]),
         ));
 
@@ -1618,7 +1621,7 @@ mod tests {
     #[test]
     fn invalid_key_material_does_not_leak_key_bytes() {
         let mut params = sa_parameters();
-        params.crypt = Some((Algorithm::new("aes-cbc"), KeyMaterial::new(Vec::new())));
+        params.crypt = Some((Algorithm::cbc_aes(), KeyMaterial::new(Vec::new())));
 
         let error = encode_sa_info(&params).unwrap_err();
 
@@ -1630,9 +1633,9 @@ mod tests {
 
     #[test]
     fn algorithm_encoders_return_zeroizing_buffers() {
-        let crypt = encode_algorithm("aes-cbc", &[0xcd; 16]).unwrap();
-        let auth = encode_auth_algorithm("hmac-sha256", &[0xab; 32], 96).unwrap();
-        let aead = encode_aead_algorithm("rfc4106(gcm(aes))", &[0xef; 36], 128).unwrap();
+        let crypt = encode_algorithm(XFRM_ENCR_CBC_AES, &[0xcd; 16]).unwrap();
+        let auth = encode_auth_algorithm(XFRM_AUTH_HMAC_SHA256, &[0xab; 32], 96).unwrap();
+        let aead = encode_aead_algorithm(XFRM_AEAD_RFC4106_GCM_AES, &[0xef; 36], 128).unwrap();
 
         assert_sensitive_buffer(&crypt);
         assert_sensitive_buffer(&auth);

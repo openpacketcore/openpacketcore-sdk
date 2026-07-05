@@ -10,8 +10,9 @@ use std::{error::Error, fmt};
 
 use opc_proto_ikev2::{
     derive_child_sa_key_material, Ikev2ChildSaCryptoProfile, Ikev2ChildSaNegotiation,
-    Ikev2EncryptionAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
-    Ikev2TrafficSelectorBuild, IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
+    Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm, Ikev2SaInitCryptoError,
+    Ikev2SaInitCryptoErrorCode, Ikev2TrafficSelectorBuild, IKEV2_TS_IPV4_ADDR_RANGE,
+    IKEV2_TS_IPV6_ADDR_RANGE,
 };
 
 use crate::{
@@ -270,7 +271,7 @@ impl Error for Ikev2ChildSaXfrmError {}
 /// Derive Child SA KEYMAT and map it into bidirectional XFRM key material.
 ///
 /// AES-GCM profiles map to [`Ikev2ChildSaXfrmKeys::aead`] with Linux
-/// `rfc4106(gcm(aes))` and a 128-bit ICV. AES-CBC profiles with supported
+/// [`crate::XFRM_AEAD_RFC4106_GCM_AES`] and a 128-bit ICV. AES-CBC profiles with supported
 /// HMAC-SHA2 integrity map to separate crypt/auth slots.
 ///
 /// # Errors
@@ -459,9 +460,7 @@ fn child_sa_xfrm_keys_from_direction(
         let aead = match profile.encryption() {
             Ikev2EncryptionAlgorithm::AesGcm16_128
             | Ikev2EncryptionAlgorithm::AesGcm16_192
-            | Ikev2EncryptionAlgorithm::AesGcm16_256 => {
-                AeadAlgorithm::new("rfc4106(gcm(aes))", 128)
-            }
+            | Ikev2EncryptionAlgorithm::AesGcm16_256 => AeadAlgorithm::rfc4106_gcm_aes(128),
             _ => return Err(Ikev2ChildSaKeyMaterialError::UnsupportedAlgorithmMapping),
         };
         return Ok(Ikev2ChildSaXfrmKeys::aead((
@@ -473,7 +472,7 @@ fn child_sa_xfrm_keys_from_direction(
     let crypt = match profile.encryption() {
         Ikev2EncryptionAlgorithm::AesCbc128
         | Ikev2EncryptionAlgorithm::AesCbc192
-        | Ikev2EncryptionAlgorithm::AesCbc256 => Algorithm::new("aes-cbc"),
+        | Ikev2EncryptionAlgorithm::AesCbc256 => Algorithm::cbc_aes(),
         _ => return Err(Ikev2ChildSaKeyMaterialError::UnsupportedAlgorithmMapping),
     };
     let Some(integrity) = profile.integrity() else {
@@ -481,11 +480,25 @@ fn child_sa_xfrm_keys_from_direction(
     };
     Ok(Ikev2ChildSaXfrmKeys::new(
         Some((
-            AuthAlgorithm::new(integrity.xfrm_name(), integrity.icv_len_bits()),
+            auth_algorithm_from_ikev2_integrity(integrity),
             KeyMaterial::new(integrity_key.to_vec()),
         )),
         Some((crypt, KeyMaterial::new(encryption_key.to_vec()))),
     ))
+}
+
+fn auth_algorithm_from_ikev2_integrity(integrity: Ikev2IntegrityAlgorithm) -> AuthAlgorithm {
+    match integrity {
+        Ikev2IntegrityAlgorithm::HmacSha2_256_128 => {
+            AuthAlgorithm::hmac_sha256(integrity.icv_len_bits())
+        }
+        Ikev2IntegrityAlgorithm::HmacSha2_384_192 => {
+            AuthAlgorithm::hmac_sha384(integrity.icv_len_bits())
+        }
+        Ikev2IntegrityAlgorithm::HmacSha2_512_256 => {
+            AuthAlgorithm::hmac_sha512(integrity.icv_len_bits())
+        }
+    }
 }
 
 fn validate_request(request: &Ikev2ChildSaXfrmRequest) -> Result<(), Ikev2ChildSaXfrmError> {
@@ -675,6 +688,7 @@ fn same_address_family(left: IpAddress, right: IpAddress) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA256, XFRM_ENCR_CBC_AES};
     use opc_proto_ikev2::{
         Ikev2ChildSaCryptoProfile, Ikev2ChildSaNegotiation, Ikev2EncryptionAlgorithm,
         Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm, Ikev2SaInitCryptoErrorCode,
@@ -737,16 +751,16 @@ mod tests {
     fn keys(seed: u8) -> Ikev2ChildSaXfrmKeys {
         Ikev2ChildSaXfrmKeys::new(
             Some((
-                AuthAlgorithm::new("hmac-sha256", 128),
+                AuthAlgorithm::hmac_sha256(128),
                 KeyMaterial::new(vec![seed; 32]),
             )),
-            Some((Algorithm::new("aes-cbc"), KeyMaterial::new(vec![seed; 20]))),
+            Some((Algorithm::cbc_aes(), KeyMaterial::new(vec![seed; 20]))),
         )
     }
 
     fn aead_keys(seed: u8) -> Ikev2ChildSaXfrmKeys {
         Ikev2ChildSaXfrmKeys::aead((
-            AeadAlgorithm::new("rfc4106(gcm(aes))", 128),
+            AeadAlgorithm::rfc4106_gcm_aes(128),
             KeyMaterial::new(vec![seed; 36]),
         ))
     }
@@ -1134,7 +1148,7 @@ mod tests {
                 a.icv_len_bits,
                 k.len()
             )),
-            Some(("rfc4106(gcm(aes))", 128, 36))
+            Some((XFRM_AEAD_RFC4106_GCM_AES, 128, 36))
         );
         assert!(built.outbound_sa.parameters.auth.is_none());
         assert!(built.outbound_sa.parameters.crypt.is_none());
@@ -1144,7 +1158,7 @@ mod tests {
                 a.icv_len_bits,
                 k.len()
             )),
-            Some(("rfc4106(gcm(aes))", 128, 36))
+            Some((XFRM_AEAD_RFC4106_GCM_AES, 128, 36))
         );
     }
 
@@ -1166,7 +1180,7 @@ mod tests {
             Some(value) => value,
             None => panic!("missing inbound AEAD keys"),
         };
-        assert_eq!(inbound.0.name, "rfc4106(gcm(aes))");
+        assert_eq!(inbound.0.name, XFRM_AEAD_RFC4106_GCM_AES);
         assert_eq!(inbound.0.icv_len_bits, 128);
         assert_eq!(
             inbound.1.as_bytes(),
@@ -1206,7 +1220,7 @@ mod tests {
                     algorithm.icv_len_bits,
                     key.len()
                 )),
-            Some(("rfc4106(gcm(aes))", 128, 36))
+            Some((XFRM_AEAD_RFC4106_GCM_AES, 128, 36))
         );
         assert_eq!(
             built
@@ -1219,7 +1233,7 @@ mod tests {
                     algorithm.icv_len_bits,
                     key.len()
                 )),
-            Some(("rfc4106(gcm(aes))", 128, 36))
+            Some((XFRM_AEAD_RFC4106_GCM_AES, 128, 36))
         );
     }
 
@@ -1241,7 +1255,7 @@ mod tests {
             Some(value) => value,
             None => panic!("missing inbound crypt keys"),
         };
-        assert_eq!(inbound_crypt.0.name, "aes-cbc");
+        assert_eq!(inbound_crypt.0.name, XFRM_ENCR_CBC_AES);
         assert_eq!(
             inbound_crypt.1.as_bytes(),
             hex_to_bytes("7ae50b9713ddfd346dbb3cfbe8b8d45a34c79925bedb4f4ae6a5ad6bc76d8ab5")
@@ -1250,7 +1264,7 @@ mod tests {
             Some(value) => value,
             None => panic!("missing inbound auth keys"),
         };
-        assert_eq!(inbound_auth.0.name, "hmac-sha256");
+        assert_eq!(inbound_auth.0.name, XFRM_AUTH_HMAC_SHA256);
         assert_eq!(inbound_auth.0.truncation_len_bits, 128);
         assert_eq!(inbound_auth.1.len(), 32);
 
