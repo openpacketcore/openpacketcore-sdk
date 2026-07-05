@@ -1,0 +1,22 @@
+[package]
+name = "opc-observability"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenPacketCore tracing subscriber setup with runtime filter reload and structural redaction"
+readme = "README.md"
+documentation = "https://docs.rs/opc-observability"
+keywords = ["5g", "observability", "tracing", "telecom", "packet-core"]
+categories = ["network-programming"]
+
+[dependencies]
+opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+
+[lints]
+workspace = true

@@ -76,3 +76,19 @@ pub use udp::{
 
 pub use builder::{Builder, StartupPhases, TryInitFn};
 pub use runtime::{run, run_with_hooks, try_run, try_run_with_hooks, RuntimeHandle, RuntimePhase};
+
+/// Build an `init_logging` callback that installs `opc-observability`.
+///
+/// The returned closure is intended for [`StartupPhases::init_logging`] and
+/// runs during [`RuntimePhase::ProcessInit`].
+#[cfg(feature = "observability")]
+#[must_use]
+pub fn init_observability_logging(
+    directive: Option<&str>,
+) -> Box<dyn Fn() -> Result<(), BootstrapError> + Send + Sync> {
+    let directive = directive.map(str::to_string);
+    Box::new(move || {
+        opc_observability::init(directive.as_deref())
+            .map_err(|err| BootstrapError::Env(Box::new(err)))
+    })
+}

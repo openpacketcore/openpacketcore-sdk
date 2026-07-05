@@ -13,6 +13,10 @@ readme = "README.md"
 documentation = "https://docs.rs/opc-runtime"
 keywords = ["5g", "cnf", "runtime", "telecom", "packet-core"]
 categories = ["network-programming"]
+[features]
+default = []
+observability = ["dep:opc-observability"]
+
 [lints]
 workspace = true
 
@@ -29,6 +33,7 @@ num_cpus = { workspace = true }
 futures-util = "0.3"
 nix = { workspace = true, features = ["net", "uio"] }
 opc-alarm = { path = "../opc-alarm", version = "0.2.0" }
+opc-observability = { path = "../opc-observability", version = "0.2.0", optional = true }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 
 [dev-dependencies]
