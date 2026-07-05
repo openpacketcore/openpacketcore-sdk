@@ -9,6 +9,7 @@
 //! | Feature   | Crates pulled                              |
 //! | :-------- | :----------------------------------------- |
 //! | `runtime` | `opc-runtime`                              |
+//! | `observability` | `opc-observability`                  |
 //! | `config`  | `opc-config-bus`, `opc-config-model`       |
 //! | `session` | `opc-session-store`, `opc-session-cache`   |
 //! | `sbi`     | `opc-sbi`                                  |
@@ -76,6 +77,8 @@ pub use opc_crypto;
 pub use opc_identity;
 #[cfg(feature = "key")]
 pub use opc_key;
+#[cfg(feature = "observability")]
+pub use opc_observability;
 #[cfg(feature = "runtime")]
 pub use opc_runtime;
 #[cfg(feature = "sbi")]
@@ -102,6 +105,15 @@ pub mod prelude {
         health::HealthResponse, Builder, Criticality, HealthModel, Readiness, RestartPolicy,
         RuntimeError, RuntimeHandle, RuntimeMode, RuntimePhase, RuntimeProfile, ShutdownToken,
         Supervisor, TaskKind, TaskName,
+    };
+
+    #[cfg(feature = "observability")]
+    pub use opc_runtime::init_observability_logging;
+
+    #[cfg(feature = "observability")]
+    pub use opc_observability::{
+        current_directive, init as init_tracing, set_directive, ObservabilityError,
+        DEFAULT_DIRECTIVE,
     };
 
     #[cfg(feature = "alarm")]
