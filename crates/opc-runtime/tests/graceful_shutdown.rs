@@ -106,6 +106,10 @@ async fn run_all_graceful_shutdown_tests_sequentially() {
     test_drain_hooks_are_idempotent_and_run_once_impl().await;
     println!("Running test_shutdown_immediate_drop_race_impl...");
     test_shutdown_immediate_drop_race_impl().await;
+    println!("Running test_delayed_hook_shutdown_uses_observation_window_impl...");
+    test_delayed_hook_shutdown_uses_observation_window_impl().await;
+    println!("Running test_immediate_hook_shutdown_ignores_large_grace_impl...");
+    test_immediate_hook_shutdown_ignores_large_grace_impl().await;
     println!("Running test_mistuned_budgets_starvation_impl...");
     test_mistuned_budgets_starvation_impl().await;
     println!("Running test_drain_incomplete_alarm_impl...");
@@ -251,6 +255,34 @@ async fn observe_sigterm_with_runtime_handle(
     control_sigterm: tokio::signal::unix::Signal,
 ) -> SigtermObservation {
     observe_sigterm(RuntimeObservation::Handle(handle), control_sigterm).await
+}
+
+async fn wait_until_hook_called(called: &AtomicBool) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !called.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("drain hook should be called");
+}
+
+async fn advance_fake_clock_until_stopped(
+    handle: &opc_runtime::RuntimeHandle,
+    clock: &FakeClock,
+    max_advance: Duration,
+    step: Duration,
+) -> bool {
+    let mut advanced = Duration::ZERO;
+    while advanced < max_advance {
+        if handle.is_stopped().await {
+            return true;
+        }
+        clock.advance(step);
+        advanced += step;
+        tokio::task::yield_now().await;
+    }
+    handle.is_stopped().await
 }
 
 #[cfg(unix)]
@@ -1322,6 +1354,96 @@ async fn test_shutdown_immediate_drop_race_impl() {
     assert!(
         task_dropped.load(Ordering::SeqCst),
         "Supervisor drain must stop supervised tasks in shutdown+drop race"
+    );
+}
+
+async fn test_delayed_hook_shutdown_uses_observation_window_impl() {
+    let clock = Arc::new(FakeClock::new());
+    let hook_delay = Duration::from_secs(5);
+    let observation_window = Duration::from_millis(100);
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Dev,
+        nf_kind: "delayed-hook-window-test-cnf".to_string(),
+        shutdown_grace: Duration::from_secs(30),
+        drain_timeout: Duration::from_secs(60),
+        readiness_observation_window: observation_window,
+        ..Default::default()
+    };
+
+    let called = Arc::new(AtomicBool::new(false));
+    let entered_sleep = Arc::new(tokio::sync::Notify::new());
+    let hook = Arc::new(DelayedHook {
+        called: called.clone(),
+        clock: clock.clone(),
+        delay: hook_delay,
+        entered_sleep: Some(entered_sleep.clone()),
+    });
+
+    let handle = Builder::new(profile)
+        .with_clock(clock.clone())
+        .with_drain_hook(hook)
+        .build()
+        .await
+        .unwrap();
+
+    handle.shutdown().await;
+    entered_sleep.notified().await;
+
+    clock.advance(hook_delay);
+    wait_until_hook_called(&called).await;
+
+    let stopped = advance_fake_clock_until_stopped(
+        &handle,
+        &clock,
+        Duration::from_secs(1),
+        observation_window / 2,
+    )
+    .await;
+
+    assert!(
+        stopped,
+        "shutdown should stop after the hook delay plus the configured readiness observation window, not after the full shutdown grace"
+    );
+}
+
+async fn test_immediate_hook_shutdown_ignores_large_grace_impl() {
+    let clock = Arc::new(FakeClock::new());
+    let observation_window = Duration::from_millis(100);
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Dev,
+        nf_kind: "immediate-hook-window-test-cnf".to_string(),
+        shutdown_grace: Duration::from_secs(30),
+        drain_timeout: Duration::from_secs(60),
+        readiness_observation_window: observation_window,
+        ..Default::default()
+    };
+
+    let called = Arc::new(AtomicBool::new(false));
+    let hook = Arc::new(SimpleHook {
+        called: called.clone(),
+    });
+
+    let handle = Builder::new(profile)
+        .with_clock(clock.clone())
+        .with_drain_hook(hook)
+        .build()
+        .await
+        .unwrap();
+
+    handle.shutdown().await;
+    wait_until_hook_called(&called).await;
+
+    let stopped = advance_fake_clock_until_stopped(
+        &handle,
+        &clock,
+        Duration::from_secs(1),
+        observation_window / 2,
+    )
+    .await;
+
+    assert!(
+        stopped,
+        "shutdown should not sleep the remaining shutdown grace after an immediately-returning hook"
     );
 }
 

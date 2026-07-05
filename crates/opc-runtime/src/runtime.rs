@@ -5,7 +5,7 @@
 //! `RuntimeHandle` exposes phase/readiness inspection, config-version
 //! metadata, the shutdown token, and drives the ordered drain sequence on
 //! shutdown (drain hooks, readiness observation window, then supervised task
-//! drain within `drain_timeout`).
+//! drain, all within `drain_timeout`).
 
 use opc_alarm::{ReadinessImpact, SharedAlarmManager};
 use std::future::Future;
@@ -362,21 +362,17 @@ impl RuntimeHandle {
             .min(self.supervisor.profile.drain_timeout)
     }
 
-    fn readiness_observation_budget(
+    fn readiness_observation_timeout(
         &self,
         drain_started_at: std::time::Instant,
     ) -> std::time::Duration {
         let elapsed = self.clock.monotonic().duration_since(drain_started_at);
-        self.supervisor
-            .profile
-            .shutdown_grace
-            .saturating_sub(elapsed)
-            .min(
-                self.supervisor
-                    .profile
-                    .drain_timeout
-                    .saturating_sub(elapsed),
-            )
+        self.supervisor.profile.readiness_observation_window.min(
+            self.supervisor
+                .profile
+                .drain_timeout
+                .saturating_sub(elapsed),
+        )
     }
 
     pub(crate) async fn drive_drain_sequence(&self, observe_readiness_window: bool) {
@@ -394,15 +390,15 @@ impl RuntimeHandle {
         self.execute_drain_hooks(self.drain_hook_timeout()).await;
 
         if observe_readiness_window {
-            let remaining = self.readiness_observation_budget(drain_started_at);
+            let observation_window = self.readiness_observation_timeout(drain_started_at);
 
             // Allow external routers and probes to observe readiness=false before worker drain
-            // begins. This observation window is carved out of the shared drain budget, not
-            // added on top of it.
-            self.clock.sleep(remaining).await;
+            // begins. This window is independently configured from the hook budget and is
+            // capped by the remaining drain timeout rather than added on top of it.
+            self.clock.sleep(observation_window).await;
         }
 
-        // Any readiness-observation sleep above already consumed part of the shared drain budget,
+        // Any readiness-observation sleep above already consumed part of the total drain budget,
         // so the remaining timeout computed here naturally shrinks before supervisor shutdown begins.
         self.finish_shutdown_with_remaining_budget(drain_started_at)
             .await;
