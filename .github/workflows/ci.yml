@@ -52,6 +52,9 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace --exclude opc-persist --all-features --quiet -- --test-threads=4
 
+      - name: Run GTP-U unsupported-platform cfg tests
+        run: RUSTFLAGS="--cfg opc_linux_gtpu_sys_force_unsupported" cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet
+
       # The opc-persist e2e suites drive real consensus subprocess clusters
       # (3-4 nodes plus TCP proxies per test). Running several clusters
       # concurrently oversubscribes shared runners and destabilizes the
