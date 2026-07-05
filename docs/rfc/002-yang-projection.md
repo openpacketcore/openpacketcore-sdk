@@ -459,7 +459,8 @@ hand-maintained side schemas.
 
 Generated schema metadata MUST include:
 
-- canonical YANG paths and module identity;
+- canonical YANG paths and module identity, with every schema-node path segment
+  fully prefix-qualified (for example `/example:system/example:hostname`);
 - config/state classification;
 - list-key ordering;
 - NACM action mapping;

@@ -287,8 +287,17 @@ fn generate_rust_artifacts(
     let sources = read_yang_sources(yang_files)?;
     let input = generation_input_from_yang_sources(profile, &sources)?;
     let canonical = input.to_canonical();
-    let schema_digest = schema_digest_from_canonical(&canonical);
-    let files = opc_yanggen::rust::generate_rust(&canonical).map_err(|err| {
+    let rust_canonical =
+        opc_yanggen::rust::normalize_for_rust_generation(&canonical).map_err(|err| {
+            Diagnostic::new(
+                DiagnosticCode::UnsupportedYangFeature,
+                format!("failed to generate Rust artifacts: {err}"),
+                None,
+                Some("adjust the source YANG to the Rust projection subset"),
+            )
+        })?;
+    let schema_digest = schema_digest_from_canonical(&rust_canonical);
+    let files = opc_yanggen::rust::generate_rust(&rust_canonical).map_err(|err| {
         Diagnostic::new(
             DiagnosticCode::UnsupportedYangFeature,
             format!("failed to generate Rust artifacts: {err}"),
