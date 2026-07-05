@@ -1,0 +1,25 @@
+[package]
+name = "opc-nacm-config"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "RFC 8341 NACM northbound datastore model and policy compiler for OpenPacketCore"
+readme = "README.md"
+documentation = "https://docs.rs/opc-nacm-config"
+keywords = ["5g", "cnf", "yang", "nacm", "packet-core"]
+categories = ["network-programming", "authentication"]
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
+opc-mgmt-principal = { path = "../opc-mgmt-principal", version = "0.2.0" }
+opc-mgmt-schema = { path = "../opc-mgmt-schema", version = "0.2.0" }
+opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
+
+[lints]
+workspace = true

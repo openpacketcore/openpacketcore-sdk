@@ -2336,6 +2336,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-nacm-config"
+version = "0.2.0"
+dependencies = [
+ "opc-config-model",
+ "opc-mgmt-principal",
+ "opc-mgmt-schema",
+ "opc-nacm",
+ "opc-types",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "opc-netconf-server"
 version = "0.2.0"
 dependencies = [
@@ -2634,6 +2647,7 @@ dependencies = [
  "opc-crypto",
  "opc-identity",
  "opc-key",
+ "opc-nacm-config",
  "opc-observability",
  "opc-runtime",
  "opc-sbi",

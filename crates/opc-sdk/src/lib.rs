@@ -10,7 +10,7 @@
 //! | :-------- | :----------------------------------------- |
 //! | `runtime` | `opc-runtime`                              |
 //! | `observability` | `opc-observability`                  |
-//! | `config`  | `opc-config-bus`, `opc-config-model`       |
+//! | `config`  | `opc-config-bus`, `opc-config-model`, `opc-nacm-config` |
 //! | `session` | `opc-session-store`, `opc-session-cache`   |
 //! | `sbi`     | `opc-sbi`                                  |
 //! | `alarm`   | `opc-alarm`                                |
@@ -77,6 +77,8 @@ pub use opc_crypto;
 pub use opc_identity;
 #[cfg(feature = "key")]
 pub use opc_key;
+#[cfg(feature = "config")]
+pub use opc_nacm_config;
 #[cfg(feature = "observability")]
 pub use opc_observability;
 #[cfg(feature = "runtime")]
@@ -134,6 +136,12 @@ pub mod prelude {
     pub use opc_config_model::{
         CommitRequest, ConfigError, ConfigOperation, RequestId, TransportType, TrustedPrincipal,
         ValidationContext, WorkloadIdentity,
+    };
+
+    #[cfg(feature = "config")]
+    pub use opc_nacm_config::{
+        NacmAccessOperation, NacmConfig, NacmConfigEffect, NacmConfigRule, NacmConfigRuleList,
+        NacmGroup, SpiffeWorkloadSelector,
     };
 
     #[cfg(feature = "session")]
