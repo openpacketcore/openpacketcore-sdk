@@ -1590,6 +1590,22 @@ mod tests {
     }
 
     #[test]
+    fn netlink_ack_uncategorized_errno_preserves_raw_os_error() {
+        // EAFNOSUPPORT (97) has no dedicated io::ErrorKind mapping, so it hits
+        // the fallback arm; the raw errno must survive for caller diagnostics.
+        let mut body = Vec::new();
+        push_i32_ne(&mut body, -97);
+        let message = encode_netlink_message(NLMSG_ERROR, 0, 11, &body).unwrap();
+
+        let error = parse_netlink_response(&message, 11).unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(97));
+        let display = error.to_string();
+        assert!(display.contains("netlink_ack"));
+        assert!(display.contains("os error 97"));
+    }
+
+    #[test]
     fn netlink_ack_sequence_mismatch_is_redaction_safe() {
         let error = parse_netlink_response(&ack(10), 9).unwrap_err();
 
