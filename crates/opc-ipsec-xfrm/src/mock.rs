@@ -510,10 +510,10 @@ mod tests {
             },
             source_address: ipv4(10, 0, 0, 1),
             auth: Some((
-                AuthAlgorithm::new("hmac-sha256", 96),
+                AuthAlgorithm::hmac_sha256(96),
                 KeyMaterial::new(vec![0xab; 32]),
             )),
-            crypt: Some((Algorithm::new("aes-cbc"), KeyMaterial::new(vec![0xcd; 32]))),
+            crypt: Some((Algorithm::cbc_aes(), KeyMaterial::new(vec![0xcd; 32]))),
             aead: None,
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),
@@ -578,10 +578,10 @@ mod tests {
             destination: params.id.destination,
             spi: params.id.spi,
             protocol: params.id.protocol,
-            auth_algo: Some("hmac-sha256".to_string()),
+            auth_algo: Some(crate::XFRM_AUTH_HMAC_SHA256.to_string()),
             auth_truncation_len_bits: Some(96),
             auth_key_len: 32,
-            crypt_algo: Some("aes-cbc".to_string()),
+            crypt_algo: Some(crate::XFRM_ENCR_CBC_AES.to_string()),
             crypt_key_len: 32,
             aead_algo: None,
             aead_icv_len_bits: None,
@@ -599,10 +599,10 @@ mod tests {
             destination: params.id.destination,
             spi: params.id.spi,
             protocol: params.id.protocol,
-            auth_algo: Some("hmac-sha256".to_string()),
+            auth_algo: Some(crate::XFRM_AUTH_HMAC_SHA256.to_string()),
             auth_truncation_len_bits: Some(96),
             auth_key_len: 32,
-            crypt_algo: Some("aes-cbc".to_string()),
+            crypt_algo: Some(crate::XFRM_ENCR_CBC_AES.to_string()),
             crypt_key_len: 32,
             aead_algo: None,
             aead_icv_len_bits: None,
@@ -620,7 +620,7 @@ mod tests {
         params.auth = None;
         params.crypt = None;
         params.aead = Some((
-            AeadAlgorithm::new("rfc4106(gcm(aes))", 128),
+            AeadAlgorithm::rfc4106_gcm_aes(128),
             KeyMaterial::new(vec![0xcd; 36]),
         ));
 
@@ -644,7 +644,7 @@ mod tests {
                 auth_key_len: 0,
                 crypt_algo: None,
                 crypt_key_len: 0,
-                aead_algo: Some("rfc4106(gcm(aes))".to_string()),
+                aead_algo: Some(crate::XFRM_AEAD_RFC4106_GCM_AES.to_string()),
                 aead_icv_len_bits: Some(128),
                 aead_key_len: 36,
                 mode: XfrmMode::Tunnel,

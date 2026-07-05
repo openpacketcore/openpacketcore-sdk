@@ -42,7 +42,8 @@ pub use model::{
     InstallSaRequest, IpAddress, KeyMaterial, LifetimeConfig, PolicyParameters, RekeyPolicyRequest,
     RekeySaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters, SpiAllocation, UdpEncap,
     XfrmAction, XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmMark, XfrmMode,
-    XfrmProbe, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP,
+    XfrmProbe, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP, XFRM_AEAD_RFC4106_GCM_AES,
+    XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384, XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES,
 };
 pub use unsupported::UnsupportedXfrmBackend;
 
@@ -75,10 +76,10 @@ mod integration_tests {
             },
             source_address: ipv4(10, 0, 0, 1),
             auth: Some((
-                AuthAlgorithm::new("hmac-sha256", 96),
+                AuthAlgorithm::hmac_sha256(96),
                 KeyMaterial::new(vec![0xab; 32]),
             )),
-            crypt: Some((Algorithm::new("aes-cbc"), KeyMaterial::new(vec![0xcd; 32]))),
+            crypt: Some((Algorithm::cbc_aes(), KeyMaterial::new(vec![0xcd; 32]))),
             aead: None,
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),

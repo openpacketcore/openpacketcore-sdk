@@ -151,10 +151,30 @@ pub enum XfrmAction {
     Block,
 }
 
+/// The exact Linux kernel XFRM name for AES-CBC encryption; do not hand-write
+/// hyphenated forms.
+pub const XFRM_ENCR_CBC_AES: &str = "cbc(aes)";
+
+/// The exact Linux kernel XFRM name for AES-GCM RFC 4106 AEAD; do not
+/// hand-write hyphenated forms.
+pub const XFRM_AEAD_RFC4106_GCM_AES: &str = "rfc4106(gcm(aes))";
+
+/// The exact Linux kernel XFRM name for HMAC-SHA-256 authentication; do not
+/// hand-write hyphenated forms.
+pub const XFRM_AUTH_HMAC_SHA256: &str = "hmac(sha256)";
+
+/// The exact Linux kernel XFRM name for HMAC-SHA-384 authentication; do not
+/// hand-write hyphenated forms.
+pub const XFRM_AUTH_HMAC_SHA384: &str = "hmac(sha384)";
+
+/// The exact Linux kernel XFRM name for HMAC-SHA-512 authentication; do not
+/// hand-write hyphenated forms.
+pub const XFRM_AUTH_HMAC_SHA512: &str = "hmac(sha512)";
+
 /// Algorithm name used for authentication or encryption.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Algorithm {
-    /// Kernel algorithm name such as `aes-cbc` or `hmac-sha256`.
+    /// Kernel algorithm name such as [`XFRM_ENCR_CBC_AES`].
     pub name: String,
 }
 
@@ -163,12 +183,17 @@ impl Algorithm {
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
     }
+
+    /// Create the Linux XFRM AES-CBC encryption algorithm.
+    pub fn cbc_aes() -> Self {
+        Self::new(XFRM_ENCR_CBC_AES)
+    }
 }
 
 /// Authentication algorithm with truncation length.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AuthAlgorithm {
-    /// Kernel algorithm name such as `hmac-sha256`.
+    /// Kernel algorithm name such as [`XFRM_AUTH_HMAC_SHA256`].
     pub name: String,
     /// Truncation length in bits, for example 96 for `auth-trunc`.
     pub truncation_len_bits: u32,
@@ -182,12 +207,27 @@ impl AuthAlgorithm {
             truncation_len_bits,
         }
     }
+
+    /// Create the Linux XFRM HMAC-SHA-256 authentication algorithm.
+    pub fn hmac_sha256(truncation_len_bits: u32) -> Self {
+        Self::new(XFRM_AUTH_HMAC_SHA256, truncation_len_bits)
+    }
+
+    /// Create the Linux XFRM HMAC-SHA-384 authentication algorithm.
+    pub fn hmac_sha384(truncation_len_bits: u32) -> Self {
+        Self::new(XFRM_AUTH_HMAC_SHA384, truncation_len_bits)
+    }
+
+    /// Create the Linux XFRM HMAC-SHA-512 authentication algorithm.
+    pub fn hmac_sha512(truncation_len_bits: u32) -> Self {
+        Self::new(XFRM_AUTH_HMAC_SHA512, truncation_len_bits)
+    }
 }
 
 /// Combined-mode AEAD algorithm with Integrity Check Value length.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AeadAlgorithm {
-    /// Kernel algorithm name such as `rfc4106(gcm(aes))`.
+    /// Kernel algorithm name such as [`XFRM_AEAD_RFC4106_GCM_AES`].
     pub name: String,
     /// ICV length in bits, for example 128 for AES-GCM-16.
     pub icv_len_bits: u32,
@@ -200,6 +240,11 @@ impl AeadAlgorithm {
             name: name.into(),
             icv_len_bits,
         }
+    }
+
+    /// Create the Linux XFRM AES-GCM RFC 4106 AEAD algorithm.
+    pub fn rfc4106_gcm_aes(icv_len_bits: u32) -> Self {
+        Self::new(XFRM_AEAD_RFC4106_GCM_AES, icv_len_bits)
     }
 }
 
@@ -525,6 +570,33 @@ mod tests {
 
         let d = KeyMaterial::new(vec![1, 2]);
         assert_ne!(a, d);
+    }
+
+    #[test]
+    fn kernel_algorithm_constants_use_linux_template_names() {
+        assert_eq!(XFRM_ENCR_CBC_AES, "cbc(aes)");
+        assert_eq!(XFRM_AEAD_RFC4106_GCM_AES, "rfc4106(gcm(aes))");
+        assert_eq!(XFRM_AUTH_HMAC_SHA256, "hmac(sha256)");
+        assert_eq!(XFRM_AUTH_HMAC_SHA384, "hmac(sha384)");
+        assert_eq!(XFRM_AUTH_HMAC_SHA512, "hmac(sha512)");
+
+        assert_eq!(Algorithm::cbc_aes().name, XFRM_ENCR_CBC_AES);
+        assert_eq!(
+            AuthAlgorithm::hmac_sha256(128),
+            AuthAlgorithm::new(XFRM_AUTH_HMAC_SHA256, 128)
+        );
+        assert_eq!(
+            AuthAlgorithm::hmac_sha384(192),
+            AuthAlgorithm::new(XFRM_AUTH_HMAC_SHA384, 192)
+        );
+        assert_eq!(
+            AuthAlgorithm::hmac_sha512(256),
+            AuthAlgorithm::new(XFRM_AUTH_HMAC_SHA512, 256)
+        );
+        assert_eq!(
+            AeadAlgorithm::rfc4106_gcm_aes(128),
+            AeadAlgorithm::new(XFRM_AEAD_RFC4106_GCM_AES, 128)
+        );
     }
 
     #[test]
