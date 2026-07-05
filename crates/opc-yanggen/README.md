@@ -1,6 +1,8 @@
 # Opc Yanggen
 
-YANG-to-Rust type projection, RFC 7951 JSON serde, iterative semantic constraint validation, and patch applicator.
+YANG-to-Rust type projection, RFC 7951 JSON serde, iterative semantic constraint
+validation, schema registry generation, NETCONF/gNMI projections, and patch
+applicators.
 
 ## Status
 
@@ -50,6 +52,13 @@ The command reads the source modules through the same YANG ingestion path,
 canonicalizes the derived `GenerationInput`, and writes the Rust files returned
 by `opc_yanggen::rust::generate_rust` into the output directory. The directory
 is created when missing. Generated filenames are preserved exactly.
+
+Generated schema registries and northbound projections use fully
+prefix-qualified schema paths for every segment, such as
+`/example:system/example:hostname`. Runtime schema lookup still accepts relaxed
+same-module spellings when they resolve unambiguously, but emitted metadata,
+gNMI updates, NETCONF selections, NACM lookups, and audit attribution share the
+fully qualified path form.
 
 The writer fails closed if the output directory contains stale top-level `.rs`
 files that are not part of the current generator output:

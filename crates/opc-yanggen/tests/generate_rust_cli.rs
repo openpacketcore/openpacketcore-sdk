@@ -143,10 +143,16 @@ fn generate_rust_writes_all_expected_files() {
     let json = assert_success_json(output);
 
     assert_eq!(json["status"], "ok");
-    assert!(json["schema_digest"]
+    let schema_digest = json["schema_digest"]
         .as_str()
-        .expect("schema_digest should be a string")
-        .starts_with("fnv1a64:"));
+        .expect("schema_digest should be a string");
+    assert!(schema_digest.starts_with("fnv1a64:"));
+    let schema_registry = fs::read_to_string(out_dir.join("schema_registry.rs"))
+        .expect("schema_registry.rs should be generated");
+    assert!(
+        schema_registry.contains(&format!("\"{schema_digest}\"")),
+        "CLI schema_digest must match generated registry digest"
+    );
     let files = json["files"]
         .as_array()
         .expect("files should be an array")

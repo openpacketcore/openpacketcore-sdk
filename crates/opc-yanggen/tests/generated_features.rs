@@ -234,6 +234,15 @@ fn test_generated_code_features() {
         assert_eq!(sys.mode, LeafPresence::Explicit("active-standby".to_string()));
         assert_eq!(sys.checkpoint_interval_ms, LeafPresence::Explicit(100));
 
+        let canonical_deltas = vec![
+            generated_test::patch::ConfigDelta::Update(
+                opc_config_model::YangPath::new("/test:system/test:mode").unwrap(),
+                "standalone".to_string()
+            )
+        ];
+        generated_test::patch::apply_patch(&mut sys, &canonical_deltas).unwrap();
+        assert_eq!(sys.mode, LeafPresence::Explicit("standalone".to_string()));
+
         let invalid = vec![
             generated_test::patch::ConfigDelta::Update(
                 opc_config_model::YangPath::new("/test:system/mode").unwrap(),
@@ -312,6 +321,72 @@ fn test_generated_code_features() {
     }
 
     #[test]
+    fn test_gnmi_set_accepts_audit_safe_same_module_path() {
+        use opc_gnmi_server::{
+            Encoding, GnmiPatchApplicator, NormalizedSet, NormalizedValue,
+        };
+
+        let value = NormalizedValue::new(
+            Encoding::JsonIetf,
+            "\"active-standby\"",
+            &opc_mgmt_limits::MgmtLimits::default(),
+        )
+        .unwrap();
+        let set = NormalizedSet {
+            updates: vec![(opc_config_model::YangPath::new("/test:system/test:mode").unwrap(), value)],
+            ..Default::default()
+        };
+
+        let candidate = generated_test::gnmi_set::patcher()
+            .apply_set(&System::default(), &set)
+            .unwrap();
+        assert_eq!(
+            candidate.mode,
+            LeafPresence::Explicit("active-standby".to_string())
+        );
+    }
+
+    #[test]
+    fn test_gnmi_json_reads_use_audit_safe_paths() {
+        use opc_gnmi_server::{GnmiJsonRenderer, ReadSelection};
+
+        let sys = System {
+            enabled: LeafPresence::Explicit(true),
+            ..Default::default()
+        };
+        let selection_paths: &[&'static str] = &["/test:system/test:enabled"];
+        let updates = generated_test::gnmi_json::renderer()
+            .render_running_json(&sys, ReadSelection::new(selection_paths))
+            .unwrap();
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].path().as_str(), "/test:system/test:enabled");
+        assert_eq!(updates[0].value_json(), "true");
+    }
+
+    #[test]
+    fn test_netconf_xml_reads_use_audit_safe_paths() {
+        use opc_mgmt_schema::{DefaultReport, NetconfXmlRenderer};
+
+        let sys = System {
+            enabled: LeafPresence::Explicit(true),
+            mode: LeafPresence::Explicit("standalone".to_string()),
+            ..Default::default()
+        };
+        let xml = generated_test::netconf_xml::renderer()
+            .render_running_config(
+                &sys,
+                &["/test:system/test:enabled"],
+                DefaultReport::Trim,
+            )
+            .unwrap();
+
+        assert!(xml.contains("xmlns:test=\"urn:opc:test\""));
+        assert!(xml.contains("<test:enabled>true</test:enabled>"));
+        assert!(!xml.contains("<test:mode>"));
+    }
+
+    #[test]
     fn test_netconf_edit_rejects_invalid_enum_value() {
         use opc_mgmt_schema::{
             EditConfigNode, EditOperation, NetconfEditError, NetconfXmlEditApplicator,
@@ -323,7 +398,7 @@ fn test_generated_code_features() {
             operation: EditOperation::Merge,
             value: None,
             children: vec![EditConfigNode {
-                schema_path: "/test:system/mode",
+                schema_path: "/test:system/test:mode",
                 operation: EditOperation::Merge,
                 value: Some("invalid".to_string()),
                 children: Vec::new(),
@@ -338,7 +413,7 @@ fn test_generated_code_features() {
         assert!(matches!(
             err,
             NetconfEditError::InvalidValue {
-                path: "/test:system/mode"
+                path: "/test:system/test:mode"
             }
         ));
     }
@@ -355,7 +430,7 @@ fn test_generated_code_features() {
             operation: EditOperation::Merge,
             value: None,
             children: vec![EditConfigNode {
-                schema_path: "/test:system/checkpoint-interval-ms",
+                schema_path: "/test:system/test:checkpoint-interval-ms",
                 operation: EditOperation::Merge,
                 value: Some("0".to_string()),
                 children: Vec::new(),
@@ -370,7 +445,7 @@ fn test_generated_code_features() {
         assert!(matches!(
             err,
             NetconfEditError::InvalidValue {
-                path: "/test:system/checkpoint-interval-ms"
+                path: "/test:system/test:checkpoint-interval-ms"
             }
         ));
     }
@@ -434,17 +509,49 @@ fn test_generated_code_features() {
             "0000000000000000000000000000000000000000000000000000000000000000"
         );
 
-        // Path tree resolves both prefixed and bare forms; config classification.
+        // The generated registry stores audit-safe fully qualified child paths,
+        // while runtime lookup still accepts the legacy same-module spelling.
+        let node_paths: Vec<&str> = reg.nodes().iter().map(|node| node.path).collect();
+        assert!(node_paths.contains(&"/test:system"));
+        assert!(node_paths.contains(&"/test:system/test:enabled"));
+        assert!(node_paths.contains(&"/test:system/test:mode"));
+        assert!(node_paths.contains(&"/test:system/test:checkpoint-interval-ms"));
+        assert!(node_paths.contains(&"/test:system/test:secret-key"));
+        assert!(!node_paths.contains(&"/test:system/enabled"));
+        let root = reg.node("/test:system").unwrap();
+        assert_eq!(
+            root.child_paths,
+            &[
+                "/test:system/test:checkpoint-interval-ms",
+                "/test:system/test:enabled",
+                "/test:system/test:mode",
+                "/test:system/test:secret-key",
+            ]
+        );
+        assert_eq!(
+            reg.node("/test:system/test:enabled").unwrap().path,
+            "/test:system/test:enabled"
+        );
+        assert_eq!(
+            reg.node("/test:system/enabled").unwrap().path,
+            "/test:system/test:enabled"
+        );
+
+        // Path tree resolves both fully prefixed and relaxed forms; config classification.
+        assert!(reg.is_valid_path("/test:system/test:enabled"));
         assert!(reg.is_valid_path("/test:system/enabled"));
         assert!(reg.is_valid_path("/system/enabled"));
         assert!(!reg.is_valid_path("/test:system/nope"));
         assert!(!reg.is_valid_path("/bogus:system/enabled"));
         assert!(!reg.is_valid_path("/test:system[test:name='unterminated/enabled"));
-        assert!(reg.is_config_path("/test:system/enabled"));
+        assert!(reg.is_config_path("/test:system/test:enabled"));
 
         // Leaf type metadata.
-        assert_eq!(reg.leaf_type("/test:system/enabled"), Some(LeafType::Boolean));
-        match reg.leaf_type("/test:system/mode") {
+        assert_eq!(
+            reg.leaf_type("/test:system/test:enabled"),
+            Some(LeafType::Boolean)
+        );
+        match reg.leaf_type("/test:system/test:mode") {
             Some(LeafType::Enumeration { values }) => {
                 assert_eq!(values.len(), 2);
                 assert_eq!(values[0].name, "standalone");
@@ -453,9 +560,15 @@ fn test_generated_code_features() {
             }
             other => panic!("unexpected mode leaf type: {other:?}"),
         }
-        assert_eq!(reg.leaf_type("/test:system/secret-key"), Some(LeafType::String));
+        assert_eq!(
+            reg.leaf_type("/test:system/test:secret-key"),
+            Some(LeafType::String)
+        );
         assert_eq!(reg.leaf_type("/test:system"), None);
-        let checkpoint_range = reg.numeric_range("/test:system/checkpoint-interval-ms");
+        let ranges = reg.numeric_ranges();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].path, "/test:system/test:checkpoint-interval-ms");
+        let checkpoint_range = reg.numeric_range("/test:system/test:checkpoint-interval-ms");
         assert_eq!(checkpoint_range.len(), 1);
         assert_eq!(checkpoint_range[0].min, 1);
         assert_eq!(checkpoint_range[0].max, i64::from(u32::MAX));
@@ -463,16 +576,16 @@ fn test_generated_code_features() {
         // Data class for the sensitive leaf, and it MUST agree with the
         // generated metadata resolver (the registry is not a side schema).
         assert_eq!(
-            reg.data_class("/test:system/secret-key"),
+            reg.data_class("/test:system/test:secret-key"),
             Some(DataClass::SecuritySecret)
         );
         let meta_dc = generated_test::metadata::get_data_class_for_path(
-            &opc_config_model::YangPath::new("/test:system/secret-key").unwrap(),
+            &opc_config_model::YangPath::new("/test:system/test:secret-key").unwrap(),
         );
-        assert_eq!(reg.data_class("/test:system/secret-key"), meta_dc);
+        assert_eq!(reg.data_class("/test:system/test:secret-key"), meta_dc);
 
         // NACM: a config node gets read + create/update/replace/delete.
-        let actions = reg.nacm_actions("/test:system/enabled");
+        let actions = reg.nacm_actions("/test:system/test:enabled");
         assert!(actions.contains(&NacmAction::Read));
         assert!(actions.contains(&NacmAction::Create));
         assert!(actions.contains(&NacmAction::Delete));
@@ -485,7 +598,7 @@ fn test_generated_code_features() {
 
         // No defaults declared in this schema.
         assert_eq!(
-            reg.default_for("/test:system/enabled", DefaultReport::ReportAll),
+            reg.default_for("/test:system/test:enabled", DefaultReport::ReportAll),
             None
         );
 
@@ -563,6 +676,32 @@ fn test_rust_generation_rejects_missing_children() {
 
     let err = generate_rust(&input).unwrap_err();
     assert!(err.message().contains("references missing child"));
+}
+
+#[test]
+fn test_rust_generation_rejects_normalized_path_collision() {
+    let mut input = create_test_input();
+    let source = YangSourceLocation::new("test.yang", 30, 1);
+    input.nodes[0]
+        .child_paths
+        .push("/test:system/test:enabled".to_string());
+    input.nodes.push(SchemaNode {
+        path: "/test:system/test:enabled".to_string(),
+        module: "test".to_string(),
+        kind: SchemaNodeKind::Leaf,
+        config: true,
+        type_ref: Some(TypeRef::Boolean),
+        source,
+        ..Default::default()
+    });
+
+    let err = generate_rust(&input).unwrap_err();
+    assert!(
+        err.message()
+            .contains("normalized generated schema path collision"),
+        "got: {}",
+        err.message()
+    );
 }
 
 #[test]

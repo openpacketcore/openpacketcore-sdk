@@ -74,6 +74,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- `opc-yanggen`: generated Rust artifacts now use fully prefix-qualified
+  schema-node paths for every segment across schema registry metadata, gNMI,
+  NETCONF, NACM, and audit-facing path attribution while preserving
+  unambiguous relaxed lookup compatibility.
 - `opc-persist`: a committed `MarkConfirmed`/`CreateRollbackPoint` whose target
   `tx_id` is absent on a node (compacted away, or restored from an older
   snapshot) no longer aborts the consensus apply transaction. Applying a
