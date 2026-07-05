@@ -28,6 +28,7 @@ GRPC_ALLOWED_ROOTS = {"opc-gnmi-server"}
 UNSAFE_ALLOWED_ROOTS = {
     "opc-libsctp-sys",
     "opc-linux-gtpu-sys",
+    "opc-linux-route-sys",
     "opc-linux-xfrm-sys",
 }
 
