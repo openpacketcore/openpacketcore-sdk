@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use crate::backend::XfrmBackend;
 use crate::error::XfrmError;
 use crate::model::{
-    AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, RekeyPolicyRequest, RekeySaRequest,
-    RemovePolicyRequest, RemoveSaRequest, SpiAllocation, XfrmProbe,
+    AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, QuerySaRequest, RekeyPolicyRequest,
+    RekeySaRequest, RemovePolicyRequest, RemoveSaRequest, SaState, SpiAllocation, XfrmProbe,
 };
 
 /// XFRM backend that reports [`XfrmError::UnsupportedPlatform`] for every
@@ -31,6 +31,10 @@ impl XfrmBackend for UnsupportedXfrmBackend {
     }
 
     async fn install_sa(&self, _request: InstallSaRequest) -> Result<(), XfrmError> {
+        Err(XfrmError::UnsupportedPlatform)
+    }
+
+    async fn query_sa(&self, _request: QuerySaRequest) -> Result<SaState, XfrmError> {
         Err(XfrmError::UnsupportedPlatform)
     }
 

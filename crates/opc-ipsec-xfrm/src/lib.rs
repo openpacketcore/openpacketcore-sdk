@@ -39,10 +39,11 @@ pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
 pub use mock::{MockOperation, MockXfrmBackend};
 pub use model::{
     AeadAlgorithm, Algorithm, AllocateSpiRequest, AuthAlgorithm, InstallPolicyRequest,
-    InstallSaRequest, IpAddress, KeyMaterial, LifetimeConfig, PolicyParameters, RekeyPolicyRequest,
-    RekeySaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters, SpiAllocation, UdpEncap,
-    XfrmAction, XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmMark, XfrmMode,
-    XfrmProbe, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP, XFRM_AEAD_RFC4106_GCM_AES,
+    InstallSaRequest, IpAddress, KeyMaterial, LifetimeConfig, LifetimeCurrent, PolicyParameters,
+    QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RemovePolicyRequest, RemoveSaRequest,
+    SaParameters, SaReplayState, SaState, SaStatistics, SpiAllocation, UdpEncap, XfrmAction,
+    XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmMark, XfrmMode, XfrmProbe,
+    XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP, XFRM_AEAD_RFC4106_GCM_AES,
     XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384, XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES,
 };
 pub use unsupported::UnsupportedXfrmBackend;
@@ -84,6 +85,7 @@ mod integration_tests {
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),
             replay_window: 32,
+            replay_state: None,
             encap: None,
             mark: None,
             if_id: None,

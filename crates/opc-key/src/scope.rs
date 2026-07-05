@@ -50,6 +50,7 @@ pub enum KeyPurpose {
     Config,
     ShadowSecurity,
     Session,
+    IpsecSa,
     Audit,
     Backup,
 }
@@ -60,6 +61,7 @@ impl KeyPurpose {
             Self::Config => "config",
             Self::ShadowSecurity => "shadow-security",
             Self::Session => "session",
+            Self::IpsecSa => "ipsec-sa",
             Self::Audit => "audit",
             Self::Backup => "backup",
         }

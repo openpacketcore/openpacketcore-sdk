@@ -1,0 +1,26 @@
+[package]
+name = "opc-route-steering"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Safe Linux route/rule steering backend model, mock backend, and redaction-safe errors for OpenPacketCore"
+readme = "README.md"
+documentation = "https://docs.rs/opc-route-steering"
+keywords = ["5g", "route", "netlink", "linux", "packet-core"]
+categories = ["network-programming", "os::linux-apis"]
+publish = false
+
+[dependencies]
+opc-linux-route-sys = { path = "../opc-linux-route-sys", version = "0.2.0" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

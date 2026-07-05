@@ -235,6 +235,13 @@ impl LinuxGtpuDataplaneBackend {
         })
     }
 
+    fn resolve_device_sync(&self, name: String) -> Result<GtpDevice, GtpuError> {
+        validate_interface_name(&name, "device.name")?;
+        let ifindex = self.ifindex_by_name_after_create(&name)?;
+        validate_ifindex(ifindex, "device.ifindex")?;
+        Ok(GtpDevice { name, ifindex })
+    }
+
     fn remove_device_sync(&self, device: GtpDevice) -> Result<(), GtpuError> {
         validate_device(&device)?;
         let body = encode_remove_device_request(&device)?;
@@ -326,6 +333,14 @@ impl GtpuDataplaneBackend for LinuxGtpuDataplaneBackend {
     async fn create_device(&self, request: CreateGtpDeviceRequest) -> Result<GtpDevice, GtpuError> {
         self.run_blocking("create_device", move |backend| {
             backend.create_device_sync(request)
+        })
+        .await
+    }
+
+    async fn resolve_device(&self, name: &str) -> Result<GtpDevice, GtpuError> {
+        let name = name.to_string();
+        self.run_blocking("resolve_device", move |backend| {
+            backend.resolve_device_sync(name)
         })
         .await
     }
@@ -1509,6 +1524,24 @@ mod tests {
         let linkinfo = attr_payload_from(body, IF_INFO_MESSAGE_LEN, IFLA_LINKINFO).unwrap();
         let info_data = attr_payload(linkinfo, IFLA_INFO_DATA).unwrap();
         assert_eq!(attr_u32(info_data, IFLA_GTP_FD1), 9);
+    }
+
+    #[tokio::test]
+    async fn linux_backend_resolves_device_by_name_without_create_mutation() {
+        let transport = CapturingTransport::new();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone());
+
+        let device = backend.resolve_device("gtp0").await.unwrap();
+
+        assert_eq!(
+            device,
+            GtpDevice {
+                name: "gtp0".to_string(),
+                ifindex: 42,
+            }
+        );
+        assert!(transport.requests().is_empty());
+        assert_eq!(retained_socket_count(&backend), 0);
     }
 
     #[tokio::test]

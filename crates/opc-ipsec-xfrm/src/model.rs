@@ -328,6 +328,105 @@ pub struct LifetimeConfig {
     pub hard_add_expires_seconds: u64,
 }
 
+/// Current lifetime counters reported by the kernel for an SA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct LifetimeCurrent {
+    /// Current byte count.
+    pub bytes: u64,
+    /// Current packet count.
+    pub packets: u64,
+    /// Kernel add time in seconds.
+    pub add_time_seconds: u64,
+    /// Kernel first-use time in seconds.
+    pub use_time_seconds: u64,
+}
+
+/// Current replay and integrity-failure counters reported by the kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SaStatistics {
+    /// Kernel replay-window counter.
+    pub replay_window: u32,
+    /// Replay failures.
+    pub replay_failures: u32,
+    /// Integrity failures.
+    pub integrity_failures: u32,
+}
+
+/// Replay/sequence state used for SA restore and query.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct SaReplayState {
+    /// Whether the state uses Extended Sequence Numbers.
+    pub esn: bool,
+    /// Outbound sequence number low word.
+    pub outbound_sequence: u32,
+    /// Inbound sequence number low word.
+    pub inbound_sequence: u32,
+    /// Outbound sequence number high word for ESN.
+    pub outbound_sequence_hi: u32,
+    /// Inbound sequence number high word for ESN.
+    pub inbound_sequence_hi: u32,
+    /// Anti-replay window size.
+    pub replay_window: u32,
+    /// Anti-replay bitmap words in kernel order.
+    pub bitmap: Vec<u32>,
+}
+
+impl SaReplayState {
+    /// Build a fresh replay state for a newly installed SA.
+    #[must_use]
+    pub fn fresh(replay_window: u32) -> Self {
+        let esn = replay_window > 32;
+        let bitmap = if esn {
+            vec![0; replay_bitmap_word_len(replay_window)]
+        } else if replay_window == 0 {
+            Vec::new()
+        } else {
+            vec![0]
+        };
+        Self {
+            esn,
+            outbound_sequence: 0,
+            inbound_sequence: 0,
+            outbound_sequence_hi: 0,
+            inbound_sequence_hi: 0,
+            replay_window,
+            bitmap,
+        }
+    }
+
+    /// Build a legacy non-ESN replay state.
+    #[must_use]
+    pub fn legacy(outbound_sequence: u32, inbound_sequence: u32, bitmap: u32) -> Self {
+        Self {
+            esn: false,
+            outbound_sequence,
+            inbound_sequence,
+            outbound_sequence_hi: 0,
+            inbound_sequence_hi: 0,
+            replay_window: 32,
+            bitmap: vec![bitmap],
+        }
+    }
+}
+
+impl fmt::Debug for SaReplayState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SaReplayState")
+            .field("esn", &self.esn)
+            .field("outbound_sequence", &self.outbound_sequence)
+            .field("inbound_sequence", &self.inbound_sequence)
+            .field("outbound_sequence_hi", &self.outbound_sequence_hi)
+            .field("inbound_sequence_hi", &self.inbound_sequence_hi)
+            .field("replay_window", &self.replay_window)
+            .field("bitmap_words", &self.bitmap.len())
+            .finish()
+    }
+}
+
+fn replay_bitmap_word_len(replay_window: u32) -> usize {
+    replay_window.div_ceil(32).max(1) as usize
+}
+
 /// Parameters needed to install or update a Security Association.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaParameters {
@@ -350,7 +449,9 @@ pub struct SaParameters {
     /// Lifetime limits.
     pub lifetime: LifetimeConfig,
     /// Replay window size.
-    pub replay_window: u8,
+    pub replay_window: u32,
+    /// Optional replay/sequence state for restore.
+    pub replay_state: Option<SaReplayState>,
     /// Optional UDP encapsulation template for NAT-T.
     pub encap: Option<UdpEncap>,
     /// Optional packet mark.
@@ -418,6 +519,40 @@ pub struct SpiAllocation {
 pub struct InstallSaRequest {
     /// SA parameters.
     pub parameters: SaParameters,
+}
+
+/// Request to query a Security Association.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QuerySaRequest {
+    /// Destination address.
+    pub destination: IpAddress,
+    /// Transform protocol.
+    pub protocol: u8,
+    /// SPI in host byte order.
+    pub spi: u32,
+}
+
+/// Redaction-safe kernel state for a queried SA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaState {
+    /// Packet selector.
+    pub selector: XfrmSelector,
+    /// SA identity.
+    pub id: XfrmId,
+    /// Source tunnel endpoint.
+    pub source_address: IpAddress,
+    /// XFRM mode.
+    pub mode: XfrmMode,
+    /// Configured replay window.
+    pub replay_window: u32,
+    /// Replay and sequence-counter state.
+    pub replay_state: SaReplayState,
+    /// Configured lifetime limits.
+    pub lifetime_config: LifetimeConfig,
+    /// Current lifetime counters.
+    pub lifetime_current: LifetimeCurrent,
+    /// Current kernel failure counters.
+    pub statistics: SaStatistics,
 }
 
 /// Request to rekey (update) an existing Security Association.
@@ -612,5 +747,33 @@ mod tests {
         let sel = XfrmSelector::new(IpAddress::Ipv6([0; 16]), IpAddress::Ipv6([1; 16]), 50);
         assert_eq!(sel.source_prefix_len, 128);
         assert_eq!(sel.destination_prefix_len, 128);
+    }
+
+    #[test]
+    fn replay_state_debug_hides_bitmap_contents() {
+        let state = SaReplayState {
+            esn: true,
+            outbound_sequence: 10,
+            inbound_sequence: 11,
+            outbound_sequence_hi: 1,
+            inbound_sequence_hi: 2,
+            replay_window: 64,
+            bitmap: vec![0xdead_beef, 0xfeed_face],
+        };
+        let debug = format!("{state:?}");
+        assert!(debug.contains("bitmap_words"));
+        assert!(!debug.contains("dead"));
+        assert!(!debug.contains("feed"));
+    }
+
+    #[test]
+    fn fresh_replay_state_uses_esn_for_windows_above_32() {
+        let legacy = SaReplayState::fresh(32);
+        assert!(!legacy.esn);
+        assert_eq!(legacy.bitmap, vec![0]);
+
+        let esn = SaReplayState::fresh(65);
+        assert!(esn.esn);
+        assert_eq!(esn.bitmap.len(), 3);
     }
 }

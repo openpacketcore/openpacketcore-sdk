@@ -1,6 +1,8 @@
 # Opc Key
 
 Key-provider traits, in-memory adapters, and tenant-bound AEAD payload helpers.
+Purpose lanes include config, shadow-security, session, IPsec SA, audit, and
+backup key separation.
 
 ## Status
 

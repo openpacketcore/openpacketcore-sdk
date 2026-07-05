@@ -30,6 +30,10 @@ impl GtpuDataplaneBackend for UnsupportedGtpuDataplaneBackend {
         Err(GtpuError::UnsupportedPlatform)
     }
 
+    async fn resolve_device(&self, _name: &str) -> Result<GtpDevice, GtpuError> {
+        Err(GtpuError::UnsupportedPlatform)
+    }
+
     async fn remove_device(&self, _device: &GtpDevice) -> Result<(), GtpuError> {
         Err(GtpuError::UnsupportedPlatform)
     }

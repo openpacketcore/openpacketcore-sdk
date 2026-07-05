@@ -10,19 +10,21 @@ use async_trait::async_trait;
 use opc_linux_xfrm_sys::{
     align_to_netlink, open_netlink_socket, receive_message, send_message, NLMSG_DONE, NLMSG_ERROR,
     NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST, XFRMA_ALG_AEAD,
-    XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT, XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_MARK, XFRMA_TMPL,
-    XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA,
-    XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK, XFRM_POLICY_FWD,
-    XFRM_POLICY_IN, XFRM_POLICY_OUT,
+    XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT, XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_MARK,
+    XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL, XFRMA_TMPL, XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY,
+    XFRM_MSG_DELSA, XFRM_MSG_GETSA, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY,
+    XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN,
+    XFRM_POLICY_OUT, XFRM_STATE_ESN,
 };
 use zeroize::Zeroizing;
 
 use crate::{
     AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, IpAddress, LifetimeConfig,
-    PolicyParameters, RekeyPolicyRequest, RekeySaRequest, RemovePolicyRequest, RemoveSaRequest,
-    SaParameters, SpiAllocation, UdpEncap, XfrmAction, XfrmBackend, XfrmBackendKind,
-    XfrmCapability, XfrmDirection, XfrmError, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmSelector,
-    XfrmTemplate, XFRM_AEAD_RFC4106_GCM_AES,
+    LifetimeCurrent, PolicyParameters, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest,
+    RemovePolicyRequest, RemoveSaRequest, SaParameters, SaReplayState, SaState, SaStatistics,
+    SpiAllocation, UdpEncap, XfrmAction, XfrmBackend, XfrmBackendKind, XfrmCapability,
+    XfrmDirection, XfrmError, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
+    XFRM_AEAD_RFC4106_GCM_AES,
 };
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -44,6 +46,8 @@ const XFRM_ALGO_AUTH_HEADER_LEN: usize = 72;
 const XFRM_ALGO_AEAD_HEADER_LEN: usize = 72;
 const XFRM_MARK_LEN: usize = 8;
 const XFRM_ENCAP_TEMPLATE_LEN: usize = 24;
+const XFRM_REPLAY_STATE_LEN: usize = 12;
+const XFRM_REPLAY_STATE_ESN_BASE_LEN: usize = 24;
 const XFRM_SPI_OFFSET_IN_SA_INFO: usize = XFRM_SELECTOR_LEN + XFRM_ADDRESS_LEN;
 
 const AF_INET: u16 = 2;
@@ -229,6 +233,16 @@ impl XfrmBackend for LinuxXfrmBackend {
             body,
         )
         .await
+    }
+
+    async fn query_sa(&self, request: QuerySaRequest) -> Result<SaState, XfrmError> {
+        validate_sa_query(request)?;
+        let body = encode_sa_id(request.destination, request.protocol, request.spi)?;
+        let response = self
+            .transact_blocking("query_sa", XFRM_MSG_GETSA, NLM_F_REQUEST | NLM_F_ACK, body)
+            .await?
+            .ok_or_else(|| XfrmError::io("query_sa", invalid_data("missing getsa response")))?;
+        parse_sa_state(&response)
     }
 
     async fn rekey_sa(&self, request: RekeySaRequest) -> Result<(), XfrmError> {
@@ -494,6 +508,7 @@ fn encode_alloc_spi_request(request: AllocateSpiRequest) -> Result<SensitiveBuff
         mode: XfrmMode::Tunnel,
         lifetime: LifetimeConfig::default(),
         replay_window: 0,
+        replay_state: None,
         encap: None,
         mark: None,
         if_id: None,
@@ -531,12 +546,22 @@ fn encode_sa_info_inner(
     out.resize(len + XFRM_LIFETIME_CURRENT_LEN, 0);
     let len = out.len();
     out.resize(len + XFRM_STATS_LEN, 0);
-    push_u32_ne(&mut out, 0);
+    push_u32_ne(
+        &mut out,
+        parameters
+            .replay_state
+            .as_ref()
+            .map(|state| state.inbound_sequence)
+            .unwrap_or(0),
+    );
     push_u32_ne(&mut out, 0);
     push_u16_ne(&mut out, family);
     push_u8(&mut out, encode_mode(parameters.mode));
-    push_u8(&mut out, parameters.replay_window);
-    push_u8(&mut out, 0);
+    push_u8(
+        &mut out,
+        parameters.replay_window.min(u32::from(u8::MAX)) as u8,
+    );
+    push_u8(&mut out, encode_sa_flags(parameters));
     out.resize(XFRM_USER_SA_INFO_LEN, 0);
 
     if let Some((auth, key)) = &parameters.auth {
@@ -563,6 +588,7 @@ fn encode_sa_info_inner(
     if let Some(encap) = parameters.encap {
         append_attr(&mut out, XFRMA_ENCAP, encode_udp_encap(encap).as_slice())?;
     }
+    append_replay_state_attr(&mut out, parameters)?;
     append_common_attrs(&mut out, parameters.mark, parameters.if_id)?;
     Ok(out)
 }
@@ -767,6 +793,97 @@ fn encode_udp_encap(encap: UdpEncap) -> SensitiveBuffer {
     out
 }
 
+fn encode_sa_flags(parameters: &SaParameters) -> u8 {
+    if parameters.replay_window > 32
+        || parameters
+            .replay_state
+            .as_ref()
+            .map(|state| state.esn)
+            .unwrap_or(false)
+    {
+        XFRM_STATE_ESN
+    } else {
+        0
+    }
+}
+
+fn append_replay_state_attr(out: &mut Vec<u8>, parameters: &SaParameters) -> Result<(), XfrmError> {
+    let state;
+    let replay_state = if let Some(replay_state) = parameters.replay_state.as_ref() {
+        replay_state
+    } else if parameters.replay_window > 32 {
+        state = SaReplayState::fresh(parameters.replay_window);
+        &state
+    } else {
+        return Ok(());
+    };
+
+    validate_replay_state(replay_state, parameters.replay_window)?;
+    if replay_state.esn {
+        append_attr(
+            out,
+            XFRMA_REPLAY_ESN_VAL,
+            &encode_replay_state_esn(replay_state)?,
+        )?;
+    } else {
+        append_attr(
+            out,
+            XFRMA_REPLAY_VAL,
+            &encode_replay_state_legacy(replay_state)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn encode_replay_state_legacy(replay_state: &SaReplayState) -> Result<SensitiveBuffer, XfrmError> {
+    if replay_state.esn {
+        return Err(XfrmError::invalid_config(
+            "replay_state.esn",
+            "legacy replay state must not set ESN",
+        ));
+    }
+    if replay_state.replay_window > 32 {
+        return Err(XfrmError::invalid_config(
+            "replay_state.replay_window",
+            "legacy replay state supports at most 32 packets",
+        ));
+    }
+    let bitmap = replay_state.bitmap.first().copied().unwrap_or(0);
+    let mut out = sensitive_buffer_with_capacity(XFRM_REPLAY_STATE_LEN);
+    push_u32_ne(&mut out, replay_state.outbound_sequence);
+    push_u32_ne(&mut out, replay_state.inbound_sequence);
+    push_u32_ne(&mut out, bitmap);
+    Ok(out)
+}
+
+fn encode_replay_state_esn(replay_state: &SaReplayState) -> Result<SensitiveBuffer, XfrmError> {
+    if !replay_state.esn {
+        return Err(XfrmError::invalid_config(
+            "replay_state.esn",
+            "ESN replay state must set ESN",
+        ));
+    }
+    let bitmap_words = u32::try_from(replay_state.bitmap.len()).map_err(|_| {
+        XfrmError::invalid_config("replay_state.bitmap", "bitmap word count overflow")
+    })?;
+    let capacity = XFRM_REPLAY_STATE_ESN_BASE_LEN
+        .checked_add(replay_state.bitmap.len().saturating_mul(4))
+        .ok_or_else(|| {
+            XfrmError::invalid_config("replay_state.bitmap", "bitmap length overflow")
+        })?;
+    let mut out = sensitive_buffer_with_capacity(capacity);
+    push_u32_ne(&mut out, bitmap_words);
+    push_u32_ne(&mut out, replay_state.outbound_sequence);
+    push_u32_ne(&mut out, replay_state.inbound_sequence);
+    push_u32_ne(&mut out, replay_state.outbound_sequence_hi);
+    push_u32_ne(&mut out, replay_state.inbound_sequence_hi);
+    push_u32_ne(&mut out, replay_state.replay_window);
+    for word in &replay_state.bitmap {
+        push_u32_ne(&mut out, *word);
+    }
+    Ok(out)
+}
+
 fn encode_mark(mark: XfrmMark) -> [u8; XFRM_MARK_LEN] {
     let mut out = [0_u8; XFRM_MARK_LEN];
     out[..4].copy_from_slice(&mark.value.to_ne_bytes());
@@ -826,6 +943,160 @@ fn parse_allocated_spi(payload: &[u8]) -> Result<u32, XfrmError> {
     Ok(spi)
 }
 
+fn parse_sa_state(payload: &[u8]) -> Result<SaState, XfrmError> {
+    if payload.len() < XFRM_USER_SA_INFO_LEN {
+        return Err(XfrmError::io(
+            "query_sa",
+            invalid_data("short getsa response"),
+        ));
+    }
+    let selector = decode_selector(payload, 0)?;
+    let destination = decode_address(payload, 56, read_u16_ne(payload, 212)?)?;
+    let spi = read_u32_be(payload, 72)?;
+    let protocol = read_u8(payload, 76)?;
+    let source_address = decode_address(payload, 80, read_u16_ne(payload, 212)?)?;
+    let lifetime_config = decode_lifetime_config(payload, 96)?;
+    let lifetime_current = decode_lifetime_current(payload, 160)?;
+    let statistics = decode_statistics(payload, 192)?;
+    let sequence = read_u32_ne(payload, 204)?;
+    let mode = decode_mode(read_u8(payload, 214)?)?;
+    let replay_window = u32::from(read_u8(payload, 215)?);
+    let flags = read_u8(payload, 216)?;
+    let replay_state = parse_replay_state_attrs(
+        payload,
+        sequence,
+        replay_window,
+        flags & XFRM_STATE_ESN != 0,
+    )?;
+    Ok(SaState {
+        selector,
+        id: XfrmId {
+            destination,
+            spi,
+            protocol,
+        },
+        source_address,
+        mode,
+        replay_window: replay_state.replay_window.max(replay_window),
+        replay_state,
+        lifetime_config,
+        lifetime_current,
+        statistics,
+    })
+}
+
+fn parse_replay_state_attrs(
+    payload: &[u8],
+    sequence: u32,
+    replay_window: u32,
+    esn_flag: bool,
+) -> Result<SaReplayState, XfrmError> {
+    if let Some(attr) = find_attr_payload(payload, XFRM_USER_SA_INFO_LEN, XFRMA_REPLAY_ESN_VAL)? {
+        return decode_replay_state_esn(attr);
+    }
+    if let Some(attr) = find_attr_payload(payload, XFRM_USER_SA_INFO_LEN, XFRMA_REPLAY_VAL)? {
+        return decode_replay_state_legacy(attr, replay_window);
+    }
+    Ok(SaReplayState {
+        esn: esn_flag,
+        outbound_sequence: 0,
+        inbound_sequence: sequence,
+        outbound_sequence_hi: 0,
+        inbound_sequence_hi: 0,
+        replay_window,
+        bitmap: Vec::new(),
+    })
+}
+
+fn decode_replay_state_legacy(
+    payload: &[u8],
+    replay_window: u32,
+) -> Result<SaReplayState, XfrmError> {
+    if payload.len() != XFRM_REPLAY_STATE_LEN {
+        return Err(XfrmError::io(
+            "query_sa",
+            invalid_data("invalid legacy replay state length"),
+        ));
+    }
+    Ok(SaReplayState {
+        esn: false,
+        outbound_sequence: read_u32_ne(payload, 0)?,
+        inbound_sequence: read_u32_ne(payload, 4)?,
+        outbound_sequence_hi: 0,
+        inbound_sequence_hi: 0,
+        replay_window,
+        bitmap: vec![read_u32_ne(payload, 8)?],
+    })
+}
+
+fn decode_replay_state_esn(payload: &[u8]) -> Result<SaReplayState, XfrmError> {
+    if payload.len() < XFRM_REPLAY_STATE_ESN_BASE_LEN {
+        return Err(XfrmError::io(
+            "query_sa",
+            invalid_data("short ESN replay state"),
+        ));
+    }
+    let bitmap_words = read_u32_ne(payload, 0)? as usize;
+    let expected_len = XFRM_REPLAY_STATE_ESN_BASE_LEN
+        .checked_add(bitmap_words.checked_mul(4).ok_or_else(|| {
+            XfrmError::io(
+                "query_sa",
+                invalid_data("ESN replay bitmap length overflow"),
+            )
+        })?)
+        .ok_or_else(|| XfrmError::io("query_sa", invalid_data("ESN replay length overflow")))?;
+    if payload.len() != expected_len {
+        return Err(XfrmError::io(
+            "query_sa",
+            invalid_data("invalid ESN replay state length"),
+        ));
+    }
+    let mut bitmap = Vec::with_capacity(bitmap_words);
+    let mut offset = XFRM_REPLAY_STATE_ESN_BASE_LEN;
+    for _ in 0..bitmap_words {
+        bitmap.push(read_u32_ne(payload, offset)?);
+        offset += 4;
+    }
+    Ok(SaReplayState {
+        esn: true,
+        outbound_sequence: read_u32_ne(payload, 4)?,
+        inbound_sequence: read_u32_ne(payload, 8)?,
+        outbound_sequence_hi: read_u32_ne(payload, 12)?,
+        inbound_sequence_hi: read_u32_ne(payload, 16)?,
+        replay_window: read_u32_ne(payload, 20)?,
+        bitmap,
+    })
+}
+
+fn find_attr_payload(
+    body: &[u8],
+    mut offset: usize,
+    attr_type: u16,
+) -> Result<Option<&[u8]>, XfrmError> {
+    while offset + ROUTE_ATTRIBUTE_HEADER_LEN <= body.len() {
+        let len = usize::from(read_u16_ne(body, offset)?);
+        let found_type = read_u16_ne(body, offset + 2)?;
+        if len < ROUTE_ATTRIBUTE_HEADER_LEN || offset + len > body.len() {
+            return Err(XfrmError::io(
+                "netlink_receive",
+                invalid_data("invalid route attribute"),
+            ));
+        }
+        if found_type == attr_type {
+            return Ok(Some(
+                &body[offset + ROUTE_ATTRIBUTE_HEADER_LEN..offset + len],
+            ));
+        }
+        offset += align_to_netlink(len).ok_or_else(|| {
+            XfrmError::io(
+                "netlink_receive",
+                invalid_data("route attribute alignment overflow"),
+            )
+        })?;
+    }
+    Ok(None)
+}
+
 fn validate_sa_parameters(
     parameters: &SaParameters,
     allow_zero_spi: bool,
@@ -850,11 +1121,8 @@ fn validate_sa_parameters(
             "protocol must be nonzero",
         ));
     }
-    if parameters.replay_window > 32 {
-        return Err(XfrmError::invalid_config(
-            "replay_window",
-            "replay window >32 requires ESN support",
-        ));
+    if let Some(replay_state) = parameters.replay_state.as_ref() {
+        validate_replay_state(replay_state, parameters.replay_window)?;
     }
     if parameters.aead.is_some() && (parameters.auth.is_some() || parameters.crypt.is_some()) {
         return Err(XfrmError::invalid_config(
@@ -883,6 +1151,52 @@ fn validate_sa_parameters(
                 "aead algorithm must use the aead slot",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_sa_query(request: QuerySaRequest) -> Result<(), XfrmError> {
+    if request.spi == 0 {
+        return Err(XfrmError::invalid_config("spi", "spi must be nonzero"));
+    }
+    if request.protocol == 0 {
+        return Err(XfrmError::invalid_config(
+            "protocol",
+            "protocol must be nonzero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_replay_state(
+    replay_state: &SaReplayState,
+    replay_window: u32,
+) -> Result<(), XfrmError> {
+    if replay_state.replay_window != replay_window {
+        return Err(XfrmError::invalid_config(
+            "replay_state.replay_window",
+            "replay state window must match SA replay window",
+        ));
+    }
+    if replay_state.replay_window > 32 && !replay_state.esn {
+        return Err(XfrmError::invalid_config(
+            "replay_state.esn",
+            "replay windows above 32 require ESN",
+        ));
+    }
+    let required_words = replay_state.replay_window.div_ceil(32).max(1) as usize;
+    if replay_state.esn {
+        if replay_state.bitmap.len() != required_words {
+            return Err(XfrmError::invalid_config(
+                "replay_state.bitmap",
+                "ESN bitmap word count must match replay window",
+            ));
+        }
+    } else if replay_state.bitmap.len() > 1 {
+        return Err(XfrmError::invalid_config(
+            "replay_state.bitmap",
+            "legacy replay state supports one bitmap word",
+        ));
     }
     Ok(())
 }
@@ -1059,6 +1373,88 @@ fn encode_action(action: XfrmAction) -> u8 {
     }
 }
 
+fn decode_selector(bytes: &[u8], offset: usize) -> Result<XfrmSelector, XfrmError> {
+    let family = read_u16_ne(bytes, offset + 40)?;
+    Ok(XfrmSelector {
+        destination: decode_address(bytes, offset, family)?,
+        source: decode_address(bytes, offset + 16, family)?,
+        destination_port: read_u16_be(bytes, offset + 32)?,
+        source_port: read_u16_be(bytes, offset + 36)?,
+        protocol: read_u8(bytes, offset + 44)?,
+        destination_prefix_len: read_u8(bytes, offset + 42)?,
+        source_prefix_len: read_u8(bytes, offset + 43)?,
+    })
+}
+
+fn decode_address(bytes: &[u8], offset: usize, family: u16) -> Result<IpAddress, XfrmError> {
+    match family {
+        AF_INET => {
+            let end = offset
+                .checked_add(4)
+                .ok_or_else(|| XfrmError::io("query_sa", invalid_data("offset overflow")))?;
+            let slice = bytes
+                .get(offset..end)
+                .ok_or_else(|| XfrmError::io("query_sa", invalid_data("short IPv4 address")))?;
+            Ok(IpAddress::Ipv4([slice[0], slice[1], slice[2], slice[3]]))
+        }
+        AF_INET6 => {
+            let end = offset
+                .checked_add(16)
+                .ok_or_else(|| XfrmError::io("query_sa", invalid_data("offset overflow")))?;
+            let slice = bytes
+                .get(offset..end)
+                .ok_or_else(|| XfrmError::io("query_sa", invalid_data("short IPv6 address")))?;
+            let mut octets = [0_u8; 16];
+            octets.copy_from_slice(slice);
+            Ok(IpAddress::Ipv6(octets))
+        }
+        _ => Err(XfrmError::io(
+            "query_sa",
+            invalid_data("unsupported address family"),
+        )),
+    }
+}
+
+fn decode_lifetime_config(bytes: &[u8], offset: usize) -> Result<LifetimeConfig, XfrmError> {
+    Ok(LifetimeConfig {
+        soft_byte_limit: read_u64_ne(bytes, offset)?,
+        hard_byte_limit: read_u64_ne(bytes, offset + 8)?,
+        soft_packet_limit: read_u64_ne(bytes, offset + 16)?,
+        hard_packet_limit: read_u64_ne(bytes, offset + 24)?,
+        soft_add_expires_seconds: read_u64_ne(bytes, offset + 32)?,
+        hard_add_expires_seconds: read_u64_ne(bytes, offset + 40)?,
+    })
+}
+
+fn decode_lifetime_current(bytes: &[u8], offset: usize) -> Result<LifetimeCurrent, XfrmError> {
+    Ok(LifetimeCurrent {
+        bytes: read_u64_ne(bytes, offset)?,
+        packets: read_u64_ne(bytes, offset + 8)?,
+        add_time_seconds: read_u64_ne(bytes, offset + 16)?,
+        use_time_seconds: read_u64_ne(bytes, offset + 24)?,
+    })
+}
+
+fn decode_statistics(bytes: &[u8], offset: usize) -> Result<SaStatistics, XfrmError> {
+    Ok(SaStatistics {
+        replay_window: read_u32_ne(bytes, offset)?,
+        replay_failures: read_u32_ne(bytes, offset + 4)?,
+        integrity_failures: read_u32_ne(bytes, offset + 8)?,
+    })
+}
+
+fn decode_mode(mode: u8) -> Result<XfrmMode, XfrmError> {
+    match mode {
+        0 => Ok(XfrmMode::Transport),
+        1 => Ok(XfrmMode::Tunnel),
+        4 => Ok(XfrmMode::Beet),
+        _ => Err(XfrmError::io(
+            "query_sa",
+            invalid_data("unsupported XFRM mode"),
+        )),
+    }
+}
+
 fn push_u8(out: &mut Vec<u8>, value: u8) {
     out.push(value);
 }
@@ -1097,6 +1493,23 @@ fn read_u16_ne(bytes: &[u8], offset: usize) -> Result<u16, XfrmError> {
     Ok(u16::from_ne_bytes([slice[0], slice[1]]))
 }
 
+fn read_u8(bytes: &[u8], offset: usize) -> Result<u8, XfrmError> {
+    bytes
+        .get(offset)
+        .copied()
+        .ok_or_else(|| XfrmError::io("netlink_receive", invalid_data("short netlink field")))
+}
+
+fn read_u16_be(bytes: &[u8], offset: usize) -> Result<u16, XfrmError> {
+    let end = offset
+        .checked_add(2)
+        .ok_or_else(|| XfrmError::io("netlink_receive", invalid_data("offset overflow")))?;
+    let slice = bytes
+        .get(offset..end)
+        .ok_or_else(|| XfrmError::io("netlink_receive", invalid_data("short netlink field")))?;
+    Ok(u16::from_be_bytes([slice[0], slice[1]]))
+}
+
 fn read_u32_ne(bytes: &[u8], offset: usize) -> Result<u32, XfrmError> {
     let end = offset
         .checked_add(4)
@@ -1105,6 +1518,28 @@ fn read_u32_ne(bytes: &[u8], offset: usize) -> Result<u32, XfrmError> {
         .get(offset..end)
         .ok_or_else(|| XfrmError::io("netlink_receive", invalid_data("short netlink field")))?;
     Ok(u32::from_ne_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn read_u32_be(bytes: &[u8], offset: usize) -> Result<u32, XfrmError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| XfrmError::io("netlink_receive", invalid_data("offset overflow")))?;
+    let slice = bytes
+        .get(offset..end)
+        .ok_or_else(|| XfrmError::io("netlink_receive", invalid_data("short netlink field")))?;
+    Ok(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn read_u64_ne(bytes: &[u8], offset: usize) -> Result<u64, XfrmError> {
+    let end = offset
+        .checked_add(8)
+        .ok_or_else(|| XfrmError::io("netlink_receive", invalid_data("offset overflow")))?;
+    let slice = bytes
+        .get(offset..end)
+        .ok_or_else(|| XfrmError::io("netlink_receive", invalid_data("short netlink field")))?;
+    Ok(u64::from_ne_bytes([
+        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+    ]))
 }
 
 fn invalid_data(message: &'static str) -> io::Error {
@@ -1225,6 +1660,7 @@ mod tests {
             mode: XfrmMode::Tunnel,
             lifetime: LifetimeConfig::default(),
             replay_window: 32,
+            replay_state: None,
             encap: None,
             mark: None,
             if_id: None,
@@ -1253,6 +1689,15 @@ mod tests {
         encode_netlink_message(NLMSG_ERROR, 0, sequence, &body)
             .unwrap()
             .to_vec()
+    }
+
+    fn netlink_message_type(message: &[u8]) -> u16 {
+        u16::from_ne_bytes([message[4], message[5]])
+    }
+
+    fn netlink_body(message: &[u8]) -> &[u8] {
+        let len = u32::from_ne_bytes([message[0], message[1], message[2], message[3]]) as usize;
+        &message[NETLINK_HEADER_LEN..len]
     }
 
     fn route_attr_payload(body: &[u8], attr_type: u16) -> Option<&[u8]> {
@@ -1448,17 +1893,53 @@ mod tests {
     }
 
     #[test]
-    fn rejects_replay_window_above_legacy_bitmap_limit() {
+    fn encodes_esn_replay_state_for_window_above_32() {
         let mut params = sa_parameters();
-        params.replay_window = 33;
+        params.replay_window = 64;
+        params.replay_state = Some(SaReplayState {
+            esn: true,
+            outbound_sequence: 10,
+            inbound_sequence: 11,
+            outbound_sequence_hi: 1,
+            inbound_sequence_hi: 2,
+            replay_window: 64,
+            bitmap: vec![0xaabb_ccdd, 0xeeff_0011],
+        });
+
+        let body = encode_sa_info(&params).unwrap();
+        let payload = route_attr_payload(&body, XFRMA_REPLAY_ESN_VAL).expect("ESN attr");
+
+        assert_eq!(body[216], XFRM_STATE_ESN);
+        assert_eq!(payload.len(), XFRM_REPLAY_STATE_ESN_BASE_LEN + 8);
+        assert_eq!(u32::from_ne_bytes(payload[0..4].try_into().unwrap()), 2);
+        assert_eq!(u32::from_ne_bytes(payload[4..8].try_into().unwrap()), 10);
+        assert_eq!(u32::from_ne_bytes(payload[8..12].try_into().unwrap()), 11);
+        assert_eq!(u32::from_ne_bytes(payload[12..16].try_into().unwrap()), 1);
+        assert_eq!(u32::from_ne_bytes(payload[16..20].try_into().unwrap()), 2);
+        assert_eq!(u32::from_ne_bytes(payload[20..24].try_into().unwrap()), 64);
+    }
+
+    #[test]
+    fn rejects_inconsistent_replay_state() {
+        let mut params = sa_parameters();
+        params.replay_window = 64;
+        params.replay_state = Some(SaReplayState {
+            esn: false,
+            outbound_sequence: 0,
+            inbound_sequence: 0,
+            outbound_sequence_hi: 0,
+            inbound_sequence_hi: 0,
+            replay_window: 64,
+            bitmap: vec![0],
+        });
 
         let error = encode_sa_info(&params).unwrap_err();
 
         assert!(matches!(
             error,
             XfrmError::InvalidConfig {
-                field: "replay_window",
-                reason: "replay window >32 requires ESN support"
+                field: "replay_state.esn",
+                reason: "replay windows above 32 require ESN"
             }
         ));
     }
@@ -1479,6 +1960,41 @@ mod tests {
             ROUTE_ATTRIBUTE_HEADER_LEN + XFRM_USER_TEMPLATE_LEN
         );
         assert_eq!(u16::from_ne_bytes([body[170], body[171]]), XFRMA_TMPL);
+    }
+
+    #[test]
+    fn parses_getsa_response_with_esn_replay_state() {
+        let mut params = sa_parameters();
+        params.replay_window = 64;
+        params.replay_state = Some(SaReplayState {
+            esn: true,
+            outbound_sequence: 100,
+            inbound_sequence: 101,
+            outbound_sequence_hi: 5,
+            inbound_sequence_hi: 6,
+            replay_window: 64,
+            bitmap: vec![0x1111_2222, 0x3333_4444],
+        });
+        let body = encode_sa_info(&params).unwrap();
+
+        let state = parse_sa_state(&body).unwrap();
+
+        assert_eq!(state.id, params.id);
+        assert_eq!(state.selector, params.selector);
+        assert_eq!(state.source_address, params.source_address);
+        assert_eq!(state.mode, XfrmMode::Tunnel);
+        assert_eq!(state.replay_window, 64);
+        assert_eq!(state.replay_state, params.replay_state.unwrap());
+    }
+
+    #[test]
+    fn rejects_malformed_getsa_replay_attrs() {
+        let mut body = encode_sa_info(&sa_parameters()).unwrap();
+        append_attr(&mut body, XFRMA_REPLAY_ESN_VAL, &[0, 0, 0]).unwrap();
+
+        let error = parse_sa_state(&body).unwrap_err();
+
+        assert_eq!(error.io_kind(), Some(io::ErrorKind::InvalidData));
     }
 
     #[tokio::test]
@@ -1571,6 +2087,47 @@ mod tests {
             .unwrap();
 
         assert_eq!(allocation.spi, 0x8765_4321);
+    }
+
+    #[tokio::test]
+    async fn query_sa_sends_getsa_and_decodes_replay_state() {
+        let mut params = sa_parameters();
+        params.replay_window = 64;
+        params.replay_state = Some(SaReplayState {
+            esn: true,
+            outbound_sequence: 7,
+            inbound_sequence: 8,
+            outbound_sequence_hi: 1,
+            inbound_sequence_hi: 2,
+            replay_window: 64,
+            bitmap: vec![0x0102_0304, 0x0506_0708],
+        });
+        let transport =
+            CapturingTransport::with_response(encode_sa_info(&params).unwrap().to_vec());
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+
+        let state = backend
+            .query_sa(QuerySaRequest {
+                destination: params.id.destination,
+                protocol: params.id.protocol,
+                spi: params.id.spi,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(state.replay_state, params.replay_state.unwrap());
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_GETSA);
+        assert_eq!(
+            u16::from_ne_bytes([requests[0][6], requests[0][7]]),
+            NLM_F_REQUEST | NLM_F_ACK
+        );
+        assert_eq!(netlink_body(&requests[0]).len(), XFRM_USER_SA_ID_LEN);
+        assert_eq!(
+            &netlink_body(&requests[0])[16..20],
+            &[0x12, 0x34, 0x56, 0x78]
+        );
     }
 
     #[test]

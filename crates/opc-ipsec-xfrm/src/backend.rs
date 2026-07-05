@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 
 use crate::model::{
-    AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, RekeyPolicyRequest, RekeySaRequest,
-    RemovePolicyRequest, RemoveSaRequest, SpiAllocation, XfrmProbe,
+    AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, QuerySaRequest, RekeyPolicyRequest,
+    RekeySaRequest, RemovePolicyRequest, RemoveSaRequest, SaState, SpiAllocation, XfrmProbe,
 };
 use crate::XfrmError;
 
@@ -20,6 +20,9 @@ pub trait XfrmBackend: Send + Sync + std::fmt::Debug {
 
     /// Install a new Security Association.
     async fn install_sa(&self, request: InstallSaRequest) -> Result<(), XfrmError>;
+
+    /// Query an existing Security Association.
+    async fn query_sa(&self, request: QuerySaRequest) -> Result<SaState, XfrmError>;
 
     /// Rekey (update) an existing Security Association.
     async fn rekey_sa(&self, request: RekeySaRequest) -> Result<(), XfrmError>;

@@ -366,6 +366,15 @@ mod tests {
             Ok(())
         }
 
+        async fn query_sa(
+            &self,
+            _request: crate::model::QuerySaRequest,
+        ) -> Result<crate::model::SaState, XfrmError> {
+            Err(XfrmError::UnsupportedFeature {
+                feature: "test query_sa",
+            })
+        }
+
         async fn rekey_sa(&self, _request: RekeySaRequest) -> Result<(), XfrmError> {
             self.record("rekey_sa");
             Ok(())
@@ -425,6 +434,7 @@ mod tests {
             mode: XfrmMode::Tunnel,
             lifetime: Default::default(),
             replay_window: 32,
+            replay_state: None,
             encap: None,
             mark: None,
             if_id: None,
