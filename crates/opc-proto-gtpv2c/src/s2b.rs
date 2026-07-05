@@ -59,7 +59,12 @@ pub const UPDATE_BEARER_REQUEST: u8 = 97;
 /// Update Bearer Response message type used by the S2b Update Session view.
 pub const UPDATE_BEARER_RESPONSE: u8 = 98;
 
-/// GTPv2-C interface type for S2b-U PGW GTP-U.
+/// GTPv2-C interface type for S2b-U ePDG GTP-U from 3GPP TS 29.274
+/// Table 8.22-1.
+pub const INTERFACE_TYPE_S2B_U_EPDG_GTP_U: u8 = 32;
+
+/// GTPv2-C interface type for S2b-U PGW GTP-U from 3GPP TS 29.274
+/// Table 8.22-1.
 pub const INTERFACE_TYPE_S2B_U_PGW_GTP_U: u8 = 33;
 
 /// Result type for S2b Production Profile v1 constructors.
@@ -128,7 +133,8 @@ pub struct S2bCreateSessionRequest<'a> {
     pub pdn_type: PdnType,
     /// PDN Address Allocation IE.
     pub paa: PdnAddressAllocation,
-    /// Bearer Context IE containing at least an EBI member.
+    /// Bearer Context IE containing at least an EBI member. A Create Session
+    /// Request may also carry the ePDG S2b-U user-plane F-TEID here.
     pub bearer_context: BearerContext<'a>,
     /// Additional typed IEs to append after the mandatory profile-owned IEs.
     pub additional_ies: Vec<TypedIe<'a>>,

@@ -4,7 +4,7 @@ use opc_proto_gtpv2c::{
     S2bMessage, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT,
     IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID,
     IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_PCO, IE_TYPE_RECOVERY,
-    INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    INTERFACE_TYPE_S2B_U_EPDG_GTP_U, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
@@ -66,6 +66,30 @@ const BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE: &[u8] = &[
     0x00,
     0x71,
     0x01, // Nested S2b-U PGW GTP-U F-TEID.
+];
+const BEARER_CONTEXT_WITH_EPDG_USER_PLANE_FTEID_IE: &[u8] = &[
+    IE_TYPE_BEARER_CONTEXT,
+    0x00,
+    0x12,
+    0x00, // Bearer Context grouped IE header.
+    IE_TYPE_EBI,
+    0x00,
+    0x01,
+    0x00,
+    0x05, // Nested EBI = 5.
+    IE_TYPE_F_TEID,
+    0x00,
+    0x09,
+    0x00,
+    0xa0,
+    0x11,
+    0x22,
+    0x33,
+    0x44,
+    0xcb,
+    0x00,
+    0x71,
+    0x0a, // Nested S2b-U ePDG GTP-U F-TEID.
 ];
 
 const CAUSE_IE: &[u8] = &[0x02, 0x00, 0x02, 0x00, 0x10, 0x00];
@@ -572,6 +596,13 @@ fn debug_output_redacts_subscriber_identifiers_and_raw_ie_bytes() {
 /// Build a minimal Create Session Request where the Sender F-TEID IE appears at
 /// `fteid_instance`. All other mandatory S2b IEs are present at instance 0.
 fn create_session_request_with_fteid_instance(fteid_instance: u8) -> Vec<u8> {
+    create_session_request_with_fteid_instance_and_bearer_context(fteid_instance, BEARER_CONTEXT_IE)
+}
+
+fn create_session_request_with_fteid_instance_and_bearer_context(
+    fteid_instance: u8,
+    bearer_context: &[u8],
+) -> Vec<u8> {
     let mut header = [
         0x48,
         s2b::CREATE_SESSION_REQUEST,
@@ -613,7 +644,7 @@ fn create_session_request_with_fteid_instance(fteid_instance: u8) -> Vec<u8> {
         &[0x80, 0x00, 0x01, 0x00, 0x00],             // Selection Mode.
         &[0x63, 0x00, 0x01, 0x00, 0x01],             // PDN Type.
         &[0x4f, 0x00, 0x05, 0x00, 0x01, 0xc6, 0x33, 0x64, 0x07], // PAA.
-        &[0x5d, 0x00, 0x05, 0x00, 0x49, 0x00, 0x01, 0x00, 0x05], // Bearer Context + EBI.
+        bearer_context,
     ];
     let body: Vec<u8> = ies.iter().copied().flatten().copied().collect();
     let length = u16::try_from(header.len() + body.len() - 4).unwrap();
@@ -926,6 +957,43 @@ fn procedure_aware_rejects_non_zero_instance_sender_fteid_for_create_session() {
             "Create Session Response with F-TEID instance {instance} should be rejected"
         );
     }
+}
+
+#[test]
+fn procedure_aware_accepts_create_session_request_bearer_context_epdg_s2b_u_fteid() {
+    let request = create_session_request_with_fteid_instance_and_bearer_context(
+        0,
+        BEARER_CONTEXT_WITH_EPDG_USER_PLANE_FTEID_IE,
+    );
+
+    let message = decode_s2b(&request);
+    assert!(matches!(message, S2bMessage::CreateSessionRequest(_)));
+    let view = procedure_view(&message);
+    let bearer = find_ie(&view.ies, IE_TYPE_BEARER_CONTEXT);
+    match &bearer.value {
+        TypedIeValue::BearerContext(context) => {
+            let ebi = find_ie(&context.members, IE_TYPE_EBI);
+            match &ebi.value {
+                TypedIeValue::EpsBearerId(value) => assert_eq!(value.value, 5),
+                other => panic!("unexpected EBI value: {other:?}"),
+            }
+
+            let f_teid = find_ie(&context.members, IE_TYPE_F_TEID);
+            match &f_teid.value {
+                TypedIeValue::FullyQualifiedTeid(value) => {
+                    assert_eq!(value.interface_type, INTERFACE_TYPE_S2B_U_EPDG_GTP_U);
+                    assert_eq!(value.teid, 0x1122_3344);
+                    assert_eq!(value.ipv4, Some([203, 0, 113, 10]));
+                    assert_eq!(value.ipv6, None);
+                }
+                other => panic!("unexpected bearer F-TEID value: {other:?}"),
+            }
+        }
+        other => panic!("unexpected Bearer Context value: {other:?}"),
+    }
+
+    let encoded = encode_s2b(&message, EncodeContext::default());
+    assert_eq!(encoded.as_ref(), request.as_slice());
 }
 
 #[test]
