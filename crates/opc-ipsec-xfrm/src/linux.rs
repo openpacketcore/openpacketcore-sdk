@@ -675,9 +675,9 @@ fn encode_template(out: &mut Vec<u8>, template: &XfrmTemplate) -> Result<(), Xfr
     push_u8(out, 0);
     push_u8(out, 0);
     out.resize(start + 52, 0);
-    push_u32_ne(out, 0);
-    push_u32_ne(out, 0);
-    push_u32_ne(out, 0);
+    push_u32_ne(out, u32::MAX);
+    push_u32_ne(out, u32::MAX);
+    push_u32_ne(out, u32::MAX);
     debug_assert_eq!(out.len() - start, XFRM_USER_TEMPLATE_LEN);
     Ok(())
 }
@@ -1960,6 +1960,28 @@ mod tests {
             ROUTE_ATTRIBUTE_HEADER_LEN + XFRM_USER_TEMPLATE_LEN
         );
         assert_eq!(u16::from_ne_bytes([body[170], body[171]]), XFRMA_TMPL);
+    }
+
+    #[test]
+    fn encodes_policy_template_algorithm_masks_as_all_algorithms() {
+        let body = encode_policy_info(&policy_parameters()).unwrap();
+        let templates = route_attr_payload_from(&body, XFRM_USER_POLICY_INFO_LEN, XFRMA_TMPL)
+            .expect("template attr");
+
+        assert_eq!(templates.len(), XFRM_USER_TEMPLATE_LEN);
+        assert_eq!(
+            u32::from_ne_bytes(templates[52..56].try_into().unwrap()),
+            u32::MAX
+        );
+        assert_eq!(
+            u32::from_ne_bytes(templates[56..60].try_into().unwrap()),
+            u32::MAX
+        );
+        assert_eq!(
+            u32::from_ne_bytes(templates[60..64].try_into().unwrap()),
+            u32::MAX
+        );
+        assert_ne!(&templates[52..64], [0; 12]);
     }
 
     #[test]

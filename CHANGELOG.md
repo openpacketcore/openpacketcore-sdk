@@ -89,6 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- `opc-ipsec-xfrm`: XFRM policy templates now encode all-ones algorithm
+  masks (`aalgos`, `ealgos`, `calgos`) instead of zero masks, so installed
+  policies can be satisfied by negotiated ESP SAs instead of dropping inbound
+  packets with `XfrmInTmplMismatch`.
 - `opc-yanggen`: generated Rust artifacts now use fully prefix-qualified
   schema-node paths for every segment across schema registry metadata, gNMI,
   NETCONF, NACM, and audit-facing path attribution while preserving
