@@ -1,6 +1,7 @@
 use opc_proto_ikev2::{
     Header, HeaderFlags, Ikev2ExchangeBoundaryState, Ikev2ExchangeDecision,
-    Ikev2ExchangeInvalidReason, Ikev2ExchangeRequest, Ikev2ExchangeTracker, PayloadType,
+    Ikev2ExchangeInvalidReason, Ikev2ExchangeKind, Ikev2ExchangeRequest, Ikev2ExchangeTracker,
+    Ikev2InitiatorMessageIdError, Ikev2InitiatorMessageIdWindow, PayloadType,
     EXCHANGE_TYPE_CREATE_CHILD_SA, EXCHANGE_TYPE_IKE_AUTH, EXCHANGE_TYPE_IKE_SA_INIT,
     EXCHANGE_TYPE_INFORMATIONAL, IKEV2_EXCHANGE_RETRANSMISSION_WINDOW,
 };
@@ -208,4 +209,96 @@ fn exchange_tracker_retains_bounded_retransmission_window() {
         IKEV2_EXCHANGE_RETRANSMISSION_WINDOW
     );
     assert_eq!(snapshot.highest_message_id, Some(100));
+}
+
+#[test]
+fn initiator_message_id_window_allocates_one_outstanding_request() {
+    let mut window = Ikev2InitiatorMessageIdWindow::new();
+
+    let first = window
+        .allocate(Ikev2ExchangeKind::Informational)
+        .expect("first allocation");
+    assert_eq!(first.message_id, 0);
+    assert_eq!(first.exchange, Ikev2ExchangeKind::Informational);
+    assert_eq!(window.outstanding(), Some(first));
+
+    let outstanding = window
+        .allocate(Ikev2ExchangeKind::CreateChildSa)
+        .expect_err("single outstanding request enforced");
+    assert_eq!(
+        outstanding,
+        Ikev2InitiatorMessageIdError::RequestOutstanding
+    );
+
+    let wrong_id = window
+        .complete_response(Ikev2ExchangeKind::Informational, 1)
+        .expect_err("response Message ID must match");
+    assert_eq!(
+        wrong_id,
+        Ikev2InitiatorMessageIdError::ResponseMessageIdMismatch
+    );
+    assert_eq!(window.outstanding(), Some(first));
+
+    let completed = window
+        .complete_response(Ikev2ExchangeKind::Informational, 0)
+        .expect("matching response completes");
+    assert_eq!(completed, first);
+    assert_eq!(window.outstanding(), None);
+    assert_eq!(window.next_message_id(), 1);
+
+    let second = window
+        .allocate(Ikev2ExchangeKind::CreateChildSa)
+        .expect("second allocation");
+    assert_eq!(second.message_id, 1);
+}
+
+#[test]
+fn initiator_message_id_window_validates_response_headers() {
+    let mut window = Ikev2InitiatorMessageIdWindow::with_next_message_id(7);
+    window
+        .allocate(Ikev2ExchangeKind::CreateChildSa)
+        .expect("allocation");
+
+    let request_like = request_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 0x8877_6655_4433_2211, 7);
+    let missing_response_flag = window
+        .complete_response_header(&request_like)
+        .expect_err("response flag required");
+    assert_eq!(
+        missing_response_flag,
+        Ikev2InitiatorMessageIdError::ResponseFlagMissing
+    );
+
+    let wrong_exchange = response_header(EXCHANGE_TYPE_INFORMATIONAL, 0x8877_6655_4433_2211, 7);
+    let exchange_error = window
+        .complete_response_header(&wrong_exchange)
+        .expect_err("exchange type must match outstanding request");
+    assert_eq!(
+        exchange_error,
+        Ikev2InitiatorMessageIdError::ResponseExchangeMismatch
+    );
+
+    let response = response_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 0x8877_6655_4433_2211, 7);
+    let completed = window
+        .complete_response_header(&response)
+        .expect("matching response header");
+    assert_eq!(completed.message_id, 7);
+    assert_eq!(window.snapshot().next_message_id, 8);
+
+    let no_outstanding = window
+        .complete_response_header(&response)
+        .expect_err("no outstanding request");
+    assert_eq!(
+        no_outstanding,
+        Ikev2InitiatorMessageIdError::NoOutstandingRequest
+    );
+}
+
+#[test]
+fn initiator_message_id_window_rejects_exhausted_counter() {
+    let mut window = Ikev2InitiatorMessageIdWindow::with_next_message_id(u32::MAX);
+    let exhausted = window
+        .allocate(Ikev2ExchangeKind::Informational)
+        .expect_err("u32 max is reserved for close/rekey before exhaustion");
+    assert_eq!(exhausted, Ikev2InitiatorMessageIdError::MessageIdExhausted);
+    assert_eq!(exhausted.as_str(), "initiator_message_id_exhausted");
 }

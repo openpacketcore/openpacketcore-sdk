@@ -1,19 +1,24 @@
 use opc_proto_ikev2::{
-    build_child_sa_response_payloads, build_ike_auth_authentication_payload,
-    build_ike_auth_cleartext_payload_chain, build_ike_auth_configuration_payload,
+    build_child_sa_response_payloads, build_create_child_sa_rekey_request_payloads,
+    build_create_child_sa_rekey_response_payloads, build_delete_payload_body,
+    build_ike_auth_authentication_payload, build_ike_auth_cleartext_payload_chain,
+    build_ike_auth_configuration_payload, build_ike_auth_delete_payload,
     build_ike_auth_identification_payload, build_ike_auth_sa_payload,
     build_ike_auth_traffic_selector_payload, compute_ike_auth_shared_key_mic,
     decode_ike_auth_cleartext_payloads, derive_ike_sa_init_key_material,
     ike_auth_shared_key_authentication_payload_body_len, negotiate_child_sa,
     verify_ike_auth_shared_key_mic, Ikev2AuthenticationPayloadBuild, Ikev2ChildSaNegotiationError,
     Ikev2ChildSaNegotiationPolicy, Ikev2ChildSaTransformRequirement,
-    Ikev2ConfigurationAttributeBuild, Ikev2ConfigurationPayloadBuild, Ikev2DhGroup,
-    Ikev2EncryptionAlgorithm, Ikev2IdentificationPayloadBuild, Ikev2IkeAuthBuildError,
-    Ikev2IkeAuthPayloadBuild, Ikev2IkeAuthPayloadError, Ikev2IkeAuthPeer, Ikev2IkeAuthSignedOctets,
-    Ikev2IkeAuthVerificationError, Ikev2PrfAlgorithm, Ikev2SaInitCryptoProfile,
-    Ikev2SaInitKeyMaterial, Ikev2SaPayload, Ikev2SaPayloadBuild, Ikev2SaProposal,
-    Ikev2SaProposalBuild, Ikev2SaTransformBuild, Ikev2TrafficSelectorBuild,
-    Ikev2TrafficSelectorPayloadBuild, PayloadType, IKEV2_AUTH_METHOD_SHARED_KEY_MIC,
+    Ikev2ConfigurationAttributeBuild, Ikev2ConfigurationPayloadBuild,
+    Ikev2CreateChildSaRekeyRequestBuild, Ikev2CreateChildSaRekeyResponseBuild, Ikev2DeletePayload,
+    Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2IdentificationPayloadBuild,
+    Ikev2IkeAuthBuildError, Ikev2IkeAuthPayloadBuild, Ikev2IkeAuthPayloadError, Ikev2IkeAuthPeer,
+    Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError, Ikev2KeyExchangePayloadBuild,
+    Ikev2NoncePayloadBuild, Ikev2PrfAlgorithm, Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
+    Ikev2SaPayload, Ikev2SaPayloadBuild, Ikev2SaProposal, Ikev2SaProposalBuild,
+    Ikev2SaTransformBuild, Ikev2TrafficSelectorBuild, Ikev2TrafficSelectorPayloadBuild,
+    PayloadChain, PayloadType, IKEV2_AUTH_METHOD_SHARED_KEY_MIC, IKEV2_IPSEC_SPI_SIZE,
+    IKEV2_NOTIFY_REKEY_SA, IKEV2_SECURITY_PROTOCOL_ID_ESP, IKEV2_SECURITY_PROTOCOL_ID_IKE,
     IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
 };
 
@@ -153,14 +158,13 @@ fn decodes_and_builds_ike_auth_cleartext_payloads() {
     .expect("CP build");
     let tsi = build_ike_auth_traffic_selector_payload(&ts_payload()).expect("TSi build");
     let tsr = build_ike_auth_traffic_selector_payload(&ts_payload()).expect("TSr build");
-    let delete = {
-        let mut body = Vec::new();
-        body.push(3);
-        body.push(4);
-        body.extend_from_slice(&1_u16.to_be_bytes());
-        body.extend_from_slice(&[1, 2, 3, 4]);
-        body
-    };
+    let delete_spi = [1, 2, 3, 4];
+    let delete = build_delete_payload_body(
+        IKEV2_SECURITY_PROTOCOL_ID_ESP,
+        IKEV2_IPSEC_SPI_SIZE,
+        &[&delete_spi],
+    )
+    .expect("Delete build");
 
     let (first, bytes) = build_ike_auth_cleartext_payload_chain(&[
         Ikev2IkeAuthPayloadBuild {
@@ -218,6 +222,68 @@ fn decodes_and_builds_ike_auth_cleartext_payloads() {
     assert!(!debug.contains("user@example.net"));
     assert!(!debug.contains("epdg.example.net"));
     assert!(!debug.contains("44"));
+}
+
+#[test]
+fn delete_payload_builder_round_trips_ike_and_esp_spis() {
+    let ike_body = build_delete_payload_body(IKEV2_SECURITY_PROTOCOL_ID_IKE, 0, &[])
+        .expect("IKE Delete build");
+    assert_eq!(ike_body, vec![1, 0, 0, 0]);
+    let ike = Ikev2DeletePayload::decode_body(&ike_body).expect("IKE Delete decode");
+    assert_eq!(ike.protocol_id, IKEV2_SECURITY_PROTOCOL_ID_IKE);
+    assert!(ike.spis.is_empty());
+    assert_eq!(ike.encode_body().expect("IKE Delete encode"), ike_body);
+
+    let esp_spi = [0xde, 0xad, 0xbe, 0xef];
+    let esp_body = build_delete_payload_body(
+        IKEV2_SECURITY_PROTOCOL_ID_ESP,
+        IKEV2_IPSEC_SPI_SIZE,
+        &[&esp_spi],
+    )
+    .expect("ESP Delete build");
+    assert_eq!(esp_body, vec![3, 4, 0, 1, 0xde, 0xad, 0xbe, 0xef]);
+    let esp = Ikev2DeletePayload::decode_body(&esp_body).expect("ESP Delete decode");
+    assert_eq!(esp.protocol_id, IKEV2_SECURITY_PROTOCOL_ID_ESP);
+    assert_eq!(esp.spis, vec![esp_spi.as_slice()]);
+    assert_eq!(
+        build_ike_auth_delete_payload(&esp).expect("Delete view build"),
+        esp_body
+    );
+
+    let second_spi = [0x10, 0x20, 0x30, 0x40];
+    let many_body = build_delete_payload_body(
+        IKEV2_SECURITY_PROTOCOL_ID_ESP,
+        IKEV2_IPSEC_SPI_SIZE,
+        &[&esp_spi, &second_spi],
+    )
+    .expect("many ESP Delete build");
+    assert_eq!(
+        many_body,
+        vec![3, 4, 0, 2, 0xde, 0xad, 0xbe, 0xef, 0x10, 0x20, 0x30, 0x40]
+    );
+    let many = Ikev2DeletePayload::decode_body(&many_body).expect("many ESP Delete decode");
+    assert_eq!(many.spis, vec![esp_spi.as_slice(), second_spi.as_slice()]);
+}
+
+#[test]
+fn delete_payload_builder_rejects_invalid_spi_shapes() {
+    let short_spi = [0xde, 0xad, 0xbe];
+    let mismatch = build_delete_payload_body(
+        IKEV2_SECURITY_PROTOCOL_ID_ESP,
+        IKEV2_IPSEC_SPI_SIZE,
+        &[&short_spi],
+    )
+    .expect_err("short ESP SPI rejected");
+    assert_eq!(mismatch, Ikev2IkeAuthBuildError::DeleteSpiSizeMismatch);
+
+    let spi = [0xde, 0xad, 0xbe, 0xef];
+    let ike_with_spi = build_delete_payload_body(IKEV2_SECURITY_PROTOCOL_ID_IKE, 4, &[&spi])
+        .expect_err("IKE Delete with SPI rejected");
+    assert_eq!(ike_with_spi, Ikev2IkeAuthBuildError::DeleteIkeSaSpiInvalid);
+
+    let esp_without_spi = build_delete_payload_body(IKEV2_SECURITY_PROTOCOL_ID_ESP, 4, &[])
+        .expect_err("ESP Delete without SPI rejected");
+    assert_eq!(esp_without_spi, Ikev2IkeAuthBuildError::DeleteSpiMissing);
 }
 
 #[test]
@@ -386,6 +452,120 @@ fn negotiates_child_sa_intent_and_builds_response_payloads() {
     let debug = format!("{selected:?}");
     assert!(!debug.contains("170"));
     assert!(!debug.contains("10, 0, 0, 1"));
+}
+
+#[test]
+fn builds_create_child_sa_rekey_request_and_response_payloads() {
+    let old_spi = [0xca, 0xfe, 0xba, 0xbe];
+    let request =
+        build_create_child_sa_rekey_request_payloads(&Ikev2CreateChildSaRekeyRequestBuild {
+            rekeyed_protocol_id: IKEV2_SECURITY_PROTOCOL_ID_ESP,
+            rekeyed_spi: old_spi.to_vec(),
+            security_association: child_sa_payload_build(),
+            nonce: Ikev2NoncePayloadBuild {
+                nonce: vec![0x11; 32],
+            },
+            key_exchange: Some(Ikev2KeyExchangePayloadBuild {
+                dh_group: 19,
+                key_exchange_data: vec![0x22; 65],
+            }),
+            traffic_selectors_initiator: ts_payload(),
+            traffic_selectors_responder: ts_payload(),
+        })
+        .expect("rekey request build");
+    let request_entries = request.into_payloads();
+    let request_types: Vec<PayloadType> = request_entries
+        .iter()
+        .map(|entry| entry.payload_type)
+        .collect();
+    assert_eq!(
+        request_types,
+        vec![
+            PayloadType::Notify,
+            PayloadType::SecurityAssociation,
+            PayloadType::Nonce,
+            PayloadType::KeyExchange,
+            PayloadType::TrafficSelectorInitiator,
+            PayloadType::TrafficSelectorResponder,
+        ]
+    );
+
+    let (first, bytes) =
+        build_ike_auth_cleartext_payload_chain(&request_entries).expect("request chain");
+    let decoded = decode_ike_auth_cleartext_payloads(first, &bytes).expect("decode request");
+    assert_eq!(decoded.notifies.len(), 1);
+    assert_eq!(
+        decoded.notifies[0].notify_message_type,
+        IKEV2_NOTIFY_REKEY_SA
+    );
+    assert_eq!(
+        decoded.notifies[0].protocol_id,
+        IKEV2_SECURITY_PROTOCOL_ID_ESP
+    );
+    assert_eq!(decoded.notifies[0].spi, old_spi.as_slice());
+    assert!(decoded.notifies[0].notification_data.is_empty());
+    assert_eq!(decoded.security_associations.len(), 1);
+    assert_eq!(decoded.traffic_selectors_initiator.len(), 1);
+    assert_eq!(decoded.traffic_selectors_responder.len(), 1);
+
+    let raw_types: Vec<PayloadType> = PayloadChain::new(first, &bytes)
+        .iter()
+        .map(|payload| payload.expect("payload decode").payload_type)
+        .collect();
+    assert_eq!(raw_types, request_types);
+
+    let response =
+        build_create_child_sa_rekey_response_payloads(&Ikev2CreateChildSaRekeyResponseBuild {
+            security_association: child_sa_payload_build(),
+            nonce: Ikev2NoncePayloadBuild {
+                nonce: vec![0x33; 32],
+            },
+            key_exchange: None,
+            traffic_selectors_initiator: ts_payload(),
+            traffic_selectors_responder: ts_payload(),
+        })
+        .expect("rekey response build");
+    let response_entries = response.into_payloads();
+    let response_types: Vec<PayloadType> = response_entries
+        .iter()
+        .map(|entry| entry.payload_type)
+        .collect();
+    assert_eq!(
+        response_types,
+        vec![
+            PayloadType::SecurityAssociation,
+            PayloadType::Nonce,
+            PayloadType::TrafficSelectorInitiator,
+            PayloadType::TrafficSelectorResponder,
+        ]
+    );
+}
+
+#[test]
+fn rekey_request_builder_rejects_invalid_rekey_notify_shape() {
+    let mut request = Ikev2CreateChildSaRekeyRequestBuild {
+        rekeyed_protocol_id: IKEV2_SECURITY_PROTOCOL_ID_IKE,
+        rekeyed_spi: vec![0xca, 0xfe, 0xba, 0xbe],
+        security_association: child_sa_payload_build(),
+        nonce: Ikev2NoncePayloadBuild {
+            nonce: vec![0x11; 32],
+        },
+        key_exchange: None,
+        traffic_selectors_initiator: ts_payload(),
+        traffic_selectors_responder: ts_payload(),
+    };
+    let invalid_protocol = build_create_child_sa_rekey_request_payloads(&request)
+        .expect_err("IKE protocol cannot identify Child-SA rekey");
+    assert_eq!(
+        invalid_protocol,
+        Ikev2IkeAuthBuildError::InvalidRekeyProtocolId
+    );
+
+    request.rekeyed_protocol_id = IKEV2_SECURITY_PROTOCOL_ID_ESP;
+    request.rekeyed_spi = vec![0xca, 0xfe, 0xba];
+    let invalid_spi = build_create_child_sa_rekey_request_payloads(&request)
+        .expect_err("short rekey SPI rejected");
+    assert_eq!(invalid_spi, Ikev2IkeAuthBuildError::RekeySpiLengthInvalid);
 }
 
 #[test]
