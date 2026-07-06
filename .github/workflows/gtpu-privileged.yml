@@ -70,3 +70,78 @@ jobs:
               ip link set lo up
               cargo test --locked -p opc-gtpu-dataplane --test linux_gtpu_privileged -- --ignored --nocapture
             '
+
+      - name: Build privileged eBPF GTP-U test
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
+          cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged --no-run
+
+      # Proves the committed CO-RE artifact end-to-end on a real kernel:
+      # uplink tc-egress GTP-U encapsulation toward the PGW peer, downlink
+      # tc-ingress decapsulation with stack forwarding to the UE netns,
+      # unknown-TEID drops, echo passthrough, restore/adoption, and
+      # ownership-safe teardown (no opc_gtpu filters or pins left behind,
+      # foreign filters never touched).
+      - name: Run privileged eBPF GTP-U datapath test in a fresh netns
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
+          sudo env \
+            "PATH=${PATH}" \
+            "CARGO_HOME=${CARGO_HOME}" \
+            "RUSTUP_HOME=${RUSTUP_HOME}" \
+            "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "OPC_GTPU_RUN_PRIVILEGED=1" \
+            unshare -n -- bash -euxo pipefail -c '
+              ip link set lo up
+              cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture
+            '
+
+  ebpf-object:
+    name: eBPF datapath object rebuild
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install pinned nightly Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-06-22 --profile minimal --component rust-src
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/opc-gtpu-dataplane-ebpf
+
+      - name: Install pinned bpf-linker
+        run: cargo install bpf-linker --version 0.10.3 --locked
+
+      # Rebuild the datapath object from source with the pinned toolchain and
+      # fail on structural drift against the committed artifact. A byte-exact
+      # comparison is not possible across build hosts (bpf-linker resolves a
+      # host LLVM), so the gate compares the program/map inventory; the
+      # privileged job above proves the committed artifact behaviorally.
+      - name: Rebuild and compare program/map inventory
+        run: |
+          set -euo pipefail
+          committed="${RUNNER_TEMP}/committed-opc-gtpu-datapath.bpf.o"
+          cp crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o "${committed}"
+          ./scripts/build-gtpu-ebpf.sh
+          rebuilt="crates/opc-gtpu-dataplane-ebpf/target/bpfel-unknown-none/release/opc-gtpu-datapath"
+          inventory() {
+            readelf -sW "$1" | awk '$4 == "FUNC" || $4 == "OBJECT" {print $4, $8}' | sort
+          }
+          inventory "${committed}" > committed.inventory
+          inventory "${rebuilt}" > rebuilt.inventory
+          cat rebuilt.inventory
+          diff -u committed.inventory rebuilt.inventory
+          for symbol in opc_gtpu_uplink opc_gtpu_downlink GTPU_UPLINK_FAR GTPU_DOWNLINK_PDR GTPU_COUNTERS GTPU_CONFIG; do
+            grep -q " ${symbol}$" committed.inventory
+          done

@@ -216,6 +216,8 @@ pub enum GtpuBackendKind {
     Unsupported,
     /// Backend talks to the Linux kernel GTP netlink interfaces.
     LinuxKernel,
+    /// Backend drives tc clsact eBPF GTP-U datapath programs.
+    LinuxEbpf,
     /// In-memory mock/dry-run backend for tests and offline development.
     Mock,
 }
@@ -233,6 +235,12 @@ pub struct GtpuProbe {
     pub gtp_module_present: bool,
     /// The process has `CAP_NET_ADMIN` in its effective set.
     pub net_admin_capable: bool,
+    /// The process can load eBPF programs (`CAP_BPF` or `CAP_SYS_ADMIN`).
+    /// Only probed by the eBPF backend; the netlink backend leaves it false.
+    pub bpf_capable: bool,
+    /// Kernel BTF (`/sys/kernel/btf/vmlinux`) is available for CO-RE loads.
+    /// Only probed by the eBPF backend; the netlink backend leaves it false.
+    pub btf_present: bool,
     /// Mutating operations appear ready: kernel reachable, module present,
     /// NET_ADMIN available, and the UDP GTP-U socket can be bound.
     pub mutation_ready: bool,
@@ -249,6 +257,8 @@ impl GtpuProbe {
             kernel_reachable: false,
             gtp_module_present: false,
             net_admin_capable: false,
+            bpf_capable: false,
+            btf_present: false,
             mutation_ready: false,
             details: Some("dry-run/mock backend"),
         }
@@ -262,6 +272,8 @@ impl GtpuProbe {
             kernel_reachable: false,
             gtp_module_present: false,
             net_admin_capable: false,
+            bpf_capable: false,
+            btf_present: false,
             mutation_ready: false,
             details: Some("GTP-U dataplane operations are not supported on this platform"),
         }

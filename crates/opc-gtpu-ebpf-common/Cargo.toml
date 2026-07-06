@@ -1,0 +1,19 @@
+[package]
+name = "opc-gtpu-ebpf-common"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared GTP-U wire-format layouts for the OpenPacketCore eBPF datapath and its userspace loader"
+readme = "README.md"
+documentation = "https://docs.rs/opc-gtpu-ebpf-common"
+keywords = ["5g", "gtpu", "gtp", "ebpf", "packet-core"]
+categories = ["network-programming", "no-std", "os::linux-apis"]
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true
