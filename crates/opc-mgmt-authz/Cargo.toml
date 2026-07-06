@@ -19,6 +19,7 @@ opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
 opc-mgmt-schema = { path = "../opc-mgmt-schema", version = "0.2.0" }
 opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 opc-types = { path = "../opc-types", version = "0.2.0" }
