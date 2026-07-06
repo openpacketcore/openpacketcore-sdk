@@ -1166,15 +1166,18 @@ mod tests {
         parse_certs_pem, parse_key_pem, IdentityState, SvidDocument, TrustBundle, TrustBundleSet,
         TrustDomain, WorkloadIdentity,
     };
-    use opc_mgmt_authz::{AuthzError, PolicySource};
+    use opc_mgmt_authz::{AuthzError, ConfigWriteAuthorizer, PolicySource, ResolvedPolicy};
     use opc_mgmt_opstate::{
         OperationalError, OperationalRequest, OperationalResponse, OperationalStateProvider,
     };
+    use opc_mgmt_principal::attach_signed_grants_from_source;
     use opc_mgmt_schema::{
         DataClass, LeafType, ModelData, NodeKind, NodeMeta, OriginEntry, SchemaRegistry,
     };
     use opc_mgmt_transport::TlsBootstrap;
-    use opc_nacm::{ModuleRegistry, NacmAction, NacmPolicy, NacmRule, YangPathPattern};
+    use opc_nacm::{
+        ModuleRegistry, NacmAction, NacmPolicy, NacmRule, NacmRuleList, YangPathPattern,
+    };
     use opc_runtime::{RuntimeMode, ShutdownToken};
     use opc_tls::PeerPolicy;
     use opc_types::Timestamp;
@@ -1336,6 +1339,39 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct GrantBackedPolicy {
+        grants: Arc<opc_nacm_config::NacmConfig>,
+    }
+
+    impl GrantBackedPolicy {
+        fn new(grants: opc_nacm_config::NacmConfig) -> Self {
+            Self {
+                grants: Arc::new(grants),
+            }
+        }
+    }
+
+    impl PolicySource for GrantBackedPolicy {
+        fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
+            Ok(read_policy())
+        }
+
+        fn active_policy_context_for_principal(
+            &self,
+            principal: &opc_config_model::TrustedPrincipal,
+        ) -> Result<ResolvedPolicy, AuthzError> {
+            let granted = attach_signed_grants_from_source(principal.clone(), self.grants.as_ref())
+                .map_err(|_| AuthzError::PolicyUnavailable)?;
+            if granted.groups.iter().any(|group| group == "gnmi-writers") {
+                Ok(ResolvedPolicy::new(grant_backed_policy(), granted)
+                    .with_mode("production-write"))
+            } else {
+                Ok(ResolvedPolicy::new(grant_backed_policy(), granted).with_mode("read-only"))
+            }
+        }
+    }
+
     struct EmptyOperationalState;
 
     impl OperationalStateProvider for EmptyOperationalState {
@@ -1434,6 +1470,7 @@ mod tests {
     #[derive(Clone)]
     struct TestBinding {
         bus: Arc<ConfigBus<SmokeConfig>>,
+        policy: Arc<dyn PolicySource>,
     }
 
     impl crate::GnmiConfigBinding<SmokeConfig> for TestBinding {
@@ -1454,7 +1491,7 @@ mod tests {
         }
 
         fn policy_source(&self) -> Arc<dyn PolicySource> {
-            Arc::new(AllowPolicy)
+            Arc::clone(&self.policy)
         }
 
         fn render_running_json(
@@ -1482,15 +1519,45 @@ mod tests {
     }
 
     async fn test_server() -> GnmiServer<SmokeConfig, TestBinding> {
+        test_server_with_policy(Arc::new(AllowPolicy)).await
+    }
+
+    async fn test_server_with_policy(
+        policy: Arc<dyn PolicySource>,
+    ) -> GnmiServer<SmokeConfig, TestBinding> {
         let bus = Arc::new(
             ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
                 .await
                 .expect("bus"),
         );
+        test_server_with_bus_and_policy(bus, policy).await
+    }
+
+    async fn test_server_with_real_write_authorizer(
+        policy: GrantBackedPolicy,
+    ) -> GnmiServer<SmokeConfig, TestBinding> {
+        let authorizer =
+            ConfigWriteAuthorizer::new(&TestRegistry, policy.clone()).expect("write authorizer");
+        let bus = Arc::new(
+            ConfigBus::new(
+                initial_config(),
+                MockManagedDatastore::new(),
+                Arc::new(authorizer),
+            )
+            .await
+            .expect("bus"),
+        );
+        test_server_with_bus_and_policy(bus, Arc::new(policy)).await
+    }
+
+    async fn test_server_with_bus_and_policy(
+        bus: Arc<ConfigBus<SmokeConfig>>,
+        policy: Arc<dyn PolicySource>,
+    ) -> GnmiServer<SmokeConfig, TestBinding> {
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
         GnmiServer::new_dev_only(
-            TestBinding { bus },
+            TestBinding { bus, policy },
             opc_mgmt_limits::MgmtLimits::default(),
             profile,
             ExtensionRegistry::default(),
@@ -1509,17 +1576,50 @@ mod tests {
     }
 
     fn allow_policy() -> NacmPolicy {
+        policy_for_actions([
+            NacmAction::Read,
+            NacmAction::Update,
+            NacmAction::Replace,
+            NacmAction::Delete,
+        ])
+    }
+
+    fn read_policy() -> NacmPolicy {
+        policy_for_actions([NacmAction::Read])
+    }
+
+    fn grant_backed_policy() -> NacmPolicy {
+        let mut modules = ModuleRegistry::new();
+        modules
+            .register_module("demo-system", "sys")
+            .expect("demo module");
+        let root_pattern = YangPathPattern::parse("/sys:system", &modules).expect("root pattern");
+        let subtree_pattern =
+            YangPathPattern::parse("/sys:system/**", &modules).expect("subtree pattern");
+        let mut builder = NacmPolicy::builder(opc_nacm::PolicyVersion::new(1));
+        for pattern in [root_pattern.clone(), subtree_pattern.clone()] {
+            builder = builder.add_rule(NacmRule::allow(NacmAction::Read, pattern));
+        }
+        let mut write_rules = Vec::new();
+        for action in [NacmAction::Update, NacmAction::Replace, NacmAction::Delete] {
+            write_rules.push(NacmRule::allow(action, root_pattern.clone()));
+            write_rules.push(NacmRule::allow(action, subtree_pattern.clone()));
+        }
+        builder
+            .add_rule_list(
+                NacmRuleList::new("gnmi-writers", ["gnmi-writers"], write_rules)
+                    .expect("writer rule-list"),
+            )
+            .build()
+    }
+
+    fn policy_for_actions<const N: usize>(actions: [NacmAction; N]) -> NacmPolicy {
         let mut modules = ModuleRegistry::new();
         modules
             .register_module("demo-system", "sys")
             .expect("demo module");
         let mut builder = NacmPolicy::builder(opc_nacm::PolicyVersion::new(1));
-        for action in [
-            NacmAction::Read,
-            NacmAction::Update,
-            NacmAction::Replace,
-            NacmAction::Delete,
-        ] {
+        for action in actions {
             builder = builder
                 .add_rule(NacmRule::allow(
                     action,
@@ -1533,6 +1633,21 @@ mod tests {
         builder.build()
     }
 
+    fn gnmi_writer_grants() -> opc_nacm_config::NacmConfig {
+        opc_nacm_config::NacmConfig::new(
+            vec![opc_nacm_config::NacmGroup::new("gnmi-writers", Vec::new())
+                .with_spiffe_selectors([opc_nacm_config::SpiffeWorkloadSelector::new(
+                    "gnmi-writer-client",
+                )
+                .trust_domain("test-domain")
+                .tenant("test")
+                .namespace("default")
+                .service_account("gnmi-client")
+                .nf_kind("amf")])],
+            Vec::new(),
+        )
+    }
+
     fn peer_policy() -> PeerPolicy {
         PeerPolicy {
             allowed_trust_domains: Some(HashSet::from([
@@ -1543,6 +1658,12 @@ mod tests {
     }
 
     fn mtls_material() -> MtlsMaterial {
+        mtls_material_for_client(
+            "spiffe://test-domain/tenant/test/ns/default/sa/gnmi-client/nf/amf/instance/0",
+        )
+    }
+
+    fn mtls_material_for_client(client_spiffe_id: &str) -> MtlsMaterial {
         let mut ca_params = CertificateParams::default();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         ca_params
@@ -1557,13 +1678,7 @@ mod tests {
             "spiffe://test-domain/tenant/test/ns/default/sa/gnmi-server/nf/amf/instance/0",
             true,
         );
-        let client = signed_leaf(
-            &ca_cert,
-            &ca_key,
-            "gNMI Client",
-            "spiffe://test-domain/tenant/test/ns/default/sa/gnmi-client/nf/amf/instance/0",
-            false,
-        );
+        let client = signed_leaf(&ca_cert, &ca_key, "gNMI Client", client_spiffe_id, false);
         let server_state = identity_state_from_pem(
             &(server.0.pem() + &ca_cert.pem()),
             &server.1.serialize_pem(),
@@ -1672,6 +1787,17 @@ mod tests {
         ShutdownToken,
         tokio::task::JoinHandle<crate::GnmiListenerResult>,
     ) {
+        spawn_listener_with_server(material, test_server().await).await
+    }
+
+    async fn spawn_listener_with_server(
+        material: &MtlsMaterial,
+        server: GnmiServer<SmokeConfig, TestBinding>,
+    ) -> (
+        SocketAddr,
+        ShutdownToken,
+        tokio::task::JoinHandle<crate::GnmiListenerResult>,
+    ) {
         let (_identity_tx, identity_rx) = watch::channel(Some(material.server_state.clone()));
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
@@ -1679,7 +1805,7 @@ mod tests {
         let task_shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
             run_gnmi_tls_listener(
-                test_server().await,
+                server,
                 listener,
                 TlsBootstrap::new(RuntimeMode::Production, peer_policy()),
                 identity_rx,
@@ -1776,6 +1902,122 @@ mod tests {
             Some(r#""mutated-host""#)
         );
         assert!(!format!("{transcript:?}").contains("BEGIN"));
+
+        shutdown.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), listener_task)
+            .await
+            .expect("listener timeout")
+            .expect("listener join");
+    }
+
+    #[tokio::test]
+    async fn live_mtls_set_authorizes_spiffe_writer_from_nacm_grants() {
+        let material = mtls_material();
+        let server =
+            test_server_with_real_write_authorizer(GrantBackedPolicy::new(gnmi_writer_grants()))
+                .await;
+        let (addr, shutdown, listener_task) = spawn_listener_with_server(&material, server).await;
+
+        let transcript = run_gnmi_mutating_smoke(
+            smoke_config(addr, &material),
+            [GnmiSmokeMutationStep {
+                set: GnmiSmokeSetOp {
+                    path: "/sys:system/sys:hostname".to_string(),
+                    op: GnmiSmokeSetOpKind::Update,
+                    json_value: Some(r#""grant-authorized-host""#.to_string()),
+                    encoding: GnmiSmokeEncoding::JsonIetf,
+                    expectation: GnmiSmokeSetExpectation::Accept,
+                },
+                readbacks: vec![GnmiSmokeReadback {
+                    get: GnmiSmokeGetRequest {
+                        path: "/sys:system/sys:hostname".to_string(),
+                        data_type: GnmiSmokeDataType::Config,
+                        encoding: GnmiSmokeEncoding::JsonIetf,
+                    },
+                    expect_leaf: Some(GnmiSmokeLeafExpectation {
+                        leaf_path: "/sys:system/sys:hostname".to_string(),
+                        expected_json: r#""grant-authorized-host""#.to_string(),
+                    }),
+                }],
+            }],
+        )
+        .await
+        .expect("grant-backed mutating smoke transcript");
+
+        assert!(matches!(
+            transcript.steps[0].set.status,
+            GnmiSmokeSetStatus::Accepted {
+                response_count: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            transcript.steps[0].readbacks[0]
+                .leaf
+                .as_ref()
+                .expect("leaf")
+                .decoded_json
+                .as_deref(),
+            Some(r#""grant-authorized-host""#)
+        );
+
+        shutdown.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), listener_task)
+            .await
+            .expect("listener timeout")
+            .expect("listener join");
+    }
+
+    #[tokio::test]
+    async fn live_mtls_set_denies_spiffe_client_without_nacm_grant() {
+        let material = mtls_material_for_client(
+            "spiffe://test-domain/tenant/test/ns/default/sa/read-only/nf/amf/instance/0",
+        );
+        let server =
+            test_server_with_real_write_authorizer(GrantBackedPolicy::new(gnmi_writer_grants()))
+                .await;
+        let (addr, shutdown, listener_task) = spawn_listener_with_server(&material, server).await;
+
+        let transcript = run_gnmi_mutating_smoke(
+            smoke_config(addr, &material),
+            [GnmiSmokeMutationStep {
+                set: GnmiSmokeSetOp {
+                    path: "/sys:system/sys:hostname".to_string(),
+                    op: GnmiSmokeSetOpKind::Update,
+                    json_value: Some(r#""unauthorized-host""#.to_string()),
+                    encoding: GnmiSmokeEncoding::JsonIetf,
+                    expectation: GnmiSmokeSetExpectation::Reject,
+                },
+                readbacks: vec![GnmiSmokeReadback {
+                    get: GnmiSmokeGetRequest {
+                        path: "/sys:system/sys:hostname".to_string(),
+                        data_type: GnmiSmokeDataType::Config,
+                        encoding: GnmiSmokeEncoding::JsonIetf,
+                    },
+                    expect_leaf: Some(GnmiSmokeLeafExpectation {
+                        leaf_path: "/sys:system/sys:hostname".to_string(),
+                        expected_json: r#""initial-host""#.to_string(),
+                    }),
+                }],
+            }],
+        )
+        .await
+        .expect("denied grant-backed mutating smoke transcript");
+
+        assert!(matches!(
+            transcript.steps[0].set.status,
+            GnmiSmokeSetStatus::Rejected { .. }
+        ));
+        assert_eq!(
+            transcript.steps[0].readbacks[0]
+                .leaf
+                .as_ref()
+                .expect("leaf")
+                .decoded_json
+                .as_deref(),
+            Some(r#""initial-host""#)
+        );
+        assert!(!format!("{transcript:?}").contains("unauthorized-host"));
 
         shutdown.request_shutdown();
         tokio::time::timeout(Duration::from_secs(5), listener_task)

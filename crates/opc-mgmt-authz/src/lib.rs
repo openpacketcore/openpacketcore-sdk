@@ -28,8 +28,8 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use opc_config_bus::{AuthorizationContext, AuthorizationError, ConfigAuthorizer};
-use opc_config_model::TrustedPrincipal;
 use opc_config_model::{ConfigOperation, YangPath as ConfigYangPath};
+use opc_config_model::{TrustedPrincipal, WorkloadIdentity};
 use opc_mgmt_schema::{ModelData, SchemaRegistry};
 use opc_nacm::{ModuleRegistry, NacmAction, NacmEvaluator, NacmPolicy, YangPath};
 use thiserror::Error;
@@ -81,6 +81,23 @@ pub trait PolicySource: Send + Sync {
     ) -> Result<NacmPolicy, AuthzError> {
         self.active_policy(principal.tenant.as_str())
     }
+
+    /// Returns the active policy plus the effective principal to evaluate.
+    ///
+    /// The default preserves the existing behavior by evaluating the original
+    /// principal. Grant-backed sources can override this method to attach
+    /// signed roles/groups before NACM evaluation and decision tracing. The
+    /// effective principal must keep the authenticated identity and tenant; only
+    /// signed authorization metadata such as roles/groups should be added.
+    fn active_policy_context_for_principal(
+        &self,
+        principal: &TrustedPrincipal,
+    ) -> Result<ResolvedPolicy, AuthzError> {
+        Ok(ResolvedPolicy::new(
+            self.active_policy_for_principal(principal)?,
+            principal.clone(),
+        ))
+    }
 }
 
 impl<T> PolicySource for &T
@@ -96,6 +113,39 @@ where
         principal: &TrustedPrincipal,
     ) -> Result<NacmPolicy, AuthzError> {
         (*self).active_policy_for_principal(principal)
+    }
+
+    fn active_policy_context_for_principal(
+        &self,
+        principal: &TrustedPrincipal,
+    ) -> Result<ResolvedPolicy, AuthzError> {
+        (*self).active_policy_context_for_principal(principal)
+    }
+}
+
+/// Active policy selection and effective principal used for one authorization.
+#[derive(Debug, Clone)]
+pub struct ResolvedPolicy {
+    /// Compiled NACM policy selected for the principal.
+    pub policy: NacmPolicy,
+    /// Principal after any signed authorization grants have been attached.
+    pub principal: TrustedPrincipal,
+    /// Optional implementation-specific policy mode for operator diagnostics.
+    pub mode: Option<String>,
+}
+
+impl ResolvedPolicy {
+    pub fn new(policy: NacmPolicy, principal: TrustedPrincipal) -> Self {
+        Self {
+            policy,
+            principal,
+            mode: None,
+        }
+    }
+
+    pub fn with_mode(mut self, mode: impl Into<String>) -> Self {
+        self.mode = Some(mode.into());
+        self
     }
 }
 
@@ -179,13 +229,15 @@ impl<'r, P: PolicySource> ReadAuthorizer<'r, P> {
         action: ReadAction,
         paths: &[&str],
     ) -> Result<Vec<PathDecision>, AuthzError> {
-        let policy = self.source.active_policy_for_principal(principal)?;
+        let resolved = self.source.active_policy_context_for_principal(principal)?;
+        let policy = &resolved.policy;
+        let authz_principal = &resolved.principal;
         let nacm_action = action.to_nacm();
         // A fresh evaluator per call: caches within this batch and stays `&self`
         // / Send-friendly for a concurrent server.
         let mut evaluator = NacmEvaluator::new();
 
-        let decisions = paths
+        let decisions: Vec<_> = paths
             .iter()
             .map(|&path| {
                 let Some(node) = self.registry.node(path) else {
@@ -197,7 +249,7 @@ impl<'r, P: PolicySource> ReadAuthorizer<'r, P> {
                 let schema_path = node.path.to_string();
                 let allowed = match YangPath::parse(node.path, &self.modules) {
                     Ok(parsed) => evaluator
-                        .evaluate_for_groups(&policy, &parsed, nacm_action, &principal.groups)
+                        .evaluate_for_groups(policy, &parsed, nacm_action, &authz_principal.groups)
                         .is_allowed(),
                     // Unparseable / unknown-prefix canonical path: deny.
                     Err(_) => false,
@@ -208,6 +260,13 @@ impl<'r, P: PolicySource> ReadAuthorizer<'r, P> {
                 }
             })
             .collect();
+        trace_read_decisions(
+            authz_principal,
+            policy,
+            resolved.mode.as_deref(),
+            nacm_action,
+            &decisions,
+        );
         Ok(decisions)
     }
 
@@ -291,11 +350,13 @@ impl<'r, P: PolicySource> ConfigWriteAuthorizer<'r, P> {
             return Ok(Vec::new());
         }
 
-        let policy = self.source.active_policy_for_principal(principal)?;
+        let resolved = self.source.active_policy_context_for_principal(principal)?;
+        let policy = &resolved.policy;
+        let authz_principal = &resolved.principal;
         let nacm_action = write_action_for_operation(operation);
         let mut evaluator = NacmEvaluator::new();
 
-        let decisions = paths
+        let decisions: Vec<_> = paths
             .iter()
             .map(|path| {
                 let Some(node) = self.registry.node(path.as_str()) else {
@@ -308,7 +369,7 @@ impl<'r, P: PolicySource> ConfigWriteAuthorizer<'r, P> {
                 let schema_path = node.path.to_string();
                 let allowed = match YangPath::parse(node.path, &self.modules) {
                     Ok(parsed) => evaluator
-                        .evaluate_for_groups(&policy, &parsed, nacm_action, &principal.groups)
+                        .evaluate_for_groups(policy, &parsed, nacm_action, &authz_principal.groups)
                         .is_allowed(),
                     Err(_) => false,
                 };
@@ -319,6 +380,14 @@ impl<'r, P: PolicySource> ConfigWriteAuthorizer<'r, P> {
                 }
             })
             .collect();
+        trace_write_decisions(
+            authz_principal,
+            policy,
+            resolved.mode.as_deref(),
+            operation,
+            nacm_action,
+            &decisions,
+        );
         Ok(decisions)
     }
 
@@ -393,14 +462,31 @@ impl<P: PolicySource> ExecAuthorizer<P> {
         principal: &TrustedPrincipal,
         operation_path: &str,
     ) -> Result<bool, AuthzError> {
-        let policy = self.source.active_policy_for_principal(principal)?;
+        let resolved = self.source.active_policy_context_for_principal(principal)?;
+        let policy = &resolved.policy;
+        let authz_principal = &resolved.principal;
         let Ok(path) = YangPath::parse(operation_path, &self.modules) else {
+            trace_exec_decision(
+                authz_principal,
+                policy,
+                resolved.mode.as_deref(),
+                INVALID_SCHEMA_PATH,
+                false,
+            );
             return Ok(false);
         };
         let mut evaluator = NacmEvaluator::new();
-        Ok(evaluator
-            .evaluate_for_groups(&policy, &path, NacmAction::Exec, &principal.groups)
-            .is_allowed())
+        let allowed = evaluator
+            .evaluate_for_groups(policy, &path, NacmAction::Exec, &authz_principal.groups)
+            .is_allowed();
+        trace_exec_decision(
+            authz_principal,
+            policy,
+            resolved.mode.as_deref(),
+            operation_path,
+            allowed,
+        );
+        Ok(allowed)
     }
 }
 
@@ -432,13 +518,196 @@ fn module_registry_from_models(models: &[ModelData]) -> Result<ModuleRegistry, A
     Ok(modules)
 }
 
+fn trace_read_decisions(
+    principal: &TrustedPrincipal,
+    policy: &NacmPolicy,
+    policy_mode: Option<&str>,
+    action: NacmAction,
+    decisions: &[PathDecision],
+) {
+    let identity = TraceIdentity::from_principal(principal);
+    for decision in decisions {
+        tracing::debug!(
+            target: "opc_mgmt_authz",
+            event = "mgmt.authz.read",
+            principal_kind = identity.kind,
+            tenant = principal.tenant.as_str(),
+            groups = ?principal.groups,
+            spiffe_trust_domain = identity.spiffe_trust_domain,
+            spiffe_tenant = identity.spiffe_tenant,
+            spiffe_namespace = identity.spiffe_namespace,
+            spiffe_service_account = identity.spiffe_service_account,
+            spiffe_nf_kind = identity.spiffe_nf_kind,
+            policy_version = policy.version().get(),
+            policy_mode = policy_mode.unwrap_or("unspecified"),
+            action = action.as_str(),
+            path = decision.path.as_str(),
+            allowed = decision.allowed,
+            "management authorization decision"
+        );
+    }
+}
+
+fn trace_write_decisions(
+    principal: &TrustedPrincipal,
+    policy: &NacmPolicy,
+    policy_mode: Option<&str>,
+    operation: ConfigOperation,
+    action: NacmAction,
+    decisions: &[WritePathDecision],
+) {
+    let identity = TraceIdentity::from_principal(principal);
+    for decision in decisions {
+        tracing::debug!(
+            target: "opc_mgmt_authz",
+            event = "mgmt.authz.write",
+            principal_kind = identity.kind,
+            tenant = principal.tenant.as_str(),
+            groups = ?principal.groups,
+            spiffe_trust_domain = identity.spiffe_trust_domain,
+            spiffe_tenant = identity.spiffe_tenant,
+            spiffe_namespace = identity.spiffe_namespace,
+            spiffe_service_account = identity.spiffe_service_account,
+            spiffe_nf_kind = identity.spiffe_nf_kind,
+            policy_version = policy.version().get(),
+            policy_mode = policy_mode.unwrap_or("unspecified"),
+            operation = ?operation,
+            action = action.as_str(),
+            path = decision.path.as_str(),
+            allowed = decision.allowed,
+            "management authorization decision"
+        );
+    }
+}
+
+fn trace_exec_decision(
+    principal: &TrustedPrincipal,
+    policy: &NacmPolicy,
+    policy_mode: Option<&str>,
+    operation_path: &str,
+    allowed: bool,
+) {
+    let identity = TraceIdentity::from_principal(principal);
+    tracing::debug!(
+        target: "opc_mgmt_authz",
+        event = "mgmt.authz.exec",
+        principal_kind = identity.kind,
+        tenant = principal.tenant.as_str(),
+        groups = ?principal.groups,
+        spiffe_trust_domain = identity.spiffe_trust_domain,
+        spiffe_tenant = identity.spiffe_tenant,
+        spiffe_namespace = identity.spiffe_namespace,
+        spiffe_service_account = identity.spiffe_service_account,
+        spiffe_nf_kind = identity.spiffe_nf_kind,
+        policy_version = policy.version().get(),
+        policy_mode = policy_mode.unwrap_or("unspecified"),
+        action = NacmAction::Exec.as_str(),
+        path = operation_path,
+        allowed,
+        "management authorization decision"
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TraceIdentity<'a> {
+    kind: &'static str,
+    spiffe_trust_domain: Option<&'a str>,
+    spiffe_tenant: Option<&'a str>,
+    spiffe_namespace: Option<&'a str>,
+    spiffe_service_account: Option<&'a str>,
+    spiffe_nf_kind: Option<&'a str>,
+}
+
+impl<'a> TraceIdentity<'a> {
+    fn from_principal(principal: &'a TrustedPrincipal) -> Self {
+        match &principal.identity {
+            WorkloadIdentity::Spiffe(spiffe) => {
+                let parts = SpiffeTraceParts::from_path(spiffe.path());
+                Self {
+                    kind: "spiffe",
+                    spiffe_trust_domain: Some(spiffe.trust_domain()),
+                    spiffe_tenant: parts.tenant,
+                    spiffe_namespace: parts.namespace,
+                    spiffe_service_account: parts.service_account,
+                    spiffe_nf_kind: parts.nf_kind,
+                }
+            }
+            WorkloadIdentity::User(_) => Self::non_spiffe("user"),
+            WorkloadIdentity::Internal(_) => Self::non_spiffe("internal"),
+        }
+    }
+
+    fn non_spiffe(kind: &'static str) -> Self {
+        Self {
+            kind,
+            spiffe_trust_domain: None,
+            spiffe_tenant: None,
+            spiffe_namespace: None,
+            spiffe_service_account: None,
+            spiffe_nf_kind: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SpiffeTraceParts<'a> {
+    tenant: Option<&'a str>,
+    namespace: Option<&'a str>,
+    service_account: Option<&'a str>,
+    nf_kind: Option<&'a str>,
+}
+
+impl<'a> SpiffeTraceParts<'a> {
+    fn from_path(path: &'a str) -> Self {
+        let mut segments = path.trim_start_matches('/').split('/');
+        let mut first = segments.next();
+        if first == Some("trust-domain") {
+            first = segments.next();
+        }
+        if first != Some("tenant") {
+            return Self::default();
+        }
+        let tenant = segments.next();
+        if segments.next() != Some("ns") {
+            return Self {
+                tenant,
+                ..Self::default()
+            };
+        }
+        let namespace = segments.next();
+        if segments.next() != Some("sa") {
+            return Self {
+                tenant,
+                namespace,
+                ..Self::default()
+            };
+        }
+        let service_account = segments.next();
+        if segments.next() != Some("nf") {
+            return Self {
+                tenant,
+                namespace,
+                service_account,
+                ..Self::default()
+            };
+        }
+        let nf_kind = segments.next();
+        Self {
+            tenant,
+            namespace,
+            service_account,
+            nf_kind,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use opc_config_model::{ConfigOperation, TrustedPrincipal, WorkloadIdentity};
     use opc_mgmt_schema::{DataClass, LeafType, ModelData, NodeKind, NodeMeta, OriginEntry};
     use opc_nacm::{NacmPolicy, NacmRule, NacmRuleList, PolicyVersion, YangPathPattern};
-    use opc_types::TenantId;
+    use opc_types::{SpiffeId, TenantId};
 
     struct TestReg;
 
@@ -564,6 +833,31 @@ mod tests {
         }
     }
 
+    /// A source that attaches signed groups in the resolved-policy context.
+    /// Tests using this source fail if an authorizer evaluates the original
+    /// transport principal instead of the effective signed-grant principal.
+    struct ResolvedGroupPolicy;
+    impl PolicySource for ResolvedGroupPolicy {
+        fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
+            Ok(NacmPolicy::empty(PolicyVersion::new(1)))
+        }
+
+        fn active_policy_context_for_principal(
+            &self,
+            principal: &TrustedPrincipal,
+        ) -> Result<ResolvedPolicy, AuthzError> {
+            Ok(ResolvedPolicy::new(
+                group_write(
+                    "resolved-writer",
+                    NacmAction::Update,
+                    "/sys:system/sys:hostname",
+                ),
+                principal.clone().with_groups(["resolved-writer"]),
+            )
+            .with_mode("production-write"))
+        }
+    }
+
     fn principal() -> TrustedPrincipal {
         TrustedPrincipal::new(
             WorkloadIdentity::Internal("tester".into()),
@@ -573,6 +867,49 @@ mod tests {
 
     fn principal_with_groups(groups: impl IntoIterator<Item = &'static str>) -> TrustedPrincipal {
         principal().with_groups(groups)
+    }
+
+    fn spiffe_principal() -> TrustedPrincipal {
+        TrustedPrincipal::new(
+            WorkloadIdentity::Spiffe(
+                SpiffeId::new(
+                    "spiffe://epdg-lab/tenant/mgmt-client/ns/epdg-gateway/sa/mgmt/nf/epdg/instance/lab",
+                )
+                .expect("valid SPIFFE ID"),
+            ),
+            TenantId::from_static("mgmt-client"),
+        )
+    }
+
+    #[test]
+    fn trace_identity_redacts_raw_spiffe_and_exposes_selector_segments() {
+        let principal = spiffe_principal();
+
+        let trace = TraceIdentity::from_principal(&principal);
+
+        assert_eq!(trace.kind, "spiffe");
+        assert_eq!(trace.spiffe_trust_domain, Some("epdg-lab"));
+        assert_eq!(trace.spiffe_tenant, Some("mgmt-client"));
+        assert_eq!(trace.spiffe_namespace, Some("epdg-gateway"));
+        assert_eq!(trace.spiffe_service_account, Some("mgmt"));
+        assert_eq!(trace.spiffe_nf_kind, Some("epdg"));
+    }
+
+    #[test]
+    fn trace_identity_omits_user_and_internal_names() {
+        let user = TrustedPrincipal::new(
+            WorkloadIdentity::User("secret-admin@example.org".to_string()),
+            TenantId::from_static("mgmt-client"),
+        );
+        let internal = principal();
+
+        let user_trace = TraceIdentity::from_principal(&user);
+        let internal_trace = TraceIdentity::from_principal(&internal);
+
+        assert_eq!(user_trace.kind, "user");
+        assert_eq!(internal_trace.kind, "internal");
+        assert_eq!(user_trace.spiffe_trust_domain, None);
+        assert_eq!(internal_trace.spiffe_trust_domain, None);
     }
 
     fn allow_read(pattern: &str) -> NacmPolicy {
@@ -891,6 +1228,17 @@ mod tests {
                 &path
             )
             .expect("principal with group must allow"));
+    }
+
+    #[test]
+    fn config_write_authorizer_evaluates_resolved_signed_groups() {
+        let authz =
+            ConfigWriteAuthorizer::new(&TestReg, ResolvedGroupPolicy).expect("write authorizer");
+        let path = config_path("/sys:system/sys:hostname");
+
+        assert!(authz
+            .may_write(&principal(), ConfigOperation::Patch, &path)
+            .expect("resolved signed group must allow"));
     }
 
     #[test]

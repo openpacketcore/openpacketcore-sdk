@@ -47,6 +47,7 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 http-body-util = "0.1"
 opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
+opc-nacm-config = { path = "../opc-nacm-config", version = "0.2.0" }
 opc-tls = { path = "../opc-tls", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 rcgen = { workspace = true }
