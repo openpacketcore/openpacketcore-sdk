@@ -14,8 +14,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Optional
 
 WIRESHARK_BASE = (
     "https://raw.githubusercontent.com/wireshark/wireshark/{sha}/epan/dissectors/asn1/ngap"
@@ -29,6 +32,9 @@ ASN_FILES = [
     "NGAP-PDU-Descriptions.asn",
 ]
 PINNED_WIRESHARK_SHA = "d296f939b42891994714939384adc3deaef3f180"
+FETCH_RETRIES = 5
+FETCH_TRANSIENT_HTTP_STATUS = {429, 500, 502, 503, 504}
+FETCH_USER_AGENT = "openpacketcore-sdk-ngap-generator/1.0"
 EXPECTED_ASN_SHA256 = {
     "NGAP-CommonDataTypes.asn": "03b1692171ec9f3c999a444eae6f82e4b10f9c02d8d81b5765dd67dbe6ce1b6c",
     "NGAP-Constants.asn": "bcd1e18bd11a40e805c25c4b54a8b7cd2fa963e452d690f2afb6219d8d202d2f",
@@ -54,10 +60,44 @@ def fetch_asn(sha: str, out_dir: Path) -> None:
     for name in ASN_FILES:
         url = f"{WIRESHARK_BASE.format(sha=sha)}/{name}"
         dest = out_dir / name
-        with urllib.request.urlopen(url) as resp:
-            data = resp.read()
+        data = fetch_url(url)
         verify_asn(name, data)
         dest.write_bytes(data)
+
+
+def fetch_url(url: str) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": FETCH_USER_AGENT})
+    for attempt in range(FETCH_RETRIES):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as error:
+            if error.code not in FETCH_TRANSIENT_HTTP_STATUS or attempt == FETCH_RETRIES - 1:
+                raise
+            retry_after = retry_after_seconds(error)
+            delay = retry_after if retry_after is not None else 2**attempt
+        except urllib.error.URLError:
+            if attempt == FETCH_RETRIES - 1:
+                raise
+            delay = 2**attempt
+
+        print(
+            f"warning: transient fetch failure for {url}; retrying in {delay}s",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
+
+    raise RuntimeError(f"unreachable fetch retry state for {url}")
+
+
+def retry_after_seconds(error: urllib.error.HTTPError) -> Optional[int]:
+    retry_after = error.headers.get("Retry-After")
+    if retry_after is None:
+        return None
+    try:
+        return max(0, min(int(retry_after), 60))
+    except ValueError:
+        return None
 
 
 def run_compiler(asn_dir: Path, output: Path) -> None:
