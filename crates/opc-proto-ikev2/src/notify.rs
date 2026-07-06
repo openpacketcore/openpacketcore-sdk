@@ -15,13 +15,6 @@ use crate::{
     HEADER_LEN,
 };
 
-/// IKEv2 Notify Message Type for COOKIE.
-///
-/// @spec IETF RFC7296 2.6; IANA IKEv2 Notify Message Status Types
-/// @req REQ-IETF-RFC7296-NOTIFY-COOKIE-CONST-001
-/// @conformance boundary-only
-pub const IKEV2_NOTIFY_COOKIE: u16 = 16_390;
-
 /// IKEv2 Notify Message Type for NAT_DETECTION_SOURCE_IP.
 ///
 /// @spec IETF RFC7296 2.23; IANA IKEv2 Notify Message Status Types
@@ -35,6 +28,23 @@ pub const IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP: u16 = 16_388;
 /// @req REQ-IETF-RFC7296-NATD-CONST-002
 /// @conformance boundary-only
 pub const IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP: u16 = 16_389;
+
+/// IKEv2 Notify Message Type for COOKIE.
+///
+/// @spec IETF RFC7296 2.6; IANA IKEv2 Notify Message Status Types
+/// @req REQ-IETF-RFC7296-NOTIFY-COOKIE-CONST-001
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_COOKIE: u16 = 16_390;
+
+/// IKEv2 Notify Message Type for REKEY_SA.
+///
+/// A CREATE_CHILD_SA exchange that replaces an existing Child SA carries this
+/// status notify with the protocol ID and inbound AH/ESP SPI of the SA being
+/// rekeyed. The notification data field is empty.
+///
+/// @spec IETF RFC7296 1.3.3, 3.10.1; IANA IKEv2 Notify Message Status Types
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_REKEY_SA: u16 = 16_393;
 
 /// IKEv2 Notify Message Type for COOKIE2.
 ///

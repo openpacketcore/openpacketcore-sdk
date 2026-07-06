@@ -48,8 +48,9 @@ pub use crypto::{
 pub use exchange::{
     Ikev2ExchangeBoundaryState, Ikev2ExchangeDecision, Ikev2ExchangeInvalidReason,
     Ikev2ExchangeKind, Ikev2ExchangeProjection, Ikev2ExchangeRequest, Ikev2ExchangeRequestKey,
-    Ikev2ExchangeSnapshot, Ikev2ExchangeTracker, Ikev2ResponderSpi,
-    IKEV2_EXCHANGE_RETRANSMISSION_WINDOW,
+    Ikev2ExchangeSnapshot, Ikev2ExchangeTracker, Ikev2InitiatorMessageIdAllocation,
+    Ikev2InitiatorMessageIdError, Ikev2InitiatorMessageIdSnapshot, Ikev2InitiatorMessageIdWindow,
+    Ikev2ResponderSpi, IKEV2_EXCHANGE_RETRANSMISSION_WINDOW,
 };
 pub use fragmentation::{
     build_ikev2_encrypted_fragment_payload_body, reassemble_decrypted_ikev2_fragments,
@@ -63,9 +64,11 @@ pub use header::{
     IKEV2_MAJOR_VERSION, IKEV2_MINOR_VERSION, IKEV2_VERSION_OCTET,
 };
 pub use ike_auth::{
-    build_child_sa_response_payloads, build_ike_auth_authentication_payload,
-    build_ike_auth_certificate_payload, build_ike_auth_certreq_payload,
-    build_ike_auth_cleartext_payload_chain, build_ike_auth_configuration_payload,
+    build_child_sa_response_payloads, build_create_child_sa_rekey_request_payloads,
+    build_create_child_sa_rekey_response_payloads, build_delete_payload_body,
+    build_ike_auth_authentication_payload, build_ike_auth_certificate_payload,
+    build_ike_auth_certreq_payload, build_ike_auth_cleartext_payload_chain,
+    build_ike_auth_configuration_payload, build_ike_auth_delete_payload,
     build_ike_auth_identification_payload, build_ike_auth_notify_payload,
     build_ike_auth_sa_payload, build_ike_auth_traffic_selector_payload,
     compute_ike_auth_shared_key_mic, decode_ike_auth_cleartext_payloads,
@@ -75,13 +78,17 @@ pub use ike_auth::{
     Ikev2CertificateRequestPayloadBuild, Ikev2ChildSaNegotiation, Ikev2ChildSaNegotiationError,
     Ikev2ChildSaNegotiationPolicy, Ikev2ChildSaResponsePayloads, Ikev2ChildSaTransformRequirement,
     Ikev2ConfigurationAttribute, Ikev2ConfigurationAttributeBuild, Ikev2ConfigurationPayload,
-    Ikev2ConfigurationPayloadBuild, Ikev2DeletePayload, Ikev2EapPayload,
+    Ikev2ConfigurationPayloadBuild, Ikev2CreateChildSaRekeyRequestBuild,
+    Ikev2CreateChildSaRekeyRequestPayloads, Ikev2CreateChildSaRekeyResponseBuild,
+    Ikev2CreateChildSaRekeyResponsePayloads, Ikev2DeletePayload, Ikev2EapPayload,
     Ikev2IdentificationPayload, Ikev2IdentificationPayloadBuild, Ikev2IkeAuthBuildError,
     Ikev2IkeAuthCleartextPayloads, Ikev2IkeAuthPayloadBuild, Ikev2IkeAuthPayloadError,
     Ikev2IkeAuthPeer, Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError,
     Ikev2TrafficSelector, Ikev2TrafficSelectorBuild, Ikev2TrafficSelectorPayload,
     Ikev2TrafficSelectorPayloadBuild, IKEV2_AUTH_METHOD_SHARED_KEY_MIC,
-    IKEV2_CERT_ENCODING_X509_SIGNATURE, IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
+    IKEV2_CERT_ENCODING_X509_SIGNATURE, IKEV2_IKE_SA_DELETE_SPI_SIZE, IKEV2_IPSEC_SPI_SIZE,
+    IKEV2_SECURITY_PROTOCOL_ID_AH, IKEV2_SECURITY_PROTOCOL_ID_ESP, IKEV2_SECURITY_PROTOCOL_ID_IKE,
+    IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
 };
 pub use ike_auth_signature::{
     compute_ike_auth_signature, verify_ike_auth_signature, Ikev2SignatureAuthKey,
@@ -107,7 +114,7 @@ pub use notify::{
     Ikev2CookieNotifyBuildError, Ikev2CookieNotifyExtractError, Ikev2NotifyPayload,
     Ikev2NotifyPayloadError, IKEV2_NOTIFY_COOKIE, IKEV2_NOTIFY_COOKIE2,
     IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION, IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP,
-    IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP, IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+    IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP, IKEV2_NOTIFY_PROTOCOL_ID_NONE, IKEV2_NOTIFY_REKEY_SA,
 };
 pub use payload::{
     validate_payload_chain, PayloadChain, PayloadType, RawPayload, RawPayloadIterator,

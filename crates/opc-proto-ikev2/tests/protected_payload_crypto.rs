@@ -4,14 +4,17 @@ use aes_gcm::{
 };
 use bytes::BytesMut;
 use opc_proto_ikev2::{
-    decrypt_ikev2_sa_init_protected_payload, derive_ike_sa_init_key_material,
-    ikev2_aes_gcm_protected_body_len, ikev2_aes_gcm_protected_payload_len, open_protected_payloads,
+    build_delete_payload_body, build_ike_auth_cleartext_payload_chain,
+    decode_ike_auth_cleartext_payloads, decrypt_ikev2_sa_init_protected_payload,
+    derive_ike_sa_init_key_material, ikev2_aes_gcm_protected_body_len,
+    ikev2_aes_gcm_protected_payload_len, open_protected_payloads,
     seal_ikev2_sa_init_protected_payload, Header, HeaderFlags, Ikev2DhGroup,
-    Ikev2EncryptionAlgorithm, Ikev2PrfAlgorithm, Ikev2ProtectedPayloadCryptoError,
-    Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoProfile, Ikev2SaInitProtectedPayloadProvider,
-    Message, PayloadChain, PayloadType, ProtectedPayloadContext, ProtectedPayloadKind,
-    ProtectedPayloadOpenError, ProtectedPayloadSealContext, EXCHANGE_TYPE_IKE_AUTH,
-    GENERIC_PAYLOAD_HEADER_LEN, HEADER_LEN,
+    Ikev2EncryptionAlgorithm, Ikev2IkeAuthPayloadBuild, Ikev2PrfAlgorithm,
+    Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoProfile,
+    Ikev2SaInitProtectedPayloadProvider, Message, PayloadChain, PayloadType,
+    ProtectedPayloadContext, ProtectedPayloadKind, ProtectedPayloadOpenError,
+    ProtectedPayloadSealContext, EXCHANGE_TYPE_IKE_AUTH, EXCHANGE_TYPE_INFORMATIONAL,
+    GENERIC_PAYLOAD_HEADER_LEN, HEADER_LEN, IKEV2_IPSEC_SPI_SIZE, IKEV2_SECURITY_PROTOCOL_ID_ESP,
 };
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
 
@@ -27,6 +30,12 @@ const EXPLICIT_IV_I2R: [u8; AES_GCM_EXPLICIT_IV_LEN] =
 const EXPLICIT_IV_R2I: [u8; AES_GCM_EXPLICIT_IV_LEN] =
     [0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97];
 const OUTER_NOTIFY_PAYLOAD_LEN: usize = GENERIC_PAYLOAD_HEADER_LEN + 4;
+
+#[derive(Clone, Copy)]
+struct ProtectedMessageShape {
+    exchange_type: u8,
+    first_inner_payload: PayloadType,
+}
 
 fn profile_128() -> Ikev2SaInitCryptoProfile {
     Ikev2SaInitCryptoProfile::new(
@@ -117,13 +126,39 @@ fn sealed_message(
     padding_len: u8,
     explicit_iv: [u8; AES_GCM_EXPLICIT_IV_LEN],
 ) -> Vec<u8> {
+    sealed_message_for_exchange(
+        profile,
+        key_material,
+        direction,
+        ProtectedMessageShape {
+            exchange_type: EXCHANGE_TYPE_IKE_AUTH,
+            first_inner_payload: PayloadType::ExtensibleAuthentication,
+        },
+        inner_payload,
+        padding_len,
+        explicit_iv,
+    )
+}
+
+fn sealed_message_for_exchange(
+    profile: Ikev2SaInitCryptoProfile,
+    key_material: &opc_proto_ikev2::Ikev2SaInitKeyMaterial,
+    direction: Ikev2ProtectedPayloadDirection,
+    shape: ProtectedMessageShape,
+    inner_payload: &[u8],
+    padding_len: u8,
+    explicit_iv: [u8; AES_GCM_EXPLICIT_IV_LEN],
+) -> Vec<u8> {
     let protected_body_len = AES_GCM_EXPLICIT_IV_LEN
         + inner_payload.len()
         + usize::from(padding_len)
         + 1
         + AES_GCM_ICV_LEN;
-    let mut encoded =
-        placeholder_message(protected_body_len, PayloadType::ExtensibleAuthentication);
+    let mut encoded = placeholder_message_for_exchange(
+        protected_body_len,
+        shape.first_inner_payload,
+        shape.exchange_type,
+    );
     let protected_body_offset = HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN;
     let prefix = &encoded[..protected_body_offset];
     let protected_body = match seal_ikev2_sa_init_protected_payload(
@@ -273,6 +308,18 @@ fn encrypted_message_after_notify(
 }
 
 fn placeholder_message(protected_body_len: usize, first_inner_payload: PayloadType) -> Vec<u8> {
+    placeholder_message_for_exchange(
+        protected_body_len,
+        first_inner_payload,
+        EXCHANGE_TYPE_IKE_AUTH,
+    )
+}
+
+fn placeholder_message_for_exchange(
+    protected_body_len: usize,
+    first_inner_payload: PayloadType,
+    exchange_type: u8,
+) -> Vec<u8> {
     let payload_len = match GENERIC_PAYLOAD_HEADER_LEN.checked_add(protected_body_len) {
         Some(value) => value,
         None => panic!("test payload length overflow"),
@@ -292,7 +339,7 @@ fn placeholder_message(protected_body_len: usize, first_inner_payload: PayloadTy
         INITIATOR_SPI,
         RESPONDER_SPI,
         PayloadType::Encrypted,
-        EXCHANGE_TYPE_IKE_AUTH,
+        exchange_type,
         HeaderFlags::from_bits(true, false, false),
         MESSAGE_ID,
     );
@@ -540,6 +587,94 @@ fn seals_responder_to_initiator_payload_that_public_opener_accepts() {
 
     assert_eq!(opened.len(), 1);
     assert_eq!(opened[0].cleartext.as_ref(), INNER_PAYLOAD);
+}
+
+#[test]
+fn seals_and_opens_empty_informational_request() {
+    let profile = profile_128();
+    let material = key_material(profile);
+    let encoded = sealed_message_for_exchange(
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+        ProtectedMessageShape {
+            exchange_type: EXCHANGE_TYPE_INFORMATIONAL,
+            first_inner_payload: PayloadType::NoNext,
+        },
+        &[],
+        0,
+        EXPLICIT_IV_I2R,
+    );
+    let message = decode_message(&encoded);
+    assert_eq!(message.header.exchange_type, EXCHANGE_TYPE_INFORMATIONAL);
+
+    let opened = match open_with_provider(
+        &encoded,
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+    ) {
+        Ok(opened) => opened,
+        Err(error) => panic!("empty INFORMATIONAL open failed: {error:?}"),
+    };
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened[0].first_inner_payload, PayloadType::NoNext);
+    assert!(opened[0].cleartext.is_empty());
+}
+
+#[test]
+fn seals_and_opens_informational_delete_payload() {
+    let profile = profile_128();
+    let material = key_material(profile);
+    let child_spi = [0xde, 0xad, 0xbe, 0xef];
+    let delete_body = build_delete_payload_body(
+        IKEV2_SECURITY_PROTOCOL_ID_ESP,
+        IKEV2_IPSEC_SPI_SIZE,
+        &[&child_spi],
+    )
+    .expect("Delete body");
+    let (first_inner_payload, cleartext) =
+        build_ike_auth_cleartext_payload_chain(&[Ikev2IkeAuthPayloadBuild {
+            payload_type: PayloadType::Delete,
+            body: delete_body,
+        }])
+        .expect("Delete cleartext chain");
+    let encoded = sealed_message_for_exchange(
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+        ProtectedMessageShape {
+            exchange_type: EXCHANGE_TYPE_INFORMATIONAL,
+            first_inner_payload,
+        },
+        &cleartext,
+        0,
+        EXPLICIT_IV_I2R,
+    );
+
+    let opened = match open_with_provider(
+        &encoded,
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+    ) {
+        Ok(opened) => opened,
+        Err(error) => panic!("Delete INFORMATIONAL open failed: {error:?}"),
+    };
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened[0].first_inner_payload, PayloadType::Delete);
+
+    let decoded = decode_ike_auth_cleartext_payloads(
+        opened[0].first_inner_payload,
+        opened[0].cleartext.as_ref(),
+    )
+    .expect("decode opened Delete");
+    assert_eq!(decoded.deletes.len(), 1);
+    assert_eq!(
+        decoded.deletes[0].protocol_id,
+        IKEV2_SECURITY_PROTOCOL_ID_ESP
+    );
+    assert_eq!(decoded.deletes[0].spis, vec![child_spi.as_slice()]);
 }
 
 #[test]

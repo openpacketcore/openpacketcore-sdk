@@ -17,13 +17,14 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::{
-    notify::{Ikev2NotifyPayload, Ikev2NotifyPayloadError},
+    notify::{Ikev2NotifyPayload, Ikev2NotifyPayloadError, IKEV2_NOTIFY_REKEY_SA},
     payload::{PayloadChain, PayloadType, RawPayload, GENERIC_PAYLOAD_HEADER_LEN},
     sa_init::{
-        encode_notify_payload_build, encode_sa_payload_build, Ikev2NotifyPayloadBuild,
-        Ikev2SaInitBuildError, Ikev2SaPayload, Ikev2SaPayloadBuild, Ikev2SaPayloadError,
-        Ikev2SaProposal, Ikev2SaProposalBuild, Ikev2SaTransform, Ikev2SaTransformBuild,
-        Ikev2TransformAttributeBuild, Ikev2TransformAttributeBuildValue,
+        encode_ke_payload_build, encode_nonce_payload_build, encode_notify_payload_build,
+        encode_sa_payload_build, Ikev2KeyExchangePayloadBuild, Ikev2NoncePayloadBuild,
+        Ikev2NotifyPayloadBuild, Ikev2SaInitBuildError, Ikev2SaPayload, Ikev2SaPayloadBuild,
+        Ikev2SaPayloadError, Ikev2SaProposal, Ikev2SaProposalBuild, Ikev2SaTransform,
+        Ikev2SaTransformBuild, Ikev2TransformAttributeBuild, Ikev2TransformAttributeBuildValue,
         Ikev2TransformAttributeValue,
     },
     sa_init_crypto::{Ikev2PrfAlgorithm, Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial},
@@ -43,6 +44,28 @@ const TS_IPV6_ADDR_LEN: usize = 16;
 pub const IKEV2_TS_IPV4_ADDR_RANGE: u8 = 7;
 /// Traffic Selector type for IPv6 address ranges.
 pub const IKEV2_TS_IPV6_ADDR_RANGE: u8 = 8;
+
+/// IKEv2 Security Protocol Identifier for the IKE SA.
+///
+/// @spec IETF RFC7296 3.3.1; IANA IKEv2 Security Protocol Identifiers
+pub const IKEV2_SECURITY_PROTOCOL_ID_IKE: u8 = 1;
+
+/// IKEv2 Security Protocol Identifier for AH Child SAs.
+///
+/// @spec IETF RFC7296 3.3.1; IANA IKEv2 Security Protocol Identifiers
+pub const IKEV2_SECURITY_PROTOCOL_ID_AH: u8 = 2;
+
+/// IKEv2 Security Protocol Identifier for ESP Child SAs.
+///
+/// @spec IETF RFC7296 3.3.1; IANA IKEv2 Security Protocol Identifiers
+pub const IKEV2_SECURITY_PROTOCOL_ID_ESP: u8 = 3;
+
+/// IKE SA Delete payload SPI size.
+pub const IKEV2_IKE_SA_DELETE_SPI_SIZE: u8 = 0;
+
+/// AH/ESP Child SA SPI size in IKEv2 Delete and REKEY_SA Notify payloads.
+pub const IKEV2_IPSEC_SPI_SIZE: u8 = 4;
+
 const IKEV2_NONCE_MIN_LEN: usize = 16;
 const IKEV2_NONCE_MAX_LEN: usize = 256;
 const IKEV2_AUTH_KEY_PAD: &[u8] = b"Key Pad for IKEv2";
@@ -554,6 +577,26 @@ impl<'a> Ikev2DeletePayload<'a> {
         }
         Ok(Self { protocol_id, spis })
     }
+
+    /// Encode this Delete payload body.
+    ///
+    /// The SPI Size field is inferred from the first SPI, or zero when no SPI
+    /// values are present. Use [`build_delete_payload_body`] when the caller
+    /// needs to validate an explicit SPI Size field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2IkeAuthBuildError`] when the Delete shape is invalid for
+    /// the protocol ID or exceeds IKEv2 size fields.
+    pub fn encode_body(&self) -> Result<Vec<u8>, Ikev2IkeAuthBuildError> {
+        let spi_size = match self.spis.first() {
+            Some(spi) => {
+                u8::try_from(spi.len()).map_err(|_| Ikev2IkeAuthBuildError::DeleteSpiTooLong)?
+            }
+            None => IKEV2_IKE_SA_DELETE_SPI_SIZE,
+        };
+        build_delete_payload_body(self.protocol_id, spi_size, &self.spis)
+    }
 }
 
 impl fmt::Debug for Ikev2DeletePayload<'_> {
@@ -855,6 +898,82 @@ impl fmt::Debug for Ikev2TrafficSelectorPayloadBuild {
     }
 }
 
+/// Builder input for a CREATE_CHILD_SA Child-SA rekey request payload set.
+///
+/// This emits only the cleartext payload bodies that belong inside the
+/// protected `SK` payload. The product remains responsible for IKE header
+/// construction, sealing, retransmission, and timeout policy.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Ikev2CreateChildSaRekeyRequestBuild {
+    /// Protocol ID of the existing Child SA being rekeyed, AH or ESP.
+    pub rekeyed_protocol_id: u8,
+    /// Inbound SPI of the existing Child SA being rekeyed.
+    pub rekeyed_spi: Vec<u8>,
+    /// SA proposal for the replacement Child SA.
+    pub security_association: Ikev2SaPayloadBuild,
+    /// Initiator nonce payload.
+    pub nonce: Ikev2NoncePayloadBuild,
+    /// Optional initiator KE payload for PFS.
+    pub key_exchange: Option<Ikev2KeyExchangePayloadBuild>,
+    /// Proposed initiator traffic selectors.
+    pub traffic_selectors_initiator: Ikev2TrafficSelectorPayloadBuild,
+    /// Proposed responder traffic selectors.
+    pub traffic_selectors_responder: Ikev2TrafficSelectorPayloadBuild,
+}
+
+impl fmt::Debug for Ikev2CreateChildSaRekeyRequestBuild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ikev2CreateChildSaRekeyRequestBuild")
+            .field("rekeyed_protocol_id", &self.rekeyed_protocol_id)
+            .field("rekeyed_spi_len", &self.rekeyed_spi.len())
+            .field("security_association", &self.security_association)
+            .field("nonce_len", &self.nonce.nonce.len())
+            .field("key_exchange_present", &self.key_exchange.is_some())
+            .field(
+                "traffic_selectors_initiator",
+                &self.traffic_selectors_initiator,
+            )
+            .field(
+                "traffic_selectors_responder",
+                &self.traffic_selectors_responder,
+            )
+            .finish()
+    }
+}
+
+/// Builder input for a CREATE_CHILD_SA Child-SA rekey response payload set.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Ikev2CreateChildSaRekeyResponseBuild {
+    /// Accepted SA proposal for the replacement Child SA.
+    pub security_association: Ikev2SaPayloadBuild,
+    /// Responder nonce payload.
+    pub nonce: Ikev2NoncePayloadBuild,
+    /// Optional responder KE payload when PFS was used.
+    pub key_exchange: Option<Ikev2KeyExchangePayloadBuild>,
+    /// Accepted initiator traffic selectors.
+    pub traffic_selectors_initiator: Ikev2TrafficSelectorPayloadBuild,
+    /// Accepted responder traffic selectors.
+    pub traffic_selectors_responder: Ikev2TrafficSelectorPayloadBuild,
+}
+
+impl fmt::Debug for Ikev2CreateChildSaRekeyResponseBuild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ikev2CreateChildSaRekeyResponseBuild")
+            .field("security_association", &self.security_association)
+            .field("nonce_len", &self.nonce.nonce.len())
+            .field("key_exchange_present", &self.key_exchange.is_some())
+            .field(
+                "traffic_selectors_initiator",
+                &self.traffic_selectors_initiator,
+            )
+            .field(
+                "traffic_selectors_responder",
+                &self.traffic_selectors_responder,
+            )
+            .finish()
+    }
+}
+
 /// IKE_AUTH peer whose AUTH payload is being computed or verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ikev2IkeAuthPeer {
@@ -979,6 +1098,85 @@ pub fn build_ike_auth_notify_payload(
     input: &Ikev2NotifyPayloadBuild,
 ) -> Result<Vec<u8>, Ikev2IkeAuthBuildError> {
     encode_notify_payload_build(input).map_err(|_| Ikev2IkeAuthBuildError::NotifySpiTooLong)
+}
+
+/// Build a Delete payload body.
+///
+/// The output is the RFC 7296 §3.11 Delete body:
+/// Protocol ID, SPI Size, Num of SPIs, and the concatenated SPI values.
+///
+/// # Errors
+///
+/// Returns [`Ikev2IkeAuthBuildError`] when the protocol/SPI shape is invalid
+/// or the SPI count exceeds the two-octet field.
+pub fn build_delete_payload_body(
+    protocol_id: u8,
+    spi_size: u8,
+    spis: &[&[u8]],
+) -> Result<Vec<u8>, Ikev2IkeAuthBuildError> {
+    validate_delete_payload_shape(protocol_id, spi_size, spis)?;
+    let spi_count =
+        u16::try_from(spis.len()).map_err(|_| Ikev2IkeAuthBuildError::DeleteSpiCountTooLong)?;
+    let spi_bytes_len = usize::from(spi_size)
+        .checked_mul(spis.len())
+        .ok_or(Ikev2IkeAuthBuildError::LengthOverflow)?;
+    let mut out = Vec::with_capacity(
+        DELETE_FIXED_BODY_LEN
+            .checked_add(spi_bytes_len)
+            .ok_or(Ikev2IkeAuthBuildError::LengthOverflow)?,
+    );
+    out.push(protocol_id);
+    out.push(spi_size);
+    out.extend_from_slice(&spi_count.to_be_bytes());
+    for spi in spis {
+        out.extend_from_slice(spi);
+    }
+    Ok(out)
+}
+
+/// Build a Delete payload body from a typed Delete view.
+///
+/// # Errors
+///
+/// Returns [`Ikev2IkeAuthBuildError`] when the Delete shape is invalid for the
+/// protocol ID or exceeds IKEv2 size fields.
+pub fn build_ike_auth_delete_payload(
+    input: &Ikev2DeletePayload<'_>,
+) -> Result<Vec<u8>, Ikev2IkeAuthBuildError> {
+    input.encode_body()
+}
+
+fn validate_delete_payload_shape(
+    protocol_id: u8,
+    spi_size: u8,
+    spis: &[&[u8]],
+) -> Result<(), Ikev2IkeAuthBuildError> {
+    match protocol_id {
+        IKEV2_SECURITY_PROTOCOL_ID_IKE => {
+            if spi_size != IKEV2_IKE_SA_DELETE_SPI_SIZE || !spis.is_empty() {
+                return Err(Ikev2IkeAuthBuildError::DeleteIkeSaSpiInvalid);
+            }
+        }
+        IKEV2_SECURITY_PROTOCOL_ID_AH | IKEV2_SECURITY_PROTOCOL_ID_ESP => {
+            if spi_size != IKEV2_IPSEC_SPI_SIZE {
+                return Err(Ikev2IkeAuthBuildError::DeleteIpsecSpiSizeInvalid);
+            }
+            if spis.is_empty() {
+                return Err(Ikev2IkeAuthBuildError::DeleteSpiMissing);
+            }
+        }
+        _ => return Err(Ikev2IkeAuthBuildError::DeleteProtocolIdUnsupported),
+    }
+
+    for spi in spis {
+        if spi.len() > usize::from(u8::MAX) {
+            return Err(Ikev2IkeAuthBuildError::DeleteSpiTooLong);
+        }
+        if spi.len() != usize::from(spi_size) {
+            return Err(Ikev2IkeAuthBuildError::DeleteSpiSizeMismatch);
+        }
+    }
+    Ok(())
 }
 
 /// Returns the IKE_AUTH shared-key AUTH payload body length for `profile`.
@@ -1266,6 +1464,112 @@ impl fmt::Debug for Ikev2ChildSaResponsePayloads {
     }
 }
 
+/// Payload builders for a Child-SA rekey CREATE_CHILD_SA request.
+///
+/// The fields are named by payload role. When building the protected
+/// cleartext chain, the RFC 7296 order is `N(REKEY_SA), SA, Ni, [KEi], TSi,
+/// TSr`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Ikev2CreateChildSaRekeyRequestPayloads {
+    /// REKEY_SA Notify payload body entry.
+    pub rekey_notify: Ikev2IkeAuthPayloadBuild,
+    /// Replacement SA proposal payload body entry.
+    pub security_association: Ikev2IkeAuthPayloadBuild,
+    /// Initiator Nonce payload body entry.
+    pub nonce: Ikev2IkeAuthPayloadBuild,
+    /// Optional initiator KE payload body entry for PFS.
+    pub key_exchange: Option<Ikev2IkeAuthPayloadBuild>,
+    /// TSi payload body entry.
+    pub traffic_selectors_initiator: Ikev2IkeAuthPayloadBuild,
+    /// TSr payload body entry.
+    pub traffic_selectors_responder: Ikev2IkeAuthPayloadBuild,
+}
+
+impl Ikev2CreateChildSaRekeyRequestPayloads {
+    /// Return payload entries in RFC 7296 CREATE_CHILD_SA request order.
+    pub fn into_payloads(self) -> Vec<Ikev2IkeAuthPayloadBuild> {
+        let mut payloads = Vec::with_capacity(if self.key_exchange.is_some() { 6 } else { 5 });
+        payloads.push(self.rekey_notify);
+        payloads.push(self.security_association);
+        payloads.push(self.nonce);
+        if let Some(key_exchange) = self.key_exchange {
+            payloads.push(key_exchange);
+        }
+        payloads.push(self.traffic_selectors_initiator);
+        payloads.push(self.traffic_selectors_responder);
+        payloads
+    }
+}
+
+impl fmt::Debug for Ikev2CreateChildSaRekeyRequestPayloads {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ikev2CreateChildSaRekeyRequestPayloads")
+            .field("rekey_notify", &self.rekey_notify)
+            .field("security_association", &self.security_association)
+            .field("nonce", &self.nonce)
+            .field("key_exchange_present", &self.key_exchange.is_some())
+            .field(
+                "traffic_selectors_initiator",
+                &self.traffic_selectors_initiator,
+            )
+            .field(
+                "traffic_selectors_responder",
+                &self.traffic_selectors_responder,
+            )
+            .finish()
+    }
+}
+
+/// Payload builders for a Child-SA rekey CREATE_CHILD_SA response.
+///
+/// The RFC 7296 order is `SA, Nr, [KEr], TSi, TSr`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Ikev2CreateChildSaRekeyResponsePayloads {
+    /// Accepted SA payload body entry.
+    pub security_association: Ikev2IkeAuthPayloadBuild,
+    /// Responder Nonce payload body entry.
+    pub nonce: Ikev2IkeAuthPayloadBuild,
+    /// Optional responder KE payload body entry for PFS.
+    pub key_exchange: Option<Ikev2IkeAuthPayloadBuild>,
+    /// TSi payload body entry.
+    pub traffic_selectors_initiator: Ikev2IkeAuthPayloadBuild,
+    /// TSr payload body entry.
+    pub traffic_selectors_responder: Ikev2IkeAuthPayloadBuild,
+}
+
+impl Ikev2CreateChildSaRekeyResponsePayloads {
+    /// Return payload entries in RFC 7296 CREATE_CHILD_SA response order.
+    pub fn into_payloads(self) -> Vec<Ikev2IkeAuthPayloadBuild> {
+        let mut payloads = Vec::with_capacity(if self.key_exchange.is_some() { 5 } else { 4 });
+        payloads.push(self.security_association);
+        payloads.push(self.nonce);
+        if let Some(key_exchange) = self.key_exchange {
+            payloads.push(key_exchange);
+        }
+        payloads.push(self.traffic_selectors_initiator);
+        payloads.push(self.traffic_selectors_responder);
+        payloads
+    }
+}
+
+impl fmt::Debug for Ikev2CreateChildSaRekeyResponsePayloads {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ikev2CreateChildSaRekeyResponsePayloads")
+            .field("security_association", &self.security_association)
+            .field("nonce", &self.nonce)
+            .field("key_exchange_present", &self.key_exchange.is_some())
+            .field(
+                "traffic_selectors_initiator",
+                &self.traffic_selectors_initiator,
+            )
+            .field(
+                "traffic_selectors_responder",
+                &self.traffic_selectors_responder,
+            )
+            .finish()
+    }
+}
+
 /// Select the first Child SA proposal and traffic selectors matching policy.
 ///
 /// This helper deliberately stops at product-neutral negotiation intent. It does
@@ -1374,6 +1678,132 @@ pub fn build_child_sa_response_payloads(
             body: tsr_body,
         },
     })
+}
+
+/// Build CREATE_CHILD_SA payload entries for rekeying an AH/ESP Child SA.
+///
+/// The returned entries are suitable for
+/// [`build_ike_auth_cleartext_payload_chain`] and preserve the RFC 7296
+/// request order `N(REKEY_SA), SA, Ni, [KEi], TSi, TSr`.
+///
+/// # Errors
+///
+/// Returns [`Ikev2IkeAuthBuildError`] when any payload cannot be encoded or the
+/// REKEY_SA protocol/SPI shape is invalid.
+pub fn build_create_child_sa_rekey_request_payloads(
+    input: &Ikev2CreateChildSaRekeyRequestBuild,
+) -> Result<Ikev2CreateChildSaRekeyRequestPayloads, Ikev2IkeAuthBuildError> {
+    validate_rekey_child_sa_spi(input.rekeyed_protocol_id, &input.rekeyed_spi)?;
+
+    let rekey_notify = build_ike_auth_notify_payload(&Ikev2NotifyPayloadBuild {
+        protocol_id: input.rekeyed_protocol_id,
+        spi: input.rekeyed_spi.clone(),
+        notify_message_type: IKEV2_NOTIFY_REKEY_SA,
+        notification_data: Vec::new(),
+    })?;
+    let sa_body = build_ike_auth_sa_payload(&input.security_association)?;
+    let nonce_body =
+        encode_nonce_payload_build(&input.nonce).map_err(Ikev2IkeAuthBuildError::Nonce)?;
+    let key_exchange = input
+        .key_exchange
+        .as_ref()
+        .map(|key_exchange| {
+            encode_ke_payload_build(key_exchange)
+                .map(|body| Ikev2IkeAuthPayloadBuild {
+                    payload_type: PayloadType::KeyExchange,
+                    body,
+                })
+                .map_err(Ikev2IkeAuthBuildError::KeyExchange)
+        })
+        .transpose()?;
+    let tsi_body = build_ike_auth_traffic_selector_payload(&input.traffic_selectors_initiator)?;
+    let tsr_body = build_ike_auth_traffic_selector_payload(&input.traffic_selectors_responder)?;
+
+    Ok(Ikev2CreateChildSaRekeyRequestPayloads {
+        rekey_notify: Ikev2IkeAuthPayloadBuild {
+            payload_type: PayloadType::Notify,
+            body: rekey_notify,
+        },
+        security_association: Ikev2IkeAuthPayloadBuild {
+            payload_type: PayloadType::SecurityAssociation,
+            body: sa_body,
+        },
+        nonce: Ikev2IkeAuthPayloadBuild {
+            payload_type: PayloadType::Nonce,
+            body: nonce_body,
+        },
+        key_exchange,
+        traffic_selectors_initiator: Ikev2IkeAuthPayloadBuild {
+            payload_type: PayloadType::TrafficSelectorInitiator,
+            body: tsi_body,
+        },
+        traffic_selectors_responder: Ikev2IkeAuthPayloadBuild {
+            payload_type: PayloadType::TrafficSelectorResponder,
+            body: tsr_body,
+        },
+    })
+}
+
+/// Build CREATE_CHILD_SA response payload entries for rekeying a Child SA.
+///
+/// The returned entries are suitable for
+/// [`build_ike_auth_cleartext_payload_chain`] and preserve the RFC 7296
+/// response order `SA, Nr, [KEr], TSi, TSr`.
+///
+/// # Errors
+///
+/// Returns [`Ikev2IkeAuthBuildError`] when any payload cannot be encoded.
+pub fn build_create_child_sa_rekey_response_payloads(
+    input: &Ikev2CreateChildSaRekeyResponseBuild,
+) -> Result<Ikev2CreateChildSaRekeyResponsePayloads, Ikev2IkeAuthBuildError> {
+    let sa_body = build_ike_auth_sa_payload(&input.security_association)?;
+    let nonce_body =
+        encode_nonce_payload_build(&input.nonce).map_err(Ikev2IkeAuthBuildError::Nonce)?;
+    let key_exchange = input
+        .key_exchange
+        .as_ref()
+        .map(|key_exchange| {
+            encode_ke_payload_build(key_exchange)
+                .map(|body| Ikev2IkeAuthPayloadBuild {
+                    payload_type: PayloadType::KeyExchange,
+                    body,
+                })
+                .map_err(Ikev2IkeAuthBuildError::KeyExchange)
+        })
+        .transpose()?;
+    let tsi_body = build_ike_auth_traffic_selector_payload(&input.traffic_selectors_initiator)?;
+    let tsr_body = build_ike_auth_traffic_selector_payload(&input.traffic_selectors_responder)?;
+
+    Ok(Ikev2CreateChildSaRekeyResponsePayloads {
+        security_association: Ikev2IkeAuthPayloadBuild {
+            payload_type: PayloadType::SecurityAssociation,
+            body: sa_body,
+        },
+        nonce: Ikev2IkeAuthPayloadBuild {
+            payload_type: PayloadType::Nonce,
+            body: nonce_body,
+        },
+        key_exchange,
+        traffic_selectors_initiator: Ikev2IkeAuthPayloadBuild {
+            payload_type: PayloadType::TrafficSelectorInitiator,
+            body: tsi_body,
+        },
+        traffic_selectors_responder: Ikev2IkeAuthPayloadBuild {
+            payload_type: PayloadType::TrafficSelectorResponder,
+            body: tsr_body,
+        },
+    })
+}
+
+fn validate_rekey_child_sa_spi(protocol_id: u8, spi: &[u8]) -> Result<(), Ikev2IkeAuthBuildError> {
+    match protocol_id {
+        IKEV2_SECURITY_PROTOCOL_ID_AH | IKEV2_SECURITY_PROTOCOL_ID_ESP => {}
+        _ => return Err(Ikev2IkeAuthBuildError::InvalidRekeyProtocolId),
+    }
+    if spi.len() != usize::from(IKEV2_IPSEC_SPI_SIZE) {
+        return Err(Ikev2IkeAuthBuildError::RekeySpiLengthInvalid);
+    }
+    Ok(())
 }
 
 fn validate_child_sa_transform_requirements(
@@ -1713,6 +2143,24 @@ pub enum Ikev2IkeAuthBuildError {
     CertificateDataEmpty,
     /// Notify SPI exceeded the one-octet SPI Size field.
     NotifySpiTooLong,
+    /// Delete SPI exceeded the one-octet SPI Size field.
+    DeleteSpiTooLong,
+    /// Delete SPI count exceeded the two-octet Num of SPIs field.
+    DeleteSpiCountTooLong,
+    /// Delete SPI Size did not match at least one SPI length.
+    DeleteSpiSizeMismatch,
+    /// Delete payload had an unsupported protocol ID.
+    DeleteProtocolIdUnsupported,
+    /// IKE SA Delete carried a non-zero SPI Size or SPI list.
+    DeleteIkeSaSpiInvalid,
+    /// AH/ESP Delete did not carry the required 4-octet SPI Size.
+    DeleteIpsecSpiSizeInvalid,
+    /// AH/ESP Delete did not include any SPI values.
+    DeleteSpiMissing,
+    /// REKEY_SA Notify used a protocol ID other than AH or ESP.
+    InvalidRekeyProtocolId,
+    /// REKEY_SA Notify SPI was not the AH/ESP four-octet SPI.
+    RekeySpiLengthInvalid,
     /// CP type was zero.
     InvalidConfigurationType,
     /// TS payload had no selectors.
@@ -1727,6 +2175,10 @@ pub enum Ikev2IkeAuthBuildError {
     TrafficSelectorAddressRangeInvalid,
     /// SA payload builder was malformed.
     SecurityAssociation(Ikev2SaInitBuildError),
+    /// Nonce payload builder was malformed.
+    Nonce(Ikev2SaInitBuildError),
+    /// KE payload builder was malformed.
+    KeyExchange(Ikev2SaInitBuildError),
     /// Child SA response builder was missing responder SPI bytes.
     ChildSaResponderSpiMissing,
 }
@@ -1745,6 +2197,15 @@ impl Ikev2IkeAuthBuildError {
             Self::InvalidCertificateEncoding => "ike_auth_build_cert_invalid_encoding",
             Self::CertificateDataEmpty => "ike_auth_build_cert_data_empty",
             Self::NotifySpiTooLong => "ike_auth_build_notify_spi_too_long",
+            Self::DeleteSpiTooLong => "ike_auth_build_delete_spi_too_long",
+            Self::DeleteSpiCountTooLong => "ike_auth_build_delete_spi_count_too_long",
+            Self::DeleteSpiSizeMismatch => "ike_auth_build_delete_spi_size_mismatch",
+            Self::DeleteProtocolIdUnsupported => "ike_auth_build_delete_protocol_id_unsupported",
+            Self::DeleteIkeSaSpiInvalid => "ike_auth_build_delete_ike_sa_spi_invalid",
+            Self::DeleteIpsecSpiSizeInvalid => "ike_auth_build_delete_ipsec_spi_size_invalid",
+            Self::DeleteSpiMissing => "ike_auth_build_delete_spi_missing",
+            Self::InvalidRekeyProtocolId => "ike_auth_build_rekey_protocol_id_invalid",
+            Self::RekeySpiLengthInvalid => "ike_auth_build_rekey_spi_length_invalid",
             Self::InvalidConfigurationType => "ike_auth_build_cp_invalid_type",
             Self::TrafficSelectorMissing => "ike_auth_build_ts_missing",
             Self::TrafficSelectorTypeUnsupported => "ike_auth_build_ts_type_unsupported",
@@ -1752,6 +2213,8 @@ impl Ikev2IkeAuthBuildError {
             Self::TrafficSelectorPortRangeInvalid => "ike_auth_build_ts_port_range_invalid",
             Self::TrafficSelectorAddressRangeInvalid => "ike_auth_build_ts_address_range_invalid",
             Self::SecurityAssociation(_) => "ike_auth_build_sa_payload",
+            Self::Nonce(_) => "ike_auth_build_nonce_payload",
+            Self::KeyExchange(_) => "ike_auth_build_ke_payload",
             Self::ChildSaResponderSpiMissing => "ike_auth_build_child_sa_responder_spi_missing",
         }
     }
@@ -1767,6 +2230,8 @@ impl Error for Ikev2IkeAuthBuildError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::SecurityAssociation(error) => Some(error),
+            Self::Nonce(error) => Some(error),
+            Self::KeyExchange(error) => Some(error),
             _ => None,
         }
     }

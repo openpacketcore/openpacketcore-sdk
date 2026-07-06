@@ -3,7 +3,7 @@
 //! @spec IETF RFC7296 2.1, 2.2, 3.1
 //! @req REQ-IETF-RFC7296-EXCHANGE-STATE-001
 
-use std::{collections::BTreeSet, fmt};
+use std::{collections::BTreeSet, error::Error, fmt};
 
 use crate::{
     header::{
@@ -109,6 +109,213 @@ impl Ikev2ExchangeKind {
 impl From<Ikev2ExchangeKind> for u8 {
     fn from(value: Ikev2ExchangeKind) -> Self {
         value.as_u8()
+    }
+}
+
+/// One locally initiated IKEv2 request allocation.
+///
+/// The value is redaction-safe and contains only the exchange kind and Message
+/// ID needed for header construction and response matching.
+///
+/// @spec IETF RFC7296 2.3
+/// @conformance boundary-only
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ikev2InitiatorMessageIdAllocation {
+    /// Exchange kind for the locally initiated request.
+    pub exchange: Ikev2ExchangeKind,
+    /// Message ID assigned to the locally initiated request.
+    pub message_id: u32,
+}
+
+/// Error returned by the initiator Message-ID window helper.
+///
+/// @spec IETF RFC7296 2.3
+/// @conformance boundary-only
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ikev2InitiatorMessageIdError {
+    /// The exchange type is not one of the tracked IKEv2 exchanges.
+    UnsupportedExchangeType,
+    /// A request is already outstanding in this direction.
+    RequestOutstanding,
+    /// The next Message ID cannot be safely allocated.
+    MessageIdExhausted,
+    /// A response was observed while no local request was outstanding.
+    NoOutstandingRequest,
+    /// The supplied response header did not carry the response flag.
+    ResponseFlagMissing,
+    /// The response exchange type did not match the outstanding request.
+    ResponseExchangeMismatch,
+    /// The response Message ID did not match the outstanding request.
+    ResponseMessageIdMismatch,
+}
+
+impl Ikev2InitiatorMessageIdError {
+    /// Stable machine-readable error code.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedExchangeType => "initiator_message_id_unsupported_exchange_type",
+            Self::RequestOutstanding => "initiator_message_id_request_outstanding",
+            Self::MessageIdExhausted => "initiator_message_id_exhausted",
+            Self::NoOutstandingRequest => "initiator_message_id_no_outstanding_request",
+            Self::ResponseFlagMissing => "initiator_message_id_response_flag_missing",
+            Self::ResponseExchangeMismatch => "initiator_message_id_response_exchange_mismatch",
+            Self::ResponseMessageIdMismatch => "initiator_message_id_response_id_mismatch",
+        }
+    }
+}
+
+impl fmt::Display for Ikev2InitiatorMessageIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Error for Ikev2InitiatorMessageIdError {}
+
+/// Snapshot of an initiator Message-ID window helper.
+///
+/// @spec IETF RFC7296 2.3
+/// @conformance boundary-only
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ikev2InitiatorMessageIdSnapshot {
+    /// Next Message ID that will be assigned when there is no outstanding request.
+    pub next_message_id: u32,
+    /// Currently outstanding locally initiated request, if any.
+    pub outstanding: Option<Ikev2InitiatorMessageIdAllocation>,
+}
+
+/// Initiator-side Message-ID allocator and single-request window helper.
+///
+/// This helper tracks only the local request direction for an established IKE
+/// SA. It allocates one Message ID at a time, rejects a second outstanding
+/// request, and clears the outstanding slot only when the matching response is
+/// observed. Retransmission timers, timeout policy, and IKE SA teardown remain
+/// product-owned.
+///
+/// @spec IETF RFC7296 2.3
+/// @conformance boundary-only
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Ikev2InitiatorMessageIdWindow {
+    next_message_id: u32,
+    outstanding: Option<Ikev2InitiatorMessageIdAllocation>,
+}
+
+impl Ikev2InitiatorMessageIdWindow {
+    /// Create a window with the next Message ID set to zero.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a window with a caller-supplied next Message ID.
+    pub const fn with_next_message_id(next_message_id: u32) -> Self {
+        Self {
+            next_message_id,
+            outstanding: None,
+        }
+    }
+
+    /// Return the next Message ID that will be assigned.
+    pub const fn next_message_id(&self) -> u32 {
+        self.next_message_id
+    }
+
+    /// Return the currently outstanding allocation, if present.
+    pub const fn outstanding(&self) -> Option<Ikev2InitiatorMessageIdAllocation> {
+        self.outstanding
+    }
+
+    /// Return a redaction-safe snapshot.
+    pub const fn snapshot(&self) -> Ikev2InitiatorMessageIdSnapshot {
+        Ikev2InitiatorMessageIdSnapshot {
+            next_message_id: self.next_message_id,
+            outstanding: self.outstanding,
+        }
+    }
+
+    /// Allocate the next Message ID for a locally initiated exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2InitiatorMessageIdError`] if a request is already
+    /// outstanding or the Message ID counter is exhausted.
+    pub fn allocate(
+        &mut self,
+        exchange: Ikev2ExchangeKind,
+    ) -> Result<Ikev2InitiatorMessageIdAllocation, Ikev2InitiatorMessageIdError> {
+        if self.outstanding.is_some() {
+            return Err(Ikev2InitiatorMessageIdError::RequestOutstanding);
+        }
+        if self.next_message_id == u32::MAX {
+            return Err(Ikev2InitiatorMessageIdError::MessageIdExhausted);
+        }
+
+        let allocation = Ikev2InitiatorMessageIdAllocation {
+            exchange,
+            message_id: self.next_message_id,
+        };
+        self.outstanding = Some(allocation);
+        Ok(allocation)
+    }
+
+    /// Match and complete a response by exchange kind and Message ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2InitiatorMessageIdError`] when no request is outstanding
+    /// or the response metadata does not match the outstanding request.
+    pub fn complete_response(
+        &mut self,
+        exchange: Ikev2ExchangeKind,
+        message_id: u32,
+    ) -> Result<Ikev2InitiatorMessageIdAllocation, Ikev2InitiatorMessageIdError> {
+        let outstanding = self
+            .outstanding
+            .ok_or(Ikev2InitiatorMessageIdError::NoOutstandingRequest)?;
+        if outstanding.exchange != exchange {
+            return Err(Ikev2InitiatorMessageIdError::ResponseExchangeMismatch);
+        }
+        if outstanding.message_id != message_id {
+            return Err(Ikev2InitiatorMessageIdError::ResponseMessageIdMismatch);
+        }
+
+        self.outstanding = None;
+        self.next_message_id = outstanding
+            .message_id
+            .checked_add(1)
+            .ok_or(Ikev2InitiatorMessageIdError::MessageIdExhausted)?;
+        Ok(outstanding)
+    }
+
+    /// Match and complete a decoded IKEv2 response header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2InitiatorMessageIdError`] if the header is not a
+    /// response, has an unsupported exchange type, or does not match the
+    /// outstanding request.
+    pub fn complete_response_header(
+        &mut self,
+        header: &Header,
+    ) -> Result<Ikev2InitiatorMessageIdAllocation, Ikev2InitiatorMessageIdError> {
+        if !header.flags.response() {
+            return Err(Ikev2InitiatorMessageIdError::ResponseFlagMissing);
+        }
+        let exchange = Ikev2ExchangeKind::from_u8(header.exchange_type)
+            .ok_or(Ikev2InitiatorMessageIdError::UnsupportedExchangeType)?;
+        self.complete_response(exchange, header.message_id)
+    }
+
+    /// Match and complete a decoded IKEv2 response message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2InitiatorMessageIdError`] when the response message does
+    /// not match the outstanding request.
+    pub fn complete_response_message(
+        &mut self,
+        message: &Message<'_>,
+    ) -> Result<Ikev2InitiatorMessageIdAllocation, Ikev2InitiatorMessageIdError> {
+        self.complete_response_header(&message.header)
     }
 }
 
