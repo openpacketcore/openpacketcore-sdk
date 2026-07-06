@@ -863,19 +863,29 @@ impl<'a> SpiffeParts<'a> {
         let tenant = segments
             .next()
             .expect("validated SPIFFE IDs always contain tenant id");
-        debug_assert_eq!(segments.next(), Some("ns"));
+        // Consume each fixed label segment into a binding BEFORE asserting on it.
+        // `debug_assert_eq!(segments.next(), …)` elides its argument in release
+        // builds, so the iterator would NOT advance there — shifting every field
+        // by one (service_account would read the namespace value) and silently
+        // breaking SPIFFE selector matching in production. Bind-then-assert
+        // consumes identically in both profiles.
+        let ns_label = segments.next();
+        debug_assert_eq!(ns_label, Some("ns"));
         let namespace = segments
             .next()
             .expect("validated SPIFFE IDs always contain namespace");
-        debug_assert_eq!(segments.next(), Some("sa"));
+        let sa_label = segments.next();
+        debug_assert_eq!(sa_label, Some("sa"));
         let service_account = segments
             .next()
             .expect("validated SPIFFE IDs always contain service account");
-        debug_assert_eq!(segments.next(), Some("nf"));
+        let nf_label = segments.next();
+        debug_assert_eq!(nf_label, Some("nf"));
         let nf_kind = segments
             .next()
             .expect("validated SPIFFE IDs always contain NF kind");
-        debug_assert_eq!(segments.next(), Some("instance"));
+        let instance_label = segments.next();
+        debug_assert_eq!(instance_label, Some("instance"));
         let instance = segments
             .next()
             .expect("validated SPIFFE IDs always contain instance id");
@@ -1427,6 +1437,41 @@ mod tests {
         .expect("attach grants");
 
         assert_eq!(principal.groups, vec!["amf-writers".to_string()]);
+    }
+
+    // Regression: a selector scoped on namespace + service_account (the path
+    // segments AFTER the tenant) must match a full canonical SPIFFE path in BOTH
+    // debug and release. `SpiffeParts::from_spiffe_id` previously advanced the
+    // path iterator inside `debug_assert_eq!(segments.next(), …)`, which is elided
+    // in release — shifting service_account to read the namespace value and
+    // silently denying every otherwise-authorized writer in production builds.
+    // Run this under `cargo test --release` to guard the release path.
+    #[test]
+    fn namespace_and_service_account_scoped_selector_matches_full_path() {
+        let config = NacmConfig::new(
+            vec![
+                NacmGroup::new("core-amf-writers", Vec::new()).with_spiffe_selectors([
+                    SpiffeWorkloadSelector::new("core-amf")
+                        .trust_domain("example.org")
+                        .tenant("acme")
+                        .namespace("core")
+                        .service_account("amf"),
+                ]),
+            ],
+            Vec::new(),
+        );
+        let principal = attach_signed_grants_from_source(
+            spiffe_principal("spiffe://example.org/tenant/acme/ns/core/sa/amf/nf/amf/instance/i1"),
+            &config,
+        )
+        .expect("attach grants");
+
+        assert_eq!(
+            principal.groups,
+            vec!["core-amf-writers".to_string()],
+            "namespace+service_account selector must resolve on a full canonical \
+             SPIFFE path in release as well as debug"
+        );
     }
 
     #[test]
