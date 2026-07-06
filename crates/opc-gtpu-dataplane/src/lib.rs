@@ -1,11 +1,13 @@
 //! Safe Linux GTP-U dataplane backend model for OpenPacketCore.
 //!
-//! This crate provides a backend trait for Linux `gtp` device and PDP-context
-//! lifecycle operations, a deterministic mock backend for tests, an
-//! unsupported-platform backend, a Linux kernel adapter, and redaction-safe
-//! error types. It deliberately does not implement GTP-U packet encoding,
-//! GTP-C/PFCP control plane, route steering, XFRM policy, namespace management,
-//! or deployment policy.
+//! This crate provides a backend trait for GTP-U dataplane device and
+//! PDP-context lifecycle operations, a deterministic mock backend for tests,
+//! an unsupported-platform backend, a Linux `gtp`-netdevice kernel adapter, an
+//! eBPF tc datapath adapter for access-gateway (uplink-capable) roles, and
+//! redaction-safe error types. It deliberately does not implement the
+//! GTP-C/PFCP control plane, route steering, XFRM policy, namespace
+//! management, or deployment policy; GTP-U packet handling itself lives in
+//! the committed eBPF datapath object and `opc-gtpu-ebpf-common`.
 //!
 //! Raw Linux netlink and socket syscalls stay in [`opc_linux_gtpu_sys`]; this
 //! crate is safe Rust and never performs `unsafe` operations.
@@ -13,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+pub mod ebpf;
 pub mod error;
 pub mod linux;
 pub mod mock;
@@ -20,6 +23,10 @@ pub mod model;
 pub mod unsupported;
 
 pub use backend::GtpuDataplaneBackend;
+pub use ebpf::{
+    EbpfGtpuDataplaneBackend, EbpfGtpuDataplaneBackendConfig, DEFAULT_BPFFS_PIN_ROOT,
+    DEFAULT_TC_PRIORITY,
+};
 pub use error::GtpuError;
 pub use linux::{LinuxGtpuDataplaneBackend, LinuxGtpuDataplaneBackendConfig};
 pub use mock::{MockGtpuDataplaneBackend, MockOperation};

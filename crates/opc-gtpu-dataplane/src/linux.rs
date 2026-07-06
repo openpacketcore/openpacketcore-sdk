@@ -550,6 +550,8 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
             kernel_reachable,
             gtp_module_present,
             net_admin_capable,
+            bpf_capable: false,
+            btf_present: false,
             mutation_ready,
             details,
         }
@@ -1160,6 +1162,8 @@ mod tests {
                     kernel_reachable: true,
                     gtp_module_present: true,
                     net_admin_capable: true,
+                    bpf_capable: false,
+                    btf_present: false,
                     mutation_ready: true,
                     details: Some("test transport"),
                 },

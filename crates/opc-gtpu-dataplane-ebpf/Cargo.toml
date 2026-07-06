@@ -1,0 +1,33 @@
+[package]
+name = "opc-gtpu-dataplane-ebpf"
+version = "0.2.0"
+authors = ["OpenPacketCore Contributors"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/openpacketcore/openpacketcore-sdk"
+description = "tc clsact eBPF GTP-U datapath programs (uplink encap, downlink decap) for opc-gtpu-dataplane"
+publish = false
+
+[dependencies]
+aya-ebpf = "0.2.1"
+opc-gtpu-ebpf-common = { path = "../opc-gtpu-ebpf-common" }
+
+[[bin]]
+name = "opc-gtpu-datapath"
+path = "src/main.rs"
+
+# Standalone workspace: this crate targets bpfel-unknown-none and is excluded
+# from the SDK workspace on purpose.
+[workspace]
+
+[profile.release]
+debug = 2
+codegen-units = 1
+lto = true
+panic = "abort"
+opt-level = 3
+
+[profile.dev]
+panic = "abort"
+opt-level = 3
+debug = 2

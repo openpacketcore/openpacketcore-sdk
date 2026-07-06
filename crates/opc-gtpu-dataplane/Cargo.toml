@@ -15,12 +15,20 @@ publish = false
 
 [dependencies]
 opc-linux-gtpu-sys = { path = "../opc-linux-gtpu-sys", version = "0.2.0" }
+opc-gtpu-ebpf-common = { path = "../opc-gtpu-ebpf-common", version = "0.2.0" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.14" }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# setns() for the privileged multi-netns integration test.
+nix = { workspace = true, features = ["sched"] }
 
 [lints]
 workspace = true

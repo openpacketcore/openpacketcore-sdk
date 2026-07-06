@@ -155,6 +155,25 @@ pub const RTM_DELLINK: u16 = 17;
 /// Query a network link.
 pub const RTM_GETLINK: u16 = 18;
 
+/// Create a traffic-control filter.
+pub const RTM_NEWTFILTER: u16 = 44;
+/// Delete a traffic-control filter.
+pub const RTM_DELTFILTER: u16 = 45;
+/// Query traffic-control filters.
+pub const RTM_GETTFILTER: u16 = 46;
+
+/// Traffic-control attribute: classifier kind string.
+pub const TCA_KIND: u16 = 1;
+/// Traffic-control attribute: classifier-specific options nest.
+pub const TCA_OPTIONS: u16 = 2;
+/// cls_bpf attribute: attached BPF program name.
+pub const TCA_BPF_NAME: u16 = 7;
+
+/// tc parent handle for the clsact ingress hook.
+pub const TC_H_CLSACT_INGRESS: u32 = 0xFFFF_FFF2;
+/// tc parent handle for the clsact egress hook.
+pub const TC_H_CLSACT_EGRESS: u32 = 0xFFFF_FFF3;
+
 /// Linux address family unspecified.
 pub const AF_UNSPEC: u8 = 0;
 /// Linux IPv4 address family.
@@ -345,6 +364,14 @@ mod tests {
         assert_eq!(NLMSG_DONE, 0x3);
         assert_eq!(RTM_NEWLINK, 16);
         assert_eq!(RTM_DELLINK, 17);
+        assert_eq!(RTM_NEWTFILTER, 44);
+        assert_eq!(RTM_DELTFILTER, 45);
+        assert_eq!(RTM_GETTFILTER, 46);
+        assert_eq!(TCA_KIND, 1);
+        assert_eq!(TCA_OPTIONS, 2);
+        assert_eq!(TCA_BPF_NAME, 7);
+        assert_eq!(TC_H_CLSACT_INGRESS, 0xFFFF_FFF2);
+        assert_eq!(TC_H_CLSACT_EGRESS, 0xFFFF_FFF3);
         assert_eq!(AF_UNSPEC, 0);
         assert_eq!(AF_INET, 2);
         assert_eq!(AF_INET6, 10);
