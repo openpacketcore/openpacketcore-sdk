@@ -3,7 +3,7 @@
 use std::{pin::Pin, sync::Arc};
 
 use opc_config_model::{AuthStrength, OpcConfig, RequestId, TrustedPrincipal};
-use opc_mgmt_audit::AuditOperation;
+use opc_mgmt_audit::{AuditOperation, AuditOutcome};
 use opc_mgmt_limits::{LimitsError, MgmtLimits};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tonic::{Request, Response, Status};
@@ -196,23 +196,59 @@ where
         request: Request<gnmi::CapabilityRequest>,
     ) -> Result<Response<gnmi::CapabilityResponse>, Status> {
         let start = std::time::Instant::now();
+        let audit_principal = request_principal(&request)
+            .ok()
+            .map(|principal| principal.principal().clone());
         if let Err(err) = self.validate_authenticated_request(&request) {
-            record_rpc_error(GnmiOperation::Capabilities, err.status(), start.elapsed());
-            return Err(status_from_error(err));
+            let final_err = record_capabilities_audit(
+                self.server.as_ref(),
+                audit_principal.as_ref(),
+                outcome_for_error(&err),
+            )
+            .err()
+            .unwrap_or(err);
+            record_rpc_error(
+                GnmiOperation::Capabilities,
+                final_err.status(),
+                start.elapsed(),
+            );
+            return Err(status_from_error(final_err));
         }
         if let Err(err) = validate_extensions_for_operation(
             self.server.extensions(),
             &request.get_ref().extension,
             ExtensionOperation::Capabilities,
         ) {
-            record_rpc_error(GnmiOperation::Capabilities, err.status(), start.elapsed());
-            return Err(status_from_error(err));
+            let final_err = record_capabilities_audit(
+                self.server.as_ref(),
+                audit_principal.as_ref(),
+                outcome_for_error(&err),
+            )
+            .err()
+            .unwrap_or(err);
+            record_rpc_error(
+                GnmiOperation::Capabilities,
+                final_err.status(),
+                start.elapsed(),
+            );
+            return Err(status_from_error(final_err));
         }
 
         let caps = self.server.capabilities();
         if let Err(err) = caps.validate() {
-            record_rpc_error(GnmiOperation::Capabilities, err.status(), start.elapsed());
-            return Err(status_from_error(err));
+            let final_err = record_capabilities_audit(
+                self.server.as_ref(),
+                audit_principal.as_ref(),
+                outcome_for_error(&err),
+            )
+            .err()
+            .unwrap_or(err);
+            record_rpc_error(
+                GnmiOperation::Capabilities,
+                final_err.status(),
+                start.elapsed(),
+            );
+            return Err(status_from_error(final_err));
         }
 
         let mut response_extensions = caps
@@ -238,6 +274,14 @@ where
             g_nmi_version: caps.gnmi_version,
             extension: response_extensions,
         };
+        if let Err(err) = record_capabilities_audit(
+            self.server.as_ref(),
+            audit_principal.as_ref(),
+            AuditOutcome::Success,
+        ) {
+            record_rpc_error(GnmiOperation::Capabilities, err.status(), start.elapsed());
+            return Err(status_from_error(err));
+        }
         record_rpc_success(GnmiOperation::Capabilities, start.elapsed());
         Ok(Response::new(response))
     }
@@ -378,6 +422,28 @@ where
 
 fn subscribe_response_queue_capacity(limits: &opc_mgmt_limits::MgmtLimits) -> usize {
     (limits.max_subscriber_queue_bytes / 4096).clamp(1, 1024)
+}
+
+fn record_capabilities_audit<C, B>(
+    server: &GnmiServer<C, B>,
+    principal: Option<&TrustedPrincipal>,
+    outcome: AuditOutcome,
+) -> Result<(), GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    let Some(principal) = principal else {
+        return Ok(());
+    };
+    record_audit(
+        server.audit(),
+        RequestId::new(),
+        principal,
+        AuditOperation::Capabilities,
+        outcome,
+        Vec::new(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1653,6 +1719,14 @@ mod tests {
         request
     }
 
+    fn authenticated_capability_request(
+        capability: gnmi::CapabilityRequest,
+    ) -> Request<gnmi::CapabilityRequest> {
+        let mut request = Request::new(capability);
+        request.extensions_mut().insert(authenticated_principal());
+        request
+    }
+
     fn commit_confirmed_extension(payload: CommitConfirmedExtension) -> gnmi_ext::Extension {
         gnmi_ext::Extension {
             ext: Some(gnmi_ext::extension::Ext::RegisteredExt(
@@ -2072,6 +2146,64 @@ mod tests {
         assert_eq!(status.code(), Code::Unimplemented);
         assert_eq!(status.message(), "gNMI operation is not supported");
         assert!(!status.message().contains("secret-extension-payload"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_capabilities_success_is_audited() {
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_policy_and_audit(
+            allow_all_read_policy(),
+            Arc::new(audit.clone()),
+        )
+        .await;
+
+        service
+            .capabilities(authenticated_capability_request(gnmi::CapabilityRequest {
+                extension: Vec::new(),
+            }))
+            .await
+            .expect("capabilities");
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Capabilities);
+        assert_eq!(events[0].outcome, AuditOutcome::Success);
+        assert!(events[0].schema_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticated_capabilities_extension_rejection_is_audited() {
+        let audit = CapturingAudit::default();
+        let service = authenticated_service_with_policy_and_audit(
+            allow_all_read_policy(),
+            Arc::new(audit.clone()),
+        )
+        .await;
+
+        let status = service
+            .capabilities(authenticated_capability_request(gnmi::CapabilityRequest {
+                extension: vec![gnmi_ext::Extension {
+                    ext: Some(gnmi_ext::extension::Ext::RegisteredExt(
+                        gnmi_ext::RegisteredExtension {
+                            id: gnmi_ext::ExtensionId::EidExperimental as i32,
+                            msg: b"secret-capability-extension".to_vec(),
+                        },
+                    )),
+                }],
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::Unimplemented);
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Capabilities);
+        assert_eq!(
+            events[0].outcome,
+            audit_failed(AuditReasonCode::OPERATION_NOT_SUPPORTED)
+        );
+        assert!(events[0].schema_paths.is_empty());
+        assert!(!format!("{events:?}").contains("secret-capability-extension"));
     }
 
     #[tokio::test]

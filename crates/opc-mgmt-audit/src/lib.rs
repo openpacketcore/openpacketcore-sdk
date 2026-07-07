@@ -30,6 +30,8 @@ const MAX_AUDIT_REASON_CODE_LEN: usize = 64;
 /// The management operation being audited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditOperation {
+    /// Capability/schema discovery.
+    Capabilities,
     /// Data read (gNMI `Get`, NETCONF `<get>`/`<get-config>`).
     Read,
     /// Subscription create.
@@ -56,6 +58,7 @@ impl AuditOperation {
     /// Stable lowercase operation code.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Capabilities => "capabilities",
             Self::Read => "read",
             Self::Subscribe => "subscribe",
             Self::Create => "create",
@@ -573,6 +576,14 @@ mod tests {
             AuditOutcome::failed_code(AuditReasonCode::OPERATION_FAILED).code(),
             Some("operation-failed")
         );
+    }
+
+    #[test]
+    fn operation_codes_are_stable() {
+        assert_eq!(AuditOperation::Capabilities.as_str(), "capabilities");
+        assert_eq!(AuditOperation::Read.as_str(), "read");
+        assert_eq!(AuditOperation::Subscribe.as_str(), "subscribe");
+        assert_eq!(AuditOperation::Exec.as_str(), "exec");
     }
 
     #[test]
