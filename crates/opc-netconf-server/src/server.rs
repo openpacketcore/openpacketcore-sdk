@@ -6887,6 +6887,18 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct PanicOnReadAudit;
+
+    impl AuditSink for PanicOnReadAudit {
+        fn record(&self, event: &AuditEvent) -> Result<(), AuditError> {
+            if matches!(event.operation, AuditOperation::Read) {
+                panic!("read audit panic");
+            }
+            Ok(())
+        }
+    }
+
     struct FixedPolicy(NacmPolicy);
 
     impl PolicySource for FixedPolicy {
@@ -13928,6 +13940,108 @@ mod tests {
             .expect("session join")
             .expect("session result");
         assert_eq!(result.rpc_count, 2);
+        wait_for_hostname(&bus, "amf-1").await;
+    }
+
+    #[tokio::test]
+    async fn nonpersistent_confirmed_commit_rolls_back_when_session_panics() {
+        let store = Arc::new(MockManagedDatastore::new());
+        store
+            .seed(StoredConfig::new(
+                opc_types::TxId::new(),
+                ConfigVersion::new(1),
+                principal(),
+                RequestSource::Northbound,
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+            ))
+            .await;
+        let bus = Arc::new(
+            ConfigBus::restore_or_new_dev_only(
+                DemoConfig {
+                    hostname: "fallback".to_string(),
+                    secret: "fallback-secret".to_string(),
+                },
+                Arc::clone(&store),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = GeneratedEditBinding {
+            bus: Arc::clone(&bus),
+            startup: None,
+        };
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            PanicOnReadAudit,
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+        let principal = principal();
+        let sessions = SessionRegistry::new();
+        let (mut client, mut server_io) = tokio::io::duplex(64 * 1024);
+        let limits = MgmtLimits::default();
+
+        let session_task = tokio::spawn(async move {
+            crate::session::run_read_only_session_with_registry(
+                &server,
+                &principal,
+                &mut server_io,
+                SessionConfig::default(),
+                502,
+                &sessions,
+            )
+            .await
+        });
+
+        let server_hello =
+            String::from_utf8(read_base10_frame(&mut client).await).expect("hello utf8");
+        assert!(server_hello.contains(NETCONF_BASE_1_0));
+
+        let client_hello = format!(
+            r#"<hello xmlns="{NETCONF_BASE_NS}"><capabilities><capability>{NETCONF_BASE_1_0}</capability></capabilities></hello>"#
+        );
+        client
+            .write_all(&base10::encode_message(client_hello.as_bytes(), &limits).expect("hello"))
+            .await
+            .expect("write client hello");
+
+        let edit = edit_config_rpc_to(
+            "candidate",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        client
+            .write_all(&base10::encode_message(edit.as_bytes(), &limits).expect("edit"))
+            .await
+            .expect("write edit");
+        let reply = String::from_utf8(read_base10_frame(&mut client).await).expect("edit reply");
+        assert!(reply.contains("<ok/>"), "edit reply: {reply}");
+
+        client
+            .write_all(
+                &base10::encode_message(confirmed_commit_rpc(30).as_bytes(), &limits)
+                    .expect("confirmed commit"),
+            )
+            .await
+            .expect("write confirmed commit");
+        let reply = String::from_utf8(read_base10_frame(&mut client).await).expect("commit reply");
+        assert!(reply.contains("<ok/>"), "commit reply: {reply}");
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+
+        client
+            .write_all(
+                &base10::encode_message(get_config_rpc("running").as_bytes(), &limits)
+                    .expect("get-config"),
+            )
+            .await
+            .expect("write get-config");
+
+        let join = session_task.await;
+        assert!(join.is_err(), "session task should propagate read panic");
         wait_for_hostname(&bus, "amf-1").await;
     }
 

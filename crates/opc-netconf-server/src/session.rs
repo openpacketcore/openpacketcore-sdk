@@ -10,9 +10,11 @@
 //! 4. dispatch bounded RPC frames through [`ReadOnlyNetconfServer`].
 
 use std::num::NonZeroU32;
+use std::panic::{self, AssertUnwindSafe};
 use std::str;
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use opc_config_bus::{ConfigEvent, ConfigReceiver};
 use opc_config_model::{OpcConfig, RequestId, TrustedPrincipal};
 use opc_mgmt_audit::AuditSink;
@@ -154,7 +156,8 @@ where
         SessionRegistryError::DuplicateSessionId => SessionError::DuplicateSessionId,
     })?;
 
-    let result = run_registered_session_loop(
+    let session_id = registration.session_id();
+    let result = AssertUnwindSafe(run_registered_session_loop(
         server,
         principal,
         stream,
@@ -162,12 +165,16 @@ where
         &mut registration,
         hello_session_id,
         sessions,
-    )
+    ))
+    .catch_unwind()
     .await;
     server
-        .rollback_pending_confirmed_commit_for_session(registration.session_id(), principal)
+        .rollback_pending_confirmed_commit_for_session(session_id, principal)
         .await;
-    result
+    match result {
+        Ok(result) => result,
+        Err(payload) => panic::resume_unwind(payload),
+    }
 }
 
 async fn run_registered_session_loop<C, B, P, A, S>(
