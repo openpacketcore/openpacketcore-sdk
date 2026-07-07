@@ -25,6 +25,7 @@ struct RuleTrieNode {
     any_child: Option<Box<RuleTrieNode>>,
     exact_rules: Vec<CompiledRule>,
     subtree_rules: Vec<CompiledRule>,
+    min_rule_index: Option<usize>,
 }
 
 impl RuleTrie {
@@ -38,8 +39,23 @@ impl RuleTrie {
 
     pub(crate) fn lookup(&self, path: &YangPath, action: NacmAction) -> Option<&CompiledRule> {
         let mut best_match = None;
-        self.root.collect(path, 0, action, &mut best_match);
+        let mut visited_nodes = 0;
+        self.root
+            .collect(path, 0, action, &mut best_match, &mut visited_nodes);
         best_match
+    }
+
+    #[cfg(test)]
+    fn lookup_with_visit_count(
+        &self,
+        path: &YangPath,
+        action: NacmAction,
+    ) -> (Option<&CompiledRule>, usize) {
+        let mut best_match = None;
+        let mut visited_nodes = 0;
+        self.root
+            .collect(path, 0, action, &mut best_match, &mut visited_nodes);
+        (best_match, visited_nodes)
     }
 
     fn insert(&mut self, index: usize, rule: &NacmRule) {
@@ -50,6 +66,7 @@ impl RuleTrie {
         };
 
         let mut node = &mut self.root;
+        node.record_reachable_rule(index);
         for segment in rule.path().segments() {
             node = match segment {
                 YangPathPatternSegment::Exact(name) => {
@@ -64,6 +81,7 @@ impl RuleTrie {
                     .get_or_insert_with(|| Box::new(RuleTrieNode::default()))
                     .as_mut(),
             };
+            node.record_reachable_rule(index);
         }
 
         if rule.path().is_subtree() {
@@ -81,8 +99,11 @@ impl RuleTrieNode {
         index: usize,
         action: NacmAction,
         best_match: &mut Option<&'a CompiledRule>,
+        visited_nodes: &mut usize,
     ) {
-        if matches!(best_match, Some(rule) if rule.index == 0) {
+        *visited_nodes += 1;
+
+        if self.cannot_beat(best_match) {
             return;
         }
 
@@ -110,16 +131,31 @@ impl RuleTrieNode {
         let segment = &path.segments()[index];
 
         if let Some(child) = self.exact_children.get(segment) {
-            child.collect(path, index + 1, action, best_match);
+            child.collect(path, index + 1, action, best_match, visited_nodes);
         }
 
         if let Some(child) = self.module_wildcard_children.get(segment.module()) {
-            child.collect(path, index + 1, action, best_match);
+            child.collect(path, index + 1, action, best_match, visited_nodes);
         }
 
         if let Some(child) = self.any_child.as_deref() {
-            child.collect(path, index + 1, action, best_match);
+            child.collect(path, index + 1, action, best_match, visited_nodes);
         }
+    }
+
+    fn record_reachable_rule(&mut self, index: usize) {
+        self.min_rule_index = Some(
+            self.min_rule_index
+                .map(|current| current.min(index))
+                .unwrap_or(index),
+        );
+    }
+
+    fn cannot_beat(&self, best_match: &Option<&CompiledRule>) -> bool {
+        let Some(min_rule_index) = self.min_rule_index else {
+            return true;
+        };
+        matches!(best_match, Some(best) if min_rule_index >= best.index)
     }
 }
 
@@ -261,5 +297,73 @@ mod tests {
         let decision = policy.evaluate(&path, NacmAction::Read);
         assert_eq!(decision.effect(), NacmEffect::Deny);
         assert_eq!(decision.matched_rule_index(), Some(0));
+    }
+
+    #[test]
+    fn lookup_prunes_higher_index_wildcard_subtrees_after_low_index_match() {
+        let registry = registry();
+        let depth = 64;
+        let exact = deep_path(depth);
+        let path = YangPath::parse(&exact, &registry).expect("parse deep path");
+        let mut rules = vec![
+            NacmRule::deny(
+                NacmAction::Read,
+                YangPathPattern::parse("/sys:system", &registry).expect("nonmatching rule"),
+            ),
+            NacmRule::allow(
+                NacmAction::Read,
+                YangPathPattern::parse(&exact, &registry).expect("early exact rule"),
+            ),
+        ];
+
+        for wildcard_at in 0..depth {
+            rules.push(NacmRule::deny(
+                NacmAction::Read,
+                YangPathPattern::parse(
+                    &deep_path_with_wildcard(depth, wildcard_at, "if:*"),
+                    &registry,
+                )
+                .expect("module wildcard rule"),
+            ));
+            rules.push(NacmRule::deny(
+                NacmAction::Read,
+                YangPathPattern::parse(
+                    &deep_path_with_wildcard(depth, wildcard_at, "*"),
+                    &registry,
+                )
+                .expect("any wildcard rule"),
+            ));
+        }
+
+        let trie = RuleTrie::from_rules(&rules);
+        let (matched, visited) = trie.lookup_with_visit_count(&path, NacmAction::Read);
+
+        assert_eq!(matched.map(|rule| rule.index), Some(1));
+        assert!(
+            visited <= depth * 3 + 4,
+            "visited {visited} nodes for depth {depth}"
+        );
+    }
+
+    fn deep_path(depth: usize) -> String {
+        let segments = (0..depth)
+            .map(|i| format!("if:n{i}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("/{segments}")
+    }
+
+    fn deep_path_with_wildcard(depth: usize, wildcard_at: usize, wildcard: &str) -> String {
+        let segments = (0..depth)
+            .map(|i| {
+                if i == wildcard_at {
+                    wildcard.to_string()
+                } else {
+                    format!("if:n{i}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("/{segments}")
     }
 }
