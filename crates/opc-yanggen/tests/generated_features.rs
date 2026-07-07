@@ -536,6 +536,14 @@ fn test_generated_code_features() {
             reg.node("/test:system/enabled").unwrap().path,
             "/test:system/test:enabled"
         );
+        let normalized_index = reg.normalized_node_index();
+        assert!(!normalized_index.is_empty());
+        assert!(normalized_index
+            .windows(2)
+            .all(|pair| (pair[0].normalized_path, pair[0].node_path)
+                <= (pair[1].normalized_path, pair[1].node_path)));
+        assert!(normalized_index.iter().any(|entry| entry.normalized_path == "/system/enabled"
+            && entry.node_path == "/test:system/test:enabled"));
 
         // Path tree resolves both fully prefixed and relaxed forms; config classification.
         assert!(reg.is_valid_path("/test:system/test:enabled"));
