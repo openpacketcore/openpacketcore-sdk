@@ -18,6 +18,10 @@ opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-runtime = { path = "../opc-runtime", version = "0.2.0" }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "fmt"] }
 
 [lints]
 workspace = true
