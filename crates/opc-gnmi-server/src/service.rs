@@ -366,9 +366,10 @@ where
                 serve_subscribe_stream(server, principal, request.into_inner(), tx.clone()).await
             {
                 send_subscribe_error(&tx, err).await;
+            } else {
+                record_rpc_success(GnmiOperation::Subscribe, start.elapsed());
             }
         });
-        record_rpc_success(GnmiOperation::Subscribe, start.elapsed());
         Ok(Response::new(Box::pin(
             tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx),
         )))
@@ -500,6 +501,7 @@ mod tests {
     use opc_redaction::metrics::METRICS;
     use prost::Message;
     use tonic::codec::Codec;
+    use tonic::codegen::tokio_stream::StreamExt;
     use tonic::Code;
 
     use super::*;
@@ -1893,6 +1895,14 @@ mod tests {
         let mut codec =
             tonic::codec::ProstCodec::<gnmi::SubscribeResponse, gnmi::SubscribeRequest>::default();
         tonic::Streaming::new_request(codec.decoder(), body, None, None)
+    }
+
+    fn authenticated_subscribe_request(
+        request: gnmi::SubscribeRequest,
+    ) -> Request<tonic::Streaming<gnmi::SubscribeRequest>> {
+        let mut request = Request::new(subscribe_stream_from(request));
+        request.extensions_mut().insert(authenticated_principal());
+        request
     }
 
     #[tokio::test]
@@ -4806,6 +4816,35 @@ mod tests {
             audit_failed(AuditReasonCode::INVALID_VALUE)
         );
         assert!(events[0].schema_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscribe_malformed_first_request_records_failure_without_success() {
+        let service =
+            authenticated_service_with_policy(allow_all_read_and_subscribe_policy()).await;
+        let success_before = gnmi_rpc_request_count("Subscribe", "success");
+        let error_before = gnmi_rpc_error_count("Subscribe", "INVALID_ARGUMENT");
+
+        let mut responses = service
+            .subscribe(authenticated_subscribe_request(gnmi::SubscribeRequest {
+                request: None,
+                extension: Vec::new(),
+            }))
+            .await
+            .expect("subscribe response stream")
+            .into_inner();
+        let status = responses
+            .next()
+            .await
+            .expect("terminal subscribe response")
+            .expect_err("malformed first request fails");
+
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(
+            gnmi_rpc_request_count("Subscribe", "success"),
+            success_before
+        );
+        assert!(gnmi_rpc_error_count("Subscribe", "INVALID_ARGUMENT") > error_before);
     }
 
     #[tokio::test]
