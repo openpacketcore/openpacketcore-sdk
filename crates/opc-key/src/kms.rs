@@ -58,11 +58,11 @@ struct KmsResponse {
     error_message: Option<String>,
 }
 
-fn decode_hex_32(hex: &str) -> Result<[u8; 32], KeyError> {
+fn decode_hex_32(hex: &str) -> Result<Zeroizing<[u8; 32]>, KeyError> {
     if hex.len() != 64 || !hex.is_ascii() {
         return Err(KeyError::Unavailable);
     }
-    let mut bytes = [0u8; 32];
+    let mut bytes = Zeroizing::new([0u8; 32]);
     for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
         let high = decode_hex_nibble(chunk[0])?;
         let low = decode_hex_nibble(chunk[1])?;
@@ -162,7 +162,7 @@ impl KmsKeyProvider {
                     "Response too large",
                 ));
             }
-            let mut resp_buf = vec![0u8; len];
+            let mut resp_buf = Zeroizing::new(vec![0u8; len]);
             stream.read_exact(&mut resp_buf).await?;
             let resp: KmsResponse = serde_json::from_slice(&resp_buf)?;
             Ok::<KmsResponse, std::io::Error>(resp)
@@ -203,12 +203,12 @@ impl KeyProvider for KmsKeyProvider {
         };
         let resp = self.call_kms(req).await?;
         let key_id_str = resp.key_id.ok_or(KeyError::NotFound)?;
-        let key_bytes_hex = resp.key_bytes_hex.ok_or(KeyError::NotFound)?;
+        let key_bytes_hex = Zeroizing::new(resp.key_bytes_hex.ok_or(KeyError::NotFound)?);
 
         let key_id = KeyId::new(key_id_str)?;
         let key_bytes = decode_hex_32(&key_bytes_hex)?;
 
-        let handle = KeyHandle::new(key_id, purpose, tenant.clone(), Zeroizing::new(key_bytes));
+        let handle = KeyHandle::new(key_id, purpose, tenant.clone(), key_bytes);
         Ok(handle)
     }
 
@@ -220,7 +220,7 @@ impl KeyProvider for KmsKeyProvider {
             key_id: Some(key_id.as_str().to_string()),
         };
         let resp = self.call_kms(req).await?;
-        let key_bytes_hex = resp.key_bytes_hex.ok_or(KeyError::NotFound)?;
+        let key_bytes_hex = Zeroizing::new(resp.key_bytes_hex.ok_or(KeyError::NotFound)?);
         let purpose_str = resp.purpose.ok_or(KeyError::NotFound)?;
         let tenant_str = resp.tenant.ok_or(KeyError::NotFound)?;
 
@@ -237,7 +237,7 @@ impl KeyProvider for KmsKeyProvider {
             .map_err(|e| KeyError::invalid_metadata("tenant", e.to_string()))?;
         let key_bytes = decode_hex_32(&key_bytes_hex)?;
 
-        let handle = KeyHandle::new(key_id.clone(), purpose, tenant, Zeroizing::new(key_bytes));
+        let handle = KeyHandle::new(key_id.clone(), purpose, tenant, key_bytes);
         Ok(handle)
     }
 
