@@ -1813,6 +1813,7 @@ mod tests {
                 GnmiListenerConfig {
                     handshake_timeout: Duration::from_secs(3),
                     incoming_channel_capacity: 4,
+                    ..GnmiListenerConfig::default()
                 },
             )
             .await

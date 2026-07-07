@@ -548,6 +548,7 @@ async fn start_harness_with_extensions_arbitration(
             listener: GnmiListenerConfig {
                 handshake_timeout: Duration::from_secs(5),
                 incoming_channel_capacity: 4,
+                ..GnmiListenerConfig::default()
             },
             ..Default::default()
         },

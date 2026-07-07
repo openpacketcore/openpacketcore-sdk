@@ -38,6 +38,14 @@ use crate::{GnmiConfigBinding, GnmiServer, GnmiService};
 pub struct GnmiListenerConfig {
     /// Maximum time allowed for one TLS handshake and principal derivation.
     pub handshake_timeout: Duration,
+    /// Maximum time allowed for one gRPC request/response future.
+    pub request_timeout: Duration,
+    /// Interval between HTTP/2 keepalive pings.
+    pub http2_keepalive_interval: Duration,
+    /// Maximum time to wait for an HTTP/2 keepalive acknowledgement.
+    pub http2_keepalive_timeout: Duration,
+    /// TCP keepalive idle time for accepted connections.
+    pub tcp_keepalive: Duration,
     /// Capacity of the accepted-connection channel handed to tonic.
     pub incoming_channel_capacity: usize,
 }
@@ -46,6 +54,10 @@ impl Default for GnmiListenerConfig {
     fn default() -> Self {
         Self {
             handshake_timeout: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(35),
+            http2_keepalive_interval: Duration::from_secs(30),
+            http2_keepalive_timeout: Duration::from_secs(10),
+            tcp_keepalive: Duration::from_secs(60),
             incoming_channel_capacity: 16,
         }
     }
@@ -164,6 +176,10 @@ where
     let (tx, rx) = mpsc::channel(config.incoming_channel_capacity);
     let accept_shutdown = shutdown.clone();
     let accept_counters = Arc::clone(&counters);
+    let request_timeout = config.request_timeout;
+    let http2_keepalive_interval = config.http2_keepalive_interval;
+    let http2_keepalive_timeout = config.http2_keepalive_timeout;
+    let tcp_keepalive = config.tcp_keepalive;
 
     let accept_task = tokio::spawn(async move {
         accept_loop(
@@ -186,6 +202,10 @@ where
     let incoming = ReceiverStream::new(rx);
     let max_concurrent_streams = u32::try_from(max_subscriptions_per_session).unwrap_or(u32::MAX);
     let serve_result = tonic::transport::Server::builder()
+        .timeout(request_timeout)
+        .http2_keepalive_interval(Some(http2_keepalive_interval))
+        .http2_keepalive_timeout(Some(http2_keepalive_timeout))
+        .tcp_keepalive(Some(tcp_keepalive))
         .concurrency_limit_per_connection(max_subscriptions_per_session)
         .max_concurrent_streams(Some(max_concurrent_streams))
         .add_service(service)
@@ -206,7 +226,13 @@ where
 }
 
 fn validate_listener_config(config: &GnmiListenerConfig) -> Result<(), GnmiListenerError> {
-    if config.handshake_timeout.is_zero() || config.incoming_channel_capacity == 0 {
+    if config.handshake_timeout.is_zero()
+        || config.request_timeout.is_zero()
+        || config.http2_keepalive_interval.is_zero()
+        || config.http2_keepalive_timeout.is_zero()
+        || config.tcp_keepalive.is_zero()
+        || config.incoming_channel_capacity == 0
+    {
         return Err(GnmiListenerError::InvalidConfig);
     }
     Ok(())
@@ -765,6 +791,54 @@ mod tests {
             .unwrap_or_default()
     }
 
+    fn assert_invalid_listener_config(config: GnmiListenerConfig) {
+        assert!(matches!(
+            validate_listener_config(&config),
+            Err(GnmiListenerError::InvalidConfig)
+        ));
+    }
+
+    #[test]
+    fn listener_config_defaults_enable_request_and_keepalive_bounds() {
+        let config = GnmiListenerConfig::default();
+
+        assert!(validate_listener_config(&config).is_ok());
+        assert!(!config.handshake_timeout.is_zero());
+        assert!(!config.request_timeout.is_zero());
+        assert!(!config.http2_keepalive_interval.is_zero());
+        assert!(!config.http2_keepalive_timeout.is_zero());
+        assert!(!config.tcp_keepalive.is_zero());
+        assert!(config.incoming_channel_capacity > 0);
+    }
+
+    #[test]
+    fn listener_config_rejects_zero_deadline_and_keepalive_controls() {
+        assert_invalid_listener_config(GnmiListenerConfig {
+            handshake_timeout: Duration::ZERO,
+            ..GnmiListenerConfig::default()
+        });
+        assert_invalid_listener_config(GnmiListenerConfig {
+            request_timeout: Duration::ZERO,
+            ..GnmiListenerConfig::default()
+        });
+        assert_invalid_listener_config(GnmiListenerConfig {
+            http2_keepalive_interval: Duration::ZERO,
+            ..GnmiListenerConfig::default()
+        });
+        assert_invalid_listener_config(GnmiListenerConfig {
+            http2_keepalive_timeout: Duration::ZERO,
+            ..GnmiListenerConfig::default()
+        });
+        assert_invalid_listener_config(GnmiListenerConfig {
+            tcp_keepalive: Duration::ZERO,
+            ..GnmiListenerConfig::default()
+        });
+        assert_invalid_listener_config(GnmiListenerConfig {
+            incoming_channel_capacity: 0,
+            ..GnmiListenerConfig::default()
+        });
+    }
+
     #[tokio::test]
     async fn production_listener_rejects_unconstrained_peer_policy() {
         let state =
@@ -846,6 +920,7 @@ mod tests {
             GnmiListenerConfig {
                 handshake_timeout: Duration::from_secs(5),
                 incoming_channel_capacity: 4,
+                ..GnmiListenerConfig::default()
             },
         ));
 
@@ -946,6 +1021,7 @@ mod tests {
             GnmiListenerConfig {
                 handshake_timeout: Duration::from_secs(5),
                 incoming_channel_capacity: 4,
+                ..GnmiListenerConfig::default()
             },
         ));
 
@@ -1008,6 +1084,7 @@ mod tests {
                 listener: GnmiListenerConfig {
                     handshake_timeout: Duration::from_secs(5),
                     incoming_channel_capacity: 4,
+                    ..GnmiListenerConfig::default()
                 },
                 ..Default::default()
             },
