@@ -292,6 +292,8 @@ impl AuditError {
 /// code (never a free-form message, so nothing sensitive leaks into the trail).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditOutcome {
+    /// The operation intent was durably recorded before the side effect.
+    Intent,
     /// The operation succeeded.
     Success,
     /// The operation was authorized-denied (e.g. NACM `access-denied`).
@@ -324,6 +326,7 @@ impl AuditOutcome {
     /// Stable outcome class string.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Intent => "intent",
             Self::Success => "success",
             Self::Denied(_) => "denied",
             Self::Failed(_) => "failed",
@@ -333,7 +336,7 @@ impl AuditOutcome {
     /// The stable reason code for a denied/failed outcome, if any.
     pub const fn code(self) -> Option<&'static str> {
         match self {
-            Self::Success => None,
+            Self::Intent | Self::Success => None,
             Self::Denied(code) | Self::Failed(code) => Some(code.as_str()),
         }
     }
@@ -563,6 +566,8 @@ mod tests {
 
     #[test]
     fn outcome_codes_are_stable() {
+        assert_eq!(AuditOutcome::Intent.as_str(), "intent");
+        assert_eq!(AuditOutcome::Intent.code(), None);
         assert_eq!(AuditOutcome::Success.as_str(), "success");
         assert_eq!(
             AuditOutcome::denied_code(AuditReasonCode::ACCESS_DENIED).as_str(),
@@ -625,6 +630,7 @@ mod tests {
 
     #[test]
     fn metric_label_helpers_sanitize_only_safe_dimensions() {
+        assert_eq!(label_safe_outcome(AuditOutcome::Intent), "intent");
         assert_eq!(label_safe_outcome(AuditOutcome::Success), "success");
         assert_eq!(
             label_safe_reason(AuditOutcome::denied_code(AuditReasonCode::ACCESS_DENIED)),

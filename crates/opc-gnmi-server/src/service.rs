@@ -3369,13 +3369,17 @@ mod tests {
         assert!(!metrics_debug.contains("secret-role"));
 
         let events = audit.events.lock().expect("audit mutex");
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, AuditOutcome::Intent);
         assert_eq!(events[1].operation, AuditOperation::Update);
+        assert_eq!(events[1].outcome, AuditOutcome::Success);
+        assert_eq!(events[2].operation, AuditOperation::Update);
         assert_eq!(
-            events[1].outcome,
+            events[2].outcome,
             audit_denied(AuditReasonCode::ACCESS_DENIED)
         );
-        assert!(events[1].schema_paths.is_empty());
+        assert!(events[2].schema_paths.is_empty());
         let audit_debug = format!("{:?}", events);
         assert!(!audit_debug.contains("secret-role"));
         assert!(!audit_debug.contains("secret-stale-host"));
@@ -3919,11 +3923,17 @@ mod tests {
             .expect("set");
 
         let events = audit.events.lock().expect("audit mutex");
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].operation, AuditOperation::Update);
-        assert_eq!(events[0].outcome, AuditOutcome::Success);
+        assert_eq!(events[0].outcome, AuditOutcome::Intent);
         assert_eq!(
             events[0].schema_paths,
+            vec![schema_node_path("/sys:system/sys:hostname")]
+        );
+        assert_eq!(events[1].operation, AuditOperation::Update);
+        assert_eq!(events[1].outcome, AuditOutcome::Success);
+        assert_eq!(
+            events[1].schema_paths,
             vec![schema_node_path("/sys:system/sys:hostname")]
         );
         let audit_debug = format!("{:?}", events);
@@ -4272,14 +4282,20 @@ mod tests {
         );
 
         let events = audit.events.lock().expect("audit mutex");
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].operation, AuditOperation::Replace);
+        assert_eq!(events[0].outcome, AuditOutcome::Intent);
         assert_eq!(
-            events[0].outcome,
+            events[0].schema_paths,
+            vec![schema_node_path("/sys:system/sys:hostname")]
+        );
+        assert_eq!(events[1].operation, AuditOperation::Replace);
+        assert_eq!(
+            events[1].outcome,
             audit_denied(AuditReasonCode::ACCESS_DENIED)
         );
         assert_eq!(
-            events[0].schema_paths,
+            events[1].schema_paths,
             vec![schema_node_path("/sys:system/sys:hostname")]
         );
         assert!(!format!("{:?}", events).contains("secret-host"));
@@ -4441,7 +4457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_set_success_audit_failure_is_generic_after_commit() {
+    async fn authenticated_set_intent_audit_failure_prevents_commit() {
         let service = authenticated_service_with_policy_and_audit(
             allow_all_read_write_policy(),
             Arc::new(FailingAudit),
@@ -4474,7 +4490,7 @@ mod tests {
                 .current_snapshot()
                 .config
                 .hostname,
-            "amf-after-audit"
+            "amf-1"
         );
     }
 
