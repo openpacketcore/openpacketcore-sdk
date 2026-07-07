@@ -132,6 +132,12 @@ impl OpcConfig for TestConfig {
         changed_paths_from_string_deltas(deltas)
     }
 
+    fn admission_payload_size_bytes(&self) -> Result<Option<usize>, ConfigError> {
+        serde_json::to_vec(&serde_json::json!({ "name": self.name }))
+            .map(|bytes| Some(bytes.len()))
+            .map_err(|_| ConfigError::new("admission-payload-size", "size measurement failed"))
+    }
+
     fn apply_delta(&mut self, delta: Self::Delta) -> Result<(), ConfigError> {
         self.name = delta;
         Ok(())

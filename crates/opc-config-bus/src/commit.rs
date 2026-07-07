@@ -57,6 +57,10 @@ const STALE_BASE_VERSION_MESSAGE: &str =
     "commit base version does not match running config version";
 const EMPTY_CHANGED_PATHS_FOR_NONEMPTY_DIFF_MESSAGE: &str =
     "changed path extraction returned no paths for a non-empty config diff";
+const CANDIDATE_PAYLOAD_SIZE_UNAVAILABLE_MESSAGE: &str =
+    "config candidate serialized payload size is unavailable";
+const CANDIDATE_PAYLOAD_SIZE_FAILED_MESSAGE: &str =
+    "config candidate serialized payload size could not be measured";
 
 pub(crate) struct Submission<C: OpcConfig> {
     pub(crate) request: CommitRequest<C>,
@@ -99,6 +103,34 @@ impl RecoveryState {
     }
 }
 
+pub(crate) struct CommitAdmissionLimits {
+    max_serialized_config_bytes: Mutex<Option<usize>>,
+}
+
+impl Default for CommitAdmissionLimits {
+    fn default() -> Self {
+        Self {
+            max_serialized_config_bytes: Mutex::new(None),
+        }
+    }
+}
+
+impl CommitAdmissionLimits {
+    fn max_serialized_config_bytes(&self) -> Option<usize> {
+        *self
+            .max_serialized_config_bytes
+            .lock()
+            .expect("admission limit mutex poisoned")
+    }
+
+    fn set_max_serialized_config_bytes(&self, max_bytes: Option<usize>) {
+        *self
+            .max_serialized_config_bytes
+            .lock()
+            .expect("admission limit mutex poisoned") = max_bytes;
+    }
+}
+
 /// Sequenced config commit worker with atomic snapshot publication.
 #[derive(Clone)]
 pub struct ConfigBus<C: OpcConfig> {
@@ -109,6 +141,7 @@ pub struct ConfigBus<C: OpcConfig> {
     pub(crate) recovery: Arc<RecoveryState>,
     pub(crate) alarm_manager: SharedAlarmManager,
     pub(crate) authorizer: Arc<dyn ConfigAuthorizer>,
+    pub(crate) admission_limits: Arc<CommitAdmissionLimits>,
 }
 
 impl<C: OpcConfig> ConfigBus<C> {
@@ -128,6 +161,7 @@ impl<C: OpcConfig> ConfigBus<C> {
         let snapshot = Arc::new(AtomicConfigSnapshot::with_state(initial, version, tx_id));
         let subscribers = Arc::new(Mutex::new(Vec::new()));
         let recovery = Arc::new(RecoveryState::default());
+        let admission_limits = Arc::new(CommitAdmissionLimits::default());
         let (tx, rx) = mpsc::channel(queue_capacity);
 
         tokio::spawn(worker_loop(
@@ -135,6 +169,7 @@ impl<C: OpcConfig> ConfigBus<C> {
             Arc::clone(&snapshot),
             Arc::clone(&subscribers),
             Arc::clone(&recovery),
+            Arc::clone(&admission_limits),
             store,
             alarm_manager.clone(),
             authorizer.clone(),
@@ -150,7 +185,27 @@ impl<C: OpcConfig> ConfigBus<C> {
             recovery,
             alarm_manager,
             authorizer,
+            admission_limits,
         }
+    }
+
+    /// Enables a serialized candidate payload cap and returns this bus handle.
+    ///
+    /// The cap is checked before diffing, validation, persistence, or
+    /// publication for requests that carry a candidate. The check uses
+    /// [`OpcConfig::admission_payload_size_bytes`]; if a cap is configured and
+    /// the config implementation cannot report a size, admission fails closed
+    /// with `AdmissionRejected`.
+    pub fn with_max_serialized_config_bytes(self, max_bytes: usize) -> Self {
+        self.set_max_serialized_config_bytes(Some(max_bytes));
+        self
+    }
+
+    /// Updates the serialized candidate payload cap for this bus and all cloned
+    /// handles. `None` disables the cap.
+    pub fn set_max_serialized_config_bytes(&self, max_bytes: Option<usize>) {
+        self.admission_limits
+            .set_max_serialized_config_bytes(max_bytes);
     }
 
     /// Submits a commit, validate-only, commit-confirmed, or rollback request
@@ -290,6 +345,7 @@ async fn worker_loop<C: OpcConfig>(
     snapshot: Arc<AtomicConfigSnapshot<C>>,
     subscribers: Arc<Mutex<Vec<Arc<SubscriberState<C>>>>>,
     recovery: Arc<RecoveryState>,
+    admission_limits: Arc<CommitAdmissionLimits>,
     store: Arc<dyn ManagedDatastore<C>>,
     alarm_manager: SharedAlarmManager,
     authorizer: Arc<dyn ConfigAuthorizer>,
@@ -321,6 +377,7 @@ async fn worker_loop<C: OpcConfig>(
                     Arc::clone(&snapshot),
                     Arc::clone(&subscribers),
                     Arc::clone(&recovery),
+                    Arc::clone(&admission_limits),
                     store.as_ref(),
                     authorizer.as_ref(),
                     impact_classifier.clone(),
@@ -470,6 +527,7 @@ async fn process_commit<C: OpcConfig>(
     snapshot: Arc<AtomicConfigSnapshot<C>>,
     subscribers: Arc<Mutex<Vec<Arc<SubscriberState<C>>>>>,
     recovery: Arc<RecoveryState>,
+    admission_limits: Arc<CommitAdmissionLimits>,
     store: &dyn ManagedDatastore<C>,
     authorizer: &dyn ConfigAuthorizer,
     impact_classifier: Arc<dyn ConfigImpactClassifier<C>>,
@@ -480,6 +538,7 @@ async fn process_commit<C: OpcConfig>(
     }
 
     ensure_deadline(request.deadline)?;
+    enforce_candidate_payload_limit(request.candidate.as_ref(), admission_limits.as_ref())?;
 
     let current = snapshot.current_snapshot();
     if matches!(request.mode, CommitMode::CommitConfirmed { .. }) && current.tx_id.is_none() {
@@ -763,6 +822,44 @@ fn ensure_candidate_base_version<C: OpcConfig>(
             STALE_BASE_VERSION_MESSAGE,
         ));
     }
+    Ok(())
+}
+
+fn enforce_candidate_payload_limit<C: OpcConfig>(
+    candidate: Option<&C>,
+    admission_limits: &CommitAdmissionLimits,
+) -> Result<(), CommitError> {
+    let Some(max_bytes) = admission_limits.max_serialized_config_bytes() else {
+        return Ok(());
+    };
+    let Some(candidate) = candidate else {
+        return Ok(());
+    };
+
+    let payload_size = candidate
+        .admission_payload_size_bytes()
+        .map_err(|_err| {
+            CommitError::new(
+                CommitErrorCode::AdmissionRejected,
+                CANDIDATE_PAYLOAD_SIZE_FAILED_MESSAGE,
+            )
+        })?
+        .ok_or_else(|| {
+            CommitError::new(
+                CommitErrorCode::AdmissionRejected,
+                CANDIDATE_PAYLOAD_SIZE_UNAVAILABLE_MESSAGE,
+            )
+        })?;
+
+    if payload_size > max_bytes {
+        return Err(CommitError::new(
+            CommitErrorCode::AdmissionRejected,
+            format!(
+                "config candidate serialized payload is {payload_size} bytes, exceeding limit of {max_bytes} bytes"
+            ),
+        ));
+    }
+
     Ok(())
 }
 

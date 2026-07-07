@@ -102,6 +102,17 @@ impl OpcConfig for types::__ROOT_TYPE__ {
         Ok(paths)
     }
 
+    fn admission_payload_size_bytes(&self) -> Result<Option<usize>, ConfigError> {
+        serde_json::to_vec(self)
+            .map(|bytes| Some(bytes.len()))
+            .map_err(|_| {
+                ConfigError::new(
+                    "admission-payload-size",
+                    "failed to serialize config for admission payload size",
+                )
+            })
+    }
+
     fn apply_delta(&mut self, delta: Self::Delta) -> Result<(), ConfigError> {
         patch::apply_patch(self, &[delta])
     }
