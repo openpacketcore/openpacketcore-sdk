@@ -25,6 +25,8 @@ fn create_test_input() -> CanonicalInput {
                 "/test:system/mode".to_string(),
                 "/test:system/checkpoint-interval-ms".to_string(),
                 "/test:system/secret-key".to_string(),
+                "/test:system/type".to_string(),
+                "/test:system/match".to_string(),
             ],
             source: source.clone(),
             ..Default::default()
@@ -83,6 +85,28 @@ fn create_test_input() -> CanonicalInput {
             kind: SchemaNodeKind::Leaf,
             config: true,
             type_ref: Some(TypeRef::String),
+            key_leaves: vec![],
+            child_paths: vec![],
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/test:system/type".to_string(),
+            module: "test".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            key_leaves: vec![],
+            child_paths: vec![],
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/test:system/match".to_string(),
+            module: "test".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::Boolean),
             key_leaves: vec![],
             child_paths: vec![],
             source: source.clone(),
@@ -185,6 +209,8 @@ fn test_generated_code_features() {
             mode: LeafPresence::Explicit("standalone".to_string()),
             checkpoint_interval_ms: LeafPresence::Explicit(1000),
             secret_key: SecretLeaf::new(LeafPresence::Explicit("supersecret".to_string())),
+            type_: LeafPresence::Explicit("control".to_string()),
+            match_: LeafPresence::Explicit(true),
         };
         // Verify JSON representation
         let serialized = serde_json::to_value(&sys).unwrap();
@@ -192,7 +218,9 @@ fn test_generated_code_features() {
             "test:enabled": true,
             "test:mode": "standalone",
             "test:checkpoint-interval-ms": 1000,
-            "test:secret-key": "supersecret"
+            "test:secret-key": "supersecret",
+            "test:type": "control",
+            "test:match": true
         }));
         
         let deserialized: System = serde_json::from_value(serialized).unwrap();
@@ -200,6 +228,8 @@ fn test_generated_code_features() {
         assert_eq!(deserialized.mode, LeafPresence::Explicit("standalone".to_string()));
         assert_eq!(deserialized.checkpoint_interval_ms, LeafPresence::Explicit(1000));
         assert_eq!(deserialized.secret_key.into_inner().into_option().unwrap(), "supersecret");
+        assert_eq!(deserialized.type_, LeafPresence::Explicit("control".to_string()));
+        assert_eq!(deserialized.match_, LeafPresence::Explicit(true));
     }
     
     #[test]
@@ -517,6 +547,8 @@ fn test_generated_code_features() {
         assert!(node_paths.contains(&"/test:system/test:mode"));
         assert!(node_paths.contains(&"/test:system/test:checkpoint-interval-ms"));
         assert!(node_paths.contains(&"/test:system/test:secret-key"));
+        assert!(node_paths.contains(&"/test:system/test:match"));
+        assert!(node_paths.contains(&"/test:system/test:type"));
         assert!(!node_paths.contains(&"/test:system/enabled"));
         let root = reg.node("/test:system").unwrap();
         assert_eq!(
@@ -524,8 +556,10 @@ fn test_generated_code_features() {
             &[
                 "/test:system/test:checkpoint-interval-ms",
                 "/test:system/test:enabled",
+                "/test:system/test:match",
                 "/test:system/test:mode",
                 "/test:system/test:secret-key",
+                "/test:system/test:type",
             ]
         );
         assert_eq!(
@@ -707,6 +741,44 @@ fn test_rust_generation_rejects_normalized_path_collision() {
     assert!(
         err.message()
             .contains("normalized generated schema path collision"),
+        "got: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn test_rust_generation_rejects_normalized_identifier_collision() {
+    let mut input = create_test_input();
+    let source = YangSourceLocation::new("test.yang", 31, 1);
+    input.nodes[0]
+        .child_paths
+        .push("/test:system/foo-bar".to_string());
+    input.nodes[0]
+        .child_paths
+        .push("/test:system/foo_bar".to_string());
+    input.nodes.push(SchemaNode {
+        path: "/test:system/foo-bar".to_string(),
+        module: "test".to_string(),
+        kind: SchemaNodeKind::Leaf,
+        config: true,
+        type_ref: Some(TypeRef::String),
+        source: source.clone(),
+        ..Default::default()
+    });
+    input.nodes.push(SchemaNode {
+        path: "/test:system/foo_bar".to_string(),
+        module: "test".to_string(),
+        kind: SchemaNodeKind::Leaf,
+        config: true,
+        type_ref: Some(TypeRef::String),
+        source,
+        ..Default::default()
+    });
+
+    let err = generate_rust(&input).unwrap_err();
+    assert!(
+        err.message()
+            .contains("normalized generated Rust identifier collision"),
         "got: {}",
         err.message()
     );
