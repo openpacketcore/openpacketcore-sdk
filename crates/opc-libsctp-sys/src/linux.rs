@@ -105,11 +105,19 @@ pub fn connect(fd: BorrowedFd<'_>, addr: &SocketAddr) -> io::Result<ConnectStatu
             len,
         )
     };
+    classify_connect_result(rc, Some(io::Error::last_os_error()))
+}
+
+fn classify_connect_result(rc: libc::c_int, error: Option<io::Error>) -> io::Result<ConnectStatus> {
     if rc == 0 {
         return Ok(ConnectStatus::Connected);
     }
-    let err = io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::EINPROGRESS) || err.kind() == io::ErrorKind::Interrupted {
+
+    let err = error.unwrap_or_else(io::Error::last_os_error);
+    if matches!(
+        err.raw_os_error(),
+        Some(errno) if errno == libc::EINPROGRESS || errno == libc::EINTR || errno == libc::EALREADY
+    ) {
         Ok(ConnectStatus::InProgress)
     } else {
         Err(err)
@@ -507,6 +515,27 @@ mod tests {
                 assert!(code == libc::EPROTONOSUPPORT || code == libc::EAFNOSUPPORT);
             }
         }
+    }
+
+    #[test]
+    fn connect_errno_classification_keeps_async_connect_in_progress() {
+        assert_eq!(
+            classify_connect_result(0, None).unwrap(),
+            ConnectStatus::Connected
+        );
+
+        for errno in [libc::EINPROGRESS, libc::EINTR, libc::EALREADY] {
+            assert_eq!(
+                classify_connect_result(-1, Some(io::Error::from_raw_os_error(errno))).unwrap(),
+                ConnectStatus::InProgress,
+                "errno={errno}"
+            );
+        }
+
+        let refused =
+            classify_connect_result(-1, Some(io::Error::from_raw_os_error(libc::ECONNREFUSED)))
+                .unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::ECONNREFUSED));
     }
 
     #[test]
