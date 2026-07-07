@@ -9,8 +9,10 @@
 //!
 //! An event records the touched **schema-node paths** (predicate-free, so list
 //! key *values* never enter the audit), and outcomes carry validated stable
-//! machine codes, never free-form messages. [`TracingAuditSink`] is a working
-//! default; a durable, tamper-evident sink over `opc-persist` is CNF-provided.
+//! machine codes, never free-form messages. [`TracingAuditSink`] is a
+//! best-effort diagnostic bridge that reports a disabled tracing target as loss;
+//! production fail-closed paths should use a durable, tamper-evident sink over
+//! `opc-persist`.
 //!
 //! Audit is a privileged record (it legitimately names the principal) and is
 //! distinct from a redaction-scrubbed diagnostic bundle. Use
@@ -19,13 +21,23 @@
 
 #![forbid(unsafe_code)]
 
-use std::fmt;
+use std::{
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use opc_config_model::{RequestId, TransportType, TrustedPrincipal, WorkloadIdentity};
 use opc_redaction::metrics_label_safe;
 use thiserror::Error;
 
 const MAX_AUDIT_REASON_CODE_LEN: usize = 64;
+static TRACING_AUDIT_EVENTS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Number of events the tracing audit sink could not emit because its tracing
+/// target was disabled.
+pub fn tracing_audit_events_dropped() -> u64 {
+    TRACING_AUDIT_EVENTS_DROPPED.load(Ordering::Relaxed)
+}
 
 /// The management operation being audited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,11 +456,24 @@ pub trait AuditSink: Send + Sync {
 
 /// An [`AuditSink`] that emits a structured event on the `opc_mgmt_audit`
 /// tracing target.
+///
+/// This sink is best-effort and not durable. It returns
+/// [`AuditError::Unavailable`] when the `opc_mgmt_audit` INFO target is
+/// disabled, and increments [`tracing_audit_events_dropped`]. It cannot prove
+/// that a downstream log collector accepted the event after tracing dispatch, so
+/// security-critical production paths should provide a durable sink instead.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TracingAuditSink;
 
 impl AuditSink for TracingAuditSink {
     fn record(&self, event: &AuditEvent) -> Result<(), AuditError> {
+        if !tracing::enabled!(target: "opc_mgmt_audit", tracing::Level::INFO) {
+            TRACING_AUDIT_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return Err(AuditError::unavailable(
+                "opc_mgmt_audit tracing target is disabled",
+            ));
+        }
+
         // schema_paths are predicate-free node names, safe to record verbatim.
         let paths = event
             .schema_paths
@@ -669,11 +694,11 @@ mod tests {
     }
 
     #[test]
-    fn tracing_sink_records_without_panicking() {
-        // Smoke test: the default sink must accept an event with no subscriber
-        // installed without panicking.
+    fn tracing_sink_reports_disabled_target_without_silent_loss() {
         let principal = principal();
-        TracingAuditSink
+        let before = tracing_audit_events_dropped();
+
+        let err = TracingAuditSink
             .record(&AuditEvent::new(
                 RequestId::new(),
                 &principal,
@@ -681,7 +706,10 @@ mod tests {
                 AuditOperation::Update,
                 AuditOutcome::failed_code(AuditReasonCode::OPERATION_FAILED),
             ))
-            .expect("trace audit");
+            .expect_err("disabled tracing audit target must fail closed");
+
+        assert!(matches!(err, AuditError::Unavailable { .. }));
+        assert_eq!(tracing_audit_events_dropped(), before + 1);
     }
 
     #[test]

@@ -1205,7 +1205,7 @@ mod tests {
         );
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
-        let server = GnmiServer::new_with_arbitration_dev_only(
+        let server = GnmiServer::new_with_audit_and_arbitration(
             TestBinding {
                 bus,
                 policy: Arc::new(FixedPolicy(allow_all_read_write_policy())),
@@ -1217,6 +1217,7 @@ mod tests {
             profile,
             extensions,
             arbitration,
+            Arc::new(CapturingAudit::default()),
         )
         .expect("server");
         if authenticated {
@@ -1506,7 +1507,7 @@ mod tests {
     ) -> GnmiService<DemoConfig, TestBinding> {
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
-        let server = GnmiServer::new_dev_only(
+        let server = GnmiServer::new_with_audit(
             TestBinding {
                 bus,
                 policy: Arc::new(FixedPolicy(policy)),
@@ -1517,6 +1518,7 @@ mod tests {
             limits,
             profile,
             ExtensionRegistry::default(),
+            Arc::new(CapturingAudit::default()),
         )
         .expect("server");
         GnmiService::new_authenticated(server)
@@ -4006,7 +4008,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
-        let server = GnmiServer::new_dev_only(
+        let server = GnmiServer::new_with_audit(
             TestBinding {
                 bus: Arc::clone(&bus),
                 policy: Arc::new(FixedPolicy(allow_all_read_write_policy())),
@@ -4017,6 +4019,7 @@ mod tests {
             MgmtLimits::default(),
             profile,
             ExtensionRegistry::default(),
+            Arc::new(CapturingAudit::default()),
         )
         .expect("server");
         let service = Arc::new(GnmiService::new_authenticated(server));

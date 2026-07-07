@@ -438,6 +438,7 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use opc_config_bus::{ConfigBus, MockManagedDatastore};
     use opc_mgmt_authz::{AuthzError, PolicySource};
+    use opc_mgmt_audit::{AuditError, AuditEvent, AuditSink};
     use opc_mgmt_opstate::{
         OperationalError, OperationalRequest, OperationalResponse, OperationalStateProvider,
     };
@@ -533,6 +534,14 @@ mod tests {
         }
     }
 
+    struct NoopAudit;
+
+    impl AuditSink for NoopAudit {
+        fn record(&self, _event: &AuditEvent) -> Result<(), AuditError> {
+            Ok(())
+        }
+    }
+
     struct UnitPatcher;
 
     impl GnmiPatchApplicator<()> for UnitPatcher {
@@ -578,11 +587,12 @@ mod tests {
         );
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
-        GnmiServer::new_dev_only(
+        GnmiServer::new_with_audit(
             TestBinding { bus },
             limits,
             profile,
             ExtensionRegistry::default(),
+            Arc::new(NoopAudit),
         )
         .expect("server")
     }
