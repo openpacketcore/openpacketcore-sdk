@@ -3,8 +3,8 @@ use crate::emit::CanonicalInput;
 use proc_macro2::TokenStream;
 use quote::quote;
 
-fn map_data_class(dc_str: &str) -> TokenStream {
-    match dc_str {
+fn map_data_class(dc_str: &str, path: &str) -> Result<TokenStream, RustGenerationError> {
+    Ok(match dc_str {
         "public" => quote! { DataClass::Public },
         "operational" => quote! { DataClass::Operational },
         "network-sensitive" => quote! { DataClass::NetworkSensitive },
@@ -15,8 +15,13 @@ fn map_data_class(dc_str: &str) -> TokenStream {
         "lawful-intercept" => quote! { DataClass::LawfulIntercept },
         "analytics-sensitive" => quote! { DataClass::AnalyticsSensitive },
         "audit-regulated" => quote! { DataClass::AuditRegulated },
-        _ => quote! { DataClass::Public },
-    }
+        other => {
+            return Err(RustGenerationError::new(format!(
+                "metadata: unknown data_class '{}' at {}",
+                other, path
+            )));
+        }
+    })
 }
 
 pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
@@ -24,7 +29,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     for node in &input.nodes {
         let path_str = &node.path;
         let data_class = if let Some(ref dc) = node.data_class {
-            map_data_class(dc)
+            map_data_class(dc, path_str)?
         } else {
             // fallback name-based for compatibility if no data_class is present
             let name = clean_segment(last_segment(&node.path));

@@ -1,6 +1,6 @@
 mod common;
 
-use opc_yanggen::rust::generate_rust;
+use opc_yanggen::rust::{generate_rust, metadata, schema_registry};
 use opc_yanggen::{
     CanonicalInput, CompareOp, ConstraintBinding, ConstraintExpr, EnumValue, GenerationInput,
     Literal, NumericRangeInterval, PathAnchor, PathExpr, SchemaModule, SchemaNode, SchemaNodeKind,
@@ -827,9 +827,8 @@ fn test_rust_generation_rejects_sensitive_structural_nodes() {
 #[test]
 fn test_schema_registry_rejects_unknown_data_class() {
     let mut input = create_test_input();
-    // A data_class outside the known DataClass set. metadata.rs would silently
-    // treat this as Public; the schema registry must instead refuse to generate
-    // rather than risk under-redacting a sensitive node (fail closed).
+    // A data_class outside the known DataClass set must refuse generation rather
+    // than risk under-redacting a sensitive node (fail closed).
     if let Some(node) = input
         .nodes
         .iter_mut()
@@ -843,6 +842,34 @@ fn test_schema_registry_rejects_unknown_data_class() {
         err.message().contains("unknown data_class"),
         "got: {}",
         err.message()
+    );
+}
+
+#[test]
+fn test_metadata_and_schema_registry_reject_unknown_data_class() {
+    let mut input = create_test_input();
+    if let Some(node) = input
+        .nodes
+        .iter_mut()
+        .find(|n| n.path == "/test:system/enabled")
+    {
+        node.data_class = Some("security-secretx".to_string());
+    }
+
+    let metadata_err = metadata::generate(&input)
+        .expect_err("metadata generation should fail closed on unknown data_class");
+    assert!(
+        metadata_err.message().contains("unknown data_class"),
+        "got: {}",
+        metadata_err.message()
+    );
+
+    let registry_err = schema_registry::generate(&input)
+        .expect_err("schema registry should fail closed on unknown data_class");
+    assert!(
+        registry_err.message().contains("unknown data_class"),
+        "got: {}",
+        registry_err.message()
     );
 }
 

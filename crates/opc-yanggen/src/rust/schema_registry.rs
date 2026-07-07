@@ -405,9 +405,9 @@ fn leaf_type_tokens(t: &TypeRef) -> TokenStream {
 
 /// Maps the node's data class to a `DataClass` token. Mirrors
 /// `metadata.rs::map_data_class` for the known kebab-case classes and the
-/// name-heuristic fallback, but is **fail-closed**: an unknown non-empty
-/// `data_class` string is a generation error rather than a silent `Public`
-/// (which would under-redact a sensitive node).
+/// name-heuristic fallback. An unknown non-empty `data_class` string is a
+/// generation error rather than a silent `Public` (which would under-redact a
+/// sensitive node).
 fn data_class_tokens(node: &SchemaNode) -> Result<TokenStream, RustGenerationError> {
     if let Some(dc) = &node.data_class {
         Ok(match dc.as_str() {
