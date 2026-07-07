@@ -42,6 +42,8 @@ fn validate_node(
     path: &str,
     format_validator: &dyn Fn(&str, &str, &str) -> Result<(), String>,
 ) -> Result<(), String> {
+    validate_schema_keywords(schema, path)?;
+
     if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
         let mut matches = 0usize;
         let mut errors = Vec::new();
@@ -109,6 +111,48 @@ fn validate_node(
         Value::String(string) => validate_string(schema, string, path, format_validator)?,
         Value::Number(number) => validate_number(schema, number, path)?,
         Value::Bool(_) | Value::Null => {}
+    }
+
+    Ok(())
+}
+
+fn validate_schema_keywords(schema: &Value, path: &str) -> Result<(), String> {
+    let Some(object) = schema.as_object() else {
+        return Ok(());
+    };
+
+    for (keyword, value) in object {
+        match keyword.as_str() {
+            "$comment" | "$id" | "$schema" | "$defs" | "default" | "definitions" | "deprecated"
+            | "description" | "examples" | "readOnly" | "title" | "writeOnly" => {}
+            "oneOf"
+            | "anyOf"
+            | "const"
+            | "enum"
+            | "type"
+            | "required"
+            | "properties"
+            | "additionalProperties"
+            | "minItems"
+            | "items"
+            | "minLength"
+            | "format"
+            | "minimum" => {
+                if keyword == "items" && value.is_array() {
+                    return Err(format!(
+                        "{path}: unsupported schema keyword 'items' tuple form"
+                    ));
+                }
+            }
+            "allOf" | "$ref" | "not" | "if" | "then" | "else" | "multipleOf" | "uniqueItems"
+            | "patternProperties" | "contains" | "dependencies" | "dependentRequired"
+            | "dependentSchemas" | "propertyNames" | "prefixItems" | "additionalItems"
+            | "maxLength" | "pattern" | "maxItems" | "maximum" | "exclusiveMinimum"
+            | "exclusiveMaximum" => {
+                return Err(format!("{path}: unsupported schema keyword '{keyword}'"));
+            }
+            _ => return Err(format!("{path}: unsupported schema keyword '{keyword}'")),
+        }
     }
 
     Ok(())
@@ -308,4 +352,62 @@ fn json_type_name(instance: &Value) -> &'static str {
 
 fn render_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "<unrenderable>".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn unsupported_structural_keywords_fail_closed() {
+        let cases = [
+            ("allOf", json!({"allOf": [{"type": "string"}]}), json!(7)),
+            ("$ref", json!({"$ref": "#/$defs/Secret"}), json!("x")),
+            ("not", json!({"not": {"type": "string"}}), json!("x")),
+            (
+                "multipleOf",
+                json!({"type": "number", "multipleOf": 5}),
+                json!(7),
+            ),
+            (
+                "uniqueItems",
+                json!({"type": "array", "uniqueItems": true}),
+                json!([1, 1]),
+            ),
+            (
+                "patternProperties",
+                json!({"type": "object", "patternProperties": {"^x": {"type": "string"}}}),
+                json!({"x": 7}),
+            ),
+            (
+                "dependencies",
+                json!({"type": "object", "dependencies": {"a": ["b"]}}),
+                json!({"a": true}),
+            ),
+            (
+                "propertyNames",
+                json!({"type": "object", "propertyNames": {"pattern": "^x"}}),
+                json!({"y": true}),
+            ),
+            (
+                "contains",
+                json!({"type": "array", "contains": {"const": 1}}),
+                json!([2]),
+            ),
+            (
+                "items",
+                json!({"type": "array", "items": [{"type": "string"}]}),
+                json!([1]),
+            ),
+        ];
+
+        for (keyword, schema, instance) in cases {
+            let err = validate(&schema, &instance).expect_err("unsupported keyword must reject");
+            assert!(
+                err.contains(keyword),
+                "error for {keyword} should name the unsupported keyword: {err}"
+            );
+        }
+    }
 }
