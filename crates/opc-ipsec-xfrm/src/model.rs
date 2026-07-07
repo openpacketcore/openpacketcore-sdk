@@ -504,6 +504,10 @@ pub struct AllocateSpiRequest {
 }
 
 /// Result of an SPI allocation.
+///
+/// Linux creates a larval SA for `XFRM_MSG_ALLOCSPI`. If the negotiation that
+/// requested this allocation aborts before installing the final SA, remove the
+/// larval entry with [`SpiAllocation::cleanup_request`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SpiAllocation {
     /// Destination address.
@@ -512,6 +516,18 @@ pub struct SpiAllocation {
     pub protocol: u8,
     /// Allocated SPI in host byte order.
     pub spi: u32,
+}
+
+impl SpiAllocation {
+    /// Build the deletion request for the larval SA created by SPI allocation.
+    #[must_use]
+    pub const fn cleanup_request(self) -> RemoveSaRequest {
+        RemoveSaRequest {
+            destination: self.destination,
+            protocol: self.protocol,
+            spi: self.spi,
+        }
+    }
 }
 
 /// Request to install a new Security Association.
@@ -775,5 +791,23 @@ mod tests {
         let esn = SaReplayState::fresh(65);
         assert!(esn.esn);
         assert_eq!(esn.bitmap.len(), 3);
+    }
+
+    #[test]
+    fn spi_allocation_builds_larval_cleanup_request() {
+        let allocation = SpiAllocation {
+            destination: IpAddress::Ipv4([192, 0, 2, 10]),
+            protocol: 50,
+            spi: 0x1000_0001,
+        };
+
+        assert_eq!(
+            allocation.cleanup_request(),
+            RemoveSaRequest {
+                destination: IpAddress::Ipv4([192, 0, 2, 10]),
+                protocol: 50,
+                spi: 0x1000_0001,
+            }
+        );
     }
 }
