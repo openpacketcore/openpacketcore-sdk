@@ -4,6 +4,8 @@ use opc_mgmt_limits::MgmtLimits;
 
 use super::FramingError;
 
+pub(crate) const MAX_CHUNK_LENGTH_DIGITS: usize = 20;
+
 /// Encodes one XML message as a single base 1.1 chunk.
 pub fn encode_message(message: &[u8], limits: &MgmtLimits) -> Result<Vec<u8>, FramingError> {
     limits.validate()?;
@@ -47,6 +49,9 @@ pub fn decode_message(frame: &[u8], limits: &MgmtLimits) -> Result<Vec<u8>, Fram
         let len_start = cursor;
         while cursor < frame.len() && frame[cursor].is_ascii_digit() {
             cursor += 1;
+            if cursor - len_start > MAX_CHUNK_LENGTH_DIGITS {
+                return Err(FramingError::InvalidChunkLength);
+            }
         }
         if len_start == cursor || cursor >= frame.len() || frame[cursor] != b'\n' {
             return Err(FramingError::InvalidChunkHeader);
@@ -123,6 +128,18 @@ mod tests {
     fn rejects_leading_zero_chunk_length() {
         let err =
             decode_message(b"\n#03\nabc\n##\n", &MgmtLimits::default()).expect_err("leading zero");
+        assert_eq!(err, FramingError::InvalidChunkLength);
+    }
+
+    #[test]
+    fn rejects_overlong_chunk_length_digit_run() {
+        let mut frame = b"\n#".to_vec();
+        frame.extend(std::iter::repeat_n(b'9', 20_000));
+        frame.extend_from_slice(b"\n<rpc/>\n##\n");
+
+        let err =
+            decode_message(&frame, &MgmtLimits::default()).expect_err("overlong chunk length");
+
         assert_eq!(err, FramingError::InvalidChunkLength);
     }
 

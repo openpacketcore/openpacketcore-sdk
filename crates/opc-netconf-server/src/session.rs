@@ -499,7 +499,7 @@ where
             if b == b'\n' {
                 break;
             }
-            if !b.is_ascii_digit() || len_bytes.len() >= 20 {
+            if !b.is_ascii_digit() || len_bytes.len() >= base11::MAX_CHUNK_LENGTH_DIGITS {
                 return Err(FramingError::InvalidChunkLength.into());
             }
             len_bytes.push(b);
