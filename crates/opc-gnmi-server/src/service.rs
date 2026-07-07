@@ -2431,7 +2431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_get_all_denied_is_audited_as_empty_success() {
+    async fn authenticated_get_all_denied_audits_denied_paths() {
         let audit = CapturingAudit::default();
         let service = authenticated_service_with_policy_and_audit(
             NacmPolicy::empty(opc_nacm::PolicyVersion::new(100)),
@@ -2454,14 +2454,23 @@ mod tests {
 
         assert!(response.notification.is_empty());
         let events = audit.events.lock().expect("audit mutex");
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].operation, AuditOperation::Read);
-        assert_eq!(events[0].outcome, AuditOutcome::Success);
-        assert!(events[0].schema_paths.is_empty());
+        assert_eq!(
+            events[0].outcome,
+            audit_denied(AuditReasonCode::ACCESS_DENIED)
+        );
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path("/sys:system/sys:hostname")]
+        );
+        assert_eq!(events[1].operation, AuditOperation::Read);
+        assert_eq!(events[1].outcome, AuditOutcome::Success);
+        assert!(events[1].schema_paths.is_empty());
     }
 
     #[tokio::test]
-    async fn authenticated_get_partial_nacm_suppression_audits_allowed_paths_only() {
+    async fn authenticated_get_partial_nacm_suppression_audits_denied_and_allowed_paths() {
         let audit = CapturingAudit::default();
         let service = authenticated_service_with_policy_and_audit(
             deny_hostname_policy(),
@@ -2485,13 +2494,22 @@ mod tests {
         let response_debug = format!("{:?}", response);
         assert!(!response_debug.contains("amf-1"));
         let events = audit.events.lock().expect("audit mutex");
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].operation, AuditOperation::Read);
-        assert_eq!(events[0].outcome, AuditOutcome::Success);
-        assert!(events[0]
+        assert_eq!(
+            events[0].outcome,
+            audit_denied(AuditReasonCode::ACCESS_DENIED)
+        );
+        assert_eq!(
+            events[0].schema_paths,
+            vec![schema_node_path("/sys:system/sys:hostname")]
+        );
+        assert_eq!(events[1].operation, AuditOperation::Read);
+        assert_eq!(events[1].outcome, AuditOutcome::Success);
+        assert!(events[1]
             .schema_paths
             .contains(&schema_node_path("/sys:system/sys:contact")));
-        assert!(!events[0]
+        assert!(!events[1]
             .schema_paths
             .contains(&schema_node_path("/sys:system/sys:hostname")));
     }
