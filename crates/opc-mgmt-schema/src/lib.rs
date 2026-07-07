@@ -1163,7 +1163,10 @@ impl<'a> NetconfXmlRenderContext<'a> {
         is_defaulted: bool,
     ) -> Result<String, NetconfProjectionError> {
         let name = self.qualified_name(path)?;
-        let data_class = self.registry.data_class(path).unwrap_or(DataClass::Public);
+        let data_class = self
+            .registry
+            .data_class(path)
+            .unwrap_or(DataClass::SecuritySecret);
         let value = if data_class.allows_cleartext() {
             raw_value.to_string()
         } else {
@@ -2131,5 +2134,55 @@ mod tests {
         assert!(!secret.contains("hunter2"));
         assert!(secret.starts_with("<ex:secret>"));
         assert!(secret.ends_with("</ex:secret>"));
+    }
+
+    #[test]
+    fn format_leaf_redacts_when_data_class_lookup_is_missing() {
+        static MODELS: &[ModelData] = &[ModelData {
+            name: "example",
+            revision: "",
+            namespace: "urn:example",
+            prefix: "ex",
+        }];
+        static NODES: &[NodeMeta] = &[NodeMeta {
+            path: "/ex:secret",
+            module: "example",
+            kind: NodeKind::Leaf,
+            config: true,
+            leaf_type: Some(LeafType::String),
+            key_leaves: &[],
+            data_class: DataClass::SecuritySecret,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[],
+        }];
+
+        struct DivergentRegistry;
+        impl SchemaRegistry for DivergentRegistry {
+            fn schema_digest(&self) -> &'static str {
+                "digest"
+            }
+            fn served_models(&self) -> &'static [ModelData] {
+                MODELS
+            }
+            fn nodes(&self) -> &'static [NodeMeta] {
+                NODES
+            }
+            fn origins(&self) -> &'static [OriginEntry] {
+                &[]
+            }
+            fn data_class(&self, _schema_path: &str) -> Option<DataClass> {
+                None
+            }
+        }
+
+        let reg = DivergentRegistry;
+        let ctx = NetconfXmlRenderContext::new(&reg, &[], DefaultReport::Trim);
+        let rendered = ctx.format_leaf("/ex:secret", "hunter2").unwrap();
+
+        assert!(!rendered.contains("hunter2"));
+        assert!(rendered.starts_with("<ex:secret>"));
+        assert!(rendered.ends_with("</ex:secret>"));
     }
 }
