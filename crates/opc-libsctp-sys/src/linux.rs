@@ -11,6 +11,8 @@ use crate::{
 
 pub const SCTP_UNORDERED_FLAG: u16 = libc::SCTP_UNORDERED as u16;
 pub const SCTP_NOTIFICATION_FLAG: i32 = libc::SCTP_NOTIFICATION;
+pub const SCTP_ASSOC_CHANGE_NOTIFICATION: u16 = 1;
+pub const SCTP_SHUTDOWN_EVENT_NOTIFICATION: u16 = 5;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
