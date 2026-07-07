@@ -221,6 +221,106 @@ async fn authorizer_uses_computed_paths_not_request_paths() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_noop_commit_with_empty_computed_paths_is_rejected_before_authorizer() {
+    #[derive(Clone)]
+    struct EmptyPathMutationConfig {
+        name: String,
+    }
+
+    impl EmptyPathMutationConfig {
+        fn new(name: impl Into<String>) -> Self {
+            Self { name: name.into() }
+        }
+    }
+
+    impl OpcConfig for EmptyPathMutationConfig {
+        type Delta = String;
+
+        fn schema_digest(&self) -> SchemaDigest {
+            SchemaDigest::from_str(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("digest")
+        }
+
+        fn diff(&self, previous: &Self) -> Result<Vec<Self::Delta>, ConfigError> {
+            if self.name == previous.name {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![format!("changed:{}", self.name)])
+            }
+        }
+
+        fn changed_paths(
+            &self,
+            _previous: &Self,
+            _deltas: &[Self::Delta],
+        ) -> Result<Vec<YangPath>, ConfigError> {
+            Ok(Vec::new())
+        }
+
+        fn apply_delta(&mut self, delta: Self::Delta) -> Result<(), ConfigError> {
+            self.name = delta;
+            Ok(())
+        }
+
+        fn validate_syntax(&self) -> Result<(), ValidationError> {
+            Ok(())
+        }
+
+        fn validate_semantics(
+            &self,
+            _ctx: &ValidationContext<EmptyPathMutationConfig>,
+        ) -> Result<(), ValidationError> {
+            Ok(())
+        }
+    }
+
+    struct CountAuth {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ConfigAuthorizer for CountAuth {
+        async fn authorize(&self, _ctx: &AuthorizationContext) -> Result<(), AuthorizationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let store = Arc::new(MockManagedDatastore::new());
+    let auth = Arc::new(CountAuth {
+        calls: AtomicUsize::new(0),
+    });
+    let bus = ConfigBus::new(
+        EmptyPathMutationConfig::new("initial"),
+        Arc::clone(&store),
+        auth.clone(),
+    )
+    .await
+    .expect("startup");
+
+    let err = bus
+        .submit(CommitRequest::commit(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            EmptyPathMutationConfig::new("changed"),
+            Vec::new(),
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .await
+        .expect_err("non-noop with empty changed paths must fail closed");
+
+    assert_eq!(err.code, CommitErrorCode::DiffFailed);
+    assert_eq!(auth.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(bus.load().name, "initial");
+    assert_eq!(store.history().await.len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_authorizer_idempotency() {
     let store = Arc::new(MockManagedDatastore::new());
 

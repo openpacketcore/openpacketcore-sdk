@@ -52,6 +52,8 @@ const PENDING_CONFIRMED_UPDATE_UNSUPPORTED_MESSAGE: &str =
     "commit-confirmed update while another confirmed commit is pending is not supported";
 const STALE_BASE_VERSION_MESSAGE: &str =
     "commit base version does not match running config version";
+const EMPTY_CHANGED_PATHS_FOR_NONEMPTY_DIFF_MESSAGE: &str =
+    "changed path extraction returned no paths for a non-empty config diff";
 
 pub(crate) struct Submission<C: OpcConfig> {
     pub(crate) request: CommitRequest<C>,
@@ -913,6 +915,14 @@ async fn compute_deltas_and_changed_paths<C: OpcConfig>(
                 log_diff_failure(request_id, &err);
                 CommitError::diff_failed(err)
             })?;
+        if !deltas.is_empty() && changed_paths.is_empty() {
+            let err = ConfigError::new(
+                "changed-path",
+                EMPTY_CHANGED_PATHS_FOR_NONEMPTY_DIFF_MESSAGE,
+            );
+            log_diff_failure(request_id, &err);
+            return Err(CommitError::diff_failed(err));
+        }
         Ok::<_, CommitError>((candidate, deltas, changed_paths))
     })
     .await
