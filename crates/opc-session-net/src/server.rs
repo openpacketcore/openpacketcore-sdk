@@ -63,14 +63,18 @@ impl fmt::Debug for SessionReplicationServer {
 }
 
 impl SessionReplicationServer {
-    /// Create a new server with optional TLS.
+    /// Create a new mTLS server.
+    ///
+    /// Production session replication must run over authenticated TLS. Use
+    /// [`SessionReplicationServer::new_insecure`] only in test builds that
+    /// explicitly enable the `insecure-test` feature.
     pub fn new(
         backend: Arc<dyn SessionStoreBackend>,
-        tls_config: Option<Arc<opc_tls::ServerConfig>>,
+        tls_config: Arc<opc_tls::ServerConfig>,
     ) -> Self {
         Self {
             backend,
-            tls_config,
+            tls_config: Some(tls_config),
             max_connections: 128,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
@@ -187,7 +191,15 @@ async fn handle_connection(
 ) -> Result<(), ProtocolError> {
     if let Some(tls_config) = tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-        let tls_stream = acceptor.accept(stream).await.map_err(ProtocolError::Io)?;
+        let tls_stream = tokio::time::timeout(idle_timeout, acceptor.accept(stream))
+            .await
+            .map_err(|_| {
+                ProtocolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "TLS handshake timed out",
+                ))
+            })?
+            .map_err(ProtocolError::Io)?;
         let (mut r, mut w) = tokio::io::split(tls_stream);
         dispatch(backend, &mut r, &mut w, max_frame_size, idle_timeout).await
     } else {
