@@ -22,7 +22,11 @@ use opc_key::{
 use opc_types::TenantId;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::RwLock;
 use tracing::{error, instrument};
 use url::Url;
 
@@ -30,15 +34,90 @@ pub use error::VaultError;
 
 const KEY_ID_SCHEME: &str = "vault";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const TOKEN_RENEW_SKEW: Duration = Duration::from_secs(60);
 
 /// Vault Transit key provider.
 #[derive(Clone)]
 pub struct VaultKeyProvider {
     client: reqwest::Client,
     base_url: Arc<Url>,
-    token: Arc<String>,
+    token: Arc<RwLock<VaultToken>>,
     mount_path: Arc<String>,
     allow_insecure_http: bool,
+    #[cfg(feature = "k8s-auth")]
+    kubernetes_auth: Option<Arc<KubernetesAuth>>,
+}
+
+struct VaultToken {
+    value: Zeroizing<String>,
+    renew_at: Option<Instant>,
+    renewable: bool,
+}
+
+impl VaultToken {
+    fn static_token(value: String) -> Self {
+        Self {
+            value: Zeroizing::new(value),
+            renew_at: None,
+            renewable: false,
+        }
+    }
+
+    fn leased(value: String, lease_duration_secs: Option<u64>, renewable: bool) -> Self {
+        let renew_at = if renewable {
+            lease_duration_secs.map(|seconds| {
+                let lease = Duration::from_secs(seconds);
+                let delay = lease
+                    .checked_sub(TOKEN_RENEW_SKEW)
+                    .unwrap_or(Duration::ZERO);
+                Instant::now() + delay
+            })
+        } else {
+            None
+        };
+
+        Self {
+            value: Zeroizing::new(value),
+            renew_at,
+            renewable,
+        }
+    }
+
+    fn renew_due(&self) -> bool {
+        self.renewable
+            && self
+                .renew_at
+                .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+}
+
+#[cfg(feature = "k8s-auth")]
+struct KubernetesAuth {
+    role: String,
+    jwt: Zeroizing<String>,
+}
+
+#[derive(Deserialize)]
+struct VaultAuthEnvelope {
+    auth: VaultAuth,
+}
+
+#[derive(Deserialize)]
+struct VaultAuth {
+    client_token: Option<String>,
+    lease_duration: Option<u64>,
+    renewable: Option<bool>,
+}
+
+enum VaultRequestError {
+    Forbidden,
+    Unavailable,
+}
+
+impl From<VaultRequestError> for KeyError {
+    fn from(_: VaultRequestError) -> Self {
+        KeyError::Unavailable
+    }
 }
 
 #[derive(Deserialize)]
@@ -71,9 +150,11 @@ impl VaultKeyProvider {
         Self {
             client: reqwest::Client::new(),
             base_url: Arc::new(base_url.into()),
-            token: Arc::new(token),
+            token: Arc::new(RwLock::new(VaultToken::static_token(token))),
             mount_path: Arc::new(mount_path),
             allow_insecure_http: false,
+            #[cfg(feature = "k8s-auth")]
+            kubernetes_auth: None,
         }
     }
 
@@ -96,21 +177,36 @@ impl VaultKeyProvider {
             return Err(VaultError::InvalidUrl);
         }
 
-        let url = self
-            .base_url
-            .join("v1/auth/kubernetes/login")
-            .map_err(|_| VaultError::InvalidUrl)?;
+        let auth = Arc::new(KubernetesAuth {
+            role: role.to_string(),
+            jwt: Zeroizing::new(jwt.to_string()),
+        });
+        let token = self.login_kubernetes(&auth).await?;
+        *self.token.write().await = token;
+        self.kubernetes_auth = Some(auth);
+        Ok(self)
+    }
 
+    #[cfg(feature = "k8s-auth")]
+    async fn login_kubernetes(&self, auth: &KubernetesAuth) -> Result<VaultToken, VaultError> {
         #[derive(Serialize)]
         struct LoginRequest<'a> {
             role: &'a str,
             jwt: &'a str,
         }
 
+        let url = self
+            .base_url
+            .join("v1/auth/kubernetes/login")
+            .map_err(|_| VaultError::InvalidUrl)?;
+
         let resp = self
             .client
             .post(url)
-            .json(&LoginRequest { role, jwt })
+            .json(&LoginRequest {
+                role: &auth.role,
+                jwt: auth.jwt.as_str(),
+            })
             .timeout(REQUEST_TIMEOUT)
             .send()
             .await
@@ -120,19 +216,16 @@ impl VaultKeyProvider {
             return Err(VaultError::AuthFailed);
         }
 
-        #[derive(Deserialize)]
-        struct Auth {
-            client_token: String,
-        }
-
-        #[derive(Deserialize)]
-        struct LoginResponse {
-            auth: Auth,
-        }
-
-        let body: LoginResponse = resp.json().await.map_err(VaultError::from)?;
-        self.token = Arc::new(body.auth.client_token);
-        Ok(self)
+        let body: VaultAuthEnvelope = resp.json().await.map_err(VaultError::from)?;
+        let token = body
+            .auth
+            .client_token
+            .ok_or(VaultError::MalformedResponse)?;
+        Ok(VaultToken::leased(
+            token,
+            body.auth.lease_duration,
+            body.auth.renewable.unwrap_or(false),
+        ))
     }
 
     fn base_url_is_secure(&self) -> bool {
@@ -152,40 +245,120 @@ impl VaultKeyProvider {
         format!("{}_{}", tenant.as_str(), purpose.as_str())
     }
 
-    async fn post<B: Serialize, T: for<'de> Deserialize<'de>>(
+    async fn current_token(&self) -> Zeroizing<String> {
+        self.token.read().await.value.clone()
+    }
+
+    async fn refresh_token_if_due(&self) -> Result<(), KeyError> {
+        if !self.token.read().await.renew_due() {
+            return Ok(());
+        }
+
+        match self.renew_token().await {
+            Ok(()) => Ok(()),
+            Err(VaultRequestError::Forbidden) => self.reauthenticate().await,
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    async fn renew_token(&self) -> Result<(), VaultRequestError> {
+        #[derive(Serialize)]
+        struct RenewRequest {}
+
+        let current = self.current_token().await;
+        let resp = self
+            .send_post_with_token("v1/auth/token/renew-self", &RenewRequest {}, &current)
+            .await?;
+        let body: VaultAuthEnvelope = resp.json().await.map_err(|e| {
+            error!(error = %e, "failed to parse vault token renewal response");
+            VaultRequestError::Unavailable
+        })?;
+        let token = body
+            .auth
+            .client_token
+            .unwrap_or_else(|| current.as_str().to_string());
+        *self.token.write().await = VaultToken::leased(
+            token,
+            body.auth.lease_duration,
+            body.auth.renewable.unwrap_or(false),
+        );
+        Ok(())
+    }
+
+    async fn reauthenticate(&self) -> Result<(), KeyError> {
+        #[cfg(feature = "k8s-auth")]
+        if let Some(auth) = &self.kubernetes_auth {
+            let token = self.login_kubernetes(auth).await.map_err(|e| {
+                error!(error = %e, "vault kubernetes reauthentication failed");
+                KeyError::Unavailable
+            })?;
+            *self.token.write().await = token;
+            return Ok(());
+        }
+
+        error!("vault returned 403 and no renewable auth method is configured");
+        Err(KeyError::Unavailable)
+    }
+
+    async fn send_post_with_token<B: Serialize>(
         &self,
         path: &str,
         body: &B,
-    ) -> Result<T, KeyError> {
-        self.ensure_secure_base_url()?;
+        token: &str,
+    ) -> Result<reqwest::Response, VaultRequestError> {
+        self.ensure_secure_base_url()
+            .map_err(|_| VaultRequestError::Unavailable)?;
 
         let url = self.base_url.join(path).map_err(|_| {
             error!("invalid vault request path");
-            KeyError::Unavailable
+            VaultRequestError::Unavailable
         })?;
 
         let resp = self
             .client
             .post(url)
-            .header("X-Vault-Token", self.token.as_str())
+            .header("X-Vault-Token", token)
             .json(body)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(|e| {
                 error!(error = %e, "vault request failed");
-                KeyError::Unavailable
+                VaultRequestError::Unavailable
             })?;
 
         let status = resp.status();
         if status == StatusCode::FORBIDDEN {
             error!("vault returned 403");
-            return Err(KeyError::Unavailable);
+            return Err(VaultRequestError::Forbidden);
         }
         if !status.is_success() {
             error!(status = %status, "vault returned error status");
-            return Err(KeyError::Unavailable);
+            return Err(VaultRequestError::Unavailable);
         }
+
+        Ok(resp)
+    }
+
+    async fn post<B: Serialize, T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, KeyError> {
+        self.refresh_token_if_due().await?;
+
+        let mut retried_auth = false;
+        let resp = loop {
+            let token = self.current_token().await;
+            match self.send_post_with_token(path, body, &token).await {
+                Ok(resp) => break resp,
+                Err(VaultRequestError::Forbidden) if !retried_auth => {
+                    retried_auth = true;
+                    self.reauthenticate().await?;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        };
 
         resp.json().await.map_err(|e| {
             error!(error = %e, "failed to parse vault response");
@@ -361,32 +534,20 @@ impl KeyProvider for VaultKeyProvider {
 
     #[instrument(level = "debug", skip(self), fields(tenant = %tenant, purpose = %purpose))]
     async fn rotate_key(&self, purpose: KeyPurpose, tenant: &TenantId) -> Result<KeyId, KeyError> {
-        self.ensure_secure_base_url()
-            .map_err(|_| KeyError::RotationFailed)?;
-
         let key_name = Self::key_name(purpose, tenant);
+
+        #[derive(Serialize)]
+        struct RotateRequest {}
 
         // Rotate the wrapping key in Transit, then mint a fresh data key under
         // the new version so callers receive a post-rotation active key id.
-        let url = self
-            .base_url
-            .join(&format!("v1/{}/keys/{}/rotate", self.mount_path, key_name))
-            .map_err(|_| KeyError::RotationFailed)?;
-        let resp = self
-            .client
-            .post(url)
-            .header("X-Vault-Token", self.token.as_str())
-            .timeout(REQUEST_TIMEOUT)
-            .send()
+        let _: serde_json::Value = self
+            .post(
+                &format!("v1/{}/keys/{}/rotate", self.mount_path, key_name),
+                &RotateRequest {},
+            )
             .await
-            .map_err(|e| {
-                error!(error = %e, "vault rotate request failed");
-                KeyError::RotationFailed
-            })?;
-        if !resp.status().is_success() {
-            error!(status = %resp.status(), "vault rotate returned error status");
-            return Err(KeyError::RotationFailed);
-        }
+            .map_err(|_| KeyError::RotationFailed)?;
 
         let (key_id, _material) = self.generate_data_key(purpose, tenant).await?;
         Ok(key_id)
