@@ -533,6 +533,92 @@ async fn commit_confirmed_expiry_rollback_failure_fences_and_alarms() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_confirmed_expiry_validates_rollback_parent_before_publish() {
+    struct InvalidRollbackParentStore {
+        inner: MockManagedDatastore<TestConfig>,
+    }
+
+    #[async_trait::async_trait]
+    impl ManagedDatastore<TestConfig> for InvalidRollbackParentStore {
+        async fn load_latest(&self) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+            self.inner.load_latest().await
+        }
+        async fn load_rollback(
+            &self,
+            target: RollbackTarget,
+        ) -> Result<StoredConfig<TestConfig>, StoreError> {
+            let mut stored = self.inner.load_rollback(target).await?;
+            stored.config =
+                TestConfig::with_semantic_error(stored.config.name, "semantic rollback failure");
+            Ok(stored)
+        }
+        async fn load_by_idempotency_key(
+            &self,
+            k: &IdempotencyKey,
+        ) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+            self.inner.load_by_idempotency_key(k).await
+        }
+        async fn append_commit(&self, commit: StoredConfig<TestConfig>) -> Result<(), StoreError> {
+            self.inner.append_commit(commit).await
+        }
+        async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
+            self.inner.clear_recovery_required(tx_id).await
+        }
+        async fn mark_confirmed(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
+            self.inner.mark_confirmed(tx_id).await
+        }
+    }
+
+    let inner = MockManagedDatastore::new();
+    inner
+        .seed(StoredConfig::new(
+            opc_types::TxId::new(),
+            ConfigVersion::new(1),
+            principal(),
+            RequestSource::Northbound,
+            TestConfig::new("initial"),
+        ))
+        .await;
+    let store = Arc::new(InvalidRollbackParentStore { inner });
+    let alarms = SharedAlarmManager::default();
+    let bus = ConfigBus::restore_or_new_with_alarm_manager_dev_only(
+        TestConfig::new("fallback"),
+        Arc::clone(&store),
+        alarms.clone(),
+    )
+    .await
+    .expect("startup succeeds");
+
+    bus.submit(
+        CommitRequest::new(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            CommitMode::CommitConfirmed {
+                timeout: Duration::from_millis(50),
+            },
+            Instant::now() + Duration::from_secs(1),
+            Some(TestConfig::new("tentative")),
+            vec![changed_path()],
+        )
+        .with_base_version(bus.version()),
+    )
+    .await
+    .expect("commit-confirmed succeeds");
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(bus.load().name, "tentative");
+    assert_eq!(bus.version(), ConfigVersion::new(2));
+    assert_eq!(bus.drift_state(), DriftState::RecoveryRequired);
+
+    let alarm = single_active_alarm(&alarms, "config-bus.commit.failure");
+    assert_eq!(alarm.severity, Severity::Major);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_confirmed_confirm_marker_failure_fences_after_append() {
     struct MarkConfirmFailureStore {
         inner: MockManagedDatastore<TestConfig>,

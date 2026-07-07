@@ -25,7 +25,10 @@ use crate::alarms::{
 };
 use crate::authorizer::ConfigAuthorizer;
 use crate::datastore::ManagedDatastore;
-use crate::restore::startup_bootstrap_principal;
+use crate::restore::{
+    restore_validation_context, startup_bootstrap_principal, validate_publishable_stored_config,
+    validate_startup_config,
+};
 use crate::rollback::resolve_candidate;
 use crate::subscribers::{ConfigReceiver, SubscriberLagPolicy, SubscriberState};
 use crate::types::{
@@ -381,6 +384,13 @@ async fn worker_loop<C: OpcConfig>(
                             tracing::error!("failed to load previous confirmed config during expiry rollback: {:?}", err);
                             err
                         })?;
+                    validate_publishable_stored_config(&prev_stored)?;
+                    let validation_context = restore_validation_context(&prev_stored);
+                    let rollback_config = validate_startup_config(
+                        prev_stored.config,
+                        validation_context,
+                    )
+                    .await?;
 
                     let rollback_version = current_snap.version.next().ok_or_else(|| {
                         StoreError::internal("version exhausted during expiry rollback")
@@ -391,7 +401,7 @@ async fn worker_loop<C: OpcConfig>(
                         rollback_version,
                         startup_bootstrap_principal(),
                         RequestSource::Internal,
-                        prev_stored.config.clone(),
+                        rollback_config.clone(),
                     );
                     rollback_record.parent_tx_id = current_snap.tx_id;
                     rollback_record.recovery_required = true;
@@ -403,7 +413,7 @@ async fn worker_loop<C: OpcConfig>(
 
                     let previous = Arc::clone(&current_snap.config);
                     let (candidate, deltas, changed_paths) = compute_deltas_and_changed_paths(
-                        prev_stored.config,
+                        rollback_config,
                         previous,
                         RequestId::new(),
                     ).await.map_err(|err| {
