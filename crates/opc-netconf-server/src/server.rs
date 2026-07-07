@@ -262,7 +262,7 @@ impl DatastoreFailure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StartupWriteAuthzFailure {
+enum WriteAuthzFailure {
     Denied,
     Unavailable,
 }
@@ -3034,6 +3034,46 @@ where
                     RpcError::operation_failed(),
                 );
             }
+            let changed_paths = match self
+                .replacement_changed_paths(&candidate.config, Some(snapshot.config.as_ref()))
+            {
+                Ok(paths) => paths,
+                Err(WriteAuthzFailure::Denied) => unreachable!("path diff cannot deny"),
+                Err(WriteAuthzFailure::Unavailable) => {
+                    return self.exec_failure_reply(
+                        &context,
+                        NetconfOperation::Commit,
+                        NETCONF_COMMIT_PATH,
+                        audit_failed("resource-denied"),
+                        RpcError::resource_denied(),
+                    );
+                }
+            };
+            match self.authorize_config_write(
+                context.principal,
+                ConfigOperation::Replace,
+                &changed_paths,
+            ) {
+                Ok(()) => {}
+                Err(WriteAuthzFailure::Denied) => {
+                    return self.exec_failure_reply(
+                        &context,
+                        NetconfOperation::Commit,
+                        NETCONF_COMMIT_PATH,
+                        audit_denied("access-denied"),
+                        RpcError::access_denied(),
+                    );
+                }
+                Err(WriteAuthzFailure::Unavailable) => {
+                    return self.exec_failure_reply(
+                        &context,
+                        NetconfOperation::Commit,
+                        NETCONF_COMMIT_PATH,
+                        audit_failed("resource-denied"),
+                        RpcError::resource_denied(),
+                    );
+                }
+            }
         }
         let timeout = confirmed_commit_timeout(request);
         let mode = if request.confirmed {
@@ -3482,17 +3522,17 @@ where
         };
 
         match self.all_config_schema_paths().and_then(|paths| {
-            self.authorize_startup_write(context.principal, ConfigOperation::Delete, &paths)
+            self.authorize_config_write(context.principal, ConfigOperation::Delete, &paths)
         }) {
             Ok(()) => {}
-            Err(StartupWriteAuthzFailure::Denied) => {
+            Err(WriteAuthzFailure::Denied) => {
                 return self.delete_config_failure_reply_for_rpc(
                     &context,
                     audit_denied("access-denied"),
                     RpcError::access_denied(),
                 );
             }
-            Err(StartupWriteAuthzFailure::Unavailable) => {
+            Err(WriteAuthzFailure::Unavailable) => {
                 return self.delete_config_failure_reply_for_rpc(
                     &context,
                     audit_failed("resource-denied"),
@@ -3515,21 +3555,21 @@ where
         }
     }
 
-    fn authorize_startup_write(
+    fn authorize_config_write(
         &self,
         principal: &TrustedPrincipal,
         operation: ConfigOperation,
         changed_paths: &[YangPath],
-    ) -> Result<(), StartupWriteAuthzFailure> {
+    ) -> Result<(), WriteAuthzFailure> {
         let authorizer =
             ConfigWriteAuthorizer::new(self.binding.schema_registry(), self.authz.policy_source())
-                .map_err(|_| StartupWriteAuthzFailure::Unavailable)?;
+                .map_err(|_| WriteAuthzFailure::Unavailable)?;
         let path_refs = changed_paths.iter().collect::<Vec<_>>();
         let decisions = authorizer
             .authorize_paths(principal, operation, &path_refs)
-            .map_err(|_| StartupWriteAuthzFailure::Unavailable)?;
+            .map_err(|_| WriteAuthzFailure::Unavailable)?;
         if decisions.iter().any(|decision| !decision.allowed) {
-            return Err(StartupWriteAuthzFailure::Denied);
+            return Err(WriteAuthzFailure::Denied);
         }
         Ok(())
     }
@@ -3538,25 +3578,25 @@ where
         &self,
         candidate: &C,
         previous: Option<&C>,
-    ) -> Result<Vec<YangPath>, StartupWriteAuthzFailure> {
+    ) -> Result<Vec<YangPath>, WriteAuthzFailure> {
         if let Some(previous) = previous {
             let deltas = candidate
                 .diff(previous)
-                .map_err(|_| StartupWriteAuthzFailure::Unavailable)?;
+                .map_err(|_| WriteAuthzFailure::Unavailable)?;
             return candidate
                 .changed_paths(previous, &deltas)
-                .map_err(|_| StartupWriteAuthzFailure::Unavailable);
+                .map_err(|_| WriteAuthzFailure::Unavailable);
         }
         self.all_config_schema_paths()
     }
 
-    fn all_config_schema_paths(&self) -> Result<Vec<YangPath>, StartupWriteAuthzFailure> {
+    fn all_config_schema_paths(&self) -> Result<Vec<YangPath>, WriteAuthzFailure> {
         self.binding
             .schema_registry()
             .nodes()
             .iter()
             .filter(|node| node.config)
-            .map(|node| YangPath::new(node.path).map_err(|_| StartupWriteAuthzFailure::Unavailable))
+            .map(|node| YangPath::new(node.path).map_err(|_| WriteAuthzFailure::Unavailable))
             .collect()
     }
 
@@ -3624,6 +3664,39 @@ where
         };
         let bus = self.binding.config_bus();
         let snapshot = bus.current_snapshot();
+        let changed_paths =
+            match self.replacement_changed_paths(&source, Some(snapshot.config.as_ref())) {
+                Ok(paths) => paths,
+                Err(WriteAuthzFailure::Denied) => unreachable!("path diff cannot deny"),
+                Err(WriteAuthzFailure::Unavailable) => {
+                    return self.copy_config_failure_reply_for_rpc(
+                        context,
+                        audit_failed("resource-denied"),
+                        RpcError::resource_denied(),
+                    );
+                }
+            };
+        match self.authorize_config_write(
+            context.principal,
+            ConfigOperation::Replace,
+            &changed_paths,
+        ) {
+            Ok(()) => {}
+            Err(WriteAuthzFailure::Denied) => {
+                return self.copy_config_failure_reply_for_rpc(
+                    context,
+                    audit_denied("access-denied"),
+                    RpcError::access_denied(),
+                );
+            }
+            Err(WriteAuthzFailure::Unavailable) => {
+                return self.copy_config_failure_reply_for_rpc(
+                    context,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        }
         let request = CommitRequest::commit(
             context.request_id,
             context.principal.clone(),
@@ -3731,8 +3804,8 @@ where
         }
         let changed_paths = match self.replacement_changed_paths(&source, previous.as_deref()) {
             Ok(paths) => paths,
-            Err(StartupWriteAuthzFailure::Denied) => unreachable!("path diff cannot deny"),
-            Err(StartupWriteAuthzFailure::Unavailable) => {
+            Err(WriteAuthzFailure::Denied) => unreachable!("path diff cannot deny"),
+            Err(WriteAuthzFailure::Unavailable) => {
                 return self.copy_config_failure_reply_for_rpc(
                     context,
                     audit_failed("resource-denied"),
@@ -3740,20 +3813,20 @@ where
                 );
             }
         };
-        match self.authorize_startup_write(
+        match self.authorize_config_write(
             context.principal,
             ConfigOperation::Replace,
             &changed_paths,
         ) {
             Ok(()) => {}
-            Err(StartupWriteAuthzFailure::Denied) => {
+            Err(WriteAuthzFailure::Denied) => {
                 return self.copy_config_failure_reply_for_rpc(
                     context,
                     audit_denied("access-denied"),
                     RpcError::access_denied(),
                 );
             }
-            Err(StartupWriteAuthzFailure::Unavailable) => {
+            Err(WriteAuthzFailure::Unavailable) => {
                 return self.copy_config_failure_reply_for_rpc(
                     context,
                     audit_failed("resource-denied"),
@@ -4233,6 +4306,41 @@ where
             }
         };
 
+        let changed_paths = match self
+            .replacement_changed_paths(&candidate.candidate, Some(snapshot.config.as_ref()))
+        {
+            Ok(paths) => paths,
+            Err(WriteAuthzFailure::Denied) => unreachable!("path diff cannot deny"),
+            Err(WriteAuthzFailure::Unavailable) => {
+                return self.edit_config_failure_reply(
+                    &context,
+                    kind,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        };
+        match self.authorize_config_write(context.principal, ConfigOperation::Patch, &changed_paths)
+        {
+            Ok(()) => {}
+            Err(WriteAuthzFailure::Denied) => {
+                return self.edit_config_failure_reply(
+                    &context,
+                    kind,
+                    audit_denied("access-denied"),
+                    RpcError::access_denied(),
+                );
+            }
+            Err(WriteAuthzFailure::Unavailable) => {
+                return self.edit_config_failure_reply(
+                    &context,
+                    kind,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        }
+
         let commit_request = CommitRequest::commit(
             context.request_id,
             context.principal.clone(),
@@ -4573,8 +4681,8 @@ where
         let changed_paths = match self.replacement_changed_paths(&candidate.candidate, Some(&base))
         {
             Ok(paths) => paths,
-            Err(StartupWriteAuthzFailure::Denied) => unreachable!("path diff cannot deny"),
-            Err(StartupWriteAuthzFailure::Unavailable) => {
+            Err(WriteAuthzFailure::Denied) => unreachable!("path diff cannot deny"),
+            Err(WriteAuthzFailure::Unavailable) => {
                 return self.edit_config_failure_reply(
                     context,
                     kind,
@@ -4600,13 +4708,10 @@ where
                 RpcError::operation_failed(),
             );
         }
-        match self.authorize_startup_write(
-            context.principal,
-            ConfigOperation::Patch,
-            &changed_paths,
-        ) {
+        match self.authorize_config_write(context.principal, ConfigOperation::Patch, &changed_paths)
+        {
             Ok(()) => {}
-            Err(StartupWriteAuthzFailure::Denied) => {
+            Err(WriteAuthzFailure::Denied) => {
                 return self.edit_config_failure_reply(
                     context,
                     kind,
@@ -4614,7 +4719,7 @@ where
                     RpcError::access_denied(),
                 );
             }
-            Err(StartupWriteAuthzFailure::Unavailable) => {
+            Err(WriteAuthzFailure::Unavailable) => {
                 return self.edit_config_failure_reply(
                     context,
                     kind,
@@ -12657,6 +12762,16 @@ mod tests {
         Arc<ConfigBus<DemoConfig>>,
         CapturingAudit,
     ) {
+        generated_edit_server_policy(policy_allow_system_but_deny_secret()).await
+    }
+
+    async fn generated_edit_server_policy(
+        policy: NacmPolicy,
+    ) -> (
+        ReadOnlyNetconfServer<DemoConfig, GeneratedEditBinding, FixedPolicy, CapturingAudit>,
+        Arc<ConfigBus<DemoConfig>>,
+        CapturingAudit,
+    ) {
         let store = Arc::new(MockManagedDatastore::new());
         store
             .seed(StoredConfig::new(
@@ -12688,7 +12803,7 @@ mod tests {
         let audit = CapturingAudit::default();
         let server = ReadOnlyNetconfServer::new(
             binding,
-            FixedPolicy(policy_allow_system_but_deny_secret()),
+            FixedPolicy(policy),
             audit.clone(),
             TransportType::NetconfTls,
         )
@@ -12798,6 +12913,42 @@ mod tests {
             .collect();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].outcome, AuditOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn running_edit_config_denies_node_write_before_allow_all_bus_authorizer() {
+        let (server, bus, audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_config_rpc(
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:secret>persisted-admin</sys:secret></sys:system>"#,
+            "merge",
+        );
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(
+            result
+                .reply_xml
+                .contains("<error-tag>access-denied</error-tag>"),
+            "{}",
+            result.reply_xml
+        );
+        assert_eq!(bus.current_snapshot().config.secret, "do-not-leak");
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, audit_denied("access-denied"));
     }
 
     #[tokio::test]
@@ -14278,7 +14429,8 @@ mod tests {
 
     #[tokio::test]
     async fn generated_edit_secret_value_never_leaks() {
-        let (server, bus, audit) = generated_edit_server_fixture().await;
+        let (server, bus, audit) =
+            generated_edit_server_policy(policy_allow_system_with_secret_writes()).await;
         let registry = SessionRegistry::new();
         let _registration = registry.register(1).expect("register session 1");
 
