@@ -124,9 +124,9 @@ pub struct ReplicationEntry {
     pub tx_id: String,
     /// The fenced mutation to replay when applying this entry.
     pub op: ReplicationOp,
-    /// Coordinator wall-clock time when the entry was created. Informational
-    /// (and the basis for TTL deadlines on replay); ordering authority is
-    /// `sequence`, never this timestamp — no wall-clock last-writer-wins.
+    /// Coordinator wall-clock time when the entry was created. Informational;
+    /// ordering authority is `sequence`, never this timestamp — no wall-clock
+    /// last-writer-wins.
     pub timestamp: Timestamp,
 }
 
@@ -168,8 +168,10 @@ pub enum ReplicationOp {
         owner: OwnerId,
         /// Fence under which the refresh was authorized.
         fence: FenceToken,
-        /// New time-to-live, applied relative to the replay clock.
+        /// Requested time-to-live, retained for audit and compatibility.
         ttl: Duration,
+        /// Absolute deadline computed once by the mutation coordinator.
+        expires_at: Timestamp,
     },
     /// Replay of a lease acquisition, installing the lease entry and bumping
     /// the key's recorded fence to `fence`.

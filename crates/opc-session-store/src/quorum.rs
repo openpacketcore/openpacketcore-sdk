@@ -474,11 +474,15 @@ impl SessionBackend for QuorumSessionStore {
     }
 
     async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
+        let now = self.clock.now_utc();
+        let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
+        let expires_at = Timestamp::from_offset_datetime(expires);
         let op = ReplicationOp::RefreshTtl {
             key: lease.key().clone(),
             owner: lease.owner().clone(),
             fence: lease.fence(),
             ttl,
+            expires_at,
         };
         self.replicate_mutation(op).await
     }

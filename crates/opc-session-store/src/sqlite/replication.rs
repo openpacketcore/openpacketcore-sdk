@@ -134,7 +134,8 @@ pub(crate) fn apply_replicated_op_sync(
             key,
             owner: _,
             fence,
-            ttl,
+            ttl: _,
+            expires_at,
         } => {
             let current_fence = current_fence_sync(conn, &key)?;
             if fence.get() < current_fence {
@@ -144,9 +145,7 @@ pub(crate) fn apply_replicated_op_sync(
             let Some(mut record) = record else {
                 return Err(StoreError::NotFound);
             };
-            let expires =
-                *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-            record.expires_at = Some(Timestamp::from_offset_datetime(expires));
+            record.expires_at = Some(expires_at);
             insert_or_replace_record_sync(conn, &record)?;
             insert_or_replace_fence_sync(conn, &key, fence.get())?;
             Ok(())

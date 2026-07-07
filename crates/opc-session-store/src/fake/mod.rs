@@ -292,7 +292,7 @@ impl FakeSessionBackend {
         lease: &LeaseGuard,
         ttl: Duration,
         now: Timestamp,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Timestamp, StoreError> {
         if !self.caps.per_key_ttl {
             return Err(StoreError::CapabilityNotSupported("per_key_ttl".into()));
         }
@@ -318,9 +318,10 @@ impl FakeSessionBackend {
         }
 
         let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-        record.expires_at = Some(Timestamp::from_offset_datetime(expires));
+        let expires_at = Timestamp::from_offset_datetime(expires);
+        record.expires_at = Some(expires_at);
         state.key_fences.insert(mk, lease.fence());
-        Ok(())
+        Ok(expires_at)
     }
 
     fn apply_replicated_op_with_state(
@@ -396,7 +397,8 @@ impl FakeSessionBackend {
                 key,
                 owner: _,
                 fence,
-                ttl,
+                ttl: _,
+                expires_at,
             } => {
                 let mk = Self::map_key(&key);
                 let current_fence = Self::current_fence(state, &mk);
@@ -404,9 +406,7 @@ impl FakeSessionBackend {
                     return Err(StoreError::StaleFence);
                 }
                 if let Some(record) = state.records.get_mut(&mk) {
-                    let expires =
-                        *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-                    record.expires_at = Some(Timestamp::from_offset_datetime(expires));
+                    record.expires_at = Some(expires_at);
                     state.key_fences.insert(mk, fence);
                     Ok(())
                 } else {
@@ -618,7 +618,7 @@ impl SessionBackend for FakeSessionBackend {
         let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
-        self.refresh_ttl_with_state(&mut state, lease, ttl, now)?;
+        let expires_at = self.refresh_ttl_with_state(&mut state, lease, ttl, now)?;
         self.append_direct_replication_entry(
             &mut state,
             ReplicationOp::RefreshTtl {
@@ -626,6 +626,7 @@ impl SessionBackend for FakeSessionBackend {
                 owner: lease.owner().clone(),
                 fence: lease.fence(),
                 ttl,
+                expires_at,
             },
             now,
         );
@@ -653,7 +654,7 @@ impl SessionBackend for FakeSessionBackend {
                     self.delete_fenced_with_state(&mut state, &lease, now),
                 ),
                 SessionOp::RefreshTtl { lease, ttl } => SessionOpResult::RefreshTtl(
-                    self.refresh_ttl_with_state(&mut state, &lease, ttl, now),
+                    self.refresh_ttl_with_state(&mut state, &lease, ttl, now).map(|_| ()),
                 ),
             };
             results.push(res);

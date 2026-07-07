@@ -209,10 +209,12 @@ async fn direct_delete_and_ttl_refresh_emit_matching_replication_ops() {
             owner: ref logged_owner,
             fence,
             ttl,
+            expires_at,
         } if logged_key == &key
             && logged_owner == lease.owner()
             && fence == lease.fence()
             && ttl == Duration::from_secs(30)
+            && expires_at > lease.acquired_at()
     ));
 
     let delete_sequence = backend.max_replication_sequence().await.unwrap() + 1;
