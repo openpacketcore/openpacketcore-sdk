@@ -836,6 +836,7 @@ fn allow_all_read_subscribe_policy() -> NacmPolicy {
     for action in [
         NacmAction::Read,
         NacmAction::Subscribe,
+        NacmAction::Create,
         NacmAction::Update,
         NacmAction::Replace,
         NacmAction::Delete,

@@ -353,7 +353,8 @@ impl<'r, P: PolicySource> ConfigWriteAuthorizer<'r, P> {
         let resolved = self.source.active_policy_context_for_principal(principal)?;
         let policy = &resolved.policy;
         let authz_principal = &resolved.principal;
-        let nacm_action = write_action_for_operation(operation);
+        let nacm_action = primary_write_action_for_operation(operation);
+        let required_actions = write_actions_for_operation(operation);
         let mut evaluator = NacmEvaluator::new();
 
         let decisions: Vec<_> = paths
@@ -368,9 +369,11 @@ impl<'r, P: PolicySource> ConfigWriteAuthorizer<'r, P> {
                 };
                 let schema_path = node.path.to_string();
                 let allowed = match YangPath::parse(node.path, &self.modules) {
-                    Ok(parsed) => evaluator
-                        .evaluate_for_groups(policy, &parsed, nacm_action, &authz_principal.groups)
-                        .is_allowed(),
+                    Ok(parsed) => required_actions.iter().all(|action| {
+                        evaluator
+                            .evaluate_for_groups(policy, &parsed, *action, &authz_principal.groups)
+                            .is_allowed()
+                    }),
                     Err(_) => false,
                 };
                 WritePathDecision {
@@ -490,7 +493,20 @@ impl<P: PolicySource> ExecAuthorizer<P> {
     }
 }
 
-fn write_action_for_operation(operation: ConfigOperation) -> NacmAction {
+const PATCH_WRITE_ACTIONS: &[NacmAction] = &[NacmAction::Create, NacmAction::Update];
+const REPLACE_WRITE_ACTIONS: &[NacmAction] = &[NacmAction::Replace];
+const DELETE_WRITE_ACTIONS: &[NacmAction] = &[NacmAction::Delete];
+
+fn write_actions_for_operation(operation: ConfigOperation) -> &'static [NacmAction] {
+    match operation {
+        ConfigOperation::Replace => REPLACE_WRITE_ACTIONS,
+        ConfigOperation::Patch => PATCH_WRITE_ACTIONS,
+        ConfigOperation::Delete => DELETE_WRITE_ACTIONS,
+        ConfigOperation::Rollback => REPLACE_WRITE_ACTIONS,
+    }
+}
+
+fn primary_write_action_for_operation(operation: ConfigOperation) -> NacmAction {
     match operation {
         ConfigOperation::Replace => NacmAction::Replace,
         ConfigOperation::Patch => NacmAction::Update,
@@ -826,7 +842,10 @@ mod tests {
             principal: &TrustedPrincipal,
         ) -> Result<NacmPolicy, AuthzError> {
             if principal.groups.iter().any(|group| group == "selected") {
-                Ok(allow_write(NacmAction::Update, "/sys:system/sys:hostname"))
+                Ok(allow_writes(
+                    &[NacmAction::Create, NacmAction::Update],
+                    "/sys:system/sys:hostname",
+                ))
             } else {
                 Ok(NacmPolicy::empty(PolicyVersion::new(1)))
             }
@@ -847,9 +866,9 @@ mod tests {
             principal: &TrustedPrincipal,
         ) -> Result<ResolvedPolicy, AuthzError> {
             Ok(ResolvedPolicy::new(
-                group_write(
+                group_writes(
                     "resolved-writer",
-                    NacmAction::Update,
+                    &[NacmAction::Create, NacmAction::Update],
                     "/sys:system/sys:hostname",
                 ),
                 principal.clone().with_groups(["resolved-writer"]),
@@ -959,17 +978,18 @@ mod tests {
             .build()
     }
 
-    fn group_write(group: &'static str, action: NacmAction, pattern: &str) -> NacmPolicy {
+    fn group_writes(group: &'static str, actions: &[NacmAction], pattern: &str) -> NacmPolicy {
         let modules = module_registry();
+        let pattern = YangPathPattern::parse(pattern, &modules).expect("pattern");
         NacmPolicy::builder(PolicyVersion::new(1))
             .add_rule_list(
                 NacmRuleList::new(
                     "writers",
                     [group],
-                    vec![NacmRule::allow(
-                        action,
-                        YangPathPattern::parse(pattern, &modules).expect("pattern"),
-                    )],
+                    actions
+                        .iter()
+                        .map(|action| NacmRule::allow(*action, pattern.clone()))
+                        .collect(),
                 )
                 .expect("rule-list"),
             )
@@ -1001,6 +1021,16 @@ mod tests {
                 YangPathPattern::parse(pattern, &modules).expect("pattern"),
             ))
             .build()
+    }
+
+    fn allow_writes(actions: &[NacmAction], pattern: &str) -> NacmPolicy {
+        let modules = module_registry();
+        let pattern = YangPathPattern::parse(pattern, &modules).expect("pattern");
+        let mut builder = NacmPolicy::builder(PolicyVersion::new(1));
+        for action in actions {
+            builder = builder.add_rule(NacmRule::allow(*action, pattern.clone()));
+        }
+        builder.build()
     }
 
     fn config_path(path: &str) -> ConfigYangPath {
@@ -1186,7 +1216,10 @@ mod tests {
     fn config_write_authorizer_allows_matching_changed_path() {
         let authz = ConfigWriteAuthorizer::new(
             &TestReg,
-            FixedPolicy(allow_write(NacmAction::Update, "/sys:system/sys:hostname")),
+            FixedPolicy(allow_writes(
+                &[NacmAction::Create, NacmAction::Update],
+                "/sys:system/sys:hostname",
+            )),
         )
         .expect("write authorizer");
 
@@ -1206,12 +1239,39 @@ mod tests {
     }
 
     #[test]
+    fn config_write_authorizer_requires_create_and_update_for_patch() {
+        let update_only = ConfigWriteAuthorizer::new(
+            &TestReg,
+            FixedPolicy(allow_write(NacmAction::Update, "/sys:system/sys:hostname")),
+        )
+        .expect("write authorizer");
+        let path = config_path("/sys:system/sys:hostname");
+
+        assert!(!update_only
+            .may_write(&principal(), ConfigOperation::Patch, &path)
+            .expect("update-only patch authorization"));
+
+        let create_and_update = ConfigWriteAuthorizer::new(
+            &TestReg,
+            FixedPolicy(allow_writes(
+                &[NacmAction::Create, NacmAction::Update],
+                "/sys:system/sys:hostname",
+            )),
+        )
+        .expect("write authorizer");
+
+        assert!(create_and_update
+            .may_write(&principal(), ConfigOperation::Patch, &path)
+            .expect("create-and-update patch authorization"));
+    }
+
+    #[test]
     fn config_write_authorizer_enforces_signed_group_rule_lists() {
         let authz = ConfigWriteAuthorizer::new(
             &TestReg,
-            FixedPolicy(group_write(
+            FixedPolicy(group_writes(
                 "telco-writer",
-                NacmAction::Update,
+                &[NacmAction::Create, NacmAction::Update],
                 "/sys:system/sys:hostname",
             )),
         )
@@ -1263,7 +1323,10 @@ mod tests {
     fn config_write_authorizer_canonicalizes_bare_paths() {
         let authz = ConfigWriteAuthorizer::new(
             &TestReg,
-            FixedPolicy(allow_write(NacmAction::Update, "/sys:system/sys:hostname")),
+            FixedPolicy(allow_writes(
+                &[NacmAction::Create, NacmAction::Update],
+                "/sys:system/sys:hostname",
+            )),
         )
         .expect("write authorizer");
 

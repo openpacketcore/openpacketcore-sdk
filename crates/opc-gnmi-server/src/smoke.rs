@@ -1578,6 +1578,7 @@ mod tests {
     fn allow_policy() -> NacmPolicy {
         policy_for_actions([
             NacmAction::Read,
+            NacmAction::Create,
             NacmAction::Update,
             NacmAction::Replace,
             NacmAction::Delete,
@@ -1601,7 +1602,12 @@ mod tests {
             builder = builder.add_rule(NacmRule::allow(NacmAction::Read, pattern));
         }
         let mut write_rules = Vec::new();
-        for action in [NacmAction::Update, NacmAction::Replace, NacmAction::Delete] {
+        for action in [
+            NacmAction::Create,
+            NacmAction::Update,
+            NacmAction::Replace,
+            NacmAction::Delete,
+        ] {
             write_rules.push(NacmRule::allow(action, root_pattern.clone()));
             write_rules.push(NacmRule::allow(action, subtree_pattern.clone()));
         }
