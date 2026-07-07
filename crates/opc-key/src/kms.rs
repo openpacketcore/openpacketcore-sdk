@@ -110,6 +110,13 @@ impl KmsKeyProvider {
     }
 
     async fn call_kms(&self, req: KmsRequest) -> Result<KmsResponse, KeyError> {
+        match tokio::time::timeout(self.timeout, self.call_kms_inner(req)).await {
+            Ok(result) => result,
+            Err(_) => Err(KeyError::Unavailable),
+        }
+    }
+
+    async fn call_kms_inner(&self, req: KmsRequest) -> Result<KmsResponse, KeyError> {
         let connect_fut = async {
             if self.endpoint.starts_with('/') || self.endpoint.starts_with("unix://") {
                 let path = self.endpoint.trim_start_matches("unix://");
@@ -133,57 +140,50 @@ impl KmsKeyProvider {
             }
         };
 
-        let mut stream = match tokio::time::timeout(self.timeout, connect_fut).await {
-            Ok(Ok(s)) => s,
-            _ => return Err(KeyError::Unavailable),
-        };
+        let mut stream = connect_fut.await?;
 
         let req_bytes = serde_json::to_vec(&req).map_err(|_| KeyError::Unavailable)?;
         let req_len = req_bytes.len() as u32;
 
-        let write_fut = async {
-            stream.write_all(&req_len.to_be_bytes()).await?;
-            stream.write_all(&req_bytes).await?;
-            stream.flush().await?;
-            Ok::<(), std::io::Error>(())
-        };
+        stream
+            .write_all(&req_len.to_be_bytes())
+            .await
+            .map_err(|_| KeyError::Unavailable)?;
+        stream
+            .write_all(&req_bytes)
+            .await
+            .map_err(|_| KeyError::Unavailable)?;
+        stream.flush().await.map_err(|_| KeyError::Unavailable)?;
 
-        if tokio::time::timeout(self.timeout, write_fut).await.is_err() {
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .map_err(|_| KeyError::Unavailable)?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > Self::MAX_RESPONSE_BYTES {
             return Err(KeyError::Unavailable);
         }
 
-        let read_fut = async {
-            let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).await?;
-            let len = u32::from_be_bytes(len_buf) as usize;
-            if len > Self::MAX_RESPONSE_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Response too large",
-                ));
-            }
-            let mut resp_buf = Zeroizing::new(vec![0u8; len]);
-            stream.read_exact(&mut resp_buf).await?;
-            let resp: KmsResponse = serde_json::from_slice(&resp_buf)?;
-            Ok::<KmsResponse, std::io::Error>(resp)
-        };
+        let mut resp_buf = Zeroizing::new(vec![0u8; len]);
+        stream
+            .read_exact(&mut resp_buf)
+            .await
+            .map_err(|_| KeyError::Unavailable)?;
+        let resp: KmsResponse =
+            serde_json::from_slice(&resp_buf).map_err(|_| KeyError::Unavailable)?;
 
-        match tokio::time::timeout(self.timeout, read_fut).await {
-            Ok(Ok(resp)) => {
-                if resp.status == "success" {
-                    Ok(resp)
-                } else {
-                    let msg = resp
-                        .error_message
-                        .unwrap_or_else(|| "KMS failed".to_string());
-                    if msg.contains("not found") {
-                        Err(KeyError::NotFound)
-                    } else {
-                        Err(KeyError::Unavailable)
-                    }
-                }
+        if resp.status == "success" {
+            Ok(resp)
+        } else {
+            let msg = resp
+                .error_message
+                .unwrap_or_else(|| "KMS failed".to_string());
+            if msg.contains("not found") {
+                Err(KeyError::NotFound)
+            } else {
+                Err(KeyError::Unavailable)
             }
-            _ => Err(KeyError::Unavailable),
         }
     }
 }

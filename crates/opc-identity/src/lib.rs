@@ -3,6 +3,8 @@
 //! Provides X.509 SVID parsing, trust-domain validation, and hot-reload
 //! primitives for mTLS identity.
 
+#![forbid(unsafe_code)]
+
 use opc_types::{InstanceId, NfKind, SpiffeId, TenantId, Timestamp};
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, UnixTime};
 use std::collections::HashMap;

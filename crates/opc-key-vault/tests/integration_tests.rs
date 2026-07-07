@@ -371,6 +371,34 @@ async fn server_error_500() {
 }
 
 #[tokio::test]
+async fn transient_server_error_is_retried() {
+    let responses = Arc::new(Mutex::new(vec![
+        MockResponse {
+            status: 500,
+            body: r#"{"errors":["transient"]}"#.into(),
+        },
+        MockResponse {
+            status: 200,
+            body: datakey_response(&[0xab; 32]),
+        },
+    ]));
+
+    let mock = MockVault::new(responses).await;
+    let provider = mock_provider(&mock, "token");
+
+    let handle = provider
+        .get_active_key(KeyPurpose::Config, &tenant())
+        .await
+        .expect("transient 500 should be retried");
+
+    assert_eq!(handle.purpose(), KeyPurpose::Config);
+    let paths = mock.request_paths().await;
+    assert_eq!(paths.len(), 2);
+    assert!(paths[0].starts_with("POST /v1/transit/datakey/plaintext/tenant-a_config "));
+    assert!(paths[1].starts_with("POST /v1/transit/datakey/plaintext/tenant-a_config "));
+}
+
+#[tokio::test]
 async fn malformed_json_response() {
     let responses = Arc::new(Mutex::new(vec![MockResponse {
         status: 200,

@@ -24,7 +24,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::{
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::RwLock;
 use tracing::{error, instrument};
@@ -35,6 +35,8 @@ pub use error::VaultError;
 const KEY_ID_SCHEME: &str = "vault";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_RENEW_SKEW: Duration = Duration::from_secs(60);
+const TRANSIENT_RETRY_ATTEMPTS: usize = 2;
+const TRANSIENT_RETRY_BASE_DELAY: Duration = Duration::from_millis(25);
 
 /// Vault Transit key provider.
 #[derive(Clone)]
@@ -348,6 +350,7 @@ impl VaultKeyProvider {
         self.refresh_token_if_due().await?;
 
         let mut retried_auth = false;
+        let mut transient_retries = 0;
         let resp = loop {
             let token = self.current_token().await;
             match self.send_post_with_token(path, body, &token).await {
@@ -355,6 +358,13 @@ impl VaultKeyProvider {
                 Err(VaultRequestError::Forbidden) if !retried_auth => {
                     retried_auth = true;
                     self.reauthenticate().await?;
+                }
+                Err(VaultRequestError::Unavailable)
+                    if transient_retries < TRANSIENT_RETRY_ATTEMPTS =>
+                {
+                    let delay = transient_retry_delay(transient_retries);
+                    transient_retries += 1;
+                    tokio::time::sleep(delay).await;
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -412,6 +422,17 @@ impl VaultKeyProvider {
         let plaintext = Zeroizing::new(body.data.plaintext);
         decode_material(&plaintext)
     }
+}
+
+fn transient_retry_delay(retry_index: usize) -> Duration {
+    let multiplier = u64::try_from(retry_index)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let jitter_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::from(duration.subsec_nanos() % 11))
+        .unwrap_or(0);
+    TRANSIENT_RETRY_BASE_DELAY.saturating_mul(multiplier as u32) + Duration::from_millis(jitter_ms)
 }
 
 /// Decode base64 key material into a zeroizing 32-byte array.
