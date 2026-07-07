@@ -9,12 +9,14 @@ use std::time::{Duration, Instant};
 use opc_config_bus::{ConfigChange, ConfigEvent, ConfigReceiver, SubscriberLagPolicy};
 use opc_config_model::{
     CommitMode, CommitRequest, ConfigOperation, OpcConfig, RequestId, RequestSource, TransportType,
-    TrustedPrincipal, ValidationContext,
+    TrustedPrincipal, ValidationContext, YangPath,
 };
 use opc_mgmt_audit::{
     AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink, SchemaNodePath,
 };
-use opc_mgmt_authz::{AuthzError, ExecAuthorizer, PolicySource, ReadAction, ReadAuthorizer};
+use opc_mgmt_authz::{
+    AuthzError, ConfigWriteAuthorizer, ExecAuthorizer, PolicySource, ReadAction, ReadAuthorizer,
+};
 use opc_mgmt_errors::{commit_error_to_netconf, NetconfError, NetconfErrorTag, NetconfErrorType};
 use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_schema::ModelData;
@@ -257,6 +259,12 @@ impl DatastoreFailure {
             Self::Failed => RpcError::operation_failed(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupWriteAuthzFailure {
+    Denied,
+    Unavailable,
 }
 
 impl From<StartupDatastoreError> for DatastoreFailure {
@@ -3473,6 +3481,26 @@ where
             }
         };
 
+        match self.all_config_schema_paths().and_then(|paths| {
+            self.authorize_startup_write(context.principal, ConfigOperation::Delete, &paths)
+        }) {
+            Ok(()) => {}
+            Err(StartupWriteAuthzFailure::Denied) => {
+                return self.delete_config_failure_reply_for_rpc(
+                    &context,
+                    audit_denied("access-denied"),
+                    RpcError::access_denied(),
+                );
+            }
+            Err(StartupWriteAuthzFailure::Unavailable) => {
+                return self.delete_config_failure_reply_for_rpc(
+                    &context,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        }
+
         match startup.delete_startup_config() {
             Ok(()) => self.delete_config_success_reply(&context),
             Err(error) => self.delete_config_failure_reply(&context, error.into()),
@@ -3485,6 +3513,51 @@ where
             XmlDatastore::Candidate => self.binding.candidate_datastore_capability(),
             XmlDatastore::Startup => self.binding.startup_datastore_capability(),
         }
+    }
+
+    fn authorize_startup_write(
+        &self,
+        principal: &TrustedPrincipal,
+        operation: ConfigOperation,
+        changed_paths: &[YangPath],
+    ) -> Result<(), StartupWriteAuthzFailure> {
+        let authorizer =
+            ConfigWriteAuthorizer::new(self.binding.schema_registry(), self.authz.policy_source())
+                .map_err(|_| StartupWriteAuthzFailure::Unavailable)?;
+        let path_refs = changed_paths.iter().collect::<Vec<_>>();
+        let decisions = authorizer
+            .authorize_paths(principal, operation, &path_refs)
+            .map_err(|_| StartupWriteAuthzFailure::Unavailable)?;
+        if decisions.iter().any(|decision| !decision.allowed) {
+            return Err(StartupWriteAuthzFailure::Denied);
+        }
+        Ok(())
+    }
+
+    fn replacement_changed_paths(
+        &self,
+        candidate: &C,
+        previous: Option<&C>,
+    ) -> Result<Vec<YangPath>, StartupWriteAuthzFailure> {
+        if let Some(previous) = previous {
+            let deltas = candidate
+                .diff(previous)
+                .map_err(|_| StartupWriteAuthzFailure::Unavailable)?;
+            return candidate
+                .changed_paths(previous, &deltas)
+                .map_err(|_| StartupWriteAuthzFailure::Unavailable);
+        }
+        self.all_config_schema_paths()
+    }
+
+    fn all_config_schema_paths(&self) -> Result<Vec<YangPath>, StartupWriteAuthzFailure> {
+        self.binding
+            .schema_registry()
+            .nodes()
+            .iter()
+            .filter(|node| node.config)
+            .map(|node| YangPath::new(node.path).map_err(|_| StartupWriteAuthzFailure::Unavailable))
+            .collect()
     }
 
     fn load_datastore_config(&self, datastore: XmlDatastore) -> Result<C, DatastoreFailure> {
@@ -3646,10 +3719,47 @@ where
             }
         };
         if self
-            .validate_config_for_datastore(&source, context, ConfigOperation::Replace, previous)
+            .validate_config_for_datastore(
+                &source,
+                context,
+                ConfigOperation::Replace,
+                previous.clone(),
+            )
             .is_err()
         {
             return self.copy_config_failure_reply(context, DatastoreFailure::Failed);
+        }
+        let changed_paths = match self.replacement_changed_paths(&source, previous.as_deref()) {
+            Ok(paths) => paths,
+            Err(StartupWriteAuthzFailure::Denied) => unreachable!("path diff cannot deny"),
+            Err(StartupWriteAuthzFailure::Unavailable) => {
+                return self.copy_config_failure_reply_for_rpc(
+                    context,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        };
+        match self.authorize_startup_write(
+            context.principal,
+            ConfigOperation::Replace,
+            &changed_paths,
+        ) {
+            Ok(()) => {}
+            Err(StartupWriteAuthzFailure::Denied) => {
+                return self.copy_config_failure_reply_for_rpc(
+                    context,
+                    audit_denied("access-denied"),
+                    RpcError::access_denied(),
+                );
+            }
+            Err(StartupWriteAuthzFailure::Unavailable) => {
+                return self.copy_config_failure_reply_for_rpc(
+                    context,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
         }
         match startup.store_startup_config(&source) {
             Ok(()) => self.copy_config_success_reply(
@@ -4460,6 +4570,19 @@ where
                 );
             }
         };
+        let changed_paths = match self.replacement_changed_paths(&candidate.candidate, Some(&base))
+        {
+            Ok(paths) => paths,
+            Err(StartupWriteAuthzFailure::Denied) => unreachable!("path diff cannot deny"),
+            Err(StartupWriteAuthzFailure::Unavailable) => {
+                return self.edit_config_failure_reply(
+                    context,
+                    kind,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        };
         let previous = Some(Arc::new(base));
         if self
             .validate_config_for_datastore(
@@ -4476,6 +4599,29 @@ where
                 audit_failed("operation-failed"),
                 RpcError::operation_failed(),
             );
+        }
+        match self.authorize_startup_write(
+            context.principal,
+            ConfigOperation::Patch,
+            &changed_paths,
+        ) {
+            Ok(()) => {}
+            Err(StartupWriteAuthzFailure::Denied) => {
+                return self.edit_config_failure_reply(
+                    context,
+                    kind,
+                    audit_denied("access-denied"),
+                    RpcError::access_denied(),
+                );
+            }
+            Err(StartupWriteAuthzFailure::Unavailable) => {
+                return self.edit_config_failure_reply(
+                    context,
+                    kind,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
         }
         match startup.store_startup_config(&candidate.candidate) {
             Ok(()) => {}
@@ -4497,7 +4643,7 @@ where
             }
         }
 
-        let paths = self.schema_paths_for_changed_paths(&candidate.changed_paths, kind.path());
+        let paths = self.schema_paths_for_changed_paths(&changed_paths, kind.path());
         if self
             .audit
             .record(
@@ -6938,7 +7084,79 @@ mod tests {
             .expect("module");
         register_netconf_module(&mut modules);
         register_netconf_nmda_module(&mut modules);
-        NacmPolicy::builder(PolicyVersion::new(1))
+        let mut builder = NacmPolicy::builder(PolicyVersion::new(1))
+            .add_rule(NacmRule::deny(
+                NacmAction::Read,
+                YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
+            ))
+            .add_rule(NacmRule::deny(
+                NacmAction::Subscribe,
+                YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
+            ))
+            .add_rule(NacmRule::deny(
+                NacmAction::Create,
+                YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
+            ))
+            .add_rule(NacmRule::deny(
+                NacmAction::Update,
+                YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
+            ))
+            .add_rule(NacmRule::deny(
+                NacmAction::Replace,
+                YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
+            ))
+            .add_rule(NacmRule::deny(
+                NacmAction::Delete,
+                YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
+            ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Read,
+                YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
+            ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Subscribe,
+                YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
+            ));
+        for action in [
+            NacmAction::Create,
+            NacmAction::Update,
+            NacmAction::Replace,
+            NacmAction::Delete,
+        ] {
+            builder = builder
+                .add_rule(NacmRule::allow(
+                    action,
+                    YangPathPattern::parse("/sys:system", &modules).expect("allow root path"),
+                ))
+                .add_rule(NacmRule::allow(
+                    action,
+                    YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
+                ));
+        }
+        builder
+            .add_rule(allow_close_session_rule(&modules))
+            .add_rule(allow_lock_rule(&modules))
+            .add_rule(allow_unlock_rule(&modules))
+            .add_rule(allow_validate_rule(&modules))
+            .add_rule(allow_commit_rule(&modules))
+            .add_rule(allow_cancel_commit_rule(&modules))
+            .add_rule(allow_discard_changes_rule(&modules))
+            .add_rule(allow_copy_config_rule(&modules))
+            .add_rule(allow_delete_config_rule(&modules))
+            .add_rule(allow_edit_config_rule(&modules))
+            .add_rule(allow_edit_data_rule(&modules))
+            .add_rule(allow_kill_session_rule(&modules))
+            .build()
+    }
+
+    fn policy_allow_system_with_secret_writes() -> NacmPolicy {
+        let mut modules = ModuleRegistry::new();
+        modules
+            .register_module("demo-system", "sys")
+            .expect("module");
+        register_netconf_module(&mut modules);
+        register_netconf_nmda_module(&mut modules);
+        let mut builder = NacmPolicy::builder(PolicyVersion::new(1))
             .add_rule(NacmRule::deny(
                 NacmAction::Read,
                 YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
@@ -6954,7 +7172,24 @@ mod tests {
             .add_rule(NacmRule::allow(
                 NacmAction::Subscribe,
                 YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
-            ))
+            ));
+        for action in [
+            NacmAction::Create,
+            NacmAction::Update,
+            NacmAction::Replace,
+            NacmAction::Delete,
+        ] {
+            builder = builder
+                .add_rule(NacmRule::allow(
+                    action,
+                    YangPathPattern::parse("/sys:system", &modules).expect("allow root path"),
+                ))
+                .add_rule(NacmRule::allow(
+                    action,
+                    YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
+                ));
+        }
+        builder
             .add_rule(allow_close_session_rule(&modules))
             .add_rule(allow_lock_rule(&modules))
             .add_rule(allow_unlock_rule(&modules))
@@ -12467,6 +12702,17 @@ mod tests {
         Arc<MemoryStartupDatastore>,
         CapturingAudit,
     ) {
+        generated_edit_server_with_startup_policy(policy_allow_system_but_deny_secret()).await
+    }
+
+    async fn generated_edit_server_with_startup_policy(
+        policy: NacmPolicy,
+    ) -> (
+        ReadOnlyNetconfServer<DemoConfig, GeneratedEditBinding, FixedPolicy, CapturingAudit>,
+        Arc<ConfigBus<DemoConfig>>,
+        Arc<MemoryStartupDatastore>,
+        CapturingAudit,
+    ) {
         let store = Arc::new(MockManagedDatastore::new());
         store
             .seed(StoredConfig::new(
@@ -12505,7 +12751,7 @@ mod tests {
         let audit = CapturingAudit::default();
         let server = ReadOnlyNetconfServer::new(
             binding,
-            FixedPolicy(policy_allow_system_but_deny_secret()),
+            FixedPolicy(policy),
             audit.clone(),
             TransportType::NetconfTls,
         )
@@ -12876,10 +13122,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_config_startup_enforces_write_nacm() {
+        let (server, _bus, startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_config_rpc_to(
+            "startup",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:secret>persisted-admin</sys:secret></sys:system>"#,
+            "merge",
+        );
+        let edited = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(
+            edited
+                .reply_xml
+                .contains("<error-tag>access-denied</error-tag>"),
+            "{}",
+            edited.reply_xml
+        );
+        assert_eq!(
+            startup.current().expect("startup config").secret,
+            "startup-secret"
+        );
+    }
+
+    #[tokio::test]
     async fn copy_config_running_to_startup_and_startup_to_running() {
         let (server, bus, startup, _audit) = generated_edit_server_with_startup_fixture().await;
         let registry = SessionRegistry::new();
         let _registration = registry.register(1).expect("register session 1");
+
+        startup
+            .store_startup_config(&DemoConfig {
+                hostname: "boot-1".to_string(),
+                secret: "do-not-leak".to_string(),
+            })
+            .expect("align startup secret");
 
         let copied_to_startup = server
             .handle_rpc_for_session_async(
@@ -12901,7 +13189,7 @@ mod tests {
         startup
             .store_startup_config(&DemoConfig {
                 hostname: "boot-3".to_string(),
-                secret: "startup-secret".to_string(),
+                secret: "do-not-leak".to_string(),
             })
             .expect("store startup");
 
@@ -12924,8 +13212,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copy_config_to_startup_enforces_write_nacm() {
+        let (server, _bus, startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let copied = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &copy_config_rpc("startup", "running"),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(
+            copied
+                .reply_xml
+                .contains("<error-tag>access-denied</error-tag>"),
+            "{}",
+            copied.reply_xml
+        );
+        let startup_config = startup.current().expect("startup config");
+        assert_eq!(startup_config.hostname, "boot-1");
+        assert_eq!(startup_config.secret, "startup-secret");
+    }
+
+    #[tokio::test]
     async fn delete_config_startup_removes_startup_only_when_delete_supported() {
-        let (server, bus, startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        let (server, bus, startup, _audit) =
+            generated_edit_server_with_startup_policy(policy_allow_system_with_secret_writes())
+                .await;
         let registry = SessionRegistry::new();
         let _registration = registry.register(1).expect("register session 1");
 
@@ -12958,6 +13277,33 @@ mod tests {
             "missing startup reply: {}",
             missing.reply_xml
         );
+    }
+
+    #[tokio::test]
+    async fn delete_config_startup_enforces_write_nacm() {
+        let (server, _bus, startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let deleted = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &delete_config_rpc("startup"),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(
+            deleted
+                .reply_xml
+                .contains("<error-tag>access-denied</error-tag>"),
+            "{}",
+            deleted.reply_xml
+        );
+        assert!(startup.current().is_some());
     }
 
     #[tokio::test]

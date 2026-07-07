@@ -671,6 +671,23 @@ fn policy_allow_system_discovery_and_exec_but_deny_secret() -> NacmPolicy {
                 .expect("allow monitoring path"),
         ));
 
+    for action in [
+        NacmAction::Create,
+        NacmAction::Update,
+        NacmAction::Replace,
+        NacmAction::Delete,
+    ] {
+        builder = builder
+            .add_rule(NacmRule::allow(
+                action,
+                YangPathPattern::parse("/sys:system", &modules).expect("allow system root path"),
+            ))
+            .add_rule(NacmRule::allow(
+                action,
+                YangPathPattern::parse("/sys:system/**", &modules).expect("allow system path"),
+            ));
+    }
+
     for path in [
         "/nc:close-session",
         "/nc:edit-config",
