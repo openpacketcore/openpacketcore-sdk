@@ -88,7 +88,7 @@ const NETCONF_CREATE_SUBSCRIPTION_PATH: &str = "/ncn:create-subscription";
 const NETCONF_NOTIFICATION_STREAM: &str = "NETCONF";
 const NETCONF_NOTIFICATION_NS: &str = "urn:ietf:params:xml:ns:netconf:notification:1.0";
 const NETCONF_CONFIG_CHANGE_NS: &str = "urn:ietf:params:xml:ns:yang:ietf-netconf-notifications";
-const NOTIFICATION_EVENT_BYTES_ESTIMATE: usize = 4096;
+const MIN_NOTIFICATION_EVENT_BYTES_ESTIMATE: usize = 4096;
 const MAX_NOTIFICATION_EVENT_CAPACITY: usize = 4096;
 const DEFAULT_CONFIRMED_COMMIT_TIMEOUT_SECS: u32 = 600;
 
@@ -1294,7 +1294,7 @@ where
 
         let receiver = self.binding.config_bus().subscribe(
             SubscriberLagPolicy::DisconnectOnLag,
-            notification_capacity(limits),
+            notification_capacity::<C>(limits),
         );
         record_rpc_success(metric_operation, context.started.elapsed());
         RpcSessionHandlingResult::with_action(
@@ -5664,8 +5664,15 @@ fn schema_node_paths(paths: &[&'static str]) -> Vec<SchemaNodePath> {
         .collect::<Vec<_>>()
 }
 
-fn notification_capacity(limits: &MgmtLimits) -> usize {
-    (limits.max_subscriber_queue_bytes / NOTIFICATION_EVENT_BYTES_ESTIMATE)
+fn notification_event_bytes_estimate<C: OpcConfig>() -> usize {
+    std::mem::size_of::<ConfigEvent<C>>()
+        .saturating_add(std::mem::size_of::<C>().saturating_mul(2))
+        .saturating_add(std::mem::size_of::<C::Delta>())
+        .max(MIN_NOTIFICATION_EVENT_BYTES_ESTIMATE)
+}
+
+fn notification_capacity<C: OpcConfig>(limits: &MgmtLimits) -> usize {
+    (limits.max_subscriber_queue_bytes / notification_event_bytes_estimate::<C>())
         .clamp(1, MAX_NOTIFICATION_EVENT_CAPACITY)
 }
 
@@ -5794,6 +5801,46 @@ mod tests {
                 paths.push(YangPath::new("/sys:system/sys:secret").expect("secret path"));
             }
             Ok(paths)
+        }
+
+        fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), ConfigError> {
+            Ok(())
+        }
+
+        fn validate_syntax(&self) -> Result<(), ValidationError> {
+            Ok(())
+        }
+
+        fn validate_semantics(
+            &self,
+            _ctx: &ValidationContext<Self>,
+        ) -> Result<(), ValidationError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct LargeNotificationConfig {
+        _payload: [u8; 8192],
+    }
+
+    impl OpcConfig for LargeNotificationConfig {
+        type Delta = ();
+
+        fn schema_digest(&self) -> SchemaDigest {
+            SchemaDigest::from_bytes([8u8; 32])
+        }
+
+        fn diff(&self, _previous: &Self) -> Result<Vec<Self::Delta>, ConfigError> {
+            Ok(Vec::new())
+        }
+
+        fn changed_paths(
+            &self,
+            _previous: &Self,
+            _deltas: &[Self::Delta],
+        ) -> Result<Vec<YangPath>, ConfigError> {
+            Ok(Vec::new())
         }
 
         fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), ConfigError> {
@@ -7346,6 +7393,20 @@ mod tests {
             .add_rule(allow_discard_changes_rule(&modules))
             .add_rule(allow_kill_session_rule(&modules))
             .build()
+    }
+
+    #[test]
+    fn notification_capacity_uses_config_specific_event_estimate() {
+        let limits = MgmtLimits {
+            max_subscriber_queue_bytes: 64 * 1024,
+            ..MgmtLimits::default()
+        };
+
+        let estimate = notification_event_bytes_estimate::<LargeNotificationConfig>();
+        let capacity = notification_capacity::<LargeNotificationConfig>(&limits);
+
+        assert!(estimate > 4096);
+        assert!(capacity * estimate <= limits.max_subscriber_queue_bytes);
     }
 
     fn policy_allow_system_and_yang_library_but_deny_secret() -> NacmPolicy {
