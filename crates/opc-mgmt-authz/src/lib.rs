@@ -25,6 +25,10 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use opc_config_bus::{AuthorizationContext, AuthorizationError, ConfigAuthorizer};
@@ -67,7 +71,7 @@ impl ReadAction {
 ///   case the caller fails closed (denies / returns `UNAVAILABLE`).
 pub trait PolicySource: Send + Sync {
     /// Returns the active compiled NACM policy for `tenant`.
-    fn active_policy(&self, tenant: &str) -> Result<NacmPolicy, AuthzError>;
+    fn active_policy(&self, tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError>;
 
     /// Returns the active compiled NACM policy for a fully resolved principal.
     ///
@@ -78,7 +82,7 @@ pub trait PolicySource: Send + Sync {
     fn active_policy_for_principal(
         &self,
         principal: &TrustedPrincipal,
-    ) -> Result<NacmPolicy, AuthzError> {
+    ) -> Result<Arc<NacmPolicy>, AuthzError> {
         self.active_policy(principal.tenant.as_str())
     }
 
@@ -104,14 +108,14 @@ impl<T> PolicySource for &T
 where
     T: PolicySource + ?Sized,
 {
-    fn active_policy(&self, tenant: &str) -> Result<NacmPolicy, AuthzError> {
+    fn active_policy(&self, tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
         (*self).active_policy(tenant)
     }
 
     fn active_policy_for_principal(
         &self,
         principal: &TrustedPrincipal,
-    ) -> Result<NacmPolicy, AuthzError> {
+    ) -> Result<Arc<NacmPolicy>, AuthzError> {
         (*self).active_policy_for_principal(principal)
     }
 
@@ -123,11 +127,34 @@ where
     }
 }
 
+impl<T> PolicySource for Arc<T>
+where
+    T: PolicySource + ?Sized,
+{
+    fn active_policy(&self, tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
+        self.as_ref().active_policy(tenant)
+    }
+
+    fn active_policy_for_principal(
+        &self,
+        principal: &TrustedPrincipal,
+    ) -> Result<Arc<NacmPolicy>, AuthzError> {
+        self.as_ref().active_policy_for_principal(principal)
+    }
+
+    fn active_policy_context_for_principal(
+        &self,
+        principal: &TrustedPrincipal,
+    ) -> Result<ResolvedPolicy, AuthzError> {
+        self.as_ref().active_policy_context_for_principal(principal)
+    }
+}
+
 /// Active policy selection and effective principal used for one authorization.
 #[derive(Debug, Clone)]
 pub struct ResolvedPolicy {
     /// Compiled NACM policy selected for the principal.
-    pub policy: NacmPolicy,
+    pub policy: Arc<NacmPolicy>,
     /// Principal after any signed authorization grants have been attached.
     pub principal: TrustedPrincipal,
     /// Optional implementation-specific policy mode for operator diagnostics.
@@ -135,7 +162,7 @@ pub struct ResolvedPolicy {
 }
 
 impl ResolvedPolicy {
-    pub fn new(policy: NacmPolicy, principal: TrustedPrincipal) -> Self {
+    pub fn new(policy: Arc<NacmPolicy>, principal: TrustedPrincipal) -> Self {
         Self {
             policy,
             principal,
@@ -192,6 +219,9 @@ pub struct ReadAuthorizer<'r, P: PolicySource> {
     registry: &'r dyn SchemaRegistry,
     modules: ModuleRegistry,
     source: P,
+    evaluator: Mutex<NacmEvaluator>,
+    #[cfg(test)]
+    cache_hits: AtomicUsize,
 }
 
 impl<'r, P: PolicySource> ReadAuthorizer<'r, P> {
@@ -204,6 +234,9 @@ impl<'r, P: PolicySource> ReadAuthorizer<'r, P> {
             registry,
             modules,
             source,
+            evaluator: Mutex::new(NacmEvaluator::new()),
+            #[cfg(test)]
+            cache_hits: AtomicUsize::new(0),
         })
     }
 
@@ -215,6 +248,11 @@ impl<'r, P: PolicySource> ReadAuthorizer<'r, P> {
     /// Returns the policy source used by this authorizer.
     pub fn policy_source(&self) -> &P {
         &self.source
+    }
+
+    #[cfg(test)]
+    fn cache_hits(&self) -> usize {
+        self.cache_hits.load(Ordering::Relaxed)
     }
 
     /// Authorizes a read action against each path for the principal's tenant.
@@ -233,9 +271,7 @@ impl<'r, P: PolicySource> ReadAuthorizer<'r, P> {
         let policy = &resolved.policy;
         let authz_principal = &resolved.principal;
         let nacm_action = action.to_nacm();
-        // A fresh evaluator per call: caches within this batch and stays `&self`
-        // / Send-friendly for a concurrent server.
-        let mut evaluator = NacmEvaluator::new();
+        let mut evaluator = lock_evaluator(&self.evaluator);
 
         let decisions: Vec<_> = paths
             .iter()
@@ -248,9 +284,19 @@ impl<'r, P: PolicySource> ReadAuthorizer<'r, P> {
                 };
                 let schema_path = node.path.to_string();
                 let allowed = match YangPath::parse(node.path, &self.modules) {
-                    Ok(parsed) => evaluator
-                        .evaluate_for_groups(policy, &parsed, nacm_action, &authz_principal.groups)
-                        .is_allowed(),
+                    Ok(parsed) => {
+                        let decision = evaluator.evaluate_for_groups(
+                            policy,
+                            &parsed,
+                            nacm_action,
+                            &authz_principal.groups,
+                        );
+                        #[cfg(test)]
+                        if decision.cache_hit() {
+                            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        decision.is_allowed()
+                    }
                     // Unparseable / unknown-prefix canonical path: deny.
                     Err(_) => false,
                 };
@@ -298,6 +344,7 @@ pub struct ConfigWriteAuthorizer<'r, P: PolicySource> {
     registry: &'r dyn SchemaRegistry,
     modules: ModuleRegistry,
     source: P,
+    evaluator: Mutex<NacmEvaluator>,
 }
 
 impl<'r, P: PolicySource> ConfigWriteAuthorizer<'r, P> {
@@ -309,6 +356,7 @@ impl<'r, P: PolicySource> ConfigWriteAuthorizer<'r, P> {
             registry,
             modules,
             source,
+            evaluator: Mutex::new(NacmEvaluator::new()),
         })
     }
 
@@ -355,7 +403,7 @@ impl<'r, P: PolicySource> ConfigWriteAuthorizer<'r, P> {
         let authz_principal = &resolved.principal;
         let nacm_action = primary_write_action_for_operation(operation);
         let required_actions = write_actions_for_operation(operation);
-        let mut evaluator = NacmEvaluator::new();
+        let mut evaluator = lock_evaluator(&self.evaluator);
 
         let decisions: Vec<_> = paths
             .iter()
@@ -438,6 +486,7 @@ where
 pub struct ExecAuthorizer<P: PolicySource> {
     modules: ModuleRegistry,
     source: P,
+    evaluator: Mutex<NacmEvaluator>,
 }
 
 impl<P: PolicySource> ExecAuthorizer<P> {
@@ -447,6 +496,7 @@ impl<P: PolicySource> ExecAuthorizer<P> {
         Ok(Self {
             modules: module_registry_from_models(models)?,
             source,
+            evaluator: Mutex::new(NacmEvaluator::new()),
         })
     }
 
@@ -478,7 +528,7 @@ impl<P: PolicySource> ExecAuthorizer<P> {
             );
             return Ok(false);
         };
-        let mut evaluator = NacmEvaluator::new();
+        let mut evaluator = lock_evaluator(&self.evaluator);
         let allowed = evaluator
             .evaluate_for_groups(policy, &path, NacmAction::Exec, &authz_principal.groups)
             .is_allowed();
@@ -513,6 +563,12 @@ fn primary_write_action_for_operation(operation: ConfigOperation) -> NacmAction 
         ConfigOperation::Delete => NacmAction::Delete,
         ConfigOperation::Rollback => NacmAction::Replace,
     }
+}
+
+fn lock_evaluator(evaluator: &Mutex<NacmEvaluator>) -> MutexGuard<'_, NacmEvaluator> {
+    evaluator
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn module_registry_from_models(models: &[ModelData]) -> Result<ModuleRegistry, AuthzError> {
@@ -724,6 +780,7 @@ mod tests {
     use opc_mgmt_schema::{DataClass, LeafType, ModelData, NodeKind, NodeMeta, OriginEntry};
     use opc_nacm::{NacmPolicy, NacmRule, NacmRuleList, PolicyVersion, YangPathPattern};
     use opc_types::{SpiffeId, TenantId};
+    use std::sync::Arc;
 
     struct TestReg;
 
@@ -816,16 +873,23 @@ mod tests {
     /// A policy source returning a fixed policy.
     struct FixedPolicy(NacmPolicy);
     impl PolicySource for FixedPolicy {
-        fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
-            Ok(self.0.clone())
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
+            Ok(Arc::new(self.0.clone()))
         }
     }
 
     /// A policy source that always errors (store unavailable).
     struct BrokenPolicy;
     impl PolicySource for BrokenPolicy {
-        fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
             Err(AuthzError::PolicyUnavailable)
+        }
+    }
+
+    struct SharedPolicy(Arc<NacmPolicy>);
+    impl PolicySource for SharedPolicy {
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
+            Ok(Arc::clone(&self.0))
         }
     }
 
@@ -833,21 +897,21 @@ mod tests {
     /// using this source fail if an authorizer regresses to tenant-only lookup.
     struct PrincipalAwarePolicy;
     impl PolicySource for PrincipalAwarePolicy {
-        fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
-            Ok(NacmPolicy::empty(PolicyVersion::new(1)))
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
+            Ok(Arc::new(NacmPolicy::empty(PolicyVersion::new(1))))
         }
 
         fn active_policy_for_principal(
             &self,
             principal: &TrustedPrincipal,
-        ) -> Result<NacmPolicy, AuthzError> {
+        ) -> Result<Arc<NacmPolicy>, AuthzError> {
             if principal.groups.iter().any(|group| group == "selected") {
-                Ok(allow_writes(
+                Ok(Arc::new(allow_writes(
                     &[NacmAction::Create, NacmAction::Update],
                     "/sys:system/sys:hostname",
-                ))
+                )))
             } else {
-                Ok(NacmPolicy::empty(PolicyVersion::new(1)))
+                Ok(Arc::new(NacmPolicy::empty(PolicyVersion::new(1))))
             }
         }
     }
@@ -857,8 +921,8 @@ mod tests {
     /// transport principal instead of the effective signed-grant principal.
     struct ResolvedGroupPolicy;
     impl PolicySource for ResolvedGroupPolicy {
-        fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
-            Ok(NacmPolicy::empty(PolicyVersion::new(1)))
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
+            Ok(Arc::new(NacmPolicy::empty(PolicyVersion::new(1))))
         }
 
         fn active_policy_context_for_principal(
@@ -866,11 +930,11 @@ mod tests {
             principal: &TrustedPrincipal,
         ) -> Result<ResolvedPolicy, AuthzError> {
             Ok(ResolvedPolicy::new(
-                group_writes(
+                Arc::new(group_writes(
                     "resolved-writer",
                     &[NacmAction::Create, NacmAction::Update],
                     "/sys:system/sys:hostname",
-                ),
+                )),
                 principal.clone().with_groups(["resolved-writer"]),
             )
             .with_mode("production-write"))
@@ -1190,6 +1254,32 @@ mod tests {
         assert!(!authz
             .may(&principal(), ReadAction::Read, "/sys:system/sys:secret")
             .expect("may"));
+    }
+
+    #[test]
+    fn policy_source_returns_shared_policy_arc() {
+        let source = SharedPolicy(Arc::new(allow_read("/sys:system/sys:hostname")));
+        let policy = source.active_policy("acme").expect("policy");
+        let _: Arc<NacmPolicy> = policy;
+    }
+
+    #[test]
+    fn read_authorizer_reuses_evaluator_cache_across_calls() {
+        let authz = ReadAuthorizer::new(
+            &TestReg,
+            SharedPolicy(Arc::new(allow_read("/sys:system/sys:hostname"))),
+        )
+        .expect("authorizer");
+
+        assert_eq!(authz.cache_hits(), 0);
+        assert!(authz
+            .may(&principal(), ReadAction::Read, "/sys:system/sys:hostname")
+            .expect("first may"));
+        assert_eq!(authz.cache_hits(), 0);
+        assert!(authz
+            .may(&principal(), ReadAction::Read, "/sys:system/sys:hostname")
+            .expect("second may"));
+        assert_eq!(authz.cache_hits(), 1);
     }
 
     #[test]

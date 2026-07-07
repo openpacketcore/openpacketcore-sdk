@@ -437,8 +437,8 @@ mod tests {
 
     use hyper_util::rt::TokioIo;
     use opc_config_bus::{ConfigBus, MockManagedDatastore};
-    use opc_mgmt_authz::{AuthzError, PolicySource};
     use opc_mgmt_audit::{AuditError, AuditEvent, AuditSink};
+    use opc_mgmt_authz::{AuthzError, PolicySource};
     use opc_mgmt_opstate::{
         OperationalError, OperationalRequest, OperationalResponse, OperationalStateProvider,
     };
@@ -518,8 +518,10 @@ mod tests {
     struct EmptyPolicy;
 
     impl PolicySource for EmptyPolicy {
-        fn active_policy(&self, _tenant: &str) -> Result<opc_nacm::NacmPolicy, AuthzError> {
-            Ok(opc_nacm::NacmPolicy::empty(opc_nacm::PolicyVersion::new(1)))
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<opc_nacm::NacmPolicy>, AuthzError> {
+            Ok(Arc::new(opc_nacm::NacmPolicy::empty(
+                opc_nacm::PolicyVersion::new(1),
+            )))
         }
     }
 

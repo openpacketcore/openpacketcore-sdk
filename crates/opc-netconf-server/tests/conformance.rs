@@ -390,8 +390,8 @@ impl AuditSink for NoopAudit {
 struct FixedPolicy(NacmPolicy);
 
 impl PolicySource for FixedPolicy {
-    fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
-        Ok(self.0.clone())
+    fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
+        Ok(Arc::new(self.0.clone()))
     }
 }
 

@@ -727,8 +727,8 @@ mod tests {
     struct FixedPolicy(NacmPolicy);
 
     impl PolicySource for FixedPolicy {
-        fn active_policy(&self, _tenant: &str) -> Result<opc_nacm::NacmPolicy, AuthzError> {
-            Ok(self.0.clone())
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<opc_nacm::NacmPolicy>, AuthzError> {
+            Ok(Arc::new(self.0.clone()))
         }
     }
 
@@ -810,7 +810,7 @@ mod tests {
     struct BrokenPolicy;
 
     impl PolicySource for BrokenPolicy {
-        fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
             Err(AuthzError::PolicyUnavailable)
         }
     }

@@ -6949,15 +6949,15 @@ mod tests {
     struct FixedPolicy(NacmPolicy);
 
     impl PolicySource for FixedPolicy {
-        fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
-            Ok(self.0.clone())
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
+            Ok(Arc::new(self.0.clone()))
         }
     }
 
     struct BrokenPolicySource;
 
     impl PolicySource for BrokenPolicySource {
-        fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
             Err(AuthzError::PolicyUnavailable)
         }
     }

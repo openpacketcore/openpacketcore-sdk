@@ -1166,8 +1166,8 @@ mod tests {
         parse_certs_pem, parse_key_pem, IdentityState, SvidDocument, TrustBundle, TrustBundleSet,
         TrustDomain, WorkloadIdentity,
     };
-    use opc_mgmt_authz::{AuthzError, ConfigWriteAuthorizer, PolicySource, ResolvedPolicy};
     use opc_mgmt_audit::{AuditError, AuditEvent, AuditSink};
+    use opc_mgmt_authz::{AuthzError, ConfigWriteAuthorizer, PolicySource, ResolvedPolicy};
     use opc_mgmt_opstate::{
         OperationalError, OperationalRequest, OperationalResponse, OperationalStateProvider,
     };
@@ -1335,8 +1335,8 @@ mod tests {
     struct AllowPolicy;
 
     impl PolicySource for AllowPolicy {
-        fn active_policy(&self, _tenant: &str) -> Result<opc_nacm::NacmPolicy, AuthzError> {
-            Ok(allow_policy())
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<opc_nacm::NacmPolicy>, AuthzError> {
+            Ok(Arc::new(allow_policy()))
         }
     }
 
@@ -1354,8 +1354,8 @@ mod tests {
     }
 
     impl PolicySource for GrantBackedPolicy {
-        fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
-            Ok(read_policy())
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
+            Ok(Arc::new(read_policy()))
         }
 
         fn active_policy_context_for_principal(
@@ -1365,10 +1365,15 @@ mod tests {
             let granted = attach_signed_grants_from_source(principal.clone(), self.grants.as_ref())
                 .map_err(|_| AuthzError::PolicyUnavailable)?;
             if granted.groups.iter().any(|group| group == "gnmi-writers") {
-                Ok(ResolvedPolicy::new(grant_backed_policy(), granted)
-                    .with_mode("production-write"))
+                Ok(
+                    ResolvedPolicy::new(Arc::new(grant_backed_policy()), granted)
+                        .with_mode("production-write"),
+                )
             } else {
-                Ok(ResolvedPolicy::new(grant_backed_policy(), granted).with_mode("read-only"))
+                Ok(
+                    ResolvedPolicy::new(Arc::new(grant_backed_policy()), granted)
+                        .with_mode("read-only"),
+                )
             }
         }
     }
