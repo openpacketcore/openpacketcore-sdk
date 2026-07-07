@@ -1000,6 +1000,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tls_listener_enforces_max_request_bytes_over_real_mtls() {
+        let state =
+            identity_state("spiffe://test-domain/tenant/test/ns/default/sa/gnmi/nf/amf/instance/0");
+        let (_identity_tx, identity_rx) = watch::channel(Some(state));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = ShutdownToken::new();
+        let limits = opc_mgmt_limits::MgmtLimits {
+            max_request_bytes: 512,
+            max_value_bytes: 256,
+            max_xpath_filter_bytes: 256,
+            ..Default::default()
+        };
+        let listener_task = tokio::spawn(run_gnmi_tls_listener(
+            server_with_limits(limits).await,
+            listener,
+            TlsBootstrap::new(RuntimeMode::Production, peer_policy()),
+            identity_rx.clone(),
+            shutdown.clone(),
+            GnmiListenerConfig {
+                handshake_timeout: Duration::from_secs(5),
+                incoming_channel_capacity: 4,
+                ..GnmiListenerConfig::default()
+            },
+        ));
+
+        let mut grpc = connect_client(addr, identity_rx).await;
+        grpc.ready().await.expect("oversized get ready");
+        let status = grpc
+            .unary(
+                Request::new(gnmi::GetRequest {
+                    prefix: None,
+                    path: Vec::new(),
+                    r#type: gnmi::get_request::DataType::All as i32,
+                    encoding: gnmi::Encoding::JsonIetf as i32,
+                    use_models: vec![gnmi::ModelData {
+                        name: "x".repeat(2048),
+                        organization: String::new(),
+                        version: String::new(),
+                    }],
+                    extension: Vec::new(),
+                }),
+                PathAndQuery::from_static("/gnmi.gNMI/Get"),
+                ProstCodec::<gnmi::GetRequest, gnmi::GetResponse>::default(),
+            )
+            .await
+            .expect_err("oversized request rejected");
+
+        assert_eq!(status.code(), tonic::Code::OutOfRange);
+
+        drop(grpc);
+        shutdown.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), listener_task)
+            .await
+            .expect("listener timeout")
+            .expect("listener join")
+            .expect("listener result");
+    }
+
+    #[tokio::test]
     async fn tls_listener_enforces_max_sessions_without_peer_leak() {
         let state =
             identity_state("spiffe://test-domain/tenant/test/ns/default/sa/gnmi/nf/amf/instance/0");
