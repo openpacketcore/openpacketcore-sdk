@@ -359,6 +359,114 @@ func TestReconcileBlockedPreflight(t *testing.T) {
 	}
 }
 
+func TestReconcileInvalidCompatibilityMetadataBlocksProduction(t *testing.T) {
+	testutil.BuildOperatorLifecycleCLI(t)
+
+	bridge, err := sdkbridge.NewBridge()
+	if err != nil {
+		t.Fatalf("Failed to create bridge: %v", err)
+	}
+
+	numa := uint16(0)
+	evidenceID := "platform-preflight-ev-1"
+	crd := &apiv1beta1.SdkManagedNetworkFunction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "bad-compat-cnf",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: apiv1beta1.SdkManagedNetworkFunctionSpec{
+			RuntimeMode:    "production",
+			ClaimsHA:       false,
+			ConfigBackend:  "consensus",
+			SessionBackend: "quorum",
+			AdminAuthRef: corev1.LocalObjectReference{
+				Name: "my-token-secret",
+			},
+			Identity: apiv1beta1.IdentityRequirements{
+				KmsEnabled:    true,
+				SpiffeEnabled: true,
+			},
+			ResourceProfile: &apiv1beta1.ResourceProfileSpec{
+				NfKind:                    "upf",
+				DataPlaneProfile:          "AfXdpFastPath",
+				NumaPolicy:                "Require",
+				GenericXdpFallbackAllowed: false,
+				IsolatedCores:             []uint16{2, 3},
+				RequireExclusiveCores:     true,
+				DataPlaneInterfaces:       []string{"ens5f0"},
+				DataPlaneNumaNode:         &numa,
+				HugepageNumaNode:          &numa,
+				PodSecurityEvidenceID:     &evidenceID,
+				BpfArtifacts:              []apiv1beta1.BpfArtifact{validAPIBpfArtifact("ens5f0", evidenceID)},
+			},
+			CompatibilityRef: &corev1.LocalObjectReference{Name: "bad-compat"},
+			Version:          "1.0.0",
+		},
+		Status: apiv1beta1.SdkManagedNetworkFunctionStatus{
+			Phase: "Pending",
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	_ = apiv1beta1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	nodeReport, err := json.Marshal(validNodeCapabilityReport())
+	if err != nil {
+		t.Fatalf("Failed to marshal node capability report: %v", err)
+	}
+	nodeCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "node-capability-report",
+			Namespace: "default",
+		},
+		Data: map[string]string{"report.json": string(nodeReport)},
+	}
+	compatCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "bad-compat",
+			Namespace: "default",
+		},
+		Data: map[string]string{"matrix.json": `{"nfKind":`},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(crd, nodeCM, compatCM).
+		WithStatusSubresource(&apiv1beta1.SdkManagedNetworkFunction{}).
+		Build()
+
+	reconciler := &SdkManagedNetworkFunctionReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+		Bridge: bridge,
+	}
+
+	_, err = reconciler.Reconcile(context.TODO(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      "bad-compat-cnf",
+			Namespace: "default",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updated := &apiv1beta1.SdkManagedNetworkFunction{}
+	err = fakeClient.Get(context.TODO(), types.NamespacedName{Name: "bad-compat-cnf", Namespace: "default"}, updated)
+	if err != nil {
+		t.Fatalf("Failed to fetch updated CR: %v", err)
+	}
+
+	if updated.Status.Phase != "Degraded" {
+		t.Fatalf("Expected phase Degraded, got %s", updated.Status.Phase)
+	}
+	if !strings.Contains(updated.Status.BlockedReason, "CompatibilityMetadataInvalid") {
+		t.Fatalf("Expected CompatibilityMetadataInvalid BlockedReason, got %q", updated.Status.BlockedReason)
+	}
+}
+
 func TestReconcileFinalizerAdded(t *testing.T) {
 	testutil.BuildOperatorLifecycleCLI(t)
 

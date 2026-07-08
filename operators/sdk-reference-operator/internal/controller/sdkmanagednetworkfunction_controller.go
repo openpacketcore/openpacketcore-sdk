@@ -117,6 +117,27 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 
 	// 2. Fetch dependencies (NodeCapabilityReport, CompatibilityMatrix, ActiveAlarms)
 	isProd := crd.Spec.RuntimeMode == "production"
+	blockInvalidMetadata := func(reason, message string) (ctrl.Result, error) {
+		crd.Status.Phase = string(conditions.PhaseDegraded)
+		crd.Status.BlockedReason = message
+		crd.Status.PreflightSummary = "Blocked: invalid metadata"
+		_ = cm.Set(conditions.Ready, metav1.ConditionFalse, reason, message, crd.Generation)
+		_ = cm.Set(conditions.Degraded, metav1.ConditionTrue, reason, message, crd.Generation)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(crd, corev1.EventTypeWarning, reason, "%s", message)
+		}
+		r.syncConditions(crd, cm)
+		if updateErr := r.Client.Status().Update(ctx, crd); updateErr != nil {
+			return ctrl.Result{}, updateErr
+		}
+		return ctrl.Result{}, nil
+	}
+	warnInvalidMetadata := func(reason, message string, err error) {
+		logger.Error(err, message)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(crd, corev1.EventTypeWarning, reason, "%s: %v", message, err)
+		}
+	}
 	if isProd && crd.Spec.ResourceProfile == nil {
 		crd.Status.Phase = string(conditions.PhaseDegraded)
 		crd.Status.BlockedReason = "Production references require a resource profile before rollout"
@@ -139,7 +160,14 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 	if err == nil {
 		if data, ok := cfgMap.Data["report.json"]; ok {
 			var report sdkbridge.NodeCapabilityReport
-			if json.Unmarshal([]byte(data), &report) == nil {
+			if err := json.Unmarshal([]byte(data), &report); err != nil {
+				reason := "NodeCapabilitiesMetadataInvalid"
+				message := fmt.Sprintf("%s: invalid report.json in ConfigMap %s/%s", reason, cfgMap.Namespace, cfgMap.Name)
+				if isProd {
+					return blockInvalidMetadata(reason, fmt.Sprintf("%s: %v", message, err))
+				}
+				warnInvalidMetadata(reason, message, err)
+			} else {
 				nodeCaps = &report
 			}
 		}
@@ -169,13 +197,27 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 		if err == nil {
 			if data, ok := compatCM.Data["matrix.json"]; ok {
 				var matrix sdkbridge.CompatibilityMatrix
-				if json.Unmarshal([]byte(data), &matrix) == nil {
+				if err := json.Unmarshal([]byte(data), &matrix); err != nil {
+					reason := "CompatibilityMetadataInvalid"
+					message := fmt.Sprintf("%s: invalid matrix.json in ConfigMap %s/%s", reason, compatCM.Namespace, compatCM.Name)
+					if isProd {
+						return blockInvalidMetadata(reason, fmt.Sprintf("%s: %v", message, err))
+					}
+					warnInvalidMetadata(reason, message, err)
+				} else {
 					compatMatrix = &matrix
 				}
 			}
 			if data, ok := compatCM.Data["evidence.json"]; ok {
 				var ev []sdkbridge.CompatibilityEvidence
-				if json.Unmarshal([]byte(data), &ev) == nil {
+				if err := json.Unmarshal([]byte(data), &ev); err != nil {
+					reason := "CompatibilityMetadataInvalid"
+					message := fmt.Sprintf("%s: invalid evidence.json in ConfigMap %s/%s", reason, compatCM.Namespace, compatCM.Name)
+					if isProd {
+						return blockInvalidMetadata(reason, fmt.Sprintf("%s: %v", message, err))
+					}
+					warnInvalidMetadata(reason, message, err)
+				} else {
 					evidence = ev
 				}
 			}
@@ -191,7 +233,14 @@ func (r *SdkManagedNetworkFunctionReconciler) Reconcile(ctx context.Context, req
 	if err == nil {
 		if data, ok := alarmCM.Data["alarms.json"]; ok {
 			var parsed []sdkbridge.Alarm
-			if json.Unmarshal([]byte(data), &parsed) == nil {
+			if err := json.Unmarshal([]byte(data), &parsed); err != nil {
+				reason := "AlarmMetadataInvalid"
+				message := fmt.Sprintf("%s: invalid alarms.json in ConfigMap %s/%s", reason, alarmCM.Namespace, alarmCM.Name)
+				if isProd {
+					return blockInvalidMetadata(reason, fmt.Sprintf("%s: %v", message, err))
+				}
+				warnInvalidMetadata(reason, message, err)
+			} else {
 				alarms = parsed
 			}
 		}
