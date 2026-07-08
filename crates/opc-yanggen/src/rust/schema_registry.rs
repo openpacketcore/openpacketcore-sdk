@@ -64,7 +64,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         .iter()
         .map(|node| (normalized_node_path(&node.path), node.path.as_str()))
         .collect();
-    normalized_entries.sort_by(|left, right| left.cmp(right));
+    normalized_entries.sort();
     let normalized_index_inits: Vec<TokenStream> = normalized_entries
         .iter()
         .map(|(normalized_path, node_path)| {
