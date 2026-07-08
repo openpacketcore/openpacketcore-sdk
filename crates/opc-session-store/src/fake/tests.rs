@@ -332,6 +332,65 @@ async fn slow_watch_receiver_is_dropped_when_buffer_fills() {
 }
 
 #[tokio::test]
+async fn fake_backend_bounds_tracked_keys_and_replication_log() {
+    let backend = FakeSessionBackend::with_limits(FakeBackendLimits {
+        max_tracked_keys: 2,
+        max_replication_entries: 3,
+    });
+    let owner = OwnerId::new("owner-a").unwrap();
+    let key_a = test_key("t1", b"bounded-a");
+    let key_b = test_key("t1", b"bounded-b");
+    let key_c = test_key("t1", b"bounded-c");
+
+    backend
+        .acquire(&key_a, owner.clone(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    backend
+        .acquire(&key_b, owner.clone(), Duration::from_secs(60))
+        .await
+        .unwrap();
+
+    let err = backend
+        .acquire(&key_c, owner.clone(), Duration::from_secs(60))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        LeaseError::Backend("fake backend tracked-key limit reached".into())
+    );
+
+    for _ in 0..5 {
+        backend
+            .acquire(&key_a, owner.clone(), Duration::from_secs(60))
+            .await
+            .unwrap();
+    }
+
+    let max_sequence = backend.max_replication_sequence().await.unwrap();
+    assert_eq!(max_sequence, 7);
+    let retained = backend
+        .get_replication_log(max_sequence - 2, 16)
+        .await
+        .unwrap();
+    assert_eq!(retained.len(), 3);
+    assert_eq!(retained.first().unwrap().sequence, max_sequence - 2);
+    assert_eq!(retained.last().unwrap().sequence, max_sequence);
+
+    let compacted = backend.get_replication_log(1, 16).await.unwrap_err();
+    assert_eq!(
+        compacted,
+        StoreError::BackendUnavailable("replication log compacted before requested start".into())
+    );
+
+    let state = backend.inner.lock().await;
+    assert_eq!(state.key_fences.len(), 2);
+    assert!(state.leases.len() <= 2);
+    assert!(state.records.len() <= 2);
+    assert_eq!(state.replication_log.len(), 3);
+}
+
+#[tokio::test]
 async fn direct_cas_succeeds_when_replication_log_and_watch_are_disabled() {
     let mut caps = BackendCapabilities::all_enabled();
     caps.ordered_replication_log = false;

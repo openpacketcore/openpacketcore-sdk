@@ -36,6 +36,7 @@ use crate::{
 pub struct FakeSessionBackend {
     inner: Arc<Mutex<FakeBackendState>>,
     caps: BackendCapabilities,
+    limits: FakeBackendLimits,
     clock: Arc<dyn Clock>,
 }
 
@@ -45,6 +46,8 @@ struct FakeBackendState {
     key_fences: HashMap<String, FenceToken>,
     next_fence: u64,
     next_credential_id: u64,
+    compacted_replication_sequence: u64,
+    last_replication_sequence: u64,
     replication_log: Vec<ReplicationEntry>,
     watchers: Vec<mpsc::Sender<Result<ReplicationEntry, StoreError>>>,
 }
@@ -58,6 +61,30 @@ struct LeaseEntry {
     guard_expires_at: Timestamp,
 }
 
+/// Resource limits for the deterministic in-memory backend.
+///
+/// `max_tracked_keys` bounds the union of session records, leases, and fence
+/// floors. Once reached, the fake rejects brand-new keys rather than evicting
+/// fence floors and weakening stale-owner protection. `max_replication_entries`
+/// bounds retained log history; older committed entries are compacted from the
+/// in-memory log while the maximum sequence still advances monotonically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FakeBackendLimits {
+    /// Maximum number of distinct session keys the fake will track.
+    pub max_tracked_keys: usize,
+    /// Maximum number of committed replication entries retained in memory.
+    pub max_replication_entries: usize,
+}
+
+impl Default for FakeBackendLimits {
+    fn default() -> Self {
+        Self {
+            max_tracked_keys: 1_000_000,
+            max_replication_entries: 1_000_000,
+        }
+    }
+}
+
 impl FakeSessionBackend {
     /// Create a new fake backend with all capabilities enabled.
     pub fn new() -> Self {
@@ -66,6 +93,19 @@ impl FakeSessionBackend {
 
     /// Create a new fake backend with a specific capability set.
     pub fn with_capabilities(caps: BackendCapabilities) -> Self {
+        Self::with_capabilities_and_limits(caps, FakeBackendLimits::default())
+    }
+
+    /// Create a new fake backend with all capabilities and explicit resource limits.
+    pub fn with_limits(limits: FakeBackendLimits) -> Self {
+        Self::with_capabilities_and_limits(BackendCapabilities::all_enabled(), limits)
+    }
+
+    /// Create a new fake backend with a specific capability set and resource limits.
+    pub fn with_capabilities_and_limits(
+        caps: BackendCapabilities,
+        limits: FakeBackendLimits,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(FakeBackendState {
                 records: HashMap::new(),
@@ -73,10 +113,13 @@ impl FakeSessionBackend {
                 key_fences: HashMap::new(),
                 next_fence: 1,
                 next_credential_id: 1,
+                compacted_replication_sequence: 0,
+                last_replication_sequence: 0,
                 replication_log: Vec::new(),
                 watchers: Vec::new(),
             })),
             caps,
+            limits,
             clock: Arc::new(TokioVirtualClock::new()),
         }
     }
@@ -111,6 +154,20 @@ impl FakeSessionBackend {
             .unwrap_or_else(|| FenceToken::new(0))
     }
 
+    fn ensure_key_capacity(
+        state: &FakeBackendState,
+        map_key: &str,
+        max_tracked_keys: usize,
+    ) -> Result<(), StoreError> {
+        if state.key_fences.contains_key(map_key) || state.key_fences.len() < max_tracked_keys {
+            Ok(())
+        } else {
+            Err(StoreError::BackendUnavailable(
+                "fake backend tracked-key limit reached".into(),
+            ))
+        }
+    }
+
     fn get_with_state(
         state: &FakeBackendState,
         key: &SessionKey,
@@ -128,6 +185,27 @@ impl FakeSessionBackend {
         state
             .watchers
             .retain(|watcher| watcher.try_send(Ok(entry.clone())).is_ok());
+    }
+
+    fn compact_replication_log(state: &mut FakeBackendState, max_replication_entries: usize) {
+        if state.replication_log.len() <= max_replication_entries {
+            return;
+        }
+
+        if max_replication_entries == 0 {
+            if let Some(entry) = state.replication_log.last() {
+                state.compacted_replication_sequence =
+                    state.compacted_replication_sequence.max(entry.sequence);
+            }
+            state.replication_log.clear();
+            return;
+        }
+
+        let drop_count = state.replication_log.len() - max_replication_entries;
+        let compacted_sequence = state.replication_log[drop_count - 1].sequence;
+        state.replication_log.drain(..drop_count);
+        state.compacted_replication_sequence =
+            state.compacted_replication_sequence.max(compacted_sequence);
     }
 
     fn prune_state(state: &mut FakeBackendState, now: Timestamp) {
@@ -230,6 +308,7 @@ impl FakeSessionBackend {
         if op.lease.fence() < current_fence {
             return Err(StoreError::StaleFence);
         }
+        Self::ensure_key_capacity(state, &mk, self.limits.max_tracked_keys)?;
 
         let existing = state
             .records
@@ -286,6 +365,7 @@ impl FakeSessionBackend {
         if lease.fence() < current_fence {
             return Err(StoreError::StaleFence);
         }
+        Self::ensure_key_capacity(state, &mk, self.limits.max_tracked_keys)?;
 
         state.records.remove(&mk);
         state.key_fences.insert(mk, lease.fence());
@@ -314,6 +394,7 @@ impl FakeSessionBackend {
         if lease.fence() < current_fence {
             return Err(StoreError::StaleFence);
         }
+        Self::ensure_key_capacity(state, &mk, self.limits.max_tracked_keys)?;
 
         let Some(record) = state.records.get_mut(&mk) else {
             return Err(StoreError::NotFound);
@@ -334,6 +415,7 @@ impl FakeSessionBackend {
         state: &mut FakeBackendState,
         op: ReplicationOp,
         now: Timestamp,
+        max_tracked_keys: usize,
     ) -> Result<(), StoreError> {
         match op {
             ReplicationOp::CompareAndSet {
@@ -348,6 +430,7 @@ impl FakeSessionBackend {
                 if new_record.fence < current_fence {
                     return Err(StoreError::StaleFence);
                 }
+                Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
 
                 let Some(lease_entry) = state.leases.get(&mk) else {
                     return Err(StoreError::StaleFence);
@@ -398,6 +481,7 @@ impl FakeSessionBackend {
                 if fence < current_fence {
                     return Err(StoreError::StaleFence);
                 }
+                Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
                 state.records.remove(&mk);
                 state.key_fences.insert(mk, fence);
                 Ok(())
@@ -414,6 +498,7 @@ impl FakeSessionBackend {
                 if fence < current_fence {
                     return Err(StoreError::StaleFence);
                 }
+                Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
                 if let Some(record) = state.records.get_mut(&mk) {
                     record.expires_at = Some(expires_at);
                     state.key_fences.insert(mk, fence);
@@ -435,6 +520,7 @@ impl FakeSessionBackend {
                 if fence < current_fence {
                     return Err(StoreError::StaleFence);
                 }
+                Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
                 if let Some(entry) = state.leases.get(&mk) {
                     if entry.active && entry.owner != owner && entry.expires_at > now {
                         return Err(StoreError::LeaseHeld);
@@ -469,6 +555,7 @@ impl FakeSessionBackend {
                 if fence < current_fence {
                     return Err(StoreError::StaleFence);
                 }
+                Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
                 state.leases.insert(
                     mk.clone(),
                     LeaseEntry {
@@ -496,6 +583,7 @@ impl FakeSessionBackend {
                 if fence < current_fence {
                     return Err(StoreError::StaleFence);
                 }
+                Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
                 if let Some(entry) = state.leases.get_mut(&mk) {
                     if entry.credential_id == credential_id {
                         entry.active = false;
@@ -506,7 +594,7 @@ impl FakeSessionBackend {
             }
             ReplicationOp::Batch { ops } => {
                 for op in ops {
-                    Self::apply_replicated_op_with_state(state, op, now)?;
+                    Self::apply_replicated_op_with_state(state, op, now, max_tracked_keys)?;
                 }
                 Ok(())
             }
@@ -523,11 +611,8 @@ impl FakeSessionBackend {
             return;
         }
 
-        let sequence = state
-            .replication_log
-            .last()
-            .map(|entry| entry.sequence.saturating_add(1))
-            .unwrap_or(1);
+        let sequence = state.last_replication_sequence.saturating_add(1);
+        state.last_replication_sequence = sequence;
         let entry = ReplicationEntry {
             sequence,
             tx_id: format!("fake-direct-{sequence}"),
@@ -539,6 +624,8 @@ impl FakeSessionBackend {
         if self.caps.watch {
             Self::notify_watchers(state, &entry);
         }
+
+        Self::compact_replication_log(state, self.limits.max_replication_entries);
     }
 
     fn rebuild_replication_state_with_entries(
@@ -551,6 +638,8 @@ impl FakeSessionBackend {
         state.key_fences.clear();
         state.next_fence = 1;
         state.next_credential_id = 1;
+        state.compacted_replication_sequence = 0;
+        state.last_replication_sequence = 0;
         state.replication_log.clear();
 
         for (expected_sequence, entry) in (1_u64..).zip(entries) {
@@ -559,8 +648,15 @@ impl FakeSessionBackend {
                     "replication log sequence gap".into(),
                 ));
             }
-            Self::apply_replicated_op_with_state(state, entry.op.clone(), entry.timestamp)?;
+            Self::apply_replicated_op_with_state(
+                state,
+                entry.op.clone(),
+                entry.timestamp,
+                self.limits.max_tracked_keys,
+            )?;
+            state.last_replication_sequence = entry.sequence;
             state.replication_log.push(entry);
+            Self::compact_replication_log(state, self.limits.max_replication_entries);
         }
 
         Ok(())
@@ -661,7 +757,8 @@ impl SessionBackend for FakeSessionBackend {
                     self.delete_fenced_with_state(&mut state, &lease, now),
                 ),
                 SessionOp::RefreshTtl { lease, ttl } => SessionOpResult::RefreshTtl(
-                    self.refresh_ttl_with_state(&mut state, &lease, ttl, now).map(|_| ()),
+                    self.refresh_ttl_with_state(&mut state, &lease, ttl, now)
+                        .map(|_| ()),
                 ),
             };
             results.push(res);
@@ -707,11 +804,7 @@ impl SessionBackend for FakeSessionBackend {
 
     async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
         let state = self.inner.lock().await;
-        Ok(state
-            .replication_log
-            .last()
-            .map(|e| e.sequence)
-            .unwrap_or(0))
+        Ok(state.last_replication_sequence)
     }
 
     async fn get_replication_log(
@@ -720,6 +813,14 @@ impl SessionBackend for FakeSessionBackend {
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
         let state = self.inner.lock().await;
+        if limit > 0
+            && start <= state.compacted_replication_sequence
+            && start <= state.last_replication_sequence
+        {
+            return Err(StoreError::BackendUnavailable(
+                "replication log compacted before requested start".into(),
+            ));
+        }
         let entries: Vec<ReplicationEntry> = state
             .replication_log
             .iter()
@@ -735,14 +836,13 @@ impl SessionBackend for FakeSessionBackend {
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
 
-        let max_seq = state
-            .replication_log
-            .last()
-            .map(|e| e.sequence)
-            .unwrap_or(0);
+        let max_seq = state.last_replication_sequence;
 
         // Check if we already have it
         if entry.sequence <= max_seq {
+            if entry.sequence <= state.compacted_replication_sequence {
+                return Ok(());
+            }
             // Check for duplicate delivery and idempotency
             if let Some(existing) = state
                 .replication_log
@@ -770,13 +870,20 @@ impl SessionBackend for FakeSessionBackend {
         }
 
         // Apply mutation
-        Self::apply_replicated_op_with_state(&mut state, entry.op.clone(), now)?;
+        Self::apply_replicated_op_with_state(
+            &mut state,
+            entry.op.clone(),
+            now,
+            self.limits.max_tracked_keys,
+        )?;
 
         // Append to replication log
+        state.last_replication_sequence = entry.sequence;
         state.replication_log.push(entry.clone());
 
         // Notify watchers
         Self::notify_watchers(&mut state, &entry);
+        Self::compact_replication_log(&mut state, self.limits.max_replication_entries);
 
         Ok(())
     }
@@ -797,6 +904,13 @@ impl SessionBackend for FakeSessionBackend {
         StoreError,
     > {
         let mut state = self.inner.lock().await;
+        if start_sequence <= state.compacted_replication_sequence
+            && start_sequence <= state.last_replication_sequence
+        {
+            return Err(StoreError::BackendUnavailable(
+                "replication log compacted before requested start".into(),
+            ));
+        }
         let (tx, rx) = mpsc::channel(WATCH_CHANNEL_CAPACITY);
 
         // Send existing entries
@@ -877,6 +991,12 @@ impl SessionLeaseManager for FakeSessionBackend {
                 return Err(LeaseError::AlreadyHeld);
             }
         }
+        Self::ensure_key_capacity(&state, &mk, self.limits.max_tracked_keys).map_err(|err| {
+            match err {
+                StoreError::BackendUnavailable(message) => LeaseError::Backend(message),
+                other => LeaseError::from(other),
+            }
+        })?;
 
         let current_fence = Self::current_fence(&state, &mk);
         let next_for_key = current_fence
