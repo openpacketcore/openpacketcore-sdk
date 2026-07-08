@@ -376,6 +376,32 @@ async fn test_persistent_connection_reconnect_after_restart() {
 }
 
 #[tokio::test]
+async fn capabilities_uses_cached_success_after_disconnect() {
+    let mtls = mtls_configs();
+    let (addr, _backend, handle) = start_server(&mtls).await;
+    let remote = RemoteSessionBackend::new(
+        addr,
+        Some(mtls.client_config.clone()),
+        Some(Duration::from_millis(200)),
+    );
+
+    let warmed = remote.capabilities().await;
+    assert!(
+        warmed.atomic_compare_and_set && warmed.monotonic_fencing_token && warmed.batch_write,
+        "expected warmed remote capabilities to reflect the full backend"
+    );
+
+    handle.abort();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let after_disconnect = remote.capabilities().await;
+    assert_eq!(
+        after_disconnect, warmed,
+        "capability transport failures must not silently downgrade a warmed remote backend"
+    );
+}
+
+#[tokio::test]
 async fn test_in_flight_request_surfaces_error_on_disconnect() {
     let mtls = mtls_configs();
     let (addr, _backend, handle) = start_server(&mtls).await;

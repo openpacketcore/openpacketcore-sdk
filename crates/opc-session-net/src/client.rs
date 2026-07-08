@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -44,6 +44,7 @@ pub struct RemoteSessionBackend {
     max_frame_size: usize,
     node_id: String,
     conn: Arc<Mutex<Option<Connection>>>,
+    cached_capabilities: Arc<RwLock<Option<BackendCapabilities>>>,
 }
 
 impl std::fmt::Debug for RemoteSessionBackend {
@@ -77,6 +78,7 @@ impl RemoteSessionBackend {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             node_id: format!("opc-session-net/{}", std::process::id()),
             conn: Arc::new(Mutex::new(None)),
+            cached_capabilities: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -202,14 +204,52 @@ impl RemoteSessionBackend {
         write_frame(&mut conn.writer, req).await?;
         read_frame(&mut conn.reader, self.max_frame_size).await
     }
+
+    fn remember_capabilities(&self, caps: BackendCapabilities) {
+        if let Ok(mut cached) = self.cached_capabilities.write() {
+            *cached = Some(caps);
+        }
+    }
+
+    fn cached_capabilities(&self) -> Option<BackendCapabilities> {
+        self.cached_capabilities
+            .read()
+            .ok()
+            .and_then(|cached| *cached)
+    }
+
+    fn capabilities_after_probe_failure(&self, reason: &str) -> BackendCapabilities {
+        if let Some(caps) = self.cached_capabilities() {
+            tracing::warn!(
+                addr = %self.addr,
+                reason,
+                "remote capabilities probe failed; using cached capabilities"
+            );
+            caps
+        } else {
+            tracing::warn!(
+                addr = %self.addr,
+                reason,
+                "remote capabilities probe failed before any cached success; returning minimal capabilities"
+            );
+            BackendCapabilities::minimal()
+        }
+    }
 }
 
 #[async_trait]
 impl SessionBackend for RemoteSessionBackend {
     async fn capabilities(&self) -> BackendCapabilities {
         match self.send_request_with_retry(Request::Capabilities).await {
-            Ok(Response::Capabilities(caps)) => caps,
-            _ => BackendCapabilities::minimal(),
+            Ok(Response::Capabilities(caps)) => {
+                self.remember_capabilities(caps);
+                caps
+            }
+            Ok(_) => self.capabilities_after_probe_failure("unexpected_response"),
+            Err(err) => {
+                let reason = store_error_kind(&err);
+                self.capabilities_after_probe_failure(reason)
+            }
         }
     }
 
@@ -531,6 +571,24 @@ where
     }
 
     Ok(())
+}
+
+fn store_error_kind(err: &StoreError) -> &'static str {
+    match err {
+        StoreError::NotFound => "not_found",
+        StoreError::StaleFence => "stale_fence",
+        StoreError::CasConflict => "cas_conflict",
+        StoreError::CapabilityNotSupported(_) => "capability_not_supported",
+        StoreError::BackendUnavailable(_) => "backend_unavailable",
+        StoreError::InvalidKey(_) => "invalid_key",
+        StoreError::LeaseHeld => "lease_held",
+        StoreError::LeaseExpired => "lease_expired",
+        StoreError::Crypto(_) => "crypto",
+        StoreError::Serialization(_) => "serialization",
+        StoreError::PayloadTooLarge { .. } => "payload_too_large",
+        StoreError::InvalidRestoreScanRequest(_) => "invalid_restore_scan_request",
+        StoreError::RestoreScanPageTooLarge { .. } => "restore_scan_page_too_large",
+    }
 }
 
 struct WatchStream {
