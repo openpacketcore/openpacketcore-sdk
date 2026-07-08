@@ -24,6 +24,9 @@ pub struct K8sCondition {
     /// Unique, one-word, CamelCase reason for the condition's last transition.
     pub reason: String,
 
+    /// OPC alarm severity preserved for consumers that distinguish major/critical.
+    pub severity: String,
+
     /// A human-readable message indicating details about the transition.
     pub message: String,
 }
@@ -44,6 +47,9 @@ pub struct K8sEvent {
     /// The action taken (e.g., "Raised", "Updated", "Cleared").
     pub action: String,
 
+    /// OPC alarm severity preserved for consumers that distinguish major/critical.
+    pub severity: String,
+
     /// The component reporting this event.
     #[serde(rename = "sourceComponent")]
     pub source_component: String,
@@ -62,6 +68,14 @@ pub struct K8sEvent {
 
 /// Projects an active or cleared alarm to a Kubernetes condition.
 pub fn alarm_to_condition(alarm: &Alarm) -> K8sCondition {
+    alarm_to_condition_with_previous(alarm, None)
+}
+
+/// Projects an alarm while preserving transition time if status is unchanged.
+pub fn alarm_to_condition_with_previous(
+    alarm: &Alarm,
+    previous: Option<&K8sCondition>,
+) -> K8sCondition {
     // Standard CamelCase format for Condition Type: e.g., "config-bus.commit.failure" -> "ConfigBusCommitFailure"
     let type_ = to_camel_case(alarm.alarm_type.as_str());
 
@@ -72,7 +86,10 @@ pub fn alarm_to_condition(alarm: &Alarm) -> K8sCondition {
         "False".to_string()
     };
 
-    let last_transition_time = alarm.updated_at.format(&Rfc3339).unwrap_or_default();
+    let last_transition_time = previous
+        .filter(|condition| condition.status == status)
+        .map(|condition| condition.last_transition_time.clone())
+        .unwrap_or_else(|| alarm.updated_at.format(&Rfc3339).unwrap_or_default());
 
     let reason = probable_cause_reason(&alarm.probable_cause);
 
@@ -81,12 +98,18 @@ pub fn alarm_to_condition(alarm: &Alarm) -> K8sCondition {
         status,
         last_transition_time,
         reason,
+        severity: alarm.severity.to_string(),
         message: alarm.text.redacted_for_export(),
     }
 }
 
 /// Projects an alarm state change to a Kubernetes event.
 pub fn alarm_to_event(alarm: &Alarm) -> K8sEvent {
+    alarm_to_event_with_count(alarm, 1)
+}
+
+/// Projects an alarm state change to a Kubernetes event with a deduplicated count.
+pub fn alarm_to_event_with_count(alarm: &Alarm, count: i32) -> K8sEvent {
     let reason = probable_cause_reason(&alarm.probable_cause);
 
     let type_ = match alarm.severity {
@@ -116,11 +139,11 @@ pub fn alarm_to_event(alarm: &Alarm) -> K8sEvent {
         message: alarm.text.redacted_for_export(),
         type_,
         action,
+        severity: alarm.severity.to_string(),
         source_component,
         first_timestamp: first_ts,
         last_timestamp: last_ts,
-        // Since OPC manages deduplication internally, a mapped event reflects the deduplicated stream
-        count: 1,
+        count,
     }
 }
 
@@ -289,5 +312,39 @@ mod tests {
 
         assert_eq!(alarm_to_condition(&alarm).reason, "PeerUnreachable");
         assert_eq!(alarm_to_event(&alarm).reason, "PeerUnreachable");
+    }
+
+    #[test]
+    fn critical_and_major_events_preserve_distinct_severity() {
+        let mut major = alarm_with_cause(ProbableCause::PeerUnreachable);
+        major.severity = Severity::Major;
+        let mut critical = alarm_with_cause(ProbableCause::PeerUnreachable);
+        critical.severity = Severity::Critical;
+
+        assert_ne!(alarm_to_event(&major).severity, alarm_to_event(&critical).severity);
+        assert_ne!(
+            alarm_to_condition(&major).severity,
+            alarm_to_condition(&critical).severity
+        );
+    }
+
+    #[test]
+    fn event_with_count_preserves_deduplicated_occurrences() {
+        let alarm = alarm_with_cause(ProbableCause::PeerUnreachable);
+
+        assert_eq!(alarm_to_event_with_count(&alarm, 7).count, 7);
+    }
+
+    #[test]
+    fn condition_with_previous_keeps_transition_time_when_status_unchanged() {
+        let mut alarm = alarm_with_cause(ProbableCause::PeerUnreachable);
+        let mut previous = alarm_to_condition(&alarm);
+        previous.last_transition_time = "2026-06-09T10:00:00Z".to_string();
+        alarm.updated_at += time::Duration::minutes(5);
+
+        let projected = alarm_to_condition_with_previous(&alarm, Some(&previous));
+
+        assert_eq!(projected.status, previous.status);
+        assert_eq!(projected.last_transition_time, previous.last_transition_time);
     }
 }
