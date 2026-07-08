@@ -399,7 +399,7 @@ async fn preflight_returns_capabilities() {
 }
 
 #[tokio::test]
-async fn preflight_ephemeral_mode_skips_safety_checks() {
+async fn preflight_ephemeral_file_mode_reports_unchecked_durability_caps() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let db_path = temp_dir.path().join("test_ephemeral.db");
 
@@ -410,7 +410,13 @@ async fn preflight_ephemeral_mode_skips_safety_checks() {
     let caps = backend.preflight().await.expect("preflight should succeed");
 
     assert!(caps.ephemeral_mode);
-    assert!(caps.is_safe_for_writes());
+    assert!(!caps.fsync_available);
+    assert!(!caps.locking_compatible);
+    assert!(!caps.same_filesystem);
+    assert!(!caps.safe_filesystem);
+    assert!(!caps.directory_permissions_safe);
+    assert_eq!(caps.free_bytes, 0);
+    assert!(!caps.is_safe_for_writes());
 }
 
 #[tokio::test]

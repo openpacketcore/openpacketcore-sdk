@@ -559,17 +559,19 @@ impl SqliteBackend {
 
         if ephemeral {
             // Ephemeral (non-durable) file-backed path — skip safety checks but
-            // still apply the full WAL pragma profile.
+            // do not fabricate durability capabilities. The backend may still
+            // accept writes in ephemeral mode, but callers must not interpret
+            // these unchecked values as production-safe storage evidence.
             return Ok(PersistCapabilities {
                 ephemeral_mode: true,
                 storage_path: path.to_string_lossy().into_owned(),
-                fsync_available: true,
-                locking_compatible: true,
-                same_filesystem: true,
-                safe_filesystem: true,
-                free_bytes: u64::MAX,
-                min_free_bytes: 0,
-                directory_permissions_safe: true,
+                fsync_available: false,
+                locking_compatible: false,
+                same_filesystem: false,
+                safe_filesystem: false,
+                free_bytes: 0,
+                min_free_bytes,
+                directory_permissions_safe: false,
                 wal_autocheckpoint_pages: 1000,
                 journal_mode: "wal".into(),
                 synchronous_setting: "extra".into(),
