@@ -26,9 +26,11 @@ use opc_config_model::{
     IdempotencyKey, OpcConfig, RequestId, RequestSource, RollbackTarget as BusRollbackTarget,
     TransportType, TrustedPrincipal, ValidationContext, ValidationError, YangPath,
 };
-use opc_key::KmsKeyProvider;
+use opc_data_governance::IdentifierType;
+use opc_key::{KeyProvider, KeyPurpose, KmsKeyProvider};
 use opc_nacm::{ModuleRegistry, NacmAction, NacmEvaluator, NacmPolicy};
 use opc_persist::{AuditRecord, CommitRecord, CommitSource, ConfigStore, RollbackTarget};
+use opc_redaction::{DigestKey, RedactionLevel, TelcoIdentifier};
 use opc_runtime::{
     health::HealthResponse, Builder, Criticality, HealthModel, Readiness, RestartPolicy,
     RuntimeError, RuntimeHandle, RuntimePhase, RuntimeProfile, ShutdownToken, Supervisor, TaskKind,
@@ -53,6 +55,7 @@ const AMF_NF_KIND: &str = "amf";
 const AMF_OWNER_ID: &str = "amf-lite-1";
 const SUBSCRIBER_CONTEXT_STATE_TYPE: &str = "subscriber-context";
 const SYSTEM_TENANT: &str = "system";
+const SUBSCRIBER_PRIVACY_KEY_DOMAIN: &[u8] = b"opc-amf-lite/subscriber-privacy-key/v1";
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -76,12 +79,12 @@ fn subscriber_context_state_type() -> Result<StateType, BoxError> {
         .map_err(|err| static_value_error("session state type", err))
 }
 
-fn subscriber_session_key(imsi: &str) -> Result<SessionKey, BoxError> {
+fn session_key_from_pseudonym(pseudonym: &str) -> Result<SessionKey, BoxError> {
     Ok(SessionKey {
         tenant: TenantId::new(SYSTEM_TENANT)?,
         nf_kind: amf_nf_kind()?,
         key_type: SessionKeyType::SubscriberContext,
-        stable_id: bytes::Bytes::copy_from_slice(imsi.as_bytes()),
+        stable_id: bytes::Bytes::copy_from_slice(pseudonym.as_bytes()),
     })
 }
 
@@ -229,10 +232,16 @@ impl OpcConfig for AmfConfig {
 /// Rich session state for UE Context.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UeSessionContext {
-    pub imsi: String,
+    pub subscriber_pseudonym: String,
+    pub subscriber_identity: String,
     pub state: String,
     pub amf_ue_ngap_id: u64,
     pub last_updated: Timestamp,
+}
+
+struct SubscriberPrivacyAlias {
+    pseudonym: String,
+    redacted_identity: String,
 }
 
 /// Helper to add a std Duration to opc_types::Timestamp
@@ -516,7 +525,7 @@ pub struct AmfLite {
     config_bus: ConfigBus<AmfConfig>,
     session_store: QuorumSessionStore,
     alarms: SharedAlarmManager,
-    _kms_provider: Arc<KmsKeyProvider>,
+    kms_provider: Arc<KmsKeyProvider>,
     clock: Arc<dyn TestClock>,
     state: Arc<RwLock<AmfLiteState>>,
     state_notify: Arc<Notify>,
@@ -673,7 +682,7 @@ impl AmfLite {
             config_bus,
             session_store,
             alarms,
-            _kms_provider: kms_provider,
+            kms_provider,
             clock,
             state,
             state_notify,
@@ -689,6 +698,36 @@ impl AmfLite {
 
     fn now(&self) -> Timestamp {
         self.clock.now()
+    }
+
+    async fn subscriber_privacy_alias(
+        &self,
+        imsi: &str,
+    ) -> Result<SubscriberPrivacyAlias, BoxError> {
+        let tenant = TenantId::new(SYSTEM_TENANT)?;
+        let key_handle = self
+            .kms_provider
+            .get_active_key(KeyPurpose::Session, &tenant)
+            .await?;
+        let digest_key = DigestKey::new(
+            key_handle.keyed_digest(SUBSCRIBER_PRIVACY_KEY_DOMAIN, b"subscriber-supi"),
+        );
+        let digest = opc_privacy::hash_identifier(&digest_key, IdentifierType::Supi, imsi);
+        let redacted_identity = TelcoIdentifier::new(IdentifierType::Imsi, imsi)
+            .redact(RedactionLevel::Class, None)
+            .to_string();
+
+        Ok(SubscriberPrivacyAlias {
+            pseudonym: format!("supi-digest:{digest}"),
+            redacted_identity,
+        })
+    }
+
+    /// Derives the backend-visible session key for a subscriber without
+    /// exposing the permanent identifier in store keys.
+    pub async fn session_key_for_subscriber(&self, imsi: &str) -> Result<SessionKey, BoxError> {
+        let alias = self.subscriber_privacy_alias(imsi).await?;
+        session_key_from_pseudonym(&alias.pseudonym)
     }
 
     async fn complete_startup(&self, timeout: Duration) -> Result<(), RuntimeError> {
@@ -724,7 +763,8 @@ impl AmfLite {
         amf_ue_ngap_id: u64,
         lease_ttl: Duration,
     ) -> Result<(), BoxError> {
-        let key = subscriber_session_key(imsi)?;
+        let alias = self.subscriber_privacy_alias(imsi).await?;
+        let key = session_key_from_pseudonym(&alias.pseudonym)?;
 
         // Acquire lease (fenced CAS lease)
         let owner = amf_owner_id()?;
@@ -751,7 +791,8 @@ impl AmfLite {
 
         let now = self.now();
         let ctx = UeSessionContext {
-            imsi: imsi.to_string(),
+            subscriber_pseudonym: alias.pseudonym,
+            subscriber_identity: alias.redacted_identity,
             state: "REGISTERED".to_string(),
             amf_ue_ngap_id,
             last_updated: now,
@@ -785,7 +826,7 @@ impl AmfLite {
 
     /// Updates UE session state.
     pub async fn update_ue_session(&self, imsi: &str, new_state: &str) -> Result<(), BoxError> {
-        let key = subscriber_session_key(imsi)?;
+        let key = self.session_key_for_subscriber(imsi).await?;
 
         // Load latest UE Context
         let latest = self

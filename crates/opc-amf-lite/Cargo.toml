@@ -20,6 +20,8 @@ opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
 opc-persist = { path = "../opc-persist", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
+opc-data-governance = { path = "../opc-data-governance", version = "0.2.0" }
+opc-privacy = { path = "../opc-privacy", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 opc-testbed = { path = "../opc-testbed", version = "0.2.0" }
 
