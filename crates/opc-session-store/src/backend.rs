@@ -23,6 +23,13 @@ use crate::{
     restore::{RestoreScanPage, RestoreScanRequest},
 };
 
+/// Per-watcher buffer size for replication watch streams.
+///
+/// Slow consumers are disconnected once this many entries are queued so watch
+/// fan-out cannot grow memory without bound. Consumers should resume from the
+/// last processed sequence.
+pub const WATCH_CHANNEL_CAPACITY: usize = 64;
+
 /// Atomic compare-and-set operation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CompareAndSet {

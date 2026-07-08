@@ -306,6 +306,32 @@ async fn direct_lease_mutations_emit_matching_replication_ops() {
 }
 
 #[tokio::test]
+async fn slow_watch_receiver_is_dropped_when_buffer_fills() {
+    use futures_util::StreamExt;
+
+    let backend = FakeSessionBackend::new();
+    let mut watch = backend.watch(1).await.unwrap();
+    let owner = OwnerId::new("owner-a").unwrap();
+    let capacity = crate::backend::WATCH_CHANNEL_CAPACITY;
+
+    for idx in 0..=capacity {
+        let key = test_key("t1", format!("slow-watch-{idx}").as_bytes());
+        backend
+            .acquire(&key, owner.clone(), Duration::from_secs(60))
+            .await
+            .unwrap();
+    }
+
+    for _ in 0..capacity {
+        assert!(watch.next().await.unwrap().is_ok());
+    }
+    let end = tokio::time::timeout(Duration::from_millis(100), watch.next())
+        .await
+        .expect("bounded watcher should close after overflow");
+    assert!(end.is_none(), "slow watcher should be dropped on overflow");
+}
+
+#[tokio::test]
 async fn direct_cas_succeeds_when_replication_log_and_watch_are_disabled() {
     let mut caps = BackendCapabilities::all_enabled();
     caps.ordered_replication_log = false;

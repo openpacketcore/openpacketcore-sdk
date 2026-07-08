@@ -12,12 +12,12 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use opc_types::Timestamp;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::{
     backend::{
         CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend,
-        SessionOp, SessionOpResult,
+        SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
     },
     capability::BackendCapabilities,
     clock::{Clock, TokioVirtualClock},
@@ -46,7 +46,7 @@ struct FakeBackendState {
     next_fence: u64,
     next_credential_id: u64,
     replication_log: Vec<ReplicationEntry>,
-    watchers: Vec<tokio::sync::mpsc::UnboundedSender<Result<ReplicationEntry, StoreError>>>,
+    watchers: Vec<mpsc::Sender<Result<ReplicationEntry, StoreError>>>,
 }
 
 struct LeaseEntry {
@@ -122,6 +122,12 @@ impl FakeSessionBackend {
             .get(&mk)
             .filter(|r| !r.is_expired_at(now))
             .cloned()
+    }
+
+    fn notify_watchers(state: &mut FakeBackendState, entry: &ReplicationEntry) {
+        state
+            .watchers
+            .retain(|watcher| watcher.try_send(Ok(entry.clone())).is_ok());
     }
 
     fn prune_state(state: &mut FakeBackendState, now: Timestamp) {
@@ -531,7 +537,7 @@ impl FakeSessionBackend {
         state.replication_log.push(entry.clone());
 
         if self.caps.watch {
-            state.watchers.retain(|w| w.send(Ok(entry.clone())).is_ok());
+            Self::notify_watchers(state, &entry);
         }
     }
 
@@ -770,7 +776,7 @@ impl SessionBackend for FakeSessionBackend {
         state.replication_log.push(entry.clone());
 
         // Notify watchers
-        state.watchers.retain(|w| w.send(Ok(entry.clone())).is_ok());
+        Self::notify_watchers(&mut state, &entry);
 
         Ok(())
     }
@@ -791,7 +797,7 @@ impl SessionBackend for FakeSessionBackend {
         StoreError,
     > {
         let mut state = self.inner.lock().await;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(WATCH_CHANNEL_CAPACITY);
 
         // Send existing entries
         for entry in state
@@ -799,7 +805,9 @@ impl SessionBackend for FakeSessionBackend {
             .iter()
             .filter(|e| e.sequence >= start_sequence)
         {
-            let _ = tx.send(Ok(entry.clone()));
+            if tx.try_send(Ok(entry.clone())).is_err() {
+                break;
+            }
         }
 
         state.watchers.push(tx);
@@ -837,7 +845,7 @@ fn compare_restore_records(
 }
 
 struct WatchStream {
-    rx: tokio::sync::mpsc::UnboundedReceiver<Result<ReplicationEntry, StoreError>>,
+    rx: mpsc::Receiver<Result<ReplicationEntry, StoreError>>,
 }
 
 impl futures_util::Stream for WatchStream {

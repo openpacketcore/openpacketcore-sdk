@@ -9,7 +9,7 @@ use futures_util::stream::BoxStream;
 use futures_util::Stream;
 use opc_session_store::backend::{
     CompareAndSet, CompareAndSetResult, ReplicationEntry, SessionBackend, SessionOp,
-    SessionOpResult,
+    SessionOpResult, WATCH_CHANNEL_CAPACITY,
 };
 use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::error::{LeaseError, StoreError};
@@ -371,7 +371,7 @@ impl SessionBackend for RemoteSessionBackend {
         let node_id = self.node_id.clone();
         let deadline = self.deadline;
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(WATCH_CHANNEL_CAPACITY);
 
         tokio::spawn(async move {
             let result = watch_connect_and_read(
@@ -456,10 +456,10 @@ async fn watch_connect_and_read(
     node_id: String,
     start_sequence: u64,
     deadline: Duration,
-    tx: tokio::sync::mpsc::UnboundedSender<Result<ReplicationEntry, StoreError>>,
+    tx: tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>,
 ) -> Result<(), ProtocolError> {
-    // Bound connect + handshake by the client deadline; the watch stream
-    // itself is long-lived and intentionally unbounded.
+    // Bound connect + handshake by the client deadline. After the handshake,
+    // bounded channel sends backpressure socket reads when consumers lag.
     let open = async {
         let tcp = TcpStream::connect(addr).await.map_err(ProtocolError::Io)?;
 
@@ -484,9 +484,11 @@ async fn watch_connect_and_read(
     let mut reader = match tokio::time::timeout(deadline, open).await {
         Ok(res) => res?,
         Err(_) => {
-            let _ = tx.send(Err(StoreError::BackendUnavailable(format!(
-                "watch handshake to {addr} timed out after {deadline:?}"
-            ))));
+            let _ = tx
+                .send(Err(StoreError::BackendUnavailable(format!(
+                    "watch handshake to {addr} timed out after {deadline:?}"
+                ))))
+                .await;
             return Err(ProtocolError::BackendUnavailable(
                 "watch handshake timed out".into(),
             ));
@@ -496,21 +498,25 @@ async fn watch_connect_and_read(
     loop {
         match read_frame::<_, Response>(&mut reader, max_frame_size).await {
             Ok(Response::WatchEntry(item)) => {
-                if tx.send(item).is_err() {
+                if tx.send(item).await.is_err() {
                     break;
                 }
             }
             Ok(_) => {
-                let _ = tx.send(Err(StoreError::BackendUnavailable(
-                    "unexpected watch frame".into(),
-                )));
+                let _ = tx
+                    .send(Err(StoreError::BackendUnavailable(
+                        "unexpected watch frame".into(),
+                    )))
+                    .await;
                 break;
             }
             Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
             Err(e) => {
-                let _ = tx.send(Err(StoreError::BackendUnavailable(e.to_string())));
+                let _ = tx
+                    .send(Err(StoreError::BackendUnavailable(e.to_string())))
+                    .await;
                 break;
             }
         }
@@ -592,7 +598,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
 }
 
 struct WatchStream {
-    rx: tokio::sync::mpsc::UnboundedReceiver<Result<ReplicationEntry, StoreError>>,
+    rx: tokio::sync::mpsc::Receiver<Result<ReplicationEntry, StoreError>>,
 }
 
 impl Stream for WatchStream {

@@ -1,7 +1,7 @@
 use crate::{backend::ReplicationEntry, error::StoreError};
 
 pub(crate) struct SqliteWatchStream {
-    pub(crate) rx: tokio::sync::mpsc::UnboundedReceiver<Result<ReplicationEntry, StoreError>>,
+    pub(crate) rx: tokio::sync::mpsc::Receiver<Result<ReplicationEntry, StoreError>>,
 }
 
 impl futures_util::Stream for SqliteWatchStream {

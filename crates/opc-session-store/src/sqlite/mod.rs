@@ -19,7 +19,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::{
     backend::{
         CompareAndSet, CompareAndSetResult, ReplicationEntry, SessionBackend, SessionOp,
-        SessionOpResult,
+        SessionOpResult, WATCH_CHANNEL_CAPACITY,
     },
     capability::BackendCapabilities,
     clock::Clock,
@@ -50,9 +50,7 @@ pub struct SqliteSessionBackend {
     caps: BackendCapabilities,
     clock: Arc<dyn Clock>,
     watchers: Arc<
-        tokio::sync::Mutex<
-            Vec<tokio::sync::mpsc::UnboundedSender<Result<ReplicationEntry, StoreError>>>,
-        >,
+        tokio::sync::Mutex<Vec<tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>>>,
     >,
 }
 
@@ -415,10 +413,8 @@ impl SessionBackend for SqliteSessionBackend {
         };
 
         if should_notify {
-            let watchers = self.watchers.lock().await;
-            for watcher in watchers.iter() {
-                let _ = watcher.send(Ok(entry.clone()));
-            }
+            let mut watchers = self.watchers.lock().await;
+            watchers.retain(|watcher| watcher.try_send(Ok(entry.clone())).is_ok());
         }
 
         Ok(())
@@ -439,12 +435,14 @@ impl SessionBackend for SqliteSessionBackend {
         futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
         StoreError,
     > {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(WATCH_CHANNEL_CAPACITY);
 
         // Query existing entries starting from start_sequence
         let existing = self.get_replication_log(start_sequence, 10000).await?;
         for entry in existing {
-            let _ = tx.send(Ok(entry));
+            if tx.try_send(Ok(entry)).is_err() {
+                break;
+            }
         }
 
         let mut watchers = self.watchers.lock().await;
