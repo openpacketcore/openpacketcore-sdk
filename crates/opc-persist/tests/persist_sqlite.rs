@@ -526,6 +526,26 @@ fn audit_key_rejects_all_zero_material() {
 }
 
 #[tokio::test]
+async fn ephemeral_backends_use_distinct_audit_hmac_keys() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path_a = temp_dir.path().join("ephemeral_a.db");
+    let db_path_b = temp_dir.path().join("ephemeral_b.db");
+
+    let backend_a = SqliteBackend::open(&db_path_a, true, 0)
+        .await
+        .expect("open first ephemeral backend");
+    let backend_b = SqliteBackend::open(&db_path_b, true, 0)
+        .await
+        .expect("open second ephemeral backend");
+
+    assert_ne!(
+        backend_a.audit_key().as_bytes(),
+        backend_b.audit_key().as_bytes(),
+        "ephemeral audit HMAC keys must not be a shared compile-time constant"
+    );
+}
+
+#[tokio::test]
 async fn durable_open_succeeds_when_database_directory_contains_single_quote() {
     let temp_dir = tempfile::Builder::new()
         .prefix("it's-safe-")

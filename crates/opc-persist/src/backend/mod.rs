@@ -17,6 +17,7 @@
 //! audit records co-durable. If the process crashes mid-commit, SQLite's WAL
 //! recovery will roll back to the last consistent state.
 
+use rand::{rngs::SysRng, TryRng};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -131,8 +132,6 @@ impl SqliteBackend {
     /// Maximum time SQLite may busy-wait on this backend connection.
     pub const SQLITE_BUSY_TIMEOUT_MS: u32 = schema::SQLITE_BUSY_TIMEOUT_MS;
 
-    const EPHEMERAL_AUDIT_KEY_BYTES: [u8; 32] = [0xA5; 32];
-
     /// Open (or create) a SQLite database at the given path.
     ///
     /// The directory must exist. If `ephemeral` is true, durability preflight
@@ -168,7 +167,7 @@ impl SqliteBackend {
             path,
             ephemeral,
             min_free_bytes,
-            AuditKey::from_static_test_bytes(Self::EPHEMERAL_AUDIT_KEY_BYTES),
+            Self::random_ephemeral_audit_key()?,
         )
         .await
     }
@@ -192,6 +191,14 @@ impl SqliteBackend {
 
     pub fn conn(&self) -> Arc<AsyncMutex<rusqlite::Connection>> {
         self.conn.clone()
+    }
+
+    fn random_ephemeral_audit_key() -> Result<AuditKey, PersistError> {
+        let mut bytes = [0u8; 32];
+        SysRng.try_fill_bytes(&mut bytes).map_err(|_| {
+            PersistError::preflight_failed("failed to generate ephemeral audit HMAC key")
+        })?;
+        AuditKey::new(bytes)
     }
 
     async fn open_inner(

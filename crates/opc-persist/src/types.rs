@@ -202,10 +202,6 @@ impl AuditKey {
         Ok(Self(Zeroizing::new(bytes)))
     }
 
-    pub(crate) fn from_static_test_bytes(bytes: [u8; 32]) -> Self {
-        Self(Zeroizing::new(bytes))
-    }
-
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
