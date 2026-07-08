@@ -159,6 +159,80 @@ assertions:
 }
 
 #[test]
+fn local_runner_rejects_unregistered_protocol_fixture() {
+    let yaml = r#"
+id: LOCAL-FIXTURE-MISSING
+title: Missing fixture provenance fails closed
+schema_version: "0.1.0"
+requirements:
+  - REQ-3GPP-TS23502-R17-4.2.2-001
+topology:
+  nfs:
+    epdg: { image: opc-epdg:test }
+    pgw: { image: opc-pgw:test }
+steps:
+  - kind: send_gtpv2c
+    from: epdg
+    to: pgw
+    fixture: fixtures/s2b/create-session-request.bin
+"#;
+    let scenario = Scenario::from_yaml(yaml).unwrap();
+    let clock = VirtualClock::new(Timestamp::now_utc());
+    let mut runner = LocalRunner::new(clock);
+
+    let err = runner
+        .run(&scenario)
+        .expect_err("missing fixture provenance must fail closed");
+    assert!(matches!(err, TestbedError::Fixture(_)));
+    assert!(err.to_string().contains("not registered"));
+}
+
+#[test]
+fn local_runner_records_registered_fixture_provenance() {
+    let yaml = r#"
+id: LOCAL-FIXTURE-RECORDED
+title: Fixture provenance is emitted
+schema_version: "0.1.0"
+requirements:
+  - REQ-3GPP-TS23502-R17-4.2.2-001
+topology:
+  nfs:
+    epdg: { image: opc-epdg:test }
+    pgw: { image: opc-pgw:test }
+steps:
+  - kind: send_gtpv2c
+    from: epdg
+    to: pgw
+    fixture: fixtures/s2b/create-session-request.bin
+"#;
+    let scenario = Scenario::from_yaml(yaml).unwrap();
+    let mut registry = FixtureRegistry::default();
+    registry
+        .register(FixtureProvenance {
+            id: "fixtures/s2b/create-session-request.bin".into(),
+            source: "synthetic-generator".into(),
+            standard_ref: "3GPP TS 29.274".into(),
+            release: "R17".into(),
+            synthetic: true,
+            sanitization: "none".into(),
+            expected_decode: "DecodeSuccess(CreateSessionRequest)".into(),
+            requirements: vec!["REQ-3GPP-TS23502-R17-4.2.2-001".into()],
+            notes: None,
+        })
+        .unwrap();
+    let clock = VirtualClock::new(Timestamp::now_utc());
+    let mut runner = LocalRunner::new(clock).with_fixture_registry(registry);
+
+    let evidence = runner.run(&scenario).unwrap();
+    assert_eq!(evidence.outcome, ScenarioOutcome::Pass);
+    assert_eq!(evidence.fixture_provenance.len(), 1);
+    assert_eq!(
+        evidence.fixture_provenance[0].id,
+        "fixtures/s2b/create-session-request.bin"
+    );
+}
+
+#[test]
 fn local_runner_rejects_missing_simulator_endpoint() {
     let yaml = r#"
 id: LOCAL-MISSING-SIM
