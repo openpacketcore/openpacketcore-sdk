@@ -543,6 +543,29 @@ async fn durable_open_succeeds_when_database_directory_contains_single_quote() {
 }
 
 #[tokio::test]
+async fn sqlite_backend_busy_timeout_is_capped_for_async_worker_profile() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = temp_dir.path().join("test_busy_timeout_cap.db");
+
+    let backend = SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect("open backend");
+
+    assert_eq!(SqliteBackend::MAX_CONCURRENT_DB_OPERATIONS, 1);
+
+    let conn = backend.conn();
+    let guard = conn.lock().await;
+    let busy_timeout_ms: u32 = guard
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .expect("query backend busy_timeout");
+
+    assert!(
+        busy_timeout_ms <= 100,
+        "busy_timeout must be capped to avoid pinning async workers, got {busy_timeout_ms}ms"
+    );
+}
+
+#[tokio::test]
 async fn load_latest_fails_closed_on_corrupt_timestamp() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let db_path = temp_dir.path().join("corrupt_ts.db");

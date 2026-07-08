@@ -2,12 +2,14 @@
 //!
 //! ## Thread Safety
 //!
-//! This implementation uses a `tokio::sync::Mutex` (held as an owned guard via
-//! `lock_owned()`) to protect a single synchronous SQLite connection. All database
-//! operations are synchronous (rusqlite does not provide an async API). The mutex
-//! ensures serialized writer access across all concurrent async tasks. SQLite I/O
-//! is local SSD or in-memory, so blocking the async worker for the duration of a
-//! query is acceptable for the management-plane single-replica profile.
+//! This implementation uses a `tokio::sync::Mutex` to protect a single
+//! synchronous SQLite connection. All database operations are synchronous
+//! (rusqlite does not provide an async API). The mutex enforces a hard
+//! one-operation-at-a-time cap across all concurrent async tasks, and the SQLite
+//! busy timeout is capped at [`SqliteBackend::SQLITE_BUSY_TIMEOUT_MS`] so a lock
+//! wait cannot pin a shared runtime worker for an unbounded or multi-second
+//! interval. This bounded profile is intentional for the management-plane
+//! single-replica reference backend.
 //!
 //! ## Atomicity
 //!
@@ -124,6 +126,11 @@ pub struct SqliteBackend {
 }
 
 impl SqliteBackend {
+    /// Hard cap enforced by the single SQLite connection mutex.
+    pub const MAX_CONCURRENT_DB_OPERATIONS: usize = 1;
+    /// Maximum time SQLite may busy-wait on this backend connection.
+    pub const SQLITE_BUSY_TIMEOUT_MS: u32 = schema::SQLITE_BUSY_TIMEOUT_MS;
+
     const EPHEMERAL_AUDIT_KEY_BYTES: [u8; 32] = [0xA5; 32];
 
     /// Open (or create) a SQLite database at the given path.

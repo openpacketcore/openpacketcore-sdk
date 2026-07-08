@@ -13,9 +13,12 @@
 
 use rusqlite::{Connection, Transaction};
 use std::path::Path;
+use std::time::Duration;
 
 /// Current schema version. Bump this and add a migration step to evolve the schema.
 pub const SCHEMA_VERSION: &str = "1.8.0";
+/// Cap SQLite lock waits on async runtime workers.
+pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 100;
 
 /// Initialize the database schema.
 ///
@@ -559,10 +562,10 @@ pub fn apply_pragma_profile(conn: &Connection) -> Result<(), rusqlite::Error> {
         PRAGMA synchronous = EXTRA;
         PRAGMA foreign_keys = ON;
         PRAGMA locking_mode = NORMAL;
-        PRAGMA busy_timeout = 1000;
         PRAGMA temp_store = MEMORY;
         "#,
     )?;
+    conn.busy_timeout(Duration::from_millis(u64::from(SQLITE_BUSY_TIMEOUT_MS)))?;
 
     // Verify temp_store was applied; if not, log a warning
     let ts: i32 = conn.query_row("PRAGMA temp_store", [], |row| row.get(0))?;
