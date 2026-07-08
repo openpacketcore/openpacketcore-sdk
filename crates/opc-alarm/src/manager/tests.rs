@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use super::*;
 use crate::model::*;
 use time::OffsetDateTime;

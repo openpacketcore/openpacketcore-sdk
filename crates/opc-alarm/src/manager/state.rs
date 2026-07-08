@@ -312,6 +312,10 @@ impl<S: AlarmStore> AlarmManager<S> {
     /// closed if the action cannot be audited. Returns `Unauthorized` when
     /// `auth.authorized` is false, and `NotFound` for unknown or no longer
     /// active alarm ids.
+    #[deprecated(
+        since = "0.2.0",
+        note = "use acknowledge_with_policy so authorization and audit are enforced"
+    )]
     pub fn acknowledge(&mut self, alarm_id: &AlarmId, auth: &SuppressionAuth) -> AlarmOpResult {
         if !auth.authorized {
             return AlarmOpResult::Unauthorized {
@@ -372,6 +376,10 @@ impl<S: AlarmStore> AlarmManager<S> {
     /// callers should use `suppress_with_policy`, which enforces both.
     /// Returns `Unauthorized` when `auth.authorized` is false, and `NotFound`
     /// for unknown or no longer active alarm ids.
+    #[deprecated(
+        since = "0.2.0",
+        note = "use suppress_with_policy so authorization, audit, and security-critical checks are enforced"
+    )]
     pub fn suppress(&mut self, alarm_id: &AlarmId, auth: &SuppressionAuth) -> AlarmOpResult {
         if !auth.authorized {
             return AlarmOpResult::Unauthorized {
