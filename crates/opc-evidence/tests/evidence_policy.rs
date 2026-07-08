@@ -16,6 +16,68 @@ fn relaxed_release_policy() -> GatePolicy {
 }
 
 #[test]
+fn release_policy_rejects_mock_bundle_verifier() {
+    let policy = GatePolicy {
+        mode: PolicyMode::Release,
+        require_sbom: true,
+        require_vex: false,
+        require_provenance: false,
+        require_performance: false,
+        require_data_governance: false,
+        allow_dirty_worktree: false,
+        expected_git_commit: None,
+    };
+    let evaluator = GateEvaluator::new(&policy);
+    let signer = MockSigner::new("policy-key");
+    let verifier = MockVerifier::new("policy-key");
+    let mut bundle = EvidenceBundle {
+        manifest: Manifest {
+            schema_version: "1.0.0".to_string(),
+            sdk_version: "0.1.0".to_string(),
+            git_commit: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            artifact_digests: vec![],
+            file_digests: vec![],
+            signing_identity: "mock-identity-policy-key".to_string(),
+            generation_tool: "opc-evidence".to_string(),
+            generation_tool_version: "0.1.0".to_string(),
+            generation_timestamp: "2026-06-08T12:00:00Z".to_string(),
+            known_incomplete_sections: vec![],
+            metadata: std::collections::HashMap::new(),
+        },
+        signature: String::new(),
+        conformance_report: None,
+        sbom: Some("{}".to_string()),
+        vex: None,
+        provenance: None,
+        performance_baseline: None,
+        data_governance_report: None,
+    };
+    bundle.signature = signer
+        .sign(&bundle_signing_bytes(&bundle).unwrap())
+        .unwrap();
+
+    let res = evaluator.evaluate(
+        &[],
+        &[],
+        Some(&bundle),
+        None,
+        Some("{}"),
+        None,
+        None,
+        None,
+        None,
+        Some(&verifier),
+        Some(&std::collections::HashMap::new()),
+    );
+
+    let err = res.expect_err("release policy must reject mock bundle verifiers");
+    assert!(
+        err.to_string().contains("non-mock bundle verifier"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn waived_status_without_waiver_record_is_rejected() {
     let req_id = RequirementId::from_str("REQ-IETF-RFC7951-V1-4.2-099").unwrap();
     let record = EvidenceRecord::new(req_id, ConformanceStatus::Waived);
@@ -183,7 +245,7 @@ fn test_gap_006_006_gate_policy() {
         metadata: std::collections::HashMap::new(),
     };
     let signer = MockSigner::new("policy-key");
-    let verifier = MockVerifier::new("policy-key");
+    let verifier = MockVerifier::new_release_capable("policy-key");
     let mut bundle = EvidenceBundle {
         manifest,
         signature: String::new(),

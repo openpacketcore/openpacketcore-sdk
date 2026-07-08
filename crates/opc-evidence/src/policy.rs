@@ -202,6 +202,13 @@ impl<'a> GateEvaluator<'a> {
             let verifier = verifier.ok_or_else(|| {
                 EvidenceError::GapGateFailed("missing verifier for bundle verification".to_string())
             })?;
+            if self.policy.mode == PolicyMode::Release
+                && verifier.security() != crate::bundle::BundleVerifierSecurity::Release
+            {
+                return Err(EvidenceError::GapGateFailed(
+                    "release policy requires a non-mock bundle verifier".to_string(),
+                ));
+            }
             let files = files.ok_or_else(|| {
                 EvidenceError::GapGateFailed("missing files for bundle verification".to_string())
             })?;

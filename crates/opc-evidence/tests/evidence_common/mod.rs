@@ -5,6 +5,63 @@ pub mod schema_support;
 
 pub use opc_evidence::*;
 
+pub struct MockSigner {
+    key: String,
+}
+
+impl MockSigner {
+    pub fn new(key: impl Into<String>) -> Self {
+        Self { key: key.into() }
+    }
+}
+
+impl BundleSigner for MockSigner {
+    fn sign(&self, data: &[u8]) -> Result<String, EvidenceError> {
+        let digest = compute_digest(data);
+        Ok(format!("mock-sig:{}:{}", self.key, digest))
+    }
+
+    fn identity(&self) -> String {
+        format!("mock-identity-{}", self.key)
+    }
+}
+
+pub struct MockVerifier {
+    key: String,
+    security: BundleVerifierSecurity,
+}
+
+impl MockVerifier {
+    pub fn new(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            security: BundleVerifierSecurity::TestOnly,
+        }
+    }
+
+    pub fn new_release_capable(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            security: BundleVerifierSecurity::Release,
+        }
+    }
+}
+
+impl BundleVerifier for MockVerifier {
+    fn verify(&self, data: &[u8], signature: &str) -> Result<(), EvidenceError> {
+        let expected = format!("mock-sig:{}:{}", self.key, compute_digest(data));
+        if signature == expected {
+            Ok(())
+        } else {
+            Err(EvidenceError::ManifestTampered)
+        }
+    }
+
+    fn security(&self) -> BundleVerifierSecurity {
+        self.security
+    }
+}
+
 pub const EVIDENCE_RECORD_SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/schemas/rfc006/v1/evidence-record.schema.json"

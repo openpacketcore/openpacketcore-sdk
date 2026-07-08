@@ -55,55 +55,17 @@ pub trait BundleSigner {
 }
 
 /// A verifier trait for verifying the signature of the bundle manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleVerifierSecurity {
+    /// Verifier is backed by release-appropriate asymmetric verification.
+    Release,
+    /// Verifier is deterministic or otherwise forgeable and must only be used in tests.
+    TestOnly,
+}
+
 pub trait BundleVerifier {
     fn verify(&self, data: &[u8], signature: &str) -> Result<(), EvidenceError>;
-}
-
-/// An in-process mock signer for testing and offline builds.
-pub struct MockSigner {
-    pub key: String,
-}
-
-impl MockSigner {
-    pub fn new(key: impl Into<String>) -> Self {
-        Self { key: key.into() }
-    }
-}
-
-impl BundleSigner for MockSigner {
-    fn sign(&self, data: &[u8]) -> Result<String, EvidenceError> {
-        let digest = crate::manifest::compute_digest(data);
-        Ok(format!("mock-sig:{}:{}", self.key, digest))
-    }
-    fn identity(&self) -> String {
-        format!("mock-identity-{}", self.key)
-    }
-}
-
-/// An in-process mock verifier matching `MockSigner`.
-pub struct MockVerifier {
-    pub key: String,
-}
-
-impl MockVerifier {
-    pub fn new(key: impl Into<String>) -> Self {
-        Self { key: key.into() }
-    }
-}
-
-impl BundleVerifier for MockVerifier {
-    fn verify(&self, data: &[u8], signature: &str) -> Result<(), EvidenceError> {
-        let expected = format!(
-            "mock-sig:{}:{}",
-            self.key,
-            crate::manifest::compute_digest(data)
-        );
-        if signature == expected {
-            Ok(())
-        } else {
-            Err(EvidenceError::ManifestTampered)
-        }
-    }
+    fn security(&self) -> BundleVerifierSecurity;
 }
 
 /// Represents the packaged evidence bundle.
