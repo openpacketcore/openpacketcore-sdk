@@ -39,7 +39,10 @@ pub(crate) fn alarm_requires_explicit_suppression_policy(alarm: &Alarm) -> bool 
                 | ProbableCause::IdentityUnavailable
                 | ProbableCause::CertificateExpired
                 | ProbableCause::KeyUnavailable
+                | ProbableCause::StorageCorruption
                 | ProbableCause::AuditChainInvalid
+                | ProbableCause::LiDeliveryFailed
                 | ProbableCause::PrivacyPolicyViolation
+                | ProbableCause::SecurityBreakGlass
         )
 }

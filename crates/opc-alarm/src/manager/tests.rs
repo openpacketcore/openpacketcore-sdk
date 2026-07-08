@@ -1366,6 +1366,47 @@ fn policy_suppress_security_critical_denied_by_default() {
 }
 
 #[test]
+fn policy_suppress_major_break_glass_alarm_requires_explicit_override() {
+    let mut mgr = make_manager();
+
+    let alarm_id = match mgr.raise(
+        AlarmType::new("security.break-glass"),
+        Severity::Major,
+        ProbableCause::SecurityBreakGlass,
+        AffectedObject::NfInstance {
+            kind: "amf".to_string(),
+            instance: "amf-1".to_string(),
+        },
+        Some("tenant-a".to_string()),
+        None,
+        None,
+        RedactedText::new("Break-glass override exercised"),
+        AlarmDetails::empty(),
+    ) {
+        AlarmOpResult::Raised { alarm } => alarm.alarm_id,
+        other => panic!("expected Raised, got {other:?}"),
+    };
+
+    let auth = TestAuthorizer {
+        allow: true,
+        allow_security_critical: false,
+    };
+    let mut audit = CapturingAuditSink::default();
+    let result = mgr.suppress_with_policy(
+        &alarm_id,
+        &alarm_action_context(&alarm_id),
+        &auth,
+        &mut audit,
+    );
+
+    assert!(matches!(result, AlarmOpResult::Unauthorized { .. }));
+    assert_eq!(audit.events.len(), 1);
+    assert_eq!(audit.events[0].action, AlarmAction::Suppress);
+    assert_eq!(audit.events[0].outcome, AlarmAuditOutcome::Denied);
+    assert_eq!(mgr.active_alarms()[0].state, AlarmState::Raised);
+}
+
+#[test]
 fn policy_suppress_security_critical_requires_explicit_override() {
     let mut mgr = make_manager();
 
