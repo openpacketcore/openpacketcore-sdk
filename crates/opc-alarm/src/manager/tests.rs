@@ -370,7 +370,7 @@ fn same_fault_different_regions_do_not_merge_or_clear_each_other() {
     let mut mgr = make_manager();
 
     // Raise alarm in region-east
-    let east = RegionId::new("region-east");
+    let east = RegionId::try_new("region-east").expect("valid region");
     let r1 = mgr.raise(
         AlarmType::new("link.down"),
         Severity::Major,
@@ -390,7 +390,7 @@ fn same_fault_different_regions_do_not_merge_or_clear_each_other() {
     };
 
     // Raise same fault in region-west — must create a SEPARATE alarm (not update east)
-    let west = RegionId::new("region-west");
+    let west = RegionId::try_new("region-west").expect("valid region");
     let r2 = mgr.raise(
         AlarmType::new("link.down"),
         Severity::Major,

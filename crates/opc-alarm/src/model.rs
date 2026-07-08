@@ -64,6 +64,7 @@ impl RegionId {
     /// # Panics
     ///
     /// Panics if the value is empty or longer than 128 bytes.
+    #[deprecated(note = "use RegionId::try_new for runtime input")]
     pub fn new(value: impl Into<String>) -> Self {
         Self::try_new(value).unwrap_or_else(|err| panic!("{err}"))
     }
