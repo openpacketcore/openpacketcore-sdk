@@ -109,27 +109,30 @@ pub fn sanitize_denial_message(msg: &str) -> String {
 }
 
 fn redact_admin_token_values(msg: &str) -> String {
-    let mut words: Vec<String> = msg.split_whitespace().map(str::to_string).collect();
-    let mut redact_next = false;
+    let mut words = Vec::new();
+    let mut redacted_value = false;
 
-    for word in &mut words {
+    for word in msg.split_whitespace() {
         let normalized = word
             .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '=')
             .to_ascii_lowercase();
 
-        if redact_next {
-            *word = "[redacted-token]".to_string();
-            redact_next = false;
+        if redacted_value {
             continue;
         }
 
-        if normalized.contains("token=") {
-            *word = "[redacted-token]".to_string();
+        if let Some(index) = word.to_ascii_lowercase().find("token=") {
+            let value_start = index + "token=".len();
+            words.push(format!("{}[redacted-token]", &word[..value_start]));
+            redacted_value = true;
             continue;
         }
+
+        words.push(word.to_string());
 
         if normalized == "token" || normalized.ends_with("_token") {
-            redact_next = true;
+            words.push("[redacted-token]".to_string());
+            redacted_value = true;
         }
     }
 
