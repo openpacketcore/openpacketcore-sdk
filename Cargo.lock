@@ -2010,6 +2010,7 @@ dependencies = [
  "opc-security-testkit",
  "opc-session-store",
  "opc-session-testkit",
+ "opc-testbed",
  "opc-types",
  "rcgen",
  "rusqlite",

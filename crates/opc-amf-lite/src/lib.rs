@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock};
 
 use opc_alarm::{
@@ -38,6 +38,7 @@ use opc_session_store::{
     FencedSessionReplica, Generation, OwnerId, QuorumSessionStore, SessionBackend, SessionKey,
     SessionKeyType, SessionLeaseManager, StateClass, StateType, StoredSessionRecord,
 };
+use opc_testbed::Clock as TestClock;
 use opc_types::{ConfigVersion, NetworkFunctionKind, SchemaDigest, TenantId, Timestamp, TxId};
 
 pub const AMF_SCHEMA_DIGEST: &str =
@@ -423,6 +424,18 @@ struct AmfLiteState {
     active_nrf_registration: bool,
 }
 
+struct SystemAmfClock;
+
+impl TestClock for SystemAmfClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::now_utc()
+    }
+
+    fn monotonic(&self) -> Instant {
+        Instant::now()
+    }
+}
+
 /// AMF-lite network function orchestrating the entire SDK substrate.
 pub struct AmfLite {
     runtime: RuntimeHandle,
@@ -430,6 +443,7 @@ pub struct AmfLite {
     session_store: QuorumSessionStore,
     alarms: SharedAlarmManager,
     _kms_provider: Arc<KmsKeyProvider>,
+    clock: Arc<dyn TestClock>,
     state: Arc<RwLock<AmfLiteState>>,
     state_notify: Arc<Notify>,
     _phase_notify: Arc<Notify>,
@@ -448,6 +462,33 @@ impl AmfLite {
         admin_addr: SocketAddr,
         nacm_policy: Arc<NacmPolicy>,
         nacm_modules: Arc<ModuleRegistry>,
+    ) -> Result<Self, RuntimeError> {
+        Self::start_with_clock(
+            initial_config,
+            config_store,
+            session_replicas,
+            kms_endpoint,
+            auth_token,
+            admin_addr,
+            nacm_policy,
+            nacm_modules,
+            Arc::new(SystemAmfClock),
+        )
+        .await
+    }
+
+    /// Launches the AMF-lite network function with an injected clock.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_clock(
+        initial_config: AmfConfig,
+        config_store: Arc<dyn ConfigStore>,
+        session_replicas: Vec<FencedSessionReplica>,
+        kms_endpoint: String,
+        auth_token: Option<String>,
+        admin_addr: SocketAddr,
+        nacm_policy: Arc<NacmPolicy>,
+        nacm_modules: Arc<ModuleRegistry>,
+        clock: Arc<dyn TestClock>,
     ) -> Result<Self, RuntimeError> {
         let alarms = SharedAlarmManager::default();
 
@@ -582,6 +623,7 @@ impl AmfLite {
             session_store,
             alarms,
             _kms_provider: kms_provider,
+            clock,
             state,
             state_notify,
             _phase_notify: phase_notify,
@@ -592,6 +634,10 @@ impl AmfLite {
         amf.complete_startup(Duration::from_secs(5)).await?;
 
         Ok(amf)
+    }
+
+    fn now(&self) -> Timestamp {
+        self.clock.now()
     }
 
     async fn complete_startup(&self, timeout: Duration) -> Result<(), RuntimeError> {
@@ -657,11 +703,12 @@ impl AmfLite {
                 );
             })?;
 
+        let now = self.now();
         let ctx = UeSessionContext {
             imsi: imsi.to_string(),
             state: "REGISTERED".to_string(),
             amf_ue_ngap_id,
-            last_updated: Timestamp::now_utc(),
+            last_updated: now,
         };
 
         let value_bytes = serde_json::to_vec(&ctx)?;
@@ -672,7 +719,7 @@ impl AmfLite {
             fence: lease.fence(),
             state_class: StateClass::AuthoritativeSession,
             state_type: StateType::new("subscriber-context").unwrap(),
-            expires_at: Some(add_duration(Timestamp::now_utc(), lease_ttl)),
+            expires_at: Some(add_duration(now, lease_ttl)),
             payload: EncryptedSessionPayload::new(value_bytes),
         };
 
@@ -715,7 +762,8 @@ impl AmfLite {
 
         let mut ctx: UeSessionContext = serde_json::from_slice(&plaintext_payload)?;
         ctx.state = new_state.to_string();
-        ctx.last_updated = Timestamp::now_utc();
+        let now = self.now();
+        ctx.last_updated = now;
 
         // Perform mutation under fence
         let value_bytes = serde_json::to_vec(&ctx)?;
@@ -733,7 +781,7 @@ impl AmfLite {
             fence: lease.fence(),
             state_class: latest.state_class,
             state_type: latest.state_type.clone(),
-            expires_at: Some(add_duration(Timestamp::now_utc(), Duration::from_secs(5))),
+            expires_at: Some(add_duration(now, Duration::from_secs(5))),
             payload: EncryptedSessionPayload::new(value_bytes),
         };
 
@@ -787,7 +835,7 @@ impl AmfLite {
             ConfigOperation::Replace,
             candidate,
             paths,
-            Instant::now() + Duration::from_secs(2),
+            self.clock.monotonic() + Duration::from_secs(2),
         )
         .with_base_version(current_snapshot.version);
 
@@ -828,7 +876,7 @@ impl AmfLite {
             RequestSource::Northbound,
             ConfigOperation::Replace,
             mode,
-            Instant::now() + Duration::from_secs(5),
+            self.clock.monotonic() + Duration::from_secs(5),
             Some(candidate),
             paths,
         )
@@ -1016,5 +1064,3 @@ async fn spawn_registration_worker(
 
     Ok(())
 }
-
-use std::time::Instant;

@@ -17,6 +17,7 @@ use opc_session_store::{
     StateClass, StateType, StoreError, StoredSessionRecord,
 };
 use opc_session_testkit::ChaosTestkit;
+use opc_testbed::VirtualClock;
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
 const TEST_AUDIT_KEY_BYTES: [u8; 32] = [0xA5; 32];
@@ -305,7 +306,10 @@ async fn test_amf_lite_e2e_happy_path() {
 
     // 6. Launch AMF-lite
     println!("[E2E] Starting AMF-lite...");
-    let amf = AmfLite::start(
+    let mut virtual_clock = VirtualClock::new(Timestamp::now_utc());
+    virtual_clock.advance(time::Duration::seconds(42));
+    let expected_session_time = virtual_clock.now();
+    let amf = AmfLite::start_with_clock(
         AmfConfig::default(),
         config_store,
         chaos.replicas.clone(),
@@ -314,6 +318,7 @@ async fn test_amf_lite_e2e_happy_path() {
         admin_addr,
         policy,
         nacm_modules,
+        Arc::new(virtual_clock),
     )
     .await
     .expect("AMF-lite starts successfully");
@@ -383,6 +388,14 @@ async fn test_amf_lite_e2e_happy_path() {
     let ctx: opc_amf_lite::UeSessionContext = serde_json::from_slice(plaintext_payload).unwrap();
     assert_eq!(ctx.state, "REGISTERED");
     assert_eq!(ctx.amf_ue_ngap_id, 101);
+    assert_eq!(ctx.last_updated, expected_session_time);
+    assert_eq!(
+        retrieved.expires_at,
+        Some(opc_amf_lite::add_duration(
+            expected_session_time,
+            Duration::from_secs(10)
+        ))
+    );
 
     // Update state to CONNECTED
     println!("[E2E] Updating UE session state to CONNECTED");
