@@ -18,7 +18,6 @@
 //! recovery will roll back to the last consistent state.
 
 use rand::{rngs::SysRng, TryRng};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
@@ -287,8 +286,16 @@ impl SqliteBackend {
             schema::get_schema_digest(&conn).map_err(|e| PersistError::sqlite(e.to_string()))?;
 
         match (current_version.as_deref(), current_digest.as_deref()) {
-            (Some(schema::SCHEMA_VERSION), Some(digest)) => {
-                debug!(schema_digest = %digest, "existing database schema found");
+            (Some(schema::SCHEMA_VERSION), Some(stored_digest)) => {
+                let live_digest = schema::current_schema_digest(&conn)
+                    .map_err(|e| PersistError::sqlite(e.to_string()))?;
+                if stored_digest != live_digest {
+                    return Err(PersistError::schema_digest_mismatch(
+                        live_digest,
+                        stored_digest.to_string(),
+                    ));
+                }
+                debug!(schema_digest = %stored_digest, "existing database schema found");
             }
             (Some("1.0.0"), _)
             | (Some("1.1.0"), _)
@@ -298,16 +305,18 @@ impl SqliteBackend {
             | (Some("1.5.0"), _)
             | (Some("1.6.0"), _)
             | (Some("1.7.0"), _)
+            | (Some("1.8.0"), _)
             | (None, _) => {
                 if let Some(from_version) = current_version.as_deref() {
                     schema::run_migrations(&conn, from_version)
                         .map_err(|e| PersistError::sqlite(e.to_string()))?;
                 }
                 Self::reseal_audit_chains_for_schema_1_6(&conn, audit_key)?;
+                let digest = schema::current_schema_digest(&conn)
+                    .map_err(|e| PersistError::sqlite(e.to_string()))?;
                 let tx = conn
                     .unchecked_transaction()
                     .map_err(|e| PersistError::sqlite(e.to_string()))?;
-                let digest = Self::current_schema_digest();
                 schema::set_schema_version(&tx, &digest)
                     .map_err(|e| PersistError::sqlite(e.to_string()))?;
                 tx.commit()
@@ -505,34 +514,6 @@ impl SqliteBackend {
 
     fn is_in_memory_database(path: &Path) -> bool {
         path == Path::new(":memory:")
-    }
-
-    /// SHA-256 of the current schema SQL — used as the schema digest.
-    fn current_schema_digest() -> String {
-        let sql = r#"
-        CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK (id = 1), schema_digest TEXT NOT NULL, sdk_version TEXT NOT NULL, created_at TEXT NOT NULL);
-        CREATE TABLE config_history (tx_id BLOB PRIMARY KEY, parent_tx_id BLOB NULL, version INTEGER NOT NULL UNIQUE, committed_at TEXT NOT NULL, principal TEXT NOT NULL, source TEXT NOT NULL, schema_digest BLOB NOT NULL, plaintext_digest BLOB NOT NULL, encrypted_blob BLOB NOT NULL, rollback_point INTEGER NOT NULL DEFAULT 0, rollback_label TEXT NULL, confirmed_deadline TEXT NULL, confirmed_at TEXT NULL, audit_count INTEGER NOT NULL DEFAULT 0, audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000');
-        CREATE TABLE audit_trail (id INTEGER PRIMARY KEY AUTOINCREMENT, tx_id BLOB NOT NULL, sequence INTEGER NOT NULL, yang_path TEXT NOT NULL, op_type TEXT NOT NULL, previous_value TEXT NULL, new_value TEXT NULL, redaction_applied INTEGER NOT NULL DEFAULT 0, previous_hash BLOB NOT NULL, entry_hmac BLOB NOT NULL, UNIQUE(tx_id, sequence));
-        CREATE TABLE config_lifecycle_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, tx_id BLOB NOT NULL, action TEXT NOT NULL, principal TEXT NOT NULL, occurred_at TEXT NOT NULL, details TEXT NOT NULL);
-        CREATE TABLE rollback_labels (label TEXT PRIMARY KEY, tx_id BLOB NOT NULL, created_at TEXT NOT NULL);
-        CREATE TABLE alarm_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, outcome TEXT NOT NULL, alarm_id TEXT NOT NULL, alarm_type TEXT NOT NULL, probable_cause TEXT NOT NULL, principal TEXT NOT NULL, tenant TEXT NULL, reason TEXT NOT NULL, scope TEXT NOT NULL, correlation_id TEXT NULL, occurred_at TEXT NOT NULL);
-        CREATE TABLE consensus_state (node_id INTEGER PRIMARY KEY, current_term INTEGER NOT NULL, voted_for INTEGER NULL);
-        CREATE TABLE consensus_log (log_index INTEGER PRIMARY KEY, term INTEGER NOT NULL, op_type TEXT NOT NULL, payload BLOB NOT NULL);
-        CREATE TABLE consensus_applied (id INTEGER PRIMARY KEY CHECK (id = 1), applied_index INTEGER NOT NULL);
-        CREATE TABLE consensus_membership (id INTEGER PRIMARY KEY CHECK (id = 1), cluster_id TEXT NOT NULL, node_id INTEGER NOT NULL, voting_members TEXT NOT NULL, non_voting_members TEXT NOT NULL, old_voting_members TEXT NULL, removed_members TEXT NOT NULL, epoch INTEGER NOT NULL);
-        CREATE TABLE consensus_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), snapshot_index INTEGER NOT NULL, snapshot_term INTEGER NOT NULL, snapshot_data BLOB NOT NULL);
-        CREATE TABLE staged_security_policy (tenant TEXT PRIMARY KEY, version INTEGER NOT NULL, staged_at TEXT NOT NULL, principal TEXT NOT NULL, encrypted_blob BLOB NOT NULL);
-        CREATE TABLE security_policy_active (tenant TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_at TEXT NOT NULL, principal TEXT NOT NULL, encrypted_blob BLOB NOT NULL);
-        CREATE TABLE security_policy_history (tenant TEXT NOT NULL, version INTEGER NOT NULL, applied_at TEXT NOT NULL, principal TEXT NOT NULL, encrypted_blob BLOB NOT NULL, tx_id BLOB NULL, label TEXT NULL, PRIMARY KEY (tenant, version));
-        CREATE TABLE security_policy_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL, timestamp TEXT NOT NULL, principal TEXT NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL, previous_hash BLOB NOT NULL, entry_hmac BLOB NOT NULL);
-        CREATE TABLE security_policy_audit_anchor (tenant TEXT PRIMARY KEY, audit_count INTEGER NOT NULL DEFAULT 0, audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000');
-        CREATE TABLE break_glass_sessions (id TEXT PRIMARY KEY, principal TEXT NOT NULL, tenant TEXT NOT NULL, reason TEXT NOT NULL, scope TEXT NOT NULL, requested_duration INTEGER NOT NULL, evidence_id TEXT NOT NULL, status TEXT NOT NULL, requested_at TEXT NOT NULL, approved_at TEXT, approver TEXT, activated_at TEXT, expires_at TEXT, denied_at TEXT, revoked_at TEXT, revoker TEXT);
-        CREATE TABLE break_glass_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL, timestamp TEXT NOT NULL, principal TEXT NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL, previous_hash BLOB NOT NULL, entry_hmac BLOB NOT NULL);
-        CREATE TABLE break_glass_audit_anchor (tenant TEXT PRIMARY KEY, audit_count INTEGER NOT NULL DEFAULT 0, audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000');
-        "#;
-        let mut hasher = Sha256::new();
-        hasher.update(sql.as_bytes());
-        format!("{:x}", hasher.finalize())
     }
 
     async fn run_preflight(

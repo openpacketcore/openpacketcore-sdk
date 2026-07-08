@@ -66,7 +66,7 @@ async fn open_migrates_schema_version_1_0_0_to_alarm_audit_schema() {
         .query_row("SELECT COUNT(*) FROM alarm_audit", [], |row| row.get(0))
         .expect("query migrated alarm audit table");
 
-    assert_eq!(sdk_version, "1.8.0");
+    assert_eq!(sdk_version, "1.8.1");
     assert_ne!(schema_digest, "legacy-digest");
     assert_eq!(alarm_audit_count, 1);
 }
@@ -113,8 +113,36 @@ async fn open_migrates_schema_version_1_4_0_to_current_schema() {
         )
         .expect("read migrated schema digest");
 
-    assert_eq!(sdk_version, "1.8.0");
+    assert_eq!(sdk_version, "1.8.1");
     assert_ne!(schema_digest, "legacy-digest-1-4");
+}
+
+#[tokio::test]
+async fn open_fails_when_live_schema_digest_differs_from_stored_digest() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = temp_dir.path().join("schema_digest_drift.db");
+
+    let backend = SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect("open backend");
+    drop(backend);
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open database for drift");
+        conn.execute(
+            "ALTER TABLE alarm_audit ADD COLUMN unexpected_drift TEXT",
+            [],
+        )
+        .expect("mutate live schema without updating digest");
+    }
+
+    let err = SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect_err("schema digest drift must fail open");
+    assert!(
+        err.to_string().contains("schema digest mismatch"),
+        "unexpected error: {err}"
+    );
 }
 
 #[tokio::test]

@@ -12,11 +12,12 @@
 //! keys to prevent orphaned audit records.
 
 use rusqlite::{Connection, Transaction};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::Duration;
 
 /// Current schema version. Bump this and add a migration step to evolve the schema.
-pub const SCHEMA_VERSION: &str = "1.8.0";
+pub const SCHEMA_VERSION: &str = "1.8.1";
 /// Cap SQLite lock waits on async runtime workers.
 pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 100;
 
@@ -487,6 +488,11 @@ pub fn run_migrations(conn: &Connection, from_version: &str) -> Result<(), rusql
         )?;
         current = "1.8.0".to_string();
     }
+    if current == "1.8.0" {
+        // Metadata-only migration: schema digests are now derived from the live
+        // SQLite schema instead of a hand-maintained SQL string.
+        current = "1.8.1".to_string();
+    }
 
     let _ = current;
 
@@ -524,6 +530,29 @@ pub fn get_schema_digest(conn: &Connection) -> Result<Option<String>, rusqlite::
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Derive the schema digest from the live SQLite schema catalog.
+pub fn current_schema_digest(conn: &Connection) -> Result<String, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT type, name, sql FROM sqlite_master \
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' \
+         ORDER BY type, name",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut hasher = Sha256::new();
+    while let Some(row) = rows.next()? {
+        let object_type: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        let sql: String = row.get(2)?;
+        hasher.update(object_type.as_bytes());
+        hasher.update([0]);
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update(sql.as_bytes());
+        hasher.update([0xff]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Write the initial (or upgraded) schema version row.
@@ -783,7 +812,7 @@ pub fn check_fsync_available(dir: &Path) -> bool {
 
 #[cfg(test)]
 mod fixture_tests {
-    use super::{initialize_schema, SCHEMA_VERSION};
+    use super::{current_schema_digest, initialize_schema, SCHEMA_VERSION};
     use rusqlite::{params, Connection};
     use std::env;
     use std::path::PathBuf;
@@ -808,10 +837,11 @@ mod fixture_tests {
 
         let conn = Connection::open(path).expect("open fixture for writing");
         initialize_schema(&conn).expect("initialize schema");
+        let schema_digest = current_schema_digest(&conn).expect("derive fixture schema digest");
 
         conn.execute(
             "INSERT INTO schema_version (id, schema_digest, sdk_version, created_at) VALUES (1, ?1, ?2, ?3)",
-            params!["fixture-digest-abc123", SCHEMA_VERSION, "2026-06-12T00:00:00Z"],
+            params![schema_digest, SCHEMA_VERSION, "2026-06-12T00:00:00Z"],
         )
         .expect("insert schema_version");
 
@@ -927,7 +957,8 @@ mod fixture_tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("read schema_version");
-        assert_eq!(digest, "fixture-digest-abc123");
+        let live_digest = current_schema_digest(&conn).expect("derive live fixture schema digest");
+        assert_eq!(digest, live_digest);
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(created_at, "2026-06-12T00:00:00Z");
 
