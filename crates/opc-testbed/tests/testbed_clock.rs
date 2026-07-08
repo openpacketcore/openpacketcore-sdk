@@ -90,10 +90,25 @@ fn virtual_clock_rejects_negative_advance() {
 }
 
 #[test]
-#[should_panic(expected = "virtual offset overflow")]
-fn virtual_clock_monotonic_overflow_panics() {
+fn virtual_clock_monotonic_extreme_advance_does_not_panic() {
     let start = opc_types::Timestamp::now_utc();
     let mut clock = VirtualClock::new(start);
     clock.advance(time::Duration::days(220_000));
     let _ = clock.monotonic();
+    assert_eq!(clock.monotonic_elapsed().as_secs(), 220_000 * 24 * 60 * 60);
+}
+
+#[test]
+fn virtual_clock_monotonic_matches_identical_advance_sequences() {
+    let start = opc_types::Timestamp::now_utc();
+    let mut first = VirtualClock::new(start);
+    let mut second = VirtualClock::new(start);
+
+    first.advance(time::Duration::seconds(5));
+    first.advance(time::Duration::milliseconds(250));
+    second.advance(time::Duration::seconds(5));
+    second.advance(time::Duration::milliseconds(250));
+
+    assert_eq!(first.monotonic_elapsed(), second.monotonic_elapsed());
+    assert_eq!(first.monotonic(), second.monotonic());
 }
