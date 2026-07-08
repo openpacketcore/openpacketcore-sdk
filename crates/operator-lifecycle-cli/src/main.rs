@@ -261,6 +261,16 @@ fn write_contract_mismatch(expected: u64) -> ! {
     std::process::exit(2);
 }
 
+fn write_contract_missing() -> ! {
+    let resp = ErrorResponse {
+        error: "Contract version mismatch: missing expectedContractVersion".to_string(),
+        contract_version: Some(CONTRACT_VERSION),
+    };
+    let _ = serde_json::to_writer(io::stdout(), &resp);
+    println!();
+    std::process::exit(2);
+}
+
 fn write_success<T: Serialize>(val: &T) {
     let resp = SuccessResponse {
         contract_version: CONTRACT_VERSION,
@@ -305,13 +315,14 @@ fn parse_request<T: serde::de::DeserializeOwned>(buffer: &str, command_name: &st
         Err(e) => write_error(&format!("Invalid JSON: {e}")),
     };
 
-    if let Some(expected) = value
+    let Some(expected) = value
         .get("expectedContractVersion")
         .and_then(|v| v.as_u64())
-    {
-        if expected as u32 != CONTRACT_VERSION {
-            write_contract_mismatch(expected);
-        }
+    else {
+        write_contract_missing();
+    };
+    if expected as u32 != CONTRACT_VERSION {
+        write_contract_mismatch(expected);
     }
 
     // Remove expectedContractVersion so it does not interfere with deserialization.
