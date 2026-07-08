@@ -581,11 +581,65 @@ async fn audit_redaction_removes_sensitive_data() {
     let record = &records[0];
 
     // Verify IP is redacted in principal
-    assert_eq!(record.principal, "operator-[REDACTED]");
+    assert_eq!(record.principal, "operator-[REDACTED_IPV4]");
 
     // Verify SUPI/IMSI is redacted in reason
-    assert_eq!(record.reason, "fixing issue for SUPI [REDACTED]");
+    assert_eq!(
+        record.reason,
+        "fixing issue for SUPI [REDACTED_SUBSCRIBER_ID]"
+    );
 
     // Verify MSISDN is redacted in correlation_id
-    assert_eq!(record.correlation_id.as_deref(), Some("msisdn-[REDACTED]"));
+    assert_eq!(
+        record.correlation_id.as_deref(),
+        Some("[REDACTED_SUBSCRIBER_ID]")
+    );
+}
+
+#[tokio::test]
+async fn audit_redaction_uses_shared_redactor_for_ipv6_and_spaced_ids() {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("test_shared_redaction.db");
+    let backend = SqliteBackend::open(&db_path, true, 0).await.unwrap();
+
+    let alarm = make_test_alarm("alarm-shared-redaction", Severity::Major);
+    let context = AlarmActionContext::new(
+        "operator-2001:db8::1",
+        "investigating IMSI 20895 00000 00001 after callback",
+        AlarmActionScope::Alarm {
+            alarm_id: alarm.alarm_id.clone(),
+        },
+    )
+    .with_correlation_id("peer=2001:db8::5 imsi=20895 00000 00002");
+
+    let event = AlarmAuditEvent {
+        action: AlarmAction::Acknowledge,
+        outcome: AlarmAuditOutcome::Authorized,
+        alarm_id: alarm.alarm_id.clone(),
+        alarm_type: alarm.alarm_type.clone(),
+        probable_cause: alarm.probable_cause.clone(),
+        principal: context.principal.clone(),
+        tenant: context.tenant.clone(),
+        reason: context.reason.clone(),
+        scope: context.scope.clone(),
+        correlation_id: context.correlation_id.clone(),
+        occurred_at: OffsetDateTime::now_utc(),
+    };
+
+    let mut sink = PersistAlarmAuditSink::new(backend.clone());
+    sink.record_alarm_action(event).unwrap();
+
+    let records = backend.query_alarm_audits().await.unwrap();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+
+    for field in [
+        record.principal.as_str(),
+        record.reason.as_str(),
+        record.correlation_id.as_deref().unwrap_or_default(),
+    ] {
+        assert!(!field.contains("2001:db8"));
+        assert!(!field.contains("20895 00000 0000"));
+        assert!(field.contains("[REDACTED_"));
+    }
 }

@@ -316,6 +316,7 @@ pub fn redact_text_with_policy(
         // (e.g. {"dnn":"internet"} or dnn: internet) before token-based
         // scanning, because the tokenizer below splits on quote characters and
         // would otherwise lose the key:value context.
+        redacted_line = redact_labeled_spaced_subscriber_ids(&redacted_line, summary, policy);
         redacted_line = redact_marker_value_pairs(&redacted_line, summary, policy);
 
         // 4. Token-based scanning for IPs, IDs, Paths, JWTs, Spiffe IDs.
@@ -612,6 +613,10 @@ fn classify_token(
             "[REDACTED_IPV6]:[REDACTED_PORT]".to_string()
         });
     }
+    if let Some(redacted) = redact_embedded_ip_suffix(trimmed) {
+        summary.ip_addresses += 1;
+        return Some(redacted);
+    }
 
     // C. Telco identifiers: IMSI/MSISDN/IMEI/NAI/SIP/APN/TEID/SPI/Diameter Session-Id/LI ID.
     // Checked before JWT because dotted telco values (APN, Diameter Session-Id)
@@ -867,6 +872,125 @@ fn redact_marker_value_pairs(
     output
 }
 
+fn redact_labeled_spaced_subscriber_ids(
+    input: &str,
+    summary: &mut RedactionSummary,
+    policy: RedactionPolicy,
+) -> String {
+    const MARKERS: &[(&str, IdentifierType)] = &[
+        ("imsi", IdentifierType::Imsi),
+        ("supi", IdentifierType::Imsi),
+        ("msisdn", IdentifierType::Msisdn),
+        ("imei", IdentifierType::Imei),
+    ];
+
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let mut replacement = None;
+        for &(marker, id_type) in MARKERS {
+            if !marker_matches_at(bytes, i, marker) {
+                continue;
+            }
+            let marker_end = i + marker.len();
+            if let Some((value_start, value_end)) = scan_spaced_subscriber_value(bytes, marker_end)
+            {
+                replacement = Some((value_start, value_end, id_type));
+                break;
+            }
+        }
+
+        if let Some((value_start, value_end, id_type)) = replacement {
+            let placeholder = record_telco_redaction_by_type(summary, id_type, policy);
+            output.push_str(&input[cursor..value_start]);
+            output.push_str(placeholder);
+            cursor = value_end;
+            i = value_end;
+            continue;
+        }
+
+        // SAFETY: the loop condition guarantees `i < bytes.len()`, so
+        // `input[i..]` is non-empty and `chars().next()` is always `Some`.
+        let ch = input[i..].chars().next().unwrap();
+        i += ch.len_utf8();
+    }
+
+    if cursor == 0 {
+        return input.to_string();
+    }
+
+    output.push_str(&input[cursor..]);
+    output
+}
+
+fn marker_matches_at(bytes: &[u8], pos: usize, marker: &str) -> bool {
+    let marker_bytes = marker.as_bytes();
+    let marker_end = pos + marker_bytes.len();
+    if marker_end >= bytes.len() {
+        return false;
+    }
+    let preceding_ok = pos == 0
+        || !bytes[pos - 1].is_ascii_alphanumeric() && !matches!(bytes[pos - 1], b'_' | b'-' | b'.');
+    if !preceding_ok || !bytes[pos..marker_end].eq_ignore_ascii_case(marker_bytes) {
+        return false;
+    }
+    bytes[marker_end].is_ascii_whitespace() || matches!(bytes[marker_end], b':' | b'=')
+}
+
+fn scan_spaced_subscriber_value(bytes: &[u8], mut pos: usize) -> Option<(usize, usize)> {
+    let mut saw_marker_separator = false;
+    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+        saw_marker_separator = true;
+        pos += 1;
+    }
+    if pos < bytes.len() && matches!(bytes[pos], b':' | b'=') {
+        saw_marker_separator = true;
+        pos += 1;
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+    }
+    if !saw_marker_separator || pos >= bytes.len() || !bytes[pos].is_ascii_digit() {
+        return None;
+    }
+
+    let value_start = pos;
+    let mut value_end = pos;
+    let mut digits = 0usize;
+    let mut saw_value_separator = false;
+
+    while value_end < bytes.len() {
+        if bytes[value_end].is_ascii_digit() {
+            digits += 1;
+            value_end += 1;
+            continue;
+        }
+
+        if !matches!(bytes[value_end], b' ' | b'\t' | b'-') {
+            break;
+        }
+
+        let separator_start = value_end;
+        while value_end < bytes.len() && matches!(bytes[value_end], b' ' | b'\t' | b'-') {
+            value_end += 1;
+        }
+        if value_end >= bytes.len() || !bytes[value_end].is_ascii_digit() {
+            value_end = separator_start;
+            break;
+        }
+        saw_value_separator = true;
+    }
+
+    if saw_value_separator && (8..=16).contains(&digits) {
+        Some((value_start, value_end))
+    } else {
+        None
+    }
+}
+
 /// Scan the bytes after a telco marker key for an optional-whitespace,
 /// `:` or `=`, optional-whitespace, and a value. Returns the byte range of the
 /// value itself (excluding any surrounding quotes). `quote` is the expected
@@ -1118,6 +1242,41 @@ fn looks_like_port(port: &str) -> bool {
         && port.len() <= 5
         && port.chars().all(|c| c.is_ascii_digit())
         && port.parse::<u16>().is_ok()
+}
+
+fn redact_embedded_ip_suffix(token: &str) -> Option<String> {
+    for (idx, delimiter) in token.char_indices().rev() {
+        if !matches!(delimiter, '-' | '_' | '/' | '=') {
+            continue;
+        }
+        let value_start = idx + delimiter.len_utf8();
+        if value_start >= token.len() {
+            continue;
+        }
+        let candidate = &token[value_start..];
+        let ip_candidate = strip_port(candidate);
+        let replacement = if looks_like_ipv4(ip_candidate) {
+            if ip_candidate == candidate {
+                "[REDACTED_IPV4]"
+            } else {
+                "[REDACTED_IPV4]:[REDACTED_PORT]"
+            }
+        } else if looks_like_ipv6(ip_candidate) {
+            if ip_candidate == candidate {
+                "[REDACTED_IPV6]"
+            } else {
+                "[REDACTED_IPV6]:[REDACTED_PORT]"
+            }
+        } else {
+            continue;
+        };
+
+        let mut redacted = String::with_capacity(token.len());
+        redacted.push_str(&token[..value_start]);
+        redacted.push_str(replacement);
+        return Some(redacted);
+    }
+    None
 }
 
 fn looks_like_ipv4(val: &str) -> bool {
@@ -1435,6 +1594,13 @@ mod tests {
         assert!(redacted.contains("12:34:56"));
         assert!(redacted.contains("[REDACTED_IPV6]"));
         assert_eq!(summary.ip_addresses, 1);
+
+        let mut summary = RedactionSummary::default();
+        let log = "principal=operator-192.168.1.100 peer=operator-2001:db8::1";
+        let redacted = redact_text(log, &mut summary);
+        assert!(redacted.contains("principal=operator-[REDACTED_IPV4]"));
+        assert!(redacted.contains("peer=operator-[REDACTED_IPV6]"));
+        assert_eq!(summary.ip_addresses, 2);
     }
 
     #[test]
@@ -1797,6 +1963,25 @@ mod tests {
         assert!(redacted.contains("state=ok"));
         assert!(redacted.contains("[REDACTED_NETWORK_SENSITIVE]"));
         assert_eq!(summary.network_sensitive_identifiers, 1);
+    }
+
+    #[test]
+    fn test_redact_text_labeled_spaced_subscriber_ids() {
+        let mut summary = RedactionSummary::default();
+        let log = "investigating IMSI 20895 00000 00001 after callback";
+        let redacted = redact_text(log, &mut summary);
+
+        assert!(!redacted.contains("20895 00000 00001"));
+        assert!(redacted.contains("IMSI [REDACTED_SUBSCRIBER_ID]"));
+        assert!(redacted.contains("after callback"));
+        assert_eq!(summary.subscriber_identifiers, 1);
+
+        let mut summary = RedactionSummary::default();
+        let log = "supi: 20895-00000-00002";
+        let redacted = redact_text(log, &mut summary);
+
+        assert_eq!(redacted, "supi: [REDACTED_SUBSCRIBER_ID]");
+        assert_eq!(summary.subscriber_identifiers, 1);
     }
 
     #[test]
