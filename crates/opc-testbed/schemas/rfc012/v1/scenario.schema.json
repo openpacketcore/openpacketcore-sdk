@@ -26,6 +26,7 @@
       }
     },
     "seed": {
+      "description": "Reserved for future deterministic simulator behavior; current SDK simulators record this value in evidence but do not consume it.",
       "type": "integer",
       "minimum": 0
     },
