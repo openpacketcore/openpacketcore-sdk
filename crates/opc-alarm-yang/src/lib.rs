@@ -3,7 +3,7 @@
 //! Defines the canonical YANG module for alarm state and operational data.
 
 use opc_alarm::{Alarm, Severity};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use time::format_description::well_known::Rfc3339;
 
 /// The YANG module definition for OpenPacketCore alarms aligned with RFC 013.
@@ -138,19 +138,31 @@ pub fn alarm_to_yang_json(alarm: &Alarm) -> Value {
     let raised_ts = alarm.raised_at.format(&Rfc3339).unwrap_or_default();
     let updated_ts = alarm.updated_at.format(&Rfc3339).unwrap_or_default();
 
-    json!({
-        "alarm-id": alarm.alarm_id.as_str(),
-        "alarm-type": alarm.alarm_type.as_str(),
-        "severity": severity_str,
-        "probable-cause": alarm.probable_cause.to_string(),
-        "affected-object": alarm.affected_object.to_string(),
-        "tenant": alarm.tenant.as_deref().unwrap_or(""),
-        "slice": alarm.slice.as_deref().unwrap_or(""),
-        "region": alarm.region.as_ref().map(|r| r.as_str()).unwrap_or(""),
-        "text": alarm.text.redacted_for_export(),
-        "raised-at": raised_ts,
-        "updated-at": updated_ts
-    })
+    let mut object = Map::new();
+    object.insert("alarm-id".to_string(), json!(alarm.alarm_id.as_str()));
+    object.insert("alarm-type".to_string(), json!(alarm.alarm_type.as_str()));
+    object.insert("severity".to_string(), json!(severity_str));
+    object.insert(
+        "probable-cause".to_string(),
+        json!(alarm.probable_cause.to_string()),
+    );
+    object.insert(
+        "affected-object".to_string(),
+        json!(alarm.affected_object.to_string()),
+    );
+    if let Some(tenant) = &alarm.tenant {
+        object.insert("tenant".to_string(), json!(tenant));
+    }
+    if let Some(slice) = &alarm.slice {
+        object.insert("slice".to_string(), json!(slice));
+    }
+    if let Some(region) = &alarm.region {
+        object.insert("region".to_string(), json!(region.as_str()));
+    }
+    object.insert("text".to_string(), json!(alarm.text.redacted_for_export()));
+    object.insert("raised-at".to_string(), json!(raised_ts));
+    object.insert("updated-at".to_string(), json!(updated_ts));
+    Value::Object(object)
 }
 
 #[cfg(test)]
@@ -192,6 +204,37 @@ mod tests {
         assert_eq!(yang_val["region"], "us-east-1");
         assert_eq!(yang_val["text"], "UPF link down");
         assert!(!yang_val["raised-at"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn alarm_to_yang_json_omits_absent_scope_leaves() {
+        let alarm = Alarm {
+            alarm_id: AlarmId::new("alarm-global"),
+            alarm_type: AlarmType::new("peer.disconnected"),
+            severity: Severity::Major,
+            probable_cause: ProbableCause::PeerUnreachable,
+            affected_object: AffectedObject::NfInstance {
+                kind: "upf".to_string(),
+                instance: "upf-1".to_string(),
+            },
+            tenant: None,
+            slice: None,
+            region: None,
+            text: RedactedText::new("UPF link down"),
+            details: AlarmDetails::empty(),
+            state: AlarmState::Raised,
+            raised_at: OffsetDateTime::now_utc(),
+            updated_at: OffsetDateTime::now_utc(),
+            cleared_at: None,
+            correlation_id: None,
+        };
+
+        let yang_val = alarm_to_yang_json(&alarm);
+        let object = yang_val.as_object().expect("yang alarm object");
+
+        assert!(!object.contains_key("tenant"));
+        assert!(!object.contains_key("slice"));
+        assert!(!object.contains_key("region"));
     }
 
     #[test]
