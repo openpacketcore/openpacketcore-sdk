@@ -45,6 +45,13 @@
         "format": "opc-gap-id"
       }
     },
+    "waiver_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
     "artifact_digests": {
       "type": "array",
       "items": {

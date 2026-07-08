@@ -2,6 +2,125 @@ mod evidence_common;
 use evidence_common::*;
 use std::str::FromStr;
 
+fn relaxed_release_policy() -> GatePolicy {
+    GatePolicy {
+        mode: PolicyMode::Release,
+        require_sbom: false,
+        require_vex: false,
+        require_provenance: false,
+        require_performance: false,
+        require_data_governance: false,
+        allow_dirty_worktree: false,
+        expected_git_commit: None,
+    }
+}
+
+#[test]
+fn waived_status_without_waiver_record_is_rejected() {
+    let req_id = RequirementId::from_str("REQ-IETF-RFC7951-V1-4.2-099").unwrap();
+    let record = EvidenceRecord::new(req_id, ConformanceStatus::Waived);
+    let policy = relaxed_release_policy();
+    let evaluator = GateEvaluator::new(&policy);
+
+    let res = evaluator.evaluate(
+        &[record],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    assert!(
+        matches!(res, Err(EvidenceError::GapGateFailed(_))),
+        "waived status without a first-class waiver record must fail, got: {res:?}"
+    );
+}
+
+#[test]
+fn waived_status_requires_approved_unexpired_matching_waiver() {
+    let req_id = RequirementId::from_str("REQ-IETF-RFC7951-V1-4.2-100").unwrap();
+    let mut record = EvidenceRecord::new(req_id.clone(), ConformanceStatus::Waived);
+    record.waiver_refs.push("WAIVER-100".to_string());
+    let policy = relaxed_release_policy();
+    let evaluator = GateEvaluator::new(&policy);
+
+    let mut waiver = WaiverRecord {
+        id: "WAIVER-100".to_string(),
+        requirement_id: req_id,
+        approver: "security-reviewer".to_string(),
+        justification: "Temporary release exception with tracked remediation".to_string(),
+        expires_at: time::OffsetDateTime::now_utc() + time::Duration::days(7),
+        approved: false,
+        ticket_ref: Some("SEC-100".to_string()),
+    };
+
+    let res = evaluator.evaluate_with_waivers(
+        &[record.clone()],
+        &[],
+        &[waiver.clone()],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        matches!(res, Err(EvidenceError::GapGateFailed(_))),
+        "unapproved waiver must fail, got: {res:?}"
+    );
+
+    waiver.approved = true;
+    waiver.expires_at = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+    let res = evaluator.evaluate_with_waivers(
+        &[record.clone()],
+        &[],
+        &[waiver.clone()],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        matches!(res, Err(EvidenceError::GapGateFailed(_))),
+        "expired waiver must fail, got: {res:?}"
+    );
+
+    waiver.expires_at = time::OffsetDateTime::now_utc() + time::Duration::days(7);
+    let res = evaluator.evaluate_with_waivers(
+        &[record],
+        &[],
+        &[waiver],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        res.is_ok(),
+        "approved unexpired waiver should pass: {res:?}"
+    );
+}
+
 #[test]
 fn test_gap_006_006_gate_policy() {
     let req_id = RequirementId::from_str("REQ-IETF-RFC7951-V1-4.2-042").unwrap();

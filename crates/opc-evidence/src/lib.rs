@@ -32,7 +32,7 @@ pub use dataplane::{
     DataplaneSnapshotAsserter, DataplaneTrafficBlockReasonCode,
 };
 pub use error::EvidenceError;
-pub use evidence::EvidenceRecord;
+pub use evidence::{EvidenceRecord, WaiverRecord};
 pub use extract::{scan_directory, scan_file, ExtractedTag, ExtractionError};
 pub use gap::{validate_status_for_gaps, Gap, GapError, GapOptions, GapSeverity, GapStatus};
 pub use manifest::{compute_digest, Manifest, ManifestEntry};
