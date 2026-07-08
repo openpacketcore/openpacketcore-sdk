@@ -171,9 +171,8 @@ async fn test_clock_skew_ttl_behavior() {
     };
     let err = coord.compare_and_set(op_2).await.unwrap_err();
     assert!(
-        err.to_string().contains("StaleFence")
-            || err.to_string().contains("lease")
-            || err.to_string().contains("expired")
+        matches!(err, StoreError::StaleFence | StoreError::LeaseExpired),
+        "expected lease authority rejection, got {err:?}"
     );
 }
 
