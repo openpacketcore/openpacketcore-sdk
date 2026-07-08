@@ -151,17 +151,14 @@ mod tests {
             panic!("poison evaluator mutex");
         }));
 
-        let result =
-            authorizer.authorize_alarm_action(AlarmAction::Acknowledge, &alarm, &context);
+        let result = authorizer.authorize_alarm_action(AlarmAction::Acknowledge, &alarm, &context);
         assert!(
             result.is_err(),
             "poisoned evaluator must fail closed with a denial"
         );
-        assert!(!authorizer.allow_security_critical_suppression(
-            &alarm,
-            &make_context(&alarm.alarm_id)
-        ));
-
+        assert!(
+            !authorizer.allow_security_critical_suppression(&alarm, &make_context(&alarm.alarm_id))
+        );
     }
 }
 

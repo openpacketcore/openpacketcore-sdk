@@ -333,7 +333,10 @@ mod tests {
         let mut dashed = alarm_with_cause(ProbableCause::PeerUnreachable);
         dashed.alarm_type = AlarmType::new("peer-disconnected");
 
-        assert_ne!(alarm_to_condition(&dotted).type_, alarm_to_condition(&dashed).type_);
+        assert_ne!(
+            alarm_to_condition(&dotted).type_,
+            alarm_to_condition(&dashed).type_
+        );
     }
 
     #[test]
@@ -343,11 +346,9 @@ mod tests {
 
         let condition_type = alarm_to_condition(&alarm).type_;
 
-        assert!(
-            condition_type
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        );
+        assert!(condition_type
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-'));
         assert!(!condition_type.contains(' '));
         assert!(!condition_type.contains(':'));
         assert!(!condition_type.contains('☃'));
@@ -385,7 +386,10 @@ mod tests {
         let mut critical = alarm_with_cause(ProbableCause::PeerUnreachable);
         critical.severity = Severity::Critical;
 
-        assert_ne!(alarm_to_event(&major).severity, alarm_to_event(&critical).severity);
+        assert_ne!(
+            alarm_to_event(&major).severity,
+            alarm_to_event(&critical).severity
+        );
         assert_ne!(
             alarm_to_condition(&major).severity,
             alarm_to_condition(&critical).severity
@@ -409,6 +413,9 @@ mod tests {
         let projected = alarm_to_condition_with_previous(&alarm, Some(&previous));
 
         assert_eq!(projected.status, previous.status);
-        assert_eq!(projected.last_transition_time, previous.last_transition_time);
+        assert_eq!(
+            projected.last_transition_time,
+            previous.last_transition_time
+        );
     }
 }

@@ -720,8 +720,7 @@ impl SdkMetrics {
             .store(0, Ordering::Relaxed);
         self.persist_audit_chain_verification_failure
             .store(0, Ordering::Relaxed);
-        self.persist_audit_write_failure
-            .store(0, Ordering::Relaxed);
+        self.persist_audit_write_failure.store(0, Ordering::Relaxed);
         self.persist_write_success.store(0, Ordering::Relaxed);
         self.persist_read_success.store(0, Ordering::Relaxed);
         self.persist_error.store(0, Ordering::Relaxed);
@@ -1274,9 +1273,7 @@ pub fn export_prometheus_text() -> String {
         "opc_persist_audit_chain_verification_total{{status=\"failure\"}} {audit_chain_fail}\n"
     ));
 
-    let audit_write_fail = METRICS
-        .persist_audit_write_failure
-        .load(Ordering::Relaxed);
+    let audit_write_fail = METRICS.persist_audit_write_failure.load(Ordering::Relaxed);
     write_metric(
         &mut out,
         "opc_persist_audit_write_failure_total",

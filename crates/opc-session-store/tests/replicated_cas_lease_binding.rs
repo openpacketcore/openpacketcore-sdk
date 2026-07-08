@@ -2,7 +2,7 @@ use bytes::Bytes;
 use opc_session_store::{
     EncryptedSessionPayload, FakeSessionBackend, Generation, OwnerId, ReplicationEntry,
     ReplicationOp, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager,
-    SqliteSessionBackend, StateClass, StateType, StoredSessionRecord, StoreError,
+    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use std::time::Duration;

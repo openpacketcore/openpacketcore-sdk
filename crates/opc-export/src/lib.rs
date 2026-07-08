@@ -2,8 +2,8 @@
 
 #![forbid(unsafe_code)]
 
-use opc_data_governance::{DataClass, RetentionPolicy};
 use opc_crypto::CryptoEnvelopeV1;
+use opc_data_governance::{DataClass, RetentionPolicy};
 use opc_redaction::RedactionLevel;
 use serde::{Deserialize, Serialize};
 
@@ -135,10 +135,7 @@ fn validate_payload_state(state: PayloadState, payload: &[u8]) -> Result<(), Exp
 
 fn is_digest_payload(payload: &[u8]) -> bool {
     payload.len() == 32
-        || (payload.len() == 64
-            && payload
-                .iter()
-                .all(|byte| byte.is_ascii_hexdigit()))
+        || (payload.len() == 64 && payload.iter().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 #[cfg(test)]

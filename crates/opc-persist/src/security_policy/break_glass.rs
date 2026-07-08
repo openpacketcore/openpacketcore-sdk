@@ -11,12 +11,12 @@ use crate::break_glass::{
 };
 
 use super::crypto::validate_principal_tenant_and_roles;
+#[cfg(any(test, feature = "dangerous-test-hooks"))]
+use super::TEST_AUDIT_FAILURE_INSERT_FAIL;
 use super::{
     audit_hash_from_blob, calculate_audit_event_hmac, SecurityPolicyError,
     SqliteSecurityPolicyService,
 };
-#[cfg(any(test, feature = "dangerous-test-hooks"))]
-use super::TEST_AUDIT_FAILURE_INSERT_FAIL;
 
 impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
     pub async fn clean_expired_all_tenants(&self) -> Result<(), SecurityPolicyError> {

@@ -708,8 +708,7 @@ fn distinct_alarm_flood_is_capped_with_overflow_signal() {
 
     match overflow {
         AlarmOpResult::ActiveLimitExceeded {
-            max_active_alarms,
-            ..
+            max_active_alarms, ..
         } => assert_eq!(max_active_alarms, 3),
         other => panic!("expected active-limit overflow signal, got {other:?}"),
     }

@@ -61,13 +61,7 @@ pub(crate) fn apply_replicated_op_sync(
                 .optional()
                 .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
-            let Some((
-                active,
-                row_credential_id,
-                owner_str,
-                fence_val,
-                guard_expires_at_str,
-            )) = row
+            let Some((active, row_credential_id, owner_str, fence_val, guard_expires_at_str)) = row
             else {
                 return Err(StoreError::StaleFence);
             };

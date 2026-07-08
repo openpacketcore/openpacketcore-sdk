@@ -10,12 +10,12 @@ use super::crypto::{
     compile_serializable_policy, decrypt_policy, encrypt_policy, register_path_modules,
     register_policy_modules, to_serializable_policy, validate_principal_tenant_and_roles,
 };
-#[cfg(any(test, feature = "dangerous-test-hooks"))]
-use super::{TEST_AUDIT_FAILURE_INSERT_FAIL, TEST_COMMIT_FAIL};
 use super::{
     audit_hash_from_blob, calculate_audit_event_hmac, ActivePolicyMetadata, PolicyHistoryEntry,
     SecurityPolicyError, SecurityPolicyService, SqliteSecurityPolicyService,
 };
+#[cfg(any(test, feature = "dangerous-test-hooks"))]
+use super::{TEST_AUDIT_FAILURE_INSERT_FAIL, TEST_COMMIT_FAIL};
 use crate::types::RollbackTarget;
 
 impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
@@ -603,25 +603,15 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
 
         if let Err(e) = tx_result {
             let reason = format!("Apply transaction failed: {e:?}");
-            self.audit_event_or_record_failure(
-                tenant,
-                &validated_spiffe,
-                "APPLY_FAILURE",
-                &reason,
-            )
-            .await;
+            self.audit_event_or_record_failure(tenant, &validated_spiffe, "APPLY_FAILURE", &reason)
+                .await;
             return Err(e);
         }
 
         if failed_simulated {
             let reason = "Apply transaction aborted due to simulated commit failure".to_string();
-            self.audit_event_or_record_failure(
-                tenant,
-                &validated_spiffe,
-                "APPLY_FAILURE",
-                &reason,
-            )
-            .await;
+            self.audit_event_or_record_failure(tenant, &validated_spiffe, "APPLY_FAILURE", &reason)
+                .await;
             return Err(SecurityPolicyError::Internal);
         }
 

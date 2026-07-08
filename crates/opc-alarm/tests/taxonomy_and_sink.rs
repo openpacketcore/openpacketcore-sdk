@@ -224,7 +224,9 @@ async fn test_bounded_alarm_sink_drops_poisoned_alarm_and_recovers() {
             let mut remaining = self.remaining_failures.lock().unwrap();
             if *remaining > 0 {
                 *remaining -= 1;
-                return Err(AlarmSinkError::DeliveryFailed("temporary outage".to_string()));
+                return Err(AlarmSinkError::DeliveryFailed(
+                    "temporary outage".to_string(),
+                ));
             }
             self.delivered
                 .lock()

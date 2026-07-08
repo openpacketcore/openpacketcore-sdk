@@ -102,11 +102,7 @@ impl MinimizationPolicy {
             ABSOLUTE_MIN_COHORT
         };
         for cohort in cohorts {
-            if cohort
-                .keys
-                .iter()
-                .any(|key| contains_raw_identifier(key))
-            {
+            if cohort.keys.iter().any(|key| contains_raw_identifier(key)) {
                 return Err(MinimizationError::UnsafeCohortKey);
             }
             if cohort.count < floor {

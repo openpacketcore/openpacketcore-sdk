@@ -52,8 +52,7 @@ impl Default for MonotonicClock {
 impl Clock for MonotonicClock {
     fn now_utc(&self) -> Timestamp {
         let elapsed = self.anchor_instant.elapsed();
-        let current_time =
-            self.anchor_time + time::Duration::seconds_f64(elapsed.as_secs_f64());
+        let current_time = self.anchor_time + time::Duration::seconds_f64(elapsed.as_secs_f64());
         Timestamp::from_offset_datetime(current_time)
     }
 }
