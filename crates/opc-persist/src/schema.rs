@@ -15,7 +15,7 @@ use rusqlite::{Connection, Transaction};
 use std::path::Path;
 
 /// Current schema version. Bump this and add a migration step to evolve the schema.
-pub const SCHEMA_VERSION: &str = "1.5.0";
+pub const SCHEMA_VERSION: &str = "1.6.0";
 
 /// Initialize the database schema.
 ///
@@ -49,7 +49,9 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             rollback_point INTEGER NOT NULL DEFAULT 0,
             rollback_label TEXT NULL,
             confirmed_deadline TEXT NULL,
-            confirmed_at TEXT NULL
+            confirmed_at TEXT NULL,
+            audit_count INTEGER NOT NULL DEFAULT 0,
+            audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
         );
 
         CREATE TABLE IF NOT EXISTS audit_trail (
@@ -205,6 +207,22 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+fn table_has_column(
+    conn: &Connection,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool, rusqlite::Error> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table_name})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Upgrade the schema from a previous version.
 ///
 /// Add new idempotent migration steps here as the schema evolves. Callers are
@@ -338,6 +356,43 @@ pub fn run_migrations(conn: &Connection, from_version: &str) -> Result<(), rusql
             "#,
         )?;
         current = "1.5.0".to_string();
+    }
+    if current == "1.5.0" {
+        if !table_has_column(conn, "config_history", "audit_count")? {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE config_history ADD COLUMN audit_count INTEGER NOT NULL DEFAULT 0;
+                "#,
+            )?;
+        }
+        if !table_has_column(conn, "config_history", "audit_terminal_hash")? {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE config_history ADD COLUMN audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000';
+                "#,
+            )?;
+        }
+        conn.execute_batch(
+            r#"
+            UPDATE config_history
+            SET audit_count = (
+                    SELECT COUNT(*)
+                    FROM audit_trail
+                    WHERE audit_trail.tx_id = config_history.tx_id
+                ),
+                audit_terminal_hash = COALESCE(
+                    (
+                        SELECT entry_hmac
+                        FROM audit_trail
+                        WHERE audit_trail.tx_id = config_history.tx_id
+                        ORDER BY sequence DESC
+                        LIMIT 1
+                    ),
+                    zeroblob(32)
+                );
+            "#,
+        )?;
+        current = "1.6.0".to_string();
     }
 
     let _ = current;
@@ -668,8 +723,8 @@ mod fixture_tests {
         .expect("insert schema_version");
 
         conn.execute(
-            "INSERT INTO config_history (tx_id, parent_tx_id, version, committed_at, principal, source, schema_digest, plaintext_digest, encrypted_blob, rollback_point, rollback_label, confirmed_deadline, confirmed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO config_history (tx_id, parent_tx_id, version, committed_at, principal, source, schema_digest, plaintext_digest, encrypted_blob, rollback_point, rollback_label, confirmed_deadline, confirmed_at, audit_count, audit_terminal_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 known_tx_id().as_slice(),
                 Option::<&[u8]>::None,
@@ -684,6 +739,8 @@ mod fixture_tests {
                 Option::<&str>::None,
                 Option::<&str>::None,
                 Option::<&str>::None,
+                1_i64,
+                [0xAA_u8; 32].as_slice(),
             ],
         )
         .expect("insert config_history");
@@ -699,8 +756,8 @@ mod fixture_tests {
                 Option::<&str>::None,
                 "new-value",
                 0_i64,
-                vec![0x00_u8].as_slice(),
-                vec![0xAA_u8].as_slice(),
+                [0x00_u8; 32].as_slice(),
+                [0xAA_u8; 32].as_slice(),
             ],
         )
         .expect("insert audit_trail");

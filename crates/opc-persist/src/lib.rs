@@ -41,11 +41,12 @@
 //! Each audit entry carries an `entry_hmac` that chains to the previous entry:
 //!
 //! ```text
-//! entry_hmac = HMAC(audit_key, tenant || sequence || canonical_entry || previous_hash)
+//! entry_hmac = HMAC(audit_key, tenant || audit_count || sequence || canonical_entry || previous_hash)
 //! ```
 //!
-//! The chain is tenant-scoped and verified whenever stored configuration is
-//! loaded. Durable backends require caller-supplied audit key material.
+//! `config_history` stores the expected audit count and terminal entry hash so
+//! truncated tails fail closed when stored configuration is loaded. Durable
+//! backends require caller-supplied audit key material.
 //!
 //! ## Usage
 //!

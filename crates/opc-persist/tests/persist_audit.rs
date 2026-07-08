@@ -184,6 +184,40 @@ async fn load_latest_fails_closed_on_wrong_length_entry_hmac() {
 }
 
 #[tokio::test]
+async fn audit_tail_truncation_is_rejected() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = temp_dir.path().join("audit_tail_truncation.db");
+
+    let backend = SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect("open backend");
+    let tx_id = TxId::new();
+    let audit = (0..5)
+        .map(|sequence| make_audit_record(tx_id, sequence, &format!("/test:path-{sequence}")))
+        .collect();
+    backend
+        .append_commit(make_commit_record(tx_id, 1), audit)
+        .await
+        .expect("append commit with audit");
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open direct conn");
+    conn.execute(
+        "DELETE FROM audit_trail WHERE tx_id = ?1 AND sequence >= 3",
+        rusqlite::params![tx_id.as_uuid().as_bytes()],
+    )
+    .expect("truncate audit tail");
+
+    let err = backend
+        .load_latest()
+        .await
+        .expect_err("load_latest should fail on audit tail truncation");
+    assert!(
+        matches!(err.kind(), PersistErrorKind::AuditChainBroken),
+        "expected AuditChainBroken after audit tail truncation, got: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_audit_trail_redaction_and_chain_verification() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let db_path = temp_dir.path().join("audit_redaction.db");

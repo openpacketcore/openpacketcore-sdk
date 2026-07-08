@@ -365,6 +365,24 @@ fn is_ipv4_candidate(candidate: &str) -> bool {
 
 impl AuditRecord {
     pub fn calculate_hmac(&self, audit_key: &AuditKey, tenant: &str) -> [u8; 32] {
+        self.calculate_hmac_inner(audit_key, tenant, None)
+    }
+
+    pub fn calculate_hmac_with_audit_count(
+        &self,
+        audit_key: &AuditKey,
+        tenant: &str,
+        audit_count: u32,
+    ) -> [u8; 32] {
+        self.calculate_hmac_inner(audit_key, tenant, Some(audit_count))
+    }
+
+    fn calculate_hmac_inner(
+        &self,
+        audit_key: &AuditKey,
+        tenant: &str,
+        audit_count: Option<u32>,
+    ) -> [u8; 32] {
         let op_type_str = match self.op_type {
             AuditOpType::Create => "CREATE",
             AuditOpType::Update => "UPDATE",
@@ -376,6 +394,10 @@ impl AuditRecord {
         // write tenant
         mac_input.extend_from_slice(&(tenant.len() as u32).to_be_bytes());
         mac_input.extend_from_slice(tenant.as_bytes());
+
+        if let Some(audit_count) = audit_count {
+            mac_input.extend_from_slice(&audit_count.to_be_bytes());
+        }
 
         // write sequence
         mac_input.extend_from_slice(&self.sequence.to_be_bytes());
@@ -430,11 +452,14 @@ impl StoredConfig {
     pub fn verify_audit_chain(&self, audit_key: &AuditKey) -> Result<(), PersistError> {
         let tenant = extract_tenant(&self.record.principal);
         let mut prev_hash = [0u8; 32];
+        let audit_count =
+            u32::try_from(self.audit.len()).map_err(|_| PersistError::audit_chain_broken())?;
         for entry in &self.audit {
             if entry.previous_hash != prev_hash {
                 return Err(PersistError::audit_chain_broken());
             }
-            let expected_hmac = entry.calculate_hmac(audit_key, &tenant);
+            let expected_hmac =
+                entry.calculate_hmac_with_audit_count(audit_key, &tenant, audit_count);
             if entry.entry_hmac != expected_hmac {
                 return Err(PersistError::audit_chain_broken());
             }

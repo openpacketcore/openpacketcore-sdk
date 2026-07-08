@@ -25,7 +25,8 @@ use uuid::Uuid;
 use crate::error::PersistError;
 use crate::preflight::PersistCapabilities;
 use crate::schema;
-use crate::types::{AuditKey, AuditOpType, CommitSource};
+use crate::types::{extract_tenant, AuditKey, AuditOpType, AuditRecord, CommitSource};
+use opc_types::TxId;
 
 mod ops;
 mod replication;
@@ -44,6 +45,8 @@ type StoredConfigRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    i64,
+    Vec<u8>,
 );
 
 /// Convert a 16-byte slice to a Uuid. Returns zero Uuid if the slice is shorter
@@ -209,7 +212,7 @@ impl SqliteBackend {
             ));
         }
 
-        let conn = Self::open_connection(&path)?;
+        let conn = Self::open_connection(&path, &audit_key)?;
 
         let backend = Self {
             db_path: path,
@@ -232,7 +235,10 @@ impl SqliteBackend {
         Self::open(std::path::PathBuf::from(":memory:"), true, 0).await
     }
 
-    fn open_connection(path: &Path) -> Result<rusqlite::Connection, PersistError> {
+    fn open_connection(
+        path: &Path,
+        audit_key: &AuditKey,
+    ) -> Result<rusqlite::Connection, PersistError> {
         let in_memory = Self::is_in_memory_database(path);
         let conn = if in_memory {
             rusqlite::Connection::open_in_memory()
@@ -274,11 +280,13 @@ impl SqliteBackend {
             | (Some("1.1.0"), _)
             | (Some("1.2.0"), _)
             | (Some("1.3.0"), _)
+            | (Some("1.5.0"), _)
             | (None, _) => {
                 if let Some(from_version) = current_version.as_deref() {
                     schema::run_migrations(&conn, from_version)
                         .map_err(|e| PersistError::sqlite(e.to_string()))?;
                 }
+                Self::reseal_audit_chains_for_schema_1_6(&conn, audit_key)?;
                 let tx = conn
                     .unchecked_transaction()
                     .map_err(|e| PersistError::sqlite(e.to_string()))?;
@@ -300,6 +308,184 @@ impl SqliteBackend {
         Ok(conn)
     }
 
+    fn reseal_audit_chains_for_schema_1_6(
+        conn: &rusqlite::Connection,
+        audit_key: &AuditKey,
+    ) -> Result<(), PersistError> {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+        let configs = {
+            let mut stmt = tx
+                .prepare("SELECT tx_id, principal FROM config_history ORDER BY version ASC")
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+            let mut configs = Vec::new();
+            for row in rows {
+                configs.push(row.map_err(|e| PersistError::sqlite(e.to_string()))?);
+            }
+            configs
+        };
+
+        for (tx_id_bytes, principal) in configs {
+            validate_uuid_bytes("config_history tx_id", &tx_id_bytes)?;
+            let tx_id = TxId::from_uuid(uuid_from_bytes(&tx_id_bytes));
+            let tenant = extract_tenant(&principal);
+            let mut audit = Self::load_audit_rows_for_reseal(&tx, tx_id, &tx_id_bytes)?;
+            let audit_count =
+                u32::try_from(audit.len()).map_err(|_| PersistError::audit_chain_broken())?;
+
+            if !Self::audit_chain_verifies_with_count(&audit, audit_key, &tenant, audit_count) {
+                Self::verify_legacy_audit_chain(&audit, audit_key, &tenant)?;
+                let mut prev_hash = [0u8; 32];
+                for entry in &mut audit {
+                    entry.previous_hash = prev_hash;
+                    entry.entry_hmac =
+                        entry.calculate_hmac_with_audit_count(audit_key, &tenant, audit_count);
+                    tx.execute(
+                        "UPDATE audit_trail SET previous_hash = ?3, entry_hmac = ?4 WHERE tx_id = ?1 AND sequence = ?2",
+                        rusqlite::params![
+                            tx_id_bytes.as_slice(),
+                            entry.sequence,
+                            &entry.previous_hash[..],
+                            &entry.entry_hmac[..],
+                        ],
+                    )
+                    .map_err(|e| PersistError::sqlite(e.to_string()))?;
+                    prev_hash = entry.entry_hmac;
+                }
+            }
+
+            let terminal_hash = audit
+                .last()
+                .map(|entry| entry.entry_hmac)
+                .unwrap_or([0u8; 32]);
+            tx.execute(
+                "UPDATE config_history SET audit_count = ?2, audit_terminal_hash = ?3 WHERE tx_id = ?1",
+                rusqlite::params![
+                    tx_id_bytes.as_slice(),
+                    audit_count as i64,
+                    &terminal_hash[..],
+                ],
+            )
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        }
+
+        tx.commit()
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    fn load_audit_rows_for_reseal(
+        conn: &rusqlite::Connection,
+        tx_id: TxId,
+        tx_id_bytes: &[u8],
+    ) -> Result<Vec<AuditRecord>, PersistError> {
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT sequence, yang_path, op_type, previous_value, new_value,
+                       redaction_applied, previous_hash, entry_hmac
+                FROM audit_trail
+                WHERE tx_id = ?1
+                ORDER BY sequence ASC
+                "#,
+            )
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map([tx_id_bytes], |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i32>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                ))
+            })
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+        let mut audit = Vec::new();
+        for row in rows {
+            let (
+                sequence,
+                yang_path,
+                op_type,
+                previous_value,
+                new_value,
+                redaction_applied,
+                previous_hash,
+                entry_hmac,
+            ) = row.map_err(|e| PersistError::sqlite(e.to_string()))?;
+            if previous_hash.len() != 32 || entry_hmac.len() != 32 {
+                return Err(PersistError::corrupt_blob());
+            }
+            audit.push(AuditRecord {
+                tx_id,
+                sequence,
+                yang_path,
+                op_type: deserialize_audit_op_type(&op_type)?,
+                previous_value,
+                new_value,
+                redaction_applied: redaction_applied != 0,
+                previous_hash: previous_hash
+                    .try_into()
+                    .expect("previous_hash length validated above"),
+                entry_hmac: entry_hmac
+                    .try_into()
+                    .expect("entry_hmac length validated above"),
+            });
+        }
+        Ok(audit)
+    }
+
+    fn audit_chain_verifies_with_count(
+        audit: &[AuditRecord],
+        audit_key: &AuditKey,
+        tenant: &str,
+        audit_count: u32,
+    ) -> bool {
+        let mut prev_hash = [0u8; 32];
+        for entry in audit {
+            if entry.previous_hash != prev_hash {
+                return false;
+            }
+            if entry.entry_hmac
+                != entry.calculate_hmac_with_audit_count(audit_key, tenant, audit_count)
+            {
+                return false;
+            }
+            prev_hash = entry.entry_hmac;
+        }
+        true
+    }
+
+    fn verify_legacy_audit_chain(
+        audit: &[AuditRecord],
+        audit_key: &AuditKey,
+        tenant: &str,
+    ) -> Result<(), PersistError> {
+        let mut prev_hash = [0u8; 32];
+        for entry in audit {
+            if entry.previous_hash != prev_hash {
+                return Err(PersistError::audit_chain_broken());
+            }
+            if entry.entry_hmac != entry.calculate_hmac(audit_key, tenant) {
+                return Err(PersistError::audit_chain_broken());
+            }
+            prev_hash = entry.entry_hmac;
+        }
+        Ok(())
+    }
+
     fn is_in_memory_database(path: &Path) -> bool {
         path == Path::new(":memory:")
     }
@@ -308,7 +494,7 @@ impl SqliteBackend {
     fn current_schema_digest() -> String {
         let sql = r#"
         CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK (id = 1), schema_digest TEXT NOT NULL, sdk_version TEXT NOT NULL, created_at TEXT NOT NULL);
-        CREATE TABLE config_history (tx_id BLOB PRIMARY KEY, parent_tx_id BLOB NULL, version INTEGER NOT NULL UNIQUE, committed_at TEXT NOT NULL, principal TEXT NOT NULL, source TEXT NOT NULL, schema_digest BLOB NOT NULL, plaintext_digest BLOB NOT NULL, encrypted_blob BLOB NOT NULL, rollback_point INTEGER NOT NULL DEFAULT 0, rollback_label TEXT NULL, confirmed_deadline TEXT NULL, confirmed_at TEXT NULL);
+        CREATE TABLE config_history (tx_id BLOB PRIMARY KEY, parent_tx_id BLOB NULL, version INTEGER NOT NULL UNIQUE, committed_at TEXT NOT NULL, principal TEXT NOT NULL, source TEXT NOT NULL, schema_digest BLOB NOT NULL, plaintext_digest BLOB NOT NULL, encrypted_blob BLOB NOT NULL, rollback_point INTEGER NOT NULL DEFAULT 0, rollback_label TEXT NULL, confirmed_deadline TEXT NULL, confirmed_at TEXT NULL, audit_count INTEGER NOT NULL DEFAULT 0, audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000');
         CREATE TABLE audit_trail (id INTEGER PRIMARY KEY AUTOINCREMENT, tx_id BLOB NOT NULL, sequence INTEGER NOT NULL, yang_path TEXT NOT NULL, op_type TEXT NOT NULL, previous_value TEXT NULL, new_value TEXT NULL, redaction_applied INTEGER NOT NULL DEFAULT 0, previous_hash BLOB NOT NULL, entry_hmac BLOB NOT NULL, UNIQUE(tx_id, sequence));
         CREATE TABLE rollback_labels (label TEXT PRIMARY KEY, tx_id BLOB NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE alarm_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, outcome TEXT NOT NULL, alarm_id TEXT NOT NULL, alarm_type TEXT NOT NULL, probable_cause TEXT NOT NULL, principal TEXT NOT NULL, tenant TEXT NULL, reason TEXT NOT NULL, scope TEXT NOT NULL, correlation_id TEXT NULL, occurred_at TEXT NOT NULL);
