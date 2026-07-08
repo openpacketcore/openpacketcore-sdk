@@ -67,10 +67,16 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
         details: &str,
     ) -> Result<(), SecurityPolicyError> {
         let conn_mutex = self.backend.conn();
-        let (previous_hash, timestamp) = {
-            let conn = conn_mutex.lock().await;
+        let timestamp = Timestamp::now_utc().to_string();
 
-            let prev_hash_row: Result<Vec<u8>, _> = conn.query_row(
+        {
+            let conn = conn_mutex.lock().await;
+            let tx = conn.unchecked_transaction().map_err(|e| {
+                tracing::error!(err = ?e, "Failed to start break-glass audit transaction");
+                SecurityPolicyError::Internal
+            })?;
+
+            let prev_hash_row: Result<Vec<u8>, _> = tx.query_row(
                 "SELECT entry_hmac FROM break_glass_audit WHERE tenant = ?1 ORDER BY id DESC LIMIT 1",
                 [tenant],
                 |row| row.get(0),
@@ -96,40 +102,34 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
                 }
             };
 
-            let timestamp = Timestamp::now_utc().to_string();
-            (previous_hash, timestamp)
-        };
+            let mut mac_input = Vec::new();
+            mac_input.extend_from_slice(&(tenant.len() as u32).to_be_bytes());
+            mac_input.extend_from_slice(tenant.as_bytes());
 
-        let mut mac_input = Vec::new();
-        mac_input.extend_from_slice(&(tenant.len() as u32).to_be_bytes());
-        mac_input.extend_from_slice(tenant.as_bytes());
+            mac_input.extend_from_slice(&(timestamp.len() as u32).to_be_bytes());
+            mac_input.extend_from_slice(timestamp.as_bytes());
 
-        mac_input.extend_from_slice(&(timestamp.len() as u32).to_be_bytes());
-        mac_input.extend_from_slice(timestamp.as_bytes());
+            mac_input.extend_from_slice(&(principal.len() as u32).to_be_bytes());
+            mac_input.extend_from_slice(principal.as_bytes());
 
-        mac_input.extend_from_slice(&(principal.len() as u32).to_be_bytes());
-        mac_input.extend_from_slice(principal.as_bytes());
+            mac_input.extend_from_slice(&(action.len() as u32).to_be_bytes());
+            mac_input.extend_from_slice(action.as_bytes());
 
-        mac_input.extend_from_slice(&(action.len() as u32).to_be_bytes());
-        mac_input.extend_from_slice(action.as_bytes());
+            mac_input.extend_from_slice(&(details.len() as u32).to_be_bytes());
+            mac_input.extend_from_slice(details.as_bytes());
 
-        mac_input.extend_from_slice(&(details.len() as u32).to_be_bytes());
-        mac_input.extend_from_slice(details.as_bytes());
+            mac_input.extend_from_slice(&previous_hash);
 
-        mac_input.extend_from_slice(&previous_hash);
+            type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+            let mut mac =
+                HmacSha256::new_from_slice(self.backend.audit_key().as_bytes()).map_err(|e| {
+                    tracing::error!(err = ?e, "Failed to create HMAC provider");
+                    SecurityPolicyError::Internal
+                })?;
+            mac.update(&mac_input);
+            let entry_hmac: [u8; 32] = mac.finalize().into_bytes().into();
 
-        type HmacSha256 = hmac::Hmac<sha2::Sha256>;
-        let mut mac =
-            HmacSha256::new_from_slice(self.backend.audit_key().as_bytes()).map_err(|e| {
-                tracing::error!(err = ?e, "Failed to create HMAC provider");
-                SecurityPolicyError::Internal
-            })?;
-        mac.update(&mac_input);
-        let entry_hmac: [u8; 32] = mac.finalize().into_bytes().into();
-
-        {
-            let conn = conn_mutex.lock().await;
-            let insert_res = conn.execute(
+            let insert_res = tx.execute(
                 "INSERT INTO break_glass_audit (tenant, timestamp, principal, action, details, previous_hash, entry_hmac) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
@@ -147,6 +147,11 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
                 tracing::error!(err = ?e, "Failed to insert break glass audit entry");
                 return Err(SecurityPolicyError::Internal);
             }
+
+            tx.commit().map_err(|e| {
+                tracing::error!(err = ?e, "Failed to commit break-glass audit transaction");
+                SecurityPolicyError::Internal
+            })?;
         }
 
         tracing::info!(
@@ -159,6 +164,18 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
         );
 
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "dangerous-test-hooks"))]
+    pub async fn break_glass_audit_event_for_test(
+        &self,
+        tenant: &str,
+        principal: &str,
+        action: &str,
+        details: &str,
+    ) -> Result<(), SecurityPolicyError> {
+        self.break_glass_audit_event(tenant, principal, action, details)
+            .await
     }
 
     async fn check_break_glass_permission(

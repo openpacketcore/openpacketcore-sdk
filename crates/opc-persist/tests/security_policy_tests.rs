@@ -717,3 +717,68 @@ async fn test_security_policy_audit_corruption_fails_closed() {
         "corrupt audit HMAC length must fail closed, got: {res:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_security_policy_audit_concurrent_appends_remain_linear() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (service, temp_dir) = setup_service().await;
+    let service = Arc::new(service);
+    let tenant = "test-tenant";
+    let principal = get_admin_principal();
+    let details_a = "a".repeat(4 * 1024 * 1024);
+    let details_b = "b".repeat(4 * 1024 * 1024);
+
+    let first = {
+        let service = Arc::clone(&service);
+        let principal = principal.clone();
+        let details = details_a.clone();
+        tokio::spawn(async move {
+            service
+                .security_policy_audit_event_for_test(tenant, &principal, "CONCURRENT_A", &details)
+                .await
+        })
+    };
+    let second = {
+        let service = Arc::clone(&service);
+        let principal = principal.clone();
+        tokio::spawn(async move {
+            service
+                .security_policy_audit_event_for_test(
+                    tenant,
+                    &principal,
+                    "CONCURRENT_B",
+                    &details_b,
+                )
+                .await
+        })
+    };
+
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+
+    let db_path = temp_dir.path().join("test_security.db");
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT previous_hash, entry_hmac FROM security_policy_audit WHERE tenant = ?1 ORDER BY id ASC",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([tenant], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .unwrap();
+
+    let mut prev_hash = vec![0u8; 32];
+    let mut row_count = 0;
+    for row in rows {
+        let (previous_hash, entry_hmac) = row.unwrap();
+        assert_eq!(
+            previous_hash, prev_hash,
+            "audit chain forked at row {row_count}"
+        );
+        prev_hash = entry_hmac;
+        row_count += 1;
+    }
+    assert_eq!(row_count, 2);
+}
