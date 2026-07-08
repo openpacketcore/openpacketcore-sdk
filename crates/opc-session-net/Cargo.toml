@@ -29,6 +29,7 @@ thiserror = { workspace = true }
 futures-util = "0.3"
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 opc-identity = { path = "../opc-identity", version = "0.2.0" }

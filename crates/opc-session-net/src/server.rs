@@ -1,8 +1,10 @@
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
+use opc_session_store::backend::CompareAndSetResult;
 use opc_session_store::quorum::SessionStoreBackend;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
@@ -42,6 +44,35 @@ impl ServerHandle {
 
 /// Default per-frame read deadline for accepted connections.
 const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const CAS_IDEMPOTENCY_CACHE_CAPACITY: usize = 4096;
+
+#[derive(Debug, Default)]
+struct CasIdempotencyCache {
+    entries: HashMap<String, CompareAndSetResult>,
+    order: VecDeque<String>,
+}
+
+impl CasIdempotencyCache {
+    fn get(&self, request_id: &str) -> Option<CompareAndSetResult> {
+        self.entries.get(request_id).cloned()
+    }
+
+    fn insert_success(&mut self, request_id: String, result: CompareAndSetResult) {
+        if self.entries.contains_key(&request_id) {
+            return;
+        }
+
+        while self.entries.len() >= CAS_IDEMPOTENCY_CACHE_CAPACITY {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+
+        self.order.push_back(request_id.clone());
+        self.entries.insert(request_id, result);
+    }
+}
 
 /// Networked session replication server.
 pub struct SessionReplicationServer {
@@ -50,6 +81,7 @@ pub struct SessionReplicationServer {
     max_connections: usize,
     max_frame_size: usize,
     idle_timeout: std::time::Duration,
+    cas_idempotency_cache: Arc<Mutex<CasIdempotencyCache>>,
 }
 
 impl fmt::Debug for SessionReplicationServer {
@@ -78,6 +110,7 @@ impl SessionReplicationServer {
             max_connections: 128,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            cas_idempotency_cache: Arc::new(Mutex::new(CasIdempotencyCache::default())),
         }
     }
 
@@ -90,6 +123,7 @@ impl SessionReplicationServer {
             max_connections: 128,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            cas_idempotency_cache: Arc::new(Mutex::new(CasIdempotencyCache::default())),
         }
     }
 
@@ -124,6 +158,7 @@ impl SessionReplicationServer {
         let sem = Arc::new(Semaphore::new(self.max_connections));
         let tls_config = self.tls_config.clone();
         let backend = self.backend.clone();
+        let cas_idempotency_cache = self.cas_idempotency_cache.clone();
         let max_frame_size = self.max_frame_size;
         let idle_timeout = self.idle_timeout;
         let connection_handles = Arc::new(Mutex::new(Vec::new()));
@@ -144,6 +179,7 @@ impl SessionReplicationServer {
                             Ok((stream, peer)) => {
                                 let backend = backend.clone();
                                 let tls_config = tls_config.clone();
+                                let cas_idempotency_cache = cas_idempotency_cache.clone();
                                 let handles = connection_handles_clone.clone();
                                 tracing::debug!(%peer, "accepted connection");
                                 let conn_handle = tokio::spawn(async move {
@@ -152,6 +188,7 @@ impl SessionReplicationServer {
                                         backend,
                                         stream,
                                         tls_config,
+                                        cas_idempotency_cache,
                                         max_frame_size,
                                         idle_timeout,
                                     )
@@ -186,6 +223,7 @@ async fn handle_connection(
     backend: Arc<dyn SessionStoreBackend>,
     stream: TcpStream,
     tls_config: Option<Arc<opc_tls::ServerConfig>>,
+    cas_idempotency_cache: Arc<Mutex<CasIdempotencyCache>>,
     max_frame_size: usize,
     idle_timeout: std::time::Duration,
 ) -> Result<(), ProtocolError> {
@@ -201,15 +239,32 @@ async fn handle_connection(
             })?
             .map_err(ProtocolError::Io)?;
         let (mut r, mut w) = tokio::io::split(tls_stream);
-        dispatch(backend, &mut r, &mut w, max_frame_size, idle_timeout).await
+        dispatch(
+            backend,
+            cas_idempotency_cache,
+            &mut r,
+            &mut w,
+            max_frame_size,
+            idle_timeout,
+        )
+        .await
     } else {
         let (mut r, mut w) = tokio::io::split(stream);
-        dispatch(backend, &mut r, &mut w, max_frame_size, idle_timeout).await
+        dispatch(
+            backend,
+            cas_idempotency_cache,
+            &mut r,
+            &mut w,
+            max_frame_size,
+            idle_timeout,
+        )
+        .await
     }
 }
 
 async fn dispatch<R, W>(
     backend: Arc<dyn SessionStoreBackend>,
+    cas_idempotency_cache: Arc<Mutex<CasIdempotencyCache>>,
     reader: &mut R,
     writer: &mut W,
     max_frame_size: usize,
@@ -263,7 +318,25 @@ where
                 let res = backend.get(&key).await;
                 write_frame(writer, &Response::Get(res)).await?;
             }
-            Request::CompareAndSet { op } => {
+            Request::CompareAndSet { op, request_id } => {
+                if let Some(request_id) = request_id {
+                    let cached = { cas_idempotency_cache.lock().await.get(&request_id) };
+                    if let Some(cached) = cached {
+                        write_frame(writer, &Response::CompareAndSet(Ok(cached))).await?;
+                        continue;
+                    }
+
+                    let res = backend.compare_and_set(op).await;
+                    if matches!(res, Ok(CompareAndSetResult::Success)) {
+                        cas_idempotency_cache
+                            .lock()
+                            .await
+                            .insert_success(request_id, CompareAndSetResult::Success);
+                    }
+                    write_frame(writer, &Response::CompareAndSet(res)).await?;
+                    continue;
+                }
+
                 let res = backend.compare_and_set(op).await;
                 write_frame(writer, &Response::CompareAndSet(res)).await?;
             }
@@ -340,4 +413,25 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cas_idempotency_cache_retains_successes_with_bound() {
+        let mut cache = CasIdempotencyCache::default();
+
+        cache.insert_success("first".into(), CompareAndSetResult::Success);
+        assert_eq!(cache.get("first"), Some(CompareAndSetResult::Success));
+
+        for idx in 0..CAS_IDEMPOTENCY_CACHE_CAPACITY {
+            cache.insert_success(format!("request-{idx}"), CompareAndSetResult::Success);
+        }
+
+        assert_eq!(cache.entries.len(), CAS_IDEMPOTENCY_CACHE_CAPACITY);
+        assert_eq!(cache.get("first"), None);
+        assert_eq!(cache.get("request-0"), Some(CompareAndSetResult::Success));
+    }
 }

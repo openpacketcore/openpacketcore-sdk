@@ -26,6 +26,8 @@ pub enum Request {
     },
     CompareAndSet {
         op: CompareAndSet,
+        #[serde(default)]
+        request_id: Option<String>,
     },
     DeleteFenced {
         lease: LeaseGuard,

@@ -266,7 +266,10 @@ impl SessionBackend for RemoteSessionBackend {
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
         match self
-            .send_request_with_retry(Request::CompareAndSet { op })
+            .send_request_with_retry(Request::CompareAndSet {
+                op,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
+            })
             .await?
         {
             Response::CompareAndSet(res) => res,

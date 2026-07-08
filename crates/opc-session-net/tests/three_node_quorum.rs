@@ -437,6 +437,116 @@ async fn test_in_flight_request_surfaces_error_on_disconnect() {
 }
 
 #[tokio::test]
+async fn direct_cas_retry_after_dropped_response_reports_success() {
+    use opc_session_net::protocol::{read_frame, write_frame, CONTRACT_VERSION};
+    use opc_session_net::{Request, Response};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+
+    let backend = Arc::new(FakeSessionBackend::new());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let first_cas = Arc::new(AtomicBool::new(true));
+    let cas_request_ids = Arc::new(Mutex::new(Vec::new()));
+
+    let server = {
+        let backend = backend.clone();
+        let first_cas = first_cas.clone();
+        let cas_request_ids = cas_request_ids.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let backend = backend.clone();
+                let first_cas = first_cas.clone();
+                let cas_request_ids = cas_request_ids.clone();
+                tokio::spawn(async move {
+                    let (mut r, mut w) = stream.into_split();
+                    let hello: Request = read_frame(&mut r, 1 << 20).await.unwrap();
+                    assert!(matches!(hello, Request::Hello { .. }));
+                    write_frame(
+                        &mut w,
+                        &Response::HelloAck {
+                            contract_version: CONTRACT_VERSION,
+                        },
+                    )
+                    .await
+                    .unwrap();
+
+                    loop {
+                        let req: Request = match read_frame(&mut r, 1 << 20).await {
+                            Ok(req) => req,
+                            Err(_) => return,
+                        };
+                        match req {
+                            Request::AcquireLease { key, owner, ttl } => {
+                                let res = backend.acquire(&key, owner, ttl).await;
+                                write_frame(&mut w, &Response::AcquireLease(res))
+                                    .await
+                                    .unwrap();
+                            }
+                            Request::CompareAndSet { op, request_id } => {
+                                let request_id =
+                                    request_id.expect("direct CAS must carry an idempotency key");
+                                let mut ids = cas_request_ids.lock().await;
+                                let first_seen_id = ids.first().cloned();
+                                ids.push(request_id.clone());
+                                drop(ids);
+
+                                if first_cas.swap(false, Ordering::SeqCst) {
+                                    let res = backend.compare_and_set(op).await;
+                                    assert_eq!(res.as_ref(), Ok(&CompareAndSetResult::Success));
+                                    return;
+                                }
+
+                                if first_seen_id.as_ref() == Some(&request_id) {
+                                    write_frame(
+                                        &mut w,
+                                        &Response::CompareAndSet(Ok(CompareAndSetResult::Success)),
+                                    )
+                                    .await
+                                    .unwrap();
+                                } else {
+                                    let res = backend.compare_and_set(op).await;
+                                    write_frame(&mut w, &Response::CompareAndSet(res))
+                                        .await
+                                        .unwrap();
+                                }
+                            }
+                            other => panic!("unexpected request in CAS retry test: {other:?}"),
+                        }
+                    }
+                });
+            }
+        })
+    };
+
+    let remote = RemoteSessionBackend::new(addr, None, Some(Duration::from_secs(2)));
+    let key = test_key();
+    let owner = OwnerId::new("owner-retry").unwrap();
+    let lease = remote
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    let result = remote
+        .compare_and_set(CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: test_record(&key, &owner, lease.fence(), Generation::new(1)),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result, CompareAndSetResult::Success);
+    let ids = cas_request_ids.lock().await;
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], ids[1], "retry must reuse the same CAS request id");
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn test_batch_and_delete() {
     let mtls = mtls_configs();
     let (addr1, _backend1, handle1) = start_server(&mtls).await;
