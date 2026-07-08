@@ -822,6 +822,51 @@ fn clear_re_raise_cycles_do_not_grow_current_state_indexes() {
 }
 
 #[test]
+fn lifecycle_timestamps_do_not_move_before_raised_at() {
+    let mut alarm = make_alarm_with_state("future-clock", AlarmState::Raised);
+    let future = OffsetDateTime::now_utc() + time::Duration::hours(1);
+    alarm.raised_at = future;
+    alarm.updated_at = future;
+    let alarm_type = alarm.alarm_type.clone();
+    let probable_cause = alarm.probable_cause.clone();
+    let affected_object = alarm.affected_object.clone();
+
+    let mut store = InMemoryStore::new();
+    AlarmStore::insert(&mut store, alarm);
+    let mut mgr = AlarmManager::new(store);
+
+    let updated = mgr.raise(
+        alarm_type.clone(),
+        Severity::Critical,
+        probable_cause.clone(),
+        affected_object.clone(),
+        None,
+        None,
+        None,
+        RedactedText::new("Peer still unreachable"),
+        AlarmDetails::empty(),
+    );
+    let AlarmOpResult::Updated { alarm } = updated else {
+        panic!("expected update for seeded alarm, got {updated:?}");
+    };
+    assert!(alarm.updated_at >= alarm.raised_at);
+
+    let cleared = mgr.clear(
+        &alarm_type,
+        probable_cause,
+        &affected_object,
+        None,
+        None,
+        None,
+    );
+    assert!(matches!(cleared, AlarmOpResult::Cleared { .. }));
+    let history = mgr.all_alarms();
+    let terminal = history.last().expect("terminal history");
+    assert!(terminal.updated_at >= terminal.raised_at);
+    assert!(terminal.cleared_at.expect("cleared timestamp") >= terminal.raised_at);
+}
+
+#[test]
 fn direct_terminal_insert_does_not_pollute_active_indexes() {
     let mut store = InMemoryStore::new();
 

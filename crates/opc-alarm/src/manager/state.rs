@@ -203,10 +203,11 @@ impl<S: AlarmStore> AlarmManager<S> {
                 AlarmOpResult::Raised { alarm }
             } else {
                 let mut updated = existing.clone();
+                let updated_at = lifecycle_timestamp_after(existing.raised_at);
                 updated.severity = severity;
                 updated.text = text;
                 updated.details = details;
-                updated.updated_at = now;
+                updated.updated_at = updated_at;
                 updated.state = match existing.state {
                     AlarmState::Acknowledged => AlarmState::Acknowledged,
                     AlarmState::Suppressed => AlarmState::Suppressed,
@@ -280,7 +281,7 @@ impl<S: AlarmStore> AlarmManager<S> {
                     cause: probable_cause,
                 }
             } else {
-                let now = OffsetDateTime::now_utc();
+                let now = lifecycle_timestamp_after(alarm.raised_at);
                 alarm.state = AlarmState::Cleared;
                 alarm.cleared_at = Some(now);
                 alarm.updated_at = now;
@@ -330,7 +331,7 @@ impl<S: AlarmStore> AlarmManager<S> {
                 };
             }
             alarm.state = AlarmState::Acknowledged;
-            alarm.updated_at = OffsetDateTime::now_utc();
+            alarm.updated_at = lifecycle_timestamp_after(alarm.raised_at);
             self.store.update(alarm.clone());
             AlarmOpResult::Acknowledged { alarm }
         } else {
@@ -394,7 +395,7 @@ impl<S: AlarmStore> AlarmManager<S> {
                 };
             }
             alarm.state = AlarmState::Suppressed;
-            alarm.updated_at = OffsetDateTime::now_utc();
+            alarm.updated_at = lifecycle_timestamp_after(alarm.raised_at);
             self.store.update(alarm.clone());
             AlarmOpResult::Suppressed { alarm }
         } else {
@@ -508,7 +509,7 @@ impl<S: AlarmStore> AlarmManager<S> {
             AlarmAction::Acknowledge => AlarmState::Acknowledged,
             AlarmAction::Suppress => AlarmState::Suppressed,
         };
-        alarm.updated_at = OffsetDateTime::now_utc();
+        alarm.updated_at = lifecycle_timestamp_after(alarm.raised_at);
         self.store.update(alarm.clone());
         self.update_global_metrics();
 
@@ -828,4 +829,8 @@ fn same_history_identity(left: &Alarm, right: &Alarm) -> bool {
         && left.slice == right.slice
         && left.region == right.region
         && left.state == right.state
+}
+
+fn lifecycle_timestamp_after(raised_at: OffsetDateTime) -> OffsetDateTime {
+    OffsetDateTime::now_utc().max(raised_at)
 }
