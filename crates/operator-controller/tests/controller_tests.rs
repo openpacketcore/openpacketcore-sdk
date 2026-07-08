@@ -951,6 +951,47 @@ fn test_multi_cluster_rollout_aggregation_and_split_brain() {
 }
 
 #[test]
+fn test_multi_cluster_reaggregate_preserves_unchanged_transition_time() {
+    let mut mc_status = MultiClusterRolloutStatus::new(1);
+
+    let first_status = ClusterRolloutStatus {
+        cluster_id: "cluster-us-east".to_string(),
+        observed_generation: 1,
+        resource_version: 1,
+        phase: LifecyclePhase::Ready,
+        conditions: vec![],
+    };
+
+    mc_status
+        .update_cluster_status("cluster-us-east", first_status)
+        .unwrap();
+
+    let stable_transition = OffsetDateTime::from_unix_timestamp(123).unwrap();
+    mc_status.conditions[0].last_transition_time = stable_transition;
+
+    let second_status = ClusterRolloutStatus {
+        cluster_id: "cluster-us-east".to_string(),
+        observed_generation: 1,
+        resource_version: 2,
+        phase: LifecyclePhase::Ready,
+        conditions: vec![],
+    };
+
+    mc_status
+        .update_cluster_status("cluster-us-east", second_status)
+        .unwrap();
+
+    let ready_cond = mc_status
+        .conditions
+        .iter()
+        .find(|c| c.r#type == "Ready")
+        .unwrap();
+    assert_eq!(ready_cond.status, ConditionStatus::True);
+    assert_eq!(ready_cond.reason, "AllClustersReady");
+    assert_eq!(ready_cond.last_transition_time, stable_transition);
+}
+
+#[test]
 fn test_multi_cluster_stale_status_rejection() {
     let mut mc_status = MultiClusterRolloutStatus::new(1);
 
