@@ -525,4 +525,37 @@ mod tests {
             "raw IMSI leaked: {output}"
         );
     }
+
+    #[test]
+    fn redaction_visitor_preserves_snake_case_error_codes() {
+        let writer = BufferWriter::default();
+        let subscriber = Registry::default().with(
+            redacting_fmt_layer()
+                .with_writer(writer.clone())
+                .without_time()
+                .with_ansi(false),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                error_code = "swu_ike_auth_child_sa_negotiation_failed",
+                opaque_blob = "q83KLcP0uVwF+7aTq83KLcP0uVwF+7aTq83KLcP0uVw=",
+                "fail-closed"
+            );
+        });
+
+        let output = writer.output();
+        assert!(
+            output.contains("error_code=swu_ike_auth_child_sa_negotiation_failed"),
+            "diagnostic error code was hidden: {output}"
+        );
+        assert!(
+            output.contains("opaque_blob=[REDACTED_SECURITY_SECRET]"),
+            "high-entropy token was not redacted: {output}"
+        );
+        assert!(
+            !output.contains("q83KLcP0uVwF+7aTq83KLcP0uVwF+7aTq83KLcP0uVw="),
+            "raw token leaked: {output}"
+        );
+    }
 }

@@ -688,20 +688,24 @@ fn looks_like_sensitive_base64(token: &str) -> bool {
     if token.len() < 32 || !token.len().is_multiple_of(4) {
         return false;
     }
+    if looks_like_lowercase_identifier_slug(token) {
+        return false;
+    }
 
     let bytes = token.as_bytes();
     let mut padding_started = false;
     let mut has_upper = false;
     let mut has_lower = false;
     let mut has_digit = false;
-    let mut has_symbol = false;
+    let mut has_standard_symbol = false;
 
     for &byte in bytes {
         match byte {
             b'A'..=b'Z' if !padding_started => has_upper = true,
             b'a'..=b'z' if !padding_started => has_lower = true,
             b'0'..=b'9' if !padding_started => has_digit = true,
-            b'+' | b'/' | b'-' | b'_' if !padding_started => has_symbol = true,
+            b'+' | b'/' if !padding_started => has_standard_symbol = true,
+            b'-' | b'_' if !padding_started => {}
             b'=' => padding_started = true,
             _ => return false,
         }
@@ -712,7 +716,32 @@ fn looks_like_sensitive_base64(token: &str) -> bool {
         return false;
     }
 
-    has_symbol || (has_upper && has_lower && has_digit)
+    has_standard_symbol || (has_upper && has_lower && has_digit)
+}
+
+fn looks_like_lowercase_identifier_slug(token: &str) -> bool {
+    let mut saw_separator = false;
+    let mut previous_was_separator = false;
+    let mut saw_word_char = false;
+
+    for byte in token.bytes() {
+        match byte {
+            b'a'..=b'z' | b'0'..=b'9' => {
+                saw_word_char = true;
+                previous_was_separator = false;
+            }
+            b'_' | b'-' => {
+                if !saw_word_char || previous_was_separator {
+                    return false;
+                }
+                saw_separator = true;
+                previous_was_separator = true;
+            }
+            _ => return false,
+        }
+    }
+
+    saw_separator && !previous_was_separator
 }
 
 /// Returns true when `token` begins with a known telco marker followed by an
@@ -1480,6 +1509,31 @@ mod tests {
         assert!(!redacted.contains("q83KLcP0uVwF+7aTq83KLcP0uVwF+7aTq83KLcP0uVw="));
         assert_eq!(redacted.matches("[REDACTED_SECURITY_SECRET]").count(), 2);
         assert_eq!(summary.secrets, 2);
+    }
+
+    #[test]
+    fn test_redact_text_preserves_snake_case_error_codes_that_resemble_base64url() {
+        let error_code = "swu_ike_auth_child_sa_negotiation_failed";
+        assert!(error_code.len() >= 32);
+        assert!(error_code.len().is_multiple_of(4));
+
+        let mut direct_summary = RedactionSummary::default();
+        let direct_redacted = redact_text(error_code, &mut direct_summary);
+        assert_eq!(direct_redacted, error_code);
+        assert_eq!(direct_summary.secrets, 0);
+
+        let mut summary = RedactionSummary::default();
+        let log = concat!(
+            "error_code=swu_ike_auth_child_sa_negotiation_failed ",
+            "wrapped token q83KLcP0uVwF+7aTq83KLcP0uVwF+7aTq83KLcP0uVw="
+        );
+
+        let redacted = redact_text(log, &mut summary);
+
+        assert!(redacted.contains("swu_ike_auth_child_sa_negotiation_failed"));
+        assert!(!redacted.contains("q83KLcP0uVwF+7aTq83KLcP0uVwF+7aTq83KLcP0uVw="));
+        assert_eq!(redacted.matches("[REDACTED_SECURITY_SECRET]").count(), 1);
+        assert_eq!(summary.secrets, 1);
     }
 
     #[test]
