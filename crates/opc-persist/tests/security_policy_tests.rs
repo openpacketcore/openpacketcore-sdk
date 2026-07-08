@@ -10,7 +10,7 @@ use opc_nacm::{
 };
 use opc_persist::{
     AuditKey, RollbackTarget, SecurityPolicyError, SecurityPolicyService, SqliteBackend,
-    SqliteSecurityPolicyService, TEST_COMMIT_FAIL,
+    SqliteSecurityPolicyService, TEST_AUDIT_SUCCESS_INSERT_FAIL, TEST_COMMIT_FAIL,
 };
 use opc_types::TenantId;
 
@@ -257,6 +257,44 @@ async fn test_apply_policy_rejects_stale_or_equal_version() {
     assert!(
         matches!(res2, Err(SecurityPolicyError::StaleVersion(_))),
         "Apply must reject equal version: {res2:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_apply_policy_rolls_back_when_success_audit_insert_fails() {
+    let _guard = TEST_MUTEX.lock().await;
+    TEST_AUDIT_SUCCESS_INSERT_FAIL.store(false, Ordering::Relaxed);
+    let (service, _temp_dir) = setup_service().await;
+    let tenant = "test-tenant";
+    let principal = get_admin_principal();
+
+    service
+        .stage_policy(tenant, &principal, make_valid_policy(1))
+        .await
+        .unwrap();
+    service.apply_policy(tenant, &principal).await.unwrap();
+
+    service
+        .stage_policy(tenant, &principal, make_valid_policy(2))
+        .await
+        .unwrap();
+
+    TEST_AUDIT_SUCCESS_INSERT_FAIL.store(true, Ordering::Relaxed);
+    let res = service.apply_policy(tenant, &principal).await;
+    TEST_AUDIT_SUCCESS_INSERT_FAIL.store(false, Ordering::Relaxed);
+
+    assert!(
+        matches!(res, Err(SecurityPolicyError::Internal)),
+        "audit insert failure should fail apply, got: {res:?}"
+    );
+
+    let active = service
+        .inspect_active_policy(tenant, &principal)
+        .await
+        .expect("active policy should still be readable");
+    assert_eq!(
+        active.version, 1,
+        "active policy mutation must roll back when APPLY_SUCCESS audit insert fails"
     );
 }
 

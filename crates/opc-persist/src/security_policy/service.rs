@@ -167,75 +167,16 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
         self.verify_security_policy_audit_chain(tenant).await?;
 
         let conn_mutex = self.backend.conn();
-        let timestamp = opc_types::Timestamp::now_utc().to_string();
-
-        {
-            let conn = conn_mutex.lock().await;
-            let tx = conn.unchecked_transaction().map_err(|e| {
-                tracing::error!(err = ?e, "Failed to start security policy audit transaction");
-                SecurityPolicyError::Internal
-            })?;
-
-            let prev_hash_row: Result<Vec<u8>, _> = tx.query_row(
-                "SELECT entry_hmac FROM security_policy_audit WHERE tenant = ?1 ORDER BY id DESC LIMIT 1",
-                [tenant],
-                |row| row.get(0),
-            );
-
-            let previous_hash: [u8; 32] = match prev_hash_row {
-                Ok(bytes) => audit_hash_from_blob(bytes, "previous security policy audit HMAC")?,
-                Err(rusqlite::Error::QueryReturnedNoRows) => [0u8; 32],
-                Err(e) => {
-                    tracing::error!(err = ?e, "Failed to fetch previous audit hash");
-                    return Err(SecurityPolicyError::Internal);
-                }
-            };
-
-            let entry_hmac = calculate_audit_event_hmac(
-                self.backend.audit_key(),
-                tenant,
-                &timestamp,
-                principal,
-                action,
-                details,
-                &previous_hash,
-            )?;
-
-            let insert_res = tx.execute(
-                "INSERT INTO security_policy_audit (tenant, timestamp, principal, action, details, previous_hash, entry_hmac) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![
-                    tenant,
-                    timestamp,
-                    principal,
-                    action,
-                    details,
-                    previous_hash.to_vec(),
-                    entry_hmac.to_vec(),
-                ],
-            );
-
-            if let Err(e) = insert_res {
-                tracing::error!(err = ?e, "Failed to insert security policy audit entry");
-                return Err(SecurityPolicyError::Internal);
-            }
-
-            tx.execute(
-                "INSERT INTO security_policy_audit_anchor (tenant, audit_count, audit_terminal_hash) \
-                 VALUES (?1, (SELECT COUNT(*) FROM security_policy_audit WHERE tenant = ?1), ?2) \
-                 ON CONFLICT(tenant) DO UPDATE SET audit_count = excluded.audit_count, audit_terminal_hash = excluded.audit_terminal_hash",
-                rusqlite::params![tenant, &entry_hmac[..]],
-            )
-            .map_err(|e| {
-                tracing::error!(err = ?e, "Failed to update security policy audit anchor");
-                SecurityPolicyError::Internal
-            })?;
-
-            tx.commit().map_err(|e| {
-                tracing::error!(err = ?e, "Failed to commit security policy audit transaction");
-                SecurityPolicyError::Internal
-            })?;
-        }
+        let conn = conn_mutex.lock().await;
+        let tx = conn.unchecked_transaction().map_err(|e| {
+            tracing::error!(err = ?e, "Failed to start security policy audit transaction");
+            SecurityPolicyError::Internal
+        })?;
+        self.insert_security_policy_audit_event_tx(&tx, tenant, principal, action, details)?;
+        tx.commit().map_err(|e| {
+            tracing::error!(err = ?e, "Failed to commit security policy audit transaction");
+            SecurityPolicyError::Internal
+        })?;
 
         tracing::info!(
             target: "security_policy_audit",
@@ -245,6 +186,79 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
             details = %details,
             "Security policy audit log"
         );
+
+        Ok(())
+    }
+
+    fn insert_security_policy_audit_event_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        tenant: &str,
+        principal: &str,
+        action: &str,
+        details: &str,
+    ) -> Result<(), SecurityPolicyError> {
+        let timestamp = opc_types::Timestamp::now_utc().to_string();
+        let prev_hash_row: Result<Vec<u8>, _> = tx.query_row(
+            "SELECT entry_hmac FROM security_policy_audit WHERE tenant = ?1 ORDER BY id DESC LIMIT 1",
+            [tenant],
+            |row| row.get(0),
+        );
+
+        let previous_hash: [u8; 32] = match prev_hash_row {
+            Ok(bytes) => audit_hash_from_blob(bytes, "previous security policy audit HMAC")?,
+            Err(rusqlite::Error::QueryReturnedNoRows) => [0u8; 32],
+            Err(e) => {
+                tracing::error!(err = ?e, "Failed to fetch previous audit hash");
+                return Err(SecurityPolicyError::Internal);
+            }
+        };
+
+        let entry_hmac = calculate_audit_event_hmac(
+            self.backend.audit_key(),
+            tenant,
+            &timestamp,
+            principal,
+            action,
+            details,
+            &previous_hash,
+        )?;
+
+        #[cfg(any(test, feature = "dangerous-test-hooks"))]
+        if super::TEST_AUDIT_SUCCESS_INSERT_FAIL.load(Ordering::Relaxed)
+            && matches!(action, "STAGE" | "APPLY_SUCCESS" | "ROLLBACK")
+        {
+            return Err(SecurityPolicyError::Internal);
+        }
+
+        tx.execute(
+            "INSERT INTO security_policy_audit (tenant, timestamp, principal, action, details, previous_hash, entry_hmac) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                tenant,
+                timestamp,
+                principal,
+                action,
+                details,
+                previous_hash.to_vec(),
+                entry_hmac.to_vec(),
+            ],
+        )
+        .map_err(|e| {
+            tracing::error!(err = ?e, "Failed to insert security policy audit entry");
+            SecurityPolicyError::Internal
+        })?;
+
+        tx.execute(
+            "INSERT INTO security_policy_audit_anchor (tenant, audit_count, audit_terminal_hash) \
+             VALUES (?1, (SELECT COUNT(*) FROM security_policy_audit WHERE tenant = ?1), ?2) \
+             ON CONFLICT(tenant) DO UPDATE SET audit_count = excluded.audit_count, audit_terminal_hash = excluded.audit_terminal_hash",
+            rusqlite::params![tenant, &entry_hmac[..]],
+        )
+        .map_err(|e| {
+            tracing::error!(err = ?e, "Failed to update security policy audit anchor");
+            SecurityPolicyError::Internal
+        })?;
 
         Ok(())
     }
@@ -275,6 +289,8 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
         let version = serializable.version;
         let encrypted_blob =
             encrypt_policy(self.key_provider.as_ref(), tenant, version, &serializable).await?;
+        self.verify_security_policy_audit_chain(tenant).await?;
+        let details = format!("Staged policy version {version}");
 
         {
             let conn_mutex = self.backend.conn();
@@ -310,15 +326,19 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
                 SecurityPolicyError::Internal
             })?;
 
+            self.insert_security_policy_audit_event_tx(
+                &tx,
+                tenant,
+                &validated_spiffe,
+                "STAGE",
+                &details,
+            )?;
+
             tx.commit().map_err(|e| {
                 tracing::error!(err = ?e, "Failed to commit staged policy transaction");
                 SecurityPolicyError::Internal
             })?;
         }
-
-        let details = format!("Staged policy version {version}");
-        self.audit_event(tenant, &validated_spiffe, "STAGE", &details)
-            .await?;
 
         Ok(())
     }
@@ -455,6 +475,8 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
                 .await;
             return Err(e);
         }
+        self.verify_security_policy_audit_chain(tenant).await?;
+        let success_details = format!("Successfully applied policy version {version}");
 
         #[cfg(any(test, feature = "dangerous-test-hooks"))]
         let mut failed_simulated = false;
@@ -509,6 +531,14 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
                 SecurityPolicyError::Internal
             })?;
 
+            self.insert_security_policy_audit_event_tx(
+                &tx,
+                tenant,
+                &validated_spiffe,
+                "APPLY_SUCCESS",
+                &success_details,
+            )?;
+
             #[cfg(any(test, feature = "dangerous-test-hooks"))]
             let mut run_commit = true;
             #[cfg(not(any(test, feature = "dangerous-test-hooks")))]
@@ -555,10 +585,6 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
             let mut cache = self.active_policies.write().await;
             cache.insert(tenant.to_string(), compiled);
         }
-
-        let details = format!("Successfully applied policy version {version}");
-        self.audit_event(tenant, &validated_spiffe, "APPLY_SUCCESS", &details)
-            .await?;
 
         Ok(())
     }
@@ -775,6 +801,8 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
                 return Err(e);
             }
         };
+        self.verify_security_policy_audit_chain(tenant).await?;
+        let success_details = format!("Rolled back active policy to version {version}");
 
         let tx_result = async {
             let conn_guard = conn_mutex.lock().await;
@@ -800,6 +828,14 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
                 SecurityPolicyError::Internal
             })?;
 
+            self.insert_security_policy_audit_event_tx(
+                &tx,
+                tenant,
+                &validated_spiffe,
+                "ROLLBACK",
+                &success_details,
+            )?;
+
             tx.commit().map_err(|e| {
                 tracing::error!(err = ?e, "Failed to commit rollback transaction");
                 SecurityPolicyError::Internal
@@ -821,10 +857,6 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
             let mut cache = self.active_policies.write().await;
             cache.insert(tenant.to_string(), compiled);
         }
-
-        let details = format!("Rolled back active policy to version {version}");
-        self.audit_event(tenant, &validated_spiffe, "ROLLBACK", &details)
-            .await?;
 
         Ok(())
     }

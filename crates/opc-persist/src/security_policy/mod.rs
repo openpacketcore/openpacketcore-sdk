@@ -26,6 +26,10 @@ pub(crate) use crypto::validate_principal_tenant_and_roles;
 pub static TEST_COMMIT_FAIL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(any(test, feature = "dangerous-test-hooks"))]
+pub static TEST_AUDIT_SUCCESS_INSERT_FAIL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Debug, Clone, thiserror::Error, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SecurityPolicyError {
     #[error("unauthorized mismatch or lack of role: {0}")]

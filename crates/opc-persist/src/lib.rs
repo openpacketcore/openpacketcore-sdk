@@ -117,12 +117,12 @@ pub use mock::{FaultInjectingStore, FaultType};
 pub use mock::{MockConfigStore, UnsafePathMock};
 pub use preflight::PersistCapabilities;
 pub use quorum::{FencedReplica, QuorumConfigStore};
-#[cfg(any(test, feature = "dangerous-test-hooks"))]
-pub use security_policy::TEST_COMMIT_FAIL;
 pub use security_policy::{
     ActivePolicyMetadata, PolicyHistoryEntry, SecurityPolicyError, SecurityPolicyService,
     SerializablePolicy, SerializableRule, SerializableRuleList, SqliteSecurityPolicyService,
 };
+#[cfg(any(test, feature = "dangerous-test-hooks"))]
+pub use security_policy::{TEST_AUDIT_SUCCESS_INSERT_FAIL, TEST_COMMIT_FAIL};
 pub use types::{
     extract_tenant, redact_entry, AuditKey, AuditOpType, AuditRecord, CommitRecord, CommitSource,
     RollbackTarget, StoredConfig,
