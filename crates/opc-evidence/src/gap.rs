@@ -4,22 +4,23 @@ use time::Date;
 use crate::{ConformanceStatus, EvidenceError};
 
 mod date_serde {
-    use once_cell::sync::Lazy;
     use serde::{self, Deserialize, Deserializer, Serializer};
     use time::{format_description::BorrowedFormatItem, Date};
 
     const FORMAT: &str = "[year]-[month]-[day]";
 
-    static FORMAT_DESCRIPTION: Lazy<Vec<BorrowedFormatItem<'static>>> = Lazy::new(|| {
-        time::format_description::parse_borrowed::<2>(FORMAT).expect("valid date format string")
-    });
+    fn format_description(
+    ) -> Result<Vec<BorrowedFormatItem<'static>>, time::error::InvalidFormatDescription> {
+        time::format_description::parse_borrowed::<2>(FORMAT)
+    }
 
     pub fn serialize<S>(date: &Date, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
+        let format_description = format_description().map_err(serde::ser::Error::custom)?;
         let s = date
-            .format(&FORMAT_DESCRIPTION)
+            .format(&format_description)
             .map_err(serde::ser::Error::custom)?;
         serializer.serialize_str(&s)
     }
@@ -29,7 +30,8 @@ mod date_serde {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        Date::parse(&s, &FORMAT_DESCRIPTION).map_err(serde::de::Error::custom)
+        let format_description = format_description().map_err(serde::de::Error::custom)?;
+        Date::parse(&s, &format_description).map_err(serde::de::Error::custom)
     }
 }
 

@@ -862,9 +862,9 @@ fn redact_marker_value_pairs(
         }
 
         if !matched {
-            // SAFETY: the loop condition guarantees `i < bytes.len()`, so
-            // `input[i..]` is non-empty and `chars().next()` is always `Some`.
-            let ch = input[i..].chars().next().unwrap();
+            let Some(ch) = input[i..].chars().next() else {
+                break;
+            };
             output.push(ch);
             i += ch.len_utf8();
         }
@@ -912,9 +912,9 @@ fn redact_labeled_spaced_subscriber_ids(
             continue;
         }
 
-        // SAFETY: the loop condition guarantees `i < bytes.len()`, so
-        // `input[i..]` is non-empty and `chars().next()` is always `Some`.
-        let ch = input[i..].chars().next().unwrap();
+        let Some(ch) = input[i..].chars().next() else {
+            break;
+        };
         i += ch.len_utf8();
     }
 

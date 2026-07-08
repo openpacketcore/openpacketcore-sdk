@@ -48,8 +48,9 @@ pub fn compute_digest(
     id_type: IdentifierType,
     raw_value: &str,
 ) -> String {
-    let mut mac =
-        HmacSha256::new_from_slice(&*key.0).expect("HMAC-SHA256 accepts keys of any size");
+    let mut padded_key = Zeroizing::new([0_u8; 64]);
+    padded_key[..key.0.len()].copy_from_slice(&*key.0);
+    let mut mac = <HmacSha256 as hmac::digest::KeyInit>::new((&*padded_key).into());
     mac.update(class.as_str().as_bytes());
     mac.update(b"\x00");
     mac.update(id_type.as_str().as_bytes());
