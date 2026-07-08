@@ -247,6 +247,7 @@ async fn test_kms_key_provider_behavior() {
         delay: None,
         unavailable: true,
         simulate_error: false,
+        ..KmsBehavior::default()
     });
     let err = provider
         .get_active_key(KeyPurpose::Config, &tenant())
@@ -259,6 +260,7 @@ async fn test_kms_key_provider_behavior() {
         delay: Some(Duration::from_millis(500)),
         unavailable: false,
         simulate_error: false,
+        ..KmsBehavior::default()
     });
     let err2 = provider
         .get_active_key(KeyPurpose::Config, &tenant())
@@ -271,6 +273,7 @@ async fn test_kms_key_provider_behavior() {
         delay: None,
         unavailable: false,
         simulate_error: true,
+        ..KmsBehavior::default()
     });
     let err3 = provider
         .get_active_key(KeyPurpose::Config, &tenant())
@@ -283,6 +286,64 @@ async fn test_kms_key_provider_behavior() {
     let missing_key_id = KeyId::new("missing-key-id").unwrap();
     let err4 = provider.get_key_by_id(&missing_key_id).await.unwrap_err();
     assert_eq!(err4, opc_key::KeyError::NotFound);
+}
+
+#[tokio::test]
+async fn test_kms_active_key_without_backing_key_returns_not_found() {
+    let socket_path = short_unix_socket_path("kms-missing-active");
+    let fake_kms = FakeKms::new_unix(&socket_path, KmsBehavior::default())
+        .await
+        .unwrap();
+    fake_kms.set_active_key("config", "tenant-a", "missing-active-key");
+
+    let provider = KmsKeyProvider::new(
+        fake_kms.endpoint().to_string(),
+        None,
+        Duration::from_millis(200),
+    );
+
+    let err = provider
+        .get_active_key(KeyPurpose::Config, &tenant())
+        .await
+        .unwrap_err();
+    assert_eq!(err, opc_key::KeyError::NotFound);
+}
+
+#[tokio::test]
+async fn test_kms_fault_responses_return_unavailable() {
+    let cases = [
+        KmsBehavior {
+            truncated_response: true,
+            ..KmsBehavior::default()
+        },
+        KmsBehavior {
+            oversized_response: true,
+            ..KmsBehavior::default()
+        },
+        KmsBehavior {
+            malformed_key_hex: true,
+            ..KmsBehavior::default()
+        },
+    ];
+
+    for (idx, behavior) in cases.into_iter().enumerate() {
+        let socket_path = short_unix_socket_path(&format!("kms-fault-{idx}"));
+        let fake_kms = FakeKms::new_unix(&socket_path, behavior).await.unwrap();
+        fake_kms.insert_key("config-active-1", "config", "tenant-a", [0x44u8; 32]);
+        fake_kms.set_active_key("config", "tenant-a", "config-active-1");
+
+        let provider = KmsKeyProvider::new(
+            fake_kms.endpoint().to_string(),
+            None,
+            Duration::from_millis(200),
+        );
+
+        let err = provider
+            .get_active_key(KeyPurpose::Config, &tenant())
+            .await
+            .unwrap_err();
+        assert_eq!(err, opc_key::KeyError::Unavailable);
+    }
 }
 
 #[tokio::test]

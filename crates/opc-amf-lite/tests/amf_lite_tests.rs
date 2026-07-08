@@ -831,6 +831,7 @@ async fn test_amf_lite_security_and_redaction() {
         unavailable: true,
         delay: None,
         simulate_error: false,
+        ..KmsBehavior::default()
     });
 
     let admin_principal = TrustedPrincipal::new(
