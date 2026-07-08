@@ -68,7 +68,8 @@ pub use persist_adapter::PersistAlarmAuditSink;
 pub use manager::{
     AlarmAction, AlarmActionAuthorizer, AlarmActionContext, AlarmActionDenied, AlarmActionScope,
     AlarmAuditEvent, AlarmAuditOutcome, AlarmAuditSink, AlarmManager, AlarmOpResult, AlarmStore,
-    InMemoryStore, SharedAlarmManager, SuppressionAuth,
+    InMemoryStore, SharedAlarmManager, SuppressionAuth, DEFAULT_ACTIVE_LIMIT,
+    DEFAULT_HISTORY_LIMIT,
 };
 pub use model::{
     AffectedObject, Alarm, AlarmDetails, AlarmId, AlarmState, AlarmType, DedupKey, InvalidRegionId,
@@ -85,6 +86,7 @@ pub mod prelude {
         AlarmAction, AlarmActionAuthorizer, AlarmActionContext, AlarmActionDenied,
         AlarmActionScope, AlarmAuditEvent, AlarmAuditOutcome, AlarmAuditSink, AlarmManager,
         AlarmOpResult, AlarmStore, InMemoryStore, SharedAlarmManager, SuppressionAuth,
+        DEFAULT_ACTIVE_LIMIT, DEFAULT_HISTORY_LIMIT,
     };
     pub use crate::model::{
         AffectedObject, Alarm, AlarmDetails, AlarmId, AlarmState, AlarmType, DedupKey,

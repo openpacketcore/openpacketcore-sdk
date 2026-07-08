@@ -667,6 +667,93 @@ fn duplicate_storm_keeps_history_bounded_and_preserves_lifecycle_evidence() {
 }
 
 #[test]
+fn distinct_alarm_flood_is_capped_with_overflow_signal() {
+    let mut mgr = AlarmManager::new(InMemoryStore::new_with_limits(16, 3));
+    let alarm_type = AlarmType::new("link.down");
+
+    for index in 0..3 {
+        let result = mgr.raise(
+            alarm_type.clone(),
+            Severity::Major,
+            ProbableCause::PeerUnreachable,
+            AffectedObject::NfInstance {
+                kind: "upf".to_string(),
+                instance: format!("upf-{index}"),
+            },
+            None,
+            None,
+            None,
+            RedactedText::new("Peer unreachable"),
+            AlarmDetails::empty(),
+        );
+        assert!(matches!(result, AlarmOpResult::Raised { .. }));
+    }
+
+    let overflow = mgr.raise(
+        alarm_type,
+        Severity::Major,
+        ProbableCause::PeerUnreachable,
+        AffectedObject::NfInstance {
+            kind: "upf".to_string(),
+            instance: "upf-overflow".to_string(),
+        },
+        None,
+        None,
+        None,
+        RedactedText::new("Peer unreachable"),
+        AlarmDetails::empty(),
+    );
+
+    match overflow {
+        AlarmOpResult::ActiveLimitExceeded {
+            max_active_alarms,
+            ..
+        } => assert_eq!(max_active_alarms, 3),
+        other => panic!("expected active-limit overflow signal, got {other:?}"),
+    }
+    assert_eq!(mgr.active_count(), 3);
+    assert_eq!(mgr.store.by_id.len(), 3);
+    assert_eq!(mgr.store.by_dedup_key.len(), 3);
+}
+
+#[test]
+fn stale_active_alarms_expire_out_of_current_indexes() {
+    let mut mgr = AlarmManager::new(InMemoryStore::new_with_limits(16, 8));
+    let alarm_type = AlarmType::new("link.down");
+    let affected_object = AffectedObject::NfInstance {
+        kind: "upf".to_string(),
+        instance: "upf-1".to_string(),
+    };
+
+    let raised = mgr.raise(
+        alarm_type,
+        Severity::Major,
+        ProbableCause::PeerUnreachable,
+        affected_object,
+        None,
+        None,
+        None,
+        RedactedText::new("Peer unreachable"),
+        AlarmDetails::empty(),
+    );
+    assert!(matches!(raised, AlarmOpResult::Raised { .. }));
+    assert_eq!(mgr.active_count(), 1);
+
+    let expired = mgr.expire_before(OffsetDateTime::now_utc() + time::Duration::seconds(1));
+
+    assert_eq!(expired, 1);
+    assert_eq!(mgr.active_count(), 0);
+    assert_eq!(mgr.store.by_id.len(), 0);
+    assert_eq!(mgr.store.by_dedup_key.len(), 0);
+    assert!(
+        mgr.all_alarms()
+            .iter()
+            .any(|alarm| alarm.state == AlarmState::Expired),
+        "expiry sweep must retain terminal Expired lifecycle evidence"
+    );
+}
+
+#[test]
 fn clear_re_raise_cycles_do_not_grow_current_state_indexes() {
     let mut mgr = AlarmManager::new(InMemoryStore::new_with_history_limit(16));
 

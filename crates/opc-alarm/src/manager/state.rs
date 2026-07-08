@@ -1,6 +1,6 @@
 //! Alarm manager core: dedup-keyed raise/update/clear semantics, the
 //! pluggable `AlarmStore` abstraction, and a bounded in-memory store whose
-//! history ring evicts the oldest record on overflow.
+//! history ring and active-alarm indexes are capped.
 
 use std::collections::{HashMap, VecDeque};
 use time::OffsetDateTime;
@@ -16,9 +16,11 @@ use crate::model::{
 
 /// Default bound on the `InMemoryStore` history ring (4096 lifecycle
 /// records). When the ring is full, the oldest history entry is evicted to
-/// admit the newest one; active-alarm indexes are unaffected by eviction, so
-/// alarm storms cannot grow memory without bound (RFC 013 §19.4).
+/// admit the newest one.
 pub const DEFAULT_HISTORY_LIMIT: usize = 4_096;
+
+/// Default bound on active alarms retained by the in-memory store.
+pub const DEFAULT_ACTIVE_LIMIT: usize = 4_096;
 
 /// Result of a manager operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +49,13 @@ pub enum AlarmOpResult {
         /// Probable cause from the clear request, kept so callers can emit
         /// the clear-without-active no-op metric per RFC 013 §8/§16.
         cause: ProbableCause,
+    },
+    /// A distinct active alarm was rejected because the active-alarm cap was reached.
+    ActiveLimitExceeded {
+        /// Configured active alarm limit for this store.
+        max_active_alarms: usize,
+        /// Dedup key of the rejected alarm.
+        dedup_key: DedupKey,
     },
     /// Alarm was suppressed.
     Suppressed {
@@ -120,6 +129,15 @@ pub trait AlarmStore {
     fn active_count(&self) -> usize {
         self.active_alarms().len()
     }
+    /// Returns a configured active-alarm cap, if this store enforces one.
+    fn active_limit(&self) -> Option<usize> {
+        None
+    }
+    /// Expires active alarms older than `cutoff`; stores that do not support
+    /// expiry may keep the default no-op.
+    fn expire_before(&mut self, _cutoff: OffsetDateTime) -> usize {
+        0
+    }
 }
 
 /// Alarm manager holding active alarms and handling raise/update/clear.
@@ -166,6 +184,9 @@ impl<S: AlarmStore> AlarmManager<S> {
 
         let res = if let Some(existing) = self.store.get_by_dedup_key(&dedup_key) {
             if !existing.state.is_active() {
+                if let Some(res) = self.active_limit_exceeded(&dedup_key) {
+                    return res;
+                }
                 let alarm = Self::new_alarm(
                     alarm_type,
                     severity,
@@ -199,6 +220,9 @@ impl<S: AlarmStore> AlarmManager<S> {
                 AlarmOpResult::Updated { alarm: updated }
             }
         } else {
+            if let Some(res) = self.active_limit_exceeded(&dedup_key) {
+                return res;
+            }
             let alarm = Self::new_alarm(
                 alarm_type,
                 severity,
@@ -218,6 +242,16 @@ impl<S: AlarmStore> AlarmManager<S> {
 
         self.update_global_metrics();
         res
+    }
+
+    fn active_limit_exceeded(&self, dedup_key: &DedupKey) -> Option<AlarmOpResult> {
+        let max_active_alarms = self.store.active_limit()?;
+        (self.store.active_count() >= max_active_alarms).then(|| {
+            AlarmOpResult::ActiveLimitExceeded {
+                max_active_alarms,
+                dedup_key: dedup_key.clone(),
+            }
+        })
     }
 
     /// Clears an alarm by dedup key.
@@ -515,6 +549,18 @@ impl<S: AlarmStore> AlarmManager<S> {
         self.store.history_by_scope(tenant, slice)
     }
 
+    /// Expires active alarms whose `updated_at` is older than `cutoff`.
+    ///
+    /// Expired alarms are removed from active indexes and retained in history
+    /// with terminal state `Expired`.
+    pub fn expire_before(&mut self, cutoff: OffsetDateTime) -> usize {
+        let expired = self.store.expire_before(cutoff);
+        if expired > 0 {
+            self.update_global_metrics();
+        }
+        expired
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_alarm(
         alarm_type: AlarmType,
@@ -554,6 +600,7 @@ pub struct InMemoryStore {
     pub(crate) by_dedup_key: HashMap<DedupKey, AlarmId>,
     pub(crate) history: VecDeque<Alarm>,
     pub(crate) history_limit: usize,
+    pub(crate) active_limit: usize,
 }
 
 impl Default for InMemoryStore {
@@ -564,9 +611,10 @@ impl Default for InMemoryStore {
 
 impl InMemoryStore {
     /// Creates a store with the default history bound
-    /// (`DEFAULT_HISTORY_LIMIT`, 4096 records).
+    /// (`DEFAULT_HISTORY_LIMIT`, 4096 records) and active-alarm bound
+    /// (`DEFAULT_ACTIVE_LIMIT`, 4096 active alarms).
     pub fn new() -> Self {
-        Self::new_with_history_limit(DEFAULT_HISTORY_LIMIT)
+        Self::new_with_limits(DEFAULT_HISTORY_LIMIT, DEFAULT_ACTIVE_LIMIT)
     }
 
     /// Creates a store whose history ring retains at most `history_limit`
@@ -574,21 +622,35 @@ impl InMemoryStore {
     /// the newest. Consecutive history entries with identical identity
     /// (same alarm id, taxonomy fields, scope, severity, and state) are
     /// coalesced in place, so a duplicate-raise storm does not consume the
-    /// ring. Active-alarm indexes are unbounded by this limit.
+    /// ring. Active-alarm indexes still use `DEFAULT_ACTIVE_LIMIT`.
     ///
     /// # Panics
     ///
     /// Panics if `history_limit` is zero.
     pub fn new_with_history_limit(history_limit: usize) -> Self {
+        Self::new_with_limits(history_limit, DEFAULT_ACTIVE_LIMIT)
+    }
+
+    /// Creates a store with explicit history and active-alarm limits.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either limit is zero.
+    pub fn new_with_limits(history_limit: usize, active_limit: usize) -> Self {
         assert!(
             history_limit > 0,
             "InMemoryStore history_limit must be greater than zero"
+        );
+        assert!(
+            active_limit > 0,
+            "InMemoryStore active_limit must be greater than zero"
         );
         Self {
             by_id: HashMap::new(),
             by_dedup_key: HashMap::new(),
             history: VecDeque::with_capacity(history_limit),
             history_limit,
+            active_limit,
         }
     }
 
@@ -677,6 +739,27 @@ impl InMemoryStore {
     pub(crate) fn active_count(&self) -> usize {
         self.by_id.len()
     }
+
+    pub(crate) fn active_limit(&self) -> usize {
+        self.active_limit
+    }
+
+    pub(crate) fn expire_before(&mut self, cutoff: OffsetDateTime) -> usize {
+        let to_expire = self
+            .by_id
+            .values()
+            .filter(|alarm| alarm.updated_at < cutoff)
+            .cloned()
+            .collect::<Vec<_>>();
+        let expired = to_expire.len();
+        for mut alarm in to_expire {
+            alarm.state = AlarmState::Expired;
+            alarm.updated_at = cutoff;
+            alarm.cleared_at = Some(cutoff);
+            self.update(alarm);
+        }
+        expired
+    }
 }
 
 impl AlarmStore for InMemoryStore {
@@ -710,6 +793,14 @@ impl AlarmStore for InMemoryStore {
 
     fn active_count(&self) -> usize {
         InMemoryStore::active_count(self)
+    }
+
+    fn active_limit(&self) -> Option<usize> {
+        Some(InMemoryStore::active_limit(self))
+    }
+
+    fn expire_before(&mut self, cutoff: OffsetDateTime) -> usize {
+        InMemoryStore::expire_before(self, cutoff)
     }
 }
 

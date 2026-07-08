@@ -28,11 +28,15 @@ pub use admin::{
 };
 pub use audit::{AlarmAuditEvent, AlarmAuditOutcome, AlarmAuditSink};
 pub use security::AlarmActionAuthorizer;
-pub use state::{AlarmManager, AlarmOpResult, AlarmStore, InMemoryStore, DEFAULT_HISTORY_LIMIT};
+pub use state::{
+    AlarmManager, AlarmOpResult, AlarmStore, InMemoryStore, DEFAULT_ACTIVE_LIMIT,
+    DEFAULT_HISTORY_LIMIT,
+};
 
 use crate::model::{
     AffectedObject, Alarm, AlarmDetails, AlarmType, ProbableCause, RedactedText, RegionId, Severity,
 };
+use time::OffsetDateTime;
 
 /// Thread-safe shared in-memory alarm manager for runtime-wide alarm plumbing.
 #[derive(Clone)]
@@ -65,6 +69,14 @@ impl SharedAlarmManager {
     /// history limit (`DEFAULT_HISTORY_LIMIT`).
     pub fn in_memory() -> Self {
         Self::default()
+    }
+
+    /// Creates a shared manager with explicit in-memory history and active limits.
+    pub fn in_memory_with_limits(history_limit: usize, active_limit: usize) -> Self {
+        Self::new(AlarmManager::new(InMemoryStore::new_with_limits(
+            history_limit,
+            active_limit,
+        )))
     }
 
     /// Locks the inner manager for multi-step operations (e.g. acknowledge
@@ -155,5 +167,10 @@ impl SharedAlarmManager {
     /// scope are excluded).
     pub fn alarm_history_by_scope(&self, tenant: Option<&str>, slice: Option<&str>) -> Vec<Alarm> {
         self.lock().alarm_history_by_scope(tenant, slice)
+    }
+
+    /// Expires active alarms whose `updated_at` is older than `cutoff`.
+    pub fn expire_before(&self, cutoff: OffsetDateTime) -> usize {
+        self.lock().expire_before(cutoff)
     }
 }
