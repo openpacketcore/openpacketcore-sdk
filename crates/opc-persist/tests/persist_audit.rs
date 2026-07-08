@@ -272,6 +272,30 @@ async fn test_audit_trail_redaction_and_chain_verification() {
             previous_hash: [0u8; 32],
             entry_hmac: [0u8; 32],
         },
+        AuditRecord {
+            tx_id,
+            sequence: 4,
+            yang_path: "/test:config/customField".to_string(),
+            op_type: AuditOpType::Update,
+            previous_value: Some(r#""2001:db8:85a3::8a2e:370:7334""#.to_string()),
+            new_value: None,
+            redaction_applied: false,
+            previous_hash: [0u8; 32],
+            entry_hmac: [0u8; 32],
+        },
+        AuditRecord {
+            tx_id,
+            sequence: 5,
+            yang_path: "/test:config/customField".to_string(),
+            op_type: AuditOpType::Update,
+            previous_value: None,
+            new_value: Some(
+                r#""VGhpcyBpcyBhIHByb2R1Y3Rpb24gQVBJIHNlY3JldCAxMjM0NQ==""#.to_string(),
+            ),
+            redaction_applied: false,
+            previous_hash: [0u8; 32],
+            entry_hmac: [0u8; 32],
+        },
     ];
 
     let record = make_commit_record(tx_id, 1);
@@ -286,7 +310,7 @@ async fn test_audit_trail_redaction_and_chain_verification() {
         .expect("load_latest should succeed")
         .expect("should have config");
 
-    assert_eq!(loaded.audit.len(), 4);
+    assert_eq!(loaded.audit.len(), 6);
 
     assert_eq!(
         loaded.audit[0].new_value,
@@ -321,10 +345,22 @@ async fn test_audit_trail_redaction_and_chain_verification() {
     );
     assert!(loaded.audit[3].redaction_applied);
 
+    assert_eq!(
+        loaded.audit[4].previous_value,
+        Some("\"<redacted>\"".to_string())
+    );
+    assert!(loaded.audit[4].redaction_applied);
+
+    assert_eq!(
+        loaded.audit[5].new_value,
+        Some("\"<redacted>\"".to_string())
+    );
+    assert!(loaded.audit[5].redaction_applied);
+
     let conn = rusqlite::Connection::open(&db_path).expect("open direct conn");
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM audit_trail WHERE previous_value LIKE '%20895%' OR new_value LIKE '%20895%' OR new_value LIKE '%secret%' OR new_value LIKE '%10.0.0.1%'",
+            "SELECT COUNT(*) FROM audit_trail WHERE previous_value LIKE '%20895%' OR new_value LIKE '%20895%' OR new_value LIKE '%secret%' OR new_value LIKE '%10.0.0.1%' OR previous_value LIKE '%2001:db8%' OR new_value LIKE '%VGhpcy%'",
             [],
             |row| row.get(0),
         )
