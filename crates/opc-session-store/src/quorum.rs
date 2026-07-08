@@ -633,10 +633,13 @@ impl SessionLeaseManager for QuorumSessionStore {
         let mut max_cred_id = 0;
         for &id in &online_ids {
             let replica = &self.replicas[id];
-            if let Ok((f, c)) = replica.inner.next_lease_info().await {
-                max_fence = max_fence.max(f);
-                max_cred_id = max_cred_id.max(c);
-            }
+            let (f, c) = replica
+                .inner
+                .next_lease_info()
+                .await
+                .map_err(|e| LeaseError::Backend(e.to_string()))?;
+            max_fence = max_fence.max(f);
+            max_cred_id = max_cred_id.max(c);
         }
 
         let fence = FenceToken::new(max_fence);

@@ -356,7 +356,9 @@ pub trait SessionBackend: Send + Sync {
 
     /// Get the next fence and credential ID globals for lease coordination.
     async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
-        Ok((1, 1))
+        Err(StoreError::CapabilityNotSupported(
+            "lease_coordination".into(),
+        ))
     }
 }
 
