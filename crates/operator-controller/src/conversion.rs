@@ -38,6 +38,7 @@ pub mod v1alpha1 {
         pub session_backend: Option<String>,
         pub admin_token: Option<String>,
         pub token_enabled: Option<bool>,
+        pub resource_profile: Option<super::v1beta1::ResourceProfileSpec>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -202,7 +203,7 @@ pub fn convert_v1alpha1_to_v1beta1(
             token_enabled,
             admin_token,
         },
-        resource_profile: None,
+        resource_profile: src.spec.resource_profile.clone(),
     };
 
     // Preserve lifecycle state and conditions
@@ -277,6 +278,7 @@ pub fn convert_v1beta1_to_v1alpha1(
         session_backend: Some(src.spec.session_backend.clone()),
         admin_token: src.spec.admin_auth.admin_token.clone(),
         token_enabled: Some(src.spec.admin_auth.token_enabled),
+        resource_profile: src.spec.resource_profile.clone(),
     };
 
     let status = src

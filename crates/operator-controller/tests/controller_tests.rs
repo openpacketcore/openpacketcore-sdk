@@ -219,6 +219,7 @@ fn test_crd_conversion_round_trip() {
             session_backend: Some("quorum".to_string()),
             admin_token: Some("verylongsecuresupersecretadmintoken123456789".to_string()),
             token_enabled: Some(true),
+            resource_profile: None,
         },
         status: Some(v1alpha1::NetworkFunctionStatus {
             lifecycle: Some(LifecycleStatus::new(3)),
@@ -254,6 +255,42 @@ fn test_crd_conversion_round_trip() {
     assert_eq!(
         round_tripped.spec.admin_token,
         Some("verylongsecuresupersecretadmintoken123456789".to_string())
+    );
+}
+
+#[test]
+fn test_crd_conversion_preserves_resource_profile_on_beta_round_trip() {
+    let original = v1beta1::NetworkFunction {
+        api_version: "openpacketcore.org/v1beta1".to_string(),
+        kind: "NfDeployment".to_string(),
+        spec: v1beta1::NetworkFunctionSpec {
+            kind: "upf".to_string(),
+            replicas: 2,
+            profile: Some("AfXdpFastPath".to_string()),
+            config_backend: "consensus".to_string(),
+            session_backend: "quorum".to_string(),
+            admin_auth: v1beta1::AdminAuthSpec {
+                admin_token: Some("verylongsecuresupersecretadmintoken123456789".to_string()),
+                token_enabled: true,
+            },
+            resource_profile: Some(v1beta1::ResourceProfileSpec {
+                data_plane_profile: "AfXdpFastPath".to_string(),
+                numa_policy: "Require".to_string(),
+            }),
+        },
+        status: Some(v1beta1::NetworkFunctionStatus {
+            lifecycle: LifecycleStatus::new(7),
+        }),
+    };
+
+    let alpha =
+        convert_v1beta1_to_v1alpha1(&original, None).expect("v1beta1 -> v1alpha1 conversion");
+    let round_tripped =
+        convert_v1alpha1_to_v1beta1(&alpha, None).expect("v1alpha1 -> v1beta1 conversion");
+
+    assert_eq!(
+        round_tripped.spec.resource_profile,
+        original.spec.resource_profile
     );
 }
 
@@ -337,6 +374,7 @@ fn test_crd_conversion_defaulting() {
         session_backend: None,
         admin_token: None,
         token_enabled: None,
+        resource_profile: None,
     };
     apply_defaults_v1alpha1(&mut spec1a);
     assert_eq!(spec1a.config_backend, Some("sqlite".to_string()));
@@ -376,6 +414,7 @@ fn test_crd_conversion_redaction() {
             session_backend: None,
             admin_token: Some("admin123".to_string()),
             token_enabled: Some(true),
+            resource_profile: None,
         },
         status: None,
     };
@@ -1038,6 +1077,7 @@ fn test_controller_compatibility_crd_conversion() {
             session_backend: Some("quorum".to_string()),
             admin_token: Some("verylongsecuresupersecretadmintoken123456789".to_string()),
             token_enabled: Some(true),
+            resource_profile: None,
         },
         status: None,
     };
