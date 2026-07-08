@@ -47,7 +47,7 @@ pub use capability::{
     AppHaDurabilityRequirement, BackendCapabilities, SessionStateProfile,
     SessionStoreHaCompatibility, SessionStorePlatformProfile,
 };
-pub use clock::{Clock, SystemClock, TokioVirtualClock};
+pub use clock::{Clock, MonotonicClock, SystemClock, TokioVirtualClock};
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;
 pub use handover::{HandoverEnvelope, HandoverError, HandoverManager, HandoverSessionRecord};
