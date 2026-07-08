@@ -10,7 +10,7 @@ use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing};
 use opc_nacm::{ModuleRegistry, NacmAction, NacmPolicy, NacmRule, PolicyVersion, YangPathPattern};
 use opc_persist::{
     AuditKey, BreakGlassAlarmNotifier, BreakGlassRequest, BreakGlassService, BreakGlassStatus,
-    SecurityPolicyService, SqliteBackend, SqliteSecurityPolicyService,
+    SecurityPolicyError, SecurityPolicyService, SqliteBackend, SqliteSecurityPolicyService,
 };
 use opc_types::TenantId;
 
@@ -493,6 +493,78 @@ async fn test_break_glass_audit_concurrent_appends_remain_linear() {
         row_count += 1;
     }
     assert_eq!(row_count, 2);
+}
+
+#[tokio::test]
+async fn test_break_glass_audit_verifier_rejects_detail_tamper() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (service, _, temp_dir) = setup_break_glass_service().await;
+    let tenant = "test-tenant";
+    let principal = get_admin_principal("requester");
+
+    for idx in 0..3 {
+        service
+            .break_glass_audit_event_for_test(
+                tenant,
+                &principal,
+                "VERIFY",
+                &format!("detail {idx}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let db_path = temp_dir.path().join("test_break_glass.db");
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "UPDATE break_glass_audit SET details = 'tampered' WHERE tenant = ?1 AND id = (
+            SELECT id FROM break_glass_audit WHERE tenant = ?1 ORDER BY id ASC LIMIT 1 OFFSET 1
+        )",
+        [tenant],
+    )
+    .unwrap();
+
+    let res = service.verify_break_glass_audit_chain(tenant).await;
+    assert!(
+        matches!(res, Err(SecurityPolicyError::Internal)),
+        "tampered break-glass audit details must fail verification, got: {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_break_glass_audit_verifier_rejects_tail_delete() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (service, _, temp_dir) = setup_break_glass_service().await;
+    let tenant = "test-tenant";
+    let principal = get_admin_principal("requester");
+
+    for idx in 0..3 {
+        service
+            .break_glass_audit_event_for_test(
+                tenant,
+                &principal,
+                "VERIFY",
+                &format!("detail {idx}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let db_path = temp_dir.path().join("test_break_glass.db");
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "DELETE FROM break_glass_audit WHERE tenant = ?1 AND id = (
+            SELECT id FROM break_glass_audit WHERE tenant = ?1 ORDER BY id DESC LIMIT 1
+        )",
+        [tenant],
+    )
+    .unwrap();
+
+    let res = service.verify_break_glass_audit_chain(tenant).await;
+    assert!(
+        matches!(res, Err(SecurityPolicyError::Internal)),
+        "deleted break-glass audit tail must fail verification, got: {res:?}"
+    );
 }
 
 #[tokio::test]

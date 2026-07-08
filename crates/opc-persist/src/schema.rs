@@ -15,7 +15,7 @@ use rusqlite::{Connection, Transaction};
 use std::path::Path;
 
 /// Current schema version. Bump this and add a migration step to evolve the schema.
-pub const SCHEMA_VERSION: &str = "1.6.0";
+pub const SCHEMA_VERSION: &str = "1.7.0";
 
 /// Initialize the database schema.
 ///
@@ -170,6 +170,12 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
         CREATE INDEX IF NOT EXISTS security_policy_audit_tenant_idx ON security_policy_audit(tenant);
 
+        CREATE TABLE IF NOT EXISTS security_policy_audit_anchor (
+            tenant TEXT PRIMARY KEY,
+            audit_count INTEGER NOT NULL DEFAULT 0,
+            audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
+        );
+
         CREATE TABLE IF NOT EXISTS break_glass_sessions (
             id TEXT PRIMARY KEY,
             principal TEXT NOT NULL,
@@ -202,6 +208,12 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
         CREATE INDEX IF NOT EXISTS break_glass_audit_tenant_idx ON break_glass_audit(tenant);
         CREATE INDEX IF NOT EXISTS break_glass_sessions_tenant_idx ON break_glass_sessions(tenant);
+
+        CREATE TABLE IF NOT EXISTS break_glass_audit_anchor (
+            tenant TEXT PRIMARY KEY,
+            audit_count INTEGER NOT NULL DEFAULT 0,
+            audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
+        );
         "#,
     )?;
     Ok(())
@@ -393,6 +405,56 @@ pub fn run_migrations(conn: &Connection, from_version: &str) -> Result<(), rusql
             "#,
         )?;
         current = "1.6.0".to_string();
+    }
+    if current == "1.6.0" {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS security_policy_audit_anchor (
+                tenant TEXT PRIMARY KEY,
+                audit_count INTEGER NOT NULL DEFAULT 0,
+                audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
+            );
+
+            CREATE TABLE IF NOT EXISTS break_glass_audit_anchor (
+                tenant TEXT PRIMARY KEY,
+                audit_count INTEGER NOT NULL DEFAULT 0,
+                audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
+            );
+
+            INSERT OR REPLACE INTO security_policy_audit_anchor (tenant, audit_count, audit_terminal_hash)
+            SELECT tenant,
+                   COUNT(*),
+                   COALESCE(
+                       (
+                           SELECT entry_hmac
+                           FROM security_policy_audit AS last_entry
+                           WHERE last_entry.tenant = security_policy_audit.tenant
+                           ORDER BY id DESC
+                           LIMIT 1
+                       ),
+                       zeroblob(32)
+                   )
+            FROM security_policy_audit
+            GROUP BY tenant;
+
+            INSERT OR REPLACE INTO break_glass_audit_anchor (tenant, audit_count, audit_terminal_hash)
+            SELECT tenant,
+                   COUNT(*),
+                   COALESCE(
+                       (
+                           SELECT entry_hmac
+                           FROM break_glass_audit AS last_entry
+                           WHERE last_entry.tenant = break_glass_audit.tenant
+                           ORDER BY id DESC
+                           LIMIT 1
+                       ),
+                       zeroblob(32)
+                   )
+            FROM break_glass_audit
+            GROUP BY tenant;
+            "#,
+        )?;
+        current = "1.7.0".to_string();
     }
 
     let _ = current;

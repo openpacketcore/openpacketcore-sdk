@@ -782,3 +782,75 @@ async fn test_security_policy_audit_concurrent_appends_remain_linear() {
     }
     assert_eq!(row_count, 2);
 }
+
+#[tokio::test]
+async fn test_security_policy_audit_verifier_rejects_detail_tamper() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (service, temp_dir) = setup_service().await;
+    let tenant = "test-tenant";
+    let principal = get_admin_principal();
+
+    for idx in 0..3 {
+        service
+            .security_policy_audit_event_for_test(
+                tenant,
+                &principal,
+                "VERIFY",
+                &format!("detail {idx}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let db_path = temp_dir.path().join("test_security.db");
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "UPDATE security_policy_audit SET details = 'tampered' WHERE tenant = ?1 AND id = (
+            SELECT id FROM security_policy_audit WHERE tenant = ?1 ORDER BY id ASC LIMIT 1 OFFSET 1
+        )",
+        [tenant],
+    )
+    .unwrap();
+
+    let res = service.verify_security_policy_audit_chain(tenant).await;
+    assert!(
+        matches!(res, Err(SecurityPolicyError::Internal)),
+        "tampered security policy audit details must fail verification, got: {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_security_policy_audit_verifier_rejects_tail_delete() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (service, temp_dir) = setup_service().await;
+    let tenant = "test-tenant";
+    let principal = get_admin_principal();
+
+    for idx in 0..3 {
+        service
+            .security_policy_audit_event_for_test(
+                tenant,
+                &principal,
+                "VERIFY",
+                &format!("detail {idx}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let db_path = temp_dir.path().join("test_security.db");
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "DELETE FROM security_policy_audit WHERE tenant = ?1 AND id = (
+            SELECT id FROM security_policy_audit WHERE tenant = ?1 ORDER BY id DESC LIMIT 1
+        )",
+        [tenant],
+    )
+    .unwrap();
+
+    let res = service.verify_security_policy_audit_chain(tenant).await;
+    assert!(
+        matches!(res, Err(SecurityPolicyError::Internal)),
+        "deleted security policy audit tail must fail verification, got: {res:?}"
+    );
+}

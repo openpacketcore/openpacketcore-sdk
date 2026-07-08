@@ -66,7 +66,7 @@ async fn open_migrates_schema_version_1_0_0_to_alarm_audit_schema() {
         .query_row("SELECT COUNT(*) FROM alarm_audit", [], |row| row.get(0))
         .expect("query migrated alarm audit table");
 
-    assert_eq!(sdk_version, "1.6.0");
+    assert_eq!(sdk_version, "1.7.0");
     assert_ne!(schema_digest, "legacy-digest");
     assert_eq!(alarm_audit_count, 1);
 }

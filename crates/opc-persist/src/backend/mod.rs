@@ -281,6 +281,7 @@ impl SqliteBackend {
             | (Some("1.2.0"), _)
             | (Some("1.3.0"), _)
             | (Some("1.5.0"), _)
+            | (Some("1.6.0"), _)
             | (None, _) => {
                 if let Some(from_version) = current_version.as_deref() {
                     schema::run_migrations(&conn, from_version)
@@ -507,6 +508,10 @@ impl SqliteBackend {
         CREATE TABLE security_policy_active (tenant TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_at TEXT NOT NULL, principal TEXT NOT NULL, encrypted_blob BLOB NOT NULL);
         CREATE TABLE security_policy_history (tenant TEXT NOT NULL, version INTEGER NOT NULL, applied_at TEXT NOT NULL, principal TEXT NOT NULL, encrypted_blob BLOB NOT NULL, tx_id BLOB NULL, label TEXT NULL, PRIMARY KEY (tenant, version));
         CREATE TABLE security_policy_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL, timestamp TEXT NOT NULL, principal TEXT NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL, previous_hash BLOB NOT NULL, entry_hmac BLOB NOT NULL);
+        CREATE TABLE security_policy_audit_anchor (tenant TEXT PRIMARY KEY, audit_count INTEGER NOT NULL DEFAULT 0, audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000');
+        CREATE TABLE break_glass_sessions (id TEXT PRIMARY KEY, principal TEXT NOT NULL, tenant TEXT NOT NULL, reason TEXT NOT NULL, scope TEXT NOT NULL, requested_duration INTEGER NOT NULL, evidence_id TEXT NOT NULL, status TEXT NOT NULL, requested_at TEXT NOT NULL, approved_at TEXT, approver TEXT, activated_at TEXT, expires_at TEXT, denied_at TEXT, revoked_at TEXT, revoker TEXT);
+        CREATE TABLE break_glass_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL, timestamp TEXT NOT NULL, principal TEXT NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL, previous_hash BLOB NOT NULL, entry_hmac BLOB NOT NULL);
+        CREATE TABLE break_glass_audit_anchor (tenant TEXT PRIMARY KEY, audit_count INTEGER NOT NULL DEFAULT 0, audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000');
         "#;
         let mut hasher = Sha256::new();
         hasher.update(sql.as_bytes());

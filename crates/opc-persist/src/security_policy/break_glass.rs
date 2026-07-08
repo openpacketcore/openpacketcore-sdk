@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use hmac::Mac;
 use std::sync::Arc;
 
 use opc_key::KeyProvider;
@@ -11,7 +10,10 @@ use crate::break_glass::{
 };
 
 use super::crypto::validate_principal_tenant_and_roles;
-use super::{SecurityPolicyError, SqliteSecurityPolicyService};
+use super::{
+    audit_hash_from_blob, calculate_audit_event_hmac, SecurityPolicyError,
+    SqliteSecurityPolicyService,
+};
 
 impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
     pub async fn clean_expired_all_tenants(&self) -> Result<(), SecurityPolicyError> {
@@ -66,6 +68,8 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
         action: &str,
         details: &str,
     ) -> Result<(), SecurityPolicyError> {
+        self.verify_break_glass_audit_chain(tenant).await?;
+
         let conn_mutex = self.backend.conn();
         let timestamp = Timestamp::now_utc().to_string();
 
@@ -83,18 +87,7 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
             );
 
             let previous_hash: [u8; 32] = match prev_hash_row {
-                Ok(bytes) => {
-                    if bytes.len() != 32 {
-                        tracing::error!(
-                            len = bytes.len(),
-                            "Invalid previous break-glass audit HMAC length"
-                        );
-                        return Err(SecurityPolicyError::Internal);
-                    }
-                    let mut h = [0u8; 32];
-                    h.copy_from_slice(&bytes);
-                    h
-                }
+                Ok(bytes) => audit_hash_from_blob(bytes, "previous break-glass audit HMAC")?,
                 Err(rusqlite::Error::QueryReturnedNoRows) => [0u8; 32],
                 Err(e) => {
                     tracing::error!(err = ?e, "Failed to fetch previous break-glass audit hash");
@@ -102,32 +95,15 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
                 }
             };
 
-            let mut mac_input = Vec::new();
-            mac_input.extend_from_slice(&(tenant.len() as u32).to_be_bytes());
-            mac_input.extend_from_slice(tenant.as_bytes());
-
-            mac_input.extend_from_slice(&(timestamp.len() as u32).to_be_bytes());
-            mac_input.extend_from_slice(timestamp.as_bytes());
-
-            mac_input.extend_from_slice(&(principal.len() as u32).to_be_bytes());
-            mac_input.extend_from_slice(principal.as_bytes());
-
-            mac_input.extend_from_slice(&(action.len() as u32).to_be_bytes());
-            mac_input.extend_from_slice(action.as_bytes());
-
-            mac_input.extend_from_slice(&(details.len() as u32).to_be_bytes());
-            mac_input.extend_from_slice(details.as_bytes());
-
-            mac_input.extend_from_slice(&previous_hash);
-
-            type HmacSha256 = hmac::Hmac<sha2::Sha256>;
-            let mut mac =
-                HmacSha256::new_from_slice(self.backend.audit_key().as_bytes()).map_err(|e| {
-                    tracing::error!(err = ?e, "Failed to create HMAC provider");
-                    SecurityPolicyError::Internal
-                })?;
-            mac.update(&mac_input);
-            let entry_hmac: [u8; 32] = mac.finalize().into_bytes().into();
+            let entry_hmac = calculate_audit_event_hmac(
+                self.backend.audit_key(),
+                tenant,
+                &timestamp,
+                principal,
+                action,
+                details,
+                &previous_hash,
+            )?;
 
             let insert_res = tx.execute(
                 "INSERT INTO break_glass_audit (tenant, timestamp, principal, action, details, previous_hash, entry_hmac) \
@@ -147,6 +123,17 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
                 tracing::error!(err = ?e, "Failed to insert break glass audit entry");
                 return Err(SecurityPolicyError::Internal);
             }
+
+            tx.execute(
+                "INSERT INTO break_glass_audit_anchor (tenant, audit_count, audit_terminal_hash) \
+                 VALUES (?1, (SELECT COUNT(*) FROM break_glass_audit WHERE tenant = ?1), ?2) \
+                 ON CONFLICT(tenant) DO UPDATE SET audit_count = excluded.audit_count, audit_terminal_hash = excluded.audit_terminal_hash",
+                rusqlite::params![tenant, &entry_hmac[..]],
+            )
+            .map_err(|e| {
+                tracing::error!(err = ?e, "Failed to update break-glass audit anchor");
+                SecurityPolicyError::Internal
+            })?;
 
             tx.commit().map_err(|e| {
                 tracing::error!(err = ?e, "Failed to commit break-glass audit transaction");
