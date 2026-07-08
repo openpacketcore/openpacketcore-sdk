@@ -101,7 +101,7 @@ impl TracingSink {
 #[async_trait]
 impl AlarmSink for TracingSink {
     async fn send(&self, alarm: Alarm) -> Result<(), AlarmSinkError> {
-        let serialized = serde_json::to_string(&alarm)
+        let serialized = serde_json::to_string(&alarm.redacted_for_export())
             .map_err(|e| AlarmSinkError::DeliveryFailed(e.to_string()))?;
         tracing::warn!(target: "opc_alarm::sink::tracing", alarm = %serialized, "Alarm published");
         Ok(())

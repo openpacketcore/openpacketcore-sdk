@@ -147,7 +147,7 @@ pub fn alarm_to_yang_json(alarm: &Alarm) -> Value {
         "tenant": alarm.tenant.as_deref().unwrap_or(""),
         "slice": alarm.slice.as_deref().unwrap_or(""),
         "region": alarm.region.as_ref().map(|r| r.as_str()).unwrap_or(""),
-        "text": alarm.text.as_str(),
+        "text": alarm.text.redacted_for_export(),
         "raised-at": raised_ts,
         "updated-at": updated_ts
     })
@@ -192,5 +192,37 @@ mod tests {
         assert_eq!(yang_val["region"], "us-east-1");
         assert_eq!(yang_val["text"], "UPF link down");
         assert!(!yang_val["raised-at"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn alarm_to_yang_json_redacts_sensitive_text() {
+        let alarm = Alarm {
+            alarm_id: AlarmId::new("alarm-123"),
+            alarm_type: AlarmType::new("peer.disconnected"),
+            severity: Severity::Critical,
+            probable_cause: ProbableCause::PeerUnreachable,
+            affected_object: AffectedObject::NfInstance {
+                kind: "upf".to_string(),
+                instance: "upf-1".to_string(),
+            },
+            tenant: Some("tenant-a".to_string()),
+            slice: Some("slice-1".to_string()),
+            region: Some(RegionId::new("us-east-1")),
+            text: RedactedText::new("peer 10.0.0.1 imsi 208950000000001 down"),
+            details: AlarmDetails::empty(),
+            state: AlarmState::Raised,
+            raised_at: OffsetDateTime::now_utc(),
+            updated_at: OffsetDateTime::now_utc(),
+            cleared_at: None,
+            correlation_id: None,
+        };
+
+        let text = alarm_to_yang_json(&alarm)["text"]
+            .as_str()
+            .expect("text is string")
+            .to_string();
+
+        assert!(!text.contains("208950000000001"));
+        assert!(!text.contains("10.0.0.1"));
     }
 }

@@ -815,6 +815,11 @@ impl AlarmDetails {
     pub fn as_value(&self) -> Option<&serde_json::Value> {
         self.0.as_ref()
     }
+
+    /// Returns a copy suitable for external export with string values redacted.
+    pub fn redacted_for_export(&self) -> Self {
+        Self(self.0.as_ref().map(redact_json_value_for_export))
+    }
 }
 
 /// Readiness impact policy per RFC 013 §12.
@@ -844,6 +849,11 @@ impl RedactedText {
     /// Wraps pre-redacted text. Callers are responsible for redaction per RFC 010.
     pub fn new(text: impl Into<String>) -> Self {
         Self(text.into())
+    }
+
+    /// Returns text scrubbed again for export surfaces that may be widely visible.
+    pub fn redacted_for_export(&self) -> String {
+        redact_string_for_export(&self.0)
     }
 
     /// Returns the wrapped text. The value is only as safe as the caller's
@@ -926,6 +936,15 @@ impl Alarm {
         )
     }
 
+    /// Returns a copy of this alarm with free-form text/details redacted for
+    /// logs, Kubernetes events, and operational data exports.
+    pub fn redacted_for_export(&self) -> Self {
+        let mut alarm = self.clone();
+        alarm.text = RedactedText::new(self.text.redacted_for_export());
+        alarm.details = self.details.redacted_for_export();
+        alarm
+    }
+
     /// Determines readiness impact based on current severity.
     ///
     /// Only active (non-terminal) alarms drive readiness. Cleared and Expired alarms
@@ -946,6 +965,29 @@ impl Alarm {
                 ReadinessImpact::NoImpact
             }
         }
+    }
+}
+
+fn redact_string_for_export(raw: &str) -> String {
+    let mut summary = opc_redaction::RedactionSummary::default();
+    opc_redaction::redact_text(raw, &mut summary)
+}
+
+fn redact_json_value_for_export(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(raw) => serde_json::Value::String(redact_string_for_export(raw)),
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(redact_json_value_for_export)
+                .collect::<Vec<_>>(),
+        ),
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), redact_json_value_for_export(value)))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 

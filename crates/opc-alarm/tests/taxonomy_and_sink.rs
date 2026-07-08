@@ -106,6 +106,21 @@ fn make_dummy_alarm() -> Alarm {
     }
 }
 
+#[test]
+fn exported_alarm_snapshot_redacts_text_and_details() {
+    let mut alarm = make_dummy_alarm();
+    alarm.text = RedactedText::new("peer 10.0.0.1 imsi 208950000000001 down");
+    alarm.details = AlarmDetails::with_value(serde_json::json!({
+        "description": "subscriber imsi 208950000000001 on 10.0.0.1"
+    }));
+
+    let exported = alarm.redacted_for_export();
+    let serialized = serde_json::to_string(&exported).unwrap();
+
+    assert!(!serialized.contains("208950000000001"));
+    assert!(!serialized.contains("10.0.0.1"));
+}
+
 #[tokio::test]
 async fn test_recording_and_tracing_sinks() {
     let rec_sink = RecordingSink::new();

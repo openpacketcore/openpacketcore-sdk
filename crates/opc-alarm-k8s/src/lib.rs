@@ -81,7 +81,7 @@ pub fn alarm_to_condition(alarm: &Alarm) -> K8sCondition {
         status,
         last_transition_time,
         reason,
-        message: alarm.text.as_str().to_string(),
+        message: alarm.text.redacted_for_export(),
     }
 }
 
@@ -113,7 +113,7 @@ pub fn alarm_to_event(alarm: &Alarm) -> K8sEvent {
 
     K8sEvent {
         reason,
-        message: alarm.text.as_str().to_string(),
+        message: alarm.text.redacted_for_export(),
         type_,
         action,
         source_component,
@@ -224,6 +224,20 @@ mod tests {
         assert_eq!(event.type_, "Warning");
         assert_eq!(event.action, "Raised");
         assert_eq!(event.source_component, "nf:upf:upf-1");
+    }
+
+    #[test]
+    fn condition_and_event_messages_redact_sensitive_alarm_text() {
+        let mut alarm = alarm_with_cause(ProbableCause::PeerUnreachable);
+        alarm.text = RedactedText::new("peer 10.0.0.1 imsi 208950000000001 down");
+
+        let cond = alarm_to_condition(&alarm);
+        let event = alarm_to_event(&alarm);
+
+        for message in [&cond.message, &event.message] {
+            assert!(!message.contains("208950000000001"));
+            assert!(!message.contains("10.0.0.1"));
+        }
     }
 
     #[test]
