@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use opc_key::KeyProvider;
@@ -14,6 +15,8 @@ use super::{
     audit_hash_from_blob, calculate_audit_event_hmac, SecurityPolicyError,
     SqliteSecurityPolicyService,
 };
+#[cfg(any(test, feature = "dangerous-test-hooks"))]
+use super::TEST_AUDIT_FAILURE_INSERT_FAIL;
 
 impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
     pub async fn clean_expired_all_tenants(&self) -> Result<(), SecurityPolicyError> {
@@ -105,6 +108,13 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
                 &previous_hash,
             )?;
 
+            #[cfg(any(test, feature = "dangerous-test-hooks"))]
+            if TEST_AUDIT_FAILURE_INSERT_FAIL.load(Ordering::Relaxed)
+                && matches!(action, "EVALUATE_DENY")
+            {
+                return Err(SecurityPolicyError::Internal);
+            }
+
             let insert_res = tx.execute(
                 "INSERT INTO break_glass_audit (tenant, timestamp, principal, action, details, previous_hash, entry_hmac) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -153,6 +163,31 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
         Ok(())
     }
 
+    async fn break_glass_audit_event_or_record_failure(
+        &self,
+        tenant: &str,
+        principal: &str,
+        action: &str,
+        details: &str,
+    ) {
+        if let Err(err) = self
+            .break_glass_audit_event(tenant, principal, action, details)
+            .await
+        {
+            opc_redaction::metrics::METRICS
+                .persist_audit_write_failure
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                err = ?err,
+                tenant = %tenant,
+                principal = %principal,
+                action = %action,
+                details = %details,
+                "Required break-glass audit write failed"
+            );
+        }
+    }
+
     #[cfg(any(test, feature = "dangerous-test-hooks"))]
     pub async fn break_glass_audit_event_for_test(
         &self,
@@ -191,9 +226,13 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
 
         if !decision.is_allowed() {
             let details = format!("NACM check denied break-glass access for action {action:?}");
-            let _ = self
-                .break_glass_audit_event(tenant, &validated_spiffe, "EVALUATE_DENY", &details)
-                .await;
+            self.break_glass_audit_event_or_record_failure(
+                tenant,
+                &validated_spiffe,
+                "EVALUATE_DENY",
+                &details,
+            )
+            .await;
 
             return Err(SecurityPolicyError::Unauthorized(format!(
                 "Access denied by active security policy for action: {action:?}"

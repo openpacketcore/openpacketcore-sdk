@@ -472,6 +472,7 @@ pub struct SdkMetrics {
     pub persist_rpc_auth_failures: AtomicU64,
     pub persist_audit_chain_verification_success: AtomicU64,
     pub persist_audit_chain_verification_failure: AtomicU64,
+    pub persist_audit_write_failure: AtomicU64,
     pub persist_write_success: AtomicU64,
     pub persist_read_success: AtomicU64,
     pub persist_error: AtomicU64,
@@ -594,6 +595,7 @@ impl SdkMetrics {
             persist_rpc_auth_failures: AtomicU64::new(0),
             persist_audit_chain_verification_success: AtomicU64::new(0),
             persist_audit_chain_verification_failure: AtomicU64::new(0),
+            persist_audit_write_failure: AtomicU64::new(0),
             persist_write_success: AtomicU64::new(0),
             persist_read_success: AtomicU64::new(0),
             persist_error: AtomicU64::new(0),
@@ -717,6 +719,8 @@ impl SdkMetrics {
         self.persist_audit_chain_verification_success
             .store(0, Ordering::Relaxed);
         self.persist_audit_chain_verification_failure
+            .store(0, Ordering::Relaxed);
+        self.persist_audit_write_failure
             .store(0, Ordering::Relaxed);
         self.persist_write_success.store(0, Ordering::Relaxed);
         self.persist_read_success.store(0, Ordering::Relaxed);
@@ -1269,6 +1273,17 @@ pub fn export_prometheus_text() -> String {
     out.push_str(&format!(
         "opc_persist_audit_chain_verification_total{{status=\"failure\"}} {audit_chain_fail}\n"
     ));
+
+    let audit_write_fail = METRICS
+        .persist_audit_write_failure
+        .load(Ordering::Relaxed);
+    write_metric(
+        &mut out,
+        "opc_persist_audit_write_failure_total",
+        "counter",
+        "Total count of failed required audit writes",
+        audit_write_fail as f64,
+    );
 
     let p_write = METRICS.persist_write_success.load(Ordering::Relaxed);
     write_metric(

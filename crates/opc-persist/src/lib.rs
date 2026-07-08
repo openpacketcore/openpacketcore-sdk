@@ -122,7 +122,9 @@ pub use security_policy::{
     SerializablePolicy, SerializableRule, SerializableRuleList, SqliteSecurityPolicyService,
 };
 #[cfg(any(test, feature = "dangerous-test-hooks"))]
-pub use security_policy::{TEST_AUDIT_SUCCESS_INSERT_FAIL, TEST_COMMIT_FAIL};
+pub use security_policy::{
+    TEST_AUDIT_FAILURE_INSERT_FAIL, TEST_AUDIT_SUCCESS_INSERT_FAIL, TEST_COMMIT_FAIL,
+};
 pub use types::{
     extract_tenant, redact_entry, AuditKey, AuditOpType, AuditRecord, CommitRecord, CommitSource,
     RollbackTarget, StoredConfig,

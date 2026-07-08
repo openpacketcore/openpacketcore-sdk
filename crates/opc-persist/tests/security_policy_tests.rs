@@ -10,7 +10,8 @@ use opc_nacm::{
 };
 use opc_persist::{
     AuditKey, RollbackTarget, SecurityPolicyError, SecurityPolicyService, SqliteBackend,
-    SqliteSecurityPolicyService, TEST_AUDIT_SUCCESS_INSERT_FAIL, TEST_COMMIT_FAIL,
+    SqliteSecurityPolicyService, TEST_AUDIT_FAILURE_INSERT_FAIL, TEST_AUDIT_SUCCESS_INSERT_FAIL,
+    TEST_COMMIT_FAIL,
 };
 use opc_types::TenantId;
 
@@ -219,6 +220,39 @@ async fn test_group_scoped_rule_lists_survive_policy_persistence() {
     assert!(!evaluator
         .evaluate_for_groups(&active_policy, &path, NacmAction::SecurityAdmin, &[])
         .is_allowed());
+}
+
+#[tokio::test]
+async fn test_denied_candidate_audit_insert_failure_increments_metric() {
+    let _guard = TEST_MUTEX.lock().await;
+    opc_redaction::metrics::METRICS.reset_all();
+    TEST_AUDIT_FAILURE_INSERT_FAIL.store(false, Ordering::Relaxed);
+
+    let (service, _temp_dir) = setup_service().await;
+    let tenant = "test-tenant";
+    let grouped_principal = get_admin_principal_with_groups(&["nacm-security-admins"]);
+    let ungrouped_principal = get_admin_principal_with_groups(&[]);
+
+    let policy = make_group_scoped_security_policy(1, "nacm-security-admins");
+    service
+        .stage_policy(tenant, &grouped_principal, policy)
+        .await
+        .expect("stage group-scoped policy");
+    TEST_AUDIT_FAILURE_INSERT_FAIL.store(true, Ordering::Relaxed);
+    let denied = service.validate_policy(tenant, &ungrouped_principal).await;
+    TEST_AUDIT_FAILURE_INSERT_FAIL.store(false, Ordering::Relaxed);
+
+    assert!(
+        matches!(denied, Err(SecurityPolicyError::ValidationFailed(_))),
+        "candidate validation should still fail closed: {denied:?}"
+    );
+    assert_eq!(
+        opc_redaction::metrics::METRICS
+            .persist_audit_write_failure
+            .load(Ordering::Relaxed),
+        1,
+        "dropped denial audit write must be observable"
+    );
 }
 
 #[tokio::test]

@@ -11,7 +11,7 @@ use super::crypto::{
     register_policy_modules, to_serializable_policy, validate_principal_tenant_and_roles,
 };
 #[cfg(any(test, feature = "dangerous-test-hooks"))]
-use super::TEST_COMMIT_FAIL;
+use super::{TEST_AUDIT_FAILURE_INSERT_FAIL, TEST_COMMIT_FAIL};
 use super::{
     audit_hash_from_blob, calculate_audit_event_hmac, ActivePolicyMetadata, PolicyHistoryEntry,
     SecurityPolicyError, SecurityPolicyService, SqliteSecurityPolicyService,
@@ -131,30 +131,50 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
         );
 
         if !decision.is_allowed() {
-            let _ = self
-                .audit_event(
-                    tenant,
-                    &validated_spiffe,
-                    "EVALUATE_DENY",
-                    "NACM check denied security-admin access to /security:policy",
-                )
-                .await;
+            self.audit_event_or_record_failure(
+                tenant,
+                &validated_spiffe,
+                "EVALUATE_DENY",
+                "NACM check denied security-admin access to /security:policy",
+            )
+            .await;
 
             return Err(SecurityPolicyError::Unauthorized(
                 "Access denied by active security policy".to_string(),
             ));
         }
 
-        let _ = self
-            .audit_event(
-                tenant,
-                &validated_spiffe,
-                "EVALUATE_ALLOW",
-                "NACM check allowed security-admin access to /security:policy",
-            )
-            .await;
+        self.audit_event_or_record_failure(
+            tenant,
+            &validated_spiffe,
+            "EVALUATE_ALLOW",
+            "NACM check allowed security-admin access to /security:policy",
+        )
+        .await;
 
         Ok(validated_spiffe)
+    }
+
+    async fn audit_event_or_record_failure(
+        &self,
+        tenant: &str,
+        principal: &str,
+        action: &str,
+        details: &str,
+    ) {
+        if let Err(err) = self.audit_event(tenant, principal, action, details).await {
+            opc_redaction::metrics::METRICS
+                .persist_audit_write_failure
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                err = ?err,
+                tenant = %tenant,
+                principal = %principal,
+                action = %action,
+                details = %details,
+                "Required security policy audit write failed"
+            );
+        }
     }
 
     async fn audit_event(
@@ -227,6 +247,16 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
         #[cfg(any(test, feature = "dangerous-test-hooks"))]
         if super::TEST_AUDIT_SUCCESS_INSERT_FAIL.load(Ordering::Relaxed)
             && matches!(action, "STAGE" | "APPLY_SUCCESS" | "ROLLBACK")
+        {
+            return Err(SecurityPolicyError::Internal);
+        }
+
+        #[cfg(any(test, feature = "dangerous-test-hooks"))]
+        if TEST_AUDIT_FAILURE_INSERT_FAIL.load(Ordering::Relaxed)
+            && matches!(
+                action,
+                "EVALUATE_DENY" | "VALIDATE_FAILURE" | "APPLY_FAILURE" | "ROLLBACK_FAILURE"
+            )
         {
             return Err(SecurityPolicyError::Internal);
         }
@@ -398,9 +428,13 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
 
         if !decision.is_allowed() {
             let reason = "Validation failed: lockout check failed, candidate policy denies security-admin role access to /security:policy".to_string();
-            let _ = self
-                .audit_event(tenant, &validated_spiffe, "VALIDATE_FAILURE", &reason)
-                .await;
+            self.audit_event_or_record_failure(
+                tenant,
+                &validated_spiffe,
+                "VALIDATE_FAILURE",
+                &reason,
+            )
+            .await;
             return Err(SecurityPolicyError::ValidationFailed(reason));
         }
 
@@ -424,14 +458,13 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
         let (version, encrypted_blob) = match row {
             Ok(res) => res,
             Err(rusqlite::Error::QueryReturnedNoRows) => {
-                let _ = self
-                    .audit_event(
-                        tenant,
-                        &validated_spiffe,
-                        "APPLY_FAILURE",
-                        "No staged policy to apply",
-                    )
-                    .await;
+                self.audit_event_or_record_failure(
+                    tenant,
+                    &validated_spiffe,
+                    "APPLY_FAILURE",
+                    "No staged policy to apply",
+                )
+                .await;
                 return Err(SecurityPolicyError::StaleVersion(
                     "No staged policy to apply".to_string(),
                 ));
@@ -457,22 +490,25 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
                 let reason = format!(
                     "Apply rejected: candidate version {version} is not newer than active version {active_version}"
                 );
-                let _ = self
-                    .audit_event(tenant, &validated_spiffe, "APPLY_FAILURE", &reason)
-                    .await;
+                self.audit_event_or_record_failure(
+                    tenant,
+                    &validated_spiffe,
+                    "APPLY_FAILURE",
+                    &reason,
+                )
+                .await;
                 return Err(SecurityPolicyError::StaleVersion(reason));
             }
         }
 
         if let Err(e) = self.validate_policy(tenant, principal).await {
-            let _ = self
-                .audit_event(
-                    tenant,
-                    &validated_spiffe,
-                    "APPLY_FAILURE",
-                    &format!("Validation failed: {e}"),
-                )
-                .await;
+            self.audit_event_or_record_failure(
+                tenant,
+                &validated_spiffe,
+                "APPLY_FAILURE",
+                &format!("Validation failed: {e}"),
+            )
+            .await;
             return Err(e);
         }
         self.verify_security_policy_audit_chain(tenant).await?;
@@ -567,17 +603,25 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
 
         if let Err(e) = tx_result {
             let reason = format!("Apply transaction failed: {e:?}");
-            let _ = self
-                .audit_event(tenant, &validated_spiffe, "APPLY_FAILURE", &reason)
-                .await;
+            self.audit_event_or_record_failure(
+                tenant,
+                &validated_spiffe,
+                "APPLY_FAILURE",
+                &reason,
+            )
+            .await;
             return Err(e);
         }
 
         if failed_simulated {
             let reason = "Apply transaction aborted due to simulated commit failure".to_string();
-            let _ = self
-                .audit_event(tenant, &validated_spiffe, "APPLY_FAILURE", &reason)
-                .await;
+            self.audit_event_or_record_failure(
+                tenant,
+                &validated_spiffe,
+                "APPLY_FAILURE",
+                &reason,
+            )
+            .await;
             return Err(SecurityPolicyError::Internal);
         }
 
@@ -795,9 +839,13 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
             Ok(res) => res,
             Err(e) => {
                 let reason = format!("{e}");
-                let _ = self
-                    .audit_event(tenant, &validated_spiffe, "ROLLBACK_FAILURE", &reason)
-                    .await;
+                self.audit_event_or_record_failure(
+                    tenant,
+                    &validated_spiffe,
+                    "ROLLBACK_FAILURE",
+                    &reason,
+                )
+                .await;
                 return Err(e);
             }
         };
@@ -847,9 +895,13 @@ impl<P: KeyProvider + 'static> SecurityPolicyService for SqliteSecurityPolicySer
 
         if let Err(e) = tx_result {
             let reason = format!("Rollback transaction failed: {e:?}");
-            let _ = self
-                .audit_event(tenant, &validated_spiffe, "ROLLBACK_FAILURE", &reason)
-                .await;
+            self.audit_event_or_record_failure(
+                tenant,
+                &validated_spiffe,
+                "ROLLBACK_FAILURE",
+                &reason,
+            )
+            .await;
             return Err(e);
         }
 
