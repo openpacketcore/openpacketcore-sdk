@@ -123,6 +123,7 @@ pub use payload::{
 pub use protected_payload_crypto::{
     decrypt_ikev2_sa_init_protected_payload, ikev2_aes_gcm_protected_body_len,
     ikev2_aes_gcm_protected_payload_len, seal_ikev2_sa_init_protected_payload,
+    seal_ikev2_sa_init_protected_payload_with_iv_counter, Ikev2AesGcmExplicitIvCounter,
     Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadCryptoErrorCode,
     Ikev2ProtectedPayloadDirection, Ikev2SaInitProtectedPayloadProvider,
     ProtectedPayloadSealContext, IKEV2_AES_GCM_EXPLICIT_IV_LEN,

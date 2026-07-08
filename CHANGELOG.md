@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-proto-ikev2`: SDK helpers for IKEv2 SA lifecycle handling, including
   Delete payload encoding, `REKEY_SA` Child-SA rekey payload assembly,
   initiator Message-ID window tracking, and protected INFORMATIONAL coverage.
+- `opc-proto-ikev2`: `Ikev2SaInitKeyMaterial::from_established_keys` for
+  rebuilding established IKE SA key material from sealed `SK_*` bytes, plus a
+  monotonic AES-GCM explicit-IV counter for HA restore without outbound nonce
+  reuse.
 - `opc-proto-pfcp`: typed IE coverage for the Session Modification lifecycle
   (Update PDR/FAR/URR/QER, Update Forwarding Parameters, Remove PDR/FAR/URR/QER)
   and the Session Report / usage-reporting flow (Report Type, Measurement
