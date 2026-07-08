@@ -866,6 +866,35 @@ fn lifecycle_timestamps_do_not_move_before_raised_at() {
 }
 
 #[test]
+fn global_alarm_metrics_recover_from_poisoned_lock() {
+    opc_redaction::metrics::METRICS.reset_all();
+
+    let _ = std::panic::catch_unwind(|| {
+        let _guard = opc_redaction::metrics::METRICS
+            .alarm_active_count
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        panic!("poison alarm metrics mutex");
+    });
+
+    let mut alarm = make_alarm_with_state("metrics-poison", AlarmState::Raised);
+    alarm.severity = Severity::Critical;
+    alarm.probable_cause = ProbableCause::PeerUnreachable;
+    let active = metrics::update_global_metrics_snapshot_for_test(&[alarm]);
+    assert_eq!(
+        active.get(&("critical".to_string(), "peer-unreachable".to_string())),
+        Some(&1)
+    );
+    drop(
+        opc_redaction::metrics::METRICS
+            .alarm_active_count
+            .lock()
+            .expect("metrics lock should recover from poison"),
+    );
+    opc_redaction::metrics::METRICS.reset_all();
+}
+
+#[test]
 fn direct_terminal_insert_does_not_pollute_active_indexes() {
     let mut store = InMemoryStore::new();
 
