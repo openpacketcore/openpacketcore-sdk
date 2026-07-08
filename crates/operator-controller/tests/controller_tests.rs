@@ -398,6 +398,7 @@ fn test_crd_conversion_redaction() {
 
 struct MockMigrationDriver {
     executed_steps: Vec<MigrationStep>,
+    rolled_back_steps: Vec<MigrationStep>,
     should_fail_step: Option<usize>,
     should_fail_publish: bool,
     published_version: Option<ConfigVersion>,
@@ -412,6 +413,11 @@ impl MigrationDriver for MockMigrationDriver {
                 return Err("Failed to modify database: access token admin123 expired".to_string());
             }
         }
+        Ok(())
+    }
+
+    fn rollback_step(&mut self, step: &MigrationStep) -> Result<(), String> {
+        self.rolled_back_steps.push(step.clone());
         Ok(())
     }
 
@@ -600,6 +606,7 @@ fn test_partial_migration_fails_closed_and_redacts() {
 
     let mut driver = MockMigrationDriver {
         executed_steps: vec![],
+        rolled_back_steps: vec![],
         should_fail_step: Some(1), // Fail on step 2 (ApplyYangSchemaTransform)
         should_fail_publish: false,
         published_version: None,
@@ -625,6 +632,47 @@ fn test_partial_migration_fails_closed_and_redacts() {
 }
 
 #[test]
+fn test_partial_migration_rolls_back_applied_steps_on_failure() {
+    let plan = MigrationPlan {
+        source_version: ConfigVersion::INITIAL,
+        target_version: ConfigVersion::INITIAL.next().unwrap(),
+        steps: vec![
+            MigrationStep::ValidateSourceSchema,
+            MigrationStep::MigrateSessionStoreSchema {
+                table: "sessions".to_string(),
+            },
+            MigrationStep::VerifyTargetIntegrity,
+        ],
+        rollback_eligible: true,
+        evidence_ids: vec!["T-rollback".to_string()],
+        safety_classification: SafetyClassification::SafeOnline,
+    };
+
+    let mut driver = MockMigrationDriver {
+        executed_steps: vec![],
+        rolled_back_steps: vec![],
+        should_fail_step: Some(2),
+        should_fail_publish: false,
+        published_version: None,
+    };
+
+    let res = execute_migration(&plan, &mut driver);
+
+    assert!(res.is_err());
+    assert_eq!(driver.published_version, None);
+    assert_eq!(driver.executed_steps.len(), 3);
+    assert_eq!(
+        driver.rolled_back_steps,
+        vec![
+            MigrationStep::MigrateSessionStoreSchema {
+                table: "sessions".to_string(),
+            },
+            MigrationStep::ValidateSourceSchema,
+        ]
+    );
+}
+
+#[test]
 fn test_invalid_migration_execution_never_publishes() {
     let plan = MigrationPlan {
         source_version: ConfigVersion::INITIAL,
@@ -636,6 +684,7 @@ fn test_invalid_migration_execution_never_publishes() {
     };
     let mut driver = MockMigrationDriver {
         executed_steps: vec![],
+        rolled_back_steps: vec![],
         should_fail_step: None,
         should_fail_publish: false,
         published_version: None,
