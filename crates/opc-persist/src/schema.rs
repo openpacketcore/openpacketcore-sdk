@@ -15,7 +15,7 @@ use rusqlite::{Connection, Transaction};
 use std::path::Path;
 
 /// Current schema version. Bump this and add a migration step to evolve the schema.
-pub const SCHEMA_VERSION: &str = "1.7.0";
+pub const SCHEMA_VERSION: &str = "1.8.0";
 
 /// Initialize the database schema.
 ///
@@ -129,6 +129,17 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
         CREATE INDEX IF NOT EXISTS audit_trail_tx_id_idx ON audit_trail(tx_id);
         CREATE INDEX IF NOT EXISTS config_history_rollback_idx ON config_history(version, rollback_point);
+
+        CREATE TABLE IF NOT EXISTS config_lifecycle_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tx_id BLOB NOT NULL REFERENCES config_history(tx_id) ON DELETE RESTRICT,
+            action TEXT NOT NULL,
+            principal TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            details TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS config_lifecycle_audit_tx_id_idx ON config_lifecycle_audit(tx_id);
 
         CREATE TABLE IF NOT EXISTS staged_security_policy (
             tenant TEXT PRIMARY KEY,
@@ -455,6 +466,23 @@ pub fn run_migrations(conn: &Connection, from_version: &str) -> Result<(), rusql
             "#,
         )?;
         current = "1.7.0".to_string();
+    }
+    if current == "1.7.0" {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS config_lifecycle_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tx_id BLOB NOT NULL REFERENCES config_history(tx_id) ON DELETE RESTRICT,
+                action TEXT NOT NULL,
+                principal TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                details TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS config_lifecycle_audit_tx_id_idx ON config_lifecycle_audit(tx_id);
+            "#,
+        )?;
+        current = "1.8.0".to_string();
     }
 
     let _ = current;

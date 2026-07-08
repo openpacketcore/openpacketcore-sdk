@@ -344,6 +344,57 @@ async fn create_rollback_point_marks_commit() {
 }
 
 #[tokio::test]
+async fn lifecycle_mutations_record_audit_rows_with_principal() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = temp_dir.path().join("test_lifecycle_audit.db");
+
+    let backend = SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect("open backend");
+
+    let tx_id = TxId::new();
+    let mut record = make_commit_record(tx_id, 1);
+    record.confirmed_deadline = Some(Timestamp::now_utc());
+    let principal = record.principal.clone();
+    backend
+        .append_commit(record, vec![])
+        .await
+        .expect("append pending commit");
+
+    backend
+        .mark_confirmed(tx_id)
+        .await
+        .expect("mark_confirmed should succeed");
+    backend
+        .create_rollback_point(tx_id, Some("golden-config".to_string()))
+        .await
+        .expect("create_rollback_point should succeed");
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open database");
+    let mut stmt = conn
+        .prepare(
+            "SELECT action, principal FROM config_lifecycle_audit WHERE tx_id = ?1 ORDER BY id ASC",
+        )
+        .expect("prepare lifecycle audit query");
+    let rows = stmt
+        .query_map(rusqlite::params![tx_id.as_uuid().as_bytes()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("query lifecycle audit");
+    let rows: Vec<_> = rows
+        .map(|row| row.expect("read lifecycle audit row"))
+        .collect();
+
+    assert_eq!(
+        rows,
+        vec![
+            ("MARK_CONFIRMED".to_string(), principal.clone()),
+            ("CREATE_ROLLBACK_POINT".to_string(), principal),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn concurrent_load_latest_does_not_block() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let db_path = temp_dir.path().join("test_concurrent.db");

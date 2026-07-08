@@ -282,6 +282,7 @@ impl SqliteBackend {
             | (Some("1.3.0"), _)
             | (Some("1.5.0"), _)
             | (Some("1.6.0"), _)
+            | (Some("1.7.0"), _)
             | (None, _) => {
                 if let Some(from_version) = current_version.as_deref() {
                     schema::run_migrations(&conn, from_version)
@@ -497,6 +498,7 @@ impl SqliteBackend {
         CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK (id = 1), schema_digest TEXT NOT NULL, sdk_version TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE config_history (tx_id BLOB PRIMARY KEY, parent_tx_id BLOB NULL, version INTEGER NOT NULL UNIQUE, committed_at TEXT NOT NULL, principal TEXT NOT NULL, source TEXT NOT NULL, schema_digest BLOB NOT NULL, plaintext_digest BLOB NOT NULL, encrypted_blob BLOB NOT NULL, rollback_point INTEGER NOT NULL DEFAULT 0, rollback_label TEXT NULL, confirmed_deadline TEXT NULL, confirmed_at TEXT NULL, audit_count INTEGER NOT NULL DEFAULT 0, audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000');
         CREATE TABLE audit_trail (id INTEGER PRIMARY KEY AUTOINCREMENT, tx_id BLOB NOT NULL, sequence INTEGER NOT NULL, yang_path TEXT NOT NULL, op_type TEXT NOT NULL, previous_value TEXT NULL, new_value TEXT NULL, redaction_applied INTEGER NOT NULL DEFAULT 0, previous_hash BLOB NOT NULL, entry_hmac BLOB NOT NULL, UNIQUE(tx_id, sequence));
+        CREATE TABLE config_lifecycle_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, tx_id BLOB NOT NULL, action TEXT NOT NULL, principal TEXT NOT NULL, occurred_at TEXT NOT NULL, details TEXT NOT NULL);
         CREATE TABLE rollback_labels (label TEXT PRIMARY KEY, tx_id BLOB NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE alarm_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, outcome TEXT NOT NULL, alarm_id TEXT NOT NULL, alarm_type TEXT NOT NULL, probable_cause TEXT NOT NULL, principal TEXT NOT NULL, tenant TEXT NULL, reason TEXT NOT NULL, scope TEXT NOT NULL, correlation_id TEXT NULL, occurred_at TEXT NOT NULL);
         CREATE TABLE consensus_state (node_id INTEGER PRIMARY KEY, current_term INTEGER NOT NULL, voted_for INTEGER NULL);

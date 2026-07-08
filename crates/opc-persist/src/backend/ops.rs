@@ -83,7 +83,17 @@ impl ConfigStore for SqliteBackend {
         let now = Timestamp::now_utc().to_string();
 
         let res = (|| -> Result<(), PersistError> {
-            let rows = guard
+            let tx = guard
+                .unchecked_transaction()
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let principal: String = tx
+                .query_row(
+                    "SELECT principal FROM config_history WHERE tx_id = ?1",
+                    params![&tx_id_bytes],
+                    |row| row.get(0),
+                )
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let rows = tx
                 .execute(
                     "UPDATE config_history SET confirmed_at = ?1 WHERE tx_id = ?2",
                     params![now, &tx_id_bytes],
@@ -93,6 +103,20 @@ impl ConfigStore for SqliteBackend {
             if rows == 0 {
                 return Err(PersistError::rollback_not_found());
             }
+            tx.execute(
+                "INSERT INTO config_lifecycle_audit (tx_id, action, principal, occurred_at, details) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    &tx_id_bytes,
+                    "MARK_CONFIRMED",
+                    principal,
+                    Timestamp::now_utc().to_string(),
+                    "commit confirmed",
+                ],
+            )
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            tx.commit()
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
             debug!(tx_id = %tx_id, "commit marked confirmed");
             Ok(())
         })();
@@ -119,15 +143,29 @@ impl ConfigStore for SqliteBackend {
         let tx_id_bytes = tx_id.as_uuid().as_bytes().to_vec();
 
         let res = (|| -> Result<(), PersistError> {
-            guard
+            let tx = guard
+                .unchecked_transaction()
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let principal: String = tx
+                .query_row(
+                    "SELECT principal FROM config_history WHERE tx_id = ?1",
+                    params![&tx_id_bytes],
+                    |row| row.get(0),
+                )
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let rows = tx
                 .execute(
                     "UPDATE config_history SET rollback_point = 1 WHERE tx_id = ?1",
                     params![&tx_id_bytes],
                 )
                 .map_err(|e| PersistError::sqlite(e.to_string()))?;
 
+            if rows == 0 {
+                return Err(PersistError::rollback_not_found());
+            }
+
             if let Some(lbl) = &label {
-                guard
+                tx
                     .execute(
                         "INSERT OR REPLACE INTO rollback_labels (label, tx_id, created_at) VALUES (?1, ?2, ?3)",
                         params![lbl, &tx_id_bytes, Timestamp::now_utc().to_string()],
@@ -135,6 +173,24 @@ impl ConfigStore for SqliteBackend {
                     .map_err(|e| PersistError::sqlite(e.to_string()))?;
             }
 
+            let details = match &label {
+                Some(lbl) => format!("rollback point created with label {lbl}"),
+                None => "rollback point created".to_string(),
+            };
+            tx.execute(
+                "INSERT INTO config_lifecycle_audit (tx_id, action, principal, occurred_at, details) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    &tx_id_bytes,
+                    "CREATE_ROLLBACK_POINT",
+                    principal,
+                    Timestamp::now_utc().to_string(),
+                    details,
+                ],
+            )
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            tx.commit()
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
             debug!(tx_id = %tx_id, label = ?label, "rollback point created");
             Ok(())
         })();
