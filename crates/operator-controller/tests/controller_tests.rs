@@ -219,6 +219,7 @@ fn test_crd_conversion_round_trip() {
             session_backend: Some("quorum".to_string()),
             admin_token: Some("verylongsecuresupersecretadmintoken123456789".to_string()),
             token_enabled: Some(true),
+            resource_profile: None,
         },
         status: Some(v1alpha1::NetworkFunctionStatus {
             lifecycle: Some(LifecycleStatus::new(3)),
@@ -254,6 +255,42 @@ fn test_crd_conversion_round_trip() {
     assert_eq!(
         round_tripped.spec.admin_token,
         Some("verylongsecuresupersecretadmintoken123456789".to_string())
+    );
+}
+
+#[test]
+fn test_crd_conversion_preserves_resource_profile_on_beta_round_trip() {
+    let original = v1beta1::NetworkFunction {
+        api_version: "openpacketcore.org/v1beta1".to_string(),
+        kind: "NfDeployment".to_string(),
+        spec: v1beta1::NetworkFunctionSpec {
+            kind: "upf".to_string(),
+            replicas: 2,
+            profile: Some("AfXdpFastPath".to_string()),
+            config_backend: "consensus".to_string(),
+            session_backend: "quorum".to_string(),
+            admin_auth: v1beta1::AdminAuthSpec {
+                admin_token: Some("verylongsecuresupersecretadmintoken123456789".to_string()),
+                token_enabled: true,
+            },
+            resource_profile: Some(v1beta1::ResourceProfileSpec {
+                data_plane_profile: "AfXdpFastPath".to_string(),
+                numa_policy: "Require".to_string(),
+            }),
+        },
+        status: Some(v1beta1::NetworkFunctionStatus {
+            lifecycle: LifecycleStatus::new(7),
+        }),
+    };
+
+    let alpha =
+        convert_v1beta1_to_v1alpha1(&original, None).expect("v1beta1 -> v1alpha1 conversion");
+    let round_tripped =
+        convert_v1alpha1_to_v1beta1(&alpha, None).expect("v1alpha1 -> v1beta1 conversion");
+
+    assert_eq!(
+        round_tripped.spec.resource_profile,
+        original.spec.resource_profile
     );
 }
 
@@ -337,6 +374,7 @@ fn test_crd_conversion_defaulting() {
         session_backend: None,
         admin_token: None,
         token_enabled: None,
+        resource_profile: None,
     };
     apply_defaults_v1alpha1(&mut spec1a);
     assert_eq!(spec1a.config_backend, Some("sqlite".to_string()));
@@ -376,6 +414,7 @@ fn test_crd_conversion_redaction() {
             session_backend: None,
             admin_token: Some("admin123".to_string()),
             token_enabled: Some(true),
+            resource_profile: None,
         },
         status: None,
     };
@@ -398,6 +437,7 @@ fn test_crd_conversion_redaction() {
 
 struct MockMigrationDriver {
     executed_steps: Vec<MigrationStep>,
+    rolled_back_steps: Vec<MigrationStep>,
     should_fail_step: Option<usize>,
     should_fail_publish: bool,
     published_version: Option<ConfigVersion>,
@@ -412,6 +452,11 @@ impl MigrationDriver for MockMigrationDriver {
                 return Err("Failed to modify database: access token admin123 expired".to_string());
             }
         }
+        Ok(())
+    }
+
+    fn rollback_step(&mut self, step: &MigrationStep) -> Result<(), String> {
+        self.rolled_back_steps.push(step.clone());
         Ok(())
     }
 
@@ -600,6 +645,7 @@ fn test_partial_migration_fails_closed_and_redacts() {
 
     let mut driver = MockMigrationDriver {
         executed_steps: vec![],
+        rolled_back_steps: vec![],
         should_fail_step: Some(1), // Fail on step 2 (ApplyYangSchemaTransform)
         should_fail_publish: false,
         published_version: None,
@@ -625,6 +671,47 @@ fn test_partial_migration_fails_closed_and_redacts() {
 }
 
 #[test]
+fn test_partial_migration_rolls_back_applied_steps_on_failure() {
+    let plan = MigrationPlan {
+        source_version: ConfigVersion::INITIAL,
+        target_version: ConfigVersion::INITIAL.next().unwrap(),
+        steps: vec![
+            MigrationStep::ValidateSourceSchema,
+            MigrationStep::MigrateSessionStoreSchema {
+                table: "sessions".to_string(),
+            },
+            MigrationStep::VerifyTargetIntegrity,
+        ],
+        rollback_eligible: true,
+        evidence_ids: vec!["T-rollback".to_string()],
+        safety_classification: SafetyClassification::SafeOnline,
+    };
+
+    let mut driver = MockMigrationDriver {
+        executed_steps: vec![],
+        rolled_back_steps: vec![],
+        should_fail_step: Some(2),
+        should_fail_publish: false,
+        published_version: None,
+    };
+
+    let res = execute_migration(&plan, &mut driver);
+
+    assert!(res.is_err());
+    assert_eq!(driver.published_version, None);
+    assert_eq!(driver.executed_steps.len(), 3);
+    assert_eq!(
+        driver.rolled_back_steps,
+        vec![
+            MigrationStep::MigrateSessionStoreSchema {
+                table: "sessions".to_string(),
+            },
+            MigrationStep::ValidateSourceSchema,
+        ]
+    );
+}
+
+#[test]
 fn test_invalid_migration_execution_never_publishes() {
     let plan = MigrationPlan {
         source_version: ConfigVersion::INITIAL,
@@ -636,6 +723,7 @@ fn test_invalid_migration_execution_never_publishes() {
     };
     let mut driver = MockMigrationDriver {
         executed_steps: vec![],
+        rolled_back_steps: vec![],
         should_fail_step: None,
         should_fail_publish: false,
         published_version: None,
@@ -863,6 +951,47 @@ fn test_multi_cluster_rollout_aggregation_and_split_brain() {
 }
 
 #[test]
+fn test_multi_cluster_reaggregate_preserves_unchanged_transition_time() {
+    let mut mc_status = MultiClusterRolloutStatus::new(1);
+
+    let first_status = ClusterRolloutStatus {
+        cluster_id: "cluster-us-east".to_string(),
+        observed_generation: 1,
+        resource_version: 1,
+        phase: LifecyclePhase::Ready,
+        conditions: vec![],
+    };
+
+    mc_status
+        .update_cluster_status("cluster-us-east", first_status)
+        .unwrap();
+
+    let stable_transition = OffsetDateTime::from_unix_timestamp(123).unwrap();
+    mc_status.conditions[0].last_transition_time = stable_transition;
+
+    let second_status = ClusterRolloutStatus {
+        cluster_id: "cluster-us-east".to_string(),
+        observed_generation: 1,
+        resource_version: 2,
+        phase: LifecyclePhase::Ready,
+        conditions: vec![],
+    };
+
+    mc_status
+        .update_cluster_status("cluster-us-east", second_status)
+        .unwrap();
+
+    let ready_cond = mc_status
+        .conditions
+        .iter()
+        .find(|c| c.r#type == "Ready")
+        .unwrap();
+    assert_eq!(ready_cond.status, ConditionStatus::True);
+    assert_eq!(ready_cond.reason, "AllClustersReady");
+    assert_eq!(ready_cond.last_transition_time, stable_transition);
+}
+
+#[test]
 fn test_multi_cluster_stale_status_rejection() {
     let mut mc_status = MultiClusterRolloutStatus::new(1);
 
@@ -989,6 +1118,7 @@ fn test_controller_compatibility_crd_conversion() {
             session_backend: Some("quorum".to_string()),
             admin_token: Some("verylongsecuresupersecretadmintoken123456789".to_string()),
             token_enabled: Some(true),
+            resource_profile: None,
         },
         status: None,
     };

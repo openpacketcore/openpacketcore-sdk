@@ -73,7 +73,8 @@ pub struct Scenario {
     pub title: String,
     /// Linked requirement IDs (RFC 006 style).
     pub requirements: Vec<String>,
-    /// Optional deterministic seed for reproducible simulator behavior.
+    /// Reserved seed recorded in evidence for future deterministic simulator
+    /// behavior. Current SDK simulators do not consume it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     pub topology: Topology,
@@ -166,7 +167,7 @@ impl Scenario {
         crate::schema::validate_scenario_document(&json)
     }
 
-    /// Deterministic seed for this scenario, defaulting to 0 if unspecified.
+    /// Reserved deterministic seed value, defaulting to 0 if unspecified.
     pub fn deterministic_seed(&self) -> u64 {
         self.seed.unwrap_or(0)
     }

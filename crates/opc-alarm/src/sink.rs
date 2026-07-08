@@ -10,6 +10,7 @@ use crate::model::Alarm;
 use async_trait::async_trait;
 use serde::Serialize;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -101,7 +102,7 @@ impl TracingSink {
 #[async_trait]
 impl AlarmSink for TracingSink {
     async fn send(&self, alarm: Alarm) -> Result<(), AlarmSinkError> {
-        let serialized = serde_json::to_string(&alarm)
+        let serialized = serde_json::to_string(&alarm.redacted_for_export())
             .map_err(|e| AlarmSinkError::DeliveryFailed(e.to_string()))?;
         tracing::warn!(target: "opc_alarm::sink::tracing", alarm = %serialized, "Alarm published");
         Ok(())
@@ -126,6 +127,7 @@ pub struct BoundedAlarmSink<S: AlarmSink> {
     tx: mpsc::Sender<Alarm>,
     status: Arc<RwLock<SinkStatus>>,
     last_error: Arc<RwLock<Option<String>>>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl<S: AlarmSink + 'static> BoundedAlarmSink<S> {
@@ -136,10 +138,12 @@ impl<S: AlarmSink + 'static> BoundedAlarmSink<S> {
         let (tx, mut rx) = mpsc::channel::<Alarm>(capacity);
         let status = Arc::new(RwLock::new(SinkStatus::Ok));
         let last_error = Arc::new(RwLock::new(None));
+        let dropped = Arc::new(AtomicU64::new(0));
 
         let worker_inner = Arc::clone(&inner);
         let worker_status = Arc::clone(&status);
         let worker_last_error = Arc::clone(&last_error);
+        let worker_dropped = Arc::clone(&dropped);
 
         let worker = async move {
             while let Some(alarm) = rx.recv().await {
@@ -152,9 +156,8 @@ impl<S: AlarmSink + 'static> BoundedAlarmSink<S> {
                         Err(e) => {
                             let err_msg = sanitize_sink_error(&e);
                             if retries >= max_retries {
-                                record_failure(&worker_status, &worker_last_error, err_msg.clone());
-                                rx.close(); // Stop receiving new alarms
-                                return;
+                                record_drop(&worker_last_error, &worker_dropped, err_msg);
+                                break;
                             }
                             retries += 1;
                             tokio::time::sleep(retry_backoff).await;
@@ -205,6 +208,7 @@ impl<S: AlarmSink + 'static> BoundedAlarmSink<S> {
             tx,
             status,
             last_error,
+            dropped,
         }
     }
 
@@ -216,6 +220,11 @@ impl<S: AlarmSink + 'static> BoundedAlarmSink<S> {
     /// Gets the last error that caused a permanent failure.
     pub fn last_error(&self) -> Option<String> {
         rw_read(&self.last_error).clone()
+    }
+
+    /// Returns the number of alarms dropped after exhausting their retry budget.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Triggers immediate shutdown of the sink and refuses new write requests.
@@ -296,6 +305,11 @@ fn record_failure(
     if *guard != SinkStatus::Shutdown {
         *guard = SinkStatus::Failed;
     }
+}
+
+fn record_drop(last_error: &RwLock<Option<String>>, dropped: &AtomicU64, error_message: String) {
+    *rw_write(last_error) = Some(sanitize_sink_message(&error_message));
+    dropped.fetch_add(1, Ordering::Relaxed);
 }
 
 fn sanitize_sink_error(error: &AlarmSinkError) -> String {

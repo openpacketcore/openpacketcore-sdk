@@ -2002,14 +2002,17 @@ dependencies = [
  "opc-config-bus",
  "opc-config-model",
  "opc-crypto",
+ "opc-data-governance",
  "opc-key",
  "opc-nacm",
  "opc-persist",
+ "opc-privacy",
  "opc-redaction",
  "opc-runtime",
  "opc-security-testkit",
  "opc-session-store",
  "opc-session-testkit",
+ "opc-testbed",
  "opc-types",
  "rcgen",
  "rusqlite",
@@ -2149,6 +2152,7 @@ dependencies = [
 name = "opc-export"
 version = "0.2.0"
 dependencies = [
+ "opc-crypto",
  "opc-data-governance",
  "opc-redaction",
  "serde",
@@ -2401,6 +2405,8 @@ dependencies = [
  "opc-tls",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2429,6 +2435,7 @@ name = "opc-netconf-server"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "opc-config-bus",
  "opc-config-model",
  "opc-identity",
@@ -2812,16 +2819,20 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
+ "opc-identity",
  "opc-session-store",
  "opc-tls",
  "opc-types",
+ "rcgen",
  "rustls-pki-types",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tokio-rustls",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

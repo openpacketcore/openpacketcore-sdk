@@ -70,7 +70,7 @@ impl AlarmAuditEvent {
             reason: context.reason.clone(),
             scope: context.scope.clone(),
             correlation_id: context.correlation_id.clone(),
-            occurred_at: OffsetDateTime::now_utc(),
+            occurred_at: OffsetDateTime::now_utc().max(alarm.raised_at),
         }
     }
 }

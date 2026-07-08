@@ -3,12 +3,13 @@
 //! This is an internal integration crate and is not published.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+use std::error::Error;
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock};
 
 use opc_alarm::{
@@ -25,9 +26,11 @@ use opc_config_model::{
     IdempotencyKey, OpcConfig, RequestId, RequestSource, RollbackTarget as BusRollbackTarget,
     TransportType, TrustedPrincipal, ValidationContext, ValidationError, YangPath,
 };
-use opc_key::KmsKeyProvider;
+use opc_data_governance::IdentifierType;
+use opc_key::{KeyProvider, KeyPurpose, KmsKeyProvider};
 use opc_nacm::{ModuleRegistry, NacmAction, NacmEvaluator, NacmPolicy};
 use opc_persist::{AuditRecord, CommitRecord, CommitSource, ConfigStore, RollbackTarget};
+use opc_redaction::{DigestKey, RedactionLevel, TelcoIdentifier};
 use opc_runtime::{
     health::HealthResponse, Builder, Criticality, HealthModel, Readiness, RestartPolicy,
     RuntimeError, RuntimeHandle, RuntimePhase, RuntimeProfile, ShutdownToken, Supervisor, TaskKind,
@@ -38,10 +41,85 @@ use opc_session_store::{
     FencedSessionReplica, Generation, OwnerId, QuorumSessionStore, SessionBackend, SessionKey,
     SessionKeyType, SessionLeaseManager, StateClass, StateType, StoredSessionRecord,
 };
+use opc_testbed::Clock as TestClock;
 use opc_types::{ConfigVersion, NetworkFunctionKind, SchemaDigest, TenantId, Timestamp, TxId};
 
 pub const AMF_SCHEMA_DIGEST: &str =
     "9876543210abcdef9876543210abcdef9876543210abcdef9876543210abcdef";
+
+const AMF_SCHEMA_DIGEST_BYTES: [u8; 32] = [
+    0x98, 0x76, 0x54, 0x32, 0x10, 0xab, 0xcd, 0xef, 0x98, 0x76, 0x54, 0x32, 0x10, 0xab, 0xcd, 0xef,
+    0x98, 0x76, 0x54, 0x32, 0x10, 0xab, 0xcd, 0xef, 0x98, 0x76, 0x54, 0x32, 0x10, 0xab, 0xcd, 0xef,
+];
+const AMF_NF_KIND: &str = "amf";
+const AMF_OWNER_ID: &str = "amf-lite-1";
+const SUBSCRIBER_CONTEXT_STATE_TYPE: &str = "subscriber-context";
+const SYSTEM_TENANT: &str = "system";
+const SUBSCRIBER_PRIVACY_KEY_DOMAIN: &[u8] = b"opc-amf-lite/subscriber-privacy-key/v1";
+
+type BoxError = Box<dyn Error + Send + Sync>;
+
+fn static_value_error(kind: &'static str, err: impl std::fmt::Display) -> BoxError {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("invalid static AMF {kind}: {err}"),
+    ))
+}
+
+fn amf_nf_kind() -> Result<NetworkFunctionKind, BoxError> {
+    NetworkFunctionKind::new(AMF_NF_KIND).map_err(|err| static_value_error("NF kind", err))
+}
+
+fn amf_owner_id() -> Result<OwnerId, BoxError> {
+    OwnerId::new(AMF_OWNER_ID).map_err(|err| static_value_error("owner id", err))
+}
+
+fn subscriber_context_state_type() -> Result<StateType, BoxError> {
+    StateType::new(SUBSCRIBER_CONTEXT_STATE_TYPE)
+        .map_err(|err| static_value_error("session state type", err))
+}
+
+fn session_key_from_pseudonym(pseudonym: &str) -> Result<SessionKey, BoxError> {
+    Ok(SessionKey {
+        tenant: TenantId::new(SYSTEM_TENANT)?,
+        nf_kind: amf_nf_kind()?,
+        key_type: SessionKeyType::SubscriberContext,
+        stable_id: bytes::Bytes::copy_from_slice(pseudonym.as_bytes()),
+    })
+}
+
+fn amf_yang_path(path: &'static str) -> Result<YangPath, CommitError> {
+    YangPath::new(path).map_err(|err| {
+        CommitError::state_machine_fault(format!(
+            "invalid static AMF YANG path {path}: {}",
+            err.message()
+        ))
+    })
+}
+
+fn amf_changed_paths(
+    current: &AmfConfig,
+    candidate: &AmfConfig,
+) -> Result<Vec<YangPath>, CommitError> {
+    let mut paths = Vec::new();
+    if current.hostname != candidate.hostname {
+        paths.push(amf_yang_path("/amf/hostname")?);
+    }
+    if current.nrf_endpoint != candidate.nrf_endpoint {
+        paths.push(amf_yang_path("/amf/nrf-endpoint")?);
+    }
+    if current.plmn_id != candidate.plmn_id {
+        paths.push(amf_yang_path("/amf/plmn-id")?);
+    }
+    if current.capacity != candidate.capacity {
+        paths.push(amf_yang_path("/amf/capacity")?);
+    }
+    if paths.is_empty() {
+        paths.push(amf_yang_path("/amf")?);
+    }
+
+    Ok(paths)
+}
 
 /// Typed configuration for the AMF-lite vertical slice.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -67,7 +145,7 @@ impl OpcConfig for AmfConfig {
     type Delta = String;
 
     fn schema_digest(&self) -> SchemaDigest {
-        SchemaDigest::from_str(AMF_SCHEMA_DIGEST).expect("valid amf schema digest")
+        SchemaDigest::from_bytes(AMF_SCHEMA_DIGEST_BYTES)
     }
 
     fn diff(&self, previous: &Self) -> Result<Vec<Self::Delta>, ConfigError> {
@@ -154,10 +232,16 @@ impl OpcConfig for AmfConfig {
 /// Rich session state for UE Context.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UeSessionContext {
-    pub imsi: String,
+    pub subscriber_pseudonym: String,
+    pub subscriber_identity: String,
     pub state: String,
     pub amf_ue_ngap_id: u64,
     pub last_updated: Timestamp,
+}
+
+struct SubscriberPrivacyAlias {
+    pseudonym: String,
+    redacted_identity: String,
 }
 
 /// Helper to add a std Duration to opc_types::Timestamp
@@ -423,13 +507,26 @@ struct AmfLiteState {
     active_nrf_registration: bool,
 }
 
+struct SystemAmfClock;
+
+impl TestClock for SystemAmfClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::now_utc()
+    }
+
+    fn monotonic(&self) -> Instant {
+        Instant::now()
+    }
+}
+
 /// AMF-lite network function orchestrating the entire SDK substrate.
 pub struct AmfLite {
     runtime: RuntimeHandle,
     config_bus: ConfigBus<AmfConfig>,
     session_store: QuorumSessionStore,
     alarms: SharedAlarmManager,
-    _kms_provider: Arc<KmsKeyProvider>,
+    kms_provider: Arc<KmsKeyProvider>,
+    clock: Arc<dyn TestClock>,
     state: Arc<RwLock<AmfLiteState>>,
     state_notify: Arc<Notify>,
     _phase_notify: Arc<Notify>,
@@ -448,6 +545,33 @@ impl AmfLite {
         admin_addr: SocketAddr,
         nacm_policy: Arc<NacmPolicy>,
         nacm_modules: Arc<ModuleRegistry>,
+    ) -> Result<Self, RuntimeError> {
+        Self::start_with_clock(
+            initial_config,
+            config_store,
+            session_replicas,
+            kms_endpoint,
+            auth_token,
+            admin_addr,
+            nacm_policy,
+            nacm_modules,
+            Arc::new(SystemAmfClock),
+        )
+        .await
+    }
+
+    /// Launches the AMF-lite network function with an injected clock.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_clock(
+        initial_config: AmfConfig,
+        config_store: Arc<dyn ConfigStore>,
+        session_replicas: Vec<FencedSessionReplica>,
+        kms_endpoint: String,
+        auth_token: Option<String>,
+        admin_addr: SocketAddr,
+        nacm_policy: Arc<NacmPolicy>,
+        nacm_modules: Arc<ModuleRegistry>,
+        clock: Arc<dyn TestClock>,
     ) -> Result<Self, RuntimeError> {
         let alarms = SharedAlarmManager::default();
 
@@ -519,45 +643,22 @@ impl AmfLite {
         let runtime = Builder::new(profile)
             .with_alarm_manager(alarms.clone())
             .with_phase_observer(move |_| phase_notify_clone.notify_waiters())
-            .with_init(move |supervisor, shutdown| {
-                let supervisor = supervisor.clone();
-                let shutdown = shutdown.clone();
+            .try_with_init(move |supervisor, shutdown| {
                 let state = state_clone.clone();
                 let state_notify = state_notify_clone.clone();
                 let config_bus = config_bus_clone.clone();
                 let alarms = alarms_clone.clone();
 
                 Box::pin(async move {
-                    // Watcher task
-                    spawn_config_watcher(
-                        &supervisor,
-                        &shutdown,
+                    initialize_amf_runtime(
+                        supervisor,
+                        shutdown,
                         config_bus,
-                        state.clone(),
-                        state_notify.clone(),
-                        alarms.clone(),
+                        state,
+                        state_notify,
+                        alarms,
                     )
                     .await
-                    .expect("watcher spawn failed");
-
-                    // Worker task (NRF Registration mock simulator)
-                    spawn_registration_worker(
-                        &supervisor,
-                        &shutdown,
-                        state.clone(),
-                        state_notify.clone(),
-                    )
-                    .await
-                    .expect("registration worker spawn failed");
-
-                    // Mark health status ready
-                    {
-                        let mut st = state.write().await;
-                        st.health.set_listeners_bound(true);
-                        st.health.set_security_material_valid(true);
-                        st.health.set_backends_reachable(true);
-                        st.health.set_critical_tasks_healthy(true);
-                    }
                 })
             })
             .build()
@@ -581,7 +682,8 @@ impl AmfLite {
             config_bus,
             session_store,
             alarms,
-            _kms_provider: kms_provider,
+            kms_provider,
+            clock,
             state,
             state_notify,
             _phase_notify: phase_notify,
@@ -592,6 +694,40 @@ impl AmfLite {
         amf.complete_startup(Duration::from_secs(5)).await?;
 
         Ok(amf)
+    }
+
+    fn now(&self) -> Timestamp {
+        self.clock.now()
+    }
+
+    async fn subscriber_privacy_alias(
+        &self,
+        imsi: &str,
+    ) -> Result<SubscriberPrivacyAlias, BoxError> {
+        let tenant = TenantId::new(SYSTEM_TENANT)?;
+        let key_handle = self
+            .kms_provider
+            .get_active_key(KeyPurpose::Session, &tenant)
+            .await?;
+        let digest_key = DigestKey::new(
+            key_handle.keyed_digest(SUBSCRIBER_PRIVACY_KEY_DOMAIN, b"subscriber-supi"),
+        );
+        let digest = opc_privacy::hash_identifier(&digest_key, IdentifierType::Supi, imsi);
+        let redacted_identity = TelcoIdentifier::new(IdentifierType::Imsi, imsi)
+            .redact(RedactionLevel::Class, None)
+            .to_string();
+
+        Ok(SubscriberPrivacyAlias {
+            pseudonym: format!("supi-digest:{digest}"),
+            redacted_identity,
+        })
+    }
+
+    /// Derives the backend-visible session key for a subscriber without
+    /// exposing the permanent identifier in store keys.
+    pub async fn session_key_for_subscriber(&self, imsi: &str) -> Result<SessionKey, BoxError> {
+        let alias = self.subscriber_privacy_alias(imsi).await?;
+        session_key_from_pseudonym(&alias.pseudonym)
     }
 
     async fn complete_startup(&self, timeout: Duration) -> Result<(), RuntimeError> {
@@ -626,16 +762,12 @@ impl AmfLite {
         imsi: &str,
         amf_ue_ngap_id: u64,
         lease_ttl: Duration,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let key = SessionKey {
-            tenant: TenantId::new("system")?,
-            nf_kind: NetworkFunctionKind::new("amf").unwrap(),
-            key_type: SessionKeyType::SubscriberContext,
-            stable_id: bytes::Bytes::copy_from_slice(imsi.as_bytes()),
-        };
+    ) -> Result<(), BoxError> {
+        let alias = self.subscriber_privacy_alias(imsi).await?;
+        let key = session_key_from_pseudonym(&alias.pseudonym)?;
 
         // Acquire lease (fenced CAS lease)
-        let owner = OwnerId::new("amf-lite-1").unwrap();
+        let owner = amf_owner_id()?;
         let lease = self
             .session_store
             .acquire(&key, owner.clone(), lease_ttl)
@@ -657,11 +789,13 @@ impl AmfLite {
                 );
             })?;
 
+        let now = self.now();
         let ctx = UeSessionContext {
-            imsi: imsi.to_string(),
+            subscriber_pseudonym: alias.pseudonym,
+            subscriber_identity: alias.redacted_identity,
             state: "REGISTERED".to_string(),
             amf_ue_ngap_id,
-            last_updated: Timestamp::now_utc(),
+            last_updated: now,
         };
 
         let value_bytes = serde_json::to_vec(&ctx)?;
@@ -671,8 +805,8 @@ impl AmfLite {
             owner,
             fence: lease.fence(),
             state_class: StateClass::AuthoritativeSession,
-            state_type: StateType::new("subscriber-context").unwrap(),
-            expires_at: Some(add_duration(Timestamp::now_utc(), lease_ttl)),
+            state_type: subscriber_context_state_type()?,
+            expires_at: Some(add_duration(now, lease_ttl)),
             payload: EncryptedSessionPayload::new(value_bytes),
         };
 
@@ -691,17 +825,8 @@ impl AmfLite {
     }
 
     /// Updates UE session state.
-    pub async fn update_ue_session(
-        &self,
-        imsi: &str,
-        new_state: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let key = SessionKey {
-            tenant: TenantId::new("system")?,
-            nf_kind: NetworkFunctionKind::new("amf").unwrap(),
-            key_type: SessionKeyType::SubscriberContext,
-            stable_id: bytes::Bytes::copy_from_slice(imsi.as_bytes()),
-        };
+    pub async fn update_ue_session(&self, imsi: &str, new_state: &str) -> Result<(), BoxError> {
+        let key = self.session_key_for_subscriber(imsi).await?;
 
         // Load latest UE Context
         let latest = self
@@ -715,7 +840,8 @@ impl AmfLite {
 
         let mut ctx: UeSessionContext = serde_json::from_slice(&plaintext_payload)?;
         ctx.state = new_state.to_string();
-        ctx.last_updated = Timestamp::now_utc();
+        let now = self.now();
+        ctx.last_updated = now;
 
         // Perform mutation under fence
         let value_bytes = serde_json::to_vec(&ctx)?;
@@ -733,7 +859,7 @@ impl AmfLite {
             fence: lease.fence(),
             state_class: latest.state_class,
             state_type: latest.state_type.clone(),
-            expires_at: Some(add_duration(Timestamp::now_utc(), Duration::from_secs(5))),
+            expires_at: Some(add_duration(now, Duration::from_secs(5))),
             payload: EncryptedSessionPayload::new(value_bytes),
         };
 
@@ -761,23 +887,7 @@ impl AmfLite {
     ) -> Result<CommitResult, CommitError> {
         let current_snapshot = self.config_bus.current_snapshot();
         let current = current_snapshot.config.as_ref();
-
-        let mut paths = Vec::new();
-        if current.hostname != candidate.hostname {
-            paths.push(YangPath::new("/amf/hostname").unwrap());
-        }
-        if current.nrf_endpoint != candidate.nrf_endpoint {
-            paths.push(YangPath::new("/amf/nrf-endpoint").unwrap());
-        }
-        if current.plmn_id != candidate.plmn_id {
-            paths.push(YangPath::new("/amf/plmn-id").unwrap());
-        }
-        if current.capacity != candidate.capacity {
-            paths.push(YangPath::new("/amf/capacity").unwrap());
-        }
-        if paths.is_empty() {
-            paths.push(YangPath::new("/amf").unwrap());
-        }
+        let paths = amf_changed_paths(current, &candidate)?;
 
         let request = CommitRequest::commit(
             RequestId::new(),
@@ -787,7 +897,7 @@ impl AmfLite {
             ConfigOperation::Replace,
             candidate,
             paths,
-            Instant::now() + Duration::from_secs(2),
+            self.clock.monotonic() + Duration::from_secs(2),
         )
         .with_base_version(current_snapshot.version);
 
@@ -803,23 +913,7 @@ impl AmfLite {
     ) -> Result<CommitResult, CommitError> {
         let current_snapshot = self.config_bus.current_snapshot();
         let current = current_snapshot.config.as_ref();
-
-        let mut paths = Vec::new();
-        if current.hostname != candidate.hostname {
-            paths.push(YangPath::new("/amf/hostname").unwrap());
-        }
-        if current.nrf_endpoint != candidate.nrf_endpoint {
-            paths.push(YangPath::new("/amf/nrf-endpoint").unwrap());
-        }
-        if current.plmn_id != candidate.plmn_id {
-            paths.push(YangPath::new("/amf/plmn-id").unwrap());
-        }
-        if current.capacity != candidate.capacity {
-            paths.push(YangPath::new("/amf/capacity").unwrap());
-        }
-        if paths.is_empty() {
-            paths.push(YangPath::new("/amf").unwrap());
-        }
+        let paths = amf_changed_paths(current, &candidate)?;
 
         let request = CommitRequest::new(
             RequestId::new(),
@@ -828,7 +922,7 @@ impl AmfLite {
             RequestSource::Northbound,
             ConfigOperation::Replace,
             mode,
-            Instant::now() + Duration::from_secs(5),
+            self.clock.monotonic() + Duration::from_secs(5),
             Some(candidate),
             paths,
         )
@@ -910,6 +1004,40 @@ impl AmfLite {
 }
 
 // Helper tasks
+async fn initialize_amf_runtime(
+    supervisor: Supervisor,
+    shutdown: ShutdownToken,
+    config_bus: ConfigBus<AmfConfig>,
+    state: Arc<RwLock<AmfLiteState>>,
+    state_notify: Arc<Notify>,
+    alarms: SharedAlarmManager,
+) -> Result<(), RuntimeError> {
+    // Watcher task
+    spawn_config_watcher(
+        &supervisor,
+        &shutdown,
+        config_bus,
+        state.clone(),
+        state_notify.clone(),
+        alarms,
+    )
+    .await?;
+
+    // Worker task (NRF Registration mock simulator)
+    spawn_registration_worker(&supervisor, &shutdown, state.clone(), state_notify.clone()).await?;
+
+    // Mark health status ready
+    {
+        let mut st = state.write().await;
+        st.health.set_listeners_bound(true);
+        st.health.set_security_material_valid(true);
+        st.health.set_backends_reachable(true);
+        st.health.set_critical_tasks_healthy(true);
+    }
+
+    Ok(())
+}
+
 async fn spawn_config_watcher(
     supervisor: &Supervisor,
     shutdown: &ShutdownToken,
@@ -1017,4 +1145,79 @@ async fn spawn_registration_worker(
     Ok(())
 }
 
-use std::time::Instant;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opc_config_bus::InMemoryManagedDatastore;
+
+    #[test]
+    fn schema_digest_bytes_match_public_hex() {
+        assert_eq!(
+            SchemaDigest::from_bytes(AMF_SCHEMA_DIGEST_BYTES).to_hex(),
+            AMF_SCHEMA_DIGEST
+        );
+    }
+
+    #[tokio::test]
+    async fn init_spawn_failure_returns_runtime_error() {
+        let alarms = SharedAlarmManager::default();
+        let config_bus = ConfigBus::restore_or_new_with_alarm_manager_dev_only(
+            AmfConfig::default(),
+            Arc::new(InMemoryManagedDatastore::new()),
+            alarms.clone(),
+        )
+        .await
+        .expect("config bus initializes");
+
+        let mut health = HealthModel::new();
+        health.set_startup_in_progress("AMFInit");
+        health.set_config_applied(true);
+        let state = Arc::new(RwLock::new(AmfLiteState {
+            config: AmfConfig::default(),
+            version: ConfigVersion::INITIAL,
+            health,
+            active_nrf_registration: false,
+        }));
+        let state_notify = Arc::new(Notify::new());
+
+        let mut profile = RuntimeProfile::production("amf-lite", uuid::Uuid::new_v4());
+        profile.budget = Some(opc_runtime::ResourceBudget {
+            max_tasks: 1,
+            ..Default::default()
+        });
+        profile.shutdown_grace = Duration::from_millis(50);
+        profile.drain_timeout = Duration::from_millis(200);
+
+        let result = Builder::new(profile)
+            .with_alarm_manager(alarms.clone())
+            .try_with_init(move |supervisor, shutdown| {
+                Box::pin(async move {
+                    initialize_amf_runtime(
+                        supervisor,
+                        shutdown,
+                        config_bus,
+                        state,
+                        state_notify,
+                        alarms,
+                    )
+                    .await
+                })
+            })
+            .build()
+            .await;
+
+        match result {
+            Err(RuntimeError::Supervisor(message)) => {
+                assert!(
+                    message.contains("max tasks limit reached"),
+                    "unexpected supervisor error: {message}"
+                );
+            }
+            Err(err) => panic!("expected supervisor budget error, got {err:?}"),
+            Ok(handle) => {
+                handle.shutdown().await;
+                panic!("expected startup to fail when spawn budget is exhausted");
+            }
+        }
+    }
+}

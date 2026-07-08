@@ -22,10 +22,11 @@ pub mod unsupported;
 
 pub use backend::XfrmBackend;
 pub use composite::{
-    install_sa_policy_with_rollback, rekey_sa_policy, remove_policy_sa, XfrmCompositeInstallError,
-    XfrmCompositeInstallRequest, XfrmCompositeOperation, XfrmCompositeOutcome,
-    XFRM_COMPOSITE_INSTALL_ORDER, XFRM_COMPOSITE_INSTALL_ROLLBACK_ORDER,
-    XFRM_COMPOSITE_REKEY_ORDER, XFRM_COMPOSITE_REMOVE_ORDER,
+    install_bidirectional_sa_policy_with_rollback, install_sa_policy_with_rollback,
+    rekey_sa_policy, remove_policy_sa, XfrmBidirectionalInstallError,
+    XfrmBidirectionalInstallOutcome, XfrmCompositeInstallError, XfrmCompositeInstallRequest,
+    XfrmCompositeOperation, XfrmCompositeOutcome, XFRM_COMPOSITE_INSTALL_ORDER,
+    XFRM_COMPOSITE_INSTALL_ROLLBACK_ORDER, XFRM_COMPOSITE_REKEY_ORDER, XFRM_COMPOSITE_REMOVE_ORDER,
 };
 pub use error::XfrmError;
 #[cfg(feature = "ikev2")]

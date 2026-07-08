@@ -21,7 +21,8 @@
 //! - rejects key predicates on non-list segments;
 //! - rejects malformed segment and key names before lookup/rendering, so
 //!   malformed input is never echoed as an unknown path;
-//! - escapes key values once, so callers never hand-concatenate paths.
+//! - validates key values and renders them as standards-compatible single-quoted
+//!   predicate literals, so callers never hand-concatenate paths.
 //!
 //! It returns the predicate-free schema path (for registry / NACM lookup) and the
 //! instance-aware canonical [`YangPath`] (for commit metadata and audit).
@@ -105,6 +106,10 @@ pub struct ResolvedPath {
     pub schema_path: String,
     /// Instance-aware canonical path for commit metadata and audit, e.g.
     /// `/sys:system/sys:user[sys:name='admin']`.
+    ///
+    /// List key values are rendered as XPath/YANG single-quoted predicate
+    /// literals. Values containing `'` fail closed instead of using a private
+    /// escape convention that standards-compliant consumers would misparse.
     pub canonical: YangPath,
     /// The resolved target node.
     pub node: &'static NodeMeta,
@@ -336,6 +341,7 @@ fn render_keys(
         let (prefix, bare) = parse_qualified_name(k).ok_or_else(|| {
             PathError::Malformed(format!("invalid key name for list '{}'", list.path))
         })?;
+        validate_key_value(list.path, v)?;
         if !key_prefix_matches(registry, list, prefix, bare) {
             return Err(PathError::UnexpectedKeys {
                 list: list.path.to_string(),
@@ -384,13 +390,22 @@ fn render_keys(
     for kl in list.key_leaves {
         let bare = bare_segment(kl);
         let value = provided.get(bare).expect("validated present above");
-        let escaped = escape_key_value(value);
         match prefix_of(kl).or(key_prefix) {
-            Some(prefix) => out.push_str(&format!("[{prefix}:{bare}='{escaped}']")),
-            None => out.push_str(&format!("[{bare}='{escaped}']")),
+            Some(prefix) => out.push_str(&format!("[{prefix}:{bare}='{value}']")),
+            None => out.push_str(&format!("[{bare}='{value}']")),
         }
     }
 
+    Ok(())
+}
+
+fn validate_key_value(list_path: &str, value: &str) -> Result<(), PathError> {
+    if value.contains('\'') {
+        return Err(PathError::Malformed(format!(
+            "invalid key value for list '{}'",
+            list_path
+        )));
+    }
     Ok(())
 }
 
@@ -484,12 +499,6 @@ fn module_for_prefix(
 /// Returns the module prefix of a `prefix:name` segment, if present.
 fn prefix_of(seg: &str) -> Option<&str> {
     seg.split_once(':').map(|(prefix, _)| prefix)
-}
-
-/// Escapes a key value for single-quoted predicate form (`\` then `'`), so the
-/// SDK path parser round-trips it.
-fn escape_key_value(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
 #[cfg(test)]
@@ -762,15 +771,27 @@ mod tests {
     }
 
     #[test]
-    fn key_values_are_escaped_once() {
+    fn key_value_single_quote_fails_closed_without_leaking_value() {
         let req = RequestPath::from_elems([
             PathSegment::new("system"),
-            PathSegment::with_keys("user", [("name", "o'brien\\x")]),
+            PathSegment::with_keys("user", [("name", "n3' or if:name='n6")]),
+        ]);
+        let err = resolve(&TestReg, &req).unwrap_err();
+        assert!(matches!(err, PathError::Malformed(_)));
+        assert!(!err.to_string().contains("n3"));
+        assert!(!err.to_string().contains("n6"));
+    }
+
+    #[test]
+    fn key_value_xpath_literal_safe_delimiters_round_trip() {
+        let req = RequestPath::from_elems([
+            PathSegment::new("system"),
+            PathSegment::with_keys("user", [("name", r#"a\b]c/d=e"q"#)]),
         ]);
         let resolved = resolve(&TestReg, &req).expect("resolve");
         assert_eq!(
             resolved.canonical.as_str(),
-            "/sys:system/sys:user[sys:name='o\\'brien\\\\x']"
+            r#"/sys:system/sys:user[sys:name='a\b]c/d=e"q']"#
         );
     }
 

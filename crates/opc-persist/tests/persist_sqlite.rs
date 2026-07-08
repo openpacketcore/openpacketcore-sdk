@@ -66,9 +66,217 @@ async fn open_migrates_schema_version_1_0_0_to_alarm_audit_schema() {
         .query_row("SELECT COUNT(*) FROM alarm_audit", [], |row| row.get(0))
         .expect("query migrated alarm audit table");
 
-    assert_eq!(sdk_version, "1.5.0");
+    assert_eq!(sdk_version, "1.8.1");
     assert_ne!(schema_digest, "legacy-digest");
     assert_eq!(alarm_audit_count, 1);
+}
+
+#[tokio::test]
+async fn open_migrates_schema_version_1_4_0_to_current_schema() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = temp_dir.path().join("test_schema_migration_1_4_0.db");
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open legacy database");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_digest TEXT NOT NULL,
+                sdk_version TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (id, schema_digest, sdk_version, created_at)
+            VALUES (1, 'legacy-digest-1-4', '1.4.0', datetime('now'));
+            "#,
+        )
+        .expect("seed legacy 1.4.0 schema version");
+    }
+
+    SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect("open and migrate 1.4.0 backend");
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open migrated database");
+    let sdk_version: String = conn
+        .query_row(
+            "SELECT sdk_version FROM schema_version WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read migrated schema version");
+    let schema_digest: String = conn
+        .query_row(
+            "SELECT schema_digest FROM schema_version WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read migrated schema digest");
+
+    assert_eq!(sdk_version, "1.8.1");
+    assert_ne!(schema_digest, "legacy-digest-1-4");
+}
+
+#[tokio::test]
+async fn open_fails_when_live_schema_digest_differs_from_stored_digest() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = temp_dir.path().join("schema_digest_drift.db");
+
+    let backend = SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect("open backend");
+    drop(backend);
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open database for drift");
+        conn.execute(
+            "ALTER TABLE alarm_audit ADD COLUMN unexpected_drift TEXT",
+            [],
+        )
+        .expect("mutate live schema without updating digest");
+    }
+
+    let err = SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect_err("schema digest drift must fail open");
+    assert!(
+        err.to_string().contains("schema digest mismatch"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn open_migrates_legacy_audit_hmacs_to_count_bound_anchor() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = temp_dir.path().join("legacy_audit_hmacs.db");
+    let audit_key = test_audit_key();
+    let tx_id = TxId::new();
+    let record = make_commit_record(tx_id, 1);
+    let mut audit = vec![
+        persist_common::make_audit_record(tx_id, 0, "/legacy/a"),
+        persist_common::make_audit_record(tx_id, 1, "/legacy/b"),
+    ];
+
+    let mut prev_hash = [0u8; 32];
+    for entry in &mut audit {
+        entry.previous_hash = prev_hash;
+        entry.entry_hmac = entry.calculate_hmac(&audit_key, "test");
+        prev_hash = entry.entry_hmac;
+    }
+    let legacy_first_hmac = audit[0].entry_hmac;
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open legacy database");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_digest TEXT NOT NULL,
+                sdk_version TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (id, schema_digest, sdk_version, created_at)
+            VALUES (1, 'legacy-digest', '1.5.0', datetime('now'));
+
+            CREATE TABLE config_history (
+                tx_id BLOB PRIMARY KEY,
+                parent_tx_id BLOB NULL,
+                version INTEGER NOT NULL UNIQUE,
+                committed_at TEXT NOT NULL,
+                principal TEXT NOT NULL,
+                source TEXT NOT NULL,
+                schema_digest BLOB NOT NULL,
+                plaintext_digest BLOB NOT NULL,
+                encrypted_blob BLOB NOT NULL,
+                rollback_point INTEGER NOT NULL DEFAULT 0,
+                rollback_label TEXT NULL,
+                confirmed_deadline TEXT NULL,
+                confirmed_at TEXT NULL
+            );
+
+            CREATE TABLE audit_trail (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tx_id BLOB NOT NULL,
+                sequence INTEGER NOT NULL,
+                yang_path TEXT NOT NULL,
+                op_type TEXT NOT NULL,
+                previous_value TEXT NULL,
+                new_value TEXT NULL,
+                redaction_applied INTEGER NOT NULL DEFAULT 0,
+                previous_hash BLOB NOT NULL,
+                entry_hmac BLOB NOT NULL,
+                UNIQUE(tx_id, sequence)
+            );
+            "#,
+        )
+        .expect("seed legacy schema");
+
+        conn.execute(
+            "INSERT INTO config_history (tx_id, parent_tx_id, version, committed_at, principal, source, schema_digest, plaintext_digest, encrypted_blob, rollback_point, rollback_label, confirmed_deadline, confirmed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                tx_id.as_uuid().as_bytes(),
+                Option::<&[u8]>::None,
+                1_i64,
+                record.committed_at.to_string(),
+                record.principal,
+                "local_operator",
+                record.schema_digest.as_bytes(),
+                record.plaintext_digest,
+                record.encrypted_blob,
+                0_i64,
+                Option::<&str>::None,
+                Option::<&str>::None,
+                Option::<&str>::None,
+            ],
+        )
+        .expect("insert legacy config");
+
+        for entry in &audit {
+            conn.execute(
+                "INSERT INTO audit_trail (tx_id, sequence, yang_path, op_type, previous_value, new_value, redaction_applied, previous_hash, entry_hmac) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    tx_id.as_uuid().as_bytes(),
+                    i64::from(entry.sequence),
+                    entry.yang_path.as_str(),
+                    "CREATE",
+                    entry.previous_value.as_deref(),
+                    entry.new_value.as_deref(),
+                    0_i64,
+                    &entry.previous_hash[..],
+                    &entry.entry_hmac[..],
+                ],
+            )
+            .expect("insert legacy audit row");
+        }
+    }
+
+    let backend = SqliteBackend::open_with_audit_key(&db_path, true, 0, audit_key.clone())
+        .await
+        .expect("open and reseal legacy audit rows");
+    let loaded = backend
+        .load_latest()
+        .await
+        .expect("load migrated config")
+        .expect("config exists");
+
+    assert_eq!(loaded.audit.len(), 2);
+    assert_ne!(loaded.audit[0].entry_hmac, legacy_first_hmac);
+    loaded
+        .verify_audit_chain(&audit_key)
+        .expect("migrated audit chain uses count-bound HMACs");
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open migrated database");
+    let (audit_count, terminal_hash): (i64, Vec<u8>) = conn
+        .query_row(
+            "SELECT audit_count, audit_terminal_hash FROM config_history WHERE tx_id = ?1",
+            rusqlite::params![tx_id.as_uuid().as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read migrated audit anchor");
+    assert_eq!(audit_count, 2);
+    assert_eq!(terminal_hash, loaded.audit[1].entry_hmac.to_vec());
 }
 
 #[tokio::test]
@@ -219,7 +427,7 @@ async fn preflight_returns_capabilities() {
 }
 
 #[tokio::test]
-async fn preflight_ephemeral_mode_skips_safety_checks() {
+async fn preflight_ephemeral_file_mode_reports_unchecked_durability_caps() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let db_path = temp_dir.path().join("test_ephemeral.db");
 
@@ -230,7 +438,13 @@ async fn preflight_ephemeral_mode_skips_safety_checks() {
     let caps = backend.preflight().await.expect("preflight should succeed");
 
     assert!(caps.ephemeral_mode);
-    assert!(caps.is_safe_for_writes());
+    assert!(!caps.fsync_available);
+    assert!(!caps.locking_compatible);
+    assert!(!caps.same_filesystem);
+    assert!(!caps.safe_filesystem);
+    assert!(!caps.directory_permissions_safe);
+    assert_eq!(caps.free_bytes, 0);
+    assert!(!caps.is_safe_for_writes());
 }
 
 #[tokio::test]
@@ -340,6 +554,26 @@ fn audit_key_rejects_all_zero_material() {
 }
 
 #[tokio::test]
+async fn ephemeral_backends_use_distinct_audit_hmac_keys() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path_a = temp_dir.path().join("ephemeral_a.db");
+    let db_path_b = temp_dir.path().join("ephemeral_b.db");
+
+    let backend_a = SqliteBackend::open(&db_path_a, true, 0)
+        .await
+        .expect("open first ephemeral backend");
+    let backend_b = SqliteBackend::open(&db_path_b, true, 0)
+        .await
+        .expect("open second ephemeral backend");
+
+    assert_ne!(
+        backend_a.audit_key().as_bytes(),
+        backend_b.audit_key().as_bytes(),
+        "ephemeral audit HMAC keys must not be a shared compile-time constant"
+    );
+}
+
+#[tokio::test]
 async fn durable_open_succeeds_when_database_directory_contains_single_quote() {
     let temp_dir = tempfile::Builder::new()
         .prefix("it's-safe-")
@@ -359,6 +593,29 @@ async fn durable_open_succeeds_when_database_directory_contains_single_quote() {
     assert!(
         caps.is_safe_for_writes(),
         "quoted path should remain safe for writes"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_backend_busy_timeout_is_capped_for_async_worker_profile() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = temp_dir.path().join("test_busy_timeout_cap.db");
+
+    let backend = SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect("open backend");
+
+    assert_eq!(SqliteBackend::MAX_CONCURRENT_DB_OPERATIONS, 1);
+
+    let conn = backend.conn();
+    let guard = conn.lock().await;
+    let busy_timeout_ms: u32 = guard
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .expect("query backend busy_timeout");
+
+    assert!(
+        busy_timeout_ms <= 100,
+        "busy_timeout must be capped to avoid pinning async workers, got {busy_timeout_ms}ms"
     );
 }
 

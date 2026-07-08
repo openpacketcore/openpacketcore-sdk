@@ -81,6 +81,14 @@ impl XfrmCompositeInstallRequest {
             spi: self.sa.parameters.id.spi,
         }
     }
+
+    /// Build the rollback request for the policy installed by this composite.
+    pub fn rollback_remove_policy(&self) -> RemovePolicyRequest {
+        RemovePolicyRequest {
+            selector: self.policy.parameters.selector.clone(),
+            direction: self.policy.parameters.direction,
+        }
+    }
 }
 
 /// Redaction-safe composite operation outcome.
@@ -210,6 +218,129 @@ impl Error for XfrmCompositeInstallError {
     }
 }
 
+/// Redaction-safe outcome for a two-direction SA/policy install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XfrmBidirectionalInstallOutcome {
+    /// True when both directions fully applied.
+    pub applied: bool,
+    /// Outcome for the first direction.
+    pub first: XfrmCompositeOutcome,
+    /// Outcome for the second direction.
+    pub second: XfrmCompositeOutcome,
+    /// True when the first direction was removed after second-direction failure.
+    pub cross_rolled_back: bool,
+    /// True when removing the first direction failed.
+    pub cross_rollback_failed: bool,
+    /// True when installed residue may remain in either direction.
+    pub partial_state_possible: bool,
+}
+
+impl XfrmBidirectionalInstallOutcome {
+    /// Both directions applied.
+    pub const fn applied(first: XfrmCompositeOutcome, second: XfrmCompositeOutcome) -> Self {
+        Self {
+            applied: true,
+            first,
+            second,
+            cross_rolled_back: false,
+            cross_rollback_failed: false,
+            partial_state_possible: false,
+        }
+    }
+
+    fn first_failed(first: XfrmCompositeOutcome) -> Self {
+        Self {
+            applied: false,
+            first,
+            second: XfrmCompositeOutcome::not_applied(XfrmCompositeOperation::InstallSa),
+            cross_rolled_back: false,
+            cross_rollback_failed: false,
+            partial_state_possible: first.partial_state_possible,
+        }
+    }
+
+    fn second_failed(
+        second: XfrmCompositeOutcome,
+        cross_rolled_back: bool,
+        cross_rollback_failed: bool,
+    ) -> Self {
+        Self {
+            applied: false,
+            first: XfrmCompositeOutcome::applied(),
+            second,
+            cross_rolled_back,
+            cross_rollback_failed,
+            partial_state_possible: second.partial_state_possible || cross_rollback_failed,
+        }
+    }
+}
+
+/// Error returned by a two-direction SA/policy install.
+#[derive(Debug, Clone)]
+pub enum XfrmBidirectionalInstallError {
+    /// First direction failed before the second direction was attempted.
+    FirstInstallFailed {
+        /// Backend/composite error from the first direction.
+        source: XfrmCompositeInstallError,
+        /// Bidirectional outcome evidence.
+        outcome: XfrmBidirectionalInstallOutcome,
+    },
+    /// Second direction failed and the first direction was rolled back.
+    SecondInstallRolledBack {
+        /// Backend/composite error from the second direction.
+        source: XfrmCompositeInstallError,
+        /// Bidirectional outcome evidence.
+        outcome: XfrmBidirectionalInstallOutcome,
+    },
+    /// Second direction failed and rollback of the first direction also failed.
+    SecondInstallRollbackFailed {
+        /// Backend/composite error from the second direction.
+        source: XfrmCompositeInstallError,
+        /// Backend error from first-direction rollback.
+        rollback: XfrmError,
+        /// Bidirectional outcome evidence.
+        outcome: XfrmBidirectionalInstallOutcome,
+    },
+}
+
+impl XfrmBidirectionalInstallError {
+    /// Stable machine-readable error code.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::FirstInstallFailed { .. } => "xfrm_bidirectional_first_install_failed",
+            Self::SecondInstallRolledBack { .. } => "xfrm_bidirectional_second_install_rolled_back",
+            Self::SecondInstallRollbackFailed { .. } => {
+                "xfrm_bidirectional_second_install_rollback_failed"
+            }
+        }
+    }
+
+    /// Return the bidirectional outcome evidence.
+    pub const fn outcome(&self) -> XfrmBidirectionalInstallOutcome {
+        match self {
+            Self::FirstInstallFailed { outcome, .. }
+            | Self::SecondInstallRolledBack { outcome, .. }
+            | Self::SecondInstallRollbackFailed { outcome, .. } => *outcome,
+        }
+    }
+}
+
+impl fmt::Display for XfrmBidirectionalInstallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Error for XfrmBidirectionalInstallError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::FirstInstallFailed { source, .. }
+            | Self::SecondInstallRolledBack { source, .. }
+            | Self::SecondInstallRollbackFailed { source, .. } => Some(source),
+        }
+    }
+}
+
 /// Install a Security Association and its Security Policy with best-effort rollback.
 ///
 /// Operation order is [`XFRM_COMPOSITE_INSTALL_ORDER`]. If policy install
@@ -252,6 +383,74 @@ where
     }
 
     Ok(XfrmCompositeOutcome::applied())
+}
+
+/// Install both directions of a Child SA and roll back cross-direction residue.
+///
+/// The first request is installed before the second. If the second direction
+/// fails, this helper removes the first direction's policy and SA in
+/// [`XFRM_COMPOSITE_REMOVE_ORDER`] so a half-installed bidirectional tunnel is
+/// not left behind.
+///
+/// # Errors
+///
+/// Returns [`XfrmBidirectionalInstallError`] with outcome evidence preserving
+/// both the failed composite result and any rollback failure.
+pub async fn install_bidirectional_sa_policy_with_rollback<B>(
+    backend: &B,
+    requests: [XfrmCompositeInstallRequest; 2],
+) -> Result<XfrmBidirectionalInstallOutcome, XfrmBidirectionalInstallError>
+where
+    B: XfrmBackend + ?Sized,
+{
+    let [first, second] = requests;
+
+    let first_outcome = match install_sa_policy_with_rollback(backend, first.clone()).await {
+        Ok(outcome) => outcome,
+        Err(source) => {
+            return Err(XfrmBidirectionalInstallError::FirstInstallFailed {
+                outcome: XfrmBidirectionalInstallOutcome::first_failed(source.outcome()),
+                source,
+            })
+        }
+    };
+
+    let second_outcome = match install_sa_policy_with_rollback(backend, second).await {
+        Ok(outcome) => outcome,
+        Err(source) => {
+            let second_outcome = source.outcome();
+            let rollback = remove_policy_sa(
+                backend,
+                first.rollback_remove_policy(),
+                first.rollback_remove_sa(),
+            )
+            .await;
+            return match rollback {
+                Ok(_) => Err(XfrmBidirectionalInstallError::SecondInstallRolledBack {
+                    outcome: XfrmBidirectionalInstallOutcome::second_failed(
+                        second_outcome,
+                        true,
+                        false,
+                    ),
+                    source,
+                }),
+                Err(rollback) => Err(XfrmBidirectionalInstallError::SecondInstallRollbackFailed {
+                    outcome: XfrmBidirectionalInstallOutcome::second_failed(
+                        second_outcome,
+                        false,
+                        true,
+                    ),
+                    source,
+                    rollback,
+                }),
+            };
+        }
+    };
+
+    Ok(XfrmBidirectionalInstallOutcome::applied(
+        first_outcome,
+        second_outcome,
+    ))
 }
 
 /// Rekey an SA plus policy using the SDK-defined composite order.
@@ -297,6 +496,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -312,6 +512,8 @@ mod tests {
         operations: Arc<Mutex<Vec<&'static str>>>,
         install_sa_error: Option<XfrmError>,
         install_policy_error: Option<XfrmError>,
+        install_policy_successes_before_failure: Option<usize>,
+        install_policy_calls: AtomicUsize,
         remove_sa_error: Option<XfrmError>,
     }
 
@@ -327,6 +529,14 @@ mod tests {
         fn with_sa_failure() -> Self {
             Self {
                 install_sa_error: Some(XfrmError::Unavailable),
+                ..Self::default()
+            }
+        }
+
+        fn with_second_policy_failure() -> Self {
+            Self {
+                install_policy_error: Some(XfrmError::Unavailable),
+                install_policy_successes_before_failure: Some(1),
                 ..Self::default()
             }
         }
@@ -390,7 +600,17 @@ mod tests {
 
         async fn install_policy(&self, _request: InstallPolicyRequest) -> Result<(), XfrmError> {
             self.record("install_policy");
-            if let Some(error) = self.install_policy_error.clone() {
+            let call_index = self.install_policy_calls.fetch_add(1, Ordering::Relaxed);
+            let should_fail = self
+                .install_policy_successes_before_failure
+                .map_or(self.install_policy_error.is_some(), |successes| {
+                    self.install_policy_error.is_some() && call_index >= successes
+                });
+            if should_fail {
+                let error = self
+                    .install_policy_error
+                    .clone()
+                    .unwrap_or(XfrmError::Unavailable);
                 return Err(error);
             }
             Ok(())
@@ -588,6 +808,42 @@ mod tests {
         assert_eq!(
             backend.operations(),
             vec!["rekey_sa", "rekey_policy", "remove_policy", "remove_sa"]
+        );
+    }
+
+    #[tokio::test]
+    async fn bidirectional_install_rolls_back_first_direction_when_second_fails() {
+        let backend = FailingCompositeBackend::with_second_policy_failure();
+
+        let error = match install_bidirectional_sa_policy_with_rollback(
+            &backend,
+            [install_request(), install_request()],
+        )
+        .await
+        {
+            Ok(value) => panic!("bidirectional install unexpectedly applied: {value:?}"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.as_str(),
+            "xfrm_bidirectional_second_install_rolled_back"
+        );
+        let outcome = error.outcome();
+        assert!(outcome.cross_rolled_back);
+        assert!(!outcome.cross_rollback_failed);
+        assert!(!outcome.partial_state_possible);
+        assert_eq!(
+            backend.operations(),
+            vec![
+                "install_sa",
+                "install_policy",
+                "install_sa",
+                "install_policy",
+                "remove_sa",
+                "remove_policy",
+                "remove_sa"
+            ]
         );
     }
 }

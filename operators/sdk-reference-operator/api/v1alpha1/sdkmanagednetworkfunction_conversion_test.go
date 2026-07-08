@@ -29,7 +29,7 @@ func TestConversionRoundTrip(t *testing.T) {
 			SessionBackend: "quorum",
 			AdminAuthRef: corev1.SecretReference{
 				Name:      "admin-token-secret",
-				Namespace: "default",
+				Namespace: "shared-security",
 			},
 			Identity: IdentityRequirements{
 				KmsEnabled:    true,
@@ -136,8 +136,7 @@ func TestConversionRoundTrip(t *testing.T) {
 		t.Errorf("Status changed during conversion round-trip")
 	}
 
-	// The namespace field on SecretReference gets populated back as the namespace of the object
-	if roundtrip.Spec.AdminAuthRef.Namespace != "default" {
-		t.Errorf("Expected AdminAuthRef.Namespace to be 'default', got '%s'", roundtrip.Spec.AdminAuthRef.Namespace)
+	if !reflect.DeepEqual(src.Spec.AdminAuthRef, roundtrip.Spec.AdminAuthRef) {
+		t.Errorf("AdminAuthRef changed during conversion round-trip")
 	}
 }

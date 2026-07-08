@@ -60,6 +60,22 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     // invariant (`SchemaRegistry::self_check`) regardless of caller input order.
     let mut sorted_nodes: Vec<&SchemaNode> = input.nodes.iter().collect();
     sorted_nodes.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut normalized_entries: Vec<(String, &str)> = sorted_nodes
+        .iter()
+        .map(|node| (normalized_node_path(&node.path), node.path.as_str()))
+        .collect();
+    normalized_entries.sort();
+    let normalized_index_inits: Vec<TokenStream> = normalized_entries
+        .iter()
+        .map(|(normalized_path, node_path)| {
+            quote! {
+                opc_mgmt_schema::NormalizedNodeEntry {
+                    normalized_path: #normalized_path,
+                    node_path: #node_path,
+                }
+            }
+        })
+        .collect();
     let mut node_inits = Vec::with_capacity(sorted_nodes.len());
     let mut range_inits = Vec::new();
     for node in sorted_nodes {
@@ -127,6 +143,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         };
 
         static NODES: &[NodeMeta] = &[ #(#node_inits),* ];
+        static NORMALIZED_NODE_INDEX: &[opc_mgmt_schema::NormalizedNodeEntry] =
+            &[ #(#normalized_index_inits),* ];
         static NUMERIC_RANGES: &[opc_mgmt_schema::NodeNumericRangeMeta] = &[ #(#range_inits),* ];
         static MODELS: &[ModelData] = &[ #(#model_inits),* ];
         static ORIGINS: &[OriginEntry] = &[ #(#origin_inits),* ];
@@ -147,6 +165,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             }
             fn nodes(&self) -> &'static [NodeMeta] {
                 NODES
+            }
+            fn normalized_node_index(&self) -> &'static [opc_mgmt_schema::NormalizedNodeEntry] {
+                NORMALIZED_NODE_INDEX
             }
             fn origins(&self) -> &'static [OriginEntry] {
                 ORIGINS
@@ -193,6 +214,17 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     };
 
     Ok(tokens.to_string())
+}
+
+fn normalized_node_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for (index, segment) in path.split('/').enumerate() {
+        if index > 0 {
+            out.push('/');
+        }
+        out.push_str(clean_segment(segment));
+    }
+    out
 }
 
 fn numeric_range_tokens(node: &SchemaNode) -> TokenStream {
@@ -373,9 +405,9 @@ fn leaf_type_tokens(t: &TypeRef) -> TokenStream {
 
 /// Maps the node's data class to a `DataClass` token. Mirrors
 /// `metadata.rs::map_data_class` for the known kebab-case classes and the
-/// name-heuristic fallback, but is **fail-closed**: an unknown non-empty
-/// `data_class` string is a generation error rather than a silent `Public`
-/// (which would under-redact a sensitive node).
+/// name-heuristic fallback. An unknown non-empty `data_class` string is a
+/// generation error rather than a silent `Public` (which would under-redact a
+/// sensitive node).
 fn data_class_tokens(node: &SchemaNode) -> Result<TokenStream, RustGenerationError> {
     if let Some(dc) = &node.data_class {
         Ok(match dc.as_str() {

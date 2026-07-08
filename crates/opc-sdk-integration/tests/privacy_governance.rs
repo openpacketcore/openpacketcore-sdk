@@ -3,7 +3,7 @@ use opc_evidence::{
     ConformanceStatus, DataGovernanceEvidenceReport, EvidenceRecord, GateEvaluator, GatePolicy,
     PolicyMode, RequirementId,
 };
-use opc_export::{ExportMetadata, ExportedItem, PayloadState};
+use opc_export::{ExportError, ExportMetadata, ExportedItem, PayloadState};
 use opc_privacy::{CohortRecord, MinimizationPolicy};
 use opc_redaction::{redact_support_bundle, BundleMode, DiagnosticEntry, RedactionLevel};
 use std::time::Duration;
@@ -129,9 +129,16 @@ fn test_export_metadata_and_validation_integration() {
     // Allows in development
     assert!(item.validate_for_export(false).is_ok());
 
-    // Allows if encrypted in production
+    // Rejects a caller relabeling cleartext as encrypted in production
     let mut encrypted_item = item.clone();
     encrypted_item.metadata.payload_state = PayloadState::Encrypted;
+    assert_eq!(
+        encrypted_item.validate_for_export(true),
+        Err(ExportError::PayloadStateInvalid)
+    );
+
+    // Allows if envelope-shaped encrypted bytes are supplied in production
+    encrypted_item.payload = valid_export_envelope_payload();
     assert!(encrypted_item.validate_for_export(true).is_ok());
 
     let mut mismatched_item = encrypted_item.clone();
@@ -144,6 +151,25 @@ fn test_export_metadata_and_validation_integration() {
         .retention_policy
         .policy_source_id = Some("   ".to_string());
     assert!(invalid_policy_item.validate_for_export(true).is_err());
+}
+
+fn valid_export_envelope_payload() -> Vec<u8> {
+    let key_id = b"backup-key-1";
+    let nonce = [0x42; 12];
+    let aad = b"export-aad";
+    let ciphertext_and_tag = [0x24; 16];
+    let mut out = Vec::new();
+    out.extend_from_slice(b"OPCE");
+    out.extend_from_slice(&1_u16.to_be_bytes());
+    out.extend_from_slice(&1_u16.to_be_bytes());
+    out.extend_from_slice(&(key_id.len() as u16).to_be_bytes());
+    out.extend_from_slice(&(nonce.len() as u16).to_be_bytes());
+    out.extend_from_slice(&(aad.len() as u32).to_be_bytes());
+    out.extend_from_slice(key_id);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(aad);
+    out.extend_from_slice(&ciphertext_and_tag);
+    out
 }
 
 #[test]

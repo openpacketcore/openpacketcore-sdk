@@ -228,6 +228,10 @@ pub fn evaluate_migration_readiness(
 pub trait MigrationDriver {
     /// Executes a single migration step.
     fn execute_step(&mut self, step: &MigrationStep) -> Result<(), String>;
+    /// Rolls back a previously successful migration step.
+    fn rollback_step(&mut self, _step: &MigrationStep) -> Result<(), String> {
+        Ok(())
+    }
     /// Marks the target version as successfully published/committed.
     fn publish_success(&mut self, target_version: ConfigVersion) -> Result<(), String>;
 }
@@ -244,18 +248,59 @@ pub fn execute_migration<D: MigrationDriver>(
         ));
     }
 
+    let mut applied_steps = Vec::new();
     for step in &plan.steps {
         if let Err(e) = driver.execute_step(step) {
             let sanitized = operator_lifecycle::sanitize_denial_message(&e);
-            return Err(format!("Migration aborted during step: {sanitized}"));
+            let rollback = rollback_applied_steps(plan, driver, &applied_steps);
+            return Err(aborted_with_rollback_message(
+                "Migration aborted during step",
+                &sanitized,
+                rollback,
+            ));
         }
+        applied_steps.push(step.clone());
     }
 
     // Finalize publish success
     if let Err(e) = driver.publish_success(plan.target_version) {
         let sanitized = operator_lifecycle::sanitize_denial_message(&e);
-        return Err(format!("Migration finalize failed: {sanitized}"));
+        let rollback = rollback_applied_steps(plan, driver, &applied_steps);
+        return Err(aborted_with_rollback_message(
+            "Migration finalize failed",
+            &sanitized,
+            rollback,
+        ));
     }
 
     Ok(())
+}
+
+fn rollback_applied_steps<D: MigrationDriver>(
+    plan: &MigrationPlan,
+    driver: &mut D,
+    applied_steps: &[MigrationStep],
+) -> Result<(), String> {
+    if !plan.rollback_eligible {
+        return Ok(());
+    }
+    for step in applied_steps.iter().rev() {
+        if let Err(err) = driver.rollback_step(step) {
+            return Err(operator_lifecycle::sanitize_denial_message(&err));
+        }
+    }
+    Ok(())
+}
+
+fn aborted_with_rollback_message(
+    prefix: &str,
+    sanitized_error: &str,
+    rollback: Result<(), String>,
+) -> String {
+    match rollback {
+        Ok(()) => format!("{prefix}: {sanitized_error}"),
+        Err(rollback_err) => {
+            format!("{prefix}: {sanitized_error}; rollback failed: {rollback_err}")
+        }
+    }
 }

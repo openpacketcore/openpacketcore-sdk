@@ -55,6 +55,7 @@ const AF_INET6: u16 = 10;
 const XFRM_INF: u64 = u64::MAX;
 const ENOENT: i32 = 2;
 const ESRCH: i32 = 3;
+const CAP_NET_ADMIN_BIT: u32 = 12;
 
 type SensitiveBuffer = Zeroizing<Vec<u8>>;
 
@@ -355,14 +356,29 @@ impl LinuxXfrmTransport for NetlinkXfrmTransport {
 
     fn probe(&self, _config: LinuxXfrmBackendConfig) -> XfrmProbe {
         match open_netlink_socket() {
-            Ok(_) => XfrmProbe {
-                kind: XfrmBackendKind::LinuxKernel,
-                platform_supported: true,
-                kernel_reachable: true,
-                net_admin_capable: true,
-                algorithms: XfrmCapability::Available,
-                details: Some("linux XFRM netlink socket reachable"),
-            },
+            Ok(_) => {
+                let net_admin_capable = process_has_cap_net_admin();
+                XfrmProbe {
+                    kind: XfrmBackendKind::LinuxKernel,
+                    platform_supported: true,
+                    kernel_reachable: true,
+                    net_admin_capable: net_admin_capable.unwrap_or(false),
+                    algorithms: if net_admin_capable == Some(false) {
+                        XfrmCapability::PermissionDenied
+                    } else {
+                        XfrmCapability::Available
+                    },
+                    details: match net_admin_capable {
+                        Some(true) => {
+                            Some("linux XFRM netlink socket reachable with CAP_NET_ADMIN")
+                        }
+                        Some(false) => {
+                            Some("linux XFRM netlink socket reachable without CAP_NET_ADMIN")
+                        }
+                        None => Some("linux XFRM netlink socket reachable; CAP_NET_ADMIN unknown"),
+                    },
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::Unsupported => XfrmProbe {
                 kind: XfrmBackendKind::LinuxKernel,
                 platform_supported: false,
@@ -389,6 +405,20 @@ impl LinuxXfrmTransport for NetlinkXfrmTransport {
             },
         }
     }
+}
+
+fn process_has_cap_net_admin() -> Option<bool> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    parse_cap_net_admin_from_status(&status)
+}
+
+fn parse_cap_net_admin_from_status(status: &str) -> Option<bool> {
+    let value = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))?
+        .trim();
+    let effective = u64::from_str_radix(value, 16).ok()?;
+    Some((effective & (1_u64 << CAP_NET_ADMIN_BIT)) != 0)
 }
 
 fn map_open_error(operation: &'static str, error: io::Error) -> XfrmError {
@@ -2185,6 +2215,20 @@ mod tests {
         let display = error.to_string();
         assert!(display.contains("netlink_ack"));
         assert!(display.contains("os error 97"));
+    }
+
+    #[test]
+    fn proc_status_cap_eff_reports_net_admin_bit() {
+        assert_eq!(
+            parse_cap_net_admin_from_status("Name:\ttest\nCapEff:\t0000000000001000\n"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_cap_net_admin_from_status("Name:\ttest\nCapEff:\t0000000000000000\n"),
+            Some(false)
+        );
+        assert_eq!(parse_cap_net_admin_from_status("Name:\ttest\n"), None);
+        assert_eq!(parse_cap_net_admin_from_status("CapEff:\tnot-hex\n"), None);
     }
 
     #[test]

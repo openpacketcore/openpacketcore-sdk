@@ -53,10 +53,14 @@
 //!   runners when the CNF binding explicitly advertises `:writable-running` and
 //!   implements the candidate builder hook. The server owns the NETCONF envelope
 //!   parser, bounded namespace-preserving `<config>` capture, NACM `exec`
-//!   authorization, running lock/write serialization, config-bus submission,
-//!   commit-error mapping, metrics, and audit. The CNF owns schema-aware XML to
-//!   config translation. This path supports running, candidate, and startup
-//!   targets only when their capabilities/backing facades are present;
+//!   authorization, per-node NACM write preflight for NETCONF-originated
+//!   running/candidate-commit/startup writes, running lock/write serialization,
+//!   config-bus submission, commit-error mapping, metrics, and audit. The CNF
+//!   owns schema-aware XML to config translation. The config bus authorizer
+//!   remains the durable commit gate and must still be wired with the same
+//!   production policy rather than a dev/test allow-all authorizer. This path
+//!   supports running, candidate, and startup targets only when their
+//!   capabilities/backing facades are present;
 //!   `test-only`, `continue-on-error`, and `rollback-on-error` fail closed.
 //! - Known-but-unimplemented NETCONF base operations are parsed only far
 //!   enough to preserve `message-id`, audit the failed attempt, and return

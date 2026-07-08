@@ -137,8 +137,20 @@ const PROCEDURE_CODE_PDU_SESSION_RESOURCE_SETUP: u8 = 29;
 const PROCEDURE_CODE_UE_CONTEXT_RELEASE: u8 = 41;
 const PROCEDURE_CODE_UPLINK_NAS_TRANSPORT: u8 = 46;
 
+const NGAP_PDU_WRAPPER_DEPTH: usize = 2;
+const NGAP_UNKNOWN_MESSAGE_DEPTH: usize = 3;
+const NGAP_TYPED_MESSAGE_DEPTH: usize = 5;
+
 fn length_error(len: usize, limit: usize) -> DecodeError {
     DecodeError::new(DecodeErrorCode::MessageLengthExceeded, len.min(limit))
+}
+
+fn enforce_depth(required: usize, ctx: DecodeContext) -> Result<(), DecodeError> {
+    if ctx.max_depth < required {
+        Err(DecodeError::new(DecodeErrorCode::DepthExceeded, 0))
+    } else {
+        Ok(())
+    }
 }
 
 /// Decode an NGAP PDU from a byte slice.
@@ -150,6 +162,7 @@ pub fn decode(buf: &[u8], ctx: DecodeContext) -> Result<Pdu, DecodeError> {
     if buf.len() > ctx.max_message_len {
         return Err(length_error(buf.len(), ctx.max_message_len));
     }
+    enforce_depth(NGAP_PDU_WRAPPER_DEPTH, ctx)?;
 
     // Decode a single PDU and capture the unconsumed remainder. `raw` must
     // cover ONLY the bytes this PDU actually consumed: copying the whole input
@@ -240,6 +253,7 @@ fn decode_message(
 
     macro_rules! decode_as {
         ($ty:ty, $variant:ident, $reason:literal) => {{
+            enforce_depth(NGAP_TYPED_MESSAGE_DEPTH, ctx)?;
             let msg: $ty = rasn::aper::decode(value).map_err(|_| {
                 DecodeError::new(DecodeErrorCode::Structural { reason: $reason }, 0)
             })?;
@@ -326,7 +340,10 @@ fn decode_message(
             decode_as!(messages::Paging, Paging, "paging")
         }
         _ if reject_unknown_message(ctx) => Err(unknown_message_error(criticality)),
-        _ => Ok(Message::Unknown(Bytes::copy_from_slice(value))),
+        _ => {
+            enforce_depth(NGAP_UNKNOWN_MESSAGE_DEPTH, ctx)?;
+            Ok(Message::Unknown(Bytes::copy_from_slice(value)))
+        }
     }
 }
 
@@ -648,6 +665,19 @@ mod tests {
         };
         let err = decode(&bytes, ctx).unwrap_err();
         assert_eq!(err.code(), &DecodeErrorCode::IeCountExceeded);
+    }
+
+    #[test]
+    fn typed_decode_enforces_depth_limit() {
+        let bytes = ngsetup_request_fixture();
+        assert!(decode(&bytes, DecodeContext::default()).is_ok());
+
+        let ctx = DecodeContext {
+            max_depth: 4,
+            ..DecodeContext::default()
+        };
+        let err = decode(&bytes, ctx).unwrap_err();
+        assert_eq!(err.code(), &DecodeErrorCode::DepthExceeded);
     }
 
     #[test]

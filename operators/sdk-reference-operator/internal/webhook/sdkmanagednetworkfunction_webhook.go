@@ -46,6 +46,15 @@ func (v *SdkManagedNetworkFunctionValidator) ValidateDelete(ctx context.Context,
 
 func (v *SdkManagedNetworkFunctionValidator) validate(ctx context.Context, crd *v1beta1.SdkManagedNetworkFunction) (admission.Warnings, error) {
 	isProd := crd.Spec.RuntimeMode == "production"
+	warnings := admission.Warnings{}
+	handleInvalidMetadata := func(reason, message string, err error) (bool, admission.Warnings, error) {
+		detail := fmt.Sprintf("%s: %s: %v", reason, message, err)
+		if isProd {
+			return true, nil, fmt.Errorf("admission validation failed: %s", detail)
+		}
+		warnings = append(warnings, detail)
+		return false, warnings, nil
+	}
 
 	// 1. Fetch the admin token secret if specified
 	var adminToken *string
@@ -87,7 +96,16 @@ func (v *SdkManagedNetworkFunctionValidator) validate(ctx context.Context, crd *
 	if err == nil {
 		if data, ok := cm.Data["report.json"]; ok {
 			var report sdkbridge.NodeCapabilityReport
-			if json.Unmarshal([]byte(data), &report) == nil {
+			if err := json.Unmarshal([]byte(data), &report); err != nil {
+				stop, outWarnings, outErr := handleInvalidMetadata(
+					"NodeCapabilitiesMetadataInvalid",
+					fmt.Sprintf("invalid report.json in ConfigMap %s/%s", cm.Namespace, cm.Name),
+					err,
+				)
+				if stop || outErr != nil {
+					return outWarnings, outErr
+				}
+			} else {
 				nodeCaps = &report
 			}
 		}
@@ -105,13 +123,31 @@ func (v *SdkManagedNetworkFunctionValidator) validate(ctx context.Context, crd *
 		if err == nil {
 			if data, ok := compatCM.Data["matrix.json"]; ok {
 				var matrix sdkbridge.CompatibilityMatrix
-				if json.Unmarshal([]byte(data), &matrix) == nil {
+				if err := json.Unmarshal([]byte(data), &matrix); err != nil {
+					stop, outWarnings, outErr := handleInvalidMetadata(
+						"CompatibilityMetadataInvalid",
+						fmt.Sprintf("invalid matrix.json in ConfigMap %s/%s", compatCM.Namespace, compatCM.Name),
+						err,
+					)
+					if stop || outErr != nil {
+						return outWarnings, outErr
+					}
+				} else {
 					compatMatrix = &matrix
 				}
 			}
 			if data, ok := compatCM.Data["evidence.json"]; ok {
 				var ev []sdkbridge.CompatibilityEvidence
-				if json.Unmarshal([]byte(data), &ev) == nil {
+				if err := json.Unmarshal([]byte(data), &ev); err != nil {
+					stop, outWarnings, outErr := handleInvalidMetadata(
+						"CompatibilityMetadataInvalid",
+						fmt.Sprintf("invalid evidence.json in ConfigMap %s/%s", compatCM.Namespace, compatCM.Name),
+						err,
+					)
+					if stop || outErr != nil {
+						return outWarnings, outErr
+					}
+				} else {
 					evidence = ev
 				}
 			}
@@ -192,7 +228,7 @@ func (v *SdkManagedNetworkFunctionValidator) validate(ctx context.Context, crd *
 			return nil, fmt.Errorf("admission validation rejected: SDK policy evaluation failure (failed closed): %w", err)
 		}
 		// Warn but allow in non-production modes
-		return admission.Warnings{fmt.Sprintf("SDK policy evaluation error: %v", err)}, nil
+		return append(warnings, fmt.Sprintf("SDK policy evaluation error: %v", err)), nil
 	}
 
 	if !resp.Allowed {
@@ -205,7 +241,7 @@ func (v *SdkManagedNetworkFunctionValidator) validate(ctx context.Context, crd *
 		return nil, errors.NewBadRequest(fmt.Sprintf("admission validation rejected: reason=%s, message=%s", reason, msg))
 	}
 
-	return nil, nil
+	return warnings, nil
 }
 
 func sdkbridgeIpsecNetworkAttachments(in []v1beta1.IpsecNetworkAttachmentSpec) []sdkbridge.IpsecNetworkAttachmentSpec {

@@ -20,6 +20,8 @@ use std::str::FromStr;
 use opc_types::{ConfigVersion, SchemaDigest};
 use time::OffsetDateTime;
 
+const MAX_STDIN_BYTES: u64 = 1024 * 1024;
+
 #[derive(Serialize, Deserialize)]
 pub struct CompatibilityRequest {
     pub operator: OperatorReleaseDescriptor,
@@ -259,6 +261,16 @@ fn write_contract_mismatch(expected: u64) -> ! {
     std::process::exit(2);
 }
 
+fn write_contract_missing() -> ! {
+    let resp = ErrorResponse {
+        error: "Contract version mismatch: missing expectedContractVersion".to_string(),
+        contract_version: Some(CONTRACT_VERSION),
+    };
+    let _ = serde_json::to_writer(io::stdout(), &resp);
+    println!();
+    std::process::exit(2);
+}
+
 fn write_success<T: Serialize>(val: &T) {
     let resp = SuccessResponse {
         contract_version: CONTRACT_VERSION,
@@ -283,19 +295,34 @@ fn write_version() -> ! {
     std::process::exit(0);
 }
 
+fn read_stdin_bounded() -> String {
+    let mut buffer = String::new();
+    let mut stdin = io::stdin().take(MAX_STDIN_BYTES + 1);
+    if let Err(e) = stdin.read_to_string(&mut buffer) {
+        write_error(&format!("Failed to read stdin: {e}"));
+    }
+    if buffer.len() as u64 > MAX_STDIN_BYTES {
+        write_error(&format!(
+            "Invalid JSON: request exceeds maximum size of {MAX_STDIN_BYTES} bytes"
+        ));
+    }
+    buffer
+}
+
 fn parse_request<T: serde::de::DeserializeOwned>(buffer: &str, command_name: &str) -> T {
     let mut value: serde_json::Value = match serde_json::from_str(buffer) {
         Ok(v) => v,
         Err(e) => write_error(&format!("Invalid JSON: {e}")),
     };
 
-    if let Some(expected) = value
+    let Some(expected) = value
         .get("expectedContractVersion")
         .and_then(|v| v.as_u64())
-    {
-        if expected as u32 != CONTRACT_VERSION {
-            write_contract_mismatch(expected);
-        }
+    else {
+        write_contract_missing();
+    };
+    if expected as u32 != CONTRACT_VERSION {
+        write_contract_mismatch(expected);
     }
 
     // Remove expectedContractVersion so it does not interfere with deserialization.
@@ -323,10 +350,7 @@ fn main() {
         write_version();
     }
 
-    let mut buffer = String::new();
-    if let Err(e) = io::stdin().read_to_string(&mut buffer) {
-        write_error(&format!("Failed to read stdin: {e}"));
-    }
+    let buffer = read_stdin_bounded();
 
     match command {
         "admission" => {

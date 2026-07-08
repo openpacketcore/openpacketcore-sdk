@@ -674,6 +674,34 @@ impl std::error::Error for DiameterSctpError {
     }
 }
 
+/// Parsed SCTP notification event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SctpEvent {
+    /// Association state changed.
+    AssociationChange {
+        /// Kernel SCTP association state value.
+        state: u16,
+        /// Kernel SCTP association error value.
+        error: u16,
+        /// Outbound stream count reported by the kernel.
+        outbound_streams: u16,
+        /// Inbound stream count reported by the kernel.
+        inbound_streams: u16,
+        /// Association identifier.
+        assoc_id: i32,
+    },
+    /// Peer shutdown notification.
+    Shutdown {
+        /// Association identifier.
+        assoc_id: i32,
+    },
+    /// Notification type not decoded by this crate yet.
+    Unknown {
+        /// Kernel SCTP notification type.
+        notification_type: u16,
+    },
+}
+
 /// Inbound SCTP message metadata and payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundMessage {
@@ -689,6 +717,8 @@ pub struct InboundMessage {
     pub assoc_id: i32,
     /// True when the message is an SCTP notification, not user payload.
     pub notification: bool,
+    /// Parsed SCTP event when this message is a known notification.
+    pub event: Option<SctpEvent>,
     /// True when the caller buffer truncated payload.
     pub truncated: bool,
     /// True when the kernel truncated ancillary control data. The payload is
@@ -1025,6 +1055,11 @@ fn map_recv(received: opc_libsctp_sys::Received, buffer: BytesMut) -> InboundMes
     } else {
         DeliveryOrder::Ordered
     };
+    let event = if received.flags.notification {
+        parse_sctp_event(&buffer)
+    } else {
+        None
+    };
     InboundMessage {
         payload: buffer.freeze(),
         stream_id: info.stream_id,
@@ -1032,9 +1067,54 @@ fn map_recv(received: opc_libsctp_sys::Received, buffer: BytesMut) -> InboundMes
         order,
         assoc_id: info.assoc_id,
         notification: received.flags.notification,
+        event,
         truncated: received.flags.payload_truncated,
         control_truncated: received.flags.control_truncated,
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_sctp_event(payload: &[u8]) -> Option<SctpEvent> {
+    let notification_type = read_u16_ne(payload, 0)?;
+    let declared_len = read_u32_ne(payload, 4)? as usize;
+    if declared_len < 8 || declared_len > payload.len() {
+        return None;
+    }
+    let payload = &payload[..declared_len];
+
+    match notification_type {
+        opc_libsctp_sys::SCTP_ASSOC_CHANGE_NOTIFICATION => Some(SctpEvent::AssociationChange {
+            state: read_u16_ne(payload, 8)?,
+            error: read_u16_ne(payload, 10)?,
+            outbound_streams: read_u16_ne(payload, 12)?,
+            inbound_streams: read_u16_ne(payload, 14)?,
+            assoc_id: read_i32_ne(payload, 16)?,
+        }),
+        opc_libsctp_sys::SCTP_SHUTDOWN_EVENT_NOTIFICATION => Some(SctpEvent::Shutdown {
+            assoc_id: read_i32_ne(payload, 8)?,
+        }),
+        other => Some(SctpEvent::Unknown {
+            notification_type: other,
+        }),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_u16_ne(bytes: &[u8], offset: usize) -> Option<u16> {
+    let slice = bytes.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_ne_bytes([slice[0], slice[1]]))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_u32_ne(bytes: &[u8], offset: usize) -> Option<u32> {
+    let slice = bytes.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_ne_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_i32_ne(bytes: &[u8], offset: usize) -> Option<i32> {
+    let slice = bytes.get(offset..offset.checked_add(4)?)?;
+    Some(i32::from_ne_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
 #[cfg(target_os = "linux")]
@@ -1480,9 +1560,22 @@ mod tests {
             order: DeliveryOrder::Ordered,
             assoc_id: 7,
             notification: false,
+            event: None,
             truncated: false,
             control_truncated: false,
         }
+    }
+
+    fn push_u16_ne(out: &mut Vec<u8>, value: u16) {
+        out.extend_from_slice(&value.to_ne_bytes());
+    }
+
+    fn push_u32_ne(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_ne_bytes());
+    }
+
+    fn push_i32_ne(out: &mut Vec<u8>, value: i32) {
+        out.extend_from_slice(&value.to_ne_bytes());
     }
 
     #[test]
@@ -1506,6 +1599,50 @@ mod tests {
         assert_eq!(
             PayloadProtocolIdentifier::from_network_order(network),
             DIAMETER_SCTP_PPID
+        );
+    }
+
+    #[test]
+    fn parses_assoc_change_notification_event() {
+        let mut payload = Vec::new();
+        push_u16_ne(
+            &mut payload,
+            opc_libsctp_sys::SCTP_ASSOC_CHANGE_NOTIFICATION,
+        );
+        push_u16_ne(&mut payload, 0);
+        push_u32_ne(&mut payload, 20);
+        push_u16_ne(&mut payload, 1);
+        push_u16_ne(&mut payload, 0);
+        push_u16_ne(&mut payload, 16);
+        push_u16_ne(&mut payload, 32);
+        push_i32_ne(&mut payload, 7);
+
+        assert_eq!(
+            parse_sctp_event(&payload),
+            Some(SctpEvent::AssociationChange {
+                state: 1,
+                error: 0,
+                outbound_streams: 16,
+                inbound_streams: 32,
+                assoc_id: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_shutdown_notification_event() {
+        let mut payload = Vec::new();
+        push_u16_ne(
+            &mut payload,
+            opc_libsctp_sys::SCTP_SHUTDOWN_EVENT_NOTIFICATION,
+        );
+        push_u16_ne(&mut payload, 0);
+        push_u32_ne(&mut payload, 12);
+        push_i32_ne(&mut payload, 9);
+
+        assert_eq!(
+            parse_sctp_event(&payload),
+            Some(SctpEvent::Shutdown { assoc_id: 9 })
         );
     }
 

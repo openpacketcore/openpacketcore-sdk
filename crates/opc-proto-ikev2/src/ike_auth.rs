@@ -2372,3 +2372,19 @@ impl fmt::Display for Ikev2ChildSaNegotiationError {
 }
 
 impl Error for Ikev2ChildSaNegotiationError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ike_auth_prf_returns_zeroizing_output() {
+        let output: Zeroizing<Vec<u8>> =
+            match ike_auth_prf(Ikev2PrfAlgorithm::HmacSha2_256, b"key", b"data") {
+                Ok(output) => output,
+                Err(error) => panic!("unexpected PRF error: {error:?}"),
+            };
+
+        assert_eq!(output.len(), Ikev2PrfAlgorithm::HmacSha2_256.output_len());
+    }
+}

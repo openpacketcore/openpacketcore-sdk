@@ -12,10 +12,14 @@
 //! keys to prevent orphaned audit records.
 
 use rusqlite::{Connection, Transaction};
+use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::time::Duration;
 
 /// Current schema version. Bump this and add a migration step to evolve the schema.
-pub const SCHEMA_VERSION: &str = "1.5.0";
+pub const SCHEMA_VERSION: &str = "1.8.1";
+/// Cap SQLite lock waits on async runtime workers.
+pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 100;
 
 /// Initialize the database schema.
 ///
@@ -49,7 +53,9 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             rollback_point INTEGER NOT NULL DEFAULT 0,
             rollback_label TEXT NULL,
             confirmed_deadline TEXT NULL,
-            confirmed_at TEXT NULL
+            confirmed_at TEXT NULL,
+            audit_count INTEGER NOT NULL DEFAULT 0,
+            audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
         );
 
         CREATE TABLE IF NOT EXISTS audit_trail (
@@ -128,6 +134,17 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS audit_trail_tx_id_idx ON audit_trail(tx_id);
         CREATE INDEX IF NOT EXISTS config_history_rollback_idx ON config_history(version, rollback_point);
 
+        CREATE TABLE IF NOT EXISTS config_lifecycle_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tx_id BLOB NOT NULL REFERENCES config_history(tx_id) ON DELETE RESTRICT,
+            action TEXT NOT NULL,
+            principal TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            details TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS config_lifecycle_audit_tx_id_idx ON config_lifecycle_audit(tx_id);
+
         CREATE TABLE IF NOT EXISTS staged_security_policy (
             tenant TEXT PRIMARY KEY,
             version INTEGER NOT NULL,
@@ -168,6 +185,12 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
         CREATE INDEX IF NOT EXISTS security_policy_audit_tenant_idx ON security_policy_audit(tenant);
 
+        CREATE TABLE IF NOT EXISTS security_policy_audit_anchor (
+            tenant TEXT PRIMARY KEY,
+            audit_count INTEGER NOT NULL DEFAULT 0,
+            audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
+        );
+
         CREATE TABLE IF NOT EXISTS break_glass_sessions (
             id TEXT PRIMARY KEY,
             principal TEXT NOT NULL,
@@ -200,9 +223,31 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
         CREATE INDEX IF NOT EXISTS break_glass_audit_tenant_idx ON break_glass_audit(tenant);
         CREATE INDEX IF NOT EXISTS break_glass_sessions_tenant_idx ON break_glass_sessions(tenant);
+
+        CREATE TABLE IF NOT EXISTS break_glass_audit_anchor (
+            tenant TEXT PRIMARY KEY,
+            audit_count INTEGER NOT NULL DEFAULT 0,
+            audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
+        );
         "#,
     )?;
     Ok(())
+}
+
+fn table_has_column(
+    conn: &Connection,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool, rusqlite::Error> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table_name})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Upgrade the schema from a previous version.
@@ -339,6 +384,115 @@ pub fn run_migrations(conn: &Connection, from_version: &str) -> Result<(), rusql
         )?;
         current = "1.5.0".to_string();
     }
+    if current == "1.5.0" {
+        if !table_has_column(conn, "config_history", "audit_count")? {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE config_history ADD COLUMN audit_count INTEGER NOT NULL DEFAULT 0;
+                "#,
+            )?;
+        }
+        if !table_has_column(conn, "config_history", "audit_terminal_hash")? {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE config_history ADD COLUMN audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000';
+                "#,
+            )?;
+        }
+        conn.execute_batch(
+            r#"
+            UPDATE config_history
+            SET audit_count = (
+                    SELECT COUNT(*)
+                    FROM audit_trail
+                    WHERE audit_trail.tx_id = config_history.tx_id
+                ),
+                audit_terminal_hash = COALESCE(
+                    (
+                        SELECT entry_hmac
+                        FROM audit_trail
+                        WHERE audit_trail.tx_id = config_history.tx_id
+                        ORDER BY sequence DESC
+                        LIMIT 1
+                    ),
+                    zeroblob(32)
+                );
+            "#,
+        )?;
+        current = "1.6.0".to_string();
+    }
+    if current == "1.6.0" {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS security_policy_audit_anchor (
+                tenant TEXT PRIMARY KEY,
+                audit_count INTEGER NOT NULL DEFAULT 0,
+                audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
+            );
+
+            CREATE TABLE IF NOT EXISTS break_glass_audit_anchor (
+                tenant TEXT PRIMARY KEY,
+                audit_count INTEGER NOT NULL DEFAULT 0,
+                audit_terminal_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
+            );
+
+            INSERT OR REPLACE INTO security_policy_audit_anchor (tenant, audit_count, audit_terminal_hash)
+            SELECT tenant,
+                   COUNT(*),
+                   COALESCE(
+                       (
+                           SELECT entry_hmac
+                           FROM security_policy_audit AS last_entry
+                           WHERE last_entry.tenant = security_policy_audit.tenant
+                           ORDER BY id DESC
+                           LIMIT 1
+                       ),
+                       zeroblob(32)
+                   )
+            FROM security_policy_audit
+            GROUP BY tenant;
+
+            INSERT OR REPLACE INTO break_glass_audit_anchor (tenant, audit_count, audit_terminal_hash)
+            SELECT tenant,
+                   COUNT(*),
+                   COALESCE(
+                       (
+                           SELECT entry_hmac
+                           FROM break_glass_audit AS last_entry
+                           WHERE last_entry.tenant = break_glass_audit.tenant
+                           ORDER BY id DESC
+                           LIMIT 1
+                       ),
+                       zeroblob(32)
+                   )
+            FROM break_glass_audit
+            GROUP BY tenant;
+            "#,
+        )?;
+        current = "1.7.0".to_string();
+    }
+    if current == "1.7.0" {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS config_lifecycle_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tx_id BLOB NOT NULL REFERENCES config_history(tx_id) ON DELETE RESTRICT,
+                action TEXT NOT NULL,
+                principal TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                details TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS config_lifecycle_audit_tx_id_idx ON config_lifecycle_audit(tx_id);
+            "#,
+        )?;
+        current = "1.8.0".to_string();
+    }
+    if current == "1.8.0" {
+        // Metadata-only migration: schema digests are now derived from the live
+        // SQLite schema instead of a hand-maintained SQL string.
+        current = "1.8.1".to_string();
+    }
 
     let _ = current;
 
@@ -378,6 +532,29 @@ pub fn get_schema_digest(conn: &Connection) -> Result<Option<String>, rusqlite::
     }
 }
 
+/// Derive the schema digest from the live SQLite schema catalog.
+pub fn current_schema_digest(conn: &Connection) -> Result<String, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT type, name, sql FROM sqlite_master \
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' \
+         ORDER BY type, name",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut hasher = Sha256::new();
+    while let Some(row) = rows.next()? {
+        let object_type: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        let sql: String = row.get(2)?;
+        hasher.update(object_type.as_bytes());
+        hasher.update([0]);
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update(sql.as_bytes());
+        hasher.update([0xff]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 /// Write the initial (or upgraded) schema version row.
 pub fn set_schema_version(tx: &Transaction, digest: &str) -> Result<(), rusqlite::Error> {
     tx.execute(
@@ -414,10 +591,10 @@ pub fn apply_pragma_profile(conn: &Connection) -> Result<(), rusqlite::Error> {
         PRAGMA synchronous = EXTRA;
         PRAGMA foreign_keys = ON;
         PRAGMA locking_mode = NORMAL;
-        PRAGMA busy_timeout = 1000;
         PRAGMA temp_store = MEMORY;
         "#,
     )?;
+    conn.busy_timeout(Duration::from_millis(u64::from(SQLITE_BUSY_TIMEOUT_MS)))?;
 
     // Verify temp_store was applied; if not, log a warning
     let ts: i32 = conn.query_row("PRAGMA temp_store", [], |row| row.get(0))?;
@@ -635,7 +812,7 @@ pub fn check_fsync_available(dir: &Path) -> bool {
 
 #[cfg(test)]
 mod fixture_tests {
-    use super::{initialize_schema, SCHEMA_VERSION};
+    use super::{current_schema_digest, initialize_schema, SCHEMA_VERSION};
     use rusqlite::{params, Connection};
     use std::env;
     use std::path::PathBuf;
@@ -660,16 +837,17 @@ mod fixture_tests {
 
         let conn = Connection::open(path).expect("open fixture for writing");
         initialize_schema(&conn).expect("initialize schema");
+        let schema_digest = current_schema_digest(&conn).expect("derive fixture schema digest");
 
         conn.execute(
             "INSERT INTO schema_version (id, schema_digest, sdk_version, created_at) VALUES (1, ?1, ?2, ?3)",
-            params!["fixture-digest-abc123", SCHEMA_VERSION, "2026-06-12T00:00:00Z"],
+            params![schema_digest, SCHEMA_VERSION, "2026-06-12T00:00:00Z"],
         )
         .expect("insert schema_version");
 
         conn.execute(
-            "INSERT INTO config_history (tx_id, parent_tx_id, version, committed_at, principal, source, schema_digest, plaintext_digest, encrypted_blob, rollback_point, rollback_label, confirmed_deadline, confirmed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO config_history (tx_id, parent_tx_id, version, committed_at, principal, source, schema_digest, plaintext_digest, encrypted_blob, rollback_point, rollback_label, confirmed_deadline, confirmed_at, audit_count, audit_terminal_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 known_tx_id().as_slice(),
                 Option::<&[u8]>::None,
@@ -684,6 +862,8 @@ mod fixture_tests {
                 Option::<&str>::None,
                 Option::<&str>::None,
                 Option::<&str>::None,
+                1_i64,
+                [0xAA_u8; 32].as_slice(),
             ],
         )
         .expect("insert config_history");
@@ -699,8 +879,8 @@ mod fixture_tests {
                 Option::<&str>::None,
                 "new-value",
                 0_i64,
-                vec![0x00_u8].as_slice(),
-                vec![0xAA_u8].as_slice(),
+                [0x00_u8; 32].as_slice(),
+                [0xAA_u8; 32].as_slice(),
             ],
         )
         .expect("insert audit_trail");
@@ -777,7 +957,8 @@ mod fixture_tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("read schema_version");
-        assert_eq!(digest, "fixture-digest-abc123");
+        let live_digest = current_schema_digest(&conn).expect("derive live fixture schema digest");
+        assert_eq!(digest, live_digest);
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(created_at, "2026-06-12T00:00:00Z");
 

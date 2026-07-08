@@ -135,7 +135,7 @@ pub fn make_audit_record(tx_id: TxId, sequence: u32, path: &str) -> AuditRecord 
         previous_hash: [0u8; 32],
         entry_hmac: [0u8; 32],
     };
-    record.entry_hmac = record.calculate_hmac(&test_audit_key(), "test");
+    record.entry_hmac = record.calculate_hmac_with_audit_count(&test_audit_key(), "test", 1);
     record
 }
 

@@ -390,8 +390,8 @@ impl AuditSink for NoopAudit {
 struct FixedPolicy(NacmPolicy);
 
 impl PolicySource for FixedPolicy {
-    fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
-        Ok(self.0.clone())
+    fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
+        Ok(Arc::new(self.0.clone()))
     }
 }
 
@@ -670,6 +670,23 @@ fn policy_allow_system_discovery_and_exec_but_deny_secret() -> NacmPolicy {
             YangPathPattern::parse("/ncm:netconf-state/**", &modules)
                 .expect("allow monitoring path"),
         ));
+
+    for action in [
+        NacmAction::Create,
+        NacmAction::Update,
+        NacmAction::Replace,
+        NacmAction::Delete,
+    ] {
+        builder = builder
+            .add_rule(NacmRule::allow(
+                action,
+                YangPathPattern::parse("/sys:system", &modules).expect("allow system root path"),
+            ))
+            .add_rule(NacmRule::allow(
+                action,
+                YangPathPattern::parse("/sys:system/**", &modules).expect("allow system path"),
+            ));
+    }
 
     for path in [
         "/nc:close-session",

@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -231,6 +232,103 @@ func TestWebhookValidationAllowsProductionPreflight(t *testing.T) {
 
 	if _, err := validator.ValidateCreate(context.TODO(), crd); err != nil {
 		t.Fatalf("Expected production validation to pass, got %v", err)
+	}
+}
+
+func TestWebhookValidationRejectsMalformedCompatibilityMetadataInProduction(t *testing.T) {
+	testutil.BuildOperatorLifecycleCLI(t)
+
+	bridge, err := sdkbridge.NewBridge()
+	if err != nil {
+		t.Fatalf("Failed to create bridge: %v", err)
+	}
+
+	scheme := runtime.NewScheme()
+	_ = v1beta1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	nodeReport, err := json.Marshal(validNodeCapabilityReport())
+	if err != nil {
+		t.Fatalf("Failed to marshal node capability report: %v", err)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "secure-token-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"admin-token": []byte("secure-token-value-with-long-length-12345"),
+		},
+	}
+	nodeCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "node-capability-report",
+			Namespace: "default",
+		},
+		Data: map[string]string{"report.json": string(nodeReport)},
+	}
+	compatCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "bad-compat",
+			Namespace: "default",
+		},
+		Data: map[string]string{"matrix.json": `{"nfKind":`},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(secret, nodeCM, compatCM).
+		Build()
+
+	validator := &SdkManagedNetworkFunctionValidator{
+		Client: fakeClient,
+		Bridge: bridge,
+	}
+
+	numa := uint16(0)
+	evidenceID := "platform-preflight-ev-1"
+	crd := &v1beta1.SdkManagedNetworkFunction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "prod-bad-compat",
+			Namespace: "default",
+		},
+		Spec: v1beta1.SdkManagedNetworkFunctionSpec{
+			RuntimeMode:    "production",
+			ClaimsHA:       false,
+			ConfigBackend:  "consensus",
+			SessionBackend: "quorum",
+			AdminAuthRef: corev1.LocalObjectReference{
+				Name: "secure-token-secret",
+			},
+			Identity: v1beta1.IdentityRequirements{
+				KmsEnabled:    true,
+				SpiffeEnabled: true,
+			},
+			ResourceProfile: &v1beta1.ResourceProfileSpec{
+				NfKind:                    "upf",
+				DataPlaneProfile:          "AfXdpFastPath",
+				NumaPolicy:                "Require",
+				GenericXdpFallbackAllowed: false,
+				IsolatedCores:             []uint16{2, 3},
+				RequireExclusiveCores:     true,
+				DataPlaneInterfaces:       []string{"ens5f0"},
+				DataPlaneNumaNode:         &numa,
+				HugepageNumaNode:          &numa,
+				PodSecurityEvidenceID:     &evidenceID,
+				BpfArtifacts:              []v1beta1.BpfArtifact{validAPIBpfArtifact("ens5f0", evidenceID)},
+			},
+			CompatibilityRef: &corev1.LocalObjectReference{Name: "bad-compat"},
+			Version:          "1.0.0",
+		},
+	}
+
+	_, err = validator.ValidateCreate(context.TODO(), crd)
+	if err == nil {
+		t.Fatalf("Expected production validation to reject malformed compatibility metadata")
+	}
+	if !strings.Contains(err.Error(), "CompatibilityMetadataInvalid") {
+		t.Fatalf("Expected CompatibilityMetadataInvalid error, got %v", err)
 	}
 }
 

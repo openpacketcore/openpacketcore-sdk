@@ -9,6 +9,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/conversion"
 )
 
+const adminAuthRefNamespaceAnnotation = "conversion.openpacketcore.io/admin-auth-ref-namespace"
+
 // ConvertTo converts this SdkManagedNetworkFunction (v1alpha1) to the Hub version (v1beta1).
 func (src *SdkManagedNetworkFunction) ConvertTo(dstRaw conversion.Hub) error {
 	dst, ok := dstRaw.(*v1beta1.SdkManagedNetworkFunction)
@@ -17,7 +19,7 @@ func (src *SdkManagedNetworkFunction) ConvertTo(dstRaw conversion.Hub) error {
 	}
 
 	// 1. Copy ObjectMeta
-	dst.ObjectMeta = src.ObjectMeta
+	dst.ObjectMeta = *src.ObjectMeta.DeepCopy()
 
 	// 2. Copy Spec
 	dst.Spec.RuntimeMode = src.Spec.RuntimeMode
@@ -25,7 +27,17 @@ func (src *SdkManagedNetworkFunction) ConvertTo(dstRaw conversion.Hub) error {
 	dst.Spec.ConfigBackend = src.Spec.ConfigBackend
 	dst.Spec.SessionBackend = src.Spec.SessionBackend
 
-	// SecretReference -> LocalObjectReference conversion (dropping namespace if set, preserving name)
+	if src.Spec.AdminAuthRef.Namespace != "" && src.Spec.AdminAuthRef.Namespace != src.Namespace {
+		if dst.Annotations == nil {
+			dst.Annotations = map[string]string{}
+		}
+		dst.Annotations[adminAuthRefNamespaceAnnotation] = src.Spec.AdminAuthRef.Namespace
+	} else if dst.Annotations != nil {
+		delete(dst.Annotations, adminAuthRefNamespaceAnnotation)
+	}
+
+	// SecretReference -> LocalObjectReference conversion carries cross-namespace
+	// references through ObjectMeta because the hub field is name-only.
 	dst.Spec.AdminAuthRef = corev1.LocalObjectReference{
 		Name: src.Spec.AdminAuthRef.Name,
 	}
@@ -118,7 +130,7 @@ func (dst *SdkManagedNetworkFunction) ConvertFrom(srcRaw conversion.Hub) error {
 	}
 
 	// 1. Copy ObjectMeta
-	dst.ObjectMeta = src.ObjectMeta
+	dst.ObjectMeta = *src.ObjectMeta.DeepCopy()
 
 	// 2. Copy Spec
 	dst.Spec.RuntimeMode = src.Spec.RuntimeMode
@@ -126,10 +138,22 @@ func (dst *SdkManagedNetworkFunction) ConvertFrom(srcRaw conversion.Hub) error {
 	dst.Spec.ConfigBackend = src.Spec.ConfigBackend
 	dst.Spec.SessionBackend = src.Spec.SessionBackend
 
-	// LocalObjectReference -> SecretReference conversion (using object namespace as default if namespace was empty)
+	adminAuthNamespace := src.Namespace
+	if namespace, ok := src.Annotations[adminAuthRefNamespaceAnnotation]; ok && namespace != "" {
+		adminAuthNamespace = namespace
+	}
+	if dst.Annotations != nil {
+		delete(dst.Annotations, adminAuthRefNamespaceAnnotation)
+		if len(dst.Annotations) == 0 {
+			dst.Annotations = nil
+		}
+	}
+
+	// LocalObjectReference -> SecretReference conversion defaults to the object
+	// namespace unless a conversion annotation preserved the original namespace.
 	dst.Spec.AdminAuthRef = corev1.SecretReference{
 		Name:      src.Spec.AdminAuthRef.Name,
-		Namespace: src.Namespace,
+		Namespace: adminAuthNamespace,
 	}
 
 	dst.Spec.Identity = IdentityRequirements{

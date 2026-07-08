@@ -2,7 +2,9 @@
 //!
 //! Wraps rustls with SPIFFE-SVID-driven certificate selection and hot reload.
 
-use opc_identity::{IdentityState, TrustDomain, WorkloadIdentity};
+#![forbid(unsafe_code)]
+
+use opc_identity::{IdentityState, TrustBundle, TrustDomain, WorkloadIdentity};
 use opc_types::{InstanceId, NfKind, TenantId};
 use rustls::DistinguishedName;
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
@@ -20,6 +22,14 @@ fn protocol_versions(compat_mode: bool) -> &'static [&'static rustls::SupportedP
     } else {
         &TLS13_ONLY
     }
+}
+
+fn root_store_from_bundle(bundle: &TrustBundle) -> Result<rustls::RootCertStore, rustls::Error> {
+    let mut root_store = rustls::RootCertStore::empty();
+    for root in &bundle.certificates {
+        root_store.add(root.clone())?;
+    }
+    Ok(root_store)
 }
 
 /// Authorization policy applied to an authenticated peer's SPIFFE workload
@@ -199,10 +209,7 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
             rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)
         })?;
 
-        let mut root_store = rustls::RootCertStore::empty();
-        for root in &bundle.certificates {
-            root_store.add(root.clone()).ok();
-        }
+        let root_store = root_store_from_bundle(bundle)?;
 
         let cert = rustls::server::ParsedCertificate::try_from(end_entity)?;
         let provider = rustls::crypto::ring::default_provider();
@@ -306,10 +313,7 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
             rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)
         })?;
 
-        let mut root_store = rustls::RootCertStore::empty();
-        for root in &bundle.certificates {
-            root_store.add(root.clone()).ok();
-        }
+        let root_store = root_store_from_bundle(bundle)?;
 
         let default_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
             .build()
@@ -562,5 +566,15 @@ mod policy_tests {
             .build_server_config();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn malformed_trust_bundle_root_is_rejected() {
+        let bundle = opc_identity::TrustBundle {
+            trust_domain: TrustDomain::new("example.test").unwrap(),
+            certificates: vec![CertificateDer::from(vec![0xde, 0xad, 0xbe, 0xef])],
+        };
+
+        assert!(root_store_from_bundle(&bundle).is_err());
     }
 }

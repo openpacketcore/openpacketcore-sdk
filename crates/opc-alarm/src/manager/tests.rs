@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use super::*;
 use crate::model::*;
 use time::OffsetDateTime;
@@ -368,7 +370,7 @@ fn same_fault_different_regions_do_not_merge_or_clear_each_other() {
     let mut mgr = make_manager();
 
     // Raise alarm in region-east
-    let east = RegionId::new("region-east");
+    let east = RegionId::try_new("region-east").expect("valid region");
     let r1 = mgr.raise(
         AlarmType::new("link.down"),
         Severity::Major,
@@ -388,7 +390,7 @@ fn same_fault_different_regions_do_not_merge_or_clear_each_other() {
     };
 
     // Raise same fault in region-west — must create a SEPARATE alarm (not update east)
-    let west = RegionId::new("region-west");
+    let west = RegionId::try_new("region-west").expect("valid region");
     let r2 = mgr.raise(
         AlarmType::new("link.down"),
         Severity::Major,
@@ -667,6 +669,92 @@ fn duplicate_storm_keeps_history_bounded_and_preserves_lifecycle_evidence() {
 }
 
 #[test]
+fn distinct_alarm_flood_is_capped_with_overflow_signal() {
+    let mut mgr = AlarmManager::new(InMemoryStore::new_with_limits(16, 3));
+    let alarm_type = AlarmType::new("link.down");
+
+    for index in 0..3 {
+        let result = mgr.raise(
+            alarm_type.clone(),
+            Severity::Major,
+            ProbableCause::PeerUnreachable,
+            AffectedObject::NfInstance {
+                kind: "upf".to_string(),
+                instance: format!("upf-{index}"),
+            },
+            None,
+            None,
+            None,
+            RedactedText::new("Peer unreachable"),
+            AlarmDetails::empty(),
+        );
+        assert!(matches!(result, AlarmOpResult::Raised { .. }));
+    }
+
+    let overflow = mgr.raise(
+        alarm_type,
+        Severity::Major,
+        ProbableCause::PeerUnreachable,
+        AffectedObject::NfInstance {
+            kind: "upf".to_string(),
+            instance: "upf-overflow".to_string(),
+        },
+        None,
+        None,
+        None,
+        RedactedText::new("Peer unreachable"),
+        AlarmDetails::empty(),
+    );
+
+    match overflow {
+        AlarmOpResult::ActiveLimitExceeded {
+            max_active_alarms, ..
+        } => assert_eq!(max_active_alarms, 3),
+        other => panic!("expected active-limit overflow signal, got {other:?}"),
+    }
+    assert_eq!(mgr.active_count(), 3);
+    assert_eq!(mgr.store.by_id.len(), 3);
+    assert_eq!(mgr.store.by_dedup_key.len(), 3);
+}
+
+#[test]
+fn stale_active_alarms_expire_out_of_current_indexes() {
+    let mut mgr = AlarmManager::new(InMemoryStore::new_with_limits(16, 8));
+    let alarm_type = AlarmType::new("link.down");
+    let affected_object = AffectedObject::NfInstance {
+        kind: "upf".to_string(),
+        instance: "upf-1".to_string(),
+    };
+
+    let raised = mgr.raise(
+        alarm_type,
+        Severity::Major,
+        ProbableCause::PeerUnreachable,
+        affected_object,
+        None,
+        None,
+        None,
+        RedactedText::new("Peer unreachable"),
+        AlarmDetails::empty(),
+    );
+    assert!(matches!(raised, AlarmOpResult::Raised { .. }));
+    assert_eq!(mgr.active_count(), 1);
+
+    let expired = mgr.expire_before(OffsetDateTime::now_utc() + time::Duration::seconds(1));
+
+    assert_eq!(expired, 1);
+    assert_eq!(mgr.active_count(), 0);
+    assert_eq!(mgr.store.by_id.len(), 0);
+    assert_eq!(mgr.store.by_dedup_key.len(), 0);
+    assert!(
+        mgr.all_alarms()
+            .iter()
+            .any(|alarm| alarm.state == AlarmState::Expired),
+        "expiry sweep must retain terminal Expired lifecycle evidence"
+    );
+}
+
+#[test]
 fn clear_re_raise_cycles_do_not_grow_current_state_indexes() {
     let mut mgr = AlarmManager::new(InMemoryStore::new_with_history_limit(16));
 
@@ -730,6 +818,80 @@ fn clear_re_raise_cycles_do_not_grow_current_state_indexes() {
             "active alarm count should drop with the current-state index"
         );
     }
+}
+
+#[test]
+fn lifecycle_timestamps_do_not_move_before_raised_at() {
+    let mut alarm = make_alarm_with_state("future-clock", AlarmState::Raised);
+    let future = OffsetDateTime::now_utc() + time::Duration::hours(1);
+    alarm.raised_at = future;
+    alarm.updated_at = future;
+    let alarm_type = alarm.alarm_type.clone();
+    let probable_cause = alarm.probable_cause.clone();
+    let affected_object = alarm.affected_object.clone();
+
+    let mut store = InMemoryStore::new();
+    AlarmStore::insert(&mut store, alarm);
+    let mut mgr = AlarmManager::new(store);
+
+    let updated = mgr.raise(
+        alarm_type.clone(),
+        Severity::Critical,
+        probable_cause.clone(),
+        affected_object.clone(),
+        None,
+        None,
+        None,
+        RedactedText::new("Peer still unreachable"),
+        AlarmDetails::empty(),
+    );
+    let AlarmOpResult::Updated { alarm } = updated else {
+        panic!("expected update for seeded alarm, got {updated:?}");
+    };
+    assert!(alarm.updated_at >= alarm.raised_at);
+
+    let cleared = mgr.clear(
+        &alarm_type,
+        probable_cause,
+        &affected_object,
+        None,
+        None,
+        None,
+    );
+    assert!(matches!(cleared, AlarmOpResult::Cleared { .. }));
+    let history = mgr.all_alarms();
+    let terminal = history.last().expect("terminal history");
+    assert!(terminal.updated_at >= terminal.raised_at);
+    assert!(terminal.cleared_at.expect("cleared timestamp") >= terminal.raised_at);
+}
+
+#[test]
+fn global_alarm_metrics_recover_from_poisoned_lock() {
+    opc_redaction::metrics::METRICS.reset_all();
+
+    let _ = std::panic::catch_unwind(|| {
+        let _guard = opc_redaction::metrics::METRICS
+            .alarm_active_count
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        panic!("poison alarm metrics mutex");
+    });
+
+    let mut alarm = make_alarm_with_state("metrics-poison", AlarmState::Raised);
+    alarm.severity = Severity::Critical;
+    alarm.probable_cause = ProbableCause::PeerUnreachable;
+    let active = metrics::update_global_metrics_snapshot_for_test(&[alarm]);
+    assert_eq!(
+        active.get(&("critical".to_string(), "peer-unreachable".to_string())),
+        Some(&1)
+    );
+    drop(
+        opc_redaction::metrics::METRICS
+            .alarm_active_count
+            .lock()
+            .expect("metrics lock should recover from poison"),
+    );
+    opc_redaction::metrics::METRICS.reset_all();
 }
 
 #[test]
@@ -1274,6 +1436,47 @@ fn policy_suppress_security_critical_denied_by_default() {
 
     assert!(matches!(result, AlarmOpResult::Unauthorized { .. }));
     assert_eq!(audit.events.len(), 1);
+    assert_eq!(audit.events[0].outcome, AlarmAuditOutcome::Denied);
+    assert_eq!(mgr.active_alarms()[0].state, AlarmState::Raised);
+}
+
+#[test]
+fn policy_suppress_major_break_glass_alarm_requires_explicit_override() {
+    let mut mgr = make_manager();
+
+    let alarm_id = match mgr.raise(
+        AlarmType::new("security.break-glass"),
+        Severity::Major,
+        ProbableCause::SecurityBreakGlass,
+        AffectedObject::NfInstance {
+            kind: "amf".to_string(),
+            instance: "amf-1".to_string(),
+        },
+        Some("tenant-a".to_string()),
+        None,
+        None,
+        RedactedText::new("Break-glass override exercised"),
+        AlarmDetails::empty(),
+    ) {
+        AlarmOpResult::Raised { alarm } => alarm.alarm_id,
+        other => panic!("expected Raised, got {other:?}"),
+    };
+
+    let auth = TestAuthorizer {
+        allow: true,
+        allow_security_critical: false,
+    };
+    let mut audit = CapturingAuditSink::default();
+    let result = mgr.suppress_with_policy(
+        &alarm_id,
+        &alarm_action_context(&alarm_id),
+        &auth,
+        &mut audit,
+    );
+
+    assert!(matches!(result, AlarmOpResult::Unauthorized { .. }));
+    assert_eq!(audit.events.len(), 1);
+    assert_eq!(audit.events[0].action, AlarmAction::Suppress);
     assert_eq!(audit.events[0].outcome, AlarmAuditOutcome::Denied);
     assert_eq!(mgr.active_alarms()[0].state, AlarmState::Raised);
 }

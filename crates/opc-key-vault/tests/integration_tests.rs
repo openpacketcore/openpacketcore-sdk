@@ -14,10 +14,17 @@ struct MockResponse {
     body: String,
 }
 
+#[derive(Clone, Debug)]
+struct RecordedRequest {
+    request_line: String,
+    #[cfg(feature = "k8s-auth")]
+    vault_token: Option<String>,
+}
+
 struct MockVault {
     url: url::Url,
-    /// Request lines (`POST /v1/... HTTP/1.1`) seen by the mock, in order.
-    requests: Arc<Mutex<Vec<String>>>,
+    /// Requests seen by the mock, in order.
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
 }
 
 impl MockVault {
@@ -36,12 +43,19 @@ impl MockVault {
 
                 let mut buf = [0u8; 4096];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
-                let request_line = String::from_utf8_lossy(&buf[..n])
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .to_string();
-                seen.lock().await.push(request_line);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let request_line = request.lines().next().unwrap_or_default().to_string();
+                #[cfg(feature = "k8s-auth")]
+                let vault_token = request.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("X-Vault-Token")
+                        .then(|| value.trim().to_string())
+                });
+                seen.lock().await.push(RecordedRequest {
+                    request_line,
+                    #[cfg(feature = "k8s-auth")]
+                    vault_token,
+                });
 
                 let resp = {
                     let mut lock = responses.lock().await;
@@ -82,7 +96,22 @@ impl MockVault {
     }
 
     async fn request_paths(&self) -> Vec<String> {
-        self.requests.lock().await.clone()
+        self.requests
+            .lock()
+            .await
+            .iter()
+            .map(|request| request.request_line.clone())
+            .collect()
+    }
+
+    #[cfg(feature = "k8s-auth")]
+    async fn request_tokens(&self) -> Vec<Option<String>> {
+        self.requests
+            .lock()
+            .await
+            .iter()
+            .map(|request| request.vault_token.clone())
+            .collect()
     }
 }
 
@@ -119,6 +148,117 @@ fn decrypt_response(plaintext: &[u8; 32]) -> String {
         r#"{{"data":{{"plaintext":"{}"}}}}"#,
         BASE64.encode(plaintext)
     )
+}
+
+#[cfg(feature = "k8s-auth")]
+fn login_response(token: &str, lease_duration: u64, renewable: bool) -> String {
+    format!(
+        r#"{{"auth":{{"client_token":"{token}","lease_duration":{lease_duration},"renewable":{renewable}}}}}"#
+    )
+}
+
+#[cfg(feature = "k8s-auth")]
+#[tokio::test]
+async fn kubernetes_auth_reauthenticates_after_403() {
+    let responses = Arc::new(Mutex::new(vec![
+        MockResponse {
+            status: 200,
+            body: login_response("expired-token", 3600, true),
+        },
+        MockResponse {
+            status: 403,
+            body: r#"{"errors":["permission denied"]}"#.into(),
+        },
+        MockResponse {
+            status: 200,
+            body: login_response("fresh-token", 3600, true),
+        },
+        MockResponse {
+            status: 200,
+            body: datakey_response(&[0xab; 32]),
+        },
+    ]));
+
+    let mock = MockVault::new(responses).await;
+    let provider =
+        VaultKeyProvider::new(mock.url.clone(), "bootstrap-token".into(), "transit".into())
+            .dangerous_allow_insecure_http()
+            .with_kubernetes_auth("amf", "jwt")
+            .await
+            .expect("kubernetes auth");
+
+    let handle = provider
+        .get_active_key(KeyPurpose::Config, &tenant())
+        .await
+        .expect("reauthenticated data key");
+
+    assert_eq!(handle.purpose(), KeyPurpose::Config);
+
+    let paths = mock.request_paths().await;
+    assert_eq!(paths.len(), 4);
+    assert!(paths[0].starts_with("POST /v1/auth/kubernetes/login "));
+    assert!(paths[1].starts_with("POST /v1/transit/datakey/plaintext/tenant-a_config "));
+    assert!(paths[2].starts_with("POST /v1/auth/kubernetes/login "));
+    assert!(paths[3].starts_with("POST /v1/transit/datakey/plaintext/tenant-a_config "));
+
+    assert_eq!(
+        mock.request_tokens().await,
+        vec![
+            None,
+            Some("expired-token".into()),
+            None,
+            Some("fresh-token".into())
+        ]
+    );
+}
+
+#[cfg(feature = "k8s-auth")]
+#[tokio::test]
+async fn kubernetes_auth_renews_short_lived_token_before_use() {
+    let responses = Arc::new(Mutex::new(vec![
+        MockResponse {
+            status: 200,
+            body: login_response("short-token", 1, true),
+        },
+        MockResponse {
+            status: 200,
+            body: login_response("renewed-token", 3600, true),
+        },
+        MockResponse {
+            status: 200,
+            body: datakey_response(&[0xcd; 32]),
+        },
+    ]));
+
+    let mock = MockVault::new(responses).await;
+    let provider =
+        VaultKeyProvider::new(mock.url.clone(), "bootstrap-token".into(), "transit".into())
+            .dangerous_allow_insecure_http()
+            .with_kubernetes_auth("amf", "jwt")
+            .await
+            .expect("kubernetes auth");
+
+    let handle = provider
+        .get_active_key(KeyPurpose::Config, &tenant())
+        .await
+        .expect("renewed data key");
+
+    assert_eq!(handle.purpose(), KeyPurpose::Config);
+
+    let paths = mock.request_paths().await;
+    assert_eq!(paths.len(), 3);
+    assert!(paths[0].starts_with("POST /v1/auth/kubernetes/login "));
+    assert!(paths[1].starts_with("POST /v1/auth/token/renew-self "));
+    assert!(paths[2].starts_with("POST /v1/transit/datakey/plaintext/tenant-a_config "));
+
+    assert_eq!(
+        mock.request_tokens().await,
+        vec![
+            None,
+            Some("short-token".into()),
+            Some("renewed-token".into())
+        ]
+    );
 }
 
 #[tokio::test]
@@ -228,6 +368,34 @@ async fn server_error_500() {
         .expect_err("should fail");
 
     assert_eq!(err, KeyError::Unavailable);
+}
+
+#[tokio::test]
+async fn transient_server_error_is_retried() {
+    let responses = Arc::new(Mutex::new(vec![
+        MockResponse {
+            status: 500,
+            body: r#"{"errors":["transient"]}"#.into(),
+        },
+        MockResponse {
+            status: 200,
+            body: datakey_response(&[0xab; 32]),
+        },
+    ]));
+
+    let mock = MockVault::new(responses).await;
+    let provider = mock_provider(&mock, "token");
+
+    let handle = provider
+        .get_active_key(KeyPurpose::Config, &tenant())
+        .await
+        .expect("transient 500 should be retried");
+
+    assert_eq!(handle.purpose(), KeyPurpose::Config);
+    let paths = mock.request_paths().await;
+    assert_eq!(paths.len(), 2);
+    assert!(paths[0].starts_with("POST /v1/transit/datakey/plaintext/tenant-a_config "));
+    assert!(paths[1].starts_with("POST /v1/transit/datakey/plaintext/tenant-a_config "));
 }
 
 #[tokio::test]

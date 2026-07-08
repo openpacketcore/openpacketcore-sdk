@@ -9,8 +9,10 @@
 //!
 //! An event records the touched **schema-node paths** (predicate-free, so list
 //! key *values* never enter the audit), and outcomes carry validated stable
-//! machine codes, never free-form messages. [`TracingAuditSink`] is a working
-//! default; a durable, tamper-evident sink over `opc-persist` is CNF-provided.
+//! machine codes, never free-form messages. [`TracingAuditSink`] is a
+//! best-effort diagnostic bridge that reports a disabled tracing target as loss;
+//! production fail-closed paths should use a durable, tamper-evident sink over
+//! `opc-persist`.
 //!
 //! Audit is a privileged record (it legitimately names the principal) and is
 //! distinct from a redaction-scrubbed diagnostic bundle. Use
@@ -19,17 +21,30 @@
 
 #![forbid(unsafe_code)]
 
-use std::fmt;
+use std::{
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use opc_config_model::{RequestId, TransportType, TrustedPrincipal, WorkloadIdentity};
 use opc_redaction::metrics_label_safe;
 use thiserror::Error;
 
 const MAX_AUDIT_REASON_CODE_LEN: usize = 64;
+const MAX_AUDIT_TX_ID_LEN: usize = 128;
+static TRACING_AUDIT_EVENTS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Number of events the tracing audit sink could not emit because its tracing
+/// target was disabled.
+pub fn tracing_audit_events_dropped() -> u64 {
+    TRACING_AUDIT_EVENTS_DROPPED.load(Ordering::Relaxed)
+}
 
 /// The management operation being audited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditOperation {
+    /// Capability/schema discovery.
+    Capabilities,
     /// Data read (gNMI `Get`, NETCONF `<get>`/`<get-config>`).
     Read,
     /// Subscription create.
@@ -56,6 +71,7 @@ impl AuditOperation {
     /// Stable lowercase operation code.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Capabilities => "capabilities",
             Self::Read => "read",
             Self::Subscribe => "subscribe",
             Self::Create => "create",
@@ -244,6 +260,55 @@ pub enum SchemaNodePathError {
     MalformedSegment,
 }
 
+/// A bounded transaction id safe for audit records and trace fields.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AuditTxId(String);
+
+impl AuditTxId {
+    /// Validates an audit transaction id.
+    pub fn new(value: impl Into<String>) -> Result<Self, AuditTxIdError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(AuditTxIdError::Empty);
+        }
+        if value.len() > MAX_AUDIT_TX_ID_LEN {
+            return Err(AuditTxIdError::TooLong);
+        }
+        if !value
+            .chars()
+            .all(|ch| matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.'))
+        {
+            return Err(AuditTxIdError::UnsafeCharacter);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the transaction id string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AuditTxId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Invalid audit transaction id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AuditTxIdError {
+    /// Transaction id was empty.
+    #[error("audit transaction id must not be empty")]
+    Empty,
+    /// Transaction id exceeded the audit transaction-id bound.
+    #[error("audit transaction id is too long")]
+    TooLong,
+    /// Transaction id contained characters outside the stable machine-code alphabet.
+    #[error("audit transaction id contains unsafe characters")]
+    UnsafeCharacter,
+}
+
 /// Audit sink failure. Display text is payload-free; backend details remain
 /// server-side diagnostics via [`Self::detail`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -289,6 +354,8 @@ impl AuditError {
 /// code (never a free-form message, so nothing sensitive leaks into the trail).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditOutcome {
+    /// The operation intent was durably recorded before the side effect.
+    Intent,
     /// The operation succeeded.
     Success,
     /// The operation was authorized-denied (e.g. NACM `access-denied`).
@@ -321,6 +388,7 @@ impl AuditOutcome {
     /// Stable outcome class string.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Intent => "intent",
             Self::Success => "success",
             Self::Denied(_) => "denied",
             Self::Failed(_) => "failed",
@@ -330,7 +398,7 @@ impl AuditOutcome {
     /// The stable reason code for a denied/failed outcome, if any.
     pub const fn code(self) -> Option<&'static str> {
         match self {
-            Self::Success => None,
+            Self::Intent | Self::Success => None,
             Self::Denied(code) | Self::Failed(code) => Some(code.as_str()),
         }
     }
@@ -390,7 +458,7 @@ pub struct AuditEvent {
     /// The outcome.
     pub outcome: AuditOutcome,
     /// Transaction id, when the operation produced/targeted one.
-    pub tx_id: Option<String>,
+    pub tx_id: Option<AuditTxId>,
 }
 
 impl AuditEvent {
@@ -420,10 +488,10 @@ impl AuditEvent {
         self
     }
 
-    /// Attaches the transaction id.
-    pub fn with_tx_id(mut self, tx_id: impl Into<String>) -> Self {
-        self.tx_id = Some(tx_id.into());
-        self
+    /// Attaches a validated transaction id.
+    pub fn with_tx_id(mut self, tx_id: impl Into<String>) -> Result<Self, AuditTxIdError> {
+        self.tx_id = Some(AuditTxId::new(tx_id)?);
+        Ok(self)
     }
 }
 
@@ -438,11 +506,24 @@ pub trait AuditSink: Send + Sync {
 
 /// An [`AuditSink`] that emits a structured event on the `opc_mgmt_audit`
 /// tracing target.
+///
+/// This sink is best-effort and not durable. It returns
+/// [`AuditError::Unavailable`] when the `opc_mgmt_audit` INFO target is
+/// disabled, and increments [`tracing_audit_events_dropped`]. It cannot prove
+/// that a downstream log collector accepted the event after tracing dispatch, so
+/// security-critical production paths should provide a durable sink instead.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TracingAuditSink;
 
 impl AuditSink for TracingAuditSink {
     fn record(&self, event: &AuditEvent) -> Result<(), AuditError> {
+        if !tracing::enabled!(target: "opc_mgmt_audit", tracing::Level::INFO) {
+            TRACING_AUDIT_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return Err(AuditError::unavailable(
+                "opc_mgmt_audit tracing target is disabled",
+            ));
+        }
+
         // schema_paths are predicate-free node names, safe to record verbatim.
         let paths = event
             .schema_paths
@@ -459,7 +540,7 @@ impl AuditSink for TracingAuditSink {
             operation = event.operation.as_str(),
             outcome = event.outcome.as_str(),
             reason = event.outcome.code().unwrap_or("-"),
-            tx_id = event.tx_id.as_deref().unwrap_or("-"),
+            tx_id = event.tx_id.as_ref().map(AuditTxId::as_str).unwrap_or("-"),
             paths = %paths,
             "management-plane audit",
         );
@@ -547,19 +628,46 @@ mod tests {
             AuditOperation::Commit,
             AuditOutcome::Success,
         )
-        .with_tx_id("tx-abc");
+        .with_tx_id("tx-abc")
+        .expect("tx id");
 
         sink.record(&event).expect("audit record");
         let captured = sink.events.lock().expect("audit mutex");
         assert_eq!(captured[0].outcome, AuditOutcome::Success);
         assert_eq!(captured[0].outcome.code(), None);
-        assert_eq!(captured[0].tx_id.as_deref(), Some("tx-abc"));
+        assert_eq!(
+            captured[0].tx_id.as_ref().map(AuditTxId::as_str),
+            Some("tx-abc")
+        );
         assert_eq!(captured[0].transport, TransportType::NetconfTls);
         assert_eq!(transport_code(captured[0].transport), "netconf-tls");
     }
 
     #[test]
+    fn audit_tx_ids_reject_injection_and_oversized_values() {
+        let principal = principal();
+        let event = AuditEvent::new(
+            RequestId::new(),
+            &principal,
+            TransportType::NetconfTls,
+            AuditOperation::Commit,
+            AuditOutcome::Success,
+        );
+
+        assert_eq!(
+            event.clone().with_tx_id("tx\ninjected").unwrap_err(),
+            AuditTxIdError::UnsafeCharacter
+        );
+        assert_eq!(
+            event.with_tx_id("x".repeat(1024 * 1024)).unwrap_err(),
+            AuditTxIdError::TooLong
+        );
+    }
+
+    #[test]
     fn outcome_codes_are_stable() {
+        assert_eq!(AuditOutcome::Intent.as_str(), "intent");
+        assert_eq!(AuditOutcome::Intent.code(), None);
         assert_eq!(AuditOutcome::Success.as_str(), "success");
         assert_eq!(
             AuditOutcome::denied_code(AuditReasonCode::ACCESS_DENIED).as_str(),
@@ -573,6 +681,14 @@ mod tests {
             AuditOutcome::failed_code(AuditReasonCode::OPERATION_FAILED).code(),
             Some("operation-failed")
         );
+    }
+
+    #[test]
+    fn operation_codes_are_stable() {
+        assert_eq!(AuditOperation::Capabilities.as_str(), "capabilities");
+        assert_eq!(AuditOperation::Read.as_str(), "read");
+        assert_eq!(AuditOperation::Subscribe.as_str(), "subscribe");
+        assert_eq!(AuditOperation::Exec.as_str(), "exec");
     }
 
     #[test]
@@ -614,6 +730,7 @@ mod tests {
 
     #[test]
     fn metric_label_helpers_sanitize_only_safe_dimensions() {
+        assert_eq!(label_safe_outcome(AuditOutcome::Intent), "intent");
         assert_eq!(label_safe_outcome(AuditOutcome::Success), "success");
         assert_eq!(
             label_safe_reason(AuditOutcome::denied_code(AuditReasonCode::ACCESS_DENIED)),
@@ -652,11 +769,11 @@ mod tests {
     }
 
     #[test]
-    fn tracing_sink_records_without_panicking() {
-        // Smoke test: the default sink must accept an event with no subscriber
-        // installed without panicking.
+    fn tracing_sink_reports_disabled_target_without_silent_loss() {
         let principal = principal();
-        TracingAuditSink
+        let before = tracing_audit_events_dropped();
+
+        let err = TracingAuditSink
             .record(&AuditEvent::new(
                 RequestId::new(),
                 &principal,
@@ -664,7 +781,10 @@ mod tests {
                 AuditOperation::Update,
                 AuditOutcome::failed_code(AuditReasonCode::OPERATION_FAILED),
             ))
-            .expect("trace audit");
+            .expect_err("disabled tracing audit target must fail closed");
+
+        assert!(matches!(err, AuditError::Unavailable { .. }));
+        assert_eq!(tracing_audit_events_dropped(), before + 1);
     }
 
     #[test]

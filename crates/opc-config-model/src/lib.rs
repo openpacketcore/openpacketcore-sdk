@@ -624,6 +624,15 @@ pub trait OpcConfig: Clone + Send + Sync + 'static {
         previous: &Self,
         deltas: &[Self::Delta],
     ) -> Result<Vec<YangPath>, ConfigError>;
+    /// Return the serialized candidate payload size used by config-bus
+    /// admission limits.
+    ///
+    /// The default reports that no serialized size is available. A config bus
+    /// with a max serialized payload configured fails closed for such configs;
+    /// generated configs should override this with their canonical JSON size.
+    fn admission_payload_size_bytes(&self) -> Result<Option<usize>, ConfigError> {
+        Ok(None)
+    }
     fn apply_delta(&mut self, delta: Self::Delta) -> Result<(), ConfigError>;
     fn validate_syntax(&self) -> Result<(), ValidationError>;
     fn validate_semantics(&self, ctx: &ValidationContext<Self>) -> Result<(), ValidationError>;

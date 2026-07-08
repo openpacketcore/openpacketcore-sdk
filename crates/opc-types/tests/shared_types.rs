@@ -95,6 +95,19 @@ fn schema_digest_and_timestamp_serde_round_trip() {
 }
 
 #[test]
+fn timestamp_add_seconds_returns_none_on_overflow() {
+    let timestamp = Timestamp::from_str("2026-05-27T10:20:30Z").expect("valid timestamp input");
+    assert!(timestamp.add_seconds(i64::MAX).is_none());
+    assert!(timestamp.add_seconds(i64::MIN).is_none());
+
+    let advanced = timestamp
+        .add_seconds(90)
+        .expect("small positive duration should be valid");
+
+    assert_eq!(advanced.to_string(), "2026-05-27T10:22:00Z");
+}
+
+#[test]
 fn config_versions_and_tx_ids_are_usable() {
     let version = ConfigVersion::INITIAL.next().unwrap().next().unwrap();
     assert_eq!(version.get(), 2);

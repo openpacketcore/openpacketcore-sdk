@@ -284,10 +284,11 @@ fn assert_no_sensitive_patterns(val: &str, field_name: &str) {
     // 1. Check for standard subscriber identifier prefixes followed by numbers or raw identifiers
     const MARKERS: [&str; 6] = ["supi", "gpsi", "imsi", "msisdn", "guti", "pei"];
     for marker in MARKERS {
-        // If it starts with or contains "imsi-", check that it does not have raw digits following it
-        if let Some(idx) = lower.find(marker) {
+        for (idx, _) in lower.match_indices(marker) {
             let suffix = &lower[idx + marker.len()..];
-            let normalized_suffix = suffix.trim_start_matches(['-', '_', ':', '=']);
+            let normalized_suffix = suffix.trim_start_matches(|c: char| {
+                c.is_ascii_whitespace() || matches!(c, '-' | '_' | ':' | '=')
+            });
             // If the suffix has digits, verify they are redacted/masked.
             // Standard check: if it contains a sequence of 5+ digits, it's considered unredacted.
             let digits_count = normalized_suffix
@@ -323,6 +324,9 @@ fn assert_no_sensitive_patterns(val: &str, field_name: &str) {
     // 4. Check for IP addresses that identify hosts, pods, or subscribers.
     if contains_ipv4_like(val) {
         panic!("Field '{field_name}' contains an IPv4 address: '{val}'");
+    }
+    if contains_ipv6_like(val) {
+        panic!("Field '{field_name}' contains an IPv6 address: '{val}'");
     }
 
     // 5. Check for SUCI format (e.g., suci-0-0-...)
@@ -401,4 +405,24 @@ fn is_ipv4_token(token: &str) -> bool {
             && part.chars().all(|c| c.is_ascii_digit())
             && part.parse::<u8>().is_ok()
     })
+}
+
+fn contains_ipv6_like(val: &str) -> bool {
+    val.split(|c: char| {
+        c.is_whitespace() || matches!(c, ',' | ';' | '=' | '\'' | '"' | '(' | ')' | '{' | '}')
+    })
+    .filter_map(normalize_ipv6_token)
+    .any(|token| token.parse::<std::net::Ipv6Addr>().is_ok())
+}
+
+fn normalize_ipv6_token(token: &str) -> Option<&str> {
+    let trimmed =
+        token.trim_matches(|c: char| !c.is_ascii_hexdigit() && c != ':' && c != '[' && c != ']');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        return rest.split_once(']').map(|(host, _)| host);
+    }
+    Some(trimmed.trim_end_matches(':'))
 }

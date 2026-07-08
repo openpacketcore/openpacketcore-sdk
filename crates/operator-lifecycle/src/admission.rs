@@ -109,28 +109,31 @@ pub fn sanitize_denial_message(msg: &str) -> String {
 }
 
 fn redact_admin_token_values(msg: &str) -> String {
-    let mut words: Vec<String> = msg.split_whitespace().map(str::to_string).collect();
-    let mut redact_next = false;
+    let mut words = Vec::new();
+    let mut redacted_remaining_value = false;
 
-    for word in &mut words {
+    for word in msg.split_whitespace() {
+        if redacted_remaining_value {
+            continue;
+        }
+
         let normalized = word
             .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '=')
             .to_ascii_lowercase();
 
-        if redact_next {
-            *word = "[redacted-token]".to_string();
-            redact_next = false;
-            continue;
-        }
-
-        if normalized.contains("token=") {
-            *word = "[redacted-token]".to_string();
+        if let Some(index) = word.to_ascii_lowercase().find("token=") {
+            words.push(format!("{}[redacted-token]", &word[..index]));
             continue;
         }
 
         if normalized == "token" || normalized.ends_with("_token") {
-            redact_next = true;
+            words.push(word.to_string());
+            words.push("[redacted-token]".to_string());
+            redacted_remaining_value = true;
+            continue;
         }
+
+        words.push(word.to_string());
     }
 
     words.join(" ")
@@ -562,5 +565,27 @@ pub fn evaluate_admission(req: &AdmissionRequest) -> AdmissionResponse {
         uid: req.uid.clone(),
         allowed,
         status,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_denial_message;
+
+    #[test]
+    fn sanitize_denial_message_preserves_inline_token_placeholder() {
+        let sanitized = sanitize_denial_message("NRF timeout using token=admin123 during drain");
+
+        assert!(sanitized.contains("[redacted-token]"));
+        assert!(sanitized.contains("during drain"));
+        assert!(!sanitized.contains("admin123"));
+        assert!(!sanitized.contains("[REDACTED_LINE_CONTAINING_SECRET]"));
+    }
+
+    #[test]
+    fn sanitize_denial_message_redacts_separated_token_value() {
+        let sanitized = sanitize_denial_message("access token admin123 expired");
+
+        assert_eq!(sanitized, "access token [redacted-token]");
     }
 }

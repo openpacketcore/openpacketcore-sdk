@@ -184,6 +184,40 @@ async fn load_latest_fails_closed_on_wrong_length_entry_hmac() {
 }
 
 #[tokio::test]
+async fn audit_tail_truncation_is_rejected() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = temp_dir.path().join("audit_tail_truncation.db");
+
+    let backend = SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect("open backend");
+    let tx_id = TxId::new();
+    let audit = (0..5)
+        .map(|sequence| make_audit_record(tx_id, sequence, &format!("/test:path-{sequence}")))
+        .collect();
+    backend
+        .append_commit(make_commit_record(tx_id, 1), audit)
+        .await
+        .expect("append commit with audit");
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open direct conn");
+    conn.execute(
+        "DELETE FROM audit_trail WHERE tx_id = ?1 AND sequence >= 3",
+        rusqlite::params![tx_id.as_uuid().as_bytes()],
+    )
+    .expect("truncate audit tail");
+
+    let err = backend
+        .load_latest()
+        .await
+        .expect_err("load_latest should fail on audit tail truncation");
+    assert!(
+        matches!(err.kind(), PersistErrorKind::AuditChainBroken),
+        "expected AuditChainBroken after audit tail truncation, got: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_audit_trail_redaction_and_chain_verification() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let db_path = temp_dir.path().join("audit_redaction.db");
@@ -238,6 +272,30 @@ async fn test_audit_trail_redaction_and_chain_verification() {
             previous_hash: [0u8; 32],
             entry_hmac: [0u8; 32],
         },
+        AuditRecord {
+            tx_id,
+            sequence: 4,
+            yang_path: "/test:config/customField".to_string(),
+            op_type: AuditOpType::Update,
+            previous_value: Some(r#""2001:db8:85a3::8a2e:370:7334""#.to_string()),
+            new_value: None,
+            redaction_applied: false,
+            previous_hash: [0u8; 32],
+            entry_hmac: [0u8; 32],
+        },
+        AuditRecord {
+            tx_id,
+            sequence: 5,
+            yang_path: "/test:config/customField".to_string(),
+            op_type: AuditOpType::Update,
+            previous_value: None,
+            new_value: Some(
+                r#""VGhpcyBpcyBhIHByb2R1Y3Rpb24gQVBJIHNlY3JldCAxMjM0NQ==""#.to_string(),
+            ),
+            redaction_applied: false,
+            previous_hash: [0u8; 32],
+            entry_hmac: [0u8; 32],
+        },
     ];
 
     let record = make_commit_record(tx_id, 1);
@@ -252,7 +310,7 @@ async fn test_audit_trail_redaction_and_chain_verification() {
         .expect("load_latest should succeed")
         .expect("should have config");
 
-    assert_eq!(loaded.audit.len(), 4);
+    assert_eq!(loaded.audit.len(), 6);
 
     assert_eq!(
         loaded.audit[0].new_value,
@@ -287,10 +345,22 @@ async fn test_audit_trail_redaction_and_chain_verification() {
     );
     assert!(loaded.audit[3].redaction_applied);
 
+    assert_eq!(
+        loaded.audit[4].previous_value,
+        Some("\"<redacted>\"".to_string())
+    );
+    assert!(loaded.audit[4].redaction_applied);
+
+    assert_eq!(
+        loaded.audit[5].new_value,
+        Some("\"<redacted>\"".to_string())
+    );
+    assert!(loaded.audit[5].redaction_applied);
+
     let conn = rusqlite::Connection::open(&db_path).expect("open direct conn");
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM audit_trail WHERE previous_value LIKE '%20895%' OR new_value LIKE '%20895%' OR new_value LIKE '%secret%' OR new_value LIKE '%10.0.0.1%'",
+            "SELECT COUNT(*) FROM audit_trail WHERE previous_value LIKE '%20895%' OR new_value LIKE '%20895%' OR new_value LIKE '%secret%' OR new_value LIKE '%10.0.0.1%' OR previous_value LIKE '%2001:db8%' OR new_value LIKE '%VGhpcy%'",
             [],
             |row| row.get(0),
         )

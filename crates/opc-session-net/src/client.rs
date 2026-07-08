@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -9,7 +9,7 @@ use futures_util::stream::BoxStream;
 use futures_util::Stream;
 use opc_session_store::backend::{
     CompareAndSet, CompareAndSetResult, ReplicationEntry, SessionBackend, SessionOp,
-    SessionOpResult,
+    SessionOpResult, WATCH_CHANNEL_CAPACITY,
 };
 use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::error::{LeaseError, StoreError};
@@ -44,6 +44,7 @@ pub struct RemoteSessionBackend {
     max_frame_size: usize,
     node_id: String,
     conn: Arc<Mutex<Option<Connection>>>,
+    cached_capabilities: Arc<RwLock<Option<BackendCapabilities>>>,
 }
 
 impl std::fmt::Debug for RemoteSessionBackend {
@@ -77,6 +78,7 @@ impl RemoteSessionBackend {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             node_id: format!("opc-session-net/{}", std::process::id()),
             conn: Arc::new(Mutex::new(None)),
+            cached_capabilities: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -202,14 +204,52 @@ impl RemoteSessionBackend {
         write_frame(&mut conn.writer, req).await?;
         read_frame(&mut conn.reader, self.max_frame_size).await
     }
+
+    fn remember_capabilities(&self, caps: BackendCapabilities) {
+        if let Ok(mut cached) = self.cached_capabilities.write() {
+            *cached = Some(caps);
+        }
+    }
+
+    fn cached_capabilities(&self) -> Option<BackendCapabilities> {
+        self.cached_capabilities
+            .read()
+            .ok()
+            .and_then(|cached| *cached)
+    }
+
+    fn capabilities_after_probe_failure(&self, reason: &str) -> BackendCapabilities {
+        if let Some(caps) = self.cached_capabilities() {
+            tracing::warn!(
+                addr = %self.addr,
+                reason,
+                "remote capabilities probe failed; using cached capabilities"
+            );
+            caps
+        } else {
+            tracing::warn!(
+                addr = %self.addr,
+                reason,
+                "remote capabilities probe failed before any cached success; returning minimal capabilities"
+            );
+            BackendCapabilities::minimal()
+        }
+    }
 }
 
 #[async_trait]
 impl SessionBackend for RemoteSessionBackend {
     async fn capabilities(&self) -> BackendCapabilities {
         match self.send_request_with_retry(Request::Capabilities).await {
-            Ok(Response::Capabilities(caps)) => caps,
-            _ => BackendCapabilities::minimal(),
+            Ok(Response::Capabilities(caps)) => {
+                self.remember_capabilities(caps);
+                caps
+            }
+            Ok(_) => self.capabilities_after_probe_failure("unexpected_response"),
+            Err(err) => {
+                let reason = store_error_kind(&err);
+                self.capabilities_after_probe_failure(reason)
+            }
         }
     }
 
@@ -226,7 +266,10 @@ impl SessionBackend for RemoteSessionBackend {
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
         match self
-            .send_request_with_retry(Request::CompareAndSet { op })
+            .send_request_with_retry(Request::CompareAndSet {
+                op,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
+            })
             .await?
         {
             Response::CompareAndSet(res) => res,
@@ -331,7 +374,7 @@ impl SessionBackend for RemoteSessionBackend {
         let node_id = self.node_id.clone();
         let deadline = self.deadline;
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(WATCH_CHANNEL_CAPACITY);
 
         tokio::spawn(async move {
             let result = watch_connect_and_read(
@@ -416,10 +459,10 @@ async fn watch_connect_and_read(
     node_id: String,
     start_sequence: u64,
     deadline: Duration,
-    tx: tokio::sync::mpsc::UnboundedSender<Result<ReplicationEntry, StoreError>>,
+    tx: tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>,
 ) -> Result<(), ProtocolError> {
-    // Bound connect + handshake by the client deadline; the watch stream
-    // itself is long-lived and intentionally unbounded.
+    // Bound connect + handshake by the client deadline. After the handshake,
+    // bounded channel sends backpressure socket reads when consumers lag.
     let open = async {
         let tcp = TcpStream::connect(addr).await.map_err(ProtocolError::Io)?;
 
@@ -444,9 +487,11 @@ async fn watch_connect_and_read(
     let mut reader = match tokio::time::timeout(deadline, open).await {
         Ok(res) => res?,
         Err(_) => {
-            let _ = tx.send(Err(StoreError::BackendUnavailable(format!(
-                "watch handshake to {addr} timed out after {deadline:?}"
-            ))));
+            let _ = tx
+                .send(Err(StoreError::BackendUnavailable(format!(
+                    "watch handshake to {addr} timed out after {deadline:?}"
+                ))))
+                .await;
             return Err(ProtocolError::BackendUnavailable(
                 "watch handshake timed out".into(),
             ));
@@ -456,21 +501,25 @@ async fn watch_connect_and_read(
     loop {
         match read_frame::<_, Response>(&mut reader, max_frame_size).await {
             Ok(Response::WatchEntry(item)) => {
-                if tx.send(item).is_err() {
+                if tx.send(item).await.is_err() {
                     break;
                 }
             }
             Ok(_) => {
-                let _ = tx.send(Err(StoreError::BackendUnavailable(
-                    "unexpected watch frame".into(),
-                )));
+                let _ = tx
+                    .send(Err(StoreError::BackendUnavailable(
+                        "unexpected watch frame".into(),
+                    )))
+                    .await;
                 break;
             }
             Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
             Err(e) => {
-                let _ = tx.send(Err(StoreError::BackendUnavailable(e.to_string())));
+                let _ = tx
+                    .send(Err(StoreError::BackendUnavailable(e.to_string())))
+                    .await;
                 break;
             }
         }
@@ -533,8 +582,26 @@ where
     Ok(())
 }
 
+fn store_error_kind(err: &StoreError) -> &'static str {
+    match err {
+        StoreError::NotFound => "not_found",
+        StoreError::StaleFence => "stale_fence",
+        StoreError::CasConflict => "cas_conflict",
+        StoreError::CapabilityNotSupported(_) => "capability_not_supported",
+        StoreError::BackendUnavailable(_) => "backend_unavailable",
+        StoreError::InvalidKey(_) => "invalid_key",
+        StoreError::LeaseHeld => "lease_held",
+        StoreError::LeaseExpired => "lease_expired",
+        StoreError::Crypto(_) => "crypto",
+        StoreError::Serialization(_) => "serialization",
+        StoreError::PayloadTooLarge { .. } => "payload_too_large",
+        StoreError::InvalidRestoreScanRequest(_) => "invalid_restore_scan_request",
+        StoreError::RestoreScanPageTooLarge { .. } => "restore_scan_page_too_large",
+    }
+}
+
 struct WatchStream {
-    rx: tokio::sync::mpsc::UnboundedReceiver<Result<ReplicationEntry, StoreError>>,
+    rx: tokio::sync::mpsc::Receiver<Result<ReplicationEntry, StoreError>>,
 }
 
 impl Stream for WatchStream {

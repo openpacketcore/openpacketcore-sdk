@@ -9,12 +9,14 @@ use std::time::{Duration, Instant};
 use opc_config_bus::{ConfigChange, ConfigEvent, ConfigReceiver, SubscriberLagPolicy};
 use opc_config_model::{
     CommitMode, CommitRequest, ConfigOperation, OpcConfig, RequestId, RequestSource, TransportType,
-    TrustedPrincipal, ValidationContext,
+    TrustedPrincipal, ValidationContext, YangPath,
 };
 use opc_mgmt_audit::{
     AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink, SchemaNodePath,
 };
-use opc_mgmt_authz::{AuthzError, ExecAuthorizer, PolicySource, ReadAction, ReadAuthorizer};
+use opc_mgmt_authz::{
+    AuthzError, ConfigWriteAuthorizer, ExecAuthorizer, PolicySource, ReadAction, ReadAuthorizer,
+};
 use opc_mgmt_errors::{commit_error_to_netconf, NetconfError, NetconfErrorTag, NetconfErrorType};
 use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_schema::ModelData;
@@ -86,7 +88,7 @@ const NETCONF_CREATE_SUBSCRIPTION_PATH: &str = "/ncn:create-subscription";
 const NETCONF_NOTIFICATION_STREAM: &str = "NETCONF";
 const NETCONF_NOTIFICATION_NS: &str = "urn:ietf:params:xml:ns:netconf:notification:1.0";
 const NETCONF_CONFIG_CHANGE_NS: &str = "urn:ietf:params:xml:ns:yang:ietf-netconf-notifications";
-const NOTIFICATION_EVENT_BYTES_ESTIMATE: usize = 4096;
+const MIN_NOTIFICATION_EVENT_BYTES_ESTIMATE: usize = 4096;
 const MAX_NOTIFICATION_EVENT_CAPACITY: usize = 4096;
 const DEFAULT_CONFIRMED_COMMIT_TIMEOUT_SECS: u32 = 600;
 
@@ -257,6 +259,12 @@ impl DatastoreFailure {
             Self::Failed => RpcError::operation_failed(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteAuthzFailure {
+    Denied,
+    Unavailable,
 }
 
 impl From<StartupDatastoreError> for DatastoreFailure {
@@ -1286,7 +1294,7 @@ where
 
         let receiver = self.binding.config_bus().subscribe(
             SubscriberLagPolicy::DisconnectOnLag,
-            notification_capacity(limits),
+            notification_capacity::<C>(limits),
         );
         record_rpc_success(metric_operation, context.started.elapsed());
         RpcSessionHandlingResult::with_action(
@@ -3026,6 +3034,46 @@ where
                     RpcError::operation_failed(),
                 );
             }
+            let changed_paths = match self
+                .replacement_changed_paths(&candidate.config, Some(snapshot.config.as_ref()))
+            {
+                Ok(paths) => paths,
+                Err(WriteAuthzFailure::Denied) => unreachable!("path diff cannot deny"),
+                Err(WriteAuthzFailure::Unavailable) => {
+                    return self.exec_failure_reply(
+                        &context,
+                        NetconfOperation::Commit,
+                        NETCONF_COMMIT_PATH,
+                        audit_failed("resource-denied"),
+                        RpcError::resource_denied(),
+                    );
+                }
+            };
+            match self.authorize_config_write(
+                context.principal,
+                ConfigOperation::Replace,
+                &changed_paths,
+            ) {
+                Ok(()) => {}
+                Err(WriteAuthzFailure::Denied) => {
+                    return self.exec_failure_reply(
+                        &context,
+                        NetconfOperation::Commit,
+                        NETCONF_COMMIT_PATH,
+                        audit_denied("access-denied"),
+                        RpcError::access_denied(),
+                    );
+                }
+                Err(WriteAuthzFailure::Unavailable) => {
+                    return self.exec_failure_reply(
+                        &context,
+                        NetconfOperation::Commit,
+                        NETCONF_COMMIT_PATH,
+                        audit_failed("resource-denied"),
+                        RpcError::resource_denied(),
+                    );
+                }
+            }
         }
         let timeout = confirmed_commit_timeout(request);
         let mode = if request.confirmed {
@@ -3473,6 +3521,26 @@ where
             }
         };
 
+        match self.all_config_schema_paths().and_then(|paths| {
+            self.authorize_config_write(context.principal, ConfigOperation::Delete, &paths)
+        }) {
+            Ok(()) => {}
+            Err(WriteAuthzFailure::Denied) => {
+                return self.delete_config_failure_reply_for_rpc(
+                    &context,
+                    audit_denied("access-denied"),
+                    RpcError::access_denied(),
+                );
+            }
+            Err(WriteAuthzFailure::Unavailable) => {
+                return self.delete_config_failure_reply_for_rpc(
+                    &context,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        }
+
         match startup.delete_startup_config() {
             Ok(()) => self.delete_config_success_reply(&context),
             Err(error) => self.delete_config_failure_reply(&context, error.into()),
@@ -3485,6 +3553,51 @@ where
             XmlDatastore::Candidate => self.binding.candidate_datastore_capability(),
             XmlDatastore::Startup => self.binding.startup_datastore_capability(),
         }
+    }
+
+    fn authorize_config_write(
+        &self,
+        principal: &TrustedPrincipal,
+        operation: ConfigOperation,
+        changed_paths: &[YangPath],
+    ) -> Result<(), WriteAuthzFailure> {
+        let authorizer =
+            ConfigWriteAuthorizer::new(self.binding.schema_registry(), self.authz.policy_source())
+                .map_err(|_| WriteAuthzFailure::Unavailable)?;
+        let path_refs = changed_paths.iter().collect::<Vec<_>>();
+        let decisions = authorizer
+            .authorize_paths(principal, operation, &path_refs)
+            .map_err(|_| WriteAuthzFailure::Unavailable)?;
+        if decisions.iter().any(|decision| !decision.allowed) {
+            return Err(WriteAuthzFailure::Denied);
+        }
+        Ok(())
+    }
+
+    fn replacement_changed_paths(
+        &self,
+        candidate: &C,
+        previous: Option<&C>,
+    ) -> Result<Vec<YangPath>, WriteAuthzFailure> {
+        if let Some(previous) = previous {
+            let deltas = candidate
+                .diff(previous)
+                .map_err(|_| WriteAuthzFailure::Unavailable)?;
+            return candidate
+                .changed_paths(previous, &deltas)
+                .map_err(|_| WriteAuthzFailure::Unavailable);
+        }
+        self.all_config_schema_paths()
+    }
+
+    fn all_config_schema_paths(&self) -> Result<Vec<YangPath>, WriteAuthzFailure> {
+        self.binding
+            .schema_registry()
+            .nodes()
+            .iter()
+            .filter(|node| node.config)
+            .map(|node| YangPath::new(node.path).map_err(|_| WriteAuthzFailure::Unavailable))
+            .collect()
     }
 
     fn load_datastore_config(&self, datastore: XmlDatastore) -> Result<C, DatastoreFailure> {
@@ -3551,6 +3664,39 @@ where
         };
         let bus = self.binding.config_bus();
         let snapshot = bus.current_snapshot();
+        let changed_paths =
+            match self.replacement_changed_paths(&source, Some(snapshot.config.as_ref())) {
+                Ok(paths) => paths,
+                Err(WriteAuthzFailure::Denied) => unreachable!("path diff cannot deny"),
+                Err(WriteAuthzFailure::Unavailable) => {
+                    return self.copy_config_failure_reply_for_rpc(
+                        context,
+                        audit_failed("resource-denied"),
+                        RpcError::resource_denied(),
+                    );
+                }
+            };
+        match self.authorize_config_write(
+            context.principal,
+            ConfigOperation::Replace,
+            &changed_paths,
+        ) {
+            Ok(()) => {}
+            Err(WriteAuthzFailure::Denied) => {
+                return self.copy_config_failure_reply_for_rpc(
+                    context,
+                    audit_denied("access-denied"),
+                    RpcError::access_denied(),
+                );
+            }
+            Err(WriteAuthzFailure::Unavailable) => {
+                return self.copy_config_failure_reply_for_rpc(
+                    context,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        }
         let request = CommitRequest::commit(
             context.request_id,
             context.principal.clone(),
@@ -3646,10 +3792,47 @@ where
             }
         };
         if self
-            .validate_config_for_datastore(&source, context, ConfigOperation::Replace, previous)
+            .validate_config_for_datastore(
+                &source,
+                context,
+                ConfigOperation::Replace,
+                previous.clone(),
+            )
             .is_err()
         {
             return self.copy_config_failure_reply(context, DatastoreFailure::Failed);
+        }
+        let changed_paths = match self.replacement_changed_paths(&source, previous.as_deref()) {
+            Ok(paths) => paths,
+            Err(WriteAuthzFailure::Denied) => unreachable!("path diff cannot deny"),
+            Err(WriteAuthzFailure::Unavailable) => {
+                return self.copy_config_failure_reply_for_rpc(
+                    context,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        };
+        match self.authorize_config_write(
+            context.principal,
+            ConfigOperation::Replace,
+            &changed_paths,
+        ) {
+            Ok(()) => {}
+            Err(WriteAuthzFailure::Denied) => {
+                return self.copy_config_failure_reply_for_rpc(
+                    context,
+                    audit_denied("access-denied"),
+                    RpcError::access_denied(),
+                );
+            }
+            Err(WriteAuthzFailure::Unavailable) => {
+                return self.copy_config_failure_reply_for_rpc(
+                    context,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
         }
         match startup.store_startup_config(&source) {
             Ok(()) => self.copy_config_success_reply(
@@ -4123,6 +4306,41 @@ where
             }
         };
 
+        let changed_paths = match self
+            .replacement_changed_paths(&candidate.candidate, Some(snapshot.config.as_ref()))
+        {
+            Ok(paths) => paths,
+            Err(WriteAuthzFailure::Denied) => unreachable!("path diff cannot deny"),
+            Err(WriteAuthzFailure::Unavailable) => {
+                return self.edit_config_failure_reply(
+                    &context,
+                    kind,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        };
+        match self.authorize_config_write(context.principal, ConfigOperation::Patch, &changed_paths)
+        {
+            Ok(()) => {}
+            Err(WriteAuthzFailure::Denied) => {
+                return self.edit_config_failure_reply(
+                    &context,
+                    kind,
+                    audit_denied("access-denied"),
+                    RpcError::access_denied(),
+                );
+            }
+            Err(WriteAuthzFailure::Unavailable) => {
+                return self.edit_config_failure_reply(
+                    &context,
+                    kind,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        }
+
         let commit_request = CommitRequest::commit(
             context.request_id,
             context.principal.clone(),
@@ -4460,6 +4678,19 @@ where
                 );
             }
         };
+        let changed_paths = match self.replacement_changed_paths(&candidate.candidate, Some(&base))
+        {
+            Ok(paths) => paths,
+            Err(WriteAuthzFailure::Denied) => unreachable!("path diff cannot deny"),
+            Err(WriteAuthzFailure::Unavailable) => {
+                return self.edit_config_failure_reply(
+                    context,
+                    kind,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
+        };
         let previous = Some(Arc::new(base));
         if self
             .validate_config_for_datastore(
@@ -4476,6 +4707,26 @@ where
                 audit_failed("operation-failed"),
                 RpcError::operation_failed(),
             );
+        }
+        match self.authorize_config_write(context.principal, ConfigOperation::Patch, &changed_paths)
+        {
+            Ok(()) => {}
+            Err(WriteAuthzFailure::Denied) => {
+                return self.edit_config_failure_reply(
+                    context,
+                    kind,
+                    audit_denied("access-denied"),
+                    RpcError::access_denied(),
+                );
+            }
+            Err(WriteAuthzFailure::Unavailable) => {
+                return self.edit_config_failure_reply(
+                    context,
+                    kind,
+                    audit_failed("resource-denied"),
+                    RpcError::resource_denied(),
+                );
+            }
         }
         match startup.store_startup_config(&candidate.candidate) {
             Ok(()) => {}
@@ -4497,7 +4748,7 @@ where
             }
         }
 
-        let paths = self.schema_paths_for_changed_paths(&candidate.changed_paths, kind.path());
+        let paths = self.schema_paths_for_changed_paths(&changed_paths, kind.path());
         if self
             .audit
             .record(
@@ -5413,8 +5664,15 @@ fn schema_node_paths(paths: &[&'static str]) -> Vec<SchemaNodePath> {
         .collect::<Vec<_>>()
 }
 
-fn notification_capacity(limits: &MgmtLimits) -> usize {
-    (limits.max_subscriber_queue_bytes / NOTIFICATION_EVENT_BYTES_ESTIMATE)
+fn notification_event_bytes_estimate<C: OpcConfig>() -> usize {
+    std::mem::size_of::<ConfigEvent<C>>()
+        .saturating_add(std::mem::size_of::<C>().saturating_mul(2))
+        .saturating_add(std::mem::size_of::<C::Delta>())
+        .max(MIN_NOTIFICATION_EVENT_BYTES_ESTIMATE)
+}
+
+fn notification_capacity<C: OpcConfig>(limits: &MgmtLimits) -> usize {
+    (limits.max_subscriber_queue_bytes / notification_event_bytes_estimate::<C>())
         .clamp(1, MAX_NOTIFICATION_EVENT_CAPACITY)
 }
 
@@ -5543,6 +5801,46 @@ mod tests {
                 paths.push(YangPath::new("/sys:system/sys:secret").expect("secret path"));
             }
             Ok(paths)
+        }
+
+        fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), ConfigError> {
+            Ok(())
+        }
+
+        fn validate_syntax(&self) -> Result<(), ValidationError> {
+            Ok(())
+        }
+
+        fn validate_semantics(
+            &self,
+            _ctx: &ValidationContext<Self>,
+        ) -> Result<(), ValidationError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct LargeNotificationConfig {
+        _payload: [u8; 8192],
+    }
+
+    impl OpcConfig for LargeNotificationConfig {
+        type Delta = ();
+
+        fn schema_digest(&self) -> SchemaDigest {
+            SchemaDigest::from_bytes([8u8; 32])
+        }
+
+        fn diff(&self, _previous: &Self) -> Result<Vec<Self::Delta>, ConfigError> {
+            Ok(Vec::new())
+        }
+
+        fn changed_paths(
+            &self,
+            _previous: &Self,
+            _deltas: &[Self::Delta],
+        ) -> Result<Vec<YangPath>, ConfigError> {
+            Ok(Vec::new())
         }
 
         fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), ConfigError> {
@@ -6636,18 +6934,30 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct PanicOnReadAudit;
+
+    impl AuditSink for PanicOnReadAudit {
+        fn record(&self, event: &AuditEvent) -> Result<(), AuditError> {
+            if matches!(event.operation, AuditOperation::Read) {
+                panic!("read audit panic");
+            }
+            Ok(())
+        }
+    }
+
     struct FixedPolicy(NacmPolicy);
 
     impl PolicySource for FixedPolicy {
-        fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
-            Ok(self.0.clone())
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
+            Ok(Arc::new(self.0.clone()))
         }
     }
 
     struct BrokenPolicySource;
 
     impl PolicySource for BrokenPolicySource {
-        fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
             Err(AuthzError::PolicyUnavailable)
         }
     }
@@ -6938,7 +7248,79 @@ mod tests {
             .expect("module");
         register_netconf_module(&mut modules);
         register_netconf_nmda_module(&mut modules);
-        NacmPolicy::builder(PolicyVersion::new(1))
+        let mut builder = NacmPolicy::builder(PolicyVersion::new(1))
+            .add_rule(NacmRule::deny(
+                NacmAction::Read,
+                YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
+            ))
+            .add_rule(NacmRule::deny(
+                NacmAction::Subscribe,
+                YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
+            ))
+            .add_rule(NacmRule::deny(
+                NacmAction::Create,
+                YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
+            ))
+            .add_rule(NacmRule::deny(
+                NacmAction::Update,
+                YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
+            ))
+            .add_rule(NacmRule::deny(
+                NacmAction::Replace,
+                YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
+            ))
+            .add_rule(NacmRule::deny(
+                NacmAction::Delete,
+                YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
+            ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Read,
+                YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
+            ))
+            .add_rule(NacmRule::allow(
+                NacmAction::Subscribe,
+                YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
+            ));
+        for action in [
+            NacmAction::Create,
+            NacmAction::Update,
+            NacmAction::Replace,
+            NacmAction::Delete,
+        ] {
+            builder = builder
+                .add_rule(NacmRule::allow(
+                    action,
+                    YangPathPattern::parse("/sys:system", &modules).expect("allow root path"),
+                ))
+                .add_rule(NacmRule::allow(
+                    action,
+                    YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
+                ));
+        }
+        builder
+            .add_rule(allow_close_session_rule(&modules))
+            .add_rule(allow_lock_rule(&modules))
+            .add_rule(allow_unlock_rule(&modules))
+            .add_rule(allow_validate_rule(&modules))
+            .add_rule(allow_commit_rule(&modules))
+            .add_rule(allow_cancel_commit_rule(&modules))
+            .add_rule(allow_discard_changes_rule(&modules))
+            .add_rule(allow_copy_config_rule(&modules))
+            .add_rule(allow_delete_config_rule(&modules))
+            .add_rule(allow_edit_config_rule(&modules))
+            .add_rule(allow_edit_data_rule(&modules))
+            .add_rule(allow_kill_session_rule(&modules))
+            .build()
+    }
+
+    fn policy_allow_system_with_secret_writes() -> NacmPolicy {
+        let mut modules = ModuleRegistry::new();
+        modules
+            .register_module("demo-system", "sys")
+            .expect("module");
+        register_netconf_module(&mut modules);
+        register_netconf_nmda_module(&mut modules);
+        let mut builder = NacmPolicy::builder(PolicyVersion::new(1))
             .add_rule(NacmRule::deny(
                 NacmAction::Read,
                 YangPathPattern::parse("/sys:system/sys:secret", &modules).expect("deny path"),
@@ -6954,7 +7336,24 @@ mod tests {
             .add_rule(NacmRule::allow(
                 NacmAction::Subscribe,
                 YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
-            ))
+            ));
+        for action in [
+            NacmAction::Create,
+            NacmAction::Update,
+            NacmAction::Replace,
+            NacmAction::Delete,
+        ] {
+            builder = builder
+                .add_rule(NacmRule::allow(
+                    action,
+                    YangPathPattern::parse("/sys:system", &modules).expect("allow root path"),
+                ))
+                .add_rule(NacmRule::allow(
+                    action,
+                    YangPathPattern::parse("/sys:system/**", &modules).expect("allow path"),
+                ));
+        }
+        builder
             .add_rule(allow_close_session_rule(&modules))
             .add_rule(allow_lock_rule(&modules))
             .add_rule(allow_unlock_rule(&modules))
@@ -6994,6 +7393,20 @@ mod tests {
             .add_rule(allow_discard_changes_rule(&modules))
             .add_rule(allow_kill_session_rule(&modules))
             .build()
+    }
+
+    #[test]
+    fn notification_capacity_uses_config_specific_event_estimate() {
+        let limits = MgmtLimits {
+            max_subscriber_queue_bytes: 64 * 1024,
+            ..MgmtLimits::default()
+        };
+
+        let estimate = notification_event_bytes_estimate::<LargeNotificationConfig>();
+        let capacity = notification_capacity::<LargeNotificationConfig>(&limits);
+
+        assert!(estimate > 4096);
+        assert!(capacity * estimate <= limits.max_subscriber_queue_bytes);
     }
 
     fn policy_allow_system_and_yang_library_but_deny_secret() -> NacmPolicy {
@@ -12422,6 +12835,16 @@ mod tests {
         Arc<ConfigBus<DemoConfig>>,
         CapturingAudit,
     ) {
+        generated_edit_server_policy(policy_allow_system_but_deny_secret()).await
+    }
+
+    async fn generated_edit_server_policy(
+        policy: NacmPolicy,
+    ) -> (
+        ReadOnlyNetconfServer<DemoConfig, GeneratedEditBinding, FixedPolicy, CapturingAudit>,
+        Arc<ConfigBus<DemoConfig>>,
+        CapturingAudit,
+    ) {
         let store = Arc::new(MockManagedDatastore::new());
         store
             .seed(StoredConfig::new(
@@ -12453,7 +12876,7 @@ mod tests {
         let audit = CapturingAudit::default();
         let server = ReadOnlyNetconfServer::new(
             binding,
-            FixedPolicy(policy_allow_system_but_deny_secret()),
+            FixedPolicy(policy),
             audit.clone(),
             TransportType::NetconfTls,
         )
@@ -12462,6 +12885,17 @@ mod tests {
     }
 
     async fn generated_edit_server_with_startup_fixture() -> (
+        ReadOnlyNetconfServer<DemoConfig, GeneratedEditBinding, FixedPolicy, CapturingAudit>,
+        Arc<ConfigBus<DemoConfig>>,
+        Arc<MemoryStartupDatastore>,
+        CapturingAudit,
+    ) {
+        generated_edit_server_with_startup_policy(policy_allow_system_but_deny_secret()).await
+    }
+
+    async fn generated_edit_server_with_startup_policy(
+        policy: NacmPolicy,
+    ) -> (
         ReadOnlyNetconfServer<DemoConfig, GeneratedEditBinding, FixedPolicy, CapturingAudit>,
         Arc<ConfigBus<DemoConfig>>,
         Arc<MemoryStartupDatastore>,
@@ -12505,7 +12939,7 @@ mod tests {
         let audit = CapturingAudit::default();
         let server = ReadOnlyNetconfServer::new(
             binding,
-            FixedPolicy(policy_allow_system_but_deny_secret()),
+            FixedPolicy(policy),
             audit.clone(),
             TransportType::NetconfTls,
         )
@@ -12552,6 +12986,42 @@ mod tests {
             .collect();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].outcome, AuditOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn running_edit_config_denies_node_write_before_allow_all_bus_authorizer() {
+        let (server, bus, audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_config_rpc(
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:secret>persisted-admin</sys:secret></sys:system>"#,
+            "merge",
+        );
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(
+            result
+                .reply_xml
+                .contains("<error-tag>access-denied</error-tag>"),
+            "{}",
+            result.reply_xml
+        );
+        assert_eq!(bus.current_snapshot().config.secret, "do-not-leak");
+
+        let events = audit.events.lock().expect("audit mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, AuditOperation::Update);
+        assert_eq!(events[0].outcome, audit_denied("access-denied"));
     }
 
     #[tokio::test]
@@ -12876,10 +13346,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_config_startup_enforces_write_nacm() {
+        let (server, _bus, startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_config_rpc_to(
+            "startup",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:secret>persisted-admin</sys:secret></sys:system>"#,
+            "merge",
+        );
+        let edited = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(
+            edited
+                .reply_xml
+                .contains("<error-tag>access-denied</error-tag>"),
+            "{}",
+            edited.reply_xml
+        );
+        assert_eq!(
+            startup.current().expect("startup config").secret,
+            "startup-secret"
+        );
+    }
+
+    #[tokio::test]
     async fn copy_config_running_to_startup_and_startup_to_running() {
         let (server, bus, startup, _audit) = generated_edit_server_with_startup_fixture().await;
         let registry = SessionRegistry::new();
         let _registration = registry.register(1).expect("register session 1");
+
+        startup
+            .store_startup_config(&DemoConfig {
+                hostname: "boot-1".to_string(),
+                secret: "do-not-leak".to_string(),
+            })
+            .expect("align startup secret");
 
         let copied_to_startup = server
             .handle_rpc_for_session_async(
@@ -12901,7 +13413,7 @@ mod tests {
         startup
             .store_startup_config(&DemoConfig {
                 hostname: "boot-3".to_string(),
-                secret: "startup-secret".to_string(),
+                secret: "do-not-leak".to_string(),
             })
             .expect("store startup");
 
@@ -12924,8 +13436,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copy_config_to_startup_enforces_write_nacm() {
+        let (server, _bus, startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let copied = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &copy_config_rpc("startup", "running"),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(
+            copied
+                .reply_xml
+                .contains("<error-tag>access-denied</error-tag>"),
+            "{}",
+            copied.reply_xml
+        );
+        let startup_config = startup.current().expect("startup config");
+        assert_eq!(startup_config.hostname, "boot-1");
+        assert_eq!(startup_config.secret, "startup-secret");
+    }
+
+    #[tokio::test]
     async fn delete_config_startup_removes_startup_only_when_delete_supported() {
-        let (server, bus, startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        let (server, bus, startup, _audit) =
+            generated_edit_server_with_startup_policy(policy_allow_system_with_secret_writes())
+                .await;
         let registry = SessionRegistry::new();
         let _registration = registry.register(1).expect("register session 1");
 
@@ -12958,6 +13501,33 @@ mod tests {
             "missing startup reply: {}",
             missing.reply_xml
         );
+    }
+
+    #[tokio::test]
+    async fn delete_config_startup_enforces_write_nacm() {
+        let (server, _bus, startup, _audit) = generated_edit_server_with_startup_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let deleted = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &delete_config_rpc("startup"),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(
+            deleted
+                .reply_xml
+                .contains("<error-tag>access-denied</error-tag>"),
+            "{}",
+            deleted.reply_xml
+        );
+        assert!(startup.current().is_some());
     }
 
     #[tokio::test]
@@ -13431,6 +14001,108 @@ mod tests {
             .expect("session join")
             .expect("session result");
         assert_eq!(result.rpc_count, 2);
+        wait_for_hostname(&bus, "amf-1").await;
+    }
+
+    #[tokio::test]
+    async fn nonpersistent_confirmed_commit_rolls_back_when_session_panics() {
+        let store = Arc::new(MockManagedDatastore::new());
+        store
+            .seed(StoredConfig::new(
+                opc_types::TxId::new(),
+                ConfigVersion::new(1),
+                principal(),
+                RequestSource::Northbound,
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+            ))
+            .await;
+        let bus = Arc::new(
+            ConfigBus::restore_or_new_dev_only(
+                DemoConfig {
+                    hostname: "fallback".to_string(),
+                    secret: "fallback-secret".to_string(),
+                },
+                Arc::clone(&store),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = GeneratedEditBinding {
+            bus: Arc::clone(&bus),
+            startup: None,
+        };
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            PanicOnReadAudit,
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+        let principal = principal();
+        let sessions = SessionRegistry::new();
+        let (mut client, mut server_io) = tokio::io::duplex(64 * 1024);
+        let limits = MgmtLimits::default();
+
+        let session_task = tokio::spawn(async move {
+            crate::session::run_read_only_session_with_registry(
+                &server,
+                &principal,
+                &mut server_io,
+                SessionConfig::default(),
+                502,
+                &sessions,
+            )
+            .await
+        });
+
+        let server_hello =
+            String::from_utf8(read_base10_frame(&mut client).await).expect("hello utf8");
+        assert!(server_hello.contains(NETCONF_BASE_1_0));
+
+        let client_hello = format!(
+            r#"<hello xmlns="{NETCONF_BASE_NS}"><capabilities><capability>{NETCONF_BASE_1_0}</capability></capabilities></hello>"#
+        );
+        client
+            .write_all(&base10::encode_message(client_hello.as_bytes(), &limits).expect("hello"))
+            .await
+            .expect("write client hello");
+
+        let edit = edit_config_rpc_to(
+            "candidate",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        client
+            .write_all(&base10::encode_message(edit.as_bytes(), &limits).expect("edit"))
+            .await
+            .expect("write edit");
+        let reply = String::from_utf8(read_base10_frame(&mut client).await).expect("edit reply");
+        assert!(reply.contains("<ok/>"), "edit reply: {reply}");
+
+        client
+            .write_all(
+                &base10::encode_message(confirmed_commit_rpc(30).as_bytes(), &limits)
+                    .expect("confirmed commit"),
+            )
+            .await
+            .expect("write confirmed commit");
+        let reply = String::from_utf8(read_base10_frame(&mut client).await).expect("commit reply");
+        assert!(reply.contains("<ok/>"), "commit reply: {reply}");
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+
+        client
+            .write_all(
+                &base10::encode_message(get_config_rpc("running").as_bytes(), &limits)
+                    .expect("get-config"),
+            )
+            .await
+            .expect("write get-config");
+
+        let join = session_task.await;
+        assert!(join.is_err(), "session task should propagate read panic");
         wait_for_hostname(&bus, "amf-1").await;
     }
 
@@ -13932,7 +14604,8 @@ mod tests {
 
     #[tokio::test]
     async fn generated_edit_secret_value_never_leaks() {
-        let (server, bus, audit) = generated_edit_server_fixture().await;
+        let (server, bus, audit) =
+            generated_edit_server_policy(policy_allow_system_with_secret_writes()).await;
         let registry = SessionRegistry::new();
         let _registration = registry.register(1).expect("register session 1");
 

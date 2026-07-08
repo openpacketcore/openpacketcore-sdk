@@ -8,6 +8,8 @@ use crate::{
 
 pub const SCTP_UNORDERED_FLAG: u16 = 1;
 pub const SCTP_NOTIFICATION_FLAG: i32 = 0x8000;
+pub const SCTP_ASSOC_CHANGE_NOTIFICATION: u16 = 1;
+pub const SCTP_SHUTDOWN_EVENT_NOTIFICATION: u16 = 5;
 
 fn unsupported() -> io::Error {
     io::Error::new(

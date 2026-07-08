@@ -1,6 +1,7 @@
 //! Scenario runners (local, kind, and hardware-lab).
 
 use crate::evidence::{ScenarioEvidence, ScenarioOutcome};
+use crate::fixtures::{FixtureProvenance, FixtureRegistry};
 use crate::scenario::{Scenario, Step};
 use crate::simulators::Simulator;
 use crate::virtual_time::VirtualClock;
@@ -12,6 +13,8 @@ pub struct LocalRunner {
     pub clock: VirtualClock,
     pub simulators: BTreeMap<String, Simulator>,
     pub state: HashMap<String, String>,
+    fixture_registry: FixtureRegistry,
+    resolved_fixture_provenance: Vec<FixtureProvenance>,
 }
 
 impl LocalRunner {
@@ -20,11 +23,19 @@ impl LocalRunner {
             clock,
             simulators: BTreeMap::new(),
             state: HashMap::new(),
+            fixture_registry: FixtureRegistry::default(),
+            resolved_fixture_provenance: Vec::new(),
         }
+    }
+
+    pub fn with_fixture_registry(mut self, registry: FixtureRegistry) -> Self {
+        self.fixture_registry = registry;
+        self
     }
 
     pub fn run(&mut self, scenario: &Scenario) -> Result<ScenarioEvidence, crate::TestbedError> {
         let started_at = *self.clock.now().as_offset_datetime();
+        self.resolved_fixture_provenance.clear();
 
         // Initialize simulators from topology
         for (name, spec) in &scenario.topology.nfs {
@@ -39,10 +50,14 @@ impl LocalRunner {
         let mut outcome = ScenarioOutcome::Pass;
 
         for (idx, step) in scenario.steps.iter().enumerate() {
-            if let Err(err) = self.execute_step(step) {
-                failure_summary = Some(format!("Step {idx} failed: {err}"));
-                outcome = ScenarioOutcome::Fail;
-                break;
+            match self.execute_step(step) {
+                Ok(()) => {}
+                Err(err @ crate::TestbedError::Fixture(_)) => return Err(err),
+                Err(err) => {
+                    failure_summary = Some(format!("Step {idx} failed: {err}"));
+                    outcome = ScenarioOutcome::Fail;
+                    break;
+                }
             }
         }
 
@@ -79,6 +94,7 @@ impl LocalRunner {
         evidence.mode = Some("in-process".to_string());
         evidence.runner_mode = Some("local".to_string());
         evidence.seed = scenario.seed;
+        evidence.fixture_provenance = self.resolved_fixture_provenance.clone();
         evidence.started_at = Some(started_at);
         evidence.finished_at = Some(finished_at);
         if let Some(summary) = failure_summary {
@@ -97,6 +113,24 @@ impl LocalRunner {
 
     fn execute_step(&mut self, step: &Step) -> Result<(), crate::TestbedError> {
         if let Some((kind, protocol_step)) = step.protocol_fixture() {
+            let provenance = self
+                .fixture_registry
+                .get(&protocol_step.fixture)
+                .ok_or_else(|| {
+                    crate::TestbedError::Fixture(format!(
+                        "fixture '{}' is not registered",
+                        protocol_step.fixture
+                    ))
+                })?
+                .clone();
+            provenance.validate()?;
+            if !self
+                .resolved_fixture_provenance
+                .iter()
+                .any(|existing| existing.id == provenance.id)
+            {
+                self.resolved_fixture_provenance.push(provenance);
+            }
             self.state.insert(
                 format!(
                     "protocol.{kind}.{}.{}.fixture",

@@ -60,6 +60,21 @@
 //! ```rust,no_run
 //! use opc_sdk::prelude::*;
 //! ```
+//!
+//! With the default feature set, the prelude also includes the security
+//! substrate entry points needed by CNFs:
+//!
+//! ```rust,no_run
+//! use opc_sdk::prelude::*;
+//!
+//! let _key_id = KeyId::new("session-key-2026-01");
+//! let _purpose = KeyPurpose::Session;
+//! let _trust_domain = TrustDomain::new("core.example");
+//! let _policy = PeerPolicy::default();
+//! let _ = std::mem::size_of::<KmsKeyProvider>();
+//! let _ = std::mem::size_of::<TlsConfigBuilder>();
+//! let _ = std::mem::size_of::<CryptoEnvelopeV1>();
+//! ```
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -142,6 +157,26 @@ pub mod prelude {
     pub use opc_nacm_config::{
         NacmAccessOperation, NacmConfig, NacmConfigEffect, NacmConfigRule, NacmConfigRuleList,
         NacmGroup, SpiffeWorkloadSelector,
+    };
+
+    #[cfg(feature = "identity")]
+    pub use opc_identity::{
+        build_identity_state, FileSvidSource, IdentityReloadError, IdentityReloadEvent,
+        IdentityState, Namespace, ServiceAccount, SvidDocument, SvidWatcher, TrustBundle,
+        TrustBundleSet, TrustDomain, WorkloadIdentity as SpiffeWorkloadIdentity,
+    };
+
+    #[cfg(feature = "identity")]
+    pub use opc_tls::{ClientConfig, PeerPolicy, ServerConfig, TlsConfigBuilder};
+
+    #[cfg(feature = "key")]
+    pub use opc_crypto::{CryptoEnvelopeV1, CryptoError};
+
+    #[cfg(feature = "key")]
+    pub use opc_key::{
+        AeadAlgorithm, ConfigAad, CryptoOperationError, EncryptedPayload, EnvelopeAad,
+        EnvelopeMetadata, KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose, KmsKeyProvider,
+        MemoryKeyProvider, SessionAad, ShadowSecurityAad,
     };
 
     #[cfg(feature = "session")]

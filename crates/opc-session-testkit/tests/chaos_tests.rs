@@ -171,9 +171,8 @@ async fn test_clock_skew_ttl_behavior() {
     };
     let err = coord.compare_and_set(op_2).await.unwrap_err();
     assert!(
-        err.to_string().contains("StaleFence")
-            || err.to_string().contains("lease")
-            || err.to_string().contains("expired")
+        matches!(err, StoreError::StaleFence | StoreError::LeaseExpired),
+        "expected lease authority rejection, got {err:?}"
     );
 }
 
@@ -350,6 +349,8 @@ async fn test_duplicate_replication_entry_idempotency() {
     let op = opc_session_store::ReplicationOp::CompareAndSet {
         key: key.clone(),
         expected_generation: None,
+        credential_id: 1,
+        guard_expires_at: lease.expires_at(),
         new_record: record,
     };
     let entry = opc_session_store::ReplicationEntry {
@@ -396,6 +397,8 @@ async fn test_partial_write_recovery_and_catch_up() {
     let op = opc_session_store::ReplicationOp::CompareAndSet {
         key: key.clone(),
         expected_generation: None,
+        credential_id: 1,
+        guard_expires_at: lease.expires_at(),
         new_record: record,
     };
     let entry = opc_session_store::ReplicationEntry {

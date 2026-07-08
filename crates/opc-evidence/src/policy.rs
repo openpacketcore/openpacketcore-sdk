@@ -1,4 +1,4 @@
-use crate::{gap::GapStatus, ConformanceStatus, EvidenceError, EvidenceRecord, Gap};
+use crate::{gap::GapStatus, ConformanceStatus, EvidenceError, EvidenceRecord, Gap, WaiverRecord};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyMode {
@@ -43,6 +43,39 @@ impl<'a> GateEvaluator<'a> {
         verifier: Option<&dyn crate::bundle::BundleVerifier>,
         files: Option<&std::collections::HashMap<String, Vec<u8>>>,
     ) -> Result<(), EvidenceError> {
+        self.evaluate_with_waivers(
+            records,
+            gaps,
+            &[],
+            bundle,
+            conformance_report,
+            sbom,
+            vex,
+            provenance,
+            performance_baseline,
+            data_governance_report,
+            verifier,
+            files,
+        )
+    }
+
+    /// Evaluates release and PR gate compliance with explicit waiver records.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_with_waivers(
+        &self,
+        records: &[EvidenceRecord],
+        gaps: &[Gap],
+        waivers: &[WaiverRecord],
+        bundle: Option<&crate::bundle::EvidenceBundle>,
+        conformance_report: Option<&str>,
+        sbom: Option<&str>,
+        vex: Option<&str>,
+        provenance: Option<&str>,
+        performance_baseline: Option<&str>,
+        data_governance_report: Option<&str>,
+        verifier: Option<&dyn crate::bundle::BundleVerifier>,
+        files: Option<&std::collections::HashMap<String, Vec<u8>>>,
+    ) -> Result<(), EvidenceError> {
         // 1. conformance status is full/implemented/tested but required evidence is absent
         for record in records {
             let status = record.status;
@@ -72,6 +105,9 @@ impl<'a> GateEvaluator<'a> {
                         "Requirement {} has status Tested but missing test_refs",
                         record.requirement_id
                     )));
+                }
+                ConformanceStatus::Waived => {
+                    validate_waived_record(record, waivers)?;
                 }
                 _ => {}
             }
@@ -166,6 +202,13 @@ impl<'a> GateEvaluator<'a> {
             let verifier = verifier.ok_or_else(|| {
                 EvidenceError::GapGateFailed("missing verifier for bundle verification".to_string())
             })?;
+            if self.policy.mode == PolicyMode::Release
+                && verifier.security() != crate::bundle::BundleVerifierSecurity::Release
+            {
+                return Err(EvidenceError::GapGateFailed(
+                    "release policy requires a non-mock bundle verifier".to_string(),
+                ));
+            }
             let files = files.ok_or_else(|| {
                 EvidenceError::GapGateFailed("missing files for bundle verification".to_string())
             })?;
@@ -271,6 +314,64 @@ impl<'a> GateEvaluator<'a> {
 
         Ok(())
     }
+}
+
+fn validate_waived_record(
+    record: &EvidenceRecord,
+    waivers: &[WaiverRecord],
+) -> Result<(), EvidenceError> {
+    if record.waiver_refs.is_empty() {
+        return Err(EvidenceError::GapGateFailed(format!(
+            "Requirement {} has status Waived but no waiver_refs",
+            record.requirement_id
+        )));
+    }
+
+    let now = time::OffsetDateTime::now_utc();
+    for waiver_ref in &record.waiver_refs {
+        let waiver = waivers
+            .iter()
+            .find(|w| w.id == *waiver_ref)
+            .ok_or_else(|| {
+                EvidenceError::GapGateFailed(format!(
+                    "Requirement {} references waiver {} but no waiver record was provided",
+                    record.requirement_id, waiver_ref
+                ))
+            })?;
+
+        if waiver.requirement_id != record.requirement_id {
+            return Err(EvidenceError::GapGateFailed(format!(
+                "Waiver {} applies to {} but record is for {}",
+                waiver.id, waiver.requirement_id, record.requirement_id
+            )));
+        }
+        if !waiver.approved {
+            return Err(EvidenceError::GapGateFailed(format!(
+                "Waiver {} for requirement {} is not approved",
+                waiver.id, record.requirement_id
+            )));
+        }
+        if waiver.approver.trim().is_empty() {
+            return Err(EvidenceError::GapGateFailed(format!(
+                "Waiver {} for requirement {} lacks an approver",
+                waiver.id, record.requirement_id
+            )));
+        }
+        if waiver.justification.trim().is_empty() {
+            return Err(EvidenceError::GapGateFailed(format!(
+                "Waiver {} for requirement {} lacks a justification",
+                waiver.id, record.requirement_id
+            )));
+        }
+        if waiver.expires_at <= now {
+            return Err(EvidenceError::GapGateFailed(format!(
+                "Waiver {} for requirement {} is expired",
+                waiver.id, record.requirement_id
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_json_artifact(name: &str, content: Option<&str>) -> Result<(), EvidenceError> {

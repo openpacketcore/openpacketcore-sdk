@@ -38,6 +38,14 @@ use crate::{GnmiConfigBinding, GnmiServer, GnmiService};
 pub struct GnmiListenerConfig {
     /// Maximum time allowed for one TLS handshake and principal derivation.
     pub handshake_timeout: Duration,
+    /// Maximum time allowed for one gRPC request/response future.
+    pub request_timeout: Duration,
+    /// Interval between HTTP/2 keepalive pings.
+    pub http2_keepalive_interval: Duration,
+    /// Maximum time to wait for an HTTP/2 keepalive acknowledgement.
+    pub http2_keepalive_timeout: Duration,
+    /// TCP keepalive idle time for accepted connections.
+    pub tcp_keepalive: Duration,
     /// Capacity of the accepted-connection channel handed to tonic.
     pub incoming_channel_capacity: usize,
 }
@@ -46,6 +54,10 @@ impl Default for GnmiListenerConfig {
     fn default() -> Self {
         Self {
             handshake_timeout: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(35),
+            http2_keepalive_interval: Duration::from_secs(30),
+            http2_keepalive_timeout: Duration::from_secs(10),
+            tcp_keepalive: Duration::from_secs(60),
             incoming_channel_capacity: 16,
         }
     }
@@ -164,6 +176,10 @@ where
     let (tx, rx) = mpsc::channel(config.incoming_channel_capacity);
     let accept_shutdown = shutdown.clone();
     let accept_counters = Arc::clone(&counters);
+    let request_timeout = config.request_timeout;
+    let http2_keepalive_interval = config.http2_keepalive_interval;
+    let http2_keepalive_timeout = config.http2_keepalive_timeout;
+    let tcp_keepalive = config.tcp_keepalive;
 
     let accept_task = tokio::spawn(async move {
         accept_loop(
@@ -186,6 +202,10 @@ where
     let incoming = ReceiverStream::new(rx);
     let max_concurrent_streams = u32::try_from(max_subscriptions_per_session).unwrap_or(u32::MAX);
     let serve_result = tonic::transport::Server::builder()
+        .timeout(request_timeout)
+        .http2_keepalive_interval(Some(http2_keepalive_interval))
+        .http2_keepalive_timeout(Some(http2_keepalive_timeout))
+        .tcp_keepalive(Some(tcp_keepalive))
         .concurrency_limit_per_connection(max_subscriptions_per_session)
         .max_concurrent_streams(Some(max_concurrent_streams))
         .add_service(service)
@@ -206,7 +226,13 @@ where
 }
 
 fn validate_listener_config(config: &GnmiListenerConfig) -> Result<(), GnmiListenerError> {
-    if config.handshake_timeout.is_zero() || config.incoming_channel_capacity == 0 {
+    if config.handshake_timeout.is_zero()
+        || config.request_timeout.is_zero()
+        || config.http2_keepalive_interval.is_zero()
+        || config.http2_keepalive_timeout.is_zero()
+        || config.tcp_keepalive.is_zero()
+        || config.incoming_channel_capacity == 0
+    {
         return Err(GnmiListenerError::InvalidConfig);
     }
     Ok(())
@@ -411,6 +437,7 @@ mod tests {
 
     use hyper_util::rt::TokioIo;
     use opc_config_bus::{ConfigBus, MockManagedDatastore};
+    use opc_mgmt_audit::{AuditError, AuditEvent, AuditSink};
     use opc_mgmt_authz::{AuthzError, PolicySource};
     use opc_mgmt_opstate::{
         OperationalError, OperationalRequest, OperationalResponse, OperationalStateProvider,
@@ -491,8 +518,10 @@ mod tests {
     struct EmptyPolicy;
 
     impl PolicySource for EmptyPolicy {
-        fn active_policy(&self, _tenant: &str) -> Result<opc_nacm::NacmPolicy, AuthzError> {
-            Ok(opc_nacm::NacmPolicy::empty(opc_nacm::PolicyVersion::new(1)))
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<opc_nacm::NacmPolicy>, AuthzError> {
+            Ok(Arc::new(opc_nacm::NacmPolicy::empty(
+                opc_nacm::PolicyVersion::new(1),
+            )))
         }
     }
 
@@ -504,6 +533,14 @@ mod tests {
             _request: &OperationalRequest,
         ) -> Result<OperationalResponse, OperationalError> {
             Ok(OperationalResponse::default())
+        }
+    }
+
+    struct NoopAudit;
+
+    impl AuditSink for NoopAudit {
+        fn record(&self, _event: &AuditEvent) -> Result<(), AuditError> {
+            Ok(())
         }
     }
 
@@ -552,11 +589,12 @@ mod tests {
         );
         let profile =
             CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
-        GnmiServer::new_dev_only(
+        GnmiServer::new_with_audit(
             TestBinding { bus },
             limits,
             profile,
             ExtensionRegistry::default(),
+            Arc::new(NoopAudit),
         )
         .expect("server")
     }
@@ -765,6 +803,54 @@ mod tests {
             .unwrap_or_default()
     }
 
+    fn assert_invalid_listener_config(config: GnmiListenerConfig) {
+        assert!(matches!(
+            validate_listener_config(&config),
+            Err(GnmiListenerError::InvalidConfig)
+        ));
+    }
+
+    #[test]
+    fn listener_config_defaults_enable_request_and_keepalive_bounds() {
+        let config = GnmiListenerConfig::default();
+
+        assert!(validate_listener_config(&config).is_ok());
+        assert!(!config.handshake_timeout.is_zero());
+        assert!(!config.request_timeout.is_zero());
+        assert!(!config.http2_keepalive_interval.is_zero());
+        assert!(!config.http2_keepalive_timeout.is_zero());
+        assert!(!config.tcp_keepalive.is_zero());
+        assert!(config.incoming_channel_capacity > 0);
+    }
+
+    #[test]
+    fn listener_config_rejects_zero_deadline_and_keepalive_controls() {
+        assert_invalid_listener_config(GnmiListenerConfig {
+            handshake_timeout: Duration::ZERO,
+            ..GnmiListenerConfig::default()
+        });
+        assert_invalid_listener_config(GnmiListenerConfig {
+            request_timeout: Duration::ZERO,
+            ..GnmiListenerConfig::default()
+        });
+        assert_invalid_listener_config(GnmiListenerConfig {
+            http2_keepalive_interval: Duration::ZERO,
+            ..GnmiListenerConfig::default()
+        });
+        assert_invalid_listener_config(GnmiListenerConfig {
+            http2_keepalive_timeout: Duration::ZERO,
+            ..GnmiListenerConfig::default()
+        });
+        assert_invalid_listener_config(GnmiListenerConfig {
+            tcp_keepalive: Duration::ZERO,
+            ..GnmiListenerConfig::default()
+        });
+        assert_invalid_listener_config(GnmiListenerConfig {
+            incoming_channel_capacity: 0,
+            ..GnmiListenerConfig::default()
+        });
+    }
+
     #[tokio::test]
     async fn production_listener_rejects_unconstrained_peer_policy() {
         let state =
@@ -846,6 +932,7 @@ mod tests {
             GnmiListenerConfig {
                 handshake_timeout: Duration::from_secs(5),
                 incoming_channel_capacity: 4,
+                ..GnmiListenerConfig::default()
             },
         ));
 
@@ -925,6 +1012,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tls_listener_enforces_max_request_bytes_over_real_mtls() {
+        let state =
+            identity_state("spiffe://test-domain/tenant/test/ns/default/sa/gnmi/nf/amf/instance/0");
+        let (_identity_tx, identity_rx) = watch::channel(Some(state));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = ShutdownToken::new();
+        let limits = opc_mgmt_limits::MgmtLimits {
+            max_request_bytes: 512,
+            max_value_bytes: 256,
+            max_xpath_filter_bytes: 256,
+            ..Default::default()
+        };
+        let listener_task = tokio::spawn(run_gnmi_tls_listener(
+            server_with_limits(limits).await,
+            listener,
+            TlsBootstrap::new(RuntimeMode::Production, peer_policy()),
+            identity_rx.clone(),
+            shutdown.clone(),
+            GnmiListenerConfig {
+                handshake_timeout: Duration::from_secs(5),
+                incoming_channel_capacity: 4,
+                ..GnmiListenerConfig::default()
+            },
+        ));
+
+        let mut grpc = connect_client(addr, identity_rx).await;
+        grpc.ready().await.expect("oversized get ready");
+        let status = grpc
+            .unary(
+                Request::new(gnmi::GetRequest {
+                    prefix: None,
+                    path: Vec::new(),
+                    r#type: gnmi::get_request::DataType::All as i32,
+                    encoding: gnmi::Encoding::JsonIetf as i32,
+                    use_models: vec![gnmi::ModelData {
+                        name: "x".repeat(2048),
+                        organization: String::new(),
+                        version: String::new(),
+                    }],
+                    extension: Vec::new(),
+                }),
+                PathAndQuery::from_static("/gnmi.gNMI/Get"),
+                ProstCodec::<gnmi::GetRequest, gnmi::GetResponse>::default(),
+            )
+            .await
+            .expect_err("oversized request rejected");
+
+        assert_eq!(status.code(), tonic::Code::OutOfRange);
+
+        drop(grpc);
+        shutdown.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), listener_task)
+            .await
+            .expect("listener timeout")
+            .expect("listener join")
+            .expect("listener result");
+    }
+
+    #[tokio::test]
     async fn tls_listener_enforces_max_sessions_without_peer_leak() {
         let state =
             identity_state("spiffe://test-domain/tenant/test/ns/default/sa/gnmi/nf/amf/instance/0");
@@ -946,6 +1093,7 @@ mod tests {
             GnmiListenerConfig {
                 handshake_timeout: Duration::from_secs(5),
                 incoming_channel_capacity: 4,
+                ..GnmiListenerConfig::default()
             },
         ));
 
@@ -1008,6 +1156,7 @@ mod tests {
                 listener: GnmiListenerConfig {
                     handshake_timeout: Duration::from_secs(5),
                     incoming_channel_capacity: 4,
+                    ..GnmiListenerConfig::default()
                 },
                 ..Default::default()
             },

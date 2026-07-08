@@ -101,6 +101,14 @@ impl TlsBootstrap {
             return Err(TransportError::UnconstrainedPeerPolicy { mode: self.mode });
         }
         validate_alpn_protocols(&self.alpn_protocols)?;
+        if self.mode.fail_closed() && self.compat_tls12 {
+            tracing::warn!(
+                target: "opc_mgmt_transport",
+                mode = ?self.mode,
+                tls12_compat = true,
+                "TLS 1.2 compatibility enabled for management transport"
+            );
+        }
 
         let mut builder = TlsConfigBuilder::new(identity)
             .with_policy(self.peer_policy)
@@ -152,6 +160,41 @@ mod tests {
     use opc_identity::{IdentityState, TrustDomain};
     use opc_tls::PeerPolicy;
     use std::collections::HashSet;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct BufferWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl BufferWriter {
+        fn output(&self) -> String {
+            let buffer = self.buffer.lock().expect("buffer mutex");
+            String::from_utf8_lossy(&buffer).to_string()
+        }
+    }
+
+    impl io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut buffer = self.buffer.lock().expect("buffer mutex");
+            buffer.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for BufferWriter {
+        type Writer = BufferWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     fn no_identity() -> watch::Receiver<Option<IdentityState>> {
         let (_tx, rx) = watch::channel(None);
@@ -225,6 +268,34 @@ mod tests {
             .with_tls12_compat(true)
             .build_server_config(no_identity());
         assert!(config.is_ok());
+    }
+
+    #[test]
+    fn tls12_compat_warns_in_fail_closed_mode() {
+        let writer = BufferWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            TlsBootstrap::new(RuntimeMode::Production, constrained_policy())
+                .with_tls12_compat(true)
+                .build_server_config(no_identity())
+                .expect("server config");
+        });
+
+        let output = writer.output();
+        assert!(
+            output.contains("TLS 1.2 compatibility enabled for management transport"),
+            "TLS 1.2 compat warning was not emitted: {output}"
+        );
+        assert!(
+            output.contains("mode=Production"),
+            "runtime mode was not recorded in warning: {output}"
+        );
     }
 
     #[test]

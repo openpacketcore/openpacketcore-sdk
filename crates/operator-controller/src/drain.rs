@@ -119,18 +119,18 @@ where
                 Ok(())
             }
             Ok(Err(err_msg)) => {
+                let sanitized = operator_lifecycle::sanitize_denial_message(&err_msg);
                 status.set_condition(
                     "Ready",
                     ConditionStatus::False,
                     &format!("{}Failed", action.as_str()),
-                    &format!("Action {} failed: {}", action.as_str(), err_msg),
+                    &format!("Action {} failed: {}", action.as_str(), sanitized),
                     observed_generation,
                     ConditionSeverity::Error,
                     true,
                     current_time,
                 );
                 status.set_phase(LifecyclePhase::Failed);
-                let sanitized = operator_lifecycle::sanitize_denial_message(&err_msg);
                 Err(sanitized)
             }
             Err(_) => {

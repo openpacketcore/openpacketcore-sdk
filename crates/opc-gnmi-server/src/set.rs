@@ -293,6 +293,15 @@ where
     )
     .with_base_version(snapshot.version);
 
+    audit_set_result(
+        server,
+        request_id,
+        principal,
+        audit_operation,
+        AuditOutcome::Intent,
+        audit_paths.clone(),
+    )?;
+
     let start = Instant::now();
     match bus.submit(commit).await {
         Ok(_) => {

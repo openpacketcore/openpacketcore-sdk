@@ -10,9 +10,11 @@
 //! 4. dispatch bounded RPC frames through [`ReadOnlyNetconfServer`].
 
 use std::num::NonZeroU32;
+use std::panic::{self, AssertUnwindSafe};
 use std::str;
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use opc_config_bus::{ConfigEvent, ConfigReceiver};
 use opc_config_model::{OpcConfig, RequestId, TrustedPrincipal};
 use opc_mgmt_audit::AuditSink;
@@ -154,7 +156,8 @@ where
         SessionRegistryError::DuplicateSessionId => SessionError::DuplicateSessionId,
     })?;
 
-    let result = run_registered_session_loop(
+    let session_id = registration.session_id();
+    let result = AssertUnwindSafe(run_registered_session_loop(
         server,
         principal,
         stream,
@@ -162,12 +165,16 @@ where
         &mut registration,
         hello_session_id,
         sessions,
-    )
+    ))
+    .catch_unwind()
     .await;
     server
-        .rollback_pending_confirmed_commit_for_session(registration.session_id(), principal)
+        .rollback_pending_confirmed_commit_for_session(session_id, principal)
         .await;
-    result
+    match result {
+        Ok(result) => result,
+        Err(payload) => panic::resume_unwind(payload),
+    }
 }
 
 async fn run_registered_session_loop<C, B, P, A, S>(
@@ -199,7 +206,7 @@ where
             stream,
             SessionFraming::Base10,
             server_hello.as_bytes(),
-            &config.limits,
+            &config,
         ) => result?,
     }
 
@@ -250,7 +257,7 @@ where
                                     stream,
                                     framing,
                                     notification_xml.as_bytes(),
-                                    &config.limits,
+                                    &config,
                                 ) => result,
                             };
                             match write_result {
@@ -306,7 +313,7 @@ where
                     rpc_count,
                 });
             }
-            write_result = write_message(stream, framing, reply.reply_xml.as_bytes(), &config.limits) => {
+            write_result = write_message(stream, framing, reply.reply_xml.as_bytes(), &config) => {
                 write_result?;
             }
         }
@@ -360,18 +367,27 @@ async fn write_message<W>(
     writer: &mut W,
     framing: SessionFraming,
     message: &[u8],
-    limits: &MgmtLimits,
+    config: &SessionConfig,
 ) -> Result<(), SessionError>
 where
     W: AsyncWrite + Unpin,
 {
     let frame = match framing {
-        SessionFraming::Base10 => base10::encode_message(message, limits)?,
-        SessionFraming::Base11 => base11::encode_message(message, limits)?,
+        SessionFraming::Base10 => base10::encode_message(message, &config.limits)?,
+        SessionFraming::Base11 => base11::encode_message(message, &config.limits)?,
     };
-    writer.write_all(&frame).await?;
-    writer.flush().await?;
-    Ok(())
+    match tokio::time::timeout(config.frame_timeout, async {
+        writer.write_all(&frame).await?;
+        writer.flush().await
+    })
+    .await
+    {
+        Ok(result) => result.map_err(SessionError::Io),
+        Err(_) => Err(SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out writing NETCONF frame",
+        ))),
+    }
 }
 
 async fn read_message<R>(
@@ -483,7 +499,7 @@ where
             if b == b'\n' {
                 break;
             }
-            if !b.is_ascii_digit() || len_bytes.len() >= 20 {
+            if !b.is_ascii_digit() || len_bytes.len() >= base11::MAX_CHUNK_LENGTH_DIGITS {
                 return Err(FramingError::InvalidChunkLength.into());
             }
             len_bytes.push(b);
@@ -549,7 +565,9 @@ where
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
 
     use opc_config_bus::{ConfigBus, MockManagedDatastore};
     use opc_config_model::{
@@ -717,8 +735,8 @@ mod tests {
     struct FixedPolicy(NacmPolicy);
 
     impl PolicySource for FixedPolicy {
-        fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
-            Ok(self.0.clone())
+        fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
+            Ok(Arc::new(self.0.clone()))
         }
     }
 
@@ -813,7 +831,102 @@ mod tests {
     where
         S: AsyncWrite + Unpin,
     {
-        write_message(stream, framing, xml.as_bytes(), &MgmtLimits::default()).await
+        let config = SessionConfig::default();
+        write_message(stream, framing, xml.as_bytes(), &config).await
+    }
+
+    struct PendingWriter;
+
+    impl AsyncWrite for PendingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_message_times_out_when_peer_stalls() {
+        let mut writer = PendingWriter;
+        let config = SessionConfig {
+            frame_timeout: Duration::from_millis(10),
+            ..SessionConfig::default()
+        };
+
+        let err = write_message(
+            &mut writer,
+            SessionFraming::Base10,
+            b"<rpc message-id=\"1\"/>",
+            &config,
+        )
+        .await
+        .expect_err("write timeout");
+
+        assert!(matches!(
+            err,
+            SessionError::Io(ref io) if io.kind() == std::io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_times_out_when_peer_stops_reading_rpc_reply() {
+        let server = server_fixture().await;
+        let principal = principal();
+        let (mut client, mut server_io) = tokio::io::duplex(1);
+        let sessions = Arc::new(SessionRegistry::new());
+        let sessions_for_task = Arc::clone(&sessions);
+        let config = SessionConfig {
+            frame_timeout: Duration::from_millis(100),
+            ..SessionConfig::default()
+        };
+
+        let task = tokio::spawn(async move {
+            run_read_only_session_with_registry(
+                &server,
+                &principal,
+                &mut server_io,
+                config,
+                79,
+                sessions_for_task.as_ref(),
+            )
+            .await
+        });
+
+        read_base10_message(&mut client, &MgmtLimits::default())
+            .await
+            .expect("read server hello")
+            .expect("server hello");
+        client_write_message(
+            &mut client,
+            SessionFraming::Base10,
+            &client_hello(&[NETCONF_BASE_1_0]),
+        )
+        .await
+        .expect("client hello");
+        client_write_message(
+            &mut client,
+            SessionFraming::Base10,
+            &get_config_rpc("slow-peer"),
+        )
+        .await
+        .expect("get-config");
+
+        let err = task.await.expect("join").expect_err("write timeout");
+        assert!(matches!(
+            err,
+            SessionError::Io(ref io) if io.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(!sessions.contains_session_for_test(79));
     }
 
     async fn wait_until_registered(sessions: &SessionRegistry, session_id: u64) {

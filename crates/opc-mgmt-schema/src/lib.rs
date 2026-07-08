@@ -198,6 +198,21 @@ pub struct NodeMeta {
     pub child_paths: &'static [&'static str],
 }
 
+/// Precomputed bare-path lookup entry for generated schema registries.
+///
+/// `normalized_path` is the prefix-free schema path returned by
+/// [`normalize_schema_path`] for `node_path`. Tables must be sorted by
+/// `(normalized_path, node_path)` so the default [`SchemaRegistry::node`]
+/// implementation can binary-search them and detect ambiguous bare paths by
+/// adjacent duplicate `normalized_path` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NormalizedNodeEntry {
+    /// Prefix-free schema path, without key predicates.
+    pub normalized_path: &'static str,
+    /// Canonical prefix-qualified schema path from [`NodeMeta::path`].
+    pub node_path: &'static str,
+}
+
 /// A gNMI origin and the module names it spans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OriginEntry {
@@ -452,6 +467,50 @@ pub fn normalize_schema_path(path: &str) -> Option<String> {
     parse_schema_path(path).map(|parsed| normalize_stripped_path(&parsed.stripped))
 }
 
+fn find_node_by_path(nodes: &'static [NodeMeta], path: &str) -> Option<&'static NodeMeta> {
+    nodes
+        .binary_search_by(|node| node.path.cmp(path))
+        .ok()
+        .map(|index| &nodes[index])
+}
+
+fn find_normalized_node_path(
+    index: &'static [NormalizedNodeEntry],
+    normalized_path: &str,
+) -> Option<&'static str> {
+    let found = index
+        .binary_search_by(|entry| entry.normalized_path.cmp(normalized_path))
+        .ok()?;
+
+    let mut first = found;
+    while first > 0 && index[first - 1].normalized_path == normalized_path {
+        first -= 1;
+    }
+
+    let mut end = found + 1;
+    while end < index.len() && index[end].normalized_path == normalized_path {
+        end += 1;
+    }
+
+    if end - first == 1 {
+        Some(index[found].node_path)
+    } else {
+        None
+    }
+}
+
+fn normalized_schema_path_matches(schema_path: &str, normalized_path: &str) -> bool {
+    let mut schema_segments = schema_path.split('/');
+    let mut normalized_segments = normalized_path.split('/');
+    loop {
+        match (schema_segments.next(), normalized_segments.next()) {
+            (Some(schema), Some(normalized)) if bare_segment(schema) == normalized => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
 /// Verifies an emitted node table's internal integrity. Exposed so a server may
 /// call it once at startup as defense-in-depth against a hand-edited generated
 /// file; the generator also runs the equivalent checks at generation time.
@@ -509,6 +568,17 @@ pub trait SchemaRegistry: Send + Sync {
     /// All schema nodes, **sorted by `path`** (the generator guarantees this).
     fn nodes(&self) -> &'static [NodeMeta];
 
+    /// Optional generated lookup table keyed by prefix-free schema paths.
+    ///
+    /// A non-empty table is treated as authoritative for bare/keyed fallback
+    /// lookup and must include every node in [`Self::nodes`], sorted by
+    /// `(normalized_path, node_path)`. Empty tables preserve compatibility for
+    /// hand-written registries; the default fallback then scans without
+    /// allocating per node.
+    fn normalized_node_index(&self) -> &'static [NormalizedNodeEntry] {
+        &[]
+    }
+
     /// The gNMI origin map.
     fn origins(&self) -> &'static [OriginEntry];
 
@@ -554,15 +624,21 @@ pub trait SchemaRegistry: Send + Sync {
             return None;
         }
 
-        if let Some(node) = self.nodes().iter().find(|n| n.path == parsed.stripped) {
+        let nodes = self.nodes();
+        if let Some(node) = find_node_by_path(nodes, &parsed.stripped) {
             return Some(node);
         }
 
         let key = normalize_stripped_path(&parsed.stripped);
-        let mut matches = self
-            .nodes()
+        let normalized_index = self.normalized_node_index();
+        if !normalized_index.is_empty() {
+            let node_path = find_normalized_node_path(normalized_index, &key)?;
+            return find_node_by_path(nodes, node_path);
+        }
+
+        let mut matches = nodes
             .iter()
-            .filter(|n| normalize_schema_path(n.path).as_deref() == Some(key.as_str()));
+            .filter(|node| normalized_schema_path_matches(node.path, &key));
         let first = matches.next()?;
         if matches.next().is_some() {
             return None;
@@ -1087,7 +1163,10 @@ impl<'a> NetconfXmlRenderContext<'a> {
         is_defaulted: bool,
     ) -> Result<String, NetconfProjectionError> {
         let name = self.qualified_name(path)?;
-        let data_class = self.registry.data_class(path).unwrap_or(DataClass::Public);
+        let data_class = self
+            .registry
+            .data_class(path)
+            .unwrap_or(DataClass::SecuritySecret);
         let value = if data_class.allows_cleartext() {
             raw_value.to_string()
         } else {
@@ -1600,6 +1679,141 @@ mod tests {
     }
 
     #[test]
+    fn indexed_bare_lookup_resolves_and_collisions_fail_closed() {
+        struct IndexedRegistry;
+
+        static NORMALIZED_INDEX: &[NormalizedNodeEntry] = &[
+            NormalizedNodeEntry {
+                normalized_path: "/system",
+                node_path: "/sys:system",
+            },
+            NormalizedNodeEntry {
+                normalized_path: "/system/hostname",
+                node_path: "/sys:system/sys:hostname",
+            },
+            NormalizedNodeEntry {
+                normalized_path: "/system/uptime",
+                node_path: "/sys:system/sys:uptime",
+            },
+            NormalizedNodeEntry {
+                normalized_path: "/system/user",
+                node_path: "/sys:system/sys:user",
+            },
+            NormalizedNodeEntry {
+                normalized_path: "/system/user/name",
+                node_path: "/sys:system/sys:user/sys:name",
+            },
+            NormalizedNodeEntry {
+                normalized_path: "/system/user/secret",
+                node_path: "/sys:system/sys:user/sys:secret",
+            },
+        ];
+
+        impl SchemaRegistry for IndexedRegistry {
+            fn schema_digest(&self) -> &'static str {
+                "fnv1a64:feedfacefeedface"
+            }
+            fn served_models(&self) -> &'static [ModelData] {
+                MODELS
+            }
+            fn nodes(&self) -> &'static [NodeMeta] {
+                NODES
+            }
+            fn origins(&self) -> &'static [OriginEntry] {
+                ORIGINS
+            }
+            fn normalized_node_index(&self) -> &'static [NormalizedNodeEntry] {
+                NORMALIZED_INDEX
+            }
+        }
+
+        let reg = IndexedRegistry;
+        assert_eq!(
+            reg.node("/system/user[name='alice']/secret")
+                .map(|node| node.path),
+            Some("/sys:system/sys:user/sys:secret")
+        );
+
+        struct CollidingIndexedRegistry;
+
+        static COLLIDING_MODELS: &[ModelData] = &[
+            ModelData {
+                name: "a",
+                revision: "",
+                namespace: "urn:a",
+                prefix: "a",
+            },
+            ModelData {
+                name: "b",
+                revision: "",
+                namespace: "urn:b",
+                prefix: "b",
+            },
+        ];
+        static COLLIDING_NODES: &[NodeMeta] = &[
+            NodeMeta {
+                path: "/a:root/a:leaf",
+                module: "a",
+                kind: NodeKind::Leaf,
+                config: true,
+                leaf_type: Some(LeafType::String),
+                key_leaves: &[],
+                data_class: DataClass::Public,
+                default: None,
+                has_default: false,
+                presence: false,
+                child_paths: &[],
+            },
+            NodeMeta {
+                path: "/b:root/b:leaf",
+                module: "b",
+                kind: NodeKind::Leaf,
+                config: true,
+                leaf_type: Some(LeafType::String),
+                key_leaves: &[],
+                data_class: DataClass::Public,
+                default: None,
+                has_default: false,
+                presence: false,
+                child_paths: &[],
+            },
+        ];
+        static COLLIDING_INDEX: &[NormalizedNodeEntry] = &[
+            NormalizedNodeEntry {
+                normalized_path: "/root/leaf",
+                node_path: "/a:root/a:leaf",
+            },
+            NormalizedNodeEntry {
+                normalized_path: "/root/leaf",
+                node_path: "/b:root/b:leaf",
+            },
+        ];
+
+        impl SchemaRegistry for CollidingIndexedRegistry {
+            fn schema_digest(&self) -> &'static str {
+                "fnv1a64:feedfacefeedface"
+            }
+            fn served_models(&self) -> &'static [ModelData] {
+                COLLIDING_MODELS
+            }
+            fn nodes(&self) -> &'static [NodeMeta] {
+                COLLIDING_NODES
+            }
+            fn origins(&self) -> &'static [OriginEntry] {
+                &[]
+            }
+            fn normalized_node_index(&self) -> &'static [NormalizedNodeEntry] {
+                COLLIDING_INDEX
+            }
+        }
+
+        let reg = CollidingIndexedRegistry;
+        assert_eq!(reg.node("/root/leaf"), None);
+        assert_eq!(reg.node("/a:root/a:leaf").map(|n| n.module), Some("a"));
+        assert_eq!(reg.node("/b:root/b:leaf").map(|n| n.module), Some("b"));
+    }
+
+    #[test]
     fn xml_escaping_obeys_basic_rules() {
         assert_eq!(xml_escape_text("a & b < c > d"), "a &amp; b &lt; c &gt; d");
         assert_eq!(
@@ -1920,5 +2134,55 @@ mod tests {
         assert!(!secret.contains("hunter2"));
         assert!(secret.starts_with("<ex:secret>"));
         assert!(secret.ends_with("</ex:secret>"));
+    }
+
+    #[test]
+    fn format_leaf_redacts_when_data_class_lookup_is_missing() {
+        static MODELS: &[ModelData] = &[ModelData {
+            name: "example",
+            revision: "",
+            namespace: "urn:example",
+            prefix: "ex",
+        }];
+        static NODES: &[NodeMeta] = &[NodeMeta {
+            path: "/ex:secret",
+            module: "example",
+            kind: NodeKind::Leaf,
+            config: true,
+            leaf_type: Some(LeafType::String),
+            key_leaves: &[],
+            data_class: DataClass::SecuritySecret,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[],
+        }];
+
+        struct DivergentRegistry;
+        impl SchemaRegistry for DivergentRegistry {
+            fn schema_digest(&self) -> &'static str {
+                "digest"
+            }
+            fn served_models(&self) -> &'static [ModelData] {
+                MODELS
+            }
+            fn nodes(&self) -> &'static [NodeMeta] {
+                NODES
+            }
+            fn origins(&self) -> &'static [OriginEntry] {
+                &[]
+            }
+            fn data_class(&self, _schema_path: &str) -> Option<DataClass> {
+                None
+            }
+        }
+
+        let reg = DivergentRegistry;
+        let ctx = NetconfXmlRenderContext::new(&reg, &[], DefaultReport::Trim);
+        let rendered = ctx.format_leaf("/ex:secret", "hunter2").unwrap();
+
+        assert!(!rendered.contains("hunter2"));
+        assert!(rendered.starts_with("<ex:secret>"));
+        assert!(rendered.ends_with("</ex:secret>"));
     }
 }

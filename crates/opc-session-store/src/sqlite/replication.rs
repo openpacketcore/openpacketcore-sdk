@@ -22,6 +22,8 @@ pub(crate) fn apply_replicated_op_sync(
         ReplicationOp::CompareAndSet {
             key,
             expected_generation,
+            credential_id,
+            guard_expires_at,
             new_record,
         } => {
             let current_fence = current_fence_sync(conn, &key)?;
@@ -29,55 +31,53 @@ pub(crate) fn apply_replicated_op_sync(
                 return Err(StoreError::StaleFence);
             }
 
-            // Verify lease in lease table is still active and not expired
-            let lease_valid = {
-                let mut lease_stmt = conn
-                    .prepare(
-                        r#"
-                    SELECT active, owner, fence, guard_expires_at
+            let mut lease_stmt = conn
+                .prepare(
+                    r#"
+                    SELECT active, credential_id, owner, fence, guard_expires_at
                     FROM leases
                     WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4
                     "#,
-                    )
-                    .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-                let row = lease_stmt
-                    .query_row(
-                        params![
-                            key.tenant.as_str(),
-                            key.nf_kind.as_str(),
-                            key.key_type.to_string(),
-                            key.stable_id.as_ref(),
-                        ],
-                        |row| {
-                            Ok((
-                                row.get::<_, i32>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, i64>(2)?,
-                                row.get::<_, String>(3)?,
-                            ))
-                        },
-                    )
-                    .optional()
-                    .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                )
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            let row = lease_stmt
+                .query_row(
+                    params![
+                        key.tenant.as_str(),
+                        key.nf_kind.as_str(),
+                        key.key_type.to_string(),
+                        key.stable_id.as_ref(),
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i32>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
-                if let Some((active, owner_str, fence_val, guard_expires_at_str)) = row {
-                    if active == 0
-                        || owner_str != new_record.owner.as_str()
-                        || fence_val as u64 != new_record.fence.get()
-                    {
-                        false
-                    } else {
-                        let guard_expires_at =
-                            Timestamp::from_str(guard_expires_at_str.as_str())
-                                .map_err(|e| StoreError::Serialization(e.to_string()))?;
-                        guard_expires_at > now
-                    }
-                } else {
-                    false
-                }
+            let Some((active, row_credential_id, owner_str, fence_val, guard_expires_at_str)) = row
+            else {
+                return Err(StoreError::StaleFence);
             };
-
-            if !lease_valid {
+            if active == 0
+                || row_credential_id as u64 != credential_id
+                || owner_str != new_record.owner.as_str()
+                || fence_val as u64 != new_record.fence.get()
+            {
+                return Err(StoreError::StaleFence);
+            }
+            let stored_guard_expires_at = Timestamp::from_str(guard_expires_at_str.as_str())
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            if stored_guard_expires_at != guard_expires_at {
+                return Err(StoreError::StaleFence);
+            }
+            if stored_guard_expires_at <= now {
                 return Err(StoreError::LeaseExpired);
             }
 
@@ -134,7 +134,8 @@ pub(crate) fn apply_replicated_op_sync(
             key,
             owner: _,
             fence,
-            ttl,
+            ttl: _,
+            expires_at,
         } => {
             let current_fence = current_fence_sync(conn, &key)?;
             if fence.get() < current_fence {
@@ -144,9 +145,7 @@ pub(crate) fn apply_replicated_op_sync(
             let Some(mut record) = record else {
                 return Err(StoreError::NotFound);
             };
-            let expires =
-                *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-            record.expires_at = Some(Timestamp::from_offset_datetime(expires));
+            record.expires_at = Some(expires_at);
             insert_or_replace_record_sync(conn, &record)?;
             insert_or_replace_fence_sync(conn, &key, fence.get())?;
             Ok(())
@@ -156,7 +155,8 @@ pub(crate) fn apply_replicated_op_sync(
             owner,
             fence,
             credential_id,
-            ttl,
+            ttl: _,
+            expires_at,
         } => {
             let current_fence = current_fence_sync(conn, &key)?;
             if fence.get() < current_fence {
@@ -200,9 +200,6 @@ pub(crate) fn apply_replicated_op_sync(
                 }
             }
 
-            let expires_at =
-                *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-            let expires_at = Timestamp::from_offset_datetime(expires_at);
             let expires_at_unix_ms =
                 (expires_at.as_offset_datetime().unix_timestamp_nanos() / 1_000_000) as i64;
 
@@ -245,15 +242,13 @@ pub(crate) fn apply_replicated_op_sync(
             owner,
             fence,
             credential_id,
-            ttl,
+            ttl: _,
+            expires_at,
         } => {
             let current_fence = current_fence_sync(conn, &key)?;
             if fence.get() < current_fence {
                 return Err(StoreError::StaleFence);
             }
-            let expires_at =
-                *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-            let expires_at = Timestamp::from_offset_datetime(expires_at);
             let expires_at_unix_ms =
                 (expires_at.as_offset_datetime().unix_timestamp_nanos() / 1_000_000) as i64;
 

@@ -39,6 +39,15 @@ where
         GnmiNacmAction::Read,
     ) {
         Ok(result) => {
+            if !result.denied_audit_paths.is_empty() {
+                record_read_audit(
+                    server,
+                    request_id,
+                    principal,
+                    AuditOutcome::denied_code(opc_mgmt_audit::AuditReasonCode::ACCESS_DENIED),
+                    result.denied_audit_paths,
+                )?;
+            }
             record_read_audit(
                 server,
                 request_id,
@@ -120,6 +129,7 @@ where
         return Ok(ReadResult {
             response: empty_get_response(),
             audit_paths: Vec::new(),
+            denied_audit_paths: Vec::new(),
         });
     }
 
@@ -144,6 +154,12 @@ where
         .filter(|decision| !decision.allowed)
         .count();
     record_nacm_denials(metric_action, denied_count);
+    let denied_entries = decisions
+        .iter()
+        .zip(selected_entries.iter())
+        .filter_map(|(decision, entry)| (!decision.allowed).then_some(entry.clone()))
+        .collect::<Vec<_>>();
+    let denied_audit_paths = audit_paths_for_entries(&denied_entries)?;
 
     let allowed_entries = decisions
         .iter()
@@ -184,6 +200,7 @@ where
         return Ok(ReadResult {
             response: empty_get_response(),
             audit_paths: Vec::new(),
+            denied_audit_paths,
         });
     }
 
@@ -236,12 +253,14 @@ where
             extension: Vec::new(),
         },
         audit_paths: render_audit_paths,
+        denied_audit_paths,
     })
 }
 
 struct ReadResult {
     response: gnmi::GetResponse,
     audit_paths: Vec<SchemaNodePath>,
+    denied_audit_paths: Vec<SchemaNodePath>,
 }
 
 struct ReadFailure {

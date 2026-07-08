@@ -183,9 +183,12 @@ impl Timestamp {
         &self.0
     }
 
-    /// Add seconds to the timestamp.
-    pub fn add_seconds(self, seconds: i64) -> Self {
-        Self(self.0 + time::Duration::seconds(seconds))
+    /// Add seconds to the timestamp, returning `None` if the result would be
+    /// outside the supported timestamp range.
+    pub fn add_seconds(self, seconds: i64) -> Option<Self> {
+        self.0
+            .checked_add(time::Duration::seconds(seconds))
+            .map(Self)
     }
 }
 

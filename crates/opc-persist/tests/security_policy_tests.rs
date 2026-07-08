@@ -10,7 +10,8 @@ use opc_nacm::{
 };
 use opc_persist::{
     AuditKey, RollbackTarget, SecurityPolicyError, SecurityPolicyService, SqliteBackend,
-    SqliteSecurityPolicyService, TEST_COMMIT_FAIL,
+    SqliteSecurityPolicyService, TEST_AUDIT_FAILURE_INSERT_FAIL, TEST_AUDIT_SUCCESS_INSERT_FAIL,
+    TEST_COMMIT_FAIL,
 };
 use opc_types::TenantId;
 
@@ -222,6 +223,39 @@ async fn test_group_scoped_rule_lists_survive_policy_persistence() {
 }
 
 #[tokio::test]
+async fn test_denied_candidate_audit_insert_failure_increments_metric() {
+    let _guard = TEST_MUTEX.lock().await;
+    opc_redaction::metrics::METRICS.reset_all();
+    TEST_AUDIT_FAILURE_INSERT_FAIL.store(false, Ordering::Relaxed);
+
+    let (service, _temp_dir) = setup_service().await;
+    let tenant = "test-tenant";
+    let grouped_principal = get_admin_principal_with_groups(&["nacm-security-admins"]);
+    let ungrouped_principal = get_admin_principal_with_groups(&[]);
+
+    let policy = make_group_scoped_security_policy(1, "nacm-security-admins");
+    service
+        .stage_policy(tenant, &grouped_principal, policy)
+        .await
+        .expect("stage group-scoped policy");
+    TEST_AUDIT_FAILURE_INSERT_FAIL.store(true, Ordering::Relaxed);
+    let denied = service.validate_policy(tenant, &ungrouped_principal).await;
+    TEST_AUDIT_FAILURE_INSERT_FAIL.store(false, Ordering::Relaxed);
+
+    assert!(
+        matches!(denied, Err(SecurityPolicyError::ValidationFailed(_))),
+        "candidate validation should still fail closed: {denied:?}"
+    );
+    assert_eq!(
+        opc_redaction::metrics::METRICS
+            .persist_audit_write_failure
+            .load(Ordering::Relaxed),
+        1,
+        "dropped denial audit write must be observable"
+    );
+}
+
+#[tokio::test]
 async fn test_apply_policy_rejects_stale_or_equal_version() {
     let _guard = TEST_MUTEX.lock().await;
     let (service, _temp_dir) = setup_service().await;
@@ -257,6 +291,44 @@ async fn test_apply_policy_rejects_stale_or_equal_version() {
     assert!(
         matches!(res2, Err(SecurityPolicyError::StaleVersion(_))),
         "Apply must reject equal version: {res2:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_apply_policy_rolls_back_when_success_audit_insert_fails() {
+    let _guard = TEST_MUTEX.lock().await;
+    TEST_AUDIT_SUCCESS_INSERT_FAIL.store(false, Ordering::Relaxed);
+    let (service, _temp_dir) = setup_service().await;
+    let tenant = "test-tenant";
+    let principal = get_admin_principal();
+
+    service
+        .stage_policy(tenant, &principal, make_valid_policy(1))
+        .await
+        .unwrap();
+    service.apply_policy(tenant, &principal).await.unwrap();
+
+    service
+        .stage_policy(tenant, &principal, make_valid_policy(2))
+        .await
+        .unwrap();
+
+    TEST_AUDIT_SUCCESS_INSERT_FAIL.store(true, Ordering::Relaxed);
+    let res = service.apply_policy(tenant, &principal).await;
+    TEST_AUDIT_SUCCESS_INSERT_FAIL.store(false, Ordering::Relaxed);
+
+    assert!(
+        matches!(res, Err(SecurityPolicyError::Internal)),
+        "audit insert failure should fail apply, got: {res:?}"
+    );
+
+    let active = service
+        .inspect_active_policy(tenant, &principal)
+        .await
+        .expect("active policy should still be readable");
+    assert_eq!(
+        active.version, 1,
+        "active policy mutation must roll back when APPLY_SUCCESS audit insert fails"
     );
 }
 
@@ -715,5 +787,142 @@ async fn test_security_policy_audit_corruption_fails_closed() {
     assert!(
         matches!(res, Err(SecurityPolicyError::Internal)),
         "corrupt audit HMAC length must fail closed, got: {res:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_security_policy_audit_concurrent_appends_remain_linear() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (service, temp_dir) = setup_service().await;
+    let service = Arc::new(service);
+    let tenant = "test-tenant";
+    let principal = get_admin_principal();
+    let details_a = "a".repeat(4 * 1024 * 1024);
+    let details_b = "b".repeat(4 * 1024 * 1024);
+
+    let first = {
+        let service = Arc::clone(&service);
+        let principal = principal.clone();
+        let details = details_a.clone();
+        tokio::spawn(async move {
+            service
+                .security_policy_audit_event_for_test(tenant, &principal, "CONCURRENT_A", &details)
+                .await
+        })
+    };
+    let second = {
+        let service = Arc::clone(&service);
+        let principal = principal.clone();
+        tokio::spawn(async move {
+            service
+                .security_policy_audit_event_for_test(
+                    tenant,
+                    &principal,
+                    "CONCURRENT_B",
+                    &details_b,
+                )
+                .await
+        })
+    };
+
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+
+    let db_path = temp_dir.path().join("test_security.db");
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT previous_hash, entry_hmac FROM security_policy_audit WHERE tenant = ?1 ORDER BY id ASC",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([tenant], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .unwrap();
+
+    let mut prev_hash = vec![0u8; 32];
+    let mut row_count = 0;
+    for row in rows {
+        let (previous_hash, entry_hmac) = row.unwrap();
+        assert_eq!(
+            previous_hash, prev_hash,
+            "audit chain forked at row {row_count}"
+        );
+        prev_hash = entry_hmac;
+        row_count += 1;
+    }
+    assert_eq!(row_count, 2);
+}
+
+#[tokio::test]
+async fn test_security_policy_audit_verifier_rejects_detail_tamper() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (service, temp_dir) = setup_service().await;
+    let tenant = "test-tenant";
+    let principal = get_admin_principal();
+
+    for idx in 0..3 {
+        service
+            .security_policy_audit_event_for_test(
+                tenant,
+                &principal,
+                "VERIFY",
+                &format!("detail {idx}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let db_path = temp_dir.path().join("test_security.db");
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "UPDATE security_policy_audit SET details = 'tampered' WHERE tenant = ?1 AND id = (
+            SELECT id FROM security_policy_audit WHERE tenant = ?1 ORDER BY id ASC LIMIT 1 OFFSET 1
+        )",
+        [tenant],
+    )
+    .unwrap();
+
+    let res = service.verify_security_policy_audit_chain(tenant).await;
+    assert!(
+        matches!(res, Err(SecurityPolicyError::Internal)),
+        "tampered security policy audit details must fail verification, got: {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_security_policy_audit_verifier_rejects_tail_delete() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (service, temp_dir) = setup_service().await;
+    let tenant = "test-tenant";
+    let principal = get_admin_principal();
+
+    for idx in 0..3 {
+        service
+            .security_policy_audit_event_for_test(
+                tenant,
+                &principal,
+                "VERIFY",
+                &format!("detail {idx}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let db_path = temp_dir.path().join("test_security.db");
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "DELETE FROM security_policy_audit WHERE tenant = ?1 AND id = (
+            SELECT id FROM security_policy_audit WHERE tenant = ?1 ORDER BY id DESC LIMIT 1
+        )",
+        [tenant],
+    )
+    .unwrap();
+
+    let res = service.verify_security_policy_audit_chain(tenant).await;
+    assert!(
+        matches!(res, Err(SecurityPolicyError::Internal)),
+        "deleted security policy audit tail must fail verification, got: {res:?}"
     );
 }

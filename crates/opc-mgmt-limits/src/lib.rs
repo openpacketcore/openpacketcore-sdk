@@ -411,6 +411,10 @@ mod tests {
                 max_xpath_filter_segments: 0,
                 ..base
             },
+            MgmtLimits {
+                min_sample_interval: Duration::ZERO,
+                ..base
+            },
         ];
         for limits in zeroed {
             assert!(

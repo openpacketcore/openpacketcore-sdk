@@ -2159,6 +2159,21 @@ mod tests {
     }
 
     #[test]
+    fn split_key_stream_rejects_short_stream_without_panicking() {
+        let profile = base_profile(Ikev2EncryptionAlgorithm::AesGcm16_128);
+        let required_len = must_ok(profile.key_material_len());
+        let short_stream = Zeroizing::new(vec![0x44; required_len - 1]);
+        let skeyseed = Zeroizing::new(vec![0x33; profile.prf.output_len()]);
+
+        let err = must_err(split_key_stream(profile, skeyseed, short_stream, None));
+
+        assert_eq!(
+            err.as_str(),
+            "ike_sa_init_crypto_key_material_limit_overflow"
+        );
+    }
+
+    #[test]
     fn aes_gcm_key_lengths_include_salt() {
         assert_eq!(
             Ikev2EncryptionAlgorithm::AesGcm16_128.key_material_len(),

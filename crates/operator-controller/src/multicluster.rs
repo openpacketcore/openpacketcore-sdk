@@ -188,6 +188,11 @@ impl MultiClusterRolloutStatus {
 
         // Regenerate aggregated status conditions
         let current_time = OffsetDateTime::now_utc();
+        let previous_ready = self
+            .conditions
+            .iter()
+            .find(|condition| condition.r#type == "Ready")
+            .cloned();
         self.conditions.clear();
 
         let (ready_status, reason, message) = match self.aggregated_phase {
@@ -225,6 +230,15 @@ impl MultiClusterRolloutStatus {
 
         // Sanitize the condition message
         let sanitized_msg = operator_lifecycle::sanitize_denial_message(message);
+        let last_transition_time = previous_ready
+            .as_ref()
+            .filter(|condition| {
+                condition.status == ready_status
+                    && condition.reason == reason
+                    && condition.message == sanitized_msg
+            })
+            .map(|condition| condition.last_transition_time)
+            .unwrap_or(current_time);
 
         self.conditions.push(LifecycleCondition {
             r#type: "Ready".to_string(),
@@ -232,7 +246,7 @@ impl MultiClusterRolloutStatus {
             reason: reason.to_string(),
             message: sanitized_msg,
             observed_generation: self.observed_generation,
-            last_transition_time: current_time,
+            last_transition_time,
             severity: if ready_status == ConditionStatus::True {
                 ConditionSeverity::Info
             } else if self.aggregated_phase == MultiClusterRolloutPhase::RollbackRequired {

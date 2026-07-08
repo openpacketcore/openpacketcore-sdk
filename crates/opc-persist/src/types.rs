@@ -6,6 +6,7 @@ use opc_data_governance::DataClass;
 use opc_redaction::{redact, RedactionLevel};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::net::Ipv6Addr;
 use std::{fmt, fmt::Debug};
 use zeroize::Zeroizing;
 
@@ -201,10 +202,6 @@ impl AuditKey {
         Ok(Self(Zeroizing::new(bytes)))
     }
 
-    pub(crate) fn from_static_test_bytes(bytes: [u8; 32]) -> Self {
-        Self(Zeroizing::new(bytes))
-    }
-
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -285,7 +282,11 @@ pub fn is_sensitive(path: &str, raw_val: &str) -> bool {
     }
 
     // 3. Value-based check: embedded subscriber identifiers or IP addresses.
-    if contains_long_digit_run(raw_val, 8) || contains_ipv4(raw_val) {
+    if contains_long_digit_run(raw_val, 8)
+        || contains_ipv4(raw_val)
+        || contains_ipv6(raw_val)
+        || contains_sensitive_base64(raw_val)
+    {
         return true;
     }
 
@@ -363,8 +364,101 @@ fn is_ipv4_candidate(candidate: &str) -> bool {
     true
 }
 
+fn contains_ipv6(input: &str) -> bool {
+    input
+        .split(|ch: char| !(ch.is_ascii_hexdigit() || ch == ':'))
+        .any(is_ipv6_candidate)
+}
+
+fn is_ipv6_candidate(candidate: &str) -> bool {
+    candidate.contains(':') && candidate.parse::<Ipv6Addr>().is_ok()
+}
+
+fn contains_sensitive_base64(input: &str) -> bool {
+    input
+        .split(|ch: char| {
+            !(ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '-' | '_'))
+        })
+        .any(is_sensitive_base64_candidate)
+}
+
+fn is_sensitive_base64_candidate(candidate: &str) -> bool {
+    if candidate.len() < 32 || candidate.len() % 4 == 1 {
+        return false;
+    }
+
+    if !candidate
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '-' | '_'))
+    {
+        return false;
+    }
+
+    let mut seen_padding = false;
+    let mut has_upper = false;
+    let mut has_lower = false;
+    let mut has_digit = false;
+    for ch in candidate.chars() {
+        if ch == '=' {
+            seen_padding = true;
+            continue;
+        }
+        if seen_padding {
+            return false;
+        }
+        has_upper |= ch.is_ascii_uppercase();
+        has_lower |= ch.is_ascii_lowercase();
+        has_digit |= ch.is_ascii_digit();
+    }
+
+    if !(has_upper && has_lower && has_digit) {
+        return false;
+    }
+
+    shannon_entropy(candidate.trim_end_matches('=')) >= 4.0
+}
+
+fn shannon_entropy(input: &str) -> f64 {
+    if input.is_empty() {
+        return 0.0;
+    }
+
+    let mut counts = [0usize; 256];
+    for byte in input.bytes() {
+        counts[usize::from(byte)] += 1;
+    }
+
+    let len = input.len() as f64;
+    counts
+        .iter()
+        .filter(|&&count| count > 0)
+        .map(|&count| {
+            let p = count as f64 / len;
+            -p * p.log2()
+        })
+        .sum()
+}
+
 impl AuditRecord {
     pub fn calculate_hmac(&self, audit_key: &AuditKey, tenant: &str) -> [u8; 32] {
+        self.calculate_hmac_inner(audit_key, tenant, None)
+    }
+
+    pub fn calculate_hmac_with_audit_count(
+        &self,
+        audit_key: &AuditKey,
+        tenant: &str,
+        audit_count: u32,
+    ) -> [u8; 32] {
+        self.calculate_hmac_inner(audit_key, tenant, Some(audit_count))
+    }
+
+    fn calculate_hmac_inner(
+        &self,
+        audit_key: &AuditKey,
+        tenant: &str,
+        audit_count: Option<u32>,
+    ) -> [u8; 32] {
         let op_type_str = match self.op_type {
             AuditOpType::Create => "CREATE",
             AuditOpType::Update => "UPDATE",
@@ -376,6 +470,10 @@ impl AuditRecord {
         // write tenant
         mac_input.extend_from_slice(&(tenant.len() as u32).to_be_bytes());
         mac_input.extend_from_slice(tenant.as_bytes());
+
+        if let Some(audit_count) = audit_count {
+            mac_input.extend_from_slice(&audit_count.to_be_bytes());
+        }
 
         // write sequence
         mac_input.extend_from_slice(&self.sequence.to_be_bytes());
@@ -430,11 +528,14 @@ impl StoredConfig {
     pub fn verify_audit_chain(&self, audit_key: &AuditKey) -> Result<(), PersistError> {
         let tenant = extract_tenant(&self.record.principal);
         let mut prev_hash = [0u8; 32];
+        let audit_count =
+            u32::try_from(self.audit.len()).map_err(|_| PersistError::audit_chain_broken())?;
         for entry in &self.audit {
             if entry.previous_hash != prev_hash {
                 return Err(PersistError::audit_chain_broken());
             }
-            let expected_hmac = entry.calculate_hmac(audit_key, &tenant);
+            let expected_hmac =
+                entry.calculate_hmac_with_audit_count(audit_key, &tenant, audit_count);
             if entry.entry_hmac != expected_hmac {
                 return Err(PersistError::audit_chain_broken());
             }

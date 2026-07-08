@@ -185,7 +185,11 @@ impl ExtensionMetricOutcome {
 /// Increments active Subscribe streams and returns a guard that decrements on
 /// drop.
 pub fn active_stream(mode: SubscribeModeMetric) -> ActiveStreamGuard {
-    adjust_active_streams(mode.as_str(), 1);
+    active_stream_for_label(mode.as_str())
+}
+
+fn active_stream_for_label(mode: &'static str) -> ActiveStreamGuard {
+    adjust_active_streams(mode, 1);
     ActiveStreamGuard { mode }
 }
 
@@ -220,12 +224,12 @@ impl SubscribeModeMetric {
 /// Active-stream gauge guard.
 #[derive(Debug)]
 pub struct ActiveStreamGuard {
-    mode: SubscribeModeMetric,
+    mode: &'static str,
 }
 
 impl Drop for ActiveStreamGuard {
     fn drop(&mut self) {
-        adjust_active_streams(self.mode.as_str(), -1);
+        adjust_active_streams(self.mode, -1);
     }
 }
 
@@ -301,13 +305,16 @@ mod tests {
 
     #[test]
     fn records_low_cardinality_metrics() {
+        const TEST_STREAM_MODE: &str = "test-stream-ci-isolation";
+        const TEST_TRANSPORT: &str = "test-gnmi-ci-isolation";
+
         let capability_success_before = rpc_request_count(GnmiOperation::Capabilities, "success");
         let get_failure_before = rpc_request_count(GnmiOperation::Get, "failure");
         let get_error_before =
             rpc_error_count(GnmiOperation::Get, MgmtStatus::InvalidArgument.as_str());
         let read_denials_before = nacm_denial_count(GnmiNacmAction::Read);
-        let active_stream_before = active_stream_count(SubscribeModeMetric::Stream);
-        let active_session_before = active_session_count(TRANSPORT_GNMI_TLS);
+        let active_stream_before = active_stream_count(TEST_STREAM_MODE);
+        let active_session_before = active_session_count(TEST_TRANSPORT);
         let listener_start_before =
             listener_event_count(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Start);
 
@@ -322,16 +329,16 @@ mod tests {
         record_listener_event(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Start);
         record_set_commit_latency(SetCommitMetric::Patch, Duration::from_millis(20));
         {
-            let _guard = active_stream(SubscribeModeMetric::Stream);
+            let _guard = active_stream_for_label(TEST_STREAM_MODE);
             assert_eq!(
-                active_stream_count(SubscribeModeMetric::Stream),
+                active_stream_count(TEST_STREAM_MODE),
                 active_stream_before + 1
             );
         }
         {
-            let _guard = active_session(TRANSPORT_GNMI_TLS);
+            let _guard = active_session(TEST_TRANSPORT);
             assert_eq!(
-                active_session_count(TRANSPORT_GNMI_TLS),
+                active_session_count(TEST_TRANSPORT),
                 active_session_before + 1
             );
         }
@@ -345,14 +352,8 @@ mod tests {
                 > get_error_before
         );
         assert!(nacm_denial_count(GnmiNacmAction::Read) >= read_denials_before + 2);
-        assert_eq!(
-            active_stream_count(SubscribeModeMetric::Stream),
-            active_stream_before
-        );
-        assert_eq!(
-            active_session_count(TRANSPORT_GNMI_TLS),
-            active_session_before
-        );
+        assert_eq!(active_stream_count(TEST_STREAM_MODE), active_stream_before);
+        assert_eq!(active_session_count(TEST_TRANSPORT), active_session_before);
         assert!(
             listener_event_count(TRANSPORT_GNMI_TLS, GnmiListenerEvent::Start)
                 > listener_start_before
@@ -389,12 +390,12 @@ mod tests {
             .unwrap_or_default()
     }
 
-    fn active_stream_count(mode: SubscribeModeMetric) -> i64 {
+    fn active_stream_count(mode: &'static str) -> i64 {
         METRICS
             .gnmi_active_streams
             .lock()
             .expect("metrics")
-            .get(mode.as_str())
+            .get(mode)
             .copied()
             .unwrap_or_default()
     }

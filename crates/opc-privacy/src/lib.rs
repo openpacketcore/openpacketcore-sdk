@@ -31,6 +31,7 @@ pub enum MinimizationError {
     InvalidPolicy,
     InvalidBinSize,
     CohortTooSmall(usize, usize),
+    UnsafeCohortKey,
     DirectIdentifierNotAllowed(DataClass),
     ClassNotAllowed(DataClass),
 }
@@ -46,6 +47,10 @@ impl std::fmt::Display for MinimizationError {
             Self::CohortTooSmall(size, threshold) => write!(
                 f,
                 "Minimization error: cohort size {size} is below k-anonymity threshold {threshold}"
+            ),
+            Self::UnsafeCohortKey => write!(
+                f,
+                "Minimization error: cohort key contains a raw sensitive identifier"
             ),
             Self::DirectIdentifierNotAllowed(class) => write!(
                 f,
@@ -97,6 +102,9 @@ impl MinimizationPolicy {
             ABSOLUTE_MIN_COHORT
         };
         for cohort in cohorts {
+            if cohort.keys.iter().any(|key| contains_raw_identifier(key)) {
+                return Err(MinimizationError::UnsafeCohortKey);
+            }
             if cohort.count < floor {
                 return Err(MinimizationError::CohortTooSmall(cohort.count, floor));
             }
@@ -114,6 +122,21 @@ impl MinimizationPolicy {
         }
         Ok(())
     }
+}
+
+/// Builds cohort records from generalized row keys, computing counts internally.
+pub fn aggregate_cohorts<I>(rows: I) -> Vec<CohortRecord>
+where
+    I: IntoIterator<Item = Vec<String>>,
+{
+    let mut counts = std::collections::BTreeMap::<Vec<String>, usize>::new();
+    for keys in rows {
+        *counts.entry(keys).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(keys, count)| CohortRecord { keys, count })
+        .collect()
 }
 
 /// Helper to bin numeric values to create safe aggregate bins.
@@ -138,6 +161,55 @@ pub fn hash_identifier(
     raw_val: &str,
 ) -> String {
     opc_redaction::compute_digest(key, DataClass::SubscriberId, id_type, raw_val)
+}
+
+fn contains_raw_identifier(key: &str) -> bool {
+    contains_long_digit_run(key) || contains_ipv4_literal(key)
+}
+
+fn contains_long_digit_run(key: &str) -> bool {
+    let mut run = 0usize;
+    for c in key.chars() {
+        if c.is_ascii_digit() {
+            run += 1;
+            if run >= 8 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+fn contains_ipv4_literal(key: &str) -> bool {
+    key.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .any(looks_like_ipv4)
+}
+
+fn looks_like_ipv4(candidate: &str) -> bool {
+    let mut parts = candidate.split('.');
+    let Some(a) = parts.next() else {
+        return false;
+    };
+    let Some(b) = parts.next() else {
+        return false;
+    };
+    let Some(c) = parts.next() else {
+        return false;
+    };
+    let Some(d) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    [a, b, c, d].iter().all(|part| {
+        !part.is_empty()
+            && part.len() <= 3
+            && part.chars().all(|c| c.is_ascii_digit())
+            && part.parse::<u8>().is_ok()
+    })
 }
 
 #[cfg(test)]
@@ -236,6 +308,50 @@ mod tests {
             count: 2,
         }];
         assert!(policy.validate_cohorts(&pair).is_ok());
+    }
+
+    #[test]
+    fn test_cohort_keys_reject_raw_identifiers_regardless_of_count() {
+        let policy = MinimizationPolicy {
+            policy_id: "analytics-v1".to_string(),
+            min_cohort_size: 2,
+            enforce_k_anonymity: true,
+            allowed_classes: vec![DataClass::AnalyticsSensitive, DataClass::Public],
+        };
+
+        for key in ["imsi:208950000000001", "peer:10.0.0.1"] {
+            let cohort = vec![CohortRecord {
+                keys: vec![key.to_string()],
+                count: 100,
+            }];
+            assert_eq!(
+                policy.validate_cohorts(&cohort),
+                Err(MinimizationError::UnsafeCohortKey)
+            );
+        }
+    }
+
+    #[test]
+    fn test_aggregate_cohorts_computes_counts_from_rows() {
+        let cohorts = aggregate_cohorts([
+            vec!["age:20-30".to_string(), "region:east".to_string()],
+            vec!["age:20-30".to_string(), "region:east".to_string()],
+            vec!["age:30-40".to_string(), "region:west".to_string()],
+        ]);
+
+        assert_eq!(
+            cohorts,
+            vec![
+                CohortRecord {
+                    keys: vec!["age:20-30".to_string(), "region:east".to_string()],
+                    count: 2,
+                },
+                CohortRecord {
+                    keys: vec!["age:30-40".to_string(), "region:west".to_string()],
+                    count: 1,
+                },
+            ]
+        );
     }
 
     #[test]

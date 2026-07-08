@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use hmac::Mac;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use opc_key::KeyProvider;
@@ -11,7 +11,12 @@ use crate::break_glass::{
 };
 
 use super::crypto::validate_principal_tenant_and_roles;
-use super::{SecurityPolicyError, SqliteSecurityPolicyService};
+#[cfg(any(test, feature = "dangerous-test-hooks"))]
+use super::TEST_AUDIT_FAILURE_INSERT_FAIL;
+use super::{
+    audit_hash_from_blob, calculate_audit_event_hmac, SecurityPolicyError,
+    SqliteSecurityPolicyService,
+};
 
 impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
     pub async fn clean_expired_all_tenants(&self) -> Result<(), SecurityPolicyError> {
@@ -66,29 +71,26 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
         action: &str,
         details: &str,
     ) -> Result<(), SecurityPolicyError> {
-        let conn_mutex = self.backend.conn();
-        let (previous_hash, timestamp) = {
-            let conn = conn_mutex.lock().await;
+        self.verify_break_glass_audit_chain(tenant).await?;
 
-            let prev_hash_row: Result<Vec<u8>, _> = conn.query_row(
+        let conn_mutex = self.backend.conn();
+        let timestamp = Timestamp::now_utc().to_string();
+
+        {
+            let conn = conn_mutex.lock().await;
+            let tx = conn.unchecked_transaction().map_err(|e| {
+                tracing::error!(err = ?e, "Failed to start break-glass audit transaction");
+                SecurityPolicyError::Internal
+            })?;
+
+            let prev_hash_row: Result<Vec<u8>, _> = tx.query_row(
                 "SELECT entry_hmac FROM break_glass_audit WHERE tenant = ?1 ORDER BY id DESC LIMIT 1",
                 [tenant],
                 |row| row.get(0),
             );
 
             let previous_hash: [u8; 32] = match prev_hash_row {
-                Ok(bytes) => {
-                    if bytes.len() != 32 {
-                        tracing::error!(
-                            len = bytes.len(),
-                            "Invalid previous break-glass audit HMAC length"
-                        );
-                        return Err(SecurityPolicyError::Internal);
-                    }
-                    let mut h = [0u8; 32];
-                    h.copy_from_slice(&bytes);
-                    h
-                }
+                Ok(bytes) => audit_hash_from_blob(bytes, "previous break-glass audit HMAC")?,
                 Err(rusqlite::Error::QueryReturnedNoRows) => [0u8; 32],
                 Err(e) => {
                     tracing::error!(err = ?e, "Failed to fetch previous break-glass audit hash");
@@ -96,40 +98,24 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
                 }
             };
 
-            let timestamp = Timestamp::now_utc().to_string();
-            (previous_hash, timestamp)
-        };
+            let entry_hmac = calculate_audit_event_hmac(
+                self.backend.audit_key(),
+                tenant,
+                &timestamp,
+                principal,
+                action,
+                details,
+                &previous_hash,
+            )?;
 
-        let mut mac_input = Vec::new();
-        mac_input.extend_from_slice(&(tenant.len() as u32).to_be_bytes());
-        mac_input.extend_from_slice(tenant.as_bytes());
+            #[cfg(any(test, feature = "dangerous-test-hooks"))]
+            if TEST_AUDIT_FAILURE_INSERT_FAIL.load(Ordering::Relaxed)
+                && matches!(action, "EVALUATE_DENY")
+            {
+                return Err(SecurityPolicyError::Internal);
+            }
 
-        mac_input.extend_from_slice(&(timestamp.len() as u32).to_be_bytes());
-        mac_input.extend_from_slice(timestamp.as_bytes());
-
-        mac_input.extend_from_slice(&(principal.len() as u32).to_be_bytes());
-        mac_input.extend_from_slice(principal.as_bytes());
-
-        mac_input.extend_from_slice(&(action.len() as u32).to_be_bytes());
-        mac_input.extend_from_slice(action.as_bytes());
-
-        mac_input.extend_from_slice(&(details.len() as u32).to_be_bytes());
-        mac_input.extend_from_slice(details.as_bytes());
-
-        mac_input.extend_from_slice(&previous_hash);
-
-        type HmacSha256 = hmac::Hmac<sha2::Sha256>;
-        let mut mac =
-            HmacSha256::new_from_slice(self.backend.audit_key().as_bytes()).map_err(|e| {
-                tracing::error!(err = ?e, "Failed to create HMAC provider");
-                SecurityPolicyError::Internal
-            })?;
-        mac.update(&mac_input);
-        let entry_hmac: [u8; 32] = mac.finalize().into_bytes().into();
-
-        {
-            let conn = conn_mutex.lock().await;
-            let insert_res = conn.execute(
+            let insert_res = tx.execute(
                 "INSERT INTO break_glass_audit (tenant, timestamp, principal, action, details, previous_hash, entry_hmac) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
@@ -147,6 +133,22 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
                 tracing::error!(err = ?e, "Failed to insert break glass audit entry");
                 return Err(SecurityPolicyError::Internal);
             }
+
+            tx.execute(
+                "INSERT INTO break_glass_audit_anchor (tenant, audit_count, audit_terminal_hash) \
+                 VALUES (?1, (SELECT COUNT(*) FROM break_glass_audit WHERE tenant = ?1), ?2) \
+                 ON CONFLICT(tenant) DO UPDATE SET audit_count = excluded.audit_count, audit_terminal_hash = excluded.audit_terminal_hash",
+                rusqlite::params![tenant, &entry_hmac[..]],
+            )
+            .map_err(|e| {
+                tracing::error!(err = ?e, "Failed to update break-glass audit anchor");
+                SecurityPolicyError::Internal
+            })?;
+
+            tx.commit().map_err(|e| {
+                tracing::error!(err = ?e, "Failed to commit break-glass audit transaction");
+                SecurityPolicyError::Internal
+            })?;
         }
 
         tracing::info!(
@@ -159,6 +161,43 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
         );
 
         Ok(())
+    }
+
+    async fn break_glass_audit_event_or_record_failure(
+        &self,
+        tenant: &str,
+        principal: &str,
+        action: &str,
+        details: &str,
+    ) {
+        if let Err(err) = self
+            .break_glass_audit_event(tenant, principal, action, details)
+            .await
+        {
+            opc_redaction::metrics::METRICS
+                .persist_audit_write_failure
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                err = ?err,
+                tenant = %tenant,
+                principal = %principal,
+                action = %action,
+                details = %details,
+                "Required break-glass audit write failed"
+            );
+        }
+    }
+
+    #[cfg(any(test, feature = "dangerous-test-hooks"))]
+    pub async fn break_glass_audit_event_for_test(
+        &self,
+        tenant: &str,
+        principal: &str,
+        action: &str,
+        details: &str,
+    ) -> Result<(), SecurityPolicyError> {
+        self.break_glass_audit_event(tenant, principal, action, details)
+            .await
     }
 
     async fn check_break_glass_permission(
@@ -187,9 +226,13 @@ impl<P: KeyProvider + 'static> SqliteSecurityPolicyService<P> {
 
         if !decision.is_allowed() {
             let details = format!("NACM check denied break-glass access for action {action:?}");
-            let _ = self
-                .break_glass_audit_event(tenant, &validated_spiffe, "EVALUATE_DENY", &details)
-                .await;
+            self.break_glass_audit_event_or_record_failure(
+                tenant,
+                &validated_spiffe,
+                "EVALUATE_DENY",
+                &details,
+            )
+            .await;
 
             return Err(SecurityPolicyError::Unauthorized(format!(
                 "Access denied by active security policy for action: {action:?}"

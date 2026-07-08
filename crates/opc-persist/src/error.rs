@@ -44,6 +44,9 @@ pub enum PersistErrorKind {
     /// The schema version in the database does not match the expected version.
     #[error("schema version mismatch: expected {expected}, found {found}")]
     SchemaVersionMismatch { expected: String, found: String },
+    /// The stored schema digest does not match the live SQLite schema.
+    #[error("schema digest mismatch: expected {expected}, found {found}")]
+    SchemaDigestMismatch { expected: String, found: String },
     /// A rusqlite error that does not fit another category.
     #[error("SQLite error: {0}")]
     Sqlite(String),
@@ -247,6 +250,13 @@ impl PersistError {
 
     pub fn schema_version_mismatch(expected: impl Into<String>, found: impl Into<String>) -> Self {
         Self::new(PersistErrorKind::SchemaVersionMismatch {
+            expected: expected.into(),
+            found: found.into(),
+        })
+    }
+
+    pub fn schema_digest_mismatch(expected: impl Into<String>, found: impl Into<String>) -> Self {
+        Self::new(PersistErrorKind::SchemaDigestMismatch {
             expected: expected.into(),
             found: found.into(),
         })

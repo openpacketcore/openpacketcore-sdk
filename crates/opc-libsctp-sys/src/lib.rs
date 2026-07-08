@@ -235,6 +235,12 @@ pub const SCTP_UNORDERED_FLAG: u16 = platform::SCTP_UNORDERED_FLAG;
 /// SCTP notification flag as returned by `recvmsg`.
 pub const SCTP_NOTIFICATION_FLAG: i32 = platform::SCTP_NOTIFICATION_FLAG;
 
+/// SCTP association-change notification type.
+pub const SCTP_ASSOC_CHANGE_NOTIFICATION: u16 = platform::SCTP_ASSOC_CHANGE_NOTIFICATION;
+
+/// SCTP shutdown notification type.
+pub const SCTP_SHUTDOWN_EVENT_NOTIFICATION: u16 = platform::SCTP_SHUTDOWN_EVENT_NOTIFICATION;
+
 #[cfg(test)]
 mod tests {
     use super::*;

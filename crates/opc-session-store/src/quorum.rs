@@ -124,6 +124,17 @@ pub struct QuorumSessionStore {
     clock: Arc<dyn Clock>,
 }
 
+fn next_replication_sequence(committed_entries: &[ReplicationEntry]) -> Result<u64, StoreError> {
+    committed_entries
+        .last()
+        .map(|entry| {
+            entry.sequence.checked_add(1).ok_or_else(|| {
+                StoreError::BackendUnavailable("replication sequence exhausted".into())
+            })
+        })
+        .unwrap_or(Ok(1))
+}
+
 impl QuorumSessionStore {
     /// Build a coordinator over `replicas`, timestamping log entries with the
     /// real system clock.
@@ -270,10 +281,7 @@ impl QuorumSessionStore {
     async fn replicate_mutation(&self, op: ReplicationOp) -> Result<(), StoreError> {
         let (online_ids, committed_entries) = self.committed_and_repaired().await?;
         let quorum = self.quorum_size();
-        let next_seq = committed_entries
-            .last()
-            .map(|entry| entry.sequence + 1)
-            .unwrap_or(1);
+        let next_seq = next_replication_sequence(&committed_entries)?;
         let tx_id = uuid::Uuid::new_v4().to_string();
         let entry = ReplicationEntry {
             sequence: next_seq,
@@ -446,6 +454,8 @@ impl SessionBackend for QuorumSessionStore {
         let op_clone = ReplicationOp::CompareAndSet {
             key: op.key.clone(),
             expected_generation: op.expected_generation,
+            credential_id: op.lease.credential_id(),
+            guard_expires_at: op.lease.expires_at(),
             new_record: op.new_record,
         };
         match self.replicate_mutation(op_clone).await {
@@ -474,11 +484,15 @@ impl SessionBackend for QuorumSessionStore {
     }
 
     async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
+        let now = self.clock.now_utc();
+        let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
+        let expires_at = Timestamp::from_offset_datetime(expires);
         let op = ReplicationOp::RefreshTtl {
             key: lease.key().clone(),
             owner: lease.owner().clone(),
             fence: lease.fence(),
             ttl,
+            expires_at,
         };
         self.replicate_mutation(op).await
     }
@@ -627,14 +641,20 @@ impl SessionLeaseManager for QuorumSessionStore {
         let mut max_cred_id = 0;
         for &id in &online_ids {
             let replica = &self.replicas[id];
-            if let Ok((f, c)) = replica.inner.next_lease_info().await {
-                max_fence = max_fence.max(f);
-                max_cred_id = max_cred_id.max(c);
-            }
+            let (f, c) = replica
+                .inner
+                .next_lease_info()
+                .await
+                .map_err(|e| LeaseError::Backend(e.to_string()))?;
+            max_fence = max_fence.max(f);
+            max_cred_id = max_cred_id.max(c);
         }
 
         let fence = FenceToken::new(max_fence);
         let credential_id = max_cred_id;
+        let now = self.clock.now_utc();
+        let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
+        let expires_at = Timestamp::from_offset_datetime(expires);
 
         let op = ReplicationOp::AcquireLease {
             key: key.clone(),
@@ -642,6 +662,7 @@ impl SessionLeaseManager for QuorumSessionStore {
             fence,
             credential_id,
             ttl,
+            expires_at,
         };
 
         let res = self.replicate_mutation(op).await;
@@ -651,10 +672,6 @@ impl SessionLeaseManager for QuorumSessionStore {
                 .fetch_add(1, Ordering::Relaxed);
         }
         res.map_err(LeaseError::from)?;
-
-        let now = self.clock.now_utc();
-        let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-        let expires_at = Timestamp::from_offset_datetime(expires);
 
         Ok(LeaseGuard::new(
             key.clone(),
@@ -667,12 +684,16 @@ impl SessionLeaseManager for QuorumSessionStore {
     }
 
     async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
+        let now = self.clock.now_utc();
+        let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
+        let expires_at = Timestamp::from_offset_datetime(expires);
         let op = ReplicationOp::RenewLease {
             key: lease.key().clone(),
             owner: lease.owner().clone(),
             fence: lease.fence(),
             credential_id: lease.credential_id(),
             ttl,
+            expires_at,
         };
 
         let res = self.replicate_mutation(op).await;
@@ -682,10 +703,6 @@ impl SessionLeaseManager for QuorumSessionStore {
                 .fetch_add(1, Ordering::Relaxed);
         }
         res.map_err(LeaseError::from)?;
-
-        let now = self.clock.now_utc();
-        let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-        let expires_at = Timestamp::from_offset_datetime(expires);
 
         Ok(LeaseGuard::new(
             lease.key().clone(),
@@ -712,5 +729,26 @@ impl SessionLeaseManager for QuorumSessionStore {
                 .fetch_add(1, Ordering::Relaxed);
         }
         res.map_err(LeaseError::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_replication_sequence_reports_overflow() {
+        let entry = ReplicationEntry {
+            sequence: u64::MAX,
+            tx_id: "max-sequence".into(),
+            op: ReplicationOp::Batch { ops: Vec::new() },
+            timestamp: Timestamp::now_utc(),
+        };
+
+        let err = next_replication_sequence(&[entry]).expect_err("sequence overflow must error");
+        assert_eq!(
+            err,
+            StoreError::BackendUnavailable("replication sequence exhausted".into())
+        );
     }
 }

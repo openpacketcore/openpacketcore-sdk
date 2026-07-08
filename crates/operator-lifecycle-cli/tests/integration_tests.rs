@@ -92,7 +92,7 @@ fn test_admission_mismatching_contract_version() {
 }
 
 #[test]
-fn test_admission_absent_contract_version_backward_compat() {
+fn test_admission_absent_contract_version_rejected() {
     let input = r#"{
         "uid": "test-uid",
         "runtime_mode": "lab",
@@ -104,10 +104,26 @@ fn test_admission_absent_contract_version_backward_compat() {
     }"#;
 
     let (stdout, code) = run_json("admission", input);
-    assert_eq!(code, 0, "expected exit 0, got {code}. stdout: {stdout}");
+    assert_eq!(code, 2, "expected exit 2, got {code}. stdout: {stdout}");
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(parsed["contractVersion"], 1);
-    assert!(parsed["allowed"].as_bool().unwrap());
+    assert!(parsed["error"]
+        .as_str()
+        .unwrap()
+        .contains("expectedContractVersion"));
+}
+
+#[test]
+fn test_admission_rejects_oversized_stdin() {
+    let oversized = " ".repeat(1024 * 1024 + 1);
+
+    let (stdout, code) = run_json("admission", &oversized);
+    assert_eq!(code, 1, "expected exit 1, got {code}. stdout: {stdout}");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(parsed["error"]
+        .as_str()
+        .unwrap()
+        .contains("request exceeds maximum size"));
 }
 
 #[test]

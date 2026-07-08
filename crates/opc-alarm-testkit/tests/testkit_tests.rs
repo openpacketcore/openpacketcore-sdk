@@ -201,6 +201,32 @@ fn test_redaction_checks_imsi_prefix() {
 }
 
 #[test]
+#[should_panic(expected = "contains unredacted subscriber identifier prefix 'imsi'")]
+fn test_redaction_checks_second_imsi_prefix() {
+    let mut alarm = make_alarm(
+        "alarm-1",
+        Severity::Critical,
+        ProbableCause::PeerUnreachable,
+        AlarmState::Raised,
+    );
+    alarm.text = RedactedText::new("First imsi-[redacted], second imsi-123456");
+    assert_redacted(&alarm);
+}
+
+#[test]
+#[should_panic(expected = "contains unredacted subscriber identifier prefix 'imsi'")]
+fn test_redaction_checks_imsi_prefix_with_whitespace_separator() {
+    let mut alarm = make_alarm(
+        "alarm-1",
+        Severity::Critical,
+        ProbableCause::PeerUnreachable,
+        AlarmState::Raised,
+    );
+    alarm.text = RedactedText::new("Failed for imsi: 12345");
+    assert_redacted(&alarm);
+}
+
+#[test]
 #[should_panic(expected = "contains a JWT-like string")]
 fn test_redaction_checks_jwt() {
     let mut alarm = make_alarm(
@@ -248,5 +274,18 @@ fn test_redaction_checks_ipv4_address() {
         AlarmState::Raised,
     );
     alarm.text = RedactedText::new("Peer reachable at 10.42.0.19");
+    assert_redacted(&alarm);
+}
+
+#[test]
+#[should_panic(expected = "contains an IPv6 address")]
+fn test_redaction_checks_ipv6_address() {
+    let mut alarm = make_alarm(
+        "alarm-1",
+        Severity::Critical,
+        ProbableCause::PeerUnreachable,
+        AlarmState::Raised,
+    );
+    alarm.text = RedactedText::new("Peer reachable at 2001:db8::42");
     assert_redacted(&alarm);
 }

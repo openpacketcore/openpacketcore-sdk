@@ -186,6 +186,39 @@ async fn validate_only_surfaces_diff_failures_without_publish() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_candidate_is_rejected_before_publish_or_persist() {
+    let store = Arc::new(MockManagedDatastore::new());
+    let bus = ConfigBus::new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
+        .await
+        .expect("startup succeeds")
+        .with_max_serialized_config_bytes(32);
+
+    let err = bus
+        .submit(CommitRequest::commit(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            TestConfig::new("oversized-candidate-payload-that-exceeds-the-cap"),
+            vec![changed_path()],
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .await
+        .expect_err("oversized candidate should be rejected");
+
+    assert_eq!(err.code, CommitErrorCode::AdmissionRejected);
+    assert!(
+        err.message.contains("serialized payload"),
+        "got: {}",
+        err.message
+    );
+    assert_eq!(bus.version(), ConfigVersion::INITIAL);
+    assert_eq!(bus.load().name, "initial");
+    assert_eq!(store.history().await.len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_returns_admitted_apply_plan_and_replays_it() {
     let store = Arc::new(MockManagedDatastore::new());
     let admitted_plan =

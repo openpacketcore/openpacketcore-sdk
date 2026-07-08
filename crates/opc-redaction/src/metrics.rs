@@ -5,12 +5,14 @@
 //! from Prometheus metric labels, and provides a thread-safe registry.
 
 use crate::TelcoIdentifier;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 const MAX_LABEL_VALUE_LEN: usize = 64;
+const MAX_DYNAMIC_ADMIN_ROUTE_LABELS: usize = 128;
+const DYNAMIC_ROUTE_OVERFLOW: &str = "other";
 
 /// Checks if a string is safe to be used as a metric label. If unsafe, returns
 /// a sanitized/redacted placeholder. Otherwise, returns the trimmed value.
@@ -212,6 +214,7 @@ impl<'a> AdminMetricsRecorder<'a> {
         let route = admin_route_label_safe(route);
         let status = admin_status_label_safe(status);
         let mut reqs = lock_or_recover(&self.metrics.admin_requests_total);
+        let route = bounded_request_route_label(route, &reqs);
         let count = reqs.entry((route, status)).or_insert(0);
         *count += 1;
     }
@@ -267,6 +270,7 @@ impl<'a> AdminMetricsRecorder<'a> {
                 .observe(latency_seconds),
             _ => {
                 let mut latencies = lock_or_recover(&self.metrics.admin_request_latency_seconds);
+                let route = bounded_latency_route_label(route, &latencies);
                 latencies.entry(route).or_default().observe(latency_seconds);
             }
         }
@@ -311,6 +315,69 @@ pub fn admin_route_label_safe(route: &str) -> String {
         other => return metrics_label_safe(other),
     };
     metrics_label_safe(normalized)
+}
+
+fn is_known_admin_route_label(route: &str) -> bool {
+    matches!(
+        route,
+        "unknown"
+            | "livez"
+            | "readyz"
+            | "startupz"
+            | "metrics"
+            | "debug_runtime"
+            | "debug_tasks"
+            | "debug_config_version"
+            | "debug_drain"
+    )
+}
+
+fn bounded_request_route_label(route: String, requests: &HashMap<(String, String), u64>) -> String {
+    if is_known_admin_route_label(&route)
+        || route == DYNAMIC_ROUTE_OVERFLOW
+        || requests.keys().any(|(existing, _)| existing == &route)
+    {
+        return route;
+    }
+
+    let distinct_dynamic_routes: HashSet<&str> = requests
+        .keys()
+        .map(|(existing, _)| existing.as_str())
+        .filter(|existing| {
+            !is_known_admin_route_label(existing) && *existing != DYNAMIC_ROUTE_OVERFLOW
+        })
+        .collect();
+
+    if distinct_dynamic_routes.len() >= MAX_DYNAMIC_ADMIN_ROUTE_LABELS {
+        DYNAMIC_ROUTE_OVERFLOW.to_string()
+    } else {
+        route
+    }
+}
+
+fn bounded_latency_route_label(
+    route: String,
+    latencies: &HashMap<String, LatencyHistogram>,
+) -> String {
+    if is_known_admin_route_label(&route)
+        || route == DYNAMIC_ROUTE_OVERFLOW
+        || latencies.contains_key(&route)
+    {
+        return route;
+    }
+
+    let distinct_dynamic_routes = latencies
+        .keys()
+        .filter(|existing| {
+            !is_known_admin_route_label(existing) && existing.as_str() != DYNAMIC_ROUTE_OVERFLOW
+        })
+        .count();
+
+    if distinct_dynamic_routes >= MAX_DYNAMIC_ADMIN_ROUTE_LABELS {
+        DYNAMIC_ROUTE_OVERFLOW.to_string()
+    } else {
+        route
+    }
 }
 
 /// Normalize and sanitize an admin HTTP status label for metrics.
@@ -405,6 +472,7 @@ pub struct SdkMetrics {
     pub persist_rpc_auth_failures: AtomicU64,
     pub persist_audit_chain_verification_success: AtomicU64,
     pub persist_audit_chain_verification_failure: AtomicU64,
+    pub persist_audit_write_failure: AtomicU64,
     pub persist_write_success: AtomicU64,
     pub persist_read_success: AtomicU64,
     pub persist_error: AtomicU64,
@@ -527,6 +595,7 @@ impl SdkMetrics {
             persist_rpc_auth_failures: AtomicU64::new(0),
             persist_audit_chain_verification_success: AtomicU64::new(0),
             persist_audit_chain_verification_failure: AtomicU64::new(0),
+            persist_audit_write_failure: AtomicU64::new(0),
             persist_write_success: AtomicU64::new(0),
             persist_read_success: AtomicU64::new(0),
             persist_error: AtomicU64::new(0),
@@ -651,6 +720,7 @@ impl SdkMetrics {
             .store(0, Ordering::Relaxed);
         self.persist_audit_chain_verification_failure
             .store(0, Ordering::Relaxed);
+        self.persist_audit_write_failure.store(0, Ordering::Relaxed);
         self.persist_write_success.store(0, Ordering::Relaxed);
         self.persist_read_success.store(0, Ordering::Relaxed);
         self.persist_error.store(0, Ordering::Relaxed);
@@ -1202,6 +1272,15 @@ pub fn export_prometheus_text() -> String {
     out.push_str(&format!(
         "opc_persist_audit_chain_verification_total{{status=\"failure\"}} {audit_chain_fail}\n"
     ));
+
+    let audit_write_fail = METRICS.persist_audit_write_failure.load(Ordering::Relaxed);
+    write_metric(
+        &mut out,
+        "opc_persist_audit_write_failure_total",
+        "counter",
+        "Total count of failed required audit writes",
+        audit_write_fail as f64,
+    );
 
     let p_write = METRICS.persist_write_success.load(Ordering::Relaxed);
     write_metric(
@@ -2082,5 +2161,46 @@ mod tests {
         let debug = format!("{recorder:?}");
         assert!(!debug.contains("imsi"));
         assert!(!debug.contains("debug_config_version"));
+    }
+
+    #[test]
+    fn admin_metrics_recorder_caps_dynamic_route_labels() {
+        let metrics = SdkMetrics::new();
+        let recorder = AdminMetricsRecorder::new(&metrics);
+
+        for i in 0..(MAX_DYNAMIC_ADMIN_ROUTE_LABELS + 8) {
+            let route = format!("tenant-route-{i}");
+            recorder.record_request(&route, 200);
+            recorder.observe_route_latency(&route, 0.01);
+        }
+
+        let reqs = metrics.admin_requests_total.lock().unwrap();
+        let dynamic_request_routes: std::collections::HashSet<_> = reqs
+            .keys()
+            .map(|(route, _status)| route.as_str())
+            .filter(|route| !is_known_admin_route_label(route) && *route != DYNAMIC_ROUTE_OVERFLOW)
+            .collect();
+        assert_eq!(dynamic_request_routes.len(), MAX_DYNAMIC_ADMIN_ROUTE_LABELS);
+        assert_eq!(
+            reqs.get(&(DYNAMIC_ROUTE_OVERFLOW.to_string(), "200".to_string())),
+            Some(&8)
+        );
+        drop(reqs);
+
+        let latencies = metrics.admin_request_latency_seconds.lock().unwrap();
+        let dynamic_latency_routes: std::collections::HashSet<_> = latencies
+            .keys()
+            .map(String::as_str)
+            .filter(|route| !is_known_admin_route_label(route) && *route != DYNAMIC_ROUTE_OVERFLOW)
+            .collect();
+        assert_eq!(dynamic_latency_routes.len(), MAX_DYNAMIC_ADMIN_ROUTE_LABELS);
+        assert_eq!(
+            latencies
+                .get(DYNAMIC_ROUTE_OVERFLOW)
+                .expect("overflow latency bucket")
+                .count
+                .load(Ordering::Relaxed),
+            8
+        );
     }
 }

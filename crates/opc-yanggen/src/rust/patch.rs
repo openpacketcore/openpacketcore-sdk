@@ -24,7 +24,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             let trimmed = node.path.trim_start_matches('/');
             !trimmed.is_empty() && !trimmed.contains('/')
         })
-        .expect("Rust generation validates one root node before emitting patches");
+        .ok_or_else(|| {
+            RustGenerationError::new("root node not found while generating patch module")
+        })?;
     let root_name = clean_segment(last_segment(&root.path));
     let root_type = format_ident!("{}", to_pascal_case(root_name));
     let root_path = &root.path;
@@ -198,9 +200,13 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         }
                                     }
                                 }
-                                let parse_key = match find_key_leaf_node
-                                    .and_then(|n| n.type_ref.as_ref())
-                                {
+                                let key_leaf_node = find_key_leaf_node.ok_or_else(|| {
+                                    RustGenerationError::new(format!(
+                                        "list '{}' key leaf '{}' is not a child node",
+                                        child.path, key_leaf
+                                    ))
+                                })?;
+                                let parse_key = match key_leaf_node.type_ref.as_ref() {
                                     Some(TypeRef::Uint16) => quote! {
                                         let parsed_key = key_val.parse::<u16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
                                     },
@@ -213,8 +219,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 };
 
                                 let key_field_ident = format_ident!("{}", to_snake_case(key_leaf));
-                                let key_is_sensitive =
-                                    is_sensitive_node(find_key_leaf_node.unwrap());
+                                let key_is_sensitive = is_sensitive_node(key_leaf_node);
                                 let key_assign = if key_is_sensitive {
                                     quote! { parsed_item.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(parsed_key.clone())); }
                                 } else {
@@ -279,9 +284,13 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         }
                                     }
                                     let key_ident = format_ident!("k_{}", to_snake_case(key_leaf));
-                                    let parse_key = match find_key_leaf_node
-                                        .and_then(|n| n.type_ref.as_ref())
-                                    {
+                                    let key_leaf_node = find_key_leaf_node.ok_or_else(|| {
+                                        RustGenerationError::new(format!(
+                                            "list '{}' key leaf '{}' is not a child node",
+                                            child.path, key_leaf
+                                        ))
+                                    })?;
+                                    let parse_key = match key_leaf_node.type_ref.as_ref() {
                                         Some(TypeRef::Uint16) => quote! {
                                             let #key_ident = key_val.parse::<u16>().map_err(|e| config_error("invalid-value", e.to_string()))?;
                                         },
@@ -303,8 +312,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     key_fields.extend(quote! {
                                         #key_field_ident: #key_ident.clone(),
                                     });
-                                    let is_sensitive =
-                                        is_sensitive_node(find_key_leaf_node.unwrap());
+                                    let is_sensitive = is_sensitive_node(key_leaf_node);
                                     if is_sensitive {
                                         key_assigns.push(quote! { parsed_item.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(#key_ident.clone())); });
                                         entry_key_assigns.push(quote! { entry.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(#key_ident.clone())); });
@@ -864,4 +872,102 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     };
 
     Ok(tokens.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diagnostic::YangSourceLocation;
+    use crate::emit::CanonicalProfile;
+    use crate::ir::{SchemaModule, StackBudget};
+
+    fn malformed_input_with_list(list: SchemaNode, extra_nodes: Vec<SchemaNode>) -> CanonicalInput {
+        let source = YangSourceLocation::new("dangling-key.yang", 1, 1);
+        let root = SchemaNode {
+            path: "/test:system".to_string(),
+            module: "test".to_string(),
+            kind: SchemaNodeKind::Container,
+            config: true,
+            child_paths: vec![list.path.clone()],
+            source: source.clone(),
+            ..Default::default()
+        };
+        let mut nodes = vec![root, list];
+        nodes.extend(extra_nodes);
+
+        CanonicalInput {
+            profile: CanonicalProfile {
+                generation: "test".to_string(),
+                lockfile_mismatch: None,
+            },
+            locked_modules: vec![],
+            schema_modules: vec![SchemaModule {
+                name: "test".to_string(),
+                revision: "2026-07-07".to_string(),
+                namespace: "urn:test".to_string(),
+                prefix: "test".to_string(),
+                source,
+                ..Default::default()
+            }],
+            nodes,
+            constraints: vec![],
+            stack_shapes: vec![],
+            stack_budget: StackBudget::default(),
+            canonicalization_skipped: false,
+            max_canonical_scan_stack_len: None,
+        }
+    }
+
+    #[test]
+    fn patch_generation_reports_missing_single_key_child_node() {
+        let source = YangSourceLocation::new("dangling-key.yang", 2, 1);
+        let list = SchemaNode {
+            path: "/test:system/test:entry".to_string(),
+            module: "test".to_string(),
+            kind: SchemaNodeKind::List,
+            config: true,
+            key_leaves: vec!["id".to_string()],
+            child_paths: vec![],
+            source,
+            ..Default::default()
+        };
+        let input = malformed_input_with_list(list, vec![]);
+
+        let err = generate(&input).expect_err("missing key child should fail closed");
+
+        assert!(err.message().contains("key leaf 'id' is not a child node"));
+        assert!(err.message().contains("/test:system/test:entry"));
+    }
+
+    #[test]
+    fn patch_generation_reports_missing_multi_key_child_node() {
+        let source = YangSourceLocation::new("dangling-key.yang", 2, 1);
+        let id = SchemaNode {
+            path: "/test:system/test:entry/test:id".to_string(),
+            module: "test".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            source: source.clone(),
+            ..Default::default()
+        };
+        let list = SchemaNode {
+            path: "/test:system/test:entry".to_string(),
+            module: "test".to_string(),
+            kind: SchemaNodeKind::List,
+            config: true,
+            key_leaves: vec!["id".to_string(), "slot".to_string()],
+            child_paths: vec![id.path.clone()],
+            source,
+            ..Default::default()
+        };
+        let input = malformed_input_with_list(list, vec![id]);
+
+        let err = generate(&input).expect_err("missing key child should fail closed");
+
+        assert!(err
+            .message()
+            .contains("key leaf 'slot' is not a child node"));
+        assert!(err.message().contains("/test:system/test:entry"));
+    }
 }

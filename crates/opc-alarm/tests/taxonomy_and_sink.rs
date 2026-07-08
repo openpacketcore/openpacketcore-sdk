@@ -106,6 +106,21 @@ fn make_dummy_alarm() -> Alarm {
     }
 }
 
+#[test]
+fn exported_alarm_snapshot_redacts_text_and_details() {
+    let mut alarm = make_dummy_alarm();
+    alarm.text = RedactedText::new("peer 10.0.0.1 imsi 208950000000001 down");
+    alarm.details = AlarmDetails::with_value(serde_json::json!({
+        "description": "subscriber imsi 208950000000001 on 10.0.0.1"
+    }));
+
+    let exported = alarm.redacted_for_export();
+    let serialized = serde_json::to_string(&exported).unwrap();
+
+    assert!(!serialized.contains("208950000000001"));
+    assert!(!serialized.contains("10.0.0.1"));
+}
+
 #[tokio::test]
 async fn test_recording_and_tracing_sinks() {
     let rec_sink = RecordingSink::new();
@@ -184,15 +199,61 @@ async fn test_bounded_alarm_sink_retry_exhaustion() {
     // Wait for worker to exhaust retries
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    assert_eq!(bounded.status(), SinkStatus::Failed);
+    assert_eq!(bounded.status(), SinkStatus::Ok);
+    assert_eq!(bounded.dropped_count(), 1);
     assert!(bounded.last_error().unwrap().contains("mock failure"));
 
-    // Subsequent sends must fail closed with RetryExhausted
-    let err = bounded.send(make_dummy_alarm()).await.unwrap_err();
-    match err {
-        AlarmSinkError::RetryExhausted(msg) => assert!(msg.contains("mock failure")),
-        other => panic!("expected RetryExhausted, got {other:?}"),
+    // Subsequent sends are accepted; each poisoned alarm is counted and dropped
+    // independently without stopping the worker.
+    bounded.send(make_dummy_alarm()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(bounded.status(), SinkStatus::Ok);
+    assert_eq!(bounded.dropped_count(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_bounded_alarm_sink_drops_poisoned_alarm_and_recovers() {
+    struct FlakySink {
+        remaining_failures: Arc<Mutex<usize>>,
+        delivered: Arc<Mutex<Vec<String>>>,
     }
+
+    #[async_trait]
+    impl AlarmSink for FlakySink {
+        async fn send(&self, alarm: Alarm) -> Result<(), AlarmSinkError> {
+            let mut remaining = self.remaining_failures.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(AlarmSinkError::DeliveryFailed(
+                    "temporary outage".to_string(),
+                ));
+            }
+            self.delivered
+                .lock()
+                .unwrap()
+                .push(alarm.alarm_id.as_str().to_string());
+            Ok(())
+        }
+    }
+
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let sink = FlakySink {
+        remaining_failures: Arc::new(Mutex::new(1)),
+        delivered: Arc::clone(&delivered),
+    };
+    let bounded = BoundedAlarmSink::new(sink, 10, 0, Duration::from_millis(1));
+    let mut poisoned = make_dummy_alarm();
+    poisoned.alarm_id = AlarmId::new("poisoned");
+    let mut recovered = make_dummy_alarm();
+    recovered.alarm_id = AlarmId::new("recovered");
+
+    bounded.send(poisoned).await.unwrap();
+    bounded.send(recovered).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    assert_eq!(bounded.status(), SinkStatus::Ok);
+    assert_eq!(bounded.dropped_count(), 1);
+    assert_eq!(*delivered.lock().unwrap(), vec!["recovered".to_string()]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -218,13 +279,12 @@ async fn test_bounded_alarm_sink_redacts_retry_error() {
     assert!(!last_error.contains("/Users/alice"));
     assert!(!last_error.contains("208950000000001"));
 
-    match bounded.send(make_dummy_alarm()).await.unwrap_err() {
-        AlarmSinkError::RetryExhausted(msg) => {
-            assert!(!msg.contains("/Users/alice"));
-            assert!(!msg.contains("208950000000001"));
-        }
-        other => panic!("expected RetryExhausted, got {other:?}"),
-    }
+    bounded.send(make_dummy_alarm()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let last_error = bounded.last_error().unwrap_or_default();
+    assert!(!last_error.contains("/Users/alice"));
+    assert!(!last_error.contains("208950000000001"));
+    assert_eq!(bounded.dropped_count(), 2);
 }
 
 #[tokio::test(start_paused = true)]

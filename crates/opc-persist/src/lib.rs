@@ -41,11 +41,12 @@
 //! Each audit entry carries an `entry_hmac` that chains to the previous entry:
 //!
 //! ```text
-//! entry_hmac = HMAC(audit_key, tenant || sequence || canonical_entry || previous_hash)
+//! entry_hmac = HMAC(audit_key, tenant || audit_count || sequence || canonical_entry || previous_hash)
 //! ```
 //!
-//! The chain is tenant-scoped and verified whenever stored configuration is
-//! loaded. Durable backends require caller-supplied audit key material.
+//! `config_history` stores the expected audit count and terminal entry hash so
+//! truncated tails fail closed when stored configuration is loaded. Durable
+//! backends require caller-supplied audit key material.
 //!
 //! ## Usage
 //!
@@ -116,11 +117,13 @@ pub use mock::{FaultInjectingStore, FaultType};
 pub use mock::{MockConfigStore, UnsafePathMock};
 pub use preflight::PersistCapabilities;
 pub use quorum::{FencedReplica, QuorumConfigStore};
-#[cfg(any(test, feature = "dangerous-test-hooks"))]
-pub use security_policy::TEST_COMMIT_FAIL;
 pub use security_policy::{
     ActivePolicyMetadata, PolicyHistoryEntry, SecurityPolicyError, SecurityPolicyService,
     SerializablePolicy, SerializableRule, SerializableRuleList, SqliteSecurityPolicyService,
+};
+#[cfg(any(test, feature = "dangerous-test-hooks"))]
+pub use security_policy::{
+    TEST_AUDIT_FAILURE_INSERT_FAIL, TEST_AUDIT_SUCCESS_INSERT_FAIL, TEST_COMMIT_FAIL,
 };
 pub use types::{
     extract_tenant, redact_entry, AuditKey, AuditOpType, AuditRecord, CommitRecord, CommitSource,

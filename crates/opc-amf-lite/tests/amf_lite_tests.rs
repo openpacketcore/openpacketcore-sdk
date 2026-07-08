@@ -13,11 +13,12 @@ use opc_persist::{
 };
 use opc_security_testkit::{short_unix_socket_path, FakeKms, KmsBehavior};
 use opc_session_store::{
-    CompareAndSet, OwnerId, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager,
-    StateClass, StateType, StoreError, StoredSessionRecord,
+    CompareAndSet, OwnerId, SessionBackend, SessionLeaseManager, StateClass, StateType, StoreError,
+    StoredSessionRecord,
 };
 use opc_session_testkit::ChaosTestkit;
-use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+use opc_testbed::VirtualClock;
+use opc_types::{TenantId, Timestamp};
 
 const TEST_AUDIT_KEY_BYTES: [u8; 32] = [0xA5; 32];
 fn test_audit_key() -> AuditKey {
@@ -305,7 +306,10 @@ async fn test_amf_lite_e2e_happy_path() {
 
     // 6. Launch AMF-lite
     println!("[E2E] Starting AMF-lite...");
-    let amf = AmfLite::start(
+    let mut virtual_clock = VirtualClock::new(Timestamp::now_utc());
+    virtual_clock.advance(time::Duration::seconds(42));
+    let expected_session_time = virtual_clock.now();
+    let amf = AmfLite::start_with_clock(
         AmfConfig::default(),
         config_store,
         chaos.replicas.clone(),
@@ -314,6 +318,7 @@ async fn test_amf_lite_e2e_happy_path() {
         admin_addr,
         policy,
         nacm_modules,
+        Arc::new(virtual_clock),
     )
     .await
     .expect("AMF-lite starts successfully");
@@ -372,17 +377,38 @@ async fn test_amf_lite_e2e_happy_path() {
         .unwrap();
 
     // Verify state registered
-    let key = SessionKey {
-        tenant: TenantId::new("system").unwrap(),
-        nf_kind: NetworkFunctionKind::new("amf").unwrap(),
-        key_type: SessionKeyType::SubscriberContext,
-        stable_id: bytes::Bytes::copy_from_slice(imsi.as_bytes()),
-    };
+    let key = amf.session_key_for_subscriber(imsi).await.unwrap();
+    assert!(
+        !key.stable_id
+            .as_ref()
+            .windows(imsi.len())
+            .any(|window| window == imsi.as_bytes()),
+        "session stable_id must not contain the raw IMSI"
+    );
     let retrieved = amf.session_store().get(&key).await.unwrap().unwrap();
     let plaintext_payload = retrieved.payload.as_bytes();
+    let payload_json = std::str::from_utf8(plaintext_payload).unwrap();
+    assert!(
+        !payload_json.contains(imsi),
+        "session payload must not contain the raw IMSI"
+    );
     let ctx: opc_amf_lite::UeSessionContext = serde_json::from_slice(plaintext_payload).unwrap();
+    assert_eq!(
+        ctx.subscriber_pseudonym,
+        std::str::from_utf8(&key.stable_id).unwrap()
+    );
+    assert!(!ctx.subscriber_pseudonym.contains(imsi));
+    assert_eq!(ctx.subscriber_identity, "<subscriber-id>");
     assert_eq!(ctx.state, "REGISTERED");
     assert_eq!(ctx.amf_ue_ngap_id, 101);
+    assert_eq!(ctx.last_updated, expected_session_time);
+    assert_eq!(
+        retrieved.expires_at,
+        Some(opc_amf_lite::add_duration(
+            expected_session_time,
+            Duration::from_secs(10)
+        ))
+    );
 
     // Update state to CONNECTED
     println!("[E2E] Updating UE session state to CONNECTED");
@@ -568,12 +594,14 @@ async fn test_amf_lite_ha_failover_and_recovery() {
         .unwrap();
 
     // Verify state in session replica 0 and 1
-    let key = SessionKey {
-        tenant: TenantId::new("system").unwrap(),
-        nf_kind: NetworkFunctionKind::new("amf").unwrap(),
-        key_type: SessionKeyType::SubscriberContext,
-        stable_id: bytes::Bytes::copy_from_slice(imsi.as_bytes()),
-    };
+    let key = amf_0.session_key_for_subscriber(imsi).await.unwrap();
+    assert!(
+        !key.stable_id
+            .as_ref()
+            .windows(imsi.len())
+            .any(|window| window == imsi.as_bytes()),
+        "session stable_id must not contain the raw IMSI"
+    );
 
     // 8. Simulate AMF Node 0 crash & Consensus leader failover
     println!("[HA] Shutting down AMF node 0 and taking consensus node 0 offline");
@@ -627,6 +655,7 @@ async fn test_amf_lite_ha_failover_and_recovery() {
     let retrieved = amf_1.session_store().get(&key).await.unwrap().unwrap();
     let ctx: opc_amf_lite::UeSessionContext =
         serde_json::from_slice(retrieved.payload.as_bytes()).unwrap();
+    assert!(!ctx.subscriber_pseudonym.contains(imsi));
     assert_eq!(ctx.amf_ue_ngap_id, 202);
 
     // Verify session replica 2 got read-repaired
@@ -802,6 +831,7 @@ async fn test_amf_lite_security_and_redaction() {
         unavailable: true,
         delay: None,
         simulate_error: false,
+        ..KmsBehavior::default()
     });
 
     let admin_principal = TrustedPrincipal::new(

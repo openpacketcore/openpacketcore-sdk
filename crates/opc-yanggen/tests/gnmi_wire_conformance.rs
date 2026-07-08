@@ -344,8 +344,8 @@ use tonic::{Code, Request};
 struct FixedPolicy(NacmPolicy);
 
 impl PolicySource for FixedPolicy {
-    fn active_policy(&self, _tenant: &str) -> Result<NacmPolicy, AuthzError> {
-        Ok(self.0.clone())
+    fn active_policy(&self, _tenant: &str) -> Result<Arc<NacmPolicy>, AuthzError> {
+        Ok(Arc::new(self.0.clone()))
     }
 }
 
@@ -548,6 +548,7 @@ async fn start_harness_with_extensions_arbitration(
             listener: GnmiListenerConfig {
                 handshake_timeout: Duration::from_secs(5),
                 incoming_channel_capacity: 4,
+                ..GnmiListenerConfig::default()
             },
             ..Default::default()
         },
@@ -835,6 +836,7 @@ fn allow_all_read_subscribe_policy() -> NacmPolicy {
     for action in [
         NacmAction::Read,
         NacmAction::Subscribe,
+        NacmAction::Create,
         NacmAction::Update,
         NacmAction::Replace,
         NacmAction::Delete,

@@ -29,12 +29,16 @@ thiserror = { workspace = true }
 futures-util = "0.3"
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
+opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros", "test-util"] }
 bytes = { workspace = true }
 futures-util = "0.3"
+rcgen = { workspace = true }
+time = { workspace = true }
 
 [lints]
 workspace = true

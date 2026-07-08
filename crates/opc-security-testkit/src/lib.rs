@@ -199,6 +199,9 @@ pub struct KmsBehavior {
     pub delay: Option<Duration>,
     pub unavailable: bool,
     pub simulate_error: bool,
+    pub truncated_response: bool,
+    pub oversized_response: bool,
+    pub malformed_key_hex: bool,
 }
 
 pub struct FakeKms {
@@ -285,17 +288,31 @@ async fn handle_kms_stream<S>(
                     let purpose = req.purpose.unwrap_or_default();
                     let tenant = req.tenant.unwrap_or_default();
 
-                    let active = active_keys.lock().unwrap();
-                    if let Some(kid) = active.get(&(purpose.clone(), tenant.clone())) {
+                    let active_key_id = active_keys
+                        .lock()
+                        .unwrap()
+                        .get(&(purpose.clone(), tenant.clone()))
+                        .cloned();
+                    if let Some(kid) = active_key_id {
                         let ks = keys.lock().unwrap();
-                        let entry = ks.get(kid).unwrap();
-                        KmsResponse {
-                            status: "success".to_string(),
-                            key_id: Some(entry.key_id.clone()),
-                            key_bytes_hex: Some(entry.key_bytes_hex.clone()),
-                            purpose: Some(purpose),
-                            tenant: Some(tenant),
-                            error_message: None,
+                        if let Some(entry) = ks.get(&kid) {
+                            KmsResponse {
+                                status: "success".to_string(),
+                                key_id: Some(entry.key_id.clone()),
+                                key_bytes_hex: Some(response_key_hex(entry, &beh)),
+                                purpose: Some(purpose),
+                                tenant: Some(tenant),
+                                error_message: None,
+                            }
+                        } else {
+                            KmsResponse {
+                                status: "error".to_string(),
+                                key_id: None,
+                                key_bytes_hex: None,
+                                purpose: None,
+                                tenant: None,
+                                error_message: Some("not found".to_string()),
+                            }
                         }
                     } else {
                         KmsResponse {
@@ -315,7 +332,7 @@ async fn handle_kms_stream<S>(
                         KmsResponse {
                             status: "success".to_string(),
                             key_id: Some(entry.key_id.clone()),
-                            key_bytes_hex: Some(entry.key_bytes_hex.clone()),
+                            key_bytes_hex: Some(response_key_hex(entry, &beh)),
                             purpose: Some(entry.purpose.clone()),
                             tenant: Some(entry.tenant.clone()),
                             error_message: None,
@@ -383,6 +400,18 @@ async fn handle_kms_stream<S>(
             Ok(bytes) => bytes,
             Err(_) => break,
         };
+        if beh.truncated_response {
+            let resp_len = resp_bytes.len() as u32;
+            let _ = stream.write_all(&resp_len.to_be_bytes()[..2]).await;
+            let _ = stream.flush().await;
+            break;
+        }
+        if beh.oversized_response {
+            let oversized_len = (64 * 1024 + 1_u32).to_be_bytes();
+            let _ = stream.write_all(&oversized_len).await;
+            let _ = stream.flush().await;
+            break;
+        }
         let resp_len = resp_bytes.len() as u32;
         if stream.write_all(&resp_len.to_be_bytes()).await.is_err() {
             break;
@@ -393,6 +422,14 @@ async fn handle_kms_stream<S>(
         if stream.flush().await.is_err() {
             break;
         }
+    }
+}
+
+fn response_key_hex(entry: &KmsKeyEntry, behavior: &KmsBehavior) -> String {
+    if behavior.malformed_key_hex {
+        "zz".repeat(32)
+    } else {
+        entry.key_bytes_hex.clone()
     }
 }
 

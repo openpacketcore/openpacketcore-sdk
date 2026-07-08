@@ -30,6 +30,7 @@ opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-runtime = { path = "../opc-runtime", version = "0.2.0" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 quick-xml = { version = "0.41", default-features = false }
 rand = { workspace = true, optional = true }
 russh = { version = "0.61.2", default-features = false, features = ["ring"] }

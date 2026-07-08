@@ -60,3 +60,25 @@ async fn sdk_alarm_raise_clear_roundtrip() {
 
     assert!(alarms.active_alarms().is_empty());
 }
+
+#[test]
+fn sdk_prelude_exposes_security_entry_points() {
+    let trust_domain = TrustDomain::new("core.example").expect("trust domain");
+    assert_eq!(trust_domain.as_str(), "core.example");
+
+    let trust_bundles = TrustBundleSet::new();
+    assert!(!trust_bundles.contains(&trust_domain));
+
+    let policy = PeerPolicy::default();
+    assert!(policy.is_unconstrained());
+
+    let key_id = KeyId::new("session-key-2026-01").expect("key id");
+    assert_eq!(key_id.as_str(), "session-key-2026-01");
+    assert_eq!(KeyPurpose::Session.as_str(), "session");
+
+    let _crypto_envelope: Option<CryptoEnvelopeV1> = None;
+    let _crypto_error = CryptoError::InvalidEnvelope;
+    let _kms_provider_size = std::mem::size_of::<KmsKeyProvider>();
+    let _memory_provider_size = std::mem::size_of::<MemoryKeyProvider>();
+    let _tls_builder_size = std::mem::size_of::<TlsConfigBuilder>();
+}

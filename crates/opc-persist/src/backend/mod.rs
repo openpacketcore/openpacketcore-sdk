@@ -2,12 +2,14 @@
 //!
 //! ## Thread Safety
 //!
-//! This implementation uses a `tokio::sync::Mutex` (held as an owned guard via
-//! `lock_owned()`) to protect a single synchronous SQLite connection. All database
-//! operations are synchronous (rusqlite does not provide an async API). The mutex
-//! ensures serialized writer access across all concurrent async tasks. SQLite I/O
-//! is local SSD or in-memory, so blocking the async worker for the duration of a
-//! query is acceptable for the management-plane single-replica profile.
+//! This implementation uses a `tokio::sync::Mutex` to protect a single
+//! synchronous SQLite connection. All database operations are synchronous
+//! (rusqlite does not provide an async API). The mutex enforces a hard
+//! one-operation-at-a-time cap across all concurrent async tasks, and the SQLite
+//! busy timeout is capped at [`SqliteBackend::SQLITE_BUSY_TIMEOUT_MS`] so a lock
+//! wait cannot pin a shared runtime worker for an unbounded or multi-second
+//! interval. This bounded profile is intentional for the management-plane
+//! single-replica reference backend.
 //!
 //! ## Atomicity
 //!
@@ -15,7 +17,7 @@
 //! audit records co-durable. If the process crashes mid-commit, SQLite's WAL
 //! recovery will roll back to the last consistent state.
 
-use sha2::{Digest, Sha256};
+use rand::{rngs::SysRng, TryRng};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
@@ -25,7 +27,8 @@ use uuid::Uuid;
 use crate::error::PersistError;
 use crate::preflight::PersistCapabilities;
 use crate::schema;
-use crate::types::{AuditKey, AuditOpType, CommitSource};
+use crate::types::{extract_tenant, AuditKey, AuditOpType, AuditRecord, CommitSource};
+use opc_types::TxId;
 
 mod ops;
 mod replication;
@@ -44,6 +47,8 @@ type StoredConfigRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    i64,
+    Vec<u8>,
 );
 
 /// Convert a 16-byte slice to a Uuid. Returns zero Uuid if the slice is shorter
@@ -121,7 +126,10 @@ pub struct SqliteBackend {
 }
 
 impl SqliteBackend {
-    const EPHEMERAL_AUDIT_KEY_BYTES: [u8; 32] = [0xA5; 32];
+    /// Hard cap enforced by the single SQLite connection mutex.
+    pub const MAX_CONCURRENT_DB_OPERATIONS: usize = 1;
+    /// Maximum time SQLite may busy-wait on this backend connection.
+    pub const SQLITE_BUSY_TIMEOUT_MS: u32 = schema::SQLITE_BUSY_TIMEOUT_MS;
 
     /// Open (or create) a SQLite database at the given path.
     ///
@@ -158,7 +166,7 @@ impl SqliteBackend {
             path,
             ephemeral,
             min_free_bytes,
-            AuditKey::from_static_test_bytes(Self::EPHEMERAL_AUDIT_KEY_BYTES),
+            Self::random_ephemeral_audit_key()?,
         )
         .await
     }
@@ -182,6 +190,14 @@ impl SqliteBackend {
 
     pub fn conn(&self) -> Arc<AsyncMutex<rusqlite::Connection>> {
         self.conn.clone()
+    }
+
+    fn random_ephemeral_audit_key() -> Result<AuditKey, PersistError> {
+        let mut bytes = [0u8; 32];
+        SysRng.try_fill_bytes(&mut bytes).map_err(|_| {
+            PersistError::preflight_failed("failed to generate ephemeral audit HMAC key")
+        })?;
+        AuditKey::new(bytes)
     }
 
     async fn open_inner(
@@ -209,7 +225,7 @@ impl SqliteBackend {
             ));
         }
 
-        let conn = Self::open_connection(&path)?;
+        let conn = Self::open_connection(&path, &audit_key)?;
 
         let backend = Self {
             db_path: path,
@@ -232,7 +248,10 @@ impl SqliteBackend {
         Self::open(std::path::PathBuf::from(":memory:"), true, 0).await
     }
 
-    fn open_connection(path: &Path) -> Result<rusqlite::Connection, PersistError> {
+    fn open_connection(
+        path: &Path,
+        audit_key: &AuditKey,
+    ) -> Result<rusqlite::Connection, PersistError> {
         let in_memory = Self::is_in_memory_database(path);
         let conn = if in_memory {
             rusqlite::Connection::open_in_memory()
@@ -267,22 +286,37 @@ impl SqliteBackend {
             schema::get_schema_digest(&conn).map_err(|e| PersistError::sqlite(e.to_string()))?;
 
         match (current_version.as_deref(), current_digest.as_deref()) {
-            (Some(schema::SCHEMA_VERSION), Some(digest)) => {
-                debug!(schema_digest = %digest, "existing database schema found");
+            (Some(schema::SCHEMA_VERSION), Some(stored_digest)) => {
+                let live_digest = schema::current_schema_digest(&conn)
+                    .map_err(|e| PersistError::sqlite(e.to_string()))?;
+                if stored_digest != live_digest {
+                    return Err(PersistError::schema_digest_mismatch(
+                        live_digest,
+                        stored_digest.to_string(),
+                    ));
+                }
+                debug!(schema_digest = %stored_digest, "existing database schema found");
             }
             (Some("1.0.0"), _)
             | (Some("1.1.0"), _)
             | (Some("1.2.0"), _)
             | (Some("1.3.0"), _)
+            | (Some("1.4.0"), _)
+            | (Some("1.5.0"), _)
+            | (Some("1.6.0"), _)
+            | (Some("1.7.0"), _)
+            | (Some("1.8.0"), _)
             | (None, _) => {
                 if let Some(from_version) = current_version.as_deref() {
                     schema::run_migrations(&conn, from_version)
                         .map_err(|e| PersistError::sqlite(e.to_string()))?;
                 }
+                Self::reseal_audit_chains_for_schema_1_6(&conn, audit_key)?;
+                let digest = schema::current_schema_digest(&conn)
+                    .map_err(|e| PersistError::sqlite(e.to_string()))?;
                 let tx = conn
                     .unchecked_transaction()
                     .map_err(|e| PersistError::sqlite(e.to_string()))?;
-                let digest = Self::current_schema_digest();
                 schema::set_schema_version(&tx, &digest)
                     .map_err(|e| PersistError::sqlite(e.to_string()))?;
                 tx.commit()
@@ -300,31 +334,186 @@ impl SqliteBackend {
         Ok(conn)
     }
 
-    fn is_in_memory_database(path: &Path) -> bool {
-        path == Path::new(":memory:")
+    fn reseal_audit_chains_for_schema_1_6(
+        conn: &rusqlite::Connection,
+        audit_key: &AuditKey,
+    ) -> Result<(), PersistError> {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+        let configs = {
+            let mut stmt = tx
+                .prepare("SELECT tx_id, principal FROM config_history ORDER BY version ASC")
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+            let mut configs = Vec::new();
+            for row in rows {
+                configs.push(row.map_err(|e| PersistError::sqlite(e.to_string()))?);
+            }
+            configs
+        };
+
+        for (tx_id_bytes, principal) in configs {
+            validate_uuid_bytes("config_history tx_id", &tx_id_bytes)?;
+            let tx_id = TxId::from_uuid(uuid_from_bytes(&tx_id_bytes));
+            let tenant = extract_tenant(&principal);
+            let mut audit = Self::load_audit_rows_for_reseal(&tx, tx_id, &tx_id_bytes)?;
+            let audit_count =
+                u32::try_from(audit.len()).map_err(|_| PersistError::audit_chain_broken())?;
+
+            if !Self::audit_chain_verifies_with_count(&audit, audit_key, &tenant, audit_count) {
+                Self::verify_legacy_audit_chain(&audit, audit_key, &tenant)?;
+                let mut prev_hash = [0u8; 32];
+                for entry in &mut audit {
+                    entry.previous_hash = prev_hash;
+                    entry.entry_hmac =
+                        entry.calculate_hmac_with_audit_count(audit_key, &tenant, audit_count);
+                    tx.execute(
+                        "UPDATE audit_trail SET previous_hash = ?3, entry_hmac = ?4 WHERE tx_id = ?1 AND sequence = ?2",
+                        rusqlite::params![
+                            tx_id_bytes.as_slice(),
+                            entry.sequence,
+                            &entry.previous_hash[..],
+                            &entry.entry_hmac[..],
+                        ],
+                    )
+                    .map_err(|e| PersistError::sqlite(e.to_string()))?;
+                    prev_hash = entry.entry_hmac;
+                }
+            }
+
+            let terminal_hash = audit
+                .last()
+                .map(|entry| entry.entry_hmac)
+                .unwrap_or([0u8; 32]);
+            tx.execute(
+                "UPDATE config_history SET audit_count = ?2, audit_terminal_hash = ?3 WHERE tx_id = ?1",
+                rusqlite::params![
+                    tx_id_bytes.as_slice(),
+                    audit_count as i64,
+                    &terminal_hash[..],
+                ],
+            )
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        }
+
+        tx.commit()
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        Ok(())
     }
 
-    /// SHA-256 of the current schema SQL — used as the schema digest.
-    fn current_schema_digest() -> String {
-        let sql = r#"
-        CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK (id = 1), schema_digest TEXT NOT NULL, sdk_version TEXT NOT NULL, created_at TEXT NOT NULL);
-        CREATE TABLE config_history (tx_id BLOB PRIMARY KEY, parent_tx_id BLOB NULL, version INTEGER NOT NULL UNIQUE, committed_at TEXT NOT NULL, principal TEXT NOT NULL, source TEXT NOT NULL, schema_digest BLOB NOT NULL, plaintext_digest BLOB NOT NULL, encrypted_blob BLOB NOT NULL, rollback_point INTEGER NOT NULL DEFAULT 0, rollback_label TEXT NULL, confirmed_deadline TEXT NULL, confirmed_at TEXT NULL);
-        CREATE TABLE audit_trail (id INTEGER PRIMARY KEY AUTOINCREMENT, tx_id BLOB NOT NULL, sequence INTEGER NOT NULL, yang_path TEXT NOT NULL, op_type TEXT NOT NULL, previous_value TEXT NULL, new_value TEXT NULL, redaction_applied INTEGER NOT NULL DEFAULT 0, previous_hash BLOB NOT NULL, entry_hmac BLOB NOT NULL, UNIQUE(tx_id, sequence));
-        CREATE TABLE rollback_labels (label TEXT PRIMARY KEY, tx_id BLOB NOT NULL, created_at TEXT NOT NULL);
-        CREATE TABLE alarm_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, outcome TEXT NOT NULL, alarm_id TEXT NOT NULL, alarm_type TEXT NOT NULL, probable_cause TEXT NOT NULL, principal TEXT NOT NULL, tenant TEXT NULL, reason TEXT NOT NULL, scope TEXT NOT NULL, correlation_id TEXT NULL, occurred_at TEXT NOT NULL);
-        CREATE TABLE consensus_state (node_id INTEGER PRIMARY KEY, current_term INTEGER NOT NULL, voted_for INTEGER NULL);
-        CREATE TABLE consensus_log (log_index INTEGER PRIMARY KEY, term INTEGER NOT NULL, op_type TEXT NOT NULL, payload BLOB NOT NULL);
-        CREATE TABLE consensus_applied (id INTEGER PRIMARY KEY CHECK (id = 1), applied_index INTEGER NOT NULL);
-        CREATE TABLE consensus_membership (id INTEGER PRIMARY KEY CHECK (id = 1), cluster_id TEXT NOT NULL, node_id INTEGER NOT NULL, voting_members TEXT NOT NULL, non_voting_members TEXT NOT NULL, old_voting_members TEXT NULL, removed_members TEXT NOT NULL, epoch INTEGER NOT NULL);
-        CREATE TABLE consensus_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), snapshot_index INTEGER NOT NULL, snapshot_term INTEGER NOT NULL, snapshot_data BLOB NOT NULL);
-        CREATE TABLE staged_security_policy (tenant TEXT PRIMARY KEY, version INTEGER NOT NULL, staged_at TEXT NOT NULL, principal TEXT NOT NULL, encrypted_blob BLOB NOT NULL);
-        CREATE TABLE security_policy_active (tenant TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_at TEXT NOT NULL, principal TEXT NOT NULL, encrypted_blob BLOB NOT NULL);
-        CREATE TABLE security_policy_history (tenant TEXT NOT NULL, version INTEGER NOT NULL, applied_at TEXT NOT NULL, principal TEXT NOT NULL, encrypted_blob BLOB NOT NULL, tx_id BLOB NULL, label TEXT NULL, PRIMARY KEY (tenant, version));
-        CREATE TABLE security_policy_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL, timestamp TEXT NOT NULL, principal TEXT NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL, previous_hash BLOB NOT NULL, entry_hmac BLOB NOT NULL);
-        "#;
-        let mut hasher = Sha256::new();
-        hasher.update(sql.as_bytes());
-        format!("{:x}", hasher.finalize())
+    fn load_audit_rows_for_reseal(
+        conn: &rusqlite::Connection,
+        tx_id: TxId,
+        tx_id_bytes: &[u8],
+    ) -> Result<Vec<AuditRecord>, PersistError> {
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT sequence, yang_path, op_type, previous_value, new_value,
+                       redaction_applied, previous_hash, entry_hmac
+                FROM audit_trail
+                WHERE tx_id = ?1
+                ORDER BY sequence ASC
+                "#,
+            )
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map([tx_id_bytes], |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i32>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                ))
+            })
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+        let mut audit = Vec::new();
+        for row in rows {
+            let (
+                sequence,
+                yang_path,
+                op_type,
+                previous_value,
+                new_value,
+                redaction_applied,
+                previous_hash,
+                entry_hmac,
+            ) = row.map_err(|e| PersistError::sqlite(e.to_string()))?;
+            if previous_hash.len() != 32 || entry_hmac.len() != 32 {
+                return Err(PersistError::corrupt_blob());
+            }
+            audit.push(AuditRecord {
+                tx_id,
+                sequence,
+                yang_path,
+                op_type: deserialize_audit_op_type(&op_type)?,
+                previous_value,
+                new_value,
+                redaction_applied: redaction_applied != 0,
+                previous_hash: previous_hash
+                    .try_into()
+                    .expect("previous_hash length validated above"),
+                entry_hmac: entry_hmac
+                    .try_into()
+                    .expect("entry_hmac length validated above"),
+            });
+        }
+        Ok(audit)
+    }
+
+    fn audit_chain_verifies_with_count(
+        audit: &[AuditRecord],
+        audit_key: &AuditKey,
+        tenant: &str,
+        audit_count: u32,
+    ) -> bool {
+        let mut prev_hash = [0u8; 32];
+        for entry in audit {
+            if entry.previous_hash != prev_hash {
+                return false;
+            }
+            if entry.entry_hmac
+                != entry.calculate_hmac_with_audit_count(audit_key, tenant, audit_count)
+            {
+                return false;
+            }
+            prev_hash = entry.entry_hmac;
+        }
+        true
+    }
+
+    fn verify_legacy_audit_chain(
+        audit: &[AuditRecord],
+        audit_key: &AuditKey,
+        tenant: &str,
+    ) -> Result<(), PersistError> {
+        let mut prev_hash = [0u8; 32];
+        for entry in audit {
+            if entry.previous_hash != prev_hash {
+                return Err(PersistError::audit_chain_broken());
+            }
+            if entry.entry_hmac != entry.calculate_hmac(audit_key, tenant) {
+                return Err(PersistError::audit_chain_broken());
+            }
+            prev_hash = entry.entry_hmac;
+        }
+        Ok(())
+    }
+
+    fn is_in_memory_database(path: &Path) -> bool {
+        path == Path::new(":memory:")
     }
 
     async fn run_preflight(
@@ -358,17 +547,19 @@ impl SqliteBackend {
 
         if ephemeral {
             // Ephemeral (non-durable) file-backed path — skip safety checks but
-            // still apply the full WAL pragma profile.
+            // do not fabricate durability capabilities. The backend may still
+            // accept writes in ephemeral mode, but callers must not interpret
+            // these unchecked values as production-safe storage evidence.
             return Ok(PersistCapabilities {
                 ephemeral_mode: true,
                 storage_path: path.to_string_lossy().into_owned(),
-                fsync_available: true,
-                locking_compatible: true,
-                same_filesystem: true,
-                safe_filesystem: true,
-                free_bytes: u64::MAX,
-                min_free_bytes: 0,
-                directory_permissions_safe: true,
+                fsync_available: false,
+                locking_compatible: false,
+                same_filesystem: false,
+                safe_filesystem: false,
+                free_bytes: 0,
+                min_free_bytes,
+                directory_permissions_safe: false,
                 wal_autocheckpoint_pages: 1000,
                 journal_mode: "wal".into(),
                 synchronous_setting: "extra".into(),

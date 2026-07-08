@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use opc_crypto::CryptoEnvelopeV1;
 use opc_data_governance::{DataClass, RetentionPolicy};
 use opc_redaction::RedactionLevel;
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,7 @@ pub enum ExportError {
     RetentionPolicyInvalid,
     TenantMismatch,
     RawSensitiveExportRejected,
+    PayloadStateInvalid,
 }
 
 impl std::fmt::Display for ExportError {
@@ -65,6 +67,10 @@ impl std::fmt::Display for ExportError {
             Self::RawSensitiveExportRejected => write!(
                 f,
                 "Export validation error: raw sensitive payload export rejected in production without encryption"
+            ),
+            Self::PayloadStateInvalid => write!(
+                f,
+                "Export validation error: payload bytes do not match declared payload state"
             ),
         }
     }
@@ -97,6 +103,8 @@ impl ExportedItem {
             .validate(is_production)
             .map_err(|_| ExportError::RetentionPolicyInvalid)?;
 
+        validate_payload_state(self.metadata.payload_state, &self.payload)?;
+
         if is_production && self.metadata.payload_state == PayloadState::Raw {
             let sensitive = !matches!(
                 self.metadata.data_class,
@@ -108,6 +116,26 @@ impl ExportedItem {
         }
         Ok(())
     }
+}
+
+fn validate_payload_state(state: PayloadState, payload: &[u8]) -> Result<(), ExportError> {
+    match state {
+        PayloadState::Encrypted => {
+            CryptoEnvelopeV1::decode(payload).map_err(|_| ExportError::PayloadStateInvalid)?;
+        }
+        PayloadState::DigestOnly => {
+            if !is_digest_payload(payload) {
+                return Err(ExportError::PayloadStateInvalid);
+            }
+        }
+        PayloadState::Redacted | PayloadState::Raw => {}
+    }
+    Ok(())
+}
+
+fn is_digest_payload(payload: &[u8]) -> bool {
+    payload.len() == 32
+        || (payload.len() == 64 && payload.iter().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 #[cfg(test)]
@@ -176,9 +204,16 @@ mod tests {
         // Allows raw sensitive in dev mode
         assert!(item.validate_for_export(false).is_ok());
 
-        // Allows encrypted sensitive in production
+        // Rejects a caller relabeling cleartext as encrypted in production
         let mut encrypted_item = item.clone();
         encrypted_item.metadata.payload_state = PayloadState::Encrypted;
+        assert_eq!(
+            encrypted_item.validate_for_export(true),
+            Err(ExportError::PayloadStateInvalid)
+        );
+
+        // Allows envelope-shaped encrypted sensitive payloads in production
+        encrypted_item.payload = valid_envelope_payload();
         assert!(encrypted_item.validate_for_export(true).is_ok());
 
         // Allows raw public in production
@@ -229,5 +264,52 @@ mod tests {
             item.validate_for_export(true),
             Err(ExportError::RetentionPolicyInvalid)
         );
+    }
+
+    #[test]
+    fn encrypted_label_with_cleartext_payload_is_rejected() {
+        let policy = RetentionPolicy {
+            data_class: DataClass::SubscriberId,
+            retention_duration: Some(Duration::from_secs(3600)),
+            legal_hold: false,
+            disposal_action: DisposalAction::Purge,
+            policy_source_id: Some("src-1".to_string()),
+            tenant_id: Some("tenant-1".to_string()),
+        };
+        let item = ExportedItem {
+            metadata: ExportMetadata {
+                data_class: DataClass::SubscriberId,
+                redaction_level: RedactionLevel::Cleartext,
+                retention_policy: policy,
+                tenant_id: "tenant-1".to_string(),
+                schema_version: "1.0.0".to_string(),
+                payload_state: PayloadState::Encrypted,
+            },
+            payload: b"raw subscriber identifier".to_vec(),
+        };
+
+        assert_eq!(
+            item.validate_for_export(true),
+            Err(ExportError::PayloadStateInvalid)
+        );
+    }
+
+    fn valid_envelope_payload() -> Vec<u8> {
+        let key_id = b"backup-key-1";
+        let nonce = [0x42; 12];
+        let aad = b"export-aad";
+        let ciphertext_and_tag = [0x24; 16];
+        let mut out = Vec::new();
+        out.extend_from_slice(b"OPCE");
+        out.extend_from_slice(&1_u16.to_be_bytes());
+        out.extend_from_slice(&1_u16.to_be_bytes());
+        out.extend_from_slice(&(key_id.len() as u16).to_be_bytes());
+        out.extend_from_slice(&(nonce.len() as u16).to_be_bytes());
+        out.extend_from_slice(&(aad.len() as u32).to_be_bytes());
+        out.extend_from_slice(key_id);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(aad);
+        out.extend_from_slice(&ciphertext_and_tag);
+        out
     }
 }

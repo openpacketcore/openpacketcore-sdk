@@ -83,7 +83,17 @@ impl ConfigStore for SqliteBackend {
         let now = Timestamp::now_utc().to_string();
 
         let res = (|| -> Result<(), PersistError> {
-            let rows = guard
+            let tx = guard
+                .unchecked_transaction()
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let principal: String = tx
+                .query_row(
+                    "SELECT principal FROM config_history WHERE tx_id = ?1",
+                    params![&tx_id_bytes],
+                    |row| row.get(0),
+                )
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let rows = tx
                 .execute(
                     "UPDATE config_history SET confirmed_at = ?1 WHERE tx_id = ?2",
                     params![now, &tx_id_bytes],
@@ -93,6 +103,20 @@ impl ConfigStore for SqliteBackend {
             if rows == 0 {
                 return Err(PersistError::rollback_not_found());
             }
+            tx.execute(
+                "INSERT INTO config_lifecycle_audit (tx_id, action, principal, occurred_at, details) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    &tx_id_bytes,
+                    "MARK_CONFIRMED",
+                    principal,
+                    Timestamp::now_utc().to_string(),
+                    "commit confirmed",
+                ],
+            )
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            tx.commit()
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
             debug!(tx_id = %tx_id, "commit marked confirmed");
             Ok(())
         })();
@@ -119,15 +143,29 @@ impl ConfigStore for SqliteBackend {
         let tx_id_bytes = tx_id.as_uuid().as_bytes().to_vec();
 
         let res = (|| -> Result<(), PersistError> {
-            guard
+            let tx = guard
+                .unchecked_transaction()
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let principal: String = tx
+                .query_row(
+                    "SELECT principal FROM config_history WHERE tx_id = ?1",
+                    params![&tx_id_bytes],
+                    |row| row.get(0),
+                )
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let rows = tx
                 .execute(
                     "UPDATE config_history SET rollback_point = 1 WHERE tx_id = ?1",
                     params![&tx_id_bytes],
                 )
                 .map_err(|e| PersistError::sqlite(e.to_string()))?;
 
+            if rows == 0 {
+                return Err(PersistError::rollback_not_found());
+            }
+
             if let Some(lbl) = &label {
-                guard
+                tx
                     .execute(
                         "INSERT OR REPLACE INTO rollback_labels (label, tx_id, created_at) VALUES (?1, ?2, ?3)",
                         params![lbl, &tx_id_bytes, Timestamp::now_utc().to_string()],
@@ -135,6 +173,24 @@ impl ConfigStore for SqliteBackend {
                     .map_err(|e| PersistError::sqlite(e.to_string()))?;
             }
 
+            let details = match &label {
+                Some(lbl) => format!("rollback point created with label {lbl}"),
+                None => "rollback point created".to_string(),
+            };
+            tx.execute(
+                "INSERT INTO config_lifecycle_audit (tx_id, action, principal, occurred_at, details) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    &tx_id_bytes,
+                    "CREATE_ROLLBACK_POINT",
+                    principal,
+                    Timestamp::now_utc().to_string(),
+                    details,
+                ],
+            )
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            tx.commit()
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
             debug!(tx_id = %tx_id, label = ?label, "rollback point created");
             Ok(())
         })();
@@ -301,8 +357,8 @@ impl SqliteBackend {
             INSERT INTO config_history
                 (tx_id, parent_tx_id, version, committed_at, principal, source,
                  schema_digest, plaintext_digest, encrypted_blob, rollback_point,
-                 confirmed_deadline)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 confirmed_deadline, audit_count, audit_terminal_hash)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, zeroblob(32))
             "#,
             params![
                 &tx_id_bytes,
@@ -323,6 +379,8 @@ impl SqliteBackend {
         let tenant = crate::types::extract_tenant(&record.principal);
         let mut prev_hash = [0u8; 32];
         let mut audit = audit;
+        let audit_count =
+            u32::try_from(audit.len()).map_err(|_| PersistError::audit_chain_broken())?;
 
         // Insert audit records
         for entry in &mut audit {
@@ -338,7 +396,8 @@ impl SqliteBackend {
             );
 
             entry.previous_hash = prev_hash;
-            entry.entry_hmac = entry.calculate_hmac(audit_key, &tenant);
+            entry.entry_hmac =
+                entry.calculate_hmac_with_audit_count(audit_key, &tenant, audit_count);
             prev_hash = entry.entry_hmac;
 
             let op_type_str = match entry.op_type {
@@ -369,6 +428,12 @@ impl SqliteBackend {
             )
             .map_err(PersistError::from)?;
         }
+
+        conn.execute(
+            "UPDATE config_history SET audit_count = ?2, audit_terminal_hash = ?3 WHERE tx_id = ?1",
+            params![&tx_id_bytes, audit_count as i64, &prev_hash[..]],
+        )
+        .map_err(PersistError::from)?;
         Ok(())
     }
 
@@ -410,11 +475,14 @@ impl SqliteBackend {
             _rollback_label,
             confirmed_deadline_str,
             confirmed_at,
+            audit_count,
+            audit_terminal_hash,
         ): StoredConfigRow = match conn.query_row(
             r#"
             SELECT tx_id, parent_tx_id, version, committed_at, principal, source,
                    schema_digest, plaintext_digest, encrypted_blob, rollback_point,
-                   rollback_label, confirmed_deadline, confirmed_at
+                   rollback_label, confirmed_deadline, confirmed_at,
+                   audit_count, audit_terminal_hash
             FROM config_history
             WHERE tx_id = ?1
             "#,
@@ -434,6 +502,8 @@ impl SqliteBackend {
                     row.get::<_, Option<String>>(10)?,
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<String>>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, Vec<u8>>(14)?,
                 ))
             },
         ) {
@@ -449,6 +519,19 @@ impl SqliteBackend {
         if schema_digest_bytes.len() != 32 {
             return Err(PersistError::corrupt_blob());
         }
+        if audit_count < 0 {
+            return Err(PersistError::inconsistent_state(
+                "negative audit_count in config_history",
+            ));
+        }
+        let audit_count =
+            usize::try_from(audit_count).map_err(|_| PersistError::audit_chain_broken())?;
+        if audit_terminal_hash.len() != 32 {
+            return Err(PersistError::corrupt_blob());
+        }
+        let audit_terminal_hash: [u8; 32] = audit_terminal_hash
+            .try_into()
+            .expect("audit_terminal_hash length validated above");
 
         // Fail closed: validate timestamp
         let committed_at = Timestamp::from_str(&committed_at_str)
@@ -590,7 +673,18 @@ impl SqliteBackend {
         }
 
         let stored = StoredConfig { record, audit };
+        if stored.audit.len() != audit_count {
+            return Err(PersistError::audit_chain_broken());
+        }
         stored.verify_audit_chain(audit_key)?;
+        let terminal_hash = stored
+            .audit
+            .last()
+            .map(|entry| entry.entry_hmac)
+            .unwrap_or([0u8; 32]);
+        if terminal_hash != audit_terminal_hash {
+            return Err(PersistError::audit_chain_broken());
+        }
         Ok(Some(stored))
     }
 

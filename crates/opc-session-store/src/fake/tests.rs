@@ -141,10 +141,14 @@ async fn direct_successful_cas_emits_ordered_replication_entry_and_watch_event()
         ReplicationOp::CompareAndSet {
             key: logged_key,
             expected_generation,
+            credential_id,
+            guard_expires_at,
             new_record,
         } => {
             assert_eq!(logged_key, &key);
             assert_eq!(expected_generation, &None);
+            assert_eq!(*credential_id, lease.credential_id());
+            assert_eq!(*guard_expires_at, lease.expires_at());
             assert_eq!(new_record.generation, Generation::new(1));
         }
         other => panic!("expected direct CAS replication op, got {other:?}"),
@@ -209,10 +213,12 @@ async fn direct_delete_and_ttl_refresh_emit_matching_replication_ops() {
             owner: ref logged_owner,
             fence,
             ttl,
+            expires_at,
         } if logged_key == &key
             && logged_owner == lease.owner()
             && fence == lease.fence()
             && ttl == Duration::from_secs(30)
+            && expires_at > lease.acquired_at()
     ));
 
     let delete_sequence = backend.max_replication_sequence().await.unwrap() + 1;
@@ -250,11 +256,13 @@ async fn direct_lease_mutations_emit_matching_replication_ops() {
             fence,
             credential_id,
             ttl,
+            expires_at,
         } if logged_key == &key
             && logged_owner == &owner
             && fence == lease.fence()
             && credential_id == lease.credential_id()
             && ttl == Duration::from_secs(60)
+            && expires_at == lease.expires_at()
     ));
 
     let renewed = backend
@@ -270,11 +278,13 @@ async fn direct_lease_mutations_emit_matching_replication_ops() {
             fence,
             credential_id,
             ttl,
+            expires_at,
         } if logged_key == &key
             && logged_owner == &owner
             && fence == renewed.fence()
             && credential_id == renewed.credential_id()
             && ttl == Duration::from_secs(90)
+            && expires_at == renewed.expires_at()
     ));
 
     let released_fence = renewed.fence();
@@ -293,6 +303,91 @@ async fn direct_lease_mutations_emit_matching_replication_ops() {
             && fence == released_fence
             && credential_id == released_credential_id
     ));
+}
+
+#[tokio::test]
+async fn slow_watch_receiver_is_dropped_when_buffer_fills() {
+    use futures_util::StreamExt;
+
+    let backend = FakeSessionBackend::new();
+    let mut watch = backend.watch(1).await.unwrap();
+    let owner = OwnerId::new("owner-a").unwrap();
+    let capacity = crate::backend::WATCH_CHANNEL_CAPACITY;
+
+    for idx in 0..=capacity {
+        let key = test_key("t1", format!("slow-watch-{idx}").as_bytes());
+        backend
+            .acquire(&key, owner.clone(), Duration::from_secs(60))
+            .await
+            .unwrap();
+    }
+
+    for _ in 0..capacity {
+        assert!(watch.next().await.unwrap().is_ok());
+    }
+    let end = tokio::time::timeout(Duration::from_millis(100), watch.next())
+        .await
+        .expect("bounded watcher should close after overflow");
+    assert!(end.is_none(), "slow watcher should be dropped on overflow");
+}
+
+#[tokio::test]
+async fn fake_backend_bounds_tracked_keys_and_replication_log() {
+    let backend = FakeSessionBackend::with_limits(FakeBackendLimits {
+        max_tracked_keys: 2,
+        max_replication_entries: 3,
+    });
+    let owner = OwnerId::new("owner-a").unwrap();
+    let key_a = test_key("t1", b"bounded-a");
+    let key_b = test_key("t1", b"bounded-b");
+    let key_c = test_key("t1", b"bounded-c");
+
+    backend
+        .acquire(&key_a, owner.clone(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    backend
+        .acquire(&key_b, owner.clone(), Duration::from_secs(60))
+        .await
+        .unwrap();
+
+    let err = backend
+        .acquire(&key_c, owner.clone(), Duration::from_secs(60))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        LeaseError::Backend("fake backend tracked-key limit reached".into())
+    );
+
+    for _ in 0..5 {
+        backend
+            .acquire(&key_a, owner.clone(), Duration::from_secs(60))
+            .await
+            .unwrap();
+    }
+
+    let max_sequence = backend.max_replication_sequence().await.unwrap();
+    assert_eq!(max_sequence, 7);
+    let retained = backend
+        .get_replication_log(max_sequence - 2, 16)
+        .await
+        .unwrap();
+    assert_eq!(retained.len(), 3);
+    assert_eq!(retained.first().unwrap().sequence, max_sequence - 2);
+    assert_eq!(retained.last().unwrap().sequence, max_sequence);
+
+    let compacted = backend.get_replication_log(1, 16).await.unwrap_err();
+    assert_eq!(
+        compacted,
+        StoreError::BackendUnavailable("replication log compacted before requested start".into())
+    );
+
+    let state = backend.inner.lock().await;
+    assert_eq!(state.key_fences.len(), 2);
+    assert!(state.leases.len() <= 2);
+    assert!(state.records.len() <= 2);
+    assert_eq!(state.replication_log.len(), 3);
 }
 
 #[tokio::test]

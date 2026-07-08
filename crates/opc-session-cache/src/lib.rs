@@ -348,11 +348,10 @@ impl SessionCache {
                                 break;
                             }
 
-                            last_sequence.store(entry_seq, Ordering::Release);
-                            seq = entry_seq;
-
                             let mut lock = cache.write().await;
                             Self::apply_invalidation_op(&mut lock, entry.op);
+                            last_sequence.store(entry_seq, Ordering::Release);
+                            seq = entry_seq;
                         }
                         Some(Err(err)) => {
                             error!(
@@ -617,5 +616,234 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::PayloadTooLarge { .. } => "payload_too_large",
         StoreError::InvalidRestoreScanRequest(_) => "invalid_restore_scan_request",
         StoreError::RestoreScanPageTooLarge { .. } => "restore_scan_page_too_large",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures_util::{stream, StreamExt};
+    use opc_session_store::{
+        EncryptedSessionPayload, FenceToken, Generation, OwnerId, SessionKeyType, StateClass,
+        StateType,
+    };
+    use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+    use std::sync::atomic::Ordering;
+    use tokio::sync::mpsc;
+
+    struct ScriptedWatchBackend {
+        max_sequence: AtomicU64,
+        watch_rx: Mutex<Option<mpsc::UnboundedReceiver<Result<ReplicationEntry, StoreError>>>>,
+        yielded_tx: mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait]
+    impl SessionBackend for ScriptedWatchBackend {
+        async fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                ordered_replication_log: true,
+                watch: true,
+                ..BackendCapabilities::minimal()
+            }
+        }
+
+        async fn get(&self, _key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn compare_and_set(
+            &self,
+            _op: CompareAndSet,
+        ) -> Result<CompareAndSetResult, StoreError> {
+            Err(StoreError::CapabilityNotSupported(
+                "compare_and_set".to_string(),
+            ))
+        }
+
+        async fn delete_fenced(
+            &self,
+            _lease: &opc_session_store::LeaseGuard,
+        ) -> Result<(), StoreError> {
+            Err(StoreError::CapabilityNotSupported(
+                "delete_fenced".to_string(),
+            ))
+        }
+
+        async fn refresh_ttl(
+            &self,
+            _lease: &opc_session_store::LeaseGuard,
+            _ttl: Duration,
+        ) -> Result<(), StoreError> {
+            Err(StoreError::CapabilityNotSupported(
+                "refresh_ttl".to_string(),
+            ))
+        }
+
+        async fn batch(&self, _ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+            Err(StoreError::CapabilityNotSupported("batch".to_string()))
+        }
+
+        async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
+            Ok(self.max_sequence.load(Ordering::Acquire))
+        }
+
+        async fn get_replication_log(
+            &self,
+            _start: u64,
+            _limit: usize,
+        ) -> Result<Vec<ReplicationEntry>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn replicate_entry(&self, _entry: ReplicationEntry) -> Result<(), StoreError> {
+            Err(StoreError::CapabilityNotSupported(
+                "replicate_entry".to_string(),
+            ))
+        }
+
+        async fn rebuild_replication_state(
+            &self,
+            _entries: Vec<ReplicationEntry>,
+        ) -> Result<(), StoreError> {
+            Err(StoreError::CapabilityNotSupported(
+                "rebuild_replication_state".to_string(),
+            ))
+        }
+
+        async fn watch(
+            &self,
+            _start_sequence: u64,
+        ) -> Result<
+            futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
+            StoreError,
+        > {
+            let rx = self
+                .watch_rx
+                .lock()
+                .await
+                .take()
+                .expect("watch stream should be requested once");
+            let yielded_tx = self.yielded_tx.clone();
+            Ok(stream::unfold(rx, move |mut rx| {
+                let yielded_tx = yielded_tx.clone();
+                async move {
+                    let item = rx.recv().await?;
+                    let _ = yielded_tx.send(());
+                    Some((item, rx))
+                }
+            })
+            .boxed())
+        }
+
+        async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
+            Ok((1, 1))
+        }
+    }
+
+    fn test_key() -> SessionKey {
+        SessionKey {
+            tenant: TenantId::new("tenant-a").expect("tenant"),
+            nf_kind: NetworkFunctionKind::from_static("amf"),
+            key_type: SessionKeyType::SubscriberContext,
+            stable_id: Bytes::copy_from_slice(b"cache-key"),
+        }
+    }
+
+    fn test_record(key: SessionKey, generation: u64) -> StoredSessionRecord {
+        StoredSessionRecord {
+            key,
+            generation: Generation::new(generation),
+            owner: OwnerId::new("owner-a").expect("owner"),
+            fence: FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("amf-state"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(b"payload"),
+        }
+    }
+
+    async fn wait_until_watch_ready(watch_ready: &AtomicBool) {
+        for _ in 0..50 {
+            if watch_ready.load(Ordering::Acquire) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("watch loop did not become ready");
+    }
+
+    #[tokio::test]
+    async fn watch_cursor_waits_for_invalidation_before_advancing() {
+        let key = test_key();
+        let cache = Arc::new(RwLock::new(HashMap::from([(
+            key.clone(),
+            test_record(key.clone(), 1),
+        )])));
+        let last_sequence = Arc::new(AtomicU64::new(0));
+        let watch_ready = Arc::new(AtomicBool::new(false));
+        let is_syncing = Arc::new(AtomicBool::new(false));
+        let watch_error_count = Arc::new(AtomicU64::new(0));
+        let (_resync_tx, resync_rx) = mpsc::unbounded_channel();
+        let (entry_tx, entry_rx) = mpsc::unbounded_channel();
+        let (yielded_tx, mut yielded_rx) = mpsc::unbounded_channel();
+        let backend = Arc::new(ScriptedWatchBackend {
+            max_sequence: AtomicU64::new(0),
+            watch_rx: Mutex::new(Some(entry_rx)),
+            yielded_tx,
+        });
+
+        let handle = tokio::spawn(SessionCache::run_watch_loop(
+            backend.clone(),
+            cache.clone(),
+            last_sequence.clone(),
+            watch_ready.clone(),
+            resync_rx,
+            is_syncing,
+            watch_error_count,
+        ));
+        wait_until_watch_ready(&watch_ready).await;
+
+        let read_guard = cache.read().await;
+        backend.max_sequence.store(1, Ordering::Release);
+        entry_tx
+            .send(Ok(ReplicationEntry {
+                sequence: 1,
+                tx_id: "tx-1".to_string(),
+                op: ReplicationOp::CompareAndSet {
+                    key: key.clone(),
+                    expected_generation: Some(Generation::new(1)),
+                    credential_id: 1,
+                    guard_expires_at: Timestamp::now_utc(),
+                    new_record: test_record(key.clone(), 2),
+                },
+                timestamp: Timestamp::now_utc(),
+            }))
+            .expect("send watch entry");
+        yielded_rx.recv().await.expect("watch entry yielded");
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if last_sequence.load(Ordering::Acquire) == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            last_sequence.load(Ordering::Acquire),
+            0,
+            "watch cursor advanced while the stale cache entry was still readable"
+        );
+
+        drop(read_guard);
+        for _ in 0..50 {
+            if last_sequence.load(Ordering::Acquire) == 1 && cache.read().await.is_empty() {
+                handle.abort();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
+        panic!("watch loop did not apply invalidation after cache lock was released");
     }
 }

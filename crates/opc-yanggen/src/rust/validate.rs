@@ -15,7 +15,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             let trimmed = node.path.trim_start_matches('/');
             !trimmed.is_empty() && !trimmed.contains('/')
         })
-        .expect("Rust generation validates one root node before emitting validation");
+        .ok_or_else(|| {
+            RustGenerationError::new("root node not found while generating validation module")
+        })?;
     let root_name = clean_segment(last_segment(&root.path));
     let root_type = format_ident!("{}", to_pascal_case(root_name));
 
@@ -67,7 +69,7 @@ fn generate_path_access(
     resolved_node: &SchemaNode,
     context_path: &str,
     input: &CanonicalInput,
-) -> TokenStream {
+) -> Result<TokenStream, RustGenerationError> {
     if resolved_node.path.starts_with(context_path) && resolved_node.path != context_path {
         let suffix = &resolved_node.path[context_path.len()..];
         let segments: Vec<&str> = suffix.split('/').filter(|s| !s.is_empty()).collect();
@@ -76,7 +78,16 @@ fn generate_path_access(
         for seg in segments {
             cur_path.push('/');
             cur_path.push_str(seg);
-            let seg_node = input.nodes.iter().find(|n| n.path == cur_path).unwrap();
+            let seg_node = input
+                .nodes
+                .iter()
+                .find(|n| n.path == cur_path)
+                .ok_or_else(|| {
+                    RustGenerationError::new(format!(
+                        "missing intermediate schema node '{cur_path}' while generating access to '{}'",
+                        resolved_node.path
+                    ))
+                })?;
             let field_ident = format_ident!("{}", to_snake_case(clean_segment(seg)));
             let is_sensitive = super::types::is_sensitive_node(seg_node);
             if is_sensitive {
@@ -88,9 +99,9 @@ fn generate_path_access(
                 access = quote! { #access.as_ref().unwrap() };
             }
         }
-        access
+        Ok(access)
     } else if resolved_node.path == context_path {
-        quote! { current_ctx }
+        Ok(quote! { current_ctx })
     } else {
         let root = input
             .nodes
@@ -99,10 +110,12 @@ fn generate_path_access(
                 let trimmed = n.path.trim_start_matches('/');
                 !trimmed.is_empty() && !trimmed.contains('/')
             })
-            .unwrap();
+            .ok_or_else(|| {
+                RustGenerationError::new("root node not found while generating path access")
+            })?;
         let root_path = &root.path;
         if resolved_node.path == *root_path {
-            quote! { _root }
+            Ok(quote! { _root })
         } else if resolved_node.path.starts_with(root_path) {
             let suffix = &resolved_node.path[root_path.len()..];
             let segments: Vec<&str> = suffix.split('/').filter(|s| !s.is_empty()).collect();
@@ -111,7 +124,16 @@ fn generate_path_access(
             for seg in segments {
                 cur_path.push('/');
                 cur_path.push_str(seg);
-                let seg_node = input.nodes.iter().find(|n| n.path == cur_path).unwrap();
+                let seg_node = input
+                    .nodes
+                    .iter()
+                    .find(|n| n.path == cur_path)
+                    .ok_or_else(|| {
+                        RustGenerationError::new(format!(
+                            "missing intermediate schema node '{cur_path}' while generating access to '{}'",
+                            resolved_node.path
+                        ))
+                    })?;
                 let field_ident = format_ident!("{}", to_snake_case(clean_segment(seg)));
                 let is_sensitive = super::types::is_sensitive_node(seg_node);
                 if is_sensitive {
@@ -123,9 +145,9 @@ fn generate_path_access(
                     access = quote! { #access.as_ref().unwrap() };
                 }
             }
-            access
+            Ok(access)
         } else {
-            quote! { _root }
+            Ok(quote! { _root })
         }
     }
 }
@@ -759,7 +781,7 @@ fn evaluate_expr(
                         "must/when constraints path resolution error: {e}"
                     ))
                 })?;
-            let access = generate_path_access(&resolved_node, context_path, input);
+            let access = generate_path_access(&resolved_node, context_path, input)?;
             let is_custom_wrapper = matches!(
                 resolved_node.type_ref,
                 Some(TypeRef::Int64) | Some(TypeRef::Decimal64)
@@ -963,7 +985,7 @@ fn evaluate_expr(
                     .ok_or_else(|| {
                         RustGenerationError::new(format!("target node '{target_path}' not found"))
                     })?;
-                let access = generate_path_access(resolved_node, context_path, input);
+                let access = generate_path_access(resolved_node, context_path, input)?;
                 let is_custom_wrapper = matches!(
                     resolved_node.type_ref,
                     Some(TypeRef::Int64) | Some(TypeRef::Decimal64)
@@ -985,5 +1007,66 @@ fn evaluate_expr(
                 func.name
             ))),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diagnostic::YangSourceLocation;
+    use crate::emit::CanonicalProfile;
+    use crate::ir::{SchemaModule, StackBudget};
+
+    fn malformed_input_with_missing_intermediate() -> (CanonicalInput, SchemaNode) {
+        let source = YangSourceLocation::new("dangling.yang", 1, 1);
+        let root = SchemaNode {
+            path: "/test:system".to_string(),
+            module: "test".to_string(),
+            kind: SchemaNodeKind::Container,
+            config: true,
+            child_paths: vec!["/test:system/test:missing/test:leaf".to_string()],
+            source: source.clone(),
+            ..Default::default()
+        };
+        let leaf = SchemaNode {
+            path: "/test:system/test:missing/test:leaf".to_string(),
+            module: "test".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            source: source.clone(),
+            ..Default::default()
+        };
+        let input = CanonicalInput {
+            profile: CanonicalProfile {
+                generation: "test".to_string(),
+                lockfile_mismatch: None,
+            },
+            locked_modules: vec![],
+            schema_modules: vec![SchemaModule {
+                name: "test".to_string(),
+                revision: "2026-07-07".to_string(),
+                namespace: "urn:test".to_string(),
+                prefix: "test".to_string(),
+                source,
+                ..Default::default()
+            }],
+            nodes: vec![root, leaf.clone()],
+            constraints: vec![],
+            stack_shapes: vec![],
+            stack_budget: StackBudget::default(),
+            canonicalization_skipped: false,
+            max_canonical_scan_stack_len: None,
+        };
+        (input, leaf)
+    }
+
+    #[test]
+    fn path_access_reports_missing_intermediate_node() {
+        let (input, leaf) = malformed_input_with_missing_intermediate();
+        let err = generate_path_access(&leaf, "/test:system", &input)
+            .expect_err("missing intermediate path should fail closed");
+        assert!(err.message().contains("missing intermediate schema node"));
+        assert!(err.message().contains("/test:system/test:missing"));
     }
 }

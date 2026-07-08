@@ -53,6 +53,18 @@ fn test_denial_messages_are_redacted() {
 }
 
 #[test]
+fn test_admin_token_redaction_covers_whitespace_fragments() {
+    let sanitized = sanitize_denial_message("admission rejected for admin token: ab cd");
+
+    assert_eq!(
+        sanitized,
+        "admission rejected for admin token: [redacted-token]"
+    );
+    assert!(!sanitized.contains("ab"));
+    assert!(!sanitized.contains("cd"));
+}
+
+#[test]
 fn test_lifecycle_condition_messages_are_sanitized() {
     let now = OffsetDateTime::now_utc();
     let mut status = LifecycleStatus::new(1);

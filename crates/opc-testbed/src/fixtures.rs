@@ -101,7 +101,7 @@ impl FixtureProvenance {
 
 /// Registry stub. In full implementation this will support loading from
 /// a fixtures/ directory with provenance sidecars.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct FixtureRegistry {
     fixtures: std::collections::HashMap<String, FixtureProvenance>,
 }

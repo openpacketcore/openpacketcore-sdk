@@ -219,19 +219,13 @@ impl SpiffeId {
     /// Extract the trust domain portion.
     pub fn trust_domain(&self) -> &str {
         let rest = &self.0["spiffe://".len()..];
-        let slash = rest
-            .find('/')
-            .expect("validated SPIFFE IDs always have a path");
-        &rest[..slash]
+        rest.find('/').map_or(rest, |slash| &rest[..slash])
     }
 
     /// Extract the path portion after the trust domain.
     pub fn path(&self) -> &str {
         let rest = &self.0["spiffe://".len()..];
-        let slash = rest
-            .find('/')
-            .expect("validated SPIFFE IDs always have a path");
-        &rest[slash..]
+        rest.find('/').map_or("", |slash| &rest[slash..])
     }
 }
 

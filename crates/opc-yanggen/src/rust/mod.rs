@@ -102,6 +102,17 @@ impl OpcConfig for types::__ROOT_TYPE__ {
         Ok(paths)
     }
 
+    fn admission_payload_size_bytes(&self) -> Result<Option<usize>, ConfigError> {
+        serde_json::to_vec(self)
+            .map(|bytes| Some(bytes.len()))
+            .map_err(|_| {
+                ConfigError::new(
+                    "admission-payload-size",
+                    "failed to serialize config for admission payload size",
+                )
+            })
+    }
+
     fn apply_delta(&mut self, delta: Self::Delta) -> Result<(), ConfigError> {
         patch::apply_patch(self, &[delta])
     }
@@ -373,8 +384,71 @@ fn validate_supported_input(input: &CanonicalInput) -> Result<&SchemaNode, RustG
     for node in &input.nodes {
         validate_supported_node(input, node)?;
     }
+    validate_rust_identifier_collisions(input)?;
 
     Ok(root)
+}
+
+fn validate_rust_identifier_collisions(input: &CanonicalInput) -> Result<(), RustGenerationError> {
+    let nodes_by_path: HashMap<&str, &SchemaNode> = input
+        .nodes
+        .iter()
+        .map(|node| (node.path.as_str(), node))
+        .collect();
+
+    for node in &input.nodes {
+        if matches!(node.kind, SchemaNodeKind::Container | SchemaNodeKind::List) {
+            let mut field_idents: HashMap<String, &str> = HashMap::new();
+            for child_path in &node.child_paths {
+                let Some(child) = nodes_by_path.get(child_path.as_str()) else {
+                    continue;
+                };
+                let local = clean_segment(last_segment(&child.path));
+                let ident = to_snake_case(local);
+                if let Some(existing) = field_idents.insert(ident.clone(), child.path.as_str()) {
+                    if existing != child.path {
+                        return Err(RustGenerationError::new(format!(
+                            "normalized generated Rust identifier collision under {}: {} and {} both map to {ident}",
+                            node.path, existing, child.path
+                        )));
+                    }
+                }
+            }
+
+            let mut key_idents: HashMap<String, &str> = HashMap::new();
+            for key in &node.key_leaves {
+                let ident = to_snake_case(key);
+                if let Some(existing) = key_idents.insert(ident.clone(), key.as_str()) {
+                    if existing != key {
+                        return Err(RustGenerationError::new(format!(
+                            "normalized generated Rust identifier collision in keys for {}: {} and {} both map to {ident}",
+                            node.path, existing, key
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut type_idents: HashMap<String, &str> = HashMap::new();
+    for node in input
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, SchemaNodeKind::Container | SchemaNodeKind::List))
+    {
+        let local = clean_segment(last_segment(&node.path));
+        let ident = to_pascal_case(local);
+        if let Some(existing) = type_idents.insert(ident.clone(), node.path.as_str()) {
+            if existing != node.path {
+                return Err(RustGenerationError::new(format!(
+                    "normalized generated Rust type identifier collision: {} and {} both map to {ident}",
+                    existing, node.path
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_supported_node(
@@ -491,11 +565,77 @@ pub fn to_pascal_case(s: &str) -> String {
             out.push(c);
         }
     }
+    if is_rust_keyword(&out) {
+        out.push('_');
+    }
     out
 }
 
 pub fn to_snake_case(s: &str) -> String {
-    s.replace(['-', ':'], "_")
+    let mut out = s.replace(['-', ':'], "_");
+    if is_rust_keyword(&out) {
+        out.push('_');
+    }
+    out
+}
+
+fn is_rust_keyword(ident: &str) -> bool {
+    matches!(
+        ident,
+        "Self"
+            | "abstract"
+            | "as"
+            | "async"
+            | "await"
+            | "become"
+            | "box"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "do"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "final"
+            | "fn"
+            | "for"
+            | "gen"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "macro"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "override"
+            | "priv"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "try"
+            | "type"
+            | "typeof"
+            | "union"
+            | "unsafe"
+            | "unsized"
+            | "use"
+            | "virtual"
+            | "where"
+            | "while"
+            | "yield"
+    )
 }
 
 pub fn last_segment(path: &str) -> &str {

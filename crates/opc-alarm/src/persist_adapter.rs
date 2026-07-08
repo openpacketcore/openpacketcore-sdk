@@ -2,12 +2,15 @@
 //! `persist` feature). Satisfies the fail-closed audit contract of
 //! `AlarmAuditSink`: if the append to the `alarm_audit` table fails, the
 //! manager abandons the suppression/acknowledgement. Free-text audit fields
-//! (principal, reason, correlation id) are scrubbed of long digit runs and
-//! IPv4 literals before persistence as a defense-in-depth layer on top of
-//! caller-side RFC 010 redaction.
+//! (principal, reason, correlation id) are scrubbed with the shared
+//! `opc-redaction` classifier before persistence as a defense-in-depth layer on
+//! top of caller-side RFC 010 redaction.
 
 use crate::manager::{AlarmActionScope, AlarmAuditEvent, AlarmAuditOutcome, AlarmAuditSink};
 use opc_persist::SqliteBackend;
+use std::any::Any;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::mpsc;
 use time::format_description::well_known::Rfc3339;
 
 /// A persist-backed audit sink implementing [`AlarmAuditSink`].
@@ -16,13 +19,49 @@ use time::format_description::well_known::Rfc3339;
 /// `alarm_audit` table of a [`SqliteBackend`] database, preserving redaction requirements
 /// by scrubbing raw sensitive values (SUPIs/phone numbers/IPs) from audit fields.
 pub struct PersistAlarmAuditSink {
-    backend: SqliteBackend,
+    tx: Option<mpsc::Sender<AuditAppendRequest>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    startup_error: Option<String>,
+}
+
+struct AuditAppendRequest {
+    event: PersistAuditEvent,
+    result_tx: mpsc::Sender<Result<(), String>>,
+}
+
+struct PersistAuditEvent {
+    action: String,
+    outcome: String,
+    alarm_id: String,
+    alarm_type: String,
+    probable_cause: String,
+    principal: String,
+    tenant: Option<String>,
+    reason: String,
+    scope: String,
+    correlation_id: Option<String>,
+    occurred_at: String,
 }
 
 impl PersistAlarmAuditSink {
     /// Create a new persist-backed alarm audit sink.
     pub fn new(backend: SqliteBackend) -> Self {
-        Self { backend }
+        let (tx, rx) = mpsc::channel();
+        match std::thread::Builder::new()
+            .name("opc-alarm-persist-audit".to_string())
+            .spawn(move || run_audit_worker(backend, rx))
+        {
+            Ok(worker) => Self {
+                tx: Some(tx),
+                worker: Some(worker),
+                startup_error: None,
+            },
+            Err(err) => Self {
+                tx: None,
+                worker: None,
+                startup_error: Some(format!("failed to spawn audit worker: {err}")),
+            },
+        }
     }
 }
 
@@ -54,111 +93,100 @@ impl AlarmAuditSink for PersistAlarmAuditSink {
         let redacted_reason = redact_sensitive_string(&event.reason);
         let redacted_correlation_id = event.correlation_id.as_deref().map(redact_sensitive_string);
 
-        let backend = self.backend.clone();
-        let action_str = action_str.to_string();
-        let outcome_str = outcome_str.to_string();
-        let alarm_id_str = event.alarm_id.as_str().to_string();
-        let alarm_type_str = event.alarm_type.as_str().to_string();
-        let probable_cause_str = event.probable_cause.to_string();
-        let tenant_str = event.tenant.clone();
+        let event = PersistAuditEvent {
+            action: action_str.to_string(),
+            outcome: outcome_str.to_string(),
+            alarm_id: event.alarm_id.as_str().to_string(),
+            alarm_type: event.alarm_type.as_str().to_string(),
+            probable_cause: event.probable_cause.to_string(),
+            principal: redacted_principal,
+            tenant: event.tenant.clone(),
+            reason: redacted_reason,
+            scope: scope_str,
+            correlation_id: redacted_correlation_id,
+            occurred_at: occurred_at_str,
+        };
 
-        // The audit append is async but `record_alarm_action` is a synchronous
-        // trait method. Run the append on a worker thread that owns its OWN
-        // single-threaded runtime rather than driving the ambient runtime's
-        // handle: blocking the ambient runtime (especially a current-thread one,
-        // or one that is shutting down) from a spawned thread can deadlock.
-        // Decoupling keeps the fail-closed audit independent of the caller's
-        // runtime flavor and lifecycle.
-        let join = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("failed to build audit runtime: {e}"))?;
-            runtime.block_on(async move {
-                backend
-                    .record_alarm_audit(
-                        &action_str,
-                        &outcome_str,
-                        &alarm_id_str,
-                        &alarm_type_str,
-                        &probable_cause_str,
-                        &redacted_principal,
-                        tenant_str.as_deref(),
-                        &redacted_reason,
-                        &scope_str,
-                        redacted_correlation_id.as_deref(),
-                        &occurred_at_str,
-                    )
-                    .await
-                    .map_err(|e| format!("Database audit append failed: {e}"))
-            })
-        })
-        .join();
+        let tx = self.tx.as_ref().ok_or_else(|| {
+            self.startup_error
+                .clone()
+                .unwrap_or_else(|| "audit worker unavailable".to_string())
+        })?;
+        let (result_tx, result_rx) = mpsc::channel();
+        tx.send(AuditAppendRequest { event, result_tx })
+            .map_err(|_| "audit worker shut down".to_string())?;
+        result_rx
+            .recv()
+            .map_err(|_| "audit worker stopped before completing append".to_string())?
+    }
+}
 
-        match join {
-            Ok(result) => result,
-            // A panic in the DB path must surface as a real audit failure with a
-            // usable reason, not an opaque join error — the manager fails closed
-            // on this, so the reason must be meaningful.
-            Err(panic) => {
-                let reason = panic
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic".to_string());
-                Err(format!("Audit append panicked: {reason}"))
+impl Drop for PersistAlarmAuditSink {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_audit_worker(backend: SqliteBackend, rx: mpsc::Receiver<AuditAppendRequest>) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build();
+
+    match runtime {
+        Ok(runtime) => {
+            for request in rx {
+                let AuditAppendRequest { event, result_tx } = request;
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    runtime.block_on(async {
+                        backend
+                            .record_alarm_audit(
+                                &event.action,
+                                &event.outcome,
+                                &event.alarm_id,
+                                &event.alarm_type,
+                                &event.probable_cause,
+                                &event.principal,
+                                event.tenant.as_deref(),
+                                &event.reason,
+                                &event.scope,
+                                event.correlation_id.as_deref(),
+                                &event.occurred_at,
+                            )
+                            .await
+                            .map_err(|e| format!("Database audit append failed: {e}"))
+                    })
+                }))
+                .unwrap_or_else(|panic| {
+                    Err(format!(
+                        "Audit append panicked: {}",
+                        panic_reason(panic.as_ref())
+                    ))
+                });
+                let _ = result_tx.send(result);
+            }
+        }
+        Err(err) => {
+            let message = format!("failed to build audit runtime: {err}");
+            for request in rx {
+                let _ = request.result_tx.send(Err(message.clone()));
             }
         }
     }
 }
 
-/// Redact sequences of 8+ consecutive digits (SUPIs/phone numbers) and IPv4 addresses.
+fn panic_reason(panic: &(dyn Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
+/// Redact audit free-text fields with the shared support-bundle redactor.
 fn redact_sensitive_string(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        // Check for 8+ consecutive digits
-        let mut digit_count = 0;
-        while i + digit_count < chars.len() && chars[i + digit_count].is_ascii_digit() {
-            digit_count += 1;
-        }
-        if digit_count >= 8 {
-            result.push_str("[REDACTED]");
-            i += digit_count;
-            continue;
-        }
-
-        // Check for IPv4 pattern at chars[i...]
-        if let Some(ipv4_len) = match_ipv4(&chars[i..]) {
-            result.push_str("[REDACTED]");
-            i += ipv4_len;
-            continue;
-        }
-
-        result.push(chars[i]);
-        i += 1;
-    }
-    result
-}
-
-fn match_ipv4(slice: &[char]) -> Option<usize> {
-    let mut idx = 0;
-    for part in 0..4 {
-        if part > 0 {
-            if idx >= slice.len() || slice[idx] != '.' {
-                return None;
-            }
-            idx += 1;
-        }
-        let mut part_len = 0;
-        while idx < slice.len() && slice[idx].is_ascii_digit() && part_len < 3 {
-            idx += 1;
-            part_len += 1;
-        }
-        if part_len == 0 {
-            return None;
-        }
-    }
-    Some(idx)
+    let mut summary = opc_redaction::RedactionSummary::default();
+    opc_redaction::redact_text(input, &mut summary)
 }
