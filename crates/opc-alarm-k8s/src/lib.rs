@@ -76,8 +76,7 @@ pub fn alarm_to_condition_with_previous(
     alarm: &Alarm,
     previous: Option<&K8sCondition>,
 ) -> K8sCondition {
-    // Standard CamelCase format for Condition Type: e.g., "config-bus.commit.failure" -> "ConfigBusCommitFailure"
-    let type_ = to_camel_case(alarm.alarm_type.as_str());
+    let type_ = condition_type_for_alarm_type(alarm.alarm_type.as_str());
 
     // Status is True if the alarm is active, False if cleared or expired
     let status = if alarm.state.is_active() {
@@ -178,6 +177,44 @@ fn custom_probable_cause_reason(value: &str) -> String {
     }
 }
 
+fn condition_type_for_alarm_type(value: &str) -> String {
+    let base = sanitized_camel_case(value, "Alarm");
+    format!("{base}-{:08x}", stable_hash32(value.as_bytes()))
+}
+
+fn sanitized_camel_case(value: &str, fallback: &str) -> String {
+    let mut out = String::new();
+    let mut capitalize = true;
+
+    for c in value.chars() {
+        if c.is_ascii_alphanumeric() {
+            if capitalize {
+                out.push(c.to_ascii_uppercase());
+                capitalize = false;
+            } else {
+                out.push(c);
+            }
+        } else {
+            capitalize = true;
+        }
+    }
+
+    if out.is_empty() {
+        fallback.to_string()
+    } else {
+        out
+    }
+}
+
+fn stable_hash32(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c_9dc5u32;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
 fn to_camel_case(s: &str) -> String {
     let mut out = String::new();
     let mut capitalize = true;
@@ -237,7 +274,7 @@ mod tests {
         let alarm = alarm_with_cause(ProbableCause::PeerUnreachable);
 
         let cond = alarm_to_condition(&alarm);
-        assert_eq!(cond.type_, "PeerDisconnected");
+        assert!(cond.type_.starts_with("PeerDisconnected-"));
         assert_eq!(cond.status, "True");
         assert_eq!(cond.reason, "PeerUnreachable");
         assert_eq!(cond.message, "UPF link down");
@@ -287,6 +324,33 @@ mod tests {
             custom_probable_cause_reason("amf  peer__timeout///retry"),
             "AmfPeerTimeoutRetry"
         );
+    }
+
+    #[test]
+    fn condition_type_disambiguates_separator_collisions() {
+        let mut dotted = alarm_with_cause(ProbableCause::PeerUnreachable);
+        dotted.alarm_type = AlarmType::new("peer.disconnected");
+        let mut dashed = alarm_with_cause(ProbableCause::PeerUnreachable);
+        dashed.alarm_type = AlarmType::new("peer-disconnected");
+
+        assert_ne!(alarm_to_condition(&dotted).type_, alarm_to_condition(&dashed).type_);
+    }
+
+    #[test]
+    fn condition_type_removes_invalid_characters() {
+        let mut alarm = alarm_with_cause(ProbableCause::PeerUnreachable);
+        alarm.alarm_type = AlarmType::new("peer disconnected:☃");
+
+        let condition_type = alarm_to_condition(&alarm).type_;
+
+        assert!(
+            condition_type
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        );
+        assert!(!condition_type.contains(' '));
+        assert!(!condition_type.contains(':'));
+        assert!(!condition_type.contains('☃'));
     }
 
     #[test]
