@@ -16,6 +16,7 @@ import (
 // ExpectedContractVersion is the major contract version the Go side expects
 // from the Rust lifecycle CLI. It must match operator_lifecycle::CONTRACT_VERSION.
 const ExpectedContractVersion uint32 = 1
+const maxCLIStdoutBytes = 1024 * 1024
 
 // ErrorKind classifies bridge errors so callers can decide retry vs terminal.
 type ErrorKind int
@@ -87,6 +88,39 @@ type Client struct {
 
 	handshakeOnce sync.Once
 	handshakeErr  error
+}
+
+type cappedBuffer struct {
+	buf      bytes.Buffer
+	limit    int
+	overflow bool
+}
+
+func newCappedBuffer(limit int) *cappedBuffer {
+	return &cappedBuffer{limit: limit}
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	remaining := b.limit - b.Len()
+	if remaining <= 0 {
+		b.overflow = true
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		_, _ = b.buf.Write(p[:remaining])
+		b.overflow = true
+		return len(p), nil
+	}
+	_, _ = b.buf.Write(p)
+	return len(p), nil
+}
+
+func (b *cappedBuffer) Bytes() []byte {
+	return b.buf.Bytes()
+}
+
+func (b *cappedBuffer) Len() int {
+	return b.buf.Len()
 }
 
 // ClientOption configures a Client.
@@ -188,13 +222,17 @@ func (c *Client) Call(ctx context.Context, subcommand string, input, output inte
 
 	cmd := exec.CommandContext(ctx, c.binaryPath, subcommand)
 	cmd.Stdin = bytes.NewReader(wrappedBytes)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	stdout := newCappedBuffer(maxCLIStdoutBytes)
+	var stderr bytes.Buffer
+	cmd.Stdout = stdout
 	cmd.Stderr = &stderr
 
 	err = cmd.Run()
 	if ctx.Err() == context.DeadlineExceeded {
 		return &Error{Kind: ErrKindTimeout, Message: fmt.Sprintf("cli %s timed out", subcommand)}
+	}
+	if stdout.overflow {
+		return &Error{Kind: ErrKindMalformedJSON, Message: fmt.Sprintf("cli %s stdout exceeded %d byte limit", subcommand, maxCLIStdoutBytes)}
 	}
 	if err != nil {
 		// Attempt structured error from stdout.
@@ -244,14 +282,17 @@ func (c *Client) runHandshake(ctx context.Context) error {
 	}
 
 	cmd := exec.CommandContext(ctx, c.binaryPath, "version")
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
+	stdout := newCappedBuffer(maxCLIStdoutBytes)
+	cmd.Stdout = stdout
 
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return &Error{Kind: ErrKindTimeout, Message: "version handshake timed out"}
 		}
 		return &Error{Kind: ErrKindBinaryMissing, Message: fmt.Sprintf("version handshake failed: %v", err)}
+	}
+	if stdout.overflow {
+		return &Error{Kind: ErrKindMalformedJSON, Message: fmt.Sprintf("version handshake stdout exceeded %d byte limit", maxCLIStdoutBytes)}
 	}
 
 	var resp struct {

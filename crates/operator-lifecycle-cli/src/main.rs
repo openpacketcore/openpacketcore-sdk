@@ -20,6 +20,8 @@ use std::str::FromStr;
 use opc_types::{ConfigVersion, SchemaDigest};
 use time::OffsetDateTime;
 
+const MAX_STDIN_BYTES: u64 = 1024 * 1024;
+
 #[derive(Serialize, Deserialize)]
 pub struct CompatibilityRequest {
     pub operator: OperatorReleaseDescriptor,
@@ -283,6 +285,20 @@ fn write_version() -> ! {
     std::process::exit(0);
 }
 
+fn read_stdin_bounded() -> String {
+    let mut buffer = String::new();
+    let mut stdin = io::stdin().take(MAX_STDIN_BYTES + 1);
+    if let Err(e) = stdin.read_to_string(&mut buffer) {
+        write_error(&format!("Failed to read stdin: {e}"));
+    }
+    if buffer.len() as u64 > MAX_STDIN_BYTES {
+        write_error(&format!(
+            "Invalid JSON: request exceeds maximum size of {MAX_STDIN_BYTES} bytes"
+        ));
+    }
+    buffer
+}
+
 fn parse_request<T: serde::de::DeserializeOwned>(buffer: &str, command_name: &str) -> T {
     let mut value: serde_json::Value = match serde_json::from_str(buffer) {
         Ok(v) => v,
@@ -323,10 +339,7 @@ fn main() {
         write_version();
     }
 
-    let mut buffer = String::new();
-    if let Err(e) = io::stdin().read_to_string(&mut buffer) {
-        write_error(&format!("Failed to read stdin: {e}"));
-    }
+    let buffer = read_stdin_bounded();
 
     match command {
         "admission" => {

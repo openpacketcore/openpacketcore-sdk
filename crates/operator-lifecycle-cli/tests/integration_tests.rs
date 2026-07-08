@@ -111,6 +111,19 @@ fn test_admission_absent_contract_version_backward_compat() {
 }
 
 #[test]
+fn test_admission_rejects_oversized_stdin() {
+    let oversized = " ".repeat(1024 * 1024 + 1);
+
+    let (stdout, code) = run_json("admission", &oversized);
+    assert_eq!(code, 1, "expected exit 1, got {code}. stdout: {stdout}");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(parsed["error"]
+        .as_str()
+        .unwrap()
+        .contains("request exceeds maximum size"));
+}
+
+#[test]
 fn test_config_apply_matching_contract_version() {
     let input = r#"{
         "expectedContractVersion": 1,

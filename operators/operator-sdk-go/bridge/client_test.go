@@ -235,6 +235,37 @@ exit 0
 	}
 }
 
+func TestClientStdoutLimit(t *testing.T) {
+	dir := t.TempDir()
+	script := writeScript(t, dir, "cli", `#!/bin/sh
+if [ "$1" = "version" ]; then
+  echo '{"contractVersion":1,"crateVersion":"0.1.0"}'
+  exit 0
+fi
+cat > /dev/null
+head -c 1048577 /dev/zero | tr '\0' x
+exit 0
+`)
+
+	c, err := NewClient(script)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var out map[string]interface{}
+	err = c.Call(context.Background(), "admission", map[string]string{}, &out)
+	if err == nil {
+		t.Fatal("expected stdout limit error")
+	}
+	var berr *Error
+	if !errors.As(err, &berr) || berr.Kind != ErrKindMalformedJSON {
+		t.Fatalf("expected ErrKindMalformedJSON, got %v", err)
+	}
+	if !strings.Contains(berr.Message, "stdout exceeded") {
+		t.Fatalf("expected stdout limit message, got %q", berr.Message)
+	}
+}
+
 func TestClientStderrCapture(t *testing.T) {
 	dir := t.TempDir()
 	script := writeScript(t, dir, "cli", `#!/bin/sh
