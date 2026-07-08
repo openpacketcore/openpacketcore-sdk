@@ -72,6 +72,52 @@ async fn open_migrates_schema_version_1_0_0_to_alarm_audit_schema() {
 }
 
 #[tokio::test]
+async fn open_migrates_schema_version_1_4_0_to_current_schema() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = temp_dir.path().join("test_schema_migration_1_4_0.db");
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open legacy database");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_digest TEXT NOT NULL,
+                sdk_version TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (id, schema_digest, sdk_version, created_at)
+            VALUES (1, 'legacy-digest-1-4', '1.4.0', datetime('now'));
+            "#,
+        )
+        .expect("seed legacy 1.4.0 schema version");
+    }
+
+    SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect("open and migrate 1.4.0 backend");
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open migrated database");
+    let sdk_version: String = conn
+        .query_row(
+            "SELECT sdk_version FROM schema_version WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read migrated schema version");
+    let schema_digest: String = conn
+        .query_row(
+            "SELECT schema_digest FROM schema_version WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read migrated schema digest");
+
+    assert_eq!(sdk_version, "1.8.0");
+    assert_ne!(schema_digest, "legacy-digest-1-4");
+}
+
+#[tokio::test]
 async fn open_migrates_legacy_audit_hmacs_to_count_bound_anchor() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let db_path = temp_dir.path().join("legacy_audit_hmacs.db");
