@@ -13,6 +13,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -818,15 +819,151 @@ func TestReconcileDrainStatusErrorWrapsContext(t *testing.T) {
 	}
 }
 
-func TestReconcileDrainFailedPhaseKeepsFinalizer(t *testing.T) {
-	reconcileDrainFailureKeepsFinalizer(t, "drain-failed-cnf", &drain.FakeOrchestrator{
+func TestReconcileDrainFailedPhaseReleasesFinalizer(t *testing.T) {
+	testutil.BuildOperatorLifecycleCLI(t)
+
+	bridge, err := sdkbridge.NewBridge()
+	if err != nil {
+		t.Fatalf("Failed to create bridge: %v", err)
+	}
+
+	now := metav1.NewTime(time.Now())
+	crd := &apiv1beta1.SdkManagedNetworkFunction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "drain-failed-cnf",
+			Namespace:         "default",
+			Generation:        1,
+			Finalizers:        []string{drainFinalizer},
+			DeletionTimestamp: &now,
+		},
+		Spec: apiv1beta1.SdkManagedNetworkFunctionSpec{
+			RuntimeMode: "dev",
+			Version:     "1.0.0",
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	_ = apiv1beta1.AddToScheme(scheme)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(crd).
+		WithStatusSubresource(&apiv1beta1.SdkManagedNetworkFunction{}).
+		Build()
+
+	reconciler := &SdkManagedNetworkFunctionReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+		Bridge: bridge,
+		Drainer: &drain.FakeOrchestrator{
+			StartFunc: func(ctx context.Context, target string) error {
+				return nil
+			},
+			StatusFunc: func(ctx context.Context, target string) (drain.DrainStatus, error) {
+				return drain.DrainStatus{Phase: drain.Failed}, nil
+			},
+		},
+	}
+
+	_, err = reconciler.Reconcile(context.TODO(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "drain-failed-cnf", Namespace: "default"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updated := &apiv1beta1.SdkManagedNetworkFunction{}
+	if err := fakeClient.Get(context.TODO(), types.NamespacedName{Name: "drain-failed-cnf", Namespace: "default"}, updated); k8serrors.IsNotFound(err) {
+		return
+	} else if err != nil {
+		t.Fatalf("Failed to get object: %v", err)
+	}
+	if controllerutil.ContainsFinalizer(updated, drainFinalizer) {
+		t.Errorf("Expected finalizer %s to be removed on failed drain", drainFinalizer)
+	}
+}
+
+func TestReconcileDrainDeletionDeadlineReleasesFinalizer(t *testing.T) {
+	testutil.BuildOperatorLifecycleCLI(t)
+
+	bridge, err := sdkbridge.NewBridge()
+	if err != nil {
+		t.Fatalf("Failed to create bridge: %v", err)
+	}
+
+	started := metav1.NewTime(time.Now().Add(-drainTimeout - time.Minute))
+	crd := &apiv1beta1.SdkManagedNetworkFunction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "drain-deadline-cnf",
+			Namespace:         "default",
+			Generation:        1,
+			Finalizers:        []string{drainFinalizer},
+			DeletionTimestamp: &started,
+		},
+		Spec: apiv1beta1.SdkManagedNetworkFunctionSpec{
+			RuntimeMode: "dev",
+			Version:     "1.0.0",
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	_ = apiv1beta1.AddToScheme(scheme)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(crd).
+		WithStatusSubresource(&apiv1beta1.SdkManagedNetworkFunction{}).
+		Build()
+
+	reconciler := &SdkManagedNetworkFunctionReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+		Bridge: bridge,
+		Drainer: &drain.FakeOrchestrator{
+			StartFunc: func(ctx context.Context, target string) error {
+				return nil
+			},
+			StatusFunc: func(ctx context.Context, target string) (drain.DrainStatus, error) {
+				return drain.DrainStatus{Phase: drain.InProgress}, nil
+			},
+		},
+	}
+
+	_, err = reconciler.Reconcile(context.TODO(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "drain-deadline-cnf", Namespace: "default"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updated := &apiv1beta1.SdkManagedNetworkFunction{}
+	if err := fakeClient.Get(context.TODO(), types.NamespacedName{Name: "drain-deadline-cnf", Namespace: "default"}, updated); k8serrors.IsNotFound(err) {
+		return
+	} else if err != nil {
+		t.Fatalf("Failed to get object: %v", err)
+	}
+	if controllerutil.ContainsFinalizer(updated, drainFinalizer) {
+		t.Errorf("Expected finalizer %s to be removed after deletion drain deadline", drainFinalizer)
+	}
+}
+
+func TestReconcileDrainFailedPhaseRunDrainCompletesForTeardown(t *testing.T) {
+	reconciler := &SdkManagedNetworkFunctionReconciler{Drainer: &drain.FakeOrchestrator{
 		StartFunc: func(ctx context.Context, target string) error {
 			return nil
 		},
 		StatusFunc: func(ctx context.Context, target string) (drain.DrainStatus, error) {
 			return drain.DrainStatus{Phase: drain.Failed}, nil
 		},
-	})
+	}}
+	crd := &apiv1beta1.SdkManagedNetworkFunction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "drain-failed-cnf",
+			Generation: 1,
+		},
+	}
+	cm := conditions.NewConditionManager(crd.Generation)
+	if err := reconciler.runDrain(context.Background(), crd, cm); err != nil {
+		t.Fatalf("failed drain phase should be terminal for teardown: %v", err)
+	}
 }
 
 func TestReconcileWorkloadSynthesisOptInCreatesDeployment(t *testing.T) {

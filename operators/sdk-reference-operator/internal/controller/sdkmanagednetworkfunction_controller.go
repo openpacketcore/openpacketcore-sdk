@@ -480,6 +480,10 @@ func (r *SdkManagedNetworkFunctionReconciler) runDrain(ctx context.Context, crd 
 	if r.Drainer == nil {
 		return nil
 	}
+	if deletionDrainDeadlineExceeded(crd, time.Now()) {
+		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainTimedOut", "Drain exceeded deletion deadline; proceeding with deletion", crd.Generation)
+		return nil
+	}
 	target := fmt.Sprintf("http://%s:8080", crd.Name) // simplistic target
 	if err := r.Drainer.Start(ctx, target); err != nil {
 		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainStartFailed", err.Error(), crd.Generation)
@@ -500,12 +504,19 @@ func (r *SdkManagedNetworkFunctionReconciler) runDrain(ctx context.Context, crd 
 		// force-delete) rather than retrying indefinitely.
 		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainTimedOut", "Drain timed out; proceeding with deletion", crd.Generation)
 		return nil
+	case drain.Failed:
+		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainFailed", "Drain failed; proceeding with deletion", crd.Generation)
+		return nil
 	default:
-		// Failed, in progress, or any other non-terminal phase: signal the
-		// caller to requeue rather than remove the finalizer.
+		// In progress or any other non-terminal phase: signal the caller to
+		// requeue rather than remove the finalizer.
 		_ = cm.Set(conditions.DrainReady, metav1.ConditionFalse, "DrainIncomplete", fmt.Sprintf("drain phase: %s", status.Phase), crd.Generation)
 		return fmt.Errorf("drain incomplete: %s", status.Phase)
 	}
+}
+
+func deletionDrainDeadlineExceeded(crd *v1beta1.SdkManagedNetworkFunction, now time.Time) bool {
+	return !crd.DeletionTimestamp.IsZero() && now.Sub(crd.DeletionTimestamp.Time) > drainTimeout
 }
 
 func (r *SdkManagedNetworkFunctionReconciler) orchestrateDrain(ctx context.Context, crd *v1beta1.SdkManagedNetworkFunction, cm *conditions.ConditionManager) (ctrl.Result, error) {
