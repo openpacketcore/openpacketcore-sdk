@@ -446,6 +446,8 @@ impl SessionBackend for QuorumSessionStore {
         let op_clone = ReplicationOp::CompareAndSet {
             key: op.key.clone(),
             expected_generation: op.expected_generation,
+            credential_id: op.lease.credential_id(),
+            guard_expires_at: op.lease.expires_at(),
             new_record: op.new_record,
         };
         match self.replicate_mutation(op_clone).await {
@@ -639,6 +641,9 @@ impl SessionLeaseManager for QuorumSessionStore {
 
         let fence = FenceToken::new(max_fence);
         let credential_id = max_cred_id;
+        let now = self.clock.now_utc();
+        let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
+        let expires_at = Timestamp::from_offset_datetime(expires);
 
         let op = ReplicationOp::AcquireLease {
             key: key.clone(),
@@ -646,6 +651,7 @@ impl SessionLeaseManager for QuorumSessionStore {
             fence,
             credential_id,
             ttl,
+            expires_at,
         };
 
         let res = self.replicate_mutation(op).await;
@@ -655,10 +661,6 @@ impl SessionLeaseManager for QuorumSessionStore {
                 .fetch_add(1, Ordering::Relaxed);
         }
         res.map_err(LeaseError::from)?;
-
-        let now = self.clock.now_utc();
-        let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-        let expires_at = Timestamp::from_offset_datetime(expires);
 
         Ok(LeaseGuard::new(
             key.clone(),
@@ -671,12 +673,16 @@ impl SessionLeaseManager for QuorumSessionStore {
     }
 
     async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
+        let now = self.clock.now_utc();
+        let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
+        let expires_at = Timestamp::from_offset_datetime(expires);
         let op = ReplicationOp::RenewLease {
             key: lease.key().clone(),
             owner: lease.owner().clone(),
             fence: lease.fence(),
             credential_id: lease.credential_id(),
             ttl,
+            expires_at,
         };
 
         let res = self.replicate_mutation(op).await;
@@ -686,10 +692,6 @@ impl SessionLeaseManager for QuorumSessionStore {
                 .fetch_add(1, Ordering::Relaxed);
         }
         res.map_err(LeaseError::from)?;
-
-        let now = self.clock.now_utc();
-        let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-        let expires_at = Timestamp::from_offset_datetime(expires);
 
         Ok(LeaseGuard::new(
             lease.key().clone(),

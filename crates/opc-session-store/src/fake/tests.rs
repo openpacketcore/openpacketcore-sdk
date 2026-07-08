@@ -141,10 +141,14 @@ async fn direct_successful_cas_emits_ordered_replication_entry_and_watch_event()
         ReplicationOp::CompareAndSet {
             key: logged_key,
             expected_generation,
+            credential_id,
+            guard_expires_at,
             new_record,
         } => {
             assert_eq!(logged_key, &key);
             assert_eq!(expected_generation, &None);
+            assert_eq!(*credential_id, lease.credential_id());
+            assert_eq!(*guard_expires_at, lease.expires_at());
             assert_eq!(new_record.generation, Generation::new(1));
         }
         other => panic!("expected direct CAS replication op, got {other:?}"),
@@ -252,11 +256,13 @@ async fn direct_lease_mutations_emit_matching_replication_ops() {
             fence,
             credential_id,
             ttl,
+            expires_at,
         } if logged_key == &key
             && logged_owner == &owner
             && fence == lease.fence()
             && credential_id == lease.credential_id()
             && ttl == Duration::from_secs(60)
+            && expires_at == lease.expires_at()
     ));
 
     let renewed = backend
@@ -272,11 +278,13 @@ async fn direct_lease_mutations_emit_matching_replication_ops() {
             fence,
             credential_id,
             ttl,
+            expires_at,
         } if logged_key == &key
             && logged_owner == &owner
             && fence == renewed.fence()
             && credential_id == renewed.credential_id()
             && ttl == Duration::from_secs(90)
+            && expires_at == renewed.expires_at()
     ));
 
     let released_fence = renewed.fence();

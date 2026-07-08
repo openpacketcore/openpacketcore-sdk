@@ -333,6 +333,8 @@ impl FakeSessionBackend {
             ReplicationOp::CompareAndSet {
                 key,
                 expected_generation,
+                credential_id,
+                guard_expires_at,
                 new_record,
             } => {
                 let mk = Self::map_key(&key);
@@ -341,17 +343,18 @@ impl FakeSessionBackend {
                     return Err(StoreError::StaleFence);
                 }
 
-                // Verify lease in state is active and not expired
-                let lease_valid = if let Some(lease_entry) = state.leases.get(&mk) {
-                    lease_entry.active
-                        && lease_entry.owner == new_record.owner
-                        && lease_entry.fence == new_record.fence
-                        && lease_entry.guard_expires_at > now
-                } else {
-                    false
+                let Some(lease_entry) = state.leases.get(&mk) else {
+                    return Err(StoreError::StaleFence);
                 };
-
-                if !lease_valid {
+                if !lease_entry.active
+                    || lease_entry.credential_id != credential_id
+                    || lease_entry.owner != new_record.owner
+                    || lease_entry.fence != new_record.fence
+                    || lease_entry.guard_expires_at != guard_expires_at
+                {
+                    return Err(StoreError::StaleFence);
+                }
+                if guard_expires_at <= now || lease_entry.expires_at <= now {
                     return Err(StoreError::LeaseExpired);
                 }
 
@@ -418,7 +421,8 @@ impl FakeSessionBackend {
                 owner,
                 fence,
                 credential_id,
-                ttl,
+                ttl: _,
+                expires_at,
             } => {
                 let mk = Self::map_key(&key);
                 let current_fence = Self::current_fence(state, &mk);
@@ -430,9 +434,6 @@ impl FakeSessionBackend {
                         return Err(StoreError::LeaseHeld);
                     }
                 }
-                let expires_at =
-                    *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-                let expires_at = Timestamp::from_offset_datetime(expires_at);
                 state.leases.insert(
                     mk.clone(),
                     LeaseEntry {
@@ -454,16 +455,14 @@ impl FakeSessionBackend {
                 owner,
                 fence,
                 credential_id,
-                ttl,
+                ttl: _,
+                expires_at,
             } => {
                 let mk = Self::map_key(&key);
                 let current_fence = Self::current_fence(state, &mk);
                 if fence < current_fence {
                     return Err(StoreError::StaleFence);
                 }
-                let expires_at =
-                    *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-                let expires_at = Timestamp::from_offset_datetime(expires_at);
                 state.leases.insert(
                     mk.clone(),
                     LeaseEntry {
@@ -588,6 +587,8 @@ impl SessionBackend for FakeSessionBackend {
         let replication_op = ReplicationOp::CompareAndSet {
             key: op.key.clone(),
             expected_generation: op.expected_generation,
+            credential_id: op.lease.credential_id(),
+            guard_expires_at: op.lease.expires_at(),
             new_record: op.new_record.clone(),
         };
         let result = self.compare_and_set_with_state(&mut state, op, now)?;
@@ -904,6 +905,7 @@ impl SessionLeaseManager for FakeSessionBackend {
                 fence,
                 credential_id,
                 ttl,
+                expires_at,
             },
             now,
         );
@@ -971,6 +973,7 @@ impl SessionLeaseManager for FakeSessionBackend {
                 fence,
                 credential_id,
                 ttl,
+                expires_at,
             },
             now,
         );

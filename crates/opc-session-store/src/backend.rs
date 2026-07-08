@@ -145,6 +145,10 @@ pub enum ReplicationOp {
         /// Generation the record must currently have (`None` = must not
         /// exist); replay fails with a CAS conflict otherwise.
         expected_generation: Option<Generation>,
+        /// Lease credential id that authorized the CAS.
+        credential_id: u64,
+        /// Exact guard deadline from the authorizing lease.
+        guard_expires_at: Timestamp,
         /// Record to install; its `fence` must not be lower than the
         /// replica's recorded fence for the key.
         new_record: StoredSessionRecord,
@@ -186,8 +190,10 @@ pub enum ReplicationOp {
         /// Credential id minted with the guard; fenced mutations must present
         /// a guard with this exact id to be accepted.
         credential_id: u64,
-        /// Lease time-to-live from the replay clock.
+        /// Requested lease time-to-live, retained for audit and compatibility.
         ttl: Duration,
+        /// Absolute guard deadline computed once by the mutation coordinator.
+        expires_at: Timestamp,
     },
     /// Replay of a lease renewal: the same fence and credential id with an
     /// extended expiry (renewal never changes the fence).
@@ -200,8 +206,10 @@ pub enum ReplicationOp {
         fence: FenceToken,
         /// Existing credential id, unchanged by renewal.
         credential_id: u64,
-        /// New time-to-live from the replay clock.
+        /// Requested new time-to-live, retained for audit and compatibility.
         ttl: Duration,
+        /// Absolute renewed guard deadline computed once by the mutation coordinator.
+        expires_at: Timestamp,
     },
     /// Replay of an explicit lease release. Marks the lease inactive but does
     /// NOT lower the key's recorded fence, so writes from the released guard
@@ -470,12 +478,16 @@ where
             ReplicationOp::CompareAndSet {
                 key,
                 expected_generation,
+                credential_id,
+                guard_expires_at,
                 new_record,
             } => {
                 let encrypted = self.encrypt_record(new_record).await?;
                 Ok(ReplicationOp::CompareAndSet {
                     key,
                     expected_generation,
+                    credential_id,
+                    guard_expires_at,
                     new_record: encrypted,
                 })
             }
@@ -486,12 +498,16 @@ where
                         ReplicationOp::CompareAndSet {
                             key,
                             expected_generation,
+                            credential_id,
+                            guard_expires_at,
                             new_record,
                         } => {
                             let encrypted = self.encrypt_record(new_record).await?;
                             encrypted_ops.push(ReplicationOp::CompareAndSet {
                                 key,
                                 expected_generation,
+                                credential_id,
+                                guard_expires_at,
                                 new_record: encrypted,
                             });
                         }
@@ -509,12 +525,16 @@ where
             ReplicationOp::CompareAndSet {
                 key,
                 expected_generation,
+                credential_id,
+                guard_expires_at,
                 new_record,
             } => {
                 let decrypted = self.decrypt_record(new_record).await?;
                 Ok(ReplicationOp::CompareAndSet {
                     key,
                     expected_generation,
+                    credential_id,
+                    guard_expires_at,
                     new_record: decrypted,
                 })
             }
@@ -525,12 +545,16 @@ where
                         ReplicationOp::CompareAndSet {
                             key,
                             expected_generation,
+                            credential_id,
+                            guard_expires_at,
                             new_record,
                         } => {
                             let decrypted = self.decrypt_record(new_record).await?;
                             decrypted_ops.push(ReplicationOp::CompareAndSet {
                                 key,
                                 expected_generation,
+                                credential_id,
+                                guard_expires_at,
                                 new_record: decrypted,
                             });
                         }
@@ -573,12 +597,16 @@ async fn decrypt_op_helper<P: KeyProvider + ?Sized>(
         ReplicationOp::CompareAndSet {
             key,
             expected_generation,
+            credential_id,
+            guard_expires_at,
             new_record,
         } => {
             let decrypted = decrypt_record_helper(provider, new_record, backend_namespace).await?;
             Ok(ReplicationOp::CompareAndSet {
                 key,
                 expected_generation,
+                credential_id,
+                guard_expires_at,
                 new_record: decrypted,
             })
         }
@@ -589,6 +617,8 @@ async fn decrypt_op_helper<P: KeyProvider + ?Sized>(
                     ReplicationOp::CompareAndSet {
                         key,
                         expected_generation,
+                        credential_id,
+                        guard_expires_at,
                         new_record,
                     } => {
                         let decrypted =
@@ -596,6 +626,8 @@ async fn decrypt_op_helper<P: KeyProvider + ?Sized>(
                         decrypted_ops.push(ReplicationOp::CompareAndSet {
                             key,
                             expected_generation,
+                            credential_id,
+                            guard_expires_at,
                             new_record: decrypted,
                         });
                     }

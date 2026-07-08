@@ -814,6 +814,8 @@ mod tests {
                 op: ReplicationOp::CompareAndSet {
                     key: key.clone(),
                     expected_generation: Some(Generation::new(1)),
+                    credential_id: 1,
+                    guard_expires_at: Timestamp::now_utc(),
                     new_record: test_record(key.clone(), 2),
                 },
                 timestamp: Timestamp::now_utc(),

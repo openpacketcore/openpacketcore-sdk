@@ -223,6 +223,7 @@ async fn plaintext_rebuild_is_rejected_before_backend_dispatch() {
                     fence: FenceToken::new(1),
                     credential_id: 1,
                     ttl: Duration::from_secs(60),
+                    expires_at: opc_types::Timestamp::now_utc(),
                 },
                 timestamp: opc_types::Timestamp::now_utc(),
             }],

@@ -350,6 +350,8 @@ async fn test_duplicate_replication_entry_idempotency() {
     let op = opc_session_store::ReplicationOp::CompareAndSet {
         key: key.clone(),
         expected_generation: None,
+        credential_id: 1,
+        guard_expires_at: lease.expires_at(),
         new_record: record,
     };
     let entry = opc_session_store::ReplicationEntry {
@@ -396,6 +398,8 @@ async fn test_partial_write_recovery_and_catch_up() {
     let op = opc_session_store::ReplicationOp::CompareAndSet {
         key: key.clone(),
         expected_generation: None,
+        credential_id: 1,
+        guard_expires_at: lease.expires_at(),
         new_record: record,
     };
     let entry = opc_session_store::ReplicationEntry {
