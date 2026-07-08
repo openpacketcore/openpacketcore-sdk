@@ -8,13 +8,14 @@ use opc_proto_ikev2::{
     decode_ike_auth_cleartext_payloads, decrypt_ikev2_sa_init_protected_payload,
     derive_ike_sa_init_key_material, ikev2_aes_gcm_protected_body_len,
     ikev2_aes_gcm_protected_payload_len, open_protected_payloads,
-    seal_ikev2_sa_init_protected_payload, Header, HeaderFlags, Ikev2DhGroup,
-    Ikev2EncryptionAlgorithm, Ikev2IkeAuthPayloadBuild, Ikev2PrfAlgorithm,
-    Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoProfile,
-    Ikev2SaInitProtectedPayloadProvider, Message, PayloadChain, PayloadType,
-    ProtectedPayloadContext, ProtectedPayloadKind, ProtectedPayloadOpenError,
-    ProtectedPayloadSealContext, EXCHANGE_TYPE_IKE_AUTH, EXCHANGE_TYPE_INFORMATIONAL,
-    GENERIC_PAYLOAD_HEADER_LEN, HEADER_LEN, IKEV2_IPSEC_SPI_SIZE, IKEV2_SECURITY_PROTOCOL_ID_ESP,
+    seal_ikev2_sa_init_protected_payload, seal_ikev2_sa_init_protected_payload_with_iv_counter,
+    Header, HeaderFlags, Ikev2AesGcmExplicitIvCounter, Ikev2DhGroup, Ikev2EncryptionAlgorithm,
+    Ikev2IkeAuthPayloadBuild, Ikev2PrfAlgorithm, Ikev2ProtectedPayloadCryptoError,
+    Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoProfile, Ikev2SaInitProtectedPayloadProvider,
+    Message, PayloadChain, PayloadType, ProtectedPayloadContext, ProtectedPayloadKind,
+    ProtectedPayloadOpenError, ProtectedPayloadSealContext, EXCHANGE_TYPE_IKE_AUTH,
+    EXCHANGE_TYPE_INFORMATIONAL, GENERIC_PAYLOAD_HEADER_LEN, HEADER_LEN, IKEV2_IPSEC_SPI_SIZE,
+    IKEV2_SECURITY_PROTOCOL_ID_ESP,
 };
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
 
@@ -271,6 +272,91 @@ fn same_aes_gcm_key_and_explicit_iv_produces_identical_sealed_body() {
     .expect("second seal succeeds");
 
     assert_eq!(first, second);
+}
+
+#[test]
+fn explicit_iv_counter_restores_next_send_value_without_reuse() {
+    let mut counter = Ikev2AesGcmExplicitIvCounter::new(0x0102_0304_0506_0708);
+
+    assert_eq!(counter.next_value(), 0x0102_0304_0506_0708);
+    assert_eq!(
+        counter.next_explicit_iv().expect("first IV"),
+        0x0102_0304_0506_0708_u64.to_be_bytes()
+    );
+
+    let persisted_next_value = counter.next_value();
+    let mut restored = Ikev2AesGcmExplicitIvCounter::new(persisted_next_value);
+
+    assert_eq!(
+        restored.next_explicit_iv().expect("restored IV"),
+        0x0102_0304_0506_0709_u64.to_be_bytes()
+    );
+    assert_eq!(restored.next_value(), 0x0102_0304_0506_070a);
+}
+
+#[test]
+fn seal_with_iv_counter_persists_next_value_for_restore() {
+    let profile = profile_128();
+    let material = key_material(profile);
+    let encoded = placeholder_message(
+        ikev2_aes_gcm_protected_body_len(INNER_PAYLOAD.len(), 0).unwrap(),
+        PayloadType::ExtensibleAuthentication,
+    );
+    let prefix = &encoded[..HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN];
+    let context = ProtectedPayloadSealContext {
+        kind: ProtectedPayloadKind::Encrypted,
+        message_prefix: prefix,
+    };
+    let mut counter = Ikev2AesGcmExplicitIvCounter::new(0x0000_0000_0000_1000);
+
+    let first = seal_ikev2_sa_init_protected_payload_with_iv_counter(
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+        context,
+        INNER_PAYLOAD,
+        0,
+        &mut counter,
+    )
+    .expect("first seal succeeds");
+    assert_eq!(&first[..AES_GCM_EXPLICIT_IV_LEN], &0x1000_u64.to_be_bytes());
+
+    let persisted_next_value = counter.next_value();
+    let mut restored = Ikev2AesGcmExplicitIvCounter::new(persisted_next_value);
+    let second = seal_ikev2_sa_init_protected_payload_with_iv_counter(
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+        context,
+        INNER_PAYLOAD,
+        0,
+        &mut restored,
+    )
+    .expect("restored seal succeeds");
+
+    assert_eq!(
+        &second[..AES_GCM_EXPLICIT_IV_LEN],
+        &0x1001_u64.to_be_bytes()
+    );
+    assert_ne!(
+        &first[..AES_GCM_EXPLICIT_IV_LEN],
+        &second[..AES_GCM_EXPLICIT_IV_LEN]
+    );
+    assert_eq!(restored.next_value(), 0x0000_0000_0000_1002);
+}
+
+#[test]
+fn explicit_iv_counter_fails_closed_before_wraparound() {
+    let mut counter = Ikev2AesGcmExplicitIvCounter::new(u64::MAX);
+    let err = counter
+        .next_explicit_iv()
+        .expect_err("counter must not wrap");
+
+    assert_eq!(
+        err.as_str(),
+        "ike_protected_payload_crypto_explicit_iv_exhausted"
+    );
+    assert_eq!(counter.next_value(), u64::MAX);
 }
 
 fn encrypted_message_after_notify(
@@ -1003,6 +1089,7 @@ fn direct_error_codes_match_variants() {
             plaintext_len: 1,
             pad_len: 2,
         },
+        Ikev2ProtectedPayloadCryptoError::ExplicitIvExhausted,
     ];
 
     let codes: Vec<&'static str> = errors.iter().map(|error| error.as_str()).collect();
@@ -1013,6 +1100,7 @@ fn direct_error_codes_match_variants() {
             "ike_protected_payload_crypto_authentication_failed",
             "ike_protected_payload_crypto_invalid_aad",
             "ike_protected_payload_crypto_invalid_padding",
+            "ike_protected_payload_crypto_explicit_iv_exhausted",
         ]
     );
 }

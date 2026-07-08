@@ -94,6 +94,56 @@ impl Ikev2ProtectedPayloadDirection {
     }
 }
 
+/// Monotonic RFC 5282 AES-GCM explicit-IV allocator for one sending direction.
+///
+/// The value returned by [`Self::next_value`] is the next outbound explicit IV
+/// counter value to persist with the IKE SA. Restoring a counter with that value
+/// resumes sending strictly after the last successfully allocated IV and avoids
+/// nonce reuse with the same `SK_e*` key and salt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Ikev2AesGcmExplicitIvCounter {
+    next_value: u64,
+}
+
+impl Ikev2AesGcmExplicitIvCounter {
+    /// Build a counter from the next explicit IV value to send.
+    ///
+    /// Pass `0` for a fresh direction, or the persisted [`Self::next_value`]
+    /// from sealed IKE SA state when adopting an established SA.
+    pub const fn new(next_value: u64) -> Self {
+        Self { next_value }
+    }
+
+    /// Next explicit IV counter value to persist for restore.
+    pub const fn next_value(self) -> u64 {
+        self.next_value
+    }
+
+    /// Allocate the next AES-GCM explicit IV in network byte order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2ProtectedPayloadCryptoError::ExplicitIvExhausted`] when
+    /// the counter has reached its fail-closed wrap guard. Rekey the IKE SA
+    /// before sending more protected messages under this direction key.
+    pub fn next_explicit_iv(
+        &mut self,
+    ) -> Result<[u8; IKEV2_AES_GCM_EXPLICIT_IV_LEN], Ikev2ProtectedPayloadCryptoError> {
+        if self.next_value == u64::MAX {
+            return Err(Ikev2ProtectedPayloadCryptoError::ExplicitIvExhausted);
+        }
+        let explicit_iv = self.next_value.to_be_bytes();
+        self.next_value += 1;
+        Ok(explicit_iv)
+    }
+}
+
+impl Default for Ikev2AesGcmExplicitIvCounter {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
 /// Stable machine-readable protected-payload crypto error code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ikev2ProtectedPayloadCryptoErrorCode {
@@ -111,6 +161,8 @@ pub enum Ikev2ProtectedPayloadCryptoErrorCode {
     AuthenticationFailed,
     /// Decrypted IKE padding is structurally invalid.
     InvalidPadding,
+    /// AES-GCM explicit IV counter cannot allocate without wrapping.
+    ExplicitIvExhausted,
 }
 
 impl Ikev2ProtectedPayloadCryptoErrorCode {
@@ -128,6 +180,7 @@ impl Ikev2ProtectedPayloadCryptoErrorCode {
             Self::InvalidAssociatedData => "ike_protected_payload_crypto_invalid_aad",
             Self::AuthenticationFailed => "ike_protected_payload_crypto_authentication_failed",
             Self::InvalidPadding => "ike_protected_payload_crypto_invalid_padding",
+            Self::ExplicitIvExhausted => "ike_protected_payload_crypto_explicit_iv_exhausted",
         }
     }
 }
@@ -177,6 +230,8 @@ pub enum Ikev2ProtectedPayloadCryptoError {
         /// Pad length octet value.
         pad_len: usize,
     },
+    /// AES-GCM explicit IV counter is exhausted.
+    ExplicitIvExhausted,
 }
 
 /// Exact AAD context for sealing one IKEv2 protected payload body.
@@ -229,6 +284,7 @@ impl Ikev2ProtectedPayloadCryptoError {
                 Ikev2ProtectedPayloadCryptoErrorCode::AuthenticationFailed
             }
             Self::InvalidPadding { .. } => Ikev2ProtectedPayloadCryptoErrorCode::InvalidPadding,
+            Self::ExplicitIvExhausted => Ikev2ProtectedPayloadCryptoErrorCode::ExplicitIvExhausted,
         }
     }
 
@@ -285,6 +341,7 @@ impl fmt::Display for Ikev2ProtectedPayloadCryptoError {
                     "invalid IKEv2 protected payload padding: plaintext length {plaintext_len}, pad length {pad_len}"
                 )
             }
+            Self::ExplicitIvExhausted => f.write_str("IKEv2 AES-GCM explicit IV counter exhausted"),
         }
     }
 }
@@ -412,19 +469,40 @@ pub fn seal_ikev2_sa_init_protected_payload(
     padding_len: u8,
     explicit_iv: [u8; IKEV2_AES_GCM_EXPLICIT_IV_LEN],
 ) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError> {
-    if context.kind != ProtectedPayloadKind::Encrypted {
-        return Err(
-            Ikev2ProtectedPayloadCryptoError::UnsupportedProtectedPayloadKind {
-                kind: context.kind,
-            },
-        );
-    }
-    if context.message_prefix.len() < HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN {
-        return Err(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData);
-    }
-    validate_profile(profile)?;
+    let keys = select_seal_keys(profile, key_material, direction, context)?;
+    let plaintext = padded_ike_plaintext(cleartext_payloads, padding_len);
+    let sealed = encrypt_aes_gcm(
+        profile.encryption(),
+        keys,
+        context.message_prefix,
+        &plaintext,
+        explicit_iv,
+    )?;
+    Ok(Bytes::from(sealed))
+}
 
-    let keys = select_keys(profile, key_material, direction)?;
+/// Authenticate and encrypt one IKEv2 `SK` payload body using a monotonic IV counter.
+///
+/// This is the stateful counterpart to
+/// [`seal_ikev2_sa_init_protected_payload`]. Persist [`Ikev2AesGcmExplicitIvCounter::next_value`]
+/// with the sealed IKE SA state after each successful call, and restore the
+/// counter with that value before an HA adopter sends more protected messages.
+///
+/// # Errors
+///
+/// Returns [`Ikev2ProtectedPayloadCryptoError`] when the profile, keys, payload
+/// kind, AAD prefix, or IV counter state is invalid.
+pub fn seal_ikev2_sa_init_protected_payload_with_iv_counter(
+    profile: Ikev2SaInitCryptoProfile,
+    key_material: &Ikev2SaInitKeyMaterial,
+    direction: Ikev2ProtectedPayloadDirection,
+    context: ProtectedPayloadSealContext<'_>,
+    cleartext_payloads: &[u8],
+    padding_len: u8,
+    iv_counter: &mut Ikev2AesGcmExplicitIvCounter,
+) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError> {
+    let keys = select_seal_keys(profile, key_material, direction, context)?;
+    let explicit_iv = iv_counter.next_explicit_iv()?;
     let plaintext = padded_ike_plaintext(cleartext_payloads, padding_len);
     let sealed = encrypt_aes_gcm(
         profile.encryption(),
@@ -454,6 +532,26 @@ fn validate_profile(
     }
 
     Ok(())
+}
+
+fn select_seal_keys<'a>(
+    profile: Ikev2SaInitCryptoProfile,
+    key_material: &'a Ikev2SaInitKeyMaterial,
+    direction: Ikev2ProtectedPayloadDirection,
+    context: ProtectedPayloadSealContext<'_>,
+) -> Result<SelectedProtectedPayloadKeys<'a>, Ikev2ProtectedPayloadCryptoError> {
+    if context.kind != ProtectedPayloadKind::Encrypted {
+        return Err(
+            Ikev2ProtectedPayloadCryptoError::UnsupportedProtectedPayloadKind {
+                kind: context.kind,
+            },
+        );
+    }
+    if context.message_prefix.len() < HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN {
+        return Err(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData);
+    }
+    validate_profile(profile)?;
+    select_keys(profile, key_material, direction)
 }
 
 fn select_keys<'a>(

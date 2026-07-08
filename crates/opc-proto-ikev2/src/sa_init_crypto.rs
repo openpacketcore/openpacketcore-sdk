@@ -901,6 +901,58 @@ pub struct Ikev2SaInitKeyMaterial {
 }
 
 impl Ikev2SaInitKeyMaterial {
+    /// Rebuild established IKE SA key material from persisted `SK_*` bytes.
+    ///
+    /// This constructor is for restoring an already-established IKE SA after
+    /// the IKE_SA_INIT DH secret and nonces have been discarded. `SKEYSEED` is
+    /// intentionally not an input because post-establishment message
+    /// protection, AUTH verification, and Child SA KEYMAT derivation use the
+    /// `SK_*` values directly. The restored value therefore reports an empty
+    /// [`Self::skeyseed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2SaInitCryptoError`] if the profile is inconsistent or any
+    /// supplied `SK_*` slice does not match the negotiated profile lengths.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_established_keys(
+        profile: Ikev2SaInitCryptoProfile,
+        ppk_applied: bool,
+        sk_d: &[u8],
+        sk_ai: &[u8],
+        sk_ar: &[u8],
+        sk_ei: &[u8],
+        sk_er: &[u8],
+        sk_pi: &[u8],
+        sk_pr: &[u8],
+    ) -> Result<Self, Ikev2SaInitCryptoError> {
+        profile.validate_consistency()?;
+
+        let prf_len = profile.prf.output_len();
+        let integrity_key_len = profile.integrity_key_len;
+        let encryption_key_len = profile.encryption.key_material_len();
+
+        validate_exact_key_len("SK_d", sk_d, prf_len)?;
+        validate_exact_key_len("SK_ai", sk_ai, integrity_key_len)?;
+        validate_exact_key_len("SK_ar", sk_ar, integrity_key_len)?;
+        validate_exact_key_len("SK_ei", sk_ei, encryption_key_len)?;
+        validate_exact_key_len("SK_er", sk_er, encryption_key_len)?;
+        validate_exact_key_len("SK_pi", sk_pi, prf_len)?;
+        validate_exact_key_len("SK_pr", sk_pr, prf_len)?;
+
+        Ok(Self {
+            ppk_applied,
+            skeyseed: Zeroizing::new(Vec::new()),
+            sk_d: Zeroizing::new(sk_d.to_vec()),
+            sk_ai: Zeroizing::new(sk_ai.to_vec()),
+            sk_ar: Zeroizing::new(sk_ar.to_vec()),
+            sk_ei: Zeroizing::new(sk_ei.to_vec()),
+            sk_er: Zeroizing::new(sk_er.to_vec()),
+            sk_pi: Zeroizing::new(sk_pi.to_vec()),
+            sk_pr: Zeroizing::new(sk_pr.to_vec()),
+        })
+    }
+
     /// Whether RFC 8784 PPK post-processing was applied to SK_d/SK_pi/SK_pr.
     pub const fn ppk_applied(&self) -> bool {
         self.ppk_applied
@@ -2512,6 +2564,128 @@ mod tests {
         assert_eq!(standard.sk_ei(), with_ppk.sk_ei());
         assert_eq!(standard.sk_er(), with_ppk.sk_er());
         assert_eq!(standard.skeyseed(), with_ppk.skeyseed());
+    }
+
+    #[test]
+    fn established_key_material_rehydrates_derived_keys_without_skeyseed() {
+        let profile = base_profile(Ikev2EncryptionAlgorithm::AesGcm16_128);
+        let ni = [0x11u8; 16];
+        let nr = [0x22u8; 16];
+        let shared = [0x33u8; 32];
+        let material = must_ok(derive_ike_sa_init_key_material(
+            profile,
+            [0x44; 8],
+            [0x55; 8],
+            &ni,
+            &nr,
+            &shared,
+            Some(b"sealed-restore-ppk"),
+        ));
+
+        let restored = must_ok(Ikev2SaInitKeyMaterial::from_established_keys(
+            profile,
+            material.ppk_applied(),
+            material.sk_d(),
+            material.sk_ai(),
+            material.sk_ar(),
+            material.sk_ei(),
+            material.sk_er(),
+            material.sk_pi(),
+            material.sk_pr(),
+        ));
+
+        assert!(restored.ppk_applied());
+        assert!(restored.skeyseed().is_empty());
+        assert_eq!(restored.sk_d(), material.sk_d());
+        assert_eq!(restored.sk_ai(), material.sk_ai());
+        assert_eq!(restored.sk_ar(), material.sk_ar());
+        assert_eq!(restored.sk_ei(), material.sk_ei());
+        assert_eq!(restored.sk_er(), material.sk_er());
+        assert_eq!(restored.sk_pi(), material.sk_pi());
+        assert_eq!(restored.sk_pr(), material.sk_pr());
+
+        let child_profile = Ikev2ChildSaCryptoProfile::new_aead(
+            profile.prf(),
+            Ikev2EncryptionAlgorithm::AesGcm16_256,
+        );
+        let child_from_live = must_ok(derive_child_sa_key_material(
+            child_profile,
+            material.sk_d(),
+            &[0xa1; 16],
+            &[0xb2; 16],
+            None,
+        ));
+        let child_from_restored = must_ok(derive_child_sa_key_material(
+            child_profile,
+            restored.sk_d(),
+            &[0xa1; 16],
+            &[0xb2; 16],
+            None,
+        ));
+        assert_eq!(child_from_restored, child_from_live);
+    }
+
+    #[test]
+    fn established_key_material_rejects_profile_length_mismatch() {
+        let profile = base_profile(Ikev2EncryptionAlgorithm::AesGcm16_128);
+        let good_sk_d = [0x10; 32];
+        let bad_sk_d = [0x10; 31];
+        let good_sk_e = [0x20; 20];
+        let bad_sk_e = [0x20; 19];
+        let good_sk_p = [0x30; 32];
+
+        assert_eq!(
+            must_err(Ikev2SaInitKeyMaterial::from_established_keys(
+                profile,
+                false,
+                &bad_sk_d,
+                &[],
+                &[],
+                &good_sk_e,
+                &good_sk_e,
+                &good_sk_p,
+                &good_sk_p,
+            ))
+            .as_str(),
+            "ike_sa_init_crypto_invalid_key_length"
+        );
+
+        assert_eq!(
+            must_err(Ikev2SaInitKeyMaterial::from_established_keys(
+                profile,
+                false,
+                &good_sk_d,
+                &[],
+                &[],
+                &bad_sk_e,
+                &good_sk_e,
+                &good_sk_p,
+                &good_sk_p,
+            ))
+            .as_str(),
+            "ike_sa_init_crypto_invalid_key_length"
+        );
+
+        let cbc_profile = Ikev2SaInitCryptoProfile::new(
+            Ikev2PrfAlgorithm::HmacSha2_256,
+            Ikev2DhGroup::Ecp256,
+            Ikev2EncryptionAlgorithm::AesCbc256,
+        );
+        assert_eq!(
+            must_err(Ikev2SaInitKeyMaterial::from_established_keys(
+                cbc_profile,
+                false,
+                &good_sk_d,
+                &[],
+                &[],
+                &[0x20; 32],
+                &[0x20; 32],
+                &good_sk_p,
+                &good_sk_p,
+            ))
+            .as_str(),
+            "ike_sa_init_crypto_inconsistent_transform_set"
+        );
     }
 
     #[test]

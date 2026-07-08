@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-: "${GOTOOLCHAIN:=go1.26.4}"
+: "${GOTOOLCHAIN:=go1.26.5}"
 export GOTOOLCHAIN
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -15,7 +15,7 @@ mkdir -p "$DOWNSTREAM"
 cat > "$DOWNSTREAM/go.mod" <<'EOF'
 module example.com/downstream-operator
 
-go 1.26.4
+go 1.26.5
 EOF
 
 cat > "$DOWNSTREAM/imports_test.go" <<'EOF'
@@ -106,7 +106,7 @@ func TestStableImports(t *testing.T) {
 EOF
 
 cat > "$TMP/go.work" <<EOF
-go 1.26.4
+go 1.26.5
 
 use (
 	$ROOT

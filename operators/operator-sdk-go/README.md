@@ -20,7 +20,7 @@ directives for this SDK. The release path for this monorepo subdirectory is:
   resolves to this subdirectory; and
 - use local `go.work` workspaces only for unpublished SDK checkout testing.
 
-The minimum supported toolchain is Go 1.26.4. The helper dependency line is
+The minimum supported toolchain is Go 1.26.5. The helper dependency line is
 intentionally aligned with Kubernetes `v0.36.x` and controller-runtime
 `v0.24.x`; downstream operators on older Go versions should either upgrade or
 pin an older SDK module release that explicitly supports their toolchain.
