@@ -1103,82 +1103,6 @@ async fn spawn_config_watcher(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use opc_config_bus::InMemoryManagedDatastore;
-
-    #[test]
-    fn schema_digest_bytes_match_public_hex() {
-        assert_eq!(
-            SchemaDigest::from_bytes(AMF_SCHEMA_DIGEST_BYTES).to_hex(),
-            AMF_SCHEMA_DIGEST
-        );
-    }
-
-    #[tokio::test]
-    async fn init_spawn_failure_returns_runtime_error() {
-        let alarms = SharedAlarmManager::default();
-        let config_bus = ConfigBus::restore_or_new_with_alarm_manager_dev_only(
-            AmfConfig::default(),
-            Arc::new(InMemoryManagedDatastore::new()),
-            alarms.clone(),
-        )
-        .await
-        .expect("config bus initializes");
-
-        let mut health = HealthModel::new();
-        health.set_startup_in_progress("AMFInit");
-        health.set_config_applied(true);
-        let state = Arc::new(RwLock::new(AmfLiteState {
-            config: AmfConfig::default(),
-            version: ConfigVersion::INITIAL,
-            health,
-            active_nrf_registration: false,
-        }));
-        let state_notify = Arc::new(Notify::new());
-
-        let mut budget = opc_runtime::ResourceBudget::default();
-        budget.max_tasks = 1;
-        let mut profile = RuntimeProfile::production("amf-lite", uuid::Uuid::new_v4());
-        profile.budget = Some(budget);
-        profile.shutdown_grace = Duration::from_millis(50);
-        profile.drain_timeout = Duration::from_millis(200);
-
-        let result = Builder::new(profile)
-            .with_alarm_manager(alarms.clone())
-            .try_with_init(move |supervisor, shutdown| {
-                Box::pin(async move {
-                    initialize_amf_runtime(
-                        supervisor,
-                        shutdown,
-                        config_bus,
-                        state,
-                        state_notify,
-                        alarms,
-                    )
-                    .await
-                })
-            })
-            .build()
-            .await;
-
-        match result {
-            Err(RuntimeError::Supervisor(message)) => {
-                assert!(
-                    message.contains("max tasks limit reached"),
-                    "unexpected supervisor error: {message}"
-                );
-            }
-            Err(err) => panic!("expected supervisor budget error, got {err:?}"),
-            Ok(handle) => {
-                handle.shutdown().await;
-                panic!("expected startup to fail when spawn budget is exhausted");
-            }
-        }
-    }
-}
-
 async fn spawn_registration_worker(
     supervisor: &Supervisor,
     shutdown: &ShutdownToken,
@@ -1219,4 +1143,81 @@ async fn spawn_registration_worker(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opc_config_bus::InMemoryManagedDatastore;
+
+    #[test]
+    fn schema_digest_bytes_match_public_hex() {
+        assert_eq!(
+            SchemaDigest::from_bytes(AMF_SCHEMA_DIGEST_BYTES).to_hex(),
+            AMF_SCHEMA_DIGEST
+        );
+    }
+
+    #[tokio::test]
+    async fn init_spawn_failure_returns_runtime_error() {
+        let alarms = SharedAlarmManager::default();
+        let config_bus = ConfigBus::restore_or_new_with_alarm_manager_dev_only(
+            AmfConfig::default(),
+            Arc::new(InMemoryManagedDatastore::new()),
+            alarms.clone(),
+        )
+        .await
+        .expect("config bus initializes");
+
+        let mut health = HealthModel::new();
+        health.set_startup_in_progress("AMFInit");
+        health.set_config_applied(true);
+        let state = Arc::new(RwLock::new(AmfLiteState {
+            config: AmfConfig::default(),
+            version: ConfigVersion::INITIAL,
+            health,
+            active_nrf_registration: false,
+        }));
+        let state_notify = Arc::new(Notify::new());
+
+        let mut profile = RuntimeProfile::production("amf-lite", uuid::Uuid::new_v4());
+        profile.budget = Some(opc_runtime::ResourceBudget {
+            max_tasks: 1,
+            ..Default::default()
+        });
+        profile.shutdown_grace = Duration::from_millis(50);
+        profile.drain_timeout = Duration::from_millis(200);
+
+        let result = Builder::new(profile)
+            .with_alarm_manager(alarms.clone())
+            .try_with_init(move |supervisor, shutdown| {
+                Box::pin(async move {
+                    initialize_amf_runtime(
+                        supervisor,
+                        shutdown,
+                        config_bus,
+                        state,
+                        state_notify,
+                        alarms,
+                    )
+                    .await
+                })
+            })
+            .build()
+            .await;
+
+        match result {
+            Err(RuntimeError::Supervisor(message)) => {
+                assert!(
+                    message.contains("max tasks limit reached"),
+                    "unexpected supervisor error: {message}"
+                );
+            }
+            Err(err) => panic!("expected supervisor budget error, got {err:?}"),
+            Ok(handle) => {
+                handle.shutdown().await;
+                panic!("expected startup to fail when spawn budget is exhausted");
+            }
+        }
+    }
 }
