@@ -14,6 +14,7 @@ documentation = "https://docs.rs/opc-export"
 keywords = ["5g", "cnf", "backup", "telecom", "packet-core"]
 categories = ["network-programming"]
 [dependencies]
+opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 opc-data-governance = { path = "../opc-data-governance", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 serde = { workspace = true }

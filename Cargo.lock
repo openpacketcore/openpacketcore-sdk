@@ -2149,6 +2149,7 @@ dependencies = [
 name = "opc-export"
 version = "0.2.0"
 dependencies = [
+ "opc-crypto",
  "opc-data-governance",
  "opc-redaction",
  "serde",
