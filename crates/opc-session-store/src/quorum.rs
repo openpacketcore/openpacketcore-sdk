@@ -124,6 +124,17 @@ pub struct QuorumSessionStore {
     clock: Arc<dyn Clock>,
 }
 
+fn next_replication_sequence(committed_entries: &[ReplicationEntry]) -> Result<u64, StoreError> {
+    committed_entries
+        .last()
+        .map(|entry| {
+            entry.sequence.checked_add(1).ok_or_else(|| {
+                StoreError::BackendUnavailable("replication sequence exhausted".into())
+            })
+        })
+        .unwrap_or(Ok(1))
+}
+
 impl QuorumSessionStore {
     /// Build a coordinator over `replicas`, timestamping log entries with the
     /// real system clock.
@@ -270,10 +281,7 @@ impl QuorumSessionStore {
     async fn replicate_mutation(&self, op: ReplicationOp) -> Result<(), StoreError> {
         let (online_ids, committed_entries) = self.committed_and_repaired().await?;
         let quorum = self.quorum_size();
-        let next_seq = committed_entries
-            .last()
-            .map(|entry| entry.sequence + 1)
-            .unwrap_or(1);
+        let next_seq = next_replication_sequence(&committed_entries)?;
         let tx_id = uuid::Uuid::new_v4().to_string();
         let entry = ReplicationEntry {
             sequence: next_seq,
@@ -721,5 +729,26 @@ impl SessionLeaseManager for QuorumSessionStore {
                 .fetch_add(1, Ordering::Relaxed);
         }
         res.map_err(LeaseError::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_replication_sequence_reports_overflow() {
+        let entry = ReplicationEntry {
+            sequence: u64::MAX,
+            tx_id: "max-sequence".into(),
+            op: ReplicationOp::Batch { ops: Vec::new() },
+            timestamp: Timestamp::now_utc(),
+        };
+
+        let err = next_replication_sequence(&[entry]).expect_err("sequence overflow must error");
+        assert_eq!(
+            err,
+            StoreError::BackendUnavailable("replication sequence exhausted".into())
+        );
     }
 }
