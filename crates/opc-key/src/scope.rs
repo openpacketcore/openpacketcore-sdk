@@ -79,24 +79,28 @@ impl fmt::Display for KeyPurpose {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AeadAlgorithm {
     Aes256GcmSiv,
+    RemoteSeal,
 }
 
 impl AeadAlgorithm {
     pub const fn id(self) -> u16 {
         match self {
             Self::Aes256GcmSiv => 1,
+            Self::RemoteSeal => 2,
         }
     }
 
     pub const fn nonce_len(self) -> usize {
         match self {
             Self::Aes256GcmSiv => 12, // AES_256_GCM_SIV_NONCE_LEN
+            Self::RemoteSeal => 0,
         }
     }
 
     pub fn from_id(value: u16) -> Result<Self, KeyError> {
         match value {
             1 => Ok(Self::Aes256GcmSiv),
+            2 => Ok(Self::RemoteSeal),
             _ => Err(KeyError::invalid_algorithm(value)),
         }
     }
@@ -524,7 +528,7 @@ struct BoundEnvelopeAad<'a> {
     metadata: &'a EnvelopeMetadata,
 }
 
-pub(crate) fn serialize_bound_aad(aad: &EnvelopeAad, key_id: &KeyId) -> Result<Vec<u8>, KeyError> {
+pub fn serialize_bound_aad(aad: &EnvelopeAad, key_id: &KeyId) -> Result<Vec<u8>, KeyError> {
     aad.validate()?;
     serde_json::to_vec(&BoundEnvelopeAad {
         tenant: &aad.tenant,
@@ -534,6 +538,22 @@ pub(crate) fn serialize_bound_aad(aad: &EnvelopeAad, key_id: &KeyId) -> Result<V
         metadata: &aad.metadata,
     })
     .map_err(|_| KeyError::invalid_metadata("aad", "failed to serialize"))
+}
+
+/// Extract the key id carried in serialized bound AAD bytes.
+///
+/// This is useful for wrappers that receive an [`crate::EncryptedPayload`]
+/// from a remote sealing provider and need to store the selected remote key id
+/// in an envelope header without parsing the full private AAD representation.
+pub fn key_id_from_bound_aad(bound_aad: &[u8]) -> Result<KeyId, KeyError> {
+    #[derive(Deserialize)]
+    struct BoundEnvelopeAadKeyId {
+        key_id: KeyId,
+    }
+
+    let parsed: BoundEnvelopeAadKeyId = serde_json::from_slice(bound_aad)
+        .map_err(|_| KeyError::invalid_metadata("aad", "failed to deserialize"))?;
+    Ok(parsed.key_id)
 }
 
 pub(crate) fn validate_key_id(value: &str) -> Result<(), KeyError> {

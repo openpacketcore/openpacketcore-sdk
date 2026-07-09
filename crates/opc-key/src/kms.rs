@@ -5,8 +5,9 @@ use zeroize::Zeroizing;
 
 use crate::{
     errors::KeyError,
-    provider::{KeyHandle, KeyProvider},
-    scope::{KeyId, KeyPurpose},
+    provider::{EncryptedPayload, KeyHandle, KeyProvider},
+    remote::RemoteSealProvider,
+    scope::{serialize_bound_aad, EnvelopeAad, KeyId, KeyPurpose},
 };
 
 enum KmsStream {
@@ -46,6 +47,12 @@ struct KmsRequest {
     purpose: Option<String>,
     tenant: Option<String>,
     key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aad_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plaintext_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ciphertext_and_tag_hex: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -56,6 +63,8 @@ struct KmsResponse {
     purpose: Option<String>,
     tenant: Option<String>,
     error_message: Option<String>,
+    ciphertext_and_tag_hex: Option<String>,
+    plaintext_hex: Option<String>,
 }
 
 fn decode_hex_32(hex: &str) -> Result<Zeroizing<[u8; 32]>, KeyError> {
@@ -80,11 +89,42 @@ fn decode_hex_nibble(byte: u8) -> Result<u8, KeyError> {
     }
 }
 
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn decode_hex_vec(hex: &str) -> Result<Vec<u8>, KeyError> {
+    let chunks = hex.as_bytes().chunks_exact(2);
+    if !chunks.remainder().is_empty() || !hex.is_ascii() {
+        return Err(KeyError::Unavailable);
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for chunk in chunks {
+        let high = decode_hex_nibble(chunk[0])?;
+        let low = decode_hex_nibble(chunk[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
 pub struct KmsKeyProvider {
     endpoint: String,
     connector: Option<tokio_rustls::TlsConnector>,
     server_name: String,
     timeout: std::time::Duration,
+}
+
+pub struct KmsRemoteSealProvider {
+    endpoint: String,
+    connector: Option<tokio_rustls::TlsConnector>,
+    server_name: String,
+    timeout: std::time::Duration,
+    key_id: KeyId,
 }
 
 impl KmsKeyProvider {
@@ -200,6 +240,9 @@ impl KeyProvider for KmsKeyProvider {
             purpose: Some(purpose.as_str().to_string()),
             tenant: Some(tenant.as_str().to_string()),
             key_id: None,
+            aad_hex: None,
+            plaintext_hex: None,
+            ciphertext_and_tag_hex: None,
         };
         let resp = self.call_kms(req).await?;
         let key_id_str = resp.key_id.ok_or(KeyError::NotFound)?;
@@ -218,6 +261,9 @@ impl KeyProvider for KmsKeyProvider {
             purpose: None,
             tenant: None,
             key_id: Some(key_id.as_str().to_string()),
+            aad_hex: None,
+            plaintext_hex: None,
+            ciphertext_and_tag_hex: None,
         };
         let resp = self.call_kms(req).await?;
         let key_bytes_hex = Zeroizing::new(resp.key_bytes_hex.ok_or(KeyError::NotFound)?);
@@ -247,10 +293,174 @@ impl KeyProvider for KmsKeyProvider {
             purpose: Some(purpose.as_str().to_string()),
             tenant: Some(tenant.as_str().to_string()),
             key_id: None,
+            aad_hex: None,
+            plaintext_hex: None,
+            ciphertext_and_tag_hex: None,
         };
         let resp = self.call_kms(req).await?;
         let key_id_str = resp.key_id.ok_or(KeyError::NotFound)?;
         KeyId::new(key_id_str)
+    }
+}
+
+impl KmsRemoteSealProvider {
+    /// Default TLS server name used when `endpoint` is a TCP address.
+    pub const DEFAULT_SERVER_NAME: &'static str = KmsKeyProvider::DEFAULT_SERVER_NAME;
+
+    /// Create a remote-seal KMS client for one remote key id.
+    ///
+    /// The external service is expected to perform AEAD/KMS Encrypt and
+    /// Decrypt server-side. The SDK sends the same serialized bound AAD bytes
+    /// used by the local envelope path and never asks the KMS to hand key
+    /// material back to the application.
+    pub fn new(
+        endpoint: String,
+        connector: Option<tokio_rustls::TlsConnector>,
+        timeout: std::time::Duration,
+        key_id: KeyId,
+    ) -> Self {
+        Self {
+            endpoint,
+            connector,
+            server_name: Self::DEFAULT_SERVER_NAME.to_string(),
+            timeout,
+            key_id,
+        }
+    }
+
+    pub fn with_server_name(mut self, server_name: impl Into<String>) -> Self {
+        self.server_name = server_name.into();
+        self
+    }
+
+    pub fn key_id(&self) -> &KeyId {
+        &self.key_id
+    }
+
+    async fn call_kms(&self, req: KmsRequest) -> Result<KmsResponse, KeyError> {
+        match tokio::time::timeout(self.timeout, self.call_kms_inner(req)).await {
+            Ok(result) => result,
+            Err(_) => Err(KeyError::Unavailable),
+        }
+    }
+
+    async fn call_kms_inner(&self, req: KmsRequest) -> Result<KmsResponse, KeyError> {
+        let connect_fut = async {
+            if self.endpoint.starts_with('/') || self.endpoint.starts_with("unix://") {
+                let path = self.endpoint.trim_start_matches("unix://");
+                let stream = tokio::net::UnixStream::connect(path)
+                    .await
+                    .map_err(|_| KeyError::Unavailable)?;
+                Ok::<KmsStream, KeyError>(KmsStream::Unix(stream))
+            } else {
+                let addr = self.endpoint.trim_start_matches("tcp://");
+                let connector = self.connector.as_ref().ok_or(KeyError::Unavailable)?;
+                let stream = tokio::net::TcpStream::connect(addr)
+                    .await
+                    .map_err(|_| KeyError::Unavailable)?;
+                let domain = rustls_pki_types::ServerName::try_from(self.server_name.clone())
+                    .map_err(|_| KeyError::Unavailable)?;
+                let tls_stream = connector
+                    .connect(domain, stream)
+                    .await
+                    .map_err(|_| KeyError::Unavailable)?;
+                Ok(KmsStream::Tls(Box::new(tls_stream)))
+            }
+        };
+
+        let mut stream = connect_fut.await?;
+
+        let req_bytes = serde_json::to_vec(&req).map_err(|_| KeyError::Unavailable)?;
+        let req_len = req_bytes.len() as u32;
+
+        stream
+            .write_all(&req_len.to_be_bytes())
+            .await
+            .map_err(|_| KeyError::Unavailable)?;
+        stream
+            .write_all(&req_bytes)
+            .await
+            .map_err(|_| KeyError::Unavailable)?;
+        stream.flush().await.map_err(|_| KeyError::Unavailable)?;
+
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .map_err(|_| KeyError::Unavailable)?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > KmsKeyProvider::MAX_RESPONSE_BYTES {
+            return Err(KeyError::Unavailable);
+        }
+
+        let mut resp_buf = Zeroizing::new(vec![0u8; len]);
+        stream
+            .read_exact(&mut resp_buf)
+            .await
+            .map_err(|_| KeyError::Unavailable)?;
+        let resp: KmsResponse =
+            serde_json::from_slice(&resp_buf).map_err(|_| KeyError::Unavailable)?;
+
+        if resp.status == "success" {
+            Ok(resp)
+        } else {
+            let msg = resp
+                .error_message
+                .unwrap_or_else(|| "KMS failed".to_string());
+            if msg.contains("not found") {
+                Err(KeyError::NotFound)
+            } else {
+                Err(KeyError::Unavailable)
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl RemoteSealProvider for KmsRemoteSealProvider {
+    async fn seal(
+        &self,
+        aad: &EnvelopeAad,
+        plaintext: &[u8],
+    ) -> Result<EncryptedPayload, KeyError> {
+        let bound_aad = serialize_bound_aad(aad, &self.key_id)?;
+        let req = KmsRequest {
+            request_type: "encrypt".to_string(),
+            purpose: Some(aad.purpose().as_str().to_string()),
+            tenant: Some(aad.tenant().as_str().to_string()),
+            key_id: Some(self.key_id.as_str().to_string()),
+            aad_hex: Some(encode_hex(&bound_aad)),
+            plaintext_hex: Some(encode_hex(plaintext)),
+            ciphertext_and_tag_hex: None,
+        };
+        let resp = self.call_kms(req).await?;
+        let ciphertext_hex = resp.ciphertext_and_tag_hex.ok_or(KeyError::Unavailable)?;
+        let ciphertext_and_tag = decode_hex_vec(&ciphertext_hex)?;
+
+        Ok(EncryptedPayload {
+            aad: bound_aad,
+            ciphertext_and_tag,
+        })
+    }
+
+    async fn unseal(
+        &self,
+        aad: &EnvelopeAad,
+        ciphertext_and_tag: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+        let bound_aad = serialize_bound_aad(aad, &self.key_id)?;
+        let req = KmsRequest {
+            request_type: "decrypt".to_string(),
+            purpose: Some(aad.purpose().as_str().to_string()),
+            tenant: Some(aad.tenant().as_str().to_string()),
+            key_id: Some(self.key_id.as_str().to_string()),
+            aad_hex: Some(encode_hex(&bound_aad)),
+            plaintext_hex: None,
+            ciphertext_and_tag_hex: Some(encode_hex(ciphertext_and_tag)),
+        };
+        let resp = self.call_kms(req).await?;
+        let plaintext_hex = Zeroizing::new(resp.plaintext_hex.ok_or(KeyError::Unavailable)?);
+        Ok(Zeroizing::new(decode_hex_vec(&plaintext_hex)?))
     }
 }
 
@@ -285,6 +495,12 @@ mod tests {
     }
 
     async fn mock_kms(response: MockResponse) -> MockKms {
+        mock_kms_recording(response).await.0
+    }
+
+    async fn mock_kms_recording(
+        response: MockResponse,
+    ) -> (MockKms, tokio::sync::oneshot::Receiver<KmsRequest>) {
         let unique = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -297,6 +513,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let listener = tokio::net::UnixListener::bind(&path).expect("bind mock KMS socket");
         let task_path = path.clone();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept mock KMS client");
             let mut len_buf = [0u8; 4];
@@ -310,8 +527,9 @@ mod tests {
                 .read_exact(&mut request)
                 .await
                 .expect("read request body");
-            let _request: KmsRequest =
+            let request: KmsRequest =
                 serde_json::from_slice(&request).expect("request JSON should decode");
+            let _ = request_tx.send(request);
 
             match response {
                 MockResponse::Bytes(body) => {
@@ -337,11 +555,12 @@ mod tests {
             let _ = std::fs::remove_file(task_path);
         });
 
-        MockKms {
+        let mock = MockKms {
             endpoint: path.to_string_lossy().into_owned(),
             path,
             handle,
-        }
+        };
+        (mock, request_rx)
     }
 
     fn tenant() -> TenantId {
@@ -367,6 +586,22 @@ mod tests {
         })
         .to_string()
         .into_bytes()
+    }
+
+    fn session_aad() -> EnvelopeAad {
+        EnvelopeAad::session(
+            tenant(),
+            1,
+            crate::SessionAad::new(
+                "smf",
+                "session-digest",
+                "ipsec-sa",
+                2,
+                9,
+                "regional-cache-a",
+            )
+            .expect("session aad"),
+        )
     }
 
     #[test]
@@ -499,5 +734,80 @@ mod tests {
             .expect_err("KMS timeout must fail");
 
         assert_eq!(err, KeyError::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn kms_remote_seal_provider_maps_seal_to_encrypt_request() {
+        let key_id = KeyId::new("session-remote-2026-01").expect("key id");
+        let ciphertext = b"kms-ciphertext-and-auth-tag";
+        let (mock, request_rx) = mock_kms_recording(MockResponse::Bytes(
+            serde_json::json!({
+                "status": "success",
+                "ciphertext_and_tag_hex": encode_hex(ciphertext),
+            })
+            .to_string()
+            .into_bytes(),
+        ))
+        .await;
+        let provider = KmsRemoteSealProvider::new(
+            mock.endpoint.clone(),
+            None,
+            Duration::from_secs(1),
+            key_id.clone(),
+        );
+        let aad = session_aad();
+
+        let sealed = provider
+            .seal(&aad, b"plain-session")
+            .await
+            .expect("kms seal");
+
+        assert_eq!(sealed.ciphertext_and_tag, ciphertext);
+        let request = request_rx.await.expect("request captured");
+        assert_eq!(request.request_type, "encrypt");
+        assert_eq!(request.key_id.as_deref(), Some(key_id.as_str()));
+        assert_eq!(
+            request.aad_hex.as_deref(),
+            Some(encode_hex(&sealed.aad).as_str())
+        );
+        assert_eq!(
+            request.plaintext_hex.as_deref(),
+            Some(encode_hex(b"plain-session").as_str())
+        );
+        assert!(request.ciphertext_and_tag_hex.is_none());
+    }
+
+    #[tokio::test]
+    async fn kms_remote_seal_provider_maps_unseal_to_decrypt_request() {
+        let key_id = KeyId::new("session-remote-2026-01").expect("key id");
+        let ciphertext = b"kms-ciphertext-and-auth-tag";
+        let (mock, request_rx) = mock_kms_recording(MockResponse::Bytes(
+            serde_json::json!({
+                "status": "success",
+                "plaintext_hex": encode_hex(b"plain-session"),
+            })
+            .to_string()
+            .into_bytes(),
+        ))
+        .await;
+        let provider = KmsRemoteSealProvider::new(
+            mock.endpoint.clone(),
+            None,
+            Duration::from_secs(1),
+            key_id.clone(),
+        );
+        let aad = session_aad();
+
+        let plaintext = provider.unseal(&aad, ciphertext).await.expect("kms unseal");
+
+        assert_eq!(plaintext.as_slice(), b"plain-session");
+        let request = request_rx.await.expect("request captured");
+        assert_eq!(request.request_type, "decrypt");
+        assert_eq!(request.key_id.as_deref(), Some(key_id.as_str()));
+        assert_eq!(
+            request.ciphertext_and_tag_hex.as_deref(),
+            Some(encode_hex(ciphertext).as_str())
+        );
+        assert!(request.plaintext_hex.is_none());
     }
 }

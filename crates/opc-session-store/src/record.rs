@@ -10,7 +10,10 @@
 use opc_crypto::{
     decrypt_decoded_envelope_with_handle, encrypt_envelope_with_handle, CryptoEnvelopeV1,
 };
-use opc_key::{EnvelopeAad, KeyHandle, KeyProvider, KeyPurpose, SessionAad, Zeroizing};
+use opc_key::{
+    key_id_from_bound_aad, serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyHandle, KeyProvider,
+    KeyPurpose, RemoteSealProvider, SessionAad, Zeroizing, AEAD_TAG_LEN,
+};
 use opc_types::Timestamp;
 
 use crate::{
@@ -198,6 +201,55 @@ impl EncryptedSessionPayload {
         ))
     }
 
+    /// Seal `record`'s payload through a remote KMS/HSM provider.
+    ///
+    /// The record is still stored as an RFC 003 envelope and the same tenant,
+    /// NF, session digest, state type, generation, fence, and backend
+    /// namespace are bound into the serialized AAD. Unlike
+    /// [`Self::encrypt`], AEAD execution is delegated to `provider`; callers
+    /// must keep a store on one seal mode because local and remote ciphertexts
+    /// use different key custody and are not expected to decrypt across modes.
+    pub async fn remote_seal<S: RemoteSealProvider + ?Sized>(
+        provider: &S,
+        record: &StoredSessionRecord,
+        backend_namespace: &str,
+    ) -> Result<Self, StoreError> {
+        let aad = build_remote_session_envelope_aad(record, backend_namespace)?;
+        let sealed = provider
+            .seal(&aad, record.payload.as_bytes())
+            .await
+            .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))?;
+        if sealed.ciphertext_and_tag.len() < AEAD_TAG_LEN {
+            return Err(StoreError::Crypto(
+                SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into(),
+            ));
+        }
+        let key_id = key_id_from_bound_aad(&sealed.aad)
+            .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))?;
+        let expected_aad = serialize_bound_aad(&aad, &key_id)
+            .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))?;
+        if expected_aad != sealed.aad {
+            return Err(StoreError::Crypto(
+                SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into(),
+            ));
+        }
+
+        let envelope = CryptoEnvelopeV1 {
+            algorithm: AeadAlgorithm::RemoteSeal,
+            key_id,
+            nonce: Vec::new(),
+            aad: sealed.aad,
+            ciphertext_and_tag: sealed.ciphertext_and_tag,
+        }
+        .encode()
+        .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))?;
+
+        Ok(Self::from_vec_with_encoding(
+            envelope,
+            SessionPayloadEncoding::EnvelopeV1,
+        ))
+    }
+
     /// Recover the plaintext payload according to the declared encoding.
     ///
     /// `Plaintext` and `LegacyPlaintext` return the bytes unchanged;
@@ -251,6 +303,61 @@ impl EncryptedSessionPayload {
             &handle,
         )?;
         decrypt_decoded_envelope_with_handle(&handle, &aad, &envelope)
+            .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE.into()))
+    }
+
+    /// Recover plaintext from a remotely sealed payload.
+    ///
+    /// Remote seal adds one KMS/HSM round-trip per seal operation (normally a
+    /// checkpoint off the hot path) and one round-trip per unseal on failover
+    /// restore, so restore latency and availability depend on the remote KMS.
+    pub async fn remote_unseal<S: RemoteSealProvider + ?Sized>(
+        &self,
+        provider: &S,
+        key: &SessionKey,
+        state_type: &StateType,
+        generation: Generation,
+        fence: FenceToken,
+        backend_namespace: &str,
+    ) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        let envelope = match self.encoding {
+            SessionPayloadEncoding::Plaintext => return Ok(self.bytes.clone()),
+            SessionPayloadEncoding::LegacyPlaintext => return Ok(self.bytes.clone()),
+            SessionPayloadEncoding::Unclassified => match CryptoEnvelopeV1::decode(&self.bytes) {
+                Ok(envelope) => envelope,
+                Err(_) => return Ok(self.bytes.clone()),
+            },
+            SessionPayloadEncoding::EnvelopeV1 => {
+                if self.bytes.is_empty() {
+                    return Err(StoreError::Crypto(
+                        SESSION_ENVELOPE_MISSING_CIPHERTEXT_MESSAGE.into(),
+                    ));
+                }
+
+                CryptoEnvelopeV1::decode(&self.bytes).map_err(|_| {
+                    StoreError::Crypto(SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE.into())
+                })?
+            }
+        };
+
+        if envelope.algorithm != AeadAlgorithm::RemoteSeal {
+            return Err(StoreError::Crypto(
+                SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE.into(),
+            ));
+        }
+
+        let aad = build_remote_session_aad(key, state_type, generation, fence, backend_namespace)?;
+        let expected_aad = serialize_bound_aad(&aad, &envelope.key_id)
+            .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE.into()))?;
+        if expected_aad != envelope.aad {
+            return Err(StoreError::Crypto(
+                SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE.into(),
+            ));
+        }
+
+        provider
+            .unseal(&aad, &envelope.ciphertext_and_tag)
+            .await
             .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE.into()))
     }
 }
@@ -329,6 +436,37 @@ pub(crate) fn build_session_envelope_aad(
     )
 }
 
+pub(crate) fn build_remote_session_envelope_aad(
+    record: &StoredSessionRecord,
+    backend_namespace: &str,
+) -> Result<EnvelopeAad, StoreError> {
+    build_remote_session_aad(
+        &record.key,
+        &record.state_type,
+        record.generation,
+        record.fence,
+        backend_namespace,
+    )
+}
+
+fn build_remote_session_aad(
+    key: &SessionKey,
+    state_type: &StateType,
+    generation: Generation,
+    fence: FenceToken,
+    backend_namespace: &str,
+) -> Result<EnvelopeAad, StoreError> {
+    let session_key_digest = key.digest();
+    build_session_aad_with_digest(
+        key,
+        state_type,
+        generation,
+        fence,
+        backend_namespace,
+        &session_key_digest,
+    )
+}
+
 fn build_session_aad(
     key: &SessionKey,
     state_type: &StateType,
@@ -339,9 +477,27 @@ fn build_session_aad(
 ) -> Result<EnvelopeAad, StoreError> {
     let session_key_digest =
         key_handle.keyed_digest(SESSION_KEY_AAD_DIGEST_DOMAIN, &key.canonical_digest_input());
+    build_session_aad_with_digest(
+        key,
+        state_type,
+        generation,
+        fence,
+        backend_namespace,
+        &session_key_digest,
+    )
+}
+
+fn build_session_aad_with_digest(
+    key: &SessionKey,
+    state_type: &StateType,
+    generation: Generation,
+    fence: FenceToken,
+    backend_namespace: &str,
+    session_key_digest: &[u8; 32],
+) -> Result<EnvelopeAad, StoreError> {
     let metadata = SessionAad::new(
         key.nf_kind.as_str(),
-        encode_lower(&session_key_digest),
+        encode_lower(session_key_digest),
         state_type.as_str(),
         generation.get(),
         fence.get(),
