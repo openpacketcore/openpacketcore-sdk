@@ -1,0 +1,19 @@
+[package]
+name = "opc-ipsec-lb-ebpf-common"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared eBPF map ABI for OpenPacketCore IPsec SWu load balancing"
+readme = "README.md"
+documentation = "https://docs.rs/opc-ipsec-lb-ebpf-common"
+keywords = ["5g", "ipsec", "ikev2", "ebpf", "load-balancing"]
+categories = ["network-programming", "no-std"]
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

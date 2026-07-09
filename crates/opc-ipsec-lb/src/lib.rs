@@ -18,6 +18,7 @@ pub mod ports;
 pub mod selector;
 pub mod spi;
 pub mod unsupported;
+pub mod xdp;
 
 pub use classifier::{
     classify_swu_packet, EspFragmentPosture, IpFragment, SwuClassification, SwuClassifierConfig,
@@ -45,6 +46,7 @@ pub use spi::{
 pub use unsupported::{
     UnsupportedOwnershipSource, UnsupportedSteeringBackend, UnsupportedVipAdvertiser,
 };
+pub use xdp::{HostXdpSteeringBackend, HostXdpSteeringBackendConfig};
 
 #[cfg(test)]
 mod integration_tests {

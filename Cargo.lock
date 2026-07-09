@@ -2242,11 +2242,16 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "hmac 0.12.1",
+ "opc-ipsec-lb-ebpf-common",
  "rand 0.10.1",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
 ]
+
+[[package]]
+name = "opc-ipsec-lb-ebpf-common"
+version = "0.2.0"
 
 [[package]]
 name = "opc-ipsec-xfrm"

@@ -1,5 +1,7 @@
 //! Redaction-safe error types for IPsec load-balancing primitives.
 
+use std::io;
+
 use thiserror::Error;
 
 /// Error type for IPsec load-balancing primitives and ports.
@@ -45,6 +47,24 @@ pub enum IpsecLbError {
         /// Stable rejection code.
         code: &'static str,
     },
+    /// Kernel or socket I/O failed.
+    #[error("IPsec load-balancing {operation} failed{}", .raw_os_error.map(|code| format!(" (os error {code})")).unwrap_or_default())]
+    Io {
+        /// Stable operation label.
+        operation: &'static str,
+        /// Captured I/O error kind.
+        kind: io::ErrorKind,
+        /// Raw OS error code, when present.
+        raw_os_error: Option<i32>,
+    },
+    /// Configuration failed validation.
+    #[error("invalid IPsec load-balancing config field '{field}': {reason}")]
+    InvalidConfig {
+        /// Stable field label.
+        field: &'static str,
+        /// Static payload-free reason.
+        reason: &'static str,
+    },
     /// Unsupported backend or platform.
     #[error("IPsec load-balancing operation is unsupported")]
     Unsupported,
@@ -72,6 +92,31 @@ impl IpsecLbError {
         Self::PacketRejected { code }
     }
 
+    /// Build a redaction-safe invalid-config error.
+    #[must_use]
+    pub const fn invalid_config(field: &'static str, reason: &'static str) -> Self {
+        Self::InvalidConfig { field, reason }
+    }
+
+    /// Build a redaction-safe I/O error.
+    #[must_use]
+    pub fn io(operation: &'static str, source: io::Error) -> Self {
+        Self::Io {
+            operation,
+            kind: source.kind(),
+            raw_os_error: source.raw_os_error(),
+        }
+    }
+
+    /// Return the raw OS error code when this is an I/O error.
+    #[must_use]
+    pub const fn raw_os_error(&self) -> Option<i32> {
+        match self {
+            Self::Io { raw_os_error, .. } => *raw_os_error,
+            _ => None,
+        }
+    }
+
     /// Build an unsafe-resume error.
     #[must_use]
     pub const fn unsafe_resume(reason: &'static str) -> Self {
@@ -90,5 +135,20 @@ mod tests {
         let debug = format!("{err:?}");
         assert!(!debug.contains("subscriber"));
         assert!(!debug.contains("key"));
+    }
+
+    #[test]
+    fn io_error_debug_discards_sensitive_source_message() {
+        let err = IpsecLbError::io(
+            "xdp_map_update",
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "subscriber=001010123456789 spi=0x11223344",
+            ),
+        );
+        let debug = format!("{err:?}");
+        assert!(debug.contains("PermissionDenied"));
+        assert!(!debug.contains("subscriber"));
+        assert!(!debug.contains("11223344"));
     }
 }

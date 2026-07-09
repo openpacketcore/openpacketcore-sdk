@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "crates/opc-ipsec-lb/**"
+      - "crates/opc-ipsec-lb-ebpf-common/**"
       - ".github/workflows/ipsec-lb.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -12,6 +13,7 @@ on:
       - main
     paths:
       - "crates/opc-ipsec-lb/**"
+      - "crates/opc-ipsec-lb-ebpf-common/**"
       - ".github/workflows/ipsec-lb.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -48,10 +50,10 @@ jobs:
         run: git diff --check
 
       - name: Run clippy
-        run: cargo clippy --locked -p opc-ipsec-lb --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common --all-targets --all-features -- -D warnings
 
       - name: Run conformance tests
-        run: cargo test --locked -p opc-ipsec-lb --all-features --quiet -- --test-threads=4
+        run: cargo test --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common --all-features --quiet -- --test-threads=4
 
   docs:
     name: Rust docs
@@ -67,4 +69,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build crate docs
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked -p opc-ipsec-lb --no-deps --all-features
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common --no-deps --all-features
