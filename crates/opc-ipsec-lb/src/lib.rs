@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bgp;
 pub mod classifier;
 pub mod cookie;
 pub mod error;
@@ -21,6 +22,7 @@ pub mod spi;
 pub mod unsupported;
 pub mod xdp;
 
+pub use bgp::{BgpRouteVipAdvertiser, BgpRouteVipAdvertiserConfig};
 pub use classifier::{
     classify_swu_packet, EspFragmentPosture, IpFragment, SwuClassification, SwuClassifierConfig,
     SwuPacket,

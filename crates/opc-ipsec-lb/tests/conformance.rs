@@ -1,11 +1,17 @@
+use std::net::{IpAddr, Ipv4Addr};
+
+use opc_route_steering::{IpPrefix, MockOperation, MockRouteSteeringBackend, RouteRequest};
+
 use opc_ipsec_lb::{
-    classify_swu_packet, measure_disruption, AntiReplayResume, ClusterNode, CookieKey, CookieSlot,
-    EspFragmentPosture, FixedEntropy, ForwardingProof, IkeCookieGate, IpAddress, IpFragment,
-    IpsecLbError, IvResumeDecision, MockOwnershipFencer, MockRePinAuditSink, MockSteeringBackend,
+    classify_swu_packet, measure_disruption, AntiReplayResume, BgpRouteVipAdvertiser,
+    BgpRouteVipAdvertiserConfig, ClusterNode, CookieKey, CookieSlot, EspFragmentPosture,
+    FixedEntropy, ForwardingProof, IkeCookieGate, IpAddress, IpFragment, IpsecLbError,
+    IvResumeDecision, MockOwnershipFencer, MockRePinAuditSink, MockSteeringBackend,
     MockSteeringOperation, RePinAuditEventKind, RePinCoordinator, RePinRequest, RekeyRequest,
     RendezvousSelector, ResumeKeySource, SaId, SameSpiResume, SelectionKey, SendIvCounter, ShardId,
     ShardSet, SpiAllocationRequest, SpiAllocator, SpiKind, SteerKey, SteeringRule,
     SwuClassification, SwuClassifierConfig, SwuPacket, TaggedSpiAllocator, TaggedSpiLayout,
+    VipAdvertisement, VipAdvertiser,
 };
 
 const IKE_HEADER_LEN: usize = 28;
@@ -214,6 +220,38 @@ fn failover_guards_reject_iv_and_replay_rollback() {
     }
     .validate()
     .is_err());
+}
+
+#[tokio::test]
+async fn bgp_vip_advertiser_programs_host_route_for_export() {
+    let route_backend = MockRouteSteeringBackend::new();
+    let advertiser = BgpRouteVipAdvertiser::with_backend(
+        route_backend.clone(),
+        BgpRouteVipAdvertiserConfig {
+            route_table: 100,
+            oif_ifindex: 42,
+            priority: Some(10),
+        },
+    )
+    .unwrap();
+
+    advertiser
+        .advertise(VipAdvertisement {
+            vip: IpAddress::V4([203, 0, 113, 10]),
+            node: ClusterNode::new("worker-a"),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        route_backend.operations(),
+        vec![MockOperation::InstallRoute(RouteRequest {
+            destination: IpPrefix::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 32),
+            oif_ifindex: 42,
+            table: 100,
+            priority: Some(10),
+        })]
+    );
 }
 
 #[tokio::test]

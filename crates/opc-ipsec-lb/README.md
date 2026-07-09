@@ -11,15 +11,17 @@ steer layer:
 - stateless IKE cookie helper for edge DoS posture;
 - failover safety guards for IV-counter and replay-window restoration;
 - audited same-SPI re-pin coordination with monotonic ownership fencing;
+- BGP route-export VIP advertisement through the safe route-steering backend;
 - reusable ports for steering backends, VIP advertisement, ownership reads,
   ownership fencing, and re-pin audit.
 
-It intentionally does not decrypt ESP, derive IPsec keys, advertise BGP/VRRP,
-or claim packet forwarding. Host-XDP steering is implemented behind the backend
-port; SR-IOV, NIC offload, VIP adapters, and live failover evidence remain
-product/lab tiers built behind the ports. A re-pin install never sets
-`forwarding_proven`; packet-flow proof must be injected by lab/product dataplane
-evidence.
+It intentionally does not decrypt ESP, derive IPsec keys, open BGP sessions,
+shell out to routing daemons, implement VRRP, or claim packet forwarding.
+Host-XDP steering and BGP route-export VIP advertisement are implemented behind
+ports; SR-IOV, NIC offload, direct BGP speaker integrations, VRRP adapters, and
+live failover evidence remain product/lab tiers built behind the ports. A
+re-pin install never sets `forwarding_proven`; packet-flow proof must be
+injected by lab/product dataplane evidence.
 
 ## Entropy note
 

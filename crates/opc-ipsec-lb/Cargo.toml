@@ -16,6 +16,7 @@ publish = false
 [dependencies]
 opc-ipsec-lb-ebpf-common = { path = "../opc-ipsec-lb-ebpf-common", version = "0.2.0" }
 opc-linux-gtpu-sys = { path = "../opc-linux-gtpu-sys", version = "0.2.0" }
+opc-route-steering = { path = "../opc-route-steering", version = "0.2.0" }
 async-trait = { workspace = true }
 hmac = { workspace = true }
 rand = { workspace = true }
