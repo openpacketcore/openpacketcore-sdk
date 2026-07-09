@@ -248,17 +248,17 @@ async fn test_three_node_quorum_kill_and_restart() {
     // 2. Create 3 remote clients
     let remote1 = Arc::new(RemoteSessionBackend::new(
         addr1,
-        Some(mtls.client_config.clone()),
+        mtls.client_config.clone(),
         None,
     ));
     let remote2 = Arc::new(RemoteSessionBackend::new(
         addr2,
-        Some(mtls.client_config.clone()),
+        mtls.client_config.clone(),
         None,
     ));
     let remote3 = Arc::new(RemoteSessionBackend::new(
         addr3,
-        Some(mtls.client_config.clone()),
+        mtls.client_config.clone(),
         None,
     ));
 
@@ -325,7 +325,7 @@ async fn test_three_node_quorum_kill_and_restart() {
     // Update the remote to point to the new address
     let remote1_new = Arc::new(RemoteSessionBackend::new(
         addr1_new,
-        Some(mtls.client_config.clone()),
+        mtls.client_config.clone(),
         None,
     ));
     let replica1_new = FencedSessionReplica::new(1, remote1_new.clone());
@@ -353,7 +353,7 @@ async fn test_persistent_connection_reconnect_after_restart() {
     let (addr, backend, handle) = start_server(&mtls).await;
     let remote = Arc::new(RemoteSessionBackend::new(
         addr,
-        Some(mtls.client_config.clone()),
+        mtls.client_config.clone(),
         None,
     ));
 
@@ -382,7 +382,7 @@ async fn capabilities_uses_cached_success_after_disconnect() {
     let (addr, _backend, handle) = start_server(&mtls).await;
     let remote = RemoteSessionBackend::new(
         addr,
-        Some(mtls.client_config.clone()),
+        mtls.client_config.clone(),
         Some(Duration::from_millis(200)),
     );
 
@@ -410,7 +410,7 @@ async fn test_in_flight_request_surfaces_error_on_disconnect() {
     // Short deadline so reconnect attempts expire before any restart.
     let remote = Arc::new(RemoteSessionBackend::new(
         addr,
-        Some(mtls.client_config.clone()),
+        mtls.client_config.clone(),
         Some(Duration::from_millis(300)),
     ));
 
@@ -437,6 +437,7 @@ async fn test_in_flight_request_surfaces_error_on_disconnect() {
 }
 
 #[tokio::test]
+#[cfg(feature = "insecure-test")]
 async fn direct_cas_retry_after_dropped_response_reports_success() {
     use opc_session_net::protocol::{read_frame, write_frame, CONTRACT_VERSION};
     use opc_session_net::{Request, Response};
@@ -521,7 +522,7 @@ async fn direct_cas_retry_after_dropped_response_reports_success() {
         })
     };
 
-    let remote = RemoteSessionBackend::new(addr, None, Some(Duration::from_secs(2)));
+    let remote = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(2)));
     let key = test_key();
     let owner = OwnerId::new("owner-retry").unwrap();
     let lease = remote
@@ -555,17 +556,17 @@ async fn test_batch_and_delete() {
 
     let remote1 = Arc::new(RemoteSessionBackend::new(
         addr1,
-        Some(mtls.client_config.clone()),
+        mtls.client_config.clone(),
         None,
     ));
     let remote2 = Arc::new(RemoteSessionBackend::new(
         addr2,
-        Some(mtls.client_config.clone()),
+        mtls.client_config.clone(),
         None,
     ));
     let remote3 = Arc::new(RemoteSessionBackend::new(
         addr3,
-        Some(mtls.client_config.clone()),
+        mtls.client_config.clone(),
         None,
     ));
 
@@ -633,17 +634,17 @@ async fn test_replication_log_and_watch() {
 
     let remote1 = Arc::new(RemoteSessionBackend::new(
         addr1,
-        Some(mtls.client_config.clone()),
+        mtls.client_config.clone(),
         None,
     ));
     let remote2 = Arc::new(RemoteSessionBackend::new(
         addr2,
-        Some(mtls.client_config.clone()),
+        mtls.client_config.clone(),
         None,
     ));
     let remote3 = Arc::new(RemoteSessionBackend::new(
         addr3,
-        Some(mtls.client_config.clone()),
+        mtls.client_config.clone(),
         None,
     ));
 
@@ -693,6 +694,7 @@ async fn test_replication_log_and_watch() {
 /// request has to reconnect rather than reuse a connection whose pending
 /// (stale) response would otherwise be read as the new request's reply.
 #[tokio::test]
+#[cfg(feature = "insecure-test")]
 async fn test_timeout_mid_exchange_forces_reconnect() {
     use opc_session_net::protocol::{read_frame, write_frame, CONTRACT_VERSION};
     use opc_session_net::{Request, Response};
@@ -748,7 +750,7 @@ async fn test_timeout_mid_exchange_forces_reconnect() {
         }
     });
 
-    let remote = RemoteSessionBackend::new(addr, None, Some(Duration::from_millis(300)));
+    let remote = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_millis(300)));
     let key = test_key();
 
     // First request hits the stalling connection and must fail at the

@@ -3,11 +3,12 @@ members = [
     "crates/*",
     "crates/opc-proto-gtpu",
 ]
-# The eBPF datapath crate builds for bpfel-unknown-none with -Z build-std and
-# its own pinned nightly toolchain; it cannot share the host workspace build
-# graph. See scripts/build-gtpu-ebpf.sh.
+# The eBPF datapath crates build for bpfel-unknown-none with -Z build-std and
+# their own pinned nightly toolchain; they cannot share the host workspace
+# build graph. See scripts/build-gtpu-ebpf.sh and scripts/build-ipsec-lb-ebpf.sh.
 exclude = [
     "crates/opc-gtpu-dataplane-ebpf",
+    "crates/opc-ipsec-lb-ebpf",
 ]
 resolver = "2"
 

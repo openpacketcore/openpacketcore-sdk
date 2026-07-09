@@ -1,0 +1,122 @@
+name: IPsec LB
+
+on:
+  pull_request:
+    paths:
+      - "crates/opc-ipsec-lb/**"
+      - "crates/opc-ipsec-lb-ebpf/**"
+      - "crates/opc-ipsec-lb-ebpf-common/**"
+      - "crates/opc-session-net/**"
+      - ".github/workflows/ipsec-lb.yml"
+      - "scripts/build-ipsec-lb-ebpf.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/opc-ipsec-lb/**"
+      - "crates/opc-ipsec-lb-ebpf/**"
+      - "crates/opc-ipsec-lb-ebpf-common/**"
+      - "crates/opc-session-net/**"
+      - ".github/workflows/ipsec-lb.yml"
+      - "scripts/build-ipsec-lb-ebpf.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  conformance:
+    name: Kernel-independent conformance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check diff whitespace
+        run: git diff --check
+
+      - name: Run clippy
+        run: cargo clippy --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common -p opc-session-net --all-targets --all-features -- -D warnings
+
+      - name: Run conformance tests
+        run: cargo test --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common -p opc-session-net --all-features --quiet -- --test-threads=4
+
+  docs:
+    name: Rust docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build crate docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common -p opc-session-net --no-deps --all-features
+
+  ebpf-object:
+    name: IPsec XDP object rebuild
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install pinned nightly Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-06-22 --profile minimal --component rust-src
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/opc-ipsec-lb-ebpf
+
+      - name: Install pinned bpf-linker
+        run: cargo install bpf-linker --version 0.10.3 --locked
+
+      - name: Rebuild and compare program/map inventory
+        run: |
+          set -euo pipefail
+          committed="${RUNNER_TEMP}/committed-opc-ipsec-lb-xdp.bpf.o"
+          cp crates/opc-ipsec-lb/bpf/opc-ipsec-lb-xdp.bpf.o "${committed}"
+          ./scripts/build-ipsec-lb-ebpf.sh
+          rebuilt="crates/opc-ipsec-lb-ebpf/target/bpfel-unknown-none/release/opc-ipsec-lb-xdp"
+          inventory() {
+            readelf -sW "$1" | awk '
+              ($4 == "FUNC" || $4 == "OBJECT") {
+                if ($8 ~ /^_RNv/) next
+                print $4, $8
+              }
+            ' | sort
+          }
+          inventory "${committed}" > committed.inventory
+          inventory "${rebuilt}" > rebuilt.inventory
+          cat rebuilt.inventory
+          diff -u committed.inventory rebuilt.inventory
+          for symbol in opc_ipsec_lb_xdp IPSEC_LB_RULES IPSEC_LB_TAG_TARGETS IPSEC_LB_CONFIG IPSEC_LB_COUNTERS; do
+            grep -q " ${symbol}$" committed.inventory
+          done

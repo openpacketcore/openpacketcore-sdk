@@ -60,13 +60,29 @@ impl std::fmt::Debug for RemoteSessionBackend {
 }
 
 impl RemoteSessionBackend {
-    /// Create a new remote backend client.
+    /// Create a new mTLS remote backend client.
     ///
     /// `deadline` bounds every backend method end-to-end, including connection
     /// retries with backoff (default 2s when `None`). On expiry the method
     /// returns the store's unavailable error so a quorum layer treats this
     /// replica as offline instead of stalling.
     pub fn new(
+        addr: SocketAddr,
+        tls_config: Arc<opc_tls::ClientConfig>,
+        deadline: Option<Duration>,
+    ) -> Self {
+        Self::from_transport(addr, Some(tls_config), deadline)
+    }
+
+    /// Create a plaintext remote backend client for tests.
+    ///
+    /// Production replication clients must use [`RemoteSessionBackend::new`].
+    #[cfg(feature = "insecure-test")]
+    pub fn new_insecure(addr: SocketAddr, deadline: Option<Duration>) -> Self {
+        Self::from_transport(addr, None, deadline)
+    }
+
+    fn from_transport(
         addr: SocketAddr,
         tls_config: Option<Arc<opc_tls::ClientConfig>>,
         deadline: Option<Duration>,
