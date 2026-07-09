@@ -1,0 +1,70 @@
+name: IPsec LB P0
+
+on:
+  pull_request:
+    paths:
+      - "crates/opc-ipsec-lb/**"
+      - ".github/workflows/ipsec-lb-p0.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/opc-ipsec-lb/**"
+      - ".github/workflows/ipsec-lb-p0.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  p0-conformance:
+    name: P0 conformance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check diff whitespace
+        run: git diff --check
+
+      - name: Run clippy
+        run: cargo clippy --locked -p opc-ipsec-lb --all-targets --all-features -- -D warnings
+
+      - name: Run P0 tests
+        run: cargo test --locked -p opc-ipsec-lb --all-features --quiet -- --test-threads=4
+
+  docs:
+    name: Rust docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build crate docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked -p opc-ipsec-lb --no-deps --all-features
