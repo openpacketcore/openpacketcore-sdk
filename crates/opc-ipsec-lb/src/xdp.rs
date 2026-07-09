@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use opc_ipsec_lb_ebpf_common::{
-    XdpConfig, XdpRuleKey, XdpRuleValue, XdpTagKey, CONFIG_VALUE_LEN, RULE_FLAG_LOCAL_OWNER,
+    XdpConfig, XdpRuleKey, XdpRuleValue, XdpTagKey, CONFIG_VALUE_LEN, MAP_CONFIG, MAP_COUNTERS,
+    MAP_SWU_RULES, MAP_TAG_TARGETS, PROG_SWU_XDP, RULE_FLAG_LOCAL_OWNER,
     RULE_FLAG_REDIRECT_IFINDEX, RULE_KEY_LEN, RULE_VALUE_LEN, TAG_TARGET_KEY_LEN,
 };
 
@@ -160,6 +161,17 @@ impl fmt::Debug for HostXdpSteeringBackend {
 }
 
 impl HostXdpSteeringBackend {
+    /// Create a Linux Host-XDP backend with the committed CO-RE object.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn new(interface: impl Into<String>, config: HostXdpSteeringBackendConfig) -> Self {
+        Self::from_runtime_and_config(
+            interface,
+            Arc::new(aya_runtime::AyaHostXdpRuntime::new()),
+            config,
+        )
+    }
+
     /// Create a fail-closed Host-XDP backend placeholder.
     ///
     /// This is useful for composition roots that want a concrete backend value
@@ -527,6 +539,295 @@ impl HostXdpRuntime for UnsupportedHostXdpRuntime {
 
     fn probe_environment(&self) -> HostXdpEnvironment {
         HostXdpEnvironment::default()
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod aya_runtime {
+    //! aya-based Host-XDP runtime.
+
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::io;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use aya::maps::{Array, HashMap as BpfHashMap, MapError};
+    use aya::programs::{ProgramError, Xdp, XdpMode};
+    use aya::{Ebpf, EbpfLoader};
+    use opc_linux_gtpu_sys as sys;
+
+    use super::{
+        HostXdpEnvironment, HostXdpRuntime, CONFIG_VALUE_LEN, MAP_CONFIG, MAP_COUNTERS,
+        MAP_SWU_RULES, MAP_TAG_TARGETS, PROG_SWU_XDP, RULE_KEY_LEN, RULE_VALUE_LEN,
+        TAG_TARGET_KEY_LEN,
+    };
+    use crate::IpsecLbError;
+
+    const DATAPATH_OBJECT: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bpf/opc-ipsec-lb-xdp.bpf.o"
+    ));
+
+    const CAP_NET_ADMIN: u32 = 12;
+    const CAP_SYS_ADMIN: u32 = 21;
+    const CAP_BPF: u32 = 39;
+
+    #[derive(Debug, Default)]
+    pub(super) struct AyaHostXdpRuntime {
+        devices: Mutex<BTreeMap<u32, LoadedDevice>>,
+    }
+
+    #[derive(Debug)]
+    struct LoadedDevice {
+        ebpf: Ebpf,
+    }
+
+    impl AyaHostXdpRuntime {
+        pub(super) fn new() -> Self {
+            Self::default()
+        }
+
+        fn load_pinned(pin_dir: &Path) -> Result<Ebpf, IpsecLbError> {
+            fs::create_dir_all(pin_dir)
+                .map_err(|error| IpsecLbError::io("xdp_pin_dir_create", error))?;
+            EbpfLoader::new()
+                .default_map_pin_directory(pin_dir)
+                .load(DATAPATH_OBJECT)
+                .map_err(|_| {
+                    IpsecLbError::io("xdp_object_load", invalid_data("object load failed"))
+                })
+        }
+
+        fn unpin(pin_dir: &Path) -> Result<(), IpsecLbError> {
+            for map_name in [MAP_SWU_RULES, MAP_TAG_TARGETS, MAP_CONFIG, MAP_COUNTERS] {
+                match fs::remove_file(pin_dir.join(map_name)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(IpsecLbError::io("xdp_map_unpin", error)),
+                }
+            }
+            match fs::remove_dir(pin_dir) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(IpsecLbError::io("xdp_pin_dir_remove", error)),
+            }
+        }
+
+        fn attach_program(ebpf: &mut Ebpf, interface: &str) -> Result<(), IpsecLbError> {
+            let program: &mut Xdp = ebpf
+                .program_mut(PROG_SWU_XDP)
+                .ok_or_else(|| {
+                    IpsecLbError::io("xdp_program_lookup", invalid_data("program missing"))
+                })?
+                .try_into()
+                .map_err(|_: ProgramError| {
+                    IpsecLbError::io("xdp_program_type", invalid_data("not an XDP program"))
+                })?;
+            program
+                .load()
+                .map_err(|error| program_error("xdp_program_load", &error))?;
+            program
+                .attach(interface, XdpMode::default())
+                .map(|_| ())
+                .map_err(|error| program_error("xdp_program_attach", &error))
+        }
+
+        fn with_device<T>(
+            &self,
+            ifindex: u32,
+            operation: &'static str,
+            f: impl FnOnce(&mut LoadedDevice) -> Result<T, IpsecLbError>,
+        ) -> Result<T, IpsecLbError> {
+            let mut devices = self
+                .devices
+                .lock()
+                .map_err(|_| IpsecLbError::io(operation, super::poisoned_lock()))?;
+            let device = devices.get_mut(&ifindex).ok_or(IpsecLbError::NotFound)?;
+            f(device)
+        }
+    }
+
+    impl HostXdpRuntime for AyaHostXdpRuntime {
+        fn ifindex_by_name(&self, name: &str) -> Result<u32, IpsecLbError> {
+            sys::ifindex_by_name(name).map_err(|error| match error.kind() {
+                io::ErrorKind::NotFound => IpsecLbError::NotFound,
+                _ => IpsecLbError::io("ifindex_lookup", error),
+            })
+        }
+
+        fn attach(
+            &self,
+            interface: &str,
+            ifindex: u32,
+            pin_dir: &Path,
+        ) -> Result<(), IpsecLbError> {
+            if self
+                .devices
+                .lock()
+                .map_err(|_| IpsecLbError::io("xdp_attach", super::poisoned_lock()))?
+                .contains_key(&ifindex)
+            {
+                return Ok(());
+            }
+            let pins_preexisted = pin_dir.is_dir();
+            let mut ebpf = Self::load_pinned(pin_dir)?;
+            if let Err(error) = Self::attach_program(&mut ebpf, interface) {
+                drop(ebpf);
+                if !pins_preexisted {
+                    let _ = Self::unpin(pin_dir);
+                }
+                return Err(error);
+            }
+            self.devices
+                .lock()
+                .map_err(|_| IpsecLbError::io("xdp_attach", super::poisoned_lock()))?
+                .insert(ifindex, LoadedDevice { ebpf });
+            Ok(())
+        }
+
+        fn detach(
+            &self,
+            _interface: &str,
+            ifindex: u32,
+            pin_dir: &Path,
+        ) -> Result<(), IpsecLbError> {
+            let held = self
+                .devices
+                .lock()
+                .map_err(|_| IpsecLbError::io("xdp_detach", super::poisoned_lock()))?
+                .remove(&ifindex);
+            drop(held);
+            Self::unpin(pin_dir)
+        }
+
+        fn rule_get(
+            &self,
+            ifindex: u32,
+            key: [u8; RULE_KEY_LEN],
+        ) -> Result<Option<[u8; RULE_VALUE_LEN]>, IpsecLbError> {
+            self.with_device(ifindex, "xdp_rule_get", |device| {
+                let map = device.ebpf.map(MAP_SWU_RULES).ok_or_else(|| {
+                    IpsecLbError::io("xdp_rules_map", invalid_data("map missing"))
+                })?;
+                let hash = BpfHashMap::<_, [u8; RULE_KEY_LEN], [u8; RULE_VALUE_LEN]>::try_from(map)
+                    .map_err(|error| map_error("xdp_rules_map", error))?;
+                match hash.get(&key, 0) {
+                    Ok(value) => Ok(Some(value)),
+                    Err(MapError::KeyNotFound) => Ok(None),
+                    Err(error) => Err(map_error("xdp_rule_get", error)),
+                }
+            })
+        }
+
+        fn rule_insert(
+            &self,
+            ifindex: u32,
+            key: [u8; RULE_KEY_LEN],
+            value: [u8; RULE_VALUE_LEN],
+        ) -> Result<(), IpsecLbError> {
+            self.with_device(ifindex, "xdp_rule_insert", |device| {
+                let map = device.ebpf.map_mut(MAP_SWU_RULES).ok_or_else(|| {
+                    IpsecLbError::io("xdp_rules_map", invalid_data("map missing"))
+                })?;
+                let mut hash =
+                    BpfHashMap::<_, [u8; RULE_KEY_LEN], [u8; RULE_VALUE_LEN]>::try_from(map)
+                        .map_err(|error| map_error("xdp_rules_map", error))?;
+                hash.insert(key, value, 0)
+                    .map_err(|error| map_error("xdp_rule_insert", error))
+            })
+        }
+
+        fn rule_remove(&self, ifindex: u32, key: [u8; RULE_KEY_LEN]) -> Result<bool, IpsecLbError> {
+            self.with_device(ifindex, "xdp_rule_remove", |device| {
+                let map = device.ebpf.map_mut(MAP_SWU_RULES).ok_or_else(|| {
+                    IpsecLbError::io("xdp_rules_map", invalid_data("map missing"))
+                })?;
+                let mut hash =
+                    BpfHashMap::<_, [u8; RULE_KEY_LEN], [u8; RULE_VALUE_LEN]>::try_from(map)
+                        .map_err(|error| map_error("xdp_rules_map", error))?;
+                match hash.remove(&key) {
+                    Ok(()) => Ok(true),
+                    Err(MapError::KeyNotFound) => Ok(false),
+                    Err(error) => Err(map_error("xdp_rule_remove", error)),
+                }
+            })
+        }
+
+        fn config_write(
+            &self,
+            ifindex: u32,
+            value: [u8; CONFIG_VALUE_LEN],
+        ) -> Result<(), IpsecLbError> {
+            self.with_device(ifindex, "xdp_config_write", |device| {
+                let map = device.ebpf.map_mut(MAP_CONFIG).ok_or_else(|| {
+                    IpsecLbError::io("xdp_config_map", invalid_data("map missing"))
+                })?;
+                let mut array = Array::<_, [u8; CONFIG_VALUE_LEN]>::try_from(map)
+                    .map_err(|error| map_error("xdp_config_map", error))?;
+                array
+                    .set(0, value, 0)
+                    .map_err(|error| map_error("xdp_config_write", error))
+            })
+        }
+
+        fn tag_target_insert(
+            &self,
+            ifindex: u32,
+            key: [u8; TAG_TARGET_KEY_LEN],
+            value: [u8; RULE_VALUE_LEN],
+        ) -> Result<(), IpsecLbError> {
+            self.with_device(ifindex, "xdp_tag_target_insert", |device| {
+                let map = device.ebpf.map_mut(MAP_TAG_TARGETS).ok_or_else(|| {
+                    IpsecLbError::io("xdp_tag_targets_map", invalid_data("map missing"))
+                })?;
+                let mut hash =
+                    BpfHashMap::<_, [u8; TAG_TARGET_KEY_LEN], [u8; RULE_VALUE_LEN]>::try_from(map)
+                        .map_err(|error| map_error("xdp_tag_targets_map", error))?;
+                hash.insert(key, value, 0)
+                    .map_err(|error| map_error("xdp_tag_target_insert", error))
+            })
+        }
+
+        fn probe_environment(&self) -> HostXdpEnvironment {
+            HostXdpEnvironment {
+                platform_supported: true,
+                bpffs_present: Path::new("/sys/fs/bpf").is_dir(),
+                btf_present: Path::new("/sys/kernel/btf/vmlinux").exists(),
+                net_admin_capable: effective_capability(CAP_NET_ADMIN).unwrap_or(false),
+                bpf_capable: effective_capability(CAP_BPF).unwrap_or(false)
+                    || effective_capability(CAP_SYS_ADMIN).unwrap_or(false),
+            }
+        }
+    }
+
+    fn effective_capability(capability: u32) -> Result<bool, IpsecLbError> {
+        let status = fs::read_to_string("/proc/self/status")
+            .map_err(|error| IpsecLbError::io("capability_probe", error))?;
+        for line in status.lines() {
+            if let Some(hex) = line.strip_prefix("CapEff:") {
+                let caps = u64::from_str_radix(hex.trim(), 16).map_err(|_| {
+                    IpsecLbError::io("capability_probe", invalid_data("invalid CapEff"))
+                })?;
+                let mask = 1_u64.checked_shl(capability).ok_or_else(|| {
+                    IpsecLbError::io("capability_probe", invalid_data("invalid capability index"))
+                })?;
+                return Ok((caps & mask) != 0);
+            }
+        }
+        Ok(false)
+    }
+
+    fn invalid_data(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, message)
+    }
+
+    fn map_error(operation: &'static str, _error: MapError) -> IpsecLbError {
+        IpsecLbError::io(operation, invalid_data("BPF map operation failed"))
+    }
+
+    fn program_error(operation: &'static str, _error: &ProgramError) -> IpsecLbError {
+        IpsecLbError::io(operation, invalid_data("BPF program operation failed"))
     }
 }
 

@@ -1,0 +1,33 @@
+[package]
+name = "opc-ipsec-lb-ebpf"
+version = "0.2.0"
+authors = ["OpenPacketCore Contributors"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/openpacketcore/openpacketcore-sdk"
+description = "XDP eBPF SWu IPsec load-balancing datapath for opc-ipsec-lb"
+publish = false
+
+[dependencies]
+aya-ebpf = "0.2.1"
+opc-ipsec-lb-ebpf-common = { path = "../opc-ipsec-lb-ebpf-common" }
+
+[[bin]]
+name = "opc-ipsec-lb-xdp"
+path = "src/main.rs"
+
+# Standalone workspace: this crate targets bpfel-unknown-none and is excluded
+# from the SDK workspace on purpose.
+[workspace]
+
+[profile.release]
+debug = 2
+codegen-units = 1
+lto = true
+panic = "abort"
+opt-level = 3
+
+[profile.dev]
+panic = "abort"
+opt-level = 3
+debug = 2
