@@ -64,6 +64,7 @@ async fn test_sqlite_capabilities_are_truthful_for_single_node_backend() {
     assert!(caps.per_key_ttl);
     assert!(caps.server_side_lease_expiry);
     assert!(caps.batch_write);
+    assert!(caps.restore_scan);
     assert!(!caps.ordered_replication_log);
     assert!(!caps.watch);
     assert_eq!(caps.max_value_bytes, 1_048_576);

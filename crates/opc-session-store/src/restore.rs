@@ -182,6 +182,29 @@ impl RestoreScanPage {
     }
 }
 
+/// Deterministic ordering shared by restore-scan backends.
+pub(crate) fn compare_restore_records(
+    left: &StoredSessionRecord,
+    right: &StoredSessionRecord,
+) -> std::cmp::Ordering {
+    left.key
+        .tenant
+        .as_str()
+        .cmp(right.key.tenant.as_str())
+        .then_with(|| left.key.nf_kind.as_str().cmp(right.key.nf_kind.as_str()))
+        .then_with(|| left.key.key_type.cmp(&right.key.key_type))
+        .then_with(|| {
+            left.key
+                .stable_id
+                .as_ref()
+                .cmp(right.key.stable_id.as_ref())
+        })
+        .then_with(|| left.state_class.cmp(&right.state_class))
+        .then_with(|| left.state_type.cmp(&right.state_type))
+        .then_with(|| left.owner.cmp(&right.owner))
+        .then_with(|| left.generation.cmp(&right.generation))
+}
+
 /// Generic restore progress stage for startup and failover evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

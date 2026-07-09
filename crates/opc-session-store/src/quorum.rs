@@ -30,6 +30,10 @@ use crate::error::{LeaseError, StoreError};
 use crate::lease::{LeaseGuard, SessionLeaseManager};
 use crate::model::{FenceToken, OwnerId, SessionKey};
 use crate::record::StoredSessionRecord;
+use crate::restore::{
+    compare_restore_records, RestoreScanCursor, RestoreScanPage, RestoreScanRequest,
+    RestoreScanScope, RESTORE_SCAN_MAX_PAGE_SIZE,
+};
 use opc_types::Timestamp;
 
 /// Helper trait combining SessionBackend and SessionLeaseManager
@@ -154,6 +158,7 @@ impl QuorumSessionStore {
             ordered_replication_log: true,
             batch_write: true,
             watch: true,
+            restore_scan: true,
             max_value_bytes: usize::MAX,
         };
         Self {
@@ -416,6 +421,56 @@ impl QuorumSessionStore {
             "no caught-up replica available for watch".into(),
         ))
     }
+
+    async fn scan_replica_restore_records(
+        replica: &FencedSessionReplica,
+    ) -> Result<Vec<StoredSessionRecord>, StoreError> {
+        let mut cursor = None;
+        let mut records = Vec::new();
+
+        loop {
+            let page = replica
+                .inner
+                .scan_restore_records(RestoreScanRequest {
+                    scope: RestoreScanScope::all(),
+                    cursor,
+                    limit: RESTORE_SCAN_MAX_PAGE_SIZE,
+                })
+                .await?;
+            let next_cursor = page.next_cursor;
+            records.extend(page.records);
+
+            if page.complete {
+                return Ok(records);
+            }
+
+            let Some(next_cursor) = next_cursor else {
+                return Err(StoreError::BackendUnavailable(
+                    "restore scan page omitted next cursor".into(),
+                ));
+            };
+            if cursor == Some(next_cursor) {
+                return Err(StoreError::BackendUnavailable(
+                    "restore scan cursor did not advance".into(),
+                ));
+            }
+            cursor = Some(next_cursor);
+        }
+    }
+
+    fn merge_restore_scan_record(
+        merged: &mut HashMap<SessionKey, StoredSessionRecord>,
+        record: StoredSessionRecord,
+    ) {
+        merged
+            .entry(record.key.clone())
+            .and_modify(|existing| {
+                if record.generation > existing.generation {
+                    *existing = record.clone();
+                }
+            })
+            .or_insert(record);
+    }
 }
 
 #[async_trait]
@@ -430,6 +485,7 @@ impl SessionBackend for QuorumSessionStore {
             caps.per_key_ttl &= replica_caps.per_key_ttl;
             caps.server_side_lease_expiry &= replica_caps.server_side_lease_expiry;
             caps.batch_write &= replica_caps.batch_write;
+            caps.restore_scan &= replica_caps.restore_scan;
             caps.max_value_bytes = caps.max_value_bytes.min(replica_caps.max_value_bytes);
         }
 
@@ -515,6 +571,64 @@ impl SessionBackend for QuorumSessionStore {
             results.push(result);
         }
         Ok(results)
+    }
+
+    async fn scan_restore_records(
+        &self,
+        request: RestoreScanRequest,
+    ) -> Result<RestoreScanPage, StoreError> {
+        request.validate()?;
+
+        let (online_ids, _) = self.committed_and_repaired().await?;
+        let quorum = self.quorum_size();
+        let mut successful_scans = 0;
+        let mut last_err = None;
+        let mut merged = HashMap::new();
+
+        for id in online_ids {
+            let replica = &self.replicas[id];
+            match Self::scan_replica_restore_records(replica).await {
+                Ok(records) => {
+                    successful_scans += 1;
+                    for record in records {
+                        Self::merge_restore_scan_record(&mut merged, record);
+                    }
+                }
+                Err(StoreError::CapabilityNotSupported(capability))
+                    if capability == "restore_scan" => {}
+                Err(err) => {
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        if successful_scans < quorum {
+            return Err(last_err.unwrap_or_else(|| {
+                StoreError::BackendUnavailable("quorum not reached for restore scan".into())
+            }));
+        }
+
+        let mut matching = Vec::new();
+        let mut excluded_count = 0;
+        for record in merged.into_values() {
+            if request.scope.matches_record(&record) {
+                matching.push(record);
+            } else {
+                excluded_count += 1;
+            }
+        }
+        matching.sort_by(compare_restore_records);
+
+        let start = request
+            .cursor
+            .map(RestoreScanCursor::offset)
+            .unwrap_or(0)
+            .min(matching.len());
+        let end = start.saturating_add(request.limit).min(matching.len());
+        let next_cursor = (end < matching.len()).then(|| RestoreScanCursor::from_offset(end));
+        let records = matching[start..end].to_vec();
+
+        Ok(RestoreScanPage::new(records, excluded_count, next_cursor))
     }
 
     async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
