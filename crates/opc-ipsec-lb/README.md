@@ -12,6 +12,7 @@ steer layer:
 - failover safety guards for IV-counter and replay-window restoration;
 - audited same-SPI re-pin coordination with monotonic ownership fencing;
 - BGP route-export VIP advertisement through the safe route-steering backend;
+- session-store backed ownership reads for authoritative SA/shard owners;
 - reusable ports for steering backends, VIP advertisement, ownership reads,
   ownership fencing, and re-pin audit.
 

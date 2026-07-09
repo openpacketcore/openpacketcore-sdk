@@ -2242,10 +2242,13 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "aya",
+ "bytes",
  "hmac 0.12.1",
  "opc-ipsec-lb-ebpf-common",
  "opc-linux-gtpu-sys",
  "opc-route-steering",
+ "opc-session-store",
+ "opc-types",
  "rand 0.10.1",
  "sha2 0.10.9",
  "thiserror 2.0.18",

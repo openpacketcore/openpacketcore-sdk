@@ -1,17 +1,25 @@
 use std::net::{IpAddr, Ipv4Addr};
+use std::time::Duration;
 
 use opc_route_steering::{IpPrefix, MockOperation, MockRouteSteeringBackend, RouteRequest};
+use opc_session_store::{
+    CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, FakeSessionBackend, Generation,
+    OwnerId, SessionBackend, SessionLeaseManager, SessionStore, StateClass, StateType,
+    StoredSessionRecord,
+};
+use opc_types::{NetworkFunctionKind, TenantId};
 
 use opc_ipsec_lb::{
     classify_swu_packet, measure_disruption, AntiReplayResume, BgpRouteVipAdvertiser,
     BgpRouteVipAdvertiserConfig, ClusterNode, CookieKey, CookieSlot, EspFragmentPosture,
     FixedEntropy, ForwardingProof, IkeCookieGate, IpAddress, IpFragment, IpsecLbError,
     IvResumeDecision, MockOwnershipFencer, MockRePinAuditSink, MockSteeringBackend,
-    MockSteeringOperation, RePinAuditEventKind, RePinCoordinator, RePinRequest, RekeyRequest,
-    RendezvousSelector, ResumeKeySource, SaId, SameSpiResume, SelectionKey, SendIvCounter, ShardId,
-    ShardSet, SpiAllocationRequest, SpiAllocator, SpiKind, SteerKey, SteeringRule,
-    SwuClassification, SwuClassifierConfig, SwuPacket, TaggedSpiAllocator, TaggedSpiLayout,
-    VipAdvertisement, VipAdvertiser,
+    MockSteeringOperation, OwnershipSource, RePinAuditEventKind, RePinCoordinator, RePinRequest,
+    RekeyRequest, RendezvousSelector, ResumeKeySource, SaId, SameSpiResume, SelectionKey,
+    SendIvCounter, SessionOwnershipKeyResolver, SessionOwnershipKeyspace,
+    SessionStoreOwnershipSource, ShardId, ShardSet, SpiAllocationRequest, SpiAllocator, SpiKind,
+    SteerKey, SteeringRule, SwuClassification, SwuClassifierConfig, SwuPacket, TaggedSpiAllocator,
+    TaggedSpiLayout, VipAdvertisement, VipAdvertiser,
 };
 
 const IKE_HEADER_LEN: usize = 28;
@@ -251,6 +259,50 @@ async fn bgp_vip_advertiser_programs_host_route_for_export() {
             table: 100,
             priority: Some(10),
         })]
+    );
+}
+
+#[tokio::test]
+async fn session_store_ownership_source_reads_authoritative_sa_owner() {
+    let store = SessionStore::new(FakeSessionBackend::new());
+    let keyspace = SessionOwnershipKeyspace::new(
+        TenantId::new("tenant-a").unwrap(),
+        NetworkFunctionKind::new("epdg").unwrap(),
+    );
+    let sa = SaId::Esp { spi: 0x5566_7788 };
+    let key = keyspace.sa_key(sa).unwrap();
+    let owner = OwnerId::new("worker-a").unwrap();
+    let lease = store
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    let record = StoredSessionRecord {
+        key: key.clone(),
+        generation: Generation::new(1),
+        owner,
+        fence: lease.fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("ipsec-lb-ownership"),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([]),
+    };
+    assert_eq!(
+        store
+            .compare_and_set(CompareAndSet {
+                key,
+                lease,
+                expected_generation: None,
+                new_record: record,
+            })
+            .await
+            .unwrap(),
+        CompareAndSetResult::Success
+    );
+
+    let source = SessionStoreOwnershipSource::new(store, keyspace);
+    assert_eq!(
+        source.sa_owner(sa).await.unwrap().unwrap().as_str(),
+        "worker-a"
     );
 }
 

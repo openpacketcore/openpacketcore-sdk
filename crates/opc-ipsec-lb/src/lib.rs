@@ -18,6 +18,7 @@ pub mod model;
 pub mod ports;
 pub mod repin;
 pub mod selector;
+pub mod session;
 pub mod spi;
 pub mod unsupported;
 pub mod xdp;
@@ -48,6 +49,9 @@ pub use repin::{
 };
 pub use selector::{
     measure_disruption, RendezvousSelector, SelectionKey, ShardDisruption, ShardSet,
+};
+pub use session::{
+    SessionOwnershipKeyResolver, SessionOwnershipKeyspace, SessionStoreOwnershipSource,
 };
 pub use spi::{
     EntropySource, FixedEntropy, RekeyRequest, SpiAllocationRequest, SpiKind, SystemEntropy,
