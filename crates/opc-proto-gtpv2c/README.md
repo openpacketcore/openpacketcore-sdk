@@ -1,68 +1,96 @@
 # opc-proto-gtpv2c
 
-`opc-proto-gtpv2c` is the OpenPacketCore GTPv2-C crate for an S2b-focused typed
-subset with **S2b Production Profile v1** available for the documented codec,
-typed-view, validation, and transport-neutral helper boundary.
+S2b-focused GTPv2-C codec for OpenPacketCore.
 
-Current scope is intentionally narrow:
+## Purpose
 
-- common GTPv2-C header decode/encode integrated with `opc-protocol` traits;
-- raw-preserving TLIV Information Element validation and iteration;
-- owned and borrowed message shells for async handoff and forwarding paths;
-- typed S2b IE examples for IMSI, Cause, Recovery, APN, AMBR, EBI, MEI,
-  MSISDN, Indication, PCO, PAA, Bearer QoS, RAT Type, Serving Network,
-  F-TEID, Bearer Context, Charging ID, PDN Type, APN Restriction, Selection
-  Mode, and APCO;
-- typed S2b message views for Echo plus Create/Modify/Delete/Update
-  Session-oriented flows, with ProcedureAware mandatory-IE checks for the
-  claimed examples;
-- public profile constructors for Echo, Create Session, Modify Bearer, Delete
-  Session, and Update Bearer profile-owned request/response shapes;
-- a transport-neutral Echo peer helper that tracks liveness, Recovery restart
-  counters, and restart-reconciliation fencing before new Echo exchanges;
-- provenance-labeled fixture replay that separates spec-authored conformance
-  bytes, independent-capture intake, parity-only ePDG regression seeds, and
-  synthetic malformed inputs;
-- a public `MessageType` enum with `Unknown(u8)` fallback plus raw fallback for
-  unsupported/private IEs; and
-- cargo-fuzz decode, typed S2b, and raw-preserving round-trip targets.
+`opc-proto-gtpv2c` implements a bounded GTPv2-C subset for ePDG/PGW S2b work.
+It combines a raw-preserving common-header and TLIV IE layer with typed S2b IE
+and message views for Echo plus Create/Modify/Delete/Update Session-oriented
+procedures.
 
-The Production Profile v1 boundary is a codec, typed-view, validation, and
-transport-neutral helper profile for ePDG/PGW S2b integration. Public profile
-constructors cover Echo, Create Session, Modify Bearer, Delete Session, and
-Update Bearer profile-owned request/response shapes. It does **not** provide a
-complete GTPv2-C implementation, full S2b semantic state-machine validation
-beyond the documented Echo and client-transaction helpers, carrier acceptance
-evidence, independent-peer interoperability evidence, or a production ePDG/PGW
-control-plane stack. See
-[CONFORMANCE.md](CONFORMANCE.md) for the precise production profile boundary.
+It is not a complete GTPv2-C implementation and not an ePDG or PGW
+control-plane stack.
 
-## Minimal use
+## API Shape
+
+- `header` exposes `Header`, `MessageType`, `decode_header`, and
+  `encode_header`.
+- `ie` exposes `RawIe`, `OwnedRawIe`, `RawIeIterator`, `validate_ie_region`,
+  `TypedIe`, `TypedIeValue`, and typed S2b IE structs such as `Cause`,
+  `Recovery`, `AccessPointName`, `BearerContext`, `FullyQualifiedTeid`, and
+  `PdnAddressAllocation`.
+- `Message<'a>` and `OwnedMessage` provide the raw borrowed/owned message
+  shells and implement the shared `opc-protocol` codec traits.
+- `S2bMessage<'a>` and `S2bProcedureMessage<'a>` provide typed S2b views and
+  raw fallback for unsupported message types.
+- Public profile constructors build profile-valid owned messages:
+  `s2b_echo_request`, `s2b_echo_response`,
+  `s2b_create_session_request`,
+  `s2b_create_session_accepted_response`,
+  `s2b_create_session_rejected_response`,
+  `s2b_modify_bearer_request`, `s2b_modify_bearer_response`,
+  `s2b_delete_session_request`, `s2b_delete_session_response`,
+  `s2b_update_bearer_request`, and `s2b_update_bearer_response`.
+- `Gtpv2cEchoPeer` and the client-transaction helper types are
+  transport-neutral state helpers; callers still own UDP, timers, persistence,
+  and product policy.
+
+## Example
 
 ```rust
-use opc_proto_gtpv2c::S2bMessage;
-use opc_protocol::{BorrowDecode, DecodeContext};
+use bytes::BytesMut;
+use opc_proto_gtpv2c::{s2b_echo_request, Recovery, S2bMessage};
+use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext, ValidationLevel};
 
-let packet = [0x40, 0x01, 0x00, 0x04, 0x00, 0x00, 0x01, 0x00];
-let (_tail, message) = S2bMessage::decode(&packet, DecodeContext::default())?;
-assert!(message.as_view().is_some());
-# Ok::<(), opc_protocol::DecodeError>(())
+let msg = s2b_echo_request(0x010203, Recovery { restart_counter: 7 })?;
+let mut encoded = BytesMut::new();
+msg.encode(&mut encoded, EncodeContext::default())?;
+
+let ctx = DecodeContext {
+    validation_level: ValidationLevel::ProcedureAware,
+    ..DecodeContext::default()
+};
+let (tail, decoded) = S2bMessage::decode(&encoded, ctx)?;
+assert!(tail.is_empty());
+assert!(decoded.as_view().is_some());
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+## Relationships
+
+This crate depends on `opc-protocol` for decode/encode contracts. GTP-U user
+plane framing lives in `opc-proto-gtpu`; Diameter, PFCP, NAS, NGAP, and IKEv2
+are separate protocol boundaries.
+
+## Status And Limits
+
+S2b Production Profile v1 is production-ready only for the documented codec,
+typed-view, ProcedureAware validation, fixture replay, and transport-neutral
+helper boundary. The crate is still `publish = false`.
+
+Known limits include no full Release 18 GTPv2-C matrix, no independent-peer
+interoperability claim, and no product state machine. `CONFORMANCE.md` also
+calls out that strict-mode support for priority-bearing MP-flag messages is a
+future fix because the current common header folds low flag bits into a spare
+field.
+
+## Roadmap
+
+- Add explicit MP-flag handling before claiming priority-bearing message
+  support.
+- Expand typed IE/procedure coverage only with matching constructor,
+  ProcedureAware validation, malformed fixtures, examples, and fuzz seeds.
+- Add licensed independent captures before claiming interoperability evidence.
 
 ## Verification
 
 ```bash
 cargo check -p opc-proto-gtpv2c --all-targets --all-features
-cargo test -p opc-proto-gtpv2c --all-features header
-cargo test -p opc-proto-gtpv2c --all-features ie_raw
-cargo test -p opc-proto-gtpv2c --all-features malformed
-cargo test -p opc-proto-gtpv2c --all-features --test corpus_replay
-cargo test -p opc-proto-gtpv2c --all-features --test s2b_typed
+cargo test -p opc-proto-gtpv2c --all-features
 cargo run -p opc-proto-gtpv2c --example production_profile_v1
 (cd crates/opc-proto-gtpv2c && cargo +nightly fuzz list)
 ```
 
-For the Production Profile v1 constructor and ProcedureAware validation path,
-see `examples/production_profile_v1.rs`. It constructs Echo, Create Session,
-Modify Bearer, Delete Session, and Update Bearer S2b messages through typed
-APIs, then encodes and decodes them without manual raw byte assembly.
+See [CONFORMANCE.md](CONFORMANCE.md) and `examples/production_profile_v1.rs`
+for the precise profile boundary and end-to-end constructor path.

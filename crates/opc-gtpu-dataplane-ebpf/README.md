@@ -1,38 +1,70 @@
 # opc-gtpu-dataplane-ebpf
 
-tc `clsact` eBPF GTP-U datapath programs for `opc-gtpu-dataplane`'s
-`EbpfGtpuDataplaneBackend`:
+## Purpose
 
-- `opc_gtpu_uplink` (tc egress): GTP-U-encapsulates subscriber uplink by
-  inner-source (UE PAA) FAR lookup — the direction the mainline `gtp`
-  netdevice cannot serve.
-- `opc_gtpu_downlink` (tc ingress): decapsulates GTPv1-U G-PDUs by TEID PDR
-  lookup and hands the inner packet to the stack (and XFRM).
+`opc-gtpu-dataplane-ebpf` contains the Rust/aya tc programs used by
+`opc-gtpu-dataplane`'s `EbpfGtpuDataplaneBackend`.
 
-Byte layouts (map values, encapsulation, header classification) come from
-`opc-gtpu-ebpf-common`, shared with the userspace loader and unit-tested in
-ordinary CI.
+It is not a normal workspace library. It targets `bpfel-unknown-none`, builds a
+CO-RE object, and is intentionally excluded from the SDK workspace.
 
-## Building
+## API Shape
 
-This crate is excluded from the SDK workspace: it targets
-`bpfel-unknown-none` with `-Z build-std=core` on a pinned nightly toolchain
-and links with `bpf-linker`. Do not build it directly; use:
+The crate exposes tc entry points, not a Rust library API:
+
+- `opc_gtpu_uplink`: tc egress program. It looks up uplink FAR state by inner
+  UE IPv4 source address, prepends `[outer IPv4][UDP][GTPv1-U]`, and redirects
+  toward the peer.
+- `opc_gtpu_downlink`: tc ingress program. It matches UDP/2152 GTPv1-U G-PDUs,
+  looks up downlink PDR state by TEID, validates the inner destination, strips
+  outer headers, and lets the inner packet continue through the stack.
+
+Map names, counter indexes, program names, and byte layouts are imported from
+`opc-gtpu-ebpf-common`.
+
+## Relationships
+
+- `opc-gtpu-ebpf-common`: shared no-std layout and classification crate.
+- `opc-gtpu-dataplane`: userspace loader and safe backend that pins maps,
+  attaches/detaches tc programs, and embeds the built object.
+- `crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o`: committed artifact
+  produced from this crate.
+
+## Status And Limits
+
+- Unpublished standalone crate (`publish = false`) with its own `Cargo.lock`.
+- Build profile uses `panic = "abort"` and optimized BPF codegen.
+- The datapath is currently IPv4 GTP-U only.
+- It does not load itself, manage bpffs pins, manage sessions, or implement
+  product policy; those live in the userspace backend.
+
+## Build
+
+Do not build this crate with normal workspace commands. Use the pinned helper:
 
 ```sh
 ./scripts/build-gtpu-ebpf.sh
 ```
-
-which refreshes the committed CO-RE artifact at
-`crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o` (embedded into
-`opc-gtpu-dataplane` at compile time). Re-run the script after any change
-here or in `opc-gtpu-ebpf-common`; CI rebuilds the object and fails on
-structural drift, and the privileged integration test exercises the committed
-artifact end-to-end.
 
 Prerequisites:
 
 ```sh
 rustup toolchain install nightly-2026-06-22 --profile minimal --component rust-src
 cargo install bpf-linker --version 0.10.3 --locked
+```
+
+## Roadmap
+
+- Keep the committed object reproducible from source and checked in CI.
+- Extend map schemas only through `opc-gtpu-ebpf-common` so loader and program
+  stay byte-for-byte compatible.
+- Add protocol support only with matching unit tests and privileged datapath
+  coverage.
+
+## Verification
+
+```sh
+./scripts/build-gtpu-ebpf.sh
+cargo test -p opc-gtpu-ebpf-common
+sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 cargo test -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture'
 ```

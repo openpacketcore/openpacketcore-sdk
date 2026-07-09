@@ -1,29 +1,78 @@
 # opc-persist
 
-SQLite-backed persistence, audit, consensus replication, and security-policy
-storage for the OpenPacketCore management substrate.
+Persistence primitives for config commits, audit chains, security policy, and
+prototype consensus storage.
 
-This crate provides:
+## Purpose
 
-- `SqliteBackend`: durable and in-memory SQLite storage with audit-key checks,
-  schema migration, WAL/preflight validation, and redaction-safe errors.
-- `ConfigStore` implementations for append-only config commits, rollback
-  points, confirmed-commit markers, and latest-state reads.
-- `SqliteSecurityPolicyService`: encrypted staging, validation, application,
-  rollback, metadata inspection, and audit for NACM security policies.
-- NACM policy serialization for flat rules and RFC 8341-style group-scoped
-  rule-lists, preserving `TrustedPrincipal.groups` evaluation after decrypting
-  and recompiling stored policy.
-- Break-glass session storage and approval checks backed by active NACM policy.
-- Consensus types and TCP replication support for quorum-backed config storage.
-- Mock and fault-injection stores used by SDK tests and downstream adapters.
+`opc-persist` provides the durable storage contracts used by configuration and
+security-policy code. The SQLite backend is the reference single-replica
+implementation; consensus and quorum types are hardening surfaces for HA tests
+and SDK integration, not a declared carrier-production consensus backend.
 
-Security-policy mutation remains fail-closed: callers must match the target
-tenant, carry the `security-admin` role, and pass the active NACM
-`security-admin` check on `/security:policy`. Group-scoped NACM rule-lists are
-evaluated with groups resolved from signed principal policy, not transport
-metadata.
+## API Shape
 
-The crate does not implement northbound gNMI, NETCONF, or gNSI transport
-servers. Those layers adapt their verified principals and requests into the
-storage and policy services exposed here.
+- `ConfigStore` is the async commit-store trait:
+  `load_latest`, `load_rollback`, `append_commit`, `mark_confirmed`,
+  `create_rollback_point`, and `preflight`.
+- `SqliteBackend::open(path, ephemeral, min_free_bytes)` opens ephemeral stores.
+  Durable stores require `open_with_audit_key`.
+- `AuditKey::new([u8; 32])` rejects all-zero keys. `verify_audit_chain`
+  validates the tamper-evident audit chain.
+- `PersistCapabilities` reports fsync, locking, filesystem, permission, and
+  free-space checks. `is_safe_for_writes` is conservative.
+- `FencedReplica` and `QuorumConfigStore` provide majority write/read behavior
+  with leader-epoch fencing over `ConfigStore` replicas.
+- `ConsensusConfigStore`, `ConsensusPeer`, `TcpPeer`, and `TcpRpcServer` expose
+  the current durable consensus prototype.
+- `SecurityPolicyService` and `SqliteSecurityPolicyService` stage, validate,
+  apply, dry-run, roll back, inspect, and list security policies.
+- Break-glass APIs model request, approval, activation, denial, revocation, and
+  expiry flows with alarm/approval hooks.
+
+```rust,no_run
+use opc_persist::{AuditKey, ConfigStore, SqliteBackend};
+
+async fn open_store() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let key = AuditKey::new([3u8; 32])?;
+    let store = SqliteBackend::open_with_audit_key("config.db", false, 10 * 1024 * 1024, key).await?;
+    store.preflight().await?;
+    Ok(())
+}
+```
+
+## Relationships
+
+- Uses `opc-key` and `opc-crypto` for encrypted security-policy/config payloads.
+- Consumed by `opc-config-bus`, AMF-lite integration, and security-policy
+  services.
+- Uses `opc-nacm` concepts at the caller/service boundary; this crate is not a
+  northbound gNMI, NETCONF, or gNSI server.
+
+## Status Notes
+
+- Durable SQLite opens without an explicit audit key fail closed.
+- `:memory:` is always ephemeral and rejected when requested as durable.
+- Security-policy changes require tenant match, a `security-admin` principal,
+  and active NACM allow on `/security:policy`.
+- Break-glass approval requires a separate approver, `security-admin`, optional
+  active NACM approve on `/security:break-glass`, and a maximum requested
+  duration of 900 seconds.
+- `dangerous-test-hooks` exposes fault injection constants/types for tests.
+
+## Roadmap
+
+- Keep SQLite as the reference backend for correctness and audit-chain tests.
+- Harden consensus transport, membership, and failure behavior before calling it
+  production-ready.
+- Keep northbound authorization and request translation outside this crate.
+
+## Verification
+
+- Source checked: `Cargo.toml`, `src/lib.rs`, backend, consensus, security
+  policy, break-glass, and tests.
+- Run with: `cargo test -p opc-persist`.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](../../LICENSE).

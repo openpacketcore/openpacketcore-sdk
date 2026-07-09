@@ -1,73 +1,84 @@
 # opc-gnmi-server
 
-Capability-honest gNMI server foundation for OpenPacketCore.
+gNMI server core for OpenPacketCore management bindings.
 
-This crate contains the pinned protobuf service skeleton for OpenPacketCore
-gNMI. ADR 0016 allows `tonic`/`prost` only in this crate. The code here locks
-the parts that are independent of full RPC behavior:
+This crate provides a tonic-based gNMI service, TLS listener wiring, request
+normalization, authorization, audit integration, capability generation, Set
+normalization, Subscribe handling, and binding traits for CNF config and
+operational-state implementations.
 
-- CNF embedding traits over `C: OpcConfig`;
-- schema-backed capability data;
-- gNMI-shaped path normalization through `opc-mgmt-path`;
-- bounded JSON value normalization;
-- fail-safe extension handling;
-- shared gNMI metrics recorders;
-- SDK-managed mTLS listener bootstrap;
-- authenticated read-only `Get` for JSON/JSON_IETF config and operational
-  data through explicit CNF/generated projection hooks;
-- authenticated atomic `Set` through generated patch applicators and
-  `opc-config-bus`;
-- opt-in OpenPacketCore commit-confirmed `Set` extension for begin, confirm,
-  cancel, and timeout. The gNMI extension does not implement NETCONF
-  `persist`/`persist-id` or operator-token semantics; token-like unknown payload
-  fields are rejected instead of ignored;
-- opt-in gNMI master-arbitration for `Set`, fenced by authenticated tenant plus
-  gNMI role. Missing role uses the OpenConfig empty-role default. Disabled
-  servers reject the extension, optional servers enforce it when present, and
-  required servers deny writes that omit it;
-- authenticated `Subscribe` for ONCE/POLL snapshots and STREAM sample/config
-  on-change delivery. OpenConfig `History` replay is not advertised or
-  implemented by this live/snapshot profile; replay requests fail closed.
+## API Shape
 
-Current RPC behavior is intentionally capability-honest: `Capabilities` is
-served from the generated schema registry and can be exposed over the
-`run_gnmi_tls_listener` mTLS path. `Get` is implemented for authenticated
-read-only JSON/JSON_IETF reads when the binding supplies projection support.
-`Set` is implemented for generated config roots with explicit patch support.
-When the OpenPacketCore commit-confirmed extension is registered, `Set` supports
-begin/confirm/cancel and timeout only. Persist-token semantics are NETCONF-only
-for this SDK boundary. `Set` can also be configured to advertise and enforce
-OpenConfig master-arbitration before candidate construction, patching, or
-commit-confirmed control.
-`Subscribe` supports JSON/JSON_IETF ONCE, POLL, STREAM SAMPLE, config
-ON_CHANGE, and operational ON_CHANGE when the binding supplies an event source;
-TARGET_DEFINED, aggregation, QoS marking, and history replay are not advertised
-by this profile and fail closed.
+Main exports include:
 
-## Encodings
+- `GnmiServer`, the validated server handle.
+- `GnmiService`, the tonic service implementation.
+- `GnmiConfigBinding`, the CNF binding trait.
+- `GnmiPatchApplicator`, used by generated or CNF-specific Set handling.
+- Capability and encoding types:
+  `CapabilityProfile`, `EncodingRegistry`, `GnmiCapabilities`, and
+  `GNMI_VERSION`.
+- Set types:
+  `NormalizedSet` and `SetOperation`.
+- Path and value normalization helpers, including `resolve_path`,
+  `resolve_paths`, and JSON/JSON_IETF typed-value normalization.
+- Arbitration and confirmed-commit extension types.
+- TLS listener, smoke-test, transport-principal, and supervision helpers.
 
-`Capabilities` advertises only `JSON_IETF` and `JSON`. `BYTES`, `ASCII`, and
-`PROTO` are intentionally not advertised and return fail-closed errors for
-`Get`, `Set`, and `Subscribe`. Generated renderers produce JSON/RFC 7951
-payloads only.
+Example imports:
 
-## External Interop
+```rust
+use opc_gnmi_server::{GnmiConfigBinding, GnmiServer};
+```
 
-Generated tonic/prost conformance covers Capabilities, Get, Set, Subscribe,
-commit-confirmed, master-arbitration-backed Set, and fail-closed unsupported
-encoding/history behavior over the supervised mTLS listener.
+`GnmiConfigBinding<C>` supplies the config bus, schema registry, Set patcher,
+policy source, config JSON renderer, and optional operational-state providers.
+Default config rendering fails closed unless implemented by generated or
+CNF-specific code.
 
-`scripts/gnmi-interop-gnmic-smoke.sh` provides an optional live-target smoke
-test with `gnmic`. It skips unless `OPC_GNMI_INTEROP=1` is set and also skips
-when `gnmic` is not on `PATH`. When enabled, it requires:
+## Relationships
 
-- `OPC_GNMI_ADDR`
-- `OPC_GNMI_CA_CERT`
-- `OPC_GNMI_CLIENT_CERT`
-- `OPC_GNMI_CLIENT_KEY`
+- Uses generated protobuf bindings from `crates/opc-gnmi-server/proto`.
+- Uses `opc-config-bus` and `opc-config-model` for Set commits.
+- Uses `opc-mgmt-path`, `opc-mgmt-schema`, `opc-mgmt-authz`,
+  `opc-mgmt-audit`, `opc-mgmt-limits`, `opc-mgmt-opstate`,
+  `opc-mgmt-principal`, and `opc-mgmt-transport`.
+- Generated gNMI JSON and Set patching support normally comes from
+  `opc-yanggen`.
 
-Optional variables are `OPC_GNMI_TLS_SERVER_NAME`, `OPC_GNMI_TIMEOUT`,
-`OPC_GNMI_GET_PATH`, `OPC_GNMI_SUBSCRIBE_PATH`, and `OPC_GNMI_ENABLE_SET=1`
-with `OPC_GNMI_SET_PATH` plus `OPC_GNMI_SET_JSON` for a mutating Set smoke
-test. The script runs Capabilities, Get, Subscribe ONCE, and optional Set over
-mTLS using `json_ietf`.
+## Status And Limits
+
+Implemented scope:
+
+- gNMI Capabilities, Get, Set, and Subscribe service paths.
+- JSON and JSON_IETF encodings.
+- TLS listener with HTTP/2 ALPN and authenticated principal injection.
+- Management limits, schema self-checks, audit hooks, policy source wiring, and
+  optional master arbitration.
+- Unknown critical extensions fail closed; unknown non-critical extensions are
+  ignored.
+
+Limitations:
+
+- BYTES, PROTO, ASCII, leaf-list typed values, and non-finite floats are
+  rejected until codecs exist.
+- Set requires a generated or CNF-specific `GnmiPatchApplicator`.
+- Config Get requires a generated or CNF-specific JSON renderer.
+- Streaming operational ON_CHANGE needs explicit operational-event providers.
+- gNMI `target` routing is not implemented; non-empty targets are rejected.
+- The commit-confirmed extension uses the experimental OpenPacketCore extension
+  ID and requires arbitration wiring.
+
+## Roadmap
+
+- Keep advertised encodings and extensions matched to implemented behavior.
+- Add codecs, target routing, and richer streaming only with schema, authz,
+  audit, and limit coverage.
+
+## Verification
+
+Run:
+
+```sh
+cargo test -p opc-gnmi-server
+```

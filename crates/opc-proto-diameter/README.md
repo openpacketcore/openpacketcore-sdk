@@ -1,57 +1,96 @@
 # opc-proto-diameter
 
-Experimental Diameter protocol scaffold for OpenPacketCore.
+Experimental Diameter mechanism scaffold for OpenPacketCore.
 
-This crate is the first SDK-owned Diameter mechanism surface from ADR 0018. It
-currently provides:
+## Purpose
 
-- RFC 6733 Diameter header framing and raw AVP framing with checked 24-bit
-  length/command fields;
-- raw-preserving message and AVP storage for future byte-exact fixtures;
-- AVP-region validation for per-message/per-group AVP count limits, duplicate
-  AVP-key rejection policy, zero padding in strict mode, and dictionary-marked
-  grouped AVP recursion bounded by `DecodeContext::max_depth`;
-- dictionary metadata types for applications, commands, AVPs, flag rules, and
-  layered lookup; and
-- feature-gated RFC 6733 base procedure helpers for CER/CEA, DWR/DWA, and
-  DPR/DPA, including optional `Origin-State-Id`, answer diagnostics
-  (`Error-Message`/raw `Failed-AVP` values), protocol-error E-bit derivation,
-  minimal CEA protocol-error answers, and transport-neutral peer
-  capability/result-code helpers with Relay Application Id handling; and
-- feature-gated typed helpers for Rf accounting and the SWm Diameter-EAP
-  DER/DEA subset, plus skeleton dictionaries for selected 3GPP application
-  work.
+`opc-proto-diameter` starts the SDK-owned Diameter surface described by ADR
+0018. It provides RFC 6733 header and raw AVP framing, dictionary metadata,
+feature-gated base peer procedure helpers, and early 3GPP application
+dictionaries and typed helpers.
 
-It intentionally does **not** provide realm routing, AAA/HSS/CDF behavior,
-watchdog threshold policy, peer transport operation, charging decisions, or any
-claim that a downstream EPC/ePDG product is carrier-ready.
+It does not provide peer transport, realm routing, AAA/HSS/CDF behavior,
+charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
+
+## API Shape
+
+- Root types include `Header`, `Message<'a>`, `OwnedMessage`, `AvpHeader`,
+  `RawAvp<'a>`, `RawAvpIterator`, `ApplicationId`, `CommandCode`, `AvpCode`,
+  `VendorId`, `CommandFlags`, and `AvpFlags`.
+- `validate_avp_region` and `validate_avp_region_with_dictionary` enforce
+  length, padding, count, duplicate-key, and dictionary-marked grouped-AVP
+  recursion rules.
+- `dictionary` exposes `Dictionary`, `DictionarySet`, `ApplicationDefinition`,
+  `CommandDefinition`, `AvpDefinition`, `AvpDataType`, `AvpFlagRules`, and
+  related metadata types.
+- The `peer` feature adds transport-neutral CER/CEA, DWR/DWA, DPR/DPA
+  builders/parsers, capability negotiation helpers, result-code helpers, and
+  `PeerSession` projection state.
+- The `app-rf` feature adds typed Rf accounting helpers.
+- The `app-swm` feature adds typed SWm Diameter-EAP DER/DEA helpers.
+- `app-gx`, `app-s6a`, `app-s6b`, and `app-swx` currently provide dictionary
+  slots rather than full typed application APIs.
+
+## Example
+
+```rust
+use opc_proto_diameter::Message;
+use opc_protocol::{BorrowDecode, DecodeContext};
+
+let packet = [
+    0x01, 0x00, 0x00, 0x14, // version, 24-bit length = 20
+    0x80, 0x00, 0x01, 0x01, // request flag, command code 0x000101
+    0x00, 0x00, 0x00, 0x00, // application id
+    0x00, 0x00, 0x00, 0x01, // hop-by-hop id
+    0x00, 0x00, 0x00, 0x02, // end-to-end id
+];
+
+let (tail, msg) = Message::decode(&packet, DecodeContext::default())?;
+assert!(tail.is_empty());
+assert_eq!(msg.header.length, 20);
+# Ok::<(), opc_protocol::DecodeError>(())
+```
 
 ## Features
 
 | Feature | Default | Scope |
 | --- | --- | --- |
-| `base` | yes | RFC 6733 common application, peer command names, and base AVP metadata scaffold. |
-| `peer` | no | Transport-neutral CER/CEA, minimal CEA protocol-error answer, DWR/DWA, DPR/DPA builders/parsers, diagnostics preservation, and peer capability/result-code helpers over the base command set. |
-| `app-gx` | no | Initial 3GPP Gx application dictionary slot. |
-| `app-rf` | no | Initial 3GPP Rf accounting application dictionary slot. |
-| `app-s6a` | no | Initial 3GPP S6a/S6d application dictionary slot. |
-| `app-s6b` | no | Initial 3GPP S6b application dictionary slot. |
-| `app-swm` | no | 3GPP SWm dictionary plus typed Diameter-EAP DER/DEA builders/parsers with ePDG-subset semantic validation. |
-| `app-swx` | no | Initial 3GPP SWx application dictionary slot. |
-| `all-apps` | no | Enables every `app-*` skeleton feature. |
+| `base` | yes | RFC 6733 common application and raw base metadata. |
+| `peer` | no | CER/CEA, DWR/DWA, DPR/DPA helpers and peer-session projections. |
+| `app-rf` | no | Rf accounting dictionary plus typed ACR/ACA helpers. |
+| `app-swm` | no | SWm dictionary plus typed Diameter-EAP DER/DEA helpers. |
+| `app-gx` | no | Gx dictionary slot only. |
+| `app-s6a` | no | S6a/S6d dictionary slot only. |
+| `app-s6b` | no | S6b dictionary slot only. |
+| `app-swx` | no | SWx dictionary slot only. |
+| `all-apps` | no | Enables every `app-*` feature. |
 
-The crate is `publish = false` while its release boundary remains
-experimental. Fixture provenance, registered fuzz targets, and the current
-conformance scope are documented in [`CONFORMANCE.md`](CONFORMANCE.md);
-remaining publication gaps include broader typed application support, additional
-independently sourced fixture intake, and downstream product integration
-evidence.
+## Status And Limits
 
-## Boundary
+The crate is experimental and `publish = false`. It has ADR 0015 evidence in
+progress for the base header and AVP layer, but it is not a production Diameter
+stack. Raw AVP bytes are not redacted; typed helper layers own their own
+redaction policies.
 
-This crate owns reusable protocol mechanisms only: wire framing, parser limits,
-raw preservation, dictionary metadata, base peer procedure message construction,
-capability intersection/result-code selection, Rf/SWm typed message helpers, and
-test helper building blocks. Products that consume it remain responsible for
-peer selection, realm policy, transport lifecycle, subscriber behavior, charging
-policy, watchdog thresholds, AAA/HSS/CDF policy, and deployment readiness.
+Use `CONFORMANCE.md` for the precise fixture provenance, fuzz target status,
+application dictionary status, and typed helper gaps.
+
+## Roadmap
+
+- Broaden typed application helpers beyond the current Rf and SWm subsets.
+- Add independently sourced fixtures before raising interoperability claims.
+- Keep transport, realm policy, watchdog thresholds, AAA/HSS/CDF behavior, and
+  charging decisions in consuming products.
+
+## Verification
+
+```bash
+cargo check -p opc-proto-diameter --all-targets --all-features
+cargo test -p opc-proto-diameter --all-features
+python3 crates/opc-proto-diameter/fuzz/generate_corpus.py self-test
+(cd crates/opc-proto-diameter && cargo +nightly fuzz list)
+```
+
+## License
+
+Apache-2.0. See [LICENSE](../../LICENSE).

@@ -1,34 +1,69 @@
 # opc-nacm-config
 
-Typed northbound NACM datastore model for OpenPacketCore.
+Operator-facing NACM configuration model.
 
-This crate provides the operator-facing `/nacm:nacm` configuration surface that
-feeds the lower-level `opc-nacm` authorization engine:
+This crate models `/nacm:nacm`, validates rule lists and groups, compiles them
+into `opc-nacm` policies, and maps matching groups into signed management
+principal grants. It is also an `OpcConfig` model for standalone NACM config.
 
-- RFC 8341-style `groups`, `rule-list`, and `rule` data structures.
-- OpenPacketCore SPIFFE selector extensions for deriving NACM group membership
-  from verified workload identities.
-- Strict validation for duplicate names, unknown group references, empty access
-  operations, unsafe strings, malformed selectors, and invalid NACM path
-  patterns.
-- Compilation into `opc_nacm::NacmPolicy` with default-deny behavior.
-- `SignedGrantSource` integration for populating `TrustedPrincipal.groups`
-  only from signed policy data after transport authentication.
-- A static `SchemaRegistry` for the standalone `/nacm` subtree.
+## API Shape
 
-Fail-closed behavior is intentional. An empty config denies by default, and a
-disabled config compiles to an empty policy rather than bypassing NACM.
+Public API:
 
-The exact `user-name` membership rules are:
+- Config model:
+  `NacmConfig`, `NacmConfigDelta`, `NacmGroup`,
+  `SpiffeWorkloadSelector`, `NacmConfigRuleList`, and `NacmConfigRule`.
+- Rule fields:
+  `NacmAccessOperation` and `NacmConfigEffect`.
+- Errors and schema:
+  `NacmConfigError` and `schema_registry`.
+- Trait implementations:
+  `OpcConfig` and `SignedGrantSource`.
 
-- SSH users match the authenticated username.
-- SPIFFE workloads match the full `spiffe://...` URI.
-- Internal principals match `internal:<name>`.
+Example imports:
 
-SPIFFE selectors match the canonical OpenPacketCore SPIFFE path layout:
-
-```text
-spiffe://<trust-domain>/tenant/<tenant>/ns/<namespace>/sa/<service-account>/nf/<nf-kind>/instance/<instance>
+```rust
+use opc_nacm_config::{schema_registry, NacmConfig};
+use opc_mgmt_principal::SignedGrantSource;
 ```
 
-Selectors are exact-match and must set at least one criterion.
+`enabled = false` compiles to an empty deny-all policy. It is fail-closed and
+does not bypass authorization.
+
+## Relationships
+
+- Compiles to `opc-nacm::NacmPolicy`.
+- Implements `opc_config_model::OpcConfig`.
+- Implements `opc_mgmt_principal::SignedGrantSource` for group grants.
+- Used by management authorization layers through active policy sources.
+
+## Status And Limits
+
+Current scope:
+
+- Full-replace config delta at `/nacm:nacm`.
+- Group membership by exact user name and SPIFFE workload selectors.
+- Rule-list validation with required groups, non-empty rules, unique names, and
+  explicit allow/deny effects.
+- Static schema registry for the standalone NACM model.
+
+Important behavior:
+
+- SPIFFE workload selectors require tenant consistency between the principal and
+  identity path.
+- Rule paths drive module registration for the compiled policy, along with
+  built-in modules. Arbitrary external schema-registry integration is not
+  provided here.
+
+## Roadmap
+
+- Keep NACM config fail-closed.
+- Add external schema integration only through a clear registry contract.
+
+## Verification
+
+Run:
+
+```sh
+cargo test -p opc-nacm-config
+```

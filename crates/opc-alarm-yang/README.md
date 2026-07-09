@@ -1,25 +1,59 @@
-# Opc Alarm Yang
+# opc-alarm-yang
 
-YANG schema and operational projections for OpenPacketCore alarms.
+YANG-style alarm schema fixture and JSON projection.
 
-## Status
+This crate exposes a static alarm YANG module string and a helper that converts
+`opc-alarm` values into YANG-shaped JSON. It does not serve NETCONF or gNMI by
+itself.
 
-**Production-ready**
+## API Shape
 
-## Reference
+Public API:
 
-[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/013-fault-management-alarm-substrate.md)
+- `YANG_ALARM_SCHEMA`, the `openpacketcore-alarm` YANG module text.
+- `alarm_to_yang_json`, converting an `opc_alarm::Alarm` into
+  `serde_json::Value`.
 
-## Quick start
+Example:
 
-```rust,no_run
-use opc_alarm_yang::...;
-
-fn main() {
-    // See the crate documentation for full API usage.
-}
+```rust
+use opc_alarm_yang::{alarm_to_yang_json, YANG_ALARM_SCHEMA};
 ```
 
-## License
+The JSON projection includes alarm identity, type, severity, probable cause,
+affected object, tenant/slice/region metadata, state, timestamps, details, and
+redacted text.
 
-This crate is licensed under the [Apache License, Version 2.0](../../LICENSE).
+## Relationships
+
+- Consumes `opc-alarm`.
+- Can be used by tests, examples, or management bindings that need a simple
+  alarm projection.
+- Independent of `opc-yanggen`; the schema is a static fixture.
+
+## Status And Limits
+
+Current scope:
+
+- Static YANG module text for alarm projection tests.
+- Pure JSON conversion helper.
+
+Limitations:
+
+- No NETCONF or gNMI server.
+- No generated schema-registry implementation.
+- No datastore or subscription support.
+
+## Roadmap
+
+- Keep this crate a lightweight projection fixture.
+- Move generated registry/server behavior into generated model or protocol
+  crates if production alarm management needs it.
+
+## Verification
+
+Run:
+
+```sh
+cargo test -p opc-alarm-yang
+```

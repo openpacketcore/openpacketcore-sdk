@@ -1,49 +1,41 @@
 # opc-proto-ikev2
 
-`opc-proto-ikev2` is an experimental IKEv2 codec scaffold for OpenPacketCore
-untrusted-access work.
+Experimental IKEv2 mechanism scaffold for OpenPacketCore untrusted-access work.
 
-Current scope is intentionally narrow:
+## Purpose
 
-- IKEv2 fixed-header decode/encode over the shared `opc-protocol` traits;
-- raw-preserving generic payload-chain walking for unencrypted payloads;
-- unknown non-critical payload preservation, while unknown critical payloads
-  always fail closed per RFC 7296;
-- protected-payload boundary metadata for `SK` and `SKF` payloads without
-  parsing ciphertext as cleartext;
-- RFC 7383 `SKF` fragment-number/total-fragments structural helpers plus
-  bounded reassembly for already-decrypted fragment cleartext;
-- a caller-supplied `CryptoProvider` trait boundary for downstream SA state and
-  key policy;
-- an SA_INIT-derived AES-GCM-16 `SK` payload opener for callers that already
-  selected an IKE SA profile, derived key material, and packet direction;
-- a matching SA_INIT-derived AES-GCM-16 `SK` sealing helper for caller-built
-  responder payloads;
-- typed IKE_AUTH cleartext payload views/builders for IDi/IDr, AUTH, CERT,
-  CERTREQ, EAP, CP, SA, TSi/TSr, Notify, and Delete payload chains;
-- transcript-bound shared-key AUTH MIC computation and verification for
-  EAP/AAA-supplied keying material;
-- transcript-bound signature AUTH computation and verification for RSA Digital
-  Signature (method 1, SHA-256) and RFC 7427 Digital Signature (method 14,
-  RSA-SHA256 and ECDSA-P256/P384) against a caller-supplied pinned SPKI or the
-  SubjectPublicKeyInfo of a caller-trusted X.509 certificate, without any
-  certificate-chain validation. Signing is ECDSA-only by default; RSA
-  *signing* requires the opt-in `rsa-signing` feature so default builds
-  perform no RSA private-key operations (RUSTSEC-2023-0071 posture), while
-  RSA *verification* of peers is always available;
-- RFC 5998 `EAP_ONLY_AUTHENTICATION` notify decode and emission helpers; and
-- product-neutral Child SA proposal/traffic-selector selection intent plus
-  response SA/TS payload builders; and
-- RFC 7296 NAT-D hash computation and semantic evaluation from typed Notify
-  payloads and caller-supplied observed UDP endpoints.
+`opc-proto-ikev2` covers transport-neutral IKEv2 wire mechanisms that are safe
+to expose as SDK primitives today: header decode/encode, unencrypted payload
+walking, protected-payload boundaries, selected SA_INIT and IKE_AUTH helpers,
+NAT detection, NAT-T datagram classification, and product-neutral Child SA
+negotiation intent.
 
-It does **not** provide an IKE SA state machine, EAP-AKA procedure, cookie or
-retransmission policy, NAT traversal policy, 3GPP ePDG profile validation,
-Child SA lifecycle management, XFRM/IPsec programming, carrier acceptance
-evidence, or a production ePDG control-plane stack. See
-[CONFORMANCE.md](CONFORMANCE.md) for the precise evidence boundary.
+It does not implement an IKE SA state machine, EAP-AKA, retransmission policy,
+cookie policy, Child SA lifecycle, XFRM/IPsec programming, 3GPP ePDG profile
+validation, carrier acceptance evidence, or a production ePDG control-plane
+stack.
 
-## Minimal use
+## API Shape
+
+- `Message<'a>` and `OwnedMessage` provide borrowed and owned IKEv2 messages.
+- `header` exposes `Header`, `HeaderFlags`, `decode_header`, and
+  `encode_header`.
+- `payload` exposes `PayloadChain`, `RawPayload`, `RawPayloadIterator`,
+  `PayloadType`, and `validate_payload_chain`.
+- `crypto` defines the caller-supplied `CryptoProvider` boundary and protected
+  payload open result types.
+- `sa_init` and `sa_init_crypto` provide typed SA/KE/Nonce/Notify helpers,
+  SA_INIT response builders, Diffie-Hellman group/profile types, and IKE/Child
+  SA key-material derivation.
+- `protected_payload_crypto` provides caller-keyed AES-GCM-16 `SK` open/seal
+  helpers for already-derived SA_INIT key material.
+- `ike_auth` and `ike_auth_signature` provide cleartext IKE_AUTH payload
+  helpers, shared-key AUTH MIC helpers, signature AUTH helpers, and Child SA
+  selector/proposal helpers.
+- `fragmentation`, `notify`, `nat_detection`, `nat_traversal`, and `exchange`
+  expose RFC-specific mechanism helpers without owning product state.
+
+## Example
 
 ```rust
 use opc_proto_ikev2::Message;
@@ -57,10 +49,36 @@ let packet = [
     0, 0, 0, 36,
     0, 0, 0, 8, 0x11, 0x22, 0x33, 0x44,
 ];
+
 let (_tail, message) = Message::decode(&packet, DecodeContext::default())?;
 assert_eq!(message.payloads().count(), 1);
 # Ok::<(), opc_protocol::DecodeError>(())
 ```
+
+## Features
+
+- `rsa-signing` enables RSA private-key signing for IKE_AUTH methods 1 and 14.
+  It is off by default; RSA verification is still available in default builds.
+- `testkit` exposes deterministic fixture builders for tests and downstream
+  harnesses.
+
+## Status And Limits
+
+The crate is experimental and `publish = false`. It has structural coverage and
+targeted crypto/helper tests for the documented scaffold, but it is not a full
+IKEv2 implementation. Certificate-chain, validity-period, name, and key-usage
+validation are caller responsibilities when using signature AUTH helpers.
+
+See [CONFORMANCE.md](CONFORMANCE.md) for the exact evidence boundary and
+explicit non-goals.
+
+## Roadmap
+
+- Add independent-peer fixtures before claiming interoperability.
+- Continue adding typed cleartext payload bodies with octet-level fixture
+  evidence.
+- Keep SA state machines, retransmission queues, cookie policy, EAP-AKA, Child
+  SA installation, and ePDG product decisions outside this crate.
 
 ## Verification
 

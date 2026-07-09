@@ -1,43 +1,74 @@
-# Opc Config Model
+# opc-config-model
 
-Shared config-model request, result, identity, and error types for OpenPacketCore.
+Shared configuration model contracts for OpenPacketCore CNFs.
 
-This crate also owns the generic config apply-plan contract. An apply plan is
-the impact classification produced after diff/validation and before durable
-commit. Validation answers "is this candidate syntactically and semantically
-valid"; the apply plan answers "can this valid candidate be applied live, and
-what operational workflow does it require?"
+This crate contains pure data types and traits used by the config subsystem. It
+does not provide a datastore, commit worker, management protocol server, or
+generated CNF model.
 
-Impact classes are ordered by operational disruption:
+## API Shape
 
-- `hot`: accepted immediately for existing and new work.
-- `warm`: accepted live, but only new work observes the change.
-- `drain-required`: accepted, but traffic must drain before it is safe.
-- `restart-required`: accepted, but the CNF must restart before it is safe.
-- `forbidden-live`: rejected by default and returned on `CommitError.apply_plan`.
+Core exports:
 
-Products install a `ConfigImpactClassifier` in `opc-config-bus` when they need
-domain-specific rules. Without one, the default classifier returns a hot plan
-from the SDK-derived changed paths, preserving existing behavior.
+- Identity and request context: `WorkloadIdentity`, `TrustedPrincipal`,
+  `AuthStrength`, `TransportType`, and `RequestSource`.
+- Request types: `ConfigOperation`, `CommitMode`, `RollbackTarget`,
+  `RequestId`, `IdempotencyKey`, and `YangPath`.
+- Commit results and failures: `CommitStatus`, `CommitErrorCode`,
+  `CommitError`, and `ConfigError`.
+- Validation contracts: `ValidationStage`, `ValidationError`, and
+  `ValidationContext`.
+- `OpcConfig`, the trait implemented by generated or hand-written CNF config
+  models.
+- `CommitRequest<C>` and `CommitResult`.
+- Apply-plan support: `ApplyPlan`, `ApplyPlanChange`, `ApplyPlanWarning`,
+  `ApplyPlanError`, `ChangeImpact`, `ChangeImpactClass`,
+  `ConfigImpactClassifier`, `HotConfigImpactClassifier`, and
+  `ConfigWorkflowRequirement`.
 
-## Status
+Example imports:
 
-**Production-ready**
-
-## Reference
-
-[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/001-management-substrate.md)
-
-## Quick start
-
-```rust,no_run
-use opc_config_model::...;
-
-fn main() {
-    // See the crate documentation for full API usage.
-}
+```rust
+use opc_config_model::{CommitRequest, OpcConfig, RequestSource};
 ```
 
-## License
+`OpcConfig` implementors provide schema identity, syntax and semantic
+validation, diff/changed-path reporting, and candidate application. Optional
+`admission_payload_size_bytes` support lets the config bus reject oversized
+requests before expensive work.
 
-This crate is licensed under the [Apache License, Version 2.0](../../LICENSE).
+## Relationships
+
+- Implemented by generated CNF config types from `opc-yanggen` or by fixtures.
+- Consumed by `opc-config-bus` for commit processing.
+- Referenced by management protocol crates, authorization adapters, and
+  operational-state projections.
+
+## Status And Limits
+
+Current scope:
+
+- Stable contracts and shared enums for config operations.
+- Redaction-friendly validation and commit errors.
+- Apply-plan impact classification for hot, warm, drain-required,
+  restart-required, and forbidden-live changes.
+
+Important behavior:
+
+- `ForbiddenLive` changes normalize to hard errors.
+- `DrainRequired` and `RestartRequired` changes block traffic until an external
+  workflow completes.
+
+## Roadmap
+
+- Keep this crate free of storage and transport dependencies.
+- Add new shared config concepts here only when multiple subsystems require the
+  same contract.
+
+## Verification
+
+Run:
+
+```sh
+cargo test -p opc-config-model
+```

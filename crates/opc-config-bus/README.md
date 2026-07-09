@@ -1,55 +1,79 @@
-# Opc Config Bus
+# opc-config-bus
 
-Transactional config bus supporting schema validation, tenant segregation, AAD-bound envelope encryption, and admission control.
+Sequenced configuration commit bus for OpenPacketCore CNFs.
 
-Candidate-bearing `commit`, `commit-confirmed`, and `validate-only` requests now
-produce a generic config apply plan after syntax/semantic validation and before
-durable append or publication. The default classifier marks SDK-derived changed
-paths as `hot`, so existing users do not need to configure anything. Products
-that need stricter behavior can use the explicit classifier constructors and
-provide an `opc_config_model::ConfigImpactClassifier`.
+This crate owns the runtime commit flow around `opc-config-model`: admission,
+authorization, validation, durable append, snapshot publication, subscribers,
+and recovery fencing. It does not define the CNF config schema itself.
 
-Apply-plan hard errors and `forbidden-live` plans fail closed before any durable
-side effect. Successful `validate-only` and commit responses expose the admitted
-plan on `CommitResult.apply_plan`; rejected plans are attached to
-`CommitError.apply_plan` with `CommitErrorCode::ApplyPlanRejected`.
+## API Shape
 
-## Status
+Main exports:
 
-**Production-ready**
+- `ConfigBus`, the commit worker and snapshot publisher.
+- `ConfigAuthorizer`, `AuthorizationContext`, `AuthorizationError`, and
+  `AllowAllAuthorizer`.
+- Datastore contracts and implementations:
+  `ManagedDatastore`, `EncryptingManagedDatastore`,
+  `InMemoryManagedDatastore`, and `MockManagedDatastore`.
+- Snapshot/event types:
+  `ConfigSnapshot`, `AtomicConfigSnapshot`, `PublishedSnapshot`,
+  `ConfigChange`, `ConfigEvent`, and `ConfigReceiver`.
+- Store and recovery types:
+  `StoredConfig`, `SealedConfig`, `StoredRequestFingerprint`,
+  `StoreError`, `StoreErrorCode`, `DriftState`, and `AuthorityMode`.
+- Subscriber behavior: `SubscriberLagPolicy`.
 
-## Non-production bootstrap store
+Example imports:
 
-`InMemoryManagedDatastore<C>` is available for local development, CI, and
-management-only bootstrap before a product has selected a durable production
-config backend. It preserves config-bus append, restore, rollback,
-idempotency, recovery-marker, and commit-confirmed behavior while the process
-is alive, but it is non-durable and must not be used as production config
-storage.
-
-```rust,no_run
-use opc_config_bus::{ConfigBus, InMemoryManagedDatastore};
+```rust
+use opc_config_bus::{ConfigBus, ConfigAuthorizer, ManagedDatastore};
 use opc_config_model::OpcConfig;
-
-async fn build_dev_bus<C: OpcConfig>(initial: C) -> Result<ConfigBus<C>, opc_config_bus::StoreError> {
-    ConfigBus::restore_or_new_dev_only(initial, InMemoryManagedDatastore::new()).await
-}
 ```
 
-## Reference
+`ConfigBus` runs a single sequenced commit worker behind a bounded queue. A
+successful submission means the request passed authorization, validation,
+durable append, and snapshot publication. A full queue fails admission
+immediately. Recovery fencing returns `RecoveryRequired` until the backing store
+is cleared.
 
-[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/001-management-substrate.md)
+## Relationships
 
-## Quick start
+- Consumes `OpcConfig` models from `opc-config-model`.
+- Uses authorizers supplied by production policy layers such as
+  `opc-mgmt-authz`.
+- Can wrap sealed durable stores through `EncryptingManagedDatastore` using
+  `opc-crypto` and `opc-key`.
+- Publishes snapshots to subscribers used by CNF runtime components.
 
-```rust,no_run
-use opc_config_bus::...;
+## Status And Limits
 
-fn main() {
-    // See the crate documentation for full API usage.
-}
+Current scope:
+
+- Authoritative single-writer config commits.
+- Bounded commit queue with immediate backpressure.
+- Bounded subscriber lag policies:
+  `DropOldest`, `DropNewest`, `DisconnectOnLag`, and `ForceResync`.
+- Idempotency and rollback support through the datastore trait.
+
+Production notes:
+
+- `InMemoryManagedDatastore` and `MockManagedDatastore` are not durable
+  production stores.
+- Constructors with `*_dev_only` install `AllowAllAuthorizer` and must stay out
+  of production wiring.
+- Built-in constructors are authoritative; `AuthorityMode::Shadow` is reserved
+  for future integration work.
+
+## Roadmap
+
+- Keep storage behind the datastore trait.
+- Add production authority modes only when a durable coordination design exists.
+
+## Verification
+
+Run:
+
+```sh
+cargo test -p opc-config-bus
 ```
-
-## License
-
-This crate is licensed under the [Apache License, Version 2.0](../../LICENSE).
