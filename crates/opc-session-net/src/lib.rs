@@ -10,7 +10,7 @@ pub mod error;
 pub mod protocol;
 pub mod server;
 
-pub use client::RemoteSessionBackend;
+pub use client::{RemoteAddrResolver, RemoteSessionBackend};
 pub use error::ProtocolError;
 pub use protocol::{Request, Response};
 pub use server::SessionReplicationServer;

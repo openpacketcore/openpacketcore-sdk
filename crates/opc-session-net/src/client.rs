@@ -1,3 +1,4 @@
+use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
@@ -5,6 +6,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::Stream;
 use opc_session_store::backend::{
@@ -26,6 +28,10 @@ use crate::protocol::{
     read_frame, write_frame, Request, Response, CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE,
 };
 
+/// Resolver callback used by [`RemoteSessionBackend::new_with_resolver`].
+pub type RemoteAddrResolver =
+    Arc<dyn Fn() -> BoxFuture<'static, io::Result<SocketAddr>> + Send + Sync>;
+
 /// Persistent transport connection to a remote session backend.
 ///
 /// The v0 client keeps a single connection and allows one in-flight request at
@@ -35,10 +41,87 @@ struct Connection {
     writer: Box<dyn AsyncWrite + Unpin + Send>,
 }
 
+#[derive(Clone)]
+enum RemoteTarget {
+    Pinned(SocketAddr),
+    Resolved {
+        server_name: Option<Arc<str>>,
+        resolve: RemoteAddrResolver,
+    },
+}
+
+impl RemoteTarget {
+    fn pinned(addr: SocketAddr) -> Self {
+        Self::Pinned(addr)
+    }
+
+    fn resolved(server_name: Option<String>, resolve: RemoteAddrResolver) -> Self {
+        Self::Resolved {
+            server_name: server_name.map(Arc::<str>::from),
+            resolve,
+        }
+    }
+
+    async fn resolve(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Pinned(addr) => Ok(*addr),
+            Self::Resolved { resolve, .. } => resolve().await,
+        }
+    }
+
+    fn tls_server_name(
+        &self,
+        resolved_addr: SocketAddr,
+    ) -> Result<rustls_pki_types::ServerName<'static>, ProtocolError> {
+        match self {
+            Self::Pinned(_) => Ok(rustls_pki_types::ServerName::IpAddress(
+                resolved_addr.ip().into(),
+            )),
+            Self::Resolved {
+                server_name: Some(server_name),
+                ..
+            } => rustls_pki_types::ServerName::try_from(server_name.to_string())
+                .map_err(|_| ProtocolError::BackendUnavailable("invalid TLS server name".into())),
+            Self::Resolved {
+                server_name: None, ..
+            } => Ok(rustls_pki_types::ServerName::IpAddress(
+                resolved_addr.ip().into(),
+            )),
+        }
+    }
+}
+
+impl std::fmt::Debug for RemoteTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pinned(addr) => f.debug_tuple("Pinned").field(addr).finish(),
+            Self::Resolved { server_name, .. } => f
+                .debug_struct("Resolved")
+                .field("server_name", server_name)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pinned(addr) => write!(f, "{addr}"),
+            Self::Resolved {
+                server_name: Some(server_name),
+                ..
+            } => write!(f, "{server_name}"),
+            Self::Resolved {
+                server_name: None, ..
+            } => f.write_str("<resolver>"),
+        }
+    }
+}
+
 /// Remote session backend client.
 #[derive(Clone)]
 pub struct RemoteSessionBackend {
-    addr: SocketAddr,
+    target: RemoteTarget,
     tls_config: Option<Arc<opc_tls::ClientConfig>>,
     deadline: Duration,
     max_frame_size: usize,
@@ -50,7 +133,7 @@ pub struct RemoteSessionBackend {
 impl std::fmt::Debug for RemoteSessionBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteSessionBackend")
-            .field("addr", &self.addr)
+            .field("target", &self.target)
             .field("tls_config", &self.tls_config.is_some())
             .field("deadline", &self.deadline)
             .field("max_frame_size", &self.max_frame_size)
@@ -71,7 +154,27 @@ impl RemoteSessionBackend {
         tls_config: Arc<opc_tls::ClientConfig>,
         deadline: Option<Duration>,
     ) -> Self {
-        Self::from_transport(addr, Some(tls_config), deadline)
+        Self::from_transport(RemoteTarget::pinned(addr), Some(tls_config), deadline)
+    }
+
+    /// Create a new mTLS remote backend client that re-resolves before each
+    /// new connection.
+    ///
+    /// Existing live connections are reused. When a connection is dropped,
+    /// the next retry calls `resolve` and connects to the returned address.
+    /// TLS verification keeps using `server_name`; it is not changed to the
+    /// resolved IP address.
+    pub fn new_with_resolver(
+        server_name: String,
+        resolve: RemoteAddrResolver,
+        tls_config: Arc<opc_tls::ClientConfig>,
+        deadline: Option<Duration>,
+    ) -> Self {
+        Self::from_transport(
+            RemoteTarget::resolved(Some(server_name), resolve),
+            Some(tls_config),
+            deadline,
+        )
     }
 
     /// Create a plaintext remote backend client for tests.
@@ -79,16 +182,25 @@ impl RemoteSessionBackend {
     /// Production replication clients must use [`RemoteSessionBackend::new`].
     #[cfg(feature = "insecure-test")]
     pub fn new_insecure(addr: SocketAddr, deadline: Option<Duration>) -> Self {
-        Self::from_transport(addr, None, deadline)
+        Self::from_transport(RemoteTarget::pinned(addr), None, deadline)
+    }
+
+    /// Create a plaintext remote backend client with re-resolution for tests.
+    #[cfg(feature = "insecure-test")]
+    pub fn new_insecure_with_resolver(
+        resolve: RemoteAddrResolver,
+        deadline: Option<Duration>,
+    ) -> Self {
+        Self::from_transport(RemoteTarget::resolved(None, resolve), None, deadline)
     }
 
     fn from_transport(
-        addr: SocketAddr,
+        target: RemoteTarget,
         tls_config: Option<Arc<opc_tls::ClientConfig>>,
         deadline: Option<Duration>,
     ) -> Self {
         Self {
-            addr,
+            target,
             tls_config,
             deadline: deadline.unwrap_or(Duration::from_secs(2)),
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
@@ -122,7 +234,7 @@ impl RemoteSessionBackend {
             Ok(res) => res,
             Err(_) => Err(StoreError::BackendUnavailable(format!(
                 "remote session backend {} unreachable within {:?}",
-                self.addr, self.deadline
+                self.target, self.deadline
             ))),
         }
     }
@@ -158,16 +270,15 @@ impl RemoteSessionBackend {
     }
 
     async fn connect(&self) -> Result<Connection, ProtocolError> {
-        let tcp = TcpStream::connect(self.addr)
-            .await
-            .map_err(ProtocolError::Io)?;
+        let addr = self.target.resolve().await.map_err(ProtocolError::Io)?;
+        let tcp = TcpStream::connect(addr).await.map_err(ProtocolError::Io)?;
 
         let (mut reader, mut writer): (
             Box<dyn AsyncRead + Unpin + Send>,
             Box<dyn AsyncWrite + Unpin + Send>,
         ) = if let Some(tls_config) = &self.tls_config {
             let connector = tokio_rustls::TlsConnector::from(tls_config.clone());
-            let server_name = rustls_pki_types::ServerName::IpAddress(self.addr.ip().into());
+            let server_name = self.target.tls_server_name(addr)?;
             let tls_stream = connector
                 .connect(server_name, tcp)
                 .await
@@ -237,14 +348,14 @@ impl RemoteSessionBackend {
     fn capabilities_after_probe_failure(&self, reason: &str) -> BackendCapabilities {
         if let Some(caps) = self.cached_capabilities() {
             tracing::warn!(
-                addr = %self.addr,
+                target = %self.target,
                 reason,
                 "remote capabilities probe failed; using cached capabilities"
             );
             caps
         } else {
             tracing::warn!(
-                addr = %self.addr,
+                target = %self.target,
                 reason,
                 "remote capabilities probe failed before any cached success; returning minimal capabilities"
             );
@@ -384,7 +495,7 @@ impl SessionBackend for RemoteSessionBackend {
         &self,
         start_sequence: u64,
     ) -> Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError> {
-        let addr = self.addr;
+        let target = self.target.clone();
         let tls_config = self.tls_config.clone();
         let max_frame_size = self.max_frame_size;
         let node_id = self.node_id.clone();
@@ -394,7 +505,7 @@ impl SessionBackend for RemoteSessionBackend {
 
         tokio::spawn(async move {
             let result = watch_connect_and_read(
-                addr,
+                target,
                 tls_config,
                 max_frame_size,
                 node_id,
@@ -469,7 +580,7 @@ impl SessionLeaseManager for RemoteSessionBackend {
 }
 
 async fn watch_connect_and_read(
-    addr: SocketAddr,
+    target: RemoteTarget,
     tls_config: Option<Arc<opc_tls::ClientConfig>>,
     max_frame_size: usize,
     node_id: String,
@@ -480,12 +591,13 @@ async fn watch_connect_and_read(
     // Bound connect + handshake by the client deadline. After the handshake,
     // bounded channel sends backpressure socket reads when consumers lag.
     let open = async {
+        let addr = target.resolve().await.map_err(ProtocolError::Io)?;
         let tcp = TcpStream::connect(addr).await.map_err(ProtocolError::Io)?;
 
         let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
             if let Some(tls_config) = &tls_config {
                 let connector = tokio_rustls::TlsConnector::from(tls_config.clone());
-                let server_name = rustls_pki_types::ServerName::IpAddress(addr.ip().into());
+                let server_name = target.tls_server_name(addr)?;
                 let tls_stream = connector
                     .connect(server_name, tcp)
                     .await
@@ -505,7 +617,7 @@ async fn watch_connect_and_read(
         Err(_) => {
             let _ = tx
                 .send(Err(StoreError::BackendUnavailable(format!(
-                    "watch handshake to {addr} timed out after {deadline:?}"
+                    "watch handshake to {target} timed out after {deadline:?}"
                 ))))
                 .await;
             return Err(ProtocolError::BackendUnavailable(
@@ -625,5 +737,113 @@ impl Stream for WatchStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
+    }
+}
+
+#[cfg(all(test, feature = "insecure-test"))]
+mod tests {
+    use super::*;
+    use futures_util::FutureExt;
+    use opc_session_store::BackendCapabilities;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+
+    async fn capability_server(
+        caps: BackendCapabilities,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read hello");
+            assert!(matches!(hello, Request::Hello { .. }));
+            write_frame(
+                &mut stream,
+                &Response::HelloAck {
+                    contract_version: CONTRACT_VERSION,
+                },
+            )
+            .await
+            .expect("write hello ack");
+
+            let req: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read request");
+            assert!(matches!(req, Request::Capabilities));
+            write_frame(&mut stream, &Response::Capabilities(caps))
+                .await
+                .expect("write capabilities");
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn resolver_backend_reconnects_to_changed_address() {
+        let caps_a = BackendCapabilities::minimal();
+        let caps_b = BackendCapabilities::all_enabled();
+        let (addr_a, handle_a) = capability_server(caps_a).await;
+        let (addr_b, handle_b) = capability_server(caps_b).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let resolver: RemoteAddrResolver = Arc::new(move || {
+            let call = resolver_calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call == 0 {
+                    Ok(addr_a)
+                } else {
+                    Ok(addr_b)
+                }
+            }
+            .boxed()
+        });
+        let backend = RemoteSessionBackend::new_insecure_with_resolver(
+            resolver,
+            Some(Duration::from_secs(2)),
+        );
+
+        assert_eq!(backend.capabilities().await, caps_a);
+        let _ = handle_a.await;
+
+        assert_eq!(backend.capabilities().await, caps_b);
+        let _ = handle_b.await;
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn socket_addr_constructor_remains_pinned_after_disconnect() {
+        let caps_a = BackendCapabilities::minimal();
+        let (addr_a, handle_a) = capability_server(caps_a).await;
+        let (_addr_b, handle_b) = capability_server(BackendCapabilities::all_enabled()).await;
+        let backend = RemoteSessionBackend::new_insecure(addr_a, Some(Duration::from_millis(250)));
+
+        assert_eq!(backend.capabilities().await, caps_a);
+        let _ = handle_a.await;
+
+        assert_eq!(backend.capabilities().await, caps_a);
+        handle_b.abort();
+    }
+
+    #[test]
+    fn resolver_target_uses_hostname_for_tls_server_name_across_addresses() {
+        let resolver: RemoteAddrResolver =
+            Arc::new(|| async { Ok("127.0.0.1:1".parse().expect("addr")) }.boxed());
+        let target = RemoteTarget::resolved(
+            Some("peer-0.sessions.core.svc.cluster.local".to_string()),
+            resolver,
+        );
+        let first = target
+            .tls_server_name("127.0.0.1:1234".parse().expect("addr"))
+            .expect("first server name");
+        let second = target
+            .tls_server_name("127.0.0.2:1234".parse().expect("addr"))
+            .expect("second server name");
+
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+        assert!(format!("{first:?}").contains("peer-0.sessions.core.svc.cluster.local"));
+        assert!(!format!("{first:?}").contains("127.0.0.1"));
     }
 }
