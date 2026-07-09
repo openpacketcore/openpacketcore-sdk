@@ -14,12 +14,13 @@ use opc_ipsec_lb::{
     BgpRouteVipAdvertiserConfig, ClusterNode, CookieKey, CookieSlot, EspFragmentPosture,
     FixedEntropy, ForwardingProof, IkeCookie, IkeCookieDecision, IkeCookieGate, IkeCookiePolicy,
     IkeCookieRequest, IpAddress, IpFragment, IpsecLbError, IvResumeDecision, MockOwnershipFencer,
-    MockRePinAuditSink, MockSteeringBackend, MockSteeringOperation, OwnershipSource,
-    RePinAuditEventKind, RePinCoordinator, RePinRequest, RekeyRequest, RendezvousSelector,
-    ResumeKeySource, SaId, SameSpiResume, SelectionKey, SendIvCounter, SessionOwnershipKeyResolver,
-    SessionOwnershipKeyspace, SessionStoreOwnershipSource, ShardId, ShardSet, SpiAllocationRequest,
-    SpiAllocator, SpiKind, SteerKey, SteeringRule, SwuClassification, SwuClassifierConfig,
-    SwuPacket, TaggedSpiAllocator, TaggedSpiLayout, VipAdvertisement, VipAdvertiser,
+    MockRePinAuditSink, MockSteeringBackend, MockSteeringOperation, NicOffloadSecurityPosture,
+    OwnershipSource, RePinAuditEventKind, RePinCoordinator, RePinRequest, RekeyRequest,
+    RendezvousSelector, ResumeKeySource, SaId, SameSpiResume, SelectionKey, SendIvCounter,
+    SessionOwnershipKeyResolver, SessionOwnershipKeyspace, SessionStoreOwnershipSource, ShardId,
+    ShardSet, SpiAllocationRequest, SpiAllocator, SpiKind, SteerKey, SteeringRule,
+    SwuClassification, SwuClassifierConfig, SwuPacket, TaggedSpiAllocator, TaggedSpiLayout,
+    VipAdvertisement, VipAdvertiser,
 };
 
 const IKE_HEADER_LEN: usize = 28;
@@ -292,6 +293,34 @@ fn failover_guards_reject_iv_and_replay_rollback() {
     }
     .validate()
     .is_err());
+}
+
+#[test]
+fn inline_nic_crypto_offload_requires_key_custody_documentation() {
+    assert!(NicOffloadSecurityPosture::steering_only()
+        .validate()
+        .is_ok());
+    assert!(matches!(
+        NicOffloadSecurityPosture::inline_ipsec_crypto(false, true)
+            .validate()
+            .unwrap_err(),
+        IpsecLbError::InvalidConfig {
+            field: "nic_offload_security",
+            ..
+        }
+    ));
+    assert!(matches!(
+        NicOffloadSecurityPosture::inline_ipsec_crypto(true, false)
+            .validate()
+            .unwrap_err(),
+        IpsecLbError::InvalidConfig {
+            field: "nic_offload_security",
+            ..
+        }
+    ));
+    NicOffloadSecurityPosture::inline_ipsec_crypto(true, true)
+        .validate()
+        .unwrap();
 }
 
 #[tokio::test]

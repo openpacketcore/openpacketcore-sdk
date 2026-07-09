@@ -15,6 +15,7 @@ pub mod error;
 pub mod failover;
 pub mod mock;
 pub mod model;
+pub mod offload;
 pub mod ports;
 pub mod repin;
 pub mod selector;
@@ -42,6 +43,7 @@ pub use model::{
     ClusterNode, IpAddress, SaId, ShardId, SteerAction, SteerKey, SteeringBackendKind,
     SteeringProbe, SteeringRule, VipAdvertisement, VipAdvertiserKind, VipProbe,
 };
+pub use offload::NicOffloadSecurityPosture;
 pub use ports::{
     OwnershipFencer, OwnershipSource, RePinAuditSink, SpiAllocator, SteeringBackend, VipAdvertiser,
 };

@@ -15,6 +15,8 @@ steer layer:
 - session-store backed ownership reads for authoritative SA/shard owners;
 - Host-XDP cross-node redirect config that fails closed unless mTLS/SPIFFE
   with no plaintext fallback is declared;
+- NIC/DPU inline IPsec crypto offload posture validation for documented
+  FIPS/HSM key-custody scope;
 - reusable ports for steering backends, VIP advertisement, ownership reads,
   ownership fencing, and re-pin audit.
 
