@@ -1,85 +1,67 @@
 # opc-session-net
 
-Networked session replication transport for OpenPacketCore.
-
-**Status: experimental.** The wire format is version-gated (see below) and may
-change in breaking ways before 1.0.
+Experimental network transport for remote session-store replicas.
 
 ## Purpose
 
-`opc-session-store` provides production-grade quorum semantics (fencing,
-leases, compare-and-set, read-repair) over in-process replica handles. This
-crate supplies the missing network leg so those replicas can live in separate
-processes or pods:
+`opc-session-net` exposes a length-prefixed JSON protocol between
+`RemoteSessionBackend` clients and `SessionReplicationServer` instances. It
+lets a `SessionBackend` or quorum coordinator call a remote replica using the
+same session-store traits.
 
-- **`SessionReplicationServer`** — a tokio TCP listener that exposes any
-  `SessionStoreBackend` (e.g. the SQLite backend) over a length-prefixed JSON
-  wire protocol, with optional mTLS via [`opc-tls`](../opc-tls/), bounded
-  concurrent connections, and a maximum frame size (default 1 MiB).
-- **`RemoteSessionBackend`** — a client implementing `SessionBackend` and
-  `SessionLeaseManager` against a remote server, so it composes directly into
-  `QuorumSessionStore`. Every method is bounded by a configurable end-to-end
-  deadline (default 2 s) covering connection retries with backoff; on expiry
-  the method reports the backend as unavailable so the quorum layer treats the
-  replica as offline instead of stalling.
+## API Shape
 
-Connections begin with a `Hello { contract_version, node_id }` handshake; a
-major-version mismatch closes the connection with a typed error.
-
-## Example
+- `RemoteSessionBackend::new(addr, tls_config, deadline)` creates a client that
+  implements `SessionBackend` and `SessionLeaseManager`.
+- `with_max_frame_size` overrides the default 1 MiB frame limit.
+- `SessionReplicationServer::new(backend, tls_config)` creates an mTLS server
+  over an `Arc<dyn SessionStoreBackend>`.
+- `SessionReplicationServer::new_insecure` exists only behind the
+  `insecure-test` feature.
+- `with_idle_timeout`, `with_max_connections`, and `with_max_frame_size`
+  configure the server.
+- `listen(bind_addr).await` starts the listener and returns a server handle and
+  bound address.
+- `Request`, `Response`, `ProtocolError`, and protocol constants live in the
+  public protocol layer.
 
 ```rust,no_run
-use std::sync::Arc;
-use opc_session_net::{RemoteSessionBackend, SessionReplicationServer};
-use opc_session_store::fake::FakeSessionBackend;
-use opc_session_store::quorum::{FencedSessionReplica, QuorumSessionStore};
+use opc_session_net::RemoteSessionBackend;
+use std::net::SocketAddr;
+use std::time::Duration;
 
-# async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-// Serve a backend (one per replica process). `None` = plaintext, test only;
-// pass an `opc_tls::ServerConfig` in real deployments.
-let backend = Arc::new(FakeSessionBackend::new());
-let server = SessionReplicationServer::new(backend, None);
-let (_handle, addr) = server.listen("127.0.0.1:0".parse()?).await?;
-
-// Compose remote replicas into a quorum store.
-let remote = Arc::new(RemoteSessionBackend::new(addr, None, None));
-let quorum = QuorumSessionStore::new(vec![FencedSessionReplica::new(1, remote)]);
-# Ok(()) }
+let addr: SocketAddr = "127.0.0.1:9443".parse().unwrap();
+let remote = RemoteSessionBackend::new(addr, None, Some(Duration::from_secs(2)));
+let _remote = remote.with_max_frame_size(1024 * 1024);
 ```
 
-See `tests/three_node_quorum.rs` for a full three-node kill/restart and
-read-repair scenario.
+## Relationships
 
-## Non-goals
+- Implements `opc-session-store` backend and lease traits over the wire.
+- Uses `opc-tls` Rustls configs for production mTLS transport.
+- Intended to be composed under `QuorumSessionStore` or other store callers.
 
-- **No consensus or leader election.** Quorum decisions, fencing, and
-  read-repair stay in `opc-session-store`'s `QuorumSessionStore`; this crate
-  is transport only.
-- **No persistence of its own.** Durability belongs to the backend each
-  server wraps (e.g. `SqliteSessionBackend`).
-- **No stable wire format yet.** Frames are versioned via the `Hello`
-  handshake (`CONTRACT_VERSION`); cross-version compatibility is not
-  guaranteed while experimental.
-- **No connection pooling or full multiplexing.** Each `RemoteSessionBackend`
-  keeps one persistent connection with a single in-flight request; the watch
-  stream holds its own dedicated long-lived connection.
+## Status Notes
 
-## Experimental Boundary
+- `publish = false`.
+- The transport is experimental.
+- Production server construction requires authenticated TLS.
+- Plaintext server support is test-only and gated behind `insecure-test`.
+- The wire contract version is `1`; the default max frame size is 1 MiB.
 
-The crate keeps its experimental label because:
+## Roadmap
 
-1. **Connection pooling / multiplexing** — ✅ single persistent connection
-   per `RemoteSessionBackend` with one in-flight request at a time. This keeps
-   replica ordering simple and bounds memory; high-throughput deployments should
-   validate this profile against their own latency and replication budget.
-2. **Wire-format freeze** — the length-prefixed JSON framing is
-   version-gated via the `Hello` handshake but not yet stable; a freeze
-   requires a documented compatibility policy (and likely a binary
-   encoding) before `CONTRACT_VERSION` is declared 1.0-stable.
-3. **Soak evidence** — multi-hour three-node soak under fault injection
-   (partition, slow-link, restart loops) recorded through `opc-evidence`,
-   plus latency/throughput baselines.
+- Harden protocol compatibility, cancellation behavior, watch streaming, and
+  operational metrics before treating this as production transport.
+- Keep plaintext transport limited to tests.
+- Keep the server wrapping `SessionStoreBackend` rather than owning storage.
+
+## Verification
+
+- Source checked: `Cargo.toml`, `src/lib.rs`, client, server, protocol, and
+  tests.
+- Run with: `cargo test -p opc-session-net --all-features`.
 
 ## License
 
-Apache-2.0. See [LICENSE](../../LICENSE).
+Licensed under the [Apache License, Version 2.0](../../LICENSE).

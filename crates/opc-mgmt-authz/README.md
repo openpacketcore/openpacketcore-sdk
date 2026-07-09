@@ -1,67 +1,71 @@
 # opc-mgmt-authz
 
-NACM authorization facade for OpenPacketCore management-plane reads,
-subscriptions, config writes, and management RPC/action execution checks.
+NACM-backed authorization adapters for management-plane operations.
 
-`opc-config-bus` enforces NACM on the **write** path (`ConfigAuthorizer`), but a
-running-config snapshot read is raw and unfiltered. The gNMI `Get`/`Subscribe`
-and NETCONF `<get>`/`<get-config>` paths must therefore authorize **reads**
-themselves, default-deny, and omit subtrees the caller may not see.
+This crate connects trusted principals, schema paths, and active NACM policies
+to read, write, and exec decisions. It is an adapter layer around `opc-nacm`,
+not a policy datastore.
 
-The authorizers reject served module sets with ambiguous prefixes at
-construction time. `opc-nacm` would otherwise preserve the ambiguity and make
-each later parse fail; surfacing that as a startup/schema error is clearer and
-still fail-closed.
+## API Shape
 
-Every authorizer calls `PolicySource::active_policy_for_principal`, then
-evaluates with the principal's signed NACM groups. The default policy-source
-implementation still loads by tenant for existing stores, but custom sources can
-select policy using the full verified principal. Missing or unresolvable groups
-do not match group-scoped rule-lists, so the default outcome remains deny.
+Public API:
 
-`ReadAuthorizer`:
+- `PolicySource`, a trait that supplies the active compiled `NacmPolicy`.
+- `ResolvedPolicy`, the policy plus optional signed groups and roles for the
+  requesting principal.
+- `ReadAuthorizer` for read, subscribe, and notification reads.
+- `ConfigWriteAuthorizer`, implementing `opc_config_bus::ConfigAuthorizer`.
+- `ExecAuthorizer` for static RPC/action paths.
+- `PathDecision`, `WritePathDecision`, `ReadAction`, and `AuthzError`.
 
-- builds a NACM `ModuleRegistry` once from the schema registry's served models;
-- selects the active compiled policy through a pluggable
-  `PolicySource` (the CNF wires `opc-persist`'s
-  `SqliteSecurityPolicyService::get_active_policy_compiled`, keeping this crate
-  free of the persistence/rusqlite dependency);
-- first resolves every input through the generated schema registry, then maps
-  the predicate-free schema path to a normalized NACM path and evaluates `read`
-  or `subscribe` against the principal's signed groups, returning an allow/deny
-  decision per path;
-- **fails closed**: an unparseable, unknown-prefix, or unknown-schema path denies;
-  a tenant with no policy (an empty policy default-denies) denies; a genuinely
-  unavailable policy store returns a payload-free `Err`, which the server maps to
-  a deny/`UNAVAILABLE`.
+Example:
 
-It returns per-path decisions; the server uses the schema registry's data class
-plus `opc-redaction` to mask secret values on the paths that are allowed. NACM
-here is schema-node scoped (the SDK NACM model collapses list instances), so this
-facade does not perform per-instance read authorization.
+```rust
+use opc_mgmt_authz::{PolicySource, ReadAuthorizer};
+use opc_mgmt_schema::SchemaRegistry;
 
-`ConfigWriteAuthorizer`:
+fn make_read_authorizer(
+    source: std::sync::Arc<dyn PolicySource>,
+    registry: std::sync::Arc<dyn SchemaRegistry>,
+) -> ReadAuthorizer {
+    ReadAuthorizer::new(source, registry)
+}
+```
 
-- implements the `opc-config-bus` `ConfigAuthorizer` admission hook;
-- maps `ConfigOperation` values to NACM write actions (`update`, `replace`, or
-  `delete`);
-- resolves each config-bus changed path through the generated schema registry
-  before evaluating NACM against the principal's signed groups;
-- allows empty changed-path batches for no-op/pre-authorized rollback admission;
-- denies unknown or unparseable paths with a fixed invalid marker so list key
-  values are not echoed; and
-- returns payload-free policy-store errors so servers can fail closed without
-  leaking storage details.
+If the policy source is unavailable, callers must fail closed. An empty active
+policy default-denies. Path resolution failures also deny access.
 
-`ExecAuthorizer`:
+## Relationships
 
-- builds a NACM `ModuleRegistry` from the YANG modules that define management
-  RPC/action nodes;
-- evaluates static operation paths such as `/nc:kill-session` with NACM
-  `exec` against the principal's signed groups;
-- denies invalid or unknown operation paths fail-closed;
-- returns the same payload-free policy-store error as `ReadAuthorizer`.
+- Uses `opc-nacm` for rule evaluation.
+- Uses `opc-mgmt-path` and `opc-mgmt-schema` for schema-scoped path decisions.
+- Implements the write-authorization trait consumed by `opc-config-bus`.
+- Uses signed groups/roles attached through `opc-mgmt-principal`.
 
-This is only the shared authorization seam. A server still must implement the
-actual operation semantics, audit, and any cross-session or datastore state
-before claiming support for an RPC such as NETCONF `<kill-session>`.
+## Status And Limits
+
+Current scope:
+
+- Schema-node scoped read/write/exec decisions.
+- Config operations mapped to NACM actions:
+  create, update, replace, delete, and rollback-as-replace.
+- `Patch` operations require both create and update permission.
+
+Limitations:
+
+- Decisions are not per-list-instance beyond the canonical path used for NACM
+  matching.
+- This crate does not store or compile operator-facing NACM config.
+
+## Roadmap
+
+- Keep authorization fail-closed.
+- Add protocol action mappings when new management operations are introduced.
+
+## Verification
+
+Run:
+
+```sh
+cargo test -p opc-mgmt-authz
+```

@@ -1,68 +1,76 @@
-# Opc Runtime
+# opc-runtime
 
-CNF runtime chassis: process startup phases, task supervision, health probes, and graceful SIGTERM drains.
+CNF runtime chassis for startup, supervision, health, shutdown, and resource
+governance.
 
-## Status
+## Purpose
 
-**Production-ready**
+`opc-runtime` provides the process-level runtime frame for OpenPacketCore CNFs:
+startup phases, supervised tasks, readiness gates, graceful drain, admin health,
+resource budgets, source admission, and deterministic test clocks.
 
-## Reference
+## API Shape
 
-[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/008-cnf-runtime-chassis.md)
-
-## Quick start
+- `Builder::new(profile)` creates a runtime builder. It supports startup phase
+  hooks, init callbacks, alarm manager injection, clock injection, drain hooks,
+  and `build`.
+- `RuntimeHandle` exposes phase, readiness, shutdown, supervisor, config
+  version metadata, alarm manager, and shutdown token access.
+- `RuntimeProfile`, `RuntimeMode`, `ResourceBudget`, and `SigintHandling`
+  define mode-specific runtime behavior.
+- `Supervisor` registers and spawns `TaskSpec` tasks with `Criticality`,
+  `RestartPolicy`, `ShutdownPolicy`, task kind, heartbeat timeout, and memory
+  pressure checks.
+- Health APIs include `HealthModel`, `HealthGateSet`, `HealthGate`,
+  `GateStatus`, `Readiness`, `StartupPhase`, and `known_gates`.
+- Shutdown APIs include `ShutdownToken`, `ShutdownPhase`, and `DrainHook`.
+- Admission APIs include `SourceTokenBucketPolicy`,
+  `SourceTokenBucket`, and `SourceAdmissionDecision`.
+- UDP helpers expose destination-address metadata where the platform supports
+  it.
+- Feature `observability` adds `init_observability_logging`.
 
 ```rust,no_run
-use opc_runtime::...;
+use opc_runtime::{Builder, RuntimeProfile};
 
-fn main() {
-    // See the crate documentation for full API usage.
+async fn start() -> Result<opc_runtime::RuntimeHandle, opc_runtime::RuntimeError> {
+    let profile = RuntimeProfile::dev("nrf");
+    let runtime = Builder::new(profile).build().await?;
+    Ok(runtime)
 }
 ```
 
-## Named health gates
+## Relationships
 
-Products can attach their own readiness/degradation policy to the generic
-`HealthGateSet` without hard-coding product names into the SDK. Use the
-`known_gates` constants or define your own gate names, set each gate's
-`GateImpact`, and let `HealthModel` aggregate them into a `Readiness` verdict.
+- Used by AMF-lite and CNF crates as the process lifecycle owner.
+- Optional `observability` integration delegates logging setup to
+  `opc-observability`.
+- Alarm integration composes with `opc-alarm` through injected shared managers.
 
-```rust
-use opc_runtime::{
-    known_gates, GateImpact, GateStatus, HealthGate, HealthGateSet, HealthModel,
-};
+## Status Notes
 
-fn configure_readiness(model: &mut HealthModel) {
-    // Map product-specific checks onto generic SDK gates.
-    let mut gates = HealthGateSet::new();
-    gates.insert(HealthGate::new(known_gates::CONFIG, GateImpact::BlocksReadiness)
-        .with_status(GateStatus::Passing));
-    gates.insert(HealthGate::new(known_gates::XFRM, GateImpact::BlocksReadiness)
-        .with_status(GateStatus::Passing));
-    gates.insert(HealthGate::new(known_gates::CHARGING_PEER, GateImpact::DegradesReadiness)
-        .with_status(GateStatus::Failing)
-        .with_message("no reachable CGF"));
+- `RuntimeMode::Production` and `RuntimeMode::Conformance` fail closed when
+  required bootstrap material is missing.
+- Dev, Lab, and Conformance modes allow debug endpoints without production
+  gating; Production and Perf require debug surfaces to be gated or disabled.
+- Empty supervisors are not ready.
+- Memory-limit pressure can force readiness to NotReady.
+- AMF/SMF/UPF dev, conformance, and production profiles require an NRF drain
+  hook.
 
-    // Assign the gate set to the health model; readiness is recomputed.
-    for gate in gates.iter().cloned() {
-        model.set_gate(gate);
-    }
-}
-```
+## Roadmap
 
-Gate semantics are fail-closed: an unknown status is treated as non-passing.
-`Informational` gates are reported in detailed health JSON but do not affect
-readiness. When no gates are registered, cheap `/readyz` probe output is
-unchanged.
+- Keep listener startup and shutdown semantics documented in the crate root.
+- Add runtime surfaces only when they can be supervised, health-gated, and
+  tested deterministically.
+- Keep optional integrations feature-gated.
 
-## UDP destination metadata
+## Verification
 
-`bind_udp_socket_with_destination_metadata` returns a Tokio UDP listener wrapper
-whose receive result includes payload length, source endpoint, and local
-destination endpoint metadata. Linux listeners use packet-info ancillary data
-when available; other platforms and non-packet-info paths fall back to concrete
-`local_addr()` evidence and report an unavailable status for wildcard binds.
+- Source checked: `Cargo.toml`, `src/lib.rs`, builder, runtime, supervisor,
+  health, profile, shutdown, admission, UDP, admin, and tests.
+- Run with: `cargo test -p opc-runtime`.
 
 ## License
 
-This crate is licensed under the [Apache License, Version 2.0](../../LICENSE).
+Licensed under the [Apache License, Version 2.0](../../LICENSE).

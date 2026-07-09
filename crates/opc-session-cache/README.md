@@ -1,25 +1,63 @@
-# Opc Session Cache
+# opc-session-cache
 
-Production-grade session cache with key-scoped invalidation, sequence tracking, and resume recovery.
+Read-through session cache with replication-watch coherence checks.
 
-## Status
+## Purpose
 
-**Production-ready**
+`opc-session-cache` wraps a `SessionBackend` with a local cache that consumes
+the backend replication log. It is designed for fast reads without allowing
+stale cached records to hide replication gaps.
 
-## Reference
+## API Shape
 
-[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/004-session-store.md)
-
-## Quick start
+- `SessionCache::new(Arc<dyn SessionBackend>)` starts a background watch loop
+  and returns `Arc<SessionCache>`.
+- `get` serves from cache only when the watch cursor is coherent; otherwise it
+  reads through to the backend.
+- `invalidate`, `clear`, `len`, and `is_empty` manage local entries.
+- `last_sequence`, `resync`, `is_syncing`, `is_watch_ready`, and
+  `watch_error_count` expose replication-watch state.
+- `SessionCache` implements `SessionBackend` and invalidates affected keys on
+  successful wrapper mutations.
 
 ```rust,no_run
-use opc_session_cache::...;
+use opc_session_cache::SessionCache;
+use opc_session_store::{FakeSessionBackend, SessionBackend};
+use std::sync::Arc;
 
-fn main() {
-    // See the crate documentation for full API usage.
+async fn cache() {
+    let backend: Arc<dyn SessionBackend> = Arc::new(FakeSessionBackend::new());
+    let cache = SessionCache::new(backend);
+    assert!(cache.is_empty().await);
 }
 ```
 
+## Relationships
+
+- Wraps the `opc-session-store::SessionBackend` trait.
+- Consumes `ReplicationEntry` watch streams and ordered replication log
+  sequence numbers from `opc-session-store`.
+
+## Status Notes
+
+- If the backend lacks watch or ordered-log capability, local cache reads stay
+  bypassed and operations read through to the backend.
+- If `max_replication_sequence` shows the watch cursor is lagging, the cache is
+  cleared and local reads are bypassed.
+- Expired records are evicted on read.
+- The cache is not a durability layer.
+
+## Roadmap
+
+- Keep correctness tied to backend replication sequence checks.
+- Add cache policy knobs only when callers have measured needs.
+- Keep mutation behavior conservative by invalidating keys on successful writes.
+
+## Verification
+
+- Source checked: `Cargo.toml`, `src/lib.rs`, and tests.
+- Run with: `cargo test -p opc-session-cache`.
+
 ## License
 
-This crate is licensed under the [Apache License, Version 2.0](../../LICENSE).
+Licensed under the [Apache License, Version 2.0](../../LICENSE).

@@ -1,25 +1,62 @@
 # opc-mgmt-transport
 
-Fail-closed mTLS bootstrap for the OpenPacketCore management plane (gNMI and
-NETCONF servers), layered over `opc-tls`.
+Shared transport policy for management-plane listeners.
 
-`opc-tls` fails closed on an unconstrained `PeerPolicy::default()` unless the
-caller explicitly opts in, and it sets no ALPN on the server config. This crate
-is the management-plane policy gate that makes the production posture explicit
-and refuses to start insecurely:
+This crate centralizes the small set of TLS and plaintext rules used by gNMI,
+NETCONF, and other management entry points. It wires `opc-tls` server settings
+into a fail-closed management policy and keeps plaintext use limited to
+non-production runtime modes.
 
-- in fail-closed runtime modes (`RuntimeMode::Production` / `Conformance`) it
-  **rejects an unconstrained `PeerPolicy`** (authentication without
-  authorization);
-- in non-fail-closed runtime modes it performs the explicit
-  `allow_any_trusted_peer()` opt-in before delegating to `opc-tls`;
-- it validates the caller's ALPN protocol ids (non-empty, <=255 bytes) and sets
-  them on the built `rustls::ServerConfig` (e.g. `h2` for gNMI/gRPC);
-- it builds the SPIFFE mTLS server config from a hot-reloading SVID watch
-  (TLS 1.3 only unless TLS 1.2 compatibility is explicitly opted in);
-- it provides a plaintext guard so a plaintext listener is permitted only for
-  `RuntimeMode::Dev` or an explicit `RuntimeMode::Lab` profile, not for
-  production, conformance, or perf runs.
+## API Shape
 
-Certificate-chain verification and the actual SVID handling stay in `opc-tls` /
-rustls; this crate only enforces the management-plane security policy and wiring.
+Public API:
+
+- `TlsBootstrap` builds an `opc_tls::ServerConfig` from a runtime mode, peer
+  policy, ALPN IDs, TLS-1.2 compatibility setting, and identity watcher.
+- `plaintext_permitted` and `ensure_plaintext_permitted` gate cleartext
+  management listeners.
+- `TransportError` reports invalid peer policy, missing or malformed ALPN IDs,
+  disallowed TLS compatibility, plaintext mode violations, and lower-level TLS
+  setup failures.
+- `ALPN_H2` is the shared HTTP/2 ALPN value used by gNMI.
+
+Example:
+
+```rust
+use opc_mgmt_transport::{ensure_plaintext_permitted, TlsBootstrap};
+use opc_runtime::RuntimeMode;
+
+ensure_plaintext_permitted(RuntimeMode::Lab)?;
+```
+
+`TlsBootstrap` rejects unconstrained peer policy in fail-closed modes such as
+`Production` and `Conformance`. Plaintext is allowed only for `Dev` and `Lab`.
+
+## Relationships
+
+- Depends on `opc-tls` for certificate, identity, and server-config mechanics.
+- Used by protocol listeners such as `opc-gnmi-server` and
+  `opc-netconf-server`.
+- Does not authenticate application principals by itself; listener code maps
+  verified identities into `opc-mgmt-principal` types.
+
+## Status And Limits
+
+Current scope:
+
+- Management-specific guardrails for TLS and plaintext operation.
+- ALPN validation and explicit TLS-1.2 compatibility opt-in.
+- No certificate-chain parsing, SPIFFE verification, or key loading logic here.
+
+## Roadmap
+
+- Keep transport policy shared across management protocols.
+- Add new ALPN or mode checks only when a concrete listener needs them.
+
+## Verification
+
+Run:
+
+```sh
+cargo test -p opc-mgmt-transport
+```

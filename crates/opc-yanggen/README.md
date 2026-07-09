@@ -1,114 +1,88 @@
-# Opc Yanggen
+# opc-yanggen
 
-YANG-to-Rust type projection, RFC 7951 JSON serde, iterative semantic constraint
-validation, schema registry generation, NETCONF/gNMI projections, and patch
-applicators.
+YANG ingestion and Rust artifact generator for OpenPacketCore management models.
 
-## Status
+This crate ingests supported YANG source, lowers it into an internal
+representation, emits deterministic schema metadata, and generates Rust support
+for config models and management protocol bindings. It is not a general-purpose
+YANG compiler.
 
-**Production-ready**
+## API Shape
 
-## Source YANG consistency gate
+Library API:
 
-`opc-yanggen` can validate that one or more source `.yang` modules match a
-hand-built or generated `GenerationInput`:
+- `compile` and `compile_with_diagnostics`.
+- Diagnostics:
+  `Diagnostic`, `DiagnosticCode`, and `YangSourceLocation`.
+- Emission helpers:
+  `emit_fixture`, `emit_fixture_from_canonical`, `emit_stack_metadata`,
+  `schema_digest`, `schema_digest_from_canonical`, `fnv1a64`,
+  `format_constraint_expr`, `CanonicalInput`, `GenerationInput`,
+  `PreScanResult`, and `MAX_CANONICALIZATION_NODES`.
+- Public modules:
+  `diagnostic`, `emit`, `ir`, `lower`, `source`, and `rust`.
+- Rust generation:
+  `generate_rust`, `normalize_for_rust_generation`, and
+  `RustGenerationError`.
 
-```rust,no_run
-use opc_yanggen::{
-    validate_generation_input_yang_sources, GenerationInput, YangSource,
-};
-
-fn validate(input: &GenerationInput, source_text: String) -> Result<(), opc_yanggen::Diagnostic> {
-    let sources = [YangSource::new("openpacketcore-example.yang", source_text)];
-    validate_generation_input_yang_sources(input, &sources)
-}
-```
-
-The gate preserves `SchemaModule::source_text` for NETCONF `<get-schema>` and
-checks module metadata, imports, node paths, child relationships, list keys,
-config/state flags, type references, defaults, presence markers, ordered-by,
-data classes, unique constraints, and the source-derived schema digest. It
-supports multiple modules/imports in the API shape.
-
-For downstream CI, the crate also provides:
+CLI commands:
 
 ```sh
-opc-yanggen validate-source --input generation-input.json --yang module.yang [--yang import.yang ...]
+opc-yanggen validate-source --input input.json --yang model.yang
+opc-yanggen ingest-source --profile cnf-profile --yang model.yang
+opc-yanggen generate-rust --profile cnf-profile --yang model.yang --out-dir generated
 ```
 
-`opc-yanggen ingest-source --profile PROFILE --yang module.yang ...` emits a
-starter `GenerationInput` JSON for the supported IR subset.
+`generate-rust` also supports `--check` and `--prune`; those modes are mutually
+exclusive. CLI output is JSON and includes status, schema digest, generated
+files, or structured diagnostics.
 
-## Rust artifact generation
+## Generated Artifact Shape
 
-Downstream CNFs can generate committed Rust projection artifacts directly from
-source YANG without maintaining local wrapper scripts:
+The Rust generator can emit:
+
+- Config model types and serde support.
+- Path constants and changed-path metadata.
+- Patch and validation helpers.
+- Redaction metadata.
+- Schema-registry implementations.
+- gNMI JSON/Get and Set support.
+- NETCONF XML render and edit support.
+- Stack metadata fixtures.
+
+## Relationships
+
+- Emits implementations consumed by `opc-config-model`,
+  `opc-mgmt-schema`, `opc-gnmi-server`, and `opc-netconf-server`.
+- Test fixtures are shared with config, NACM, and management protocol crates.
+- Management protocol crates should depend on generated artifacts, not on parser
+  internals.
+
+## Status And Limits
+
+Current scope:
+
+- Deterministic ingestion, validation, canonicalization, and Rust generation for
+  the supported OpenPacketCore YANG subset.
+- Fail-closed diagnostics for unsupported or unsafe constructs.
+
+Known constraints:
+
+- `deviation`, arbitrary `extension`, and unresolved `if-feature` usage are
+  reported through diagnostics rather than silently accepted.
+- Generated behavior is bounded by the supported subset and should be validated
+  with generated tests before production use.
+
+## Roadmap
+
+- Expand YANG feature coverage only when generated config, gNMI, NETCONF,
+  redaction, and schema-registry behavior can be produced coherently.
+- Keep generated output deterministic so schema digests remain meaningful.
+
+## Verification
+
+Run:
 
 ```sh
-opc-yanggen generate-rust --profile PROFILE --yang module.yang [--yang import.yang ...] --out-dir src/generated
+cargo test -p opc-yanggen
 ```
-
-The command reads the source modules through the same YANG ingestion path,
-canonicalizes the derived `GenerationInput`, and writes the Rust files returned
-by `opc_yanggen::rust::generate_rust` into the output directory. The directory
-is created when missing. Generated filenames are preserved exactly.
-
-Generated schema registries and northbound projections use fully
-prefix-qualified schema paths for every segment, such as
-`/example:system/example:hostname`. Runtime schema lookup still accepts relaxed
-same-module spellings when they resolve unambiguously, but emitted metadata,
-gNMI updates, NETCONF selections, NACM lookups, and audit attribution share the
-fully qualified path form.
-
-The writer fails closed if the output directory contains stale top-level `.rs`
-files that are not part of the current generator output:
-
-```sh
-opc-yanggen generate-rust --profile PROFILE --yang module.yang --out-dir src/generated --prune
-```
-
-Use `--prune` in write mode to remove stale generated `.rs` files before
-writing the current output.
-
-For CI drift detection, use check mode:
-
-```sh
-opc-yanggen generate-rust --profile PROFILE --yang module.yang [--yang import.yang ...] --out-dir src/generated --check
-```
-
-Check mode does not modify the filesystem. It fails if a generated file is
-missing, differs byte-for-byte, or if a stale top-level `.rs` file exists in the
-output directory. `--prune` is rejected with `--check`.
-
-Successful generate/check output is structured JSON containing `status`,
-`schema_digest`, and the generated `files`; check mode also includes
-`"mode": "check"`. Failures use the standard diagnostic JSON envelope.
-
-This first source path is intentionally fail-closed. Constructs not represented
-by the current IR, such as `must`, `when`, `uses`, `augment`, deviations, and
-extensions other than `*:data-class`, return `DiagnosticCode::UnsupportedYangFeature`
-instead of being silently dropped. Documentation/comment-only source changes do
-not affect the schema digest.
-
-Deferred: YANG cardinality statements such as `mandatory`, `min-elements`, and
-`max-elements` are accepted by the parser for current source skeletons but are
-not represented in `GenerationInput` yet, so they are not part of the
-consistency comparison or digest contract.
-
-## Reference
-
-[RFC](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/002-yang-projection.md)
-
-## Quick start
-
-```rust,no_run
-use opc_yanggen::...;
-
-fn main() {
-    // See the crate documentation for full API usage.
-}
-```
-
-## License
-
-This crate is licensed under the [Apache License, Version 2.0](../../LICENSE).

@@ -1,33 +1,70 @@
-# Opc Sdk
+# opc-sdk
 
-OpenPacketCore SDK facade crate — compose CNFs from a single dependency.
+Feature-gated facade for common OpenPacketCore SDK crates.
 
-## Status
+This crate re-exports the high-level runtime, observability, config, session,
+SBI, alarm, identity, key, crypto, TLS, NACM-config, and shared-type crates used
+by CNFs. It is a convenience facade, not a replacement for depending directly on
+specialized protocol or generated model crates.
 
-**Production-ready core facade**
+## API Shape
 
-The default feature set exposes the SDK runtime, configuration, session, SBI,
-alarm, identity, key, and shared-type composition surface. Experimental protocol
-codecs, including the S2b-focused `opc-proto-gtpv2c` crate, the Diameter base
-scaffold in `opc-proto-diameter`, and the IKEv2 scaffold in
-`opc-proto-ikev2`, are intentionally not re-exported by this facade or its
-prelude; CNFs that need them should add the relevant protocol crate as a
-direct dependency and follow that crate's conformance boundary.
+Optional root re-exports are controlled by Cargo features:
 
-## Reference
+- `runtime` -> `opc_runtime`
+- `observability` -> `opc_observability`
+- `config` -> `opc_config_model`, `opc_config_bus`, and `opc_nacm_config`
+- `session` -> `opc_session_cache` and `opc_session_store`
+- `sbi` -> `opc_sbi`
+- `alarm` -> `opc_alarm`
+- `identity` -> `opc_identity` and `opc_tls`
+- `key` -> `opc_key` and `opc_crypto`
+- `types` -> `opc_types`
+- `testkit` -> `opc-sbi?/testkit`
 
-[RFC 008](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/008-cnf-runtime-chassis.md), [RFC 001](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/001-management-substrate.md), [RFC 004](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/004-session-store.md), [RFC 007](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/docs/rfc/007-sbi-service-framework.md)
+The `prelude` module gathers commonly used types from the enabled features.
 
-## Quick start
+Example:
 
-```rust,no_run
+```rust
 use opc_sdk::prelude::*;
-
-fn main() {
-    // See the crate documentation for full API usage.
-}
 ```
 
-## License
+Default features enable the common CNF runtime stack. Disable defaults when a
+library needs a smaller dependency surface.
 
-This crate is licensed under the [Apache License, Version 2.0](../../LICENSE).
+## Relationships
+
+- Re-exports stable SDK building blocks from sibling crates.
+- Leaves protocol server crates such as `opc-gnmi-server` and
+  `opc-netconf-server` as direct dependencies so applications opt in
+  explicitly.
+- Leaves generated CNF config crates outside the facade.
+
+## Status And Limits
+
+Current scope:
+
+- Convenience imports for application code and examples.
+- Feature-gated dependency surface for CNF services.
+- Smoke examples for runtime, alarms, config, SBI, identity, and security
+  prelude wiring.
+
+Limitations:
+
+- No management protocol codec/server facade.
+- No generated schema or model exports.
+
+## Roadmap
+
+- Keep the facade narrow and feature-gated.
+- Add re-exports only for stable, broadly used SDK crates.
+
+## Verification
+
+Run:
+
+```sh
+cargo test -p opc-sdk
+cargo run -p opc-sdk --example minimal_cnf
+```

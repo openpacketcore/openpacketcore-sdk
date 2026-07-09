@@ -1,22 +1,69 @@
 # opc-gtpu-ebpf-common
 
-Shared GTP-U (3GPP TS 29.281) wire-format layouts for the OpenPacketCore eBPF
-tc datapath and its userspace loader.
+## Purpose
 
-This `no_std`, dependency-free crate is the single source of truth for:
+`opc-gtpu-ebpf-common` is the shared, dependency-free, no-std layout crate for
+the GTP-U eBPF datapath and its userspace loader. It is the single source of
+truth for BPF map values, program/map names, counter indexes, and byte-exact
+GTP-U encapsulation/classification helpers.
 
-- The BPF map key/value byte layouts exchanged between
-  `opc-gtpu-dataplane`'s `EbpfGtpuDataplaneBackend` and the
-  `opc-gtpu-dataplane-ebpf` tc programs (`UplinkFar`, `DownlinkPdr`), plus the
-  map, program, and counter-index names.
-- The exact 36-byte `[outer IPv4][UDP][GTPv1-U]` uplink encapsulation
-  (`build_uplink_encap`), including the outer IPv4 header checksum.
-- The downlink GTPv1-U header classification (`classify_gtpu`): G-PDU vs
-  echo/error-indication vs non-GTPv1, TEID extraction, and S/PN/E optional
-  block and extension-header detection.
+## API Shape
 
-Keeping this logic in a plain Rust crate means the datapath's byte-exact
-behavior is unit-tested in ordinary CI without a kernel, and the eBPF program
-and its loader can never disagree about layouts.
+- Constants for GTP-U, IPv4, UDP, map names, program names, and counter slots.
+- `UplinkFar` and `DownlinkPdr` encode/decode fixed BPF map value layouts.
+- `build_uplink_encap` builds the exact 36-byte outer IPv4/UDP/GTPv1-U header
+  sequence for uplink encapsulation.
+- `classify_gtpu` classifies a mandatory GTP-U header as `NotGtpV1`,
+  `NotGpdu`, or `Gpdu { teid, length, has_opt, has_ext }`.
+- `ipv4_header_checksum` computes an option-free IPv4 header checksum.
 
-It deliberately contains no map access, no loader logic, and no policy.
+All multi-byte wire and map fields are network byte order unless noted in the
+Rust docs.
+
+## Usage
+
+```rust
+use opc_gtpu_ebpf_common::{
+    build_uplink_encap, DownlinkPdr, UplinkFar, GTPU_ENCAP_LEN,
+};
+
+let far = UplinkFar {
+    peer_ip: [192, 0, 2, 10],
+    local_ip: [192, 0, 2, 20],
+    o_teid: 0x2000_0001u32.to_be_bytes(),
+};
+let bytes = far.encode();
+assert_eq!(UplinkFar::decode(&bytes), far);
+
+let pdr = DownlinkPdr { ue_ip: [10, 23, 0, 2] };
+assert_eq!(DownlinkPdr::decode(&pdr.encode()), pdr);
+
+let encap = build_uplink_encap(&far, 64).unwrap();
+assert_eq!(encap.len(), GTPU_ENCAP_LEN);
+```
+
+## Relationships
+
+- Used by `opc-gtpu-dataplane-ebpf` inside BPF code.
+- Used by `opc-gtpu-dataplane` userspace code when writing pinned maps and
+  validating datapath ownership.
+
+## Status And Limits
+
+- `#![no_std]`, `#![forbid(unsafe_code)]`, and dependency-free.
+- Contains no map access, loader code, tc hooks, kernel syscalls, or product
+  policy.
+- Downlink classification only inspects the mandatory GTP-U header; extension
+  walking happens in the eBPF program.
+
+## Roadmap
+
+- Treat layout changes as compatibility-sensitive and cover them with tests.
+- Add new map or counter fields only when both loader and BPF program consume
+  the same versioned layout.
+
+## Verification
+
+```sh
+cargo test -p opc-gtpu-ebpf-common
+```

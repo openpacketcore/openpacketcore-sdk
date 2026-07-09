@@ -28,6 +28,11 @@ downstream product responsibilities.
 
 See [`docs/quickstart.md`](docs/quickstart.md) for a guided first build and a minimal CNF example.
 
+Each crate README now documents that crate's purpose, API shape, relationships,
+status and limits, roadmap, and verification command. The table below keeps the
+workspace-level RFC/ADR map intact so reviewers can trace each crate back to the
+design record that owns its boundary.
+
 ---
 
 ## Workspace Layout & SDK Boundaries
@@ -39,19 +44,26 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
 | [`opc-sdk`](crates/opc-sdk/) | Facade crate: feature-gated re-exports of the core composition surface, a `prelude`, and the `minimal_cnf` end-to-end example. | [Quickstart](docs/quickstart.md) |
-| [`opc-runtime`](crates/opc-runtime/) | CNF runtime chassis: process startup phases, task supervision, health probes, and graceful SIGTERM drains. | [RFC 008](docs/rfc/008-cnf-runtime-chassis.md) |
+| [`opc-runtime`](crates/opc-runtime/) | CNF runtime chassis: process startup phases, task supervision, health probes, admin/probe routes, metrics, and graceful SIGTERM drains. | [RFC 008](docs/rfc/008-cnf-runtime-chassis.md), [ADR 0005](docs/adr/0005-runtime-observability-admin-probes.md) |
+| [`opc-observability`](crates/opc-observability/) | Tracing subscriber setup with runtime filter reload and structural redaction. | [ADR 0005](docs/adr/0005-runtime-observability-admin-probes.md) |
 | [`opc-protocol`](crates/opc-protocol/) | Zero-copy protocol codec framework: traits, context, errors, and fuzzing contracts. | [RFC 005](docs/rfc/005-protocol-framework.md) |
-| [`opc-proto-gtpu`](crates/opc-proto-gtpu/) | GTP-U protocol codec for the user-plane data path. | — |
-| [`opc-proto-diameter`](crates/opc-proto-diameter/) | Diameter base codec and dictionary scaffold: RFC 6733 header/AVP framing, base peer procedure helpers, bounded grouped AVP validation, fixture-provenance notes, fuzz targets, typed Rf/SWm helpers, and selected 3GPP application dictionary subsets *(experimental; no realm routing, transport operation, AAA/HSS/CDF behavior, or product readiness claim)*. | [Conformance](crates/opc-proto-diameter/CONFORMANCE.md) |
-| [`opc-proto-pfcp`](crates/opc-proto-pfcp/) | PFCP codec (TS 29.244): message layer, raw TLV preservation, and typed session-management IEs *(experimental)*. | — |
-| [`opc-proto-nas`](crates/opc-proto-nas/) | NAS-5GS (TS 24.501) codec: headers, body dispatch, mobile identity, BCD unpacking, Registration/Security Mode IEs, and NAS security hooks *(experimental)*. | — |
-| [`opc-proto-ngap`](crates/opc-proto-ngap/) | NGAP (TS 38.413) v0 decoder via `rasn` APER: PDU framing, fixture-proven NGSetupRequest, raw-preserving re-encode *(experimental v0)*. | [ADR 0013](docs/adr/0013-ngap-asn1-strategy.md) |
-| [`opc-proto-gtpv2c`](crates/opc-proto-gtpv2c/) | GTPv2-C (TS 29.274) experimental S2b subset: raw-preserving header/IE shell plus typed Echo/Create/Modify/Delete/Update views. | — |
-| [`opc-proto-ikev2`](crates/opc-proto-ikev2/) | IKEv2 (RFC 7296/RFC 7383) experimental scaffold: fixed header, raw generic payload-chain walking for unencrypted payloads, unknown payload preservation, SKF fragmentation structure/reassembly helpers, and crypto-provider boundary traits *(no IKE SA state machine, EAP-AKA, or Child SA lifecycle)*. | [Conformance](crates/opc-proto-ikev2/CONFORMANCE.md) |
+| [`opc-proto-gtpu`](crates/opc-proto-gtpu/) | GTP-U protocol codec for the user-plane data path. | [RFC 005](docs/rfc/005-protocol-framework.md) |
+| [`opc-proto-diameter`](crates/opc-proto-diameter/) | Diameter base codec and dictionary scaffold: RFC 6733 header/AVP framing, base peer procedure helpers, bounded grouped AVP validation, fixture-provenance notes, fuzz targets, typed Rf/SWm helpers, and selected 3GPP application dictionary subsets *(experimental; no realm routing, transport operation, AAA/HSS/CDF behavior, or product readiness claim)*. | [RFC 005](docs/rfc/005-protocol-framework.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md), [Conformance](crates/opc-proto-diameter/CONFORMANCE.md) |
+| [`opc-proto-pfcp`](crates/opc-proto-pfcp/) | PFCP codec (TS 29.244): message layer, raw TLV preservation, and typed session-management IEs. | [RFC 005](docs/rfc/005-protocol-framework.md) |
+| [`opc-proto-nas`](crates/opc-proto-nas/) | NAS-5GS (TS 24.501) codec: headers, body dispatch, mobile identity, BCD unpacking, Registration/Security Mode IEs, and NAS security hooks *(experimental)*. | [RFC 005](docs/rfc/005-protocol-framework.md) |
+| [`opc-proto-ngap`](crates/opc-proto-ngap/) | NGAP (TS 38.413) v0 decoder via `rasn` APER: PDU framing, fixture-proven NGSetupRequest, raw-preserving re-encode *(experimental v0)*. | [RFC 005](docs/rfc/005-protocol-framework.md), [ADR 0013](docs/adr/0013-ngap-asn1-strategy.md) |
+| [`opc-proto-gtpv2c`](crates/opc-proto-gtpv2c/) | GTPv2-C (TS 29.274) experimental S2b subset: raw-preserving header/IE shell plus typed Echo/Create/Modify/Delete/Update views. | [RFC 005](docs/rfc/005-protocol-framework.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
+| [`opc-proto-ikev2`](crates/opc-proto-ikev2/) | IKEv2 (RFC 7296/RFC 7383) experimental scaffold: fixed header, raw generic payload-chain walking for unencrypted payloads, unknown payload preservation, SKF fragmentation structure/reassembly helpers, and crypto-provider boundary traits *(no IKE SA state machine, EAP-AKA, or Child SA lifecycle)*. | [RFC 005](docs/rfc/005-protocol-framework.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md), [Conformance](crates/opc-proto-ikev2/CONFORMANCE.md) |
 | [`opc-sctp`](crates/opc-sctp/) | Safe Linux SCTP transport wrapper for CNFs that terminate N2/NGAP or other SCTP interfaces. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
 | [`opc-libsctp-sys`](crates/opc-libsctp-sys/) | Narrow unsafe Linux SCTP UAPI boundary used only by `opc-sctp`; unsupported platforms fail explicitly. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
-| [`opc-linux-xfrm-sys`](crates/opc-linux-xfrm-sys/) | Narrow unsafe Linux XFRM netlink UAPI boundary; unsupported platforms fail explicitly. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
+| [`opc-linux-xfrm-sys`](crates/opc-linux-xfrm-sys/) | Narrow unsafe Linux XFRM netlink UAPI boundary; unsupported platforms fail explicitly. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
+| [`opc-linux-gtpu-sys`](crates/opc-linux-gtpu-sys/) | Narrow unsafe Linux GTP-U rtnetlink/generic-netlink UAPI boundary used by the safe dataplane wrapper. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
+| [`opc-linux-route-sys`](crates/opc-linux-route-sys/) | Narrow unsafe Linux rtnetlink route/rule UAPI boundary used by route steering. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
 | [`opc-ipsec-xfrm`](crates/opc-ipsec-xfrm/) | Safe Linux XFRM IPsec backend model, mock backend, redaction-safe errors, and opt-in IKEv2 Child SA to XFRM request mapping. | [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
+| [`opc-route-steering`](crates/opc-route-steering/) | Safe Linux route/rule steering backend model, mock backend, and redaction-safe errors for packet-core CNFs. | [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md), [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md) |
+| [`opc-gtpu-dataplane`](crates/opc-gtpu-dataplane/) | Safe Linux GTP-U dataplane backend model, Linux and eBPF backend adapters, mock backend, capability probes, and redaction-safe errors. | [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md), [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md) |
+| [`opc-gtpu-dataplane-ebpf`](crates/opc-gtpu-dataplane-ebpf/) | Standalone Rust eBPF tc datapath program for GTP-U uplink/downlink handling; built with the pinned script outside the host workspace. | [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
+| [`opc-gtpu-ebpf-common`](crates/opc-gtpu-ebpf-common/) | Shared GTP-U wire-format constants, map names, and map value layouts for the eBPF datapath and userspace loader. | [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
 | [`opc-node-resources`](crates/opc-node-resources/) | Validates `ResourceProfile` compatibility against observed `NodeCapabilityReport`. | [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md) |
 
 ### Config & Management (`crates/`)
@@ -116,46 +128,48 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
 | [`opc-sbi`](crates/opc-sbi/) | Shared SBI client/server, auth, NRF, retry, and testkit primitives. | [RFC 007](docs/rfc/007-sbi-service-framework.md) |
+| [`opc-peer-discovery`](crates/opc-peer-discovery/) | Transport-neutral peer discovery, resolver injection, deterministic selection, and peer-discovery evidence. | [RFC 007](docs/rfc/007-sbi-service-framework.md) |
 | [`opc-api-nnrf`](crates/opc-api-nnrf/) | Generated Rust types for 3GPP TS 29.510 NRF `NfProfile` / `NfService` *(experimental)*. | [Design note](docs/design/openapi-codegen-plan.md) |
 
 ### Release Assurance (`crates/`)
 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
-| [`opc-evidence`](crates/opc-evidence/) | Release assurance pipeline: SBOM generation, VEX scanning, and gate policy enforcement. | [RFC 006](docs/rfc/006-conformance-pipeline.md) |
+| [`opc-evidence`](crates/opc-evidence/) | Release assurance pipeline: SBOM generation, VEX scanning, gap gates, dataplane snapshots, and gate policy enforcement. | [RFC 006](docs/rfc/006-conformance-pipeline.md) |
 
 ### Operator Lifecycle (`crates/`)
 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
 | [`operator-lifecycle`](crates/operator-lifecycle/) | Kubernetes production-readiness lifecycle foundation, config-apply, admission, and drain/upgrade planning. | [RFC 009](docs/rfc/009-operator-lifecycle-upgrade.md) |
-| [`operator-controller`](crates/operator-controller/) | Kubernetes operator controller execution layer *(internal, not published)*. | — |
-| [`operator-lifecycle-cli`](crates/operator-lifecycle-cli/) | CLI interface exposing Rust SDK lifecycle contracts to Go controller-runtime operators via JSON *(internal, not published)*. | — |
+| [`operator-controller`](crates/operator-controller/) | Kubernetes operator controller execution layer *(internal, not published)*. | [RFC 009](docs/rfc/009-operator-lifecycle-upgrade.md) |
+| [`operator-lifecycle-cli`](crates/operator-lifecycle-cli/) | CLI interface exposing Rust SDK lifecycle contracts to Go controller-runtime operators via JSON *(internal, not published)*. | [RFC 009](docs/rfc/009-operator-lifecycle-upgrade.md) |
 
 ### Testing & Integration (`crates/`)
 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
 | [`opc-testbed`](crates/opc-testbed/) | Scenario DSL, virtual time, assertions, fixture provenance, and simulator framework. | [RFC 012](docs/rfc/012-testbed-simulator-framework.md) |
-| [`opc-sdk-integration`](crates/opc-sdk-integration/) | Integration crate wiring runtime, config bus, alarms, and testbed evidence *(internal, not published)*. | — |
-| [`opc-config-fixture`](crates/opc-config-fixture/) | Generated-like config fixture for integration testing *(internal, not published)*. | — |
+| [`opc-dataplane-testkit`](crates/opc-dataplane-testkit/) | Deterministic dataplane traffic generation, GTP-U helpers, reflectors, continuity evidence, and packet-continuity reports. | [RFC 006](docs/rfc/006-conformance-pipeline.md), [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md) |
+| [`opc-sdk-integration`](crates/opc-sdk-integration/) | Integration crate wiring runtime, config bus, alarms, and testbed evidence *(internal, not published)*. | [RFC 012](docs/rfc/012-testbed-simulator-framework.md) |
+| [`opc-config-fixture`](crates/opc-config-fixture/) | Generated-like config fixture for integration testing *(internal, not published)*. | [RFC 001](docs/rfc/001-management-substrate.md), [RFC 002](docs/rfc/002-yang-projection.md) |
 | [`opc-amf-lite`](crates/opc-amf-lite/) | Realistic AMF-lite control-plane vertical slice integration proving SDK seams *(internal, not published)*. | [ADR 0011](docs/adr/0011-first-nf-vertical-proof.md) |
 
 ### Internal Testkits (`crates/`)
 
-| Crate | Purpose |
-| :--- | :--- |
-| [`opc-alarm-testkit`](crates/opc-alarm-testkit/) | Deterministic testing and assertions for alarms *(internal)*. |
-| [`opc-security-testkit`](crates/opc-security-testkit/) | Fake fixtures and fault injection for security validation *(internal)*. |
-| [`opc-session-testkit`](crates/opc-session-testkit/) | Chaos and failure testing for session replication *(internal)*. |
-| [`opc-amf-lite-testkit`](crates/opc-amf-lite-testkit/) | Reusable test fixtures and builders for `opc-amf-lite` *(internal)*. |
+| Crate | Purpose | Reference |
+| :--- | :--- | :--- |
+| [`opc-alarm-testkit`](crates/opc-alarm-testkit/) | Deterministic testing and assertions for alarms *(internal)*. | [RFC 013](docs/rfc/013-fault-management-alarm-substrate.md) |
+| [`opc-security-testkit`](crates/opc-security-testkit/) | Fake fixtures and fault injection for security validation *(internal)*. | [RFC 003](docs/rfc/003-security-substrate.md) |
+| [`opc-session-testkit`](crates/opc-session-testkit/) | Chaos and failure testing for session replication *(internal)*. | [RFC 004](docs/rfc/004-session-store.md) |
+| [`opc-amf-lite-testkit`](crates/opc-amf-lite-testkit/) | Reusable test fixtures and builders for `opc-amf-lite` *(internal)*. | [ADR 0011](docs/adr/0011-first-nf-vertical-proof.md) |
 
 ### Shared Types (`crates/`)
 
-| Crate | Purpose |
-| :--- | :--- |
-| [`opc-types`](crates/opc-types/) | Shared identifier, version, time, and redaction types. |
-| [`opc-schema-validate`](crates/opc-schema-validate/) | Lightweight JSON Schema validation engine (subset used by testbed/evidence schemas). |
+| Crate | Purpose | Reference |
+| :--- | :--- | :--- |
+| [`opc-types`](crates/opc-types/) | Shared identifier, version, time, and redaction types. | [RFC 003](docs/rfc/003-security-substrate.md), [RFC 010](docs/rfc/010-data-governance-privacy.md) |
+| [`opc-schema-validate`](crates/opc-schema-validate/) | Lightweight JSON Schema validation engine (subset used by testbed/evidence schemas). | [RFC 006](docs/rfc/006-conformance-pipeline.md), [RFC 012](docs/rfc/012-testbed-simulator-framework.md) |
 
 ### Kubernetes Operators (`operators/`)
 
@@ -165,6 +179,27 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 ### Reference Consumers (`examples/`)
 
 * [`smf-reference`](examples/smf-reference/): A deliberately bounded reference SMF that consumes the Rust SDK from outside the workspace (its own `Cargo.toml` and lockfile). It proves runtime startup, NRF registration, real PFCP/N4 bytes over UDP, and session-state tracking. Not a product-grade SMF.
+
+---
+
+## Workspace Roadmap
+
+Detailed crate roadmaps live in each crate README. At the workspace level, the
+current roadmap is:
+
+1. Keep the facade and crate READMEs synchronized with public exports, feature
+   flags, verification commands, and maturity boundaries.
+2. Harden management-plane integration across generated YANG models, schema
+   registries, gNMI, NETCONF, NACM, audit, and config commit flows.
+3. Expand protocol conformance where it serves SDK consumers while keeping
+   product behavior such as AAA/HSS/CDF logic, IKE SA state machines, and
+   carrier policy outside codec crates.
+4. Continue privileged Linux dataplane validation for GTP-U, XFRM, route
+   steering, SCTP, and eBPF with explicit platform prerequisites.
+5. Strengthen session-state, persistence, evidence, and privacy/governance
+   contracts before downstream CNFs rely on them as release gates.
+6. Move operator lifecycle contracts toward production operator integration
+   while keeping the included Go operator as a reference harness.
 
 ---
 
@@ -202,6 +237,13 @@ Run all unit, integration, and chaos test suites:
 ```bash
 cargo test --locked --workspace --exclude opc-persist --all-features --quiet -- --test-threads=4
 cargo test --locked -p opc-persist --all-features --quiet -- --test-threads=1
+```
+
+The standalone eBPF datapath crate is excluded from the host workspace build
+graph. Build it with:
+
+```bash
+scripts/build-gtpu-ebpf.sh
 ```
 
 ### 6. Rust Documentation

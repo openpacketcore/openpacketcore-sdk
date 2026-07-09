@@ -1,39 +1,78 @@
 # opc-mgmt-opstate
 
-The NF-supplied operational-state provider contract for the OpenPacketCore
-management plane.
+Operational-state contracts for management protocols.
 
-`opc-config-bus` owns *configuration*; it does not hold config-false
-(operational/state) data. gNMI `Get(STATE|OPERATIONAL|ALL)` and NETCONF `<get>`
-must read that data from the consuming NF. This crate defines the seam every CNF
-implements: [`OperationalStateProvider`].
+This crate defines how CNFs expose operational values and operational event
+streams to gNMI, NETCONF, and generated management bindings. It also contains a
+projection for config-apply workflow state.
 
-The defining rule is **anti-fabrication**: a provider returns values only for the
-SDK-canonical `YangPath`s it can actually supply. Omitting a requested path means
-"no operational data here" — the server simply omits it — and the provider must
-never invent a value or an origin it does not know. NMDA [`Origin`] metadata is
-attached only when requested and genuinely known.
+## API Shape
 
-Values are carried as syntax-checked RFC 7951 JSON strings so this stays
-decoupled from any particular generated model while still failing closed on
-malformed provider output. `OperationalResponse::validate_for_request` lets
-servers reject provider responses that report unrequested paths, duplicate paths,
-or origin metadata the request did not ask for. The streaming on-change
-subscription used by gNMI `Subscribe`/NETCONF notifications is layered in the
-Subscribe slice, not here.
+Core exports:
 
-The `config_apply` helper module provides a generic projection DTO for accepted
-and rejected config apply plans. Products supply their own YANG placement, then
-use `ConfigApplyPlanState` to emit validated RFC 7951 JSON with the last
-accepted plan, last rejected plan, known active version/transaction id, and any
-active traffic block reason derived from an admitted drain/restart plan. When an
-external drain/restart workflow completes, `ConfigWorkflowCompletion` records a
-matching config version, transaction id, or product revision label so clients can
-distinguish an apply plan that never required workflow from one whose required
-workflow has completed. `ConfigCandidateStatus` carries pending/rejected
-candidate identity, warning counts/codes, and stable commit rejection metadata
-without raw candidate payloads or free-form error messages.
-`ConfigWorkflowActionTarget` and `ConfigWorkflowActionResult` define the shared
-management action contract for completing an active config workflow, including
-stable conflict reasons for no running config, target mismatch, and no workflow
-required.
+- `Origin`, `OperationalRequest`, `OperationalResponse`, and
+  `OperationalValue`.
+- `OperationalStateProvider` for on-demand operational reads.
+- `OperationalSubscriptionRequest`, `OperationalEvent`,
+  `OperationalEventSender`, `OperationalEventReceiver`, and
+  `operational_event_channel` for bounded event streams.
+- `OperationalError`, `OperationalValueError`, `OperationalResponseError`, and
+  `OperationalStreamError`.
+
+Config-apply projection exports:
+
+- `ConfigApplyPlanState`.
+- `ConfigCandidateState` and `ConfigCandidateStatus`.
+- `ConfigWorkflowCompletion`.
+- `ConfigWorkflowActionTarget`, `ConfigWorkflowActionStatus`,
+  `ConfigWorkflowActionConflictReason`, and `ConfigWorkflowActionResult`.
+
+Example:
+
+```rust
+use opc_mgmt_opstate::{OperationalRequest, OperationalStateProvider};
+
+fn read_opstate(
+    provider: &dyn OperationalStateProvider,
+    request: OperationalRequest,
+) -> Result<opc_mgmt_opstate::OperationalResponse, opc_mgmt_opstate::OperationalError> {
+    provider.get(&request)
+}
+```
+
+Operational values are RFC 7951 JSON strings checked at construction. Providers
+must omit unknown paths instead of fabricating values. Origin may be included
+only when requested and genuinely known.
+
+## Relationships
+
+- Consumed by `opc-gnmi-server` and `opc-netconf-server`.
+- Uses `opc-config-model` paths and config workflow metadata.
+- Uses `opc-mgmt-errors` to map commit failures in apply-plan state.
+
+## Status And Limits
+
+Current scope:
+
+- Anti-fabrication read contract for operational state.
+- Bounded operational event channels.
+- Config-apply workflow state suitable for management-plane projection.
+
+Limitations:
+
+- This crate does not collect metrics, watch Kubernetes resources, or implement
+  a CNF provider. CNFs must implement the provider traits.
+- Event queue sizing is bounded; a zero queue request normalizes to one.
+
+## Roadmap
+
+- Keep protocol-facing operational contracts stable.
+- Add reusable projections only when multiple protocol crates need them.
+
+## Verification
+
+Run:
+
+```sh
+cargo test -p opc-mgmt-opstate
+```

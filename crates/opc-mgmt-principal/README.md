@@ -1,38 +1,69 @@
 # opc-mgmt-principal
 
-Maps a transport-authenticated SPIFFE workload identity
-(`opc_identity::WorkloadIdentity`) or verified SSH public-key user to the config-bus
-`opc_config_model::TrustedPrincipal` used for commit admission, authorization,
-and audit.
+Trusted principal construction for management-plane requests.
 
-The conversion is deliberately narrow and **fail-safe by omission**: it stamps
-`AuthStrength::MutualTls` for SPIFFE/mTLS or `AuthStrength::SshPublicKey` for
-SSH public-key/certificate authentication and carries the identity + tenant, but
-produces a principal with **no roles and no groups**. Authorization grants must
-come only from a signed policy source (e.g. `opc-persist`'s NACM policy
-datastore), never from transport metadata - so the caller attaches roles/groups
-*after* this conversion, from a trusted source, via
-`opc_mgmt_principal::with_signed_grants`. That wrapper is intentionally thin:
-its job is to make the signed-policy requirement visible at every call site.
+This crate converts already-verified transport identities into
+`opc-config-model::TrustedPrincipal` values and attaches signed authorization
+grants from trusted policy sources. It does not verify certificates or SSH keys
+itself.
 
-For callers that need a typed source boundary, the crate also provides:
+## API Shape
 
-- `SignedGrantSource`: resolves signed roles/groups for an already verified
-  `TrustedPrincipal`.
-- `SignedPrincipalGrants`: the resolved role and NACM group set.
-- `PrincipalGrantKey`: tenant plus identity lookup key, preventing cross-tenant
-  grant bleed.
-- `InMemorySignedGrantStore`: deterministic test/adapter store for policy
-  material that has already been verified by the caller.
-- `attach_signed_grants_from_source`: fail-closed helper that resolves grants
-  and returns a principal populated with only those signed grants.
+Public API:
 
-An unavailable grant source returns a payload-free error. A missing key in the
-in-memory store returns empty grants, which leaves the principal without NACM
-groups and therefore fails closed under group-scoped rule-lists.
+- `principal_for_workload`, mapping verified SPIFFE/mTLS workload identity into
+  a mutual-TLS principal.
+- `principal_for_ssh_user`, mapping a verified SSH username and tenant into an
+  SSH public-key principal.
+- `SignedPrincipalGrants` and `PrincipalGrantKey`.
+- `SignedGrantSource`, implemented by policy/config sources that issue signed
+  group and role grants.
+- `InMemorySignedGrantStore`, a small in-memory implementation for tests and
+  local wiring.
+- `with_signed_grants` and `attach_signed_grants_from_source`.
+- `PrincipalMappingError` and `GrantResolutionError`.
 
-`opc-identity` only verifies SAN/expiry/trust-domain when it derives the
-identity; the mTLS chain itself must already have been verified by rustls during
-the handshake. SSH callers must likewise verify the SSH key or certificate before
-calling `principal_for_ssh_user`; the tenant must come from trusted listener or
-operator policy, not from the username.
+Example:
+
+```rust
+use opc_mgmt_principal::{principal_for_ssh_user, SignedGrantSource};
+```
+
+Transport-derived principals start with no roles or groups. Roles and groups
+must be attached from a trusted signed-grant source, not from transport metadata
+or request headers.
+
+## Relationships
+
+- Uses `opc-identity` workload identities for SPIFFE/mTLS mapping.
+- Produces `opc-config-model::TrustedPrincipal` values consumed by config,
+  NACM, audit, and protocol crates.
+- `opc-nacm-config` implements `SignedGrantSource` for NACM group membership.
+
+## Status And Limits
+
+Current scope:
+
+- Verified workload and SSH-user principal mapping.
+- Signed grant attachment.
+- Bounded SSH username validation.
+
+Not in scope:
+
+- Certificate validation.
+- SSH authentication.
+- Persistent grant storage.
+
+## Roadmap
+
+- Keep principal construction narrow and auditable.
+- Add new transport mappings only after their identity has already been
+  verified outside this crate.
+
+## Verification
+
+Run:
+
+```sh
+cargo test -p opc-mgmt-principal
+```
