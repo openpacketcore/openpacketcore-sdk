@@ -98,6 +98,39 @@ pub enum HostXdpTarget {
     },
 }
 
+/// Security posture for cross-node Host-XDP redirect traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HostXdpClusterChannelSecurity {
+    /// No cross-node redirect channel is configured.
+    #[default]
+    LocalOnly,
+    /// Cross-node traffic is carried over an authenticated, encrypted
+    /// mTLS/SPIFFE channel.
+    MtlsSpiffe {
+        /// Whether plaintext fallback is allowed by the deployment.
+        plaintext_fallback: bool,
+    },
+}
+
+impl HostXdpClusterChannelSecurity {
+    /// Authenticated and encrypted mTLS/SPIFFE channel with no plaintext fallback.
+    #[must_use]
+    pub const fn mtls_spiffe() -> Self {
+        Self::MtlsSpiffe {
+            plaintext_fallback: false,
+        }
+    }
+
+    fn permits_cross_node_redirect(self) -> bool {
+        matches!(
+            self,
+            Self::MtlsSpiffe {
+                plaintext_fallback: false
+            }
+        )
+    }
+}
+
 /// Precomputed target for one routing tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostXdpTagTarget {
@@ -124,6 +157,8 @@ pub struct HostXdpSteeringBackendConfig {
     /// Complete routing-tag target table used for stateless steady-state
     /// steering. This is O(tags), not O(active SAs).
     pub tag_targets: BTreeMap<u16, HostXdpTagTarget>,
+    /// Security posture for cross-node redirect targets.
+    pub cluster_channel_security: HostXdpClusterChannelSecurity,
 }
 
 impl Default for HostXdpSteeringBackendConfig {
@@ -134,6 +169,7 @@ impl Default for HostXdpSteeringBackendConfig {
             esp_tag_bits: 0,
             owner_targets: BTreeMap::new(),
             tag_targets: BTreeMap::new(),
+            cluster_channel_security: HostXdpClusterChannelSecurity::LocalOnly,
         }
     }
 }
@@ -431,7 +467,28 @@ fn validate_xdp_config(config: &HostXdpSteeringBackendConfig) -> Result<(), Ipse
             ));
         }
     }
+    if has_cross_node_redirect(config)
+        && !config
+            .cluster_channel_security
+            .permits_cross_node_redirect()
+    {
+        return Err(IpsecLbError::invalid_config(
+            "cluster_channel_security",
+            "cross-node redirect requires mTLS/SPIFFE with no plaintext fallback",
+        ));
+    }
     Ok(())
+}
+
+fn has_cross_node_redirect(config: &HostXdpSteeringBackendConfig) -> bool {
+    config
+        .owner_targets
+        .values()
+        .any(|target| matches!(target, HostXdpTarget::Redirect { .. }))
+        || config
+            .tag_targets
+            .values()
+            .any(|target| matches!(target.target, HostXdpTarget::Redirect { .. }))
 }
 
 fn validate_tag_bits(field: &'static str, bits: u8, total_bits: u8) -> Result<(), IpsecLbError> {
@@ -1052,6 +1109,7 @@ mod tests {
             esp_tag_bits: 2,
             owner_targets,
             tag_targets,
+            cluster_channel_security: HostXdpClusterChannelSecurity::mtls_spiffe(),
         }
     }
 
@@ -1123,6 +1181,7 @@ mod tests {
                 esp_tag_bits: 2,
                 owner_targets: BTreeMap::new(),
                 tag_targets: BTreeMap::new(),
+                cluster_channel_security: HostXdpClusterChannelSecurity::LocalOnly,
             },
         );
 
@@ -1152,6 +1211,50 @@ mod tests {
                 .await,
             Err(IpsecLbError::InvalidConfig {
                 field: "tag_targets",
+                ..
+            })
+        ));
+        assert_eq!(runtime.attached_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cross_node_redirect_requires_mtls_spiffe_channel() {
+        let runtime = Arc::new(TestRuntime::default());
+        let mut insecure_config = config(ShardId::new(1), 42);
+        insecure_config.cluster_channel_security = HostXdpClusterChannelSecurity::LocalOnly;
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            insecure_config,
+        );
+
+        assert!(matches!(
+            backend
+                .install_rule(rule(ShardId::new(1), SteerKey::EspSpi(1)))
+                .await,
+            Err(IpsecLbError::InvalidConfig {
+                field: "cluster_channel_security",
+                ..
+            })
+        ));
+        assert_eq!(runtime.attached_count(), 0);
+
+        let mut plaintext_fallback = config(ShardId::new(1), 42);
+        plaintext_fallback.cluster_channel_security = HostXdpClusterChannelSecurity::MtlsSpiffe {
+            plaintext_fallback: true,
+        };
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            plaintext_fallback,
+        );
+
+        assert!(matches!(
+            backend
+                .install_rule(rule(ShardId::new(1), SteerKey::EspSpi(1)))
+                .await,
+            Err(IpsecLbError::InvalidConfig {
+                field: "cluster_channel_security",
                 ..
             })
         ));

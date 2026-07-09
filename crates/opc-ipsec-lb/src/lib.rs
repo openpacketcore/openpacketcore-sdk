@@ -63,7 +63,10 @@ pub use spi::{
 pub use unsupported::{
     UnsupportedOwnershipSource, UnsupportedSteeringBackend, UnsupportedVipAdvertiser,
 };
-pub use xdp::{HostXdpSteeringBackend, HostXdpSteeringBackendConfig};
+pub use xdp::{
+    HostXdpClusterChannelSecurity, HostXdpSteeringBackend, HostXdpSteeringBackendConfig,
+    HostXdpTagTarget, HostXdpTarget,
+};
 
 #[cfg(test)]
 mod integration_tests {
