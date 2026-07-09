@@ -11,8 +11,10 @@ same session-store traits.
 
 ## API Shape
 
-- `RemoteSessionBackend::new(addr, tls_config, deadline)` creates a client that
-  implements `SessionBackend` and `SessionLeaseManager`.
+- `RemoteSessionBackend::new(addr, tls_config, deadline)` creates an mTLS
+  client that implements `SessionBackend` and `SessionLeaseManager`.
+- `RemoteSessionBackend::new_insecure` exists only behind the `insecure-test`
+  feature.
 - `with_max_frame_size` overrides the default 1 MiB frame limit.
 - `SessionReplicationServer::new(backend, tls_config)` creates an mTLS server
   over an `Arc<dyn SessionStoreBackend>`.
@@ -28,10 +30,15 @@ same session-store traits.
 ```rust,no_run
 use opc_session_net::RemoteSessionBackend;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
+fn client_tls_config() -> Arc<opc_tls::ClientConfig> {
+    unimplemented!("compose from opc-tls/opc-identity at the product boundary")
+}
+
 let addr: SocketAddr = "127.0.0.1:9443".parse().unwrap();
-let remote = RemoteSessionBackend::new(addr, None, Some(Duration::from_secs(2)));
+let remote = RemoteSessionBackend::new(addr, client_tls_config(), Some(Duration::from_secs(2)));
 let _remote = remote.with_max_frame_size(1024 * 1024);
 ```
 
@@ -45,8 +52,9 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 
 - `publish = false`.
 - The transport is experimental.
-- Production server construction requires authenticated TLS.
-- Plaintext server support is test-only and gated behind `insecure-test`.
+- Production client and server construction requires authenticated TLS.
+- Plaintext client/server support is test-only and gated behind
+  `insecure-test`.
 - The wire contract version is `1`; the default max frame size is 1 MiB.
 
 ## Roadmap
