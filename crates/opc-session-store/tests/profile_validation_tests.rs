@@ -6,10 +6,10 @@ use opc_session_store::{
 };
 use std::time::Duration;
 
-// 1. Exhaustive property test over all 2^7 = 128 combinations of boolean capabilities.
+// 1. Exhaustive property test over all 2^8 = 256 combinations of boolean capabilities.
 #[test]
 fn test_exhaustive_capabilities_validation() {
-    for i in 0..128 {
+    for i in 0..256 {
         let caps = BackendCapabilities {
             atomic_compare_and_set: (i & 1) != 0,
             monotonic_fencing_token: (i & 2) != 0,
@@ -18,6 +18,7 @@ fn test_exhaustive_capabilities_validation() {
             ordered_replication_log: (i & 16) != 0,
             batch_write: (i & 32) != 0,
             watch: (i & 64) != 0,
+            restore_scan: (i & 128) != 0,
             max_value_bytes: 1024,
         };
 
@@ -95,11 +96,13 @@ fn test_exhaustive_capabilities_validation() {
                 SessionStateProfile::ReplicatedDisasterRecovery,
                 &caps,
             );
-            let expected_missing: Vec<&'static str> =
-                vec![(!caps.ordered_replication_log).then_some("ordered_replication_log")]
-                    .into_iter()
-                    .flatten()
-                    .collect();
+            let expected_missing: Vec<&'static str> = vec![
+                (!caps.ordered_replication_log).then_some("ordered_replication_log"),
+                (!caps.restore_scan).then_some("restore_scan"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
 
             if expected_missing.is_empty() {
                 assert!(res.is_ok());

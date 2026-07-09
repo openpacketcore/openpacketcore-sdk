@@ -36,6 +36,11 @@ pub struct BackendCapabilities {
     pub batch_write: bool,
     /// Advisory: not enforced by the backend trait; consumed by carrier profile validation.
     pub watch: bool,
+    /// Backend can enumerate live records in deterministic order for startup
+    /// or failover restore. Missing serialized fields default to false so
+    /// older capability payloads fail closed.
+    #[serde(default)]
+    pub restore_scan: bool,
     /// Largest payload (in bytes) the backend accepts for a single record;
     /// larger writes fail with `StoreError::PayloadTooLarge` without being
     /// stored.
@@ -53,6 +58,7 @@ impl BackendCapabilities {
             ordered_replication_log: true,
             batch_write: true,
             watch: true,
+            restore_scan: true,
             max_value_bytes: usize::MAX,
         }
     }
@@ -67,6 +73,7 @@ impl BackendCapabilities {
             ordered_replication_log: false,
             batch_write: false,
             watch: false,
+            restore_scan: false,
             max_value_bytes: 1_048_576,
         }
     }
@@ -311,6 +318,9 @@ pub fn validate_backend_for_profile(
             if !capabilities.ordered_replication_log {
                 missing.push("ordered_replication_log");
             }
+            if !capabilities.restore_scan {
+                missing.push("restore_scan");
+            }
         }
     }
 
@@ -417,6 +427,7 @@ mod tests {
             CapabilityError::MissingCapabilities { profile, missing } => {
                 assert_eq!(profile, SessionStateProfile::ReplicatedDisasterRecovery);
                 assert!(missing.contains(&"ordered_replication_log"));
+                assert!(missing.contains(&"restore_scan"));
             }
         }
     }
@@ -440,7 +451,8 @@ mod tests {
             .await
             .is_ok());
 
-        // SQLite does not have ordered_replication_log, so it is NOT suitable for ReplicatedDisasterRecovery.
+        // SQLite does not advertise ordered_replication_log on its own, so it
+        // is NOT suitable for ReplicatedDisasterRecovery.
         let err = backend
             .assert_suitable_for(SessionStateProfile::ReplicatedDisasterRecovery)
             .await

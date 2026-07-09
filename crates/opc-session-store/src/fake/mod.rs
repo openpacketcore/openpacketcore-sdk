@@ -26,7 +26,7 @@ use crate::{
     lease::{LeaseGuard, SessionLeaseManager},
     model::{FenceToken, OwnerId, SessionKey},
     record::StoredSessionRecord,
-    restore::{RestoreScanCursor, RestoreScanPage, RestoreScanRequest},
+    restore::{compare_restore_records, RestoreScanCursor, RestoreScanPage, RestoreScanRequest},
 };
 
 /// In-memory session backend and lease manager for deterministic tests.
@@ -770,6 +770,9 @@ impl SessionBackend for FakeSessionBackend {
         &self,
         request: RestoreScanRequest,
     ) -> Result<RestoreScanPage, StoreError> {
+        if !self.caps.restore_scan {
+            return Err(StoreError::CapabilityNotSupported("restore_scan".into()));
+        }
         request.validate()?;
 
         let mut state = self.inner.lock().await;
@@ -934,28 +937,6 @@ impl SessionBackend for FakeSessionBackend {
         let state = self.inner.lock().await;
         Ok((state.next_fence, state.next_credential_id))
     }
-}
-
-fn compare_restore_records(
-    left: &StoredSessionRecord,
-    right: &StoredSessionRecord,
-) -> std::cmp::Ordering {
-    left.key
-        .tenant
-        .as_str()
-        .cmp(right.key.tenant.as_str())
-        .then_with(|| left.key.nf_kind.as_str().cmp(right.key.nf_kind.as_str()))
-        .then_with(|| left.key.key_type.cmp(&right.key.key_type))
-        .then_with(|| {
-            left.key
-                .stable_id
-                .as_ref()
-                .cmp(right.key.stable_id.as_ref())
-        })
-        .then_with(|| left.state_class.cmp(&right.state_class))
-        .then_with(|| left.state_type.cmp(&right.state_type))
-        .then_with(|| left.owner.cmp(&right.owner))
-        .then_with(|| left.generation.cmp(&right.generation))
 }
 
 struct WatchStream {

@@ -199,6 +199,7 @@ fn sqlite_capabilities() -> BackendCapabilities {
         ordered_replication_log: false,
         batch_write: true,
         watch: false,
+        restore_scan: true,
         max_value_bytes: SQLITE_SESSION_MAX_VALUE_BYTES,
     }
 }
