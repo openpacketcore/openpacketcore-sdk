@@ -2,219 +2,238 @@
 
 [![CI](https://github.com/openpacketcore/openpacketcore-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/openpacketcore/openpacketcore-sdk/actions/workflows/ci.yml)
 
-OpenPacketCore SDK is a Rust workspace for building cloud-native packet-core
-network functions. It provides reusable SDK primitives for runtime startup,
-configuration, management protocols, session state, security, observability,
-protocol codecs, dataplane integration, operator lifecycle contracts, and
-release-assurance evidence.
+A robust, polyglot software development kit for building resilient, cloud-native 5G packet core network functions (CNFs). This SDK provides the standardized runtime chassis, quorum-replicated session storage, encrypted config persistence, northbound gNMI/NETCONF management-plane foundations, data-governance/redaction boundary enforcement, and release-assurance evidence pipelines for packet core software with high-assurance deployment requirements.
 
-The repository is intentionally modular. The root README describes the workspace
-shape and cross-crate roadmap; each crate README is the source of truth for that
-crate's API surface, status, limitations, verification command, and local
-roadmap.
+The GTP-U user-plane codec is also applicable to LTE/EPC user plane. The SDK
+now includes three experimental, transport-neutral protocol crates: the
+`opc-proto-gtpv2c` crate, limited to an S2b typed GTPv2-C subset; the
+`opc-proto-diameter` crate for RFC 6733 framing, base peer procedures, and
+initial 3GPP application dictionary work; and the `opc-proto-ikev2` crate for
+IKEv2 header and generic payload-chain scaffolding. They are consumed as direct
+protocol dependencies, not through the `opc-sdk` default feature set or prelude.
+They do **not** provide a product-ready EPC or ePDG control-plane stack: full
+GTP-C and S1AP stacks are not provided; Diameter realm routing, AAA/HSS/CDF
+behavior, IKE SA state machines, EAP-AKA, Child SA lifecycle policy, transport
+operations, deployment privileges, and carrier-readiness decisions remain
+downstream product responsibilities.
 
-## Boundary
+> [!IMPORTANT]
+> **Production Readiness & Reference Boundaries**
+> * **Rust SDK Core**: The core Rust libraries have passed the current P0 SDK release-readiness gates. Downstream CNFs still need product-specific integration, deployment, and carrier acceptance validation.
+> * **Go Reference Operator**: The Go operator located under `operators/sdk-reference-operator/` is a **reference harness and development utility only**. It is explicitly not a production-grade controller. Downstream product teams are responsible for implementing product-specific Kubernetes operators.
+> * **Rust Reference SMF**: The `examples/smf-reference/` workspace is a **reference consumer and API acid test**, not a product-grade SMF. It has no N7/PCF, charging, NAS, or real UPF selection.
+> * **No Unconditional Claims**: Standard deployments require integration with your local platform security policies, hardware topologies, and external KMS/SPIFFE infrastructure.
 
-- The Rust SDK crates are reusable building blocks, not a complete AMF, SMF,
-  UPF, ePDG, N3IWF, or operator product.
-- Experimental protocol crates expose useful codec/mechanism APIs, but do not
-  claim full 3GPP control-plane product behavior.
-- Linux dataplane and kernel-facing crates require the privileges, kernel
-  modules, network namespaces, eBPF support, and platform policy expected by
-  their individual READMEs.
-- The Go operator under `operators/sdk-reference-operator/` is a reference
-  harness. Product teams are expected to build product-specific Kubernetes
-  controllers and CRDs.
-- The reference SMF under `examples/smf-reference/` is an API acid test, not a
-  production SMF.
+## Getting started
 
-## Getting Started
+See [`docs/quickstart.md`](docs/quickstart.md) for a guided first build and a minimal CNF example.
 
-Start with [`docs/quickstart.md`](docs/quickstart.md) for a first build and a
-minimal CNF example.
+Each crate README now documents that crate's purpose, API shape, relationships,
+status and limits, roadmap, and verification command. The table below keeps the
+workspace-level RFC/ADR map intact so reviewers can trace each crate back to the
+design record that owns its boundary.
 
-For the facade API, see [`crates/opc-sdk/README.md`](crates/opc-sdk/README.md).
-For crate-specific usage and status, open the README in the crate directory.
+---
 
-## API Shape
+## Workspace Layout & SDK Boundaries
 
-### Facade, Runtime, And Shared Types
+The SDK is organized into a clean multi-crate Rust workspace and a Go reference operator directory:
 
-| Crate | API shape |
-| :--- | :--- |
-| [`opc-sdk`](crates/opc-sdk/) | Feature-gated facade re-exporting the core SDK crates plus a prelude and minimal CNF example. |
-| [`opc-runtime`](crates/opc-runtime/) | Startup phases, task supervision, shutdown/drain hooks, health checks, runtime modes, UDP helpers, and optional observability bootstrap. |
-| [`opc-types`](crates/opc-types/) | Shared IDs, NF kinds, PLMN/S-NSSAI values, schema/config versions, timestamps, transaction IDs, and redaction wrappers. |
-| [`opc-observability`](crates/opc-observability/) | Tracing subscriber setup, runtime filter reload, and redacting field formatting. |
-| [`opc-schema-validate`](crates/opc-schema-validate/) | Lightweight JSON Schema subset validator used by SDK fixtures and evidence schemas. |
+### Core Runtime & Platform (`crates/`)
 
-### Configuration And Management
+| Crate | Purpose | Reference |
+| :--- | :--- | :--- |
+| [`opc-sdk`](crates/opc-sdk/) | Facade crate: feature-gated re-exports of the core composition surface, a `prelude`, and the `minimal_cnf` end-to-end example. | [Quickstart](docs/quickstart.md) |
+| [`opc-runtime`](crates/opc-runtime/) | CNF runtime chassis: process startup phases, task supervision, health probes, admin/probe routes, metrics, and graceful SIGTERM drains. | [RFC 008](docs/rfc/008-cnf-runtime-chassis.md), [ADR 0005](docs/adr/0005-runtime-observability-admin-probes.md) |
+| [`opc-observability`](crates/opc-observability/) | Tracing subscriber setup with runtime filter reload and structural redaction. | [ADR 0005](docs/adr/0005-runtime-observability-admin-probes.md) |
+| [`opc-protocol`](crates/opc-protocol/) | Zero-copy protocol codec framework: traits, context, errors, and fuzzing contracts. | [RFC 005](docs/rfc/005-protocol-framework.md) |
+| [`opc-proto-gtpu`](crates/opc-proto-gtpu/) | GTP-U protocol codec for the user-plane data path. | [RFC 005](docs/rfc/005-protocol-framework.md) |
+| [`opc-proto-diameter`](crates/opc-proto-diameter/) | Diameter base codec and dictionary scaffold: RFC 6733 header/AVP framing, base peer procedure helpers, bounded grouped AVP validation, fixture-provenance notes, fuzz targets, typed Rf/SWm helpers, and selected 3GPP application dictionary subsets *(experimental; no realm routing, transport operation, AAA/HSS/CDF behavior, or product readiness claim)*. | [RFC 005](docs/rfc/005-protocol-framework.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md), [Conformance](crates/opc-proto-diameter/CONFORMANCE.md) |
+| [`opc-proto-pfcp`](crates/opc-proto-pfcp/) | PFCP codec (TS 29.244): message layer, raw TLV preservation, and typed session-management IEs. | [RFC 005](docs/rfc/005-protocol-framework.md) |
+| [`opc-proto-nas`](crates/opc-proto-nas/) | NAS-5GS (TS 24.501) codec: headers, body dispatch, mobile identity, BCD unpacking, Registration/Security Mode IEs, and NAS security hooks *(experimental)*. | [RFC 005](docs/rfc/005-protocol-framework.md) |
+| [`opc-proto-ngap`](crates/opc-proto-ngap/) | NGAP (TS 38.413) v0 decoder via `rasn` APER: PDU framing, fixture-proven NGSetupRequest, raw-preserving re-encode *(experimental v0)*. | [RFC 005](docs/rfc/005-protocol-framework.md), [ADR 0013](docs/adr/0013-ngap-asn1-strategy.md) |
+| [`opc-proto-gtpv2c`](crates/opc-proto-gtpv2c/) | GTPv2-C (TS 29.274) experimental S2b subset: raw-preserving header/IE shell plus typed Echo/Create/Modify/Delete/Update views. | [RFC 005](docs/rfc/005-protocol-framework.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
+| [`opc-proto-ikev2`](crates/opc-proto-ikev2/) | IKEv2 (RFC 7296/RFC 7383) experimental scaffold: fixed header, raw generic payload-chain walking for unencrypted payloads, unknown payload preservation, SKF fragmentation structure/reassembly helpers, and crypto-provider boundary traits *(no IKE SA state machine, EAP-AKA, or Child SA lifecycle)*. | [RFC 005](docs/rfc/005-protocol-framework.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md), [Conformance](crates/opc-proto-ikev2/CONFORMANCE.md) |
+| [`opc-sctp`](crates/opc-sctp/) | Safe Linux SCTP transport wrapper for CNFs that terminate N2/NGAP or other SCTP interfaces. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
+| [`opc-libsctp-sys`](crates/opc-libsctp-sys/) | Narrow unsafe Linux SCTP UAPI boundary used only by `opc-sctp`; unsupported platforms fail explicitly. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
+| [`opc-linux-xfrm-sys`](crates/opc-linux-xfrm-sys/) | Narrow unsafe Linux XFRM netlink UAPI boundary; unsupported platforms fail explicitly. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
+| [`opc-linux-gtpu-sys`](crates/opc-linux-gtpu-sys/) | Narrow unsafe Linux GTP-U rtnetlink/generic-netlink UAPI boundary used by the safe dataplane wrapper. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
+| [`opc-linux-route-sys`](crates/opc-linux-route-sys/) | Narrow unsafe Linux rtnetlink route/rule UAPI boundary used by route steering. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
+| [`opc-ipsec-xfrm`](crates/opc-ipsec-xfrm/) | Safe Linux XFRM IPsec backend model, mock backend, redaction-safe errors, and opt-in IKEv2 Child SA to XFRM request mapping. | [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
+| [`opc-route-steering`](crates/opc-route-steering/) | Safe Linux route/rule steering backend model, mock backend, and redaction-safe errors for packet-core CNFs. | [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md), [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md) |
+| [`opc-gtpu-dataplane`](crates/opc-gtpu-dataplane/) | Safe Linux GTP-U dataplane backend model, Linux and eBPF backend adapters, mock backend, capability probes, and redaction-safe errors. | [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md), [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md) |
+| [`opc-gtpu-dataplane-ebpf`](crates/opc-gtpu-dataplane-ebpf/) | Standalone Rust eBPF tc datapath program for GTP-U uplink/downlink handling; built with the pinned script outside the host workspace. | [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
+| [`opc-gtpu-ebpf-common`](crates/opc-gtpu-ebpf-common/) | Shared GTP-U wire-format constants, map names, and map value layouts for the eBPF datapath and userspace loader. | [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
+| [`opc-node-resources`](crates/opc-node-resources/) | Validates `ResourceProfile` compatibility against observed `NodeCapabilityReport`. | [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md) |
 
-| Crate | API shape |
-| :--- | :--- |
-| [`opc-config-model`](crates/opc-config-model/) | Commit requests/results, trusted principals, request identity, config operations, validation context, and config error taxonomy. |
-| [`opc-config-bus`](crates/opc-config-bus/) | Atomic config snapshots, commit sequencing, authorizers, datastores, rollback, restore, metrics, and bounded subscriber fanout. |
-| [`opc-config-fixture`](crates/opc-config-fixture/) | Generated-like toy config model and deltas for integration tests. |
-| [`opc-persist`](crates/opc-persist/) | `ConfigStore` contract, SQLite backend, quorum/fenced replicas, break-glass controls, security policy, audit integration, and consensus-node binary. |
-| [`opc-nacm`](crates/opc-nacm/) | Normalized YANG paths and NACM rule evaluation. |
-| [`opc-nacm-config`](crates/opc-nacm-config/) | RFC 8341-style NACM datastore model, validation, SPIFFE workload selectors, and policy compiler. |
-| [`opc-yanggen`](crates/opc-yanggen/) | YANG source ingest, constrained IR lowering, Rust/schema projection, generated registry support, and `opc-yanggen` CLI. |
-| [`opc-mgmt-schema`](crates/opc-mgmt-schema/) | Runtime YANG schema registry, node metadata, NETCONF projection traits, XML render/edit traits, and registry validation. |
-| [`opc-mgmt-path`](crates/opc-mgmt-path/) | Registry-validated canonical YANG path construction and resolution. |
-| [`opc-mgmt-principal`](crates/opc-mgmt-principal/) | Mapping SPIFFE or SSH transport identities into config-bus trusted principals and signed grants. |
-| [`opc-mgmt-authz`](crates/opc-mgmt-authz/) | NACM authorization facades for reads, writes, subscriptions, and exec/action paths. |
-| [`opc-mgmt-audit`](crates/opc-mgmt-audit/) | Management audit event model, outcome/reason labels, and pluggable audit sink. |
-| [`opc-mgmt-errors`](crates/opc-mgmt-errors/) | Transport-neutral management status taxonomy and gNMI/NETCONF error mappings. |
-| [`opc-mgmt-limits`](crates/opc-mgmt-limits/) | Fail-closed parser/session/input bounds shared by management protocols. |
-| [`opc-mgmt-opstate`](crates/opc-mgmt-opstate/) | Operational-state provider and event source contracts for northbound reads/subscriptions. |
-| [`opc-mgmt-transport`](crates/opc-mgmt-transport/) | Management-plane TLS bootstrap, ALPN policy, and plaintext-mode guardrails. |
-| [`opc-gnmi-server`](crates/opc-gnmi-server/) | Capability-honest gNMI foundation for Capabilities/Get/Set/Subscribe over SDK-managed transport. |
-| [`opc-gnmi-server/proto`](crates/opc-gnmi-server/proto/) | Checked-in protobuf sources and generated-code notes for the gNMI server crate. |
-| [`opc-netconf-server`](crates/opc-netconf-server/) | Capability-gated NETCONF server core, framing, transports, sessions, NACM/audit hooks, bounded XML, and testkit support. |
+### Config & Management (`crates/`)
 
-### Security, Identity, Privacy, And Evidence
+| Crate | Purpose | Reference |
+| :--- | :--- | :--- |
+| [`opc-config-bus`](crates/opc-config-bus/) | Transactional config bus supporting schema validation, tenant segregation, AAD-bound envelope encryption, and admission control. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-config-model`](crates/opc-config-model/) | Shared config-model request, result, identity, and error types. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-persist`](crates/opc-persist/) | Tamper-evident SQLite datastores, consensus config store membership, and fail-closed storage fault injection hooks. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-nacm`](crates/opc-nacm/) | Normalized YANG path parsing and NACM authorization evaluation. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-nacm-config`](crates/opc-nacm-config/) | Typed `/nacm` datastore model with RFC 8341 group/rule-list validation, SPIFFE group selectors, signed-grant resolution, and policy compilation. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-yanggen`](crates/opc-yanggen/) | YANG-to-Rust type projection, RFC 7951 JSON serde, schema registry generation, NETCONF XML/gNMI JSON projections, and patch applicators. | [RFC 002](docs/rfc/002-yang-projection.md) |
+| [`opc-mgmt-schema`](crates/opc-mgmt-schema/) | Runtime schema-registry contract consumed by generated CNF models and northbound servers. | [RFC 002](docs/rfc/002-yang-projection.md) |
+| [`opc-mgmt-path`](crates/opc-mgmt-path/) | Registry-validated YANG path normalization shared by gNMI, NETCONF, NACM, config commits, and audit. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-principal`](crates/opc-mgmt-principal/) | Converts transport-authenticated SPIFFE or SSH identities into grant-free config principals. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-authz`](crates/opc-mgmt-authz/) | Shared NACM authorization facade for reads, subscriptions, config writes, and management RPC/action execution. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-audit`](crates/opc-mgmt-audit/) | Management operation audit event model and pluggable audit sink for allowed, failed, and denied requests. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-errors`](crates/opc-mgmt-errors/) | Transport-neutral management status taxonomy and gNMI/NETCONF error mappings. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-limits`](crates/opc-mgmt-limits/) | Shared fail-closed input limits for management protocol parsers and sessions. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-opstate`](crates/opc-mgmt-opstate/) | CNF-supplied operational-state provider contract for gNMI `Get`/`Subscribe` and NETCONF `<get>`. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-transport`](crates/opc-mgmt-transport/) | Fail-closed mTLS and plaintext-policy bootstrap for management listeners. | [RFC 003](docs/rfc/003-security-substrate.md) |
+| [`opc-gnmi-server`](crates/opc-gnmi-server/) | Capability-honest gNMI server foundation with schema-backed Capabilities/Get/Set/Subscribe over SDK-managed mTLS. | [gNMI spec](docs/design/opc-gnmi-server-spec.md) |
+| [`opc-netconf-server`](crates/opc-netconf-server/) | Capability-gated NETCONF server core with SSH/TLS transports, datastore operations, NACM, audit, and bounded XML handling. | [RFC 001](docs/rfc/001-management-substrate.md) |
 
-| Crate | API shape |
-| :--- | :--- |
-| [`opc-identity`](crates/opc-identity/) | SPIFFE identity model, file SVID source, trust bundles, reload events, and SVID watcher. |
-| [`opc-tls`](crates/opc-tls/) | Reloading rustls client/server configs and SPIFFE-aware certificate verifiers. |
-| [`opc-key`](crates/opc-key/) | Key-provider traits, in-memory provider, key scopes, AEAD payload helpers, and KMS boundary traits. |
-| [`opc-key-vault`](crates/opc-key-vault/) | HashiCorp Vault Transit adapter for `opc-key`, with optional Kubernetes auth. |
-| [`opc-crypto`](crates/opc-crypto/) | AEAD envelope encode/decode and provider-driven encryption/decryption helpers. |
-| [`opc-data-governance`](crates/opc-data-governance/) | Data classes, telco identifier classes, and retention policy types. |
-| [`opc-redaction`](crates/opc-redaction/) | Redaction levels, safe rendering, keyed digests, telco identifiers, metrics labels, and support-bundle redaction. |
-| [`opc-privacy`](crates/opc-privacy/) | Minimization policies, cohort aggregation, value binning, and identifier hashing. |
-| [`opc-export`](crates/opc-export/) | Classified export metadata, payload state, and validation errors for signed/exported items. |
-| [`opc-evidence`](crates/opc-evidence/) | Evidence bundles, manifests, requirements, gap gates, SBOM/VEX records, provenance, dataplane snapshots, and release policy evaluation. |
+### Security & Identity (`crates/`)
 
-### Session State
+| Crate | Purpose | Reference |
+| :--- | :--- | :--- |
+| [`opc-identity`](crates/opc-identity/) | SPIFFE Workload Identity and SVID reload support. | [RFC 003](docs/rfc/003-security-substrate.md) |
+| [`opc-key`](crates/opc-key/) | Key-provider traits, in-memory adapters, and tenant-bound AEAD payload helpers. | [RFC 003](docs/rfc/003-security-substrate.md) |
+| [`opc-crypto`](crates/opc-crypto/) | AEAD envelope encoding, decoding, and provider-driven encryption. | [RFC 003](docs/rfc/003-security-substrate.md) |
+| [`opc-tls`](crates/opc-tls/) | Reloadable SPIFFE-aware mTLS client and server support. | [RFC 003](docs/rfc/003-security-substrate.md) |
+| [`opc-key-vault`](crates/opc-key-vault/) | HashiCorp Vault Transit `KeyProvider` adapter using the wrapped-data-key envelope pattern *(experimental)*. | [RFC 003](docs/rfc/003-security-substrate.md) |
 
-| Crate | API shape |
-| :--- | :--- |
-| [`opc-session-store`](crates/opc-session-store/) | Session backend/store contracts, records, leases, CAS, quorum/fenced replicas, payload codecs, restore evidence, handover, fake backend, and SQLite backend. |
-| [`opc-session-cache`](crates/opc-session-cache/) | Key-scoped invalidation, sequence tracking, and resume-aware session cache. |
-| [`opc-session-net`](crates/opc-session-net/) | Experimental networked session replication protocol, remote backend client, and replication server. |
+### Session & State (`crates/`)
 
-### Protocols, Transport, And SBI
+| Crate | Purpose | Reference |
+| :--- | :--- | :--- |
+| [`opc-session-store`](crates/opc-session-store/) | Quorum-replicated session database supporting lease management, CAS operations, and change-stream watches. Quorum semantics (fencing, leases, CAS, read-repair) are production-grade within a process; networked replication is experimental and provided by `opc-session-net`. | [RFC 004](docs/rfc/004-session-store.md) |
+| [`opc-session-cache`](crates/opc-session-cache/) | Production-grade session cache with key-scoped invalidation, sequence tracking, and resume recovery. | [RFC 004](docs/rfc/004-session-store.md) |
+| [`opc-session-net`](crates/opc-session-net/) | Networked session replication transport: mTLS length-prefixed wire protocol, replication server, and remote backend client *(experimental)*. | [RFC 004](docs/rfc/004-session-store.md) |
 
-| Crate | API shape |
-| :--- | :--- |
-| [`opc-protocol`](crates/opc-protocol/) | Shared codec traits, decode/encode contexts, structured errors, spec references, and fuzzing contracts. |
-| [`opc-proto-gtpu`](crates/opc-proto-gtpu/) | GTP-U header/message codec, extension-header walking, PDU Session Container helpers, and chain validation. |
-| [`opc-proto-pfcp`](crates/opc-proto-pfcp/) | PFCP message/header codec, raw IE preservation, typed N4 session-management IEs, and Production Profile v1 builders/validators. |
-| [`opc-proto-gtpv2c`](crates/opc-proto-gtpv2c/) | Experimental GTPv2-C S2b subset: header, raw/typed IE layer, message shell, and S2b profile builders. |
-| [`opc-proto-ngap`](crates/opc-proto-ngap/) | Experimental NGAP APER PDU framing, first AMF N2 typed dispatch, and raw-preserving re-encode path. |
-| [`opc-proto-nas`](crates/opc-proto-nas/) | Experimental NAS-5GS framing, mobile identity views, BCD helpers, message dispatch, and NAS security hooks. |
-| [`opc-proto-diameter`](crates/opc-proto-diameter/) | Experimental Diameter RFC 6733 header/AVP codec, dictionary scaffold, peer helpers, and selected app dictionaries. |
-| [`opc-proto-ikev2`](crates/opc-proto-ikev2/) | Experimental IKEv2 mechanism crate for headers, payload chains, fragmentation, NAT detection, SA_INIT/AUTH helpers, and crypto provider traits. |
-| [`opc-api-nnrf`](crates/opc-api-nnrf/) | Generated Rust payload types for 3GPP TS 29.510 NRF APIs; operation wiring lives elsewhere. |
-| [`opc-sbi`](crates/opc-sbi/) | Shared SBI auth, client/server primitives, headers, problem details, retry policy, NRF helpers, runtime hooks, and testkit support. |
-| [`opc-peer-discovery`](crates/opc-peer-discovery/) | Transport-neutral peer discovery inputs, resolver injection, cache keys, deterministic selection, and evidence output. |
-| [`opc-sctp`](crates/opc-sctp/) | Safe SCTP endpoint/association model, PPIDs, connect projections, Diameter SCTP peer helpers, metrics, and health. |
-| [`opc-libsctp-sys`](crates/opc-libsctp-sys/) | Narrow Linux SCTP socket UAPI wrapper used by `opc-sctp`. |
+### Alarms & Observability (`crates/`)
 
-### Dataplane, Linux, And Node Resources
+| Crate | Purpose | Reference |
+| :--- | :--- | :--- |
+| [`opc-alarm`](crates/opc-alarm/) | Alarm model, severity taxonomy, dedup/update/clear manager, and in-memory store. | [RFC 013](docs/rfc/013-fault-management-alarm-substrate.md) |
+| [`opc-alarm-k8s`](crates/opc-alarm-k8s/) | Kubernetes condition and event mappings for OpenPacketCore alarms. | [RFC 013](docs/rfc/013-fault-management-alarm-substrate.md) |
+| [`opc-alarm-yang`](crates/opc-alarm-yang/) | YANG schema and operational projections for OpenPacketCore alarms. | [RFC 013](docs/rfc/013-fault-management-alarm-substrate.md) |
 
-| Crate | API shape |
-| :--- | :--- |
-| [`opc-gtpu-dataplane`](crates/opc-gtpu-dataplane/) | Safe GTP-U dataplane backend trait, Linux backend, eBPF backend adapter, mock backend, probe model, PDP context model, and redaction-safe errors. |
-| [`opc-gtpu-dataplane-ebpf`](crates/opc-gtpu-dataplane-ebpf/) | Standalone Rust eBPF tc datapath program for GTP-U uplink/downlink handling; built with the pinned script, not normal host Cargo. |
-| [`opc-gtpu-ebpf-common`](crates/opc-gtpu-ebpf-common/) | Shared wire-format constants, map names, map value layouts, checksum helpers, and GTP-U classification for eBPF/userspace. |
-| [`opc-dataplane-testkit`](crates/opc-dataplane-testkit/) | Deterministic traffic generation, GTP-U helpers, reflectors, continuity observer, and dataplane evidence reports. |
-| [`opc-ipsec-xfrm`](crates/opc-ipsec-xfrm/) | Safe XFRM backend trait, Linux/mock/unsupported backends, IPsec model, composite reconciliation, and optional IKEv2 Child SA mapping. |
-| [`opc-route-steering`](crates/opc-route-steering/) | Safe route/rule steering backend trait, Linux/mock/unsupported backends, route/rule model, and redaction-safe errors. |
-| [`opc-linux-gtpu-sys`](crates/opc-linux-gtpu-sys/) | Narrow Linux GTP-U rtnetlink/generic-netlink UAPI wrapper. |
-| [`opc-linux-route-sys`](crates/opc-linux-route-sys/) | Narrow Linux rtnetlink route/rule UAPI wrapper. |
-| [`opc-linux-xfrm-sys`](crates/opc-linux-xfrm-sys/) | Narrow Linux XFRM netlink UAPI wrapper. |
-| [`opc-node-resources`](crates/opc-node-resources/) | Node capability reports, resource profiles, CPU/NUMA/hugepage/network/BPF/pod-security checks, and dataplane preflight validation. |
+### Data Governance & Privacy (`crates/`)
 
-### Alarms And Fault Management
+| Crate | Purpose | Reference |
+| :--- | :--- | :--- |
+| [`opc-redaction`](crates/opc-redaction/) | Support-bundle redactor scrubbing SUPIs, GPSIs, IPs, paths, and private keys. | [RFC 010](docs/rfc/010-data-governance-privacy.md) |
+| [`opc-data-governance`](crates/opc-data-governance/) | Data classification, tenant boundary isolation, retention policies, and legal holds. | [RFC 010](docs/rfc/010-data-governance-privacy.md) |
+| [`opc-privacy`](crates/opc-privacy/) | Client-side privacy: cohort binning and k-anonymity validation. | [RFC 010](docs/rfc/010-data-governance-privacy.md) |
+| [`opc-export`](crates/opc-export/) | Metadata-preserving schema/payload export validation for backup and restore. | [RFC 010](docs/rfc/010-data-governance-privacy.md) |
 
-| Crate | API shape |
-| :--- | :--- |
-| [`opc-alarm`](crates/opc-alarm/) | Alarm model, severity taxonomy, manager, sink traits, in-memory store, optional NACM adapter, and optional persistence adapter. |
-| [`opc-alarm-k8s`](crates/opc-alarm-k8s/) | Projection from alarms to Kubernetes-like conditions and events. |
-| [`opc-alarm-yang`](crates/opc-alarm-yang/) | Alarm YANG schema string and JSON operational projection. |
-| [`opc-alarm-testkit`](crates/opc-alarm-testkit/) | Alarm and audit assertions plus redaction checks for tests. |
+### Service-Based Interface (`crates/`)
 
-### Operator Lifecycle
+| Crate | Purpose | Reference |
+| :--- | :--- | :--- |
+| [`opc-sbi`](crates/opc-sbi/) | Shared SBI client/server, auth, NRF, retry, and testkit primitives. | [RFC 007](docs/rfc/007-sbi-service-framework.md) |
+| [`opc-peer-discovery`](crates/opc-peer-discovery/) | Transport-neutral peer discovery, resolver injection, deterministic selection, and peer-discovery evidence. | [RFC 007](docs/rfc/007-sbi-service-framework.md) |
+| [`opc-api-nnrf`](crates/opc-api-nnrf/) | Generated Rust types for 3GPP TS 29.510 NRF `NfProfile` / `NfService` *(experimental)*. | [Design note](docs/design/openapi-codegen-plan.md) |
 
-| Crate | API shape |
-| :--- | :--- |
-| [`operator-lifecycle`](crates/operator-lifecycle/) | Admission, compatibility, config-apply, drain/upgrade planning, phase/status projection, and reconcile intent contracts. |
-| [`operator-controller`](crates/operator-controller/) | Controller execution helpers for CRD conversion, state migration, drain execution, multi-cluster status, and status patches. |
-| [`operator-lifecycle-cli`](crates/operator-lifecycle-cli/) | JSON CLI bridge exposing Rust lifecycle contracts to Go controller-runtime operators. |
+### Release Assurance (`crates/`)
 
-### Integration Crates And Testkits
+| Crate | Purpose | Reference |
+| :--- | :--- | :--- |
+| [`opc-evidence`](crates/opc-evidence/) | Release assurance pipeline: SBOM generation, VEX scanning, gap gates, dataplane snapshots, and gate policy enforcement. | [RFC 006](docs/rfc/006-conformance-pipeline.md) |
 
-| Crate | API shape |
-| :--- | :--- |
-| [`opc-testbed`](crates/opc-testbed/) | Scenario DSL, virtual time, runner, assertions, fixture provenance, evidence, and simulator framework. |
-| [`opc-sdk-integration`](crates/opc-sdk-integration/) | Toy network function wiring runtime, config bus, alarms, and testbed evidence. |
-| [`opc-amf-lite`](crates/opc-amf-lite/) | Internal AMF-lite vertical slice for proving SDK seams; not a production AMF. |
-| [`opc-amf-lite-testkit`](crates/opc-amf-lite-testkit/) | Fixture builders and pattern docs for `opc-amf-lite`. |
-| [`opc-security-testkit`](crates/opc-security-testkit/) | Fake CA/SPIRE/KMS fixtures and fault injection for security tests. |
-| [`opc-session-testkit`](crates/opc-session-testkit/) | Skewable clock, chaos testkit, and restore evidence assertions for session replication. |
+### Operator Lifecycle (`crates/`)
 
-## Non-Rust Reference Areas
+| Crate | Purpose | Reference |
+| :--- | :--- | :--- |
+| [`operator-lifecycle`](crates/operator-lifecycle/) | Kubernetes production-readiness lifecycle foundation, config-apply, admission, and drain/upgrade planning. | [RFC 009](docs/rfc/009-operator-lifecycle-upgrade.md) |
+| [`operator-controller`](crates/operator-controller/) | Kubernetes operator controller execution layer *(internal, not published)*. | [RFC 009](docs/rfc/009-operator-lifecycle-upgrade.md) |
+| [`operator-lifecycle-cli`](crates/operator-lifecycle-cli/) | CLI interface exposing Rust SDK lifecycle contracts to Go controller-runtime operators via JSON *(internal, not published)*. | [RFC 009](docs/rfc/009-operator-lifecycle-upgrade.md) |
 
-| Path | Purpose |
-| :--- | :--- |
-| [`operators/sdk-reference-operator`](operators/sdk-reference-operator/) | Go controller-runtime reference harness that consumes Rust lifecycle decisions through the CLI boundary. |
-| [`operators/operator-sdk-go`](operators/operator-sdk-go/) | Reusable Go operator helpers for conditions, bridges, drain handling, workload policy, CNI, gates, rollout, metrics, and tests. |
-| [`examples/smf-reference`](examples/smf-reference/) | Bounded Rust reference SMF consumer with real PFCP/N4 bytes and SDK runtime integration; not a product SMF. |
+### Testing & Integration (`crates/`)
 
-## Roadmap
+| Crate | Purpose | Reference |
+| :--- | :--- | :--- |
+| [`opc-testbed`](crates/opc-testbed/) | Scenario DSL, virtual time, assertions, fixture provenance, and simulator framework. | [RFC 012](docs/rfc/012-testbed-simulator-framework.md) |
+| [`opc-dataplane-testkit`](crates/opc-dataplane-testkit/) | Deterministic dataplane traffic generation, GTP-U helpers, reflectors, continuity evidence, and packet-continuity reports. | [RFC 006](docs/rfc/006-conformance-pipeline.md), [RFC 011](docs/rfc/011-node-dataplane-resource-contract.md) |
+| [`opc-sdk-integration`](crates/opc-sdk-integration/) | Integration crate wiring runtime, config bus, alarms, and testbed evidence *(internal, not published)*. | [RFC 012](docs/rfc/012-testbed-simulator-framework.md) |
+| [`opc-config-fixture`](crates/opc-config-fixture/) | Generated-like config fixture for integration testing *(internal, not published)*. | [RFC 001](docs/rfc/001-management-substrate.md), [RFC 002](docs/rfc/002-yang-projection.md) |
+| [`opc-amf-lite`](crates/opc-amf-lite/) | Realistic AMF-lite control-plane vertical slice integration proving SDK seams *(internal, not published)*. | [ADR 0011](docs/adr/0011-first-nf-vertical-proof.md) |
 
-The crate READMEs contain the detailed roadmap for each local API. At the
-workspace level, current work is organized around:
+### Internal Testkits (`crates/`)
 
-1. Keeping the facade and crate READMEs synchronized with public exports,
-   feature flags, test commands, and explicit maturity boundaries.
-2. Hardening management-plane integration across generated YANG models,
-   schema registries, gNMI, NETCONF, NACM, audit, and config commit flows.
-3. Expanding protocol conformance where it serves SDK consumers, while keeping
+| Crate | Purpose | Reference |
+| :--- | :--- | :--- |
+| [`opc-alarm-testkit`](crates/opc-alarm-testkit/) | Deterministic testing and assertions for alarms *(internal)*. | [RFC 013](docs/rfc/013-fault-management-alarm-substrate.md) |
+| [`opc-security-testkit`](crates/opc-security-testkit/) | Fake fixtures and fault injection for security validation *(internal)*. | [RFC 003](docs/rfc/003-security-substrate.md) |
+| [`opc-session-testkit`](crates/opc-session-testkit/) | Chaos and failure testing for session replication *(internal)*. | [RFC 004](docs/rfc/004-session-store.md) |
+| [`opc-amf-lite-testkit`](crates/opc-amf-lite-testkit/) | Reusable test fixtures and builders for `opc-amf-lite` *(internal)*. | [ADR 0011](docs/adr/0011-first-nf-vertical-proof.md) |
+
+### Shared Types (`crates/`)
+
+| Crate | Purpose | Reference |
+| :--- | :--- | :--- |
+| [`opc-types`](crates/opc-types/) | Shared identifier, version, time, and redaction types. | [RFC 003](docs/rfc/003-security-substrate.md), [RFC 010](docs/rfc/010-data-governance-privacy.md) |
+| [`opc-schema-validate`](crates/opc-schema-validate/) | Lightweight JSON Schema validation engine (subset used by testbed/evidence schemas). | [RFC 006](docs/rfc/006-conformance-pipeline.md), [RFC 012](docs/rfc/012-testbed-simulator-framework.md) |
+
+### Kubernetes Operators (`operators/`)
+
+* [`sdk-reference-operator`](operators/sdk-reference-operator/): A minimal Kubernetes `controller-runtime` operator in Go that consumes Rust SDK policy decisions (admission validation, conversion, and migration planning) through a schema-driven CLI boundary.
+* [`operator-sdk-go`](operators/operator-sdk-go/): Reusable Go packages (`conditions`, `bridge`, `drain`, `workload`, `cni`, `gates`, `rollout`, `opmetrics`, `testing`) for building CNF operators. Packet-core helper additions for runtime gates, UDP/SCTP ports, Multus/SR-IOV attachments, and drain integration are experimental mechanism helpers; product CRDs, Helm/RBAC, privileges, and readiness policy remain downstream.
+
+### Reference Consumers (`examples/`)
+
+* [`smf-reference`](examples/smf-reference/): A deliberately bounded reference SMF that consumes the Rust SDK from outside the workspace (its own `Cargo.toml` and lockfile). It proves runtime startup, NRF registration, real PFCP/N4 bytes over UDP, and session-state tracking. Not a product-grade SMF.
+
+---
+
+## Workspace Roadmap
+
+Detailed crate roadmaps live in each crate README. At the workspace level, the
+current roadmap is:
+
+1. Keep the facade and crate READMEs synchronized with public exports, feature
+   flags, verification commands, and maturity boundaries.
+2. Harden management-plane integration across generated YANG models, schema
+   registries, gNMI, NETCONF, NACM, audit, and config commit flows.
+3. Expand protocol conformance where it serves SDK consumers while keeping
    product behavior such as AAA/HSS/CDF logic, IKE SA state machines, and
    carrier policy outside codec crates.
-4. Continuing privileged Linux dataplane validation for GTP-U, XFRM, route
-   steering, SCTP, and eBPF without hiding the platform prerequisites.
-5. Strengthening session-state, persistence, evidence, and privacy/governance
+4. Continue privileged Linux dataplane validation for GTP-U, XFRM, route
+   steering, SCTP, and eBPF with explicit platform prerequisites.
+5. Strengthen session-state, persistence, evidence, and privacy/governance
    contracts before downstream CNFs rely on them as release gates.
-6. Moving operator lifecycle contracts toward production operator integration
+6. Move operator lifecycle contracts toward production operator integration
    while keeping the included Go operator as a reference harness.
 
-## Verification Gates
+---
 
-Use these gates before publishing a release candidate or relying on a broad
-workspace change.
+## Verification & Validation Gates
 
-### Rust Formatting
+To ensure release stability, the repository enforces several validation gates. These must all pass before a release candidate is pushed.
 
+### 1. Code Formatting
+Ensure all workspace Rust code complies with formatting rules:
 ```bash
 cargo fmt --all --check
 ```
 
-### Diff Hygiene
-
+### 2. Git Cleanliness Check
+Ensure there are no whitespace errors or trailing diff anomalies:
 ```bash
 git diff --check
 ```
 
-### Rust Lints
-
+### 3. Rust Clippy Linters
+Ensure the workspace is warning-free across all compilation targets and feature sets:
 ```bash
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ```
 
-### Management-Plane Policy
-
+### 4. Management-Plane Policy Gates
+Ensure dependency-boundary, SCTP FFI, and generated-management policy checks pass:
 ```bash
 python3 scripts/check-management-plane-policy.py --self-test
 python3 scripts/check-management-plane-policy.py --check
 ```
 
-### Rust Tests
-
+### 5. Workspace Test Suite
+Run all unit, integration, and chaos test suites:
 ```bash
 cargo test --locked --workspace --exclude opc-persist --all-features --quiet -- --test-threads=4
 cargo test --locked -p opc-persist --all-features --quiet -- --test-threads=1
@@ -227,14 +246,14 @@ graph. Build it with:
 scripts/build-gtpu-ebpf.sh
 ```
 
-### Rust Documentation
-
+### 6. Rust Documentation
+Build workspace documentation with warnings denied:
 ```bash
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 ```
 
-### Go Operator Tests
-
+### 7. Go Operator Tests
+Run reference operator and reusable Go operator SDK tests:
 ```bash
 cd operators/sdk-reference-operator
 go test ./...
@@ -243,8 +262,8 @@ cd ../operator-sdk-go
 go test ./...
 ```
 
-### Kubernetes Manifests
-
+### 8. Kubernetes Manifest Validation
+Compile Kustomize reference manifests and render the Helm chart in both cert-manager and manual-certificate modes:
 ```bash
 kubectl kustomize operators/sdk-reference-operator/config/default
 
@@ -253,12 +272,16 @@ helm template sdk-ref operators/helm/sdk-reference-operator/ > /tmp/rendered-cer
 helm template sdk-ref operators/helm/sdk-reference-operator/ --set webhook.certMode=manual --set webhook.secretName=my-secret > /tmp/rendered-manual.yaml
 ```
 
+---
+
 ## Community
 
-- [Contributing](CONTRIBUTING.md) - development setup, validation gates, and commit conventions.
-- [Code of Conduct](CODE_OF_CONDUCT.md) - Contributor Covenant v2.1.
-- [Security](SECURITY.md) - vulnerability reporting and disclosure policy.
-- [Governance](GOVERNANCE.md) - decision process and maintainer criteria.
+* [Contributing](CONTRIBUTING.md) — development setup, validation gates, and commit conventions.
+* [Code of Conduct](CODE_OF_CONDUCT.md) — Contributor Covenant v2.1.
+* [Security](SECURITY.md) — vulnerability reporting and disclosure policy.
+* [Governance](GOVERNANCE.md) — decision process and maintainer criteria.
+
+---
 
 ## License
 
