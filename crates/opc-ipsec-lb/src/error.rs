@@ -74,6 +74,18 @@ pub enum IpsecLbError {
     /// Requested state was not found.
     #[error("IPsec load-balancing state not found")]
     NotFound,
+    /// Ownership fencing rejected the transition.
+    #[error("IPsec load-balancing ownership conflict: {reason}")]
+    OwnershipConflict {
+        /// Static, redaction-safe reason.
+        reason: &'static str,
+    },
+    /// Forwarding proof did not match the re-pin outcome.
+    #[error("IPsec load-balancing forwarding proof rejected: {reason}")]
+    ForwardingProofRejected {
+        /// Static, redaction-safe reason.
+        reason: &'static str,
+    },
     /// Failover resume would violate nonce or replay safety.
     #[error("unsafe failover resume: {reason}")]
     UnsafeResume {
@@ -121,6 +133,18 @@ impl IpsecLbError {
     #[must_use]
     pub const fn unsafe_resume(reason: &'static str) -> Self {
         Self::UnsafeResume { reason }
+    }
+
+    /// Build a redaction-safe ownership conflict.
+    #[must_use]
+    pub const fn ownership_conflict(reason: &'static str) -> Self {
+        Self::OwnershipConflict { reason }
+    }
+
+    /// Build a redaction-safe forwarding proof rejection.
+    #[must_use]
+    pub const fn forwarding_proof_rejected(reason: &'static str) -> Self {
+        Self::ForwardingProofRejected { reason }
     }
 }
 

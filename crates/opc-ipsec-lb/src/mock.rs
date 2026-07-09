@@ -9,7 +9,10 @@ use crate::error::IpsecLbError;
 use crate::model::{
     ClusterNode, SaId, ShardId, SteeringProbe, SteeringRule, VipAdvertisement, VipProbe,
 };
-use crate::ports::{OwnershipSource, SteeringBackend, VipAdvertiser};
+use crate::ports::{
+    OwnershipFencer, OwnershipSource, RePinAuditSink, SteeringBackend, VipAdvertiser,
+};
+use crate::repin::{OwnershipFence, OwnershipFenceGrant, OwnershipFenceRequest, RePinAuditEvent};
 
 /// Recorded steering operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,6 +306,191 @@ impl OwnershipSource for MockOwnershipSource {
     }
 }
 
+/// Mock ownership fencer.
+#[derive(Debug, Clone)]
+pub struct MockOwnershipFencer {
+    state: Arc<Mutex<MockOwnershipFenceState>>,
+}
+
+#[derive(Debug)]
+struct MockOwnershipFenceState {
+    owners: BTreeMap<SaId, (ClusterNode, OwnershipFence)>,
+    operations: Vec<OwnershipFenceRequest>,
+    next_fence: u64,
+    failure: Option<IpsecLbError>,
+}
+
+impl MockOwnershipFencer {
+    /// Build a mock fencer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MockOwnershipFenceState {
+                owners: BTreeMap::new(),
+                operations: Vec::new(),
+                next_fence: 2,
+                failure: None,
+            })),
+        }
+    }
+
+    /// Set the current owner for an SA with the initial fence token.
+    pub fn set_owner(&self, sa: SaId, owner: ClusterNode) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .owners
+            .insert(sa, (owner, OwnershipFence::new(1).unwrap()));
+        state.next_fence = state.next_fence.max(2);
+    }
+
+    /// Return the current owner for an SA.
+    #[must_use]
+    pub fn owner(&self, sa: SaId) -> Option<ClusterNode> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.owners.get(&sa).map(|(owner, _)| owner.clone())
+    }
+
+    /// Return recorded fence operations.
+    #[must_use]
+    pub fn operations(&self) -> Vec<OwnershipFenceRequest> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.operations.clone()
+    }
+
+    /// Inject a failure for future fence operations.
+    pub fn set_failure(&self, failure: IpsecLbError) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.failure = Some(failure);
+    }
+}
+
+impl Default for MockOwnershipFencer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl OwnershipFencer for MockOwnershipFencer {
+    async fn fence_sa_owner(
+        &self,
+        request: OwnershipFenceRequest,
+    ) -> Result<OwnershipFenceGrant, IpsecLbError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(failure) = &state.failure {
+            return Err(failure.clone());
+        }
+        let Some((current_owner, _current_fence)) = state.owners.get(&request.sa) else {
+            return Err(IpsecLbError::NotFound);
+        };
+        if *current_owner != request.previous_owner {
+            return Err(IpsecLbError::ownership_conflict(
+                "expected previous owner does not hold the SA",
+            ));
+        }
+        let fence = OwnershipFence::new(state.next_fence)?;
+        state.next_fence = state
+            .next_fence
+            .checked_add(1)
+            .ok_or_else(|| IpsecLbError::invalid_config("fence", "fence token exhausted"))?;
+        state
+            .owners
+            .insert(request.sa, (request.new_owner.clone(), fence));
+        state.operations.push(request.clone());
+        Ok(OwnershipFenceGrant {
+            sa: request.sa,
+            owner: request.new_owner,
+            fence,
+        })
+    }
+}
+
+/// Mock re-pin audit sink.
+#[derive(Debug, Clone)]
+pub struct MockRePinAuditSink {
+    state: Arc<Mutex<MockRePinAuditState>>,
+}
+
+#[derive(Debug, Default)]
+struct MockRePinAuditState {
+    events: Vec<RePinAuditEvent>,
+    failure: Option<IpsecLbError>,
+}
+
+impl MockRePinAuditSink {
+    /// Build a mock audit sink.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MockRePinAuditState::default())),
+        }
+    }
+
+    /// Inject a failure for future audit records.
+    pub fn set_failure(&self, failure: IpsecLbError) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.failure = Some(failure);
+    }
+
+    /// Clear the injected audit failure.
+    pub fn clear_failure(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.failure = None;
+    }
+
+    /// Return recorded audit events.
+    #[must_use]
+    pub fn events(&self) -> Vec<RePinAuditEvent> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.events.clone()
+    }
+}
+
+impl Default for MockRePinAuditSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl RePinAuditSink for MockRePinAuditSink {
+    async fn record_repin(&self, event: RePinAuditEvent) -> Result<(), IpsecLbError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(failure) = &state.failure {
+            return Err(failure.clone());
+        }
+        state.events.push(event);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +546,42 @@ mod tests {
                 .as_str(),
             "node-b"
         );
+    }
+
+    #[tokio::test]
+    async fn mock_fencer_rejects_stale_owner() {
+        let fencer = MockOwnershipFencer::new();
+        let sa = SaId::Esp { spi: 9 };
+        fencer.set_owner(sa, ClusterNode::new("node-a"));
+        let err = fencer
+            .fence_sa_owner(OwnershipFenceRequest {
+                sa,
+                previous_owner: ClusterNode::new("node-stale"),
+                new_owner: ClusterNode::new("node-b"),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IpsecLbError::OwnershipConflict { .. }));
+        assert_eq!(fencer.owner(sa).unwrap().as_str(), "node-a");
+    }
+
+    #[tokio::test]
+    async fn mock_repin_audit_can_fail_closed() {
+        let audit = MockRePinAuditSink::new();
+        audit.set_failure(IpsecLbError::Unsupported);
+        let err = audit
+            .record_repin(RePinAuditEvent {
+                kind: crate::repin::RePinAuditEventKind::Attempt,
+                sa: SaId::Esp { spi: 9 },
+                previous_owner: ClusterNode::new("node-a"),
+                new_owner: ClusterNode::new("node-b"),
+                fence: None,
+                forwarding_proven: false,
+                failure_code: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err, IpsecLbError::Unsupported);
+        assert!(audit.events().is_empty());
     }
 }

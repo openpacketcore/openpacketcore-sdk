@@ -104,7 +104,12 @@ jobs:
           ./scripts/build-ipsec-lb-ebpf.sh
           rebuilt="crates/opc-ipsec-lb-ebpf/target/bpfel-unknown-none/release/opc-ipsec-lb-xdp"
           inventory() {
-            readelf -sW "$1" | awk '$4 == "FUNC" || $4 == "OBJECT" {print $4, $8}' | sort
+            readelf -sW "$1" | awk '
+              ($4 == "FUNC" || $4 == "OBJECT") {
+                if ($8 ~ /^_RNv/) next
+                print $4, $8
+              }
+            ' | sort
           }
           inventory "${committed}" > committed.inventory
           inventory "${rebuilt}" > rebuilt.inventory

@@ -15,6 +15,7 @@ pub mod failover;
 pub mod mock;
 pub mod model;
 pub mod ports;
+pub mod repin;
 pub mod selector;
 pub mod spi;
 pub mod unsupported;
@@ -28,14 +29,21 @@ pub use cookie::{CookieKey, CookieSlot, IkeCookie, IkeCookieGate};
 pub use error::IpsecLbError;
 pub use failover::{AntiReplayResume, IvResumeDecision, SendIvCounter};
 pub use mock::{
-    MockOwnershipSource, MockSteeringBackend, MockSteeringOperation, MockVipAdvertiser,
-    MockVipOperation,
+    MockOwnershipFencer, MockOwnershipSource, MockRePinAuditSink, MockSteeringBackend,
+    MockSteeringOperation, MockVipAdvertiser, MockVipOperation,
 };
 pub use model::{
     ClusterNode, IpAddress, SaId, ShardId, SteerAction, SteerKey, SteeringBackendKind,
     SteeringProbe, SteeringRule, VipAdvertisement, VipAdvertiserKind, VipProbe,
 };
-pub use ports::{OwnershipSource, SpiAllocator, SteeringBackend, VipAdvertiser};
+pub use ports::{
+    OwnershipFencer, OwnershipSource, RePinAuditSink, SpiAllocator, SteeringBackend, VipAdvertiser,
+};
+pub use repin::{
+    ForwardingProof, OwnershipFence, OwnershipFenceGrant, OwnershipFenceRequest, RePinAuditEvent,
+    RePinAuditEventKind, RePinCoordinator, RePinOutcome, RePinRequest, ResumeKeySource,
+    SameSpiResume,
+};
 pub use selector::{
     measure_disruption, RendezvousSelector, SelectionKey, ShardDisruption, ShardSet,
 };

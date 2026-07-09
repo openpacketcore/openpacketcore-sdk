@@ -1,9 +1,11 @@
 use opc_ipsec_lb::{
-    classify_swu_packet, measure_disruption, AntiReplayResume, CookieKey, CookieSlot,
-    EspFragmentPosture, FixedEntropy, IkeCookieGate, IpAddress, IpFragment, IvResumeDecision,
-    RekeyRequest, RendezvousSelector, SelectionKey, SendIvCounter, ShardId, ShardSet,
-    SpiAllocationRequest, SpiAllocator, SpiKind, SteerKey, SwuClassification, SwuClassifierConfig,
-    SwuPacket, TaggedSpiAllocator, TaggedSpiLayout,
+    classify_swu_packet, measure_disruption, AntiReplayResume, ClusterNode, CookieKey, CookieSlot,
+    EspFragmentPosture, FixedEntropy, ForwardingProof, IkeCookieGate, IpAddress, IpFragment,
+    IpsecLbError, IvResumeDecision, MockOwnershipFencer, MockRePinAuditSink, MockSteeringBackend,
+    MockSteeringOperation, RePinAuditEventKind, RePinCoordinator, RePinRequest, RekeyRequest,
+    RendezvousSelector, ResumeKeySource, SaId, SameSpiResume, SelectionKey, SendIvCounter, ShardId,
+    ShardSet, SpiAllocationRequest, SpiAllocator, SpiKind, SteerKey, SteeringRule,
+    SwuClassification, SwuClassifierConfig, SwuPacket, TaggedSpiAllocator, TaggedSpiLayout,
 };
 
 const IKE_HEADER_LEN: usize = 28;
@@ -212,4 +214,125 @@ fn failover_guards_reject_iv_and_replay_rollback() {
     }
     .validate()
     .is_err());
+}
+
+#[tokio::test]
+async fn repin_requires_audit_fence_and_injected_forwarding_proof() {
+    let steering = MockSteeringBackend::new();
+    let fencer = MockOwnershipFencer::new();
+    let audit = MockRePinAuditSink::new();
+    let coordinator = RePinCoordinator::new(steering.clone(), fencer.clone(), audit.clone());
+
+    let sa = SaId::Esp { spi: 0x1122_3344 };
+    let previous_owner = ClusterNode::new("worker-a");
+    let new_owner = ClusterNode::new("worker-b");
+    fencer.set_owner(sa, previous_owner.clone());
+
+    let rule = SteeringRule {
+        shard: ShardId::new(1),
+        owner: ShardId::new(2),
+        key: SteerKey::EspSpi(0x1122_3344),
+    };
+    let outcome = coordinator
+        .repin(RePinRequest {
+            sa,
+            previous_owner: previous_owner.clone(),
+            new_owner: new_owner.clone(),
+            rule,
+            resume: SameSpiResume {
+                previous_sa: sa,
+                resumed_sa: sa,
+                previous_send_iv_next: 41,
+                restored_send_iv_next: 42,
+                anti_replay: AntiReplayResume {
+                    previous_highest_accepted: 100,
+                    restored_highest_accepted: 101,
+                },
+                key_source: ResumeKeySource::LiveMirrored,
+            },
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        steering.operations(),
+        vec![MockSteeringOperation::Install(rule)]
+    );
+    assert_eq!(fencer.owner(sa).unwrap().as_str(), "worker-b");
+    assert!(!outcome.forwarding_proven());
+
+    let events = audit.events();
+    assert_eq!(events[0].kind, RePinAuditEventKind::Attempt);
+    assert_eq!(events[1].kind, RePinAuditEventKind::Fenced);
+    assert_eq!(events[2].kind, RePinAuditEventKind::SteeringInstalled);
+    assert!(!events.iter().any(|event| event.forwarding_proven));
+
+    let proof = ForwardingProof::new(sa, outcome.fence(), 3).unwrap();
+    let proven = outcome.with_forwarding_proof(proof).unwrap();
+    assert!(proven.forwarding_proven());
+}
+
+#[tokio::test]
+async fn repin_fails_closed_when_audit_or_resume_is_unsafe() {
+    let steering = MockSteeringBackend::new();
+    let fencer = MockOwnershipFencer::new();
+    let audit = MockRePinAuditSink::new();
+    let coordinator = RePinCoordinator::new(steering.clone(), fencer.clone(), audit.clone());
+
+    let sa = SaId::Esp { spi: 7 };
+    let previous_owner = ClusterNode::new("worker-a");
+    let new_owner = ClusterNode::new("worker-b");
+    fencer.set_owner(sa, previous_owner.clone());
+    audit.set_failure(IpsecLbError::Unsupported);
+
+    let rule = SteeringRule {
+        shard: ShardId::new(1),
+        owner: ShardId::new(2),
+        key: SteerKey::EspSpi(7),
+    };
+    let request = RePinRequest {
+        sa,
+        previous_owner: previous_owner.clone(),
+        new_owner: new_owner.clone(),
+        rule,
+        resume: SameSpiResume {
+            previous_sa: sa,
+            resumed_sa: sa,
+            previous_send_iv_next: 10,
+            restored_send_iv_next: 11,
+            anti_replay: AntiReplayResume {
+                previous_highest_accepted: 5,
+                restored_highest_accepted: 5,
+            },
+            key_source: ResumeKeySource::LiveMirrored,
+        },
+    };
+    assert_eq!(
+        coordinator.repin(request.clone()).await.unwrap_err(),
+        IpsecLbError::Unsupported
+    );
+    assert!(steering.operations().is_empty());
+    assert_eq!(fencer.owner(sa).unwrap().as_str(), "worker-a");
+
+    audit.clear_failure();
+    let unsafe_request = RePinRequest {
+        resume: SameSpiResume {
+            previous_sa: sa,
+            resumed_sa: SaId::Esp { spi: 8 },
+            previous_send_iv_next: 10,
+            restored_send_iv_next: 11,
+            anti_replay: AntiReplayResume {
+                previous_highest_accepted: 5,
+                restored_highest_accepted: 5,
+            },
+            key_source: ResumeKeySource::PersistedKeyMaterial,
+        },
+        ..request
+    };
+    assert!(matches!(
+        coordinator.repin(unsafe_request).await.unwrap_err(),
+        IpsecLbError::UnsafeResume { .. }
+    ));
+    assert!(steering.operations().is_empty());
+    assert_eq!(fencer.owner(sa).unwrap().as_str(), "worker-a");
 }

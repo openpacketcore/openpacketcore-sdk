@@ -6,6 +6,7 @@ use crate::error::IpsecLbError;
 use crate::model::{
     ClusterNode, SaId, ShardId, SteeringProbe, SteeringRule, VipAdvertisement, VipProbe,
 };
+use crate::repin::{OwnershipFenceGrant, OwnershipFenceRequest, RePinAuditEvent};
 use crate::spi::{RekeyRequest, SpiAllocationRequest, SpiKind, TaggedSpi};
 
 /// Tagged SPI allocator port.
@@ -54,4 +55,22 @@ pub trait OwnershipSource: Send + Sync + std::fmt::Debug {
 
     /// Return the current owner for an SA.
     async fn sa_owner(&self, sa: SaId) -> Result<Option<ClusterNode>, IpsecLbError>;
+}
+
+/// Ownership fencing port used before re-pinning a resumed SA.
+#[async_trait]
+pub trait OwnershipFencer: Send + Sync + std::fmt::Debug {
+    /// Move ownership to a new owner only if the expected previous owner still
+    /// holds the SA, returning a fresh monotonic fence token.
+    async fn fence_sa_owner(
+        &self,
+        request: OwnershipFenceRequest,
+    ) -> Result<OwnershipFenceGrant, IpsecLbError>;
+}
+
+/// Audit sink for SA ownership changes and steering re-pins.
+#[async_trait]
+pub trait RePinAuditSink: Send + Sync + std::fmt::Debug {
+    /// Record a redaction-safe re-pin audit event.
+    async fn record_repin(&self, event: RePinAuditEvent) -> Result<(), IpsecLbError>;
 }

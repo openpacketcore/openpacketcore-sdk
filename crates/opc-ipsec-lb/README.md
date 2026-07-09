@@ -10,11 +10,16 @@ steer layer:
 - UDP/500 and UDP/4500 SWu classifier with RFC 3948 non-ESP marker handling;
 - stateless IKE cookie helper for edge DoS posture;
 - failover safety guards for IV-counter and replay-window restoration;
-- reusable ports for steering backends, VIP advertisement, and ownership reads.
+- audited same-SPI re-pin coordination with monotonic ownership fencing;
+- reusable ports for steering backends, VIP advertisement, ownership reads,
+  ownership fencing, and re-pin audit.
 
-It intentionally does not decrypt ESP, derive IPsec keys, program XDP, advertise
-BGP/VRRP, or claim packet forwarding. Host-XDP, SR-IOV, NIC offload, and live
-failover evidence remain product/lab tiers built behind the ports.
+It intentionally does not decrypt ESP, derive IPsec keys, advertise BGP/VRRP,
+or claim packet forwarding. Host-XDP steering is implemented behind the backend
+port; SR-IOV, NIC offload, VIP adapters, and live failover evidence remain
+product/lab tiers built behind the ports. A re-pin install never sets
+`forwarding_proven`; packet-flow proof must be injected by lab/product dataplane
+evidence.
 
 ## Entropy note
 
