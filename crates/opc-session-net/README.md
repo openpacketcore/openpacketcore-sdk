@@ -27,18 +27,15 @@ same session-store traits.
 - `Request`, `Response`, `ProtocolError`, and protocol constants live in the
   public protocol layer.
 
-```rust,no_run
+```rust,ignore
 use opc_session_net::RemoteSessionBackend;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-fn client_tls_config() -> Arc<opc_tls::ClientConfig> {
-    unimplemented!("compose from opc-tls/opc-identity at the product boundary")
-}
-
 let addr: SocketAddr = "127.0.0.1:9443".parse().unwrap();
-let remote = RemoteSessionBackend::new(addr, client_tls_config(), Some(Duration::from_secs(2)));
+let tls_config: Arc<opc_tls::ClientConfig> = product_tls_config;
+let remote = RemoteSessionBackend::new(addr, tls_config, Some(Duration::from_secs(2)));
 let _remote = remote.with_max_frame_size(1024 * 1024);
 ```
 

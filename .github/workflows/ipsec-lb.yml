@@ -6,6 +6,7 @@ on:
       - "crates/opc-ipsec-lb/**"
       - "crates/opc-ipsec-lb-ebpf/**"
       - "crates/opc-ipsec-lb-ebpf-common/**"
+      - "crates/opc-session-net/**"
       - ".github/workflows/ipsec-lb.yml"
       - "scripts/build-ipsec-lb-ebpf.sh"
       - "Cargo.toml"
@@ -17,6 +18,7 @@ on:
       - "crates/opc-ipsec-lb/**"
       - "crates/opc-ipsec-lb-ebpf/**"
       - "crates/opc-ipsec-lb-ebpf-common/**"
+      - "crates/opc-session-net/**"
       - ".github/workflows/ipsec-lb.yml"
       - "scripts/build-ipsec-lb-ebpf.sh"
       - "Cargo.toml"
@@ -54,10 +56,10 @@ jobs:
         run: git diff --check
 
       - name: Run clippy
-        run: cargo clippy --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common -p opc-session-net --all-targets --all-features -- -D warnings
 
       - name: Run conformance tests
-        run: cargo test --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common --all-features --quiet -- --test-threads=4
+        run: cargo test --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common -p opc-session-net --all-features --quiet -- --test-threads=4
 
   docs:
     name: Rust docs
@@ -73,7 +75,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build crate docs
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common --no-deps --all-features
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common -p opc-session-net --no-deps --all-features
 
   ebpf-object:
     name: IPsec XDP object rebuild

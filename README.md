@@ -19,7 +19,7 @@ downstream product responsibilities.
 
 > [!IMPORTANT]
 > **Production Readiness & Reference Boundaries**
-> * **Rust SDK Core**: The core Rust libraries have passed the current P0 SDK release-readiness gates. Downstream CNFs still need product-specific integration, deployment, and carrier acceptance validation.
+> * **Rust SDK Core**: The core Rust libraries have passed the current kernel-independent SDK release-readiness gates. Downstream CNFs still need product-specific integration, deployment, and carrier acceptance validation.
 > * **Go Reference Operator**: The Go operator located under `operators/sdk-reference-operator/` is a **reference harness and development utility only**. It is explicitly not a production-grade controller. Downstream product teams are responsible for implementing product-specific Kubernetes operators.
 > * **Rust Reference SMF**: The `examples/smf-reference/` workspace is a **reference consumer and API acid test**, not a product-grade SMF. It has no N7/PCF, charging, NAS, or real UPF selection.
 > * **No Unconditional Claims**: Standard deployments require integration with your local platform security policies, hardware topologies, and external KMS/SPIFFE infrastructure.
