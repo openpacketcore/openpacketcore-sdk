@@ -2,17 +2,17 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use opc_crypto::CryptoEnvelopeV1;
 use opc_key::{
-    KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose, MemoryKeyProvider, Zeroizing,
-    AES_256_GCM_SIV_KEY_LEN,
+    KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose, MemoryKeyProvider,
+    MemoryRemoteSealProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN,
 };
 use opc_session_store::{
     BackendCapabilities, CompareAndSet, CompareAndSetResult, EncryptedSessionPayload,
     EncryptingSessionBackend, FakeSessionBackend, FenceToken, Generation, OwnerId,
-    RestoreScanRequest, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
-    SessionOpResult, SessionPayloadEncoding, StateClass, StateType, StoreError,
-    StoredSessionRecord,
+    RemoteSealingSessionBackend, ReplicationEntry, ReplicationOp, RestoreScanRequest,
+    SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult,
+    SessionPayloadEncoding, StateClass, StateType, StoreError, StoredSessionRecord,
 };
-use opc_types::{NetworkFunctionKind, TenantId};
+use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Barrier;
 
@@ -35,6 +35,15 @@ fn test_provider() -> Arc<MemoryKeyProvider> {
         )
         .expect("insert key");
     provider
+}
+
+fn test_remote_seal_provider() -> Arc<MemoryRemoteSealProvider> {
+    Arc::new(MemoryRemoteSealProvider::new(
+        KeyId::new("session-remote-2026-01").expect("key id"),
+        KeyPurpose::Session,
+        tenant(),
+        Zeroizing::new([0x33; AES_256_GCM_SIV_KEY_LEN]),
+    ))
 }
 
 fn test_key() -> SessionKey {
@@ -217,6 +226,225 @@ async fn encrypting_session_backend_round_trips_compare_and_set_get_and_batch_re
         inner_scan_page.records[0].payload.as_bytes(),
         &batch_payload
     );
+}
+
+#[tokio::test]
+async fn remote_sealing_session_backend_round_trips_compare_and_set_get_and_batch_results() {
+    let inner = Arc::new(FakeSessionBackend::new());
+    let provider = test_remote_seal_provider();
+    let backend = RemoteSealingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+        "regional-cache-a",
+    );
+    let key = test_key();
+    let lease = backend
+        .acquire(
+            &key,
+            OwnerId::new("owner-a").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("lease");
+
+    let result = backend
+        .compare_and_set(CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: test_record(key.clone(), 1, &lease),
+        })
+        .await
+        .expect("write");
+    assert_eq!(result, CompareAndSetResult::Success);
+
+    let inner_record = inner.get(&key).await.expect("inner get").expect("stored");
+    assert_ne!(inner_record.payload.as_bytes(), b"plain-session");
+    let envelope = CryptoEnvelopeV1::decode(inner_record.payload.as_bytes()).expect("envelope");
+    assert_eq!(envelope.algorithm, opc_key::AeadAlgorithm::RemoteSeal);
+    assert!(envelope.nonce.is_empty());
+
+    let round_trip = backend
+        .get(&key)
+        .await
+        .expect("backend get")
+        .expect("stored");
+    assert_eq!(round_trip.payload.as_bytes(), b"plain-session");
+
+    let conflict = backend
+        .compare_and_set(CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: test_record(key.clone(), 2, &lease),
+        })
+        .await
+        .expect("conflict result");
+    match conflict {
+        CompareAndSetResult::Success => panic!("expected conflict"),
+        CompareAndSetResult::Conflict { current } => {
+            let current = current.expect("current record");
+            assert_eq!(current.payload.as_bytes(), b"plain-session");
+        }
+    }
+
+    let batch_payload = Bytes::from_static(b"plain-session-batch");
+    let results = backend
+        .batch(vec![
+            SessionOp::Get { key: key.clone() },
+            SessionOp::CompareAndSet(CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: Some(Generation::new(1)),
+                new_record: StoredSessionRecord {
+                    payload: EncryptedSessionPayload::new(batch_payload.clone()),
+                    ..test_record(key.clone(), 2, &lease)
+                },
+            }),
+        ])
+        .await
+        .expect("batch");
+
+    match &results[0] {
+        SessionOpResult::Get(Ok(Some(record))) => {
+            assert_eq!(record.payload.as_bytes(), b"plain-session");
+        }
+        other => panic!("unexpected get result: {other:?}"),
+    }
+    assert!(matches!(
+        &results[1],
+        SessionOpResult::CompareAndSet(Ok(CompareAndSetResult::Success))
+    ));
+
+    let scan_page = backend
+        .scan_restore_records(RestoreScanRequest::all(16))
+        .await
+        .expect("restore scan");
+    assert_eq!(scan_page.loaded_count, 1);
+    assert_eq!(scan_page.records[0].payload.as_bytes(), &batch_payload);
+}
+
+#[tokio::test]
+async fn remote_sealing_session_backend_rejects_local_aead_envelopes() {
+    let inner = Arc::new(FakeSessionBackend::new());
+    let local_provider = test_provider();
+    let local_writer = EncryptingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&local_provider),
+        "regional-cache-a",
+    );
+    let remote_reader =
+        RemoteSealingSessionBackend::new(inner, test_remote_seal_provider(), "regional-cache-a");
+    let key = test_key();
+    let lease = local_writer
+        .acquire(
+            &key,
+            OwnerId::new("owner-a").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("lease");
+
+    local_writer
+        .compare_and_set(CompareAndSet {
+            key: key.clone(),
+            lease,
+            expected_generation: None,
+            new_record: StoredSessionRecord {
+                key: key.clone(),
+                generation: Generation::new(1),
+                owner: OwnerId::new("owner-a").expect("owner"),
+                fence: FenceToken::new(1),
+                state_class: StateClass::AuthoritativeSession,
+                state_type: StateType::new("smf-pdu-context").expect("state type"),
+                expires_at: None,
+                payload: EncryptedSessionPayload::new(Bytes::from_static(b"plain-session")),
+            },
+        })
+        .await
+        .expect("write");
+
+    let err = remote_reader
+        .get(&key)
+        .await
+        .expect_err("remote mode must fail closed on local AEAD envelope");
+    assert_eq!(
+        err,
+        StoreError::Crypto("session envelope decryption failed".into())
+    );
+}
+
+#[tokio::test]
+async fn remote_sealing_replication_log_seals_and_unseals_nested_batch_cas_records() {
+    let inner = Arc::new(FakeSessionBackend::new());
+    let provider = test_remote_seal_provider();
+    let backend = RemoteSealingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+        "regional-cache-a",
+    );
+    let key = test_key();
+    let (_next_fence, credential_id) = backend
+        .next_lease_info()
+        .await
+        .expect("next lease info before acquire");
+    let lease = backend
+        .acquire(
+            &key,
+            OwnerId::new("owner-a").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("lease");
+
+    backend
+        .replicate_entry(ReplicationEntry {
+            sequence: 2,
+            tx_id: "remote-batch-cas".to_string(),
+            op: ReplicationOp::Batch {
+                ops: vec![ReplicationOp::CompareAndSet {
+                    key: key.clone(),
+                    expected_generation: None,
+                    credential_id,
+                    guard_expires_at: lease.expires_at(),
+                    new_record: test_record(key.clone(), 1, &lease),
+                }],
+            },
+            timestamp: Timestamp::now_utc(),
+        })
+        .await
+        .expect("replicate batch");
+
+    let inner_entries = inner
+        .get_replication_log(2, 1)
+        .await
+        .expect("inner replication log");
+    match &inner_entries[0].op {
+        ReplicationOp::Batch { ops } => match &ops[0] {
+            ReplicationOp::CompareAndSet { new_record, .. } => {
+                assert_ne!(new_record.payload.as_bytes(), b"plain-session");
+                let envelope =
+                    CryptoEnvelopeV1::decode(new_record.payload.as_bytes()).expect("envelope");
+                assert_eq!(envelope.algorithm, opc_key::AeadAlgorithm::RemoteSeal);
+            }
+            other => panic!("unexpected nested op: {other:?}"),
+        },
+        other => panic!("unexpected replication op: {other:?}"),
+    }
+
+    let wrapper_entries = backend
+        .get_replication_log(2, 1)
+        .await
+        .expect("wrapper replication log");
+    match &wrapper_entries[0].op {
+        ReplicationOp::Batch { ops } => match &ops[0] {
+            ReplicationOp::CompareAndSet { new_record, .. } => {
+                assert_eq!(new_record.payload.as_bytes(), b"plain-session");
+            }
+            other => panic!("unexpected nested op: {other:?}"),
+        },
+        other => panic!("unexpected replication op: {other:?}"),
+    }
 }
 
 #[tokio::test]

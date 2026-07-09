@@ -11,7 +11,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use futures_util::future::join_all;
-use opc_key::KeyProvider;
+use opc_key::{KeyProvider, RemoteSealProvider};
 use opc_types::Timestamp;
 
 use crate::{
@@ -882,6 +882,549 @@ impl<B, P> SessionLeaseManager for EncryptingSessionBackend<B, P>
 where
     B: SessionLeaseManager + Send + Sync + ?Sized,
     P: KeyProvider + ?Sized,
+{
+    async fn acquire(
+        &self,
+        key: &SessionKey,
+        owner: crate::model::OwnerId,
+        ttl: Duration,
+    ) -> Result<LeaseGuard, LeaseError> {
+        self.inner.acquire(key, owner, ttl).await
+    }
+
+    async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
+        self.inner.renew(lease, ttl).await
+    }
+
+    async fn release(&self, lease: LeaseGuard) -> Result<(), LeaseError> {
+        self.inner.release(lease).await
+    }
+}
+
+/// Session-backend wrapper that delegates payload sealing to a remote KMS/HSM.
+///
+/// This is an opt-in alternative to [`EncryptingSessionBackend`]. The default
+/// local-AEAD path is unchanged; consumers choose one seal mode per durable
+/// store. Do not mix local-AEAD and remote-seal records in the same store:
+/// they share the record/AAD metadata shape, but key custody differs and a
+/// record written in one mode is not required to decrypt in the other.
+///
+/// Remote seal adds one KMS round-trip per seal (for example, each checkpoint,
+/// normally off the hot path) and one KMS round-trip per unseal (each restored
+/// session during failover), adding KMS latency and a KMS availability
+/// dependency to restore.
+#[derive(Clone)]
+pub struct RemoteSealingSessionBackend<B: ?Sized, S: ?Sized> {
+    inner: Arc<B>,
+    provider: Arc<S>,
+    backend_namespace: Arc<str>,
+}
+
+impl<B: ?Sized, S: ?Sized> RemoteSealingSessionBackend<B, S> {
+    /// Wrap `inner` so every record payload is sealed by `provider` before
+    /// persistence and unsealed on reads.
+    pub fn new(inner: Arc<B>, provider: Arc<S>, backend_namespace: impl Into<String>) -> Self {
+        Self {
+            inner,
+            provider,
+            backend_namespace: Arc::<str>::from(backend_namespace.into()),
+        }
+    }
+
+    /// The wrapped backend. Records obtained through it directly carry
+    /// remotely sealed envelope payloads.
+    pub fn inner(&self) -> &Arc<B> {
+        &self.inner
+    }
+
+    /// The remote seal provider used for payload seal/unseal.
+    pub fn provider(&self) -> &Arc<S> {
+        &self.provider
+    }
+
+    /// The namespace string bound into every envelope's AAD.
+    pub fn backend_namespace(&self) -> &str {
+        &self.backend_namespace
+    }
+}
+
+impl<B, S> RemoteSealingSessionBackend<B, S>
+where
+    B: SessionBackend + ?Sized,
+    S: RemoteSealProvider + ?Sized,
+{
+    async fn seal_record(
+        &self,
+        mut record: StoredSessionRecord,
+    ) -> Result<StoredSessionRecord, StoreError> {
+        record.payload = EncryptedSessionPayload::remote_seal(
+            self.provider.as_ref(),
+            &record,
+            self.backend_namespace(),
+        )
+        .await?;
+        Ok(record)
+    }
+
+    async fn unseal_record(
+        &self,
+        mut record: StoredSessionRecord,
+    ) -> Result<StoredSessionRecord, StoreError> {
+        let plaintext = record
+            .payload
+            .remote_unseal(
+                self.provider.as_ref(),
+                &record.key,
+                &record.state_type,
+                record.generation,
+                record.fence,
+                self.backend_namespace(),
+            )
+            .await?;
+        record.payload = EncryptedSessionPayload::new_zeroizing(plaintext);
+        Ok(record)
+    }
+
+    async fn unseal_optional_record(
+        &self,
+        record: Option<StoredSessionRecord>,
+    ) -> Result<Option<StoredSessionRecord>, StoreError> {
+        match record {
+            Some(record) => self.unseal_record(record).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn unseal_cas_result(
+        &self,
+        result: CompareAndSetResult,
+    ) -> Result<CompareAndSetResult, StoreError> {
+        match result {
+            CompareAndSetResult::Success => Ok(CompareAndSetResult::Success),
+            CompareAndSetResult::Conflict { current } => Ok(CompareAndSetResult::Conflict {
+                current: self.unseal_optional_record(current).await?,
+            }),
+        }
+    }
+
+    async fn unseal_batch_result(&self, result: SessionOpResult) -> SessionOpResult {
+        match result {
+            SessionOpResult::Get(result) => SessionOpResult::Get(match result {
+                Ok(record) => self.unseal_optional_record(record).await,
+                Err(err) => Err(err),
+            }),
+            SessionOpResult::CompareAndSet(result) => {
+                SessionOpResult::CompareAndSet(match result {
+                    Ok(result) => self.unseal_cas_result(result).await,
+                    Err(err) => Err(err),
+                })
+            }
+            SessionOpResult::DeleteFenced(result) => SessionOpResult::DeleteFenced(result),
+            SessionOpResult::RefreshTtl(result) => SessionOpResult::RefreshTtl(result),
+        }
+    }
+
+    async fn seal_op(&self, op: ReplicationOp) -> Result<ReplicationOp, StoreError> {
+        match op {
+            ReplicationOp::CompareAndSet {
+                key,
+                expected_generation,
+                credential_id,
+                guard_expires_at,
+                new_record,
+            } => {
+                let sealed = self.seal_record(new_record).await?;
+                Ok(ReplicationOp::CompareAndSet {
+                    key,
+                    expected_generation,
+                    credential_id,
+                    guard_expires_at,
+                    new_record: sealed,
+                })
+            }
+            ReplicationOp::Batch { ops } => {
+                let mut sealed_ops = Vec::with_capacity(ops.len());
+                for o in ops {
+                    match o {
+                        ReplicationOp::CompareAndSet {
+                            key,
+                            expected_generation,
+                            credential_id,
+                            guard_expires_at,
+                            new_record,
+                        } => {
+                            let sealed = self.seal_record(new_record).await?;
+                            sealed_ops.push(ReplicationOp::CompareAndSet {
+                                key,
+                                expected_generation,
+                                credential_id,
+                                guard_expires_at,
+                                new_record: sealed,
+                            });
+                        }
+                        other => sealed_ops.push(other),
+                    }
+                }
+                Ok(ReplicationOp::Batch { ops: sealed_ops })
+            }
+            other => Ok(other),
+        }
+    }
+
+    async fn unseal_op(&self, op: ReplicationOp) -> Result<ReplicationOp, StoreError> {
+        match op {
+            ReplicationOp::CompareAndSet {
+                key,
+                expected_generation,
+                credential_id,
+                guard_expires_at,
+                new_record,
+            } => {
+                let unsealed = self.unseal_record(new_record).await?;
+                Ok(ReplicationOp::CompareAndSet {
+                    key,
+                    expected_generation,
+                    credential_id,
+                    guard_expires_at,
+                    new_record: unsealed,
+                })
+            }
+            ReplicationOp::Batch { ops } => {
+                let mut unsealed_ops = Vec::with_capacity(ops.len());
+                for o in ops {
+                    match o {
+                        ReplicationOp::CompareAndSet {
+                            key,
+                            expected_generation,
+                            credential_id,
+                            guard_expires_at,
+                            new_record,
+                        } => {
+                            let unsealed = self.unseal_record(new_record).await?;
+                            unsealed_ops.push(ReplicationOp::CompareAndSet {
+                                key,
+                                expected_generation,
+                                credential_id,
+                                guard_expires_at,
+                                new_record: unsealed,
+                            });
+                        }
+                        other => unsealed_ops.push(other),
+                    }
+                }
+                Ok(ReplicationOp::Batch { ops: unsealed_ops })
+            }
+            other => Ok(other),
+        }
+    }
+}
+
+async fn remote_unseal_record_helper<S: RemoteSealProvider + ?Sized>(
+    provider: &S,
+    mut record: StoredSessionRecord,
+    backend_namespace: &str,
+) -> Result<StoredSessionRecord, StoreError> {
+    let plaintext = record
+        .payload
+        .remote_unseal(
+            provider,
+            &record.key,
+            &record.state_type,
+            record.generation,
+            record.fence,
+            backend_namespace,
+        )
+        .await?;
+    record.payload = EncryptedSessionPayload::new_zeroizing(plaintext);
+    Ok(record)
+}
+
+async fn remote_unseal_op_helper<S: RemoteSealProvider + ?Sized>(
+    provider: &S,
+    op: ReplicationOp,
+    backend_namespace: &str,
+) -> Result<ReplicationOp, StoreError> {
+    match op {
+        ReplicationOp::CompareAndSet {
+            key,
+            expected_generation,
+            credential_id,
+            guard_expires_at,
+            new_record,
+        } => {
+            let unsealed =
+                remote_unseal_record_helper(provider, new_record, backend_namespace).await?;
+            Ok(ReplicationOp::CompareAndSet {
+                key,
+                expected_generation,
+                credential_id,
+                guard_expires_at,
+                new_record: unsealed,
+            })
+        }
+        ReplicationOp::Batch { ops } => {
+            let mut unsealed_ops = Vec::with_capacity(ops.len());
+            for o in ops {
+                match o {
+                    ReplicationOp::CompareAndSet {
+                        key,
+                        expected_generation,
+                        credential_id,
+                        guard_expires_at,
+                        new_record,
+                    } => {
+                        let unsealed =
+                            remote_unseal_record_helper(provider, new_record, backend_namespace)
+                                .await?;
+                        unsealed_ops.push(ReplicationOp::CompareAndSet {
+                            key,
+                            expected_generation,
+                            credential_id,
+                            guard_expires_at,
+                            new_record: unsealed,
+                        });
+                    }
+                    other => unsealed_ops.push(other),
+                }
+            }
+            Ok(ReplicationOp::Batch { ops: unsealed_ops })
+        }
+        other => Ok(other),
+    }
+}
+
+#[async_trait]
+impl<B, S> SessionBackend for RemoteSealingSessionBackend<B, S>
+where
+    B: SessionBackend + 'static + ?Sized,
+    S: RemoteSealProvider + 'static + ?Sized,
+{
+    async fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities().await
+    }
+
+    async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        let record = self.inner.get(key).await?;
+        self.unseal_optional_record(record).await
+    }
+
+    async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        let sealed_record = self.seal_record(op.new_record).await?;
+        let result = self
+            .inner
+            .compare_and_set(CompareAndSet {
+                key: op.key,
+                lease: op.lease,
+                expected_generation: op.expected_generation,
+                new_record: sealed_record,
+            })
+            .await?;
+        self.unseal_cas_result(result).await
+    }
+
+    async fn delete_fenced(&self, lease: &LeaseGuard) -> Result<(), StoreError> {
+        self.inner.delete_fenced(lease).await
+    }
+
+    async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
+        self.inner.refresh_ttl(lease, ttl).await
+    }
+
+    async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        if !self.inner.capabilities().await.batch_write {
+            return Err(StoreError::CapabilityNotSupported("batch_write".into()));
+        }
+
+        let mut sealed_ops = Vec::with_capacity(ops.len());
+        let mut slots = Vec::with_capacity(ops.len());
+        for op in ops {
+            match op {
+                SessionOp::Get { key } => {
+                    sealed_ops.push(SessionOp::Get { key });
+                    slots.push(EncryptedBatchSlot::BackendResult);
+                }
+                SessionOp::CompareAndSet(cas) => match self.seal_record(cas.new_record).await {
+                    Ok(new_record) => {
+                        sealed_ops.push(SessionOp::CompareAndSet(CompareAndSet {
+                            key: cas.key,
+                            lease: cas.lease,
+                            expected_generation: cas.expected_generation,
+                            new_record,
+                        }));
+                        slots.push(EncryptedBatchSlot::BackendResult);
+                    }
+                    Err(err) => {
+                        slots.push(EncryptedBatchSlot::SyntheticResult(Box::new(
+                            SessionOpResult::CompareAndSet(Err(err)),
+                        )));
+                    }
+                },
+                SessionOp::DeleteFenced { lease } => {
+                    sealed_ops.push(SessionOp::DeleteFenced { lease });
+                    slots.push(EncryptedBatchSlot::BackendResult);
+                }
+                SessionOp::RefreshTtl { lease, ttl } => {
+                    sealed_ops.push(SessionOp::RefreshTtl { lease, ttl });
+                    slots.push(EncryptedBatchSlot::BackendResult);
+                }
+            }
+        }
+
+        let backend_results = if sealed_ops.is_empty() && !slots.is_empty() {
+            Vec::new()
+        } else {
+            self.inner.batch(sealed_ops).await?
+        };
+
+        let mut backend_results = backend_results.into_iter();
+        let mut unsealed = vec![None; slots.len()];
+        let mut pending = Vec::new();
+        for (index, slot) in slots.into_iter().enumerate() {
+            match slot {
+                EncryptedBatchSlot::BackendResult => {
+                    let Some(result) = backend_results.next() else {
+                        return Err(StoreError::BackendUnavailable(
+                            "session batch returned fewer results than requested".into(),
+                        ));
+                    };
+                    pending.push(async move { (index, self.unseal_batch_result(result).await) });
+                }
+                EncryptedBatchSlot::SyntheticResult(result) => unsealed[index] = Some(*result),
+            }
+        }
+
+        if backend_results.next().is_some() {
+            return Err(StoreError::BackendUnavailable(
+                "session batch returned more results than requested".into(),
+            ));
+        }
+
+        for (index, result) in join_all(pending).await {
+            unsealed[index] = Some(result);
+        }
+
+        unsealed
+            .into_iter()
+            .map(|result| {
+                result.ok_or_else(|| {
+                    StoreError::BackendUnavailable(
+                        "session batch returned fewer results than requested".into(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    async fn scan_restore_records(
+        &self,
+        request: RestoreScanRequest,
+    ) -> Result<RestoreScanPage, StoreError> {
+        let mut page = self.inner.scan_restore_records(request).await?;
+        let mut unsealed = Vec::with_capacity(page.records.len());
+        for record in page.records {
+            unsealed.push(self.unseal_record(record).await?);
+        }
+        page.records = unsealed;
+        page.loaded_count = page.records.len();
+        Ok(page)
+    }
+
+    async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
+        self.inner.max_replication_sequence().await
+    }
+
+    async fn get_replication_log(
+        &self,
+        start: u64,
+        limit: usize,
+    ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        let mut entries = self.inner.get_replication_log(start, limit).await?;
+        for entry in &mut entries {
+            entry.op = self.unseal_op(entry.op.clone()).await?;
+        }
+        Ok(entries)
+    }
+
+    async fn replicate_entry(&self, mut entry: ReplicationEntry) -> Result<(), StoreError> {
+        entry.op = self.seal_op(entry.op).await?;
+        self.inner.replicate_entry(entry).await
+    }
+
+    async fn rebuild_replication_state(
+        &self,
+        mut entries: Vec<ReplicationEntry>,
+    ) -> Result<(), StoreError> {
+        for entry in &mut entries {
+            entry.op = self.seal_op(entry.op.clone()).await?;
+        }
+        self.inner.rebuild_replication_state(entries).await
+    }
+
+    fn watch<'life0, 'async_trait>(
+        &'life0 self,
+        start_sequence: u64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn futures_util::Future<
+                    Output = Result<
+                        futures_util::stream::BoxStream<
+                            'static,
+                            Result<ReplicationEntry, StoreError>,
+                        >,
+                        StoreError,
+                    >,
+                > + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        let inner = self.inner.clone();
+        let provider = self.provider.clone();
+        let backend_namespace = self.backend_namespace.clone();
+        Box::pin(async move {
+            let stream = inner.watch(start_sequence).await?;
+            use futures_util::StreamExt;
+            let stream = stream.then(move |res| {
+                let provider = provider.clone();
+                let backend_namespace = backend_namespace.clone();
+                async move {
+                    match res {
+                        Ok(mut entry) => {
+                            match remote_unseal_op_helper(
+                                provider.as_ref(),
+                                entry.op,
+                                &backend_namespace,
+                            )
+                            .await
+                            {
+                                Ok(dec) => {
+                                    entry.op = dec;
+                                    Ok(entry)
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            });
+            Ok(stream.boxed())
+        })
+    }
+
+    async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
+        self.inner.next_lease_info().await
+    }
+}
+
+#[async_trait]
+impl<B, S> SessionLeaseManager for RemoteSealingSessionBackend<B, S>
+where
+    B: SessionLeaseManager + Send + Sync + ?Sized,
+    S: RemoteSealProvider + ?Sized,
 {
     async fn acquire(
         &self,

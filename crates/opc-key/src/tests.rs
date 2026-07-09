@@ -86,6 +86,18 @@ fn session_aad_serialization_is_stable() {
 }
 
 #[test]
+fn key_id_can_be_recovered_from_bound_aad() {
+    let aad = session_aad();
+    let key_id = KeyId::new("session-active-2026-01").expect("key id");
+    let serialized = serialize_bound_aad(&aad, &key_id).expect("serialize aad");
+
+    assert_eq!(
+        key_id_from_bound_aad(&serialized).expect("key id from aad"),
+        key_id
+    );
+}
+
+#[test]
 fn key_purpose_ipsec_sa_has_stable_wire_form() {
     assert_eq!(KeyPurpose::IpsecSa.as_str(), "ipsec-sa");
     assert_eq!(KeyPurpose::IpsecSa.to_string(), "ipsec-sa");
@@ -137,6 +149,52 @@ fn encrypt_and_decrypt_bound_payload_round_trip() {
             .encrypt_payload(&aad, plaintext, nonce)
             .expect("encrypt again"),
         encrypted
+    );
+}
+
+#[tokio::test]
+async fn memory_remote_seal_provider_round_trips_and_binds_aad() {
+    let provider = MemoryRemoteSealProvider::new(
+        KeyId::new("session-active-2026-01").expect("key id"),
+        KeyPurpose::Session,
+        tenant(),
+        Zeroizing::new([0x42; AES_256_GCM_SIV_KEY_LEN]),
+    );
+    let aad = session_aad();
+    let plaintext = b"sealed session checkpoint";
+
+    let sealed = provider.seal(&aad, plaintext).await.expect("seal");
+    assert_ne!(sealed.ciphertext_and_tag, plaintext);
+    assert_eq!(
+        key_id_from_bound_aad(&sealed.aad).expect("key id"),
+        provider.key_id().clone()
+    );
+
+    let opened = provider
+        .unseal(&aad, &sealed.ciphertext_and_tag)
+        .await
+        .expect("unseal");
+    assert_eq!(opened.as_slice(), plaintext);
+
+    let wrong_aad = EnvelopeAad::session(
+        tenant(),
+        5,
+        SessionAad::new(
+            "amf",
+            "sub-a1f5f3d9",
+            "amf-registration-context",
+            43,
+            7,
+            "regional-cache-a",
+        )
+        .expect("valid session aad"),
+    );
+    assert_eq!(
+        provider
+            .unseal(&wrong_aad, &sealed.ciphertext_and_tag)
+            .await
+            .expect_err("wrong aad must fail"),
+        KeyError::Unavailable
     );
 }
 

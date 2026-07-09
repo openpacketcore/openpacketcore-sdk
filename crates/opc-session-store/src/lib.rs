@@ -38,8 +38,8 @@ pub mod sqlite;
 pub mod store;
 
 pub use backend::{
-    CompareAndSet, CompareAndSetResult, EncryptingSessionBackend, ReplicationEntry, ReplicationOp,
-    SessionBackend, SessionOp, SessionOpResult,
+    CompareAndSet, CompareAndSetResult, EncryptingSessionBackend, RemoteSealingSessionBackend,
+    ReplicationEntry, ReplicationOp, SessionBackend, SessionOp, SessionOpResult,
 };
 pub use capability::{
     assert_backend_suitable_for_profile, assert_suitable_for,

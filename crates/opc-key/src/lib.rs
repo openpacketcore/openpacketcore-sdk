@@ -12,19 +12,21 @@ pub mod errors;
 pub mod kms;
 pub mod memory;
 pub mod provider;
+pub mod remote;
 pub mod scope;
 
 #[cfg(test)]
 mod tests;
 
 pub use errors::{CryptoOperationError, KeyError};
-pub use kms::KmsKeyProvider;
+pub use kms::{KmsKeyProvider, KmsRemoteSealProvider};
 pub use memory::MemoryKeyProvider;
 pub use provider::{
     EncryptedPayload, KeyHandle, KeyProvider, Zeroizing, AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN,
     AES_256_GCM_SIV_NONCE_LEN,
 };
+pub use remote::{MemoryRemoteSealProvider, RemoteSealProvider};
 pub use scope::{
-    AeadAlgorithm, ConfigAad, EnvelopeAad, EnvelopeMetadata, KeyId, KeyPurpose, SessionAad,
-    ShadowSecurityAad,
+    key_id_from_bound_aad, serialize_bound_aad, AeadAlgorithm, ConfigAad, EnvelopeAad,
+    EnvelopeMetadata, KeyId, KeyPurpose, SessionAad, ShadowSecurityAad,
 };
