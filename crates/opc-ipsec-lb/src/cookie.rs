@@ -118,13 +118,16 @@ impl Default for IkeCookiePolicy {
 
 /// Input tuple for an IKE_SA_INIT COOKIE decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IkeCookieRequest {
+pub struct IkeCookieRequest<'a> {
     /// Initiator SPI from the IKE header.
     pub initiator_spi: u64,
     /// Source IP address observed at the edge.
     pub source_ip: IpAddress,
     /// SWu VIP or local destination address observed at the edge.
     pub destination_ip: IpAddress,
+    /// Initiator nonce `Ni` from the IKE_SA_INIT Nonce payload, bound into the
+    /// cookie per RFC 7296 §2.6.
+    pub initiator_nonce: &'a [u8],
     /// COOKIE echoed by the initiator, if the request carried one.
     pub echoed_cookie: Option<IkeCookie>,
     /// Current stateless cookie rotation slot.
@@ -168,16 +171,27 @@ impl IkeCookieGate {
     }
 
     /// Generate a cookie for an IKE_SA_INIT edge tuple.
+    ///
+    /// Binds the initiator nonce `Ni` per RFC 7296 §2.6
+    /// (`Cookie = Hash(Ni | IPi | SPIi | <secret>)`), plus the destination IP and
+    /// rotation slot. Binding `Ni` ties the cookie to the specific IKE_SA_INIT
+    /// attempt so a challenge cannot be satisfied by replaying a cookie minted for
+    /// a different nonce within the same slot.
     pub fn generate(
         &self,
         initiator_spi: u64,
         source_ip: IpAddress,
         destination_ip: IpAddress,
         slot: CookieSlot,
+        initiator_nonce: &[u8],
     ) -> Result<IkeCookie, IpsecLbError> {
         let mut mac = HmacSha256::new_from_slice(&self.key.0)
             .map_err(|_| IpsecLbError::EntropyUnavailable)?;
-        mac.update(b"opc-ipsec-lb/ike-cookie/v1");
+        mac.update(b"opc-ipsec-lb/ike-cookie/v2");
+        // Length-prefix the variable-length nonce so the concatenation is
+        // unambiguous (RFC 7296 §3.9 allows a 16..=256-octet nonce).
+        mac.update(&(initiator_nonce.len() as u64).to_be_bytes());
+        mac.update(initiator_nonce);
         mac.update(&initiator_spi.to_be_bytes());
         feed_ip(&mut mac, source_ip);
         feed_ip(&mut mac, destination_ip);
@@ -196,13 +210,21 @@ impl IkeCookieGate {
         source_ip: IpAddress,
         destination_ip: IpAddress,
         current_slot: CookieSlot,
+        initiator_nonce: &[u8],
     ) -> Result<(), IpsecLbError> {
-        let current = self.generate(initiator_spi, source_ip, destination_ip, current_slot)?;
+        let current = self.generate(
+            initiator_spi,
+            source_ip,
+            destination_ip,
+            current_slot,
+            initiator_nonce,
+        )?;
         let previous = self.generate(
             initiator_spi,
             source_ip,
             destination_ip,
             current_slot.previous(),
+            initiator_nonce,
         )?;
         if cookie.constant_time_eq(current) || cookie.constant_time_eq(previous) {
             Ok(())
@@ -218,7 +240,7 @@ impl IkeCookieGate {
     /// or previous rotation slot.
     pub fn evaluate(
         &self,
-        request: IkeCookieRequest,
+        request: IkeCookieRequest<'_>,
         policy: IkeCookiePolicy,
     ) -> Result<IkeCookieDecision, IpsecLbError> {
         if let Some(cookie) = request.echoed_cookie {
@@ -228,6 +250,7 @@ impl IkeCookieGate {
                 request.source_ip,
                 request.destination_ip,
                 request.slot,
+                request.initiator_nonce,
             )?;
             return Ok(IkeCookieDecision::Allow);
         }
@@ -238,6 +261,7 @@ impl IkeCookieGate {
                 request.source_ip,
                 request.destination_ip,
                 request.slot,
+                request.initiator_nonce,
             )?;
             Ok(IkeCookieDecision::Challenge { cookie })
         } else {
@@ -273,38 +297,53 @@ mod tests {
         IkeCookieGate::new(CookieKey::new([0x42; 32]))
     }
 
+    const NI: [u8; 16] = [0x33; 16];
+
     #[test]
     fn cookie_round_trips_current_and_previous_slot_without_state() {
         let gate = gate();
         let src = IpAddress::V4([198, 51, 100, 9]);
         let dst = IpAddress::V4([203, 0, 113, 1]);
-        let cookie = gate.generate(0x1234, src, dst, CookieSlot::new(9)).unwrap();
-        gate.verify(cookie, 0x1234, src, dst, CookieSlot::new(9))
+        let cookie = gate
+            .generate(0x1234, src, dst, CookieSlot::new(9), &NI)
             .unwrap();
-        gate.verify(cookie, 0x1234, src, dst, CookieSlot::new(10))
+        gate.verify(cookie, 0x1234, src, dst, CookieSlot::new(9), &NI)
+            .unwrap();
+        gate.verify(cookie, 0x1234, src, dst, CookieSlot::new(10), &NI)
             .unwrap();
     }
 
     #[test]
-    fn cookie_binds_source_ip_and_initiator_spi() {
+    fn cookie_binds_source_ip_initiator_spi_and_nonce() {
         let gate = gate();
         let src = IpAddress::V4([198, 51, 100, 9]);
         let dst = IpAddress::V4([203, 0, 113, 1]);
-        let cookie = gate.generate(0x1234, src, dst, CookieSlot::new(9)).unwrap();
+        let cookie = gate
+            .generate(0x1234, src, dst, CookieSlot::new(9), &NI)
+            .unwrap();
+        // Wrong initiator SPI.
         assert!(matches!(
-            gate.verify(cookie, 0x1235, src, dst, CookieSlot::new(9))
+            gate.verify(cookie, 0x1235, src, dst, CookieSlot::new(9), &NI)
                 .unwrap_err(),
             IpsecLbError::CookieRejected
         ));
+        // Wrong source IP.
         assert!(gate
             .verify(
                 cookie,
                 0x1234,
                 IpAddress::V4([198, 51, 100, 10]),
                 dst,
-                CookieSlot::new(9)
+                CookieSlot::new(9),
+                &NI,
             )
             .is_err());
+        // Wrong initiator nonce Ni (RFC 7296 §2.6 binding).
+        assert!(matches!(
+            gate.verify(cookie, 0x1234, src, dst, CookieSlot::new(9), &[0x44; 16])
+                .unwrap_err(),
+            IpsecLbError::CookieRejected
+        ));
     }
 
     #[test]
@@ -330,6 +369,7 @@ mod tests {
             initiator_spi: 0x1234,
             source_ip: src,
             destination_ip: dst,
+            initiator_nonce: &NI,
             echoed_cookie: None,
             slot: CookieSlot::new(9),
         };
@@ -362,6 +402,7 @@ mod tests {
             initiator_spi: 0x1234,
             source_ip: IpAddress::V4([198, 51, 100, 9]),
             destination_ip: IpAddress::V4([203, 0, 113, 1]),
+            initiator_nonce: &NI,
             echoed_cookie: Some(IkeCookie::from_bytes([0xff; 32])),
             slot: CookieSlot::new(9),
         };

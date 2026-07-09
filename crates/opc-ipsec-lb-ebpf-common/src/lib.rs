@@ -297,6 +297,38 @@ const fn extract_high_tag_u32(value: u32, bits: u8) -> Option<u16> {
     Some(((value >> (32 - bits)) & ((1_u32 << bits) - 1)) as u16)
 }
 
+/// FNV-1a offset basis for the stateless IKE_SA_INIT bootstrap tag.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a prime for the stateless IKE_SA_INIT bootstrap tag.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Compute the stateless bootstrap routing tag for an initial IKE_SA_INIT.
+///
+/// An initial IKE_SA_INIT has a zero responder SPI, so there is no allocated
+/// tagged SPI to route on yet. This is the single source of truth shared by the
+/// XDP datapath and the userspace classifier so both steer such a packet to the
+/// same shard: FNV-1a over the big-endian initiator SPI followed by the source-IP
+/// octets (4 for IPv4, 16 for IPv6), masked to `tag_bits` high-order tag slots.
+/// Returns `None` for an out-of-range tag width.
+#[must_use]
+pub fn bootstrap_tag(initiator_spi: u64, source_ip_octets: &[u8], tag_bits: u8) -> Option<u16> {
+    if tag_bits == 0 || tag_bits > 16 {
+        return None;
+    }
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in initiator_spi.to_be_bytes() {
+        hash = fnv1a(hash, byte);
+    }
+    for &byte in source_ip_octets {
+        hash = fnv1a(hash, byte);
+    }
+    Some((hash & ((1_u64 << tag_bits) - 1)) as u16)
+}
+
+const fn fnv1a(hash: u64, byte: u8) -> u64 {
+    (hash ^ (byte as u64)).wrapping_mul(FNV_PRIME)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +374,21 @@ mod tests {
         let key = XdpTagKey { tag: 0x03ff };
         assert_eq!(key.encode(), [0x03, 0xff]);
         assert_eq!(XdpTagKey::decode(&key.encode()), key);
+    }
+
+    #[test]
+    fn bootstrap_tag_is_deterministic_masked_and_width_checked() {
+        let a = bootstrap_tag(0x0102_0304_0506_0708, &[198, 51, 100, 7], 8);
+        assert_eq!(
+            a,
+            bootstrap_tag(0x0102_0304_0506_0708, &[198, 51, 100, 7], 8)
+        );
+        assert!(a.unwrap() < 256);
+        assert!(bootstrap_tag(0xdead_beef, &[203, 0, 113, 9], 4).unwrap() < 16);
+        // IPv6 octets (16 bytes) are accepted too.
+        assert!(bootstrap_tag(7, &[0x20; 16], 10).unwrap() < 1024);
+        assert_eq!(bootstrap_tag(1, &[], 0), None);
+        assert_eq!(bootstrap_tag(1, &[], 17), None);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Tagged SPI allocation and decoding.
 
 use rand::{rngs::SysRng, TryRng};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::error::IpsecLbError;
@@ -247,7 +248,31 @@ pub struct TaggedSpiAllocator<E = SystemEntropy> {
     layout: TaggedSpiLayout,
     shards: ShardSet,
     selector: RendezvousSelector,
+    /// Precomputed shard -> owned routing tags, built once at construction so
+    /// allocation does not re-run the O(2^tag_bits * shards) rendezvous map on
+    /// every attach.
+    shard_tags: BTreeMap<ShardId, Vec<u64>>,
     entropy: E,
+}
+
+/// Precompute, for each shard, the routing tags it owns under the rendezvous
+/// selector (the canonical tag->shard mapping, matching `decode`). Rendezvous
+/// selection is infallible for a non-empty `ShardSet`, so any error just skips a
+/// tag rather than panicking.
+fn precompute_shard_tags(
+    layout: TaggedSpiLayout,
+    shards: &ShardSet,
+) -> BTreeMap<ShardId, Vec<u64>> {
+    let selector = RendezvousSelector;
+    let mut map: BTreeMap<ShardId, Vec<u64>> = BTreeMap::new();
+    // `tag_bits` is 1..=MAX_TAG_BITS (16) by construction, so the shift is bounded.
+    let tag_count: u64 = 1 << layout.tag_bits();
+    for tag in 0..tag_count {
+        if let Ok(shard) = selector.select(shards, &SelectionKey::Tag(tag)) {
+            map.entry(shard).or_default().push(tag);
+        }
+    }
+    map
 }
 
 impl TaggedSpiAllocator<SystemEntropy> {
@@ -264,10 +289,12 @@ where
     /// Build an allocator from an explicit entropy source.
     #[must_use]
     pub fn new(layout: TaggedSpiLayout, shards: ShardSet, entropy: E) -> Self {
+        let shard_tags = precompute_shard_tags(layout, &shards);
         Self {
             layout,
             shards,
             selector: RendezvousSelector,
+            shard_tags,
             entropy,
         }
     }
@@ -284,26 +311,14 @@ where
         Ok(u64::from_be_bytes(bytes) & self.layout.random_mask())
     }
 
-    fn tags_for_shard(&self, shard: ShardId) -> Result<Vec<u64>, IpsecLbError> {
+    fn tags_for_shard(&self, shard: ShardId) -> Result<&[u64], IpsecLbError> {
         if !self.shards.contains(shard) {
             return Err(IpsecLbError::UnknownShard);
         }
-        let tag_count = 1u64
-            .checked_shl(u32::from(self.layout.tag_bits()))
-            .ok_or(IpsecLbError::TagSpaceExhausted)?;
-        let mut tags = Vec::new();
-        for tag in 0..tag_count {
-            let selected = self
-                .selector
-                .select(&self.shards, &SelectionKey::Tag(tag))?;
-            if selected == shard {
-                tags.push(tag);
-            }
+        match self.shard_tags.get(&shard) {
+            Some(tags) if !tags.is_empty() => Ok(tags),
+            _ => Err(IpsecLbError::TagSpaceExhausted),
         }
-        if tags.is_empty() {
-            return Err(IpsecLbError::TagSpaceExhausted);
-        }
-        Ok(tags)
     }
 
     fn choose_tag(&self, shard: ShardId) -> Result<u64, IpsecLbError> {

@@ -71,6 +71,7 @@ fn classifier_demuxes_500_4500_ike_esp_and_mobike() {
     let shard_set = shards(3);
     let config = SwuClassifierConfig {
         shards: &shard_set,
+        bootstrap_tag_bits: 8,
         esp_fragment_posture: EspFragmentPosture::PreventIpFragmentation,
     };
     let source = IpAddress::V4([198, 51, 100, 7]);
@@ -162,6 +163,7 @@ fn classifier_reports_non_first_fragments_explicitly() {
             packet,
             SwuClassifierConfig {
                 shards: &shard_set,
+                bootstrap_tag_bits: 8,
                 esp_fragment_posture: EspFragmentPosture::PreventIpFragmentation,
             },
         )
@@ -173,6 +175,7 @@ fn classifier_reports_non_first_fragments_explicitly() {
             packet,
             SwuClassifierConfig {
                 shards: &shard_set,
+                bootstrap_tag_bits: 8,
                 esp_fragment_posture: EspFragmentPosture::ReassembleBeforeSteer,
             },
         ),
@@ -200,10 +203,11 @@ fn cookie_is_stateless_and_tamper_bound() {
     let gate = IkeCookieGate::new(CookieKey::new([0x7b; 32]));
     let src = IpAddress::V4([198, 51, 100, 7]);
     let dst = IpAddress::V4([203, 0, 113, 8]);
+    let ni = [0x33u8; 16];
     let cookie = gate
-        .generate(0x1234, src, dst, CookieSlot::new(88))
+        .generate(0x1234, src, dst, CookieSlot::new(88), &ni)
         .unwrap();
-    gate.verify(cookie, 0x1234, src, dst, CookieSlot::new(88))
+    gate.verify(cookie, 0x1234, src, dst, CookieSlot::new(88), &ni)
         .unwrap();
     assert!(gate
         .verify(
@@ -212,6 +216,7 @@ fn cookie_is_stateless_and_tamper_bound() {
             IpAddress::V4([198, 51, 100, 8]),
             dst,
             CookieSlot::new(88),
+            &ni,
         )
         .is_err());
 }
@@ -221,10 +226,12 @@ fn cookie_gate_challenges_cookieless_init_before_state_allocation() {
     let gate = IkeCookieGate::new(CookieKey::new([0x81; 32]));
     let src = IpAddress::V4([198, 51, 100, 9]);
     let dst = IpAddress::V4([203, 0, 113, 1]);
+    let ni = [0x33u8; 16];
     let request = IkeCookieRequest {
         initiator_spi: 0xfeed_beef,
         source_ip: src,
         destination_ip: dst,
+        initiator_nonce: &ni,
         echoed_cookie: None,
         slot: CookieSlot::new(42),
     };

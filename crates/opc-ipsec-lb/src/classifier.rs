@@ -1,5 +1,7 @@
 //! SWu UDP/500 and UDP/4500 packet classification.
 
+use opc_ipsec_lb_ebpf_common::bootstrap_tag;
+
 use crate::error::IpsecLbError;
 use crate::model::{IpAddress, SteerKey};
 use crate::selector::{RendezvousSelector, SelectionKey, ShardSet};
@@ -44,6 +46,10 @@ impl IpFragment {
 pub struct SwuClassifierConfig<'a> {
     /// Current shard set used for IKE_SA_INIT bootstrap.
     pub shards: &'a ShardSet,
+    /// Number of high-order routing-tag bits used for IKE responder SPIs. Must
+    /// match the datapath `XdpConfig.ike_tag_bits`, so the userspace and XDP
+    /// bootstrap decisions steer an initial IKE_SA_INIT to the same shard.
+    pub bootstrap_tag_bits: u8,
     /// ESP IP-fragment posture.
     pub esp_fragment_posture: EspFragmentPosture,
 }
@@ -185,19 +191,37 @@ fn classify_ike(
                 code: "zero_responder_spi_outside_ike_sa_init",
             };
         }
-        let key = SteerKey::IkeInit {
-            initiator_spi: header.initiator_spi,
-            source_ip,
+        // Steer an initial IKE_SA_INIT (no allocated SPI yet) to the shard that
+        // owns its bootstrap tag, using the SAME FNV tag the XDP datapath computes
+        // (`ebpf_common::bootstrap_tag`) and the SAME rendezvous tag->shard mapping
+        // the allocator's `decode` uses — so userspace and datapath agree.
+        let tag = match source_ip {
+            IpAddress::V4(octets) => {
+                bootstrap_tag(header.initiator_spi, &octets, config.bootstrap_tag_bits)
+            }
+            IpAddress::V6(octets) => {
+                bootstrap_tag(header.initiator_spi, &octets, config.bootstrap_tag_bits)
+            }
+        };
+        let Some(tag) = tag else {
+            return SwuClassification::Rejected {
+                code: "invalid_bootstrap_tag_bits",
+            };
         };
         let selector = RendezvousSelector;
-        let selection = SelectionKey::IkeInit {
-            initiator_spi: header.initiator_spi,
-            source_ip,
+        let Ok(bootstrap_shard) =
+            selector.select(config.shards, &SelectionKey::Tag(u64::from(tag)))
+        else {
+            return SwuClassification::Rejected {
+                code: "no_bootstrap_shard",
+            };
         };
-        let bootstrap_shard = selector.select(config.shards, &selection).ok();
         return SwuClassification::Steer {
-            key,
-            bootstrap_shard,
+            key: SteerKey::IkeInit {
+                initiator_spi: header.initiator_spi,
+                source_ip,
+            },
+            bootstrap_shard: Some(bootstrap_shard),
         };
     }
 
@@ -245,6 +269,7 @@ mod tests {
     fn config(shards: &ShardSet) -> SwuClassifierConfig<'_> {
         SwuClassifierConfig {
             shards,
+            bootstrap_tag_bits: 8,
             esp_fragment_posture: EspFragmentPosture::PreventIpFragmentation,
         }
     }
@@ -403,6 +428,7 @@ mod tests {
             },
             SwuClassifierConfig {
                 shards: &shards,
+                bootstrap_tag_bits: 8,
                 esp_fragment_posture: EspFragmentPosture::ReassembleBeforeSteer,
             },
         );

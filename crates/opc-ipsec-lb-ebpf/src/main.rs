@@ -15,7 +15,8 @@ use aya_ebpf::{
     programs::XdpContext,
 };
 use opc_ipsec_lb_ebpf_common::{
-    XdpConfig, XdpRuleKey, XdpRuleValue, XdpTagKey, CONFIG_VALUE_LEN, COUNTER_DROP_MALFORMED,
+    bootstrap_tag, XdpConfig, XdpRuleKey, XdpRuleValue, XdpTagKey, CONFIG_VALUE_LEN,
+    COUNTER_DROP_MALFORMED,
     COUNTER_LOCAL_OWNER, COUNTER_MISS, COUNTER_NATT_KEEPALIVE, COUNTER_PASS_NON_SWU,
     COUNTER_REDIRECT, COUNTER_SLOTS, ESP_HEADER_PREFIX_LEN, ETH_HDR_LEN, ETH_P_IPV4, ETH_P_IPV6,
     IKEV2_EXCHANGE_IKE_SA_INIT, IKEV2_HDR_LEN, IKEV2_MAJOR_VERSION, NAT_T_KEEPALIVE,
@@ -47,8 +48,6 @@ const IPV6_NEXT_HEADER_HOP: u8 = 0;
 const IPV6_NEXT_HEADER_ROUTING: u8 = 43;
 const IPV6_NEXT_HEADER_DEST: u8 = 60;
 const IPV4_FRAG_MASK: u16 = 0x3fff;
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 #[xdp]
 pub fn opc_ipsec_lb_xdp(ctx: XdpContext) -> u32 {
@@ -175,7 +174,14 @@ fn steer_ike(ctx: &XdpContext, ike_offset: usize, source_ip: IpSource) -> Result
         if exchange_type != IKEV2_EXCHANGE_IKE_SA_INIT {
             return Err(());
         }
-        return tag_action(bootstrap_tag(initiator_spi, source_ip, config.ike_tag_bits)?);
+        // Shared with the userspace classifier via `ebpf_common::bootstrap_tag`
+        // so both steer an initial IKE_SA_INIT to the same shard.
+        let tag = match source_ip {
+            IpSource::V4(octets) => bootstrap_tag(initiator_spi, &octets, config.ike_tag_bits),
+            IpSource::V6(octets) => bootstrap_tag(initiator_spi, &octets, config.ike_tag_bits),
+        }
+        .ok_or(())?;
+        return tag_action(tag);
     }
 
     let key = XdpRuleKey::ike_responder_spi(responder_spi).encode();
@@ -230,33 +236,6 @@ fn apply_value(value: XdpRuleValue) -> u32 {
     }
     count(COUNTER_DROP_MALFORMED);
     XDP_DROP
-}
-
-fn bootstrap_tag(initiator_spi: u64, source_ip: IpSource, tag_bits: u8) -> Result<u16, ()> {
-    if tag_bits == 0 || tag_bits > 16 {
-        return Err(());
-    }
-    let mut hash = FNV_OFFSET;
-    for byte in initiator_spi.to_be_bytes() {
-        hash = fnv(hash, byte);
-    }
-    match source_ip {
-        IpSource::V4(octets) => {
-            for byte in octets {
-                hash = fnv(hash, byte);
-            }
-        }
-        IpSource::V6(octets) => {
-            for byte in octets {
-                hash = fnv(hash, byte);
-            }
-        }
-    }
-    Ok((hash & ((1_u64 << tag_bits) - 1)) as u16)
-}
-
-fn fnv(hash: u64, byte: u8) -> u64 {
-    (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
 }
 
 fn count(index: u32) {
