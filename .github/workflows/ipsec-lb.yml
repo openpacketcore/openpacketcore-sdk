@@ -1,10 +1,10 @@
-name: IPsec LB P0
+name: IPsec LB
 
 on:
   pull_request:
     paths:
       - "crates/opc-ipsec-lb/**"
-      - ".github/workflows/ipsec-lb-p0.yml"
+      - ".github/workflows/ipsec-lb.yml"
       - "Cargo.toml"
       - "Cargo.lock"
   push:
@@ -12,7 +12,7 @@ on:
       - main
     paths:
       - "crates/opc-ipsec-lb/**"
-      - ".github/workflows/ipsec-lb-p0.yml"
+      - ".github/workflows/ipsec-lb.yml"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -26,8 +26,8 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
-  p0-conformance:
-    name: P0 conformance
+  conformance:
+    name: Kernel-independent conformance
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -50,7 +50,7 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked -p opc-ipsec-lb --all-targets --all-features -- -D warnings
 
-      - name: Run P0 tests
+      - name: Run conformance tests
         run: cargo test --locked -p opc-ipsec-lb --all-features --quiet -- --test-threads=4
 
   docs:

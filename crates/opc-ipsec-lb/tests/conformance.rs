@@ -23,13 +23,13 @@ fn ike_header(initiator_spi: u64, responder_spi: u64, exchange_type: u8) -> Vec<
 }
 
 #[test]
-fn p0_spi_allocator_rejects_unsatisfiable_normative_entropy_floor() {
+fn spi_allocator_rejects_unsatisfiable_normative_entropy_floor() {
     assert!(TaggedSpiLayout::new(SpiKind::Ikev2Responder, 8, 64).is_err());
     assert!(TaggedSpiLayout::new(SpiKind::ChildEsp, 8, 64).is_err());
 }
 
 #[test]
-fn p0_spi_allocator_decodes_owner_and_keeps_rekey_tag_stable() {
+fn spi_allocator_decodes_owner_and_keeps_rekey_tag_stable() {
     let layout = TaggedSpiLayout::new(SpiKind::ChildEsp, 8, 24).unwrap();
     let allocator =
         TaggedSpiAllocator::new(layout, shards(4), FixedEntropy::new((0..64).collect()));
@@ -50,7 +50,7 @@ fn p0_spi_allocator_decodes_owner_and_keeps_rekey_tag_stable() {
 }
 
 #[test]
-fn p0_classifier_demuxes_500_4500_ike_esp_and_mobike() {
+fn classifier_demuxes_500_4500_ike_esp_and_mobike() {
     let shard_set = shards(3);
     let config = SwuClassifierConfig {
         shards: &shard_set,
@@ -129,7 +129,7 @@ fn p0_classifier_demuxes_500_4500_ike_esp_and_mobike() {
 }
 
 #[test]
-fn p0_classifier_reports_non_first_fragments_explicitly() {
+fn classifier_reports_non_first_fragments_explicitly() {
     let shard_set = shards(2);
     let packet = SwuPacket {
         udp_destination_port: 4500,
@@ -164,7 +164,7 @@ fn p0_classifier_reports_non_first_fragments_explicitly() {
 }
 
 #[test]
-fn p0_rendezvous_selection_is_stable_and_measured_for_disruption() {
+fn rendezvous_selection_is_stable_and_measured_for_disruption() {
     let selector = RendezvousSelector;
     let before = shards(5);
     let after = shards(6);
@@ -179,7 +179,7 @@ fn p0_rendezvous_selection_is_stable_and_measured_for_disruption() {
 }
 
 #[test]
-fn p0_cookie_is_stateless_and_tamper_bound() {
+fn cookie_is_stateless_and_tamper_bound() {
     let gate = IkeCookieGate::new(CookieKey::new([0x7b; 32]));
     let src = IpAddress::V4([198, 51, 100, 7]);
     let dst = IpAddress::V4([203, 0, 113, 8]);
@@ -200,7 +200,7 @@ fn p0_cookie_is_stateless_and_tamper_bound() {
 }
 
 #[test]
-fn p0_failover_guards_reject_iv_and_replay_rollback() {
+fn failover_guards_reject_iv_and_replay_rollback() {
     assert_eq!(
         SendIvCounter::resume_after(7).unwrap(),
         IvResumeDecision::Resume(SendIvCounter::new(8))

@@ -3,7 +3,8 @@
 //! This crate owns the reusable, kernel-independent contract for steering SWu
 //! traffic by IKE/ESP SPI without ever handling IPsec key material. Product
 //! crates compose these primitives with XDP/NIC backends and live failover
-//! evidence; this crate keeps P0 conformance deterministic and CI-provable.
+//! evidence; this crate keeps kernel-independent conformance deterministic and
+//! CI-provable.
 
 #![forbid(unsafe_code)]
 
@@ -50,7 +51,7 @@ mod integration_tests {
     use super::*;
 
     #[test]
-    fn p0_primitives_are_key_material_free_by_type_shape() {
+    fn primitives_are_key_material_free_by_type_shape() {
         let probe = SteeringProbe::mock();
         assert!(probe.key_material_free);
         assert!(!format!("{:?}", SteerKey::EspSpi(0x1234_5678)).contains("key"));

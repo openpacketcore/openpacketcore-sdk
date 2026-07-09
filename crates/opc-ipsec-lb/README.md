@@ -2,7 +2,7 @@
 
 Pure SWu IKE/IPsec load-balancing primitives for OpenPacketCore CNFs.
 
-This crate is the kernel-independent P0 foundation for an ePDG/N3IWF/TWIF
+This crate is the kernel-independent foundation for an ePDG/N3IWF/TWIF
 steer layer:
 
 - tagged SPI layout and allocation policy;
