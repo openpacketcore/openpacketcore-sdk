@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use opc_ipsec_lb_ebpf_common::{
-    XdpRuleKey, XdpRuleValue, RULE_FLAG_REDIRECT_IFINDEX, RULE_KEY_LEN, RULE_VALUE_LEN,
+    XdpConfig, XdpRuleKey, XdpRuleValue, XdpTagKey, CONFIG_VALUE_LEN, RULE_FLAG_LOCAL_OWNER,
+    RULE_FLAG_REDIRECT_IFINDEX, RULE_KEY_LEN, RULE_VALUE_LEN, TAG_TARGET_KEY_LEN,
 };
 
 use crate::error::IpsecLbError;
@@ -68,8 +69,41 @@ pub(crate) trait HostXdpRuntime: Send + Sync + fmt::Debug {
     /// Remove a rule map entry; returns whether it existed.
     fn rule_remove(&self, ifindex: u32, key: [u8; RULE_KEY_LEN]) -> Result<bool, IpsecLbError>;
 
+    /// Write the single-slot datapath configuration.
+    fn config_write(&self, ifindex: u32, value: [u8; CONFIG_VALUE_LEN])
+        -> Result<(), IpsecLbError>;
+
+    /// Insert or replace a routing tag target.
+    fn tag_target_insert(
+        &self,
+        ifindex: u32,
+        key: [u8; TAG_TARGET_KEY_LEN],
+        value: [u8; RULE_VALUE_LEN],
+    ) -> Result<(), IpsecLbError>;
+
     /// Probe the environment for XDP readiness.
     fn probe_environment(&self) -> HostXdpEnvironment;
+}
+
+/// Local or cross-node XDP target for a shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostXdpTarget {
+    /// Packet should pass to the local stack on this node.
+    Local,
+    /// Packet should be redirected to another interface.
+    Redirect {
+        /// Redirect target ifindex.
+        ifindex: NonZeroU32,
+    },
+}
+
+/// Precomputed target for one routing tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostXdpTagTarget {
+    /// Owner shard selected for the tag.
+    pub owner: ShardId,
+    /// Local or cross-node target for that owner.
+    pub target: HostXdpTarget,
 }
 
 /// Host-XDP backend configuration.
@@ -77,18 +111,28 @@ pub(crate) trait HostXdpRuntime: Send + Sync + fmt::Debug {
 pub struct HostXdpSteeringBackendConfig {
     /// bpffs directory under which per-interface pin directories are created.
     pub bpffs_pin_root: PathBuf,
-    /// Owner shard to redirect target ifindex.
+    /// Number of high bits used as routing tag for IKE responder SPIs.
+    pub ike_tag_bits: u8,
+    /// Number of high bits used as routing tag for ESP SPIs.
+    pub esp_tag_bits: u8,
+    /// Owner shard to local/redirect target.
     ///
     /// A missing owner is a configuration error. The backend refuses to install
     /// the rule rather than risking a correct-not-drop violation.
-    pub owner_redirect_ifindexes: BTreeMap<ShardId, NonZeroU32>,
+    pub owner_targets: BTreeMap<ShardId, HostXdpTarget>,
+    /// Complete routing-tag target table used for stateless steady-state
+    /// steering. This is O(tags), not O(active SAs).
+    pub tag_targets: BTreeMap<u16, HostXdpTagTarget>,
 }
 
 impl Default for HostXdpSteeringBackendConfig {
     fn default() -> Self {
         Self {
             bpffs_pin_root: PathBuf::from(DEFAULT_BPFFS_PIN_ROOT),
-            owner_redirect_ifindexes: BTreeMap::new(),
+            ike_tag_bits: 0,
+            esp_tag_bits: 0,
+            owner_targets: BTreeMap::new(),
+            tag_targets: BTreeMap::new(),
         }
     }
 }
@@ -187,6 +231,7 @@ impl HostXdpSteeringBackend {
 
     fn ensure_attached_sync(&self) -> Result<u32, IpsecLbError> {
         validate_interface_name(&self.inner.interface)?;
+        validate_xdp_config(&self.inner.config)?;
         if let Some(ifindex) = *self.attached_ifindex()? {
             return Ok(ifindex);
         }
@@ -200,6 +245,7 @@ impl HostXdpSteeringBackend {
         self.inner
             .runtime
             .attach(&self.inner.interface, ifindex, &self.pin_dir())?;
+        self.sync_datapath_config(ifindex)?;
         *self.attached_ifindex()? = Some(ifindex);
         Ok(ifindex)
     }
@@ -238,22 +284,34 @@ impl HostXdpSteeringBackend {
     }
 
     fn encode_rule_value(&self, rule: SteeringRule) -> Result<[u8; RULE_VALUE_LEN], IpsecLbError> {
-        let redirect_ifindex = self
+        let target = self
             .inner
             .config
-            .owner_redirect_ifindexes
+            .owner_targets
             .get(&rule.owner)
             .copied()
             .ok_or_else(|| {
-                IpsecLbError::invalid_config("rule.owner", "owner shard has no redirect ifindex")
-            })?
-            .get();
-        Ok(XdpRuleValue {
-            owner_shard: rule.owner.get(),
-            redirect_ifindex,
-            flags: RULE_FLAG_REDIRECT_IFINDEX,
+                IpsecLbError::invalid_config("rule.owner", "owner shard has no XDP target")
+            })?;
+        Ok(encode_xdp_target(rule.owner, target))
+    }
+
+    fn sync_datapath_config(&self, ifindex: u32) -> Result<(), IpsecLbError> {
+        let config = XdpConfig {
+            ike_tag_bits: self.inner.config.ike_tag_bits,
+            esp_tag_bits: self.inner.config.esp_tag_bits,
+            flags: 0,
         }
-        .encode())
+        .encode();
+        self.inner.runtime.config_write(ifindex, config)?;
+        for (tag, target) in &self.inner.config.tag_targets {
+            self.inner.runtime.tag_target_insert(
+                ifindex,
+                XdpTagKey { tag: *tag }.encode(),
+                encode_xdp_target(target.owner, target.target),
+            )?;
+        }
+        Ok(())
     }
 
     fn probe_sync(&self) -> SteeringProbe {
@@ -263,7 +321,7 @@ impl HostXdpSteeringBackend {
             && env.btf_present
             && env.net_admin_capable
             && env.bpf_capable
-            && !self.inner.config.owner_redirect_ifindexes.is_empty();
+            && validate_xdp_config(&self.inner.config).is_ok();
         let details = if !env.platform_supported {
             Some("Host-XDP steering unsupported on this platform")
         } else if !env.bpffs_present {
@@ -274,8 +332,8 @@ impl HostXdpSteeringBackend {
             Some("CAP_NET_ADMIN is not effective")
         } else if !env.bpf_capable {
             Some("CAP_BPF or CAP_SYS_ADMIN is not effective")
-        } else if self.inner.config.owner_redirect_ifindexes.is_empty() {
-            Some("no owner redirect targets configured")
+        } else if validate_xdp_config(&self.inner.config).is_err() {
+            Some("Host-XDP tag target configuration is incomplete")
         } else {
             Some("Host-XDP steering mutation ready")
         };
@@ -309,6 +367,69 @@ impl SteeringBackend for HostXdpSteeringBackend {
         self.run_blocking("host_xdp_probe", move |backend| Ok(backend.probe_sync()))
             .await
     }
+}
+
+fn encode_xdp_target(owner: ShardId, target: HostXdpTarget) -> [u8; RULE_VALUE_LEN] {
+    match target {
+        HostXdpTarget::Local => XdpRuleValue {
+            owner_shard: owner.get(),
+            redirect_ifindex: 0,
+            flags: RULE_FLAG_LOCAL_OWNER,
+        }
+        .encode(),
+        HostXdpTarget::Redirect { ifindex } => XdpRuleValue {
+            owner_shard: owner.get(),
+            redirect_ifindex: ifindex.get(),
+            flags: RULE_FLAG_REDIRECT_IFINDEX,
+        }
+        .encode(),
+    }
+}
+
+fn validate_xdp_config(config: &HostXdpSteeringBackendConfig) -> Result<(), IpsecLbError> {
+    validate_tag_bits("ike_tag_bits", config.ike_tag_bits, 64)?;
+    validate_tag_bits("esp_tag_bits", config.esp_tag_bits, 32)?;
+    if config.owner_targets.is_empty() {
+        return Err(IpsecLbError::invalid_config(
+            "owner_targets",
+            "at least one owner target is required",
+        ));
+    }
+    let required_tags = 1usize << config.ike_tag_bits.max(config.esp_tag_bits);
+    if config.tag_targets.len() != required_tags {
+        return Err(IpsecLbError::invalid_config(
+            "tag_targets",
+            "tag target table must cover the full configured tag space",
+        ));
+    }
+    for expected in 0..required_tags {
+        let tag = u16::try_from(expected).map_err(|_| {
+            IpsecLbError::invalid_config("tag_targets", "tag target exceeds u16 range")
+        })?;
+        let Some(target) = config.tag_targets.get(&tag) else {
+            return Err(IpsecLbError::invalid_config(
+                "tag_targets",
+                "tag target table has a gap",
+            ));
+        };
+        if !config.owner_targets.contains_key(&target.owner) {
+            return Err(IpsecLbError::invalid_config(
+                "tag_targets",
+                "tag target references an unknown owner",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_tag_bits(field: &'static str, bits: u8, total_bits: u8) -> Result<(), IpsecLbError> {
+    if bits == 0 || bits > 16 || bits >= total_bits {
+        return Err(IpsecLbError::invalid_config(
+            field,
+            "tag bits must be in range 1..=16 and fit the SPI width",
+        ));
+    }
+    Ok(())
 }
 
 fn encode_rule_key(key: SteerKey) -> Result<[u8; RULE_KEY_LEN], IpsecLbError> {
@@ -387,6 +508,23 @@ impl HostXdpRuntime for UnsupportedHostXdpRuntime {
         Err(IpsecLbError::Unsupported)
     }
 
+    fn config_write(
+        &self,
+        _ifindex: u32,
+        _value: [u8; CONFIG_VALUE_LEN],
+    ) -> Result<(), IpsecLbError> {
+        Err(IpsecLbError::Unsupported)
+    }
+
+    fn tag_target_insert(
+        &self,
+        _ifindex: u32,
+        _key: [u8; TAG_TARGET_KEY_LEN],
+        _value: [u8; RULE_VALUE_LEN],
+    ) -> Result<(), IpsecLbError> {
+        Err(IpsecLbError::Unsupported)
+    }
+
     fn probe_environment(&self) -> HostXdpEnvironment {
         HostXdpEnvironment::default()
     }
@@ -410,7 +548,9 @@ mod tests {
         env: HostXdpEnvironment,
         attached: Vec<(String, u32, PathBuf)>,
         detached: Vec<(String, u32, PathBuf)>,
+        config: Option<[u8; CONFIG_VALUE_LEN]>,
         rules: HashMap<(u32, [u8; RULE_KEY_LEN]), [u8; RULE_VALUE_LEN]>,
+        tag_targets: HashMap<(u32, [u8; TAG_TARGET_KEY_LEN]), [u8; RULE_VALUE_LEN]>,
     }
 
     impl Default for TestState {
@@ -426,7 +566,9 @@ mod tests {
                 },
                 attached: Vec::new(),
                 detached: Vec::new(),
+                config: None,
                 rules: HashMap::new(),
+                tag_targets: HashMap::new(),
             }
         }
     }
@@ -455,6 +597,21 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .rules
                 .len()
+        }
+
+        fn tag_target_count(&self) -> usize {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .tag_targets
+                .len()
+        }
+
+        fn config_value(&self) -> Option<[u8; CONFIG_VALUE_LEN]> {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .config
         }
     }
 
@@ -533,6 +690,32 @@ mod tests {
                 .is_some())
         }
 
+        fn config_write(
+            &self,
+            _ifindex: u32,
+            value: [u8; CONFIG_VALUE_LEN],
+        ) -> Result<(), IpsecLbError> {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .config = Some(value);
+            Ok(())
+        }
+
+        fn tag_target_insert(
+            &self,
+            ifindex: u32,
+            key: [u8; TAG_TARGET_KEY_LEN],
+            value: [u8; RULE_VALUE_LEN],
+        ) -> Result<(), IpsecLbError> {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .tag_targets
+                .insert((ifindex, key), value);
+            Ok(())
+        }
+
         fn probe_environment(&self) -> HostXdpEnvironment {
             self.state
                 .lock()
@@ -542,11 +725,32 @@ mod tests {
     }
 
     fn config(owner: ShardId, ifindex: u32) -> HostXdpSteeringBackendConfig {
-        let mut owner_redirect_ifindexes = BTreeMap::new();
-        owner_redirect_ifindexes.insert(owner, NonZeroU32::new(ifindex).unwrap());
+        let mut owner_targets = BTreeMap::new();
+        owner_targets.insert(
+            owner,
+            HostXdpTarget::Redirect {
+                ifindex: NonZeroU32::new(ifindex).unwrap(),
+            },
+        );
+        let tag_targets = (0..4)
+            .map(|tag| {
+                (
+                    tag,
+                    HostXdpTagTarget {
+                        owner,
+                        target: HostXdpTarget::Redirect {
+                            ifindex: NonZeroU32::new(ifindex).unwrap(),
+                        },
+                    },
+                )
+            })
+            .collect();
         HostXdpSteeringBackendConfig {
             bpffs_pin_root: PathBuf::from("/tmp/opc-ipsec-lb-test"),
-            owner_redirect_ifindexes,
+            ike_tag_bits: 2,
+            esp_tag_bits: 2,
+            owner_targets,
+            tag_targets,
         }
     }
 
@@ -573,6 +777,8 @@ mod tests {
 
         assert_eq!(runtime.attached_count(), 1);
         assert_eq!(runtime.rule_count(), 1);
+        assert_eq!(runtime.tag_target_count(), 4);
+        assert_eq!(runtime.config_value(), Some([2, 2, 0, 0]));
         let probe = backend.probe().await.unwrap();
         assert_eq!(probe.kind, SteeringBackendKind::HostXdp);
         assert!(probe.key_material_free);
@@ -583,9 +789,12 @@ mod tests {
     async fn conflicting_owner_for_same_key_is_rejected() {
         let runtime = Arc::new(TestRuntime::default());
         let mut config = config(ShardId::new(1), 42);
-        config
-            .owner_redirect_ifindexes
-            .insert(ShardId::new(2), NonZeroU32::new(43).unwrap());
+        config.owner_targets.insert(
+            ShardId::new(2),
+            HostXdpTarget::Redirect {
+                ifindex: NonZeroU32::new(43).unwrap(),
+            },
+        );
         let backend = HostXdpSteeringBackend::with_runtime_and_config("swu0", runtime, config);
         let first = rule(ShardId::new(1), SteerKey::IkeResponderSpi(0x0102_0304));
         let second = SteeringRule {
@@ -609,7 +818,10 @@ mod tests {
             runtime.clone(),
             HostXdpSteeringBackendConfig {
                 bpffs_pin_root: PathBuf::from("/tmp/opc-ipsec-lb-test"),
-                owner_redirect_ifindexes: BTreeMap::new(),
+                ike_tag_bits: 2,
+                esp_tag_bits: 2,
+                owner_targets: BTreeMap::new(),
+                tag_targets: BTreeMap::new(),
             },
         );
 
@@ -619,6 +831,26 @@ mod tests {
                 .await,
             Err(IpsecLbError::InvalidConfig {
                 field: "rule.owner",
+                ..
+            })
+        ));
+        assert_eq!(runtime.attached_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn incomplete_tag_targets_fail_before_attach() {
+        let runtime = Arc::new(TestRuntime::default());
+        let mut config = config(ShardId::new(1), 42);
+        config.tag_targets.remove(&3);
+        let backend =
+            HostXdpSteeringBackend::with_runtime_and_config("swu0", runtime.clone(), config);
+
+        assert!(matches!(
+            backend
+                .install_rule(rule(ShardId::new(1), SteerKey::EspSpi(1)))
+                .await,
+            Err(IpsecLbError::InvalidConfig {
+                field: "tag_targets",
                 ..
             })
         ));

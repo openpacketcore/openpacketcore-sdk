@@ -38,6 +38,10 @@ pub const IKEV2_EXCHANGE_IKE_SA_INIT: u8 = 34;
 
 /// BPF map name: installed steering rules.
 pub const MAP_SWU_RULES: &str = "IPSEC_LB_RULES";
+/// BPF map name: precomputed routing-tag targets.
+pub const MAP_TAG_TARGETS: &str = "IPSEC_LB_TAG_TARGETS";
+/// BPF map name: single-slot datapath configuration.
+pub const MAP_CONFIG: &str = "IPSEC_LB_CONFIG";
 /// BPF map name: per-CPU datapath counters.
 pub const MAP_COUNTERS: &str = "IPSEC_LB_COUNTERS";
 /// XDP program name.
@@ -47,6 +51,10 @@ pub const PROG_SWU_XDP: &str = "opc_ipsec_lb_xdp";
 pub const RULE_KEY_LEN: usize = 17;
 /// Map value byte length.
 pub const RULE_VALUE_LEN: usize = 8;
+/// Tag-target map key byte length.
+pub const TAG_TARGET_KEY_LEN: usize = 2;
+/// Datapath config value byte length.
+pub const CONFIG_VALUE_LEN: usize = 4;
 
 /// Rule key kind for IKE packets keyed by responder SPI.
 pub const RULE_KIND_IKE_RESPONDER_SPI: u8 = 1;
@@ -57,6 +65,8 @@ pub const RULE_KIND_IKE_INIT: u8 = 3;
 
 /// Rule flag: redirect to another interface instead of passing locally.
 pub const RULE_FLAG_REDIRECT_IFINDEX: u16 = 1;
+/// Rule flag: pass to local stack because this node owns the target.
+pub const RULE_FLAG_LOCAL_OWNER: u16 = 2;
 
 /// Counter index: packets passed through because they were not SWu traffic.
 pub const COUNTER_PASS_NON_SWU: u32 = 0;
@@ -204,6 +214,89 @@ impl XdpRuleValue {
     }
 }
 
+/// Fixed tag-target map key.
+///
+/// The key is the routing tag extracted from the high bits of a responder IKE
+/// SPI or inbound ESP SPI. Tags are precomputed by userspace and do not scale
+/// with active SAs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XdpTagKey {
+    /// Routing tag.
+    pub tag: u16,
+}
+
+impl XdpTagKey {
+    /// Encode into the fixed map-key byte layout.
+    #[must_use]
+    pub const fn encode(&self) -> [u8; TAG_TARGET_KEY_LEN] {
+        self.tag.to_be_bytes()
+    }
+
+    /// Decode from the fixed map-key byte layout.
+    #[must_use]
+    pub const fn decode(value: &[u8; TAG_TARGET_KEY_LEN]) -> Self {
+        Self {
+            tag: u16::from_be_bytes([value[0], value[1]]),
+        }
+    }
+}
+
+/// Single-slot datapath configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XdpConfig {
+    /// Number of high bits used as routing tag for IKE responder SPIs.
+    pub ike_tag_bits: u8,
+    /// Number of high bits used as routing tag for ESP SPIs.
+    pub esp_tag_bits: u8,
+    /// Reserved for future flags; must be zero for now.
+    pub flags: u16,
+}
+
+impl XdpConfig {
+    /// Encode into the fixed config byte layout.
+    #[must_use]
+    pub const fn encode(&self) -> [u8; CONFIG_VALUE_LEN] {
+        let flags = self.flags.to_be_bytes();
+        [self.ike_tag_bits, self.esp_tag_bits, flags[0], flags[1]]
+    }
+
+    /// Decode from the fixed config byte layout.
+    #[must_use]
+    pub const fn decode(value: &[u8; CONFIG_VALUE_LEN]) -> Self {
+        Self {
+            ike_tag_bits: value[0],
+            esp_tag_bits: value[1],
+            flags: u16::from_be_bytes([value[2], value[3]]),
+        }
+    }
+
+    /// Extract the configured routing tag from a 64-bit IKE responder SPI.
+    #[must_use]
+    pub const fn ike_tag(&self, spi: u64) -> Option<u16> {
+        extract_high_tag_u64(spi, self.ike_tag_bits)
+    }
+
+    /// Extract the configured routing tag from a 32-bit ESP SPI.
+    #[must_use]
+    pub const fn esp_tag(&self, spi: u32) -> Option<u16> {
+        extract_high_tag_u32(spi, self.esp_tag_bits)
+    }
+}
+
+const fn extract_high_tag_u64(value: u64, bits: u8) -> Option<u16> {
+    if bits == 0 || bits > 16 || bits >= 64 {
+        return None;
+    }
+    Some(((value >> (64 - bits)) & ((1_u64 << bits) - 1)) as u16)
+}
+
+const fn extract_high_tag_u32(value: u32, bits: u8) -> Option<u16> {
+    if bits == 0 || bits > 16 || bits >= 32 {
+        return None;
+    }
+    Some(((value >> (32 - bits)) & ((1_u32 << bits) - 1)) as u16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +327,40 @@ mod tests {
         let encoded = value.encode();
         assert_eq!(encoded, [0, 7, 0, 0, 0, 42, 0, 1]);
         assert_eq!(XdpRuleValue::decode(&encoded), value);
+    }
+
+    #[test]
+    fn config_and_tag_target_encoding_are_stable() {
+        let config = XdpConfig {
+            ike_tag_bits: 8,
+            esp_tag_bits: 6,
+            flags: 0,
+        };
+        assert_eq!(config.encode(), [8, 6, 0, 0]);
+        assert_eq!(XdpConfig::decode(&config.encode()), config);
+
+        let key = XdpTagKey { tag: 0x03ff };
+        assert_eq!(key.encode(), [0x03, 0xff]);
+        assert_eq!(XdpTagKey::decode(&key.encode()), key);
+    }
+
+    #[test]
+    fn tag_extraction_uses_high_order_bits() {
+        let config = XdpConfig {
+            ike_tag_bits: 8,
+            esp_tag_bits: 4,
+            flags: 0,
+        };
+        assert_eq!(config.ike_tag(0xab00_0000_0000_0001), Some(0xab));
+        assert_eq!(config.esp_tag(0xc000_0001), Some(0x0c));
+        assert_eq!(
+            XdpConfig {
+                ike_tag_bits: 17,
+                esp_tag_bits: 4,
+                flags: 0,
+            }
+            .ike_tag(1),
+            None
+        );
     }
 }
