@@ -354,6 +354,17 @@ where
             }
         };
 
+        // Do not trust the fencer port blindly: a grant for a different SA or a
+        // different owner would install a steering override toward the wrong
+        // node. Reject it before any steering mutation.
+        if grant.sa != request.sa || grant.owner != request.new_owner {
+            let error = IpsecLbError::ownership_conflict(
+                "fence grant does not match the requested SA and new owner",
+            );
+            record_failure(&self.audit, &request, Some(grant.fence), &error).await;
+            return Err(error);
+        }
+
         self.audit
             .record_repin(RePinAuditEvent::fenced(&request, grant.fence))
             .await?;

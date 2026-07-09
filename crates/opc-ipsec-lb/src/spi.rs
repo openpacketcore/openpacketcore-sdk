@@ -115,12 +115,22 @@ impl TaggedSpiLayout {
         mask_for_bits(self.total_bits())
     }
 
+    /// Smallest SPI value this kind may allocate. RFC 4303 §2.1 / IANA reserve
+    /// ESP SPI values 1..=255 (and 0 for every kind), so a Child ESP SPI must be
+    /// >= 256; a zero SPI is reserved for all kinds.
+    fn min_value(self) -> u64 {
+        match self.kind {
+            SpiKind::ChildEsp => 256,
+            _ => 1,
+        }
+    }
+
     fn encode(self, tag: u64, random: u64) -> Result<u64, IpsecLbError> {
         if tag > self.tag_mask() || random > self.random_mask() {
             return Err(IpsecLbError::SpiOutOfRange);
         }
         let value = (tag << self.unpredictable_bits()) | random;
-        if value == 0 || value > self.max_value() {
+        if value < self.min_value() || value > self.max_value() {
             return Err(IpsecLbError::SpiOutOfRange);
         }
         Ok(value)
@@ -430,5 +440,28 @@ mod tests {
             allocator.decode(SpiKind::ChildEsp, 0).unwrap_err(),
             IpsecLbError::SpiOutOfRange
         ));
+    }
+
+    #[test]
+    fn esp_layout_excludes_iana_reserved_low_spis() {
+        // RFC 4303 §2.1 / IANA reserve ESP SPI values 1..=255; the allocator must
+        // never emit them. IKE reserves only 0.
+        let esp = TaggedSpiLayout::new(SpiKind::ChildEsp, 8, 24).unwrap();
+        assert!(matches!(
+            esp.encode(0, 5).unwrap_err(),
+            IpsecLbError::SpiOutOfRange
+        ));
+        assert!(matches!(
+            esp.encode(0, 255).unwrap_err(),
+            IpsecLbError::SpiOutOfRange
+        ));
+        assert_eq!(esp.encode(0, 256).unwrap(), 256);
+
+        let ike = TaggedSpiLayout::new(SpiKind::Ikev2Responder, 8, 24).unwrap();
+        assert!(matches!(
+            ike.encode(0, 0).unwrap_err(),
+            IpsecLbError::SpiOutOfRange
+        ));
+        assert_eq!(ike.encode(0, 5).unwrap(), 5);
     }
 }
