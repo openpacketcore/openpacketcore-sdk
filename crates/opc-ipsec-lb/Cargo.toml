@@ -24,6 +24,7 @@ bytes = { workspace = true }
 hmac = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
+subtle = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 

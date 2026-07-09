@@ -28,7 +28,10 @@ pub use classifier::{
     classify_swu_packet, EspFragmentPosture, IpFragment, SwuClassification, SwuClassifierConfig,
     SwuPacket,
 };
-pub use cookie::{CookieKey, CookieSlot, IkeCookie, IkeCookieGate};
+pub use cookie::{
+    CookieKey, CookieSlot, IkeCookie, IkeCookieDecision, IkeCookieGate, IkeCookiePolicy,
+    IkeCookieRequest,
+};
 pub use error::IpsecLbError;
 pub use failover::{AntiReplayResume, IvResumeDecision, SendIvCounter};
 pub use mock::{

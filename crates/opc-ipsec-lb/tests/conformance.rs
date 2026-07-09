@@ -12,14 +12,14 @@ use opc_types::{NetworkFunctionKind, TenantId};
 use opc_ipsec_lb::{
     classify_swu_packet, measure_disruption, AntiReplayResume, BgpRouteVipAdvertiser,
     BgpRouteVipAdvertiserConfig, ClusterNode, CookieKey, CookieSlot, EspFragmentPosture,
-    FixedEntropy, ForwardingProof, IkeCookieGate, IpAddress, IpFragment, IpsecLbError,
-    IvResumeDecision, MockOwnershipFencer, MockRePinAuditSink, MockSteeringBackend,
-    MockSteeringOperation, OwnershipSource, RePinAuditEventKind, RePinCoordinator, RePinRequest,
-    RekeyRequest, RendezvousSelector, ResumeKeySource, SaId, SameSpiResume, SelectionKey,
-    SendIvCounter, SessionOwnershipKeyResolver, SessionOwnershipKeyspace,
-    SessionStoreOwnershipSource, ShardId, ShardSet, SpiAllocationRequest, SpiAllocator, SpiKind,
-    SteerKey, SteeringRule, SwuClassification, SwuClassifierConfig, SwuPacket, TaggedSpiAllocator,
-    TaggedSpiLayout, VipAdvertisement, VipAdvertiser,
+    FixedEntropy, ForwardingProof, IkeCookie, IkeCookieDecision, IkeCookieGate, IkeCookiePolicy,
+    IkeCookieRequest, IpAddress, IpFragment, IpsecLbError, IvResumeDecision, MockOwnershipFencer,
+    MockRePinAuditSink, MockSteeringBackend, MockSteeringOperation, OwnershipSource,
+    RePinAuditEventKind, RePinCoordinator, RePinRequest, RekeyRequest, RendezvousSelector,
+    ResumeKeySource, SaId, SameSpiResume, SelectionKey, SendIvCounter, SessionOwnershipKeyResolver,
+    SessionOwnershipKeyspace, SessionStoreOwnershipSource, ShardId, ShardSet, SpiAllocationRequest,
+    SpiAllocator, SpiKind, SteerKey, SteeringRule, SwuClassification, SwuClassifierConfig,
+    SwuPacket, TaggedSpiAllocator, TaggedSpiLayout, VipAdvertisement, VipAdvertiser,
 };
 
 const IKE_HEADER_LEN: usize = 28;
@@ -213,6 +213,70 @@ fn cookie_is_stateless_and_tamper_bound() {
             CookieSlot::new(88),
         )
         .is_err());
+}
+
+#[test]
+fn cookie_gate_challenges_cookieless_init_before_state_allocation() {
+    let gate = IkeCookieGate::new(CookieKey::new([0x81; 32]));
+    let src = IpAddress::V4([198, 51, 100, 9]);
+    let dst = IpAddress::V4([203, 0, 113, 1]);
+    let request = IkeCookieRequest {
+        initiator_spi: 0xfeed_beef,
+        source_ip: src,
+        destination_ip: dst,
+        echoed_cookie: None,
+        slot: CookieSlot::new(42),
+    };
+
+    let cookie = match gate
+        .evaluate(request, IkeCookiePolicy::require_cookie())
+        .unwrap()
+    {
+        IkeCookieDecision::Challenge { cookie } => cookie,
+        IkeCookieDecision::Allow => panic!("cookieless IKE_SA_INIT must be challenged"),
+    };
+
+    let echoed = IkeCookieRequest {
+        echoed_cookie: Some(cookie),
+        ..request
+    };
+    assert_eq!(
+        gate.evaluate(echoed, IkeCookiePolicy::require_cookie())
+            .unwrap(),
+        IkeCookieDecision::Allow
+    );
+
+    let mut tampered = cookie.as_bytes();
+    tampered[0] ^= 0xff;
+    assert_eq!(
+        gate.evaluate(
+            IkeCookieRequest {
+                echoed_cookie: Some(IkeCookie::from_bytes(tampered)),
+                ..request
+            },
+            IkeCookiePolicy::require_cookie(),
+        )
+        .unwrap_err(),
+        IpsecLbError::CookieRejected
+    );
+
+    assert_eq!(
+        gate.evaluate(
+            IkeCookieRequest {
+                source_ip: IpAddress::V4([198, 51, 100, 10]),
+                echoed_cookie: Some(cookie),
+                ..request
+            },
+            IkeCookiePolicy::require_cookie(),
+        )
+        .unwrap_err(),
+        IpsecLbError::CookieRejected
+    );
+    assert_eq!(
+        gate.evaluate(request, IkeCookiePolicy::allow_without_cookie())
+            .unwrap(),
+        IkeCookieDecision::Allow
+    );
 }
 
 #[test]
