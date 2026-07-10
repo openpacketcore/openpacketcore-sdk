@@ -1,7 +1,7 @@
 //! Tagged SPI allocation and decoding.
 
 use rand::{rngs::SysRng, TryRng};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use crate::error::IpsecLbError;
@@ -138,7 +138,7 @@ impl TaggedSpiLayout {
     }
 
     fn decode_tag(self, value: u64) -> Result<u64, IpsecLbError> {
-        if value == 0 || value > self.max_value() {
+        if value < self.min_value() || value > self.max_value() {
             return Err(IpsecLbError::SpiOutOfRange);
         }
         Ok((value >> self.unpredictable_bits()) & self.tag_mask())
@@ -253,6 +253,9 @@ pub struct TaggedSpiAllocator<E = SystemEntropy> {
     /// every attach.
     shard_tags: BTreeMap<ShardId, Vec<u64>>,
     entropy: E,
+    /// Externally live SPIs, such as HA-restored SAs, that fresh and rekey
+    /// allocation must redraw past. Clones share this set.
+    reserved: Arc<Mutex<BTreeSet<u64>>>,
 }
 
 /// Precompute, for each shard, the routing tags it owns under the rendezvous
@@ -296,6 +299,7 @@ where
             selector: RendezvousSelector,
             shard_tags,
             entropy,
+            reserved: Arc::default(),
         }
     }
 
@@ -327,6 +331,66 @@ where
         let index = (random as usize) % tags.len();
         Ok(tags[index])
     }
+
+    /// Reserve an externally live tagged SPI.
+    ///
+    /// The supplied kind, tag, and shard must be the canonical metadata that
+    /// this allocator decodes from `value`. The operation is idempotent and
+    /// shared by every clone of this allocator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpsecLbError`] when the SPI does not belong to this allocator's
+    /// kind/layout/shard map or its metadata is inconsistent.
+    pub fn reserve(&self, spi: TaggedSpi) -> Result<bool, IpsecLbError> {
+        self.validate_tagged_spi(spi)?;
+        Ok(self.lock_reserved().insert(spi.value))
+    }
+
+    /// Release a reservation after the corresponding SA is no longer live.
+    ///
+    /// Returns `true` when a reservation existed. Canonical metadata is still
+    /// required so a stale or wrong-kind release cannot free another live SA's
+    /// exclusion by raw value alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpsecLbError`] when `spi` is not canonical for this allocator.
+    pub fn release(&self, spi: TaggedSpi) -> Result<bool, IpsecLbError> {
+        self.validate_tagged_spi(spi)?;
+        Ok(self.lock_reserved().remove(&spi.value))
+    }
+
+    /// Return whether a canonical tagged SPI is currently reserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpsecLbError`] when `spi` is not canonical for this allocator.
+    pub fn is_reserved(&self, spi: TaggedSpi) -> Result<bool, IpsecLbError> {
+        self.validate_tagged_spi(spi)?;
+        Ok(self.is_value_reserved(spi.value))
+    }
+
+    fn validate_tagged_spi(&self, spi: TaggedSpi) -> Result<(), IpsecLbError> {
+        let decoded = self.decode(spi.kind, spi.value)?;
+        if decoded.tag != spi.tag || decoded.shard != spi.shard {
+            return Err(IpsecLbError::invalid_config(
+                "tagged_spi",
+                "tag and shard metadata must match the encoded SPI value",
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_value_reserved(&self, value: u64) -> bool {
+        self.lock_reserved().contains(&value)
+    }
+
+    fn lock_reserved(&self) -> std::sync::MutexGuard<'_, BTreeSet<u64>> {
+        self.reserved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 impl<E> SpiAllocator for TaggedSpiAllocator<E>
@@ -341,6 +405,9 @@ where
         for _ in 0..MAX_ALLOCATION_ATTEMPTS {
             let random = self.random_low_bits()?;
             if let Ok(value) = self.layout.encode(tag, random) {
+                if self.is_value_reserved(value) {
+                    continue;
+                }
                 return Ok(TaggedSpi {
                     kind: request.kind,
                     value,
@@ -359,7 +426,7 @@ where
         for _ in 0..MAX_ALLOCATION_ATTEMPTS {
             let random = self.random_low_bits()?;
             if let Ok(value) = self.layout.encode(request.replaces.tag, random) {
-                if value == request.replaces.value {
+                if value == request.replaces.value || self.is_value_reserved(value) {
                     continue;
                 }
                 return Ok(TaggedSpi {
@@ -448,11 +515,139 @@ mod tests {
     }
 
     #[test]
+    fn allocation_and_rekey_redraw_past_reserved_spis() {
+        let layout = TaggedSpiLayout::new(SpiKind::ChildEsp, 8, 24).unwrap();
+        let entropy: Vec<u8> = (0..64).collect();
+        let probe =
+            TaggedSpiAllocator::new(layout, shard_set(), FixedEntropy::new(entropy.clone()));
+        let request = SpiAllocationRequest {
+            kind: SpiKind::ChildEsp,
+            shard: ShardId::new(1),
+        };
+        let blocked = probe.allocate(request).unwrap();
+
+        let allocator = TaggedSpiAllocator::new(layout, shard_set(), FixedEntropy::new(entropy));
+        assert!(allocator.reserve(blocked).unwrap());
+        let redrawn = allocator.allocate(request).unwrap();
+        assert_ne!(redrawn.value, blocked.value);
+
+        let rekey_entropy: Vec<u8> = (64..128).collect();
+        let rekey_probe = TaggedSpiAllocator::new(
+            layout,
+            shard_set(),
+            FixedEntropy::new(rekey_entropy.clone()),
+        );
+        let blocked_rekey = rekey_probe
+            .allocate_rekey(RekeyRequest { replaces: redrawn })
+            .unwrap();
+        let rekey_allocator =
+            TaggedSpiAllocator::new(layout, shard_set(), FixedEntropy::new(rekey_entropy));
+        assert!(rekey_allocator.reserve(blocked_rekey).unwrap());
+        let replacement = rekey_allocator
+            .allocate_rekey(RekeyRequest { replaces: redrawn })
+            .unwrap();
+        assert_ne!(replacement.value, blocked_rekey.value);
+        assert_eq!(replacement.tag, redrawn.tag);
+        assert_eq!(replacement.shard, redrawn.shard);
+    }
+
+    #[test]
+    fn cloned_allocators_share_idempotent_reservations_and_release() {
+        let layout = TaggedSpiLayout::new(SpiKind::ChildEsp, 8, 24).unwrap();
+        let allocator =
+            TaggedSpiAllocator::new(layout, shard_set(), FixedEntropy::new((0..64).collect()));
+        let spi = allocator
+            .allocate(SpiAllocationRequest {
+                kind: SpiKind::ChildEsp,
+                shard: ShardId::new(2),
+            })
+            .unwrap();
+        let clone = allocator.clone();
+
+        assert!(clone.reserve(spi).unwrap());
+        assert!(!allocator.reserve(spi).unwrap());
+        assert!(allocator.is_reserved(spi).unwrap());
+        assert!(allocator.release(spi).unwrap());
+        assert!(!clone.is_reserved(spi).unwrap());
+        assert!(!clone.release(spi).unwrap());
+    }
+
+    #[test]
+    fn reservation_rejects_wrong_kind_and_noncanonical_metadata() {
+        let layout = TaggedSpiLayout::new(SpiKind::ChildEsp, 8, 24).unwrap();
+        let allocator =
+            TaggedSpiAllocator::new(layout, shard_set(), FixedEntropy::new((0..64).collect()));
+        let spi = allocator
+            .allocate(SpiAllocationRequest {
+                kind: SpiKind::ChildEsp,
+                shard: ShardId::new(1),
+            })
+            .unwrap();
+
+        let wrong_kind = TaggedSpi {
+            kind: SpiKind::Ikev2Responder,
+            ..spi
+        };
+        assert!(matches!(
+            allocator.reserve(wrong_kind),
+            Err(IpsecLbError::SpiOutOfRange)
+        ));
+
+        let wrong_tag = TaggedSpi {
+            tag: spi.tag ^ 1,
+            ..spi
+        };
+        assert!(matches!(
+            allocator.reserve(wrong_tag),
+            Err(IpsecLbError::InvalidConfig {
+                field: "tagged_spi",
+                ..
+            })
+        ));
+
+        let wrong_shard = TaggedSpi {
+            shard: ShardId::new(u16::MAX),
+            ..spi
+        };
+        assert!(matches!(
+            allocator.reserve(wrong_shard),
+            Err(IpsecLbError::InvalidConfig {
+                field: "tagged_spi",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reserved_collision_exhausts_within_bounded_attempts() {
+        let layout = TaggedSpiLayout::new(SpiKind::ChildEsp, 8, 24).unwrap();
+        let entropy = vec![0x5a, 0xc3];
+        let probe =
+            TaggedSpiAllocator::new(layout, shard_set(), FixedEntropy::new(entropy.clone()));
+        let request = SpiAllocationRequest {
+            kind: SpiKind::ChildEsp,
+            shard: ShardId::new(1),
+        };
+        let blocked = probe.allocate(request).unwrap();
+        let allocator = TaggedSpiAllocator::new(layout, shard_set(), FixedEntropy::new(entropy));
+        allocator.reserve(blocked).unwrap();
+
+        assert_eq!(
+            allocator.allocate(request).unwrap_err(),
+            IpsecLbError::AllocationAttemptsExhausted
+        );
+    }
+
+    #[test]
     fn decode_rejects_zero_spi() {
         let layout = TaggedSpiLayout::new(SpiKind::ChildEsp, 8, 24).unwrap();
         let allocator = TaggedSpiAllocator::new(layout, shard_set(), FixedEntropy::new(vec![0x01]));
         assert!(matches!(
             allocator.decode(SpiKind::ChildEsp, 0).unwrap_err(),
+            IpsecLbError::SpiOutOfRange
+        ));
+        assert!(matches!(
+            allocator.decode(SpiKind::ChildEsp, 255).unwrap_err(),
             IpsecLbError::SpiOutOfRange
         ));
     }

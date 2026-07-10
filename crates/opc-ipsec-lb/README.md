@@ -6,6 +6,8 @@ This crate is the kernel-independent foundation for an ePDG/N3IWF/TWIF
 steer layer:
 
 - tagged SPI layout and allocation policy;
+- clone-shared tagged-SPI reservations for excluding HA-restored live SAs from
+  fresh and rekey allocation, with explicit release on SA retirement;
 - rendezvous selection for shard and `IKE_SA_INIT` bootstrap routing;
 - UDP/500 and UDP/4500 SWu classifier with RFC 3948 non-ESP marker handling;
 - stateless IKE cookie helper for edge DoS posture;
