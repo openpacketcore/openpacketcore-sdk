@@ -31,8 +31,8 @@ pub use measurement::{
 };
 pub use opc_proto_gtpu::GTPU_EXT_PDU_SESSION_CONTAINER;
 pub use reflector::{
-    GtpuReflector, ReflectorAction, ReflectorConfig, ReflectorPolicy, ReflectorSendReason,
-    ReflectorStats, RouteTarget,
+    GtpuReflector, MultiSessionReflectorConfig, ReflectorAction, ReflectorConfig, ReflectorPolicy,
+    ReflectorSendReason, ReflectorSession, ReflectorStats, RouteTarget, MAX_REFLECTOR_SESSIONS,
 };
 pub use traffic::{
     ContinuityObserver, GeneratedPacket, GtpuReturnDatagramOutcome, TrafficEngine, TrafficPlan,

@@ -10,6 +10,9 @@ use crate::gtpu::{
 use crate::measurement::echo_tpdu;
 use crate::DataplaneTestkitError;
 
+/// Hard upper bound for one reflector's configured session table.
+pub const MAX_REFLECTOR_SESSIONS: usize = 4_096;
+
 /// Target used by route-mode reflection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteTarget {
@@ -42,6 +45,38 @@ pub struct ReflectorConfig {
     /// Recovery IE restart counter used in Echo Response.
     pub recovery_counter: u8,
     /// Forwarding policy.
+    pub policy: ReflectorPolicy,
+}
+
+/// One uplink-to-downlink GTP-U session mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReflectorSession {
+    /// Local PGW/UPF-side TEID expected on the uplink G-PDU.
+    pub local_teid: u32,
+    /// Peer ePDG/gateway-side TEID stamped on the reflected downlink G-PDU.
+    pub peer_teid: u32,
+    /// Peer UDP socket receiving the reflected downlink G-PDU.
+    pub peer_addr: SocketAddr,
+}
+
+impl From<ReflectorConfig> for ReflectorSession {
+    fn from(config: ReflectorConfig) -> Self {
+        Self {
+            local_teid: config.local_teid,
+            peer_teid: config.peer_teid,
+            peer_addr: config.peer_addr,
+        }
+    }
+}
+
+/// Configuration for a bounded multi-session GTP-U reflector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiSessionReflectorConfig {
+    /// Maximum concurrently configured session mappings.
+    pub max_sessions: usize,
+    /// Recovery IE restart counter used in Echo Response.
+    pub recovery_counter: u8,
+    /// Forwarding policy shared by configured sessions.
     pub policy: ReflectorPolicy,
 }
 
@@ -97,9 +132,62 @@ pub enum ReflectorAction {
 /// In-memory GTP-U reflector/forwarder.
 #[derive(Debug, Clone)]
 pub struct GtpuReflector {
-    config: ReflectorConfig,
+    sessions: ReflectorSessions,
+    max_sessions: usize,
+    recovery_counter: u8,
+    policy: ReflectorPolicy,
     stats: ReflectorStats,
     next_error_sequence: u16,
+}
+
+#[derive(Debug, Clone)]
+enum ReflectorSessions {
+    Single(Option<ReflectorSession>),
+    Multiple(Vec<ReflectorSession>),
+}
+
+impl ReflectorSessions {
+    fn find(&self, local_teid: u32) -> Option<ReflectorSession> {
+        match self {
+            Self::Single(session) => session.filter(|session| session.local_teid == local_teid),
+            Self::Multiple(sessions) => sessions
+                .iter()
+                .copied()
+                .find(|session| session.local_teid == local_teid),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Single(session) => usize::from(session.is_some()),
+            Self::Multiple(sessions) => sessions.len(),
+        }
+    }
+
+    fn push(&mut self, session: ReflectorSession) {
+        match self {
+            Self::Single(slot) => *slot = Some(session),
+            Self::Multiple(sessions) => sessions.push(session),
+        }
+    }
+
+    fn remove(&mut self, local_teid: u32) -> Option<ReflectorSession> {
+        match self {
+            Self::Single(session) => {
+                if session.is_some_and(|session| session.local_teid == local_teid) {
+                    session.take()
+                } else {
+                    None
+                }
+            }
+            Self::Multiple(sessions) => {
+                let index = sessions
+                    .iter()
+                    .position(|session| session.local_teid == local_teid)?;
+                Some(sessions.swap_remove(index))
+            }
+        }
+    }
 }
 
 impl GtpuReflector {
@@ -107,7 +195,14 @@ impl GtpuReflector {
     #[must_use]
     pub const fn new(config: ReflectorConfig) -> Self {
         Self {
-            config,
+            sessions: ReflectorSessions::Single(Some(ReflectorSession {
+                local_teid: config.local_teid,
+                peer_teid: config.peer_teid,
+                peer_addr: config.peer_addr,
+            })),
+            max_sessions: 1,
+            recovery_counter: config.recovery_counter,
+            policy: config.policy,
             stats: ReflectorStats {
                 gpdu_received: 0,
                 gpdu_forwarded: 0,
@@ -118,6 +213,84 @@ impl GtpuReflector {
             },
             next_error_sequence: 1,
         }
+    }
+
+    /// Create an empty bounded multi-session reflector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataplaneTestkitError::InvalidReflectorCapacity`] when the
+    /// configured capacity is zero or above [`MAX_REFLECTOR_SESSIONS`].
+    pub fn new_multi(config: MultiSessionReflectorConfig) -> Result<Self, DataplaneTestkitError> {
+        if config.max_sessions == 0 || config.max_sessions > MAX_REFLECTOR_SESSIONS {
+            return Err(DataplaneTestkitError::InvalidReflectorCapacity);
+        }
+        Ok(Self {
+            sessions: ReflectorSessions::Multiple(Vec::new()),
+            max_sessions: config.max_sessions,
+            recovery_counter: config.recovery_counter,
+            policy: config.policy,
+            stats: ReflectorStats::default(),
+            next_error_sequence: 1,
+        })
+    }
+
+    /// Create a multi-session reflector and register an initial mapping set.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same capacity/session errors as [`Self::new_multi`] and
+    /// [`Self::register_session`]. No partially constructed reflector escapes
+    /// on failure.
+    pub fn with_sessions(
+        config: MultiSessionReflectorConfig,
+        sessions: impl IntoIterator<Item = ReflectorSession>,
+    ) -> Result<Self, DataplaneTestkitError> {
+        let mut reflector = Self::new_multi(config)?;
+        for session in sessions {
+            reflector.register_session(session)?;
+        }
+        Ok(reflector)
+    }
+
+    /// Register one uplink TEID to downlink peer mapping.
+    ///
+    /// Re-registering the exact mapping is idempotent and returns `false`.
+    /// Reusing a local TEID with different peer metadata fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-session, conflicting-session, or capacity error.
+    pub fn register_session(
+        &mut self,
+        session: ReflectorSession,
+    ) -> Result<bool, DataplaneTestkitError> {
+        validate_session(session)?;
+        if let Some(existing) = self.sessions.find(session.local_teid) {
+            return if existing == session {
+                Ok(false)
+            } else {
+                Err(DataplaneTestkitError::ReflectorSessionConflict)
+            };
+        }
+        if self.sessions.len() >= self.max_sessions {
+            return Err(DataplaneTestkitError::ReflectorSessionCapacityExceeded);
+        }
+        self.sessions.push(session);
+        Ok(true)
+    }
+
+    /// Remove a mapping by its local uplink TEID.
+    ///
+    /// Returns the removed mapping, or `None` when it was not configured.
+    pub fn remove_session(&mut self, local_teid: u32) -> Option<ReflectorSession> {
+        self.sessions.remove(local_teid)
+    }
+
+    /// Return the number of currently configured session mappings.
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
     }
 
     /// Return current reflector counters.
@@ -142,7 +315,7 @@ impl GtpuReflector {
 
         match message.header.message_type {
             GTPU_MSG_GPDU => {
-                if message.header.teid != self.config.local_teid {
+                let Some(session) = self.sessions.find(message.header.teid) else {
                     self.stats.error_indications_sent =
                         self.stats.error_indications_sent.saturating_add(1);
                     let sequence = self.take_error_sequence();
@@ -153,9 +326,9 @@ impl GtpuReflector {
                         packet,
                         reason: ReflectorSendReason::ErrorIndication,
                     });
-                }
+                };
                 self.stats.gpdu_received = self.stats.gpdu_received.saturating_add(1);
-                self.handle_gpdu(message.payload.as_ref())
+                self.handle_gpdu(session, message.payload.as_ref())
             }
             GTPU_MSG_ECHO_REQUEST => {
                 if message.header.teid != 0 {
@@ -172,7 +345,7 @@ impl GtpuReflector {
                 };
                 self.stats.echo_requests_answered =
                     self.stats.echo_requests_answered.saturating_add(1);
-                let packet = encode_echo_response(sequence, self.config.recovery_counter)?;
+                let packet = encode_echo_response(sequence, self.recovery_counter)?;
                 Ok(ReflectorAction::Send {
                     destination: source,
                     packet,
@@ -200,14 +373,18 @@ impl GtpuReflector {
         }
     }
 
-    fn handle_gpdu(&mut self, tpdu: &[u8]) -> Result<ReflectorAction, DataplaneTestkitError> {
-        match self.config.policy {
+    fn handle_gpdu(
+        &mut self,
+        session: ReflectorSession,
+        tpdu: &[u8],
+    ) -> Result<ReflectorAction, DataplaneTestkitError> {
+        match self.policy {
             ReflectorPolicy::Echo => {
                 let echoed = echo_tpdu(tpdu)?;
-                let packet = encode_gpdu(self.config.peer_teid, &echoed)?;
+                let packet = encode_gpdu(session.peer_teid, &echoed)?;
                 self.stats.gpdu_forwarded = self.stats.gpdu_forwarded.saturating_add(1);
                 Ok(ReflectorAction::Send {
-                    destination: self.config.peer_addr,
+                    destination: session.peer_addr,
                     packet,
                     reason: ReflectorSendReason::ReflectedGpdu,
                 })
@@ -235,6 +412,13 @@ impl GtpuReflector {
         self.next_error_sequence = self.next_error_sequence.wrapping_add(1).max(1);
         sequence
     }
+}
+
+fn validate_session(session: ReflectorSession) -> Result<(), DataplaneTestkitError> {
+    if session.local_teid == 0 || session.peer_teid == 0 || session.peer_addr.port() == 0 {
+        return Err(DataplaneTestkitError::InvalidReflectorSession);
+    }
+    Ok(())
 }
 
 fn error_indication_payload(offending_teid: u32, peer_ip: IpAddr) -> Vec<u8> {
