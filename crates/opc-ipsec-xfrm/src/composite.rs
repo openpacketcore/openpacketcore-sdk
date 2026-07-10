@@ -648,6 +648,7 @@ mod tests {
                 protocol: 50,
             },
             source_address: ipv4(10, 0, 0, 1),
+            request_id: None,
             auth: None,
             crypt: None,
             aead: None,
@@ -670,6 +671,7 @@ mod tests {
             templates: vec![XfrmTemplate {
                 id: sa_parameters().id,
                 source_address: ipv4(10, 0, 0, 1),
+                request_id: None,
                 mode: XfrmMode::Tunnel,
             }],
             mark: None,

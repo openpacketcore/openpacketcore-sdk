@@ -18,7 +18,8 @@ use opc_proto_ikev2::{
 use crate::{
     AeadAlgorithm, Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress,
     KeyMaterial, LifetimeConfig, PolicyParameters, SaParameters, XfrmAction,
-    XfrmCompositeInstallRequest, XfrmDirection, XfrmId, XfrmMode, XfrmSelector, XfrmTemplate,
+    XfrmCompositeInstallRequest, XfrmDirection, XfrmId, XfrmMode, XfrmRequestId, XfrmSelector,
+    XfrmTemplate,
 };
 
 /// IKEv2 Security Protocol ID for ESP proposals.
@@ -323,6 +324,32 @@ pub fn derive_child_sa_xfrm_keys(
 pub fn build_xfrm_requests_from_ikev2_child_sa(
     request: &Ikev2ChildSaXfrmRequest,
 ) -> Result<Ikev2ChildSaXfrmRequests, Ikev2ChildSaXfrmError> {
+    build_xfrm_requests_from_ikev2_child_sa_inner(request, None)
+}
+
+/// Build Child-SA installs whose policies match a shared XFRM request ID.
+///
+/// Both SA states carry `request_id`, while their policy templates use a
+/// wildcard SPI and the same non-zero request ID. Reusing the request ID for an
+/// old and replacement Child SA lets one selector policy admit both SPIs during
+/// RFC 7296 make-before-break overlap. The caller owns request-ID allocation and
+/// retirement; unrelated live Child SAs must not share one.
+///
+/// # Errors
+///
+/// Returns [`Ikev2ChildSaXfrmError`] under the same validation rules as
+/// [`build_xfrm_requests_from_ikev2_child_sa`].
+pub fn build_xfrm_requests_from_ikev2_child_sa_with_request_id(
+    request: &Ikev2ChildSaXfrmRequest,
+    request_id: XfrmRequestId,
+) -> Result<Ikev2ChildSaXfrmRequests, Ikev2ChildSaXfrmError> {
+    build_xfrm_requests_from_ikev2_child_sa_inner(request, Some(request_id))
+}
+
+fn build_xfrm_requests_from_ikev2_child_sa_inner(
+    request: &Ikev2ChildSaXfrmRequest,
+    request_id: Option<XfrmRequestId>,
+) -> Result<Ikev2ChildSaXfrmRequests, Ikev2ChildSaXfrmError> {
     validate_request(request)?;
 
     let initiator_spi = initiator_spi_u32(&request.negotiation.initiator_spi)?;
@@ -382,6 +409,7 @@ pub fn build_xfrm_requests_from_ikev2_child_sa(
             selector: inbound_selector.clone(),
             id: inbound_id,
             source_address: request.remote_tunnel_address,
+            request_id,
             auth: request.inbound.auth.clone(),
             crypt: request.inbound.crypt.clone(),
             aead: request.inbound.aead.clone(),
@@ -399,6 +427,7 @@ pub fn build_xfrm_requests_from_ikev2_child_sa(
             selector: outbound_selector.clone(),
             id: outbound_id,
             source_address: request.local_tunnel_address,
+            request_id,
             auth: request.outbound.auth.clone(),
             crypt: request.outbound.crypt.clone(),
             aead: request.outbound.aead.clone(),
@@ -418,8 +447,9 @@ pub fn build_xfrm_requests_from_ikev2_child_sa(
             action: XfrmAction::Allow,
             priority: request.policy_priority,
             templates: vec![XfrmTemplate {
-                id: inbound_id,
+                id: policy_template_id(inbound_id, request_id),
                 source_address: request.remote_tunnel_address,
+                request_id,
                 mode: request.mode,
             }],
             mark: None,
@@ -433,8 +463,9 @@ pub fn build_xfrm_requests_from_ikev2_child_sa(
             action: XfrmAction::Allow,
             priority: request.policy_priority,
             templates: vec![XfrmTemplate {
-                id: outbound_id,
+                id: policy_template_id(outbound_id, request_id),
                 source_address: request.local_tunnel_address,
+                request_id,
                 mode: request.mode,
             }],
             mark: None,
@@ -448,6 +479,13 @@ pub fn build_xfrm_requests_from_ikev2_child_sa(
         inbound_policy,
         outbound_policy,
     })
+}
+
+fn policy_template_id(sa_id: XfrmId, request_id: Option<XfrmRequestId>) -> XfrmId {
+    XfrmId {
+        spi: if request_id.is_some() { 0 } else { sa_id.spi },
+        ..sa_id
+    }
 }
 
 fn child_sa_xfrm_keys_from_direction(
@@ -811,7 +849,16 @@ mod tests {
             ipv4(10, 20, 0, 20)
         );
         assert_eq!(built.inbound_sa.parameters.selector.protocol, 17);
+        assert_eq!(built.inbound_sa.parameters.request_id, None);
         assert_eq!(built.inbound_policy.parameters.direction, XfrmDirection::In);
+        assert_eq!(
+            built.inbound_policy.parameters.templates[0].id.spi,
+            0x5566_7788
+        );
+        assert_eq!(
+            built.inbound_policy.parameters.templates[0].request_id,
+            None
+        );
 
         assert_eq!(
             built.outbound_sa.parameters.id.destination,
@@ -838,6 +885,35 @@ mod tests {
         let composites = built.composite_installs();
         assert_eq!(composites[0].sa.parameters.id.spi, 0x5566_7788);
         assert_eq!(composites[1].sa.parameters.id.spi, 0x1122_3344);
+    }
+
+    #[test]
+    fn shared_request_id_builds_one_unpinned_policy_contract_for_rekey_overlap() {
+        assert!(XfrmRequestId::new(0).is_none());
+        let request_id = XfrmRequestId::new(7_001).expect("nonzero request ID");
+        let old_request = request();
+        let mut new_request = request();
+        new_request.responder_spi = 0x99aa_bbcc;
+        new_request.negotiation.initiator_spi = 0xddee_ff01_u32.to_be_bytes().to_vec();
+
+        let old = build_xfrm_requests_from_ikev2_child_sa_with_request_id(&old_request, request_id)
+            .expect("old Child SA");
+        let new = build_xfrm_requests_from_ikev2_child_sa_with_request_id(&new_request, request_id)
+            .expect("replacement Child SA");
+
+        assert_ne!(old.inbound_sa.parameters.id, new.inbound_sa.parameters.id);
+        assert_ne!(old.outbound_sa.parameters.id, new.outbound_sa.parameters.id);
+        assert_eq!(old.inbound_sa.parameters.request_id, Some(request_id));
+        assert_eq!(new.inbound_sa.parameters.request_id, Some(request_id));
+        assert_eq!(old.outbound_sa.parameters.request_id, Some(request_id));
+        assert_eq!(new.outbound_sa.parameters.request_id, Some(request_id));
+
+        assert_eq!(old.inbound_policy, new.inbound_policy);
+        assert_eq!(old.outbound_policy, new.outbound_policy);
+        for policy in [&old.inbound_policy, &old.outbound_policy] {
+            assert_eq!(policy.parameters.templates[0].id.spi, 0);
+            assert_eq!(policy.parameters.templates[0].request_id, Some(request_id));
+        }
     }
 
     #[test]

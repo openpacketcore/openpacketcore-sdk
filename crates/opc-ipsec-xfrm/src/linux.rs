@@ -23,8 +23,8 @@ use crate::{
     LifetimeCurrent, PolicyParameters, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest,
     RemovePolicyRequest, RemoveSaRequest, SaParameters, SaReplayState, SaState, SaStatistics,
     SpiAllocation, UdpEncap, XfrmAction, XfrmBackend, XfrmBackendKind, XfrmCapability,
-    XfrmDirection, XfrmError, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
-    XFRM_AEAD_RFC4106_GCM_AES,
+    XfrmDirection, XfrmError, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmRequestId, XfrmSelector,
+    XfrmTemplate, XFRM_AEAD_RFC4106_GCM_AES,
 };
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -532,6 +532,7 @@ fn encode_alloc_spi_request(request: AllocateSpiRequest) -> Result<SensitiveBuff
             protocol: request.protocol,
         },
         source_address: request.destination,
+        request_id: None,
         auth: None,
         crypt: None,
         aead: None,
@@ -584,7 +585,10 @@ fn encode_sa_info_inner(
             .map(|state| state.inbound_sequence)
             .unwrap_or(0),
     );
-    push_u32_ne(&mut out, 0);
+    push_u32_ne(
+        &mut out,
+        parameters.request_id.map_or(0, XfrmRequestId::get),
+    );
     push_u16_ne(&mut out, family);
     push_u8(&mut out, encode_mode(parameters.mode));
     push_u8(
@@ -700,7 +704,7 @@ fn encode_template(out: &mut Vec<u8>, template: &XfrmTemplate) -> Result<(), Xfr
     push_u16_ne(out, address_family(template.id.destination));
     out.resize(start + 28, 0);
     encode_address(out, template.source_address);
-    push_u32_ne(out, 0);
+    push_u32_ne(out, template.request_id.map_or(0, XfrmRequestId::get));
     push_u8(out, encode_mode(template.mode));
     push_u8(out, 0);
     push_u8(out, 0);
@@ -989,6 +993,7 @@ fn parse_sa_state(payload: &[u8]) -> Result<SaState, XfrmError> {
     let lifetime_current = decode_lifetime_current(payload, 160)?;
     let statistics = decode_statistics(payload, 192)?;
     let sequence = read_u32_ne(payload, 204)?;
+    let request_id = XfrmRequestId::new(read_u32_ne(payload, 208)?);
     let mode = decode_mode(read_u8(payload, 214)?)?;
     let replay_window = u32::from(read_u8(payload, 215)?);
     let flags = read_u8(payload, 216)?;
@@ -1006,6 +1011,7 @@ fn parse_sa_state(payload: &[u8]) -> Result<SaState, XfrmError> {
             protocol,
         },
         source_address,
+        request_id,
         mode,
         replay_window: replay_state.replay_window.max(replay_window),
         replay_state,
@@ -1247,10 +1253,10 @@ fn validate_policy_parameters(parameters: &PolicyParameters) -> Result<(), XfrmE
         ));
     }
     for template in &parameters.templates {
-        if template.id.spi == 0 {
+        if template.id.spi == 0 && template.request_id.is_none() {
             return Err(XfrmError::invalid_config(
-                "template.spi",
-                "spi must be nonzero",
+                "template.request_id",
+                "wildcard SPI requires a nonzero request ID",
             ));
         }
         if template.id.protocol == 0 {
@@ -1681,6 +1687,7 @@ mod tests {
                 protocol: 50,
             },
             source_address: ipv4(10, 0, 0, 1),
+            request_id: None,
             auth: Some((
                 AuthAlgorithm::hmac_sha256(96),
                 KeyMaterial::new(vec![0xab; 32]),
@@ -1706,6 +1713,7 @@ mod tests {
             templates: vec![XfrmTemplate {
                 id: sa_parameters().id,
                 source_address: ipv4(10, 0, 0, 1),
+                request_id: None,
                 mode: XfrmMode::Tunnel,
             }],
             mark: None,
@@ -1993,6 +2001,43 @@ mod tests {
     }
 
     #[test]
+    fn encodes_request_id_on_sa_and_wildcard_policy_template() {
+        let request_id = XfrmRequestId::new(7_001).expect("nonzero request ID");
+        let mut sa = sa_parameters();
+        sa.request_id = Some(request_id);
+        let sa_body = encode_sa_info(&sa).expect("SA encodes");
+        assert_eq!(read_u32_ne(&sa_body, 208).expect("SA request ID"), 7_001);
+
+        let mut policy = policy_parameters();
+        policy.templates[0].id.spi = 0;
+        policy.templates[0].request_id = Some(request_id);
+        let policy_body = encode_policy_info(&policy).expect("policy encodes");
+        let template = route_attr_payload_from(&policy_body, XFRM_USER_POLICY_INFO_LEN, XFRMA_TMPL)
+            .expect("template attr");
+        assert_eq!(read_u32_be(template, 16).expect("wildcard SPI"), 0);
+        assert_eq!(
+            read_u32_ne(template, 44).expect("template request ID"),
+            7_001
+        );
+    }
+
+    #[test]
+    fn rejects_wildcard_policy_template_without_request_id() {
+        let mut policy = policy_parameters();
+        policy.templates[0].id.spi = 0;
+
+        let error = encode_policy_info(&policy).expect_err("unbound wildcard must fail closed");
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "template.request_id",
+                reason: "wildcard SPI requires a nonzero request ID"
+            }
+        ));
+    }
+
+    #[test]
     fn encodes_policy_template_algorithm_masks_as_all_algorithms() {
         let body = encode_policy_info(&policy_parameters()).unwrap();
         let templates = route_attr_payload_from(&body, XFRM_USER_POLICY_INFO_LEN, XFRMA_TMPL)
@@ -2017,6 +2062,7 @@ mod tests {
     #[test]
     fn parses_getsa_response_with_esn_replay_state() {
         let mut params = sa_parameters();
+        params.request_id = XfrmRequestId::new(7_001);
         params.replay_window = 64;
         params.replay_state = Some(SaReplayState {
             esn: true,
@@ -2037,6 +2083,7 @@ mod tests {
         assert_eq!(state.mode, XfrmMode::Tunnel);
         assert_eq!(state.replay_window, 64);
         assert_eq!(state.replay_state, params.replay_state.unwrap());
+        assert_eq!(state.request_id, XfrmRequestId::new(7_001));
     }
 
     #[test]
