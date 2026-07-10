@@ -2367,6 +2367,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-mgmt-command"
+version = "0.2.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "opc-mgmt-errors"
 version = "0.2.0"
 dependencies = [

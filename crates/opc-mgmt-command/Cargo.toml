@@ -1,0 +1,19 @@
+[package]
+name = "opc-mgmt-command"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Transport-neutral operational command catalog and validation contracts for OpenPacketCore CNFs"
+readme = "README.md"
+documentation = "https://docs.rs/opc-mgmt-command"
+keywords = ["5g", "cnf", "cli", "gnmi", "netconf"]
+categories = ["network-programming"]
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

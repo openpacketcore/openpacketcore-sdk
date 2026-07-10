@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- RFC 014 and `opc-mgmt-command`: the model-driven interactive operational
+  console contract plus a transport-neutral, bounded command catalog with
+  schema-validated reads, subscriptions, allowlisted actions, presentation
+  metadata, and deterministic registry freeze.
 - `opc-nacm`/`opc-nacm-config`/`opc-mgmt-authz`/`opc-persist`/
   `opc-mgmt-principal`: RFC 8341-style NACM rule-lists scoped to signed
   principal groups, principal-aware policy selection, a typed `/nacm` datastore

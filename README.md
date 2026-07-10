@@ -86,6 +86,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | [`opc-mgmt-audit`](crates/opc-mgmt-audit/) | Management operation audit event model and pluggable audit sink for allowed, failed, and denied requests. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-mgmt-errors`](crates/opc-mgmt-errors/) | Transport-neutral management status taxonomy and gNMI/NETCONF error mappings. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-mgmt-limits`](crates/opc-mgmt-limits/) | Shared fail-closed input limits for management protocol parsers and sessions. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-mgmt-command`](crates/opc-mgmt-command/) | Transport-neutral operational command catalog, bounded grammar, schema/action validation, and deterministic registry freeze. | [RFC 014](docs/rfc/014-interactive-operational-console.md) |
 | [`opc-mgmt-opstate`](crates/opc-mgmt-opstate/) | CNF-supplied operational-state provider contract for gNMI `Get`/`Subscribe` and NETCONF `<get>`. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-mgmt-transport`](crates/opc-mgmt-transport/) | Fail-closed mTLS and plaintext-policy bootstrap for management listeners. | [RFC 003](docs/rfc/003-security-substrate.md) |
 | [`opc-gnmi-server`](crates/opc-gnmi-server/) | Capability-honest gNMI server foundation with schema-backed Capabilities/Get/Set/Subscribe over SDK-managed mTLS. | [gNMI spec](docs/design/opc-gnmi-server-spec.md) |
