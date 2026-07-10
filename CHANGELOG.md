@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-ipsec-lb`: `SessionStoreOwnershipFencer`, a production ownership
+  promotion adapter that acquires the session-store lease, commits a
+  generation-guarded owner change, and projects the committed store fence into
+  the re-pin grant; production HA wiring requires a majority-committing store.
 - RFC 014 and `opc-mgmt-command`: the model-driven interactive operational
   console contract plus a transport-neutral, bounded command catalog with
   schema-validated reads, subscriptions, allowlisted actions, presentation
@@ -64,11 +68,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed fuzz corpora for the GTP-U, NAS, Diameter, and IKEv2 targets.
 
 ### Changed
+- **BREAKING — `opc-ipsec-lb`:** same-SPI failover callers must migrate
+  `AntiReplayResume` struct literals to either `ExactWindowRestore` or
+  `BoundedReopening`, rename the checkpoint field to
+  `checkpointed_send_iv_next`, and supply protocol-typed
+  `send_iv_forward_jump` evidence. ESP ESN counter-mode evidence must include
+  the caller-attested maximum peer receive-sequence lag; IKE IV64 evidence is
+  unchanged. Custom `OwnershipFencer` implementations must support exact
+  retry-proof validation and read-only committed-grant recovery. Re-pin
+  requests now carry a deployment-unique transition ID and the exact
+  predecessor fence; custom `OwnershipSource` implementations must return an
+  authoritative SA owner/fence snapshot. `RePinCoordinator` now also requires
+  an `OwnershipSource` and returns `RePinError`. Its recovery partial is
+  intentionally single-use and no longer `Clone`; retain and replay the
+  original request after cancellation, or pass a returned partial to
+  `RePinCoordinator::retry`. Identical steering installs and re-pin audit
+  events are now required to be idempotent so ambiguous acknowledgements
+  converge without duplicate side effects.
+- **BREAKING — `opc-ipsec-lb`:** session-store ownership records must use the
+  exact resolver key, `AuthoritativeSession` class and `ipsec-lb-ownership`
+  state/key types, a non-zero fence, no expiry, a valid `OwnerId`, and a
+  plaintext payload. Birth/pre-transition records use an empty payload;
+  promoted records carry the SDK's versioned transition ID and request
+  fingerprint metadata. Existing TTL-bearing records and records with any
+  other payload shape must be migrated before adopting the stricter
+  source/fencer boundary.
 - `opc-proto-pfcp` graduated from experimental to publishable
   (`publish = true`); moved from the held-experimental tier to the publishable
   tier in `CONTRIBUTING.md`.
 
 ### Security
+- `opc-ipsec-lb`: require an RFC 6311-style outbound IV forward-jump for both
+  persisted and live-mirrored same-SPI failover state, with protocol-matched
+  64-bit counter evidence, explicit ESP peer receive-lag bounds, checked
+  RFC 4303 ESN reconstruction arithmetic, non-zero resumed SA identifiers,
+  exact restored-counter validation, and SA-to-steering-key binding before
+  ownership is mutated.
 - `opc-sbi`: bind the validated JWT-SVID to the mTLS peer identity. The
   validator now rejects a token whose subject does not match the transport
   peer (`TokenBindingMismatch`) and, in production, a request that carries no

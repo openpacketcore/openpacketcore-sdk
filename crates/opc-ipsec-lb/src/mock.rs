@@ -12,7 +12,11 @@ use crate::model::{
 use crate::ports::{
     OwnershipFencer, OwnershipSource, RePinAuditSink, SteeringBackend, VipAdvertiser,
 };
-use crate::repin::{OwnershipFence, OwnershipFenceGrant, OwnershipFenceRequest, RePinAuditEvent};
+use crate::repin::{
+    validate_sa_identifier, OwnershipFence, OwnershipFenceGrant, OwnershipFenceRequest,
+    OwnershipRetryProof, OwnershipSnapshot, OwnershipTransitionFingerprint, OwnershipTransitionId,
+    RePinAuditEvent,
+};
 
 /// Recorded steering operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +40,8 @@ struct MockSteeringState {
     rules: BTreeSet<SteeringRuleOrder>,
     operations: Vec<MockSteeringOperation>,
     failure: Option<IpsecLbError>,
+    install_attempts: usize,
+    install_failure_on_call: Option<(usize, IpsecLbError)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -45,6 +51,14 @@ struct SteeringRuleOrder {
     key_tag: u8,
     key_value_hi: u64,
     key_value_lo: u64,
+}
+
+impl SteeringRuleOrder {
+    const fn same_steer_key(self, other: Self) -> bool {
+        self.key_tag == other.key_tag
+            && self.key_value_hi == other.key_value_hi
+            && self.key_value_lo == other.key_value_lo
+    }
 }
 
 impl From<SteeringRule> for SteeringRuleOrder {
@@ -83,6 +97,8 @@ impl MockSteeringBackend {
                 rules: BTreeSet::new(),
                 operations: Vec::new(),
                 failure: None,
+                install_attempts: 0,
+                install_failure_on_call: None,
             })),
         }
     }
@@ -94,6 +110,45 @@ impl MockSteeringBackend {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.failure = Some(failure);
+    }
+
+    /// Clear the persistent operation failure.
+    pub fn clear_failure(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.failure = None;
+    }
+
+    /// Fail exactly the numbered install call, counting from one.
+    pub fn fail_install_on_call(
+        &self,
+        call: usize,
+        failure: IpsecLbError,
+    ) -> Result<(), IpsecLbError> {
+        if call == 0 {
+            return Err(IpsecLbError::invalid_config(
+                "call",
+                "mock failure call must be non-zero",
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.install_failure_on_call = Some((call, failure));
+        Ok(())
+    }
+
+    /// Return the number of attempted rule installations.
+    #[must_use]
+    pub fn install_attempts(&self) -> usize {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.install_attempts
     }
 
     /// Return recorded operations.
@@ -120,12 +175,31 @@ impl SteeringBackend for MockSteeringBackend {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.install_attempts = state.install_attempts.saturating_add(1);
+        let ordered_rule = rule.into();
+        if state.rules.contains(&ordered_rule) {
+            return Ok(());
+        }
+        if state
+            .rules
+            .iter()
+            .any(|existing| existing.same_steer_key(ordered_rule))
+        {
+            return Err(IpsecLbError::AlreadyExists);
+        }
         if let Some(failure) = &state.failure {
             return Err(failure.clone());
         }
-        if !state.rules.insert(rule.into()) {
-            return Err(IpsecLbError::AlreadyExists);
+        if state
+            .install_failure_on_call
+            .as_ref()
+            .is_some_and(|(call, _)| *call == state.install_attempts)
+        {
+            if let Some((_, failure)) = state.install_failure_on_call.take() {
+                return Err(failure);
+            }
         }
+        state.rules.insert(ordered_rule);
         state.operations.push(MockSteeringOperation::Install(rule));
         Ok(())
     }
@@ -264,7 +338,7 @@ pub struct MockOwnershipSource {
 #[derive(Debug, Default)]
 struct MockOwnershipState {
     shard_owners: BTreeMap<ShardId, ClusterNode>,
-    sa_owners: BTreeMap<SaId, ClusterNode>,
+    sa_owners: BTreeMap<SaId, OwnershipSnapshot>,
 }
 
 impl MockOwnershipSource {
@@ -279,11 +353,19 @@ impl MockOwnershipSource {
 
     /// Set an SA owner.
     pub fn set_sa_owner(&self, sa: SaId, owner: ClusterNode) {
+        self.set_sa_ownership(
+            sa,
+            OwnershipSnapshot::new(owner, OwnershipFence::new(1).unwrap()),
+        );
+    }
+
+    /// Set an authoritative SA owner and fence snapshot.
+    pub fn set_sa_ownership(&self, sa: SaId, snapshot: OwnershipSnapshot) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.sa_owners.insert(sa, owner);
+        state.sa_owners.insert(sa, snapshot);
     }
 }
 
@@ -297,7 +379,7 @@ impl OwnershipSource for MockOwnershipSource {
         Ok(state.shard_owners.get(&shard).cloned())
     }
 
-    async fn sa_owner(&self, sa: SaId) -> Result<Option<ClusterNode>, IpsecLbError> {
+    async fn sa_ownership(&self, sa: SaId) -> Result<Option<OwnershipSnapshot>, IpsecLbError> {
         let state = self
             .state
             .lock()
@@ -314,11 +396,19 @@ pub struct MockOwnershipFencer {
 
 #[derive(Debug)]
 struct MockOwnershipFenceState {
-    owners: BTreeMap<SaId, (ClusterNode, OwnershipFence)>,
+    owners: BTreeMap<SaId, MockOwnershipEntry>,
     operations: Vec<OwnershipFenceRequest>,
+    recovery_attempts: usize,
+    retry_validation_attempts: usize,
     next_fence: u64,
     failure: Option<IpsecLbError>,
 }
+
+type MockOwnershipEntry = (
+    ClusterNode,
+    OwnershipFence,
+    Option<(OwnershipTransitionId, OwnershipTransitionFingerprint)>,
+);
 
 impl MockOwnershipFencer {
     /// Build a mock fencer.
@@ -328,6 +418,8 @@ impl MockOwnershipFencer {
             state: Arc::new(Mutex::new(MockOwnershipFenceState {
                 owners: BTreeMap::new(),
                 operations: Vec::new(),
+                recovery_attempts: 0,
+                retry_validation_attempts: 0,
                 next_fence: 2,
                 failure: None,
             })),
@@ -342,7 +434,7 @@ impl MockOwnershipFencer {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state
             .owners
-            .insert(sa, (owner, OwnershipFence::new(1).unwrap()));
+            .insert(sa, (owner, OwnershipFence::new(1).unwrap(), None));
         state.next_fence = state.next_fence.max(2);
     }
 
@@ -353,7 +445,7 @@ impl MockOwnershipFencer {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.owners.get(&sa).map(|(owner, _)| owner.clone())
+        state.owners.get(&sa).map(|(owner, _, _)| owner.clone())
     }
 
     /// Return recorded fence operations.
@@ -366,7 +458,27 @@ impl MockOwnershipFencer {
         state.operations.clone()
     }
 
-    /// Inject a failure for future fence operations.
+    /// Return the number of authoritative grant-recovery reads.
+    #[must_use]
+    pub fn recovery_attempts(&self) -> usize {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.recovery_attempts
+    }
+
+    /// Return the number of authoritative retry-proof validation attempts.
+    #[must_use]
+    pub fn retry_validation_attempts(&self) -> usize {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.retry_validation_attempts
+    }
+
+    /// Inject a failure for future ownership recovery, fencing, and proof reads.
     pub fn set_failure(&self, failure: IpsecLbError) {
         let mut state = self
             .state
@@ -384,10 +496,61 @@ impl Default for MockOwnershipFencer {
 
 #[async_trait]
 impl OwnershipFencer for MockOwnershipFencer {
+    async fn recover_fence_grant(
+        &self,
+        request: &OwnershipFenceRequest,
+    ) -> Result<Option<OwnershipFenceGrant>, IpsecLbError> {
+        validate_sa_identifier(request.sa)?;
+        if request.previous_owner == request.new_owner {
+            return Err(IpsecLbError::ownership_conflict(
+                "ownership recovery requires distinct owners",
+            ));
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.recovery_attempts = state.recovery_attempts.saturating_add(1);
+        if let Some(failure) = &state.failure {
+            return Err(failure.clone());
+        }
+        let Some((owner, fence, transition_id)) = state.owners.get(&request.sa) else {
+            return Err(IpsecLbError::NotFound);
+        };
+        if owner == &request.previous_owner {
+            return if *fence == request.previous_fence {
+                Ok(None)
+            } else {
+                Err(IpsecLbError::ownership_conflict(
+                    "expected previous owner holds a different authoritative fence",
+                ))
+            };
+        }
+        if owner != &request.new_owner {
+            return Err(IpsecLbError::ownership_conflict(
+                "neither requested owner holds the authoritative SA record",
+            ));
+        }
+        if *transition_id != Some((request.transition_id, request.fingerprint)) {
+            return Err(IpsecLbError::ownership_conflict(
+                "current owner was committed by a different ownership transition",
+            ));
+        }
+        Ok(Some(OwnershipFenceGrant {
+            sa: request.sa,
+            transition_id: request.transition_id,
+            fingerprint: request.fingerprint,
+            owner: owner.clone(),
+            fence: *fence,
+        }))
+    }
+
     async fn fence_sa_owner(
         &self,
         request: OwnershipFenceRequest,
     ) -> Result<OwnershipFenceGrant, IpsecLbError> {
+        validate_sa_identifier(request.sa)?;
         let mut state = self
             .state
             .lock()
@@ -395,7 +558,9 @@ impl OwnershipFencer for MockOwnershipFencer {
         if let Some(failure) = &state.failure {
             return Err(failure.clone());
         }
-        let Some((current_owner, _current_fence)) = state.owners.get(&request.sa) else {
+        let Some((current_owner, current_fence, _current_transition)) =
+            state.owners.get(&request.sa)
+        else {
             return Err(IpsecLbError::NotFound);
         };
         if *current_owner != request.previous_owner {
@@ -403,20 +568,56 @@ impl OwnershipFencer for MockOwnershipFencer {
                 "expected previous owner does not hold the SA",
             ));
         }
+        if *current_fence != request.previous_fence {
+            return Err(IpsecLbError::ownership_conflict(
+                "expected previous owner holds a different authoritative fence",
+            ));
+        }
         let fence = OwnershipFence::new(state.next_fence)?;
         state.next_fence = state
             .next_fence
             .checked_add(1)
             .ok_or_else(|| IpsecLbError::invalid_config("fence", "fence token exhausted"))?;
-        state
-            .owners
-            .insert(request.sa, (request.new_owner.clone(), fence));
+        state.owners.insert(
+            request.sa,
+            (
+                request.new_owner.clone(),
+                fence,
+                Some((request.transition_id, request.fingerprint)),
+            ),
+        );
         state.operations.push(request.clone());
         Ok(OwnershipFenceGrant {
             sa: request.sa,
+            transition_id: request.transition_id,
+            fingerprint: request.fingerprint,
             owner: request.new_owner,
             fence,
         })
+    }
+
+    async fn validate_retry_proof(&self, proof: &OwnershipRetryProof) -> Result<(), IpsecLbError> {
+        validate_sa_identifier(proof.sa())?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.retry_validation_attempts = state.retry_validation_attempts.saturating_add(1);
+        if let Some(failure) = &state.failure {
+            return Err(failure.clone());
+        }
+        let Some((owner, fence, transition_id)) = state.owners.get(&proof.sa()) else {
+            return Err(IpsecLbError::NotFound);
+        };
+        if owner != proof.owner()
+            || *fence != proof.fence()
+            || *transition_id != Some((proof.transition_id(), proof.fingerprint()))
+        {
+            return Err(IpsecLbError::ownership_conflict(
+                "retry proof does not match the authoritative owner and fence",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -430,6 +631,8 @@ pub struct MockRePinAuditSink {
 struct MockRePinAuditState {
     events: Vec<RePinAuditEvent>,
     failure: Option<IpsecLbError>,
+    record_attempts: usize,
+    failure_on_call: Option<(usize, IpsecLbError)>,
 }
 
 impl MockRePinAuditSink {
@@ -450,6 +653,22 @@ impl MockRePinAuditSink {
         state.failure = Some(failure);
     }
 
+    /// Fail exactly the numbered record call, counting from one.
+    pub fn fail_on_call(&self, call: usize, failure: IpsecLbError) -> Result<(), IpsecLbError> {
+        if call == 0 {
+            return Err(IpsecLbError::invalid_config(
+                "call",
+                "mock failure call must be non-zero",
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.failure_on_call = Some((call, failure));
+        Ok(())
+    }
+
     /// Clear the injected audit failure.
     pub fn clear_failure(&self) {
         let mut state = self
@@ -468,6 +687,16 @@ impl MockRePinAuditSink {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.events.clone()
     }
+
+    /// Return the number of attempted audit records.
+    #[must_use]
+    pub fn record_attempts(&self) -> usize {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.record_attempts
+    }
 }
 
 impl Default for MockRePinAuditSink {
@@ -483,8 +712,21 @@ impl RePinAuditSink for MockRePinAuditSink {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.record_attempts = state.record_attempts.saturating_add(1);
+        if state.events.contains(&event) {
+            return Ok(());
+        }
         if let Some(failure) = &state.failure {
             return Err(failure.clone());
+        }
+        if state
+            .failure_on_call
+            .as_ref()
+            .is_some_and(|(call, _)| *call == state.record_attempts)
+        {
+            if let Some((_, failure)) = state.failure_on_call.take() {
+                return Err(failure);
+            }
         }
         state.events.push(event);
         Ok(())
@@ -556,6 +798,9 @@ mod tests {
         let err = fencer
             .fence_sa_owner(OwnershipFenceRequest {
                 sa,
+                transition_id: OwnershipTransitionId::new(1).unwrap(),
+                fingerprint: OwnershipTransitionFingerprint::from_bytes([1; 32]),
+                previous_fence: OwnershipFence::new(1).unwrap(),
                 previous_owner: ClusterNode::new("node-stale"),
                 new_owner: ClusterNode::new("node-b"),
             })
@@ -573,6 +818,7 @@ mod tests {
             .record_repin(RePinAuditEvent {
                 kind: crate::repin::RePinAuditEventKind::Attempt,
                 sa: SaId::Esp { spi: 9 },
+                transition_id: OwnershipTransitionId::new(1).unwrap(),
                 previous_owner: ClusterNode::new("node-a"),
                 new_owner: ClusterNode::new("node-b"),
                 fence: None,
