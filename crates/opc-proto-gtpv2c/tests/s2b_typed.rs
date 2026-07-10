@@ -3,8 +3,8 @@ use opc_proto_gtpv2c::{
     decode_typed_ie_sequence, s2b, CauseValue, FullyQualifiedTeid, Message, MessageType,
     S2bMessage, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT,
     IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID,
-    IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_PCO, IE_TYPE_RECOVERY,
-    INTERFACE_TYPE_S2B_U_EPDG_GTP_U, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_PCO, IE_TYPE_RECOVERY, INTERFACE_TYPE_S2B_EPDG_GTP_C,
+    INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_EPDG_GTP_U, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
@@ -38,6 +38,14 @@ const UPDATE_BEARER_REQUEST_FIXTURE: &[u8] =
     include_bytes!("fixtures/spec/update_bearer_request_bearer_context.bin");
 const UPDATE_BEARER_RESPONSE_FIXTURE: &[u8] =
     include_bytes!("fixtures/spec/update_bearer_response_cause.bin");
+
+#[test]
+fn s2b_interface_type_registry_matches_ts_29_274_table_8_22_1() {
+    assert_eq!(INTERFACE_TYPE_S2B_EPDG_GTP_C, 30);
+    assert_eq!(INTERFACE_TYPE_S2B_U_EPDG_GTP_U, 31);
+    assert_eq!(INTERFACE_TYPE_S2B_PGW_GTP_C, 32);
+    assert_eq!(INTERFACE_TYPE_S2B_U_PGW_GTP_U, 33);
+}
 
 const BEARER_CONTEXT_IE: &[u8] = &[
     0x5d, 0x00, 0x05, 0x00, // Bearer Context grouped IE header.
@@ -81,7 +89,7 @@ const BEARER_CONTEXT_WITH_EPDG_USER_PLANE_FTEID_IE: &[u8] = &[
     0x00,
     0x09,
     0x00,
-    0xa0,
+    0x9f,
     0x11,
     0x22,
     0x33,

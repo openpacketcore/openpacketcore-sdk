@@ -59,9 +59,17 @@ pub const UPDATE_BEARER_REQUEST: u8 = 97;
 /// Update Bearer Response message type used by the S2b Update Session view.
 pub const UPDATE_BEARER_RESPONSE: u8 = 98;
 
+/// GTPv2-C interface type for S2b ePDG GTP-C from 3GPP TS 29.274
+/// Table 8.22-1.
+pub const INTERFACE_TYPE_S2B_EPDG_GTP_C: u8 = 30;
+
 /// GTPv2-C interface type for S2b-U ePDG GTP-U from 3GPP TS 29.274
 /// Table 8.22-1.
-pub const INTERFACE_TYPE_S2B_U_EPDG_GTP_U: u8 = 32;
+pub const INTERFACE_TYPE_S2B_U_EPDG_GTP_U: u8 = 31;
+
+/// GTPv2-C interface type for S2b PGW GTP-C from 3GPP TS 29.274
+/// Table 8.22-1.
+pub const INTERFACE_TYPE_S2B_PGW_GTP_C: u8 = 32;
 
 /// GTPv2-C interface type for S2b-U PGW GTP-U from 3GPP TS 29.274
 /// Table 8.22-1.
