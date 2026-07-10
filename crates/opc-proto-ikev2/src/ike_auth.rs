@@ -38,6 +38,7 @@ const CP_ATTR_HEADER_LEN: usize = 4;
 const TS_FIXED_BODY_LEN: usize = 4;
 const TS_SELECTOR_HEADER_LEN: usize = 8;
 const DELETE_FIXED_BODY_LEN: usize = 4;
+const IKEV2_TRANSFORM_TYPE_DH: u8 = 4;
 const TS_IPV4_ADDR_LEN: usize = 4;
 const TS_IPV6_ADDR_LEN: usize = 16;
 /// Traffic Selector type for IPv4 address ranges.
@@ -1417,7 +1418,9 @@ pub struct Ikev2ChildSaNegotiationPolicy {
     /// Accepted protocol IDs, for example ESP.
     pub accepted_protocol_ids: Vec<u8>,
     /// Required transform constraints. Every entry must match one selected
-    /// transform in a proposal.
+    /// transform in a proposal, and every transform type offered by an accepted
+    /// proposal must have a corresponding requirement. This prevents accepting
+    /// a proposal while silently omitting an unconstrained transform type.
     pub required_transforms: Vec<Ikev2ChildSaTransformRequirement>,
     /// Accepted initiator traffic selectors. Empty means accept any offered TSi
     /// and select the first one.
@@ -1590,6 +1593,7 @@ pub fn negotiate_child_sa(
 
     let mut saw_accepted_protocol = false;
     let mut saw_transforms = false;
+    let mut saw_unconstrained_transform_type = false;
     let mut selected = None;
     for proposal in &sa.proposals {
         if !policy.accepted_protocol_ids.contains(&proposal.protocol_id) {
@@ -1600,6 +1604,10 @@ pub fn negotiate_child_sa(
             continue;
         }
         saw_transforms = true;
+        if proposal_has_unconstrained_transform_type(proposal, &policy.required_transforms) {
+            saw_unconstrained_transform_type = true;
+            continue;
+        }
         if let Some(transforms) =
             select_transforms_for_policy(proposal, &policy.required_transforms)
         {
@@ -1613,6 +1621,9 @@ pub fn negotiate_child_sa(
             return Err(Ikev2ChildSaNegotiationError::NoSupportedProposal)
         }
         None if !saw_transforms => return Err(Ikev2ChildSaNegotiationError::NoTransforms),
+        None if saw_unconstrained_transform_type => {
+            return Err(Ikev2ChildSaNegotiationError::UnconstrainedTransformType)
+        }
         None => return Err(Ikev2ChildSaNegotiationError::NoSupportedProposal),
     };
 
@@ -1694,6 +1705,7 @@ pub fn build_create_child_sa_rekey_request_payloads(
     input: &Ikev2CreateChildSaRekeyRequestBuild,
 ) -> Result<Ikev2CreateChildSaRekeyRequestPayloads, Ikev2IkeAuthBuildError> {
     validate_rekey_child_sa_spi(input.rekeyed_protocol_id, &input.rekeyed_spi)?;
+    validate_rekey_key_exchange_shape(&input.security_association, input.key_exchange.as_ref())?;
 
     let rekey_notify = build_ike_auth_notify_payload(&Ikev2NotifyPayloadBuild {
         protocol_id: input.rekeyed_protocol_id,
@@ -1756,6 +1768,7 @@ pub fn build_create_child_sa_rekey_request_payloads(
 pub fn build_create_child_sa_rekey_response_payloads(
     input: &Ikev2CreateChildSaRekeyResponseBuild,
 ) -> Result<Ikev2CreateChildSaRekeyResponsePayloads, Ikev2IkeAuthBuildError> {
+    validate_rekey_key_exchange_shape(&input.security_association, input.key_exchange.as_ref())?;
     let sa_body = build_ike_auth_sa_payload(&input.security_association)?;
     let nonce_body =
         encode_nonce_payload_build(&input.nonce).map_err(Ikev2IkeAuthBuildError::Nonce)?;
@@ -1806,6 +1819,34 @@ fn validate_rekey_child_sa_spi(protocol_id: u8, spi: &[u8]) -> Result<(), Ikev2I
     Ok(())
 }
 
+fn validate_rekey_key_exchange_shape(
+    security_association: &Ikev2SaPayloadBuild,
+    key_exchange: Option<&Ikev2KeyExchangePayloadBuild>,
+) -> Result<(), Ikev2IkeAuthBuildError> {
+    let mut dh_offered = false;
+    let mut key_exchange_group_offered = false;
+    for transform in security_association
+        .proposals
+        .iter()
+        .flat_map(|proposal| &proposal.transforms)
+        .filter(|transform| transform.transform_type == IKEV2_TRANSFORM_TYPE_DH)
+    {
+        dh_offered = true;
+        if key_exchange.is_some_and(|key_exchange| key_exchange.dh_group == transform.transform_id)
+        {
+            key_exchange_group_offered = true;
+        }
+    }
+
+    match (dh_offered, key_exchange) {
+        (false, None) => Ok(()),
+        (false, Some(_)) => Err(Ikev2IkeAuthBuildError::UnexpectedKeyExchange),
+        (true, None) => Err(Ikev2IkeAuthBuildError::KeyExchangeRequired),
+        (true, Some(_)) if key_exchange_group_offered => Ok(()),
+        (true, Some(_)) => Err(Ikev2IkeAuthBuildError::KeyExchangeDhGroupMismatch),
+    }
+}
+
 fn validate_child_sa_transform_requirements(
     requirements: &[Ikev2ChildSaTransformRequirement],
 ) -> Result<(), Ikev2ChildSaNegotiationError> {
@@ -1843,6 +1884,17 @@ fn select_transforms_for_policy(
                 .map(transform_build_from_view)
         })
         .collect()
+}
+
+fn proposal_has_unconstrained_transform_type(
+    proposal: &Ikev2SaProposal<'_>,
+    requirements: &[Ikev2ChildSaTransformRequirement],
+) -> bool {
+    proposal.transforms.iter().any(|transform| {
+        !requirements
+            .iter()
+            .any(|requirement| requirement.transform_type == transform.transform_type)
+    })
 }
 
 fn select_traffic_selector<'a, 'b>(
@@ -2179,6 +2231,12 @@ pub enum Ikev2IkeAuthBuildError {
     Nonce(Ikev2SaInitBuildError),
     /// KE payload builder was malformed.
     KeyExchange(Ikev2SaInitBuildError),
+    /// A CREATE_CHILD_SA proposal selected a D-H transform but omitted KE.
+    KeyExchangeRequired,
+    /// A CREATE_CHILD_SA payload included KE without a D-H transform.
+    UnexpectedKeyExchange,
+    /// CREATE_CHILD_SA KE used a group not offered by the SA proposal.
+    KeyExchangeDhGroupMismatch,
     /// Child SA response builder was missing responder SPI bytes.
     ChildSaResponderSpiMissing,
 }
@@ -2215,6 +2273,9 @@ impl Ikev2IkeAuthBuildError {
             Self::SecurityAssociation(_) => "ike_auth_build_sa_payload",
             Self::Nonce(_) => "ike_auth_build_nonce_payload",
             Self::KeyExchange(_) => "ike_auth_build_ke_payload",
+            Self::KeyExchangeRequired => "ike_auth_build_ke_required",
+            Self::UnexpectedKeyExchange => "ike_auth_build_ke_unexpected",
+            Self::KeyExchangeDhGroupMismatch => "ike_auth_build_ke_dh_group_mismatch",
             Self::ChildSaResponderSpiMissing => "ike_auth_build_child_sa_responder_spi_missing",
         }
     }
@@ -2344,6 +2405,9 @@ pub enum Ikev2ChildSaNegotiationError {
     NoSupportedProposal,
     /// Selected proposal had no transforms.
     NoTransforms,
+    /// An accepted-protocol proposal offered a transform type that policy did
+    /// not constrain, so echoing only policy-selected types would alter it.
+    UnconstrainedTransformType,
     /// TSi or TSr was empty.
     TrafficSelectorMissing,
     /// No offered TSi or TSr matched the supplied selector policy.
@@ -2359,6 +2423,7 @@ impl Ikev2ChildSaNegotiationError {
             Self::DuplicateTransformRequirement => "ike_child_sa_duplicate_transform_requirement",
             Self::NoSupportedProposal => "ike_child_sa_no_supported_proposal",
             Self::NoTransforms => "ike_child_sa_no_transforms",
+            Self::UnconstrainedTransformType => "ike_child_sa_unconstrained_transform_type",
             Self::TrafficSelectorMissing => "ike_child_sa_traffic_selector_missing",
             Self::TrafficSelectorMismatch => "ike_child_sa_traffic_selector_mismatch",
         }

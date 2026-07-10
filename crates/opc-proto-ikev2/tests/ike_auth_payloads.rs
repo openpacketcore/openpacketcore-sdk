@@ -6,9 +6,9 @@ use opc_proto_ikev2::{
     build_ike_auth_identification_payload, build_ike_auth_sa_payload,
     build_ike_auth_traffic_selector_payload, compute_ike_auth_shared_key_mic,
     decode_ike_auth_cleartext_payloads, derive_ike_sa_init_key_material,
-    ike_auth_shared_key_authentication_payload_body_len, negotiate_child_sa,
-    verify_ike_auth_shared_key_mic, Ikev2AuthenticationPayloadBuild, Ikev2ChildSaNegotiationError,
-    Ikev2ChildSaNegotiationPolicy, Ikev2ChildSaTransformRequirement,
+    encode_nonce_payload_build, ike_auth_shared_key_authentication_payload_body_len,
+    negotiate_child_sa, verify_ike_auth_shared_key_mic, Ikev2AuthenticationPayloadBuild,
+    Ikev2ChildSaNegotiationError, Ikev2ChildSaNegotiationPolicy, Ikev2ChildSaTransformRequirement,
     Ikev2ConfigurationAttributeBuild, Ikev2ConfigurationPayloadBuild,
     Ikev2CreateChildSaRekeyRequestBuild, Ikev2CreateChildSaRekeyResponseBuild, Ikev2DeletePayload,
     Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2IdentificationPayloadBuild,
@@ -46,6 +46,16 @@ fn child_sa_payload_build() -> Ikev2SaPayloadBuild {
             ],
         }],
     }
+}
+
+fn child_sa_pfs_payload_build(dh_group: u16) -> Ikev2SaPayloadBuild {
+    let mut payload = child_sa_payload_build();
+    payload.proposals[0].transforms.push(Ikev2SaTransformBuild {
+        transform_type: 4,
+        transform_id: dh_group,
+        attributes: Vec::new(),
+    });
+    payload
 }
 
 fn ts_payload() -> Ikev2TrafficSelectorPayloadBuild {
@@ -129,6 +139,21 @@ fn shared_key_auth_payload_length_helper_matches_builder() {
             auth_body.len()
         );
     }
+}
+
+#[test]
+fn public_nonce_payload_builder_validates_and_encodes_nonce() {
+    let nonce = Ikev2NoncePayloadBuild {
+        nonce: vec![0x5a; 32],
+    };
+    assert_eq!(
+        encode_nonce_payload_build(&nonce).expect("valid nonce"),
+        nonce.nonce
+    );
+
+    let error = encode_nonce_payload_build(&Ikev2NoncePayloadBuild { nonce: vec![0; 15] })
+        .expect_err("short nonce must fail closed");
+    assert_eq!(error.as_str(), "ike_sa_init_build_nonce_too_short");
 }
 
 #[test]
@@ -455,13 +480,96 @@ fn negotiates_child_sa_intent_and_builds_response_payloads() {
 }
 
 #[test]
+fn child_sa_negotiation_never_silently_drops_pfs_transform_type() {
+    let sa = build_ike_auth_sa_payload(&child_sa_pfs_payload_build(19)).expect("PFS SA build");
+    let tsi = build_ike_auth_traffic_selector_payload(&ts_payload()).expect("TSi build");
+    let tsr = build_ike_auth_traffic_selector_payload(&ts_payload()).expect("TSr build");
+    let (first, bytes) = build_ike_auth_cleartext_payload_chain(&[
+        Ikev2IkeAuthPayloadBuild {
+            payload_type: PayloadType::SecurityAssociation,
+            body: sa,
+        },
+        Ikev2IkeAuthPayloadBuild {
+            payload_type: PayloadType::TrafficSelectorInitiator,
+            body: tsi,
+        },
+        Ikev2IkeAuthPayloadBuild {
+            payload_type: PayloadType::TrafficSelectorResponder,
+            body: tsr,
+        },
+    ])
+    .expect("cleartext chain build");
+    let decoded = decode_ike_auth_cleartext_payloads(first, &bytes).expect("decode PFS offer");
+
+    let unconstrained = negotiate_child_sa(
+        &decoded.security_associations[0],
+        &decoded.traffic_selectors_initiator[0],
+        &decoded.traffic_selectors_responder[0],
+        &Ikev2ChildSaNegotiationPolicy {
+            accepted_protocol_ids: vec![IKEV2_SECURITY_PROTOCOL_ID_ESP],
+            required_transforms: vec![Ikev2ChildSaTransformRequirement {
+                transform_type: 1,
+                accepted_transform_ids: vec![20],
+            }],
+            accepted_initiator_traffic_selectors: Vec::new(),
+            accepted_responder_traffic_selectors: Vec::new(),
+        },
+    )
+    .expect_err("unconstrained D-H transform must not be omitted");
+    assert_eq!(
+        unconstrained,
+        Ikev2ChildSaNegotiationError::UnconstrainedTransformType
+    );
+
+    let selected = negotiate_child_sa(
+        &decoded.security_associations[0],
+        &decoded.traffic_selectors_initiator[0],
+        &decoded.traffic_selectors_responder[0],
+        &Ikev2ChildSaNegotiationPolicy {
+            accepted_protocol_ids: vec![IKEV2_SECURITY_PROTOCOL_ID_ESP],
+            required_transforms: vec![
+                Ikev2ChildSaTransformRequirement {
+                    transform_type: 1,
+                    accepted_transform_ids: vec![20],
+                },
+                Ikev2ChildSaTransformRequirement {
+                    transform_type: 4,
+                    accepted_transform_ids: vec![19],
+                },
+            ],
+            accepted_initiator_traffic_selectors: Vec::new(),
+            accepted_responder_traffic_selectors: Vec::new(),
+        },
+    )
+    .expect("PFS policy selects every offered transform type");
+    assert_eq!(selected.transforms.len(), 2);
+    assert!(selected
+        .transforms
+        .iter()
+        .any(|transform| transform.transform_type == 4 && transform.transform_id == 19));
+
+    let response = build_child_sa_response_payloads(&selected, vec![0x10, 0x20, 0x30, 0x40])
+        .expect("response");
+    let (response_first, response_bytes) =
+        build_ike_auth_cleartext_payload_chain(&[response.security_association])
+            .expect("response chain");
+    let response_decoded =
+        decode_ike_auth_cleartext_payloads(response_first, &response_bytes).expect("response SA");
+    let echoed = &response_decoded.security_associations[0].proposals[0].transforms;
+    assert_eq!(echoed.len(), 2);
+    assert!(echoed
+        .iter()
+        .any(|transform| transform.transform_type == 4 && transform.transform_id == 19));
+}
+
+#[test]
 fn builds_create_child_sa_rekey_request_and_response_payloads() {
     let old_spi = [0xca, 0xfe, 0xba, 0xbe];
     let request =
         build_create_child_sa_rekey_request_payloads(&Ikev2CreateChildSaRekeyRequestBuild {
             rekeyed_protocol_id: IKEV2_SECURITY_PROTOCOL_ID_ESP,
             rekeyed_spi: old_spi.to_vec(),
-            security_association: child_sa_payload_build(),
+            security_association: child_sa_pfs_payload_build(19),
             nonce: Ikev2NoncePayloadBuild {
                 nonce: vec![0x11; 32],
             },
@@ -566,6 +674,38 @@ fn rekey_request_builder_rejects_invalid_rekey_notify_shape() {
     let invalid_spi = build_create_child_sa_rekey_request_payloads(&request)
         .expect_err("short rekey SPI rejected");
     assert_eq!(invalid_spi, Ikev2IkeAuthBuildError::RekeySpiLengthInvalid);
+}
+
+#[test]
+fn rekey_builder_enforces_dh_and_key_exchange_consistency() {
+    let mut request = Ikev2CreateChildSaRekeyRequestBuild {
+        rekeyed_protocol_id: IKEV2_SECURITY_PROTOCOL_ID_ESP,
+        rekeyed_spi: vec![0xca, 0xfe, 0xba, 0xbe],
+        security_association: child_sa_pfs_payload_build(19),
+        nonce: Ikev2NoncePayloadBuild {
+            nonce: vec![0x11; 32],
+        },
+        key_exchange: None,
+        traffic_selectors_initiator: ts_payload(),
+        traffic_selectors_responder: ts_payload(),
+    };
+
+    let missing = build_create_child_sa_rekey_request_payloads(&request)
+        .expect_err("D-H transform requires KE");
+    assert_eq!(missing, Ikev2IkeAuthBuildError::KeyExchangeRequired);
+
+    request.key_exchange = Some(Ikev2KeyExchangePayloadBuild {
+        dh_group: 20,
+        key_exchange_data: vec![0x22; 65],
+    });
+    let mismatch = build_create_child_sa_rekey_request_payloads(&request)
+        .expect_err("KE group must match an offered D-H transform");
+    assert_eq!(mismatch, Ikev2IkeAuthBuildError::KeyExchangeDhGroupMismatch);
+
+    request.security_association = child_sa_payload_build();
+    let unexpected = build_create_child_sa_rekey_request_payloads(&request)
+        .expect_err("KE without a D-H transform must fail closed");
+    assert_eq!(unexpected, Ikev2IkeAuthBuildError::UnexpectedKeyExchange);
 }
 
 #[test]

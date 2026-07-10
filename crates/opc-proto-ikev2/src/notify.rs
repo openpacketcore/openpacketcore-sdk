@@ -1,4 +1,4 @@
-//! IKEv2 Notify payload helpers for COOKIE retry boundaries.
+//! IKEv2 Notify payload registry and COOKIE retry helpers.
 //!
 //! @spec IETF RFC7296 2.6, 3.10
 //! @req REQ-IETF-RFC7296-NOTIFY-COOKIE-001
@@ -14,6 +14,108 @@ use crate::{
     payload::{PayloadType, RawPayload, GENERIC_PAYLOAD_HEADER_LEN},
     HEADER_LEN,
 };
+
+/// IKEv2 Notify error type for UNSUPPORTED_CRITICAL_PAYLOAD.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD: u16 = 1;
+
+/// IKEv2 Notify error type for INVALID_IKE_SPI.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_INVALID_IKE_SPI: u16 = 4;
+
+/// IKEv2 Notify error type for INVALID_MAJOR_VERSION.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_INVALID_MAJOR_VERSION: u16 = 5;
+
+/// IKEv2 Notify error type for INVALID_SYNTAX.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_INVALID_SYNTAX: u16 = 7;
+
+/// IKEv2 Notify error type for INVALID_MESSAGE_ID.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_INVALID_MESSAGE_ID: u16 = 9;
+
+/// IKEv2 Notify error type for INVALID_SPI.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_INVALID_SPI: u16 = 11;
+
+/// IKEv2 Notify error type for NO_PROPOSAL_CHOSEN.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN: u16 = 14;
+
+/// IKEv2 Notify error type for INVALID_KE_PAYLOAD.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_INVALID_KE_PAYLOAD: u16 = 17;
+
+/// IKEv2 Notify error type for AUTHENTICATION_FAILED.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_AUTHENTICATION_FAILED: u16 = 24;
+
+/// IKEv2 Notify error type for SINGLE_PAIR_REQUIRED.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_SINGLE_PAIR_REQUIRED: u16 = 34;
+
+/// IKEv2 Notify error type for NO_ADDITIONAL_SAS.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_NO_ADDITIONAL_SAS: u16 = 35;
+
+/// IKEv2 Notify error type for INTERNAL_ADDRESS_FAILURE.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_INTERNAL_ADDRESS_FAILURE: u16 = 36;
+
+/// IKEv2 Notify error type for FAILED_CP_REQUIRED.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_FAILED_CP_REQUIRED: u16 = 37;
+
+/// IKEv2 Notify error type for TS_UNACCEPTABLE.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_TS_UNACCEPTABLE: u16 = 38;
+
+/// IKEv2 Notify error type for INVALID_SELECTORS.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_INVALID_SELECTORS: u16 = 39;
+
+/// IKEv2 Notify error type for TEMPORARY_FAILURE.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_TEMPORARY_FAILURE: u16 = 43;
+
+/// IKEv2 Notify error type for CHILD_SA_NOT_FOUND.
+///
+/// @spec IETF RFC7296 3.10.1
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_CHILD_SA_NOT_FOUND: u16 = 44;
 
 /// IKEv2 Notify Message Type for NAT_DETECTION_SOURCE_IP.
 ///

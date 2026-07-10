@@ -1207,7 +1207,13 @@ pub(crate) fn encode_ke_payload_build(
     Ok(out)
 }
 
-pub(crate) fn encode_nonce_payload_build(
+/// Encode an IKEv2 Nonce payload body from a typed builder.
+///
+/// # Errors
+///
+/// Returns [`Ikev2SaInitBuildError`] when the nonce is outside the RFC 7296
+/// 16-to-256-octet range.
+pub fn encode_nonce_payload_build(
     payload: &Ikev2NoncePayloadBuild,
 ) -> Result<Vec<u8>, Ikev2SaInitBuildError> {
     validate_nonce_len_for_build(payload.nonce.len())?;
