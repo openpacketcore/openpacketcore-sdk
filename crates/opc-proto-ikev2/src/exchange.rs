@@ -319,6 +319,94 @@ impl Ikev2InitiatorMessageIdWindow {
     }
 }
 
+/// Redaction-safe snapshot of a responder Message-ID replay window.
+///
+/// Message IDs are public protocol counters. The snapshot intentionally
+/// contains no packet bytes, SPIs, or key material.
+///
+/// @spec IETF RFC7296 2.3
+/// @conformance boundary-only
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Ikev2ResponderMessageIdSnapshot {
+    /// Highest authenticated peer request Message ID already accepted.
+    pub highest_processed: Option<u32>,
+    /// Whether the Message-ID space is exhausted and every later request must
+    /// be rejected until the IKE SA is replaced.
+    pub exhausted: bool,
+}
+
+/// Responder-side anti-replay window for peer-initiated IKEv2 requests.
+///
+/// The caller must invoke [`Self::accept_request`] only after the complete
+/// request, including its Message ID in the authenticated header, has passed
+/// integrity verification. A strictly greater ID is fresh and advances the
+/// high-water mark. Duplicate and stale IDs are rejected without changing
+/// state. Forward gaps are accepted because only the authenticated peer can
+/// produce them and an abandoned lower exchange must not wedge the SA.
+///
+/// Once `u32::MAX` is accepted, the window remains exhausted and rejects every
+/// request; Message IDs never wrap on an IKE SA.
+///
+/// @spec IETF RFC7296 2.3
+/// @conformance boundary-only
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Ikev2ResponderMessageIdWindow {
+    highest_processed: Option<u32>,
+}
+
+impl Ikev2ResponderMessageIdWindow {
+    /// Create an empty window that accepts the first authenticated request ID.
+    pub const fn new() -> Self {
+        Self {
+            highest_processed: None,
+        }
+    }
+
+    /// Seed a window with the highest authenticated peer request ID that was
+    /// already processed, such as the final IKE_AUTH request during transition
+    /// to established-SA state or the persisted high-water mark during restore.
+    pub const fn with_highest_processed(highest_processed: u32) -> Self {
+        Self {
+            highest_processed: Some(highest_processed),
+        }
+    }
+
+    /// Return the highest authenticated peer request ID already accepted.
+    pub const fn highest_processed(&self) -> Option<u32> {
+        self.highest_processed
+    }
+
+    /// Return whether no greater Message ID can be represented on this SA.
+    pub const fn is_exhausted(&self) -> bool {
+        matches!(self.highest_processed, Some(u32::MAX))
+    }
+
+    /// Return a redaction-safe snapshot.
+    pub const fn snapshot(&self) -> Ikev2ResponderMessageIdSnapshot {
+        Ikev2ResponderMessageIdSnapshot {
+            highest_processed: self.highest_processed,
+            exhausted: self.is_exhausted(),
+        }
+    }
+
+    /// Accept and record a fresh authenticated peer request Message ID.
+    ///
+    /// Returns `true` only when `message_id` is strictly greater than every
+    /// previously accepted ID. Returns `false`, without changing state, for a
+    /// duplicate, stale ID, or any request after counter exhaustion.
+    #[must_use = "the request must be dropped when this returns false"]
+    pub fn accept_request(&mut self, message_id: u32) -> bool {
+        if self
+            .highest_processed
+            .is_some_and(|highest| message_id <= highest)
+        {
+            return false;
+        }
+        self.highest_processed = Some(message_id);
+        true
+    }
+}
+
 /// Redaction-safe key for identifying same-request retransmissions.
 ///
 /// @spec IETF RFC7296 2.1, 2.2

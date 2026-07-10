@@ -5,7 +5,7 @@
 //! leaves IKE negotiation, namespace choice, and deployment privileges to the
 //! product.
 
-use std::fmt;
+use std::{fmt, num::NonZeroU32};
 
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -81,6 +81,29 @@ pub struct XfrmId {
     pub spi: u32,
     /// Transform protocol such as `IPPROTO_ESP`.
     pub protocol: u8,
+}
+
+/// Non-zero Linux XFRM request identifier (`reqid`).
+///
+/// A shared request ID binds multiple SA states to one policy template without
+/// pinning that template to a particular SPI. Zero is represented by `None` on
+/// models that do not use request-ID binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct XfrmRequestId(NonZeroU32);
+
+impl XfrmRequestId {
+    /// Construct a non-zero request identifier.
+    pub const fn new(value: u32) -> Option<Self> {
+        match NonZeroU32::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Return the raw Linux request identifier.
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
 }
 
 /// UDP encapsulation type for ESP-in-UDP NAT traversal.
@@ -436,6 +459,8 @@ pub struct SaParameters {
     pub id: XfrmId,
     /// Source tunnel endpoint.
     pub source_address: IpAddress,
+    /// Optional request identifier shared with matching policy templates.
+    pub request_id: Option<XfrmRequestId>,
     /// Authentication algorithm and key.
     pub auth: Option<(AuthAlgorithm, KeyMaterial)>,
     /// Encryption algorithm and key.
@@ -486,6 +511,9 @@ pub struct XfrmTemplate {
     pub id: XfrmId,
     /// Source tunnel endpoint.
     pub source_address: IpAddress,
+    /// Optional request identifier. A template with wildcard SPI (`0`) must
+    /// carry a non-zero request ID so it cannot match unrelated SAs.
+    pub request_id: Option<XfrmRequestId>,
     /// XFRM mode.
     pub mode: XfrmMode,
 }
@@ -557,6 +585,8 @@ pub struct SaState {
     pub id: XfrmId,
     /// Source tunnel endpoint.
     pub source_address: IpAddress,
+    /// Request identifier returned by the kernel, when configured.
+    pub request_id: Option<XfrmRequestId>,
     /// XFRM mode.
     pub mode: XfrmMode,
     /// Configured replay window.

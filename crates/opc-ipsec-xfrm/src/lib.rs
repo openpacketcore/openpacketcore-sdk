@@ -31,7 +31,8 @@ pub use composite::{
 pub use error::XfrmError;
 #[cfg(feature = "ikev2")]
 pub use ikev2::{
-    build_xfrm_requests_from_ikev2_child_sa, derive_child_sa_xfrm_keys,
+    build_xfrm_requests_from_ikev2_child_sa,
+    build_xfrm_requests_from_ikev2_child_sa_with_request_id, derive_child_sa_xfrm_keys,
     Ikev2ChildSaDirectionalXfrmKeys, Ikev2ChildSaKeyMaterialError, Ikev2ChildSaXfrmError,
     Ikev2ChildSaXfrmKeys, Ikev2ChildSaXfrmRequest, Ikev2ChildSaXfrmRequests,
     IKEV2_SECURITY_PROTOCOL_ID_ESP, IPPROTO_ESP,
@@ -44,7 +45,7 @@ pub use model::{
     QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RemovePolicyRequest, RemoveSaRequest,
     SaParameters, SaReplayState, SaState, SaStatistics, SpiAllocation, UdpEncap, XfrmAction,
     XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmMark, XfrmMode, XfrmProbe,
-    XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP, XFRM_AEAD_RFC4106_GCM_AES,
+    XfrmRequestId, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP, XFRM_AEAD_RFC4106_GCM_AES,
     XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384, XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES,
 };
 pub use unsupported::UnsupportedXfrmBackend;
@@ -77,6 +78,7 @@ mod integration_tests {
                 protocol: 50,
             },
             source_address: ipv4(10, 0, 0, 1),
+            request_id: None,
             auth: Some((
                 AuthAlgorithm::hmac_sha256(96),
                 KeyMaterial::new(vec![0xab; 32]),
@@ -106,6 +108,7 @@ mod integration_tests {
                     protocol: 50,
                 },
                 source_address: ipv4(10, 0, 0, 1),
+                request_id: None,
                 mode: XfrmMode::Tunnel,
             }],
             mark: None,

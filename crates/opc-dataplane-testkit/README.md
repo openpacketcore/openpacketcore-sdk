@@ -17,8 +17,10 @@ used unless a caller builds those around it.
 - `decode_gtpu`, `encode_gpdu`, `encode_gpdu_with_extensions`,
   `encode_echo_request`, and `validate_error_indication_ies`: GTP-U test
   datagram helpers built on `opc-proto-gtpu`.
-- `GtpuReflector`, `ReflectorConfig`, `ReflectorPolicy`, `ReflectorAction`,
-  and `ReflectorStats`: in-memory TEID-scoped echo, sink, and route behavior.
+- `GtpuReflector`, `ReflectorConfig`, `MultiSessionReflectorConfig`,
+  `ReflectorSession`, `ReflectorPolicy`, `ReflectorAction`, and
+  `ReflectorStats`: bounded in-memory single- or multi-TEID echo, sink, and
+  route behavior.
 - `ContinuityObserver`, `GtpuReturnDatagramOutcome`,
   `PacketContinuityBudget`, `PacketContinuityReport`, and `LatencySummary`:
   redaction-safe forwarding and packet-continuity evidence.
@@ -85,6 +87,8 @@ assert!(report.packet_continuity_proven);
   with safe `flow_id` values and can be checked with `validate_redaction`.
 - GTP-U helpers support the message shapes needed by the current continuity and
   reflector tests; they are not a full conformance test suite for TS 29.281.
+- Multi-session reflection keys mappings by the inbound local TEID learned from
+  control-plane F-TEIDs; inner-flow learning remains a product/lab concern.
 
 ## Roadmap
 

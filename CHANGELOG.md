@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-proto-ikev2`: a seedable responder Message-ID replay window, the full
+  RFC 7296 error-notify registry, public nonce encoding, and stricter
+  CREATE_CHILD_SA rekey proposal/KE validation.
+- `opc-ipsec-xfrm`: non-zero request IDs and wildcard-SPI policy templates so
+  old and replacement Child SAs can overlap under one stable policy contract.
+- `opc-ipsec-lb`: clone-shared tagged-SPI reservations; allocation and rekey
+  now skip SPIs restored by another session owner.
+- `opc-proto-gtpv2c`: a bounded TS 24.008 PCO container codec for P-CSCF and
+  DNS address requests/responses, including repeated response containers and
+  accepted-session PCO access.
+- `opc-dataplane-testkit`: a bounded multi-session GTP-U reflector keyed by
+  inbound local TEID, with idempotent registration and conflict detection.
 - `opc-ipsec-lb`: `SessionStoreOwnershipFencer`, a production ownership
   promotion adapter that acquires the session-store lease, commits a
   generation-guarded owner change, and projects the committed store fence into
@@ -68,6 +80,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed fuzz corpora for the GTP-U, NAS, Diameter, and IKEv2 targets.
 
 ### Changed
+- **BREAKING — `opc-ipsec-xfrm`:** XFRM SA requests, policy templates, and
+  decoded SA state now carry an optional `XfrmRequestId`; callers using public
+  struct literals must initialize the new field.
 - **BREAKING — `opc-ipsec-lb`:** same-SPI failover callers must migrate
   `AntiReplayResume` struct literals to either `ExactWindowRestore` or
   `BoundedReopening`, rename the checkpoint field to
@@ -135,6 +150,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- `opc-proto-gtpv2c`: S2b F-TEIDs now use the standardized ePDG/PGW data-plane
+  interface type 31; the control-plane constants remain 30 and 32.
 - `opc-ipsec-xfrm`: XFRM policy templates now encode all-ones algorithm
   masks (`aalgos`, `ealgos`, `calgos`) instead of zero masks, so installed
   policies can be satisfied by negotiated ESP SAs instead of dropping inbound

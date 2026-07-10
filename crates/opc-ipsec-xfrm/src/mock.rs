@@ -271,6 +271,7 @@ fn sa_state_from_parameters(parameters: &crate::model::SaParameters) -> SaState 
         selector: parameters.selector.clone(),
         id: parameters.id,
         source_address: parameters.source_address,
+        request_id: parameters.request_id,
         mode: parameters.mode,
         replay_window: parameters.replay_window,
         replay_state,
@@ -583,6 +584,7 @@ mod tests {
                 protocol: 50,
             },
             source_address: ipv4(10, 0, 0, 1),
+            request_id: None,
             auth: Some((
                 AuthAlgorithm::hmac_sha256(96),
                 KeyMaterial::new(vec![0xab; 32]),
@@ -612,6 +614,7 @@ mod tests {
                     protocol: 50,
                 },
                 source_address: ipv4(10, 0, 0, 1),
+                request_id: None,
                 mode: XfrmMode::Tunnel,
             }],
             mark: None,

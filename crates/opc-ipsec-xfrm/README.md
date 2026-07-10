@@ -22,7 +22,7 @@ management, product SA/SPD policy, or deployment defaults.
 - Model exports include `IpAddress`, `XfrmSelector`, `XfrmId`, `SaParameters`,
   `PolicyParameters`, `XfrmTemplate`, `InstallSaRequest`,
   `InstallPolicyRequest`, `QuerySaRequest`, `SaState`, `SaReplayState`,
-  `UdpEncap`, `XfrmMark`, `LifetimeConfig`, and `XfrmProbe`.
+  `XfrmRequestId`, `UdpEncap`, `XfrmMark`, `LifetimeConfig`, and `XfrmProbe`.
 - Algorithm/key exports include `Algorithm`, `AuthAlgorithm`, `AeadAlgorithm`,
   `KeyMaterial`, and Linux XFRM algorithm-name constants.
 - Composite helpers include `install_sa_policy_with_rollback`,
@@ -56,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             protocol: 50,
         },
         source_address: IpAddress::Ipv4([10, 0, 0, 1]),
+        request_id: None,
         auth: Some((AuthAlgorithm::hmac_sha256(96), KeyMaterial::new(vec![0xab; 32]))),
         crypt: None,
         aead: None,
@@ -90,6 +91,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `query_sa` returns replay/lifetime/statistics state but never key material.
 - The `ikev2` feature maps validated Child SA intent to XFRM requests; it does
   not run IKE, allocate SPIs, or choose product policy.
+- The IKEv2 mapper keeps SPI-pinned policies as its compatibility default and
+  also supports a shared non-zero request ID with wildcard policy-template SPI
+  for simultaneous old/new Child-SA rekey overlap.
 
 ## Roadmap
 

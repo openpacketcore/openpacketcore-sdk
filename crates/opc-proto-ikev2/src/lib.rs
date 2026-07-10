@@ -50,7 +50,8 @@ pub use exchange::{
     Ikev2ExchangeKind, Ikev2ExchangeProjection, Ikev2ExchangeRequest, Ikev2ExchangeRequestKey,
     Ikev2ExchangeSnapshot, Ikev2ExchangeTracker, Ikev2InitiatorMessageIdAllocation,
     Ikev2InitiatorMessageIdError, Ikev2InitiatorMessageIdSnapshot, Ikev2InitiatorMessageIdWindow,
-    Ikev2ResponderSpi, IKEV2_EXCHANGE_RETRANSMISSION_WINDOW,
+    Ikev2ResponderMessageIdSnapshot, Ikev2ResponderMessageIdWindow, Ikev2ResponderSpi,
+    IKEV2_EXCHANGE_RETRANSMISSION_WINDOW,
 };
 pub use fragmentation::{
     build_ikev2_encrypted_fragment_payload_body, reassemble_decrypted_ikev2_fragments,
@@ -112,9 +113,16 @@ pub use nat_traversal::{
 pub use notify::{
     build_ike_sa_init_cookie_response, extract_ike_sa_init_cookie_notify, Ikev2CookieNotify,
     Ikev2CookieNotifyBuildError, Ikev2CookieNotifyExtractError, Ikev2NotifyPayload,
-    Ikev2NotifyPayloadError, IKEV2_NOTIFY_COOKIE, IKEV2_NOTIFY_COOKIE2,
-    IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION, IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP,
-    IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP, IKEV2_NOTIFY_PROTOCOL_ID_NONE, IKEV2_NOTIFY_REKEY_SA,
+    Ikev2NotifyPayloadError, IKEV2_NOTIFY_AUTHENTICATION_FAILED, IKEV2_NOTIFY_CHILD_SA_NOT_FOUND,
+    IKEV2_NOTIFY_COOKIE, IKEV2_NOTIFY_COOKIE2, IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION,
+    IKEV2_NOTIFY_FAILED_CP_REQUIRED, IKEV2_NOTIFY_INTERNAL_ADDRESS_FAILURE,
+    IKEV2_NOTIFY_INVALID_IKE_SPI, IKEV2_NOTIFY_INVALID_KE_PAYLOAD,
+    IKEV2_NOTIFY_INVALID_MAJOR_VERSION, IKEV2_NOTIFY_INVALID_MESSAGE_ID,
+    IKEV2_NOTIFY_INVALID_SELECTORS, IKEV2_NOTIFY_INVALID_SPI, IKEV2_NOTIFY_INVALID_SYNTAX,
+    IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP, IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP,
+    IKEV2_NOTIFY_NO_ADDITIONAL_SAS, IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+    IKEV2_NOTIFY_REKEY_SA, IKEV2_NOTIFY_SINGLE_PAIR_REQUIRED, IKEV2_NOTIFY_TEMPORARY_FAILURE,
+    IKEV2_NOTIFY_TS_UNACCEPTABLE, IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
 };
 pub use payload::{
     validate_payload_chain, PayloadChain, PayloadType, RawPayload, RawPayloadIterator,
@@ -129,14 +137,14 @@ pub use protected_payload_crypto::{
     ProtectedPayloadSealContext, IKEV2_AES_GCM_EXPLICIT_IV_LEN,
 };
 pub use sa_init::{
-    build_ike_sa_init_response, decode_ike_sa_init_request_payloads, Ikev2KeyExchangePayload,
-    Ikev2KeyExchangePayloadBuild, Ikev2KeyExchangePayloadError, Ikev2NoncePayload,
-    Ikev2NoncePayloadBuild, Ikev2NoncePayloadError, Ikev2NotifyPayloadBuild, Ikev2SaInitBuildError,
-    Ikev2SaInitPayloadError, Ikev2SaInitPayloads, Ikev2SaInitResponsePayloads, Ikev2SaPayload,
-    Ikev2SaPayloadBuild, Ikev2SaPayloadError, Ikev2SaProposal, Ikev2SaProposalBuild,
-    Ikev2SaTransform, Ikev2SaTransformBuild, Ikev2TransformAttribute, Ikev2TransformAttributeBuild,
-    Ikev2TransformAttributeBuildValue, Ikev2TransformAttributeValue, Ikev2VendorIdPayload,
-    Ikev2VendorIdPayloadError,
+    build_ike_sa_init_response, decode_ike_sa_init_request_payloads, encode_nonce_payload_build,
+    Ikev2KeyExchangePayload, Ikev2KeyExchangePayloadBuild, Ikev2KeyExchangePayloadError,
+    Ikev2NoncePayload, Ikev2NoncePayloadBuild, Ikev2NoncePayloadError, Ikev2NotifyPayloadBuild,
+    Ikev2SaInitBuildError, Ikev2SaInitPayloadError, Ikev2SaInitPayloads,
+    Ikev2SaInitResponsePayloads, Ikev2SaPayload, Ikev2SaPayloadBuild, Ikev2SaPayloadError,
+    Ikev2SaProposal, Ikev2SaProposalBuild, Ikev2SaTransform, Ikev2SaTransformBuild,
+    Ikev2TransformAttribute, Ikev2TransformAttributeBuild, Ikev2TransformAttributeBuildValue,
+    Ikev2TransformAttributeValue, Ikev2VendorIdPayload, Ikev2VendorIdPayloadError,
 };
 pub use sa_init_crypto::{
     derive_child_sa_key_material, derive_ike_sa_init_key_material, Ikev2ChildSaCryptoProfile,

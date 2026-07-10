@@ -42,6 +42,18 @@ pub enum DataplaneTestkitError {
     /// A G-PDU arrived for a TEID not configured on the reflector.
     #[error("G-PDU arrived for an unknown local TEID")]
     UnknownTeid,
+    /// Multi-session reflector capacity was zero or above its hard bound.
+    #[error("invalid GTP-U reflector session capacity")]
+    InvalidReflectorCapacity,
+    /// A reflector session used an invalid zero TEID or UDP port.
+    #[error("invalid GTP-U reflector session")]
+    InvalidReflectorSession,
+    /// A local TEID was already mapped to a different peer target.
+    #[error("conflicting GTP-U reflector session")]
+    ReflectorSessionConflict,
+    /// A new reflector session would exceed configured capacity.
+    #[error("GTP-U reflector session capacity exceeded")]
+    ReflectorSessionCapacityExceeded,
     /// A serialized evidence value failed redaction validation.
     #[error("redaction violation: {0}")]
     RedactionViolation(String),

@@ -2,9 +2,10 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use opc_dataplane_testkit::{
     build_measurement_tpdu, decode_gtpu, encode_echo_request, encode_gpdu,
-    encode_gpdu_with_extensions, ContinuityObserver, GtpuReflector, GtpuReturnDatagramOutcome,
-    InnerIpFlow, PacketContinuityBudget, ReflectorAction, ReflectorConfig, ReflectorPolicy,
-    ReflectorSendReason, RouteTarget, TrafficEngine, TrafficPlan, GTPU_EXT_PDU_SESSION_CONTAINER,
+    encode_gpdu_with_extensions, ContinuityObserver, DataplaneTestkitError, GtpuReflector,
+    GtpuReturnDatagramOutcome, InnerIpFlow, MultiSessionReflectorConfig, PacketContinuityBudget,
+    ReflectorAction, ReflectorConfig, ReflectorPolicy, ReflectorSendReason, ReflectorSession,
+    RouteTarget, TrafficEngine, TrafficPlan, GTPU_EXT_PDU_SESSION_CONTAINER,
     GTPU_MSG_ECHO_RESPONSE, GTPU_MSG_ERROR_INDICATION, GTPU_MSG_GPDU,
 };
 
@@ -273,6 +274,117 @@ fn reflector_handles_echo_request_and_unknown_teid_error_indication() {
     );
     assert_eq!(report.gtpu_error_indications, 1);
     assert!(!report.packet_continuity_proven);
+}
+
+#[test]
+fn multi_session_reflector_isolates_teid_to_peer_mappings_and_capacity() {
+    let peer_two_addr = SocketAddr::from(([192, 0, 2, 11], 2152));
+    let session_one = ReflectorSession {
+        local_teid: REFLECTOR_TEID,
+        peer_teid: ENGINE_TEID,
+        peer_addr: engine_addr(),
+    };
+    let session_two = ReflectorSession {
+        local_teid: 0x1000_0002,
+        peer_teid: 0x2000_0002,
+        peer_addr: peer_two_addr,
+    };
+    let mut reflector = GtpuReflector::with_sessions(
+        MultiSessionReflectorConfig {
+            max_sessions: 2,
+            recovery_counter: 9,
+            policy: ReflectorPolicy::Echo,
+        },
+        [session_one, session_two],
+    )
+    .expect("two-session reflector");
+    assert_eq!(reflector.session_count(), 2);
+    assert!(!reflector
+        .register_session(session_one)
+        .expect("exact registration is idempotent"));
+
+    let tpdu = build_measurement_tpdu(ipv4_flow(), 9, 1_000).expect("build T-PDU");
+    for (session, source) in [(session_one, engine_addr()), (session_two, peer_two_addr)] {
+        let uplink = encode_gpdu(session.local_teid, &tpdu).expect("encode uplink");
+        let ReflectorAction::Send {
+            destination,
+            packet,
+            reason,
+        } = reflector
+            .handle_datagram(source, &uplink)
+            .expect("reflect mapped session")
+        else {
+            panic!("expected reflected G-PDU");
+        };
+        assert_eq!(destination, session.peer_addr);
+        assert_eq!(reason, ReflectorSendReason::ReflectedGpdu);
+        assert_eq!(
+            decode_gtpu(&packet).expect("decode downlink").header.teid,
+            session.peer_teid
+        );
+    }
+
+    let conflict = ReflectorSession {
+        peer_teid: 0x2000_0099,
+        ..session_one
+    };
+    assert_eq!(
+        reflector.register_session(conflict),
+        Err(DataplaneTestkitError::ReflectorSessionConflict)
+    );
+    let over_capacity = ReflectorSession {
+        local_teid: 0x1000_0003,
+        peer_teid: 0x2000_0003,
+        peer_addr: SocketAddr::from(([192, 0, 2, 12], 2152)),
+    };
+    assert_eq!(
+        reflector.register_session(over_capacity),
+        Err(DataplaneTestkitError::ReflectorSessionCapacityExceeded)
+    );
+
+    assert_eq!(
+        reflector.remove_session(session_two.local_teid),
+        Some(session_two)
+    );
+    let unknown = encode_gpdu(session_two.local_teid, &tpdu).expect("unknown uplink");
+    let ReflectorAction::Send { reason, .. } = reflector
+        .handle_datagram(peer_two_addr, &unknown)
+        .expect("unknown TEID emits Error Indication")
+    else {
+        panic!("expected error indication");
+    };
+    assert_eq!(reason, ReflectorSendReason::ErrorIndication);
+}
+
+#[test]
+fn multi_session_reflector_rejects_invalid_bounds_and_session_shape() {
+    assert_eq!(
+        GtpuReflector::new_multi(MultiSessionReflectorConfig {
+            max_sessions: 0,
+            recovery_counter: 1,
+            policy: ReflectorPolicy::Echo,
+        })
+        .expect_err("zero capacity"),
+        DataplaneTestkitError::InvalidReflectorCapacity
+    );
+
+    let mut reflector = GtpuReflector::new_multi(MultiSessionReflectorConfig {
+        max_sessions: 1,
+        recovery_counter: 1,
+        policy: ReflectorPolicy::Echo,
+    })
+    .expect("bounded reflector");
+    assert_eq!(
+        reflector.register_session(ReflectorSession {
+            local_teid: 0,
+            peer_teid: ENGINE_TEID,
+            peer_addr: engine_addr(),
+        }),
+        Err(DataplaneTestkitError::InvalidReflectorSession)
+    );
+
+    let legacy = echo_reflector();
+    assert_eq!(legacy.session_count(), 1);
 }
 
 #[test]

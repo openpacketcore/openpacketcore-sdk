@@ -627,6 +627,7 @@ mod tests {
         assert_eq!(size_of::<XfrmUserSaInfo>(), 224);
         assert_eq!(offset_of!(XfrmUserSaInfo, id), 56);
         assert_eq!(offset_of!(XfrmUserSaInfo, lifetime_config), 96);
+        assert_eq!(offset_of!(XfrmUserSaInfo, request_id), 208);
         assert_eq!(offset_of!(XfrmUserSaInfo, family), 212);
         assert_eq!(size_of::<XfrmUserSaId>(), 24);
         assert_eq!(offset_of!(XfrmUserSaId, family), 20);
@@ -641,6 +642,7 @@ mod tests {
         assert_eq!(offset_of!(NetlinkErrorMessage, message), 4);
         assert_eq!(size_of::<XfrmUserTemplate>(), 64);
         assert_eq!(offset_of!(XfrmUserTemplate, source_address), 28);
+        assert_eq!(offset_of!(XfrmUserTemplate, request_id), 44);
         assert_eq!(offset_of!(XfrmUserTemplate, auth_algorithms), 52);
         assert_eq!(size_of::<XfrmUserSpiInfo>(), 232);
         assert_eq!(offset_of!(XfrmUserSpiInfo, min_spi), 224);

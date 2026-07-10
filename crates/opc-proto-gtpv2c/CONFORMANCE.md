@@ -118,6 +118,10 @@ and fuzz-seed mirror evidence before claiming additional production coverage.
      support.
    - PCO/APCO and Indication are typed as opaque byte-preserving containers so
      nested or future protocol options/flags are not silently dropped.
+   - The optional TS 24.008 PCO inner codec bounds parsing to 64 containers,
+     projects repeated IPv4/IPv6 DNS and P-CSCF addresses in wire order, and
+     safely skips well-formed unknown containers without changing opaque IE
+     round trips.
    - Bearer QoS decodes the fixed 22-octet shape into priority/QCI plus
      40-bit maximum and guaranteed bit-rate fields; Charging ID decodes as a
      four-octet identifier.
