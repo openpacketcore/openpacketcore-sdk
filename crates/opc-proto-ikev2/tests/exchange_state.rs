@@ -1,8 +1,8 @@
 use opc_proto_ikev2::{
     Header, HeaderFlags, Ikev2ExchangeBoundaryState, Ikev2ExchangeDecision,
     Ikev2ExchangeInvalidReason, Ikev2ExchangeKind, Ikev2ExchangeRequest, Ikev2ExchangeTracker,
-    Ikev2InitiatorMessageIdError, Ikev2InitiatorMessageIdWindow, PayloadType,
-    EXCHANGE_TYPE_CREATE_CHILD_SA, EXCHANGE_TYPE_IKE_AUTH, EXCHANGE_TYPE_IKE_SA_INIT,
+    Ikev2InitiatorMessageIdError, Ikev2InitiatorMessageIdWindow, Ikev2ResponderMessageIdWindow,
+    PayloadType, EXCHANGE_TYPE_CREATE_CHILD_SA, EXCHANGE_TYPE_IKE_AUTH, EXCHANGE_TYPE_IKE_SA_INIT,
     EXCHANGE_TYPE_INFORMATIONAL, IKEV2_EXCHANGE_RETRANSMISSION_WINDOW,
 };
 
@@ -301,4 +301,45 @@ fn initiator_message_id_window_rejects_exhausted_counter() {
         .expect_err("u32 max is reserved for close/rekey before exhaustion");
     assert_eq!(exhausted, Ikev2InitiatorMessageIdError::MessageIdExhausted);
     assert_eq!(exhausted.as_str(), "initiator_message_id_exhausted");
+}
+
+#[test]
+fn responder_message_id_window_rejects_duplicate_and_stale_requests() {
+    let mut window = Ikev2ResponderMessageIdWindow::new();
+
+    assert!(window.accept_request(0));
+    assert!(!window.accept_request(0));
+    assert!(
+        window.accept_request(3),
+        "authenticated forward gaps are fresh"
+    );
+    assert!(!window.accept_request(2));
+    assert_eq!(window.highest_processed(), Some(3));
+}
+
+#[test]
+fn responder_message_id_window_restores_seeded_high_water_mark() {
+    let mut window = Ikev2ResponderMessageIdWindow::with_highest_processed(7);
+
+    assert!(!window.accept_request(7));
+    assert!(!window.accept_request(6));
+    assert!(window.accept_request(8));
+    assert_eq!(
+        window.snapshot(),
+        opc_proto_ikev2::Ikev2ResponderMessageIdSnapshot {
+            highest_processed: Some(8),
+            exhausted: false,
+        }
+    );
+}
+
+#[test]
+fn responder_message_id_window_saturates_at_maximum() {
+    let mut window = Ikev2ResponderMessageIdWindow::with_highest_processed(u32::MAX - 1);
+
+    assert!(window.accept_request(u32::MAX));
+    assert!(window.is_exhausted());
+    assert!(!window.accept_request(0));
+    assert!(!window.accept_request(u32::MAX));
+    assert_eq!(window.highest_processed(), Some(u32::MAX));
 }

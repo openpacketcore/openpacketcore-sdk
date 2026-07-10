@@ -50,7 +50,8 @@ pub use exchange::{
     Ikev2ExchangeKind, Ikev2ExchangeProjection, Ikev2ExchangeRequest, Ikev2ExchangeRequestKey,
     Ikev2ExchangeSnapshot, Ikev2ExchangeTracker, Ikev2InitiatorMessageIdAllocation,
     Ikev2InitiatorMessageIdError, Ikev2InitiatorMessageIdSnapshot, Ikev2InitiatorMessageIdWindow,
-    Ikev2ResponderSpi, IKEV2_EXCHANGE_RETRANSMISSION_WINDOW,
+    Ikev2ResponderMessageIdSnapshot, Ikev2ResponderMessageIdWindow, Ikev2ResponderSpi,
+    IKEV2_EXCHANGE_RETRANSMISSION_WINDOW,
 };
 pub use fragmentation::{
     build_ikev2_encrypted_fragment_payload_body, reassemble_decrypted_ikev2_fragments,
