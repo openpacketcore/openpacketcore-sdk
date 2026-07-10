@@ -7,6 +7,7 @@ use crate::model::{
     ClusterNode, SaId, ShardId, SteeringProbe, SteeringRule, VipAdvertisement, VipProbe,
 };
 use crate::ports::{OwnershipSource, SteeringBackend, VipAdvertiser};
+use crate::repin::OwnershipSnapshot;
 
 /// Unsupported steering backend.
 #[derive(Debug, Clone, Copy, Default)]
@@ -80,7 +81,7 @@ impl OwnershipSource for UnsupportedOwnershipSource {
         Err(IpsecLbError::Unsupported)
     }
 
-    async fn sa_owner(&self, _sa: SaId) -> Result<Option<ClusterNode>, IpsecLbError> {
+    async fn sa_ownership(&self, _sa: SaId) -> Result<Option<OwnershipSnapshot>, IpsecLbError> {
         Err(IpsecLbError::Unsupported)
     }
 }

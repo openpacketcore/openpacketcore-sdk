@@ -34,7 +34,10 @@ pub use cookie::{
     IkeCookieRequest,
 };
 pub use error::IpsecLbError;
-pub use failover::{AntiReplayResume, IvResumeDecision, SendIvCounter};
+pub use failover::{
+    AntiReplayResume, IvResumeDecision, SendIvCounter, SendIvCounterMode, SendIvForwardJump,
+    MAX_ESP_SEND_IV_FORWARD_JUMP, MIN_SEND_IV_FORWARD_JUMP,
+};
 pub use mock::{
     MockOwnershipFencer, MockOwnershipSource, MockRePinAuditSink, MockSteeringBackend,
     MockSteeringOperation, MockVipAdvertiser, MockVipOperation,
@@ -48,15 +51,17 @@ pub use ports::{
     OwnershipFencer, OwnershipSource, RePinAuditSink, SpiAllocator, SteeringBackend, VipAdvertiser,
 };
 pub use repin::{
-    ForwardingProof, OwnershipFence, OwnershipFenceGrant, OwnershipFenceRequest, RePinAuditEvent,
-    RePinAuditEventKind, RePinCoordinator, RePinOutcome, RePinRequest, ResumeKeySource,
-    SameSpiResume,
+    ForwardingProof, OwnershipFence, OwnershipFenceGrant, OwnershipFenceRequest,
+    OwnershipRetryProof, OwnershipSnapshot, OwnershipTransitionFingerprint, OwnershipTransitionId,
+    RePinAuditEvent, RePinAuditEventKind, RePinCoordinator, RePinError, RePinOutcome,
+    RePinPartialFailure, RePinRequest, RePinRetryStage, ResumeKeySource, SameSpiResume,
 };
 pub use selector::{
     measure_disruption, RendezvousSelector, SelectionKey, ShardDisruption, ShardSet,
 };
 pub use session::{
-    SessionOwnershipKeyResolver, SessionOwnershipKeyspace, SessionStoreOwnershipSource,
+    SessionOwnershipKeyResolver, SessionOwnershipKeyspace, SessionStoreOwnershipFencer,
+    SessionStoreOwnershipSource,
 };
 pub use spi::{
     EntropySource, FixedEntropy, RekeyRequest, SpiAllocationRequest, SpiKind, SystemEntropy,

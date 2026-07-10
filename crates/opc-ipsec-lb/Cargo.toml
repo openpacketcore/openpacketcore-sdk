@@ -26,13 +26,14 @@ rand = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.14" }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true
