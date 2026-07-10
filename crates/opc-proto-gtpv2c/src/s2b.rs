@@ -21,11 +21,11 @@ use crate::header::Header;
 pub use crate::header::MessageType;
 use crate::ie::{
     decode_typed_ie_sequence, encode_typed_ie_sequence, AccessPointName, BearerContext, Cause,
-    CauseValue, EpsBearerId, FullyQualifiedTeid, PdnAddressAllocation, PdnType, RatType, Recovery,
-    SelectionMode, ServingNetwork, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APN,
-    IE_TYPE_BEARER_CONTEXT, IE_TYPE_CAUSE, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_PAA,
-    IE_TYPE_PDN_TYPE, IE_TYPE_RAT_TYPE, IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE,
-    IE_TYPE_SERVING_NETWORK,
+    CauseValue, EpsBearerId, FullyQualifiedTeid, PdnAddressAllocation, PdnType,
+    ProtocolConfigurationOptions, RatType, Recovery, SelectionMode, ServingNetwork, TbcdDigits,
+    TypedIe, TypedIeValue, IE_TYPE_APN, IE_TYPE_BEARER_CONTEXT, IE_TYPE_CAUSE, IE_TYPE_EBI,
+    IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_PAA, IE_TYPE_PCO, IE_TYPE_PDN_TYPE, IE_TYPE_RAT_TYPE,
+    IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE, IE_TYPE_SERVING_NETWORK,
 };
 use crate::{Message, OwnedMessage};
 
@@ -568,6 +568,13 @@ pub struct CreateSessionAcceptedResponseSummary {
     pub bearer_user_plane_f_teid: FullyQualifiedTeid,
     /// PGW-allocated PDN Address Allocation from top-level PAA IE instance 0.
     pub paa: Option<PdnAddressAllocation>,
+    /// Opaque TS 24.008 PCO contents from top-level PCO IE instance 0.
+    ///
+    /// Use [`crate::PcoAddressConfiguration::decode_network_contents`] for the
+    /// bounded DNS/P-CSCF address projection. Keeping the transport value here
+    /// preserves accepted-bearer summary behavior when optional PCO contents
+    /// are malformed or contain protocols the SDK does not decode.
+    pub pco: Option<ProtocolConfigurationOptions>,
 }
 
 impl fmt::Debug for CreateSessionAcceptedResponseSummary {
@@ -602,6 +609,11 @@ impl fmt::Debug for CreateSessionAcceptedResponseSummary {
                     .paa
                     .as_ref()
                     .is_some_and(|paa| paa.ipv6_prefix.is_some()),
+            )
+            .field("pco_present", &self.pco.is_some())
+            .field(
+                "pco_value_len",
+                &self.pco.as_ref().map(|pco| pco.value.len()),
             )
             .finish()
     }
@@ -2590,6 +2602,17 @@ fn find_response_paa(
     }
 }
 
+fn find_response_pco(ies: &[TypedIe<'_>]) -> Option<ProtocolConfigurationOptions> {
+    ies.iter().find_map(|ie| match &ie.value {
+        TypedIeValue::ProtocolConfigurationOptions(pco)
+            if ie.ie_type() == IE_TYPE_PCO && ie.instance == 0 =>
+        {
+            Some(pco.clone())
+        }
+        _ => None,
+    })
+}
+
 fn find_bearer_context_s2b_u_f_teid(
     ies: &[TypedIe<'_>],
 ) -> Result<FullyQualifiedTeid, CreateSessionResponseSummaryError> {
@@ -2656,6 +2679,7 @@ fn project_create_session_response(
         let bearer_ebi = find_bearer_context_ebi(&view.ies)?;
         let bearer_user_plane_f_teid = find_bearer_context_s2b_u_f_teid(&view.ies)?;
         let paa = find_response_paa(&view.ies)?;
+        let pco = find_response_pco(&view.ies);
 
         Ok(CreateSessionResponseSummary::Accepted(
             CreateSessionAcceptedResponseSummary {
@@ -2666,6 +2690,7 @@ fn project_create_session_response(
                 bearer_ebi,
                 bearer_user_plane_f_teid,
                 paa,
+                pco,
             },
         ))
     } else {
@@ -3514,8 +3539,11 @@ mod tests {
     }
 
     #[test]
-    fn accepted_create_session_summary_projects_paa_and_user_plane_f_teid() {
+    fn accepted_create_session_summary_projects_paa_pco_and_user_plane_f_teid() {
         let paa = response_paa([203, 0, 113, 9]);
+        let pco = ProtocolConfigurationOptions {
+            value: vec![0x80, 0x00, 0x0d, 0x04, 8, 8, 8, 8],
+        };
         let message = accepted_response(
             vec![
                 bearer_ebi(5),
@@ -3528,7 +3556,10 @@ mod tests {
                     )),
                 ),
             ],
-            vec![typed_ie(0, TypedIeValue::PdnAddressAllocation(paa.clone()))],
+            vec![
+                typed_ie(0, TypedIeValue::PdnAddressAllocation(paa.clone())),
+                typed_ie(0, TypedIeValue::ProtocolConfigurationOptions(pco.clone())),
+            ],
         );
 
         let summary = match decode_create_session_response_summary(
@@ -3543,6 +3574,17 @@ mod tests {
             panic!("expected accepted summary");
         };
         assert_eq!(accepted.paa, Some(paa));
+        assert_eq!(accepted.pco, Some(pco));
+        let projected_pco = match &accepted.pco {
+            Some(pco) => pco,
+            None => panic!("PCO was not projected"),
+        };
+        let decoded_pco =
+            match crate::PcoAddressConfiguration::decode_network_contents(&projected_pco.value) {
+                Ok(decoded) => decoded,
+                Err(error) => panic!("PCO address decode failed: {error}"),
+            };
+        assert_eq!(decoded_pco.dns_server_ipv4, vec![[8, 8, 8, 8]]);
         assert_eq!(
             accepted.bearer_user_plane_f_teid.interface_type,
             INTERFACE_TYPE_S2B_U_PGW_GTP_U
@@ -3555,8 +3597,10 @@ mod tests {
 
         let debug = format!("{accepted:?}");
         assert!(debug.contains("paa_ipv4_present: true"));
+        assert!(debug.contains("pco_present: true"));
         assert!(!debug.contains("[203, 0, 113, 9]"));
         assert!(!debug.contains("[203, 0, 113, 1]"));
+        assert!(!debug.contains("8, 8, 8, 8"));
         assert!(!debug.contains("287454020"));
     }
 

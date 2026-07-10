@@ -24,6 +24,9 @@ control-plane stack.
   shells and implement the shared `opc-protocol` codec traits.
 - `S2bMessage<'a>` and `S2bProcedureMessage<'a>` provide typed S2b views and
   raw fallback for unsupported message types.
+- `PcoRequest` and `PcoAddressConfiguration` provide a bounded TS 24.008 inner
+  codec for IPv4/IPv6 DNS and P-CSCF containers while the outer PCO/APCO IE
+  transport remains opaque and byte-preserving.
 - Public profile constructors build profile-valid owned messages:
   `s2b_echo_request`, `s2b_echo_response`,
   `s2b_create_session_request`,
@@ -70,7 +73,9 @@ typed-view, ProcedureAware validation, fixture replay, and transport-neutral
 helper boundary. The crate is still `publish = false`.
 
 Known limits include no full Release 18 GTPv2-C matrix, no independent-peer
-interoperability claim, and no product state machine. `CONFORMANCE.md` also
+interoperability claim, and no product state machine. The PCO inner codec is
+limited to DNS/P-CSCF address projection and safely skips other well-formed
+containers. `CONFORMANCE.md` also
 calls out that strict-mode support for priority-bearing MP-flag messages is a
 future fix because the current common header folds low flag bits into a spare
 field.

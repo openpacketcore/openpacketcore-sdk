@@ -26,6 +26,7 @@ pub(crate) const fn is_strict(level: ValidationLevel) -> bool {
 pub mod header;
 pub mod ie;
 pub mod message;
+pub mod pco;
 pub mod s2b;
 
 pub use header::{decode_header, encode_header, Header, MessageType, GTPV2C_VERSION};
@@ -42,6 +43,11 @@ pub use ie::{
     IE_TYPE_RAT_TYPE, IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE, IE_TYPE_SERVING_NETWORK,
 };
 pub use message::{Message, OwnedMessage};
+pub use pco::{
+    PcoAddressConfiguration, PcoDecodeError, PcoRequest, PCO_CONTAINER_DNS_SERVER_IPV4,
+    PCO_CONTAINER_DNS_SERVER_IPV6, PCO_CONTAINER_P_CSCF_IPV4, PCO_CONTAINER_P_CSCF_IPV6,
+    PCO_HEADER_PPP_FOR_IP_PDN, PCO_MAX_CONTAINERS,
+};
 pub use s2b::{
     decode_create_session_response_summary, decode_echo_message_evidence, is_s2b_message_type,
     s2b_create_session_accepted_response, s2b_create_session_rejected_response,
