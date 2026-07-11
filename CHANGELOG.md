@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-sa-mirror` (RFC 015): experimental live SA keymat mirroring for
+  near-hitless IPsec failover in which keys never persist — producer/sink/
+  takeover ports, an in-memory standby holder with epoch anti-rollback and
+  fail-closed capacity, an mTLS-only keymat transport with zeroizing frame
+  buffers, and takeover output pre-validated as
+  `SameSpiResume { key_source: LiveMirrored }` for the fenced re-pin.
 - `opc-proto-ikev2`: a seedable responder Message-ID replay window, the full
   RFC 7296 error-notify registry, public nonce encoding, and stricter
   CREATE_CHILD_SA rekey proposal/KE validation.

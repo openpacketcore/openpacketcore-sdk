@@ -139,6 +139,7 @@ The current held crates and their graduation requirements are:
 | Crate | Status | Graduation requirement |
 |:------|:-------|:-----------------------|
 | `opc-session-net` | experimental | A stable wire-format contract with a documented compatibility policy and soak evidence across at least one minor version bump. See `crates/opc-session-net/README.md`. |
+| `opc-sa-mirror` | experimental | A stable keymat wire-format contract with a documented compatibility policy (graduation criteria decided together with `opc-session-net`'s), plus downstream CNF evidence that a live-mirrored takeover passes the fenced re-pin on real owner loss. See `docs/rfc/015-live-sa-mirror.md`. |
 | `opc-key-vault` | experimental | A production-readiness review covering Vault policy scoping, secret-zero handling, lease rotation, and an integration test against a real or containerized Vault Transit instance. |
 | `opc-proto-nas` | experimental | Structured parsing of the remaining 5GMM and 5GSM message bodies listed as out-of-scope in `crates/opc-proto-nas/CONFORMANCE.md`, with spec-byte fixtures for each message. |
 | `opc-proto-ngap` | experimental | A working canonical (typed) APER encoder path, verified by external fixtures for `NGSetupResponse` and `NGSetupFailure`, after the upstream `rasn` APER encoder misalignment is resolved or replaced. See `crates/opc-proto-ngap/CONFORMANCE.md`. |
