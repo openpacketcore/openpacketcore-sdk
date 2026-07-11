@@ -15,7 +15,7 @@ accepted.
 |:---|:---|
 | [0001](0001-secure-config-management.md) | Config management is secure by default, commit-confirmed, audited, and explicitly authorized. |
 | [0002](0002-config-store-consensus-ha.md) | Config persistence HA uses `ConsensusConfigStore` with Raft-style quorum safety, authenticated transport, durable membership, and snapshot integrity. |
-| [0003](0003-session-store-quorum-replication.md) | Authoritative session state uses quorum ordered-log replication with majority-supported repair, not standalone SQLite HA. |
+| [0003](0003-session-store-quorum-replication.md) | Authoritative session HA targets validated quorum membership and durable ordered-log consensus; current majority-visible repair remains experimental, and standalone SQLite is not HA. |
 | [0004](0004-security-identity-keying-audit.md) | Production identity, TLS, keys, and audit integrity are explicit SDK substrates with fail-closed adapters. |
 | [0005](0005-runtime-observability-admin-probes.md) | Runtime health, admin/probe routes, metrics, and alarms are shared SDK surfaces with production authorization and redaction. |
 | [0006](0006-fault-injection-fail-closed-validation.md) | Storage, security, runtime, HA, and release evidence are validated through fail-closed fault injection. |

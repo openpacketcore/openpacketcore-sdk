@@ -19,7 +19,7 @@ testbed boundaries.
 - `NacmConfigAuthorizer` adapts `opc-nacm` policy evaluation to config-bus
   authorization.
 - `AmfLite::start` and `start_with_clock` launch the slice with config store,
-  session replicas, KMS endpoint, admin address, NACM policy/modules, and
+  validated session topology, KMS endpoint, admin address, NACM policy/modules, and
   optional injected clock.
 - Runtime methods include `register_ue`, `update_ue_session`,
   `session_key_for_subscriber`, `commit_config`, `commit_config_with_mode`,
@@ -40,8 +40,9 @@ assert_eq!(AMF_SCHEMA_DIGEST.len(), 64);
 - Uses `opc-runtime` for lifecycle, readiness, shutdown, and supervision.
 - Uses `opc-config-bus`, `opc-config-model`, and `opc-persist` for transactional
   encrypted config commits.
-- Uses `opc-session-store` quorum/fencing plus `EncryptingSessionBackend` for
-  UE session state.
+- Uses `opc-session-store` validated topology/quorum/fencing plus
+  `EncryptingSessionBackend` for UE session state. Backend wrapping preserves
+  and revalidates the admitted topology metadata.
 - Uses `opc-key` and `opc-crypto` through a KMS provider boundary.
 - Uses `opc-nacm` for config authorization, `opc-alarm` for alarm reporting,
   and `opc-redaction`/`opc-privacy` for subscriber-safe identifiers.
@@ -58,6 +59,9 @@ assert_eq!(AMF_SCHEMA_DIGEST.len(), 64);
   behavior through `opc-security-testkit`.
 - Config consensus and session HA paths are exercised by tests, but their
   production readiness is bounded by the underlying SDK crates.
+- AMF-lite topology is in-process test evidence. It does not establish fresh
+  peer readiness, authenticated membership, durable session consensus, or
+  carrier HA qualification.
 
 ## Roadmap
 

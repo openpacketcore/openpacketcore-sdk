@@ -18,8 +18,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
     backend::{
-        CompareAndSet, CompareAndSetResult, ReplicationEntry, SessionBackend, SessionOp,
-        SessionOpResult, WATCH_CHANNEL_CAPACITY,
+        BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry,
+        SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
     },
     capability::BackendCapabilities,
     clock::Clock,
@@ -258,6 +258,10 @@ fn apply_pragma_profile(conn: &Connection, in_memory: bool) -> Result<(), StoreE
 
 #[async_trait]
 impl SessionBackend for SqliteSessionBackend {
+    fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
+        Some(BackendInstanceIdentity::for_shared(&self.conn))
+    }
+
     async fn capabilities(&self) -> BackendCapabilities {
         self.caps
     }

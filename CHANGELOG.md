@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-session-store`: immutable replica descriptors and
+  `ValidatedQuorumTopology` admission with distinct logical ID, canonical
+  endpoint, expected TLS identity, failure domain, backing identity, and exact
+  local-self selection. An explicit lab singleton reports `single-replica`,
+  never quorum HA.
 - `opc-sa-mirror` (RFC 015): experimental live SA keymat mirroring for
   near-hitless IPsec failover in which keys never persist — producer/sink/
   takeover ports, an in-memory standby holder with epoch anti-rollback and
@@ -26,10 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepted-session PCO access.
 - `opc-dataplane-testkit`: a bounded multi-session GTP-U reflector keyed by
   inbound local TEID, with idempotent registration and conflict detection.
-- `opc-ipsec-lb`: `SessionStoreOwnershipFencer`, a production ownership
+- `opc-ipsec-lb`: `SessionStoreOwnershipFencer`, an ownership
   promotion adapter that acquires the session-store lease, commits a
   generation-guarded owner change, and projects the committed store fence into
-  the re-pin grant; production HA wiring requires a majority-committing store.
+  the re-pin grant; production HA wiring requires durable majority authority,
+  which the current session quorum prototype does not establish before #127.
 - RFC 014 and `opc-mgmt-command`: the model-driven interactive operational
   console contract plus a transport-neutral, bounded command catalog with
   schema-validated reads, subscriptions, allowlisted actions, presentation
@@ -86,6 +92,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed fuzz corpora for the GTP-U, NAS, Diameter, and IKEv2 targets.
 
 ### Changed
+- **BREAKING — `opc-session-store`:** the deprecated raw-vector
+  `QuorumSessionStore::new` remains source-compatible but is now deliberately
+  non-operational: it advertises `unknown`, masks capabilities, and rejects
+  operations. Migrate HA callers through `QuorumTopologyConfig` and
+  `ValidatedQuorumTopology`; migrate one-replica tests/labs through
+  `try_new_lab_singleton`. AMF-lite and the session testkit now require an
+  explicit validated local member and preserve topology while wrapping
+  backends. External backend adapters used as votes must return
+  `Some(BackendInstanceIdentity)`; forwarding wrappers must delegate it, and
+  the default `None` fails topology admission.
 - **BREAKING — `opc-session-net`:** the wire contract is now v2 for remote
   restore scans. The exact-version Hello handshake rejects v1/v2 peers, so all
   clients and servers require a coordinated upgrade; mixed-version rolling
@@ -167,13 +183,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- `opc-session-store`: quorum construction now rejects empty/undersized/even HA
+  membership, missing or ambiguous self, duplicate logical IDs, canonical
+  endpoints, declared TLS identities, failure domains, backing identities, and
+  duplicate process-local adapter instances before I/O. The denominator is
+  immutable validated membership and result accounting is keyed by `ReplicaId`,
+  so one conforming SDK backend instance cannot be wrapped into multiple votes.
+  Declared backing identity and authenticated peer binding remain separate
+  requirements. A real
+  mTLS SQLite regression proves that bare logical self is independent from FQDN
+  endpoints. This closes #123 configured-topology admission only; #124/#125,
+  #127–#129, and #133–#135 remain production blockers.
 - `opc-session-net`: remote backends and replication servers now carry
   validated cursor-paged restore scans, shorten multi-record pages to the
   effective client/server frame limit, and return a typed error when one
   record cannot fit. This implements the transport parity tracked by #126; it
   does not implement bounded majority-authoritative restore (#133), fixed-width
   wire stabilization (#134), invariant-safe model decoding (#135), or session
-  HA qualification (#123–#125, #127–#129).
+  HA qualification (#124/#125, #127–#129).
 - `opc-persist`: standalone default-feature test builds no longer depend on
   fault-injection symbols that exist only with `dangerous-test-hooks`; CI now
   compiles the default package contract before workspace all-feature unification

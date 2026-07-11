@@ -111,8 +111,10 @@ pub enum SessionStorePlatformProfile {
     /// accepted single-replica deployments, but not for active/standby traffic
     /// readiness claims.
     SingleReplica,
-    /// Quorum replicated session-store profile with ordered durable mutation
-    /// semantics.
+    /// Platform-selected quorum profile. A runtime store may return this value
+    /// only after configured membership passed topology validation; this value
+    /// alone is not peer reachability, authenticated membership, or durable
+    /// commit evidence.
     Quorum,
     /// The platform profile name is not recognized by this SDK contract.
     Unknown,
@@ -124,7 +126,9 @@ impl SessionStorePlatformProfile {
     ///
     /// Unknown inputs collapse to [`Self::Unknown`] without retaining the raw
     /// text, so status paths can fail closed without leaking platform object
-    /// names or deployment-specific labels.
+    /// names or deployment-specific labels. Parsing a name is configuration
+    /// intent only; use the constructed store's topology profile before a
+    /// runtime readiness claim.
     pub fn from_backend_profile_name(profile: &str) -> Self {
         let canonical = profile.trim().to_lowercase().replace(['_', ' '], "-");
         match canonical.as_str() {

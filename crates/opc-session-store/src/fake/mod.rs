@@ -16,8 +16,8 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::{
     backend::{
-        CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend,
-        SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
+        BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry,
+        ReplicationOp, SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
     },
     capability::BackendCapabilities,
     clock::{Clock, TokioVirtualClock},
@@ -671,6 +671,10 @@ impl Default for FakeSessionBackend {
 
 #[async_trait]
 impl SessionBackend for FakeSessionBackend {
+    fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
+        Some(BackendInstanceIdentity::for_shared(&self.inner))
+    }
+
     async fn capabilities(&self) -> BackendCapabilities {
         self.caps
     }

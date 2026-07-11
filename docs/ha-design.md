@@ -8,9 +8,11 @@ OpenPacketCore config and session persistence surfaces.
   Raft-like safety guards, snapshots, metrics hooks, and multi-process fault
   tests. These are tested prototype properties, not carrier HA qualification.
 - **Session Store**: `QuorumSessionStore` is an in-process quorum ordered-log
-  adapter with a majority-visible-prefix repair prototype, watch cursors,
-  stale-replica catch-up, and chaos tests. Production networked HA depends on the experimental
-  `opc-session-net` transport and further distributed/soak evidence.
+  adapter with fail-closed configured-topology admission, a
+  majority-visible-prefix repair prototype, watch cursors, stale-replica
+  catch-up, and chaos tests. Production networked HA depends on the
+  experimental `opc-session-net` transport and further distributed/soak
+  evidence.
 
 Historical closure language below refers only to scoped algorithms and test
 harnesses. Config-store qualification (`GAP-001-006`) and production networked
@@ -87,12 +89,32 @@ Platform hardening concerns—including TLS/SPIFFE SVID and bundle watch/reload 
 ## 2. Replicated Session Store Ordered Log: `QuorumSessionStore`
 
 The algorithm below describes intended and prototype-tested behavior; it is not
-yet durable distributed proof or a production deployment contract. Validated
-topology/readiness/identity (#123–#125), durable sequencing and safe fork
-recovery (#127–#129), and bounded majority-authoritative restore (#133) remain
-open; wire-width and shared model-decoding hardening remain #134/#135.
+yet durable distributed proof or a production deployment contract. Configured
+topology admission is implemented. Fresh readiness/authenticated identity
+(#124/#125), durable sequencing and safe fork recovery (#127–#129), and bounded
+majority-authoritative restore (#133) remain open; wire-width and shared
+model-decoding hardening remain #134/#135.
 
 `QuorumSessionStore` coordinates session leases and CAS mutations across a set of `SessionStoreBackend` replicas using quorum-backed ordered replication. It is not a Raft implementation; its target safety contract is a durable committed log prefix where an entry is authoritative only after the same sequence entry is present on a majority of replicas.
+
+### Configured topology admission
+
+Operational construction consumes `ValidatedQuorumTopology`. HA admission
+requires an odd set of 3 through 31 members, one exact local `ReplicaId`, and
+unique logical IDs, canonical endpoints, expected TLS identities, failure
+domains, backing-store identities, and process-local adapter instances. The required
+quorum is precomputed from that immutable configured membership, and vote
+accounting is keyed by `ReplicaId` rather than raw vector entries.
+
+Logical identity, endpoint, TLS identity, failure domain, and backing identity
+are independent. A bare local ID can belong to a member with an FQDN endpoint;
+no hostname shortening or endpoint-as-identity inference occurs. The explicit
+lab singleton reports `single-replica`. The deprecated raw-vector constructor
+reports `unknown`, masks capabilities, and refuses operations.
+
+These checks prove configuration distinctness only. They do not prove fresh
+peer reachability (#124), bind the declared identity to the mTLS peer (#125),
+or establish durable commit/repair/restore authority (#127/#128/#133).
 
 ### Network restore transport (protocol v2)
 

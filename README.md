@@ -113,7 +113,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
-| [`opc-session-store`](crates/opc-session-store/) | Session database primitives supporting lease management, fenced CAS operations, change-stream watches, and extensively tested in-process quorum coordination. Production networked HA remains conditional; replication transport is experimental and provided by `opc-session-net`. | [RFC 004](docs/rfc/004-session-store.md) |
+| [`opc-session-store`](crates/opc-session-store/) | Session database primitives supporting lease management, fenced CAS operations, change-stream watches, validated configured quorum topology, and an explicit non-HA lab singleton. Production networked HA remains conditional; replication transport is experimental and provided by `opc-session-net`. | [RFC 004](docs/rfc/004-session-store.md) |
 | [`opc-session-cache`](crates/opc-session-cache/) | Coherence-aware read-through session cache with key-scoped invalidation, sequence tracking, and resume recovery. It is not a durability layer and does not elevate the selected backend/profile's maturity. | [RFC 004](docs/rfc/004-session-store.md) |
 | [`opc-session-net`](crates/opc-session-net/) | Networked session replication transport: mTLS length-prefixed wire protocol, replication server, remote backend client, and protocol-v2 paged restore scans *(experimental; v1/v2 mixed deployments are unsupported)*. | [RFC 004](docs/rfc/004-session-store.md) |
 

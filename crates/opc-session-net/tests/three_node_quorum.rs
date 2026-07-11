@@ -5,7 +5,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
-use opc_session_net::{RemoteSessionBackend, SessionReplicationServer};
+use opc_session_net::{RemoteAddrResolver, RemoteSessionBackend, SessionReplicationServer};
 use opc_session_store::backend::{
     CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend,
 };
@@ -18,7 +18,10 @@ use opc_session_store::model::{
 use opc_session_store::quorum::{FencedSessionReplica, QuorumSessionStore, SessionStoreBackend};
 use opc_session_store::record::{EncryptedSessionPayload, StoredSessionRecord};
 use opc_session_store::{
-    RestoreScanCursor, RestoreScanRequest, RestoreScanScope, SqliteSessionBackend, StoreError,
+    QuorumReplicaDescriptor, QuorumReplicaMember, QuorumTopologyConfig, ReplicaBackingIdentity,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanCursor,
+    RestoreScanRequest, RestoreScanScope, SqliteSessionBackend, StoreError,
+    ValidatedQuorumTopology,
 };
 use opc_tls::TlsConfigBuilder;
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
@@ -27,6 +30,40 @@ use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 struct TestMtls {
     server_config: Arc<opc_tls::ServerConfig>,
     client_config: Arc<opc_tls::ClientConfig>,
+}
+
+fn topology_replica_id(index: usize) -> ReplicaId {
+    ReplicaId::new(format!("test-replica-{index}")).expect("test replica ID")
+}
+
+fn topology_member(replica: FencedSessionReplica) -> QuorumReplicaMember {
+    let index = replica.id;
+    QuorumReplicaMember::new(
+        QuorumReplicaDescriptor::new(
+            topology_replica_id(index),
+            ReplicaEndpoint::new(format!("test-replica-{index}.invalid"), 7443)
+                .expect("test endpoint"),
+            ReplicaTlsIdentity::new(format!("spiffe://test/session/replica/{index}"))
+                .expect("test TLS identity"),
+            ReplicaFailureDomain::new(format!("test-failure-domain-{index}"))
+                .expect("test failure domain"),
+            ReplicaBackingIdentity::new(format!("test-backing-{index}"))
+                .expect("test backing identity"),
+        ),
+        replica,
+    )
+}
+
+fn validated_quorum(
+    local_replica_index: usize,
+    replicas: Vec<FencedSessionReplica>,
+) -> QuorumSessionStore {
+    let topology = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new(
+        topology_replica_id(local_replica_index),
+        replicas.into_iter().map(topology_member).collect(),
+    ))
+    .expect("valid network test topology");
+    QuorumSessionStore::from_validated_topology(topology)
 }
 
 fn test_key() -> SessionKey {
@@ -348,7 +385,7 @@ async fn unusable_client_or_server_frame_bound_masks_restore_capability() {
 }
 
 #[tokio::test]
-async fn boot_restore_and_live_survivor_scan_use_local_and_remote_sqlite_replicas() {
+async fn validated_bare_self_and_fqdn_peers_restore_over_mtls_sqlite_replicas() {
     let mtls = mtls_configs();
     let local = Arc::new(SqliteSessionBackend::in_memory().expect("local SQLite"));
     let (addr1, _backend1, handle1) = start_server_with_backend(
@@ -361,21 +398,72 @@ async fn boot_restore_and_live_survivor_scan_use_local_and_remote_sqlite_replica
         SqliteSessionBackend::in_memory().expect("remote SQLite 2"),
     )
     .await;
-    let remote1 = Arc::new(RemoteSessionBackend::new(
-        addr1,
+    let peer1_host = "epdg-app-1.epdg-app-quorum.epdg-gateway.svc.cluster.local";
+    let peer2_host = "epdg-app-2.epdg-app-quorum.epdg-gateway.svc.cluster.local";
+    let resolver1: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(addr1) }));
+    let resolver2: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(addr2) }));
+    let remote1 = Arc::new(RemoteSessionBackend::new_with_resolver(
+        peer1_host.to_string(),
+        resolver1,
         mtls.client_config.clone(),
         Some(Duration::from_millis(300)),
     ));
-    let remote2 = Arc::new(RemoteSessionBackend::new(
-        addr2,
+    let remote2 = Arc::new(RemoteSessionBackend::new_with_resolver(
+        peer2_host.to_string(),
+        resolver2,
         mtls.client_config.clone(),
         Some(Duration::from_millis(300)),
     ));
-    let quorum = QuorumSessionStore::new(vec![
-        FencedSessionReplica::new(1, local),
-        FencedSessionReplica::new(2, remote1),
-        FencedSessionReplica::new(3, remote2),
-    ]);
+    let logical_self = ReplicaId::new("epdg-app-0").expect("bare logical self");
+    let member = |slot,
+                  id: ReplicaId,
+                  host: &str,
+                  port,
+                  tls_identity: &str,
+                  backend: Arc<dyn SessionStoreBackend>| {
+        QuorumReplicaMember::new(
+            QuorumReplicaDescriptor::new(
+                id,
+                ReplicaEndpoint::new(host, port).expect("FQDN endpoint"),
+                ReplicaTlsIdentity::new(tls_identity).expect("declared TLS identity"),
+                ReplicaFailureDomain::new(format!("pod/epdg-app-{slot}")).expect("failure domain"),
+                ReplicaBackingIdentity::new(format!("pvc/session-store-{slot}"))
+                    .expect("backing identity"),
+            ),
+            FencedSessionReplica::new(slot, backend),
+        )
+    };
+    let members = vec![
+        member(
+            0,
+            logical_self.clone(),
+            "epdg-app-0.epdg-app-quorum.epdg-gateway.svc.cluster.local",
+            7443,
+            "spiffe://test/session/epdg-app-0",
+            local,
+        ),
+        member(
+            1,
+            ReplicaId::new("epdg-app-1").expect("peer ID"),
+            peer1_host,
+            addr1.port(),
+            "spiffe://test/session/epdg-app-1",
+            remote1,
+        ),
+        member(
+            2,
+            ReplicaId::new("epdg-app-2").expect("peer ID"),
+            peer2_host,
+            addr2.port(),
+            "spiffe://test/session/epdg-app-2",
+            remote2,
+        ),
+    ];
+    let topology =
+        ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new(logical_self.clone(), members))
+            .expect("bare logical self must match its explicit FQDN member record");
+    assert_eq!(topology.summary().local_replica_id(), Some(&logical_self));
+    let quorum = QuorumSessionStore::from_validated_topology(topology);
 
     let empty = quorum
         .scan_restore_records(RestoreScanRequest::all(2))
@@ -584,8 +672,10 @@ async fn test_three_node_quorum_kill_and_restart() {
     let replica2 = FencedSessionReplica::new(2, remote2.clone());
     let replica3 = FencedSessionReplica::new(3, remote3.clone());
 
-    let quorum =
-        QuorumSessionStore::new(vec![replica1.clone(), replica2.clone(), replica3.clone()]);
+    let quorum = validated_quorum(
+        1,
+        vec![replica1.clone(), replica2.clone(), replica3.clone()],
+    );
 
     let empty_restore = quorum
         .scan_restore_records(RestoreScanRequest::all(16))
@@ -670,7 +760,7 @@ async fn test_three_node_quorum_kill_and_restart() {
     let replica1_new = FencedSessionReplica::new(1, remote1_new.clone());
 
     // Create a new quorum with the restarted replica
-    let quorum2 = QuorumSessionStore::new(vec![replica1_new, replica2.clone(), replica3.clone()]);
+    let quorum2 = validated_quorum(1, vec![replica1_new, replica2.clone(), replica3.clone()]);
 
     // Wait for things to settle
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -925,7 +1015,7 @@ async fn test_batch_and_delete() {
     let replica2 = FencedSessionReplica::new(2, remote2);
     let replica3 = FencedSessionReplica::new(3, remote3);
 
-    let quorum = QuorumSessionStore::new(vec![replica1, replica2, replica3]);
+    let quorum = validated_quorum(1, vec![replica1, replica2, replica3]);
 
     let key = test_key();
     let owner = OwnerId::new("owner-batch").unwrap();
@@ -1003,7 +1093,7 @@ async fn test_replication_log_and_watch() {
     let replica2 = FencedSessionReplica::new(2, remote2);
     let replica3 = FencedSessionReplica::new(3, remote3);
 
-    let quorum = QuorumSessionStore::new(vec![replica1, replica2, replica3]);
+    let quorum = validated_quorum(1, vec![replica1, replica2, replica3]);
 
     let key = test_key();
     let owner = OwnerId::new("owner-watch").unwrap();

@@ -312,7 +312,7 @@ async fn test_amf_lite_e2e_happy_path() {
     let amf = AmfLite::start_with_clock(
         AmfConfig::default(),
         config_store,
-        chaos.replicas.clone(),
+        chaos.validated_topology(0).expect("valid AMF topology"),
         kms_endpoint,
         Some(auth_token.clone()),
         admin_addr,
@@ -532,7 +532,9 @@ async fn test_amf_lite_ha_failover_and_recovery() {
     let amf_0 = AmfLite::start(
         AmfConfig::default(),
         group[0].clone(),
-        chaos.replicas.clone(),
+        chaos
+            .validated_topology(0)
+            .expect("valid AMF node 0 topology"),
         kms_endpoint.clone(),
         Some(auth_token.clone()),
         admin_addr,
@@ -629,7 +631,9 @@ async fn test_amf_lite_ha_failover_and_recovery() {
     let amf_1 = AmfLite::start(
         AmfConfig::default(),
         group[1].clone(),
-        chaos.replicas.clone(),
+        chaos
+            .validated_topology(1)
+            .expect("valid AMF node 1 topology"),
         kms_endpoint.clone(),
         Some(auth_token.clone()),
         admin_addr_new,
@@ -791,7 +795,7 @@ async fn test_amf_lite_security_and_redaction() {
     let amf = AmfLite::start(
         AmfConfig::default(),
         config_store,
-        chaos.replicas.clone(),
+        chaos.validated_topology(0).expect("valid AMF topology"),
         kms_endpoint.clone(),
         Some(auth_token.clone()),
         admin_addr,

@@ -116,6 +116,23 @@ coordination; its production network path depends on the experimental
 `opc-session-net` transport. Neither is a production-profile claim until its
 documented graduation requirements and downstream distributed/soak gates pass.
 
+### Session topology admission
+
+Construct HA-shaped session stores only from `ValidatedQuorumTopology`. The SDK
+rejects membership outside the odd 3-through-31 bound, missing/ambiguous local
+self, duplicate logical IDs/endpoints/TLS identities/failure domains/backing
+identities, and duplicate process-local adapter instances before server readiness. The quorum
+denominator is the admitted configured membership, not current reachability.
+
+`ValidatedQuorumTopology::try_new_lab_singleton` is an explicit lab path and
+advertises `single-replica`. The deprecated raw-vector constructor advertises
+`unknown` and is non-operational. Logical self must be configured explicitly;
+do not derive it by shortening an FQDN or comparing endpoint strings.
+
+This admission result is not a durable-ready signal. A production operator
+must still require the fresh peer-majority path in #124 and authenticated
+membership binding in #125 before traffic readiness.
+
 ### Tested HA algorithm and prototype features
 
 1. **Persisted Ordered-Log Prototype**: Exercises replication of mutations (lease acquire, renew, release, compare-and-set, delete, TTL refresh, and batch operations) across replicas using a sequence-numbered log. Durable sequence/commit authority remains #127.
@@ -140,9 +157,9 @@ rolling upgrade.
 This is not production HA qualification. Do not infer readiness from bind
 success or cached capabilities (#124), use quorum restore as authority before
 #127/#133, treat current divergence repair as authoritative before #128, or
-auto-resolve a legacy fork before #129. Topology and authenticated replica identity (#123/#125) are also
-prerequisites; fixed-width wire DTOs and invariant-safe model decoding remain
-#134/#135.
+auto-resolve a legacy fork before #129. Authenticated replica identity (#125)
+is also a prerequisite; fixed-width wire DTOs and invariant-safe model decoding
+remain #134/#135.
 
 ## Operator-facing SDK surfaces available now
 
@@ -209,6 +226,7 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
 
 - **Config Store Consensus Hardening**: `ConsensusConfigStore` provides durable membership, TCP RPC framing over real mTLS transport with SPIFFE identity verification bound to the configured workload profile and active membership, election/heartbeats, no-op commit safety, snapshot HMAC verification, controlled TCP server lifecycle (bounded concurrency/timeout/oneshot shutdown), membership-change guardrails, and consensus metrics dump hooks. Checked via the out-of-process multi-process campaigns, failovers, network partitioning, and pending commits surviving restarts.
 - **Session Store Quorum Replication Prototype**: `QuorumSessionStore` exercises session leases and CAS mutations across a majority of replicas using an ordered log with watch/change-stream resume cursors, catch-up/read-repair, and partial-write rollback. The durable authority and repair claims remain conditional on #127/#128.
+- **Session Topology Admission**: HA-shaped construction requires an immutable validated set of distinct declared votes and exactly one explicit local member. The lab singleton reports `single-replica`; raw unvalidated construction reports `unknown` and refuses operations. This is configuration evidence, not readiness or authenticated membership (#124/#125).
 - **Fault Coverage**: Reusable chaos test fixtures and tests cover split-brain, stale leader writes, replication lag, stale fences, restart/rejoin behavior, divergent read fail-closed behavior, clock skew, and multi-writer rejection. They also cover session-store durable rejoin/catch-up, read-repair, ordered-log replay, duplicate delivery, partial-write rollback, and prevention of failed partial-write resurrection.
 - **SQLite Writer Envelope**: Each replica still serializes local durable writes through SQLite. `ConsensusConfigStore` and `QuorumSessionStore` provide the tested consensus and ordered-replication mechanisms described above; neither constitutes production HA qualification, and standalone SQLite is not HA.
 - **Capability Envelope**: `SqliteSessionBackend` reports CAS, fencing, TTL, lease-expiry, and batch support without `watch` or `ordered_replication_log` support. `QuorumSessionStore` reports `watch = true` and `ordered_replication_log = true`, but those feature declarations are not a fresh-quorum readiness proof (#124). Use `validate_backend_for_profile` or `StateClass::required_profile()` before binding a backend.

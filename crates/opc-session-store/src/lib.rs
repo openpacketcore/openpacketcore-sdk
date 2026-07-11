@@ -15,6 +15,7 @@
 //! | [`backend`] | Storage API trait, CAS, batch operations |
 //! | [`lease`] | Lease manager and fencing rules |
 //! | [`record`] | Stored record format and encrypted payloads |
+//! | [`topology`] | Validated quorum membership and replica identity |
 //! | [`fake`] | In-memory backend and lease manager for tests |
 //! | [`error`] | `StoreError` and `LeaseError` |
 
@@ -36,10 +37,12 @@ pub mod record;
 pub mod restore;
 pub mod sqlite;
 pub mod store;
+pub mod topology;
 
 pub use backend::{
-    CompareAndSet, CompareAndSetResult, EncryptingSessionBackend, RemoteSealingSessionBackend,
-    ReplicationEntry, ReplicationOp, SessionBackend, SessionOp, SessionOpResult,
+    BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, EncryptingSessionBackend,
+    RemoteSealingSessionBackend, ReplicationEntry, ReplicationOp, SessionBackend, SessionOp,
+    SessionOpResult,
 };
 pub use capability::{
     assert_backend_suitable_for_profile, assert_suitable_for,
@@ -73,3 +76,10 @@ pub use restore::{
 };
 pub use sqlite::SqliteSessionBackend;
 pub use store::SessionStore;
+pub use topology::{
+    QuorumReplicaDescriptor, QuorumReplicaMember, QuorumTopologyConfig, QuorumTopologyError,
+    QuorumTopologyMode, QuorumTopologySummary, ReplicaBackingIdentity, ReplicaEndpoint,
+    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicaTopologyField,
+    ReplicaTopologyFieldError, ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
+    REPLICA_IDENTITY_MAX_BYTES, REPLICA_ID_MAX_BYTES,
+};

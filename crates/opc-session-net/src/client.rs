@@ -10,8 +10,8 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::Stream;
 use opc_session_store::backend::{
-    CompareAndSet, CompareAndSetResult, ReplicationEntry, SessionBackend, SessionOp,
-    SessionOpResult, WATCH_CHANNEL_CAPACITY,
+    BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry, SessionBackend,
+    SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
 };
 use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::error::{LeaseError, StoreError};
@@ -390,6 +390,10 @@ impl RemoteSessionBackend {
 
 #[async_trait]
 impl SessionBackend for RemoteSessionBackend {
+    fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
+        Some(BackendInstanceIdentity::for_shared(&self.conn))
+    }
+
     async fn capabilities(&self) -> BackendCapabilities {
         match self.send_request_with_retry(Request::Capabilities).await {
             Ok(Response::Capabilities(caps)) => {

@@ -11,8 +11,9 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use opc_session_store::{
-    BackendCapabilities, CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp,
-    SessionBackend, SessionKey, SessionOp, SessionOpResult, StoreError, StoredSessionRecord,
+    BackendCapabilities, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
+    ReplicationEntry, ReplicationOp, SessionBackend, SessionKey, SessionOp, SessionOpResult,
+    StoreError, StoredSessionRecord,
 };
 
 /// A local, in-memory read-through session cache that stays coherent with the
@@ -461,6 +462,10 @@ impl Drop for SessionCache {
 
 #[async_trait::async_trait]
 impl SessionBackend for SessionCache {
+    fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
+        self.backend.backend_instance_identity()
+    }
+
     async fn capabilities(&self) -> BackendCapabilities {
         self.backend.capabilities().await
     }
