@@ -156,6 +156,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- `opc-persist`: standalone default-feature test builds no longer depend on
+  fault-injection symbols that exist only with `dangerous-test-hooks`; CI now
+  compiles the default package contract before workspace all-feature unification
+  can mask it.
 - `opc-proto-diameter`: the SWm DEA parse now matches vendor-specific AVPs by
   (vendor-id, code) instead of routing every vendor AVP to the unknown-AVP
   rejection path, so a conformant DEA carrying mandatory 3GPP subscription

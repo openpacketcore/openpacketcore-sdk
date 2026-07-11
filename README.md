@@ -227,8 +227,12 @@ git diff --check
 ### 3. Rust Clippy Linters
 Ensure the workspace is warning-free across all compilation targets and feature sets:
 ```bash
+cargo clippy --locked -p opc-persist --all-targets --no-default-features -- -D warnings
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ```
+
+The isolated `opc-persist` command runs before workspace feature unification so
+default-profile conditional imports remain warning-free.
 
 ### 4. Management-Plane Policy Gates
 Ensure dependency-boundary, SCTP FFI, and generated-management policy checks pass:
@@ -240,9 +244,21 @@ python3 scripts/check-management-plane-policy.py --check
 ### 5. Workspace Test Suite
 Run all unit, integration, and chaos test suites:
 ```bash
+cargo test --locked -p opc-persist --no-run
+cargo test --locked -p opc-persist \
+  --test break_glass_tests \
+  --test security_policy_tests \
+  --test security_policy_stress_tests \
+  --test security_policy_empirical_tests \
+  -- --test-threads=1
 cargo test --locked --workspace --exclude opc-persist --all-features --quiet -- --test-threads=4
 cargo test --locked -p opc-persist --all-features --quiet -- --test-threads=1
 ```
+
+The first command compiles the standalone default-feature test contract, and
+the second executes its security-policy and break-glass behavior without test
+hooks. The serial all-feature command executes the fault-injection suites as
+well as the ordinary persistence coverage.
 
 The standalone eBPF datapath crate is excluded from the host workspace build
 graph. Build it with:

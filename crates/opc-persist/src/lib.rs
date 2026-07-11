@@ -82,7 +82,9 @@
 //! preflight rejection of unsafe paths and other trait-bound behavior without
 //! touching the filesystem. The storage fault-injection decorator is compiled
 //! only with the `dangerous-test-hooks` feature and must not be enabled in
-//! production profiles.
+//! production profiles. Integration tests that use those hooks are gated by the
+//! same feature so the default package test contract remains independent of
+//! fault-injection APIs.
 
 #![deny(unsafe_code)]
 // The crate is fully safe Rust. Filesystem checks use safe shell-out commands

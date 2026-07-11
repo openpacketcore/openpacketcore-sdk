@@ -46,6 +46,19 @@ jobs:
       - name: Run opc-proto-diameter corpus generator self-test
         run: python3 crates/opc-proto-diameter/fuzz/generate_corpus.py self-test
 
+      # Compile this package in isolation before workspace all-feature
+      # unification can mask an accidental dependency on test-only hooks.
+      - name: Check opc-persist default test contract
+        run: |
+          cargo clippy --locked -p opc-persist --all-targets --no-default-features -- -D warnings
+          cargo test --locked -p opc-persist --no-run
+          cargo test --locked -p opc-persist \
+            --test break_glass_tests \
+            --test security_policy_tests \
+            --test security_policy_stress_tests \
+            --test security_policy_empirical_tests \
+            -- --test-threads=1
+
       - name: Run clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
