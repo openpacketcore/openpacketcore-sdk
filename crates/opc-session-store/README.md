@@ -35,6 +35,14 @@ evidence.
   logical ID, and unique declared vote identities before any backend I/O.
 - `QuorumSessionStore::from_validated_topology` is the operational construction
   path.
+- `QuorumSessionStore::probe_durable_readiness` performs a fresh, bounded
+  point-in-time assessment of distinct voter reachability, majority-prefix
+  agreement, and safe strict-prefix catch-up. It does not consult cached
+  capabilities.
+- `DurableReadinessReport` returns `Ready`, `NoQuorum`, `TopologyInvalid`, or
+  `RecoveryRequired`, together with `configured_voters`,
+  `fresh_reachable_voters`, `agreeing_voters`, `required_quorum`, the optional
+  `majority_visible_prefix_index`, and typed per-replica observations.
 - `ValidatedQuorumTopology::try_new_lab_singleton` is the explicit one-replica
   lab path. Its topology mode is `lab-singleton`; its platform profile is
   `single-replica`, never quorum HA.
@@ -125,6 +133,34 @@ forwarding wrappers must delegate that identity. The default `None` fails
 admission with `MissingBackendInstanceIdentity`. The token describes a local
 adapter instance only; it does not authenticate a remote physical store.
 
+### Fresh durable readiness
+
+`BackendCapabilities` and `SessionStorePlatformProfile::Quorum` are admission
+evidence. They describe implemented methods and configured shape, but do not
+prove that peers are reachable now. Before opening traffic, call
+`probe_durable_readiness()` and require `DurableReadinessState::Ready`. Set
+custom limits once with `with_durable_readiness_options`; explicit probes and
+authoritative operations always use that same store-level policy.
+
+The report is bounded by an end-to-end timeout and a per-replica log-entry
+budget. Log evidence is loaded in bounded adaptive pages rather than one
+whole-log wire frame. Its stable replica failure classes are `Transport`, `Authentication`,
+`Timeout`, `Protocol`, `Backend`, `LogUnavailable`, `Divergent`,
+`RepairFailed`, and `ProbeBudgetExceeded`. The report's `Debug` output redacts
+replica identities, and the report contains no raw transport or backend error.
+
+`Ready` means a distinct configured majority freshly supplied usable evidence
+and agrees on one majority-visible prefix. It is point-in-time evidence, not a
+lease or durable commit proof. Every authoritative quorum operation repeats the
+same fail-closed assessment rather than relying on an earlier probe result.
+Consumers must keep ownership publication and traffic advertisement behind the
+same continuously refreshed gate; a readiness report is not an ownership
+lease.
+Safe automatic repair only appends the missing suffix to a replica whose log is
+a strict prefix of the majority-visible log. A conflicting entry or longer
+minority tail yields `RecoveryRequired`; the readiness path does not truncate or
+destructively rebuild the fork.
+
 ## Relationships
 
 - Uses `opc-types` for tenant/NF/time/version identifiers.
@@ -141,9 +177,10 @@ adapter instance only; it does not authenticate a remote physical store.
 - SQLite file backends use WAL in tests and persist across restart.
 - `FakeSessionBackend` is for tests.
 - Configured topology validation proves only an odd, distinct voting set and
-  one exact local member. It does not prove peer reachability, authenticated
-  membership, durable commit authority, safe repair, restore authority, or
-  production HA qualification.
+  one exact local member. Fresh readiness separately proves a point-in-time
+  reachable and agreeing majority, but neither result proves authenticated
+  membership, durable commit authority, operator-safe fork recovery, restore
+  authority, or production HA qualification.
 - A bare logical self ID such as `epdg-app-0` may select a member whose endpoint
   is the full `epdg-app-0.<headless-service>.<namespace>.svc.cluster.local`
   FQDN. The SDK never shortens endpoints or treats endpoint text as identity.
@@ -166,10 +203,11 @@ adapter instance only; it does not authenticate a remote physical store.
 
 - Keep backend capabilities explicit so HA/profile suitability can fail closed.
 - Continue hardening restore evidence and traffic-blocking gates.
-- Complete fresh-quorum readiness and authenticated peer identity (#124/#125),
-  durable sequencing and safe fork repair/recovery (#127–#129), and bounded
+- Complete authenticated peer identity (#125), durable sequencing and safe
+  fork repair/recovery (#127–#129), and bounded
   majority-authoritative restore (#133), fixed-width wire stabilization (#134),
-  plus invariant-safe model decoding (#135).
+  invariant-safe model decoding (#135), plus oversized-TTL and zero-sequence
+  panic elimination (#137/#138).
 - Keep encryption AAD bound to namespace, NF kind, state type, generation,
   fence, and session-key digest.
 

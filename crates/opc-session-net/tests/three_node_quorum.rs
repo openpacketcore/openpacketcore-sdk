@@ -18,10 +18,10 @@ use opc_session_store::model::{
 use opc_session_store::quorum::{FencedSessionReplica, QuorumSessionStore, SessionStoreBackend};
 use opc_session_store::record::{EncryptedSessionPayload, StoredSessionRecord};
 use opc_session_store::{
-    QuorumReplicaDescriptor, QuorumReplicaMember, QuorumTopologyConfig, ReplicaBackingIdentity,
-    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanCursor,
-    RestoreScanRequest, RestoreScanScope, SqliteSessionBackend, StoreError,
-    ValidatedQuorumTopology,
+    DurableReadinessOptions, DurableReadinessState, QuorumReplicaDescriptor, QuorumReplicaMember,
+    QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
+    ReplicaReadinessFailure, ReplicaTlsIdentity, RestoreScanCursor, RestoreScanRequest,
+    RestoreScanScope, SqliteSessionBackend, StoreError, ValidatedQuorumTopology,
 };
 use opc_tls::TlsConfigBuilder;
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
@@ -465,6 +465,14 @@ async fn validated_bare_self_and_fqdn_peers_restore_over_mtls_sqlite_replicas() 
     assert_eq!(topology.summary().local_replica_id(), Some(&logical_self));
     let quorum = QuorumSessionStore::from_validated_topology(topology);
 
+    let readiness = quorum.probe_durable_readiness().await;
+    assert_eq!(readiness.state(), DurableReadinessState::Ready);
+    assert_eq!(readiness.configured_voters(), 3);
+    assert_eq!(readiness.fresh_reachable_voters(), 3);
+    assert_eq!(readiness.agreeing_voters(), 3);
+    assert_eq!(readiness.required_quorum(), 2);
+    assert_eq!(readiness.majority_visible_prefix_index(), Some(0));
+
     let empty = quorum
         .scan_restore_records(RestoreScanRequest::all(2))
         .await
@@ -677,6 +685,10 @@ async fn test_three_node_quorum_kill_and_restart() {
         vec![replica1.clone(), replica2.clone(), replica3.clone()],
     );
 
+    let initial_readiness = quorum.probe_durable_readiness().await;
+    assert_eq!(initial_readiness.state(), DurableReadinessState::Ready);
+    assert_eq!(initial_readiness.fresh_reachable_voters(), 3);
+
     let empty_restore = quorum
         .scan_restore_records(RestoreScanRequest::all(16))
         .await
@@ -723,6 +735,10 @@ async fn test_three_node_quorum_kill_and_restart() {
     // Wait a moment for the connection to drop
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    let two_of_three_readiness = quorum.probe_durable_readiness().await;
+    assert_eq!(two_of_three_readiness.state(), DurableReadinessState::Ready);
+    assert_eq!(two_of_three_readiness.fresh_reachable_voters(), 2);
+
     // 6. Assert quorum writes still succeed (2 of 3 is a quorum)
     let lease2 = quorum.renew(&lease, Duration::from_secs(60)).await.unwrap();
     let record2 = test_record(&key, &owner, lease2.fence(), Generation::new(2));
@@ -765,14 +781,19 @@ async fn test_three_node_quorum_kill_and_restart() {
     // Wait for things to settle
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // 8. Assert read-repair / resync behavior
-    // The restarted replica should be repaired on the next read
+    // 8. Assert safe strict-prefix catch-up behavior.
+    // The restarted replica should receive only its missing suffix.
     let read_repaired = quorum2.get(&key).await.unwrap();
     assert_eq!(read_repaired.as_ref(), Some(&record2));
 
     handle2.abort();
     handle3.abort();
     tokio::time::sleep(Duration::from_millis(200)).await;
+    let one_of_three_readiness = quorum2.probe_durable_readiness().await;
+    assert_eq!(
+        one_of_three_readiness.state(),
+        DurableReadinessState::NoQuorum
+    );
     let no_restore_quorum = quorum2
         .scan_restore_records(RestoreScanRequest::all(16))
         .await
@@ -1209,4 +1230,507 @@ async fn test_timeout_mid_exchange_forces_reconnect() {
         connections.load(Ordering::SeqCst) >= 2,
         "client must reconnect after a timed-out exchange"
     );
+}
+
+#[tokio::test]
+async fn durable_readiness_probe_classifies_tls_accept_then_close_as_transport() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test endpoint");
+    let addr = listener.local_addr().expect("test endpoint address");
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept TLS probe client");
+        accepted_tx.send(()).expect("signal accepted connection");
+        drop(stream);
+    });
+
+    let mtls = mtls_configs();
+    let remote =
+        RemoteSessionBackend::new(addr, mtls.client_config, Some(Duration::from_millis(250)));
+
+    assert_eq!(
+        remote.probe_replication_head().await,
+        Err(ReplicaReadinessFailure::Transport)
+    );
+    accepted_rx.await.expect("raw peer accepted TLS connection");
+    server.await.expect("raw peer task");
+}
+
+#[tokio::test]
+#[cfg(feature = "insecure-test")]
+async fn durable_readiness_probe_classifies_stalled_peer_as_timeout() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test endpoint");
+    let addr = listener.local_addr().expect("test endpoint address");
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.expect("accept probe client");
+        std::future::pending::<()>().await;
+    });
+    let remote = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_millis(100)));
+
+    assert_eq!(
+        remote.probe_replication_head().await,
+        Err(ReplicaReadinessFailure::Timeout)
+    );
+    server.abort();
+}
+
+#[tokio::test]
+#[cfg(feature = "insecure-test")]
+async fn durable_readiness_probe_classifies_version_mismatch_as_protocol() {
+    use opc_session_net::protocol::{read_frame, write_frame, CONTRACT_VERSION};
+    use opc_session_net::{Request, Response};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test endpoint");
+    let addr = listener.local_addr().expect("test endpoint address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept probe client");
+        let hello: Request = read_frame(&mut stream, 1 << 20)
+            .await
+            .expect("read client hello");
+        assert!(matches!(hello, Request::Hello { .. }));
+        write_frame(
+            &mut stream,
+            &Response::HelloAck {
+                contract_version: CONTRACT_VERSION - 1,
+            },
+        )
+        .await
+        .expect("write incompatible hello response");
+    });
+    let remote = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+
+    assert_eq!(
+        remote.probe_replication_head().await,
+        Err(ReplicaReadinessFailure::Protocol)
+    );
+    server.await.expect("protocol test server");
+}
+
+#[tokio::test]
+#[cfg(feature = "insecure-test")]
+async fn durable_readiness_probe_classifies_redacted_remote_rejection_as_backend() {
+    use opc_session_net::protocol::{read_frame, write_frame, CONTRACT_VERSION};
+    use opc_session_net::{Request, Response};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test endpoint");
+    let addr = listener.local_addr().expect("test endpoint address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept probe client");
+        let hello: Request = read_frame(&mut stream, 1 << 20)
+            .await
+            .expect("read client hello");
+        assert!(matches!(hello, Request::Hello { .. }));
+        write_frame(
+            &mut stream,
+            &Response::HelloAck {
+                contract_version: CONTRACT_VERSION,
+            },
+        )
+        .await
+        .expect("write hello response");
+        let probe: Request = read_frame(&mut stream, 1 << 20)
+            .await
+            .expect("read replication-head probe");
+        assert!(matches!(probe, Request::MaxReplicationSequence));
+        write_frame(
+            &mut stream,
+            &Response::MaxReplicationSequence(Err(StoreError::BackendUnavailable(
+                "private-database-path-canary".to_string(),
+            ))),
+        )
+        .await
+        .expect("write backend rejection");
+    });
+    let remote = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+
+    let failure = remote
+        .probe_replication_head()
+        .await
+        .expect_err("remote rejection must fail readiness");
+    assert_eq!(failure, ReplicaReadinessFailure::Backend);
+    assert!(!format!("{failure:?}").contains("private-database-path-canary"));
+    server.await.expect("backend rejection test server");
+}
+
+#[tokio::test]
+#[cfg(feature = "insecure-test")]
+async fn durable_readiness_probe_classifies_redacted_generic_error_as_protocol() {
+    use opc_session_net::protocol::{read_frame, write_frame, CONTRACT_VERSION};
+    use opc_session_net::{Request, Response};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test endpoint");
+    let addr = listener.local_addr().expect("test endpoint address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept probe client");
+        let hello: Request = read_frame(&mut stream, 1 << 20)
+            .await
+            .expect("read client hello");
+        assert!(matches!(hello, Request::Hello { .. }));
+        write_frame(
+            &mut stream,
+            &Response::HelloAck {
+                contract_version: CONTRACT_VERSION,
+            },
+        )
+        .await
+        .expect("write hello response");
+        let probe: Request = read_frame(&mut stream, 1 << 20)
+            .await
+            .expect("read replication-head probe");
+        assert!(matches!(probe, Request::MaxReplicationSequence));
+        write_frame(
+            &mut stream,
+            &Response::Error {
+                message: "secret-peer-diagnostic-canary".to_string(),
+            },
+        )
+        .await
+        .expect("write generic protocol error");
+    });
+    let remote = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+
+    let failure = remote
+        .probe_replication_head()
+        .await
+        .expect_err("a generic error response is not a valid replication head");
+    assert_eq!(failure, ReplicaReadinessFailure::Protocol);
+    assert!(!format!("{failure:?}").contains("secret-peer-diagnostic-canary"));
+    server.await.expect("protocol-error test server");
+}
+
+#[tokio::test]
+#[cfg(feature = "insecure-test")]
+async fn cancelled_readiness_probe_drops_connection_before_the_next_probe() {
+    use opc_session_net::protocol::{read_frame, write_frame, CONTRACT_VERSION};
+    use opc_session_net::{Request, Response};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test endpoint");
+    let addr = listener.local_addr().expect("test endpoint address");
+    let (first_probe_tx, first_probe_rx) = tokio::sync::oneshot::channel();
+    let (release_stale_tx, release_stale_rx) = tokio::sync::oneshot::channel();
+    let (first_connection_done_tx, first_connection_done_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.expect("accept first probe client");
+        let hello: Request = read_frame(&mut first, 1 << 20)
+            .await
+            .expect("read first client hello");
+        assert!(matches!(hello, Request::Hello { .. }));
+        write_frame(
+            &mut first,
+            &Response::HelloAck {
+                contract_version: CONTRACT_VERSION,
+            },
+        )
+        .await
+        .expect("write first hello response");
+        let probe: Request = read_frame(&mut first, 1 << 20)
+            .await
+            .expect("read first replication-head probe");
+        assert!(matches!(probe, Request::MaxReplicationSequence));
+        first_probe_tx.send(()).expect("signal stalled exchange");
+
+        release_stale_rx
+            .await
+            .expect("test releases stale response after cancellation");
+        let _ = write_frame(&mut first, &Response::MaxReplicationSequence(Ok(7))).await;
+        drop(first);
+        first_connection_done_tx
+            .send(())
+            .expect("signal first connection completion");
+
+        let (mut second, _) = listener.accept().await.expect("accept second probe client");
+        let hello: Request = read_frame(&mut second, 1 << 20)
+            .await
+            .expect("read second client hello");
+        assert!(matches!(hello, Request::Hello { .. }));
+        write_frame(
+            &mut second,
+            &Response::HelloAck {
+                contract_version: CONTRACT_VERSION,
+            },
+        )
+        .await
+        .expect("write second hello response");
+        let probe: Request = read_frame(&mut second, 1 << 20)
+            .await
+            .expect("read second replication-head probe");
+        assert!(matches!(probe, Request::MaxReplicationSequence));
+        write_frame(&mut second, &Response::MaxReplicationSequence(Ok(42)))
+            .await
+            .expect("write fresh replication head");
+    });
+
+    let remote = Arc::new(RemoteSessionBackend::new_insecure(
+        addr,
+        Some(Duration::from_secs(5)),
+    ));
+    let cancelled = tokio::spawn({
+        let remote = remote.clone();
+        async move { remote.probe_replication_head().await }
+    });
+    first_probe_rx
+        .await
+        .expect("first readiness request reached the peer");
+    cancelled.abort();
+    assert!(cancelled
+        .await
+        .expect_err("aborted readiness probe must be cancelled")
+        .is_cancelled());
+    release_stale_tx
+        .send(())
+        .expect("release stale first response");
+    first_connection_done_rx
+        .await
+        .expect("first connection was retired");
+
+    let recovered = tokio::time::timeout(Duration::from_secs(2), remote.probe_replication_head())
+        .await
+        .expect("fresh probe must not stall behind the cancelled exchange")
+        .expect("fresh probe must reconnect");
+    assert_eq!(
+        recovered, 42,
+        "the next probe must not consume the stale head from the cancelled exchange"
+    );
+    server.await.expect("cancellation test server");
+}
+
+#[tokio::test]
+async fn cached_capabilities_do_not_substitute_for_fresh_quorum_evidence() {
+    let mtls = mtls_configs();
+    let (addr1, _backend1, handle1) = start_server(&mtls).await;
+    let (addr2, _backend2, handle2) = start_server(&mtls).await;
+    let (addr3, _backend3, handle3) = start_server(&mtls).await;
+    let remote1 = Arc::new(RemoteSessionBackend::new(
+        addr1,
+        mtls.client_config.clone(),
+        Some(Duration::from_millis(200)),
+    ));
+    let remote2 = Arc::new(RemoteSessionBackend::new(
+        addr2,
+        mtls.client_config.clone(),
+        Some(Duration::from_millis(200)),
+    ));
+    let remote3 = Arc::new(RemoteSessionBackend::new(
+        addr3,
+        mtls.client_config.clone(),
+        Some(Duration::from_millis(200)),
+    ));
+    let quorum = validated_quorum(
+        1,
+        vec![
+            FencedSessionReplica::new(1, remote1),
+            FencedSessionReplica::new(2, remote2),
+            FencedSessionReplica::new(3, remote3),
+        ],
+    )
+    .with_durable_readiness_options(DurableReadinessOptions::new(Duration::from_millis(500), 32));
+
+    let warmed = quorum.capabilities().await;
+    assert!(warmed.atomic_compare_and_set);
+    assert!(warmed.monotonic_fencing_token);
+    assert!(warmed.batch_write);
+    assert!(warmed.restore_scan);
+    assert_eq!(
+        quorum.probe_durable_readiness().await.state(),
+        DurableReadinessState::Ready
+    );
+
+    handle2.abort();
+    handle3.abort();
+    let report = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let report = quorum.probe_durable_readiness().await;
+            if report.state() == DurableReadinessState::NoQuorum {
+                break report;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two stopped voters must become unavailable within the test bound");
+    assert_eq!(report.configured_voters(), 3);
+    assert_eq!(report.fresh_reachable_voters(), 1);
+    assert_eq!(report.agreeing_voters(), 0);
+    assert_eq!(report.required_quorum(), 2);
+
+    let still_descriptive = quorum.capabilities().await;
+    assert_eq!(
+        still_descriptive.atomic_compare_and_set,
+        warmed.atomic_compare_and_set
+    );
+    assert_eq!(
+        still_descriptive.monotonic_fencing_token,
+        warmed.monotonic_fencing_token
+    );
+    assert_eq!(still_descriptive.batch_write, warmed.batch_write);
+    assert_eq!(still_descriptive.max_value_bytes, warmed.max_value_bytes);
+
+    let key = test_key_with_stable_id(b"cached-capabilities-no-quorum");
+    assert!(
+        quorum.get(&key).await.is_err(),
+        "cached feature support must not authorize a read without fresh quorum evidence"
+    );
+    assert!(
+        quorum
+            .acquire(
+                &key,
+                OwnerId::new("cached-capabilities-owner").expect("test owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .is_err(),
+        "cached feature support must not authorize a lease without fresh quorum evidence"
+    );
+    assert!(
+        quorum
+            .scan_restore_records(RestoreScanRequest::all(1))
+            .await
+            .is_err(),
+        "cached feature support must not authorize a restore scan without fresh quorum evidence"
+    );
+
+    handle1.abort();
+}
+
+#[tokio::test]
+async fn durable_readiness_adaptively_pages_a_log_larger_than_one_wire_frame() {
+    use opc_session_net::protocol::DEFAULT_MAX_FRAME_SIZE;
+    use opc_session_net::Response;
+
+    let expires_at =
+        Timestamp::from_offset_datetime(time::OffsetDateTime::now_utc() + time::Duration::hours(1));
+    let owner = OwnerId::new("large-log-owner").expect("test owner");
+    let entries = (1_u64..=3)
+        .map(|sequence| ReplicationEntry {
+            sequence,
+            tx_id: format!("large-log-{sequence}-{}", "x".repeat(400_000)),
+            op: ReplicationOp::AcquireLease {
+                key: SessionKey {
+                    tenant: TenantId::new("tenant-a").expect("test tenant"),
+                    nf_kind: NetworkFunctionKind::from_static("smf"),
+                    key_type: SessionKeyType::PduSession,
+                    stable_id: Bytes::from(format!("large-log-key-{sequence}")),
+                },
+                owner: owner.clone(),
+                fence: FenceToken::new(sequence),
+                credential_id: sequence,
+                ttl: Duration::from_secs(60),
+                expires_at,
+            },
+            timestamp: Timestamp::now_utc(),
+        })
+        .collect::<Vec<_>>();
+    let aggregate_frame = serde_json::to_vec(&Response::GetReplicationLog(Ok(entries.clone())))
+        .expect("serialize aggregate replication-log response");
+    assert!(
+        aggregate_frame.len() > DEFAULT_MAX_FRAME_SIZE,
+        "fixture must exceed one default wire frame"
+    );
+    for entry in &entries {
+        let single_frame =
+            serde_json::to_vec(&Response::GetReplicationLog(Ok(vec![entry.clone()])))
+                .expect("serialize one-entry replication-log response");
+        assert!(
+            single_frame.len() < DEFAULT_MAX_FRAME_SIZE,
+            "each page must fit after adaptive reduction"
+        );
+    }
+
+    let backends = [
+        FakeSessionBackend::new(),
+        FakeSessionBackend::new(),
+        FakeSessionBackend::new(),
+    ];
+    for backend in &backends {
+        for entry in &entries {
+            backend
+                .replicate_entry(entry.clone())
+                .await
+                .expect("seed identical replication log");
+        }
+    }
+
+    let mtls = mtls_configs();
+    let (addr1, _backend1, handle1) = start_server_with_backend(&mtls, backends[0].clone()).await;
+    let (addr2, _backend2, handle2) = start_server_with_backend(&mtls, backends[1].clone()).await;
+    let (addr3, _backend3, handle3) = start_server_with_backend(&mtls, backends[2].clone()).await;
+    let quorum = validated_quorum(
+        1,
+        vec![
+            FencedSessionReplica::new(
+                1,
+                Arc::new(RemoteSessionBackend::new(
+                    addr1,
+                    mtls.client_config.clone(),
+                    Some(Duration::from_secs(2)),
+                )),
+            ),
+            FencedSessionReplica::new(
+                2,
+                Arc::new(RemoteSessionBackend::new(
+                    addr2,
+                    mtls.client_config.clone(),
+                    Some(Duration::from_secs(2)),
+                )),
+            ),
+            FencedSessionReplica::new(
+                3,
+                Arc::new(RemoteSessionBackend::new(
+                    addr3,
+                    mtls.client_config.clone(),
+                    Some(Duration::from_secs(2)),
+                )),
+            ),
+        ],
+    )
+    .with_durable_readiness_options(DurableReadinessOptions::new(
+        Duration::from_secs(5),
+        entries.len(),
+    ));
+
+    let report = quorum.probe_durable_readiness().await;
+    assert_eq!(report.state(), DurableReadinessState::Ready);
+    assert_eq!(report.fresh_reachable_voters(), 3);
+    assert_eq!(report.agreeing_voters(), 3);
+    assert_eq!(report.majority_visible_prefix_index(), Some(3));
+    assert_eq!(
+        quorum
+            .get(&test_key_with_stable_id(b"large-log-read"))
+            .await
+            .expect("real read must use the same paged assessment"),
+        None
+    );
+
+    handle1.abort();
+    handle2.abort();
+    handle3.abort();
+}
+
+#[tokio::test]
+async fn durable_readiness_probe_classifies_untrusted_peer_as_authentication() {
+    let server_mtls = mtls_configs();
+    let unrelated_client_mtls = mtls_configs();
+    let (addr, _backend, handle) = start_server(&server_mtls).await;
+    let remote = RemoteSessionBackend::new(
+        addr,
+        unrelated_client_mtls.client_config,
+        Some(Duration::from_millis(400)),
+    );
+
+    assert_eq!(
+        remote.probe_replication_head().await,
+        Err(ReplicaReadinessFailure::Authentication)
+    );
+    handle.abort();
 }

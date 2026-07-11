@@ -9,10 +9,10 @@ OpenPacketCore config and session persistence surfaces.
   tests. These are tested prototype properties, not carrier HA qualification.
 - **Session Store**: `QuorumSessionStore` is an in-process quorum ordered-log
   adapter with fail-closed configured-topology admission, a
-  majority-visible-prefix repair prototype, watch cursors, stale-replica
-  catch-up, and chaos tests. Production networked HA depends on the
-  experimental `opc-session-net` transport and further distributed/soak
-  evidence.
+  fresh bounded durable-readiness assessment, safe strict-prefix catch-up,
+  watch cursors, and chaos tests. Production networked HA depends on the
+  experimental `opc-session-net` transport and further safety and
+  distributed/soak evidence.
 
 Historical closure language below refers only to scoped algorithms and test
 harnesses. Config-store qualification (`GAP-001-006`) and production networked
@@ -90,10 +90,11 @@ Platform hardening concerns—including TLS/SPIFFE SVID and bundle watch/reload 
 
 The algorithm below describes intended and prototype-tested behavior; it is not
 yet durable distributed proof or a production deployment contract. Configured
-topology admission is implemented. Fresh readiness/authenticated identity
-(#124/#125), durable sequencing and safe fork recovery (#127–#129), and bounded
-majority-authoritative restore (#133) remain open; wire-width and shared
-model-decoding hardening remain #134/#135.
+topology admission and fresh durable readiness are implemented. Authenticated
+identity (#125), durable sequencing and safe fork recovery (#127–#129), and
+bounded majority-authoritative restore (#133) remain open; wire-width and shared
+model-decoding hardening remain #134/#135, while oversized-TTL and
+zero-replication-sequence panic elimination remain #137/#138.
 
 `QuorumSessionStore` coordinates session leases and CAS mutations across a set of `SessionStoreBackend` replicas using quorum-backed ordered replication. It is not a Raft implementation; its target safety contract is a durable committed log prefix where an entry is authoritative only after the same sequence entry is present on a majority of replicas.
 
@@ -113,8 +114,38 @@ lab singleton reports `single-replica`. The deprecated raw-vector constructor
 reports `unknown`, masks capabilities, and refuses operations.
 
 These checks prove configuration distinctness only. They do not prove fresh
-peer reachability (#124), bind the declared identity to the mTLS peer (#125),
-or establish durable commit/repair/restore authority (#127/#128/#133).
+peer reachability, bind the declared identity to the mTLS peer (#125), or
+establish durable commit/repair/restore authority (#127/#128/#133).
+
+### Fresh durable readiness
+
+Capability declarations and `SessionStorePlatformProfile::Quorum` remain
+admission evidence only. `QuorumSessionStore::probe_durable_readiness` bypasses
+cached capabilities and performs a fresh, deadline- and log-work-bounded
+assessment of the admitted voters. `DurableReadinessReport` exposes these stable
+states: `Ready`, `NoQuorum`, `TopologyInvalid`, and `RecoveryRequired`;
+configured, freshly reachable, agreeing, and required voter counts
+(`configured_voters`, `fresh_reachable_voters`, `agreeing_voters`, and
+`required_quorum`); an optional `majority_visible_prefix_index`; and one typed
+observation per configured voter.
+
+The limits are configured once on the store and are shared by explicit probes
+and authoritative operations. Log evidence is fetched in bounded adaptive
+pages, so a healthy log larger than one network frame remains assessable.
+
+Per-replica failure classes are `Transport`, `Authentication`, `Timeout`,
+`Protocol`, `Backend`, `LogUnavailable`, `Divergent`, `RepairFailed`, and
+`ProbeBudgetExceeded`. These are bounded reason codes rather than raw peer,
+transport, or backend errors. The report is point-in-time evidence rather than
+a lease, and each authoritative operation repeats the same fail-closed
+assessment.
+
+Automatic readiness repair is limited to appending a majority-visible suffix
+to a replica whose complete log is a strict shorter prefix. A conflict or
+longer minority tail produces `RecoveryRequired`; this path neither truncates
+nor destructively rebuilds the replica. The observed index is deliberately
+called majority-visible rather than committed until #127/#128 establish durable
+commit and repair authority.
 
 ### Network restore transport (protocol v2)
 
@@ -131,21 +162,22 @@ This closes per-replica transport parity only. Quorum selection/merge remains
 ### Log & Replication Model
 - **Persisted Replica Logs**: The current coordinator assigns sequence numbers to replicated mutations (AcquireLease, RenewLease, ReleaseLease, CompareAndSet, DeleteFenced, RefreshTtl, Batch), and each accepting replica writes them to `session_replication_log`. Leader/term-gated global sequence authority remains #127.
 - **Idempotency & Replay Semantics**: Duplicate delivery is handled safely. Before appending, replicas check if the entry's sequence has already been applied. If the transaction ID (`tx_id`) matches, the duplicate is accepted as an idempotent success; if it differs, the replica fails closed on sequence divergence. Replaying operations does not mutate the state twice.
-- **Current Majority-Visible Prefix Heuristic**: The coordinator compares the logs visible from the current online majority and rebuilds replicas to that shared prefix. This is prototype behavior, not durable commit proof: without #127/#128, a later visible majority can omit a previously acknowledged entry and drive unsafe truncation.
+- **Current Majority-Visible Prefix Heuristic**: The coordinator compares fresh logs visible from the configured majority. It may append a missing suffix to an exact strict-prefix replica, but a conflict or longer minority tail fails with `RecoveryRequired` and is not truncated. This remains a heuristic, not durable commit proof: without #127/#128, a later visible majority may still omit a previously acknowledged entry.
 - **Resume Tokens / Watch Cursors**: Exposes watches backed by sequence numbers, allowing consumers to supply sequence cursors and resume receiving updates from the exact sequence they left off.
-- **Replica Catch-Up & Read Repair Prototype**: The coordinator queries replica log progress on every write or read and repairs against the current majority-visible prefix. Reads require identical records on a majority quorum and fail closed if no quorum result exists, but repair authority remains unproven until #127/#128.
-- **Failed-Write Rollback Fixture**: If a new replication entry reaches fewer than a majority of replicas, the current implementation attempts to rebuild successful partial writes to the previously observed prefix. Tests exercise this path; they do not prove resurrection safety across partitions/restarts before #127/#128.
-- **Feature Declarations**: Replicated adapters declare `ordered_replication_log = true` and `watch = true`, while standalone SQLite reports `false`. These bits describe implemented methods; they are not fresh-quorum readiness or production qualification (#124).
+- **Replica Catch-Up & Read Repair Prototype**: The coordinator freshly queries replica log progress on every write or read and uses the same bounded assessment path as the readiness probe. Reads require identical records on a majority quorum and fail closed if no quorum result exists, but commit and repair authority remain unproven until #127/#128.
+- **Failed-Write Fail-Closed Fixture**: If a new replication entry reaches fewer than a majority of replicas, the operation fails closed and the existing write path attempts a best-effort rollback of the partial suffix. Separately, an already-visible ambiguous minority tail returns `RecoveryRequired` without mutation. These fixtures do not establish durable repair authority or prove resurrection safety across partitions/restarts before #127/#128.
+- **Feature Declarations**: Replicated adapters declare `ordered_replication_log = true` and `watch = true`, while standalone SQLite reports `false`. These bits describe implemented methods; they are not fresh-quorum readiness or production qualification. Consumers must use `probe_durable_readiness` for current evidence.
+- **Low-Cardinality Readiness Telemetry**: Metrics expose probe success/failure, the latest ready state, configured/freshly-reachable/agreeing/required voter counts, the majority-visible prefix, and bounded failure reasons (`timeout`, `authentication`, `transport`, `divergent`, and `recovery_required`) without replica IDs, endpoints, or raw errors as labels.
 
 ---
 
 ## 3. Local Session Cache Invalidation: `SessionCache`
 
-`SessionCache` (implemented in the `opc-session-cache` crate) provides a local, in-memory read-through cache for session records in downstream CNFs. It keeps cache hits behind an explicit coherence gate: local values are served only when the background watch stream is active and the processed sequence is caught up to the backend's committed replication sequence. If the cursor cannot be verified, reads bypass local memory and go directly to the authoritative backend.
+`SessionCache` (implemented in the `opc-session-cache` crate) provides a local, in-memory read-through cache for session records in downstream CNFs. It keeps cache hits behind an explicit coherence gate: local values are served only when the background watch stream is active and the processed sequence is caught up to the backend's reported replication sequence. If the cursor cannot be verified, reads bypass local memory and go directly to the authoritative backend.
 
 ### Coherence & Invalidation Model
 - **Read-Through Population**: When `get` misses the local cache, the record is fetched from the authoritative backend. It is populated in memory only after the cache verifies that the watch cursor is caught up to `max_replication_sequence`. If the cursor is lagging, unavailable, or syncing, the read succeeds from the backend but the value is not cached.
-- **Coherent Cache Hits Only**: Before serving a cached value, the cache checks that the watched sequence is at least the backend's current committed sequence. If the backend is ahead, the cache clears local state, marks the watch unhealthy, and bypasses cache hits until the watch loop catches up or resyncs.
+- **Coherent Cache Hits Only**: Before serving a cached value, the cache checks that the watched sequence is at least the backend's current reported sequence. If the backend is ahead, the cache clears local state, marks the watch unhealthy, and bypasses cache hits until the watch loop catches up or resyncs.
 - **Background Watch Subscription**: Spawns a background task that subscribes to `watch(last_sequence + 1)` on the session store, receiving replication entries in monotonic order. Any mutation (CompareAndSet, DeleteFenced, RefreshTtl, AcquireLease, RenewLease, ReleaseLease) to a key results in the key being evicted from the cache.
 - **Monotonic Sequence Tracking & Gaps**: The cache tracks the processed sequence number globally. If a gap is detected (`sequence > last_sequence + 1`), indicating missed log entries, the cache invalidates its entire state and triggers a full resync from the current maximum sequence number of the backend.
 - **Idempotency**: Duplicate events (`sequence <= last_sequence`) are detected and ignored, preserving the sequence cursor and cache safety.
@@ -177,11 +209,17 @@ This closes per-replica transport parity only. Quorum selection/merge remains
 These in-process fixtures exercise observed behavior; they are not durable
 distributed commit or repair proof (#127/#128).
 
+- **Fresh durable readiness**: Exercises ready/no-quorum/recovery-required
+  outcomes, bounded probe work, strict-prefix append, and typed replica
+  failures independently of cached capabilities.
 - **Split-brain healing**: Exercises coordinator recovery after simulated partitions are resolved.
 - **Durable catch-up**: Rejoining replicas are caught up automatically with log replication.
 - **Duplicate delivery**: Duplicate entries are resolved idempotently without duplicate mutations.
-- **Partial-write recovery**: Failing mid-flight writes are recovered and reconciled to majority nodes.
+- **Partial-write fail-closed evidence**: Failing mid-flight writes are rejected;
+  the fixtures do not claim automatic destructive reconciliation.
 - **Stale-fence replay**: Stale fence updates are rejected monotonically.
-- **Read repair**: Divergent nodes are updated and verified on read.
+- **Strict-prefix repair**: A stale strict-prefix replica may be appended and
+  verified on read; divergent or longer-tail replicas instead require
+  recovery and are not mutated.
 - **Restart/rejoin across profiles**: Exercises restart/rejoin behavior under fake, SQLite, and replicated profiles.
 - **No wall-clock LWW**: Observes that the tested ordering paths do not select authoritative state by wall-clock time.

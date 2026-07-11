@@ -3,9 +3,11 @@
 //! `QuorumSessionStore` composes replica backends directly in this process and
 //! admits HA operation only from an immutable [`ValidatedQuorumTopology`]. The
 //! current coordinator derives a majority-visible replication-log prefix and
-//! repairs online replicas to that prefix. That is prototype behavior, not
-//! durable consensus or commit proof; leader/term sequencing and proven repair
-//! authority remain required before a production HA claim.
+//! may append its missing suffix to a strict-prefix replica. Conflicts require
+//! recovery and are never destructively repaired by readiness. This is
+//! prototype behavior, not durable consensus or commit proof; leader/term
+//! sequencing and proven repair authority remain required before a production
+//! HA claim.
 //!
 //! The networked transport that exposes a replica over a wire protocol lives
 //! in the separate `opc-session-net` crate; from this module's perspective a
@@ -17,6 +19,7 @@
 //! be exercised in-process without real networking.
 
 use async_trait::async_trait;
+use futures_util::future::join_all;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -31,6 +34,10 @@ use crate::clock::{Clock, SystemClock};
 use crate::error::{LeaseError, StoreError};
 use crate::lease::{LeaseGuard, SessionLeaseManager};
 use crate::model::{FenceToken, OwnerId, SessionKey};
+use crate::readiness::{
+    DurableReadinessOptions, DurableReadinessReport, DurableReadinessState,
+    ReplicaReadinessFailure, ReplicaReadinessObservation, ReplicaReadinessOutcome,
+};
 use crate::record::StoredSessionRecord;
 use crate::restore::{
     compare_restore_records, RestoreScanCursor, RestoreScanPage, RestoreScanRequest,
@@ -137,7 +144,43 @@ pub struct QuorumSessionStore {
     topology: QuorumTopologySummary,
     caps: BackendCapabilities,
     clock: Arc<dyn Clock>,
+    readiness_options: DurableReadinessOptions,
 }
+
+struct ReplicaLogProbe {
+    index: usize,
+    head: Option<u64>,
+    log: Option<Vec<ReplicationEntry>>,
+    failure: Option<ReplicaReadinessFailure>,
+}
+
+impl ReplicaLogProbe {
+    fn failed(index: usize, head: Option<u64>, failure: ReplicaReadinessFailure) -> Self {
+        Self {
+            index,
+            head,
+            log: None,
+            failure: Some(failure),
+        }
+    }
+
+    fn complete(index: usize, head: u64, log: Vec<ReplicationEntry>) -> Self {
+        Self {
+            index,
+            head: Some(head),
+            log: Some(log),
+            failure: None,
+        }
+    }
+}
+
+struct QuorumAssessment {
+    report: DurableReadinessReport,
+    ready_indices: Vec<usize>,
+    majority_visible_prefix: Vec<ReplicationEntry>,
+}
+
+const DURABLE_READINESS_LOG_PAGE_ENTRIES: usize = 16;
 
 fn next_replication_sequence(committed_entries: &[ReplicationEntry]) -> Result<u64, StoreError> {
     committed_entries
@@ -206,6 +249,7 @@ impl QuorumSessionStore {
             topology,
             caps,
             clock: Arc::new(SystemClock),
+            readiness_options: DurableReadinessOptions::default(),
         }
     }
 
@@ -225,6 +269,21 @@ impl QuorumSessionStore {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Configure the single bounded readiness policy shared by explicit
+    /// probes and all authoritative operations.
+    ///
+    /// Keeping one store-level policy prevents a probe from succeeding under
+    /// looser limits than the operation it is intended to gate.
+    pub fn with_durable_readiness_options(mut self, options: DurableReadinessOptions) -> Self {
+        self.readiness_options = options;
+        self
+    }
+
+    /// Return the bounded policy used by probes and authoritative operations.
+    pub const fn durable_readiness_options(&self) -> DurableReadinessOptions {
+        self.readiness_options
     }
 
     fn quorum_size(&self) -> usize {
@@ -248,118 +307,406 @@ impl QuorumSessionStore {
         self.members[index].descriptor().replica_id()
     }
 
-    async fn online_replica_indices(&self) -> Result<Vec<usize>, StoreError> {
-        self.ensure_operational_topology()?;
-        let mut online_ids = Vec::new();
-        for (idx, member) in self.members.iter().enumerate() {
-            let replica = member.replica();
-            if replica.check_network().await.is_err() {
-                continue;
+    async fn collect_replica_log(
+        &self,
+        index: usize,
+        deadline: tokio::time::Instant,
+        max_log_entries: usize,
+    ) -> ReplicaLogProbe {
+        let replica = self.replica(index);
+        match tokio::time::timeout_at(deadline, replica.check_network()).await {
+            Err(_) => {
+                return ReplicaLogProbe::failed(index, None, ReplicaReadinessFailure::Timeout)
             }
-            if replica.inner.max_replication_sequence().await.is_ok() {
-                online_ids.push(idx);
+            Ok(Err(_)) => {
+                return ReplicaLogProbe::failed(index, None, ReplicaReadinessFailure::Transport)
             }
+            Ok(Ok(())) => {}
         }
-        Ok(online_ids)
+
+        let head =
+            match tokio::time::timeout_at(deadline, replica.inner.probe_replication_head()).await {
+                Err(_) => {
+                    return ReplicaLogProbe::failed(index, None, ReplicaReadinessFailure::Timeout)
+                }
+                Ok(Err(failure)) => return ReplicaLogProbe::failed(index, None, failure),
+                Ok(Ok(head)) => head,
+            };
+
+        let limit = match usize::try_from(head) {
+            Ok(limit) if limit <= max_log_entries => limit,
+            _ => {
+                return ReplicaLogProbe::failed(
+                    index,
+                    Some(head),
+                    ReplicaReadinessFailure::ProbeBudgetExceeded,
+                )
+            }
+        };
+        let log = match self.load_replica_log_pages(index, limit, deadline).await {
+            Ok(log) => log,
+            Err(failure) => return ReplicaLogProbe::failed(index, Some(head), failure),
+        };
+
+        ReplicaLogProbe::complete(index, head, log)
     }
 
-    async fn committed_log_state(&self) -> Result<(Vec<usize>, Vec<ReplicationEntry>), StoreError> {
-        let online_ids = self.online_replica_indices().await?;
-        let quorum = self.quorum_size();
-        let online_voters = online_ids
-            .iter()
-            .map(|index| self.replica_id(*index))
-            .collect::<HashSet<_>>();
-        if online_voters.len() < quorum {
-            return Err(StoreError::BackendUnavailable("quorum not reached".into()));
-        }
+    async fn load_replica_log_pages(
+        &self,
+        index: usize,
+        expected_entries: usize,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<ReplicationEntry>, ReplicaReadinessFailure> {
+        let replica = self.replica(index);
+        let mut entries = Vec::new();
+        let mut page_limit = DURABLE_READINESS_LOG_PAGE_ENTRIES.min(expected_entries);
 
-        let mut logs = Vec::with_capacity(online_ids.len());
-        let mut max_seq = 0;
-        for &id in &online_ids {
-            let replica = self.replica(id);
-            let seq = replica.inner.max_replication_sequence().await?;
-            max_seq = max_seq.max(seq);
-            let entries = if seq == 0 {
-                Vec::new()
-            } else {
-                replica.inner.get_replication_log(1, seq as usize).await?
-            };
-            logs.push((self.replica_id(id).clone(), entries));
-        }
-
-        let mut committed = Vec::new();
-        for sequence in 1..=max_seq {
-            let mut votes: HashMap<String, (ReplicationEntry, HashSet<ReplicaId>)> = HashMap::new();
-            for (replica_id, log) in &logs {
-                let Some(entry) = log.get((sequence - 1) as usize) else {
-                    continue;
-                };
-                if entry.sequence != sequence {
+        while entries.len() < expected_entries {
+            let remaining = expected_entries - entries.len();
+            let request_limit = page_limit.min(remaining);
+            let start = u64::try_from(entries.len())
+                .ok()
+                .and_then(|offset| offset.checked_add(1))
+                .ok_or(ReplicaReadinessFailure::ProbeBudgetExceeded)?;
+            let page = match tokio::time::timeout_at(
+                deadline,
+                replica.inner.get_replication_log(start, request_limit),
+            )
+            .await
+            {
+                Err(_) => return Err(ReplicaReadinessFailure::Timeout),
+                Ok(Err(_)) if request_limit > 1 => {
+                    page_limit = (request_limit / 2).max(1);
                     continue;
                 }
-                let key = serde_json::to_string(entry)
-                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
-                votes
-                    .entry(key)
-                    .and_modify(|(_, voters)| {
-                        voters.insert(replica_id.clone());
-                    })
-                    .or_insert_with(|| (entry.clone(), HashSet::from([replica_id.clone()])));
+                Ok(Err(_)) => return Err(ReplicaReadinessFailure::LogUnavailable),
+                Ok(Ok(page)) => page,
+            };
+
+            if page.is_empty() || page.len() > request_limit {
+                return Err(ReplicaReadinessFailure::Divergent);
+            }
+            let page_is_contiguous = page.iter().enumerate().all(|(offset, entry)| {
+                u64::try_from(offset)
+                    .ok()
+                    .and_then(|offset| start.checked_add(offset))
+                    == Some(entry.sequence)
+            });
+            if !page_is_contiguous {
+                return Err(ReplicaReadinessFailure::Divergent);
+            }
+            entries.extend(page);
+        }
+
+        Ok(entries)
+    }
+
+    fn majority_visible_prefix(probes: &[ReplicaLogProbe], quorum: usize) -> Vec<ReplicationEntry> {
+        let logs = probes
+            .iter()
+            .filter_map(|probe| probe.log.as_ref())
+            .collect::<Vec<_>>();
+        let mut supporters = (0..logs.len()).collect::<Vec<_>>();
+        let mut prefix = Vec::new();
+
+        loop {
+            let position = prefix.len();
+            let mut groups: Vec<(&ReplicationEntry, Vec<usize>)> = Vec::new();
+            for supporter in supporters.iter().copied() {
+                let Some(entry) = logs[supporter].get(position) else {
+                    continue;
+                };
+                if let Some((_, voters)) =
+                    groups.iter_mut().find(|(candidate, _)| *candidate == entry)
+                {
+                    voters.push(supporter);
+                } else {
+                    groups.push((entry, vec![supporter]));
+                }
             }
 
-            let Some((entry, _)) = votes
-                .into_values()
+            let Some((entry, next_supporters)) = groups
+                .into_iter()
                 .find(|(_, voters)| voters.len() >= quorum)
             else {
                 break;
             };
-            committed.push(entry);
+            prefix.push(entry.clone());
+            supporters = next_supporters;
         }
 
-        Ok((online_ids, committed))
+        prefix
     }
 
-    async fn repair_online_replicas(
-        &self,
-        online_ids: &[usize],
-        committed_entries: &[ReplicationEntry],
-    ) -> Result<(), StoreError> {
-        for &id in online_ids {
-            let replica = self.replica(id);
-            let seq = replica.inner.max_replication_sequence().await.unwrap_or(0);
-            let current = if seq == 0 {
-                Vec::new()
-            } else {
-                replica
-                    .inner
-                    .get_replication_log(1, seq as usize)
-                    .await
-                    .unwrap_or_default()
+    async fn assess_durable_readiness(&self, options: DurableReadinessOptions) -> QuorumAssessment {
+        let configured_voters = self.members.len();
+        let required_quorum = self.quorum_size();
+        if self.topology.mode() == QuorumTopologyMode::UnvalidatedLegacy {
+            return QuorumAssessment {
+                report: DurableReadinessReport::new(
+                    DurableReadinessState::TopologyInvalid,
+                    configured_voters,
+                    0,
+                    0,
+                    required_quorum,
+                    None,
+                    Vec::new(),
+                ),
+                ready_indices: Vec::new(),
+                majority_visible_prefix: Vec::new(),
             };
-            if current != committed_entries {
-                opc_redaction::metrics::METRICS
-                    .session_replica_repair
-                    .fetch_add(1, Ordering::Relaxed);
-                opc_redaction::metrics::METRICS
-                    .session_replica_catchup
-                    .fetch_add(1, Ordering::Relaxed);
-                replica
-                    .inner
-                    .rebuild_replication_state(committed_entries.to_vec())
-                    .await?;
+        }
+
+        let deadline = tokio::time::Instant::now() + options.timeout();
+        let probes = join_all(
+            (0..configured_voters)
+                .map(|index| self.collect_replica_log(index, deadline, options.max_log_entries())),
+        )
+        .await;
+        let fresh_reachable_voters = probes.iter().filter(|probe| probe.head.is_some()).count();
+        let usable_voters = probes.iter().filter(|probe| probe.log.is_some()).count();
+
+        let mut observations = probes
+            .iter()
+            .map(|probe| {
+                ReplicaReadinessObservation::new(
+                    self.replica_id(probe.index).clone(),
+                    probe.head,
+                    probe
+                        .failure
+                        .map(ReplicaReadinessOutcome::Failed)
+                        .unwrap_or(ReplicaReadinessOutcome::Fresh),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        if usable_voters < required_quorum {
+            let recovery_required = probes
+                .iter()
+                .any(|probe| probe.failure == Some(ReplicaReadinessFailure::Divergent));
+            return QuorumAssessment {
+                report: DurableReadinessReport::new(
+                    if recovery_required {
+                        DurableReadinessState::RecoveryRequired
+                    } else {
+                        DurableReadinessState::NoQuorum
+                    },
+                    configured_voters,
+                    fresh_reachable_voters,
+                    0,
+                    required_quorum,
+                    None,
+                    observations,
+                ),
+                ready_indices: Vec::new(),
+                majority_visible_prefix: Vec::new(),
+            };
+        }
+
+        let prefix = Self::majority_visible_prefix(&probes, required_quorum);
+        let prefix_index = u64::try_from(prefix.len()).unwrap_or(u64::MAX);
+        let mut ready_indices = Vec::new();
+        let mut repair_candidates = Vec::new();
+        let mut recovery_required = probes.iter().any(|probe| {
+            probe.failure == Some(ReplicaReadinessFailure::Divergent)
+                || (probe.log.is_none()
+                    && probe
+                        .head
+                        .is_some_and(|observed_head| observed_head > prefix_index))
+        });
+
+        for probe in &probes {
+            let Some(log) = probe.log.as_ref() else {
+                continue;
+            };
+            let shared_len = log.len().min(prefix.len());
+            if log[..shared_len] != prefix[..shared_len] || log.len() > prefix.len() {
+                observations[probe.index] = ReplicaReadinessObservation::new(
+                    self.replica_id(probe.index).clone(),
+                    probe.head,
+                    ReplicaReadinessOutcome::Failed(ReplicaReadinessFailure::Divergent),
+                );
+                recovery_required = true;
+            } else if log.len() == prefix.len() {
+                observations[probe.index] = ReplicaReadinessObservation::new(
+                    self.replica_id(probe.index).clone(),
+                    probe.head,
+                    ReplicaReadinessOutcome::Ready,
+                );
+                ready_indices.push(probe.index);
+            } else {
+                repair_candidates.push((probe.index, log.len()));
             }
         }
-        Ok(())
+
+        let repair_results = if recovery_required {
+            Vec::new()
+        } else {
+            join_all(repair_candidates.into_iter().map(|(index, start)| {
+                let missing = &prefix[start..];
+                async move {
+                    opc_redaction::metrics::METRICS
+                        .session_replica_repair
+                        .fetch_add(1, Ordering::Relaxed);
+                    for entry in missing.iter().cloned() {
+                        match tokio::time::timeout_at(
+                            deadline,
+                            self.replica(index).inner.replicate_entry(entry),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) | Err(_) => return (index, false),
+                        }
+                    }
+                    opc_redaction::metrics::METRICS
+                        .session_replica_catchup
+                        .fetch_add(1, Ordering::Relaxed);
+                    (index, true)
+                }
+            }))
+            .await
+        };
+
+        for (index, repaired) in repair_results {
+            if repaired {
+                observations[index] = ReplicaReadinessObservation::new(
+                    self.replica_id(index).clone(),
+                    Some(u64::try_from(prefix.len()).unwrap_or(u64::MAX)),
+                    ReplicaReadinessOutcome::Repaired,
+                );
+                ready_indices.push(index);
+            } else {
+                observations[index] = ReplicaReadinessObservation::new(
+                    self.replica_id(index).clone(),
+                    probes[index].head,
+                    ReplicaReadinessOutcome::Failed(ReplicaReadinessFailure::RepairFailed),
+                );
+            }
+        }
+
+        let agreeing_voters = ready_indices.len();
+        let state = if recovery_required {
+            DurableReadinessState::RecoveryRequired
+        } else if agreeing_voters >= required_quorum {
+            DurableReadinessState::Ready
+        } else {
+            DurableReadinessState::NoQuorum
+        };
+        QuorumAssessment {
+            report: DurableReadinessReport::new(
+                state,
+                configured_voters,
+                fresh_reachable_voters,
+                agreeing_voters,
+                required_quorum,
+                Some(prefix_index),
+                observations,
+            ),
+            ready_indices,
+            majority_visible_prefix: prefix,
+        }
+    }
+
+    fn record_readiness_metrics(report: &DurableReadinessReport) {
+        let metrics = &opc_redaction::metrics::METRICS;
+        let usize_to_u64 = |value| u64::try_from(value).unwrap_or(u64::MAX);
+        metrics
+            .session_durable_readiness_ready
+            .store(if report.is_ready() { 1 } else { 0 }, Ordering::Relaxed);
+        metrics
+            .session_durable_readiness_configured_voters
+            .store(usize_to_u64(report.configured_voters()), Ordering::Relaxed);
+        metrics
+            .session_durable_readiness_fresh_reachable_voters
+            .store(
+                usize_to_u64(report.fresh_reachable_voters()),
+                Ordering::Relaxed,
+            );
+        metrics
+            .session_durable_readiness_agreeing_voters
+            .store(usize_to_u64(report.agreeing_voters()), Ordering::Relaxed);
+        metrics
+            .session_durable_readiness_required_quorum
+            .store(usize_to_u64(report.required_quorum()), Ordering::Relaxed);
+        metrics
+            .session_durable_readiness_majority_visible_prefix
+            .store(
+                report.majority_visible_prefix_index().unwrap_or(0),
+                Ordering::Relaxed,
+            );
+
+        if report.is_ready() {
+            metrics
+                .session_durable_readiness_probe_success
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            metrics
+                .session_durable_readiness_probe_failure
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if report.state() == DurableReadinessState::RecoveryRequired {
+            metrics
+                .session_durable_readiness_recovery_required_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        for observation in report.replica_observations() {
+            match observation.outcome() {
+                ReplicaReadinessOutcome::Failed(ReplicaReadinessFailure::Timeout) => {
+                    metrics
+                        .session_durable_readiness_timeout_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                ReplicaReadinessOutcome::Failed(ReplicaReadinessFailure::Authentication) => {
+                    metrics
+                        .session_durable_readiness_authentication_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                ReplicaReadinessOutcome::Failed(ReplicaReadinessFailure::Transport) => {
+                    metrics
+                        .session_durable_readiness_transport_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                ReplicaReadinessOutcome::Failed(ReplicaReadinessFailure::Divergent) => {
+                    metrics
+                        .session_durable_readiness_divergent_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Perform a fresh, bounded assessment of distinct replica reachability,
+    /// majority-prefix agreement, and safe strict-prefix catch-up.
+    ///
+    /// Cached capabilities are never consulted. The result is point-in-time
+    /// evidence only; every authoritative operation repeats this same
+    /// fail-closed assessment.
+    pub async fn probe_durable_readiness(&self) -> DurableReadinessReport {
+        let assessment = self.assess_durable_readiness(self.readiness_options).await;
+        Self::record_readiness_metrics(&assessment.report);
+        assessment.report
     }
 
     async fn committed_and_repaired(
         &self,
     ) -> Result<(Vec<usize>, Vec<ReplicationEntry>), StoreError> {
-        let (online_ids, committed_entries) = self.committed_log_state().await?;
-        self.repair_online_replicas(&online_ids, &committed_entries)
-            .await?;
-        Ok((online_ids, committed_entries))
+        let assessment = self.assess_durable_readiness(self.readiness_options).await;
+        match assessment.report.state() {
+            DurableReadinessState::Ready => {
+                Ok((assessment.ready_indices, assessment.majority_visible_prefix))
+            }
+            DurableReadinessState::TopologyInvalid => Err(StoreError::BackendUnavailable(
+                "session-store topology is not validated".into(),
+            )),
+            DurableReadinessState::NoQuorum => Err(StoreError::BackendUnavailable(
+                "durable session-store quorum not ready".into(),
+            )),
+            DurableReadinessState::RecoveryRequired => Err(StoreError::BackendUnavailable(
+                "durable session-store recovery required".into(),
+            )),
+        }
     }
 
     async fn replicate_mutation(&self, op: ReplicationOp) -> Result<(), StoreError> {
@@ -486,17 +833,10 @@ impl QuorumSessionStore {
         futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
         StoreError,
     > {
-        let (online_ids, committed_entries) = self.committed_and_repaired().await?;
-        let committed_seq = committed_entries
-            .last()
-            .map(|entry| entry.sequence)
-            .unwrap_or(0);
-        for id in online_ids {
-            let replica = self.replica(id);
-            if let Ok(seq) = replica.inner.max_replication_sequence().await {
-                if seq >= committed_seq {
-                    return replica.inner.watch(start_sequence).await;
-                }
+        let (ready_ids, _) = self.committed_and_repaired().await?;
+        for id in ready_ids {
+            if let Ok(stream) = self.replica(id).inner.watch(start_sequence).await {
+                return Ok(stream);
             }
         }
         Err(StoreError::BackendUnavailable(
@@ -720,7 +1060,7 @@ impl SessionBackend for QuorumSessionStore {
     }
 
     async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
-        let (_, committed_entries) = self.committed_log_state().await?;
+        let (_, committed_entries) = self.committed_and_repaired().await?;
         Ok(committed_entries
             .last()
             .map(|entry| entry.sequence)
@@ -732,7 +1072,7 @@ impl SessionBackend for QuorumSessionStore {
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
-        let (_, committed_entries) = self.committed_log_state().await?;
+        let (_, committed_entries) = self.committed_and_repaired().await?;
         Ok(committed_entries
             .into_iter()
             .filter(|entry| entry.sequence >= start)
@@ -842,15 +1182,25 @@ impl SessionLeaseManager for QuorumSessionStore {
 
         let mut max_fence = 0;
         let mut max_cred_id = 0;
-        for &id in &online_ids {
-            let replica = self.replica(id);
-            let (f, c) = replica
-                .inner
-                .next_lease_info()
-                .await
-                .map_err(|e| LeaseError::Backend(e.to_string()))?;
-            max_fence = max_fence.max(f);
-            max_cred_id = max_cred_id.max(c);
+        let mut sequencing_voters = HashSet::new();
+        let sequencing_results = join_all(
+            online_ids
+                .iter()
+                .copied()
+                .map(|id| async move { (id, self.replica(id).inner.next_lease_info().await) }),
+        )
+        .await;
+        for (id, result) in sequencing_results {
+            if let Ok((fence, credential_id)) = result {
+                sequencing_voters.insert(self.replica_id(id).clone());
+                max_fence = max_fence.max(fence);
+                max_cred_id = max_cred_id.max(credential_id);
+            }
+        }
+        if sequencing_voters.len() < self.quorum_size() {
+            return Err(LeaseError::Backend(
+                "quorum not reached for lease_coordination".into(),
+            ));
         }
 
         let fence = FenceToken::new(max_fence);

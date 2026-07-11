@@ -32,14 +32,15 @@ use opc_nacm::{ModuleRegistry, NacmAction, NacmEvaluator, NacmPolicy};
 use opc_persist::{AuditRecord, CommitRecord, CommitSource, ConfigStore, RollbackTarget};
 use opc_redaction::{DigestKey, RedactionLevel, TelcoIdentifier};
 use opc_runtime::{
-    health::HealthResponse, Builder, Criticality, HealthModel, Readiness, RestartPolicy,
-    RuntimeError, RuntimeHandle, RuntimePhase, RuntimeProfile, ShutdownToken, Supervisor, TaskKind,
-    TaskName,
+    health::HealthResponse, known_gates, Builder, Criticality, GateImpact, GateStatus, HealthGate,
+    HealthModel, Readiness, RestartPolicy, RuntimeError, RuntimeHandle, RuntimePhase,
+    RuntimeProfile, ShutdownToken, Supervisor, TaskKind, TaskName,
 };
 use opc_session_store::{
-    CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, EncryptingSessionBackend,
-    Generation, OwnerId, QuorumSessionStore, SessionBackend, SessionKey, SessionKeyType,
-    SessionLeaseManager, StateClass, StateType, StoredSessionRecord, ValidatedQuorumTopology,
+    CompareAndSet, CompareAndSetResult, DurableReadinessOptions, EncryptedSessionPayload,
+    EncryptingSessionBackend, Generation, OwnerId, QuorumSessionStore, SessionBackend, SessionKey,
+    SessionKeyType, SessionLeaseManager, StateClass, StateType, StoredSessionRecord,
+    ValidatedQuorumTopology, DEFAULT_DURABLE_READINESS_MAX_LOG_ENTRIES,
 };
 use opc_testbed::Clock as TestClock;
 use opc_types::{ConfigVersion, NetworkFunctionKind, SchemaDigest, TenantId, Timestamp, TxId};
@@ -56,6 +57,9 @@ const AMF_OWNER_ID: &str = "amf-lite-1";
 const SUBSCRIBER_CONTEXT_STATE_TYPE: &str = "subscriber-context";
 const SYSTEM_TENANT: &str = "system";
 const SUBSCRIBER_PRIVACY_KEY_DOMAIN: &[u8] = b"opc-amf-lite/subscriber-privacy-key/v1";
+const SESSION_STORE_READINESS_TASK: &str = "amf-session-store-readiness";
+const SESSION_STORE_READINESS_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+const SESSION_STORE_READINESS_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -609,7 +613,11 @@ impl AmfLite {
             .map_err(|_| {
                 RuntimeError::Supervisor("session topology validation failed".to_string())
             })?;
-        let session_store = QuorumSessionStore::from_validated_topology(session_topology);
+        let session_store = QuorumSessionStore::from_validated_topology(session_topology)
+            .with_durable_readiness_options(DurableReadinessOptions::new(
+                SESSION_STORE_READINESS_PROBE_TIMEOUT,
+                DEFAULT_DURABLE_READINESS_MAX_LOG_ENTRIES,
+            ));
 
         // 4. Initial state
         let mut health = HealthModel::new();
@@ -632,6 +640,7 @@ impl AmfLite {
         let phase_notify_clone = phase_notify.clone();
         let config_bus_clone = config_bus.clone();
         let alarms_clone = alarms.clone();
+        let session_store_clone = session_store.clone();
 
         let mut profile = RuntimeProfile::production("amf-lite", uuid::Uuid::new_v4());
         profile.budget = Some(opc_runtime::ResourceBudget::default());
@@ -646,12 +655,14 @@ impl AmfLite {
                 let state_notify = state_notify_clone.clone();
                 let config_bus = config_bus_clone.clone();
                 let alarms = alarms_clone.clone();
+                let session_store = session_store_clone.clone();
 
                 Box::pin(async move {
                     initialize_amf_runtime(
                         supervisor,
                         shutdown,
                         config_bus,
+                        session_store,
                         state,
                         state_notify,
                         alarms,
@@ -1006,6 +1017,7 @@ async fn initialize_amf_runtime(
     supervisor: Supervisor,
     shutdown: ShutdownToken,
     config_bus: ConfigBus<AmfConfig>,
+    session_store: QuorumSessionStore,
     state: Arc<RwLock<AmfLiteState>>,
     state_notify: Arc<Notify>,
     alarms: SharedAlarmManager,
@@ -1021,6 +1033,15 @@ async fn initialize_amf_runtime(
     )
     .await?;
 
+    spawn_session_store_readiness(
+        &supervisor,
+        &shutdown,
+        session_store,
+        state.clone(),
+        state_notify.clone(),
+    )
+    .await?;
+
     // Worker task (NRF Registration mock simulator)
     spawn_registration_worker(&supervisor, &shutdown, state.clone(), state_notify.clone()).await?;
 
@@ -1029,9 +1050,94 @@ async fn initialize_amf_runtime(
         let mut st = state.write().await;
         st.health.set_listeners_bound(true);
         st.health.set_security_material_valid(true);
-        st.health.set_backends_reachable(true);
         st.health.set_critical_tasks_healthy(true);
     }
+
+    Ok(())
+}
+
+async fn spawn_session_store_readiness(
+    supervisor: &Supervisor,
+    shutdown: &ShutdownToken,
+    session_store: QuorumSessionStore,
+    state: Arc<RwLock<AmfLiteState>>,
+    state_notify: Arc<Notify>,
+) -> Result<(), RuntimeError> {
+    let task_name = TaskName::new(SESSION_STORE_READINESS_TASK);
+    supervisor
+        .register(
+            task_name.clone(),
+            TaskKind::BackgroundSync,
+            Criticality::Fatal,
+            RestartPolicy::no_restart(),
+        )
+        .await?;
+    supervisor.set_readiness_gated(&task_name, true).await;
+
+    {
+        let mut st = state.write().await;
+        st.health.set_backends_reachable(false);
+        st.health.set_gate(
+            HealthGate::new(known_gates::SESSION_STORE, GateImpact::BlocksReadiness)
+                .with_status(GateStatus::Unknown)
+                .with_message("durable readiness has not been probed"),
+        );
+    }
+    state_notify.notify_waiters();
+
+    let supervisor_for_task = supervisor.clone();
+    let shutdown = shutdown.clone();
+    supervisor
+        .spawn(
+            task_name.clone(),
+            TaskKind::BackgroundSync,
+            Criticality::Fatal,
+            RestartPolicy::no_restart(),
+            move || {
+                let session_store = session_store.clone();
+                let state = state.clone();
+                let state_notify = state_notify.clone();
+                let supervisor = supervisor_for_task.clone();
+                let task_name = task_name.clone();
+                let shutdown = shutdown.clone();
+
+                Box::pin(async move {
+                    loop {
+                        let report = tokio::select! {
+                            _ = shutdown.shutdown_acknowledged() => return Ok(()),
+                            report = session_store.probe_durable_readiness() => report,
+                        };
+                        let is_ready = report.is_ready();
+                        let reason_code = report.reason_code();
+
+                        {
+                            let mut st = state.write().await;
+                            st.health.set_backends_reachable(is_ready);
+                            st.health.set_gate(
+                                HealthGate::new(
+                                    known_gates::SESSION_STORE,
+                                    GateImpact::BlocksReadiness,
+                                )
+                                .with_status(if is_ready {
+                                    GateStatus::Passing
+                                } else {
+                                    GateStatus::Failing
+                                })
+                                .with_message(reason_code),
+                            );
+                        }
+                        state_notify.notify_waiters();
+                        supervisor.set_task_ready(&task_name, is_ready).await;
+
+                        tokio::select! {
+                            _ = shutdown.shutdown_acknowledged() => return Ok(()),
+                            _ = tokio::time::sleep(SESSION_STORE_READINESS_PROBE_INTERVAL) => {}
+                        }
+                    }
+                })
+            },
+        )
+        .await?;
 
     Ok(())
 }
@@ -1147,6 +1253,7 @@ async fn spawn_registration_worker(
 mod tests {
     use super::*;
     use opc_config_bus::InMemoryManagedDatastore;
+    use opc_session_testkit::ChaosTestkit;
 
     #[test]
     fn schema_digest_bytes_match_public_hex() {
@@ -1177,6 +1284,12 @@ mod tests {
             active_nrf_registration: false,
         }));
         let state_notify = Arc::new(Notify::new());
+        let chaos = ChaosTestkit::new(3);
+        let session_store = QuorumSessionStore::from_validated_topology(
+            chaos
+                .validated_topology(0)
+                .expect("valid test session topology"),
+        );
 
         let mut profile = RuntimeProfile::production("amf-lite", uuid::Uuid::new_v4());
         profile.budget = Some(opc_runtime::ResourceBudget {
@@ -1194,6 +1307,7 @@ mod tests {
                         supervisor,
                         shutdown,
                         config_bus,
+                        session_store,
                         state,
                         state_notify,
                         alarms,
@@ -1216,6 +1330,154 @@ mod tests {
                 handle.shutdown().await;
                 panic!("expected startup to fail when spawn budget is exhausted");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_session_readiness_blocks_startup_tracks_loss_and_recovers() {
+        let alarms = SharedAlarmManager::default();
+        let config_bus = ConfigBus::restore_or_new_with_alarm_manager_dev_only(
+            AmfConfig::default(),
+            Arc::new(InMemoryManagedDatastore::new()),
+            alarms.clone(),
+        )
+        .await
+        .expect("config bus initializes");
+
+        let mut health = HealthModel::new();
+        health.set_startup_in_progress("AMFInit");
+        health.set_config_applied(true);
+        let state = Arc::new(RwLock::new(AmfLiteState {
+            config: AmfConfig::default(),
+            version: ConfigVersion::INITIAL,
+            health,
+            active_nrf_registration: false,
+        }));
+        let state_notify = Arc::new(Notify::new());
+
+        let chaos = ChaosTestkit::new(3);
+        chaos.set_online(1, false).await;
+        chaos.set_online(2, false).await;
+        let session_store = QuorumSessionStore::from_validated_topology(
+            chaos
+                .validated_topology(0)
+                .expect("valid test session topology"),
+        );
+
+        let mut profile = RuntimeProfile::production("amf-lite", uuid::Uuid::new_v4());
+        profile.budget = Some(opc_runtime::ResourceBudget::default());
+        profile.shutdown_grace = Duration::from_millis(50);
+        profile.drain_timeout = Duration::from_millis(200);
+
+        let state_for_init = state.clone();
+        let handle = Builder::new(profile)
+            .with_alarm_manager(alarms.clone())
+            .try_with_init(move |supervisor, shutdown| {
+                Box::pin(async move {
+                    initialize_amf_runtime(
+                        supervisor,
+                        shutdown,
+                        config_bus,
+                        session_store,
+                        state_for_init,
+                        state_notify,
+                        alarms,
+                    )
+                    .await
+                })
+            })
+            .build()
+            .await
+            .expect("runtime initializes while durable readiness is pending");
+
+        wait_for_session_gate(&state, GateStatus::Failing).await;
+        assert_eq!(handle.phase().await, RuntimePhase::PeerWarmup);
+        assert_eq!(handle.readiness().await, Readiness::NotReady);
+        {
+            let st = state.read().await;
+            assert!(!st.health.backends_reachable);
+            assert_eq!(st.health.gates.readiness(), Readiness::NotReady);
+            let gate_name = opc_runtime::GateName::new(known_gates::SESSION_STORE);
+            assert_eq!(
+                st.health.gates.get(&gate_name).map(|gate| gate.impact),
+                Some(GateImpact::BlocksReadiness)
+            );
+        }
+
+        let supervisor_health = handle.supervisor().health().await;
+        let readiness_task = supervisor_health
+            .task_states
+            .get(SESSION_STORE_READINESS_TASK)
+            .expect("readiness task is supervised");
+        assert_eq!(readiness_task.kind, "background-sync");
+        assert_eq!(readiness_task.criticality, "fatal");
+
+        chaos.set_online(1, true).await;
+        wait_for_readiness(&handle, Readiness::Ready).await;
+        wait_for_phase(&handle, RuntimePhase::Ready).await;
+        wait_for_session_gate(&state, GateStatus::Passing).await;
+        assert!(state.read().await.health.backends_reachable);
+
+        chaos.set_online(1, false).await;
+        wait_for_readiness(&handle, Readiness::NotReady).await;
+        wait_for_session_gate(&state, GateStatus::Failing).await;
+        assert!(!state.read().await.health.backends_reachable);
+
+        chaos.set_online(2, true).await;
+        wait_for_readiness(&handle, Readiness::Ready).await;
+        wait_for_session_gate(&state, GateStatus::Passing).await;
+        assert!(state.read().await.health.backends_reachable);
+
+        handle.shutdown().await;
+    }
+
+    async fn wait_for_readiness(handle: &RuntimeHandle, expected: Readiness) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if handle.readiness().await == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for runtime readiness {expected:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_phase(handle: &RuntimeHandle, expected: RuntimePhase) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if handle.phase().await == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for runtime phase {expected:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_session_gate(state: &Arc<RwLock<AmfLiteState>>, expected: GateStatus) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let gate_name = opc_runtime::GateName::new(known_gates::SESSION_STORE);
+        loop {
+            let status = state
+                .read()
+                .await
+                .health
+                .gates
+                .get(&gate_name)
+                .map(|gate| gate.status);
+            if status == Some(expected) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for session-store gate {expected:?}; observed {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }

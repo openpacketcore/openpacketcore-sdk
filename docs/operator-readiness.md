@@ -129,17 +129,62 @@ advertises `single-replica`. The deprecated raw-vector constructor advertises
 `unknown` and is non-operational. Logical self must be configured explicitly;
 do not derive it by shortening an FQDN or comparing endpoint strings.
 
-This admission result is not a durable-ready signal. A production operator
-must still require the fresh peer-majority path in #124 and authenticated
-membership binding in #125 before traffic readiness.
+This admission result is not a durable-ready signal. Capability declarations
+and `SessionStorePlatformProfile::Quorum` are also admission evidence only. A
+production operator must separately require fresh durable readiness and
+authenticated membership binding (#125) before traffic readiness.
+
+### Session durable readiness
+
+`QuorumSessionStore::probe_durable_readiness` performs a fresh, bounded
+point-in-time assessment without consulting cached capabilities. Require
+`DurableReadinessState::Ready`; the other stable states are `NoQuorum`,
+`TopologyInvalid`, and `RecoveryRequired`. The report includes
+`configured_voters`, `fresh_reachable_voters`, `agreeing_voters`,
+`required_quorum`, an optional `majority_visible_prefix_index`, and per-replica
+typed observations.
+
+Configure timeout and log-work limits once with
+`with_durable_readiness_options`; probes and authoritative operations share
+that exact policy. Log evidence is fetched in bounded adaptive pages rather
+than requiring the complete log to fit one wire frame.
+
+The bounded failure classes are `Transport`, `Authentication`, `Timeout`,
+`Protocol`, `Backend`, `LogUnavailable`, `Divergent`, `RepairFailed`, and
+`ProbeBudgetExceeded`.
+Do not log raw peer errors or turn replica IDs/endpoints into metric labels.
+The exported metrics intentionally use only fixed names and bounded reasons for
+probe outcome, current readiness,
+configured/freshly-reachable/agreeing/required voter counts, majority-visible
+prefix, and bounded
+timeout/authentication/transport/divergent/recovery-required failures.
+The only labels on this readiness surface are bounded `status` values
+(`success`/`failure`) and bounded `reason` values (`timeout`, `authentication`,
+`transport`, `divergent`, and `recovery_required`); its gauges carry no identity
+labels.
+
+Readiness evidence can become stale immediately. AMF-lite therefore starts
+with its session-store gate closed, probes immediately and continuously, and
+keeps both the health gate and supervised-task readiness closed whenever the
+fresh report is not `Ready`. Each authoritative store operation independently
+repeats the same assessment. Downstream CNFs must apply the same continuous
+traffic-readiness pattern rather than opening traffic permanently after one
+successful startup probe.
+
+Ownership publication is part of that gate, not a separate optimistic path.
+Do not publish or renew shard/session ownership, claim a floating VIP, or
+advertise service traffic until the report is `Ready`. On later quorum loss,
+stop new ownership publication and traffic advertisement immediately and enter
+the product's fenced relinquish/handoff workflow; a prior readiness report is
+not an ownership lease.
 
 ### Tested HA algorithm and prototype features
 
 1. **Persisted Ordered-Log Prototype**: Exercises replication of mutations (lease acquire, renew, release, compare-and-set, delete, TTL refresh, and batch operations) across replicas using a sequence-numbered log. Durable sequence/commit authority remains #127.
 2. **Local Idempotency & Replay Checks**: Fixtures exercise duplicate handling by log position, generation, fence, and transaction identity without wall-clock last-writer-wins. Cross-partition authority remains conditional on #127/#128.
 3. **Resume Cursors**: Exposes change-stream watches backed by the ordered log, allowing client streams to resume and catch up after disconnects.
-4. **Stale Replica Recovery Heuristic**: Rejoined and stale replicas are currently rebuilt from the prefix shared by the visible majority. This is not commit-proven recovery; #127/#128 must prevent a later majority from erasing a previously acknowledged entry.
-5. **Declared Feature Envelope**: `QuorumSessionStore` advertises `ordered_replication_log = true` and `watch = true`, while standalone SQLite reports `false`. These bits describe available methods, not a fresh peer-quorum readiness proof (#124).
+4. **Stale Replica Recovery Heuristic**: The readiness/operation assessment may append a missing suffix only when a replica's complete log is a strict prefix of the majority-visible log. Conflicts and longer minority tails yield `RecoveryRequired` without truncation or destructive rebuild. This is still not commit-proven recovery; #127/#128 must prevent a later majority from omitting a previously acknowledged entry.
+5. **Declared Feature Envelope**: `QuorumSessionStore` advertises `ordered_replication_log = true` and `watch = true`, while standalone SQLite reports `false`. These bits describe available methods, not fresh peer-quorum evidence or production qualification. Use `probe_durable_readiness` for the current point-in-time result.
 
 ### Session transport v2 rollout boundary
 
@@ -155,11 +200,13 @@ scans on each replica, then restore traffic. Do not perform a mixed-version
 rolling upgrade.
 
 This is not production HA qualification. Do not infer readiness from bind
-success or cached capabilities (#124), use quorum restore as authority before
+success, static profiles, or cached capabilities; use the fresh bounded probe
+and continuous gate. Do not use quorum restore as authority before
 #127/#133, treat current divergence repair as authoritative before #128, or
 auto-resolve a legacy fork before #129. Authenticated replica identity (#125)
 is also a prerequisite; fixed-width wire DTOs and invariant-safe model decoding
-remain #134/#135.
+remain #134/#135. Oversized-TTL and zero-replication-sequence panic elimination
+remain #137/#138.
 
 ## Operator-facing SDK surfaces available now
 
@@ -225,11 +272,11 @@ The SDK includes a config-store consensus hardening prototype (`ConsensusConfigS
 The standard SQLite-backed config and session store profiles (`SqliteBackend` and `SqliteSessionBackend`) are single-node only. They are acceptable only for development, conformance, lab, or explicitly accepted edge/single-replica deployments, and must not be used to claim carrier HA without a production consensus/replication layer.
 
 - **Config Store Consensus Hardening**: `ConsensusConfigStore` provides durable membership, TCP RPC framing over real mTLS transport with SPIFFE identity verification bound to the configured workload profile and active membership, election/heartbeats, no-op commit safety, snapshot HMAC verification, controlled TCP server lifecycle (bounded concurrency/timeout/oneshot shutdown), membership-change guardrails, and consensus metrics dump hooks. Checked via the out-of-process multi-process campaigns, failovers, network partitioning, and pending commits surviving restarts.
-- **Session Store Quorum Replication Prototype**: `QuorumSessionStore` exercises session leases and CAS mutations across a majority of replicas using an ordered log with watch/change-stream resume cursors, catch-up/read-repair, and partial-write rollback. The durable authority and repair claims remain conditional on #127/#128.
-- **Session Topology Admission**: HA-shaped construction requires an immutable validated set of distinct declared votes and exactly one explicit local member. The lab singleton reports `single-replica`; raw unvalidated construction reports `unknown` and refuses operations. This is configuration evidence, not readiness or authenticated membership (#124/#125).
-- **Fault Coverage**: Reusable chaos test fixtures and tests cover split-brain, stale leader writes, replication lag, stale fences, restart/rejoin behavior, divergent read fail-closed behavior, clock skew, and multi-writer rejection. They also cover session-store durable rejoin/catch-up, read-repair, ordered-log replay, duplicate delivery, partial-write rollback, and prevention of failed partial-write resurrection.
+- **Session Store Quorum Replication Prototype**: `QuorumSessionStore` exercises session leases and CAS mutations across a majority of replicas using an ordered log with watch/change-stream resume cursors, strict-prefix catch-up, and partial-write fail-closed fixtures. Durable authority and repair claims remain conditional on #127/#128.
+- **Session Topology and Readiness**: HA-shaped construction requires an immutable validated set of distinct declared votes and exactly one explicit local member. The lab singleton reports `single-replica`; raw unvalidated construction reports `unknown` and refuses operations. Topology and capabilities are admission evidence. `probe_durable_readiness` separately provides fresh bounded majority evidence, while authenticated membership remains #125.
+- **Fault Coverage**: Reusable chaos test fixtures and tests cover split-brain, stale leader writes, replication lag, stale fences, restart/rejoin behavior, divergent read fail-closed behavior, clock skew, and multi-writer rejection. They also cover session-store durable rejoin/catch-up, strict-prefix append, ordered-log replay, duplicate delivery, partial-write fail-closed behavior, and no-destructive-repair evidence for an already-visible ambiguous tail. This is not proof of automatic fork reconciliation or failed-write resurrection safety before #127/#128.
 - **SQLite Writer Envelope**: Each replica still serializes local durable writes through SQLite. `ConsensusConfigStore` and `QuorumSessionStore` provide the tested consensus and ordered-replication mechanisms described above; neither constitutes production HA qualification, and standalone SQLite is not HA.
-- **Capability Envelope**: `SqliteSessionBackend` reports CAS, fencing, TTL, lease-expiry, and batch support without `watch` or `ordered_replication_log` support. `QuorumSessionStore` reports `watch = true` and `ordered_replication_log = true`, but those feature declarations are not a fresh-quorum readiness proof (#124). Use `validate_backend_for_profile` or `StateClass::required_profile()` before binding a backend.
+- **Capability Envelope**: `SqliteSessionBackend` reports CAS, fencing, TTL, lease-expiry, and batch support without `watch` or `ordered_replication_log` support. `QuorumSessionStore` reports `watch = true` and `ordered_replication_log = true`, but those feature declarations remain static admission evidence. Use `validate_backend_for_profile` or `StateClass::required_profile()` before binding a backend, and use `probe_durable_readiness` plus continuous traffic gating for current quorum evidence.
 - **Payload Bound**: The backend enforces a 1 MiB payload limit through `BackendCapabilities::max_value_bytes`; state types that need larger values require an explicit profile decision.
 - **Storage Fault-Injection**: Reusable `FaultInjectingStore` and `FaultType` adapters under `opc-persist` allow injecting disk-full, fsync/write failure, corrupt database/WAL, failed rollback target load, failed rollback point creation, audit-chain corruption, and startup recovery fencing. These hooks are compiled only with the `dangerous-test-hooks` feature and must not be enabled in production profiles. They cover all RFC 001 §14.3 failures, asserting fail-closed config publication/notifications, redacting SQL internals/raw paths/secrets from client-visible errors, raising alarms, and updating metrics.
 

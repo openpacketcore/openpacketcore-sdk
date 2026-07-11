@@ -16,6 +16,7 @@
 //! | [`lease`] | Lease manager and fencing rules |
 //! | [`record`] | Stored record format and encrypted payloads |
 //! | [`topology`] | Validated quorum membership and replica identity |
+//! | [`readiness`] | Fresh, bounded durable-quorum readiness evidence |
 //! | [`fake`] | In-memory backend and lease manager for tests |
 //! | [`error`] | `StoreError` and `LeaseError` |
 
@@ -33,6 +34,7 @@ pub mod model;
 pub mod owned_session;
 pub mod payload_codec;
 pub mod quorum;
+pub mod readiness;
 pub mod record;
 pub mod restore;
 pub mod sqlite;
@@ -67,6 +69,12 @@ pub use payload_codec::{
     SessionPayloadFormat, SessionPayloadVersion, SESSION_PAYLOAD_JSON_CONTENT_TYPE,
 };
 pub use quorum::{FencedSessionReplica, QuorumSessionStore, SessionStoreBackend};
+pub use readiness::{
+    DurableReadinessOptions, DurableReadinessReport, DurableReadinessState,
+    ReplicaReadinessFailure, ReplicaReadinessObservation, ReplicaReadinessOutcome,
+    DEFAULT_DURABLE_READINESS_MAX_LOG_ENTRIES, DEFAULT_DURABLE_READINESS_TIMEOUT,
+    MAX_DURABLE_READINESS_LOG_ENTRIES, MAX_DURABLE_READINESS_TIMEOUT,
+};
 pub use record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 pub use restore::{
     summarize_restore_records, OwnerFenceMetadata, RestoreBlockReason, RestoreBlockReasonCode,

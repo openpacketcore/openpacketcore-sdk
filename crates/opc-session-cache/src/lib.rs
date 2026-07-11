@@ -520,6 +520,12 @@ impl SessionBackend for SessionCache {
         self.backend.max_replication_sequence().await
     }
 
+    async fn probe_replication_head(
+        &self,
+    ) -> Result<u64, opc_session_store::ReplicaReadinessFailure> {
+        self.backend.probe_replication_head().await
+    }
+
     async fn get_replication_log(
         &self,
         start: u64,

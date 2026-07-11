@@ -136,6 +136,12 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         self.backend.max_replication_sequence().await
     }
 
+    async fn probe_replication_head(
+        &self,
+    ) -> Result<u64, crate::readiness::ReplicaReadinessFailure> {
+        self.backend.probe_replication_head().await
+    }
+
     async fn get_replication_log(
         &self,
         start: u64,

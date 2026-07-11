@@ -43,6 +43,10 @@ assert_eq!(AMF_SCHEMA_DIGEST.len(), 64);
 - Uses `opc-session-store` validated topology/quorum/fencing plus
   `EncryptingSessionBackend` for UE session state. Backend wrapping preserves
   and revalidates the admitted topology metadata.
+- Runs an immediately probing, continuously supervised durable-readiness task.
+  AMF readiness stays closed until a fresh distinct replica majority passes;
+  later quorum loss makes `/readyz` return not-ready, and readiness reopens only
+  after a new successful probe.
 - Uses `opc-key` and `opc-crypto` through a KMS provider boundary.
 - Uses `opc-nacm` for config authorization, `opc-alarm` for alarm reporting,
   and `opc-redaction`/`opc-privacy` for subscriber-safe identifiers.
@@ -59,9 +63,12 @@ assert_eq!(AMF_SCHEMA_DIGEST.len(), 64);
   behavior through `opc-security-testkit`.
 - Config consensus and session HA paths are exercised by tests, but their
   production readiness is bounded by the underlying SDK crates.
-- AMF-lite topology is in-process test evidence. It does not establish fresh
-  peer readiness, authenticated membership, durable session consensus, or
-  carrier HA qualification.
+- Static session-store profile and capability checks are admission evidence,
+  not liveness evidence. The supervised durable-readiness gate is the runtime
+  signal used to admit traffic.
+- AMF-lite topology remains in-process test evidence. A successful readiness
+  probe does not by itself establish authenticated identity binding, durable
+  session consensus, or carrier HA qualification.
 
 ## Roadmap
 

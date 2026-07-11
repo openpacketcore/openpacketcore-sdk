@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-session-store`: `probe_durable_readiness` and stable readiness report
+  types for fresh, deadline- and log-work-bounded quorum evidence. Reports
+  distinguish `Ready`, `NoQuorum`, `TopologyInvalid`, and `RecoveryRequired`;
+  expose configured, freshly reachable, agreeing, and required voter counts
+  plus the majority-visible prefix; and use typed, redaction-safe replica
+  failure classes instead of raw errors. Capability declarations and
+  `SessionStorePlatformProfile::Quorum` remain admission evidence only.
 - `opc-session-store`: immutable replica descriptors and
   `ValidatedQuorumTopology` admission with distinct logical ID, canonical
   endpoint, expected TLS identity, failure domain, backing identity, and exact
@@ -183,6 +190,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- `opc-session-store`/`opc-amf-lite`: durable readiness no longer succeeds from
+  a bound server or cached capabilities while real quorum operations fail.
+  Probes and operations use one store-level policy and the same fresh
+  fail-closed majority assessment; adaptive bounded paging keeps log evidence
+  usable when the aggregate log exceeds one wire frame;
+  strict shorter prefixes are caught up by append only, while conflicts and
+  longer minority tails return `RecoveryRequired` without destructive rebuild.
+  AMF-lite now keeps traffic readiness behind a continuously supervised
+  session-store gate, and low-cardinality metrics expose probe outcomes,
+  configured/freshly-reachable/agreeing/required counts, the majority-visible
+  prefix, and bounded failure reasons. This closes #124 only; authenticated
+  identity (#125), durable authority and operator-safe
+  fork recovery (#127–#129), majority-authoritative restore (#133), and
+  wire/model hardening (#134/#135) remain production blockers. Oversized-TTL and
+  zero-replication-sequence panic elimination remain tracked by #137/#138.
 - `opc-session-store`: quorum construction now rejects empty/undersized/even HA
   membership, missing or ambiguous self, duplicate logical IDs, canonical
   endpoints, declared TLS identities, failure domains, backing identities, and
@@ -192,15 +214,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Declared backing identity and authenticated peer binding remain separate
   requirements. A real
   mTLS SQLite regression proves that bare logical self is independent from FQDN
-  endpoints. This closes #123 configured-topology admission only; #124/#125,
-  #127–#129, and #133–#135 remain production blockers.
+  endpoints. This closes #123 configured-topology admission only. Fresh
+  durable readiness was scoped separately to #124 and is described above;
+  #125, #127–#129, #133–#135, and #137/#138 remain production blockers.
 - `opc-session-net`: remote backends and replication servers now carry
   validated cursor-paged restore scans, shorten multi-record pages to the
   effective client/server frame limit, and return a typed error when one
   record cannot fit. This implements the transport parity tracked by #126; it
   does not implement bounded majority-authoritative restore (#133), fixed-width
   wire stabilization (#134), invariant-safe model decoding (#135), or session
-  HA qualification (#124/#125, #127–#129).
+  HA qualification (#125, #127–#129).
 - `opc-persist`: standalone default-feature test builds no longer depend on
   fault-injection symbols that exist only with `dangerous-test-hooks`; CI now
   compiles the default package contract before workspace all-feature unification
