@@ -1,11 +1,14 @@
 //! 3GPP SWm Diameter-EAP dictionary subset and typed helpers.
 //!
 //! This module covers the ePDG-restricted SWm DER/DEA exchange that carries
-//! EAP payloads between the ePDG and an AAA/DRA peer. It does not implement
-//! transport state, realm routing, or IKEv2 policy.
+//! EAP payloads between the ePDG and an AAA/DRA peer, plus the subscription
+//! AVPs a DEA may carry (APN-Configuration and Service-Selection). It does
+//! not implement transport state, realm routing, or IKEv2 policy.
 //!
 //! @spec 3GPP TS29273
+//! @spec 3GPP TS29272 7.3
 //! @spec IETF RFC4072
+//! @spec IETF RFC5778
 //! @conformance scaffold — see CONFORMANCE.md
 
 use bytes::BytesMut;
@@ -22,7 +25,7 @@ use crate::dictionary::{
     ApplicationDefinition, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey, CommandDefinition,
     CommandKind, Dictionary,
 };
-use crate::{ApplicationId, AvpCode, CommandCode, Message, OwnedMessage};
+use crate::{ApplicationId, AvpCode, AvpHeader, CommandCode, Message, OwnedMessage};
 
 /// 3GPP SWm application identifier.
 pub const APPLICATION_ID: ApplicationId = ApplicationId::new(16_777_264);
@@ -40,6 +43,33 @@ pub const AVP_EAP_MASTER_SESSION_KEY: AvpCode = AvpCode::new(464);
 pub const AVP_AUTH_REQUEST_TYPE: AvpCode = AvpCode::new(274);
 /// State AVP code.
 pub const AVP_STATE: AvpCode = AvpCode::new(24);
+/// Service-Selection AVP code (RFC 5778 §6.2).
+pub const AVP_SERVICE_SELECTION: AvpCode = AvpCode::new(493);
+
+/// APN-Configuration grouped AVP code (3GPP TS 29.272 §7.3.35).
+pub const AVP_APN_CONFIGURATION: AvpCode = AvpCode::new(1430);
+/// Context-Identifier AVP code (3GPP TS 29.272 §7.3.27).
+pub const AVP_CONTEXT_IDENTIFIER: AvpCode = AvpCode::new(1423);
+/// PDN-Type AVP code (3GPP TS 29.272 §7.3.62).
+pub const AVP_PDN_TYPE: AvpCode = AvpCode::new(1456);
+/// EPS-Subscribed-QoS-Profile grouped AVP code (3GPP TS 29.272 §7.3.37).
+pub const AVP_EPS_SUBSCRIBED_QOS_PROFILE: AvpCode = AvpCode::new(1431);
+/// QoS-Class-Identifier AVP code (3GPP TS 29.212 §5.3.17).
+pub const AVP_QOS_CLASS_IDENTIFIER: AvpCode = AvpCode::new(1028);
+/// Allocation-Retention-Priority grouped AVP code (3GPP TS 29.212 §5.3.32).
+pub const AVP_ALLOCATION_RETENTION_PRIORITY: AvpCode = AvpCode::new(1034);
+/// Priority-Level AVP code (3GPP TS 29.212 §5.3.45).
+pub const AVP_PRIORITY_LEVEL: AvpCode = AvpCode::new(1046);
+/// Pre-emption-Capability AVP code (3GPP TS 29.212 §5.3.46).
+pub const AVP_PRE_EMPTION_CAPABILITY: AvpCode = AvpCode::new(1047);
+/// Pre-emption-Vulnerability AVP code (3GPP TS 29.212 §5.3.47).
+pub const AVP_PRE_EMPTION_VULNERABILITY: AvpCode = AvpCode::new(1048);
+/// AMBR grouped AVP code (3GPP TS 29.272 §7.3.41).
+pub const AVP_AMBR: AvpCode = AvpCode::new(1435);
+/// Max-Requested-Bandwidth-UL AVP code (3GPP TS 29.214 §5.3.15).
+pub const AVP_MAX_REQUESTED_BANDWIDTH_UL: AvpCode = AvpCode::new(516);
+/// Max-Requested-Bandwidth-DL AVP code (3GPP TS 29.214 §5.3.14).
+pub const AVP_MAX_REQUESTED_BANDWIDTH_DL: AvpCode = AvpCode::new(515);
 
 /// Auth-Request-Type value for AUTHORIZE_AUTHENTICATE.
 pub const AUTH_REQUEST_TYPE_AUTHORIZE_AUTHENTICATE: u32 = 3;
@@ -72,7 +102,7 @@ pub const COMMAND_DIAMETER_EAP_ANSWER: CommandDefinition = CommandDefinition::ne
     SpecRef::new("3gpp", "TS29273", "DEA"),
 );
 
-const SWM_AVPS: [AvpDefinition; 5] = [
+const SWM_AVPS: [AvpDefinition; 18] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_EAP_PAYLOAD),
         "EAP-Payload",
@@ -107,6 +137,97 @@ const SWM_AVPS: [AvpDefinition; 5] = [
         AvpDataType::OctetString,
         AvpFlagRules::base_optional(),
         SpecRef::new("ietf", "RFC6733", "6.38"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_SERVICE_SELECTION),
+        "Service-Selection",
+        AvpDataType::Utf8String,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC5778", "6.2"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_APN_CONFIGURATION, VENDOR_ID_3GPP),
+        "APN-Configuration",
+        AvpDataType::Grouped,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS29272", "7.3.35"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_CONTEXT_IDENTIFIER, VENDOR_ID_3GPP),
+        "Context-Identifier",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS29272", "7.3.27"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_PDN_TYPE, VENDOR_ID_3GPP),
+        "PDN-Type",
+        AvpDataType::Enumerated,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS29272", "7.3.62"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_EPS_SUBSCRIBED_QOS_PROFILE, VENDOR_ID_3GPP),
+        "EPS-Subscribed-QoS-Profile",
+        AvpDataType::Grouped,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS29272", "7.3.37"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_QOS_CLASS_IDENTIFIER, VENDOR_ID_3GPP),
+        "QoS-Class-Identifier",
+        AvpDataType::Enumerated,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS29212", "5.3.17"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_ALLOCATION_RETENTION_PRIORITY, VENDOR_ID_3GPP),
+        "Allocation-Retention-Priority",
+        AvpDataType::Grouped,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS29212", "5.3.32"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_PRIORITY_LEVEL, VENDOR_ID_3GPP),
+        "Priority-Level",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS29212", "5.3.45"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_PRE_EMPTION_CAPABILITY, VENDOR_ID_3GPP),
+        "Pre-emption-Capability",
+        AvpDataType::Enumerated,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS29212", "5.3.46"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_PRE_EMPTION_VULNERABILITY, VENDOR_ID_3GPP),
+        "Pre-emption-Vulnerability",
+        AvpDataType::Enumerated,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS29212", "5.3.47"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_AMBR, VENDOR_ID_3GPP),
+        "AMBR",
+        AvpDataType::Grouped,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS29272", "7.3.41"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_MAX_REQUESTED_BANDWIDTH_UL, VENDOR_ID_3GPP),
+        "Max-Requested-Bandwidth-UL",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS29214", "5.3.15"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_MAX_REQUESTED_BANDWIDTH_DL, VENDOR_ID_3GPP),
+        "Max-Requested-Bandwidth-DL",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS29214", "5.3.14"),
     ),
 ];
 
@@ -187,6 +308,96 @@ impl SwmResultCategory {
     }
 }
 
+/// PDN-Type values (3GPP TS 29.272 §7.3.62).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PdnType {
+    /// IPv4 only.
+    Ipv4,
+    /// IPv6 only.
+    Ipv6,
+    /// IPv4v6 dual stack.
+    Ipv4v6,
+    /// IPv4 or IPv6.
+    Ipv4OrIpv6,
+    /// Unknown or application-specific value.
+    Other(u32),
+}
+
+impl PdnType {
+    /// Return the wire value.
+    pub const fn value(self) -> u32 {
+        match self {
+            Self::Ipv4 => 0,
+            Self::Ipv6 => 1,
+            Self::Ipv4v6 => 2,
+            Self::Ipv4OrIpv6 => 3,
+            Self::Other(v) => v,
+        }
+    }
+
+    /// Parse from a wire value.
+    pub const fn from_value(value: u32) -> Self {
+        match value {
+            0 => Self::Ipv4,
+            1 => Self::Ipv6,
+            2 => Self::Ipv4v6,
+            3 => Self::Ipv4OrIpv6,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// Allocation-Retention-Priority grouped AVP (3GPP TS 29.212 §5.3.32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocationRetentionPriority {
+    /// Priority-Level.
+    pub priority_level: u32,
+    /// Pre-emption-Capability.
+    pub pre_emption_capability: Option<u32>,
+    /// Pre-emption-Vulnerability.
+    pub pre_emption_vulnerability: Option<u32>,
+}
+
+/// EPS-Subscribed-QoS-Profile grouped AVP (3GPP TS 29.272 §7.3.37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpsSubscribedQosProfile {
+    /// QoS-Class-Identifier.
+    pub qos_class_identifier: u32,
+    /// Allocation-Retention-Priority grouped child.
+    pub allocation_retention_priority: AllocationRetentionPriority,
+}
+
+/// AMBR grouped AVP (3GPP TS 29.272 §7.3.41).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ambr {
+    /// Max-Requested-Bandwidth-UL in bits per second.
+    pub max_requested_bandwidth_ul: u32,
+    /// Max-Requested-Bandwidth-DL in bits per second.
+    pub max_requested_bandwidth_dl: u32,
+}
+
+/// APN-Configuration grouped AVP (3GPP TS 29.272 §7.3.35).
+///
+/// Models the minimal subscription subset useful on a SWm DEA:
+/// Context-Identifier, Service-Selection, PDN-Type, and the optional
+/// EPS-Subscribed-QoS-Profile and AMBR children. The remaining TS 29.272
+/// children (for example VPLMN-Dynamic-Address-Allowed, PDN-GW-Allocation-Type,
+/// MIP6-Agent-Info, and 3GPP-Charging-Characteristics) are deliberately not
+/// modeled yet; they fall through to the unknown-AVP policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApnConfiguration {
+    /// Context-Identifier.
+    pub context_identifier: u32,
+    /// Service-Selection / APN name (redacted in diagnostic output).
+    pub service_selection: Redacted<String>,
+    /// PDN-Type.
+    pub pdn_type: PdnType,
+    /// EPS-Subscribed-QoS-Profile grouped child.
+    pub eps_subscribed_qos_profile: Option<EpsSubscribedQosProfile>,
+    /// AMBR grouped child.
+    pub ambr: Option<Ambr>,
+}
+
 /// A SWm Diameter-EAP-Request (DER).
 #[derive(Clone, PartialEq, Eq)]
 pub struct SwmDiameterEapRequest {
@@ -246,6 +457,11 @@ pub struct SwmDiameterEapAnswer {
     pub origin_realm: Redacted<String>,
     /// User-Name (redacted in diagnostic output).
     pub user_name: Option<Redacted<String>>,
+    /// Service-Selection / default APN (redacted in diagnostic output).
+    pub service_selection: Option<Redacted<String>>,
+    /// APN-Configuration grouped AVPs (only their count appears in
+    /// diagnostic output).
+    pub apn_configurations: Vec<ApnConfiguration>,
     /// EAP-Payload (redacted in diagnostic output).
     pub eap_payload: Option<Redacted<Vec<u8>>>,
     /// EAP-Reissued-Payload (redacted in diagnostic output).
@@ -268,6 +484,8 @@ impl std::fmt::Debug for SwmDiameterEapAnswer {
             .field("origin_host", &self.origin_host)
             .field("origin_realm", &self.origin_realm)
             .field("user_name", &self.user_name)
+            .field("service_selection", &self.service_selection)
+            .field("apn_configurations", &self.apn_configurations.len())
             .field("eap_payload", &self.eap_payload)
             .field("eap_reissued_payload", &self.eap_reissued_payload)
             .field("error_message", &self.error_message)
@@ -374,6 +592,24 @@ impl SwmDiameterEapAnswer {
                     "DEA",
                 ));
             }
+        }
+        if let Some(service_selection) = self.service_selection.as_ref() {
+            if service_selection.as_ref().is_empty() {
+                return Err(encode_structural_error(
+                    "SWm DEA Service-Selection must not be empty when present",
+                    "DEA",
+                ));
+            }
+        }
+        if self
+            .apn_configurations
+            .iter()
+            .any(|apn| apn.service_selection.as_ref().is_empty())
+        {
+            return Err(encode_structural_error(
+                "SWm DEA APN-Configuration Service-Selection must not be empty",
+                "DEA",
+            ));
         }
         if self.auth_application_id != APPLICATION_ID.get() {
             return Err(encode_structural_error(
@@ -726,6 +962,18 @@ pub fn build_swm_diameter_eap_answer(
             ctx,
         )?;
     }
+    if let Some(service_selection) = answer.service_selection.as_ref() {
+        builder_helpers::append_utf8_avp(
+            &mut raw_avps,
+            AVP_SERVICE_SELECTION,
+            service_selection.as_ref(),
+            true,
+            ctx,
+        )?;
+    }
+    for apn_configuration in &answer.apn_configurations {
+        append_apn_configuration_avp(&mut raw_avps, apn_configuration, ctx)?;
+    }
     if let Some(eap_payload) = answer.eap_payload.as_ref() {
         builder_helpers::append_octet_string_avp(
             &mut raw_avps,
@@ -798,6 +1046,8 @@ pub fn parse_swm_diameter_eap_answer(
     let mut origin_host = None;
     let mut origin_realm = None;
     let mut user_name = None;
+    let mut service_selection = None;
+    let mut apn_configurations = Vec::new();
     let mut eap_payload = None;
     let mut eap_reissued_payload = None;
     let mut error_message = None;
@@ -811,8 +1061,20 @@ pub fn parse_swm_diameter_eap_answer(
         |offset, avp| {
             let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "DEA")?;
             let code = avp.header.code;
-            if avp.header.vendor_id.is_some() {
-                return builder_helpers::handle_unknown_avp(ctx, &avp, offset, "DEA");
+            // Vendor-specific AVPs are matched by (vendor-id, code); only
+            // genuinely unknown ones fall through to the unknown-AVP policy.
+            if let Some(vendor_id) = avp.header.vendor_id {
+                if code == AVP_APN_CONFIGURATION && vendor_id == VENDOR_ID_3GPP {
+                    apn_configurations.push(parse_apn_configuration(
+                        avp.value,
+                        ctx,
+                        value_offset,
+                        1,
+                    )?);
+                } else {
+                    builder_helpers::handle_unknown_avp(ctx, &avp, offset, "DEA")?;
+                }
+                return Ok(());
             }
             if code == base::AVP_SESSION_ID {
                 let value = builder_helpers::parse_string_value(avp.value, value_offset, "8.8")?;
@@ -840,6 +1102,14 @@ pub fn parse_swm_diameter_eap_answer(
             } else if code == base::AVP_USER_NAME {
                 let value = builder_helpers::parse_string_value(avp.value, value_offset, "8.14")?;
                 builder_helpers::set_once(&mut user_name, Redacted::from(value), offset, "8.14")?;
+            } else if code == AVP_SERVICE_SELECTION {
+                let value = builder_helpers::parse_string_value(avp.value, value_offset, "6.2")?;
+                builder_helpers::set_once(
+                    &mut service_selection,
+                    Redacted::from(value),
+                    offset,
+                    "6.2",
+                )?;
             } else if code == AVP_EAP_PAYLOAD {
                 builder_helpers::set_once(
                     &mut eap_payload,
@@ -914,6 +1184,8 @@ pub fn parse_swm_diameter_eap_answer(
             "DEA",
         )?,
         user_name,
+        service_selection,
+        apn_configurations,
         eap_payload,
         eap_reissued_payload,
         error_message,
@@ -922,6 +1194,319 @@ pub fn parse_swm_diameter_eap_answer(
     };
     validate_decoded_answer(&answer)?;
     Ok(answer)
+}
+
+fn append_apn_configuration_avp(
+    dst: &mut BytesMut,
+    apn: &ApnConfiguration,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    let mut value = BytesMut::new();
+    builder_helpers::append_vendor_u32_avp(
+        &mut value,
+        AVP_CONTEXT_IDENTIFIER,
+        VENDOR_ID_3GPP,
+        apn.context_identifier,
+        true,
+        ctx,
+    )?;
+    builder_helpers::append_vendor_u32_avp(
+        &mut value,
+        AVP_PDN_TYPE,
+        VENDOR_ID_3GPP,
+        apn.pdn_type.value(),
+        true,
+        ctx,
+    )?;
+    builder_helpers::append_utf8_avp(
+        &mut value,
+        AVP_SERVICE_SELECTION,
+        apn.service_selection.as_ref(),
+        true,
+        ctx,
+    )?;
+    if let Some(profile) = apn.eps_subscribed_qos_profile.as_ref() {
+        append_eps_subscribed_qos_profile_avp(&mut value, profile, ctx)?;
+    }
+    if let Some(ambr) = apn.ambr.as_ref() {
+        append_ambr_avp(&mut value, ambr, ctx)?;
+    }
+    builder_helpers::append_avp(
+        dst,
+        AvpHeader::vendor(AVP_APN_CONFIGURATION, VENDOR_ID_3GPP, true),
+        &value,
+        ctx,
+    )
+}
+
+fn parse_apn_configuration(
+    value: &[u8],
+    ctx: DecodeContext,
+    base_offset: usize,
+    depth: usize,
+) -> Result<ApnConfiguration, DecodeError> {
+    let mut context_identifier = None;
+    let mut service_selection = None;
+    let mut pdn_type = None;
+    let mut eps_subscribed_qos_profile = None;
+    let mut ambr = None;
+    builder_helpers::for_each_avp(value, ctx, base_offset, depth, |offset, avp| {
+        let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "7.3.35")?;
+        let code = avp.header.code;
+        let vendor_id = avp.header.vendor_id;
+        if code == AVP_CONTEXT_IDENTIFIER && vendor_id == Some(VENDOR_ID_3GPP) {
+            let value = builder_helpers::parse_u32_value(avp.value, value_offset, "7.3.27")?;
+            builder_helpers::set_once(&mut context_identifier, value, offset, "7.3.35")?;
+        } else if code == AVP_PDN_TYPE && vendor_id == Some(VENDOR_ID_3GPP) {
+            let value = builder_helpers::parse_u32_value(avp.value, value_offset, "7.3.62")?;
+            builder_helpers::set_once(&mut pdn_type, PdnType::from_value(value), offset, "7.3.35")?;
+        } else if code == AVP_SERVICE_SELECTION && vendor_id.is_none() {
+            let value = builder_helpers::parse_string_value(avp.value, value_offset, "6.2")?;
+            builder_helpers::set_once(
+                &mut service_selection,
+                Redacted::from(value),
+                offset,
+                "7.3.35",
+            )?;
+        } else if code == AVP_EPS_SUBSCRIBED_QOS_PROFILE && vendor_id == Some(VENDOR_ID_3GPP) {
+            builder_helpers::set_once(
+                &mut eps_subscribed_qos_profile,
+                parse_eps_subscribed_qos_profile(avp.value, ctx, value_offset, depth + 1)?,
+                offset,
+                "7.3.35",
+            )?;
+        } else if code == AVP_AMBR && vendor_id == Some(VENDOR_ID_3GPP) {
+            builder_helpers::set_once(
+                &mut ambr,
+                parse_ambr(avp.value, ctx, value_offset, depth + 1)?,
+                offset,
+                "7.3.35",
+            )?;
+        } else {
+            builder_helpers::handle_unknown_avp(ctx, &avp, offset, "7.3.35")?;
+        }
+        Ok(())
+    })?;
+    Ok(ApnConfiguration {
+        context_identifier: context_identifier.ok_or_else(|| {
+            missing_child_error(base_offset, "missing Context-Identifier child AVP")
+        })?,
+        service_selection: service_selection.ok_or_else(|| {
+            missing_child_error(base_offset, "missing Service-Selection child AVP")
+        })?,
+        pdn_type: pdn_type
+            .ok_or_else(|| missing_child_error(base_offset, "missing PDN-Type child AVP"))?,
+        eps_subscribed_qos_profile,
+        ambr,
+    })
+}
+
+fn append_eps_subscribed_qos_profile_avp(
+    dst: &mut BytesMut,
+    profile: &EpsSubscribedQosProfile,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    let mut value = BytesMut::new();
+    builder_helpers::append_vendor_u32_avp(
+        &mut value,
+        AVP_QOS_CLASS_IDENTIFIER,
+        VENDOR_ID_3GPP,
+        profile.qos_class_identifier,
+        true,
+        ctx,
+    )?;
+    append_allocation_retention_priority_avp(
+        &mut value,
+        &profile.allocation_retention_priority,
+        ctx,
+    )?;
+    builder_helpers::append_avp(
+        dst,
+        AvpHeader::vendor(AVP_EPS_SUBSCRIBED_QOS_PROFILE, VENDOR_ID_3GPP, true),
+        &value,
+        ctx,
+    )
+}
+
+fn parse_eps_subscribed_qos_profile(
+    value: &[u8],
+    ctx: DecodeContext,
+    base_offset: usize,
+    depth: usize,
+) -> Result<EpsSubscribedQosProfile, DecodeError> {
+    let mut qos_class_identifier = None;
+    let mut allocation_retention_priority = None;
+    builder_helpers::for_each_avp(value, ctx, base_offset, depth, |offset, avp| {
+        let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "7.3.37")?;
+        let code = avp.header.code;
+        let vendor_id = avp.header.vendor_id;
+        if code == AVP_QOS_CLASS_IDENTIFIER && vendor_id == Some(VENDOR_ID_3GPP) {
+            let value = builder_helpers::parse_u32_value(avp.value, value_offset, "5.3.17")?;
+            builder_helpers::set_once(&mut qos_class_identifier, value, offset, "7.3.37")?;
+        } else if code == AVP_ALLOCATION_RETENTION_PRIORITY && vendor_id == Some(VENDOR_ID_3GPP) {
+            builder_helpers::set_once(
+                &mut allocation_retention_priority,
+                parse_allocation_retention_priority(avp.value, ctx, value_offset, depth + 1)?,
+                offset,
+                "7.3.37",
+            )?;
+        } else {
+            builder_helpers::handle_unknown_avp(ctx, &avp, offset, "7.3.37")?;
+        }
+        Ok(())
+    })?;
+    Ok(EpsSubscribedQosProfile {
+        qos_class_identifier: qos_class_identifier.ok_or_else(|| {
+            missing_child_error(base_offset, "missing QoS-Class-Identifier child AVP")
+        })?,
+        allocation_retention_priority: allocation_retention_priority.ok_or_else(|| {
+            missing_child_error(
+                base_offset,
+                "missing Allocation-Retention-Priority child AVP",
+            )
+        })?,
+    })
+}
+
+fn append_allocation_retention_priority_avp(
+    dst: &mut BytesMut,
+    arp: &AllocationRetentionPriority,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    let mut value = BytesMut::new();
+    builder_helpers::append_vendor_u32_avp(
+        &mut value,
+        AVP_PRIORITY_LEVEL,
+        VENDOR_ID_3GPP,
+        arp.priority_level,
+        true,
+        ctx,
+    )?;
+    if let Some(pre_emption_capability) = arp.pre_emption_capability {
+        builder_helpers::append_vendor_u32_avp(
+            &mut value,
+            AVP_PRE_EMPTION_CAPABILITY,
+            VENDOR_ID_3GPP,
+            pre_emption_capability,
+            true,
+            ctx,
+        )?;
+    }
+    if let Some(pre_emption_vulnerability) = arp.pre_emption_vulnerability {
+        builder_helpers::append_vendor_u32_avp(
+            &mut value,
+            AVP_PRE_EMPTION_VULNERABILITY,
+            VENDOR_ID_3GPP,
+            pre_emption_vulnerability,
+            true,
+            ctx,
+        )?;
+    }
+    builder_helpers::append_avp(
+        dst,
+        AvpHeader::vendor(AVP_ALLOCATION_RETENTION_PRIORITY, VENDOR_ID_3GPP, true),
+        &value,
+        ctx,
+    )
+}
+
+fn parse_allocation_retention_priority(
+    value: &[u8],
+    ctx: DecodeContext,
+    base_offset: usize,
+    depth: usize,
+) -> Result<AllocationRetentionPriority, DecodeError> {
+    let mut priority_level = None;
+    let mut pre_emption_capability = None;
+    let mut pre_emption_vulnerability = None;
+    builder_helpers::for_each_avp(value, ctx, base_offset, depth, |offset, avp| {
+        let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "5.3.32")?;
+        let code = avp.header.code;
+        let vendor_id = avp.header.vendor_id;
+        if code == AVP_PRIORITY_LEVEL && vendor_id == Some(VENDOR_ID_3GPP) {
+            let value = builder_helpers::parse_u32_value(avp.value, value_offset, "5.3.45")?;
+            builder_helpers::set_once(&mut priority_level, value, offset, "5.3.32")?;
+        } else if code == AVP_PRE_EMPTION_CAPABILITY && vendor_id == Some(VENDOR_ID_3GPP) {
+            let value = builder_helpers::parse_u32_value(avp.value, value_offset, "5.3.46")?;
+            builder_helpers::set_once(&mut pre_emption_capability, value, offset, "5.3.32")?;
+        } else if code == AVP_PRE_EMPTION_VULNERABILITY && vendor_id == Some(VENDOR_ID_3GPP) {
+            let value = builder_helpers::parse_u32_value(avp.value, value_offset, "5.3.47")?;
+            builder_helpers::set_once(&mut pre_emption_vulnerability, value, offset, "5.3.32")?;
+        } else {
+            builder_helpers::handle_unknown_avp(ctx, &avp, offset, "5.3.32")?;
+        }
+        Ok(())
+    })?;
+    Ok(AllocationRetentionPriority {
+        priority_level: priority_level
+            .ok_or_else(|| missing_child_error(base_offset, "missing Priority-Level child AVP"))?,
+        pre_emption_capability,
+        pre_emption_vulnerability,
+    })
+}
+
+fn append_ambr_avp(dst: &mut BytesMut, ambr: &Ambr, ctx: EncodeContext) -> Result<(), EncodeError> {
+    let mut value = BytesMut::new();
+    builder_helpers::append_vendor_u32_avp(
+        &mut value,
+        AVP_MAX_REQUESTED_BANDWIDTH_UL,
+        VENDOR_ID_3GPP,
+        ambr.max_requested_bandwidth_ul,
+        true,
+        ctx,
+    )?;
+    builder_helpers::append_vendor_u32_avp(
+        &mut value,
+        AVP_MAX_REQUESTED_BANDWIDTH_DL,
+        VENDOR_ID_3GPP,
+        ambr.max_requested_bandwidth_dl,
+        true,
+        ctx,
+    )?;
+    builder_helpers::append_avp(
+        dst,
+        AvpHeader::vendor(AVP_AMBR, VENDOR_ID_3GPP, true),
+        &value,
+        ctx,
+    )
+}
+
+fn parse_ambr(
+    value: &[u8],
+    ctx: DecodeContext,
+    base_offset: usize,
+    depth: usize,
+) -> Result<Ambr, DecodeError> {
+    let mut max_requested_bandwidth_ul = None;
+    let mut max_requested_bandwidth_dl = None;
+    builder_helpers::for_each_avp(value, ctx, base_offset, depth, |offset, avp| {
+        let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "7.3.41")?;
+        let code = avp.header.code;
+        let vendor_id = avp.header.vendor_id;
+        if code == AVP_MAX_REQUESTED_BANDWIDTH_UL && vendor_id == Some(VENDOR_ID_3GPP) {
+            let value = builder_helpers::parse_u32_value(avp.value, value_offset, "5.3.15")?;
+            builder_helpers::set_once(&mut max_requested_bandwidth_ul, value, offset, "7.3.41")?;
+        } else if code == AVP_MAX_REQUESTED_BANDWIDTH_DL && vendor_id == Some(VENDOR_ID_3GPP) {
+            let value = builder_helpers::parse_u32_value(avp.value, value_offset, "5.3.14")?;
+            builder_helpers::set_once(&mut max_requested_bandwidth_dl, value, offset, "7.3.41")?;
+        } else {
+            builder_helpers::handle_unknown_avp(ctx, &avp, offset, "7.3.41")?;
+        }
+        Ok(())
+    })?;
+    Ok(Ambr {
+        max_requested_bandwidth_ul: max_requested_bandwidth_ul.ok_or_else(|| {
+            missing_child_error(base_offset, "missing Max-Requested-Bandwidth-UL child AVP")
+        })?,
+        max_requested_bandwidth_dl: max_requested_bandwidth_dl.ok_or_else(|| {
+            missing_child_error(base_offset, "missing Max-Requested-Bandwidth-DL child AVP")
+        })?,
+    })
+}
+
+fn missing_child_error(base_offset: usize, reason: &'static str) -> DecodeError {
+    DecodeError::new(DecodeErrorCode::Structural { reason }, base_offset)
+        .with_spec_ref(SpecRef::new("ietf", "RFC6733", "grouped"))
 }
 
 fn encode_structural_error(reason: &'static str, section: &'static str) -> EncodeError {
@@ -1017,6 +1602,24 @@ fn validate_decoded_answer(answer: &SwmDiameterEapAnswer) -> Result<(), DecodeEr
                 "DEA",
             ));
         }
+    }
+    if let Some(service_selection) = answer.service_selection.as_ref() {
+        if service_selection.as_ref().is_empty() {
+            return Err(decode_structural_error(
+                "SWm DEA Service-Selection must not be empty when present",
+                "DEA",
+            ));
+        }
+    }
+    if answer
+        .apn_configurations
+        .iter()
+        .any(|apn| apn.service_selection.as_ref().is_empty())
+    {
+        return Err(decode_structural_error(
+            "SWm DEA APN-Configuration Service-Selection must not be empty",
+            "DEA",
+        ));
     }
     if !answer.auth_request_type.is_authorize_authenticate() {
         return Err(decode_structural_error(
