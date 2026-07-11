@@ -62,9 +62,10 @@ impl Encode for TwoOctets<'_> {
 
 ## Status And Limits
 
-The trait, context, and error surface is production-ready as the shared SDK
-contract. Individual protocol crates are responsible for enforcing the context
-limits they support and for documenting their own conformance boundaries.
+The trait, context, and error surface is a ready reusable SDK core within this
+narrow contract. That status does not transfer to individual codecs. Protocol
+crates are responsible for enforcing their supported context limits and
+documenting their own conformance and maturity boundaries.
 
 Allocation budgets are advisory targets, not a runtime allocator sandbox. Use
 protocol-specific limits or an external resource guard when hard allocation

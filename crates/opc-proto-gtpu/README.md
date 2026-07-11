@@ -54,9 +54,12 @@ Control-plane GTPv2-C is intentionally separate in `opc-proto-gtpv2c`.
 
 ## Status And Limits
 
-The GTPv1-U framing and PDU Session Container boundary is production-ready for
-the documented codec surface. `CONFORMANCE.md` records the TS 29.281 baseline,
-supported features, fuzzing, and explicit exclusions.
+The documented GTPv1-U framing and PDU Session Container surface is a
+conditional codec candidate, not a current production approval.
+`CONFORMANCE.md` records the TS 29.281 baseline, supported features, fuzzing,
+and explicit exclusions. A broader maturity claim still requires redaction-safe
+payload diagnostics, distinct unknown-extension drop/preserve behavior, and
+independently sourced maximum-boundary and unknown-extension fixtures.
 
 Canonical encode normalizes header bits where appropriate. Raw-preserving encode
 uses `EncodeContext { raw_preserving: true, .. }` and is the mode to use when

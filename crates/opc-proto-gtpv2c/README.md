@@ -68,9 +68,10 @@ are separate protocol boundaries.
 
 ## Status And Limits
 
-S2b Production Profile v1 is production-ready only for the documented codec,
-typed-view, ProcedureAware validation, fixture replay, and transport-neutral
-helper boundary. The crate is still `publish = false`.
+`S2b Production Profile v1` is the retained identifier for an experimental
+codec, typed-view, `ProcedureAware` validation, fixture-replay, and
+transport-neutral helper candidate. The name does not confer production
+approval, and the crate remains `publish = false`.
 
 Known limits include no full Release 18 GTPv2-C matrix, no independent-peer
 interoperability claim, and no product state machine. The PCO inner codec is

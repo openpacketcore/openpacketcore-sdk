@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Production-grade session cache with key-scoped invalidation, sequence tracking, and resume recovery (GAP-004-006)"
+description = "Read-through session cache with key-scoped invalidation, sequence tracking, and resume recovery"
 
 
 readme = "README.md"

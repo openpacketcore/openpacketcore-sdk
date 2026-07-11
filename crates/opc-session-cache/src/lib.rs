@@ -1,5 +1,5 @@
-//! Production-grade session cache with key-scoped invalidation, sequence tracking,
-//! and resume recovery (GAP-004-006).
+//! Read-through session cache with key-scoped invalidation, sequence tracking,
+//! and resume recovery.
 
 #![forbid(unsafe_code)]
 

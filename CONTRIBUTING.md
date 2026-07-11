@@ -114,35 +114,44 @@ Before requesting review, please confirm:
 2. Roll the `[Unreleased]` section of `CHANGELOG.md` into a dated version
    section and update the comparison links.
 3. Run the full validation gates, then tag `vX.Y.Z` and push the tag. The
-   `Release Validation` workflow re-runs the gates and uploads SBOMs and
-   release evidence.
+   current `Release Validation` workflow runs a subset of repository checks and
+   uploads Cargo metadata, rendered manifests, the Git revision, and Rust/Go
+   SBOMs. It does not yet emit or enforce the complete RFC 006 VEX, provenance,
+   conformance/gap, performance, and signed-bundle evidence set; its artifact
+   upload is not a signed release attestation.
 4. crates.io publishing is staged in `.github/workflows/release.yml` as a
    commented-out `publish` job; enabling it requires a `CARGO_REGISTRY_TOKEN`
-   repository secret. Until it is enabled, releases are source releases
-   (git tag + GitHub release) only.
+   repository secret. Until it is enabled, the automated path validates a tag
+   and uploads workflow artifacts; it does not publish crates or create a
+   GitHub Release.
 
-### Publish tiers
+### Cargo publication eligibility
 
-The workspace is split into two publish tiers. `scripts/publish-order.py --check`
-verifies that every crate declares its tier consistently (`publish = true` or
-`publish = false`) and that the dependency graph has no cycles.
+Cargo publication eligibility is release mechanics, not a production-maturity
+or support declaration. Packages that omit `publish` or set `publish = true`
+are Cargo-publishable; packages with `publish = false` are held.
+`scripts/publish-order.py --check` validates the eligible dependency graph and
+required version keys, but it does not require every manifest to declare an
+explicit boolean.
 
-- **Tier 1 — publish now.** These crates are produced by
-  `scripts/publish-order.py` and are published to crates.io in topological
-  dependency order. cargo verifies each crate's dependencies against the
-  registry at publish time, so every dependency must be live before the
-  dependent is published.
-- **Tier 2 — held/experimental.** These crates carry `publish = false` in their
-  `Cargo.toml`. They are built and tested with the workspace but are not
-  published until they graduate to Tier 1.
+At this revision, the workspace contains 46 Cargo-publishable packages and 29
+held packages. The authoritative current publication list is generated rather
+than duplicated here:
 
-The publishable crates are:
+```bash
+python3 scripts/publish-order.py --names
+```
 
-| Crate | Status |
-|:------|:-------|
-| `opc-proto-pfcp` | publishable |
+Eligible crates must be published in the generated topological order because
+Cargo resolves registry dependencies while verifying each package. Every
+dependency must be live before its dependent can be published.
 
-The current held crates and their graduation requirements are:
+The following table records selected explicitly experimental crates with
+documented graduation requirements. It is intentionally not the complete set
+of held packages: internal adapters, testkits, platform-specific crates, and
+reference components may remain unpublished without being graduation
+candidates. Cargo metadata and each package manifest are authoritative for
+eligibility.
 
 | Crate | Status | Graduation requirement |
 |:------|:-------|:-----------------------|
@@ -151,14 +160,15 @@ The current held crates and their graduation requirements are:
 | `opc-key-vault` | experimental | A production-readiness review covering Vault policy scoping, secret-zero handling, lease rotation, and an integration test against a real or containerized Vault Transit instance. |
 | `opc-proto-nas` | experimental | Structured parsing of the remaining 5GMM and 5GSM message bodies listed as out-of-scope in `crates/opc-proto-nas/CONFORMANCE.md`, with spec-byte fixtures for each message. |
 | `opc-proto-ngap` | experimental | A working canonical (typed) APER encoder path, verified by external fixtures for `NGSetupResponse` and `NGSetupFailure`, after the upstream `rasn` APER encoder misalignment is resolved or replaced. See `crates/opc-proto-ngap/CONFORMANCE.md`. |
-| `opc-proto-gtpv2c` | experimental S2b subset | Expanded S2b procedure and IE coverage beyond the current typed subset, with mandatory-IE validation and spec-authored byte fixtures for every newly claimed GTPv2-C message/IE. See `crates/opc-proto-gtpv2c/CONFORMANCE.md`. |
+| `opc-proto-gtpv2c` | experimental S2b subset | Correct MP-flag/priority handling, independent-peer interoperability, and completion of the declared compatibility and negative-evidence matrix. Any future coverage expansion must also add mandatory-IE validation and spec-authored fixtures. See `crates/opc-proto-gtpv2c/CONFORMANCE.md`. |
 | `opc-proto-diameter` | experimental base + Rf/SWm dictionaries | ADR 0015 conformance claim for the base header/AVP layer, typed helpers and independently sourced fixtures for at least the remaining `app-gx`, `app-s6a`, `app-s6b`, and `app-swx` skeleton dictionaries, and downstream product integration evidence. See `crates/opc-proto-diameter/CONFORMANCE.md`. |
 | `opc-proto-ikev2` | experimental header/payload-chain scaffold | Typed cleartext payload-body coverage, RFC 7383 fragmentation framing checks, independent fixture provenance where used, and downstream product integration evidence for the IKE SA/EAP-AKA/Child SA policy boundary. See `crates/opc-proto-ikev2/CONFORMANCE.md`. |
 | `opc-api-nnrf` | experimental | Client/server stub generation and expanded OpenAPI operation coverage, plus generator stability across regenerated `types.rs` from the same pinned 3GPP YAML. See `crates/opc-api-nnrf/CONFORMANCE.md`. |
 
-To change a crate's tier, update `publish` in its `Cargo.toml` and move its row
-from the held table to the publishable list; the next release section in
-`CHANGELOG.md` must note the graduation.
+Changing Cargo eligibility requires updating `publish` in the package manifest.
+Changing maturity additionally requires the crate's documented graduation
+evidence and an independent review; the next release section in `CHANGELOG.md`
+must record either change.
 
 ### Publishing a release
 

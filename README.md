@@ -2,7 +2,13 @@
 
 [![CI](https://github.com/openpacketcore/openpacketcore-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/openpacketcore/openpacketcore-sdk/actions/workflows/ci.yml)
 
-A robust, polyglot software development kit for building resilient, cloud-native 5G packet core network functions (CNFs). This SDK provides the standardized runtime chassis, quorum-replicated session storage, encrypted config persistence, northbound gNMI/NETCONF management-plane foundations, data-governance/redaction boundary enforcement, and release-assurance evidence pipelines for packet core software with high-assurance deployment requirements.
+A polyglot software development kit of reusable foundations for cloud-native 5G
+packet core network functions (CNFs). It includes runtime-chassis APIs,
+in-process session-quorum coordination, encrypted config-persistence primitives,
+northbound gNMI/NETCONF foundations, data-governance/redaction mechanisms, and
+release-assurance schemas and policy APIs. Each surface has its own documented
+maturity and deployment boundary; this repository does not currently claim a
+workspace-wide high-assurance production profile.
 
 The GTP-U user-plane codec is also applicable to LTE/EPC user plane. The SDK
 now includes three experimental, transport-neutral protocol crates: the
@@ -19,7 +25,7 @@ downstream product responsibilities.
 
 > [!IMPORTANT]
 > **Production Readiness & Reference Boundaries**
-> * **Rust SDK Core**: The core Rust libraries have passed the current kernel-independent SDK release-readiness gates. Downstream CNFs still need product-specific integration, deployment, and carrier acceptance validation.
+> * **Rust SDK Core**: Core Rust libraries are covered by the repository's kernel-independent CI gates for the tested feature profiles. This is scoped verification, not a signed release attestation or production-readiness claim; no workspace-wide production profile is currently approved. Candidate releases and downstream CNFs still require release-evidence, privileged/kernel, integration, deployment, and carrier-acceptance validation.
 > * **Go Reference Operator**: The Go operator located under `operators/sdk-reference-operator/` is a **reference harness and development utility only**. It is explicitly not a production-grade controller. Downstream product teams are responsible for implementing product-specific Kubernetes operators.
 > * **Rust Reference SMF**: The `examples/smf-reference/` workspace is a **reference consumer and API acid test**, not a product-grade SMF. It has no N7/PCF, charging, NAS, or real UPF selection.
 > * **No Unconditional Claims**: Standard deployments require integration with your local platform security policies, hardware topologies, and external KMS/SPIFFE infrastructure.
@@ -107,8 +113,8 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
-| [`opc-session-store`](crates/opc-session-store/) | Quorum-replicated session database supporting lease management, CAS operations, and change-stream watches. Quorum semantics (fencing, leases, CAS, read-repair) are production-grade within a process; networked replication is experimental and provided by `opc-session-net`. | [RFC 004](docs/rfc/004-session-store.md) |
-| [`opc-session-cache`](crates/opc-session-cache/) | Production-grade session cache with key-scoped invalidation, sequence tracking, and resume recovery. | [RFC 004](docs/rfc/004-session-store.md) |
+| [`opc-session-store`](crates/opc-session-store/) | Session database primitives supporting lease management, fenced CAS operations, change-stream watches, and extensively tested in-process quorum coordination. Production networked HA remains conditional; replication transport is experimental and provided by `opc-session-net`. | [RFC 004](docs/rfc/004-session-store.md) |
+| [`opc-session-cache`](crates/opc-session-cache/) | Coherence-aware read-through session cache with key-scoped invalidation, sequence tracking, and resume recovery. It is not a durability layer and does not elevate the selected backend/profile's maturity. | [RFC 004](docs/rfc/004-session-store.md) |
 | [`opc-session-net`](crates/opc-session-net/) | Networked session replication transport: mTLS length-prefixed wire protocol, replication server, and remote backend client *(experimental)*. | [RFC 004](docs/rfc/004-session-store.md) |
 
 ### Alarms & Observability (`crates/`)
@@ -140,13 +146,13 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
-| [`opc-evidence`](crates/opc-evidence/) | Release assurance pipeline: SBOM generation, VEX scanning, gap gates, dataplane snapshots, and gate policy enforcement. | [RFC 006](docs/rfc/006-conformance-pipeline.md) |
+| [`opc-evidence`](crates/opc-evidence/) | Release-assurance schemas and library primitives for SBOM, VEX, provenance, gap, performance, bundle, and policy evaluation. Complete signed-bundle production and enforcement are not yet wired into repository release workflows. | [RFC 006](docs/rfc/006-conformance-pipeline.md) |
 
 ### Operator Lifecycle (`crates/`)
 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
-| [`operator-lifecycle`](crates/operator-lifecycle/) | Kubernetes production-readiness lifecycle foundation, config-apply, admission, and drain/upgrade planning. | [RFC 009](docs/rfc/009-operator-lifecycle-upgrade.md) |
+| [`operator-lifecycle`](crates/operator-lifecycle/) | Kubernetes lifecycle policy foundation for config-apply, admission, compatibility, and drain/upgrade planning. | [RFC 009](docs/rfc/009-operator-lifecycle-upgrade.md) |
 | [`operator-controller`](crates/operator-controller/) | Kubernetes operator controller execution layer *(internal, not published)*. | [RFC 009](docs/rfc/009-operator-lifecycle-upgrade.md) |
 | [`operator-lifecycle-cli`](crates/operator-lifecycle-cli/) | CLI interface exposing Rust SDK lifecycle contracts to Go controller-runtime operators via JSON *(internal, not published)*. | [RFC 009](docs/rfc/009-operator-lifecycle-upgrade.md) |
 
@@ -210,7 +216,10 @@ current roadmap is:
 
 ## Verification & Validation Gates
 
-To ensure release stability, the repository enforces several validation gates. These must all pass before a release candidate is pushed.
+The commands below are repository CI/developer verification gates for their
+stated source, feature, and platform scopes. They are necessary but not
+sufficient for a production release. End-to-end RFC 006 signed-evidence
+enforcement is not yet wired into the release workflow.
 
 ### 1. Code Formatting
 Ensure all workspace Rust code complies with formatting rules:

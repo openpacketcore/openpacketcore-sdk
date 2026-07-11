@@ -53,9 +53,11 @@ assert_eq!(status.phase, LifecyclePhase::Ready);
 
 ## Status And Limits
 
-- Production-readiness rules are implemented for admission, compatibility,
-  commit-confirmed config apply, preflight integration, drain/upgrade planning,
-  and redaction-safe lifecycle status.
+- Production-profile decision rules have pure-logic implementations for
+  admission, compatibility, commit-confirmed config apply, preflight
+  integration, drain/upgrade planning, and redaction-safe lifecycle status.
+  Production use remains conditional on hardened adapters, bounded inputs and
+  deadlines, real rollback capability, and downstream controller integration.
 - Lifecycle conditions serialize with Kubernetes-style camelCase fields and
   RFC3339 `lastTransitionTime`; legacy tuple timestamps still deserialize.
 - App config payloads are intentionally rejected at platform spec/status

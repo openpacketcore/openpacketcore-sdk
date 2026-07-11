@@ -66,8 +66,8 @@ fn run_scenario(yaml: &str) -> Result<(), Box<dyn std::error::Error>> {
 ## Status Notes
 
 - Core scenario parsing, validation, local runner mechanics, fixture
-  provenance, virtual time, and evidence conversion are production-ready for
-  SDK tests.
+  provenance, virtual time, and evidence conversion are ready for use in SDK
+  tests. This is test-infrastructure scope, not a deployment maturity claim.
 - Kind and hardware-lab runners currently produce validated plans or dry-run
   evidence; live environment execution remains downstream/operator-owned.
 - Scenario `seed` is recorded for deterministic evidence but current SDK

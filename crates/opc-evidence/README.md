@@ -4,10 +4,10 @@ Evidence schemas, bundle verification, and gate policy evaluation.
 
 ## Purpose
 
-`opc-evidence` holds the SDK-owned evidence record types used by conformance,
-release gates, performance baselines, SBOM/VEX/provenance checks, and
-packet-core experimental packs. It validates evidence structure and rejects
-unsafe artifacts before they become release evidence.
+`opc-evidence` holds the SDK-owned evidence record types and library primitives
+for conformance, release policy, performance baselines, SBOM/VEX/provenance
+checks, and packet-core experimental packs. Repository workflows do not yet
+assemble and enforce the complete signed RFC 006 release artifact set.
 
 ## API Shape
 
@@ -48,6 +48,15 @@ assert_eq!(record.status, ConformanceStatus::Tested);
 
 ## Status Notes
 
+- These are library APIs, not an end-to-end release attestation. Current PR and
+  release workflows do not invoke `GateEvaluator` over the complete required
+  artifact set.
+- Embedded bundle blobs are covered by `bundle_signing_bytes` and verified with
+  their manifest digests. The SBOM, VEX, provenance, performance, and governance
+  arguments supplied separately to `GateEvaluator` are not yet cross-checked
+  against that verified bundle.
+- Repository workflows do not wire a production signer/verifier or complete
+  bundle/policy execution.
 - Release gate evaluation requires `BundleVerifierSecurity::Release`; test or
   mock verifiers are rejected in release mode.
 - Bundle verification checks schema version, signatures, file digests, and

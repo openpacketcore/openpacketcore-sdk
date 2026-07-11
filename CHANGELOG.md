@@ -86,6 +86,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed fuzz corpora for the GTP-U, NAS, Diameter, and IKEv2 targets.
 
 ### Changed
+- Documentation and package metadata now distinguish scoped implementation
+  evidence, Cargo publication eligibility, and production maturity. Historical
+  status snapshots, release-evidence primitives, and conditional
+  session/protocol profiles no longer imply current production approval.
 - **BREAKING — `opc-ipsec-xfrm`:** XFRM SA requests, policy templates, and
   decoded SA state now carry an optional `XfrmRequestId`; callers using public
   struct literals must initialize the new field.
@@ -114,9 +118,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fingerprint metadata. Existing TTL-bearing records and records with any
   other payload shape must be migrated before adopting the stricter
   source/fencer boundary.
-- `opc-proto-pfcp` graduated from experimental to publishable
-  (`publish = true`); moved from the held-experimental tier to the publishable
-  tier in `CONTRIBUTING.md`.
+- `opc-proto-pfcp` changed Cargo publication eligibility to `publish = true`.
+  Publication eligibility is not a production-maturity graduation; its
+  `Production Profile v1` name remains a compatibility identifier for a
+  conditional codec candidate.
 
 ### Security
 - `opc-ipsec-lb`: require an RFC 6311-style outbound IV forward-jump for both

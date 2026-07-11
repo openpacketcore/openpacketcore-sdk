@@ -58,11 +58,13 @@ state and policy.
 
 ## Status And Limits
 
-Production Profile v1 is production-ready for the documented N4 codec,
-construction, typed decode/encode, and semantic validation boundary. The raw
-layer is the byte-exact forwarding surface. The typed layer may canonicalize
-spare bits and discard future extension octets it does not model, so use raw
-IEs for arbitrary peer-traffic forwarding.
+`Production Profile v1` is the retained API/profile identifier for the
+documented N4 codec candidate; the name is not a production-readiness
+attestation. Graduation remains blocked on encoder capacity and header/length
+invariants, declared-PDU limit scoping, and independent N4 fixture/peer
+evidence. The raw layer is the byte-exact forwarding surface. The typed layer
+may canonicalize spare bits and discard future extension octets it does not
+model, so use raw IEs for arbitrary peer-traffic forwarding.
 
 See [CONFORMANCE.md](CONFORMANCE.md) for the exact IE families, procedures,
 semantic rules, fuzzing, and remaining codec boundary.
