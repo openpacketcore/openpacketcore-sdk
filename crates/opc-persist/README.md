@@ -58,7 +58,11 @@ async fn open_store() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 - Break-glass approval requires a separate approver, `security-admin`, optional
   active NACM approve on `/security:break-glass`, and a maximum requested
   duration of 900 seconds.
-- `dangerous-test-hooks` exposes fault injection constants/types for tests.
+- `dangerous-test-hooks` exposes fault-injection controls and test-only audit
+  helpers for explicitly gated tests. Ordinary integration tests compile and
+  run without the feature. Integration tests compile `opc-persist` as a
+  dependency, so `cfg(test)` alone does not expose these APIs. `--all-features`
+  enables the hooks and is a CI/test profile, not a production build profile.
 
 ## Roadmap
 
@@ -71,7 +75,10 @@ async fn open_store() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 - Source checked: `Cargo.toml`, `src/lib.rs`, backend, consensus, security
   policy, break-glass, and tests.
-- Run with: `cargo test -p opc-persist`.
+- Compile and run the default contract with
+  `cargo test --locked -p opc-persist`.
+- Run fault-injection and consensus coverage serially with
+  `cargo test --locked -p opc-persist --all-features -- --test-threads=1`.
 
 ## License
 

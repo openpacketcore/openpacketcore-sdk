@@ -37,6 +37,14 @@ All pull requests must be green on the following commands before review:
 ```bash
 cargo fmt --all --check
 git diff --check
+cargo clippy --locked -p opc-persist --all-targets --no-default-features -- -D warnings
+cargo test --locked -p opc-persist --no-run
+cargo test --locked -p opc-persist \
+  --test break_glass_tests \
+  --test security_policy_tests \
+  --test security_policy_stress_tests \
+  --test security_policy_empirical_tests \
+  -- --test-threads=1
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features --quiet -- --test-threads=4
 ( cd operators/sdk-reference-operator && go vet ./... && go test ./... )

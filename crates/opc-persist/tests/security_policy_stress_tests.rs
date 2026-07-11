@@ -1,3 +1,4 @@
+#[cfg(feature = "dangerous-test-hooks")]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -5,9 +6,11 @@ use tokio::sync::Barrier;
 
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing};
 use opc_nacm::{ModuleRegistry, NacmAction, NacmPolicy, NacmRule, PolicyVersion, YangPathPattern};
+#[cfg(feature = "dangerous-test-hooks")]
+use opc_persist::TEST_COMMIT_FAIL;
 use opc_persist::{
     AuditKey, RollbackTarget, SecurityPolicyError, SecurityPolicyService, SqliteBackend,
-    SqliteSecurityPolicyService, TEST_COMMIT_FAIL,
+    SqliteSecurityPolicyService,
 };
 use opc_types::TenantId;
 
@@ -291,6 +294,7 @@ async fn test_stale_version_prevention() {
     assert_eq!(metadata.version, 11);
 }
 
+#[cfg(feature = "dangerous-test-hooks")]
 #[tokio::test]
 async fn test_failed_apply_rollback_and_cache_consistency() {
     let _guard = TEST_MUTEX.lock().await;

@@ -6,9 +6,11 @@ use tokio::sync::Mutex;
 
 use opc_key::{EnvelopeAad, KeyId, KeyProvider, KeyPurpose, MemoryKeyProvider, Zeroizing};
 use opc_nacm::{ModuleRegistry, NacmAction, NacmPolicy, NacmRule, PolicyVersion, YangPathPattern};
+#[cfg(feature = "dangerous-test-hooks")]
+use opc_persist::TEST_COMMIT_FAIL;
 use opc_persist::{
     AuditKey, RollbackTarget, SecurityPolicyError, SecurityPolicyService, SqliteBackend,
-    SqliteSecurityPolicyService, TEST_COMMIT_FAIL,
+    SqliteSecurityPolicyService,
 };
 use opc_types::TenantId;
 
@@ -271,6 +273,7 @@ async fn test_concurrent_mutations_stress() {
     }
 }
 
+#[cfg(feature = "dangerous-test-hooks")]
 #[tokio::test]
 async fn test_failed_apply_rollback_empirical() {
     let _guard = EMPIRICAL_TEST_MUTEX.lock().await;

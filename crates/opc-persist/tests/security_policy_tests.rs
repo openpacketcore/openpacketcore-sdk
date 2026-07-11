@@ -1,7 +1,8 @@
+#[cfg(feature = "dangerous-test-hooks")]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tempfile::tempdir;
-use tokio::sync::Mutex;
+use tokio::sync::{Barrier, Mutex};
 
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing};
 use opc_nacm::{
@@ -10,8 +11,11 @@ use opc_nacm::{
 };
 use opc_persist::{
     AuditKey, RollbackTarget, SecurityPolicyError, SecurityPolicyService, SqliteBackend,
-    SqliteSecurityPolicyService, TEST_AUDIT_FAILURE_INSERT_FAIL, TEST_AUDIT_SUCCESS_INSERT_FAIL,
-    TEST_COMMIT_FAIL,
+    SqliteSecurityPolicyService,
+};
+#[cfg(feature = "dangerous-test-hooks")]
+use opc_persist::{
+    TEST_AUDIT_FAILURE_INSERT_FAIL, TEST_AUDIT_SUCCESS_INSERT_FAIL, TEST_COMMIT_FAIL,
 };
 use opc_types::TenantId;
 
@@ -222,6 +226,7 @@ async fn test_group_scoped_rule_lists_survive_policy_persistence() {
         .is_allowed());
 }
 
+#[cfg(feature = "dangerous-test-hooks")]
 #[tokio::test]
 async fn test_denied_candidate_audit_insert_failure_increments_metric() {
     let _guard = TEST_MUTEX.lock().await;
@@ -294,6 +299,7 @@ async fn test_apply_policy_rejects_stale_or_equal_version() {
     );
 }
 
+#[cfg(feature = "dangerous-test-hooks")]
 #[tokio::test]
 async fn test_apply_policy_rolls_back_when_success_audit_insert_fails() {
     let _guard = TEST_MUTEX.lock().await;
@@ -520,6 +526,7 @@ async fn test_tenant_and_role_authorization_enforced() {
     );
 }
 
+#[cfg(feature = "dangerous-test-hooks")]
 #[tokio::test]
 async fn test_failed_apply_leaves_previous_policy_active() {
     let _guard = TEST_MUTEX.lock().await;
@@ -654,46 +661,46 @@ async fn test_additional_security_policy_verifications() {
         "Expected list_policy_history to reject tenant mismatch, got: {res_history:?}"
     );
 
-    // 3. Database transaction commit failures correctly trigger audit events
-    // Let's stage version 2 first
-    let policy2 = make_valid_policy(2);
-    service
-        .stage_policy(tenant, &admin_principal, policy2)
-        .await
-        .unwrap();
-
-    // Enable simulated commit failure
-    TEST_COMMIT_FAIL.store(true, Ordering::Relaxed);
-    let res_apply = service.apply_policy(tenant, &admin_principal).await;
-    assert!(
-        res_apply.is_err(),
-        "Expected apply_policy to fail due to simulated commit failure"
-    );
-    TEST_COMMIT_FAIL.store(false, Ordering::Relaxed);
-
-    // Verify the database has the APPLY_FAILURE audit event
     let conn = backend.conn();
+    #[cfg(feature = "dangerous-test-hooks")]
     {
-        let db = conn.lock().await;
-        let mut stmt = db
-            .prepare(
-                "SELECT action, details FROM security_policy_audit WHERE action = 'APPLY_FAILURE'",
-            )
+        // 3. Database transaction commit failures correctly trigger audit events
+        let policy2 = make_valid_policy(2);
+        service
+            .stage_policy(tenant, &admin_principal, policy2)
+            .await
             .unwrap();
-        let mut rows = stmt.query([]).unwrap();
-        let mut found = false;
-        while let Some(row) = rows.next().unwrap() {
-            let action: String = row.get(0).unwrap();
-            let details: String = row.get(1).unwrap();
-            assert_eq!(action, "APPLY_FAILURE");
-            assert!(details.contains("simulated commit failure") || details.contains("failed"));
-            found = true;
+
+        TEST_COMMIT_FAIL.store(true, Ordering::Relaxed);
+        let res_apply = service.apply_policy(tenant, &admin_principal).await;
+        assert!(
+            res_apply.is_err(),
+            "Expected apply_policy to fail due to simulated commit failure"
+        );
+        TEST_COMMIT_FAIL.store(false, Ordering::Relaxed);
+
+        {
+            let db = conn.lock().await;
+            let mut stmt = db
+                .prepare(
+                    "SELECT action, details FROM security_policy_audit WHERE action = 'APPLY_FAILURE'",
+                )
+                .unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            let mut found = false;
+            while let Some(row) = rows.next().unwrap() {
+                let action: String = row.get(0).unwrap();
+                let details: String = row.get(1).unwrap();
+                assert_eq!(action, "APPLY_FAILURE");
+                assert!(details.contains("simulated commit failure") || details.contains("failed"));
+                found = true;
+            }
+            assert!(found, "Expected to find APPLY_FAILURE in audit table");
         }
-        assert!(found, "Expected to find APPLY_FAILURE in audit table");
     }
 
-    // Now let's trigger a ROLLBACK_FAILURE
-    // First, stage and apply version 2 successfully to have a history of v1 and v2
+    // 3 (default) / 4 (fault-injection profile). A database failure during
+    // rollback must be audited independently of the simulated commit hook.
     let policy2 = make_valid_policy(2);
     service
         .stage_policy(tenant, &admin_principal, policy2)
@@ -704,13 +711,11 @@ async fn test_additional_security_policy_verifications() {
         .await
         .unwrap();
 
-    // To force rollback to fail, we will drop the security_policy_active table
     {
         let db = conn.lock().await;
         db.execute("DROP TABLE security_policy_active", []).unwrap();
     }
 
-    // Now calling rollback should fail
     let res_rollback = service
         .rollback_policy(tenant, &admin_principal, RollbackTarget::Previous)
         .await;
@@ -719,7 +724,6 @@ async fn test_additional_security_policy_verifications() {
         "Expected rollback_policy to fail because table was dropped"
     );
 
-    // Verify that ROLLBACK_FAILURE is in the audit table
     {
         let db = conn.lock().await;
         let mut stmt = db.prepare("SELECT action, details FROM security_policy_audit WHERE action = 'ROLLBACK_FAILURE'").unwrap();
@@ -794,39 +798,51 @@ async fn test_security_policy_audit_corruption_fails_closed() {
 async fn test_security_policy_audit_concurrent_appends_remain_linear() {
     let _guard = TEST_MUTEX.lock().await;
     let (service, temp_dir) = setup_service().await;
-    let service = Arc::new(service);
     let tenant = "test-tenant";
     let principal = get_admin_principal();
-    let details_a = "a".repeat(4 * 1024 * 1024);
-    let details_b = "b".repeat(4 * 1024 * 1024);
+    service
+        .stage_policy(tenant, &principal, make_valid_policy(1))
+        .await
+        .unwrap();
+    let service = Arc::new(service);
+    let barrier = Arc::new(Barrier::new(3));
 
     let first = {
         let service = Arc::clone(&service);
         let principal = principal.clone();
-        let details = details_a.clone();
+        let barrier = Arc::clone(&barrier);
         tokio::spawn(async move {
+            barrier.wait().await;
             service
-                .security_policy_audit_event_for_test(tenant, &principal, "CONCURRENT_A", &details)
+                .dry_run_policy(
+                    tenant,
+                    &principal,
+                    "/security:policy",
+                    NacmAction::SecurityAdmin,
+                )
                 .await
         })
     };
     let second = {
         let service = Arc::clone(&service);
         let principal = principal.clone();
+        let barrier = Arc::clone(&barrier);
         tokio::spawn(async move {
+            barrier.wait().await;
             service
-                .security_policy_audit_event_for_test(
+                .dry_run_policy(
                     tenant,
                     &principal,
-                    "CONCURRENT_B",
-                    &details_b,
+                    "/security:policy",
+                    NacmAction::SecurityAdmin,
                 )
                 .await
         })
     };
 
-    first.await.unwrap().unwrap();
-    second.await.unwrap().unwrap();
+    barrier.wait().await;
+    assert!(first.await.unwrap().unwrap().is_allowed());
+    assert!(second.await.unwrap().unwrap().is_allowed());
 
     let db_path = temp_dir.path().join("test_security.db");
     let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -852,7 +868,10 @@ async fn test_security_policy_audit_concurrent_appends_remain_linear() {
         prev_hash = entry_hmac;
         row_count += 1;
     }
-    assert_eq!(row_count, 2);
+    assert_eq!(
+        row_count, 3,
+        "one stage and two dry-run audit rows expected"
+    );
 }
 
 #[tokio::test]
@@ -862,14 +881,9 @@ async fn test_security_policy_audit_verifier_rejects_detail_tamper() {
     let tenant = "test-tenant";
     let principal = get_admin_principal();
 
-    for idx in 0..3 {
+    for version in 1..=3 {
         service
-            .security_policy_audit_event_for_test(
-                tenant,
-                &principal,
-                "VERIFY",
-                &format!("detail {idx}"),
-            )
+            .stage_policy(tenant, &principal, make_valid_policy(version))
             .await
             .unwrap();
     }
@@ -898,14 +912,9 @@ async fn test_security_policy_audit_verifier_rejects_tail_delete() {
     let tenant = "test-tenant";
     let principal = get_admin_principal();
 
-    for idx in 0..3 {
+    for version in 1..=3 {
         service
-            .security_policy_audit_event_for_test(
-                tenant,
-                &principal,
-                "VERIFY",
-                &format!("detail {idx}"),
-            )
+            .stage_policy(tenant, &principal, make_valid_policy(version))
             .await
             .unwrap();
     }

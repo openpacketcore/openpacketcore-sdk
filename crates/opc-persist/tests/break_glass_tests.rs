@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tempfile::tempdir;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Barrier, Mutex as TokioMutex};
 
 mod common;
 use common::wait_until_async;
@@ -141,6 +141,62 @@ async fn setup_break_glass_service() -> (
     let service =
         SqliteSecurityPolicyService::new_with_notifier(backend, key_provider, alarm_notifier);
     (service, alarm_manager, temp_dir)
+}
+
+fn make_test_break_glass_request(
+    tenant: &str,
+    principal: &str,
+    evidence_id: &str,
+) -> BreakGlassRequest {
+    BreakGlassRequest {
+        principal: principal.to_string(),
+        tenant: tenant.to_string(),
+        reason: format!("Investigate incident {evidence_id}"),
+        scope: "/security:break-glass".to_string(),
+        requested_duration: 60,
+        evidence_id: evidence_id.to_string(),
+    }
+}
+
+async fn install_break_glass_policy(
+    service: &SqliteSecurityPolicyService<MemoryKeyProvider>,
+    tenant: &str,
+    principal: &str,
+) {
+    service
+        .stage_policy(
+            tenant,
+            principal,
+            make_break_glass_policy(1, true, true, true, true),
+        )
+        .await
+        .unwrap();
+    service.apply_policy(tenant, principal).await.unwrap();
+}
+
+async fn seed_break_glass_audit(
+    service: &SqliteSecurityPolicyService<MemoryKeyProvider>,
+    tenant: &str,
+    requester: &str,
+    approver: &str,
+) {
+    install_break_glass_policy(service, tenant, requester).await;
+    let session = service
+        .request_break_glass(
+            tenant,
+            requester,
+            make_test_break_glass_request(tenant, requester, "AUDIT-SEED"),
+        )
+        .await
+        .unwrap();
+    service
+        .approve_break_glass(tenant, approver, &session.id)
+        .await
+        .unwrap();
+    service
+        .revoke_break_glass(tenant, requester, &session.id)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -439,32 +495,37 @@ async fn test_break_glass_audit_corruption_fails_closed() {
 async fn test_break_glass_audit_concurrent_appends_remain_linear() {
     let _guard = TEST_MUTEX.lock().await;
     let (service, _, temp_dir) = setup_break_glass_service().await;
-    let service = Arc::new(service);
     let tenant = "test-tenant";
-    let principal = get_admin_principal("requester");
-    let details_a = "a".repeat(4 * 1024 * 1024);
-    let details_b = "b".repeat(4 * 1024 * 1024);
+    let principal_a = get_admin_principal("requester-a");
+    let principal_b = get_admin_principal("requester-b");
+    install_break_glass_policy(&service, tenant, &principal_a).await;
+    let request_a = make_test_break_glass_request(tenant, &principal_a, "CONCURRENT-A");
+    let request_b = make_test_break_glass_request(tenant, &principal_b, "CONCURRENT-B");
+    let service = Arc::new(service);
+    let barrier = Arc::new(Barrier::new(3));
 
     let first = {
         let service = Arc::clone(&service);
-        let principal = principal.clone();
-        let details = details_a.clone();
+        let barrier = Arc::clone(&barrier);
         tokio::spawn(async move {
+            barrier.wait().await;
             service
-                .break_glass_audit_event_for_test(tenant, &principal, "CONCURRENT_A", &details)
+                .request_break_glass(tenant, &principal_a, request_a)
                 .await
         })
     };
     let second = {
         let service = Arc::clone(&service);
-        let principal = principal.clone();
+        let barrier = Arc::clone(&barrier);
         tokio::spawn(async move {
+            barrier.wait().await;
             service
-                .break_glass_audit_event_for_test(tenant, &principal, "CONCURRENT_B", &details_b)
+                .request_break_glass(tenant, &principal_b, request_b)
                 .await
         })
     };
 
+    barrier.wait().await;
     first.await.unwrap().unwrap();
     second.await.unwrap().unwrap();
 
@@ -500,19 +561,9 @@ async fn test_break_glass_audit_verifier_rejects_detail_tamper() {
     let _guard = TEST_MUTEX.lock().await;
     let (service, _, temp_dir) = setup_break_glass_service().await;
     let tenant = "test-tenant";
-    let principal = get_admin_principal("requester");
-
-    for idx in 0..3 {
-        service
-            .break_glass_audit_event_for_test(
-                tenant,
-                &principal,
-                "VERIFY",
-                &format!("detail {idx}"),
-            )
-            .await
-            .unwrap();
-    }
+    let requester = get_admin_principal("requester");
+    let approver = get_admin_principal("approver");
+    seed_break_glass_audit(&service, tenant, &requester, &approver).await;
 
     let db_path = temp_dir.path().join("test_break_glass.db");
     let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -536,19 +587,9 @@ async fn test_break_glass_audit_verifier_rejects_tail_delete() {
     let _guard = TEST_MUTEX.lock().await;
     let (service, _, temp_dir) = setup_break_glass_service().await;
     let tenant = "test-tenant";
-    let principal = get_admin_principal("requester");
-
-    for idx in 0..3 {
-        service
-            .break_glass_audit_event_for_test(
-                tenant,
-                &principal,
-                "VERIFY",
-                &format!("detail {idx}"),
-            )
-            .await
-            .unwrap();
-    }
+    let requester = get_admin_principal("requester");
+    let approver = get_admin_principal("approver");
+    seed_break_glass_audit(&service, tenant, &requester, &approver).await;
 
     let db_path = temp_dir.path().join("test_break_glass.db");
     let conn = rusqlite::Connection::open(db_path).unwrap();
