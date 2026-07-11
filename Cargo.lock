@@ -2701,6 +2701,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-sa-mirror"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "opc-identity",
+ "opc-ipsec-lb",
+ "opc-tls",
+ "rcgen",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "opc-sbi"
 version = "0.2.0"
 dependencies = [
