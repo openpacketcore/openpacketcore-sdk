@@ -1,20 +1,27 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream;
+mod support;
+
 use opc_session_store::{
-    BackendCapabilities, CompareAndSet, CompareAndSetResult, FencedSessionReplica, LeaseError,
-    LeaseGuard, OwnerId, QuorumSessionStore, ReplicationEntry, SessionBackend, SessionKey,
-    SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult, StoreError,
-    StoredSessionRecord,
+    BackendCapabilities, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, LeaseError,
+    LeaseGuard, OwnerId, ReplicationEntry, SessionBackend, SessionKey, SessionKeyType,
+    SessionLeaseManager, SessionOp, SessionOpResult, StoreError, StoredSessionRecord,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use std::{sync::Arc, time::Duration};
 
 #[derive(Debug)]
-struct MissingLeaseCoordinationBackend;
+struct MissingLeaseCoordinationBackend {
+    identity: Arc<()>,
+}
 
 #[async_trait]
 impl SessionBackend for MissingLeaseCoordinationBackend {
+    fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
+        Some(BackendInstanceIdentity::for_shared(&self.identity))
+    }
+
     async fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities::all_enabled()
     }
@@ -105,8 +112,10 @@ fn test_key() -> SessionKey {
 
 #[tokio::test]
 async fn quorum_acquire_fails_when_replica_omits_next_lease_info() {
-    let backend = Arc::new(MissingLeaseCoordinationBackend);
-    let quorum = QuorumSessionStore::new(vec![FencedSessionReplica::new(0, backend)]);
+    let backend = Arc::new(MissingLeaseCoordinationBackend {
+        identity: Arc::new(()),
+    });
+    let quorum = support::lab_singleton(support::member(0, backend));
 
     let err = quorum
         .acquire(

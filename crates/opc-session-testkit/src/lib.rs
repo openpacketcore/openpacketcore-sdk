@@ -7,8 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opc_session_store::{
-    Clock, FakeSessionBackend, FencedSessionReplica, QuorumSessionStore, RestoreBlockReason,
-    RestoreBlockReasonCode, TokioVirtualClock,
+    Clock, FakeSessionBackend, FencedSessionReplica, QuorumReplicaDescriptor, QuorumReplicaMember,
+    QuorumSessionStore, QuorumTopologyConfig, QuorumTopologyError, ReplicaBackingIdentity,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreBlockReason,
+    RestoreBlockReasonCode, TokioVirtualClock, ValidatedQuorumTopology,
 };
 use opc_types::Timestamp;
 
@@ -96,15 +98,34 @@ impl ChaosTestkit {
     /// Build a QuorumSessionStore coordinator client.
     /// You can specify which replica IDs this client is capable of reaching. Replicas not in
     /// `reached_replica_ids` will be marked offline from this client's point of view.
-    pub fn build_coordinator(&self, reached_replica_ids: &[usize]) -> QuorumSessionStore {
+    pub fn build_coordinator(
+        &self,
+        local_replica_id: usize,
+        reached_replica_ids: &[usize],
+    ) -> Result<QuorumSessionStore, QuorumTopologyError> {
         let mut view_replicas = Vec::new();
         for replica in &self.replicas {
             let mut wrapped_replica = replica.clone();
             let reached = reached_replica_ids.contains(&replica.id);
             wrapped_replica.client_online = Arc::new(tokio::sync::Mutex::new(reached));
-            view_replicas.push(wrapped_replica);
+            view_replicas.push(test_member(wrapped_replica)?);
         }
-        QuorumSessionStore::new(view_replicas)
+        let topology = build_topology(local_replica_id, view_replicas)?;
+        Ok(QuorumSessionStore::from_validated_topology(topology))
+    }
+
+    /// Build validated topology for a production-shaped consumer under test.
+    pub fn validated_topology(
+        &self,
+        local_replica_id: usize,
+    ) -> Result<ValidatedQuorumTopology, QuorumTopologyError> {
+        let members = self
+            .replicas
+            .iter()
+            .cloned()
+            .map(test_member)
+            .collect::<Result<Vec<_>, _>>()?;
+        build_topology(local_replica_id, members)
     }
 
     /// Set replication lag (delayed responses) on a specific replica.
@@ -135,6 +156,34 @@ impl ChaosTestkit {
             self.clocks[replica_id].set_skew(skew, negative);
         }
     }
+}
+
+fn test_replica_id(index: usize) -> Result<ReplicaId, QuorumTopologyError> {
+    ReplicaId::new(format!("chaos-replica-{index}"))
+}
+
+fn test_member(replica: FencedSessionReplica) -> Result<QuorumReplicaMember, QuorumTopologyError> {
+    let index = replica.id;
+    Ok(QuorumReplicaMember::new(
+        QuorumReplicaDescriptor::new(
+            test_replica_id(index)?,
+            ReplicaEndpoint::new(format!("chaos-replica-{index}.invalid"), 7443)?,
+            ReplicaTlsIdentity::new(format!("spiffe://test/chaos/replica/{index}"))?,
+            ReplicaFailureDomain::new(format!("chaos-failure-domain-{index}"))?,
+            ReplicaBackingIdentity::new(format!("chaos-backing-{index}"))?,
+        ),
+        replica,
+    ))
+}
+
+fn build_topology(
+    local_replica_id: usize,
+    members: Vec<QuorumReplicaMember>,
+) -> Result<ValidatedQuorumTopology, QuorumTopologyError> {
+    ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new(
+        test_replica_id(local_replica_id)?,
+        members,
+    ))
 }
 
 /// Fluent assertions for session-store restart and failover restore evidence.

@@ -183,6 +183,10 @@ pub mod prelude {
     #[cfg(feature = "session")]
     pub use opc_session_store::{
         model::{SessionKey, SessionKeyType},
-        QuorumSessionStore, SessionStoreBackend,
+        QuorumReplicaDescriptor, QuorumReplicaMember, QuorumSessionStore, QuorumTopologyConfig,
+        QuorumTopologyError, QuorumTopologyMode, QuorumTopologySummary, ReplicaBackingIdentity,
+        ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicaTopologyField,
+        ReplicaTopologyFieldError, SessionStoreBackend, ValidatedQuorumTopology,
+        QUORUM_TOPOLOGY_MAX_MEMBERS, REPLICA_IDENTITY_MAX_BYTES, REPLICA_ID_MAX_BYTES,
     };
 }

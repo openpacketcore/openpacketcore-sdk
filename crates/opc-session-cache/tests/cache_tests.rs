@@ -5,9 +5,10 @@ use std::time::Duration;
 use futures_util::{stream, StreamExt};
 use opc_session_cache::SessionCache;
 use opc_session_store::{
-    BackendCapabilities, CompareAndSet, CompareAndSetResult, Generation, OwnerId, ReplicationEntry,
-    SessionBackend, SessionKey, SessionLeaseManager, SessionOp, SessionOpResult, StateClass,
-    StateType, StoreError, StoredSessionRecord,
+    BackendCapabilities, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
+    FakeSessionBackend, Generation, OwnerId, ReplicationEntry, SessionBackend, SessionKey,
+    SessionLeaseManager, SessionOp, SessionOpResult, StateClass, StateType, StoreError,
+    StoredSessionRecord,
 };
 use opc_session_testkit::ChaosTestkit;
 
@@ -18,6 +19,18 @@ fn test_session_key() -> SessionKey {
         key_type: opc_session_store::SessionKeyType::SubscriberContext,
         stable_id: bytes::Bytes::copy_from_slice(&[0xAA; 16]),
     }
+}
+
+#[tokio::test]
+async fn cache_delegates_backend_adapter_instance_identity() {
+    let backend: Arc<dyn SessionBackend> = Arc::new(FakeSessionBackend::new());
+    let expected = backend.backend_instance_identity();
+    let first = SessionCache::new(backend.clone());
+    let second = SessionCache::new(backend);
+
+    assert!(expected.is_some());
+    assert_eq!(first.backend_instance_identity(), expected);
+    assert_eq!(second.backend_instance_identity(), expected);
 }
 
 fn make_record(
@@ -89,6 +102,10 @@ struct WatchModeBackend {
 
 #[async_trait::async_trait]
 impl SessionBackend for WatchModeBackend {
+    fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
+        self.inner.backend_instance_identity()
+    }
+
     async fn capabilities(&self) -> BackendCapabilities {
         let mut caps = self.inner.capabilities().await;
         match self.mode {
@@ -173,7 +190,11 @@ impl SessionBackend for WatchModeBackend {
 #[tokio::test]
 async fn test_cache_miss_and_populate() {
     let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(testkit.build_coordinator(&[0, 1, 2]));
+    let coord = Arc::new(
+        testkit
+            .build_coordinator(0, &[0, 1, 2])
+            .expect("valid cache test topology"),
+    );
     let cache = SessionCache::new(coord.clone());
     wait_for_watch_ready(&cache).await;
 
@@ -211,7 +232,11 @@ async fn test_cache_miss_and_populate() {
 #[tokio::test]
 async fn test_update_invalidates_cache() {
     let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(testkit.build_coordinator(&[0, 1, 2]));
+    let coord = Arc::new(
+        testkit
+            .build_coordinator(0, &[0, 1, 2])
+            .expect("valid cache test topology"),
+    );
     let cache = SessionCache::new(coord.clone());
     wait_for_watch_ready(&cache).await;
 
@@ -262,7 +287,11 @@ async fn test_update_invalidates_cache() {
 #[tokio::test]
 async fn test_delete_invalidates_cache() {
     let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(testkit.build_coordinator(&[0, 1, 2]));
+    let coord = Arc::new(
+        testkit
+            .build_coordinator(0, &[0, 1, 2])
+            .expect("valid cache test topology"),
+    );
     let cache = SessionCache::new(coord.clone());
     wait_for_watch_ready(&cache).await;
 
@@ -303,7 +332,11 @@ async fn test_delete_invalidates_cache() {
 #[tokio::test]
 async fn test_ttl_refresh_invalidates_cache() {
     let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(testkit.build_coordinator(&[0, 1, 2]));
+    let coord = Arc::new(
+        testkit
+            .build_coordinator(0, &[0, 1, 2])
+            .expect("valid cache test topology"),
+    );
     let cache = SessionCache::new(coord.clone());
     wait_for_watch_ready(&cache).await;
 
@@ -343,7 +376,11 @@ async fn test_ttl_refresh_invalidates_cache() {
 #[tokio::test]
 async fn test_manual_resync() {
     let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(testkit.build_coordinator(&[0, 1, 2]));
+    let coord = Arc::new(
+        testkit
+            .build_coordinator(0, &[0, 1, 2])
+            .expect("valid cache test topology"),
+    );
     let cache = SessionCache::new(coord.clone());
     wait_for_watch_ready(&cache).await;
 
@@ -379,7 +416,11 @@ async fn test_manual_resync() {
 #[tokio::test]
 async fn test_no_watch_backend_bypasses_local_cache() {
     let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(testkit.build_coordinator(&[0, 1, 2]));
+    let coord = Arc::new(
+        testkit
+            .build_coordinator(0, &[0, 1, 2])
+            .expect("valid cache test topology"),
+    );
 
     let key = test_session_key();
     let owner = OwnerId::from_str("owner").unwrap();
@@ -413,7 +454,11 @@ async fn test_no_watch_backend_bypasses_local_cache() {
 #[tokio::test]
 async fn test_lagging_watch_bypasses_stale_cached_record() {
     let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(testkit.build_coordinator(&[0, 1, 2]));
+    let coord = Arc::new(
+        testkit
+            .build_coordinator(0, &[0, 1, 2])
+            .expect("valid cache test topology"),
+    );
 
     let key = test_session_key();
     let owner = OwnerId::from_str("owner").unwrap();
@@ -462,7 +507,11 @@ async fn test_lagging_watch_bypasses_stale_cached_record() {
 #[tokio::test]
 async fn test_wrapper_compare_and_set_invalidates_immediately() {
     let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(testkit.build_coordinator(&[0, 1, 2]));
+    let coord = Arc::new(
+        testkit
+            .build_coordinator(0, &[0, 1, 2])
+            .expect("valid cache test topology"),
+    );
     let cache = SessionCache::new(coord.clone());
     wait_for_watch_ready(&cache).await;
 

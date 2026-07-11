@@ -1,8 +1,10 @@
 use bytes::Bytes;
+mod support;
+
 use opc_session_store::{
     summarize_restore_records, BackendCapabilities, CompareAndSet, CompareAndSetResult,
-    EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedSessionReplica, Generation,
-    OwnerId, QuorumSessionStore, RestoreBlockReason, RestoreBlockReasonCode, RestoreRecordSummary,
+    EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation, OwnerId,
+    QuorumSessionStore, RestoreBlockReason, RestoreBlockReasonCode, RestoreRecordSummary,
     RestoreScanCursor, RestoreScanPage, RestoreScanRequest, RestoreScanScope, SessionBackend,
     SessionKey, SessionKeyType, SessionLeaseManager, SessionStoreBackend, SqliteSessionBackend,
     StateClass, StateType, StoreError, StoredSessionRecord, RESTORE_SCAN_MAX_PAGE_SIZE,
@@ -144,11 +146,11 @@ fn sqlite_quorum(size: usize) -> (QuorumSessionStore, Vec<Arc<SqliteSessionBacke
         .enumerate()
         .map(|(idx, backend)| {
             let backend: Arc<dyn SessionStoreBackend> = backend.clone();
-            FencedSessionReplica::new(idx, backend)
+            support::member(idx, backend)
         })
         .collect();
 
-    (QuorumSessionStore::new(replicas), backends)
+    (support::validated_ha(replicas), backends)
 }
 
 #[test]
@@ -383,10 +385,10 @@ async fn restore_scan_capability_is_enforced_and_quorum_aggregated() {
         StoreError::CapabilityNotSupported("restore_scan".into())
     );
 
-    let quorum = QuorumSessionStore::new(vec![
-        FencedSessionReplica::new(0, Arc::new(FakeSessionBackend::new())),
-        FencedSessionReplica::new(1, Arc::new(FakeSessionBackend::with_capabilities(caps))),
-        FencedSessionReplica::new(2, Arc::new(FakeSessionBackend::new())),
+    let quorum = support::validated_ha(vec![
+        support::member(0, Arc::new(FakeSessionBackend::new())),
+        support::member(1, Arc::new(FakeSessionBackend::with_capabilities(caps))),
+        support::member(2, Arc::new(FakeSessionBackend::new())),
     ]);
 
     assert!(!quorum.capabilities().await.restore_scan);

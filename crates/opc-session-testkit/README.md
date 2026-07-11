@@ -14,8 +14,11 @@ partitioning, replica lag, and restore-evidence assertions around
   positive or negative skew through `set_skew`.
 - `ChaosTestkit::new(num_replicas)` builds fake fenced replicas with shared
   virtual time.
-- `build_coordinator(reached_replica_ids)` creates a `QuorumSessionStore` view
-  where only selected replicas are reachable.
+- `build_coordinator(local_replica_id, reached_replica_ids)` creates a
+  validated `QuorumSessionStore` view where one explicit logical member is
+  local and only selected replicas are reachable.
+- `validated_topology(local_replica_id)` supplies immutable test topology to a
+  production-shaped consumer without discarding replica identity metadata.
 - `set_lag`, `set_online`, and `set_clock_skew` inject replica faults.
 - `RestoreEvidenceAsserter::new(block_reasons)` exposes fluent assertions for
   stale-owner rejection, traffic blocking, and redaction-safe messages.
@@ -27,7 +30,7 @@ use std::time::Duration;
 async fn partition() {
     let kit = ChaosTestkit::new(3);
     kit.set_lag(1, Some(Duration::from_millis(50))).await;
-    let _coordinator = kit.build_coordinator(&[0, 2]);
+    let _coordinator = kit.build_coordinator(0, &[0, 2]).unwrap();
 }
 ```
 
@@ -41,6 +44,8 @@ async fn partition() {
 
 - `publish = false`.
 - Intended for tests only.
+- Synthetic `.invalid` endpoints and SPIFFE-like IDs are test metadata, not
+  live authenticated membership evidence.
 - Clock skew is deterministic and based on `TokioVirtualClock`.
 - Restore assertions panic like normal test assertions.
 

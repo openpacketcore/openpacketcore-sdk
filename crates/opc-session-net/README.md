@@ -53,6 +53,9 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 - Implements `opc-session-store` backend and lease traits over the wire.
 - Uses `opc-tls` Rustls configs for production mTLS transport.
 - Intended to be composed under `QuorumSessionStore` or other store callers.
+- HA-shaped composition must use `ValidatedQuorumTopology`; logical replica
+  ID, dial endpoint, expected TLS identity, failure domain, backing identity,
+  and exact local self are independent inputs.
 
 ## Status Notes
 
@@ -68,15 +71,21 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 - Restore scan is a bulk enumeration boundary. Production authorization still
   depends on binding authenticated peer identity to authorized replica
   membership (#125).
+- Configured topology admission rejects duplicate declared vote identities,
+  canonical endpoints, and duplicate process-local adapter instances, plus a
+  missing or ambiguous local member. It cannot detect dishonest backing labels,
+  independently constructed clients targeting one store through DNS aliases,
+  or a mismatch between declarations and the live mTLS peer; that authenticated
+  authorization remains #125.
 - Remote scan transport parity does not qualify networked session HA for
-  production. Topology, fresh-quorum readiness, identity, durable authority,
+  production. Fresh-quorum readiness, identity, durable authority,
   fork recovery, bounded majority-authoritative restore, fixed-width wire DTOs,
-  and model-level decode invariants remain open in #123–#125, #127–#129, and
+  and model-level decode invariants remain open in #124/#125, #127–#129, and
   #133–#135.
 
 ## Roadmap
 
-- Close #123–#125, #127–#129, and #133–#135; add distributed failure and soak
+- Close #124/#125, #127–#129, and #133–#135; add distributed failure and soak
   evidence before treating this as production transport.
 - Keep plaintext transport limited to tests.
 - Keep the server wrapping `SessionStoreBackend` rather than owning storage.

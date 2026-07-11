@@ -1,21 +1,23 @@
 //! In-process quorum coordination over a set of session replicas.
 //!
-//! `QuorumSessionStore` composes its replica backends directly in this
-//! process and drives them through a shared, gap-free replication log: a
-//! mutation commits once a strict majority (`n/2 + 1`) of replicas have
-//! durably appended the identical log entry, and divergent or partially
-//! written replicas are repaired back to the committed prefix before the next
-//! operation proceeds. The networked transport that exposes a replica over a
-//! wire protocol lives in the separate `opc-session-net` crate; from this
-//! module's perspective a remote replica is simply another
-//! `SessionStoreBackend` implementation handed to the coordinator.
+//! `QuorumSessionStore` composes replica backends directly in this process and
+//! admits HA operation only from an immutable [`ValidatedQuorumTopology`]. The
+//! current coordinator derives a majority-visible replication-log prefix and
+//! repairs online replicas to that prefix. That is prototype behavior, not
+//! durable consensus or commit proof; leader/term sequencing and proven repair
+//! authority remain required before a production HA claim.
+//!
+//! The networked transport that exposes a replica over a wire protocol lives
+//! in the separate `opc-session-net` crate; from this module's perspective a
+//! remote replica is another [`SessionStoreBackend`] implementation paired
+//! with validated configured identity.
 //!
 //! `FencedSessionReplica` wraps each replica with controllable online flags
 //! and artificial lag so partition, failover, and split-brain scenarios can
 //! be exercised in-process without real networking.
 
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,6 +36,10 @@ use crate::restore::{
     compare_restore_records, RestoreScanCursor, RestoreScanPage, RestoreScanRequest,
     RestoreScanScope, RESTORE_SCAN_MAX_PAGE_SIZE,
 };
+use crate::topology::{
+    QuorumReplicaMember, QuorumTopologyMode, QuorumTopologySummary, ReplicaId,
+    ValidatedQuorumTopology,
+};
 use opc_types::Timestamp;
 
 /// Helper trait combining SessionBackend and SessionLeaseManager
@@ -44,8 +50,10 @@ impl<T: SessionBackend + SessionLeaseManager> SessionStoreBackend for T {}
 /// online/offline states, and epoch/fencing checks.
 #[derive(Clone)]
 pub struct FencedSessionReplica {
-    /// Position of this replica in the coordinator's replica set; used to
-    /// address it during read-repair and partial-write rollback.
+    /// Legacy fault-injection/test-control slot retained for compatibility.
+    ///
+    /// Validated quorum identity and vote accounting use the member's
+    /// [`ReplicaId`], never this number.
     pub id: usize,
     /// The actual backend plus lease manager for this replica — an in-memory
     /// or SQLite backend in tests, or a remote backend from `opc-session-net`
@@ -119,11 +127,14 @@ impl FencedSessionReplica {
 
 /// In-process replicated quorum session-store adapter over a set of replicas.
 ///
-/// This adapter coordinates CAS and lease operations across a majority of
-/// replicas, backed by a durable replication log and read-repair recovery.
+/// This adapter exercises CAS and lease coordination across a majority of
+/// replicas using the current ordered-log and read-repair prototype. A quorum
+/// coordinator is composite and deliberately provides no backend-instance
+/// identity, so it cannot itself be nested as a voting topology member.
 #[derive(Clone)]
 pub struct QuorumSessionStore {
-    replicas: Vec<FencedSessionReplica>,
+    members: Vec<QuorumReplicaMember>,
+    topology: QuorumTopologySummary,
     caps: BackendCapabilities,
     clock: Arc<dyn Clock>,
 }
@@ -140,16 +151,45 @@ fn next_replication_sequence(committed_entries: &[ReplicationEntry]) -> Result<u
 }
 
 impl QuorumSessionStore {
-    /// Build a coordinator over `replicas`, timestamping log entries with the
-    /// real system clock.
+    /// Build an operational coordinator from topology that already passed HA
+    /// or explicit lab-singleton admission.
     ///
-    /// Quorum is a strict majority of the full replica set — `n/2 + 1` of all
-    /// configured replicas, with offline ones still counted in the
-    /// denominator — so a set of `n` replicas tolerates `(n-1)/2` failures.
-    /// Reads likewise require a majority of replicas to return an identical
-    /// record before a value is trusted, and every operation read-repairs
-    /// divergent replicas to the committed log prefix first.
+    /// The quorum denominator is the validated immutable configured membership,
+    /// not the set of currently reachable backends.
+    pub fn from_validated_topology(topology: ValidatedQuorumTopology) -> Self {
+        let (topology, members) = topology.into_parts();
+        Self::build(topology, members)
+    }
+
+    /// Build a non-operational coordinator from a raw positional vector.
+    ///
+    /// This compatibility constructor retains the old source shape, but the
+    /// resulting store advertises an unknown platform profile and every store
+    /// operation fails closed. Migrate to [`Self::from_validated_topology`], or
+    /// to [`ValidatedQuorumTopology::try_new_lab_singleton`] for an explicit
+    /// one-replica lab.
+    #[deprecated(
+        note = "raw replica vectors are non-operational; construct a ValidatedQuorumTopology"
+    )]
     pub fn new(replicas: Vec<FencedSessionReplica>) -> Self {
+        let configured_members = replicas.len();
+        let members = replicas
+            .into_iter()
+            .enumerate()
+            .map(|(index, replica)| {
+                QuorumReplicaMember::new(
+                    crate::topology::QuorumReplicaDescriptor::unvalidated_legacy(index),
+                    replica,
+                )
+            })
+            .collect();
+        Self::build(
+            QuorumTopologySummary::unvalidated_legacy(configured_members),
+            members,
+        )
+    }
+
+    fn build(topology: QuorumTopologySummary, members: Vec<QuorumReplicaMember>) -> Self {
         let caps = BackendCapabilities {
             atomic_compare_and_set: true,
             monotonic_fencing_token: true,
@@ -162,10 +202,21 @@ impl QuorumSessionStore {
             max_value_bytes: usize::MAX,
         };
         Self {
-            replicas,
+            members,
+            topology,
             caps,
             clock: Arc::new(SystemClock),
         }
+    }
+
+    /// Redaction-safe immutable topology summary.
+    pub fn topology(&self) -> &QuorumTopologySummary {
+        &self.topology
+    }
+
+    /// Platform profile this admitted topology is permitted to advertise.
+    pub const fn platform_profile(&self) -> crate::capability::SessionStorePlatformProfile {
+        self.topology.mode().platform_profile()
     }
 
     /// Replace the clock used to timestamp replication entries and to compute
@@ -177,12 +228,31 @@ impl QuorumSessionStore {
     }
 
     fn quorum_size(&self) -> usize {
-        (self.replicas.len() / 2) + 1
+        self.topology.required_quorum()
+    }
+
+    fn ensure_operational_topology(&self) -> Result<(), StoreError> {
+        if self.topology.mode() == QuorumTopologyMode::UnvalidatedLegacy {
+            return Err(StoreError::BackendUnavailable(
+                "session-store topology is not validated".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn replica(&self, index: usize) -> &FencedSessionReplica {
+        self.members[index].replica()
+    }
+
+    fn replica_id(&self, index: usize) -> &ReplicaId {
+        self.members[index].descriptor().replica_id()
     }
 
     async fn online_replica_indices(&self) -> Result<Vec<usize>, StoreError> {
+        self.ensure_operational_topology()?;
         let mut online_ids = Vec::new();
-        for (idx, replica) in self.replicas.iter().enumerate() {
+        for (idx, member) in self.members.iter().enumerate() {
+            let replica = member.replica();
             if replica.check_network().await.is_err() {
                 continue;
             }
@@ -196,14 +266,18 @@ impl QuorumSessionStore {
     async fn committed_log_state(&self) -> Result<(Vec<usize>, Vec<ReplicationEntry>), StoreError> {
         let online_ids = self.online_replica_indices().await?;
         let quorum = self.quorum_size();
-        if online_ids.len() < quorum {
+        let online_voters = online_ids
+            .iter()
+            .map(|index| self.replica_id(*index))
+            .collect::<HashSet<_>>();
+        if online_voters.len() < quorum {
             return Err(StoreError::BackendUnavailable("quorum not reached".into()));
         }
 
         let mut logs = Vec::with_capacity(online_ids.len());
         let mut max_seq = 0;
         for &id in &online_ids {
-            let replica = &self.replicas[id];
+            let replica = self.replica(id);
             let seq = replica.inner.max_replication_sequence().await?;
             max_seq = max_seq.max(seq);
             let entries = if seq == 0 {
@@ -211,13 +285,13 @@ impl QuorumSessionStore {
             } else {
                 replica.inner.get_replication_log(1, seq as usize).await?
             };
-            logs.push(entries);
+            logs.push((self.replica_id(id).clone(), entries));
         }
 
         let mut committed = Vec::new();
         for sequence in 1..=max_seq {
-            let mut votes: HashMap<String, (ReplicationEntry, usize)> = HashMap::new();
-            for log in &logs {
+            let mut votes: HashMap<String, (ReplicationEntry, HashSet<ReplicaId>)> = HashMap::new();
+            for (replica_id, log) in &logs {
                 let Some(entry) = log.get((sequence - 1) as usize) else {
                     continue;
                 };
@@ -228,11 +302,16 @@ impl QuorumSessionStore {
                     .map_err(|e| StoreError::Serialization(e.to_string()))?;
                 votes
                     .entry(key)
-                    .and_modify(|(_, count)| *count += 1)
-                    .or_insert((entry.clone(), 1));
+                    .and_modify(|(_, voters)| {
+                        voters.insert(replica_id.clone());
+                    })
+                    .or_insert_with(|| (entry.clone(), HashSet::from([replica_id.clone()])));
             }
 
-            let Some((entry, _)) = votes.into_values().find(|(_, count)| *count >= quorum) else {
+            let Some((entry, _)) = votes
+                .into_values()
+                .find(|(_, voters)| voters.len() >= quorum)
+            else {
                 break;
             };
             committed.push(entry);
@@ -247,7 +326,7 @@ impl QuorumSessionStore {
         committed_entries: &[ReplicationEntry],
     ) -> Result<(), StoreError> {
         for &id in online_ids {
-            let replica = &self.replicas[id];
+            let replica = self.replica(id);
             let seq = replica.inner.max_replication_sequence().await.unwrap_or(0);
             let current = if seq == 0 {
                 Vec::new()
@@ -295,14 +374,14 @@ impl QuorumSessionStore {
             timestamp: self.clock.now_utc(),
         };
 
-        let mut successes = 0;
+        let mut successful_voters = HashSet::new();
         let mut successful_ids = Vec::new();
         let mut last_err = None;
         for id in &online_ids {
-            let replica = &self.replicas[*id];
+            let replica = self.replica(*id);
             match replica.inner.replicate_entry(entry.clone()).await {
                 Ok(()) => {
-                    successes += 1;
+                    successful_voters.insert(self.replica_id(*id).clone());
                     successful_ids.push(*id);
                 }
                 Err(e) => {
@@ -311,7 +390,7 @@ impl QuorumSessionStore {
             }
         }
 
-        if successes >= quorum {
+        if successful_voters.len() >= quorum {
             opc_redaction::metrics::METRICS
                 .session_quorum_write_success
                 .fetch_add(1, Ordering::Relaxed);
@@ -327,7 +406,8 @@ impl QuorumSessionStore {
                 opc_redaction::metrics::METRICS
                     .session_failed_partial_write_rollback
                     .fetch_add(1, Ordering::Relaxed);
-                let _ = self.replicas[id]
+                let _ = self
+                    .replica(id)
                     .inner
                     .rebuild_replication_state(committed_entries.clone())
                     .await;
@@ -350,11 +430,11 @@ impl QuorumSessionStore {
         let quorum = self.quorum_size();
 
         // Query all online replicas and count occurrences of each result
-        let mut results: Vec<Option<StoredSessionRecord>> = Vec::new();
+        let mut results: Vec<(ReplicaId, Option<StoredSessionRecord>)> = Vec::new();
         for id in &online_ids {
-            let replica = &self.replicas[*id];
+            let replica = self.replica(*id);
             if let Ok(rec) = replica.inner.get(key).await {
-                results.push(rec);
+                results.push((self.replica_id(*id).clone(), rec));
             }
         }
 
@@ -362,11 +442,13 @@ impl QuorumSessionStore {
         let mut consensus_val = None;
         let mut consensus_found = false;
 
-        for candidate in &results {
-            let mut count = 0;
-            for r in &results {
-                match (candidate, r) {
-                    (None, None) => count += 1,
+        for (_, candidate) in &results {
+            let mut voters = HashSet::new();
+            for (replica_id, result) in &results {
+                match (candidate, result) {
+                    (None, None) => {
+                        voters.insert(replica_id.clone());
+                    }
                     (Some(c), Some(x))
                         if c.generation == x.generation
                             && c.owner == x.owner
@@ -376,12 +458,12 @@ impl QuorumSessionStore {
                             && c.expires_at == x.expires_at
                             && c.payload == x.payload =>
                     {
-                        count += 1;
+                        voters.insert(replica_id.clone());
                     }
                     _ => {}
                 }
             }
-            if count >= quorum {
+            if voters.len() >= quorum {
                 consensus_val = candidate.clone();
                 consensus_found = true;
                 break;
@@ -410,7 +492,7 @@ impl QuorumSessionStore {
             .map(|entry| entry.sequence)
             .unwrap_or(0);
         for id in online_ids {
-            let replica = &self.replicas[id];
+            let replica = self.replica(id);
             if let Ok(seq) = replica.inner.max_replication_sequence().await {
                 if seq >= committed_seq {
                     return replica.inner.watch(start_sequence).await;
@@ -476,9 +558,13 @@ impl QuorumSessionStore {
 #[async_trait]
 impl SessionBackend for QuorumSessionStore {
     async fn capabilities(&self) -> BackendCapabilities {
+        if self.topology.mode() == QuorumTopologyMode::UnvalidatedLegacy {
+            return BackendCapabilities::minimal();
+        }
         let mut caps = self.caps;
 
-        for replica in &self.replicas {
+        for member in &self.members {
+            let replica = member.replica();
             let replica_caps = replica.inner.capabilities().await;
             caps.atomic_compare_and_set &= replica_caps.atomic_compare_and_set;
             caps.monotonic_fencing_token &= replica_caps.monotonic_fencing_token;
@@ -540,6 +626,7 @@ impl SessionBackend for QuorumSessionStore {
     }
 
     async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
+        self.ensure_operational_topology()?;
         let now = self.clock.now_utc();
         let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
         let expires_at = Timestamp::from_offset_datetime(expires);
@@ -554,6 +641,7 @@ impl SessionBackend for QuorumSessionStore {
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        self.ensure_operational_topology()?;
         let mut results = Vec::with_capacity(ops.len());
         for op in ops {
             let result = match op {
@@ -581,15 +669,15 @@ impl SessionBackend for QuorumSessionStore {
 
         let (online_ids, _) = self.committed_and_repaired().await?;
         let quorum = self.quorum_size();
-        let mut successful_scans = 0;
+        let mut successful_scans = HashSet::new();
         let mut last_err = None;
         let mut merged = HashMap::new();
 
         for id in online_ids {
-            let replica = &self.replicas[id];
+            let replica = self.replica(id);
             match Self::scan_replica_restore_records(replica).await {
                 Ok(records) => {
-                    successful_scans += 1;
+                    successful_scans.insert(self.replica_id(id).clone());
                     for record in records {
                         Self::merge_restore_scan_record(&mut merged, record);
                     }
@@ -602,7 +690,7 @@ impl SessionBackend for QuorumSessionStore {
             }
         }
 
-        if successful_scans < quorum {
+        if successful_scans.len() < quorum {
             return Err(last_err.unwrap_or_else(|| {
                 StoreError::BackendUnavailable("quorum not reached for restore scan".into())
             }));
@@ -679,14 +767,14 @@ impl SessionBackend for QuorumSessionStore {
             ));
         }
 
-        let mut successes = 0;
+        let mut successful_voters = HashSet::new();
         let mut successful_ids = Vec::new();
         let mut last_err = None;
         for id in online_ids {
-            let replica = &self.replicas[id];
+            let replica = self.replica(id);
             match replica.inner.replicate_entry(entry.clone()).await {
                 Ok(()) => {
-                    successes += 1;
+                    successful_voters.insert(self.replica_id(id).clone());
                     successful_ids.push(id);
                 }
                 Err(e) => {
@@ -694,7 +782,7 @@ impl SessionBackend for QuorumSessionStore {
                 }
             }
         }
-        if successes >= self.quorum_size() {
+        if successful_voters.len() >= self.quorum_size() {
             opc_redaction::metrics::METRICS
                 .session_committed_replication_sequence
                 .store(entry.sequence, Ordering::Relaxed);
@@ -704,7 +792,8 @@ impl SessionBackend for QuorumSessionStore {
                 opc_redaction::metrics::METRICS
                     .session_failed_partial_write_rollback
                     .fetch_add(1, Ordering::Relaxed);
-                let _ = self.replicas[id]
+                let _ = self
+                    .replica(id)
                     .inner
                     .rebuild_replication_state(committed_entries.clone())
                     .await;
@@ -754,7 +843,7 @@ impl SessionLeaseManager for QuorumSessionStore {
         let mut max_fence = 0;
         let mut max_cred_id = 0;
         for &id in &online_ids {
-            let replica = &self.replicas[id];
+            let replica = self.replica(id);
             let (f, c) = replica
                 .inner
                 .next_lease_info()
@@ -798,6 +887,8 @@ impl SessionLeaseManager for QuorumSessionStore {
     }
 
     async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
+        self.ensure_operational_topology()
+            .map_err(LeaseError::from)?;
         let now = self.clock.now_utc();
         let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
         let expires_at = Timestamp::from_offset_datetime(expires);

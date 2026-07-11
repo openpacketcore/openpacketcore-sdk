@@ -38,8 +38,8 @@ use opc_runtime::{
 };
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, EncryptingSessionBackend,
-    FencedSessionReplica, Generation, OwnerId, QuorumSessionStore, SessionBackend, SessionKey,
-    SessionKeyType, SessionLeaseManager, StateClass, StateType, StoredSessionRecord,
+    Generation, OwnerId, QuorumSessionStore, SessionBackend, SessionKey, SessionKeyType,
+    SessionLeaseManager, StateClass, StateType, StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_testbed::Clock as TestClock;
 use opc_types::{ConfigVersion, NetworkFunctionKind, SchemaDigest, TenantId, Timestamp, TxId};
@@ -539,7 +539,7 @@ impl AmfLite {
     pub async fn start(
         initial_config: AmfConfig,
         config_store: Arc<dyn ConfigStore>,
-        session_replicas: Vec<FencedSessionReplica>,
+        session_topology: ValidatedQuorumTopology,
         kms_endpoint: String,
         auth_token: Option<String>,
         admin_addr: SocketAddr,
@@ -549,7 +549,7 @@ impl AmfLite {
         Self::start_with_clock(
             initial_config,
             config_store,
-            session_replicas,
+            session_topology,
             kms_endpoint,
             auth_token,
             admin_addr,
@@ -565,7 +565,7 @@ impl AmfLite {
     pub async fn start_with_clock(
         initial_config: AmfConfig,
         config_store: Arc<dyn ConfigStore>,
-        session_replicas: Vec<FencedSessionReplica>,
+        session_topology: ValidatedQuorumTopology,
         kms_endpoint: String,
         auth_token: Option<String>,
         admin_addr: SocketAddr,
@@ -598,20 +598,18 @@ impl AmfLite {
         .map_err(|e| RuntimeError::Supervisor(format!("config bus init failed: {e}")))?;
 
         // 3. Quorum Session Store wrapped in mTLS/KMS encrypting envelope
-        let mut wrapped_replicas = Vec::new();
-        for rep in session_replicas {
-            let encrypting_backend = EncryptingSessionBackend::new(
-                rep.inner.clone(),
-                kms_provider.clone(),
-                "amf-sessions",
-            );
-            let mut wrapped = FencedSessionReplica::new(rep.id, Arc::new(encrypting_backend));
-            wrapped.client_online = rep.client_online.clone();
-            wrapped.node_online = rep.node_online.clone();
-            wrapped.lag = rep.lag.clone();
-            wrapped_replicas.push(wrapped);
-        }
-        let session_store = QuorumSessionStore::new(wrapped_replicas);
+        let session_topology = session_topology
+            .try_map_backends(|_, backend| {
+                Arc::new(EncryptingSessionBackend::new(
+                    backend,
+                    kms_provider.clone(),
+                    "amf-sessions",
+                ))
+            })
+            .map_err(|_| {
+                RuntimeError::Supervisor("session topology validation failed".to_string())
+            })?;
+        let session_store = QuorumSessionStore::from_validated_topology(session_topology);
 
         // 4. Initial state
         let mut health = HealthModel::new();

@@ -1,13 +1,45 @@
 use opc_session_store::{
     BackendCapabilities, CompareAndSet, CompareAndSetResult, FakeSessionBackend,
-    FencedSessionReplica, Generation, OwnerId, QuorumSessionStore, SessionBackend, SessionKey,
+    FencedSessionReplica, Generation, OwnerId, QuorumReplicaDescriptor, QuorumReplicaMember,
+    QuorumSessionStore, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
+    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionBackend, SessionKey,
     SessionLeaseManager, SessionOp, SessionOpResult, StateClass, StateType, StoreError,
-    StoredSessionRecord,
+    StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_session_testkit::ChaosTestkit;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+
+fn validated_quorum(replicas: Vec<FencedSessionReplica>) -> QuorumSessionStore {
+    let members = replicas
+        .into_iter()
+        .map(|replica| {
+            let index = replica.id;
+            QuorumReplicaMember::new(
+                QuorumReplicaDescriptor::new(
+                    ReplicaId::new(format!("direct-chaos-replica-{index}"))
+                        .expect("test replica ID"),
+                    ReplicaEndpoint::new(format!("direct-chaos-replica-{index}.invalid"), 7443)
+                        .expect("test endpoint"),
+                    ReplicaTlsIdentity::new(format!("spiffe://test/direct-chaos/replica/{index}"))
+                        .expect("test TLS identity"),
+                    ReplicaFailureDomain::new(format!("direct-chaos-failure-domain-{index}"))
+                        .expect("test failure domain"),
+                    ReplicaBackingIdentity::new(format!("direct-chaos-backing-{index}"))
+                        .expect("test backing identity"),
+                ),
+                replica,
+            )
+        })
+        .collect();
+    let topology = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new(
+        ReplicaId::new("direct-chaos-replica-0").expect("test local ID"),
+        members,
+    ))
+    .expect("valid direct chaos topology");
+    QuorumSessionStore::from_validated_topology(topology)
+}
 
 fn test_session_key() -> SessionKey {
     SessionKey {
@@ -51,9 +83,13 @@ async fn test_split_brain_partition_and_healing() {
     let testkit = ChaosTestkit::new(3);
 
     // Coordinator A reaches Node 0 and Node 1 (Majority)
-    let coord_a = testkit.build_coordinator(&[0, 1]);
+    let coord_a = testkit
+        .build_coordinator(0, &[0, 1])
+        .expect("valid coordinator A topology");
     // Coordinator B reaches Node 2 (Minority)
-    let coord_b = testkit.build_coordinator(&[2]);
+    let coord_b = testkit
+        .build_coordinator(2, &[2])
+        .expect("valid coordinator B topology");
 
     let key = test_session_key();
     let owner_a = OwnerId::from_str("owner-a").unwrap();
@@ -84,7 +120,9 @@ async fn test_split_brain_partition_and_healing() {
     assert_eq!(cas_res, CompareAndSetResult::Success);
 
     // Heal partition: Coordinator B can now reach all nodes
-    let coord_healed = testkit.build_coordinator(&[0, 1, 2]);
+    let coord_healed = testkit
+        .build_coordinator(0, &[0, 1, 2])
+        .expect("valid healed topology");
     let loaded = coord_healed.get(&key).await.unwrap().unwrap();
     assert_eq!(loaded.generation.get(), 1);
 }
@@ -92,7 +130,9 @@ async fn test_split_brain_partition_and_healing() {
 #[tokio::test]
 async fn test_stale_leader_and_multi_writer_rejection() {
     let testkit = ChaosTestkit::new(3);
-    let coord = testkit.build_coordinator(&[0, 1, 2]);
+    let coord = testkit
+        .build_coordinator(0, &[0, 1, 2])
+        .expect("valid chaos topology");
 
     let key = test_session_key();
     let owner_1 = OwnerId::from_str("owner-1").unwrap();
@@ -132,7 +172,9 @@ async fn test_stale_leader_and_multi_writer_rejection() {
 #[tokio::test]
 async fn test_clock_skew_ttl_behavior() {
     let testkit = ChaosTestkit::new(3);
-    let coord = testkit.build_coordinator(&[0, 1, 2]);
+    let coord = testkit
+        .build_coordinator(0, &[0, 1, 2])
+        .expect("valid chaos topology");
 
     let key = test_session_key();
     let owner = OwnerId::from_str("owner").unwrap();
@@ -179,7 +221,9 @@ async fn test_clock_skew_ttl_behavior() {
 #[tokio::test]
 async fn test_restart_rejoin_monotonicity() {
     let testkit = ChaosTestkit::new(3);
-    let coord = testkit.build_coordinator(&[0, 1, 2]);
+    let coord = testkit
+        .build_coordinator(0, &[0, 1, 2])
+        .expect("valid chaos topology");
 
     let key = test_session_key();
     let owner = OwnerId::from_str("owner").unwrap();
@@ -214,7 +258,9 @@ async fn test_restart_rejoin_monotonicity() {
 #[tokio::test]
 async fn test_replication_lag() {
     let testkit = ChaosTestkit::new(3);
-    let coord = testkit.build_coordinator(&[0, 1, 2]);
+    let coord = testkit
+        .build_coordinator(0, &[0, 1, 2])
+        .expect("valid chaos topology");
 
     // Set 50ms lag on Node 0 and Node 1
     testkit.set_lag(0, Some(Duration::from_millis(50))).await;
@@ -271,7 +317,7 @@ async fn test_divergent_read_fails_closed_without_record_quorum() {
         );
     }
 
-    let coord = QuorumSessionStore::new(replicas);
+    let coord = validated_quorum(replicas);
     let err = coord.get(&key).await.unwrap_err();
 
     assert!(matches!(
@@ -284,7 +330,9 @@ async fn test_divergent_read_fails_closed_without_record_quorum() {
 #[tokio::test]
 async fn test_advertised_capabilities() {
     let testkit = ChaosTestkit::new(3);
-    let coord = testkit.build_coordinator(&[0, 1, 2]);
+    let coord = testkit
+        .build_coordinator(0, &[0, 1, 2])
+        .expect("valid chaos topology");
 
     let caps = coord.capabilities().await;
     assert!(caps.atomic_compare_and_set);
@@ -311,7 +359,7 @@ async fn test_capabilities_intersect_wrapped_replica_capabilities() {
         ),
         FencedSessionReplica::new(2, Arc::new(FakeSessionBackend::new())),
     ];
-    let coord = QuorumSessionStore::new(replicas);
+    let coord = validated_quorum(replicas);
 
     let caps = coord.capabilities().await;
 
@@ -328,7 +376,9 @@ async fn test_capabilities_intersect_wrapped_replica_capabilities() {
 #[tokio::test]
 async fn test_duplicate_replication_entry_idempotency() {
     let testkit = ChaosTestkit::new(3);
-    let coord = testkit.build_coordinator(&[0, 1, 2]);
+    let coord = testkit
+        .build_coordinator(0, &[0, 1, 2])
+        .expect("valid chaos topology");
 
     let key = test_session_key();
     let owner = OwnerId::from_str("dup-owner").unwrap();
@@ -382,7 +432,9 @@ async fn test_partial_write_recovery_and_catch_up() {
     let key = test_session_key();
     let owner = OwnerId::from_str("partial-owner").unwrap();
 
-    let coord_majority = testkit.build_coordinator(&[0, 1, 2]);
+    let coord_majority = testkit
+        .build_coordinator(0, &[0, 1, 2])
+        .expect("valid majority topology");
 
     // Acquire lease on majority coordinator (replicates AcquireLease to all 3)
     let lease = coord_majority
@@ -446,7 +498,9 @@ async fn test_partial_write_recovery_and_catch_up() {
 #[tokio::test]
 async fn test_replicated_batch_does_not_reapply_writes_for_results() {
     let testkit = ChaosTestkit::new(3);
-    let coord = testkit.build_coordinator(&[0, 1, 2]);
+    let coord = testkit
+        .build_coordinator(0, &[0, 1, 2])
+        .expect("valid chaos topology");
 
     let key = test_session_key();
     let owner = OwnerId::from_str("batch-owner").unwrap();
@@ -494,7 +548,7 @@ async fn test_replica_restart_rejoin_catch_up_sqlite() {
     }
 
     // Coord reaches Node 0, Node 1, Node 2
-    let coord = QuorumSessionStore::new(replicas.clone());
+    let coord = validated_quorum(replicas.clone());
 
     let key = test_session_key();
     let owner = OwnerId::from_str("sqlite-owner").unwrap();
@@ -546,7 +600,9 @@ async fn test_replica_restart_rejoin_catch_up_sqlite() {
 #[tokio::test]
 async fn test_watch_change_stream_resume() {
     let testkit = ChaosTestkit::new(3);
-    let coord = testkit.build_coordinator(&[0, 1, 2]);
+    let coord = testkit
+        .build_coordinator(0, &[0, 1, 2])
+        .expect("valid chaos topology");
 
     let key = test_session_key();
     let owner = OwnerId::from_str("watch-owner").unwrap();

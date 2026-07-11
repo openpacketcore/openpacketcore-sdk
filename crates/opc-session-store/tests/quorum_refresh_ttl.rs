@@ -1,8 +1,10 @@
 use bytes::Bytes;
+mod support;
+
 use opc_session_store::{
-    Clock, CompareAndSet, EncryptedSessionPayload, FakeSessionBackend, FencedSessionReplica,
-    Generation, OwnerId, QuorumSessionStore, SessionBackend, SessionKey, SessionKeyType,
-    SessionLeaseManager, StateClass, StateType, StoredSessionRecord,
+    Clock, CompareAndSet, EncryptedSessionPayload, FakeSessionBackend, Generation, OwnerId,
+    SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, StateClass, StateType,
+    StoredSessionRecord,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use std::{sync::Arc, time::Duration};
@@ -61,10 +63,10 @@ async fn refresh_ttl_replicates_one_deadline_across_skewed_replicas() {
         .map(|idx| {
             let replica_clock = Arc::new(FixedClock::new(timestamp_after(base, idx)));
             let backend = Arc::new(FakeSessionBackend::new().with_clock(replica_clock));
-            FencedSessionReplica::new(idx as usize, backend)
+            support::member(idx as usize, backend)
         })
         .collect();
-    let quorum = QuorumSessionStore::new(replicas).with_clock(coordinator_clock);
+    let quorum = support::validated_ha(replicas).with_clock(coordinator_clock);
 
     let key = test_key(b"quorum-refresh-ttl");
     let owner = OwnerId::new("owner-a").expect("owner");

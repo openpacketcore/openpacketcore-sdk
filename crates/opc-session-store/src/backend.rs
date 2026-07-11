@@ -259,8 +259,29 @@ pub enum ReplicationOp {
 /// [`EncryptedSessionPayload::envelope`] for RFC 003 ciphertext rows and
 /// [`EncryptedSessionPayload::legacy_plaintext`] only for intentional
 /// migrations of pre-envelope plaintext rows.
+///
+/// Backend adapters used in validated quorum topology must opt in by returning
+/// a stable process-local instance root from
+/// [`Self::backend_instance_identity`]. Forwarding wrappers must delegate to
+/// their inner backend. Topology admission rejects an absent identity and uses
+/// a present identity to prevent one conforming SDK backend instance from
+/// receiving multiple configured votes through wrappers. It does not prove
+/// remote physical-store identity; that remains separate declared and
+/// authenticated topology metadata.
 #[async_trait]
 pub trait SessionBackend: Send + Sync {
+    /// Process-local instance root declared by this backend adapter.
+    ///
+    /// The default deliberately returns `None`, which makes validated topology
+    /// admission fail closed. Eligible adapters must return a stable identity;
+    /// clone-sharing backends and forwarding wrappers must share or delegate
+    /// it. Remote clients identify their local client instance, not the remote
+    /// store. This value is never serialized, displayed, or used as a
+    /// distributed/authenticated replica identity.
+    fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
+        None
+    }
+
     /// Return the capability declaration for this backend.
     async fn capabilities(&self) -> BackendCapabilities;
 
@@ -359,6 +380,27 @@ pub trait SessionBackend: Send + Sync {
         Err(StoreError::CapabilityNotSupported(
             "lease_coordination".into(),
         ))
+    }
+}
+
+/// Opaque process-local adapter identity used only for duplicate admission.
+///
+/// Debug output is redacted because the value is derived from an allocation
+/// address. It is intentionally not hashable, persistent, network-visible, or
+/// an authentication identity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BackendInstanceIdentity(usize);
+
+impl BackendInstanceIdentity {
+    /// Derive one identity shared by every clone holding the same `Arc`.
+    pub fn for_shared<T: ?Sized>(value: &Arc<T>) -> Self {
+        Self(Arc::as_ptr(value).cast::<()>() as usize)
+    }
+}
+
+impl std::fmt::Debug for BackendInstanceIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BackendInstanceIdentity(<redacted>)")
     }
 }
 
@@ -660,6 +702,10 @@ where
     B: SessionBackend + 'static + ?Sized,
     P: KeyProvider + 'static + ?Sized,
 {
+    fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
+        self.inner.backend_instance_identity()
+    }
+
     async fn capabilities(&self) -> BackendCapabilities {
         self.inner.capabilities().await
     }
@@ -1199,6 +1245,10 @@ where
     B: SessionBackend + 'static + ?Sized,
     S: RemoteSealProvider + 'static + ?Sized,
 {
+    fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
+        self.inner.backend_instance_identity()
+    }
+
     async fn capabilities(&self) -> BackendCapabilities {
         self.inner.capabilities().await
     }
