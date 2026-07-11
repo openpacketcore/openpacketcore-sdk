@@ -1,0 +1,40 @@
+[package]
+name = "opc-sa-mirror"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Live IPsec SA keymat mirroring for near-hitless failover without keys at rest (experimental)"
+readme = "README.md"
+documentation = "https://docs.rs/opc-sa-mirror"
+keywords = ["ipsec", "ikev2", "failover", "ha", "packet-core"]
+categories = ["network-programming"]
+publish = false # experimental: not published until graduation
+
+[dependencies]
+# Deliberately NO opc-session-store / opc-persist dependency: this crate is the
+# never-persisting key plane (RFC 015 §4).
+opc-ipsec-lb = { path = "../opc-ipsec-lb", version = "0.2.0" }
+opc-tls = { path = "../opc-tls", version = "0.2.0" }
+async-trait = { workspace = true }
+futures-util = "0.3"
+rustls-pki-types = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros"] }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+opc-identity = { path = "../opc-identity", version = "0.2.0" }
+rcgen = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros", "test-util"] }
+
+[lints]
+workspace = true
