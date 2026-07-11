@@ -93,6 +93,18 @@ mechanical message-shape validation only; AAA challenge selection, subscriber
 authorization, realm routing, transport state, and EAP-AKA policy remain
 downstream product work.
 
+The SWm DEA parse matches vendor-specific AVPs by (vendor-id, code); only
+genuinely unknown AVPs fall through to the unknown-AVP policy (mandatory
+unknown AVPs remain fail-closed). The DEA additionally decodes and encodes
+the TS 29.273 subscription AVPs `Service-Selection` (RFC 5778) and
+`APN-Configuration` (TS 29.272 §7.3.35) with the child subset
+`Context-Identifier`, `Service-Selection`, `PDN-Type`,
+`EPS-Subscribed-QoS-Profile` (QCI + Allocation-Retention-Priority), and
+`AMBR`. The remaining APN-Configuration children (for example
+`VPLMN-Dynamic-Address-Allowed`, `PDN-GW-Allocation-Type`, `MIP6-Agent-Info`,
+and `3GPP-Charging-Characteristics`) are deliberately not modeled yet and are
+handled by the unknown-AVP policy.
+
 ### 6. Redaction
 
 Sensitive typed fields are wrapped in `Redacted<T>`. `Debug` and `Display`
@@ -105,7 +117,10 @@ Covered redacted fields:
   `SubscriptionId::subscription_id_data`, IP addresses inside `PsInformation`.
 - `SwmDiameterEapRequest` / `SwmDiameterEapAnswer`: `Session-Id`, `Origin-Host`,
   `Origin-Realm`, `Destination-Realm`, `Destination-Host`, `User-Name`,
-  `EAP-Payload`, `EAP-Reissued-Payload`, `EAP-Master-Session-Key`.
+  `EAP-Payload`, `EAP-Reissued-Payload`, `EAP-Master-Session-Key`,
+  `Service-Selection` (top level and inside
+  `ApnConfiguration::service_selection`). `SwmDiameterEapAnswer` debug output
+  shows only the count of `apn_configurations`, never their contents.
 
 Raw AVP bytes are **not** redacted: the raw layer is intentionally a
 byte-preserving forwarding surface, and redaction is a typed-layer policy.

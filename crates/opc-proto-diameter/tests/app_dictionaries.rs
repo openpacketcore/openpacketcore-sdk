@@ -6,13 +6,14 @@ use opc_proto_diameter::apps::rf::{
     RfAccountingRequest, SubscriptionId, SubscriptionIdType, UsedServiceUnit,
 };
 use opc_proto_diameter::apps::swm::{
-    AuthRequestType, SwmDiameterEapAnswer, SwmDiameterEapRequest, SwmResultCategory,
+    AllocationRetentionPriority, Ambr, ApnConfiguration, AuthRequestType, EpsSubscribedQosProfile,
+    PdnType, SwmDiameterEapAnswer, SwmDiameterEapRequest, SwmResultCategory,
 };
 use opc_proto_diameter::{
     apps, base, ApplicationId, AvpCode, AvpDataType, AvpHeader, AvpKey, CommandCode, CommandFlags,
     CommandKind, DictionarySet, Header, Message, OwnedMessage, RawAvp, VendorId,
 };
-use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
+use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext, UnknownIePolicy};
 
 fn encode_message(message: &opc_proto_diameter::OwnedMessage) -> BytesMut {
     let mut encoded = BytesMut::new();
@@ -234,6 +235,8 @@ fn swm_answer_result_category_is_classified() {
         origin_host: "aaa.home.example".into(),
         origin_realm: "home.example".into(),
         user_name: None,
+        service_selection: None,
+        apn_configurations: vec![],
         eap_payload: None,
         eap_reissued_payload: None,
         error_message: None,
@@ -432,11 +435,34 @@ fn sample_swm_answer() -> SwmDiameterEapAnswer {
         origin_host: "aaa.home.example".into(),
         origin_realm: "home.example".into(),
         user_name: None,
+        service_selection: None,
+        apn_configurations: vec![],
         eap_payload: Some(vec![0x03, 0x18, 0x00, 0x04].into()),
         eap_reissued_payload: None,
         error_message: None,
         state_avps: vec![],
         eap_master_session_key: Some(vec![0xAA; 32].into()),
+    }
+}
+
+#[cfg(feature = "app-swm")]
+fn sample_apn_configuration() -> ApnConfiguration {
+    ApnConfiguration {
+        context_identifier: 7,
+        service_selection: "internet.mnc001.mcc001.gprs".into(),
+        pdn_type: PdnType::Ipv4v6,
+        eps_subscribed_qos_profile: Some(EpsSubscribedQosProfile {
+            qos_class_identifier: 9,
+            allocation_retention_priority: AllocationRetentionPriority {
+                priority_level: 15,
+                pre_emption_capability: Some(1),
+                pre_emption_vulnerability: Some(0),
+            },
+        }),
+        ambr: Some(Ambr {
+            max_requested_bandwidth_ul: 50_000_000,
+            max_requested_bandwidth_dl: 150_000_000,
+        }),
     }
 }
 
@@ -641,6 +667,76 @@ fn build_raw_swm_der_with(
         ),
         raw_avps: raw_avps.freeze(),
     }
+}
+
+/// Raw success DEA carrying EAP material plus caller-provided extra AVPs.
+#[cfg(feature = "app-swm")]
+fn build_raw_swm_dea_with_extras(extras: &[BytesMut]) -> OwnedMessage {
+    let mut raw_avps = BytesMut::new();
+    raw_avps.extend_from_slice(&encode_raw_avp(base::AVP_SESSION_ID, true, b"sess;swm;001"));
+    raw_avps.extend_from_slice(&encode_raw_avp(
+        base::AVP_AUTH_APPLICATION_ID,
+        true,
+        &apps::swm::APPLICATION_ID.get().to_be_bytes(),
+    ));
+    raw_avps.extend_from_slice(&encode_raw_avp(
+        apps::swm::AVP_AUTH_REQUEST_TYPE,
+        true,
+        &3u32.to_be_bytes(),
+    ));
+    raw_avps.extend_from_slice(&encode_raw_avp(
+        base::AVP_RESULT_CODE,
+        true,
+        &2001u32.to_be_bytes(),
+    ));
+    raw_avps.extend_from_slice(&encode_raw_avp(
+        base::AVP_ORIGIN_HOST,
+        true,
+        b"aaa.home.example",
+    ));
+    raw_avps.extend_from_slice(&encode_raw_avp(
+        base::AVP_ORIGIN_REALM,
+        true,
+        b"home.example",
+    ));
+    raw_avps.extend_from_slice(&encode_raw_avp(
+        apps::swm::AVP_EAP_PAYLOAD,
+        true,
+        &[0x03, 0x18, 0x00, 0x04],
+    ));
+    for extra in extras {
+        raw_avps.extend_from_slice(extra);
+    }
+    OwnedMessage {
+        header: Header::new(
+            CommandFlags::answer(true, false),
+            CommandCode::new(268),
+            ApplicationId::new(16_777_264),
+            1,
+            2,
+        ),
+        raw_avps: raw_avps.freeze(),
+    }
+}
+
+/// Raw APN-Configuration grouped value with the three required children.
+#[cfg(feature = "app-swm")]
+fn raw_apn_configuration_children(context_identifier: u32, apn: &[u8], pdn_type: u32) -> BytesMut {
+    let mut value = BytesMut::new();
+    value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_CONTEXT_IDENTIFIER,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &context_identifier.to_be_bytes(),
+    ));
+    value.extend_from_slice(&encode_raw_avp(apps::swm::AVP_SERVICE_SELECTION, true, apn));
+    value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_PDN_TYPE,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &pdn_type.to_be_bytes(),
+    ));
+    value
 }
 
 #[cfg(feature = "app-swm")]
@@ -952,4 +1048,412 @@ fn rf_grouped_mscc_rejects_excessive_nesting_depth() {
         ..DecodeContext::default()
     };
     assert!(apps::rf::parse_rf_accounting_request(&decoded, ctx).is_err());
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dictionary_contains_subscription_avps() {
+    let dictionary = apps::swm::dictionary();
+
+    let service_selection = dictionary
+        .find_avp(AvpKey::ietf(apps::swm::AVP_SERVICE_SELECTION))
+        .expect("Service-Selection must be present");
+    assert_eq!(service_selection.data_type(), AvpDataType::Utf8String);
+
+    let apn_configuration = dictionary
+        .find_avp(AvpKey::vendor(
+            apps::swm::AVP_APN_CONFIGURATION,
+            apps::VENDOR_ID_3GPP,
+        ))
+        .expect("APN-Configuration must be present");
+    assert_eq!(apn_configuration.data_type(), AvpDataType::Grouped);
+
+    let context_identifier = dictionary
+        .find_avp(AvpKey::vendor(
+            apps::swm::AVP_CONTEXT_IDENTIFIER,
+            apps::VENDOR_ID_3GPP,
+        ))
+        .expect("Context-Identifier must be present");
+    assert_eq!(context_identifier.data_type(), AvpDataType::Unsigned32);
+
+    let pdn_type = dictionary
+        .find_avp(AvpKey::vendor(
+            apps::swm::AVP_PDN_TYPE,
+            apps::VENDOR_ID_3GPP,
+        ))
+        .expect("PDN-Type must be present");
+    assert_eq!(pdn_type.data_type(), AvpDataType::Enumerated);
+
+    // Vendor-specific AVP keys must not shadow or match the vendor-neutral space.
+    assert!(dictionary
+        .find_avp(AvpKey::ietf(apps::swm::AVP_APN_CONFIGURATION))
+        .is_none());
+}
+
+/// Defect regression: an M-flagged vendor-specific APN-Configuration in the
+/// DEA must be matched by (vendor-id, code) and surfaced, not routed to the
+/// unknown-AVP rejection path.
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_parses_mandatory_vendor_apn_configuration() {
+    let mut apn_value = raw_apn_configuration_children(7, b"internet.mnc001.mcc001.gprs", 2);
+    let mut arp_value = BytesMut::new();
+    arp_value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_PRIORITY_LEVEL,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &15u32.to_be_bytes(),
+    ));
+    arp_value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_PRE_EMPTION_CAPABILITY,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &1u32.to_be_bytes(),
+    ));
+    arp_value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_PRE_EMPTION_VULNERABILITY,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &0u32.to_be_bytes(),
+    ));
+    let mut qos_value = BytesMut::new();
+    qos_value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_QOS_CLASS_IDENTIFIER,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &9u32.to_be_bytes(),
+    ));
+    qos_value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_ALLOCATION_RETENTION_PRIORITY,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &arp_value,
+    ));
+    apn_value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_EPS_SUBSCRIBED_QOS_PROFILE,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &qos_value,
+    ));
+    let mut ambr_value = BytesMut::new();
+    ambr_value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_MAX_REQUESTED_BANDWIDTH_UL,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &50_000_000u32.to_be_bytes(),
+    ));
+    ambr_value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_MAX_REQUESTED_BANDWIDTH_DL,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &150_000_000u32.to_be_bytes(),
+    ));
+    apn_value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_AMBR,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &ambr_value,
+    ));
+    let extras = [
+        encode_raw_vendor_avp(
+            apps::swm::AVP_APN_CONFIGURATION,
+            apps::VENDOR_ID_3GPP,
+            true,
+            &apn_value,
+        ),
+        encode_raw_avp(
+            apps::swm::AVP_SERVICE_SELECTION,
+            true,
+            b"internet.mnc001.mcc001.gprs",
+        ),
+    ];
+    let message = build_raw_swm_dea_with_extras(&extras);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    let answer = apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::default())
+        .expect("DEA with vendor subscription AVPs must parse");
+    assert_eq!(
+        answer
+            .service_selection
+            .as_ref()
+            .map(|s| s.as_ref().as_str()),
+        Some("internet.mnc001.mcc001.gprs")
+    );
+    assert_eq!(answer.apn_configurations, vec![sample_apn_configuration()]);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_subscription_avps_round_trip() {
+    let mut answer = sample_swm_answer();
+    answer.service_selection = Some("internet.mnc001.mcc001.gprs".into());
+    answer.apn_configurations = vec![
+        sample_apn_configuration(),
+        ApnConfiguration {
+            context_identifier: 8,
+            service_selection: "ims.mnc001.mcc001.gprs".into(),
+            pdn_type: PdnType::Ipv6,
+            eps_subscribed_qos_profile: None,
+            ambr: None,
+        },
+    ];
+    let built = apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default())
+        .expect("SWm DEA build must succeed");
+    let encoded = encode_message(&built);
+    let message = decode_message(&encoded);
+    let parsed = apps::swm::parse_swm_diameter_eap_answer(&message, DecodeContext::default())
+        .expect("SWm DEA parse must succeed");
+    assert_eq!(parsed, answer);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dictionary_validation_recognizes_grouped_subscription_avps() {
+    let mut answer = sample_swm_answer();
+    answer.service_selection = Some("internet.mnc001.mcc001.gprs".into());
+    answer.apn_configurations = vec![sample_apn_configuration()];
+    let built = apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default())
+        .expect("SWm DEA build must succeed");
+    let encoded = encode_message(&built);
+    let message = decode_message(&encoded);
+    assert!(message
+        .validate_avps_with_dictionary(
+            DecodeContext::default(),
+            DictionarySet::new(&[apps::swm::dictionary()]),
+        )
+        .is_ok());
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_rejects_unknown_mandatory_vendor_avp() {
+    let extras = [encode_raw_vendor_avp(
+        AvpCode::new(9999),
+        apps::VENDOR_ID_3GPP,
+        true,
+        b"unknown",
+    )];
+    let message = build_raw_swm_dea_with_extras(&extras);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    let err = apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::default())
+        .expect_err("unknown mandatory vendor AVP must be rejected");
+    assert!(matches!(
+        err.code(),
+        opc_protocol::DecodeErrorCode::UnknownCriticalIe
+    ));
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_unknown_vendor_avp_policy_matrix() {
+    let extras = [encode_raw_vendor_avp(
+        AvpCode::new(9999),
+        apps::VENDOR_ID_3GPP,
+        false,
+        b"unknown",
+    )];
+    let message = build_raw_swm_dea_with_extras(&extras);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+
+    for policy in [UnknownIePolicy::Preserve, UnknownIePolicy::Drop] {
+        let ctx = DecodeContext {
+            unknown_ie_policy: policy,
+            ..DecodeContext::default()
+        };
+        let answer = apps::swm::parse_swm_diameter_eap_answer(&decoded, ctx)
+            .expect("non-mandatory unknown vendor AVP must be tolerated");
+        // The typed projection does not retain the opaque unknown AVP.
+        assert!(answer.apn_configurations.is_empty());
+        assert!(answer.service_selection.is_none());
+    }
+
+    let ctx = DecodeContext {
+        unknown_ie_policy: UnknownIePolicy::Reject,
+        ..DecodeContext::default()
+    };
+    assert!(apps::swm::parse_swm_diameter_eap_answer(&decoded, ctx).is_err());
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_apn_configuration_rejects_missing_required_child() {
+    // Context-Identifier and PDN-Type present, Service-Selection missing.
+    let mut apn_value = BytesMut::new();
+    apn_value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_CONTEXT_IDENTIFIER,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &7u32.to_be_bytes(),
+    ));
+    apn_value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_PDN_TYPE,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &2u32.to_be_bytes(),
+    ));
+    let extras = [encode_raw_vendor_avp(
+        apps::swm::AVP_APN_CONFIGURATION,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &apn_value,
+    )];
+    let message = build_raw_swm_dea_with_extras(&extras);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    let err = apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::default())
+        .expect_err("APN-Configuration without Service-Selection must be rejected");
+    assert!(matches!(
+        err.code(),
+        opc_protocol::DecodeErrorCode::Structural { .. }
+    ));
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_apn_configuration_rejects_duplicate_child() {
+    let mut apn_value = raw_apn_configuration_children(7, b"internet.mnc001.mcc001.gprs", 2);
+    apn_value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_PDN_TYPE,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &0u32.to_be_bytes(),
+    ));
+    let extras = [encode_raw_vendor_avp(
+        apps::swm::AVP_APN_CONFIGURATION,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &apn_value,
+    )];
+    let message = build_raw_swm_dea_with_extras(&extras);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    let err = apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::default())
+        .expect_err("duplicate PDN-Type child must be rejected");
+    assert!(matches!(
+        err.code(),
+        opc_protocol::DecodeErrorCode::DuplicateIe
+    ));
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_apn_configuration_rejects_unknown_mandatory_child() {
+    let mut apn_value = raw_apn_configuration_children(7, b"internet.mnc001.mcc001.gprs", 2);
+    apn_value.extend_from_slice(&encode_raw_vendor_avp(
+        AvpCode::new(9999),
+        apps::VENDOR_ID_3GPP,
+        true,
+        b"unknown",
+    ));
+    let extras = [encode_raw_vendor_avp(
+        apps::swm::AVP_APN_CONFIGURATION,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &apn_value,
+    )];
+    let message = build_raw_swm_dea_with_extras(&extras);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    let err = apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::default())
+        .expect_err("unknown mandatory child AVP must be rejected");
+    assert!(matches!(
+        err.code(),
+        opc_protocol::DecodeErrorCode::UnknownCriticalIe
+    ));
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_apn_configuration_tolerates_unknown_optional_child() {
+    let mut apn_value = raw_apn_configuration_children(7, b"internet.mnc001.mcc001.gprs", 2);
+    apn_value.extend_from_slice(&encode_raw_vendor_avp(
+        AvpCode::new(9999),
+        apps::VENDOR_ID_3GPP,
+        false,
+        b"unknown",
+    ));
+    let extras = [encode_raw_vendor_avp(
+        apps::swm::AVP_APN_CONFIGURATION,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &apn_value,
+    )];
+    let message = build_raw_swm_dea_with_extras(&extras);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    let answer = apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::default())
+        .expect("unknown optional child AVP must be tolerated");
+    assert_eq!(answer.apn_configurations.len(), 1);
+    assert_eq!(answer.apn_configurations[0].context_identifier, 7);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_apn_configuration_rejects_malformed_child_value() {
+    // PDN-Type value shorter than the four-octet Enumerated encoding.
+    let mut apn_value = BytesMut::new();
+    apn_value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_CONTEXT_IDENTIFIER,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &7u32.to_be_bytes(),
+    ));
+    apn_value.extend_from_slice(&encode_raw_avp(
+        apps::swm::AVP_SERVICE_SELECTION,
+        true,
+        b"internet.mnc001.mcc001.gprs",
+    ));
+    apn_value.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_PDN_TYPE,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &[0x00, 0x00, 0x02],
+    ));
+    let extras = [encode_raw_vendor_avp(
+        apps::swm::AVP_APN_CONFIGURATION,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &apn_value,
+    )];
+    let message = build_raw_swm_dea_with_extras(&extras);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    let err = apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::default())
+        .expect_err("malformed PDN-Type child must be rejected");
+    assert!(matches!(
+        err.code(),
+        opc_protocol::DecodeErrorCode::InvalidLength { .. }
+    ));
+
+    // A grouped value that is not valid AVP framing must also fail closed.
+    let extras = [encode_raw_vendor_avp(
+        apps::swm::AVP_APN_CONFIGURATION,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &[0xFF, 0xFF, 0xFF],
+    )];
+    let message = build_raw_swm_dea_with_extras(&extras);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    assert!(apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::default()).is_err());
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_debug_redacts_subscription_data() {
+    let mut answer = sample_swm_answer();
+    answer.service_selection = Some("internet.mnc001.mcc001.gprs".into());
+    answer.apn_configurations = vec![sample_apn_configuration()];
+
+    let debug = format!("{:?}", answer);
+    assert!(!debug.contains("internet.mnc001"));
+    assert!(debug.contains("REDACTED"));
+    // Grouped subscription entries appear only as a count.
+    assert!(debug.contains("apn_configurations: 1"));
+
+    let debug = format!("{:?}", sample_apn_configuration());
+    assert!(!debug.contains("internet.mnc001"));
+    assert!(debug.contains("REDACTED"));
 }

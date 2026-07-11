@@ -156,6 +156,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- `opc-proto-diameter`: the SWm DEA parse now matches vendor-specific AVPs by
+  (vendor-id, code) instead of routing every vendor AVP to the unknown-AVP
+  rejection path, so a conformant DEA carrying mandatory 3GPP subscription
+  AVPs (TS 29.273) no longer fails to parse; genuinely unknown mandatory AVPs
+  remain fail-closed. The DEA additionally gains a typed, redaction-safe
+  decode/encode surface for `Service-Selection` (RFC 5778) and
+  `APN-Configuration` (TS 29.272 §7.3.35) with `Context-Identifier`,
+  `PDN-Type`, `EPS-Subscribed-QoS-Profile`, and `AMBR` children.
 - `opc-proto-gtpv2c`: S2b F-TEIDs now use the standardized ePDG/PGW data-plane
   interface type 31; the control-plane constants remain 30 and 32.
 - `opc-ipsec-xfrm`: XFRM policy templates now encode all-ones algorithm
