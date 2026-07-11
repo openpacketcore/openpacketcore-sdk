@@ -39,9 +39,10 @@
 //! segregation, AAD-bound envelope encryption, and admission control.
 //!
 //! **Session store.** [`opc_session_store`] and [`opc_session_cache`] provide
-//! quorum-replicated session databases with lease management, CAS operations,
-//! and change-stream watches. Quorum semantics are production-grade within a
-//! single process; networked replication is experimental (see `opc-session-net`).
+//! session-state, lease, fenced-CAS, change-stream, in-process quorum, and cache
+//! mechanisms. These paths are extensively tested within one process, but
+//! production use remains profile-conditional; networked replication is
+//! experimental (see `opc-session-net`).
 //!
 //! **Security substrate.** [`opc_identity`] and [`opc_tls`] handle SPIFFE
 //! workload identity, reloadable mTLS, and certificate rotation.

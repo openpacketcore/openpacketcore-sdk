@@ -3,8 +3,19 @@
 This document details the High Availability (HA) architecture and implementation for the
 OpenPacketCore config and session persistence surfaces.
 
-- **Config Store**: The config persistence layer uses `ConsensusConfigStore` (implemented in the `opc-persist` crate), a hardened HA consensus persistence backend with durable fixed membership, transport-level mTLS/SPIFFE identity validation, controlled server lifecycle, complete Raft-like safety/no-op commit gating, caught-up non-voter promotion guardrails, snapshot HMAC verification, and consensus metrics dump hooks. Checked via multi-process chaos and failover test suites. This closes the config-store HA backend gap, while broader platform hardening concerns such as SVID/bundle hot reload (`GAP-003-001`), Prometheus export (`GAP-001-004`), KMS-backed key provider support (`GAP-003-004`), and storage-fault injection (`GAP-001-005`) have been fully closed and integrated.
-- **Session Store**: The session persistence layer uses `QuorumSessionStore`, a quorum ordered-log replication adapter for authoritative session state. It closes `GAP-004-004` and `GAP-004-007` with durable ordered log replication, committed-prefix repair, watch cursors, stale-replica catch-up, and session HA chaos evidence. The dedicated local-cache invalidation contract is closed by `opc-session-cache`; remaining SDK/profile boundaries are tracked in `docs/implementation-status.md`.
+- **Config Store**: `ConsensusConfigStore` is a durable config-consensus
+  prototype with durable membership, transport-level mTLS/SPIFFE identity checks,
+  Raft-like safety guards, snapshots, metrics hooks, and multi-process fault
+  tests. These are tested prototype properties, not carrier HA qualification.
+- **Session Store**: `QuorumSessionStore` is an in-process quorum ordered-log
+  adapter with committed-prefix repair, watch cursors, stale-replica catch-up,
+  and chaos tests. Production networked HA depends on the experimental
+  `opc-session-net` transport and further distributed/soak evidence.
+
+Historical closure language below refers only to scoped algorithms and test
+harnesses. Config-store qualification (`GAP-001-006`) and production networked
+session HA (`GAP-004-004`) remain open; neither component is approved as a
+production deployment profile.
 
 ---
 
@@ -49,11 +60,14 @@ Rejoining replicas are caught up before they can participate as authoritative re
 ### Failure & Operator Assumptions
 - **Quorum Sizing**: A cluster of $N$ nodes requires a majority quorum of $\lfloor N/2 \rfloor + 1$ online nodes to commit writes or serve reads.
 - **Failure Closed**: If a partition splits the cluster such that no group has a majority, both sides fail closed. Reads and writes fail immediately, preventing split-brain or data divergence.
-- **Membership**: Durable fixed-membership configuration is persisted in the SQLite schema (`consensus_membership` table) at startup, ensuring that quorum sizing is fixed and cannot shrink accidentally. Startup is rejected if the configured node ID does not match the persisted node identity.
+- **Membership**: Initial/current membership and node identity are persisted in
+  the SQLite schema (`consensus_membership` table). Controlled voter changes use
+  the joint-consensus path, quorum cannot shrink accidentally, and startup is
+  rejected when the configured node ID differs from the persisted identity.
 
-### Config-Store HA Consensus State (GAP-001-006 Closed)
+### Config-store consensus prototype evidence (`GAP-001-006`)
 
-`ConsensusConfigStore` has closed the config-store HA backend gap with these validated properties:
+`ConsensusConfigStore` has these validated prototype properties:
 
 - **Transport-level mTLS & SPIFFE Peer Identity**: RPC communication is secured over transport-level mTLS using `rustls`. Client and server certificates are verified against the configured CA bundle, certificate SAN SPIFFE IDs are parsed with `x509-parser`, and peer identity is bound to the local node's configured SPIFFE workload profile, the expected node ID, the request cluster ID, and active cluster membership. The legacy JSON certificate fields are ignored for trust decisions.
 - **Controlled Server Concurrency & Lifecycle**: The TCP server handles connection binding with `SO_REUSEADDR` socket option enablement, implements an explicit oneshot shutdown hook, limits server-side concurrency to 100 connections via semaphore, and enforces connection handshake, read, and write timeouts (5s).

@@ -35,7 +35,8 @@ library needs a smaller dependency surface.
 
 ## Relationships
 
-- Re-exports stable SDK building blocks from sibling crates.
+- Re-exports SDK building blocks from sibling crates. Enabling a feature does
+  not attest to the production maturity of its transitive crates or adapters.
 - Leaves protocol server crates such as `opc-gnmi-server` and
   `opc-netconf-server` as direct dependencies so applications opt in
   explicitly.
@@ -50,6 +51,10 @@ Current scope:
 - Smoke examples for runtime, alarms, config, SBI, identity, and security
   prelude wiring.
 
+The facade has no independent production maturity. Each enabled crate and
+deployment profile retains its own status and limits, and the default feature
+set is a composition convenience rather than an approved production profile.
+
 Limitations:
 
 - No management protocol codec/server facade.
@@ -58,7 +63,8 @@ Limitations:
 ## Roadmap
 
 - Keep the facade narrow and feature-gated.
-- Add re-exports only for stable, broadly used SDK crates.
+- Add re-exports only for broadly used SDK crates whose maturity and limits are
+  documented.
 
 ## Verification
 

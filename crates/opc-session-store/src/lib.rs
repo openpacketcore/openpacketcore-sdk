@@ -2,9 +2,9 @@
 //! High-performance session store substrate for OpenPacketCore (RFC 004).
 //!
 //! This crate provides the core abstractions for storing, leasing, and mutating
-//! per-session network-function state with strict fencing correctness. It is
-//! designed for carrier-grade 5G CNFs where stale owners must not overwrite
-//! newer session state.
+//! per-session network-function state with strict fencing correctness. Its
+//! stale-owner protections are intended for 5G CNF session-state boundaries;
+//! production suitability remains specific to the selected backend profile.
 //!
 //! # Module map
 //!

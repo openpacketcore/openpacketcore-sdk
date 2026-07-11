@@ -11,7 +11,10 @@ of downstream CNF teams.
 Durable architecture decisions for the completed hardening work are recorded in
 [`docs/adr/`](adr/).
 
-## Final validation scope
+The task closures below are historical, scope-specific records. They are not a
+current production-profile approval or a signed release attestation.
+
+## Historical final validation scope
 
 The final pass ran after these hardening seams closed:
 
@@ -62,13 +65,12 @@ worker pane. The following gates passed:
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features`
 - Kustomize/Helm rendering checks for the reference operator
 
-Final validation for this snapshot is **not complete**: the remaining deferred
-gate below is blocked by a `cargo-deny` advisory database/tooling
-compatibility issue. It is **deferred (environment-limited),
-supervisor-waived** for this readiness snapshot. Evidence source: supervisor
-decision by `claude-supervisor` recorded for `T-8c57ecee`. The deferral is due
-to environment limitations, not code defects, and must be satisfied before any
-production/carrier-acceptance claim.
+Final validation for this historical snapshot was **not complete**: its
+`cargo-deny` advisories gate was environment-limited and supervisor-waived.
+Evidence source: the supervisor decision recorded for `T-8c57ecee`. Current CI
+includes `cargo-deny` advisories, bans, licenses, and sources checks; every
+candidate must rely on its own current results. This historical waiver is not
+current release evidence or production/carrier-acceptance approval.
 
 Go operator verification was re-run on July 3, 2026 with Go 1.26.4 for both
 `operators/sdk-reference-operator` and `operators/operator-sdk-go`: `gofmt -l`,
@@ -80,9 +82,9 @@ local `go.work` fixture.
 |:---|:---|:---|
 | `cargo deny check advisories` | Deferred (environment-limited), supervisor-waived | The installed `cargo-deny` 0.17.0 cannot parse a CVSS 4.0 entry in the cached advisory database (`RUSTSEC-2026-0146`), so the advisories check fails before scanning the local lockfile. `cargo audit --no-fetch` of the same lockfile passes. |
 
-This deferred gate must be re-run in a CI/dev environment with the required
-`cargo-deny`/advisory-db version before the initiative merges to `main` or
-before any production/carrier-acceptance readiness claim.
+At that snapshot the deferred gate still required a compatible
+`cargo-deny`/advisory-db environment. It does not describe the status of a
+current candidate.
 
 ## EPC/untrusted-access final hardening addendum
 
@@ -105,11 +107,16 @@ policy CLI and Go helper packages as auditable building blocks, then add
 product-specific CRDs, deployment privileges, network attachments, integration
 tests, and release evidence in the downstream CNF operator repository.
 
-## Current hardening status: session-store HA closed
+## HA hardening scope
 
-As of the June 8, 2026 HA review pass, both config-store HA (`GAP-001-006`) and session-store carrier HA (`GAP-004-004` and `GAP-004-007`) are closed. `QuorumSessionStore` is now the SDK's replicated session backend for authoritative session state. Its safety model is quorum ordered replication with committed-prefix repair, not standalone SQLite HA and not a Raft replacement.
+The June 8 review closed the listed algorithmic and test-harness tasks, not
+carrier HA qualification. `ConsensusConfigStore` remains a durable
+config-consensus prototype. `QuorumSessionStore` provides in-process quorum
+coordination; its production network path depends on the experimental
+`opc-session-net` transport. Neither is a production-profile claim until its
+documented graduation requirements and downstream distributed/soak gates pass.
 
-### Completed HA Features
+### Tested HA algorithm and prototype features
 
 1. **Durable Ordered Log Replication**: Replicates authoritative mutations (lease acquire, renew, release, compare-and-set, delete, TTL refresh, and batch operations) sequentially across replicas using a sequence-numbered replication log.
 2. **Idempotency & Replay Safety**: Replayed operations are duplicate-safe. State is derived strictly from log position, generation, fence, and transaction identity. Wall-clock last-writer-wins is not used.
@@ -129,7 +136,7 @@ As of the June 8, 2026 HA review pass, both config-store HA (`GAP-001-006`) and 
 | Session persistence encryption | `EncryptingSessionBackend` wraps a durable SQLite backend (`SqliteSessionBackend`) or `FakeSessionBackend`. It seals session payloads, decrypts reads and CAS conflicts, preserves legacy migration markers, and fails closed on corrupt envelopes. | `crates/opc-session-store/src/backend.rs`, `crates/opc-session-store/src/sqlite.rs`, `crates/opc-session-store/tests/sqlite.rs` |
 | Runtime alarms | `SharedAlarmManager` is used by runtime supervision and config-bus failure paths; toy NF integration uses the runtime-owned manager rather than separate toy glue. | `crates/opc-runtime/src/supervisor.rs`, `crates/opc-config-bus/src/lib.rs`, `crates/opc-sdk-integration/tests/toy_runtime.rs` |
 | Graceful drain | `DrainHook` and `NrfDrainHook` provide the shared SIGTERM/NRF drain integration point. Hook timeouts and hook errors raise drain-incomplete alarms, and `NrfRuntimeBuilderExt` gives first NF adopters a one-call registration path. | `crates/opc-runtime/src/shutdown.rs`, `crates/opc-sbi/src/nrf/mod.rs`, `crates/opc-runtime/tests/graceful_shutdown.rs` |
-| Evidence format | `opc-evidence` validates RFC 006 records, manifests, gap records, and schema fixtures. Automated extraction, deterministic SBOM/VEX generation, provenance, serialized performance baselines, bundle verification, and gate policy are implemented and release-gated. Bundle signing is exposed through signer/verifier traits plus deterministic in-process test signing; real Sigstore/Cosign integration remains an external adapter boundary. | `crates/opc-evidence/src/extract.rs`, `crates/opc-evidence/src/sbom.rs`, `crates/opc-evidence/src/vex.rs`, `crates/opc-evidence/src/provenance.rs`, `crates/opc-evidence/src/bundle.rs`, `crates/opc-evidence/src/performance.rs`, `crates/opc-evidence/src/policy.rs`, `crates/opc-evidence/tests/evidence_pipeline.rs`, `docs/implementation-status.md#known-gaps` (`GAP-006-*`) |
+| Evidence format | `opc-evidence` provides tested RFC 006 record, manifest, gap, SBOM/VEX, provenance, performance, bundle, and policy-evaluation library primitives. Embedded bundle blobs are signature-covered, but separately supplied `GateEvaluator` artifact arguments are not cross-checked against that verified bundle. Repository workflows do not yet invoke the evaluator or wire a production signer/verifier and complete artifact set. | `crates/opc-evidence/src/extract.rs`, `crates/opc-evidence/src/sbom.rs`, `crates/opc-evidence/src/vex.rs`, `crates/opc-evidence/src/provenance.rs`, `crates/opc-evidence/src/bundle.rs`, `crates/opc-evidence/src/performance.rs`, `crates/opc-evidence/src/policy.rs`, `crates/opc-evidence/tests/evidence_bundle.rs`, `crates/opc-evidence/tests/evidence_policy.rs`, `docs/implementation-status.md#known-gaps` (`GAP-006-*`) |
 | Data governance and privacy | Provides support-bundle redaction API scrubbing SUPI, secrets, IPs, and paths (`opc-redaction`), declarative `RetentionPolicy` models with legal hold enforcement (`opc-data-governance`), classification-preserving export metadata validation (`opc-export`), k-anonymity validation and cohort binning (`opc-privacy`), and data governance evidence gates (`opc-evidence`). | `crates/opc-redaction/src/support_bundle.rs`, `crates/opc-data-governance/src/retention.rs`, `crates/opc-export/src/lib.rs`, `crates/opc-privacy/src/lib.rs`, `crates/opc-evidence/src/data_governance.rs`, `crates/opc-sdk-integration/tests/privacy_governance.rs` |
 
 
@@ -163,7 +170,7 @@ operator glue:
    fail closed if the required NRF hook is missing.
 7. Use `RuntimeProfile::conformance` only for deterministic tests and evidence
    generation; do not ship lab/conformance behavior as production policy.
-8. **Install a production-ready `ConfigAuthorizer`**: Production NFs must
+8. **Install a production-profile `ConfigAuthorizer`**: Production NFs must
    install a valid authorizer (for example, enforcing NACM policies or specific
    security claims) via `ConfigBus::new`, `ConfigBus::with_queue_capacity`,
    `ConfigBus::new_with_alarm_manager`, `ConfigBus::restore_or_new`, or
@@ -183,14 +190,19 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
 - **Config Store Consensus Hardening**: `ConsensusConfigStore` provides durable membership, TCP RPC framing over real mTLS transport with SPIFFE identity verification bound to the configured workload profile and active membership, election/heartbeats, no-op commit safety, snapshot HMAC verification, controlled TCP server lifecycle (bounded concurrency/timeout/oneshot shutdown), membership-change guardrails, and consensus metrics dump hooks. Checked via the out-of-process multi-process campaigns, failovers, network partitioning, and pending commits surviving restarts.
 - **Session Store Quorum Replication**: `QuorumSessionStore` coordinates session leases and CAS mutations across a majority of replicas using a durable ordered log with watch/change-stream resume cursors, committed-prefix catch-up/read-repair, and partial quorum write rollback.
 - **Fault Coverage**: Reusable chaos test fixtures and tests cover split-brain, stale leader writes, replication lag, stale fences, restart/rejoin behavior, divergent read fail-closed behavior, clock skew, and multi-writer rejection. They also cover session-store durable rejoin/catch-up, read-repair, ordered-log replay, duplicate delivery, partial-write rollback, and prevention of failed partial-write resurrection.
-- **SQLite Writer Envelope**: Each replica still serializes local durable writes through SQLite. Config-store HA is provided by `ConsensusConfigStore` quorum replication, and session-store HA is provided by `QuorumSessionStore` ordered replication, not by standalone SQLite.
+- **SQLite Writer Envelope**: Each replica still serializes local durable writes through SQLite. `ConsensusConfigStore` and `QuorumSessionStore` provide the tested consensus and ordered-replication mechanisms described above; neither constitutes production HA qualification, and standalone SQLite is not HA.
 - **Capability Envelope**: `SqliteSessionBackend` reports CAS, fencing, TTL, lease-expiry, and batch support without `watch` or `ordered_replication_log` support. `QuorumSessionStore` reports `watch = true` and `ordered_replication_log = true`. Use `validate_backend_for_profile` or `StateClass::required_profile()` before binding a backend.
 - **Payload Bound**: The backend enforces a 1 MiB payload limit through `BackendCapabilities::max_value_bytes`; state types that need larger values require an explicit profile decision.
 - **Storage Fault-Injection**: Reusable `FaultInjectingStore` and `FaultType` adapters under `opc-persist` allow injecting disk-full, fsync/write failure, corrupt database/WAL, failed rollback target load, failed rollback point creation, audit-chain corruption, and startup recovery fencing. These hooks are compiled only with the `dangerous-test-hooks` feature and must not be enabled in production profiles. They cover all RFC 001 §14.3 failures, asserting fail-closed config publication/notifications, redacting SQL internals/raw paths/secrets from client-visible errors, raising alarms, and updating metrics.
 
 ## Machine-Readable Compatibility Policy Contract
 
-The SDK includes a production-grade compatibility policy engine under `operator-lifecycle` and `operator-controller` that enforces rules across operator version, SDK version, NF kind, NF version, CRD API version, config schema version, state schema version, required features, required runtime mode, required persistence profiles, and migration paths.
+The SDK includes a compatibility-policy foundation under `operator-lifecycle`
+and `operator-controller` for rules across operator version, SDK version, NF
+kind/version, CRD API version, config/state schema version, features, runtime
+mode, persistence profiles, and migration paths. Production use remains
+conditional on boundary hardening, real rollback capability, bounded inputs and
+deadlines, and downstream controller integration.
 
 ### Core Policies:
 1. **Strict Serde Boundaries**: All compatibility structures use `#[serde(deny_unknown_fields)]` to reject malformed or unknown fields.
@@ -203,7 +215,12 @@ The SDK includes a production-grade compatibility policy engine under `operator-
 
 ## Platform Preflight Contract (GAP-011-003 through GAP-011-007)
 
-The SDK provides a comprehensive production platform preflight enforcement layer. This layer validates that the host node configuration matches the CNF workload specification before admission or rollout readiness can pass. In Production mode, checks **fail closed** immediately; in Lab mode, violations trigger degraded states/warnings but allow fallback.
+The SDK provides a platform-preflight model and pure validation layer. It
+compares supplied node capabilities with a CNF workload specification for
+admission and rollout policy. `RuntimeMode::Production` selects fail-closed
+validation rules; it is a configuration mode, not production-readiness or
+deployment approval. In Lab mode, violations trigger degraded states or
+warnings and may allow explicit fallback.
 
 ### Preflight Contract Elements:
 1. **CPU & NUMA Layout (GAP-011-003)**:
@@ -234,7 +251,11 @@ The SDK provides a comprehensive production platform preflight enforcement layer
 
 ## Runtime Resource Budget & Hardening Contract (GAP-008-003 and GAP-008-004)
 
-The SDK guarantees runtime stability and resource isolation in `opc-runtime` through an explicit Tokio-runtime construction helper and SDK-level supervisor gates. In `Production` mode, the runtime **fails closed** during bootstrap if limits are absent or invalid.
+The SDK exposes runtime-budget declarations, a Tokio-runtime construction
+helper, and selected admission and supervisor checks in `opc-runtime`. These
+mechanisms do not guarantee complete runtime stability or resource isolation.
+In `RuntimeMode::Production`, bootstrap fails closed when required SDK budget
+limits are absent or invalid; the mode name is not a maturity designation.
 
 ### Hardening & Resource Contracts:
 1. **Explicit Budget Mandate (GAP-008-003)**:
@@ -304,9 +325,21 @@ To demonstrate how the Rust SDK policy contracts are consumed by a Go operator, 
 
 ## Production readiness and reference boundaries
 
-The P0 Rust SDK production-readiness blockers are closed, but the SDK should not be presented as universally carrier-production-ready until remaining P1 boundaries are either completed or explicitly accepted for a target deployment. The Go SDK reference operator harness itself is not Kubernetes-operator-ready as a production-grade product deployment, and is a reference-only harness not intended for managing carrier-grade network functions in production. Downstream teams must build their own production CNF operators wrapping these SDK contracts and validate them in envtest/kind/cluster environments.
+The dated hardening tasks documented here are closed within their stated
+SDK/library scopes. That does not establish closure of every current P0
+production-readiness blocker or make the workspace universally
+carrier-production-ready. Production readiness must be assessed for a named
+feature, persistence, platform, and deployment profile using current
+candidate-specific evidence. The Go SDK reference operator is a reference
+harness and is not Kubernetes-operator-ready as a production product;
+downstream teams must add their own controller behavior and envtest, kind, and
+cluster validation.
 
-Furthermore, the SDK provides procedure-faithful peer simulators, reusable testkits, dry-run runners, and compliant evidence output, but the SDK does not become a production CNF, nor does it become the production Kubernetes operator. Live hardware lab execution remains dependent on downstream environment wiring.
+The SDK provides peer-simulator and testkit primitives, dry-run runners, and
+evidence schema/policy primitives. The repository does not yet generate and
+enforce the complete signed RFC 006 release bundle, and the SDK is neither a
+production CNF nor a production Kubernetes operator. Live hardware and
+downstream product validation remain deployment responsibilities.
 
 The first in-tree NF proof is `opc-amf-lite`, an AMF-oriented N2/N1 control-plane
 slice. IKEv2/IPsec, ESP/xfrm orchestration, and N3IWF/NWu procedure crates are
@@ -340,13 +373,22 @@ The following items are updated in `docs/implementation-status.md`:
   - `GAP-011-007` (Strict lab fallback gating in Production mode).
   - `GAP-008-003` (Tokio runtime builder profile mapping and runtime budget validation).
   - `GAP-008-004` (Hung-task and memory-budget fault injection verification).
-  - `GAP-006-001` through `GAP-006-006` (RFC 006 Release Assurance and Evidence pipeline, including automated extraction, CycloneDX SBOM/VEX, SLSA provenance, bundle assembly/signing traits, performance baselines, and fail-closed gate policy).
+  - `GAP-006-001` through `GAP-006-006` at library-API scope (RFC 006 extraction, SBOM/VEX, provenance, bundle/signing traits, performance, and gate-policy primitives). End-to-end workflow integration remains open as `GAP-006-007`.
   - `GAP-012-001` (Procedure-faithful AMF, SMF, and UPF simulator state machines with deterministic chaos/failure/clock injection).
   - `GAP-012-002` (First reusable per-NF testkit crate `opc-amf-lite-testkit` and documented testkit adoption pattern).
   - `GAP-012-003` (Local in-process runner, Kubernetes `kind` dry-run manifest runner, and `hardware-lab` dry-run preflight validation runner).
 - **Narrowed / Partial**:
-  (None in this category)
+  - RFC 001 config consensus has extensive prototype evidence, but carrier HA
+    qualification remains open.
+  - RFC 004 ordered-quorum semantics are tested in process, but networked
+    session HA is not graduated.
+  - RFC 006 evidence primitives are implemented as library APIs, but the full
+    candidate artifact set, production signer/verifier wiring, cross-checking
+    of separately supplied policy artifacts against the verified bundle, and
+    workflow enforcement are incomplete.
 - **Open / Remaining Gaps**:
-  (None in this category for evidence/release assurance)
+  - `GAP-001-006` (config-store carrier HA qualification).
+  - `GAP-004-004` (production networked session HA qualification).
+  - `GAP-006-007` (end-to-end RFC 006 PR/release workflow integration).
 
 Operators can use the new `operator-lifecycle` library, the `operator-controller` execution layer, and the `operators/sdk-reference-operator` Go harness to model state, run webhooks, perform platform preflights, and aggregate fleet statuses. However, product-specific logic for real CNF deployments remains the responsibility of individual CNF teams.

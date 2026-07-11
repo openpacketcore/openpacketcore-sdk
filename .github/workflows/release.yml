@@ -88,9 +88,9 @@ jobs:
   #   1. Add a CARGO_REGISTRY_TOKEN repository secret (a crates.io API token
   #      scoped to publish).
   #   2. Uncomment the job below.
-  # The job publishes only tier-1 crates (crates with `publish = false` are
-  # skipped by `scripts/publish-order.py`, which emits dependency order), and
-  # dry-runs the full set before the first real publish.
+  # The job publishes Cargo-publishable workspace crates (packages with
+  # `publish = false` are skipped by `scripts/publish-order.py`, which emits
+  # dependency order), and dry-runs the full set before the first real publish.
   #
   # publish:
   #   name: Publish to crates.io
@@ -111,7 +111,7 @@ jobs:
   #           cargo publish -p "$crate" --locked --dry-run --no-verify
   #         done
   #
-  #     - name: Publish tier-1 crates in dependency order
+  #     - name: Publish Cargo-publishable crates in dependency order
   #       env:
   #         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
   #       run: |

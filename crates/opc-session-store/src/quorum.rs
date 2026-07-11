@@ -117,7 +117,7 @@ impl FencedSessionReplica {
     }
 }
 
-/// Production-ready replicated quorum session-store adapter over a set of replicas.
+/// In-process replicated quorum session-store adapter over a set of replicas.
 ///
 /// This adapter coordinates CAS and lease operations across a majority of
 /// replicas, backed by a durable replication log and read-repair recovery.

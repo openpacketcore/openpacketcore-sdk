@@ -4,6 +4,9 @@
 
 Accepted
 
+This status accepts the architectural decision. It does not mean the complete
+pipeline is implemented; the implementation status below remains partial.
+
 ## Date
 
 2026-06-08
@@ -16,7 +19,8 @@ assurance, and auditability.
 
 ## Decision
 
-`opc-evidence` is the RFC 006 release-assurance pipeline.
+`opc-evidence` defines the SDK-owned data model and policy engine for the RFC
+006 release-assurance pipeline.
 
 It provides:
 
@@ -34,6 +38,15 @@ It provides:
 - PR/release gate policy that fails closed on missing evidence, missing
   signatures, tampering, mismatched commits, dirty release provenance, malformed
   JSON, or unsafe evidence content.
+
+### Implementation status
+
+The library primitives are implemented and tested. Repository workflows do not
+yet produce and enforce the complete RFC 006 artifact set or invoke the release
+policy evaluator. Embedded bundle blobs are covered by the bundle signature and
+manifest digests, but artifact arguments supplied separately to `GateEvaluator`
+are not cross-checked against that verified bundle. Consequently, this ADR's
+end-to-end pipeline decision is only partially implemented.
 
 ## Consequences
 
@@ -53,5 +66,7 @@ hard dependency on one hosted signing provider.
 - `crates/opc-evidence/src/bundle.rs`
 - `crates/opc-evidence/src/performance.rs`
 - `crates/opc-evidence/src/policy.rs`
-- `crates/opc-evidence/tests/evidence_pipeline.rs`
-
+- `crates/opc-evidence/tests/evidence_bundle.rs`
+- `crates/opc-evidence/tests/evidence_policy.rs`
+- `crates/opc-evidence/tests/evidence_sbom_vex.rs`
+- `crates/opc-evidence/tests/evidence_provenance.rs`

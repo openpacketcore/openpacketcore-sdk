@@ -7,22 +7,22 @@ This document defines the conformance of the `opc-proto-pfcp` crate against
 
 - **Document**: 3GPP TS 29.244
 - **Release**: Release 18 (R18)
-- **Status**: v3 — session-management codec subset complete and published;
-  Production Profile v1 is implemented for the N4 codec and validation boundary
-  defined below
+- **Status**: v3 — session-management codec subset implemented and published;
+  `Production Profile v1` is a compatibility identifier for the N4 codec
+  candidate below, not a current production approval
 
 ## Production Profile v1 — N4 Codec and Validation
 
-`opc-proto-pfcp` Production Profile v1 is intentionally a **codec and
-validation profile** for SMF/UPF N4 integration. It includes typed construction,
-decode, encode, and semantic validation for the profile-owned procedures below.
-It does not claim to implement an SMF, UPF, PFCP transport stack, node
-selection, local policy, charging, persistence, or high-availability
-control-plane behavior.
+`opc-proto-pfcp` retains `Production Profile v1` as its public **codec and
+validation profile** identifier for SMF/UPF N4 integration. The identifier does
+not attest production maturity. The profile includes typed construction,
+decode, encode, and semantic validation for the procedures below. It does not
+claim to implement an SMF, UPF, PFCP transport stack, node selection, local
+policy, charging, persistence, or high-availability control-plane behavior.
 
 ### Profile-owned procedures
 
-The production profile owns typed decode, encode, construction, and semantic
+The named profile owns typed decode, encode, construction, and semantic
 validation for these PFCP procedures:
 
 | Procedure | Message types | Profile requirement |
@@ -37,7 +37,7 @@ validation for these PFCP procedures:
 
 ### Profile-owned IE families
 
-The production profile owns the IE families needed for N4 session-management
+The named profile owns the IE families needed for N4 session-management
 flows:
 
 - Node and recovery IEs: Node ID, Recovery Time Stamp, Cause, Offending IE.
@@ -91,8 +91,8 @@ profile failures and must cover at least these rules:
   the raw layer.
 - Builder APIs added for this profile must not construct messages missing
   mandatory profile-owned IEs.
-- Semantic validation APIs must be additive and stable under semver once this
-  profile is marked production-ready.
+- Semantic validation APIs must be additive and stable under semver if this
+  profile is later graduated.
 
 ### Explicit non-goals
 
@@ -252,11 +252,13 @@ preallocate from a wire-declared length. Three layers guard them:
 - `examples/production_profile_v1.rs` is the runnable profile-v1 integration
   example for downstream SDK users.
 
-## Remaining Production Boundary
+## Remaining Graduation Boundary
 
-The profile is production-ready only for the N4 codec and validation boundary
-documented above. The following are outside the production claim unless a future
-profile explicitly adds them.
+The profile is not currently production-approved. Graduation requires fixing
+encoder capacity and header/length invariants, scoping declared-PDU limits to
+the decoded message rather than unrelated tail bytes, and adding independent N4
+fixture/peer evidence. The following also remain outside the candidate boundary
+unless a future profile explicitly adds them.
 
 ## Codec Boundary (v1+)
 

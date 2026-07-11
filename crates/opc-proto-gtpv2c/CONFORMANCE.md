@@ -3,8 +3,9 @@
 ## Scope
 
 - **Specification family:** 3GPP TS 29.274 (GTPv2-C), Release 18 naming.
-- **Crate status:** S2b-focused typed subset with a raw-preserving message/IE
-  shell and S2b Production Profile v1 available for the documented boundary.
+- **Crate status:** Experimental S2b-focused typed subset with a raw-preserving
+  message/IE shell. `S2b Production Profile v1` is the retained candidate
+  identifier for the documented boundary, not a maturity attestation.
 - **Implemented evidence:** common-header structural parsing, raw TLIV IE
   boundary validation, raw-preserving encode/decode, provenance-labeled fixture
   corpus replay, independent-capture intake checks, malformed-input replay,
@@ -15,11 +16,11 @@
   Public profile constructors cover Echo, Create Session, Modify Bearer,
   Delete Session, and Update Bearer profile-owned request/response shapes.
 
-## S2b Production Profile v1 — Target Boundary
+## S2b Production Profile v1 — Experimental Target Boundary
 
-S2b Production Profile v1 is the first production-ready boundary for
-`opc-proto-gtpv2c`. The profile is a **codec, typed-view, validation, and
-transport-neutral helper profile** for ePDG/PGW S2b integration. It does not
+S2b Production Profile v1 is a retained public identifier for an experimental
+**codec, typed-view, validation, and transport-neutral helper profile** for
+ePDG/PGW S2b integration. It is not a production-ready boundary. It does not
 claim to implement a PGW, ePDG, UDP transport, retransmission loop, bearer
 policy engine, APN/DNN authorization service, charging policy, roaming policy,
 independent-peer interoperability, or carrier-accepted control-plane product.
@@ -77,18 +78,20 @@ failures and must cover at least these rules:
   unknown and vendor-specific IEs.
 - Typed builders added for this profile must not construct messages missing
   mandatory profile-owned IEs.
-- Procedure-aware validation APIs and stable projection/error codes must remain
-  additive under semver once this profile is marked production-ready.
+- Procedure-aware validation APIs and projection/error codes must remain
+  additive under semver if this profile is later graduated.
 - Product code must continue to enforce APN/DNN policy, bearer policy, roaming
   policy, charging policy, persistence, and transport behavior outside this
   crate.
 
 ### Graduation status
 
-No open graduation blockers remain for the documented S2b Production Profile v1
-boundary. Future expansion of this boundary must add the same constructor,
-ProcedureAware validation, positive fixture, malformed negative fixture, example,
-and fuzz-seed mirror evidence before claiming additional production coverage.
+Open graduation blockers include correct MP-flag/priority handling, independent
+peer interoperability, and completion of the declared compatibility and
+negative-evidence matrix. Future expansion of this boundary must add the same
+constructor, `ProcedureAware` validation, positive fixture, malformed negative
+fixture, example, and fuzz-seed mirror evidence before claiming additional
+coverage.
 
 ## Covered in this subset
 
