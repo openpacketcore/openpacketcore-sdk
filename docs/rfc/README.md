@@ -22,6 +22,7 @@ engineers.
 | [012](012-testbed-simulator-framework.md) | Testbed and Simulator Framework | Scenario DSL, simulators, fixtures, virtual time |
 | [013](013-fault-management-alarm-substrate.md) | Fault Management and Alarm Substrate | Alarms, severity, probable cause, FM sinks |
 | [014](014-interactive-operational-console.md) | Interactive Operational Console and Command Framework | CNF command catalogs, human login, typed operations, first-class TUI |
+| [015](015-live-sa-mirror.md) | Live SA Keymat Mirror | Keys-never-persist failover, standby custody, mTLS keymat transport, re-pin composition |
 
 ## Recommended Reading Order
 
@@ -31,14 +32,15 @@ engineers.
 4. RFC 002: YANG projection.
 5. RFC 007: SBI framework.
 6. RFC 004: session store.
-7. RFC 005: protocol framework.
-8. RFC 009: operator lifecycle.
-9. RFC 010: data governance.
-10. RFC 011: node/data-plane resources.
-11. RFC 013: fault management.
-12. RFC 014: interactive operational console.
-13. RFC 012: testbed framework.
-14. RFC 006: evidence pipeline.
+7. RFC 015: live SA keymat mirror.
+8. RFC 005: protocol framework.
+9. RFC 009: operator lifecycle.
+10. RFC 010: data governance.
+11. RFC 011: node/data-plane resources.
+12. RFC 013: fault management.
+13. RFC 014: interactive operational console.
+14. RFC 012: testbed framework.
+15. RFC 006: evidence pipeline.
 
 RFC 006 should be revisited after each implementation slice because it defines
 the evidence required to claim that the slice is complete.
