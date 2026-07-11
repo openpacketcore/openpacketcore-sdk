@@ -671,7 +671,9 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
         ),
         StoreError::PayloadTooLarge { .. }
         | StoreError::InvalidRestoreScanRequest(_)
-        | StoreError::RestoreScanPageTooLarge { .. } => {
+        | StoreError::InvalidRestoreScanResponse(_)
+        | StoreError::RestoreScanPageTooLarge { .. }
+        | StoreError::RestoreScanResponseTooLarge { .. } => {
             IpsecLbError::invalid_config("session_store", "session-store read failed")
         }
     }

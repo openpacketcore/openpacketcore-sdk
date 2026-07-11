@@ -615,7 +615,9 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::Serialization(_) => "serialization",
         StoreError::PayloadTooLarge { .. } => "payload_too_large",
         StoreError::InvalidRestoreScanRequest(_) => "invalid_restore_scan_request",
+        StoreError::InvalidRestoreScanResponse(_) => "invalid_restore_scan_response",
         StoreError::RestoreScanPageTooLarge { .. } => "restore_scan_page_too_large",
+        StoreError::RestoreScanResponseTooLarge { .. } => "restore_scan_response_too_large",
     }
 }
 

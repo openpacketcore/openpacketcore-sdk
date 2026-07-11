@@ -5,14 +5,18 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use opc_session_store::backend::CompareAndSetResult;
+use opc_session_store::error::StoreError;
 use opc_session_store::quorum::SessionStoreBackend;
+use opc_session_store::{RestoreScanCursor, RestoreScanPage, RestoreScanRequest};
+use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
 use tracing;
 
 use crate::error::ProtocolError;
 use crate::protocol::{
-    read_frame_within, write_frame, Request, Response, CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE,
+    ensure_frame_fits, read_frame_within, write_frame, write_frame_within, Request, Response,
+    CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE, MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE,
 };
 
 /// Handle to a running [`SessionReplicationServer`].
@@ -44,7 +48,111 @@ impl ServerHandle {
 
 /// Default per-frame read deadline for accepted connections.
 const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFAULT_RESTORE_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const RESTORE_SCAN_CONCURRENCY: usize = 1;
 const CAS_IDEMPOTENCY_CACHE_CAPACITY: usize = 4096;
+
+#[derive(Clone)]
+struct DispatchConfig {
+    max_frame_size: usize,
+    idle_timeout: std::time::Duration,
+    restore_scan_timeout: std::time::Duration,
+    restore_scan_slots: Arc<Semaphore>,
+}
+
+#[derive(Serialize)]
+enum RestoreScanResponseRef<'a> {
+    ScanRestoreRecords(Result<&'a RestoreScanPage, &'a StoreError>),
+}
+
+fn bounded_restore_scan_response(
+    result: Result<RestoreScanPage, StoreError>,
+    request: &RestoreScanRequest,
+    max_response_frame_size: usize,
+) -> Result<Response, ProtocolError> {
+    let mut page = match result {
+        Ok(page) => page,
+        Err(error) => return bounded_restore_scan_error_response(error, max_response_frame_size),
+    };
+
+    if let Err(error) = page.validate_for_request(request) {
+        return bounded_restore_scan_error_response(error, max_response_frame_size);
+    }
+
+    loop {
+        let response = RestoreScanResponseRef::ScanRestoreRecords(Ok(&page));
+        match ensure_frame_fits(&response, max_response_frame_size) {
+            Ok(()) => return Ok(Response::ScanRestoreRecords(Ok(page))),
+            Err(ProtocolError::FrameTooLarge(_)) if page.records.len() > 1 => {
+                let retained = (page.records.len() / 2).max(1);
+                page.records.truncate(retained);
+                page.loaded_count = page.records.len();
+                let start = request.cursor.map(RestoreScanCursor::offset).unwrap_or(0);
+                let next = start.checked_add(page.records.len()).ok_or_else(|| {
+                    ProtocolError::BackendUnavailable(
+                        "restore scan cursor overflowed while fitting response".to_string(),
+                    )
+                })?;
+                page.next_cursor = Some(RestoreScanCursor::from_offset(next));
+                page.complete = false;
+            }
+            Err(ProtocolError::FrameTooLarge(_)) => {
+                return bounded_restore_scan_error_response(
+                    StoreError::RestoreScanResponseTooLarge {
+                        max_bytes: max_response_frame_size,
+                    },
+                    max_response_frame_size,
+                );
+            }
+            Err(other) => return Err(other),
+        }
+    }
+}
+
+fn bounded_restore_scan_error_response(
+    error: StoreError,
+    max_response_frame_size: usize,
+) -> Result<Response, ProtocolError> {
+    let response = Response::ScanRestoreRecords(Err(sanitize_restore_scan_error(error)));
+    match ensure_frame_fits(&response, max_response_frame_size) {
+        Ok(()) => Ok(response),
+        Err(ProtocolError::FrameTooLarge(_)) => {
+            let fallback = Response::ScanRestoreRecords(Err(StoreError::BackendUnavailable(
+                "restore scan error exceeded the response limit".to_string(),
+            )));
+            ensure_frame_fits(&fallback, max_response_frame_size)?;
+            Ok(fallback)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+fn sanitize_restore_scan_error(error: StoreError) -> StoreError {
+    match error {
+        StoreError::CapabilityNotSupported(_) => {
+            StoreError::CapabilityNotSupported("restore_scan".to_string())
+        }
+        StoreError::BackendUnavailable(_) => {
+            StoreError::BackendUnavailable("restore scan backend unavailable".to_string())
+        }
+        StoreError::InvalidKey(_) => {
+            StoreError::InvalidKey("restore scan backend rejected a record".to_string())
+        }
+        StoreError::Crypto(_) => {
+            StoreError::Crypto("restore scan record cryptography failed".to_string())
+        }
+        StoreError::Serialization(_) => {
+            StoreError::Serialization("restore scan record decoding failed".to_string())
+        }
+        StoreError::InvalidRestoreScanRequest(_) => {
+            StoreError::InvalidRestoreScanRequest("restore scan request was rejected".to_string())
+        }
+        StoreError::InvalidRestoreScanResponse(_) => StoreError::InvalidRestoreScanResponse(
+            "restore scan backend returned an invalid page".to_string(),
+        ),
+        other => other,
+    }
+}
 
 #[derive(Debug, Default)]
 struct CasIdempotencyCache {
@@ -81,6 +189,7 @@ pub struct SessionReplicationServer {
     max_connections: usize,
     max_frame_size: usize,
     idle_timeout: std::time::Duration,
+    restore_scan_timeout: std::time::Duration,
     cas_idempotency_cache: Arc<Mutex<CasIdempotencyCache>>,
 }
 
@@ -90,6 +199,7 @@ impl fmt::Debug for SessionReplicationServer {
             .field("tls_config", &self.tls_config.is_some())
             .field("max_connections", &self.max_connections)
             .field("max_frame_size", &self.max_frame_size)
+            .field("restore_scan_timeout", &self.restore_scan_timeout)
             .finish()
     }
 }
@@ -110,6 +220,7 @@ impl SessionReplicationServer {
             max_connections: 128,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            restore_scan_timeout: DEFAULT_RESTORE_SCAN_TIMEOUT,
             cas_idempotency_cache: Arc::new(Mutex::new(CasIdempotencyCache::default())),
         }
     }
@@ -123,6 +234,7 @@ impl SessionReplicationServer {
             max_connections: 128,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            restore_scan_timeout: DEFAULT_RESTORE_SCAN_TIMEOUT,
             cas_idempotency_cache: Arc::new(Mutex::new(CasIdempotencyCache::default())),
         }
     }
@@ -132,6 +244,14 @@ impl SessionReplicationServer {
     /// freeing its connection slot.
     pub fn with_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.idle_timeout = timeout;
+        self
+    }
+
+    /// Set the maximum duration of one cancellable backend restore-scan
+    /// request. Blocking backend implementations must enforce their own work
+    /// bounds; bounded SQLite/quorum scan work remains tracked in #133.
+    pub fn with_restore_scan_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.restore_scan_timeout = timeout;
         self
     }
 
@@ -159,8 +279,12 @@ impl SessionReplicationServer {
         let tls_config = self.tls_config.clone();
         let backend = self.backend.clone();
         let cas_idempotency_cache = self.cas_idempotency_cache.clone();
-        let max_frame_size = self.max_frame_size;
-        let idle_timeout = self.idle_timeout;
+        let dispatch_config = DispatchConfig {
+            max_frame_size: self.max_frame_size,
+            idle_timeout: self.idle_timeout,
+            restore_scan_timeout: self.restore_scan_timeout,
+            restore_scan_slots: Arc::new(Semaphore::new(RESTORE_SCAN_CONCURRENCY)),
+        };
         let connection_handles = Arc::new(Mutex::new(Vec::new()));
         let connection_handles_clone = connection_handles.clone();
 
@@ -180,6 +304,7 @@ impl SessionReplicationServer {
                                 let backend = backend.clone();
                                 let tls_config = tls_config.clone();
                                 let cas_idempotency_cache = cas_idempotency_cache.clone();
+                                let dispatch_config = dispatch_config.clone();
                                 let handles = connection_handles_clone.clone();
                                 tracing::debug!(%peer, "accepted connection");
                                 let conn_handle = tokio::spawn(async move {
@@ -189,8 +314,7 @@ impl SessionReplicationServer {
                                         stream,
                                         tls_config,
                                         cas_idempotency_cache,
-                                        max_frame_size,
-                                        idle_timeout,
+                                        dispatch_config,
                                     )
                                     .await
                                     {
@@ -224,9 +348,9 @@ async fn handle_connection(
     stream: TcpStream,
     tls_config: Option<Arc<opc_tls::ServerConfig>>,
     cas_idempotency_cache: Arc<Mutex<CasIdempotencyCache>>,
-    max_frame_size: usize,
-    idle_timeout: std::time::Duration,
+    dispatch_config: DispatchConfig,
 ) -> Result<(), ProtocolError> {
+    let idle_timeout = dispatch_config.idle_timeout;
     if let Some(tls_config) = tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
         let tls_stream = tokio::time::timeout(idle_timeout, acceptor.accept(stream))
@@ -244,8 +368,7 @@ async fn handle_connection(
             cas_idempotency_cache,
             &mut r,
             &mut w,
-            max_frame_size,
-            idle_timeout,
+            dispatch_config,
         )
         .await
     } else {
@@ -255,8 +378,7 @@ async fn handle_connection(
             cas_idempotency_cache,
             &mut r,
             &mut w,
-            max_frame_size,
-            idle_timeout,
+            dispatch_config,
         )
         .await
     }
@@ -267,13 +389,19 @@ async fn dispatch<R, W>(
     cas_idempotency_cache: Arc<Mutex<CasIdempotencyCache>>,
     reader: &mut R,
     writer: &mut W,
-    max_frame_size: usize,
-    idle_timeout: std::time::Duration,
+    dispatch_config: DispatchConfig,
 ) -> Result<(), ProtocolError>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    let DispatchConfig {
+        max_frame_size,
+        idle_timeout,
+        restore_scan_timeout,
+        restore_scan_slots,
+    } = dispatch_config;
+
     // Hello handshake — bounded so a peer that connects and stalls is reaped.
     let hello: Request = read_frame_within(reader, max_frame_size, idle_timeout).await?;
     match hello {
@@ -281,16 +409,25 @@ where
             contract_version, ..
         } => {
             if contract_version != CONTRACT_VERSION {
+                write_frame_within(
+                    writer,
+                    &Response::HelloAck {
+                        contract_version: CONTRACT_VERSION,
+                    },
+                    idle_timeout,
+                )
+                .await?;
                 return Err(ProtocolError::VersionMismatch {
                     local: CONTRACT_VERSION,
                     remote: contract_version,
                 });
             }
-            write_frame(
+            write_frame_within(
                 writer,
                 &Response::HelloAck {
                     contract_version: CONTRACT_VERSION,
                 },
+                idle_timeout,
             )
             .await?;
         }
@@ -311,7 +448,10 @@ where
 
         match req {
             Request::Capabilities => {
-                let caps = backend.capabilities().await;
+                let mut caps = backend.capabilities().await;
+                if max_frame_size < MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE {
+                    caps.restore_scan = false;
+                }
                 write_frame(writer, &Response::Capabilities(caps)).await?;
             }
             Request::Get { key } => {
@@ -351,6 +491,63 @@ where
             Request::Batch { ops } => {
                 let res = backend.batch(ops).await;
                 write_frame(writer, &Response::Batch(res)).await?;
+            }
+            Request::ScanRestoreRecords {
+                request: wire_request,
+                max_response_frame_size,
+            } => {
+                let client_max = usize::try_from(max_response_frame_size).map_err(|_| {
+                    ProtocolError::BackendUnavailable(
+                        "restore scan response limit is not representable".to_string(),
+                    )
+                })?;
+                let effective_max = client_max.min(max_frame_size);
+                if effective_max < MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE {
+                    return Err(ProtocolError::FrameTooLarge(
+                        MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE,
+                    ));
+                }
+
+                let request = match RestoreScanRequest::try_from(wire_request) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let response = bounded_restore_scan_error_response(error, effective_max)?;
+                        write_frame_within(writer, &response, idle_timeout).await?;
+                        continue;
+                    }
+                };
+
+                let permit = match restore_scan_slots.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        let response = bounded_restore_scan_error_response(
+                            StoreError::BackendUnavailable(
+                                "restore scan capacity exhausted".to_string(),
+                            ),
+                            effective_max,
+                        )?;
+                        write_frame_within(writer, &response, idle_timeout).await?;
+                        continue;
+                    }
+                };
+                let mut backend_request = request.clone();
+                let frame_limited_records =
+                    (effective_max / MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE).max(1);
+                backend_request.limit = backend_request.limit.min(frame_limited_records);
+                let result = match tokio::time::timeout(
+                    restore_scan_timeout,
+                    backend.scan_restore_records(backend_request),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_elapsed) => Err(StoreError::BackendUnavailable(
+                        "restore scan exceeded the server deadline".to_string(),
+                    )),
+                };
+                let response = bounded_restore_scan_response(result, &request, effective_max)?;
+                drop(permit);
+                write_frame_within(writer, &response, idle_timeout).await?;
             }
             Request::MaxReplicationSequence => {
                 let res = backend.max_replication_sequence().await;
@@ -418,6 +615,30 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use opc_session_store::{
+        EncryptedSessionPayload, FenceToken, Generation, OwnerId, SessionKey, SessionKeyType,
+        StateClass, StateType, StoredSessionRecord,
+    };
+    use opc_types::{NetworkFunctionKind, TenantId};
+
+    fn restore_record(stable_id: &'static [u8], payload_len: usize) -> StoredSessionRecord {
+        StoredSessionRecord {
+            key: SessionKey {
+                tenant: TenantId::from_static("tenant-a"),
+                nf_kind: NetworkFunctionKind::from_static("smf"),
+                key_type: SessionKeyType::PduSession,
+                stable_id: Bytes::from_static(stable_id),
+            },
+            generation: Generation::new(1),
+            owner: OwnerId::new("owner-a").expect("owner"),
+            fence: FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("pdu-session"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(vec![7; payload_len]),
+        }
+    }
 
     #[test]
     fn cas_idempotency_cache_retains_successes_with_bound() {
@@ -433,5 +654,81 @@ mod tests {
         assert_eq!(cache.entries.len(), CAS_IDEMPOTENCY_CACHE_CAPACITY);
         assert_eq!(cache.get("first"), None);
         assert_eq!(cache.get("request-0"), Some(CompareAndSetResult::Success));
+    }
+
+    #[test]
+    fn bounded_restore_scan_response_truncates_and_advances_cursor() {
+        let request = RestoreScanRequest {
+            scope: Default::default(),
+            cursor: Some(RestoreScanCursor::from_offset(7)),
+            limit: 2,
+        };
+        let first = restore_record(b"a", 64);
+        let second = restore_record(b"b", 64);
+        let full_page = RestoreScanPage::new(vec![first.clone(), second], 0, None);
+        let expected_prefix =
+            RestoreScanPage::new(vec![first], 0, Some(RestoreScanCursor::from_offset(8)));
+        let budget = serde_json::to_vec(&Response::ScanRestoreRecords(Ok(expected_prefix.clone())))
+            .expect("encode prefix")
+            .len();
+        assert!(
+            serde_json::to_vec(&Response::ScanRestoreRecords(Ok(full_page.clone())))
+                .expect("encode full page")
+                .len()
+                > budget
+        );
+
+        let response = bounded_restore_scan_response(Ok(full_page), &request, budget)
+            .expect("bounded response");
+        assert!(matches!(
+            response,
+            Response::ScanRestoreRecords(Ok(page)) if page == expected_prefix
+        ));
+    }
+
+    #[test]
+    fn borrowed_restore_response_has_the_owned_wire_shape() {
+        let page = RestoreScanPage::new(vec![restore_record(b"a", 8)], 0, None);
+        let borrowed = RestoreScanResponseRef::ScanRestoreRecords(Ok(&page));
+        let owned = Response::ScanRestoreRecords(Ok(page.clone()));
+
+        assert_eq!(
+            serde_json::to_vec(&borrowed).expect("encode borrowed response"),
+            serde_json::to_vec(&owned).expect("encode owned response")
+        );
+    }
+
+    #[test]
+    fn single_oversized_restore_record_returns_a_bounded_typed_error() {
+        let request = RestoreScanRequest::all(1);
+        let page = RestoreScanPage::new(vec![restore_record(b"large", 2048)], 0, None);
+
+        let response =
+            bounded_restore_scan_response(Ok(page), &request, MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE)
+                .expect("bounded response");
+        assert!(matches!(
+            response,
+            Response::ScanRestoreRecords(Err(StoreError::RestoreScanResponseTooLarge {
+                max_bytes: MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE
+            }))
+        ));
+    }
+
+    #[test]
+    fn backend_error_text_is_replaced_with_a_fixed_message() {
+        let response = bounded_restore_scan_response(
+            Err(StoreError::BackendUnavailable(
+                "secret database path and schema details".to_string(),
+            )),
+            &RestoreScanRequest::all(1),
+            MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE,
+        )
+        .expect("bounded error response");
+
+        assert!(matches!(
+            response,
+            Response::ScanRestoreRecords(Err(StoreError::BackendUnavailable(message)))
+                if message == "restore scan backend unavailable"
+        ));
     }
 }

@@ -8,8 +8,8 @@ OpenPacketCore config and session persistence surfaces.
   Raft-like safety guards, snapshots, metrics hooks, and multi-process fault
   tests. These are tested prototype properties, not carrier HA qualification.
 - **Session Store**: `QuorumSessionStore` is an in-process quorum ordered-log
-  adapter with committed-prefix repair, watch cursors, stale-replica catch-up,
-  and chaos tests. Production networked HA depends on the experimental
+  adapter with a majority-visible-prefix repair prototype, watch cursors,
+  stale-replica catch-up, and chaos tests. Production networked HA depends on the experimental
   `opc-session-net` transport and further distributed/soak evidence.
 
 Historical closure language below refers only to scoped algorithms and test
@@ -86,16 +86,34 @@ Platform hardening concerns—including TLS/SPIFFE SVID and bundle watch/reload 
 
 ## 2. Replicated Session Store Ordered Log: `QuorumSessionStore`
 
-`QuorumSessionStore` coordinates session leases and CAS mutations across a set of `SessionStoreBackend` replicas using quorum-backed ordered replication. It is not a Raft implementation; its safety contract is a durable committed log prefix where an entry is authoritative only after the same sequence entry is present on a majority of reachable replicas.
+The algorithm below describes intended and prototype-tested behavior; it is not
+yet durable distributed proof or a production deployment contract. Validated
+topology/readiness/identity (#123–#125), durable sequencing and safe fork
+recovery (#127–#129), and bounded majority-authoritative restore (#133) remain
+open; wire-width and shared model-decoding hardening remain #134/#135.
+
+`QuorumSessionStore` coordinates session leases and CAS mutations across a set of `SessionStoreBackend` replicas using quorum-backed ordered replication. It is not a Raft implementation; its target safety contract is a durable committed log prefix where an entry is authoritative only after the same sequence entry is present on a majority of replicas.
+
+### Network restore transport (protocol v2)
+
+`opc-session-net` protocol v2 carries validated restore-scan requests and pages
+to individual remote replicas. A server may shorten a multi-record page to the
+smaller client/server frame budget; callers resume from `next_cursor`, while a
+single record that cannot fit returns `RestoreScanResponseTooLarge`. The Hello
+handshake requires an exact version match, so v1/v2 peers require a coordinated
+upgrade and cannot form a mixed rolling deployment.
+
+This closes per-replica transport parity only. Quorum selection/merge remains
+#133, while durable sequencing and repair authority remain #127/#128.
 
 ### Log & Replication Model
-- **Durable Ordered Log**: Replicated mutations (AcquireLease, RenewLease, ReleaseLease, CompareAndSet, DeleteFenced, RefreshTtl, Batch) are assigned monotonically increasing sequence numbers and written to a durable SQL table (`session_replication_log`).
+- **Persisted Replica Logs**: The current coordinator assigns sequence numbers to replicated mutations (AcquireLease, RenewLease, ReleaseLease, CompareAndSet, DeleteFenced, RefreshTtl, Batch), and each accepting replica writes them to `session_replication_log`. Leader/term-gated global sequence authority remains #127.
 - **Idempotency & Replay Semantics**: Duplicate delivery is handled safely. Before appending, replicas check if the entry's sequence has already been applied. If the transaction ID (`tx_id`) matches, the duplicate is accepted as an idempotent success; if it differs, the replica fails closed on sequence divergence. Replaying operations does not mutate the state twice.
-- **Committed Prefix Safety**: The coordinator computes the committed prefix from entries that have majority support at the same sequence. A single-replica or minority uncommitted tail is not promoted during catch-up. Stale or divergent replicas are rebuilt from the committed prefix before new writes are attempted.
+- **Current Majority-Visible Prefix Heuristic**: The coordinator compares the logs visible from the current online majority and rebuilds replicas to that shared prefix. This is prototype behavior, not durable commit proof: without #127/#128, a later visible majority can omit a previously acknowledged entry and drive unsafe truncation.
 - **Resume Tokens / Watch Cursors**: Exposes watches backed by sequence numbers, allowing consumers to supply sequence cursors and resume receiving updates from the exact sequence they left off.
-- **Replica Catch-Up & Read Repair**: The coordinator queries replica log progress on every write or read. Stale replicas are repaired from the committed prefix before the operation completes. Reads require identical records on a majority quorum and fail closed if no quorum result exists.
-- **Failed-Write Rollback**: If a new replication entry reaches fewer than a majority of replicas, successful partial writes are rebuilt back to the prior committed prefix so that the failed write cannot be resurrected by a future catch-up.
-- **Capabilities**: Backends report `ordered_replication_log = true` and `watch = true` truthfully under replicated profiles, while standalone SQLite reports `false`.
+- **Replica Catch-Up & Read Repair Prototype**: The coordinator queries replica log progress on every write or read and repairs against the current majority-visible prefix. Reads require identical records on a majority quorum and fail closed if no quorum result exists, but repair authority remains unproven until #127/#128.
+- **Failed-Write Rollback Fixture**: If a new replication entry reaches fewer than a majority of replicas, the current implementation attempts to rebuild successful partial writes to the previously observed prefix. Tests exercise this path; they do not prove resurrection safety across partitions/restarts before #127/#128.
+- **Feature Declarations**: Replicated adapters declare `ordered_replication_log = true` and `watch = true`, while standalone SQLite reports `false`. These bits describe implemented methods; they are not fresh-quorum readiness or production qualification (#124).
 
 ---
 
@@ -133,11 +151,15 @@ Platform hardening concerns—including TLS/SPIFFE SVID and bundle watch/reload 
 - **Compaction appendability**: Confirms compacted leaders retain the snapshot index/term needed to append later committed entries.
 
 ### Session Store HA Failure Tests (Ordered Replication)
-- **Split-brain healing**: Proves the coordinator can recover and heal after partitions are resolved.
+
+These in-process fixtures exercise observed behavior; they are not durable
+distributed commit or repair proof (#127/#128).
+
+- **Split-brain healing**: Exercises coordinator recovery after simulated partitions are resolved.
 - **Durable catch-up**: Rejoining replicas are caught up automatically with log replication.
 - **Duplicate delivery**: Duplicate entries are resolved idempotently without duplicate mutations.
 - **Partial-write recovery**: Failing mid-flight writes are recovered and reconciled to majority nodes.
 - **Stale-fence replay**: Stale fence updates are rejected monotonically.
 - **Read repair**: Divergent nodes are updated and verified on read.
-- **Restart/rejoin across profiles**: Ensures restart/rejoin safety under fake, SQLite, and replicated profiles.
-- **No wall-clock LWW**: Strict consensus logic ensures that clock drift/jumps do not compromise write correctness.
+- **Restart/rejoin across profiles**: Exercises restart/rejoin behavior under fake, SQLite, and replicated profiles.
+- **No wall-clock LWW**: Observes that the tested ordering paths do not select authoritative state by wall-clock time.
