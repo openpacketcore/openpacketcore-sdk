@@ -29,6 +29,10 @@ through to the trait's unsupported-operation default.
   pages. The server may return fewer records than requested so the encoded
   response fits the smaller client/server frame limit; callers continue from
   `next_cursor` until `complete`.
+- `SessionBackend::probe_replication_head` performs a fresh, deadline-bounded
+  wire request. It does not consult the client's capability cache and reports
+  transport, authentication, timeout, protocol, and backend failures through
+  redaction-safe `ReplicaReadinessFailure` variants.
 - If one record cannot fit, the call returns
   `StoreError::RestoreScanResponseTooLarge` instead of retrying indefinitely.
 - `listen(bind_addr).await` starts the listener and returns a server handle and
@@ -68,6 +72,10 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 - The Hello handshake requires an exact version match. Protocol v1 and v2
   peers do not interoperate, so all session-net clients and servers require a
   coordinated upgrade; mixed-version rolling upgrades are unsupported.
+- `capabilities()` is descriptive admission evidence and may fall back to a
+  previously successful negotiation after a disconnect. It is not a liveness
+  or durable-readiness signal; replicated callers must use the fresh
+  replication-head probe and require a distinct agreeing majority.
 - Restore scan is a bulk enumeration boundary. Production authorization still
   depends on binding authenticated peer identity to authorized replica
   membership (#125).
@@ -77,15 +85,15 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
   independently constructed clients targeting one store through DNS aliases,
   or a mismatch between declarations and the live mTLS peer; that authenticated
   authorization remains #125.
-- Remote scan transport parity does not qualify networked session HA for
-  production. Fresh-quorum readiness, identity, durable authority,
-  fork recovery, bounded majority-authoritative restore, fixed-width wire DTOs,
-  and model-level decode invariants remain open in #124/#125, #127–#129, and
-  #133–#135.
+- Remote scan and fresh-probe transport parity do not by themselves qualify
+  networked session HA for production. Authenticated identity binding, durable
+  authority, fork recovery, bounded majority-authoritative restore,
+  fixed-width wire DTOs, and model-level decode invariants remain open in
+  #125, #127–#129, and #133–#135.
 
 ## Roadmap
 
-- Close #124/#125, #127–#129, and #133–#135; add distributed failure and soak
+- Close #125, #127–#129, and #133–#135; add distributed failure and soak
   evidence before treating this as production transport.
 - Keep plaintext transport limited to tests.
 - Keep the server wrapping `SessionStoreBackend` rather than owning storage.

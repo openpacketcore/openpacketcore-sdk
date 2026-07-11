@@ -4,6 +4,10 @@ pub enum ProtocolError {
     FrameTooLarge(usize),
     #[error("version mismatch: local={local}, remote={remote}")]
     VersionMismatch { local: u32, remote: u32 },
+    #[error("peer authentication failed")]
+    Authentication,
+    #[error("unexpected protocol response")]
+    UnexpectedResponse,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]

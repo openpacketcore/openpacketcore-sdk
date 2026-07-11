@@ -19,7 +19,7 @@ use opc_session_store::lease::{LeaseGuard, SessionLeaseManager};
 use opc_session_store::model::{OwnerId, SessionKey};
 
 use opc_session_store::record::StoredSessionRecord;
-use opc_session_store::{RestoreScanPage, RestoreScanRequest};
+use opc_session_store::{ReplicaReadinessFailure, RestoreScanPage, RestoreScanRequest};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -41,6 +41,69 @@ pub type RemoteAddrResolver =
 struct Connection {
     reader: Box<dyn AsyncRead + Unpin + Send>,
     writer: Box<dyn AsyncWrite + Unpin + Send>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteRequestFailure {
+    Transport,
+    Authentication,
+    Timeout,
+    Protocol,
+    Backend,
+}
+
+impl RemoteRequestFailure {
+    fn from_protocol_error(error: &ProtocolError) -> Self {
+        match error {
+            ProtocolError::Io(error) if error.kind() == io::ErrorKind::TimedOut => Self::Timeout,
+            ProtocolError::Io(_) => Self::Transport,
+            ProtocolError::Authentication => Self::Authentication,
+            ProtocolError::BackendUnavailable(_) => Self::Backend,
+            ProtocolError::FrameTooLarge(_)
+            | ProtocolError::VersionMismatch { .. }
+            | ProtocolError::UnexpectedResponse
+            | ProtocolError::Serialization(_) => Self::Protocol,
+        }
+    }
+
+    const fn is_retryable(self) -> bool {
+        matches!(self, Self::Transport | Self::Timeout | Self::Backend)
+    }
+
+    const fn reason_code(self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::Authentication => "authentication",
+            Self::Timeout => "timeout",
+            Self::Protocol => "protocol",
+            Self::Backend => "backend",
+        }
+    }
+}
+
+fn classify_tls_connect_error(error: io::Error) -> ProtocolError {
+    let is_rustls_failure = error.get_ref().is_some_and(|source| {
+        source
+            .downcast_ref::<tokio_rustls::rustls::Error>()
+            .is_some()
+    });
+    if is_rustls_failure {
+        ProtocolError::Authentication
+    } else {
+        ProtocolError::Io(error)
+    }
+}
+
+impl From<RemoteRequestFailure> for ReplicaReadinessFailure {
+    fn from(failure: RemoteRequestFailure) -> Self {
+        match failure {
+            RemoteRequestFailure::Transport => Self::Transport,
+            RemoteRequestFailure::Authentication => Self::Authentication,
+            RemoteRequestFailure::Timeout => Self::Timeout,
+            RemoteRequestFailure::Protocol => Self::Protocol,
+            RemoteRequestFailure::Backend => Self::Backend,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -83,7 +146,7 @@ impl RemoteTarget {
                 server_name: Some(server_name),
                 ..
             } => rustls_pki_types::ServerName::try_from(server_name.to_string())
-                .map_err(|_| ProtocolError::BackendUnavailable("invalid TLS server name".into())),
+                .map_err(|_| ProtocolError::Authentication),
             Self::Resolved {
                 server_name: None, ..
             } => Ok(rustls_pki_types::ServerName::IpAddress(
@@ -218,27 +281,45 @@ impl RemoteSessionBackend {
         self
     }
 
-    async fn send_request_with_retry(&self, req: Request) -> Result<Response, StoreError> {
+    async fn send_request_classified(
+        &self,
+        req: Request,
+    ) -> Result<Response, RemoteRequestFailure> {
+        let mut last_failure = None;
+        let mut request_in_flight = true;
         let attempts = async {
             let mut backoff_ms = 100u64;
             loop {
+                request_in_flight = true;
                 match self.do_request(&req).await {
                     Ok(resp) => return Ok(resp),
-                    Err(ProtocolError::Io(_)) | Err(ProtocolError::BackendUnavailable(_)) => {
+                    Err(error) => {
+                        let failure = RemoteRequestFailure::from_protocol_error(&error);
+                        if !failure.is_retryable() {
+                            return Err(failure);
+                        }
+                        last_failure = Some(failure);
+                        request_in_flight = false;
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         backoff_ms = (backoff_ms * 2).min(1000);
                     }
-                    Err(e) => return Err(StoreError::BackendUnavailable(e.to_string())),
                 }
             }
         };
         match tokio::time::timeout(self.deadline, attempts).await {
             Ok(res) => res,
-            Err(_) => Err(StoreError::BackendUnavailable(format!(
-                "remote session backend {} unreachable within {:?}",
-                self.target, self.deadline
-            ))),
+            Err(_) if request_in_flight => Err(RemoteRequestFailure::Timeout),
+            Err(_) => Err(last_failure.unwrap_or(RemoteRequestFailure::Timeout)),
         }
+    }
+
+    async fn send_request_with_retry(&self, req: Request) -> Result<Response, StoreError> {
+        self.send_request_classified(req).await.map_err(|failure| {
+            StoreError::BackendUnavailable(format!(
+                "remote session backend request failed: {}",
+                failure.reason_code()
+            ))
+        })
     }
 
     async fn send_lease_request_with_retry(&self, req: Request) -> Result<Response, LeaseError> {
@@ -284,7 +365,7 @@ impl RemoteSessionBackend {
             let tls_stream = connector
                 .connect(server_name, tcp)
                 .await
-                .map_err(ProtocolError::Io)?;
+                .map_err(classify_tls_connect_error)?;
             let (r, w) = tokio::io::split(tls_stream);
             (Box::new(r), Box::new(w))
         } else {
@@ -317,9 +398,7 @@ impl RemoteSessionBackend {
                 return Err(ProtocolError::BackendUnavailable(message));
             }
             _ => {
-                return Err(ProtocolError::BackendUnavailable(
-                    "expected HelloAck".into(),
-                ));
+                return Err(ProtocolError::UnexpectedResponse);
             }
         }
 
@@ -554,6 +633,25 @@ impl SessionBackend for RemoteSessionBackend {
         }
     }
 
+    async fn probe_replication_head(&self) -> Result<u64, ReplicaReadinessFailure> {
+        let response = self
+            .send_request_classified(Request::MaxReplicationSequence)
+            .await
+            .map_err(ReplicaReadinessFailure::from)?;
+        match response {
+            Response::MaxReplicationSequence(Ok(sequence)) => Ok(sequence),
+            Response::MaxReplicationSequence(Err(_)) => Err(ReplicaReadinessFailure::Backend),
+            Response::Error { .. } => {
+                self.discard_connection().await;
+                Err(ReplicaReadinessFailure::Protocol)
+            }
+            _ => {
+                self.discard_connection().await;
+                Err(ReplicaReadinessFailure::Protocol)
+            }
+        }
+    }
+
     async fn get_replication_log(
         &self,
         start: u64,
@@ -704,7 +802,7 @@ async fn watch_connect_and_read(
                 let tls_stream = connector
                     .connect(server_name, tcp)
                     .await
-                    .map_err(ProtocolError::Io)?;
+                    .map_err(classify_tls_connect_error)?;
                 let (mut r, mut w) = tokio::io::split(tls_stream);
                 watch_handshake(&mut r, &mut w, max_frame_size, &node_id, start_sequence).await?;
                 Box::new(r)
@@ -789,9 +887,7 @@ where
             }
         }
         _ => {
-            return Err(ProtocolError::BackendUnavailable(
-                "expected HelloAck".into(),
-            ));
+            return Err(ProtocolError::UnexpectedResponse);
         }
     }
 
@@ -804,9 +900,7 @@ where
             return Err(ProtocolError::BackendUnavailable(message));
         }
         _ => {
-            return Err(ProtocolError::BackendUnavailable(
-                "expected WatchStream".into(),
-            ));
+            return Err(ProtocolError::UnexpectedResponse);
         }
     }
 

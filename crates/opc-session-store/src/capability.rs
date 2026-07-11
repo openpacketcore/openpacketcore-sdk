@@ -185,13 +185,18 @@ impl AppHaDurabilityRequirement {
     }
 }
 
-/// Compatibility outcome between app HA intent and platform session-store
-/// profile.
+/// Static admission compatibility between app HA intent and a declared
+/// platform session-store profile.
+///
+/// This type does not carry runtime reachability, agreement, or repair
+/// evidence. A compatible quorum profile must still pass a fresh
+/// [`crate::DurableReadinessReport`] before traffic readiness is opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(rename_all = "kebab-case")]
 pub enum SessionStoreHaCompatibility {
-    /// The platform profile satisfies the app HA durability requirement.
+    /// The declared profile statically satisfies the app HA requirement.
+    /// Runtime durable readiness remains a separate mandatory gate.
     Compatible,
     /// The platform profile is unknown, so readiness must fail closed until the
     /// product/operator maps it to a known SDK capability profile.
@@ -202,12 +207,18 @@ pub enum SessionStoreHaCompatibility {
 }
 
 impl SessionStoreHaCompatibility {
-    /// Whether this outcome allows traffic readiness to be claimed.
+    /// Whether static profile admission is compatible.
+    ///
+    /// `true` does not authorize traffic readiness without fresh runtime
+    /// durable-readiness evidence.
     pub const fn is_compatible(self) -> bool {
         matches!(self, Self::Compatible)
     }
 
-    /// Whether this outcome should block traffic readiness/status claims.
+    /// Whether static incompatibility must block traffic readiness/status.
+    ///
+    /// `false` only clears this admission blocker; it does not make the store
+    /// ready.
     pub const fn blocks_traffic(self) -> bool {
         !self.is_compatible()
     }
@@ -224,7 +235,9 @@ impl SessionStoreHaCompatibility {
     /// Redaction-safe operator/status message.
     pub const fn message(self) -> &'static str {
         match self {
-            Self::Compatible => "session-store profile is compatible with app HA requirement",
+            Self::Compatible => {
+                "session-store profile is statically compatible; fresh runtime readiness required"
+            }
             Self::UnknownPlatformProfile => {
                 "session-store platform profile is unknown to the SDK compatibility contract"
             }
@@ -235,12 +248,14 @@ impl SessionStoreHaCompatibility {
     }
 }
 
-/// Evaluate whether a platform session-store HA profile satisfies an app HA
-/// durability requirement.
+/// Evaluate whether a declared platform session-store HA profile statically
+/// satisfies an app HA durability requirement.
 ///
 /// Incompatibility is a traffic-readiness/status outcome, not a platform
 /// reconcile failure: callers should keep deployment reconciliation valid while
 /// blocking traffic claims with [`SessionStoreHaCompatibility::reason_code`].
+/// A compatible result is admission evidence only and must be combined with a
+/// fresh durable-readiness report at runtime.
 pub const fn evaluate_session_store_ha_compatibility(
     requirement: AppHaDurabilityRequirement,
     platform_profile: SessionStorePlatformProfile,

@@ -1,9 +1,9 @@
 use opc_session_store::{
-    BackendCapabilities, CompareAndSet, CompareAndSetResult, FakeSessionBackend,
-    FencedSessionReplica, Generation, OwnerId, QuorumReplicaDescriptor, QuorumReplicaMember,
-    QuorumSessionStore, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
-    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionBackend, SessionKey,
-    SessionLeaseManager, SessionOp, SessionOpResult, StateClass, StateType, StoreError,
+    BackendCapabilities, CompareAndSet, CompareAndSetResult, DurableReadinessState,
+    FakeSessionBackend, FencedSessionReplica, Generation, OwnerId, QuorumReplicaDescriptor,
+    QuorumReplicaMember, QuorumSessionStore, QuorumTopologyConfig, ReplicaBackingIdentity,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionBackend,
+    SessionKey, SessionLeaseManager, SessionOp, SessionOpResult, StateClass, StateType, StoreError,
     StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_session_testkit::ChaosTestkit;
@@ -106,7 +106,7 @@ async fn test_split_brain_partition_and_healing() {
         .acquire(&key, owner_b, Duration::from_secs(10))
         .await
         .unwrap_err();
-    assert!(err_b.to_string().contains("quorum not reached"));
+    assert!(err_b.to_string().contains("quorum not ready"));
 
     // Coordinator A writes successfully
     let record_a = make_record(&key, 1, &lease_a);
@@ -426,7 +426,7 @@ async fn test_duplicate_replication_entry_idempotency() {
 }
 
 #[tokio::test]
-async fn test_partial_write_recovery_and_catch_up() {
+async fn test_partial_write_requires_recovery_without_destructive_truncation() {
     let testkit = ChaosTestkit::new(3);
 
     let key = test_session_key();
@@ -472,27 +472,43 @@ async fn test_partial_write_recovery_and_catch_up() {
     // Replicas 1 and 2 do NOT have it yet (they are at sequence 1)
     assert!(testkit.replicas[1].inner.get(&key).await.unwrap().is_none());
 
-    // Write a clean record through the quorum coordinator. The coordinator must
-    // repair Node 0 back to the committed prefix, discard the uncommitted tail,
-    // and then commit this clean entry at sequence 2.
+    // The minority-only longer tail is ambiguous without durable term/commit
+    // authority. Readiness and writes must require recovery without truncating
+    // or overwriting any replica.
+    let report = coord_majority.probe_durable_readiness().await;
+    assert_eq!(report.state(), DurableReadinessState::RecoveryRequired);
+    assert_eq!(report.majority_visible_prefix_index(), Some(1));
+
     let record2 = make_record_with_payload(&key, 1, &lease, b"committed clean write");
     let op2 = CompareAndSet {
         key: key.clone(),
         lease,
         expected_generation: None,
-        new_record: record2.clone(),
+        new_record: record2,
     };
-    coord_majority.compare_and_set(op2).await.unwrap();
+    let error = coord_majority
+        .compare_and_set(op2)
+        .await
+        .expect_err("ambiguous minority tail must block writes");
+    assert!(error.to_string().contains("recovery required"));
 
-    // Verify all replicas are caught up and have the committed clean entry, not
-    // the uncommitted partial write from Node 0.
-    let fetched = coord_majority.get(&key).await.unwrap().unwrap();
-    assert_eq!(fetched, record2);
-
-    let node1_fetched = testkit.replicas[1].inner.get(&key).await.unwrap().unwrap();
-    assert_eq!(node1_fetched, record2);
-    let node0_fetched = testkit.replicas[0].inner.get(&key).await.unwrap().unwrap();
-    assert_eq!(node0_fetched, record2);
+    // No destructive repair occurred: the minority tail remains available for
+    // the future #128 recovery workflow, and the other replicas stay unchanged.
+    let node0_after = testkit.replicas[0].inner.get(&key).await.unwrap().unwrap();
+    assert_eq!(node0_after.generation.get(), 1);
+    assert!(testkit.replicas[1].inner.get(&key).await.unwrap().is_none());
+    assert!(testkit.replicas[2].inner.get(&key).await.unwrap().is_none());
+    assert_eq!(
+        testkit.replicas[0]
+            .inner
+            .max_replication_sequence()
+            .await
+            .unwrap(),
+        2
+    );
+    for replica in &testkit.replicas[1..] {
+        assert_eq!(replica.inner.max_replication_sequence().await.unwrap(), 1);
+    }
 }
 
 #[tokio::test]

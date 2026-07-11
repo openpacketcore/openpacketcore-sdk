@@ -45,6 +45,20 @@ async fn wait_for_shutdown(amf: &AmfLite) {
     }
 }
 
+async fn wait_for_amf_readiness(amf: &AmfLite, expected: opc_runtime::Readiness) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if amf.readiness().await == expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for AMF readiness {expected:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn query_admin(addr: SocketAddr, path: &str, token: Option<&str>) -> (u16, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -343,6 +357,20 @@ async fn test_amf_lite_e2e_happy_path() {
     println!("[E2E] Querying admin /readyz (unauthorized)");
     let (status_unauth, _) = query_admin(admin_addr, "/readyz", None).await;
     assert_eq!(status_unauth, 401);
+
+    println!("[E2E] Removing the durable session-store quorum");
+    chaos.set_online(1, false).await;
+    chaos.set_online(2, false).await;
+    wait_for_amf_readiness(&amf, opc_runtime::Readiness::NotReady).await;
+    let (status_no_quorum, _) = query_admin(admin_addr, "/readyz", Some(&auth_token)).await;
+    assert_eq!(status_no_quorum, 503);
+
+    println!("[E2E] Restoring the durable session-store quorum");
+    chaos.set_online(1, true).await;
+    chaos.set_online(2, true).await;
+    wait_for_amf_readiness(&amf, opc_runtime::Readiness::Ready).await;
+    let (status_quorum_restored, _) = query_admin(admin_addr, "/readyz", Some(&auth_token)).await;
+    assert_eq!(status_quorum_restored, 200);
 
     // 8. Config update commit
     println!("[E2E] Committing new config via northbound principal");

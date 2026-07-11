@@ -492,6 +492,19 @@ pub struct SdkMetrics {
     pub session_lease_renew: AtomicU64,
     pub session_lease_release: AtomicU64,
     pub session_lease_delete: AtomicU64,
+    pub session_durable_readiness_probe_success: AtomicU64,
+    pub session_durable_readiness_probe_failure: AtomicU64,
+    pub session_durable_readiness_ready: AtomicI64,
+    pub session_durable_readiness_configured_voters: AtomicU64,
+    pub session_durable_readiness_fresh_reachable_voters: AtomicU64,
+    pub session_durable_readiness_agreeing_voters: AtomicU64,
+    pub session_durable_readiness_required_quorum: AtomicU64,
+    pub session_durable_readiness_majority_visible_prefix: AtomicU64,
+    pub session_durable_readiness_timeout_failures: AtomicU64,
+    pub session_durable_readiness_authentication_failures: AtomicU64,
+    pub session_durable_readiness_transport_failures: AtomicU64,
+    pub session_durable_readiness_divergent_failures: AtomicU64,
+    pub session_durable_readiness_recovery_required_failures: AtomicU64,
 
     // === NACM / Authz ===
     pub nacm_eval_allow: AtomicU64,
@@ -614,6 +627,19 @@ impl SdkMetrics {
             session_lease_renew: AtomicU64::new(0),
             session_lease_release: AtomicU64::new(0),
             session_lease_delete: AtomicU64::new(0),
+            session_durable_readiness_probe_success: AtomicU64::new(0),
+            session_durable_readiness_probe_failure: AtomicU64::new(0),
+            session_durable_readiness_ready: AtomicI64::new(0),
+            session_durable_readiness_configured_voters: AtomicU64::new(0),
+            session_durable_readiness_fresh_reachable_voters: AtomicU64::new(0),
+            session_durable_readiness_agreeing_voters: AtomicU64::new(0),
+            session_durable_readiness_required_quorum: AtomicU64::new(0),
+            session_durable_readiness_majority_visible_prefix: AtomicU64::new(0),
+            session_durable_readiness_timeout_failures: AtomicU64::new(0),
+            session_durable_readiness_authentication_failures: AtomicU64::new(0),
+            session_durable_readiness_transport_failures: AtomicU64::new(0),
+            session_durable_readiness_divergent_failures: AtomicU64::new(0),
+            session_durable_readiness_recovery_required_failures: AtomicU64::new(0),
 
             nacm_eval_allow: AtomicU64::new(0),
             nacm_eval_deny: AtomicU64::new(0),
@@ -745,6 +771,32 @@ impl SdkMetrics {
         self.session_lease_renew.store(0, Ordering::Relaxed);
         self.session_lease_release.store(0, Ordering::Relaxed);
         self.session_lease_delete.store(0, Ordering::Relaxed);
+        self.session_durable_readiness_probe_success
+            .store(0, Ordering::Relaxed);
+        self.session_durable_readiness_probe_failure
+            .store(0, Ordering::Relaxed);
+        self.session_durable_readiness_ready
+            .store(0, Ordering::Relaxed);
+        self.session_durable_readiness_configured_voters
+            .store(0, Ordering::Relaxed);
+        self.session_durable_readiness_fresh_reachable_voters
+            .store(0, Ordering::Relaxed);
+        self.session_durable_readiness_agreeing_voters
+            .store(0, Ordering::Relaxed);
+        self.session_durable_readiness_required_quorum
+            .store(0, Ordering::Relaxed);
+        self.session_durable_readiness_majority_visible_prefix
+            .store(0, Ordering::Relaxed);
+        self.session_durable_readiness_timeout_failures
+            .store(0, Ordering::Relaxed);
+        self.session_durable_readiness_authentication_failures
+            .store(0, Ordering::Relaxed);
+        self.session_durable_readiness_transport_failures
+            .store(0, Ordering::Relaxed);
+        self.session_durable_readiness_divergent_failures
+            .store(0, Ordering::Relaxed);
+        self.session_durable_readiness_recovery_required_failures
+            .store(0, Ordering::Relaxed);
 
         self.nacm_eval_allow.store(0, Ordering::Relaxed);
         self.nacm_eval_deny.store(0, Ordering::Relaxed);
@@ -1399,6 +1451,124 @@ pub fn export_prometheus_text() -> String {
         "opc_session_store_lease_ops_total{{op=\"delete\"}} {s_lease_del}\n"
     ));
 
+    let readiness_probe_success = METRICS
+        .session_durable_readiness_probe_success
+        .load(Ordering::Relaxed);
+    let readiness_probe_failure = METRICS
+        .session_durable_readiness_probe_failure
+        .load(Ordering::Relaxed);
+    out.push_str(
+        "# HELP opc_session_store_durable_readiness_probe_total Total count of fresh durable-readiness probes\n",
+    );
+    out.push_str("# TYPE opc_session_store_durable_readiness_probe_total counter\n");
+    out.push_str(&format!(
+        "opc_session_store_durable_readiness_probe_total{{status=\"success\"}} {readiness_probe_success}\n"
+    ));
+    out.push_str(&format!(
+        "opc_session_store_durable_readiness_probe_total{{status=\"failure\"}} {readiness_probe_failure}\n"
+    ));
+
+    let readiness_ready = METRICS
+        .session_durable_readiness_ready
+        .load(Ordering::Relaxed);
+    write_metric(
+        &mut out,
+        "opc_session_store_durable_readiness_ready",
+        "gauge",
+        "Whether the most recent durable-readiness probe succeeded (1) or not (0)",
+        readiness_ready as f64,
+    );
+
+    let readiness_configured_voters = METRICS
+        .session_durable_readiness_configured_voters
+        .load(Ordering::Relaxed);
+    write_metric(
+        &mut out,
+        "opc_session_store_durable_readiness_configured_voters",
+        "gauge",
+        "Configured distinct session-store voters in the most recent durable-readiness probe",
+        readiness_configured_voters as f64,
+    );
+
+    let readiness_fresh_reachable_voters = METRICS
+        .session_durable_readiness_fresh_reachable_voters
+        .load(Ordering::Relaxed);
+    write_metric(
+        &mut out,
+        "opc_session_store_durable_readiness_fresh_reachable_voters",
+        "gauge",
+        "Distinct session-store voters freshly reached by the most recent durable-readiness probe",
+        readiness_fresh_reachable_voters as f64,
+    );
+
+    let readiness_agreeing_voters = METRICS
+        .session_durable_readiness_agreeing_voters
+        .load(Ordering::Relaxed);
+    write_metric(
+        &mut out,
+        "opc_session_store_durable_readiness_agreeing_voters",
+        "gauge",
+        "Distinct session-store voters agreeing on the majority-visible prefix in the most recent probe",
+        readiness_agreeing_voters as f64,
+    );
+
+    let readiness_required_quorum = METRICS
+        .session_durable_readiness_required_quorum
+        .load(Ordering::Relaxed);
+    write_metric(
+        &mut out,
+        "opc_session_store_durable_readiness_required_quorum",
+        "gauge",
+        "Distinct voter acknowledgements required for session-store durable readiness",
+        readiness_required_quorum as f64,
+    );
+
+    let readiness_majority_visible_prefix = METRICS
+        .session_durable_readiness_majority_visible_prefix
+        .load(Ordering::Relaxed);
+    write_metric(
+        &mut out,
+        "opc_session_store_durable_readiness_majority_visible_prefix",
+        "gauge",
+        "Highest majority-visible session-store prefix freshly observed by a configured majority",
+        readiness_majority_visible_prefix as f64,
+    );
+
+    let readiness_timeout_failures = METRICS
+        .session_durable_readiness_timeout_failures
+        .load(Ordering::Relaxed);
+    let readiness_authentication_failures = METRICS
+        .session_durable_readiness_authentication_failures
+        .load(Ordering::Relaxed);
+    let readiness_transport_failures = METRICS
+        .session_durable_readiness_transport_failures
+        .load(Ordering::Relaxed);
+    let readiness_divergent_failures = METRICS
+        .session_durable_readiness_divergent_failures
+        .load(Ordering::Relaxed);
+    let readiness_recovery_required_failures = METRICS
+        .session_durable_readiness_recovery_required_failures
+        .load(Ordering::Relaxed);
+    out.push_str(
+        "# HELP opc_session_store_durable_readiness_failures_total Total count of durable-readiness failures by bounded reason\n",
+    );
+    out.push_str("# TYPE opc_session_store_durable_readiness_failures_total counter\n");
+    out.push_str(&format!(
+        "opc_session_store_durable_readiness_failures_total{{reason=\"timeout\"}} {readiness_timeout_failures}\n"
+    ));
+    out.push_str(&format!(
+        "opc_session_store_durable_readiness_failures_total{{reason=\"authentication\"}} {readiness_authentication_failures}\n"
+    ));
+    out.push_str(&format!(
+        "opc_session_store_durable_readiness_failures_total{{reason=\"transport\"}} {readiness_transport_failures}\n"
+    ));
+    out.push_str(&format!(
+        "opc_session_store_durable_readiness_failures_total{{reason=\"divergent\"}} {readiness_divergent_failures}\n"
+    ));
+    out.push_str(&format!(
+        "opc_session_store_durable_readiness_failures_total{{reason=\"recovery_required\"}} {readiness_recovery_required_failures}\n"
+    ));
+
     // --- NACM / Authz ---
     let nacm_allow = METRICS.nacm_eval_allow.load(Ordering::Relaxed);
     out.push_str("# HELP opc_nacm_eval_total Total count of NACM policy evaluations\n");
@@ -2011,6 +2181,45 @@ mod tests {
         METRICS.config_bus_phase_latency_apply.observe(0.025);
         METRICS.persist_leader_term.store(10, Ordering::Relaxed);
         METRICS.runtime_budget_exhausted.store(2, Ordering::Relaxed);
+        METRICS
+            .session_durable_readiness_probe_success
+            .store(11, Ordering::Relaxed);
+        METRICS
+            .session_durable_readiness_probe_failure
+            .store(12, Ordering::Relaxed);
+        METRICS
+            .session_durable_readiness_ready
+            .store(1, Ordering::Relaxed);
+        METRICS
+            .session_durable_readiness_configured_voters
+            .store(3, Ordering::Relaxed);
+        METRICS
+            .session_durable_readiness_fresh_reachable_voters
+            .store(2, Ordering::Relaxed);
+        METRICS
+            .session_durable_readiness_agreeing_voters
+            .store(2, Ordering::Relaxed);
+        METRICS
+            .session_durable_readiness_required_quorum
+            .store(2, Ordering::Relaxed);
+        METRICS
+            .session_durable_readiness_majority_visible_prefix
+            .store(42, Ordering::Relaxed);
+        METRICS
+            .session_durable_readiness_timeout_failures
+            .store(13, Ordering::Relaxed);
+        METRICS
+            .session_durable_readiness_authentication_failures
+            .store(14, Ordering::Relaxed);
+        METRICS
+            .session_durable_readiness_transport_failures
+            .store(15, Ordering::Relaxed);
+        METRICS
+            .session_durable_readiness_divergent_failures
+            .store(16, Ordering::Relaxed);
+        METRICS
+            .session_durable_readiness_recovery_required_failures
+            .store(17, Ordering::Relaxed);
 
         if let Ok(mut lag) = METRICS.persist_peer_replication_lag.lock() {
             lag.insert(1, 42);
@@ -2064,6 +2273,36 @@ mod tests {
         assert!(!exported.contains("{ }"));
         assert!(exported.contains("opc_persist_leader_term 10\n"));
         assert!(exported.contains("opc_runtime_budget_exhausted_total 2\n"));
+        assert!(exported
+            .contains("opc_session_store_durable_readiness_probe_total{status=\"success\"} 11\n"));
+        assert!(exported
+            .contains("opc_session_store_durable_readiness_probe_total{status=\"failure\"} 12\n"));
+        assert!(exported.contains("opc_session_store_durable_readiness_ready 1\n"));
+        assert!(exported.contains("opc_session_store_durable_readiness_configured_voters 3\n"));
+        assert!(exported.contains("opc_session_store_durable_readiness_fresh_reachable_voters 2\n"));
+        assert!(exported.contains("opc_session_store_durable_readiness_agreeing_voters 2\n"));
+        assert!(exported.contains("opc_session_store_durable_readiness_required_quorum 2\n"));
+        assert!(exported.contains(
+            "# HELP opc_session_store_durable_readiness_majority_visible_prefix Highest majority-visible session-store prefix freshly observed by a configured majority\n"
+        ));
+        assert!(
+            exported.contains("opc_session_store_durable_readiness_majority_visible_prefix 42\n")
+        );
+        assert!(exported.contains(
+            "opc_session_store_durable_readiness_failures_total{reason=\"timeout\"} 13\n"
+        ));
+        assert!(exported.contains(
+            "opc_session_store_durable_readiness_failures_total{reason=\"authentication\"} 14\n"
+        ));
+        assert!(exported.contains(
+            "opc_session_store_durable_readiness_failures_total{reason=\"transport\"} 15\n"
+        ));
+        assert!(exported.contains(
+            "opc_session_store_durable_readiness_failures_total{reason=\"divergent\"} 16\n"
+        ));
+        assert!(exported.contains(
+            "opc_session_store_durable_readiness_failures_total{reason=\"recovery_required\"} 17\n"
+        ));
         assert!(exported.contains("opc_admin_requests_total{route=\"readyz\",status=\"200\"} 1\n"));
         assert!(exported
             .contains("opc_admin_requests_total{route=\"redacted\",status=\"invalid\"} 1\n"));
@@ -2113,6 +2352,82 @@ mod tests {
         assert!(!after.contains("opc_netconf_sessions_active{transport=\"netconf-tls\""));
         assert!(!after.contains("opc_admin_requests_total{route=\"readyz\""));
         assert!(!after.contains("opc_admin_request_latency_seconds_count{route=\"product_status\""));
+        assert!(after
+            .contains("opc_session_store_durable_readiness_probe_total{status=\"success\"} 0\n"));
+        assert!(after.contains("opc_session_store_durable_readiness_ready 0\n"));
+        assert!(after.contains("opc_session_store_durable_readiness_configured_voters 0\n"));
+        assert!(after.contains("opc_session_store_durable_readiness_fresh_reachable_voters 0\n"));
+        assert!(after.contains("opc_session_store_durable_readiness_agreeing_voters 0\n"));
+        assert!(after.contains("opc_session_store_durable_readiness_required_quorum 0\n"));
+        assert!(after.contains("opc_session_store_durable_readiness_majority_visible_prefix 0\n"));
+        assert!(after.contains(
+            "opc_session_store_durable_readiness_failures_total{reason=\"divergent\"} 0\n"
+        ));
+        assert!(after.contains(
+            "opc_session_store_durable_readiness_failures_total{reason=\"recovery_required\"} 0\n"
+        ));
+    }
+
+    #[test]
+    fn durable_readiness_metrics_initialize_and_reset() {
+        let metrics = SdkMetrics::new();
+        let counters_and_gauges = [
+            &metrics.session_durable_readiness_probe_success,
+            &metrics.session_durable_readiness_probe_failure,
+            &metrics.session_durable_readiness_configured_voters,
+            &metrics.session_durable_readiness_fresh_reachable_voters,
+            &metrics.session_durable_readiness_agreeing_voters,
+            &metrics.session_durable_readiness_required_quorum,
+            &metrics.session_durable_readiness_majority_visible_prefix,
+            &metrics.session_durable_readiness_timeout_failures,
+            &metrics.session_durable_readiness_authentication_failures,
+            &metrics.session_durable_readiness_transport_failures,
+            &metrics.session_durable_readiness_divergent_failures,
+            &metrics.session_durable_readiness_recovery_required_failures,
+        ];
+
+        assert!(counters_and_gauges
+            .iter()
+            .all(|metric| metric.load(Ordering::Relaxed) == 0));
+        assert_eq!(
+            metrics
+                .session_durable_readiness_ready
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        for metric in counters_and_gauges {
+            metric.store(1, Ordering::Relaxed);
+        }
+        metrics
+            .session_durable_readiness_ready
+            .store(1, Ordering::Relaxed);
+
+        metrics.reset_all();
+
+        let reset_counters_and_gauges = [
+            &metrics.session_durable_readiness_probe_success,
+            &metrics.session_durable_readiness_probe_failure,
+            &metrics.session_durable_readiness_configured_voters,
+            &metrics.session_durable_readiness_fresh_reachable_voters,
+            &metrics.session_durable_readiness_agreeing_voters,
+            &metrics.session_durable_readiness_required_quorum,
+            &metrics.session_durable_readiness_majority_visible_prefix,
+            &metrics.session_durable_readiness_timeout_failures,
+            &metrics.session_durable_readiness_authentication_failures,
+            &metrics.session_durable_readiness_transport_failures,
+            &metrics.session_durable_readiness_divergent_failures,
+            &metrics.session_durable_readiness_recovery_required_failures,
+        ];
+        assert!(reset_counters_and_gauges
+            .iter()
+            .all(|metric| metric.load(Ordering::Relaxed) == 0));
+        assert_eq!(
+            metrics
+                .session_durable_readiness_ready
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]

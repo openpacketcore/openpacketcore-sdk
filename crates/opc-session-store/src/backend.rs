@@ -115,13 +115,13 @@ pub enum SessionOpResult {
 
 /// One position in the ordered replication log (RFC 004 §11.2).
 ///
-/// Replicated coordinators (see the `quorum` module) treat the log as the
-/// source of truth: an entry is committed once a majority of replicas have
-/// durably appended the identical entry at the same `sequence`, and replica
-/// state is rebuilt by replaying the committed prefix in order.
+/// Replicated coordinators (see the `quorum` module) treat the log as their
+/// source of truth and derive a majority-visible prefix from identical entries
+/// at each `sequence`. That observation is not a durable consensus commit
+/// proof; term/leader authority remains a separate production-readiness gap.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReplicationEntry {
-    /// 1-based, gap-free position in the log. Quorum commitment is decided
+    /// 1-based, gap-free position in the log. Majority agreement is assessed
     /// per sequence; replicas reject entries that would create a gap or
     /// diverge from an already-applied sequence.
     pub sequence: u64,
@@ -249,10 +249,11 @@ pub enum ReplicationOp {
 /// fail with `StoreError::StaleFence` when the guard's token is lower than
 /// the key's recorded fence (RFC 004 §9.2).
 ///
-/// The replication-log methods (`max_replication_sequence` through `watch`)
-/// have default implementations that return
-/// `StoreError::CapabilityNotSupported`; backends declaring
-/// `ordered_replication_log` or `watch` must override them.
+/// The replication-log data and mutation methods have fail-closed defaults
+/// that return `StoreError::CapabilityNotSupported`; backends declaring
+/// `ordered_replication_log` or `watch` must override them. The fresh-head
+/// readiness method delegates to `max_replication_sequence` by default and
+/// network adapters should override it to retain typed transport failures.
 ///
 /// Durable adapters that reconstruct [`StoredSessionRecord`] from persisted
 /// bytes MUST preserve payload encoding explicitly: use
@@ -330,6 +331,20 @@ pub trait SessionBackend: Send + Sync {
         Err(StoreError::CapabilityNotSupported(
             "ordered_replication_log".into(),
         ))
+    }
+
+    /// Obtain a fresh replication head for durable-readiness assessment.
+    ///
+    /// Network adapters should override this method to preserve typed
+    /// transport, authentication, timeout, and protocol failures. The default
+    /// performs a real backend request and maps its opaque failure to the
+    /// generic backend category; it never consults cached capabilities.
+    async fn probe_replication_head(
+        &self,
+    ) -> Result<u64, crate::readiness::ReplicaReadinessFailure> {
+        self.max_replication_sequence()
+            .await
+            .map_err(|_| crate::readiness::ReplicaReadinessFailure::Backend)
     }
 
     /// Retrieve log entries in the range [start, start + limit).
@@ -838,6 +853,12 @@ where
 
     async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
         self.inner.max_replication_sequence().await
+    }
+
+    async fn probe_replication_head(
+        &self,
+    ) -> Result<u64, crate::readiness::ReplicaReadinessFailure> {
+        self.inner.probe_replication_head().await
     }
 
     async fn get_replication_log(
@@ -1381,6 +1402,12 @@ where
 
     async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
         self.inner.max_replication_sequence().await
+    }
+
+    async fn probe_replication_head(
+        &self,
+    ) -> Result<u64, crate::readiness::ReplicaReadinessFailure> {
+        self.inner.probe_replication_head().await
     }
 
     async fn get_replication_log(
