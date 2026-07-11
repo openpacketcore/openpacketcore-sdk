@@ -4,7 +4,7 @@
 //! and restore gates without decoding product payloads or making any packet
 //! forwarding claim.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use opc_redaction::{redact_text, RedactionSummary};
 use opc_types::{NetworkFunctionKind, TenantId};
@@ -134,6 +134,20 @@ impl RestoreScanRequest {
                 max: RESTORE_SCAN_MAX_PAGE_SIZE,
             });
         }
+        if let Some(owner) = &self.scope.owner {
+            if owner.as_str().is_empty() || owner.as_str().len() > 128 {
+                return Err(StoreError::InvalidRestoreScanRequest(
+                    "restore scan owner filter is invalid".to_string(),
+                ));
+            }
+        }
+        if let Some(SessionKeyType::Other(key_type)) = &self.scope.key_type {
+            if key_type.is_empty() || key_type.len() > 128 {
+                return Err(StoreError::InvalidRestoreScanRequest(
+                    "restore scan key-type filter is invalid".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -179,6 +193,90 @@ impl RestoreScanPage {
     /// Header-only restore summary for this page.
     pub fn record_summary(&self) -> RestoreRecordSummary {
         RestoreRecordSummary::from_records(&self.records, self.excluded_count)
+    }
+
+    /// Validate this page against the request that produced it.
+    ///
+    /// Network adapters must call this on untrusted peer responses before
+    /// exposing records to a quorum or restore consumer.
+    pub fn validate_for_request(&self, request: &RestoreScanRequest) -> Result<(), StoreError> {
+        request.validate()?;
+
+        if self.records.len() > request.limit {
+            return Err(StoreError::InvalidRestoreScanResponse(
+                "restore scan returned more records than requested".to_string(),
+            ));
+        }
+        if self.loaded_count != self.records.len() {
+            return Err(StoreError::InvalidRestoreScanResponse(
+                "restore scan loaded count does not match the record count".to_string(),
+            ));
+        }
+        if self.complete != self.next_cursor.is_none() {
+            return Err(StoreError::InvalidRestoreScanResponse(
+                "restore scan completion flag and next cursor disagree".to_string(),
+            ));
+        }
+        if self
+            .records
+            .iter()
+            .any(|record| !request.scope.matches_record(record))
+        {
+            return Err(StoreError::InvalidRestoreScanResponse(
+                "restore scan returned a record outside the requested scope".to_string(),
+            ));
+        }
+
+        let mut keys = HashSet::with_capacity(self.records.len());
+        for record in &self.records {
+            if record.owner.as_str().is_empty() || record.owner.as_str().len() > 128 {
+                return Err(StoreError::InvalidRestoreScanResponse(
+                    "restore scan returned a record with an invalid owner".to_string(),
+                ));
+            }
+            if let SessionKeyType::Other(key_type) = &record.key.key_type {
+                if key_type.is_empty() || key_type.len() > 128 {
+                    return Err(StoreError::InvalidRestoreScanResponse(
+                        "restore scan returned a record with an invalid key type".to_string(),
+                    ));
+                }
+            }
+            if !keys.insert(record.key.clone()) {
+                return Err(StoreError::InvalidRestoreScanResponse(
+                    "restore scan returned a duplicate session key".to_string(),
+                ));
+            }
+        }
+        if self
+            .records
+            .windows(2)
+            .any(|pair| compare_restore_records(&pair[0], &pair[1]).is_ge())
+        {
+            return Err(StoreError::InvalidRestoreScanResponse(
+                "restore scan records are not in deterministic order".to_string(),
+            ));
+        }
+
+        if let Some(next_cursor) = self.next_cursor {
+            if self.records.is_empty() {
+                return Err(StoreError::InvalidRestoreScanResponse(
+                    "incomplete restore scan page contains no records".to_string(),
+                ));
+            }
+            let start = request.cursor.map(RestoreScanCursor::offset).unwrap_or(0);
+            let expected = start.checked_add(self.records.len()).ok_or_else(|| {
+                StoreError::InvalidRestoreScanResponse(
+                    "restore scan cursor offset overflowed".to_string(),
+                )
+            })?;
+            if next_cursor.offset() != expected {
+                return Err(StoreError::InvalidRestoreScanResponse(
+                    "restore scan cursor did not advance by the returned record count".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 

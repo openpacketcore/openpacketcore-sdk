@@ -19,13 +19,15 @@ use opc_session_store::lease::{LeaseGuard, SessionLeaseManager};
 use opc_session_store::model::{OwnerId, SessionKey};
 
 use opc_session_store::record::StoredSessionRecord;
+use opc_session_store::{RestoreScanPage, RestoreScanRequest};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::error::ProtocolError;
 use crate::protocol::{
-    read_frame, write_frame, Request, Response, CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE,
+    ensure_frame_fits, read_frame, write_frame, Request, Response, RestoreScanWireRequest,
+    CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE, MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE,
 };
 
 /// Resolver callback used by [`RemoteSessionBackend::new_with_resolver`].
@@ -304,6 +306,7 @@ impl RemoteSessionBackend {
         match ack {
             Response::HelloAck { contract_version } => {
                 if contract_version != CONTRACT_VERSION {
+                    self.clear_cached_capabilities();
                     return Err(ProtocolError::VersionMismatch {
                         local: CONTRACT_VERSION,
                         remote: contract_version,
@@ -338,6 +341,12 @@ impl RemoteSessionBackend {
         }
     }
 
+    fn clear_cached_capabilities(&self) {
+        if let Ok(mut cached) = self.cached_capabilities.write() {
+            *cached = None;
+        }
+    }
+
     fn cached_capabilities(&self) -> Option<BackendCapabilities> {
         self.cached_capabilities
             .read()
@@ -345,14 +354,25 @@ impl RemoteSessionBackend {
             .and_then(|cached| *cached)
     }
 
+    fn capabilities_for_transport(
+        &self,
+        mut caps: BackendCapabilities,
+        fresh_v2_negotiation: bool,
+    ) -> BackendCapabilities {
+        if !fresh_v2_negotiation || self.max_frame_size < MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE {
+            caps.restore_scan = false;
+        }
+        caps
+    }
+
     fn capabilities_after_probe_failure(&self, reason: &str) -> BackendCapabilities {
         if let Some(caps) = self.cached_capabilities() {
             tracing::warn!(
                 target = %self.target,
                 reason,
-                "remote capabilities probe failed; using cached capabilities"
+                "remote capabilities probe failed; using cached capabilities with negotiated operations masked"
             );
-            caps
+            self.capabilities_for_transport(caps, false)
         } else {
             tracing::warn!(
                 target = %self.target,
@@ -362,6 +382,10 @@ impl RemoteSessionBackend {
             BackendCapabilities::minimal()
         }
     }
+
+    async fn discard_connection(&self) {
+        self.conn.lock().await.take();
+    }
 }
 
 #[async_trait]
@@ -370,7 +394,7 @@ impl SessionBackend for RemoteSessionBackend {
         match self.send_request_with_retry(Request::Capabilities).await {
             Ok(Response::Capabilities(caps)) => {
                 self.remember_capabilities(caps);
-                caps
+                self.capabilities_for_transport(caps, true)
             }
             Ok(_) => self.capabilities_after_probe_failure("unexpected_response"),
             Err(err) => {
@@ -437,6 +461,81 @@ impl SessionBackend for RemoteSessionBackend {
             Response::Batch(res) => res,
             Response::Error { message } => Err(StoreError::BackendUnavailable(message)),
             _ => Err(StoreError::BackendUnavailable("unexpected response".into())),
+        }
+    }
+
+    async fn scan_restore_records(
+        &self,
+        request: RestoreScanRequest,
+    ) -> Result<RestoreScanPage, StoreError> {
+        request.validate()?;
+        if self.max_frame_size < MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE {
+            return Err(StoreError::RestoreScanResponseTooLarge {
+                max_bytes: self.max_frame_size,
+            });
+        }
+        let wire_request = RestoreScanWireRequest::try_from(&request)?;
+        let max_response_frame_size = u32::try_from(self.max_frame_size).unwrap_or(u32::MAX);
+        let outbound = Request::ScanRestoreRecords {
+            request: wire_request,
+            max_response_frame_size,
+        };
+        ensure_frame_fits(&outbound, self.max_frame_size)
+            .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
+
+        let response = match self.send_request_with_retry(outbound).await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(
+                    target = %self.target,
+                    failure = store_error_kind(&error),
+                    "remote restore scan failed"
+                );
+                return Err(error);
+            }
+        };
+
+        match response {
+            Response::ScanRestoreRecords(Ok(page)) => {
+                if let Err(error) = page.validate_for_request(&request) {
+                    self.discard_connection().await;
+                    tracing::warn!(
+                        target = %self.target,
+                        failure = store_error_kind(&error),
+                        "remote restore scan response was rejected"
+                    );
+                    return Err(error);
+                }
+                Ok(page)
+            }
+            Response::ScanRestoreRecords(Err(error)) => {
+                tracing::warn!(
+                    target = %self.target,
+                    failure = store_error_kind(&error),
+                    "remote restore scan failed"
+                );
+                Err(error)
+            }
+            Response::Error { .. } => {
+                self.discard_connection().await;
+                tracing::warn!(
+                    target = %self.target,
+                    failure = "protocol_error",
+                    "remote restore scan failed"
+                );
+                Err(StoreError::BackendUnavailable(
+                    "remote restore scan returned a protocol error".to_string(),
+                ))
+            }
+            _ => {
+                self.discard_connection().await;
+                tracing::warn!(
+                    target = %self.target,
+                    failure = "unexpected_response",
+                    "remote restore scan response was rejected"
+                );
+                Err(StoreError::BackendUnavailable("unexpected response".into()))
+            }
         }
     }
 
@@ -724,7 +823,9 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::Serialization(_) => "serialization",
         StoreError::PayloadTooLarge { .. } => "payload_too_large",
         StoreError::InvalidRestoreScanRequest(_) => "invalid_restore_scan_request",
+        StoreError::InvalidRestoreScanResponse(_) => "invalid_restore_scan_response",
         StoreError::RestoreScanPageTooLarge { .. } => "restore_scan_page_too_large",
+        StoreError::RestoreScanResponseTooLarge { .. } => "restore_scan_response_too_large",
     }
 }
 
@@ -781,6 +882,46 @@ mod tests {
         (addr, handle)
     }
 
+    async fn version_mismatch_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read hello");
+            assert!(matches!(hello, Request::Hello { .. }));
+            write_frame(
+                &mut stream,
+                &Response::HelloAck {
+                    contract_version: CONTRACT_VERSION - 1,
+                },
+            )
+            .await
+            .expect("write incompatible hello ack");
+        });
+        (addr, handle)
+    }
+
+    async fn legacy_close_without_ack_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read hello");
+            assert!(matches!(hello, Request::Hello { .. }));
+            // Protocol v1 closed immediately when the peer version differed;
+            // it did not send a HelloAck that disclosed its version.
+        });
+        (addr, handle)
+    }
+
     #[tokio::test]
     async fn resolver_backend_reconnects_to_changed_address() {
         let caps_a = BackendCapabilities::minimal();
@@ -825,6 +966,177 @@ mod tests {
 
         assert_eq!(backend.capabilities().await, caps_a);
         handle_b.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_version_mismatch_clears_cached_restore_capability() {
+        let (compatible_addr, compatible_handle) =
+            capability_server(BackendCapabilities::all_enabled()).await;
+        let (incompatible_addr, incompatible_handle) = version_mismatch_server().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = calls.clone();
+        let resolver: RemoteAddrResolver = Arc::new(move || {
+            let call = resolver_calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call == 0 {
+                    Ok(compatible_addr)
+                } else {
+                    Ok(incompatible_addr)
+                }
+            }
+            .boxed()
+        });
+        let backend = RemoteSessionBackend::new_insecure_with_resolver(
+            resolver,
+            Some(Duration::from_secs(1)),
+        );
+
+        assert!(backend.capabilities().await.restore_scan);
+        let _ = compatible_handle.await;
+
+        let incompatible = backend.capabilities().await;
+        assert!(
+            !incompatible.restore_scan,
+            "an explicitly incompatible protocol must not retain restore support"
+        );
+        let _ = incompatible_handle.await;
+    }
+
+    #[tokio::test]
+    async fn legacy_close_without_ack_masks_cached_restore_capability() {
+        let (compatible_addr, compatible_handle) =
+            capability_server(BackendCapabilities::all_enabled()).await;
+        let (legacy_addr, legacy_handle) = legacy_close_without_ack_server().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = calls.clone();
+        let resolver: RemoteAddrResolver = Arc::new(move || {
+            let call = resolver_calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call == 0 {
+                    Ok(compatible_addr)
+                } else {
+                    Ok(legacy_addr)
+                }
+            }
+            .boxed()
+        });
+        let backend = RemoteSessionBackend::new_insecure_with_resolver(
+            resolver,
+            Some(Duration::from_millis(250)),
+        );
+
+        let warmed = backend.capabilities().await;
+        assert!(warmed.restore_scan);
+        let _ = compatible_handle.await;
+
+        let legacy = backend.capabilities().await;
+        assert!(
+            legacy.atomic_compare_and_set,
+            "cached v1 operation was lost"
+        );
+        assert!(
+            !legacy.restore_scan,
+            "v2-only restore support must be masked when fresh negotiation fails"
+        );
+        let _ = legacy_handle.await;
+    }
+
+    #[tokio::test]
+    async fn malformed_restore_page_is_rejected_and_discards_the_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read hello");
+            assert!(matches!(hello, Request::Hello { .. }));
+            write_frame(
+                &mut stream,
+                &Response::HelloAck {
+                    contract_version: CONTRACT_VERSION,
+                },
+            )
+            .await
+            .expect("write hello ack");
+            let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read restore request");
+            assert!(matches!(request, Request::ScanRestoreRecords { .. }));
+
+            let mut invalid_page = RestoreScanPage::new(Vec::new(), 0, None);
+            invalid_page.loaded_count = 1;
+            write_frame(&mut stream, &Response::ScanRestoreRecords(Ok(invalid_page)))
+                .await
+                .expect("write invalid page");
+        });
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+
+        let error = backend
+            .scan_restore_records(RestoreScanRequest::all(1))
+            .await
+            .expect_err("malformed peer page must fail closed");
+        assert!(matches!(error, StoreError::InvalidRestoreScanResponse(_)));
+        assert!(
+            backend.conn.lock().await.is_none(),
+            "a connection that returned a malformed page must not be reused"
+        );
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn remote_restore_scan_timeout_respects_the_method_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read hello");
+            assert!(matches!(hello, Request::Hello { .. }));
+            write_frame(
+                &mut stream,
+                &Response::HelloAck {
+                    contract_version: CONTRACT_VERSION,
+                },
+            )
+            .await
+            .expect("write hello ack");
+            let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read restore request");
+            assert!(matches!(request, Request::ScanRestoreRecords { .. }));
+            std::future::pending::<()>().await;
+        });
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_millis(100)));
+        let started = tokio::time::Instant::now();
+
+        let error = backend
+            .scan_restore_records(RestoreScanRequest::all(1))
+            .await
+            .expect_err("stalled restore response must time out");
+        assert!(matches!(error, StoreError::BackendUnavailable(_)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(backend.conn.lock().await.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_restore_request_fails_before_connecting() {
+        let backend = RemoteSessionBackend::new_insecure(
+            "127.0.0.1:1".parse().expect("address"),
+            Some(Duration::from_secs(1)),
+        );
+
+        let error = backend
+            .scan_restore_records(RestoreScanRequest::all(0))
+            .await
+            .expect_err("zero limit must fail validation");
+        assert!(matches!(error, StoreError::InvalidRestoreScanRequest(_)));
     }
 
     #[test]

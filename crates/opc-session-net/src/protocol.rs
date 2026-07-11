@@ -2,17 +2,85 @@ use std::time::Duration;
 
 use opc_session_store::backend::{CompareAndSet, ReplicationEntry, SessionOp, SessionOpResult};
 use opc_session_store::capability::BackendCapabilities;
+use opc_session_store::error::StoreError;
 use opc_session_store::lease::LeaseGuard;
 use opc_session_store::model::{OwnerId, SessionKey};
 use opc_session_store::record::StoredSessionRecord;
+use opc_session_store::{RestoreScanCursor, RestoreScanPage, RestoreScanRequest, RestoreScanScope};
 use serde::{Deserialize, Serialize};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::ProtocolError;
 
-pub const CONTRACT_VERSION: u32 = 1;
+pub const CONTRACT_VERSION: u32 = 2;
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 1024 * 1024;
+pub const MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE: usize = 512;
+
+/// Architecture-independent restore-scan request carried by protocol v2.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RestoreScanWireRequest {
+    scope: RestoreScanScope,
+    cursor: Option<u64>,
+    limit: u32,
+}
+
+impl TryFrom<&RestoreScanRequest> for RestoreScanWireRequest {
+    type Error = StoreError;
+
+    fn try_from(request: &RestoreScanRequest) -> Result<Self, Self::Error> {
+        request.validate()?;
+        let cursor = request
+            .cursor
+            .map(RestoreScanCursor::offset)
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| {
+                StoreError::InvalidRestoreScanRequest(
+                    "restore scan cursor exceeds the protocol range".to_string(),
+                )
+            })?;
+        let limit = u32::try_from(request.limit).map_err(|_| {
+            StoreError::InvalidRestoreScanRequest(
+                "restore scan limit exceeds the protocol range".to_string(),
+            )
+        })?;
+        Ok(Self {
+            scope: request.scope.clone(),
+            cursor,
+            limit,
+        })
+    }
+}
+
+impl TryFrom<RestoreScanWireRequest> for RestoreScanRequest {
+    type Error = StoreError;
+
+    fn try_from(request: RestoreScanWireRequest) -> Result<Self, Self::Error> {
+        let cursor = request
+            .cursor
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| {
+                StoreError::InvalidRestoreScanRequest(
+                    "restore scan cursor is not representable on this server".to_string(),
+                )
+            })?
+            .map(RestoreScanCursor::from_offset);
+        let limit = usize::try_from(request.limit).map_err(|_| {
+            StoreError::InvalidRestoreScanRequest(
+                "restore scan limit is not representable on this server".to_string(),
+            )
+        })?;
+        let request = Self {
+            scope: request.scope,
+            cursor,
+            limit,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Request {
@@ -38,6 +106,10 @@ pub enum Request {
     },
     Batch {
         ops: Vec<SessionOp>,
+    },
+    ScanRestoreRecords {
+        request: RestoreScanWireRequest,
+        max_response_frame_size: u32,
     },
     MaxReplicationSequence,
     GetReplicationLog {
@@ -84,6 +156,7 @@ pub enum Response {
     DeleteFenced(Result<(), opc_session_store::error::StoreError>),
     RefreshTtl(Result<(), opc_session_store::error::StoreError>),
     Batch(Result<Vec<SessionOpResult>, opc_session_store::error::StoreError>),
+    ScanRestoreRecords(Result<RestoreScanPage, opc_session_store::error::StoreError>),
     MaxReplicationSequence(Result<u64, opc_session_store::error::StoreError>),
     GetReplicationLog(Result<Vec<ReplicationEntry>, opc_session_store::error::StoreError>),
     ReplicateEntry(Result<(), opc_session_store::error::StoreError>),
@@ -105,7 +178,7 @@ where
     T: Serialize,
 {
     let json = serde_json::to_vec(frame).map_err(ProtocolError::Serialization)?;
-    let len = json.len() as u32;
+    let len = u32::try_from(json.len()).map_err(|_| ProtocolError::FrameTooLarge(json.len()))?;
     writer
         .write_all(&len.to_be_bytes())
         .await
@@ -113,6 +186,80 @@ where
     writer.write_all(&json).await.map_err(ProtocolError::Io)?;
     writer.flush().await.map_err(ProtocolError::Io)?;
     Ok(())
+}
+
+/// Write a complete frame within `timeout`.
+///
+/// Servers use this for bounded responses so a peer that stops reading cannot
+/// retain a connection slot indefinitely.
+pub async fn write_frame_within<W, T>(
+    writer: &mut W,
+    frame: &T,
+    timeout: std::time::Duration,
+) -> Result<(), ProtocolError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: Serialize,
+{
+    match tokio::time::timeout(timeout, write_frame(writer, frame)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(ProtocolError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out writing frame to peer",
+        ))),
+    }
+}
+
+struct BoundedFrameCounter {
+    encoded_len: usize,
+    max_frame_size: usize,
+    exceeded_at: Option<usize>,
+}
+
+impl std::io::Write for BoundedFrameCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let Some(attempted) = self.encoded_len.checked_add(buf.len()) else {
+            self.exceeded_at = Some(usize::MAX);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encoded frame length overflowed",
+            ));
+        };
+        if attempted > self.max_frame_size {
+            self.exceeded_at = Some(attempted);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encoded frame exceeds configured limit",
+            ));
+        }
+        self.encoded_len = attempted;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Validate an encoded frame size without allocating the encoded payload.
+pub(crate) fn ensure_frame_fits<T>(frame: &T, max_frame_size: usize) -> Result<(), ProtocolError>
+where
+    T: Serialize,
+{
+    let mut counter = BoundedFrameCounter {
+        encoded_len: 0,
+        max_frame_size,
+        exceeded_at: None,
+    };
+    match serde_json::to_writer(&mut counter, frame) {
+        Ok(()) => Ok(()),
+        Err(_) if counter.exceeded_at.is_some() => Err(ProtocolError::FrameTooLarge(
+            counter
+                .exceeded_at
+                .unwrap_or(max_frame_size.saturating_add(1)),
+        )),
+        Err(error) => Err(ProtocolError::Serialization(error)),
+    }
 }
 
 pub async fn read_frame<R, T>(reader: &mut R, max_frame_size: usize) -> Result<T, ProtocolError>
@@ -159,5 +306,82 @@ where
             std::io::ErrorKind::TimedOut,
             "timed out reading frame from peer",
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_scan_protocol_v2_frames_round_trip() {
+        assert_eq!(CONTRACT_VERSION, 2);
+
+        let domain_request = RestoreScanRequest {
+            scope: RestoreScanScope::all(),
+            cursor: Some(RestoreScanCursor::from_offset(7)),
+            limit: 3,
+        };
+        let request = Request::ScanRestoreRecords {
+            request: RestoreScanWireRequest::try_from(&domain_request).expect("wire request"),
+            max_response_frame_size: 32_768,
+        };
+        let encoded = serde_json::to_vec(&request).expect("encode request");
+        let decoded: Request = serde_json::from_slice(&encoded).expect("decode request");
+        match decoded {
+            Request::ScanRestoreRecords {
+                request,
+                max_response_frame_size,
+            } => {
+                assert_eq!(
+                    RestoreScanRequest::try_from(request).expect("domain request"),
+                    domain_request
+                );
+                assert_eq!(max_response_frame_size, 32_768);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let response = Response::ScanRestoreRecords(Ok(RestoreScanPage::new(Vec::new(), 0, None)));
+        let encoded = serde_json::to_vec(&response).expect("encode response");
+        let decoded: Response = serde_json::from_slice(&encoded).expect("decode response");
+        assert!(matches!(
+            decoded,
+            Response::ScanRestoreRecords(Ok(RestoreScanPage {
+                loaded_count: 0,
+                complete: true,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn bounded_encoder_rejects_oversized_restore_frame() {
+        let response =
+            Response::ScanRestoreRecords(Err(StoreError::BackendUnavailable("x".repeat(1024))));
+        assert!(matches!(
+            ensure_frame_fits(&response, 128),
+            Err(ProtocolError::FrameTooLarge(_))
+        ));
+
+        let terminal = Response::ScanRestoreRecords(Err(StoreError::RestoreScanResponseTooLarge {
+            max_bytes: MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE,
+        }));
+        ensure_frame_fits(&terminal, MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE)
+            .expect("minimum response budget must fit the terminal error");
+    }
+
+    #[tokio::test]
+    async fn oversized_declared_frame_is_rejected_before_payload_read() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        tokio::spawn(async move {
+            writer
+                .write_all(&1024_u32.to_be_bytes())
+                .await
+                .expect("write length");
+        });
+
+        let result = read_frame::<_, Response>(&mut reader, 128).await;
+        assert!(matches!(result, Err(ProtocolError::FrameTooLarge(1024))));
     }
 }

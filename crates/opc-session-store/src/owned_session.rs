@@ -388,8 +388,14 @@ impl OwnedSessionMutationError {
             StoreError::InvalidRestoreScanRequest(_) => Self::StoreRejected {
                 code: "invalid-restore-scan-request",
             },
+            StoreError::InvalidRestoreScanResponse(_) => Self::StoreRejected {
+                code: "invalid-restore-scan-response",
+            },
             StoreError::RestoreScanPageTooLarge { .. } => Self::StoreRejected {
                 code: "restore-scan-page-too-large",
+            },
+            StoreError::RestoreScanResponseTooLarge { .. } => Self::StoreRejected {
+                code: "restore-scan-response-too-large",
             },
         }
     }

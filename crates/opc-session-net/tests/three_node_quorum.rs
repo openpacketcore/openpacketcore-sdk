@@ -9,15 +9,19 @@ use opc_session_net::{RemoteSessionBackend, SessionReplicationServer};
 use opc_session_store::backend::{
     CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend,
 };
+use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::fake::FakeSessionBackend;
 use opc_session_store::lease::SessionLeaseManager;
 use opc_session_store::model::{
     FenceToken, Generation, OwnerId, SessionKey, SessionKeyType, StateClass, StateType,
 };
-use opc_session_store::quorum::{FencedSessionReplica, QuorumSessionStore};
+use opc_session_store::quorum::{FencedSessionReplica, QuorumSessionStore, SessionStoreBackend};
 use opc_session_store::record::{EncryptedSessionPayload, StoredSessionRecord};
+use opc_session_store::{
+    RestoreScanCursor, RestoreScanRequest, RestoreScanScope, SqliteSessionBackend, StoreError,
+};
 use opc_tls::TlsConfigBuilder;
-use opc_types::{NetworkFunctionKind, TenantId};
+use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
 #[derive(Clone)]
 struct TestMtls {
@@ -26,12 +30,38 @@ struct TestMtls {
 }
 
 fn test_key() -> SessionKey {
+    test_key_with_stable_id(b"test-session")
+}
+
+fn test_key_with_stable_id(stable_id: &'static [u8]) -> SessionKey {
     SessionKey {
         tenant: TenantId::new("tenant-a").unwrap(),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from_static(b"test-session"),
+        stable_id: Bytes::from_static(stable_id),
     }
+}
+
+async fn write_test_record<B>(backend: &B, key: SessionKey, owner: OwnerId) -> StoredSessionRecord
+where
+    B: SessionBackend + SessionLeaseManager,
+{
+    let lease = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .expect("acquire test lease");
+    let record = test_record(&key, &owner, lease.fence(), Generation::new(1));
+    let result = backend
+        .compare_and_set(CompareAndSet {
+            key,
+            lease,
+            expected_generation: None,
+            new_record: record.clone(),
+        })
+        .await
+        .expect("write test record");
+    assert_eq!(result, CompareAndSetResult::Success);
+    record
 }
 
 fn test_record(
@@ -150,18 +180,277 @@ async fn start_server(
     start_server_with_backend(mtls, backend).await
 }
 
-async fn start_server_with_backend(
+async fn start_server_with_backend<B>(
     mtls: &TestMtls,
-    backend: FakeSessionBackend,
-) -> (
-    SocketAddr,
-    FakeSessionBackend,
-    opc_session_net::server::ServerHandle,
-) {
+    backend: B,
+) -> (SocketAddr, B, opc_session_net::server::ServerHandle)
+where
+    B: SessionStoreBackend + Clone + 'static,
+{
     let server =
         SessionReplicationServer::new(Arc::new(backend.clone()), mtls.server_config.clone());
     let (handle, addr) = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
     (addr, backend, handle)
+}
+
+#[tokio::test]
+async fn remote_restore_scan_round_trips_scope_and_pagination_over_mtls() {
+    let mtls = mtls_configs();
+    let (addr, backend, handle) = start_server(&mtls).await;
+    let remote = RemoteSessionBackend::new(addr, mtls.client_config.clone(), None);
+
+    assert!(remote.capabilities().await.restore_scan);
+    let empty = remote
+        .scan_restore_records(RestoreScanRequest::all(1))
+        .await
+        .expect("empty remote restore scan");
+    assert!(empty.records.is_empty());
+    assert!(empty.complete);
+
+    let owner_a = OwnerId::new("owner-a").unwrap();
+    let owner_b = OwnerId::new("owner-b").unwrap();
+    write_test_record(&backend, test_key_with_stable_id(b"a"), owner_a.clone()).await;
+    write_test_record(&backend, test_key_with_stable_id(b"b"), owner_b.clone()).await;
+    write_test_record(&backend, test_key_with_stable_id(b"c"), owner_a.clone()).await;
+
+    let request = RestoreScanRequest {
+        scope: RestoreScanScope {
+            owner: Some(owner_a),
+            ..RestoreScanScope::all()
+        },
+        cursor: None,
+        limit: 1,
+    };
+    let first = remote
+        .scan_restore_records(request.clone())
+        .await
+        .expect("first remote restore page");
+    assert_eq!(first.records.len(), 1);
+    assert_eq!(first.records[0].key.stable_id.as_ref(), b"a");
+    assert_eq!(first.excluded_count, 1);
+    assert!(!first.complete);
+    assert!(first.next_cursor.is_some());
+
+    let second = remote
+        .scan_restore_records(RestoreScanRequest {
+            cursor: first.next_cursor,
+            ..request
+        })
+        .await
+        .expect("second remote restore page");
+    assert_eq!(second.records.len(), 1);
+    assert_eq!(second.records[0].key.stable_id.as_ref(), b"c");
+    assert_eq!(second.excluded_count, 1);
+    assert!(second.complete);
+    assert!(second.next_cursor.is_none());
+
+    let large_key = test_key_with_stable_id(b"d");
+    let large_lease = backend
+        .acquire(&large_key, owner_b.clone(), Duration::from_secs(60))
+        .await
+        .expect("acquire large-record lease");
+    let mut large_record = test_record(
+        &large_key,
+        &owner_b,
+        large_lease.fence(),
+        Generation::new(1),
+    );
+    large_record.payload = EncryptedSessionPayload::new(vec![7; 2048]);
+    assert_eq!(
+        backend
+            .compare_and_set(CompareAndSet {
+                key: large_key,
+                lease: large_lease,
+                expected_generation: None,
+                new_record: large_record,
+            })
+            .await
+            .expect("write large record"),
+        CompareAndSetResult::Success
+    );
+
+    let small_frame_remote = RemoteSessionBackend::new(
+        addr,
+        mtls.client_config.clone(),
+        Some(Duration::from_secs(1)),
+    )
+    .with_max_frame_size(512);
+    let oversized = small_frame_remote
+        .scan_restore_records(RestoreScanRequest {
+            scope: RestoreScanScope::all(),
+            cursor: Some(RestoreScanCursor::from_offset(3)),
+            limit: 1,
+        })
+        .await
+        .expect_err("a single record larger than the peer frame must fail closed");
+    assert_eq!(
+        oversized,
+        StoreError::RestoreScanResponseTooLarge { max_bytes: 512 }
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn remote_restore_capability_matches_executable_backend_support() {
+    let mtls = mtls_configs();
+    let mut capabilities = BackendCapabilities::all_enabled();
+    capabilities.restore_scan = false;
+    let backend = FakeSessionBackend::with_capabilities(capabilities);
+    let (addr, _backend, handle) = start_server_with_backend(&mtls, backend).await;
+    let remote = RemoteSessionBackend::new(addr, mtls.client_config.clone(), None);
+
+    assert!(!remote.capabilities().await.restore_scan);
+    assert_eq!(
+        remote
+            .scan_restore_records(RestoreScanRequest::all(1))
+            .await
+            .expect_err("remote backend without scan capability must fail closed"),
+        StoreError::CapabilityNotSupported("restore_scan".to_string())
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn unusable_client_or_server_frame_bound_masks_restore_capability() {
+    let mtls = mtls_configs();
+    let (addr, _backend, handle) = start_server(&mtls).await;
+    let constrained_client = RemoteSessionBackend::new(
+        addr,
+        mtls.client_config.clone(),
+        Some(Duration::from_secs(1)),
+    )
+    .with_max_frame_size(511);
+
+    assert!(!constrained_client.capabilities().await.restore_scan);
+    assert_eq!(
+        constrained_client
+            .scan_restore_records(RestoreScanRequest::all(1))
+            .await
+            .expect_err("client frame below the protocol minimum must reject scans"),
+        StoreError::RestoreScanResponseTooLarge { max_bytes: 511 }
+    );
+    handle.abort();
+
+    let backend = FakeSessionBackend::new();
+    let server = SessionReplicationServer::new(Arc::new(backend), mtls.server_config.clone())
+        .with_max_frame_size(511);
+    let (server_handle, server_addr) = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let default_client = RemoteSessionBackend::new(
+        server_addr,
+        mtls.client_config.clone(),
+        Some(Duration::from_secs(1)),
+    );
+
+    assert!(!default_client.capabilities().await.restore_scan);
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn boot_restore_and_live_survivor_scan_use_local_and_remote_sqlite_replicas() {
+    let mtls = mtls_configs();
+    let local = Arc::new(SqliteSessionBackend::in_memory().expect("local SQLite"));
+    let (addr1, _backend1, handle1) = start_server_with_backend(
+        &mtls,
+        SqliteSessionBackend::in_memory().expect("remote SQLite 1"),
+    )
+    .await;
+    let (addr2, _backend2, handle2) = start_server_with_backend(
+        &mtls,
+        SqliteSessionBackend::in_memory().expect("remote SQLite 2"),
+    )
+    .await;
+    let remote1 = Arc::new(RemoteSessionBackend::new(
+        addr1,
+        mtls.client_config.clone(),
+        Some(Duration::from_millis(300)),
+    ));
+    let remote2 = Arc::new(RemoteSessionBackend::new(
+        addr2,
+        mtls.client_config.clone(),
+        Some(Duration::from_millis(300)),
+    ));
+    let quorum = QuorumSessionStore::new(vec![
+        FencedSessionReplica::new(1, local),
+        FencedSessionReplica::new(2, remote1),
+        FencedSessionReplica::new(3, remote2),
+    ]);
+
+    let empty = quorum
+        .scan_restore_records(RestoreScanRequest::all(2))
+        .await
+        .expect("one local and two remote replicas must complete an empty scan");
+    assert!(empty.records.is_empty());
+
+    let owner = OwnerId::new("owner-quorum-restore").unwrap();
+    for stable_id in [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()] {
+        write_test_record(&quorum, test_key_with_stable_id(stable_id), owner.clone()).await;
+    }
+
+    let expired_key = test_key_with_stable_id(b"expired");
+    let expired_lease = quorum
+        .acquire(&expired_key, owner.clone(), Duration::from_secs(60))
+        .await
+        .expect("acquire expired-record lease");
+    let mut expired_record = test_record(
+        &expired_key,
+        &owner,
+        expired_lease.fence(),
+        Generation::new(1),
+    );
+    expired_record.expires_at = Some(Timestamp::from_offset_datetime(
+        time::OffsetDateTime::UNIX_EPOCH,
+    ));
+    assert_eq!(
+        quorum
+            .compare_and_set(CompareAndSet {
+                key: expired_key,
+                lease: expired_lease,
+                expected_generation: None,
+                new_record: expired_record,
+            })
+            .await
+            .expect("write expired record"),
+        CompareAndSetResult::Success
+    );
+
+    let request = RestoreScanRequest::all(2);
+    let first = quorum
+        .scan_restore_records(request.clone())
+        .await
+        .expect("first quorum restore page");
+    assert_eq!(first.records.len(), 2);
+    assert_eq!(first.records[0].key.stable_id.as_ref(), b"a");
+    assert_eq!(first.records[1].key.stable_id.as_ref(), b"b");
+    assert!(!first.complete);
+
+    let second = quorum
+        .scan_restore_records(RestoreScanRequest {
+            cursor: first.next_cursor,
+            ..request
+        })
+        .await
+        .expect("second quorum restore page");
+    assert_eq!(second.records.len(), 1);
+    assert_eq!(second.records[0].key.stable_id.as_ref(), b"c");
+    assert!(second.complete);
+
+    handle1.abort();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let degraded = quorum
+        .scan_restore_records(RestoreScanRequest::all(3))
+        .await
+        .expect("one local and one remote replica must still satisfy quorum");
+    assert_eq!(degraded.records.len(), 3);
+
+    handle2.abort();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let unavailable = quorum
+        .scan_restore_records(RestoreScanRequest::all(3))
+        .await
+        .expect_err("one local replica must not satisfy a three-replica quorum");
+    assert!(matches!(unavailable, StoreError::BackendUnavailable(_)));
 }
 
 #[tokio::test]
@@ -191,6 +480,34 @@ async fn stalled_connection_is_reaped_after_idle_timeout() {
         .expect("read from reaped connection");
 
     drop(handle);
+}
+
+#[tokio::test]
+#[cfg(feature = "insecure-test")]
+async fn incompatible_client_receives_server_contract_before_disconnect() {
+    use opc_session_net::protocol::{read_frame, write_frame, CONTRACT_VERSION};
+    use opc_session_net::{Request, Response};
+
+    let server = SessionReplicationServer::new_insecure(Arc::new(FakeSessionBackend::new()));
+    let (handle, addr) = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    write_frame(
+        &mut stream,
+        &Request::Hello {
+            contract_version: CONTRACT_VERSION - 1,
+            node_id: "old-client".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let response: Response = read_frame(&mut stream, 1024).await.unwrap();
+    assert!(matches!(
+        response,
+        Response::HelloAck { contract_version } if contract_version == CONTRACT_VERSION
+    ));
+
+    handle.abort();
 }
 
 #[tokio::test]
@@ -270,6 +587,13 @@ async fn test_three_node_quorum_kill_and_restart() {
     let quorum =
         QuorumSessionStore::new(vec![replica1.clone(), replica2.clone(), replica3.clone()]);
 
+    let empty_restore = quorum
+        .scan_restore_records(RestoreScanRequest::all(16))
+        .await
+        .expect("three remote replicas must complete an empty restore scan");
+    assert!(empty_restore.records.is_empty());
+    assert!(empty_restore.complete);
+
     // 4. Lease and write conformance
     let key = test_key();
     let owner = OwnerId::new("owner-1").unwrap();
@@ -292,6 +616,12 @@ async fn test_three_node_quorum_kill_and_restart() {
         .await
         .unwrap();
     assert_eq!(cas_result, CompareAndSetResult::Success);
+
+    let restored = quorum
+        .scan_restore_records(RestoreScanRequest::all(16))
+        .await
+        .expect("three remote replicas must restore the committed record");
+    assert_eq!(restored.records, vec![record.clone()]);
 
     // Read back
     let read = quorum.get(&key).await.unwrap();
@@ -317,6 +647,15 @@ async fn test_three_node_quorum_kill_and_restart() {
         .unwrap();
     assert_eq!(cas_result2, CompareAndSetResult::Success);
 
+    let restored_with_one_replica_down = quorum
+        .scan_restore_records(RestoreScanRequest::all(16))
+        .await
+        .expect("two live remote replicas must complete a quorum restore scan");
+    assert_eq!(
+        restored_with_one_replica_down.records,
+        vec![record2.clone()]
+    );
+
     // 7. Restart the server
     let server1_new =
         SessionReplicationServer::new(Arc::new(backend1.clone()), mtls.server_config.clone());
@@ -341,10 +680,20 @@ async fn test_three_node_quorum_kill_and_restart() {
     let read_repaired = quorum2.get(&key).await.unwrap();
     assert_eq!(read_repaired.as_ref(), Some(&record2));
 
-    // Cleanup
-    handle1_new.abort();
     handle2.abort();
     handle3.abort();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let no_restore_quorum = quorum2
+        .scan_restore_records(RestoreScanRequest::all(16))
+        .await
+        .expect_err("one live remote replica must not satisfy a three-replica quorum");
+    assert!(matches!(
+        no_restore_quorum,
+        StoreError::BackendUnavailable(_)
+    ));
+
+    // Cleanup
+    handle1_new.abort();
 }
 
 #[tokio::test]
@@ -396,9 +745,11 @@ async fn capabilities_uses_cached_success_after_disconnect() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let after_disconnect = remote.capabilities().await;
+    let mut expected = warmed;
+    expected.restore_scan = false;
     assert_eq!(
-        after_disconnect, warmed,
-        "capability transport failures must not silently downgrade a warmed remote backend"
+        after_disconnect, expected,
+        "cached backend features may survive transport loss, but v2-only restore support must be masked without a fresh negotiation"
     );
 }
 

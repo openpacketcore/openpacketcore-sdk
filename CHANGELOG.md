@@ -86,6 +86,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed fuzz corpora for the GTP-U, NAS, Diameter, and IKEv2 targets.
 
 ### Changed
+- **BREAKING — `opc-session-net`:** the wire contract is now v2 for remote
+  restore scans. The exact-version Hello handshake rejects v1/v2 peers, so all
+  clients and servers require a coordinated upgrade; mixed-version rolling
+  upgrades are unsupported. Public `Request`/`Response` and `StoreError` enums
+  also gain restore-scan variants, so external exhaustive matches must add
+  arms for them.
 - Documentation and package metadata now distinguish scoped implementation
   evidence, Cargo publication eligibility, and production maturity. Historical
   status snapshots, release-evidence primitives, and conditional
@@ -161,6 +167,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- `opc-session-net`: remote backends and replication servers now carry
+  validated cursor-paged restore scans, shorten multi-record pages to the
+  effective client/server frame limit, and return a typed error when one
+  record cannot fit. This implements the transport parity tracked by #126; it
+  does not implement bounded majority-authoritative restore (#133), fixed-width
+  wire stabilization (#134), invariant-safe model decoding (#135), or session
+  HA qualification (#123–#125, #127–#129).
 - `opc-persist`: standalone default-feature test builds no longer depend on
   fault-injection symbols that exist only with `dangerous-test-hooks`; CI now
   compiles the default package contract before workspace all-feature unification

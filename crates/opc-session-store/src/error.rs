@@ -76,6 +76,10 @@ pub enum StoreError {
     /// product payload fields.
     #[error("invalid restore scan request: {0}")]
     InvalidRestoreScanRequest(String),
+    /// A backend returned a restore page that violated the request contract.
+    /// The message is SDK-controlled and must not include record keys or payloads.
+    #[error("invalid restore scan response: {0}")]
+    InvalidRestoreScanResponse(String),
     /// Restore scan page size exceeds the SDK maximum. Nothing was read.
     #[error("restore scan page too large: requested {requested} exceeds maximum {max}")]
     RestoreScanPageTooLarge {
@@ -83,6 +87,14 @@ pub enum StoreError {
         requested: usize,
         /// Maximum supported page size.
         max: usize,
+    },
+    /// A restore-scan response could not fit within the configured response
+    /// budget, either because the budget is below the protocol minimum or one
+    /// record is too large. Increase the frame limit or reduce the stored value.
+    #[error("restore scan response exceeds the {max_bytes}-byte response limit")]
+    RestoreScanResponseTooLarge {
+        /// Maximum encoded response size accepted by the caller.
+        max_bytes: usize,
     },
 }
 

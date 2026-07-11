@@ -31,6 +31,8 @@ evidence.
 - Restore APIs include `RestoreScanRequest`, `RestoreScanPage`,
   `RestoreBlockReason`, summaries, page-size constants, and
   `summarize_restore_records`.
+- `opc-session-net` protocol v2 lets an individual remote backend execute the
+  same validated cursor-paged restore scan as a local backend.
 - `SessionStore<B>` wraps a backend in a typed store handle.
 
 ```rust,no_run
@@ -59,11 +61,19 @@ async fn open() -> Result<(), opc_session_store::StoreError> {
 - `StateClass` drives monotonic-generation and profile requirements.
 - SQLite file backends use WAL in tests and persist across restart.
 - `FakeSessionBackend` is for tests.
+- Remote transport parity does not make `QuorumSessionStore` restore a
+  production authority: its current aggregation still materializes replica
+  scans and resolves records without durable majority/commit proof (#127,
+  #133).
 
 ## Roadmap
 
 - Keep backend capabilities explicit so HA/profile suitability can fail closed.
 - Continue hardening restore evidence and traffic-blocking gates.
+- Complete validated topology/readiness/peer identity (#123–#125), durable
+  sequencing and safe fork repair/recovery (#127–#129), and bounded
+  majority-authoritative restore (#133), plus invariant-safe model decoding
+  (#135).
 - Keep encryption AAD bound to namespace, NF kind, state type, generation,
   fence, and session-key digest.
 

@@ -7,7 +7,9 @@ Experimental network transport for remote session-store replicas.
 `opc-session-net` exposes a length-prefixed JSON protocol between
 `RemoteSessionBackend` clients and `SessionReplicationServer` instances. It
 lets a `SessionBackend` or quorum coordinator call a remote replica using the
-same session-store traits.
+same session-store traits. Protocol v2 carries cursor-paged
+`SessionBackend::scan_restore_records` calls, so remote replicas no longer fall
+through to the trait's unsupported-operation default.
 
 ## API Shape
 
@@ -21,7 +23,14 @@ same session-store traits.
 - `SessionReplicationServer::new_insecure` exists only behind the
   `insecure-test` feature.
 - `with_idle_timeout`, `with_max_connections`, and `with_max_frame_size`
-  configure the server.
+  configure the server; `with_restore_scan_timeout` bounds cancellable backend
+  scan work.
+- `RemoteSessionBackend::scan_restore_records` validates requests and peer
+  pages. The server may return fewer records than requested so the encoded
+  response fits the smaller client/server frame limit; callers continue from
+  `next_cursor` until `complete`.
+- If one record cannot fit, the call returns
+  `StoreError::RestoreScanResponseTooLarge` instead of retrying indefinitely.
 - `listen(bind_addr).await` starts the listener and returns a server handle and
   bound address.
 - `Request`, `Response`, `ProtocolError`, and protocol constants live in the
@@ -52,12 +61,23 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 - Production client and server construction requires authenticated TLS.
 - Plaintext client/server support is test-only and gated behind
   `insecure-test`.
-- The wire contract version is `1`; the default max frame size is 1 MiB.
+- The wire contract version is `2`; the default max frame size is 1 MiB.
+- The Hello handshake requires an exact version match. Protocol v1 and v2
+  peers do not interoperate, so all session-net clients and servers require a
+  coordinated upgrade; mixed-version rolling upgrades are unsupported.
+- Restore scan is a bulk enumeration boundary. Production authorization still
+  depends on binding authenticated peer identity to authorized replica
+  membership (#125).
+- Remote scan transport parity does not qualify networked session HA for
+  production. Topology, fresh-quorum readiness, identity, durable authority,
+  fork recovery, bounded majority-authoritative restore, fixed-width wire DTOs,
+  and model-level decode invariants remain open in #123–#125, #127–#129, and
+  #133–#135.
 
 ## Roadmap
 
-- Harden protocol compatibility, cancellation behavior, watch streaming, and
-  operational metrics before treating this as production transport.
+- Close #123–#125, #127–#129, and #133–#135; add distributed failure and soak
+  evidence before treating this as production transport.
 - Keep plaintext transport limited to tests.
 - Keep the server wrapping `SessionStoreBackend` rather than owning storage.
 

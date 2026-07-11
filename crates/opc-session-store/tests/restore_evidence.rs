@@ -3,9 +3,9 @@ use opc_session_store::{
     summarize_restore_records, BackendCapabilities, CompareAndSet, CompareAndSetResult,
     EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedSessionReplica, Generation,
     OwnerId, QuorumSessionStore, RestoreBlockReason, RestoreBlockReasonCode, RestoreRecordSummary,
-    RestoreScanCursor, RestoreScanRequest, RestoreScanScope, SessionBackend, SessionKey,
-    SessionKeyType, SessionLeaseManager, SessionStoreBackend, SqliteSessionBackend, StateClass,
-    StateType, StoreError, StoredSessionRecord, RESTORE_SCAN_MAX_PAGE_SIZE,
+    RestoreScanCursor, RestoreScanPage, RestoreScanRequest, RestoreScanScope, SessionBackend,
+    SessionKey, SessionKeyType, SessionLeaseManager, SessionStoreBackend, SqliteSessionBackend,
+    StateClass, StateType, StoreError, StoredSessionRecord, RESTORE_SCAN_MAX_PAGE_SIZE,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use std::{sync::Arc, time::Duration};
@@ -321,6 +321,51 @@ async fn restore_scan_rejects_bad_page_sizes() {
         StoreError::RestoreScanPageTooLarge { requested, max }
             if requested == RESTORE_SCAN_MAX_PAGE_SIZE + 1 && max == RESTORE_SCAN_MAX_PAGE_SIZE
     ));
+}
+
+#[test]
+fn restore_scan_page_validation_rejects_untrusted_contract_violations() {
+    let request = RestoreScanRequest::all(2);
+    let first = record("owner-a", b"a", StateClass::AuthoritativeSession, 1, 1);
+    let second = record("owner-a", b"b", StateClass::AuthoritativeSession, 1, 1);
+    RestoreScanPage::new(vec![first.clone(), second.clone()], 0, None)
+        .validate_for_request(&request)
+        .expect("valid deterministic page");
+
+    let assert_invalid = |page: RestoreScanPage| {
+        assert!(matches!(
+            page.validate_for_request(&request),
+            Err(StoreError::InvalidRestoreScanResponse(_))
+        ));
+    };
+
+    let mut wrong_count = RestoreScanPage::new(vec![first.clone()], 0, None);
+    wrong_count.loaded_count = 2;
+    assert_invalid(wrong_count);
+
+    assert_invalid(RestoreScanPage::new(
+        vec![first.clone(), first.clone()],
+        0,
+        None,
+    ));
+    assert_invalid(RestoreScanPage::new(vec![second, first.clone()], 0, None));
+
+    let mut nonadvancing = RestoreScanPage::new(
+        vec![first.clone()],
+        0,
+        Some(RestoreScanCursor::from_offset(2)),
+    );
+    nonadvancing.complete = false;
+    assert_invalid(nonadvancing);
+
+    let invalid_owner: OwnerId = serde_json::from_str("\"\"").expect("deserialize owner");
+    let mut invalid_record = first.clone();
+    invalid_record.owner = invalid_owner;
+    assert_invalid(RestoreScanPage::new(vec![invalid_record], 0, None));
+
+    let mut invalid_key_type = first;
+    invalid_key_type.key.key_type = SessionKeyType::Other("x".repeat(129));
+    assert_invalid(RestoreScanPage::new(vec![invalid_key_type], 0, None));
 }
 
 #[tokio::test]
