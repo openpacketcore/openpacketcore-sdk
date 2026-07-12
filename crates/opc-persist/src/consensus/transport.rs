@@ -14,6 +14,7 @@ use super::identity::{
     build_client_tls_connector, extract_spiffe_id_from_cert_der, parse_local_spiffe_profile,
     parse_spiffe_id,
 };
+use super::rpc_timing::{RPC_INITIAL_RETRY_DELAY, RPC_MAX_ATTEMPTS};
 use super::{
     AppendEntriesRequest, AppendEntriesResponse, ConsensusConfigStore, ConsensusMetrics,
     ConsensusOp, ConsensusPeer, InstallSnapshotRequest, InstallSnapshotResponse, NodeIdentity,
@@ -133,15 +134,14 @@ async fn send_rpc(
     timeout_dur: std::time::Duration,
 ) -> Result<RpcResponse, PersistError> {
     let mut attempt = 0;
-    let max_attempts = 3;
-    let mut delay = std::time::Duration::from_millis(50);
+    let mut delay = RPC_INITIAL_RETRY_DELAY;
 
     loop {
         attempt += 1;
         match send_rpc_once(peer, &req, timeout_dur).await {
             Ok(resp) => return Ok(resp),
             Err(e) => {
-                if attempt >= max_attempts {
+                if attempt >= RPC_MAX_ATTEMPTS {
                     return Err(redact_error(e));
                 }
                 tokio::time::sleep(delay).await;
@@ -939,5 +939,19 @@ impl ConfigStore for ConsensusConfigStore {
 
     async fn preflight(&self) -> Result<PersistCapabilities, PersistError> {
         self.inner.preflight().await
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::super::rpc_timing::rpc_io_timeout_and_backoff_budget;
+    use std::time::Duration;
+
+    #[test]
+    fn rpc_budget_includes_all_io_stage_timeouts_retries_and_backoff() {
+        assert_eq!(
+            rpc_io_timeout_and_backoff_budget(Duration::from_millis(500)),
+            Duration::from_millis(7_650)
+        );
     }
 }

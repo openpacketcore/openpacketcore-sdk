@@ -2,7 +2,7 @@ mod common;
 
 use common::{
     connect_raw_tls, generate_custom_identity, generate_test_ca_and_identities,
-    AuthenticatedRequest, TestCluster,
+    wait_for_automatic_leader, AuthenticatedRequest, NodeMetricsDiagnostic, TestCluster,
 };
 use opc_types::TxId;
 use serde_json::json;
@@ -12,6 +12,37 @@ use tokio::time::sleep;
 
 fn get_dynamic_base_port() -> u16 {
     common::find_free_port_block(50)
+}
+
+#[test]
+fn metrics_diagnostic_rejects_success_missing_required_fields() {
+    let mut diagnostic = NodeMetricsDiagnostic::new(1);
+    diagnostic.observe_response(&json!({
+        "success": true,
+        "data": {
+            "role": "Follower",
+            "term": 6,
+            "election_count": 1,
+            "leader_changes": 0
+        }
+    }));
+    diagnostic.observe_response(&json!({
+        "success": true,
+        "data": {
+            "role": "Leader",
+            "term": 7,
+            "election_count": 2
+        }
+    }));
+
+    assert_eq!(diagnostic.role.as_deref(), Some("Follower"));
+    assert_eq!(diagnostic.term, Some(6));
+    assert_eq!(diagnostic.election_count, Some(1));
+    assert_eq!(diagnostic.leader_changes, Some(0));
+    assert_eq!(
+        diagnostic.command_error.as_deref(),
+        Some("DumpMetrics success response is missing required field(s): leader_changes")
+    );
 }
 
 #[tokio::test]
@@ -75,46 +106,28 @@ async fn test_metrics_election_count() {
     sleep(Duration::from_millis(500)).await;
 
     cluster.kill_node(0).await;
-    let mut new_leader = None;
-    for _attempt in 0..35 {
-        for &node_id in &[1, 2] {
-            if let Ok(resp) = cluster
-                .nodes
-                .get_mut(&node_id)
-                .unwrap()
-                .send_command(json!({
-                    "command": "DumpMetrics"
-                }))
-                .await
-            {
-                if resp["success"].as_bool().unwrap_or(false)
-                    && resp["data"]["role"].as_str() == Some("Leader")
-                {
-                    new_leader = Some(node_id);
-                    break;
-                }
-            }
-        }
-        if new_leader.is_some() {
-            break;
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
-    let leader_id = new_leader.expect("Leader should be elected after failover");
-
-    let m = cluster
-        .nodes
-        .get_mut(&leader_id)
-        .unwrap()
-        .send_command(json!({
-            "command": "DumpMetrics"
-        }))
-        .await
-        .unwrap();
-    let election_count = m["data"]["election_count"].as_u64().unwrap();
-    let leader_changes = m["data"]["leader_changes"].as_u64().unwrap();
-    assert!(election_count >= 1);
-    assert!(leader_changes >= 1);
+    let observation = wait_for_automatic_leader(
+        &mut cluster,
+        &[1, 2],
+        "leader failover after terminating node 0",
+    )
+    .await;
+    let leader_id = observation.leader_id;
+    let survivor_diagnostics = observation.diagnostics;
+    let leader_metrics = survivor_diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.node_id == leader_id)
+        .expect("elected leader should have a metrics diagnostic");
+    let election_count = leader_metrics.election_count.unwrap_or(0);
+    let leader_changes = leader_metrics.leader_changes.unwrap_or(0);
+    assert!(
+        election_count >= 1,
+        "new leader should report at least one election; survivor diagnostics: {survivor_diagnostics:#?}"
+    );
+    assert!(
+        leader_changes >= 1,
+        "new leader should report at least one leader change; survivor diagnostics: {survivor_diagnostics:#?}"
+    );
 }
 
 #[tokio::test]
