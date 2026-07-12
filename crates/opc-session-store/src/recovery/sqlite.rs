@@ -60,6 +60,7 @@ pub(super) struct ResetInput<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RecoveryFailpoint {
     AfterTargetBackupCopy,
@@ -312,6 +313,7 @@ fn inspect_current(
 ) -> Result<RecoveryReplicaEvidence, RecoveryError> {
     budget.check()?;
     preflight_current_tables(conn, budget)?;
+    validate_exact_recovery_schema(conn, false)?;
     let (schema_version, cluster, configuration, epoch): (i64, Vec<u8>, Vec<u8>, i64) = conn
         .query_row(
             "SELECT schema_version, cluster_id, configuration_id, configuration_epoch FROM consensus_identity WHERE singleton = 1",
@@ -398,9 +400,7 @@ fn inspect_current(
     budget.check()?;
     Ok(RecoveryReplicaEvidence {
         replica_token: super::replica_token(input.key, &input.replica.replica_id)?,
-        backing_identity: RecoveryDigest::from_bytes(
-            input.replica.backing_identity.fingerprint(),
-        ),
+        backing_identity: RecoveryDigest::from_bytes(input.replica.backing_identity.fingerprint()),
         path_binding,
         file_identity,
         format: RecoveryReplicaFormat::Openraft,
@@ -649,9 +649,7 @@ fn inspect_legacy(
     let sequence_high_water = local_head_index.unwrap_or(0);
     Ok(RecoveryReplicaEvidence {
         replica_token: super::replica_token(input.key, &input.replica.replica_id)?,
-        backing_identity: RecoveryDigest::from_bytes(
-            input.replica.backing_identity.fingerprint(),
-        ),
+        backing_identity: RecoveryDigest::from_bytes(input.replica.backing_identity.fingerprint()),
         path_binding,
         file_identity,
         format: RecoveryReplicaFormat::LegacyUnproven,
@@ -759,7 +757,10 @@ fn validate_legacy_schema(conn: &Connection) -> Result<(), RecoveryError> {
     Ok(())
 }
 
-fn validate_exact_recovery_schema(conn: &Connection) -> Result<(), RecoveryError> {
+fn validate_exact_recovery_schema(
+    conn: &Connection,
+    require_recovery_table: bool,
+) -> Result<(), RecoveryError> {
     let expected = BTreeSet::from([
         "consensus_applied",
         "consensus_committed",
@@ -790,11 +791,18 @@ fn validate_exact_recovery_schema(conn: &Connection) -> Result<(), RecoveryError
         .map_err(|_| RecoveryError::CorruptReplica)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    if objects.len() != expected.len()
-        || objects
-            .iter()
-            .any(|(kind, name)| kind != "table" || !expected.contains(name.as_str()))
-    {
+    let observed = objects
+        .iter()
+        .map(|(_, name)| name.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_without_recovery = expected
+        .iter()
+        .copied()
+        .filter(|name| *name != "consensus_operator_recovery")
+        .collect::<BTreeSet<_>>();
+    let exact_names =
+        observed == expected || (!require_recovery_table && observed == expected_without_recovery);
+    if !exact_names || objects.iter().any(|(kind, _)| kind != "table") {
         return Err(RecoveryError::CorruptReplica);
     }
     Ok(())
@@ -1318,10 +1326,7 @@ pub(super) fn backup_and_reset_replica(
         }
         if progress < TargetInstallState::SnapshotInstalled {
             if progress == TargetInstallState::Pending {
-                require_snapshot_install_temporary_absent(
-                    target,
-                    source_snapshot_name.as_deref(),
-                )?;
+                require_snapshot_install_temporary_absent(target, source_snapshot_name.as_deref())?;
                 workflow
                     .target_installs
                     .insert(target_token.to_hex(), TargetInstallState::SnapshotCopying);
@@ -1377,13 +1382,8 @@ pub(super) fn backup_and_reset_replica(
                     .insert(target_token.to_hex(), TargetInstallState::DatabaseCopying);
                 write_workflow(input.key, &workflow_dir, &workflow)?;
             }
-            if target_matches_staged_recovery(
-                input.key,
-                input.plan,
-                target,
-                &staged,
-                input.limits,
-            )? {
+            if target_matches_staged_recovery(input.key, input.plan, target, &staged, input.limits)?
+            {
                 workflow
                     .target_installs
                     .insert(target_token.to_hex(), TargetInstallState::DatabaseInstalled);
@@ -1476,16 +1476,13 @@ fn acquire_fleet_execution_locks(
     let mut locks = Vec::with_capacity(replicas.len());
     for replica in replicas {
         let paths = validate_bound_replica_path(key, plan, replica)?;
-        let file = open_regular_read(&paths.database)
-            .map_err(|_| RecoveryError::FileOperationFailed)?;
+        let file =
+            open_regular_read(&paths.database).map_err(|_| RecoveryError::FileOperationFailed)?;
         let metadata = file
             .metadata()
             .map_err(|_| RecoveryError::FileOperationFailed)?;
-        let file = nix::fcntl::Flock::lock(
-            file,
-            nix::fcntl::FlockArg::LockExclusiveNonblock,
-        )
-        .map_err(|_| RecoveryError::FileOperationFailed)?;
+        let file = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|_| RecoveryError::FileOperationFailed)?;
         locks.push(ReplicaExecutionLock {
             path: paths.database,
             _file: file,
@@ -1527,10 +1524,7 @@ fn revalidate_execution_lock(
 }
 
 #[cfg(not(unix))]
-fn revalidate_execution_lock(
-    _locks: &[()],
-    _path: &Path,
-) -> Result<(), RecoveryError> {
+fn revalidate_execution_lock(_locks: &[()], _path: &Path) -> Result<(), RecoveryError> {
     Err(RecoveryError::InvalidRequest)
 }
 
@@ -1568,7 +1562,10 @@ pub(super) fn set_fleet_latches_audit_pending(
     }
     opc_redaction::metrics::METRICS
         .session_operator_recovery_audit_pending
-        .store(i64::from(audit_pending), std::sync::atomic::Ordering::Relaxed);
+        .store(
+            i64::from(audit_pending),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     Ok(())
 }
 
@@ -1757,9 +1754,10 @@ fn ensure_target_backup(
             original_name: Some(snapshot.file_name),
         });
     }
-    let backed_up_replica = RecoveryReplica::new(
+    let backed_up_replica = RecoveryReplica::new_bound(
         target.replica_id.clone(),
         target.backing_identity.clone(),
+        target.admitted_identity,
         backup_database.clone(),
         backup_snapshots,
     );
@@ -1959,9 +1957,10 @@ fn create_checkpoint(
     } else {
         (None, None)
     };
-    let replica = RecoveryReplica::new(
+    let replica = RecoveryReplica::new_bound(
         source.replica_id.clone(),
         source.backing_identity.clone(),
+        source.admitted_identity,
         &database,
         &snapshots,
     );
@@ -2022,9 +2021,10 @@ fn verify_checkpoint(
         (None, None) => {}
         _ => return Err(RecoveryError::BackupCorrupt),
     }
-    let replica = RecoveryReplica::new(
+    let replica = RecoveryReplica::new_bound(
         source.replica_id.clone(),
         source.backing_identity.clone(),
+        source.admitted_identity,
         &database,
         &snapshots,
     );
@@ -2064,9 +2064,10 @@ fn stage_source(
             convert_legacy_checkpoint(&paths.database, staged, limits)?;
         }
     }
-    let staged_replica = RecoveryReplica::new(
+    let staged_replica = RecoveryReplica::new_bound(
         source.replica_id.clone(),
         source.backing_identity.clone(),
+        source.admitted_identity,
         staged.to_path_buf(),
         paths.snapshots.clone(),
     );
@@ -2154,7 +2155,7 @@ fn stage_source(
                 plan.body.watch_cursor_invalidation_floor,
             )
             .map_err(|_| RecoveryError::CorruptReplica)?;
-            validate_exact_recovery_schema(&conn)?;
+            validate_exact_recovery_schema(&conn, true)?;
         }
     }
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode = DELETE;")
@@ -2305,9 +2306,10 @@ fn verify_staged_source(
     limits: RecoveryLimits,
 ) -> Result<(), RecoveryError> {
     let checkpoint_paths = canonical_replica_paths(checkpoint, false)?;
-    let staged_replica = RecoveryReplica::new(
+    let staged_replica = RecoveryReplica::new_bound(
         checkpoint.replica_id.clone(),
         checkpoint.backing_identity.clone(),
+        checkpoint.admitted_identity,
         staged.to_path_buf(),
         checkpoint_paths.snapshots,
     );
@@ -2328,8 +2330,7 @@ fn verify_staged_source(
         || evidence.pending_plan_digest != Some(plan.plan_digest)
         || evidence.application_sequence != plan.body.application_sequence_high_water
         || evidence.watch_sequence != plan.body.watch_cursor_invalidation_floor
-        || evidence.watch_cursor_invalidation_floor
-            != plan.body.watch_cursor_invalidation_floor
+        || evidence.watch_cursor_invalidation_floor != plan.body.watch_cursor_invalidation_floor
         || evidence.fence_high_water > plan.body.fence_high_water
         || evidence.credential_high_water > plan.body.credential_high_water
         || evidence.logical_state_digest != planned_source.logical_state_digest
@@ -2477,8 +2478,7 @@ fn verify_target_installed(
         || evidence.pending_plan_digest != Some(plan.plan_digest)
         || evidence.application_sequence != plan.body.application_sequence_high_water
         || evidence.watch_sequence != plan.body.watch_cursor_invalidation_floor
-        || evidence.watch_cursor_invalidation_floor
-            != plan.body.watch_cursor_invalidation_floor
+        || evidence.watch_cursor_invalidation_floor != plan.body.watch_cursor_invalidation_floor
         || evidence.logical_state_digest != planned_source.logical_state_digest
     {
         return Err(RecoveryError::BackupCorrupt);
@@ -3040,6 +3040,20 @@ fn canonical_replica_paths(
 ) -> Result<CanonicalReplicaPaths, RecoveryError> {
     validate_path_text(&replica.database_path)?;
     validate_path_text(&replica.snapshot_directory)?;
+    match fs::symlink_metadata(&replica.database_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
+            return Err(RecoveryError::InvalidRequest);
+        }
+        Ok(_) => {}
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(RecoveryError::DatabaseUnavailable),
+    }
+    let raw_snapshot_metadata = fs::symlink_metadata(&replica.snapshot_directory)
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    if raw_snapshot_metadata.file_type().is_symlink() || !raw_snapshot_metadata.file_type().is_dir()
+    {
+        return Err(RecoveryError::InvalidRequest);
+    }
     let database = if allow_missing {
         replica.database_path.clone()
     } else {
@@ -3090,11 +3104,11 @@ fn recovery_file_identity(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        return Ok(RecoveryDigest::from_bytes(plan_mac(
+        Ok(RecoveryDigest::from_bytes(plan_mac(
             key,
             FILE_IDENTITY_DOMAIN,
             &[&metadata.dev().to_be_bytes(), &metadata.ino().to_be_bytes()],
-        )?));
+        )?))
     }
     #[cfg(not(unix))]
     {

@@ -27,19 +27,25 @@ gates still apply.
   its first backup. A changed source, changed target, changed global
   fence/credential high-water, wrong cluster, pending workflow, or lost
   majority aborts before mutation.
+- Every vote supplies the same opaque backing identity admitted by the quorum
+  topology. Planning binds that identity, the canonical database/snapshot
+  paths, and the database device/inode; duplicate identities, paths, or
+  hard-link aliases cannot count as independent majority evidence.
 - Every explicitly selected target is backed up and integrity-verified before
   any target is replaced. Legacy recovery explicitly selects every PVC,
   including the chosen source PVC.
 - One immutable checkpoint is created from the selected source after all
   quarantine backups complete. Every selected legacy PVC is converted from
   that same checkpoint; the procedure never reselects a branch while resuming.
-- Reset replicas remain readiness-fenced by the exact pending recovery epoch
-  and plan digest. Only a normal command committed by the current local
-  Openraft leader can finalize the recovery.
+- Before backup, every voter receives a durable local campaign latch beside
+  its database. The latch is outside SQLite so snapshot install cannot erase
+  it; it blocks standalone operations, ordinary quorum operations, and
+  readiness until finalization and its success audit complete. The replicated
+  pending epoch/digest remains the Openraft-owned cluster fence.
 - Finalization invalidates pre-recovery leases and credentials, preserves or
   raises every observed fence and credential high-water, commits a monotonic
-  recovery epoch, and requires a fresh durable-readiness barrier before
-  service admission.
+  recovery epoch, and requires a fresh linearizable rejoin barrier before the
+  local readiness latches can be cleared.
 
 ## Prerequisites
 
@@ -48,7 +54,11 @@ gates still apply.
    ID, configuration ID, configuration epoch, and logical `ReplicaId` mapping.
 2. Supply the exact admitted voter set and all of its file-backed replicas. Do
    not substitute DNS names, FQDNs, pod hostnames, endpoints, or certificate
-   identities for logical replica identity.
+   identities for logical replica identity. Construct each `RecoveryReplica`
+   with `RecoveryReplica::from_topology` and the validated topology that will
+   run the recovered fleet; the constructor copies the admitted
+   `ReplicaBackingIdentity` and consensus configuration instead of accepting a
+   recovery-only identity.
 3. Mount a dedicated backup root owned by the recovery process. On Unix it must
    be a real directory with mode `0700`; artifacts are created as `0600` files
    beneath `0700` directories. Symlinks, permissive modes, unexpected files,
@@ -111,9 +121,14 @@ authenticated quarantine backup.
    backup root. It performs, in order:
 
    - full-fleet re-inspection and authority/high-water revalidation;
+   - durable local admission latches on every voter;
    - an HMAC-authenticated quarantine backup for every selected target;
    - creation and verification of one immutable source checkpoint;
-   - creation of one staged image bound to the pending epoch and plan digest;
+   - import into one fresh SDK-created schema that rejects triggers, views,
+     and unknown objects, followed by an exact logical-state digest check;
+   - creation of one staged image bound to the pending epoch, plan digest,
+     application/watch maxima, cursor invalidation floor, and allocation
+     floors;
    - atomic installation on each explicitly selected target; and
    - a sealed transition to `awaiting_epoch_commit`.
 
@@ -121,11 +136,13 @@ authenticated quarantine backup.
    admitted identity and membership. A pending member may exchange Raft traffic
    so the cluster can form, but ordinary session operations and readiness stay
    blocked.
-5. Route `LegacyForkRecovery::finalize` to the current leader's local
-   administrative boundary. The generic peer RPC surface cannot forward or
-   authorize this command. Finalization commits the exact epoch/digest and
-   preserved high-waters through Openraft, deactivates old leases, advances the
-   allocation floors, and runs the ordinary durable-readiness barrier.
+5. Route `LegacyForkRecovery::finalize`, with the same full replica set, to the
+   current leader's local administrative boundary. The generic peer RPC
+   surface cannot forward or authorize this command. Finalization commits the
+   exact epoch/digest and preserved high-waters through Openraft, deactivates
+   old leases, advances the allocation floors, proves rejoin through an
+   internal linearizable barrier while public readiness remains latched, and
+   clears the latches only after the durable success audit.
 6. Resume traffic only after the returned and durably journaled state is
    `rejoined`, `opc_session_store_operator_recovery_required` is `0`, and the
    normal durable-readiness probe is ready on the expected members.
@@ -139,7 +156,10 @@ authenticated quarantine backup.
 Reuse the same sealed plan, integrity key, exact replica set, confirmation, and
 backup root. Do not delete individual artifacts or create a new source choice.
 The workflow authenticates its journal, every target manifest, the immutable
-checkpoint, and the staged image before continuing.
+checkpoint, and the staged image before continuing. Per-file states record
+copy/install intent before creation, rename, and fsync boundaries. A retry
+cleans only a journal-owned partial artifact, verifies already-promoted files,
+and never reinstalls a target recorded as complete.
 
 | Durable state | Meaning | Safe next action |
 | --- | --- | --- |
@@ -149,6 +169,12 @@ checkpoint, and the staged image before continuing.
 | `epoch_committed` | Openraft committed fencing, but the rejoin barrier is incomplete. | Resume `finalize`; do not serve traffic. |
 | `rejoined` | The epoch and fresh durable-readiness barrier completed. | Admit service after ordinary product readiness checks. |
 | `audit_pending` | A side effect completed but its success audit was unavailable. | Restore the audit sink and resume the same operation; keep readiness blocked. |
+
+On process restart, opening a latched SQLite voter reconstructs the required,
+epoch, and audit-pending gauges from the fixed-width sidecar before the store
+can advertise capabilities. The first quorum readiness/operation probe also
+validates the latch identity against the admitted consensus identity and fails
+closed on mismatch or corruption.
 
 ## Abort matrix
 
@@ -193,6 +219,7 @@ The observer emits the fixed states above and the low-cardinality alarms
 - `opc_session_store_operator_recovery_attempts_total`
 - `opc_session_store_operator_recovery_failures_total`
 - `opc_session_store_operator_recovery_required`
+- `opc_session_store_operator_recovery_audit_pending`
 - `opc_session_store_operator_recovery_epoch`
 - `opc_session_store_operator_recovery_rejoins_total`
 

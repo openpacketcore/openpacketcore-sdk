@@ -300,7 +300,7 @@ fn create_legacy_replica(root: &Path, id: ReplicaId, fence: u64) -> RecoveryRepl
     drop(conn);
     let backing = ReplicaBackingIdentity::new(format!("recovery-backing-{}", id.as_str()))
         .expect("recovery backing identity");
-    RecoveryReplica::new(id, backing, database, snapshots)
+    RecoveryReplica::new_bound(id, backing, identity(), database, snapshots)
 }
 
 fn private_tempdir() -> tempfile::TempDir {
@@ -480,6 +480,49 @@ fn planning_rejects_duplicate_backing_path_and_hardlink_votes() {
     std::fs::hard_link(&hardlinks[0].database_path, &hardlinks[1].database_path)
         .expect("create database hardlink alias");
     assert_rejected(&hardlinks, &ids);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let symlink_root = tempfile::tempdir().expect("symlink root");
+        let mut symlinked = vec![
+            create_legacy_replica(symlink_root.path(), ids[0].clone(), 1),
+            create_legacy_replica(symlink_root.path(), ids[1].clone(), 2),
+            create_legacy_replica(symlink_root.path(), ids[2].clone(), 3),
+        ];
+        let alias = symlink_root.path().join("database-alias.sqlite");
+        symlink(&symlinked[1].database_path, &alias).expect("create database symlink alias");
+        symlinked[1].database_path = alias;
+        assert_rejected(&symlinked, &ids);
+    }
+}
+
+#[test]
+fn recovery_replica_is_derived_from_validated_topology() {
+    let (topology, admitted_identity, _) = singleton_topology();
+    let admitted_member = topology.members()[0].clone();
+    let replica = RecoveryReplica::from_topology(
+        &topology,
+        admitted_member.replica_id().clone(),
+        "/private/recovery.sqlite",
+        "/private/recovery-snapshots",
+    )
+    .expect("derive recovery input from admitted topology");
+    assert_eq!(replica.replica_id(), admitted_member.replica_id());
+    assert_eq!(
+        replica.backing_identity(),
+        admitted_member.backing_identity()
+    );
+    assert_eq!(replica.admitted_identity, admitted_identity);
+    assert!(matches!(
+        RecoveryReplica::from_topology(
+            &topology,
+            replica_id("not-an-admitted-member"),
+            "/private/missing.sqlite",
+            "/private/missing-snapshots",
+        ),
+        Err(RecoveryError::InvalidRequest)
+    ));
 }
 
 #[test]
@@ -980,7 +1023,9 @@ fn campaign_preserves_fleet_maxima_and_preflights_sqlite_successors() {
             5
         );
         let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM session_replication_log", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM session_replication_log", [], |row| {
+                row.get(0)
+            })
             .expect("count invalidated log");
         assert_eq!(rows, 0);
     }
@@ -1105,7 +1150,7 @@ fn claim_current_replica(
         0,
         0,
     )
-        .expect("claim legacy checkpoint");
+    .expect("claim legacy checkpoint");
     let membership = Membership::new(vec![members.clone()], members.clone());
     let entry: Entry<SessionRaftTypeConfig> = Entry {
         log_id,
@@ -1220,6 +1265,44 @@ fn planning_rejects_untrusted_legacy_schema_objects() {
             "untrusted {suffix} must fail closed"
         );
     }
+
+    let temp = tempfile::tempdir().expect("current schema test root");
+    let ids = [
+        replica_id("schema-current-a"),
+        replica_id("schema-current-b"),
+        replica_id("schema-current-c"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 1),
+        create_legacy_replica(temp.path(), ids[1].clone(), 1),
+        create_legacy_replica(temp.path(), ids[2].clone(), 2),
+    ];
+    let members = node_set(&ids);
+    let log_id = LogId::new(
+        CommittedLeaderId::new(1, *members.first().expect("node")),
+        0,
+    );
+    for replica in &replicas {
+        claim_current_replica(replica, &members, log_id);
+    }
+    Connection::open(&replicas[1].database_path)
+        .expect("open current hostile schema")
+        .execute_batch("CREATE VIEW hostile_current_view AS SELECT * FROM consensus_machine;")
+        .expect("install current hostile view");
+    let manager = recovery(AllowRecovery);
+    assert_eq!(
+        manager.plan(
+            &context(),
+            identity(),
+            members,
+            &replicas,
+            &ids[0],
+            &ids[2..],
+            RecoveryDecisionBasis::VerifiedCommittedMajority,
+            RecoveryLimits::default(),
+        ),
+        Err(RecoveryError::CorruptReplica)
+    );
 }
 
 #[tokio::test]
@@ -1640,7 +1723,7 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
         replica_id("campaign-replica-b"),
         replica_id("campaign-replica-c"),
     ];
-    let replicas = vec![
+    let mut replicas = vec![
         create_legacy_replica(temp.path(), ids[0].clone(), 11),
         create_legacy_replica(temp.path(), ids[1].clone(), 23),
         create_legacy_replica(temp.path(), ids[2].clone(), 37),
@@ -1733,6 +1816,9 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
             .collect::<Vec<_>>(),
     );
     let campaign_identity = SessionConsensusIdentity::new(cluster, configuration, epoch);
+    for replica in &mut replicas {
+        replica.admitted_identity = campaign_identity;
+    }
     let members = node_set_for(campaign_identity, &ids);
     let manager = recovery(AllowRecovery);
     let plan = manager
@@ -2003,7 +2089,7 @@ async fn recovery_epoch_is_durable_idempotent_and_invalidates_old_credentials() 
         0,
         0,
     )
-        .expect("claim legacy state");
+    .expect("claim legacy state");
     let fence_high = consensus::observed_fence_high_water_sync(&conn).expect("fence high-water");
     let credential_high =
         consensus::observed_credential_high_water_sync(&conn).expect("credential high-water");
@@ -2216,14 +2302,7 @@ async fn finalization_failpoints_resume_before_after_epoch_and_rejoin() {
     );
 
     let completed = manager
-        .finalize(
-            &context(),
-            &store,
-            &plan,
-            &confirmation,
-            &[],
-            backup.path(),
-        )
+        .finalize(&context(), &store, &plan, &confirmation, &[], backup.path())
         .await
         .expect("resume finalization to rejoin");
     assert_eq!(completed.state(), RecoveryExecutionState::Rejoined);

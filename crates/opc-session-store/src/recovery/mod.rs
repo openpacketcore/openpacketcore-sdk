@@ -30,13 +30,15 @@ use crate::consensus::{
     OperatorRecoveryCommitError, SessionConsensusIdentity, SessionConsensusNodeId,
     SessionConsensusRequestId,
 };
-use crate::topology::{ReplicaBackingIdentity, ReplicaId, QUORUM_TOPOLOGY_MAX_MEMBERS};
+use crate::topology::{
+    ReplicaBackingIdentity, ReplicaId, ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
+};
 use crate::ConsensusSessionStore;
 
 use self::sqlite::{
-    backup_and_reset_replica, clear_fleet_latches, inspect_replica, resume_execution_state,
-    replica_has_recovery_latch, resume_audit_state, seal_plan, set_fleet_latches_audit_pending, verify_plan_seal,
-    InspectionInput, ResetInput,
+    backup_and_reset_replica, clear_fleet_latches, inspect_replica, replica_has_recovery_latch,
+    resume_audit_state, resume_execution_state, seal_plan, set_fleet_latches_audit_pending,
+    verify_plan_seal, InspectionInput, ResetInput,
 };
 
 const RECOVERY_PLAN_VERSION: u16 = 1;
@@ -291,22 +293,53 @@ impl fmt::Debug for RecoveryContext {
 pub struct RecoveryReplica {
     replica_id: ReplicaId,
     backing_identity: ReplicaBackingIdentity,
+    admitted_identity: SessionConsensusIdentity,
     database_path: PathBuf,
     snapshot_directory: PathBuf,
 }
 
 impl RecoveryReplica {
-    /// Build one replica input. Paths are canonicalized and bound into the plan
-    /// during inspection; raw path text is never included in plan output.
-    pub fn new(
+    /// Build one replica input from an already validated consensus topology.
+    ///
+    /// The logical ID, opaque backing identity, and consensus configuration
+    /// are copied from the admitted member; callers cannot substitute a
+    /// recovery-only backing identity. Paths are canonicalized and bound into
+    /// the plan during inspection; raw path text is never included in plan
+    /// output.
+    pub fn from_topology(
+        topology: &ValidatedQuorumTopology,
+        replica_id: ReplicaId,
+        database_path: impl Into<PathBuf>,
+        snapshot_directory: impl Into<PathBuf>,
+    ) -> Result<Self, RecoveryError> {
+        let admitted_identity = topology
+            .consensus_identity()
+            .ok_or(RecoveryError::InvalidRequest)?;
+        let member = topology
+            .members()
+            .iter()
+            .find(|member| member.replica_id() == &replica_id)
+            .ok_or(RecoveryError::InvalidRequest)?;
+        Ok(Self::new_bound(
+            replica_id,
+            member.backing_identity().clone(),
+            admitted_identity,
+            database_path,
+            snapshot_directory,
+        ))
+    }
+
+    fn new_bound(
         replica_id: ReplicaId,
         backing_identity: ReplicaBackingIdentity,
+        admitted_identity: SessionConsensusIdentity,
         database_path: impl Into<PathBuf>,
         snapshot_directory: impl Into<PathBuf>,
     ) -> Self {
         Self {
             replica_id,
             backing_identity,
+            admitted_identity,
             database_path: database_path.into(),
             snapshot_directory: snapshot_directory.into(),
         }
@@ -1130,12 +1163,9 @@ where
             Ok(mut state) => {
                 let mut audit_completed = false;
                 if state == RecoveryExecutionState::AuditPending {
-                    let resume = resume_audit_state(
-                        &self.integrity_key,
-                        plan,
-                        backup_root.as_ref(),
-                    )?
-                    .ok_or(RecoveryError::BackupCorrupt)?;
+                    let resume =
+                        resume_audit_state(&self.integrity_key, plan, backup_root.as_ref())?
+                            .ok_or(RecoveryError::BackupCorrupt)?;
                     if let Err(error) = self.audit_plan_completion(context, plan) {
                         self.observer.observe(RecoverySignal {
                             state: RecoveryExecutionState::AuditPending,
@@ -1149,12 +1179,7 @@ where
                         backup_root.as_ref(),
                         resume,
                     )?;
-                    set_fleet_latches_audit_pending(
-                        &self.integrity_key,
-                        plan,
-                        replicas,
-                        false,
-                    )?;
+                    set_fleet_latches_audit_pending(&self.integrity_key, plan, replicas, false)?;
                     state = resume;
                     audit_completed = true;
                 } else if matches!(
@@ -1173,12 +1198,7 @@ where
                             plan,
                             backup_root.as_ref(),
                         )?;
-                        set_fleet_latches_audit_pending(
-                            &self.integrity_key,
-                            plan,
-                            replicas,
-                            true,
-                        )?;
+                        set_fleet_latches_audit_pending(&self.integrity_key, plan, replicas, true)?;
                         self.observer.observe(RecoverySignal {
                             state: RecoveryExecutionState::AuditPending,
                             alarm: Some(RecoveryAlarm::AuditPending),
@@ -1213,12 +1233,14 @@ where
     }
 
     /// Commit the recovery epoch and invalidate every pre-recovery lease through
-    /// the current Openraft leader, then prove rejoin with the ordinary durable
-    /// readiness barrier.
+    /// the current Openraft leader, then prove rejoin through an internal
+    /// linearizable barrier while the public readiness latch remains closed.
     ///
     /// This call must be sent to the current leader's local admin boundary. The
     /// generic peer-forwarding RPC rejects recovery intents, so peer mTLS alone
-    /// never grants operator-recovery authority.
+    /// never grants operator-recovery authority. `replicas` must be the same
+    /// complete fleet supplied to planning and execution; its local latches are
+    /// cleared only after the required success audit is durable.
     pub async fn finalize(
         &self,
         context: &RecoveryContext,
@@ -1259,6 +1281,7 @@ where
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     async fn finalize_with_failpoint(
         &self,
         context: &RecoveryContext,
@@ -1281,6 +1304,7 @@ where
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finalize_inner(
         &self,
         context: &RecoveryContext,
@@ -1324,18 +1348,8 @@ where
             let resume = resume_audit_state(&self.integrity_key, plan, backup_root)?
                 .ok_or(RecoveryError::BackupCorrupt)?;
             self.audit_plan_completion(context, plan)?;
-            sqlite::transition_after_audit(
-                &self.integrity_key,
-                plan,
-                backup_root,
-                resume,
-            )?;
-            set_fleet_latches_audit_pending(
-                &self.integrity_key,
-                plan,
-                replicas,
-                false,
-            )?;
+            sqlite::transition_after_audit(&self.integrity_key, plan, backup_root, resume)?;
+            set_fleet_latches_audit_pending(&self.integrity_key, plan, replicas, false)?;
             current = resume;
         }
         if current == RecoveryExecutionState::Rejoined {
@@ -1402,12 +1416,7 @@ where
         sqlite::record_rejoin_proven(&self.integrity_key, plan, backup_root)?;
         if let Err(error) = self.audit_plan_completion(context, plan) {
             sqlite::record_audit_pending(&self.integrity_key, plan, backup_root)?;
-            set_fleet_latches_audit_pending(
-                &self.integrity_key,
-                plan,
-                replicas,
-                true,
-            )?;
+            set_fleet_latches_audit_pending(&self.integrity_key, plan, replicas, true)?;
             self.observer.observe(RecoverySignal {
                 state: RecoveryExecutionState::AuditPending,
                 alarm: Some(RecoveryAlarm::AuditPending),
@@ -1548,6 +1557,9 @@ fn validate_member_inputs(
     let mut replica_ids = BTreeSet::new();
     let mut derived_members = BTreeSet::new();
     for replica in replicas {
+        if replica.admitted_identity != identity {
+            return Err(RecoveryError::WrongCluster);
+        }
         if !replica_ids.insert(replica.replica_id.clone()) {
             return Err(RecoveryError::InvalidRequest);
         }

@@ -5,8 +5,8 @@
 //! redaction-safe failures into Openraft storage errors.
 
 use std::collections::BTreeSet;
-use std::io;
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -54,7 +54,9 @@ pub(crate) fn operator_recovery_latch_path(database: &Path) -> io::Result<PathBu
     Ok(database.with_file_name(latch_name))
 }
 
-fn encode_operator_recovery_latch(latch: OperatorRecoveryLatch) -> [u8; OPERATOR_RECOVERY_LATCH_BYTES] {
+fn encode_operator_recovery_latch(
+    latch: OperatorRecoveryLatch,
+) -> [u8; OPERATOR_RECOVERY_LATCH_BYTES] {
     let mut encoded = [0_u8; OPERATOR_RECOVERY_LATCH_BYTES];
     encoded[..8].copy_from_slice(OPERATOR_RECOVERY_LATCH_MAGIC);
     encoded[8..40].copy_from_slice(latch.identity.cluster_id().as_bytes());
@@ -136,7 +138,9 @@ pub(crate) fn read_operator_recovery_latch_sync(
     {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(invalid_data("session operator recovery latch permissions are invalid"));
+            return Err(invalid_data(
+                "session operator recovery latch permissions are invalid",
+            ));
         }
     }
     let mut encoded = [0_u8; OPERATOR_RECOVERY_LATCH_BYTES];
@@ -150,11 +154,17 @@ pub(crate) fn read_operator_recovery_latch_sync(
 
 fn write_latch_file(path: &Path, latch: OperatorRecoveryLatch, create_new: bool) -> io::Result<()> {
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(!create_new).create_new(create_new);
+    options
+        .write(true)
+        .create(true)
+        .truncate(!create_new)
+        .create_new(create_new);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let mut file = options.open(path)?;
     file.write_all(&encode_operator_recovery_latch(latch))?;
@@ -172,8 +182,19 @@ pub(crate) fn ensure_operator_recovery_latch_sync(
     expected: OperatorRecoveryLatch,
 ) -> io::Result<()> {
     match read_operator_recovery_latch_sync(database)? {
-        Some(observed) if observed == expected || (observed == OperatorRecoveryLatch { audit_pending: !expected.audit_pending, ..expected }) => Ok(()),
-        Some(_) => Err(invalid_data("a different session operator recovery latch is active")),
+        Some(observed)
+            if observed == expected
+                || (observed
+                    == OperatorRecoveryLatch {
+                        audit_pending: !expected.audit_pending,
+                        ..expected
+                    }) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(invalid_data(
+            "a different session operator recovery latch is active",
+        )),
         None => write_latch_file(&operator_recovery_latch_path(database)?, expected, true),
     }
 }
@@ -189,7 +210,9 @@ pub(crate) fn set_operator_recovery_latch_audit_pending_sync(
         || observed.recovery_epoch != expected.recovery_epoch
         || observed.plan_digest != expected.plan_digest
     {
-        return Err(invalid_data("session operator recovery latch does not match"));
+        return Err(invalid_data(
+            "session operator recovery latch does not match",
+        ));
     }
     let path = operator_recovery_latch_path(database)?;
     let temporary = path.with_extension("opc-recovery-latch.tmp");
@@ -226,7 +249,9 @@ pub(crate) fn clear_operator_recovery_latch_sync(
         || observed.plan_digest != expected.plan_digest
         || observed.audit_pending
     {
-        return Err(invalid_data("session operator recovery latch cannot be cleared"));
+        return Err(invalid_data(
+            "session operator recovery latch cannot be cleared",
+        ));
     }
     let path = operator_recovery_latch_path(database)?;
     std::fs::remove_file(&path)?;
@@ -877,6 +902,7 @@ pub(crate) fn observed_credential_high_water_sync(conn: &Connection) -> io::Resu
     Ok(high)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn claim_legacy_checkpoint_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,

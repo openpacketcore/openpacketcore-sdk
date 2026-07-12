@@ -108,10 +108,30 @@ impl SqliteSessionBackend {
     /// Open (or create) a SQLite database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
-        let conn = Connection::open(path)
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        let conn =
+            Connection::open(path).map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
         let canonical = std::fs::canonicalize(path)
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        if let Some(latch) =
+            consensus::read_operator_recovery_latch_sync(&canonical).map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "session operator recovery latch is unavailable".into(),
+                )
+            })?
+        {
+            opc_redaction::metrics::METRICS
+                .session_operator_recovery_required
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            opc_redaction::metrics::METRICS
+                .session_operator_recovery_epoch
+                .fetch_max(latch.recovery_epoch, std::sync::atomic::Ordering::Relaxed);
+            opc_redaction::metrics::METRICS
+                .session_operator_recovery_audit_pending
+                .store(
+                    i64::from(latch.audit_pending),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+        }
         Self::new_with_conn(conn, false, Some(canonical))
     }
 

@@ -695,9 +695,12 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
 - Recovery unit tests use distinct file-backed databases for two- and
   three-branch legacy campaigns and current-format minority repair. They cover
   whole-fleet backup-before-mutation, immutable checkpoint installation,
-  source/target drift, corrupt artifacts, pending-workflow rejection,
-  backup/snapshot/epoch/rejoin failpoint resume, inspection budgets, cursor
-  invalidation, audit/readiness fencing, and exact legacy confirmation.
+  duplicate backing/path/hard-link rejection, source/target drift, exact fresh
+  schema import, corrupt artifacts, pending-workflow rejection, per-file
+  backup/stage/install and epoch/rejoin failpoint resume, fleet-wide maxima and
+  SQLite successor exhaustion, inspection budgets, cursor invalidation,
+  audit/readiness latching, terminal idempotency, and exact legacy
+  confirmation.
 - Run with: `cargo test -p opc-session-store`.
 
 ## License
