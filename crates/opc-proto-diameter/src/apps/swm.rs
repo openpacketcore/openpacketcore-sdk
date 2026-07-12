@@ -1,9 +1,12 @@
 //! 3GPP SWm Diameter-EAP dictionary subset and typed helpers.
 //!
 //! This module covers the ePDG-restricted SWm DER/DEA exchange that carries
-//! EAP payloads between the ePDG and an AAA/DRA peer, plus the subscription
-//! AVPs a DEA may carry (APN-Configuration and Service-Selection). It does
-//! not implement transport state, realm routing, or IKEv2 policy.
+//! EAP payloads between the ePDG and an AAA/DRA peer, plus a bounded
+//! subscription-profile extension surface for APN-Configuration, its default
+//! Context-Identifier, and Service-Selection. The top-level default pointer is
+//! accepted under the DEA extension-AVP wildcard; it is not part of the
+//! baseline SWm DEA command ABNF. This module does not implement transport
+//! state, realm routing, or IKEv2 policy.
 //!
 //! @spec 3GPP TS29273
 //! @spec 3GPP TS29272 7.3
@@ -16,6 +19,7 @@ use opc_protocol::{
     DecodeContext, DecodeError, DecodeErrorCode, EncodeContext, EncodeError, EncodeErrorCode,
     SpecRef,
 };
+use std::collections::HashSet;
 
 use super::builder_helpers;
 use super::VENDOR_ID_3GPP;
@@ -457,8 +461,22 @@ pub struct SwmDiameterEapAnswer {
     pub origin_realm: Redacted<String>,
     /// User-Name (redacted in diagnostic output).
     pub user_name: Option<Redacted<String>>,
-    /// Service-Selection / default APN (redacted in diagnostic output).
+    /// Top-level Service-Selection (redacted in diagnostic output).
+    ///
+    /// This is distinct from the subscription default APN pointer carried by
+    /// [`Self::default_context_identifier`].
     pub service_selection: Option<Redacted<String>>,
+    /// Optional extension Context-Identifier selecting the subscription's
+    /// default APN-Configuration.
+    ///
+    /// TS 29.272 defines this pointer inside an APN-Configuration-Profile. Some
+    /// AAA profiles project it into the SWm DEA's extension AVPs; the baseline
+    /// SWm DEA command ABNF does not enumerate it. Emit it only when peer
+    /// support is part of the deployment profile. When this pointer is
+    /// present, validation requires it to resolve to exactly one supplied,
+    /// nonzero child Context-Identifier. Use
+    /// [`Self::default_apn_configuration`] instead of matching it manually.
+    pub default_context_identifier: Option<u32>,
     /// APN-Configuration grouped AVPs (only their count appears in
     /// diagnostic output).
     pub apn_configurations: Vec<ApnConfiguration>,
@@ -485,6 +503,10 @@ impl std::fmt::Debug for SwmDiameterEapAnswer {
             .field("origin_realm", &self.origin_realm)
             .field("user_name", &self.user_name)
             .field("service_selection", &self.service_selection)
+            .field(
+                "default_context_identifier",
+                &self.default_context_identifier,
+            )
             .field("apn_configurations", &self.apn_configurations.len())
             .field("eap_payload", &self.eap_payload)
             .field("eap_reissued_payload", &self.eap_reissued_payload)
@@ -601,16 +623,7 @@ impl SwmDiameterEapAnswer {
                 ));
             }
         }
-        if self
-            .apn_configurations
-            .iter()
-            .any(|apn| apn.service_selection.as_ref().is_empty())
-        {
-            return Err(encode_structural_error(
-                "SWm DEA APN-Configuration Service-Selection must not be empty",
-                "DEA",
-            ));
-        }
+        validate_apn_profile(self).map_err(|reason| encode_structural_error(reason, "DEA"))?;
         if self.auth_application_id != APPLICATION_ID.get() {
             return Err(encode_structural_error(
                 "SWm DEA Auth-Application-Id must be the SWm application id",
@@ -667,6 +680,19 @@ impl SwmDiameterEapAnswer {
         option_redacted_bytes_has_material(&self.eap_payload)
             || option_redacted_bytes_has_material(&self.eap_reissued_payload)
             || option_redacted_bytes_has_material(&self.eap_master_session_key)
+    }
+
+    /// Resolve the declared subscription default APN configuration.
+    ///
+    /// This accessor fails safe and returns `None` unless the answer carries
+    /// exact `DIAMETER_SUCCESS` and the profile has a pointer that resolves
+    /// without violating any child identifier or Service-Selection invariant.
+    pub fn default_apn_configuration(&self) -> Option<&ApnConfiguration> {
+        validate_apn_profile(self).ok()?;
+        let default_context_identifier = self.default_context_identifier?;
+        self.apn_configurations
+            .iter()
+            .find(|apn| apn.context_identifier == default_context_identifier)
     }
 }
 
@@ -962,6 +988,16 @@ pub fn build_swm_diameter_eap_answer(
             ctx,
         )?;
     }
+    if let Some(default_context_identifier) = answer.default_context_identifier {
+        builder_helpers::append_vendor_u32_avp(
+            &mut raw_avps,
+            AVP_CONTEXT_IDENTIFIER,
+            VENDOR_ID_3GPP,
+            default_context_identifier,
+            true,
+            ctx,
+        )?;
+    }
     if let Some(service_selection) = answer.service_selection.as_ref() {
         builder_helpers::append_utf8_avp(
             &mut raw_avps,
@@ -1047,6 +1083,7 @@ pub fn parse_swm_diameter_eap_answer(
     let mut origin_realm = None;
     let mut user_name = None;
     let mut service_selection = None;
+    let mut default_context_identifier = None;
     let mut apn_configurations = Vec::new();
     let mut eap_payload = None;
     let mut eap_reissued_payload = None;
@@ -1064,7 +1101,16 @@ pub fn parse_swm_diameter_eap_answer(
             // Vendor-specific AVPs are matched by (vendor-id, code); only
             // genuinely unknown ones fall through to the unknown-AVP policy.
             if let Some(vendor_id) = avp.header.vendor_id {
-                if code == AVP_APN_CONFIGURATION && vendor_id == VENDOR_ID_3GPP {
+                if code == AVP_CONTEXT_IDENTIFIER && vendor_id == VENDOR_ID_3GPP {
+                    let value =
+                        builder_helpers::parse_u32_value(avp.value, value_offset, "7.3.27")?;
+                    builder_helpers::set_once(
+                        &mut default_context_identifier,
+                        value,
+                        offset,
+                        "DEA",
+                    )?;
+                } else if code == AVP_APN_CONFIGURATION && vendor_id == VENDOR_ID_3GPP {
                     apn_configurations.push(parse_apn_configuration(
                         avp.value,
                         ctx,
@@ -1185,6 +1231,7 @@ pub fn parse_swm_diameter_eap_answer(
         )?,
         user_name,
         service_selection,
+        default_context_identifier,
         apn_configurations,
         eap_payload,
         eap_reissued_payload,
@@ -1611,16 +1658,7 @@ fn validate_decoded_answer(answer: &SwmDiameterEapAnswer) -> Result<(), DecodeEr
             ));
         }
     }
-    if answer
-        .apn_configurations
-        .iter()
-        .any(|apn| apn.service_selection.as_ref().is_empty())
-    {
-        return Err(decode_structural_error(
-            "SWm DEA APN-Configuration Service-Selection must not be empty",
-            "DEA",
-        ));
-    }
+    validate_apn_profile(answer).map_err(|reason| decode_structural_error(reason, "DEA"))?;
     if !answer.auth_request_type.is_authorize_authenticate() {
         return Err(decode_structural_error(
             "SWm DEA Auth-Request-Type must be AUTHORIZE_AUTHENTICATE",
@@ -1657,6 +1695,42 @@ fn validate_decoded_answer(answer: &SwmDiameterEapAnswer) -> Result<(), DecodeEr
             "DEA",
         ));
     }
+    Ok(())
+}
+
+fn validate_apn_profile(answer: &SwmDiameterEapAnswer) -> Result<(), &'static str> {
+    if answer.result_code != base::RESULT_CODE_DIAMETER_SUCCESS
+        && (answer.default_context_identifier.is_some() || !answer.apn_configurations.is_empty())
+    {
+        return Err("SWm DEA APN profile material requires DIAMETER_SUCCESS");
+    }
+    if answer.default_context_identifier == Some(0) {
+        return Err("SWm DEA default Context-Identifier must not be zero");
+    }
+
+    let mut context_identifiers = HashSet::new();
+    let mut service_selections = HashSet::new();
+    for apn in &answer.apn_configurations {
+        if apn.context_identifier == 0 {
+            return Err("SWm DEA APN-Configuration Context-Identifier must not be zero");
+        }
+        if !context_identifiers.insert(apn.context_identifier) {
+            return Err("SWm DEA APN-Configuration Context-Identifier values must be unique");
+        }
+        if apn.service_selection.as_ref().is_empty() {
+            return Err("SWm DEA APN-Configuration Service-Selection must not be empty");
+        }
+        if !service_selections.insert(apn.service_selection.as_ref().as_str()) {
+            return Err("SWm DEA APN-Configuration Service-Selection values must be unique");
+        }
+    }
+
+    if let Some(default_context_identifier) = answer.default_context_identifier {
+        if !context_identifiers.contains(&default_context_identifier) {
+            return Err("SWm DEA default Context-Identifier must identify an APN-Configuration");
+        }
+    }
+
     Ok(())
 }
 

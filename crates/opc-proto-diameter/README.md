@@ -27,7 +27,11 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   builders/parsers, capability negotiation helpers, result-code helpers, and
   `PeerSession` projection state.
 - The `app-rf` feature adds typed Rf accounting helpers.
-- The `app-swm` feature adds typed SWm Diameter-EAP DER/DEA helpers.
+- The `app-swm` feature adds typed SWm Diameter-EAP DER/DEA helpers, including
+  exact, fail-closed resolution of an opt-in top-level default
+  `Context-Identifier` extension to one of its repeated APN configurations.
+  The top-level `Service-Selection` remains a distinct AVP and is not treated
+  as that default pointer.
 - `app-gx`, `app-s6a`, `app-s6b`, and `app-swx` currently provide dictionary
   slots rather than full typed application APIs.
 
@@ -74,6 +78,18 @@ redaction policies.
 
 Use `CONFORMANCE.md` for the precise fixture provenance, fuzz target status,
 application dictionary status, and typed helper gaps.
+
+`SwmDiameterEapAnswer` struct literals must initialize
+`default_context_identifier`; use `None` to preserve the prior wire shape or
+`Some(id)` only when the deployment's AAA profile projects the TS 29.272
+APN-Configuration-Profile default pointer into the SWm DEA extension surface.
+The baseline SWm DEA command ABNF does not enumerate that top-level AVP. SDK
+receivers predating this field reject the extension emitted with its required
+M-bit as unknown, so upgrade decoders before enabling its emission from
+encoders. Repeated projected APN configurations currently require
+`DuplicateIePolicy::Last`; the conservative blanket duplicate pre-scan cannot
+distinguish repeatable profile AVPs until #131 is resolved, while typed
+singleton fields remain protected by their own duplicate checks.
 
 ## Roadmap
 
