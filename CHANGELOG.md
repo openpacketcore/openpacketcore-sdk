@@ -150,6 +150,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed fuzz corpora for the GTP-U, NAS, Diameter, and IKEv2 targets.
 
 ### Changed
+- **BREAKING — `opc-persist`:** #177 replaces the crate's custom Raft-style
+  config engine and `QuorumConfigStore` majority wrapper with
+  `ConsensusConfigStore` on the exact-pinned `opc-consensus` Openraft engine.
+  The old election/replication/read-index/membership/snapshot modules, private
+  config TCP peer/server types, custom consensus metrics/error families, and
+  the standalone consensus-node binary are removed. Config consensus now exposes
+  only the shared bounded `ConsensusPeer`/`ConsensusRpcHandler` boundary;
+  production mTLS, deadlines, peer authentication, and certificate/trust
+  rotation remain owned by `opc-session-net` and the CNF composition, with no
+  second config TCP transport.
+  The authority hand-off is atomic per SQLite database: one immediate
+  transaction checks legacy state, imports an approved applied snapshot when
+  required, creates `config_raft_identity`, and fences every public standalone
+  mutation including retained and freshly reopened backend clones.
+  `SqliteBackend::conn`, `SqliteBackend::audit_key`, and `AuditKey::as_bytes`
+  are no longer public; consumers use typed store operations and opaque key
+  ownership instead of mutable/raw authority escape hatches. Normal open
+  rejects nonempty legacy authority. Offline recovery requires the source
+  file's exact SHA-256, exact latest transaction ID/version, a contiguous
+  parent/version history (without assuming the retained origin is version 1),
+  and explicit
+  `DiscardUnknownAppendedSuffix`; unprovable target tails are discarded rather
+  than inferred committed. Rollback is only a stopped-fleet restore of
+  preserved pre-migration backups, not deletion or reverse translation of
+  `config_raft_*` state.
+  Durable log floors are immutable, encoded log entries are capped at 16 MiB,
+  and persisted holes fail closed while Openraft may still replace an explicit
+  uncommitted suffix. Snapshot startup verifies referenced authority before a
+  bounded orphan/sidecar cleanup, and cancellation-safe guards remove receive,
+  build, install, promote, and approved-recovery staging. Forwarded mutations
+  and read barriers propagate the one caller's remaining timeout budget rather
+  than minting a new server deadline. Payload-mismatched request-ID reuse is a
+  deterministic no-op with the stable `RequestIdCollision` error and does not
+  destroy the original recoverable outcome.
+  The application/HKMS layer encrypts before proposal; Openraft persists and
+  replicates only sealed ciphertext, deterministic metadata, and redacted
+  finalized audit, never plaintext, provider/key handles, or raw key material.
+  In-process formation, partition/heal, failover, response-loss, snapshot,
+  fencing, and migration tests plus an AMF-lite provider-backed encryption,
+  key-rotation, follower/snapshot/restart, shared-wire/live-artifact canary, and
+  exact provider-call integration are three-node provider/HKMS-boundary
+  qualification. Shared transport tests cover
+  a renewed SVID on a subsequent new call/full handshake and reject wrong
+  rotated identities; they do not prove seamless old-connection retirement.
+  The suite also forms a real three-node config Openraft cluster and
+  commits/linearizably reads through the existing mTLS peer/server. Remote-HKMS,
+  out-of-process/deployed-network integration, resource, soak, seamless fleet
+  rotation, and release evidence remain `GAP-001-006`.
 - **BREAKING — `opc-session-store`:** production HA construction now requires
   `QuorumTopologyConfig::new_consensus`, a file-backed local SQLite adapter,
   exact consensus peer routes, handler installation, and cluster
@@ -287,9 +335,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at one exact revision and a rollback decoder that can read the retained target
   representation before old writers restart, or a coherent checkpoint/reverse
   migration; the separate `OPCH`/#135 rollback barrier still applies.
-  Session-net's one response deadline does not change `opc-persist`'s
-  `TcpPeer::timeout` per-I/O-stage behavior across up to three attempts with backoff; #169 owns one atomic
-  end-to-end logical-RPC deadline, safe-retry policy, and metrics. Seamless
+  Session-net's response deadline remains part of the shared production
+  transport. #177 removes `opc-persist`'s private TCP peer/server and uses the
+  same transport-neutral consensus ports instead of defining another deadline,
+  retry, or certificate lifecycle. Seamless
   credential/trust rotation remains #158, remote-seal historical-key rotation
   remains #179, and distributed resource/failover/soak plus payload-protection
   qualification remains #143.
@@ -492,46 +541,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
-- **BREAKING — `opc-persist`**: `TcpPeer` now enforces `--rpc-timeout` as one
-  checked absolute logical-RPC deadline across authentication/TLS setup,
-  bounded cooperative JSON framing, TCP connect, mTLS, writes, response
-  length/body reads, decode,
-  all retry attempts, and 50/100 ms backoff. Zero expires before I/O and
-  unrepresentable durations fail closed. Permanent local identity and
-  certificate-verification failures are not retried into timeout errors;
-  replay-safe Raft/read requests may retry after ambiguous delivery, while
-  `TimeoutNow` never does. Exact `AppendEntries` replays preserve newer
-  uncommitted suffixes, stale heartbeats never truncate them, and applied
-  conflicts fail without mutation. Snapshot config, audit, membership,
-  snapshot/applied markers, and log compaction now install in one SQLite
-  transaction; the former public config-only
-  `consensus_install_snapshot_state` escape hatch is removed. Raft coordinates
-  fail closed at SQLite's signed-integer boundary instead of wrapping.
-  Authenticated peer error strings and `NodeIdentity` debug output cannot expose
-  peer text or TLS material. Mutating wire requests bind candidate/leader IDs
-  to the authenticated voter. Local identity/acceptor publication and each
-  adapter identity swap are cancellation-atomic; registration and multi-peer
-  propagation are serialized and fallible, and callers retain trust overlap
-  and retry until convergence. Production callers can use the new fallible
-  `try_add_peer` API. Vote and peer fan-out are concurrent, abandoned read
-  quorum probes are cancelled, and synchronous/background per-peer catch-up
-  passes share one gate, stop after 64 rounds (at most two logical RPCs per
-  round), coalesce redundant background triggers, and resume later. Typed
-  timeout metrics now expose fixed request-family and failure-stage dimensions
-  without identity or endpoint labels. `PersistErrorKind` gains the public
-  `ConsensusRpcTimeout` variant, so downstream exhaustive matches must add it.
-  The timeout behavior is also intentionally incompatible with the former
-  per-stage reset: operators must retune the value as an end-to-end budget and
-  roll out the new value coherently across cluster members. The CLI help, crate
-  documentation, cancellation/stall tests, and certificate-rotation guidance
-  describe the same contract.
-- `opc-persist`: automatic leader-failover and split-vote recovery coverage now
-  uses one shared finite observer instead of undersized fixed polling counts.
-  Its test deadline derives four rounds from the configured maximum election
-  timeout plus one logical RPC deadline for concurrent voting-peer fan-out;
-  success never forces a campaign, while failures report each candidate's last
-  complete role/term/election metrics and latest command error. The shared
-  timing helper prevents test/transport drift.
 - `opc-session-store`: `FakeSessionBackend` now stages compound replicated
   entries and whole-state rebuilds before atomically swapping live data. A late
   child/replay failure no longer leaves partial records, leases, fences,

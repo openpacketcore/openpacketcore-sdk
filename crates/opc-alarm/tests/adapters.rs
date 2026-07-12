@@ -488,11 +488,9 @@ async fn audit_append_failure_causes_fail_closed() {
     let db_path = temp_dir.path().join("test_fail_closed.db");
     let backend = SqliteBackend::open(&db_path, true, 0).await.unwrap();
 
-    // Drop the alarm_audit table to force SQL execution errors
-    backend
-        .execute_raw_for_test("DROP TABLE alarm_audit")
-        .await
-        .unwrap();
+    // Exercise fail-closed handling through a narrow typed fault. The test
+    // hook cannot execute SQL or mutate config/consensus authority.
+    backend.inject_alarm_audit_write_failure_for_test();
 
     let registry = make_registry();
     let ack_pattern = YangPathPattern::parse(

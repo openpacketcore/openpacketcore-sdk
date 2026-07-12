@@ -26,7 +26,8 @@ linearizable-read authority. `ConsensusSessionStore` is the operational store;
 This RFC does not claim production qualification: divergence recovery (#128),
 operator-safe legacy-fork recovery (#129), majority-authoritative bounded
 restore (#133), distributed qualification (#143), and seamless credential
-rotation remain gates.
+rotation beyond the qualified subsequent-new-call/full-handshake SVID scope
+remain gates.
 
 ## 2. Scope
 
@@ -931,14 +932,19 @@ across the independent `OPCH`/#135 boundary retains its checkpoint/reverse-
 migration requirement.
 
 #159 establishes only session-net response/write and wire-containment bounds.
-It does not close #167 or #168, does not implement seamless SVID/trust-bundle
-rotation (#162 -> #161 -> #163 -> #158 -> #164), and does not provide #143's
-payload-key/distributed production qualification. It also does not change
-`opc-persist`'s already-implemented #169 `TcpPeer::timeout` contract, whose one
-atomic end-to-end logical-RPC deadline covers attempts and backoff with safe
-retry policy and bounded metrics. Any compatibility transport work must
-preserve #127's Openraft authority rather than reopen direct mutation as a
-quorum path.
+It does not close #167 or #168 and does not provide #143's
+payload-key/distributed production qualification. Real-mTLS transport tests now
+qualify a renewed SVID on a subsequent new call/full handshake and rejection
+of rotated client/server identities outside the bound peer scope. That scoped
+evidence is not seamless rotation, old-connection retirement, multi-process
+rotation/soak, or the complete trust-bundle, revocation, and
+authentication-age lifecycle. #177 removes `opc-persist`'s separate config TCP
+path and reuses the shared consensus peer/handler boundary instead of defining
+another timeout or credential lifecycle. An in-process real-mTLS integration
+forms a three-node config Openraft cluster and commits/linearizably reads
+through the existing peer/server types. Any compatibility transport work
+must preserve the single Openraft authority rather than reopen direct mutation
+as a quorum path.
 
 ### 12.4 Consensus-Only Session Transport
 
@@ -979,13 +985,15 @@ This authenticated transport plus #127 commit authority is still not a
 production qualification. #133 MUST provide bounded majority-authoritative
 restore behavior without reopening a direct backend/rebuild port. #128 and
 #129 remain the divergence and legacy-fork recovery gates, and #143 remains the
-distributed partition/restart/resource/soak and payload-key gate. Seamless
-transport credential rotation MUST complete, in dependency order, #162
-(material epochs), #161 (atomic reload), #163 (reauthentication across an
-epoch), #158 (seamless rotation), and #164 (qualification). Implementations
-MUST overlap old/new trust, retire old connections, enforce revocation and a
-documented maximum authentication age, and bound reconnect storms; a fresh
-handshake by itself is not seamless-rotation evidence.
+distributed partition/restart/resource/soak and payload-key gate. Real-mTLS
+transport tests now qualify live client/server SVID reload observed by a fresh
+full handshake on a subsequent new call, success for a correctly scoped
+renewed identity, and rejection of an incorrectly scoped rotated identity.
+They do not exercise an in-flight or retained old connection. Full seamless
+production rotation MUST additionally overlap old/new trust, retire old
+connections, enforce revocation and a documented maximum authentication age,
+bound reconnect storms, and supply multi-process/soak evidence. The scoped
+in-process new-call result does not close those fleet lifecycle requirements.
 
 ## 13. Local Cache
 

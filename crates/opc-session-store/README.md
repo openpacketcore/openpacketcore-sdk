@@ -632,12 +632,14 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
   coherent checkpoint/reverse migration. #167 owns the production stable-ID
   model/persistence/privacy/audit contract; #168 owns the durable canonical
   transaction-ID type and migration coordinated with #127/#128/#143. This
-  supplies no durable authority, seamless credential rotation (#158), or distributed and
-  payload-key qualification (#143). #169 separately owns `opc-persist`'s
-  replacement of `TcpPeer::timeout`'s per-stage behavior (up to three attempts
-  with backoff) with an
-  atomic end-to-end logical-RPC deadline, safe retry policy, and metrics; #159
-  does not change that behavior.
+  supplies no durable authority or distributed/payload-key qualification
+  (#143). Shared real-mTLS tests now qualify a renewed SVID on a subsequent new
+  call/full handshake and wrong-scope rejection. They do not exercise seamless
+  old-connection retirement. Broader multi-process rotation/soak and the
+  complete trust-bundle, revocation, authentication-age, and seamless
+  continuity lifecycle remain separate production gates. #177 removes
+  `opc-persist`'s private config TCP path and reuses the shared consensus ports;
+  #159 does not define a second config deadline or credential lifecycle.
 
 ## Roadmap
 
@@ -646,9 +648,11 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
 - Complete operator-safe legacy recovery (#129), bounded
   majority-authoritative restore (#133), watch handoff correctness
   (#145), absolute-expiry admission (#148), production stable-ID and
-  transaction-ID persistence contracts (#167/#168), and persist peer
-  logical-RPC deadlines (#169), then complete the production qualification
-  profile. Seamless certificate/trust-bundle lifecycle is #158;
+  transaction-ID persistence contracts (#167/#168), then complete the
+  production qualification profile. A renewed SVID on a subsequent new
+  call/full handshake and wrong-scope rejection have scoped real-mTLS coverage;
+  seamless connection retirement and the broader certificate/trust,
+  revocation, authentication-age, multi-process, and soak work remains open;
   remote-seal historical-key rotation is #179, and distributed
   payload-protection evidence remains #143.
 - Keep encryption AAD bound to namespace, NF kind, state type, generation,

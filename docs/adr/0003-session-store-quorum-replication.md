@@ -358,10 +358,18 @@ move together; independent `OPCH`/#135 rollback barriers still apply. #167 owns
 the production stable-ID model/persistence/privacy/audit contract; #168 owns the
 canonical durable transaction-ID type and migration coordinated with
 #127/#128/#143.
-Session-net's deadline does not fix `opc-persist`'s `TcpPeer::timeout`
-per-stage multiplication across up to three attempts with backoff; #169 owns one atomic
-end-to-end logical-RPC deadline, safe retry policy, and metrics.
-Seamless SVID and trust-bundle lifecycle remains #158; remote-seal
+Session-net's bounded call remains the shared production transport contract.
+#177 removes `opc-persist`'s private config TCP path and composes config
+consensus through the same transport-neutral peer/handler ports instead of a
+second timeout or credential lifecycle. A real-mTLS integration forms a
+three-node config Openraft cluster and commits/linearizably reads through those
+existing peer/server types. Separate real-mTLS tests qualify a renewed SVID on
+a subsequent new call/full handshake and wrong-scope rejection on this shared
+transport. They do not prove seamless rotation or old-connection retirement.
+Multi-process rotation/soak and the complete trust-bundle,
+revocation, authentication-age, and seamless-continuity lifecycle retain their
+production gates;
+remote-seal
 historical-key rotation remains #179; distributed payload-protection and
 failure/soak/resource qualification remains #143.
 
