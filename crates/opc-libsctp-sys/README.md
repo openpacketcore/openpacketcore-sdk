@@ -13,9 +13,10 @@ other protocol codecs.
 
 - Types: `AssocId`, `AddressFamily`, `SocketStyle`, `ConnectStatus`, `InitMsg`,
   `EventSubscriptions`, `SendInfo`, `RecvInfo`, `RecvFlags`, and `Received`.
-- Functions: `open_socket`, `bind`, `listen`, `accept`, `connect`,
-  `socket_error`, `set_initmsg`, `set_nodelay`, `set_recv_rcvinfo`,
-  `set_events`, `send_msg`, and `recv_msg`.
+- Functions: `open_socket`, single-address `bind`/`connect`, bounded atomic
+  `bind_addresses`/`connect_addresses`, `local_addresses`, `peer_addresses`,
+  `listen`, `accept`, `socket_error`, `set_initmsg`, `set_nodelay`,
+  `set_recv_rcvinfo`, `set_events`, `send_msg`, and `recv_msg`.
 - Constants: `SCTP_UNORDERED_FLAG`, `SCTP_NOTIFICATION_FLAG`,
   `SCTP_ASSOC_CHANGE_NOTIFICATION`, and `SCTP_SHUTDOWN_EVENT_NOTIFICATION`.
 
@@ -40,17 +41,20 @@ let fd = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne)?;
 - Unpublished workspace crate (`publish = false`).
 - Contains Linux SCTP syscall/ancillary-data `unsafe`.
 - Non-Linux builds return explicit unsupported-platform errors.
-- Multi-address SCTP helpers are not exposed here yet; safe callers currently
-  fail closed on multihoming rather than attempting partial support.
+- Bindx/connectx use the Linux packed-address socket UAPI directly, without a
+  runtime `libsctp` dependency, and accept at most `MAX_SCTP_ADDRESSES` entries.
+- Address-list inspection is bounded to the same maximum and rejects malformed
+  kernel responses before exposing them to the safe crate.
 
 ## Roadmap
 
-- Add SCTP options only when the safe crate can validate and expose them
-  without guessing at UAPI layout.
+- Add further SCTP options only when the safe crate can validate and expose
+  them without guessing at UAPI layout.
 - Keep unsupported-platform behavior explicit and tested.
 
 ## Verification
 
 ```sh
 cargo test -p opc-libsctp-sys
+cargo test -p opc-libsctp-sys linux::tests::loopback_bindx_connectx_reports_all_addresses -- --ignored --exact
 ```
