@@ -5,9 +5,11 @@ use tempfile::NamedTempFile;
 
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, Generation, HandoverEnvelope,
-    HandoverError, HandoverManager, HandoverPhase, HandoverTxId, LeaseGuard, OwnerId,
-    SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SqliteSessionBackend,
-    StateClass, StateType, StoreError, StoredSessionRecord, SystemClock, TokioVirtualClock,
+    HandoverEnvelopeDecodeError, HandoverEnvelopeFormat, HandoverError, HandoverManager,
+    HandoverPhase, HandoverTxId, LeaseGuard, OwnerId, SessionBackend, SessionKey, SessionKeyType,
+    SessionLeaseManager, SqliteSessionBackend, StateClass, StateType, StoreError,
+    StoredSessionRecord, SystemClock, TokioVirtualClock, HANDOVER_ENVELOPE_MAGIC,
+    HANDOVER_ENVELOPE_VERSION, HANDOVER_PHASE_HEADER_MAX_BYTES,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 
@@ -22,6 +24,234 @@ fn test_key(stable_id: &[u8]) -> SessionKey {
         key_type: SessionKeyType::PduSession,
         stable_id: Bytes::copy_from_slice(stable_id),
     }
+}
+
+#[test]
+fn typed_invalid_handover_owner_never_downgrades_to_legacy_stable() {
+    let sentinel = "sensitive-owner".repeat(16);
+    let phase = serde_json::to_vec(&serde_json::json!({
+        "active": { "owner": sentinel.clone() }
+    }))
+    .expect("phase JSON");
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&(phase.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(&phase);
+    encoded.extend_from_slice(b"opaque-payload");
+
+    let error = HandoverEnvelope::<Vec<u8>>::unpack_raw(&encoded).unwrap_err();
+    assert_eq!(error, HandoverEnvelopeDecodeError::InvalidPhase);
+    assert!(!error.to_string().contains(&sentinel));
+    assert!(!format!("{error:?}").contains(&sentinel));
+
+    let legacy = b"legacy-bare-payload";
+    let decoded = HandoverEnvelope::<Vec<u8>>::unpack_raw(legacy).expect("legacy payload");
+    assert_eq!(decoded.phase, HandoverPhase::Stable);
+    assert_eq!(decoded.payload, legacy);
+
+    let versioned = HandoverEnvelope {
+        phase: HandoverPhase::Stable,
+        payload: b"versioned-payload".to_vec(),
+    }
+    .pack_raw()
+    .unwrap();
+    assert!(versioned.starts_with(&HANDOVER_ENVELOPE_MAGIC));
+    assert_eq!(
+        versioned[HANDOVER_ENVELOPE_MAGIC.len()],
+        HANDOVER_ENVELOPE_VERSION
+    );
+    let versioned = HandoverEnvelope::<Vec<u8>>::unpack_raw(&versioned).unwrap();
+    assert_eq!(versioned.phase, HandoverPhase::Stable);
+    assert_eq!(versioned.payload, b"versioned-payload");
+
+    let legacy_phase = serde_json::to_vec(&HandoverPhase::Stable).unwrap();
+    let mut original_format = Vec::new();
+    original_format.extend_from_slice(&(legacy_phase.len() as u32).to_be_bytes());
+    original_format.extend_from_slice(&legacy_phase);
+    original_format.extend_from_slice(b"original-format-payload");
+    let original_format = HandoverEnvelope::<Vec<u8>>::unpack_raw(&original_format).unwrap();
+    assert_eq!(original_format.phase, HandoverPhase::Stable);
+    assert_eq!(original_format.payload, b"original-format-payload");
+}
+
+#[test]
+fn malformed_claimed_handover_headers_fail_closed() {
+    let malformed_phase = b"{not-json";
+    let mut malformed = Vec::new();
+    malformed.extend_from_slice(&(malformed_phase.len() as u32).to_be_bytes());
+    malformed.extend_from_slice(malformed_phase);
+
+    let mut truncated = Vec::new();
+    truncated.extend_from_slice(&10_u32.to_be_bytes());
+    truncated.extend_from_slice(b"{");
+
+    let mut oversized = Vec::new();
+    oversized.extend_from_slice(
+        &u32::try_from(HANDOVER_PHASE_HEADER_MAX_BYTES + 1)
+            .unwrap()
+            .to_be_bytes(),
+    );
+    oversized.extend_from_slice(b"{");
+
+    let mut wrong_version = Vec::new();
+    wrong_version.extend_from_slice(&HANDOVER_ENVELOPE_MAGIC);
+    wrong_version.push(HANDOVER_ENVELOPE_VERSION + 1);
+    wrong_version.extend_from_slice(&1_u32.to_be_bytes());
+    wrong_version.push(b'"');
+
+    let cases = [
+        (
+            "zero-length",
+            vec![0, 0, 0, 0],
+            HandoverEnvelopeDecodeError::InvalidHeader,
+        ),
+        (
+            "malformed JSON",
+            malformed,
+            HandoverEnvelopeDecodeError::InvalidPhase,
+        ),
+        (
+            "truncated",
+            truncated,
+            HandoverEnvelopeDecodeError::InvalidHeader,
+        ),
+        (
+            "oversized",
+            oversized,
+            HandoverEnvelopeDecodeError::InvalidHeader,
+        ),
+        (
+            "wrong version",
+            wrong_version,
+            HandoverEnvelopeDecodeError::InvalidHeader,
+        ),
+        (
+            "truncated versioned prefix",
+            HANDOVER_ENVELOPE_MAGIC.to_vec(),
+            HandoverEnvelopeDecodeError::InvalidHeader,
+        ),
+    ];
+
+    for (name, encoded, expected) in cases {
+        assert_eq!(
+            HandoverEnvelope::<Vec<u8>>::unpack_raw(&encoded),
+            Err(expected),
+            "{name} header"
+        );
+    }
+}
+
+#[test]
+fn ambiguous_bare_handover_payloads_require_product_migration() {
+    let bounded_truncated_bare = [0, 0, 0, 1];
+    assert_eq!(
+        HandoverEnvelope::<Vec<u8>>::unpack_raw(&bounded_truncated_bare),
+        Err(HandoverEnvelopeDecodeError::InvalidHeader)
+    );
+
+    // This is valid bare JSON, but its first four bytes form an oversized
+    // original-format length and the remainder looks like JSON. A product that
+    // knows it is bare state must explicitly wrap it before upgrading.
+    let ambiguous_json = b"[12345]";
+    assert_eq!(
+        HandoverEnvelope::<Vec<u8>>::unpack_raw(ambiguous_json),
+        Err(HandoverEnvelopeDecodeError::InvalidHeader)
+    );
+    assert_eq!(
+        HandoverEnvelope::<Vec<u8>>::unpack_json(ambiguous_json),
+        Err(HandoverEnvelopeDecodeError::InvalidHeader)
+    );
+}
+
+#[test]
+fn preflight_format_is_syntactic_and_exposes_prefix_collisions() {
+    let phase = serde_json::to_vec(&HandoverPhase::Stable).unwrap();
+    let mut original_looking_bare = Vec::new();
+    original_looking_bare.extend_from_slice(&(phase.len() as u32).to_be_bytes());
+    original_looking_bare.extend_from_slice(&phase);
+    original_looking_bare.extend_from_slice(b"historically-bare-product-bytes");
+
+    let (format, _) =
+        HandoverEnvelope::<Vec<u8>>::unpack_raw_with_format(&original_looking_bare).unwrap();
+    assert_eq!(format, HandoverEnvelopeFormat::OriginalLengthPrefixed);
+
+    let versioned_looking_bare = HandoverEnvelope {
+        phase: HandoverPhase::Stable,
+        payload: b"historically-bare-opch-collision".to_vec(),
+    }
+    .pack_raw()
+    .unwrap();
+    let (format, _) =
+        HandoverEnvelope::<Vec<u8>>::unpack_raw_with_format(&versioned_looking_bare).unwrap();
+    assert_eq!(format, HandoverEnvelopeFormat::VersionedV1);
+
+    let (format, _) =
+        HandoverEnvelope::<Vec<u8>>::unpack_raw_with_format(b"legacy-bare-payload").unwrap();
+    assert_eq!(format, HandoverEnvelopeFormat::Bare);
+}
+
+#[tokio::test]
+async fn typed_invalid_handover_owner_fails_before_backend_mutation() {
+    let backend = Arc::new(SqliteSessionBackend::in_memory().unwrap());
+    let key = test_key(b"invalid-envelope-owner");
+    let owner = OwnerId::new("owner-a").unwrap();
+    let lease = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    let sentinel = "sensitive-owner".repeat(16);
+    let phase = serde_json::to_vec(&serde_json::json!({
+        "active": { "owner": sentinel.clone() }
+    }))
+    .expect("phase JSON");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(phase.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&phase);
+    payload.extend_from_slice(b"opaque-payload");
+    let record = StoredSessionRecord {
+        key: key.clone(),
+        generation: Generation::new(1),
+        owner,
+        fence: lease.fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::new("smf-pdu-context").unwrap(),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new(payload),
+    };
+    backend
+        .compare_and_set(CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: record.clone(),
+        })
+        .await
+        .unwrap();
+
+    let manager = HandoverManager::new(Arc::clone(&backend), Arc::new(SystemClock));
+    let error = manager
+        .prepare_handover(
+            &lease,
+            Generation::new(1),
+            HandoverTxId::new(),
+            OwnerId::new("owner-b").unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        HandoverError::InvalidEnvelope(HandoverEnvelopeDecodeError::InvalidPhase)
+    );
+    assert!(!error.to_string().contains(&sentinel));
+    let json_error = match manager.get_record_json::<serde_json::Value>(&key).await {
+        Ok(_) => panic!("typed-invalid JSON envelope must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        json_error,
+        HandoverError::InvalidEnvelope(HandoverEnvelopeDecodeError::InvalidPhase)
+    );
+    assert_eq!(backend.get(&key).await.unwrap(), Some(record));
 }
 
 async fn setup_initial_record(

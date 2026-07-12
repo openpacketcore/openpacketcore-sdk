@@ -159,7 +159,7 @@ impl SessionOwnershipKeyspace {
         SessionKey {
             tenant: self.tenant.clone(),
             nf_kind: self.nf_kind.clone(),
-            key_type: SessionKeyType::Other(OWNERSHIP_KEY_TYPE.to_owned()),
+            key_type: SessionKeyType::other(OWNERSHIP_KEY_TYPE).expect("static ownership key type"),
             stable_id: Bytes::from(stable_id),
         }
     }
@@ -544,7 +544,7 @@ fn validate_ownership_record(
             "ownership records must be authoritative-session state",
         ));
     }
-    if record.key.key_type != SessionKeyType::Other(OWNERSHIP_KEY_TYPE.to_owned()) {
+    if record.key.key_type.as_str() != OWNERSHIP_KEY_TYPE {
         return Err(IpsecLbError::invalid_config(
             "session_store.key_type",
             "ownership record key type mismatch",
@@ -1941,7 +1941,8 @@ mod tests {
         ));
 
         let mut wrong_key_type = valid.clone();
-        wrong_key_type.key.key_type = SessionKeyType::Other("not-ownership".to_owned());
+        wrong_key_type.key.key_type =
+            SessionKeyType::other("not-ownership").expect("test key type");
         let wrong_expected_key = wrong_key_type.key.clone();
         assert!(matches!(
             validate_ownership_record(&wrong_key_type, &wrong_expected_key),
@@ -1984,12 +1985,11 @@ mod tests {
 
         for invalid_owner in [String::new(), "x".repeat(129)] {
             let mut hostile = serde_json::to_value(&valid).unwrap();
-            hostile["owner"] = serde_json::Value::String(invalid_owner);
-            let deserialized: StoredSessionRecord = serde_json::from_value(hostile).unwrap();
-            assert!(matches!(
-                validate_ownership_record(&deserialized, &expected_key),
-                Err(IpsecLbError::InvalidConfig { .. })
-            ));
+            hostile["owner"] = serde_json::Value::String(invalid_owner.clone());
+            let error = serde_json::from_value::<StoredSessionRecord>(hostile).unwrap_err();
+            if !invalid_owner.is_empty() {
+                assert!(!error.to_string().contains(&invalid_owner));
+            }
         }
     }
 

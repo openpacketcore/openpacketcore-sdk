@@ -71,6 +71,57 @@ async fn test_sqlite_capabilities_are_truthful_for_single_node_backend() {
 }
 
 #[tokio::test]
+async fn test_sqlite_restore_order_matches_canonical_key_type_order() {
+    let backend = SqliteSessionBackend::in_memory().unwrap();
+    let key_types = vec![
+        SessionKeyType::SubscriberContext,
+        SessionKeyType::PduSession,
+        SessionKeyType::TeidMapping,
+        SessionKeyType::PfcpSeid,
+        SessionKeyType::HandoverTransaction,
+        SessionKeyType::other("aaa-custom").unwrap(),
+        SessionKeyType::other("zzz-custom").unwrap(),
+    ];
+
+    for (index, key_type) in key_types.into_iter().enumerate() {
+        let key = SessionKey {
+            key_type,
+            ..test_key(format!("ordered-{index}").as_bytes())
+        };
+        let lease = backend
+            .acquire(
+                &key,
+                OwnerId::new("owner-a").unwrap(),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        backend
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: None,
+                new_record: test_record(key, 1, &lease),
+            })
+            .await
+            .unwrap();
+    }
+
+    let request = opc_session_store::RestoreScanRequest::all(16);
+    let page = backend.scan_restore_records(request.clone()).await.unwrap();
+    page.validate_for_request(&request).unwrap();
+
+    let observed = page
+        .records
+        .iter()
+        .map(|record| record.key.key_type.as_str())
+        .collect::<Vec<_>>();
+    let mut expected = observed.clone();
+    expected.sort_unstable();
+    assert_eq!(observed, expected);
+}
+
+#[tokio::test]
 async fn test_sqlite_file_backend_applies_wal_profile() {
     let file = NamedTempFile::new().unwrap();
     let path = file.path().to_path_buf();

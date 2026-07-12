@@ -4,7 +4,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use super::ops::{
-    current_fence_sync, format_rfc3339_normalized, insert_or_replace_fence_sync, prune_sync,
+    current_fence_sync, format_rfc3339_normalized, insert_or_replace_fence_sync,
+    persisted_owner_id, prune_sync,
 };
 use crate::{
     error::LeaseError,
@@ -54,7 +55,9 @@ pub(crate) fn acquire_sync(
         .map_err(|e| LeaseError::Backend(e.to_string()))?;
 
     if let Some((active, owner_str, guard_expires_at_str)) = row {
-        if active != 0 && owner_str != owner.as_str() {
+        let stored_owner = persisted_owner_id(owner_str)
+            .map_err(|_| LeaseError::Backend("persisted session owner is invalid".to_string()))?;
+        if active != 0 && stored_owner != owner {
             let guard_expires_at = Timestamp::from_str(guard_expires_at_str.as_str())
                 .map_err(|e| LeaseError::Backend(e.to_string()))?;
             if guard_expires_at > now {
@@ -201,7 +204,9 @@ pub(crate) fn renew_sync(
     if credential_id as u64 != lease.credential_id() {
         return Err(LeaseError::StaleFence);
     }
-    if owner_str != lease.owner().as_str() {
+    let stored_owner = persisted_owner_id(owner_str)
+        .map_err(|_| LeaseError::Backend("persisted session owner is invalid".to_string()))?;
+    if stored_owner != *lease.owner() {
         return Err(LeaseError::AlreadyHeld);
     }
 
@@ -301,7 +306,9 @@ pub(crate) fn release_sync(
     if credential_id as u64 != lease.credential_id() {
         return Err(LeaseError::StaleFence);
     }
-    if owner_str != lease.owner().as_str() {
+    let stored_owner = persisted_owner_id(owner_str)
+        .map_err(|_| LeaseError::Backend("persisted session owner is invalid".to_string()))?;
+    if stored_owner != *lease.owner() {
         return Err(LeaseError::AlreadyHeld);
     }
 

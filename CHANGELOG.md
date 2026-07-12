@@ -140,6 +140,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every client, server, and wrapper participant as one coordinated fleet; do
   not claim rolling compatibility. #134 must pin the limits and error encoding
   in the versioned fixed-width DTO and handshake contract.
+- **BREAKING — `opc-session-store`/`opc-session-net`:** `OwnerId` and
+  deployment-specific session-key type names now accept exactly 1 through 128
+  UTF-8 encoded bytes. `SessionKeyType::Other(String)` is replaced by the
+  structurally validated `Other(CustomSessionKeyType)`, and runtime callers use
+  the fallible `SessionKeyType::other`. The five canonical reserved spellings
+  (`subscriber-context`, `pdu-session`, `teid-mapping`, `pfcp-seid`, and
+  `handover-transaction`) always decode to their well-known variants and cannot
+  be constructed as `Other`; ordering is by the canonical persisted string,
+  not enum declaration order. Serde, SQLite hydration, restore scans, lease and
+  fenced-mutation reads, replication-log hydration, and session-net request and
+  response decoding now apply the same invariants. Existing valid protocol-v3
+  JSON retains its string shape, but this is a Rust source break and a stricter
+  semantic-admission boundary: an older v3 participant may still emit values a
+  new participant rejects. Drain and upgrade every session-net client, server,
+  and wrapper as one coordinated stop/upgrade/start; prefer deploying this
+  change together with #134's versioned fixed-width DTO and handshake work.
+  `HandoverEnvelope::unpack_raw` and `HandoverSessionRecord::unpack_raw` now
+  return `Result`; both types' public `unpack_json` methods use
+  `HandoverEnvelopeDecodeError` instead of `serde_json::Error`; and
+  `HandoverError` gains `InvalidEnvelope`. Callers and exhaustive matches must
+  migrate to the redaction-safe typed failure. Newly
+  packed handover envelopes use the `OPCH` magic plus an exact version byte.
+  The bounded non-`OPCH` classifier accepts current-valid original syntax and
+  some bare payloads; ambiguous, zero-length, truncated, oversized JSON-looking,
+  malformed, or typed-invalid claims fail before mutation. New
+  `unpack_*_with_format` APIs expose syntactic format, which is not provenance.
+  The identity audit does not classify live or nested-log payloads, so rollout
+  requires a complete product-aware decrypted replay preflight and coordinated
+  upgrade of every handover reader/writer. After the first live/replayable
+  `OPCH` write, rollback requires a coherent fleet checkpoint or reviewed
+  reverse migration of records, logs, snapshots, and restore sources.
 - Documentation and package metadata now distinguish scoped implementation
   evidence, Cargo publication eligibility, and production maturity. Historical
   status snapshots, release-evidence primitives, and conditional
@@ -178,6 +209,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conditional codec candidate.
 
 ### Security
+- `opc-session-store`: add the bounded, read-only
+  `opc-session-store-audit identity-invariants` pre-upgrade command for existing
+  SQLite stores. It requires explicit non-zero row, per-entry JSON-byte, and
+  total JSON-byte budgets; the per-entry budget cannot exceed the total or
+  SQLite's signed `i64` length range. It scans a single drained snapshot in fixed 256-row
+  pages; and emits versioned count-only JSON for relational owner/key-type and
+  full nested replication-entry violations. `compliant` exits 0,
+  `violations_found` exits 1, and `incomplete` or command/setup failure exits 2.
+  Reports and errors never echo database paths, row identities, owner/key
+  values, or replication JSON. The audit does not truncate, rename, rewrite, or
+  repair state. Violations require audited migration/store replacement and a
+  new audit; an incomplete result blocks upgrade but budget exhaustion may be
+  resolved by increasing the explicit budgets and re-running the audit.
+- `opc-session-store`: newly packed handover envelopes carry an exact `OPCH`
+  magic/version header. The bounded non-`OPCH` classifier accepts current-valid
+  original syntax and some bare payloads; ambiguous, malformed, zero-length,
+  truncated, oversized JSON-looking, unknown, or typed-invalid claims return a
+  fieldless error before mutation. `HandoverEnvelopeFormat` makes the syntactic
+  result explicit without claiming provenance. Identity audit compliance does
+  not certify live or replayable payload copies; use the documented complete
+  handover preflight and one-way migration/rollback barrier.
 - `opc-session-store`: `EncryptingSessionBackend` and
   `RemoteSealingSessionBackend` now use bounded iterative traversal to protect
   every nested replicated CAS before replicate/rebuild delegation and to
@@ -324,9 +376,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configured/freshly-reachable/agreeing/required counts, the majority-visible
   prefix, and bounded failure reasons. This closes #124 only; durable authority
   and operator-safe fork recovery (#127–#129), majority-authoritative restore
-  (#133), and wire/model hardening (#134/#135) remain production blockers.
-  Checked TTL and replication-sequence rejection are closed above under
-  #137/#138; production qualification remains #143.
+  (#133), and wire stabilization (#134) remain production blockers. #135's
+  scoped model/persistence admission is implemented above. Checked TTL and
+  replication-sequence rejection are closed under #137/#138; production
+  qualification remains #143.
 - `opc-session-store`: quorum construction now rejects empty/undersized/even HA
   membership, missing or ambiguous self, duplicate logical IDs, canonical
   endpoints, declared TLS identities, failure domains, backing identities, and
@@ -338,15 +391,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mTLS SQLite regression proves that bare logical self is independent from FQDN
   endpoints. This closes #123 configured-topology admission only. Fresh
   durable readiness was scoped separately to #124 and is described above;
-  #127–#129 and #133–#135 remain production blockers; #137/#138 input bounds
-  are closed above and the full qualification remains #143.
+  #127–#129, #133, and #134 remain production blockers; #135's scoped identity
+  admission and #137/#138 input bounds are closed above, and the full
+  qualification remains #143.
 - `opc-session-net`: remote backends and replication servers now carry
   validated cursor-paged restore scans, shorten multi-record pages to the
   effective client/server frame limit, and return a typed error when one
   record cannot fit. This implements the transport parity tracked by #126; it
   does not implement bounded majority-authoritative restore (#133), fixed-width
-  wire stabilization (#134), invariant-safe model decoding (#135), or session
-  HA qualification (#127–#129).
+  wire stabilization (#134), or session HA qualification (#127–#129). #135's
+  scoped model/persistence admission is implemented above.
 - `opc-persist`: standalone default-feature test builds no longer depend on
   fault-injection symbols that exist only with `dangerous-test-hooks`; CI now
   compiles the default package contract before workspace all-feature unification

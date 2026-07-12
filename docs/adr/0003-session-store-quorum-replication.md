@@ -32,6 +32,10 @@ The target session-store contract includes:
   TTLs, with zero accepted as immediate expiry and exact checked deadline
   arithmetic at every direct, nested, persistence, quorum, and transport
   boundary.
+- Structural owner and session-key identities: owner IDs and custom key-type
+  names contain 1 through 128 UTF-8 encoded bytes; reserved key-type strings
+  have one canonical well-known representation; ordering follows the persisted
+  string; and model, persistence, and transport decode all fail closed.
 - Bounded iterative replication trees: depth 16 from a depth-1 root and 256
   total operation nodes per entry, counting every node including `Batch`.
 - Encryption/sealing of every nested replicated CAS before delegation and
@@ -108,10 +112,12 @@ require a coordinated v2-to-v3 stop/upgrade/start; mixed fleets are not
 supported. This identity binding is not consensus or fork recovery. Durable
 commit authority, commit-proven repair, operator-safe fork recovery, and
 bounded majority-authoritative restore remain open in #127–#129 and #133.
-Fixed-width wire DTOs and invariant-safe model decoding remain #134/#135;
-checked TTL rejection is implemented under #137, and malformed sequence zero,
-checked increment, rebuild-prefix, SQLite signed-boundary, cache, and
-authenticated wire rejection are implemented under #138. Production
+Fixed-width wire DTOs remain #134. Invariant-safe owner/key model decoding,
+bounded count-only SQLite admission, and typed-invalid handover rejection are
+implemented under #135; checked TTL rejection is implemented under #137, and
+malformed sequence zero, checked increment, rebuild-prefix, SQLite
+signed-boundary, cache, and authenticated wire rejection are implemented under
+#138. Production
 qualification, including seamless credential/trust rotation, remains #143.
 Watch handoff correctness (#145) and absolute-record-expiry admission (#148)
 also remain open. Bounded nested-CAS protection is implemented under #147;
@@ -144,6 +150,43 @@ replay/rebuild and is neither clamped nor rewritten automatically. Replicated
 deadline validation admits at most one microsecond above exact
 `entry.timestamp + ttl` solely for legacy `seconds_f64` rounding; new deadlines
 remain exact, the TTL maximum is unchanged, and larger mismatches fail closed.
+
+Under #135, `OwnerId` and custom session-key names accept 1 through 128 UTF-8
+encoded bytes. `SessionKeyType::Other` now contains a validated
+`CustomSessionKeyType`; reserved names decode only to the canonical well-known
+variants, and ordering uses canonical string order. Serde, SQLite hydration,
+and session-net decode reuse that admission. Valid v3 JSON strings retain their
+shape, but Rust construction is source-breaking and semantic admission is
+stricter. An older v3 peer may emit values a new peer rejects, so all clients,
+servers, and wrappers require coordinated stop/upgrade/start. #135 should ship
+with #134's versioned DTO/handshake work where possible.
+
+Existing SQLite replicas must be drained and checked with
+`opc-session-store-audit identity-invariants` using explicit non-zero
+`--max-rows`, `--max-entry-json-bytes`, and `--max-total-json-bytes` budgets.
+The per-entry budget cannot exceed the total or SQLite's signed `i64` length
+range.
+The read-only/query-only audit scans one snapshot in fixed 256-row pages and
+emits version-1 count-only JSON. Only `compliant` with exit 0 passes;
+`violations_found`/1, `incomplete`/2, and redacted `error`/2 block upgrade. It
+never emits database paths or persisted raw values and never truncates,
+renames, repairs, or rewrites state. A violation requires a reviewed
+semantic-preserving migration or audited store replacement and a new audit.
+
+New handover envelopes use the `OPCH` magic and an exact version byte. The exact
+bounded non-`OPCH` classifier in RFC 004 §10.3 accepts current-valid original
+syntax and some bare payloads; ambiguous, truncated, oversized JSON-looking,
+malformed, unknown, or typed-invalid claims return a fieldless error before
+mutation. Successful detection is not provenance. The identity audit does not
+classify live or nested-log payload bytes, so products require the complete
+provenance-aware replay preflight. Once any live/replayable `OPCH` copy is
+written, old SDKs silently see opaque `Stable` data; downgrade requires a
+coherent drained checkpoint restore or reviewed reverse migration of every
+record/log/snapshot/restore copy across every handover reader/writer.
+
+This closes the scoped #135 boundary, not durable authority or production HA.
+#127 and #134 remain open, and #143 still requires distributed qualification,
+including seamless SVID, payload-protection-key, and trust-bundle rotation.
 
 `MAX_REPLICATION_OPERATION_DEPTH` is 16 and
 `MAX_REPLICATION_OPERATIONS_PER_ENTRY` is 256. The root operation is depth 1,
@@ -201,6 +244,10 @@ identity remain fixed by the manifest.
 - `crates/opc-session-store/tests/quorum_topology.rs`
 - `crates/opc-session-store/tests/encryption.rs`
 - `crates/opc-session-store/tests/replication_structure_bounds.rs`
+- `crates/opc-session-store/tests/persisted_identity_bounds.rs`
+- `crates/opc-session-store/tests/sqlite_identity_audit.rs`
+- `crates/opc-session-store/tests/sqlite_identity_audit_cli.rs`
+- `crates/opc-session-store/tests/handover.rs`
 - `crates/opc-session-net/tests/three_node_quorum.rs`
 - `crates/opc-session-net/tests/authenticated_replica_identity.rs`
 - `crates/opc-amf-lite/tests/amf_lite_tests.rs`

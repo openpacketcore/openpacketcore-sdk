@@ -360,14 +360,14 @@ fn restore_scan_page_validation_rejects_untrusted_contract_violations() {
     nonadvancing.complete = false;
     assert_invalid(nonadvancing);
 
-    let invalid_owner: OwnerId = serde_json::from_str("\"\"").expect("deserialize owner");
-    let mut invalid_record = first.clone();
-    invalid_record.owner = invalid_owner;
-    assert_invalid(RestoreScanPage::new(vec![invalid_record], 0, None));
+    let page = RestoreScanPage::new(vec![first], 0, None);
+    let mut invalid_owner = serde_json::to_value(&page).expect("serialize page");
+    invalid_owner["records"][0]["owner"] = serde_json::json!("");
+    assert!(serde_json::from_value::<RestoreScanPage>(invalid_owner).is_err());
 
-    let mut invalid_key_type = first;
-    invalid_key_type.key.key_type = SessionKeyType::Other("x".repeat(129));
-    assert_invalid(RestoreScanPage::new(vec![invalid_key_type], 0, None));
+    let mut invalid_key_type = serde_json::to_value(&page).expect("serialize page");
+    invalid_key_type["records"][0]["key"]["key_type"] = serde_json::json!("x".repeat(129));
+    assert!(serde_json::from_value::<RestoreScanPage>(invalid_key_type).is_err());
 }
 
 #[tokio::test]

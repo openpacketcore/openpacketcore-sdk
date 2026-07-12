@@ -33,6 +33,10 @@ evidence.
   `checked_session_deadline` define the common checked TTL/deadline contract.
 - `SessionKey`, `SessionKeyType`, `StateClass`, `StateType`, `Generation`,
   `OwnerId`, and `FenceToken` describe session identity and ownership.
+- `CustomSessionKeyType` makes deployment-specific key-type invariants
+  structural, and `sqlite::audit::audit_sqlite_identity_invariants` plus the
+  `opc-session-store-audit` binary provide a bounded, read-only legacy-store
+  admission check.
 - `StoredSessionRecord` carries key, generation, owner, fence, state class/type,
   expiry, and encrypted payload bytes.
 - `SqliteSessionBackend::open(path)` and `in_memory()` provide the reference
@@ -83,6 +87,139 @@ async fn open() -> Result<(), opc_session_store::StoreError> {
     Ok(())
 }
 ```
+
+### Identity invariants and legacy SQLite admission
+
+`OwnerId` and a deployment-specific `SessionKeyType` name each contain exactly
+1 through 128 UTF-8 encoded bytes. The limit is bytes, not Unicode scalar
+values: for example, 64 two-byte `é` characters are accepted and 65 are not.
+`SessionKeyType::Other` contains a `CustomSessionKeyType` with private storage,
+so an empty, oversized, or reserved custom name cannot be constructed through
+the public API. Runtime callers use the fallible `SessionKeyType::other`.
+
+The canonical reserved names are `subscriber-context`, `pdu-session`,
+`teid-mapping`, `pfcp-seid`, and `handover-transaction`. Parsing any of these
+strings produces its well-known variant; `SessionKeyType::other` rejects it so
+one persisted string cannot have two in-memory representations. Serialization,
+display, SQLite identity, key-digest input, and `Ord` all use the canonical
+string. Ordering therefore follows string order across known and custom values,
+not enum declaration order.
+
+Custom deserializers enforce the same bounds for Serde values. SQLite point
+reads validate persisted record owners; restore scans validate persisted key
+types and owners; lease acquire, renew, release, and fenced mutations validate
+the stored active owner before using it; and replication-log hydration validates
+the complete nested entry. Session-net request and response decoding reuses
+those deserializers before backend dispatch or caller exposure. Errors are
+fixed or fieldless and do not include the rejected raw owner, key type, record,
+or replication entry. Newly packed handover envelopes carry the `OPCH` magic
+and an exact version byte, so their header and phase always decode strictly.
+Original length-prefixed envelopes remain readable only when their phase is
+complete, no larger than `HANDOVER_PHASE_HEADER_MAX_BYTES` (1,024 bytes), and
+valid under the current `HandoverPhase` model. Non-`OPCH` input uses the exact
+legacy classifier below; compatibility is not claimed for every arbitrary bare
+payload or every envelope accepted by an older unbounded reader.
+
+Before starting this SDK against an existing SQLite store, drain all writers
+and run the audit against the resulting point-in-time database:
+
+```text
+opc-session-store-audit identity-invariants \
+  --database /path/to/session-store.db \
+  --max-rows N \
+  --max-entry-json-bytes N \
+  --max-total-json-bytes N
+```
+
+All three budgets are required and non-zero;
+`--max-entry-json-bytes` must not exceed `--max-total-json-bytes` or SQLite's
+signed `i64` length range. The audit
+opens an existing database read-only, enables SQLite `query_only`, scans one
+consistent snapshot in fixed 256-row pages, and applies `--max-rows` across
+`session_records`, `leases`, `key_fences`, and `session_replication_log` in
+that order. The two JSON budgets bound individual and cumulative replication
+entries before strict `ReplicationEntry` decoding and domain validation.
+
+Report schema version 1 contains only the requested limits, per-table scanned
+counts, violation counts (`invalid_owner_fields`,
+`invalid_session_key_type_fields`, and `invalid_replication_entries`), and an
+optional bounded `incomplete_reason`. It never emits the database path, row
+identity, tenant, owner, key type, stable ID, payload, transaction, or raw JSON.
+The command contract is:
+
+- `compliant` JSON on stdout and exit 0 only after the complete snapshot fits
+  the budgets and has no violations;
+- `violations_found` JSON on stdout and exit 1 after a complete scan finds one
+  or more violations;
+- `incomplete` JSON on stdout and exit 2 for row/JSON budget exhaustion,
+  unsupported schema, database-read failure, or counter overflow; and
+- redacted `error` JSON on stderr and exit 2 for invalid arguments or limits,
+  database open/setup failure, or output failure.
+
+`violations_found`, `incomplete`, and `error` all block upgrade. Increase the
+budgets and re-run an incomplete audit, or perform a separately reviewed,
+product-owned migration that preserves identity and authoritative-history
+semantics, then audit the resulting snapshot again. The SDK and audit never
+truncate, rename, normalize, delete, or rewrite invalid identities or log
+entries automatically. Store replacement is the safer recovery when those
+semantics cannot be established.
+
+The identity audit deliberately does not read, decrypt, or classify payload
+bytes in live records or nested `ReplicationOp::CompareAndSet` log entries;
+`compliant` therefore does not certify handover payload compatibility. Every NF
+or product using `HandoverEnvelope` must run a separate, provenance-aware
+preflight over the complete drained/decrypted replay population: live records,
+every recursively nested replication-log/snapshot record, restore/rebuild
+sources, and any other retained copy that can become authoritative. Use
+`unpack_raw_with_format` or typed `unpack_json_with_format`; decoder success
+alone is not a pass. For non-`OPCH` bytes, the syntactic classifier is exactly:
+
+- fewer than four bytes fall back to bare `Stable`;
+- a zero first-word, or a big-endian length from 1 through 1,024 whose phase
+  slice is truncated, is `InvalidHeader`;
+- a complete 1-through-1,024-byte phase slice is an original envelope when it
+  decodes as the current `HandoverPhase`; JSON-looking invalid phase bytes are
+  `InvalidPhase`, while non-JSON-looking bytes fall back to bare `Stable`; and
+- a length above 1,024 is `InvalidHeader` when the bytes after the first word
+  begin, after ASCII whitespace, like a JSON value; otherwise it falls back to
+  bare `Stable`.
+
+This deliberately rejects some ambiguous bare values (for example
+`[0, 0, 0, 1]` and some bare JSON) rather than downgrading possibly corrupted
+typed state. Prefix collisions can also decode successfully: on a snapshot
+known to predate `OPCH`, `HandoverEnvelopeFormat::VersionedV1` is necessarily a
+historical bare collision, and every `OriginalLengthPrefixed` classification
+must be confirmed against product provenance and payload semantics. When a
+product can authoritatively identify a value as historical bare `Stable` state,
+it must explicitly wrap the complete original bytes with `pack_raw`/`pack_json`
+through a reviewed migration that preserves fencing, generation, encryption,
+and payload semantics. Oversized/newly invalid phases or classifications that
+cannot be proven need an equally reviewed semantic migration or store
+replacement.
+
+Accepted protocol-v3 identities keep the same JSON string shape, but the Rust
+API is source-breaking (`Other(String)` becomes
+`Other(CustomSessionKeyType)`, and `other` is fallible) and wire admission is
+semantically stricter. Handover decoding is also source-breaking:
+`unpack_raw` now returns `Result`, `unpack_json` returns
+`HandoverEnvelopeDecodeError`, and `HandoverError` gains `InvalidEnvelope`.
+`pack_raw`/`pack_json` now write the versioned `OPCH` envelope; a compatible
+original or bare record rewrites to the versioned form on its next transition.
+An older v3 participant can emit an empty or oversized value that a new
+participant rejects. Do not use a mixed rolling deployment:
+stop writers and traffic, run both preflights, upgrade every session-net
+client/server/protection wrapper and every NF or product handover reader/writer,
+then restart and restore traffic. Prefer one coordinated rollout with #134 so
+the fixed-width DTO and handshake explicitly negotiate the identity contract.
+
+The persisted handover migration is one-way once any `OPCH` record or replayable
+copy is written: an older SDK reader treats the new envelope as opaque bare
+`Stable` payload. Do not roll back binaries after that point. Rollback requires
+keeping the fleet drained and either restoring one coherent fleet-wide
+pre-upgrade checkpoint (explicitly accepting or reconciling all post-checkpoint
+mutations) or running a reviewed reverse migration over every live and
+replayable copy, including nested logs, snapshots, and restore sources. #134
+negotiation does not make an opaque `OPCH` payload readable by an older binary.
 
 ### Validated HA construction
 
@@ -367,6 +504,9 @@ do not provide rotation evidence.
 - Nested replicated CAS payloads are protected under the bounded iterative
   contract above. This is confidentiality and input-boundary hardening, not
   consensus, durable authority, wire stabilization, or production HA.
+- The #135 identity/model boundary and offline SQLite audit are implemented,
+  but do not establish durable sequencing, fork recovery, restore authority,
+  wire stabilization, seamless rotation, or production HA.
 
 ## Roadmap
 
@@ -374,9 +514,10 @@ do not provide rotation evidence.
 - Continue hardening restore evidence and traffic-blocking gates.
 - Complete durable sequencing and safe fork repair/recovery (#127–#129),
   bounded majority-authoritative restore (#133), fixed-width wire stabilization
-  (#134), invariant-safe model decoding (#135), watch handoff correctness
-  (#145), and absolute-expiry admission (#148), then complete the production
-  qualification profile and distributed evidence in #143.
+  (#134), watch handoff correctness (#145), and absolute-expiry admission
+  (#148), then complete the production qualification profile and distributed
+  evidence—including seamless certificate, payload-protection-key, and
+  trust-bundle rotation—in #143.
 - Keep encryption AAD bound to namespace, NF kind, state type, generation,
   fence, and session-key digest.
 
@@ -405,6 +546,14 @@ do not provide rotation evidence.
   rebuild, log, and watch round trips; depth/count boundaries; no plaintext or
   protected-byte exposure; and late-provider failure without backend
   delegation or partial entry/page exposure.
+- `tests/persisted_identity_bounds.rs`, `tests/sqlite_identity_audit.rs`, and
+  `tests/sqlite_identity_audit_cli.rs` cover valid legacy hydration, hostile
+  owner/key identities across SQLite and nested logs, no-effect rejection,
+  exact byte boundaries, bounded count-only auditing, redaction, and stable
+  command status/exit behavior. `tests/handover.rs` covers versioned and
+  bounded/current-valid original-format round trips, the exact non-`OPCH`
+  classifier including ambiguous bare rejection, and malformed/truncated/
+  oversized/typed-invalid rejection without mutation.
 - Run with: `cargo test -p opc-session-store`.
 
 ## License

@@ -347,6 +347,107 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use opc_session_store::{
+        CompareAndSetResult, EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation,
+        ReplicationOp, SessionKeyType, SessionLeaseManager, StateClass, StateType,
+    };
+    use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+    use serde::de::DeserializeOwned;
+
+    const OWNER_SENTINEL: &str = "peer-owner-sensitive-sentinel";
+    const KEY_TYPE_SENTINEL: &str = "peer-key-type-sensitive-sentinel";
+
+    fn replace_json_string(
+        value: &mut serde_json::Value,
+        needle: &str,
+        replacement: &str,
+    ) -> usize {
+        match value {
+            serde_json::Value::String(current) if current == needle => {
+                *current = replacement.to_owned();
+                1
+            }
+            serde_json::Value::Array(values) => values
+                .iter_mut()
+                .map(|value| replace_json_string(value, needle, replacement))
+                .sum(),
+            serde_json::Value::Object(fields) => fields
+                .values_mut()
+                .map(|value| replace_json_string(value, needle, replacement))
+                .sum(),
+            _ => 0,
+        }
+    }
+
+    fn json<T: Serialize>(frame: T) -> serde_json::Value {
+        serde_json::to_value(frame).expect("serialize valid protocol frame")
+    }
+
+    fn assert_hostile_mutations_rejected<T>(
+        family: &str,
+        frame: &serde_json::Value,
+        field: &str,
+        sentinel: &str,
+        oversized: &str,
+    ) where
+        T: DeserializeOwned + std::fmt::Debug,
+    {
+        let valid_json = serde_json::to_vec(frame).expect("serialize valid protocol frame");
+        serde_json::from_slice::<T>(&valid_json)
+            .unwrap_or_else(|error| panic!("valid {family} frame did not decode: {error}"));
+
+        for (boundary, replacement) in [("empty", ""), ("129-byte", oversized)] {
+            let mut hostile = frame.clone();
+            let replaced = replace_json_string(&mut hostile, sentinel, replacement);
+            assert!(
+                replaced > 0,
+                "{family} frame did not contain the {field} sentinel"
+            );
+
+            let hostile_json =
+                serde_json::to_vec(&hostile).expect("serialize hostile protocol frame");
+            let error = serde_json::from_slice::<T>(&hostile_json).unwrap_err();
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+
+            for secret in [OWNER_SENTINEL, KEY_TYPE_SENTINEL, replacement] {
+                if secret.is_empty() {
+                    continue;
+                }
+                assert!(
+                    !display.contains(secret),
+                    "{family} {field} {boundary} error leaked peer input: {display}"
+                );
+                assert!(
+                    !debug.contains(secret),
+                    "{family} {field} {boundary} debug error leaked peer input: {debug}"
+                );
+            }
+        }
+    }
+
+    fn test_session_key() -> SessionKey {
+        SessionKey {
+            tenant: TenantId::new("tenant-a").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::new("smf").expect("test NF kind"),
+            key_type: SessionKeyType::other(KEY_TYPE_SENTINEL).expect("test key type"),
+            stable_id: Bytes::from_static(b"protocol-invariant-boundary"),
+        }
+    }
+
+    fn test_record(key: SessionKey, owner: OwnerId, fence: FenceToken) -> StoredSessionRecord {
+        StoredSessionRecord {
+            key,
+            generation: Generation::new(1),
+            owner,
+            fence,
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::new("protocol-boundary").expect("test state type"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(b"payload"),
+        }
+    }
 
     #[test]
     fn restore_scan_protocol_v3_frames_round_trip() {
@@ -404,6 +505,187 @@ mod tests {
         }));
         ensure_frame_fits(&terminal, MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE)
             .expect("minimum response budget must fit the terminal error");
+    }
+
+    #[tokio::test]
+    async fn hostile_model_values_fail_during_decode_across_protocol_families() {
+        let oversized = format!("{}x", "é".repeat(64));
+        assert_eq!(oversized.len(), 129, "test value must be 129 UTF-8 bytes");
+
+        let key = test_session_key();
+        let owner = OwnerId::new(OWNER_SENTINEL).expect("test owner");
+        let backend = FakeSessionBackend::new();
+        let lease = backend
+            .acquire(&key, owner.clone(), Duration::from_secs(60))
+            .await
+            .expect("test lease");
+        let record = test_record(key.clone(), owner.clone(), lease.fence());
+        let cas = CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: record.clone(),
+        };
+        let restore_request = RestoreScanRequest {
+            scope: RestoreScanScope {
+                tenant: None,
+                nf_kind: None,
+                key_type: Some(key.key_type.clone()),
+                state_class: None,
+                state_type: None,
+                owner: Some(owner.clone()),
+            },
+            cursor: None,
+            limit: 1,
+        };
+        let timestamp = Timestamp::now_utc();
+        let entry = ReplicationEntry {
+            sequence: 1,
+            tx_id: "protocol-invariant-entry".to_owned(),
+            op: ReplicationOp::RefreshTtl {
+                key: key.clone(),
+                owner: owner.clone(),
+                fence: lease.fence(),
+                ttl: Duration::from_secs(60),
+                expires_at: timestamp,
+            },
+            timestamp,
+        };
+
+        let request_frames = [
+            (
+                "acquire request",
+                json(Request::AcquireLease {
+                    key: key.clone(),
+                    owner: owner.clone(),
+                    ttl: Duration::from_secs(60),
+                }),
+                true,
+            ),
+            (
+                "lease request",
+                json(Request::RenewLease {
+                    lease: lease.clone(),
+                    ttl: Duration::from_secs(60),
+                }),
+                true,
+            ),
+            (
+                "get request",
+                json(Request::Get { key: key.clone() }),
+                false,
+            ),
+            (
+                "CAS request",
+                json(Request::CompareAndSet {
+                    op: cas.clone(),
+                    request_id: Some("protocol-invariant-request".to_owned()),
+                }),
+                true,
+            ),
+            (
+                "batch request",
+                json(Request::Batch {
+                    ops: vec![
+                        SessionOp::Get { key: key.clone() },
+                        SessionOp::CompareAndSet(cas.clone()),
+                    ],
+                }),
+                true,
+            ),
+            (
+                "restore scope request",
+                json(Request::ScanRestoreRecords {
+                    request: RestoreScanWireRequest::try_from(&restore_request)
+                        .expect("wire restore request"),
+                    max_response_frame_size: 32_768,
+                }),
+                true,
+            ),
+            (
+                "replicate request",
+                json(Request::ReplicateEntry {
+                    entry: entry.clone(),
+                }),
+                true,
+            ),
+            (
+                "rebuild request",
+                json(Request::RebuildReplicationState {
+                    entries: vec![entry.clone()],
+                }),
+                true,
+            ),
+        ];
+
+        let response_frames = [
+            ("lease response", json(Response::AcquireLease(Ok(lease)))),
+            (
+                "get response",
+                json(Response::Get(Ok(Some(record.clone())))),
+            ),
+            (
+                "CAS response",
+                json(Response::CompareAndSet(Ok(CompareAndSetResult::Conflict {
+                    current: Some(record.clone()),
+                }))),
+            ),
+            (
+                "batch response",
+                json(Response::Batch(Ok(vec![SessionOpResult::Get(Ok(Some(
+                    record.clone(),
+                )))]))),
+            ),
+            (
+                "restore page response",
+                json(Response::ScanRestoreRecords(Ok(RestoreScanPage::new(
+                    vec![record],
+                    0,
+                    None,
+                )))),
+            ),
+            (
+                "replication log response",
+                json(Response::GetReplicationLog(Ok(vec![entry.clone()]))),
+            ),
+            ("watch response", json(Response::WatchEntry(Ok(entry)))),
+        ];
+
+        for (family, frame, has_owner) in request_frames {
+            if has_owner {
+                assert_hostile_mutations_rejected::<Request>(
+                    family,
+                    &frame,
+                    "owner",
+                    OWNER_SENTINEL,
+                    &oversized,
+                );
+            }
+            assert_hostile_mutations_rejected::<Request>(
+                family,
+                &frame,
+                "key type",
+                KEY_TYPE_SENTINEL,
+                &oversized,
+            );
+        }
+
+        for (family, frame) in response_frames {
+            assert_hostile_mutations_rejected::<Response>(
+                family,
+                &frame,
+                "owner",
+                OWNER_SENTINEL,
+                &oversized,
+            );
+            assert_hostile_mutations_rejected::<Response>(
+                family,
+                &frame,
+                "key type",
+                KEY_TYPE_SENTINEL,
+                &oversized,
+            );
+        }
     }
 
     #[tokio::test]
