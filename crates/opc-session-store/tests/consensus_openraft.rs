@@ -1106,6 +1106,120 @@ async fn cold_start_concurrent_mutations_share_one_gap_free_committed_sequence()
 }
 
 #[tokio::test]
+async fn restore_pages_use_only_linearizable_applied_state_and_fail_closed_when_stale() {
+    let cluster = TestCluster::start().await;
+
+    for label in [b"restore-a".as_slice(), b"restore-b", b"restore-c"] {
+        let key = session_key(label);
+        let lease = cluster.stores[0]
+            .acquire(
+                &key,
+                owner(format!(
+                    "restore-owner-{}",
+                    char::from(label[label.len() - 1])
+                )),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("acquire restore-test lease through the fleet");
+        assert_eq!(
+            cluster.stores[1]
+                .compare_and_set(CompareAndSet {
+                    key: key.clone(),
+                    lease: lease.clone(),
+                    expected_generation: None,
+                    new_record: sealed_record(key, 1, &lease, b"sealed-restore-state"),
+                })
+                .await
+                .expect("commit restore-test record through the fleet"),
+            CompareAndSetResult::Success
+        );
+    }
+
+    let first_pages = futures_util::future::join_all(
+        cluster
+            .stores
+            .iter()
+            .map(|store| store.scan_restore_records(RestoreScanRequest::all(2))),
+    )
+    .await
+    .into_iter()
+    .map(|page| page.expect("linearizable first restore page"))
+    .collect::<Vec<_>>();
+    assert_eq!(first_pages[0].records.len(), 2);
+    assert!(!first_pages[0].complete);
+    assert!(first_pages
+        .iter()
+        .all(|page| page.records == first_pages[0].records));
+
+    let stale_cursor = first_pages[0]
+        .next_cursor
+        .clone()
+        .expect("bounded first page has a continuation");
+    for (store, first_page) in cluster.stores.iter().zip(&first_pages) {
+        let second = store
+            .scan_restore_records(RestoreScanRequest {
+                cursor: first_page.next_cursor.clone(),
+                ..RestoreScanRequest::all(2)
+            })
+            .await
+            .expect("linearizable second restore page");
+        assert_eq!(second.records.len(), 1);
+        assert!(second.complete);
+        assert_eq!(second.records[0].key.stable_id.as_ref(), b"restore-c");
+    }
+
+    cluster.isolate(0);
+    let isolated = tokio::time::timeout(
+        Duration::from_secs(2),
+        cluster.stores[0].scan_restore_records(RestoreScanRequest::all(1)),
+    )
+    .await
+    .expect("isolated restore attempt is bounded");
+    assert!(matches!(isolated, Err(StoreError::BackendUnavailable(_))));
+
+    cluster.heal(0);
+    cluster
+        .wait_all_ready(RECOVERY_TIMEOUT)
+        .await
+        .expect("healed node regains linearizable restore authority");
+
+    let new_key = session_key(b"restore-d");
+    let new_lease = cluster.stores[2]
+        .acquire(&new_key, owner("restore-owner-d"), Duration::from_secs(30))
+        .await
+        .expect("acquire lease after restore cursor publication");
+    assert_eq!(
+        cluster.stores[1]
+            .compare_and_set(CompareAndSet {
+                key: new_key.clone(),
+                lease: new_lease.clone(),
+                expected_generation: None,
+                new_record: sealed_record(new_key, 1, &new_lease, b"sealed-restore-state"),
+            })
+            .await
+            .expect("commit record after restore cursor publication"),
+        CompareAndSetResult::Success
+    );
+
+    let stale = cluster.stores[0]
+        .scan_restore_records(RestoreScanRequest {
+            cursor: Some(stale_cursor),
+            ..RestoreScanRequest::all(2)
+        })
+        .await
+        .expect_err("record mutation must invalidate an older restore snapshot");
+    assert_eq!(stale, StoreError::RestoreScanCursorStale);
+
+    let restarted = cluster.stores[0]
+        .scan_restore_records(RestoreScanRequest::all(4))
+        .await
+        .expect("restart from the first page after a stale cursor");
+    assert_eq!(restarted.records.len(), 4);
+    assert!(restarted.complete);
+}
+
+#[tokio::test]
 async fn isolated_node_fails_closed_and_recovers_after_both_peer_paths_heal() {
     let cluster = TestCluster::start().await;
     cluster.isolate(0);

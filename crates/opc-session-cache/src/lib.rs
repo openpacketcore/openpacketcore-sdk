@@ -689,6 +689,8 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::InvalidRestoreScanResponse(_) => "invalid_restore_scan_response",
         StoreError::RestoreScanPageTooLarge { .. } => "restore_scan_page_too_large",
         StoreError::RestoreScanResponseTooLarge { .. } => "restore_scan_response_too_large",
+        StoreError::RestoreScanCursorStale => "restore_scan_cursor_stale",
+        StoreError::RestoreScanWorkBudgetExceeded => "restore_scan_work_budget_exceeded",
     }
 }
 

@@ -20,7 +20,7 @@ use crate::{
     lease::{LeaseGuard, SessionLeaseManager},
     model::{FenceToken, Generation, OwnerId, SessionKey},
     record::{EncryptedSessionPayload, StoredSessionRecord},
-    restore::{RestoreScanPage, RestoreScanRequest},
+    restore::{RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest},
     topology::{ReplicaId, ReplicaTlsIdentity},
     ttl::{checked_session_deadline, validate_session_ttl},
 };
@@ -664,6 +664,14 @@ pub trait SessionBackend: Send + Sync {
         None
     }
 
+    /// Restore cursor/evidence profile implemented by this backend.
+    ///
+    /// `None` is fail-closed for remote capability advertisement. Production
+    /// transport may expose restore only for [`RestoreScanCursorProfile::DurableOpaqueV1`].
+    fn restore_scan_cursor_profile(&self) -> Option<RestoreScanCursorProfile> {
+        None
+    }
+
     /// Return the capability declaration for this backend.
     async fn capabilities(&self) -> BackendCapabilities;
 
@@ -1092,6 +1100,10 @@ where
         self.inner.peer_binding()
     }
 
+    fn restore_scan_cursor_profile(&self) -> Option<RestoreScanCursorProfile> {
+        self.inner.restore_scan_cursor_profile()
+    }
+
     async fn capabilities(&self) -> BackendCapabilities {
         self.inner.capabilities().await
     }
@@ -1499,6 +1511,10 @@ where
 
     fn peer_binding(&self) -> Option<BackendPeerBinding> {
         self.inner.peer_binding()
+    }
+
+    fn restore_scan_cursor_profile(&self) -> Option<RestoreScanCursorProfile> {
+        self.inner.restore_scan_cursor_profile()
     }
 
     async fn capabilities(&self) -> BackendCapabilities {
