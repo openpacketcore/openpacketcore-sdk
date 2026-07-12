@@ -1589,6 +1589,8 @@ fn is_deterministic_intent_rejection(error: &StoreError) -> bool {
         | StoreError::InvalidRestoreScanRequest(_)
         | StoreError::InvalidRestoreScanResponse(_)
         | StoreError::RestoreScanPageTooLarge { .. }
+        | StoreError::RestoreScanCursorStale
+        | StoreError::RestoreScanWorkBudgetExceeded
         | StoreError::RestoreScanResponseTooLarge { .. } => false,
     }
 }
@@ -2236,6 +2238,8 @@ pub(crate) fn build_snapshot_database_sync(
             "#,
         )
         .map_err(db_error)?;
+    ops::rotate_restore_scan_epoch_sync(&destination)
+        .map_err(|_| invalid_data("built session consensus snapshot restore metadata failed"))?;
     validate_existing_schema(&destination, identity, expected_members)
         .map_err(|_| invalid_data("built session consensus snapshot failed validation"))?;
     validate_sealed_state_sync(&destination)?;
@@ -2270,6 +2274,8 @@ fn validate_snapshot_database_sync(
     }
     validate_existing_schema(&conn, identity, expected_members)
         .map_err(|_| invalid_data("session consensus snapshot identity is invalid"))?;
+    ops::read_restore_scan_state_sync(&conn)
+        .map_err(|_| invalid_data("session consensus snapshot restore metadata is invalid"))?;
     validate_sealed_state_sync(&conn)?;
     let applied = read_applied_sync(&conn, identity)?;
     let membership = read_membership_sync(&conn, identity, expected_members)?;
@@ -2374,6 +2380,10 @@ pub(crate) fn install_snapshot_database_sync(
                 "consensus_operator_recovery",
                 "singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor",
             ),
+            (
+                "restore_scan_state",
+                "singleton, epoch, revision, cursor_key",
+            ),
         ] {
             tx.execute(&format!("DELETE FROM {table}"), [])
                 .map_err(db_error)?;
@@ -2385,6 +2395,12 @@ pub(crate) fn install_snapshot_database_sync(
             )
             .map_err(db_error)?;
         }
+        // Restore cursors are local evidence, not replicated state-machine
+        // authority. Every snapshot destination gets a fresh incarnation so
+        // two nodes installing the same coherent snapshot cannot consume one
+        // another's continuation token.
+        ops::rotate_restore_scan_incarnation_sync(&tx)
+            .map_err(|_| invalid_data("installed session snapshot restore metadata failed"))?;
         tx.execute(
             "INSERT OR REPLACE INTO consensus_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
             params![
@@ -2525,6 +2541,8 @@ pub(crate) fn read_current_snapshot_sync(
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -2533,6 +2551,7 @@ mod tests {
 
     use super::*;
     use crate::model::{OwnerId, SessionKey, SessionKeyType};
+    use crate::restore::{RestoreScanCursor, RestoreScanRequest, RestoreScanScope};
 
     fn identity() -> SessionConsensusIdentity {
         SessionConsensusIdentity::new(
@@ -2723,6 +2742,144 @@ mod tests {
             })
             .expect("snapshot count");
         assert_eq!(0, count);
+    }
+
+    #[tokio::test]
+    async fn installed_snapshot_invalidates_source_cursor_and_first_page_restarts() {
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.lock().await;
+        let identity = identity();
+        let expected = expected_members();
+        initialize_schema(&source_conn, identity, &expected).expect("source consensus schema");
+        apply_entries_sync(
+            &source_conn,
+            identity,
+            &expected,
+            &source.caps,
+            vec![membership_entry()],
+        )
+        .expect("apply admitted membership");
+        let (source_epoch, source_revision, source_cursor_key) =
+            ops::read_restore_scan_state_sync(&source_conn).expect("source cursor state");
+        let scope = RestoreScanScope::all();
+        let source_cursor = RestoreScanCursor::durable(
+            &source_cursor_key,
+            source_epoch,
+            source_revision,
+            timestamp(0),
+            &scope,
+            &key(),
+            1,
+        )
+        .expect("source cursor");
+
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("installed.sqlite");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity, &expected, &snapshot_path)
+                .expect("build snapshot");
+        drop(source_conn);
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "restore-cursor-incarnation".to_string(),
+        };
+
+        let target = SqliteSessionBackend::in_memory().expect("target backend");
+        let target_conn = target.conn.lock().await;
+        initialize_schema(&target_conn, identity, &expected).expect("target consensus schema");
+        let byte_length = std::fs::metadata(&snapshot_path)
+            .expect("snapshot metadata")
+            .len();
+        install_snapshot_database_sync(
+            &target_conn,
+            identity,
+            &expected,
+            &snapshot_path,
+            &meta,
+            "installed.opc",
+            [0x5a; 32],
+            byte_length,
+        )
+        .expect("install snapshot");
+
+        let stale = ops::scan_restore_records_sync(
+            &target_conn,
+            RestoreScanRequest {
+                scope: scope.clone(),
+                cursor: Some(source_cursor),
+                limit: 1,
+            },
+            timestamp(1),
+            Arc::new(AtomicBool::new(false)),
+            std::time::Instant::now() + Duration::from_secs(5),
+            false,
+        )
+        .expect_err("snapshot install creates a new cursor incarnation");
+        assert_eq!(stale, StoreError::RestoreScanCursorStale);
+        let first_page = ops::scan_restore_records_sync(
+            &target_conn,
+            RestoreScanRequest {
+                scope,
+                cursor: None,
+                limit: 1,
+            },
+            timestamp(1),
+            Arc::new(AtomicBool::new(false)),
+            std::time::Instant::now() + Duration::from_secs(5),
+            false,
+        )
+        .expect("restart from first page");
+        assert!(first_page.complete);
+        assert!(first_page.records.is_empty());
+
+        let (target_epoch, target_revision, target_cursor_key) =
+            ops::read_restore_scan_state_sync(&target_conn).expect("target cursor state");
+        let target_cursor = RestoreScanCursor::durable(
+            &target_cursor_key,
+            target_epoch,
+            target_revision,
+            timestamp(1),
+            &RestoreScanScope::all(),
+            &key(),
+            1,
+        )
+        .expect("target-local cursor");
+
+        let second_target = SqliteSessionBackend::in_memory().expect("second target backend");
+        let second_target_conn = second_target.conn.lock().await;
+        initialize_schema(&second_target_conn, identity, &expected)
+            .expect("second target consensus schema");
+        install_snapshot_database_sync(
+            &second_target_conn,
+            identity,
+            &expected,
+            &snapshot_path,
+            &meta,
+            "installed-second.opc",
+            [0x6b; 32],
+            byte_length,
+        )
+        .expect("install same snapshot on second target");
+        let (second_epoch, _, second_cursor_key) =
+            ops::read_restore_scan_state_sync(&second_target_conn)
+                .expect("second-target cursor state");
+        assert_ne!(target_epoch, second_epoch);
+        assert_ne!(*target_cursor_key, *second_cursor_key);
+        let cross_node = ops::scan_restore_records_sync(
+            &second_target_conn,
+            RestoreScanRequest {
+                scope: RestoreScanScope::all(),
+                cursor: Some(target_cursor),
+                limit: 1,
+            },
+            timestamp(1),
+            Arc::new(AtomicBool::new(false)),
+            std::time::Instant::now() + Duration::from_secs(5),
+            false,
+        )
+        .expect_err("same snapshot still yields node-local cursor incarnations");
+        assert_eq!(cross_node, StoreError::RestoreScanCursorStale);
     }
 
     #[tokio::test]

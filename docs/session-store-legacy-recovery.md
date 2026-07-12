@@ -129,7 +129,8 @@ authenticated quarantine backup.
    - creation of one staged image bound to the pending epoch, plan digest,
      application/watch maxima, cursor invalidation floor, and allocation
      floors;
-   - atomic installation on each explicitly selected target; and
+   - a distinct local restore-cursor incarnation for each target, written and
+     synced in the temporary database before atomic installation; and
    - a sealed transition to `awaiting_epoch_commit`.
 
 4. Keep the fleet drained. Start the recovered Openraft members under the exact

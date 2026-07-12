@@ -403,6 +403,12 @@ impl OwnedSessionMutationError {
             StoreError::RestoreScanPageTooLarge { .. } => Self::StoreRejected {
                 code: "restore-scan-page-too-large",
             },
+            StoreError::RestoreScanCursorStale => Self::StoreRejected {
+                code: "restore-scan-cursor-stale",
+            },
+            StoreError::RestoreScanWorkBudgetExceeded => Self::StoreRejected {
+                code: "restore-scan-work-budget-exceeded",
+            },
             StoreError::RestoreScanResponseTooLarge { .. } => Self::StoreRejected {
                 code: "restore-scan-response-too-large",
             },

@@ -21,7 +21,7 @@ use crate::consensus::{
     SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId, SessionConsensusIdentity,
     SessionConsensusNodeId, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
-use crate::sqlite::consensus;
+use crate::sqlite::{consensus, ops};
 use crate::ReplicationEntry;
 
 const PATH_MAX_BYTES: usize = 4_096;
@@ -68,6 +68,7 @@ pub(super) enum RecoveryFailpoint {
     AfterBackup,
     AfterStagedCopy,
     AfterSnapshotInstall,
+    AfterDatabaseTemporaryPrepared,
     AfterDatabaseInstall,
 }
 
@@ -728,13 +729,17 @@ fn validate_legacy_schema(conn: &Connection) -> Result<(), RecoveryError> {
             return Err(RecoveryError::CorruptReplica);
         }
     }
-    let expected = BTreeSet::from([
+    let has_restore_scan_state = validate_restore_scan_schema_if_present(conn)?;
+    let mut expected = BTreeSet::from([
         "key_fences".to_string(),
         "lease_globals".to_string(),
         "leases".to_string(),
         "session_records".to_string(),
         "session_replication_log".to_string(),
     ]);
+    if has_restore_scan_state {
+        expected.insert("restore_scan_state".to_string());
+    }
     let mut statement = conn
         .prepare(
             "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
@@ -757,11 +762,121 @@ fn validate_legacy_schema(conn: &Connection) -> Result<(), RecoveryError> {
     Ok(())
 }
 
+fn validate_restore_scan_schema_if_present(conn: &Connection) -> Result<bool, RecoveryError> {
+    if !table_exists(conn, "restore_scan_state")? {
+        return Ok(false);
+    }
+    let mut statement = conn
+        .prepare("PRAGMA table_info(restore_scan_state)")
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let observed = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(|_| RecoveryError::CorruptReplica)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let legacy = vec![
+        (
+            0,
+            "singleton".to_string(),
+            "INTEGER".to_string(),
+            0,
+            None,
+            1,
+        ),
+        (1, "epoch".to_string(), "BLOB".to_string(), 1, None, 0),
+        (2, "revision".to_string(), "INTEGER".to_string(), 1, None, 0),
+    ];
+    let mut migrated = legacy.clone();
+    migrated.push((3, "cursor_key".to_string(), "BLOB".to_string(), 0, None, 0));
+    let mut current = legacy.clone();
+    current.push((3, "cursor_key".to_string(), "BLOB".to_string(), 1, None, 0));
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'restore_scan_state'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let normalized_sql = normalize_schema_sql(&sql);
+    let expected_sql = if observed == legacy {
+        normalize_schema_sql(
+            r#"
+            CREATE TABLE restore_scan_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                epoch BLOB NOT NULL CHECK (length(epoch) = 16),
+                revision INTEGER NOT NULL CHECK (revision >= 0)
+            )
+            "#,
+        )
+    } else if observed == migrated {
+        normalize_schema_sql(
+            r#"
+            CREATE TABLE restore_scan_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                epoch BLOB NOT NULL CHECK (length(epoch) = 16),
+                revision INTEGER NOT NULL CHECK (revision >= 0),
+                cursor_key BLOB CHECK (
+                    cursor_key IS NULL OR length(cursor_key) = 32
+                )
+            )
+            "#,
+        )
+    } else if observed == current {
+        normalize_schema_sql(
+            r#"
+            CREATE TABLE restore_scan_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                epoch BLOB NOT NULL CHECK (length(epoch) = 16),
+                revision INTEGER NOT NULL CHECK (revision >= 0),
+                cursor_key BLOB NOT NULL CHECK (length(cursor_key) = 32)
+            )
+            "#,
+        )
+    } else {
+        return Err(RecoveryError::CorruptReplica);
+    };
+    if normalized_sql != expected_sql {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    Ok(true)
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+fn ensure_restore_scan_metadata(conn: &Connection) -> Result<(), RecoveryError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS restore_scan_state (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            epoch BLOB NOT NULL CHECK (length(epoch) = 16),
+            revision INTEGER NOT NULL CHECK (revision >= 0)
+        );
+        "#,
+    )
+    .map_err(|_| RecoveryError::FileOperationFailed)?;
+    ops::initialize_restore_scan_metadata_sync(conn).map_err(|_| RecoveryError::FileOperationFailed)
+}
+
 fn validate_exact_recovery_schema(
     conn: &Connection,
     require_recovery_table: bool,
 ) -> Result<(), RecoveryError> {
-    let expected = BTreeSet::from([
+    let has_restore_scan_state = validate_restore_scan_schema_if_present(conn)?;
+    let mut expected = BTreeSet::from([
         "consensus_applied",
         "consensus_committed",
         "consensus_identity",
@@ -779,6 +894,9 @@ fn validate_exact_recovery_schema(
         "session_records",
         "session_replication_log",
     ]);
+    if has_restore_scan_state {
+        expected.insert("restore_scan_state");
+    }
     let mut statement = conn
         .prepare(
             "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
@@ -1389,7 +1507,14 @@ pub(super) fn backup_and_reset_replica(
                     .insert(target_token.to_hex(), TargetInstallState::DatabaseInstalled);
                 write_workflow(input.key, &workflow_dir, &workflow)?;
             } else {
-                install_staged_database(target, &staged, input.plan, true)?;
+                install_staged_database(
+                    target,
+                    &staged,
+                    input.plan,
+                    true,
+                    #[cfg(test)]
+                    input.failpoint,
+                )?;
                 verify_target_installed(input.key, input.plan, target, input.limits)?;
                 #[cfg(test)]
                 if input
@@ -1418,8 +1543,14 @@ pub(super) fn backup_and_reset_replica(
                 }));
             if finalized {
                 verify_target_finalized(input.key, input.plan, target, input.limits)?;
-            } else {
-                verify_target_installed(input.key, input.plan, target, input.limits)?;
+            } else if !target_matches_staged_recovery(
+                input.key,
+                input.plan,
+                target,
+                &staged,
+                input.limits,
+            )? {
+                return Err(RecoveryError::BackupCorrupt);
             }
         }
     }
@@ -2088,6 +2219,7 @@ fn stage_source(
         return Err(RecoveryError::SourceChanged);
     }
     let mut conn = open_read_write(staged)?;
+    ensure_restore_scan_metadata(&conn)?;
     match plan.body.basis {
         RecoveryDecisionBasis::VerifiedCommittedMajority => {
             let tx = conn
@@ -2449,10 +2581,19 @@ fn target_matches_staged_recovery(
     key: &RecoveryIntegrityKey,
     plan: &RecoveryPlan,
     target: &RecoveryReplica,
-    _staged: &Path,
+    staged: &Path,
     limits: RecoveryLimits,
 ) -> Result<bool, RecoveryError> {
-    Ok(verify_target_installed(key, plan, target, limits).is_ok())
+    if verify_target_installed(key, plan, target, limits).is_err() {
+        return Ok(false);
+    }
+    let target = open_read_only(&canonical_replica_paths(target, false)?.database)?;
+    let staged = open_read_only(staged)?;
+    let (target_epoch, _, target_key) =
+        ops::read_restore_scan_state_sync(&target).map_err(|_| RecoveryError::CorruptReplica)?;
+    let (staged_epoch, _, staged_key) =
+        ops::read_restore_scan_state_sync(&staged).map_err(|_| RecoveryError::CorruptReplica)?;
+    Ok(target_epoch != staged_epoch && *target_key != *staged_key)
 }
 
 fn verify_target_installed(
@@ -2518,6 +2659,7 @@ fn install_staged_database(
     staged: &Path,
     plan: &RecoveryPlan,
     resume_partial: bool,
+    #[cfg(test)] failpoint: Option<RecoveryFailpoint>,
 ) -> Result<(), RecoveryError> {
     let paths = canonical_replica_paths(target, false)?;
     let parent = paths
@@ -2540,6 +2682,17 @@ fn install_staged_database(
             .map_err(|_| RecoveryError::FileOperationFailed)?
             .len(),
     )?;
+    let conn = open_read_write(&temporary)?;
+    ops::rotate_restore_scan_incarnation_sync(&conn)
+        .map_err(|_| RecoveryError::FileOperationFailed)?;
+    drop(conn);
+    open_regular_read(&temporary)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| RecoveryError::FileOperationFailed)?;
+    #[cfg(test)]
+    if failpoint == Some(RecoveryFailpoint::AfterDatabaseTemporaryPrepared) {
+        return Err(RecoveryError::InjectedFailure);
+    }
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = paths.database.as_os_str().to_os_string();
         sidecar.push(suffix);

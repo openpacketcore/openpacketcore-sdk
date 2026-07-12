@@ -35,6 +35,8 @@ hmac = { workspace = true }
 zeroize = { workspace = true }
 libc = "0.2"
 nix = { workspace = true, features = ["fs"] }
+aes-gcm-siv = { workspace = true }
+rand = { workspace = true }
 futures-util = "0.3"
 # rusqlite 0.40 pulls libsqlite3-sys 0.38, whose build script needs cfg_select!
 # (Rust 1.91); held at 0.32 while the workspace MSRV is 1.88.

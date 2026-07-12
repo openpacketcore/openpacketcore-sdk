@@ -106,9 +106,12 @@ pub use recovery::{
 };
 pub use restore::{
     summarize_restore_records, OwnerFenceMetadata, RestoreBlockReason, RestoreBlockReasonCode,
-    RestoreRecordSummary, RestoreScanCursor, RestoreScanPage, RestoreScanRequest, RestoreScanScope,
-    RestoreStage, StoredRecordHeaderSummary, RESTORE_SCAN_DEFAULT_PAGE_SIZE,
-    RESTORE_SCAN_MAX_PAGE_SIZE,
+    RestoreRecordSummary, RestoreScanCursor, RestoreScanCursorProfile, RestoreScanPage,
+    RestoreScanRequest, RestoreScanScope, RestoreStage, StoredRecordHeaderSummary,
+    RESTORE_SCAN_DEFAULT_PAGE_SIZE, RESTORE_SCAN_MAX_EXAMINED_METADATA_BYTES,
+    RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE, RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
+    RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES, RESTORE_SCAN_MAX_PAGE_SIZE,
+    RESTORE_SCAN_MAX_SQLITE_VM_STEPS, RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS,
 };
 pub use sqlite::SqliteSessionBackend;
 pub use store::SessionStore;

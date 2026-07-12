@@ -478,10 +478,11 @@ not an ownership lease.
    Openraft-owned, rejects committed/applied truncation and stale snapshots,
    validates restart artifacts, and qualifies divergent-tail/snapshot recovery.
    #129 provides the default-deny offline whole-fleet procedure documented in
-   the [legacy recovery runbook](session-store-legacy-recovery.md); #133 must
-   make restore scans bounded and majority-authoritative; and #143
-   must supply distributed partition/restart/resource/soak and payload-key
-   qualification. Until those land, this is implemented commit authority, not
+   the [legacy recovery runbook](session-store-legacy-recovery.md). #133 bounds
+   restore scans over the barrier-confirmed local applied state; method
+   availability still is not readiness evidence. #143 must supply distributed
+   partition/restart/resource/soak and payload-key qualification. Until that
+   lands, this is implemented commit and recovery authority, not
    production HA qualification.
 
 ### Current-format follower recovery runbook
@@ -592,11 +593,22 @@ be admitted to a production migration. `MAX_SESSION_TTL` controls
 session/lease state only; it does not define
 certificate expiry, trust-bundle validity, or authentication age.
 
-A successful restore page may be shorter than requested to fit the effective
-client/server frame limit; follow `next_cursor` until `complete`. A single
-record that cannot fit returns `RestoreScanResponseTooLarge`.
+A successful restore page may be shorter than requested to respect the backend
+4 MiB payload, 8 MiB retained-page, 8 MiB examined key/filter metadata, or
+4,096 examined-candidate budget; a narrow scope may yield an empty page with
+an advancing cursor. Follow the confidential authenticated `next_cursor` until
+the issuer reports `complete`. Compatibility peer validation checks bounds,
+order, scope, cursor shape, and claimed progress; it cannot prove that an
+authenticated server did not omit a record or falsely report completion.
+Production completeness comes only from scanning the barrier-confirmed local
+Openraft-applied state. A page that
+cannot fit the effective wire frame returns `RestoreScanResponseTooLarge` and
+is retried from the same cursor with a smaller record limit.
 
-Wire-schema revision 2 negotiates the response budget explicitly. The client
+Wire-schema revision 3 retains revision 2's negotiated response budget and
+adds the AES-256-GCM-SIV snapshot-bound cursor, explicit durable-page profile,
+and typed stale/work-budget outcomes. Offset cursors from the local fake are
+rejected on this remote surface. The client
 Hello requests its response-frame limit; HelloAck returns the accepted
 client/server minimum and the server's separate request-frame limit. All three
 values are checked `u32` values of at least
@@ -654,6 +666,8 @@ outage: drain session traffic and writers; run the identity audit and complete
 handover/nested-payload preflights; stop every session-net client, server, and
 protection wrapper plus every product handover reader/writer; upgrade them
 together; verify v4 authenticated handshakes, empty/multi-page restore scans,
+an empty advancing page across more than 4,096 excluded candidates, modified-
+cursor rejection, cursor restart after mutation, resume after process restart,
 bounded maximum-payload get/CAS/batch/log/restore/watch traffic, slow-reader slot
 recovery, and fresh quorum evidence on each replica; then
 restore traffic. Do not perform a mixed-version rolling upgrade.
@@ -661,14 +675,18 @@ restore traffic. Do not perform a mixed-version rolling upgrade.
 Public `Request`/`Response` remain, but `Hello`/`HelloAck` gain an optional
 `contract_profile`, so exhaustive construction and matching must account for
 the field. Private v4 DTOs use `u32` for restore/log request limits and the
-client restore response budget; `u64` for restore cursors/excluded counts,
-`max_value_bytes`, and size-bearing store errors; and checked conversion before
-dispatch/exposure. Restore `loaded_count` and `complete` are recomputed rather
-than trusted from the peer. Independent limits are 256 batch operations, 1,024
-restore records, 65,536 log entries, and 65,536 rebuild entries; the configured
-frame bound remains separate. #159 now enforces that negotiated bound and one
+client restore response budget; a confidential authenticated restore cursor;
+`u64` for
+excluded counts, `max_value_bytes`, and size-bearing store errors; and checked
+conversion before dispatch/exposure. Restore `loaded_count` and `complete` are
+recomputed rather than trusted from the peer. Independent limits are 256 batch
+operations, 1,024 restore records, 4 MiB of restore payload and 4,096 examined
+live candidates per page, 65,536 log entries, and 65,536 rebuild entries; the
+configured frame bound remains
+separate. #159 now enforces that negotiated bound and one
 absolute write deadline across every ordinary response/watch item. The profile
-pins wire-schema revision 2, error-set revision 1,
+pins wire-schema revision 3, error-set revision 2,
+`max_restore_scan_examined_rows = 4096`,
 `min_frame_size = 8192`, `max_frame_size = 16777216`, 128-byte
 owner/custom-key/state-type bounds,
 `stable_id_max_bytes = 64`, `replication_tx_id_max_bytes = 128`,
@@ -676,11 +694,31 @@ owner/custom-key/state-type bounds,
 depth-16/256-node trees. Stable IDs contain 1 through 64 bytes, replication
 transaction IDs contain 1 through 128 UTF-8 bytes, and CAS request IDs, when
 present, are canonical lowercase hyphenated UUIDs with the exact 36-byte encoding. A
-revision-1 v4 participant is incompatible despite
+revision-2 or older v4 participant is incompatible despite
 sharing the same ALPN, so that profile transition also requires the coordinated
 stop/upgrade/start above. `ContractProfile::max_frame_size` is a public Rust
 source break for external struct literals/destructuring and must be updated in
 that same transition.
+
+Opening an existing SQLite store adds only the 32-byte
+`restore_scan_state.cursor_key` metadata field and does not backfill session
+records. Verify that O(1) migration on every replica before traffic admission.
+A consensus snapshot created before revision 3 lacks the cursor key and is not
+an installable revision-3 repair source; after the coordinated upgrade, take
+and validate a fresh coherent snapshot before declaring rollback/recovery
+coverage.
+
+Restore cursors are backend-incarnation/node-bound. A same-PVC process restart
+retains the cursor key and epoch and can resume a page. Another node or an
+installed snapshot has a different cursor incarnation and returns typed
+`RestoreScanCursorStale`; the operator/CNF must discard partial pagination and
+restart from the first page. Do not merge pages across nodes or snapshots.
+The maximum local consensus-key cursor is roughly 4 MiB after hex encoding, so
+it does not fit session-net's 1 MiB default frame. The compatibility server
+returns typed `RestoreScanResponseTooLarge` without writing a partial frame;
+only a sufficiently large negotiated frame (bounded at 16 MiB) can carry it.
+The session-net record profile remains independently limited to 64-byte stable
+IDs.
 
 A mutation may commit before response encoding or delivery fails. A disconnect,
 oversize fallback, or write timeout is an ambiguous result, not rollback proof.
@@ -697,6 +735,22 @@ oversize and authenticated slow-reader campaigns keep memory, tasks, file
 descriptors, CPU, and connection slots bounded and that shutdown barriers still
 complete.
 
+Restore runbook evidence must record low-cardinality counters/histograms for
+page outcome, `cursor_profile`, `complete`, loaded records, excluded/examined
+candidates, payload bytes, elapsed time, and typed restart reason
+(`stale_cursor`, `work_budget`, `response_too_large`, `cancelled`). Alert when
+stale/work-budget restarts repeat, a scan makes no cursor progress, or restore
+latency consumes the CNF RTO. An empty page is healthy only when it carries a
+different durable cursor and the examined count is nonzero. On a stale cursor,
+discard all partial restore results and restart at page one after fresh
+Openraft readiness; never splice snapshots. On cancellation or deadline, wait
+for the SDK call to finish releasing its SQLite worker before retrying. SQLite
+admits one clone-shared blocking restore worker per backend before
+`spawn_blocking`; a timed-out waiter spawns no worker, while the admitted worker
+retains its permit until its cancellation callback exits. These
+labels must never contain cursor bytes, tenant/NF/key fields, owner, payload,
+database path, peer text, or certificate identity.
+
 A fresh version/profile/authentication or malformed-handshake failure clears
 the capability cache and reports every boolean false with
 `max_value_bytes = 0`. A cache retained after transient transport loss is
@@ -711,9 +765,10 @@ Either scope change requires another coordinated rollout.
 
 This is not production HA qualification. Do not infer readiness from bind
 success, static profiles, or cached capabilities; use the fresh bounded probe
-and continuous gate. #127 now provides Openraft commit authority, but do not use
-restore results as majority authority before #133 or apply #128's
-current-format Openraft recovery rules to a legacy fork. Use only #129's
+and continuous gate. #127 now provides Openraft commit authority and #133
+provides bounded snapshot-bound applied-state restore. Do not treat divergence
+repair outside #128's current-format rules or apply those rules to a legacy
+fork. Use only #129's
 [explicit offline procedure](session-store-legacy-recovery.md). Protocol
 identity/fixed-width binding is not fork recovery. #135's invariant-safe model decoding
 and bounded offline identity audit and #134's fixed-width v4 DTOs are implemented.
@@ -728,9 +783,8 @@ remain #168 and must be coordinated with #127/#128/#143. Session-net's response
 deadline is independent of `opc-persist`'s already-implemented #169
 `TcpPeer::timeout` contract: one atomic end-to-end logical-RPC deadline covers
 its attempts and backoff, with safe retry and bounded metrics. Seamless
-SVID/trust-bundle lifecycle remains
-#162 -> #161 -> #163 -> #158 -> #164, while the remaining
-distributed/payload-key production evidence stays open in #143.
+SVID/trust-bundle lifecycle remains #162 -> #161 -> #163 -> #158 -> #164, while
+the remaining distributed/payload-key production evidence stays open in #143.
 
 #159 does not rewrite persisted session-store bytes. In-profile stores need no
 format conversion, but a retained empty/over-64-byte stable ID or
@@ -834,8 +888,8 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
   Openraft engine for elections, voting, log matching, committed membership,
   snapshot coordination, and linearizable reads. Its SQLite state machine owns
   deterministic session semantics and exposes journal/watch changes only after
-  apply. #127, #128, and #129 are implemented; #133/#143 remain restore and
-  distributed-qualification gates.
+  apply. #127, #128, #129, and #133 are implemented; #143 remains the
+  distributed-qualification gate.
 - **Session Topology, Identity, and Readiness**: HA construction requires one
   immutable descriptor set, explicit logical self, configuration digest, and
   positive epoch. Stable node IDs derive from cluster plus logical

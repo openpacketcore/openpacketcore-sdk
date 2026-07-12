@@ -380,6 +380,21 @@ fn two_branch_legacy_dry_run_is_deterministic_redacted_and_non_mutating() {
         create_legacy_replica(temp.path(), second_id.clone(), 29),
         create_legacy_replica(temp.path(), third_id.clone(), 29),
     ];
+    for replica in &replicas {
+        Connection::open(&replica.database_path)
+            .expect("open pre-cursor legacy replica")
+            .execute_batch(
+                r#"
+                DROP TABLE restore_scan_state;
+                CREATE TABLE restore_scan_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    epoch BLOB NOT NULL CHECK (length(epoch) = 16),
+                    revision INTEGER NOT NULL CHECK (revision >= 0)
+                );
+                "#,
+            )
+            .expect("install exact pre-cursor restore schema");
+    }
     let before = replicas
         .iter()
         .map(|replica| file_digest(&replica.database_path))
@@ -580,6 +595,7 @@ fn legacy_reset_requires_exact_confirmation_and_preserves_quarantine() {
         .expect("execute legacy reset");
     assert_eq!(report.state(), RecoveryExecutionState::AwaitingEpochCommit);
 
+    let mut restore_incarnations = BTreeSet::new();
     for replica in &replicas {
         let target = Connection::open(&replica.database_path).expect("open recovered target");
         let identity_rows: i64 = target
@@ -611,9 +627,14 @@ fn legacy_reset_requires_exact_confirmation_and_preserves_quarantine() {
         assert_eq!(identity_rows, 1);
         assert_eq!(fence, 17);
         assert_eq!(pending, 1);
-        assert_eq!(objects.len(), 16);
+        let (restore_epoch, _, restore_key) =
+            crate::sqlite::ops::read_restore_scan_state_sync(&target)
+                .expect("read recovered restore incarnation");
+        restore_incarnations.insert((restore_epoch, *restore_key));
+        assert_eq!(objects.len(), 17);
         assert!(objects.iter().all(|(kind, _)| kind == "table"));
     }
+    assert_eq!(restore_incarnations.len(), replicas.len());
 
     let workflow = backup
         .path()
@@ -1266,6 +1287,46 @@ fn planning_rejects_untrusted_legacy_schema_objects() {
         );
     }
 
+    let temp = tempfile::tempdir().expect("restore schema test root");
+    let ids = [
+        replica_id("schema-restore-a"),
+        replica_id("schema-restore-b"),
+        replica_id("schema-restore-c"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 1),
+        create_legacy_replica(temp.path(), ids[1].clone(), 2),
+        create_legacy_replica(temp.path(), ids[2].clone(), 3),
+    ];
+    Connection::open(&replicas[1].database_path)
+        .expect("open hostile restore schema")
+        .execute_batch(
+            r#"
+            DROP TABLE restore_scan_state;
+            CREATE TABLE restore_scan_state (
+                singleton INTEGER PRIMARY KEY,
+                epoch BLOB NOT NULL,
+                revision INTEGER NOT NULL,
+                cursor_key BLOB NOT NULL
+            );
+            "#,
+        )
+        .expect("install hostile same-name restore schema");
+    let manager = recovery(AllowRecovery);
+    assert_eq!(
+        manager.plan(
+            &context(),
+            identity(),
+            node_set(&ids),
+            &replicas,
+            &ids[0],
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        ),
+        Err(RecoveryError::CorruptReplica)
+    );
+
     let temp = tempfile::tempdir().expect("current schema test root");
     let ids = [
         replica_id("schema-current-a"),
@@ -1461,6 +1522,7 @@ fn backup_and_snapshot_failpoints_resume_without_losing_quarantine() {
         RecoveryFailpoint::AfterBackup,
         RecoveryFailpoint::AfterStagedCopy,
         RecoveryFailpoint::AfterSnapshotInstall,
+        RecoveryFailpoint::AfterDatabaseTemporaryPrepared,
         RecoveryFailpoint::AfterDatabaseInstall,
     ] {
         assert_eq!(
@@ -1492,6 +1554,17 @@ fn backup_and_snapshot_failpoints_resume_without_losing_quarantine() {
         .expect("resume failpoint workflow"),
         RecoveryExecutionState::AwaitingEpochCommit
     );
+    let restore_incarnations = replicas
+        .iter()
+        .map(|replica| {
+            let conn =
+                Connection::open(&replica.database_path).expect("open failpoint-recovered replica");
+            let (epoch, _, key) = crate::sqlite::ops::read_restore_scan_state_sync(&conn)
+                .expect("read failpoint-recovered restore incarnation");
+            (epoch, *key)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(restore_incarnations.len(), replicas.len());
 }
 
 #[cfg(unix)]

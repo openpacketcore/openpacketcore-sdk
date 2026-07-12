@@ -15,8 +15,8 @@ OpenPacketCore config and session persistence surfaces.
   protection wrapper.
 
 Historical closure language below refers only to scoped algorithms and test
-harnesses. The config migration (#177), majority-authoritative restore (#133),
-and production networked qualification (#143 plus the
+harnesses. The config migration (#177) and production networked qualification
+(#143 plus the
 credential-rotation chain) remain open; neither component is yet approved as a
 production deployment profile.
 
@@ -161,10 +161,10 @@ deployment claim. Current-format follower recovery is Openraft-owned and
 hardened under #128. #129 supplies an offline, audited whole-fleet legacy-fork
 campaign that quarantines every selected PVC and resumes from one immutable
 operator-selected checkpoint without becoming a second runtime authority; see
-the [recovery runbook](session-store-legacy-recovery.md). Bounded
-majority-authoritative restore remains #133, watch and expiry
-hardening remain #145/#148, and network/resource/rotation qualification remains
-#143 and the #162 -> #161 -> #163 -> #158 -> #164 credential chain. Stable IDs,
+the [recovery runbook](session-store-legacy-recovery.md). #133 provides bounded
+applied-state restore with snapshot-bound cursors. Watch and expiry hardening
+remain #145/#148, and network/resource/rotation qualification remains #143 and
+the #162 -> #161 -> #163 -> #158 -> #164 credential chain. Stable IDs,
 durable transaction IDs, and log-range cursors remain #167/#168/#171.
 
 ### Configured topology admission
@@ -302,9 +302,9 @@ backends, and authenticated client/server admission. Here, effects means
 application/backend mutation or provider work: clients reject before
 resolution/dialing, while servers reject after request receipt but before
 backend dispatch and may return the typed response. The new public error
-variants require external exhaustive matches. Protocol v4 maps them through
-private fixed-width DTOs under error revision 1 and rejects v3 peers during the
-exact handshake. Operators must audit legacy
+variants require external exhaustive matches. Protocol v4 introduced their
+private fixed-width DTOs in error revision 1; current error revision 2 retains
+those encodings and rejects v3 peers during the exact handshake. Operators must audit legacy
 persisted logs before upgrade because a TTL-bearing entry
 above the bound now fails closed during replay/rebuild rather than being
 clamped or rewritten. Replicated deadline validation permits at most one
@@ -389,10 +389,19 @@ visible unless a separate approved storage layer protects them.
 
 ### Legacy backend and restore transport (protocol v4)
 
-`opc-session-net` protocol v4 carries validated restore-scan requests and pages
-to individual remote replicas. A server may shorten a multi-record page to the
-smaller client/server frame budget; callers resume from `next_cursor`, while a
-single record that cannot fit returns `RestoreScanResponseTooLarge`.
+The opt-in `opc-session-net` protocol v4 carries validated restore-scan
+requests and pages to individual remote replicas. It admits only the
+`DurableOpaqueV1` page profile; offset cursors from the local fake are rejected
+and can never become remote restore evidence. Backend pages are capped at
+1,024 records, 4 MiB of payload, and 4,096 examined live candidates plus one
+lookahead. Narrow scopes may therefore return an empty advancing page. The
+cursor is an AES-256-GCM-SIV ciphertext that confidentially and
+authentically binds the composite seek key, backend epoch, record revision,
+logical time, scope, and progress. A modified, stale, or cross-scope cursor
+fails typed and restarts from page one. A server never fabricates a replacement
+cursor while fitting a wire frame; an encoded page that cannot fit returns
+`RestoreScanResponseTooLarge` so the caller can retry the same cursor with a
+smaller record limit.
 
 Every production participant is created with an opaque authenticated TLS
 config and a binding derived from one immutable `SessionReplicationManifest`.
@@ -412,24 +421,41 @@ deployment or highest-common-version negotiation. Public `Request`/`Response`
 remain available, but `Hello`/`HelloAck` gain an optional `contract_profile`, so
 exhaustive construction and matching must account for the new field.
 
-Wire-schema revision 2 extends the exact v4 bootstrap with directional frame
+Wire-schema revision 3 retains revision 2's directional frame
 budgets. Hello sends `requested_response_frame_size`; HelloAck returns the
 client/server-minimum `accepted_response_frame_size` plus the independent
 `server_request_frame_size`. Each checked `u32` must be at least
 `MIN_NEGOTIATED_FRAME_SIZE` (8 KiB, or 8,192 bytes) and at most
 `MAX_NEGOTIATED_FRAME_SIZE` (16 MiB, or 16,777,216 bytes).
 `MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE` aliases the same minimum. Unequal
-client/server settings are therefore explicit. Revision-1 and revision-2 v4
-participants do not interoperate even though their ALPN text is the same.
+client/server settings are therefore explicit. Revision 3 carries the
+confidential cursor and explicit durable-page profile and pins the payload and
+8 MiB retained-page, 8 MiB examined key/filter-metadata, and
+examined-candidate budgets; error-set revision 2 carries stale-cursor and
+work-budget failures. Different exact v4
+profiles do not interoperate even though their ALPN text is the same.
+
+Cursor ciphertext is variable-length up to the consensus RPC/key ceiling and
+uses separated HMAC-derived AES-256-GCM-SIV and synthetic-nonce keys. Identical
+semantic positions encode identically. Only the cumulative examined-row
+position is clear and bound into cursor authentication, allowing a structural
+check of the issuer's claimed progress; the issuer authenticates it when the
+cursor returns. It cannot prove page completeness or server honesty. The seek
+and snapshot fields remain confidential. Cursors survive a same-PVC
+restart but are node/incarnation-bound. Another node or an installed snapshot
+returns typed stale-cursor state and the caller restarts at page one.
 
 The private v4 DTOs use `u32` for restore/log request limits and the restore
-response budget, and `u64` for restore cursors/excluded counts,
+response budget, a confidential authenticated strictly bounded restore cursor, and
+`u64` excluded counts,
 `max_value_bytes`, and size-bearing store errors. Restore `loaded_count` and
 `complete` are omitted and recomputed after decode. Independent work limits
 admit 256 batch operations, 1,024 restore records, 65,536 log entries, and
 65,536 rebuild entries; the configured frame bound remains separate. The exact
-profile pins wire-schema revision 2, error-set revision 1, 128-byte
-owner/custom-key/state-type bounds, the 31,536,000-second TTL maximum, and
+profile pins wire-schema revision 3, error-set revision 2, a 4 MiB restore
+payload bound, `max_restore_scan_examined_rows = 4096`, 128-byte
+owner/custom-key/state-type bounds, the
+31,536,000-second TTL maximum, and
 depth-16/256-node replication trees. Revision 2 also pins
 `min_frame_size = 8192`, `max_frame_size = 16777216`,
 `stable_id_max_bytes = 64`,
@@ -520,11 +546,10 @@ uses bounded operation-family/reason categories for oversize/fallback/timeout
 without logging keys, payloads, owners, transaction IDs, peer identities, or
 backend/peer-controlled error text.
 
-This closes per-replica compatibility transport parity only. Restore
-selection/merge remains #133. Protocol v4 is not the production consensus
-protocol and does not establish authority; #127 uses the separate Openraft
-transport above, while #129 legacy-fork recovery remains an offline,
-operator-authorized campaign.
+Protocol v4 remains a compatibility transport and does not establish
+authority. #127 uses the separate Openraft transport; #133 scans only the
+barrier-confirmed local applied state with bounded work, while #129 legacy-fork
+recovery remains an offline, operator-authorized campaign.
 
 ### Log & Replication Model
 - **Openraft Log Authority**: Openraft allocates and commits its zero-based log

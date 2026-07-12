@@ -9,6 +9,7 @@
 //! is the only mutation and read-authority path.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,6 +41,7 @@ pub(crate) mod watch;
 
 const SQLITE_SESSION_MAX_VALUE_BYTES: usize = 1_048_576;
 const CONSENSUS_AUTHORITY_REQUIRED: &str = "consensus_authority_required";
+const RESTORE_SCAN_BLOCKING_WORKERS: usize = 1;
 
 /// Begin one standalone operation while holding SQLite's write reservation.
 ///
@@ -99,9 +101,18 @@ pub struct SqliteSessionBackend {
     database_path: Option<Arc<PathBuf>>,
     caps: BackendCapabilities,
     clock: Arc<dyn Clock>,
+    restore_scan_workers: Arc<tokio::sync::Semaphore>,
     watchers: Arc<
         tokio::sync::Mutex<Vec<tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>>>,
     >,
+}
+
+struct RestoreScanCancellation(Arc<AtomicBool>);
+
+impl Drop for RestoreScanCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 impl SqliteSessionBackend {
@@ -171,6 +182,24 @@ impl SqliteSessionBackend {
             [],
         )
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+
+        // Local, non-authoritative metadata for opaque bounded restore
+        // cursors. The epoch distinguishes database incarnations while the
+        // revision invalidates pagination whenever visible record state
+        // changes. Neither value allocates session mutation authority.
+        conn.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS restore_scan_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                epoch BLOB NOT NULL CHECK (length(epoch) = 16),
+                revision INTEGER NOT NULL CHECK (revision >= 0),
+                cursor_key BLOB NOT NULL CHECK (length(cursor_key) = 32)
+            );
+            "#,
+            [],
+        )
+        .map_err(|_| StoreError::BackendUnavailable("session restore metadata failed".into()))?;
+        ops::initialize_restore_scan_metadata_sync(&conn)?;
 
         // Create table for storing lease entries
         conn.execute(
@@ -252,6 +281,9 @@ impl SqliteSessionBackend {
             database_path: database_path.map(Arc::new),
             caps: sqlite_capabilities(),
             clock: Arc::new(crate::clock::SystemClock),
+            restore_scan_workers: Arc::new(tokio::sync::Semaphore::new(
+                RESTORE_SCAN_BLOCKING_WORKERS,
+            )),
             watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         })
     }
@@ -295,15 +327,72 @@ impl SqliteSessionBackend {
         &self,
         request: RestoreScanRequest,
         logical_time: opc_types::Timestamp,
+        deadline: tokio::time::Instant,
     ) -> Result<RestoreScanPage, StoreError> {
-        let conn = self.conn.lock().await;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|_| StoreError::BackendUnavailable("session store scan failed".into()))?;
-        let result = ops::scan_restore_records_sync(&tx, request, logical_time)?;
-        tx.commit()
-            .map_err(|_| StoreError::BackendUnavailable("session store scan failed".into()))?;
-        Ok(result)
+        self.run_restore_scan(request, logical_time, deadline, false)
+            .await
+    }
+
+    async fn run_restore_scan(
+        &self,
+        request: RestoreScanRequest,
+        logical_time: opc_types::Timestamp,
+        deadline: tokio::time::Instant,
+        standalone: bool,
+    ) -> Result<RestoreScanPage, StoreError> {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = RestoreScanCancellation(Arc::clone(&cancellation));
+        // Admission happens before `spawn_blocking` and the owned permit stays
+        // with the blocking closure. A timed-out caller therefore cannot
+        // detach another worker behind the one SQLite connection; later calls
+        // wait asynchronously and disappear cleanly when their futures drop.
+        let worker_permit = tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&self.restore_scan_workers).acquire_owned(),
+        )
+        .await
+        .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)?
+        .map_err(|_| StoreError::BackendUnavailable("session restore scan unavailable".into()))?;
+        // Acquire the async connection guard before entering the blocking
+        // pool so a busy connection is part of the same absolute operation
+        // deadline and never strands a blocking thread waiting on a mutex.
+        let conn = tokio::time::timeout_at(deadline, Arc::clone(&self.conn).lock_owned())
+            .await
+            .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)?;
+        let operation_deadline = deadline.into_std();
+        let task = tokio::task::spawn_blocking(move || {
+            let _worker_permit = worker_permit;
+            if cancellation.load(Ordering::Acquire) {
+                return Err(StoreError::RestoreScanWorkBudgetExceeded);
+            }
+            let tx = if standalone {
+                standalone_transaction(&conn)?
+            } else {
+                conn.unchecked_transaction().map_err(|_| {
+                    StoreError::BackendUnavailable("session store scan failed".into())
+                })?
+            };
+            let result = ops::scan_restore_records_sync(
+                &tx,
+                request,
+                logical_time,
+                Arc::clone(&cancellation),
+                operation_deadline,
+                standalone,
+            )?;
+            if cancellation.load(Ordering::Acquire) {
+                return Err(StoreError::RestoreScanWorkBudgetExceeded);
+            }
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store scan failed".into()))?;
+            Ok(result)
+        });
+        tokio::time::timeout_at(deadline, task)
+            .await
+            .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)?
+            .map_err(|_| {
+                StoreError::BackendUnavailable("session restore scan task failed".into())
+            })?
     }
 
     /// Read the committed application-journal head after the caller has
@@ -529,6 +618,10 @@ fn apply_pragma_profile(conn: &Connection, in_memory: bool) -> Result<(), StoreE
 
 #[async_trait]
 impl SessionBackend for SqliteSessionBackend {
+    fn restore_scan_cursor_profile(&self) -> Option<crate::RestoreScanCursorProfile> {
+        Some(crate::RestoreScanCursorProfile::DurableOpaqueV1)
+    }
+
     fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
         Some(BackendInstanceIdentity::for_shared(&self.conn))
     }
@@ -656,14 +749,13 @@ impl SessionBackend for SqliteSessionBackend {
         &self,
         request: RestoreScanRequest,
     ) -> Result<RestoreScanPage, StoreError> {
-        let conn = self.conn.lock().await;
         let now = self.clock.now_utc();
-        let tx = standalone_transaction(&conn)?;
-        let result = ops::scan_restore_records_sync(&tx, request, now)?;
-        ops::prune_sync(&tx, now)?;
-        tx.commit()
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        Ok(result)
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(
+                crate::RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS,
+            ))
+            .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
+        self.run_restore_scan(request, now, deadline, true).await
     }
 
     async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
@@ -849,5 +941,128 @@ impl SessionLeaseManager for SqliteSessionBackend {
         tx.commit()
             .map_err(|e| LeaseError::Backend(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod restore_cancellation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn queued_worker_admission_uses_the_restore_operation_deadline() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
+        let held_permit = Arc::clone(&backend.restore_scan_workers)
+            .acquire_owned()
+            .await
+            .expect("hold restore worker admission");
+
+        for _ in 0..4 {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(25);
+            let error = backend
+                .run_restore_scan(
+                    RestoreScanRequest::all(1),
+                    backend.clock.now_utc(),
+                    deadline,
+                    true,
+                )
+                .await
+                .expect_err("queued scan must stop at its absolute deadline");
+            assert_eq!(error, StoreError::RestoreScanWorkBudgetExceeded);
+        }
+        drop(held_permit);
+
+        let page = backend
+            .scan_restore_records(RestoreScanRequest::all(1))
+            .await
+            .expect("worker admission recovers after repeated timeouts");
+        assert!(page.complete);
+    }
+
+    #[tokio::test]
+    async fn held_connection_admission_is_async_bounded_and_recovers() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
+        let held_connection = backend.conn.lock().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(25);
+        let error = backend
+            .run_restore_scan(
+                RestoreScanRequest::all(1),
+                backend.clock.now_utc(),
+                deadline,
+                true,
+            )
+            .await
+            .expect_err("connection admission must stop at the operation deadline");
+        assert_eq!(error, StoreError::RestoreScanWorkBudgetExceeded);
+        assert_eq!(
+            backend.restore_scan_workers.available_permits(),
+            RESTORE_SCAN_BLOCKING_WORKERS,
+            "a connection timeout cannot detach a blocking worker"
+        );
+        drop(held_connection);
+
+        let page = backend
+            .scan_restore_records(RestoreScanRequest::all(1))
+            .await
+            .expect("connection admission recovers after timeout");
+        assert!(page.complete);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_cancelled_restore_scans_admit_only_one_blocking_worker() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
+        let held_connection = backend.conn.lock().await;
+        let first_backend = backend.clone();
+        let mut scans = vec![tokio::spawn(async move {
+            first_backend
+                .scan_restore_records(RestoreScanRequest::all(1))
+                .await
+        })];
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while backend.restore_scan_workers.available_permits()
+                != RESTORE_SCAN_BLOCKING_WORKERS - 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first restore worker acquires the sole admission permit");
+
+        for _ in 0..64 {
+            let cancelled_backend = backend.clone();
+            scans.push(tokio::spawn(async move {
+                cancelled_backend
+                    .scan_restore_records(RestoreScanRequest::all(1))
+                    .await
+            }));
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            backend.restore_scan_workers.available_permits(),
+            0,
+            "queued callers cannot admit another blocking worker"
+        );
+
+        for scan in &scans {
+            scan.abort();
+        }
+        for scan in scans {
+            let cancelled = scan.await.expect_err("scan task is cancelled");
+            assert!(cancelled.is_cancelled());
+        }
+        assert_eq!(
+            backend.restore_scan_workers.available_permits(),
+            RESTORE_SCAN_BLOCKING_WORKERS,
+            "cancelling async connection admission cannot detach a worker"
+        );
+        drop(held_connection);
+
+        let page = tokio::time::timeout(
+            Duration::from_secs(1),
+            backend.scan_restore_records(RestoreScanRequest::all(1)),
+        )
+        .await
+        .expect("cancelled blocking task releases the connection promptly")
+        .expect("fresh restore scan succeeds");
+        assert!(page.complete);
     }
 }

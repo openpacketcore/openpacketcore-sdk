@@ -543,20 +543,34 @@ impl ConsensusSessionStore {
         request_id: SessionConsensusRequestId,
         intent: SessionMutationIntent,
     ) -> Result<SessionConsensusResponse, StoreError> {
-        self.require_exact_membership_admission()?;
-        if self
-            .inner
-            .backend
-            .consensus_operator_recovery_pending(self.inner.identity)
-            .await
-            .unwrap_or(true)
-        {
-            return Err(consensus_unavailable());
-        }
-        validate_consensus_intent(&intent)?;
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
+        self.submit_request_before(request_id, intent, deadline)
+            .await
+    }
+
+    async fn submit_request_before(
+        &self,
+        request_id: SessionConsensusRequestId,
+        intent: SessionMutationIntent,
+        deadline: tokio::time::Instant,
+    ) -> Result<SessionConsensusResponse, StoreError> {
+        self.require_exact_membership_admission()?;
+        let recovery_pending = tokio::time::timeout_at(
+            deadline,
+            self.inner
+                .backend
+                .consensus_operator_recovery_pending(self.inner.identity),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(true);
+        if recovery_pending {
+            return Err(consensus_unavailable());
+        }
+        validate_consensus_intent(&intent)?;
         let request = ForwardMutationRequest { request_id, intent };
         let mut preferred = None;
 
@@ -964,20 +978,31 @@ impl ConsensusSessionStore {
         }
     }
 
-    async fn logical_read_time(&self) -> Result<Timestamp, StoreError> {
+    async fn logical_read_time_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Timestamp, StoreError> {
         let response = self
-            .submit_intent(SessionMutationIntent::AdvanceLogicalTime)
+            .submit_request_before(
+                SessionConsensusRequestId::new(),
+                SessionMutationIntent::AdvanceLogicalTime,
+                deadline,
+            )
             .await?;
         response.result?;
         if response.raft_log_index == 0 {
             return Err(consensus_unavailable());
         }
-        let deadline = tokio::time::Instant::now()
-            .checked_add(self.inner.operation_timeout)
-            .ok_or_else(consensus_unavailable)?;
         self.wait_for_local_apply(response.raft_log_index, deadline)
             .await?;
         response.logical_time.ok_or_else(consensus_unavailable)
+    }
+
+    async fn logical_read_time(&self) -> Result<Timestamp, StoreError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.logical_read_time_before(deadline).await
     }
 }
 
@@ -1151,6 +1176,10 @@ fn protocol_rejection() -> SessionConsensusWireResponse {
 
 #[async_trait]
 impl SessionBackend for ConsensusSessionStore {
+    fn restore_scan_cursor_profile(&self) -> Option<crate::RestoreScanCursorProfile> {
+        Some(crate::RestoreScanCursorProfile::DurableOpaqueV1)
+    }
+
     fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
         Some(BackendInstanceIdentity::for_shared(&self.inner))
     }
@@ -1230,10 +1259,16 @@ impl SessionBackend for ConsensusSessionStore {
         request: RestoreScanRequest,
     ) -> Result<RestoreScanPage, StoreError> {
         request.validate()?;
-        let logical_time = self.logical_read_time().await?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
+        let logical_time =
+            tokio::time::timeout_at(deadline, self.logical_read_time_before(deadline))
+                .await
+                .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)??;
         self.inner
             .backend
-            .consensus_scan_restore_records_at(request, logical_time)
+            .consensus_scan_restore_records_at(request, logical_time, deadline)
             .await
     }
 
