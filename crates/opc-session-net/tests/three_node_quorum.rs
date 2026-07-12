@@ -1987,6 +1987,63 @@ async fn test_three_node_quorum_kill_and_restart() {
 }
 
 #[tokio::test]
+async fn abort_and_wait_releases_listener_and_registered_handlers() {
+    let mtls = mtls_configs();
+    let (addr, _backend, handle) = start_server(&mtls, 2).await;
+    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_millis(200)));
+    let key = test_key_with_stable_id(b"shutdown-barrier");
+
+    assert_eq!(
+        remote.get(&key).await.expect("warm persistent connection"),
+        None
+    );
+    handle.abort();
+    handle.abort_and_wait().await;
+
+    let rebound = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("listener address must be reusable when the barrier returns");
+    let result = tokio::time::timeout(Duration::from_secs(1), remote.get(&key))
+        .await
+        .expect("the retired handler must not keep serving past the barrier");
+    assert!(
+        result.is_err(),
+        "the established handler remained usable after abort_and_wait"
+    );
+    drop(rebound);
+}
+
+#[tokio::test]
+async fn cancelling_abort_and_wait_cannot_leave_handler_live() {
+    let mtls = mtls_configs();
+    let (addr, _backend, handle) = start_server(&mtls, 2).await;
+    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_millis(200)));
+    let key = test_key_with_stable_id(b"cancelled-shutdown-barrier");
+
+    assert_eq!(
+        remote.get(&key).await.expect("warm persistent connection"),
+        None
+    );
+
+    let mut barrier = Box::pin(handle.abort_and_wait());
+    let was_pending = std::future::poll_fn(|cx| {
+        let poll = std::future::Future::poll(barrier.as_mut(), cx);
+        std::task::Poll::Ready(poll.is_pending())
+    })
+    .await;
+    assert!(was_pending, "the test must cancel a pending barrier");
+    drop(barrier);
+
+    let result = tokio::time::timeout(Duration::from_secs(1), remote.get(&key))
+        .await
+        .expect("cancelled barrier cleanup must remain bounded");
+    assert!(
+        result.is_err(),
+        "a handler served a request after its teardown barrier was cancelled"
+    );
+}
+
+#[tokio::test]
 async fn test_persistent_connection_reconnect_after_restart() {
     let mtls = mtls_configs();
     let (addr, backend, handle) = start_server(&mtls, 2).await;
@@ -1997,8 +2054,7 @@ async fn test_persistent_connection_reconnect_after_restart() {
     assert_eq!(remote.get(&key).await.unwrap(), None);
 
     // Kill the server. The old TCP connection may linger until the next write.
-    handle.abort();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    handle.abort_and_wait().await;
 
     // Restart a server on the same address with the same backend state.
     let server = SessionReplicationServer::new(
@@ -2011,7 +2067,7 @@ async fn test_persistent_connection_reconnect_after_restart() {
     // The next request must transparently reconnect rather than fail.
     assert_eq!(remote.get(&key).await.unwrap(), None);
 
-    handle_new.abort();
+    handle_new.abort_and_wait().await;
 }
 
 #[tokio::test]
@@ -2026,8 +2082,7 @@ async fn capabilities_uses_cached_success_after_disconnect() {
         "expected warmed remote capabilities to reflect the full backend"
     );
 
-    handle.abort();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.abort_and_wait().await;
 
     let after_disconnect = remote.capabilities().await;
     let mut expected = warmed;
@@ -2039,7 +2094,7 @@ async fn capabilities_uses_cached_success_after_disconnect() {
 }
 
 #[tokio::test]
-async fn test_in_flight_request_surfaces_error_on_disconnect() {
+async fn test_request_after_shutdown_surfaces_error_within_deadline() {
     let mtls = mtls_configs();
     let (addr, _backend, handle) = start_server(&mtls, 2).await;
 
@@ -2056,9 +2111,8 @@ async fn test_in_flight_request_surfaces_error_on_disconnect() {
     let key = test_key();
     assert_eq!(remote.get(&key).await.unwrap(), None);
 
-    // Kill the server while a request is about to be issued.
-    handle.abort();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Stop the server and all established handlers before issuing the request.
+    handle.abort_and_wait().await;
 
     let start = tokio::time::Instant::now();
     let result = remote.get(&key).await;
@@ -2668,8 +2722,8 @@ async fn cached_capabilities_do_not_substitute_for_fresh_quorum_evidence() {
         DurableReadinessState::Ready
     );
 
-    handle2.abort();
-    handle3.abort();
+    handle2.abort_and_wait().await;
+    handle3.abort_and_wait().await;
     let report = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let report = quorum.probe_durable_readiness().await;
@@ -2697,6 +2751,10 @@ async fn cached_capabilities_do_not_substitute_for_fresh_quorum_evidence() {
     );
     assert_eq!(still_descriptive.batch_write, warmed.batch_write);
     assert_eq!(still_descriptive.max_value_bytes, warmed.max_value_bytes);
+    assert!(
+        !still_descriptive.restore_scan,
+        "operations that require a fresh v3 negotiation must be masked after transport loss"
+    );
 
     let key = test_key_with_stable_id(b"cached-capabilities-no-quorum");
     assert!(
@@ -2722,7 +2780,7 @@ async fn cached_capabilities_do_not_substitute_for_fresh_quorum_evidence() {
         "cached feature support must not authorize a restore scan without fresh quorum evidence"
     );
 
-    handle1.abort();
+    handle1.abort_and_wait().await;
 }
 
 #[tokio::test]

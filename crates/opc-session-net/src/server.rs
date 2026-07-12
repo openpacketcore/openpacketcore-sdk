@@ -29,25 +29,68 @@ use crate::protocol::{
 /// Handle to a running [`SessionReplicationServer`].
 #[derive(Debug)]
 pub struct ServerHandle {
-    abort_handle: tokio::task::AbortHandle,
+    accept_handle: tokio::task::JoinHandle<()>,
     _shutdown_tx: tokio::sync::mpsc::Sender<()>,
-    connection_handles: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+    connection_tasks: Arc<std::sync::Mutex<ConnectionTaskRegistry>>,
+}
+
+#[derive(Debug)]
+struct ConnectionTaskRegistry {
+    stopping: bool,
+    handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl ServerHandle {
-    /// Abort the server task and all in-flight connection handlers immediately.
+    /// Schedule immediate cancellation of the listener and every connection.
+    ///
+    /// This non-blocking compatibility method returns before cancellation has
+    /// completed. Use [`Self::abort_and_wait`] when subsequent work must know
+    /// that the listener and all registered handlers have stopped.
     pub fn abort(&self) {
-        self.abort_handle.abort();
-        let handles = self.connection_handles.clone();
-        tokio::spawn(async move {
-            let mut guard = handles.lock().await;
-            for handle in guard.drain(..) {
-                handle.abort();
-            }
-        });
+        self.accept_handle.abort();
+        let mut registry = self
+            .connection_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.stopping = true;
+        for handle in &registry.handles {
+            handle.abort();
+        }
     }
 
-    /// Request graceful shutdown.
+    /// Abort the listener and every connection, then wait for all tasks to end.
+    ///
+    /// When this future returns, no handler registered by this server remains
+    /// alive and the bound listener has been dropped. This is the deterministic
+    /// lifecycle barrier for tests and callers that must restart or probe the
+    /// endpoint immediately after teardown.
+    pub async fn abort_and_wait(mut self) {
+        // Abort every registered handler before the first await. If the caller
+        // cancels this barrier, dropping JoinHandles can detach only tasks that
+        // have already received cancellation. The shared `stopping` flag also
+        // prevents an accept already in progress from registering a late task.
+        self.abort();
+        let _ = (&mut self.accept_handle).await;
+
+        let handles = {
+            let mut registry = self
+                .connection_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut registry.handles)
+        };
+        for handle in &handles {
+            handle.abort();
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+
+    /// Request graceful listener shutdown without waiting for completion.
+    ///
+    /// Existing connection handlers are allowed to finish independently. Use
+    /// [`Self::abort_and_wait`] when a hard completion barrier is required.
     pub fn shutdown(self) {
         drop(self._shutdown_tx);
     }
@@ -318,8 +361,11 @@ impl SessionReplicationServer {
             restore_scan_timeout: self.restore_scan_timeout,
             restore_scan_slots: Arc::new(Semaphore::new(RESTORE_SCAN_CONCURRENCY)),
         };
-        let connection_handles = Arc::new(Mutex::new(Vec::new()));
-        let connection_handles_clone = connection_handles.clone();
+        let connection_tasks = Arc::new(std::sync::Mutex::new(ConnectionTaskRegistry {
+            stopping: false,
+            handles: Vec::new(),
+        }));
+        let connection_tasks_clone = connection_tasks.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -338,8 +384,14 @@ impl SessionReplicationServer {
                                 let tls_config = tls_config.clone();
                                 let cas_idempotency_cache = cas_idempotency_cache.clone();
                                 let dispatch_config = dispatch_config.clone();
-                                let handles = connection_handles_clone.clone();
                                 tracing::debug!(%peer, "accepted connection");
+                                let mut registry = connection_tasks_clone
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                registry.handles.retain(|handle| !handle.is_finished());
+                                if registry.stopping {
+                                    break;
+                                }
                                 let conn_handle = tokio::spawn(async move {
                                     let _permit = permit;
                                     if let Err(e) = handle_connection(
@@ -354,7 +406,7 @@ impl SessionReplicationServer {
                                         tracing::debug!(%peer, error = ?e, "connection handler exited");
                                     }
                                 });
-                                handles.lock().await.push(conn_handle.abort_handle());
+                                registry.handles.push(conn_handle);
                             }
                             Err(e) => {
                                 tracing::warn!(error = ?e, "accept failed");
@@ -367,9 +419,9 @@ impl SessionReplicationServer {
 
         Ok((
             ServerHandle {
-                abort_handle: handle.abort_handle(),
+                accept_handle: handle,
                 _shutdown_tx: shutdown_tx,
-                connection_handles,
+                connection_tasks,
             },
             bound_addr,
         ))
