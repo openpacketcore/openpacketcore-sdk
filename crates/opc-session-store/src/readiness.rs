@@ -7,6 +7,101 @@
 
 use crate::topology::ReplicaId;
 
+/// Local Openraft recovery posture observed during a durable-readiness probe.
+///
+/// This is deliberately lower-cardinality than Openraft's internal metrics.
+/// It exposes only whether the local durable replica is synchronized, applying
+/// authoritative state, waiting for quorum, or requires operator action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DurableRecoveryState {
+    /// The local state machine applied through the successful committed
+    /// barrier returned by Openraft.
+    Synchronized,
+    /// The local durable log is ahead of the applied state machine and
+    /// Openraft is responsible for completing catch-up.
+    CatchingUp,
+    /// No authoritative barrier completed; no destructive repair was run.
+    AwaitingQuorum,
+    /// Openraft stopped fatally or durable state failed closed and requires
+    /// operator recovery.
+    RecoveryRequired,
+}
+
+impl DurableRecoveryState {
+    /// Stable low-cardinality code suitable for health and metrics surfaces.
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::Synchronized => "synchronized",
+            Self::CatchingUp => "catching_up",
+            Self::AwaitingQuorum => "awaiting_quorum",
+            Self::RecoveryRequired => "recovery_required",
+        }
+    }
+}
+
+/// Redaction-safe local progress for Openraft-owned recovery.
+///
+/// Indexes are operational counters, not session identifiers. The report does
+/// not expose terms, node IDs, endpoints, payloads, transaction IDs, or
+/// Openraft error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DurableRecoveryProgress {
+    state: DurableRecoveryState,
+    local_log_index: Option<u64>,
+    local_applied_index: Option<u64>,
+    snapshot_index: Option<u64>,
+    purged_index: Option<u64>,
+}
+
+impl DurableRecoveryProgress {
+    pub(crate) const fn new(
+        state: DurableRecoveryState,
+        local_log_index: Option<u64>,
+        local_applied_index: Option<u64>,
+        snapshot_index: Option<u64>,
+        purged_index: Option<u64>,
+    ) -> Self {
+        Self {
+            state,
+            local_log_index,
+            local_applied_index,
+            snapshot_index,
+            purged_index,
+        }
+    }
+
+    /// Typed recovery posture.
+    pub const fn state(self) -> DurableRecoveryState {
+        self.state
+    }
+
+    /// Stable low-cardinality recovery code.
+    pub const fn reason_code(self) -> &'static str {
+        self.state.reason_code()
+    }
+
+    /// Last local Openraft log index, when one remains after compaction.
+    pub const fn local_log_index(self) -> Option<u64> {
+        self.local_log_index
+    }
+
+    /// Last locally applied Openraft log index.
+    pub const fn local_applied_index(self) -> Option<u64> {
+        self.local_applied_index
+    }
+
+    /// Last index represented by the current local snapshot.
+    pub const fn snapshot_index(self) -> Option<u64> {
+        self.snapshot_index
+    }
+
+    /// Last index durably purged after snapshot compaction.
+    pub const fn purged_index(self) -> Option<u64> {
+        self.purged_index
+    }
+}
+
 /// Point-in-time result of a fresh durable-readiness assessment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -141,6 +236,7 @@ pub struct DurableReadinessReport {
     agreeing_voters: usize,
     required_quorum: usize,
     majority_visible_prefix_index: Option<u64>,
+    recovery_progress: DurableRecoveryProgress,
     replica_observations: Vec<ReplicaReadinessObservation>,
 }
 
@@ -154,6 +250,13 @@ impl DurableReadinessReport {
         majority_visible_prefix_index: Option<u64>,
         replica_observations: Vec<ReplicaReadinessObservation>,
     ) -> Self {
+        let recovery_state = match state {
+            DurableReadinessState::Ready => DurableRecoveryState::Synchronized,
+            DurableReadinessState::RecoveryRequired => DurableRecoveryState::RecoveryRequired,
+            DurableReadinessState::NoQuorum | DurableReadinessState::TopologyInvalid => {
+                DurableRecoveryState::AwaitingQuorum
+            }
+        };
         Self {
             state,
             configured_voters,
@@ -161,8 +264,17 @@ impl DurableReadinessReport {
             agreeing_voters,
             required_quorum,
             majority_visible_prefix_index,
+            recovery_progress: DurableRecoveryProgress::new(recovery_state, None, None, None, None),
             replica_observations,
         }
+    }
+
+    pub(crate) const fn with_recovery_progress(
+        mut self,
+        recovery_progress: DurableRecoveryProgress,
+    ) -> Self {
+        self.recovery_progress = recovery_progress;
+        self
     }
 
     /// Overall point-in-time readiness state.
@@ -216,6 +328,12 @@ impl DurableReadinessReport {
     /// Openraft log index returned by the successful linearizable barrier.
     pub const fn committed_barrier_index(&self) -> Option<u64> {
         self.majority_visible_prefix_index
+    }
+
+    /// Local Openraft recovery posture and bounded progress counters observed
+    /// during this same readiness assessment.
+    pub const fn recovery_progress(&self) -> DurableRecoveryProgress {
+        self.recovery_progress
     }
 
     /// Bounded typed observations. The Openraft adapter reports only its local

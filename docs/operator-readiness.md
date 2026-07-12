@@ -428,6 +428,12 @@ is Openraft barrier/committed-apply evidence, not a custom majority-log-prefix
 calculation. Do not reconstruct authority from the individual report counters
 or observations.
 
+The same report exposes `recovery_progress()` with a closed state set:
+`synchronized`, `catching_up`, `awaiting_quorum`, or `recovery_required`, and
+optional local log/applied/snapshot/purged indexes. These are redaction-safe
+progress counters, not branch-selection evidence and not authorization to
+truncate, rebuild, or serve traffic.
+
 The store's one bounded operation deadline applies to the complete leader,
 network, barrier, and local-apply path. Do not log raw peer errors or turn
 replica IDs, endpoints, DNS names, or SPIFFE identities into metric labels.
@@ -468,12 +474,40 @@ not an ownership lease.
    log, committed/applied/purged positions, membership, request outcomes, and
    the application chain; bounded checksummed snapshots carry only one coherent
    sealed state-machine image.
-6. **Remaining Qualification**: #128 must reconcile a diverged replica from
-   committed authority; #129 must provide operator-safe legacy-fork recovery;
+6. **Remaining Qualification**: #128 makes current-format repair exclusively
+   Openraft-owned, rejects committed/applied truncation and stale snapshots,
+   validates restart artifacts, and qualifies divergent-tail/snapshot recovery.
+   #129 must still provide operator-safe legacy-fork recovery;
    #133 must make restore scans bounded and majority-authoritative; and #143
    must supply distributed partition/restart/resource/soak and payload-key
    qualification. Until those land, this is implemented commit authority, not
    production HA qualification.
+
+### Current-format follower recovery runbook
+
+1. Close traffic, ownership publication, VIP advertisement, and new lease
+   acquisition unless the fresh report is `Ready`.
+2. For `catching_up` or `awaiting_quorum`, verify the exact admitted peer set,
+   bidirectional authenticated consensus reachability, and durable volume
+   availability. Restore connectivity and allow Openraft to reconcile. Do not
+   copy rows, call raw rebuild APIs, or delete a PVC.
+3. Confirm progress through the bounded local indexes only. Recovery is
+   complete only when a fresh barrier reports `Ready` and `synchronized`.
+4. On `recovery_required`, preserve the SQLite database, WAL/SHM if present,
+   snapshot directory, deployment identity/configuration/epoch, and the
+   redacted readiness report. Do not edit or retry around a corrupt referenced
+   snapshot; replace/recover the member only from an approved committed source.
+5. If storage predates Openraft or startup reports legacy recovery required,
+   stop. Use #129's audited workflow; current-format automatic recovery cannot
+   infer a committed branch from legacy rows.
+
+The adapter removes bounded SDK-named interrupted staging files on restart but
+does not delete unknown operator files. A missing/corrupt referenced snapshot,
+directory above 8,192 entries, cross-identity image, or snapshot behind the
+committed/applied floor fails closed before service admission. Covered-log
+purge waits at most ten seconds for asynchronous snapshot apply to advance the
+durable floor; timeout stops the Openraft node rather than deleting unapplied
+history.
 
 ### Session payload protection boundary
 
@@ -676,8 +710,8 @@ Either scope change requires another coordinated rollout.
 This is not production HA qualification. Do not infer readiness from bind
 success, static profiles, or cached capabilities; use the fresh bounded probe
 and continuous gate. #127 now provides Openraft commit authority, but do not use
-restore results as majority authority before #133, treat divergence repair as
-implemented before #128, or auto-resolve a legacy fork before #129. Protocol
+restore results as majority authority before #133 or apply #128's
+current-format Openraft recovery rules to a legacy fork before #129. Protocol
 identity/fixed-width binding is not fork recovery. #135's invariant-safe model decoding
 and bounded offline identity audit and #134's fixed-width v4 DTOs are implemented.
 Checked TTL and sequence boundaries now fail closed under #137/#138, and
@@ -797,8 +831,8 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
   Openraft engine for elections, voting, log matching, committed membership,
   snapshot coordination, and linearizable reads. Its SQLite state machine owns
   deterministic session semantics and exposes journal/watch changes only after
-  apply. #127 is implemented; #128/#129/#133/#143 remain qualification and
-  recovery gates.
+  apply. #127 and #128 are implemented; #129/#133/#143 remain qualification
+  and legacy-recovery gates.
 - **Session Topology, Identity, and Readiness**: HA construction requires one
   immutable descriptor set, explicit logical self, configuration digest, and
   positive epoch. Stable node IDs derive from cluster plus logical
@@ -809,9 +843,12 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
   capability evidence.
 - **Fault Coverage**: Tests cover concurrent pristine formation, cross-node
   lease/CAS visibility, follower linearizable reads, partition-bounded failure
-  and rejoin, restart, and delivered-but-lost response idempotency. These are
-  implementation tests, not #143 distributed production qualification, and
-  they do not implement #128 divergence repair or #129 legacy-fork recovery.
+  and rejoin, restart, delivered-but-lost response idempotency, replacement of
+  repeated uncommitted tails above an immutable committed prefix, stale and
+  cross-identity snapshot rejection, corrupt-snapshot restart, and interrupted
+  staging cleanup. These implement #128's storage/recovery boundary but are not
+  #143 distributed production qualification and do not implement #129 legacy
+  recovery.
 - **SQLite Writer Envelope**: Each node persists Openraft vote/log/membership,
   committed/applied positions, deterministic state, outcomes, and bounded
   snapshots in its own SQLite-backed store. Standalone `SqliteSessionBackend`

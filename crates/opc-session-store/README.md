@@ -328,6 +328,13 @@ adapter waits for local apply through the returned index. The report's `Debug`
 output redacts replica identities and contains no raw transport, backend, or
 peer-controlled error text.
 
+`recovery_progress()` reports one stable local posture—`synchronized`,
+`catching_up`, `awaiting_quorum`, or `recovery_required`—plus optional local
+log, applied, snapshot, and purged indexes. These counters are bounded
+operational evidence only. They contain no term, endpoint, certificate,
+session key, transaction ID, or payload, and callers must not reconstruct a
+repair decision from them.
+
 `Ready` means Openraft completed a fresh linearizable barrier against the
 admitted voting configuration and this node applied through that barrier. It
 is point-in-time evidence, not an ownership lease. Every authoritative read or
@@ -343,6 +350,36 @@ idempotent request outcomes, bounded snapshots, and watch cursors. Raw
 `replicate_entry`, whole-state rebuild, and caller-selected lease sequencing
 are rejected by the production consensus adapter; those are not alternate
 ways to establish authority.
+
+### Openraft follower recovery
+
+Openraft is the only online repair authority. Its term/log-matching protocol
+may replace an uncommitted suffix above the persisted committed and applied
+floor, or install a checksummed snapshot from the current leader. The SQLite
+adapter independently rejects any truncate at or below either durable floor
+and rejects a snapshot whose last log ID would move committed or applied state
+backward. It never selects a branch by counting application rows visible now.
+
+Snapshot receive/build/promote staging is file-backed and bounded. On restart,
+the adapter validates the one metadata-referenced snapshot before Openraft
+starts, removes only SDK-named interrupted staging files and unreferenced
+promoted snapshots, and fails closed above 8,192 directory entries
+or the current snapshot is missing, corrupt, or inconsistent. Snapshot table
+replacement remains one SQLite transaction, so retry after interruption is
+idempotent. Because Openraft schedules snapshot apply and covered-log purge on
+separate workers, purge waits at most ten seconds for the persisted applied
+floor and otherwise fails closed. Fences, lease credentials, application
+sequence, request outcomes, and logical time move together with the
+authoritative state-machine image.
+
+Runbook: keep traffic and ownership publication closed unless readiness is
+`Ready`. During `catching_up` or `awaiting_quorum`, restore authenticated peer
+reachability and let Openraft reconcile; do not invoke raw rebuild or edit a
+PVC. `recovery_required` blocks traffic and requires preserving the database,
+snapshot directory, and redacted report for operator analysis. A database from
+the removed pre-Openraft coordinator has no durable commit proof and remains
+the explicit #129 legacy-recovery workflow; current-format automatic recovery
+must never guess a legacy branch.
 
 ### Encryption and HKMS boundary
 
@@ -606,8 +643,8 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
 
 - Keep backend capabilities explicit so HA/profile suitability can fail closed.
 - Continue hardening restore evidence and traffic-blocking gates.
-- Complete committed-state divergence repair and operator-safe legacy recovery
-  (#128/#129), bounded majority-authoritative restore (#133), watch handoff correctness
+- Complete operator-safe legacy recovery (#129), bounded
+  majority-authoritative restore (#133), watch handoff correctness
   (#145), absolute-expiry admission (#148), production stable-ID and
   transaction-ID persistence contracts (#167/#168), and persist peer
   logical-RPC deadlines (#169), then complete the production qualification

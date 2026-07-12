@@ -91,8 +91,8 @@ pub use payload_codec::{
 };
 pub use quorum::{QuorumSessionStore, SessionStoreBackend};
 pub use readiness::{
-    DurableReadinessReport, DurableReadinessState, ReplicaReadinessFailure,
-    ReplicaReadinessObservation, ReplicaReadinessOutcome,
+    DurableReadinessReport, DurableReadinessState, DurableRecoveryProgress, DurableRecoveryState,
+    ReplicaReadinessFailure, ReplicaReadinessObservation, ReplicaReadinessOutcome,
 };
 pub use record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 pub use restore::{

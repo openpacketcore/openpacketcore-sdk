@@ -42,8 +42,8 @@ use crate::error::{LeaseError, StoreError};
 use crate::lease::{LeaseGuard, SessionLeaseManager};
 use crate::model::{OwnerId, SessionKey};
 use crate::readiness::{
-    DurableReadinessReport, DurableReadinessState, ReplicaReadinessObservation,
-    ReplicaReadinessOutcome,
+    DurableReadinessReport, DurableReadinessState, DurableRecoveryProgress, DurableRecoveryState,
+    ReplicaReadinessObservation, ReplicaReadinessOutcome,
 };
 use crate::record::SessionPayloadEncoding;
 use crate::record::StoredSessionRecord;
@@ -74,8 +74,9 @@ pub enum ConsensusSessionStoreOpenError {
     /// The exact remote consensus peer set did not match admitted membership.
     #[error("session consensus peer set does not match topology")]
     PeerSetMismatch,
-    /// A nonempty legacy authority requires the explicit recovery workflow.
-    #[error("session consensus legacy recovery is required")]
+    /// Legacy or corrupt durable authority requires an explicit recovery
+    /// workflow before this member may join.
+    #[error("session consensus durable recovery is required")]
     RecoveryRequired,
     /// Persisted identity/schema does not match this deployment.
     #[error("session consensus durable identity does not match configuration")]
@@ -97,10 +98,10 @@ pub enum ConsensusSessionStoreOpenError {
 impl From<SessionConsensusStorageError> for ConsensusSessionStoreOpenError {
     fn from(error: SessionConsensusStorageError) -> Self {
         match error {
-            SessionConsensusStorageError::RecoveryRequired => Self::RecoveryRequired,
+            SessionConsensusStorageError::RecoveryRequired
+            | SessionConsensusStorageError::CorruptState => Self::RecoveryRequired,
             SessionConsensusStorageError::IdentityMismatch
             | SessionConsensusStorageError::SchemaVersionMismatch
-            | SessionConsensusStorageError::CorruptState
             | SessionConsensusStorageError::InvalidIdentity => Self::DurableIdentityMismatch,
             SessionConsensusStorageError::BackendUnavailable => Self::StorageUnavailable,
         }
@@ -412,22 +413,50 @@ impl ConsensusSessionStore {
     pub async fn probe_durable_readiness(&self) -> DurableReadinessReport {
         let configured = self.inner.members.len();
         let quorum = (configured / 2) + 1;
-        let no_quorum = || {
-            DurableReadinessReport::new(
-                DurableReadinessState::NoQuorum,
-                configured,
-                0,
-                0,
-                quorum,
-                None,
-                Vec::new(),
+        let report_without_barrier = |state, recovery_progress| {
+            DurableReadinessReport::new(state, configured, 0, 0, quorum, None, Vec::new())
+                .with_recovery_progress(recovery_progress)
+        };
+        let progress = || {
+            let metrics = self.inner.raft.metrics();
+            let metrics = metrics.borrow();
+            let state = if metrics.running_state.is_err() {
+                DurableRecoveryState::RecoveryRequired
+            } else if metrics.last_log_index
+                > metrics.last_applied.as_ref().map(|log_id| log_id.index)
+            {
+                DurableRecoveryState::CatchingUp
+            } else {
+                DurableRecoveryState::AwaitingQuorum
+            };
+            DurableRecoveryProgress::new(
+                state,
+                metrics.last_log_index,
+                metrics.last_applied.as_ref().map(|log_id| log_id.index),
+                metrics.snapshot.as_ref().map(|log_id| log_id.index),
+                metrics.purged.as_ref().map(|log_id| log_id.index),
             )
         };
         if !self.exact_membership_is_admitted() {
-            return no_quorum();
+            let progress = progress();
+            let state = if progress.state() == DurableRecoveryState::RecoveryRequired {
+                DurableReadinessState::RecoveryRequired
+            } else {
+                DurableReadinessState::NoQuorum
+            };
+            return report_without_barrier(state, progress);
         }
         match self.linearizable_barrier().await {
             Ok(log_id) => {
+                let metrics = self.inner.raft.metrics();
+                let metrics = metrics.borrow();
+                let recovery_progress = DurableRecoveryProgress::new(
+                    DurableRecoveryState::Synchronized,
+                    metrics.last_log_index,
+                    metrics.last_applied.as_ref().map(|log_id| log_id.index),
+                    metrics.snapshot.as_ref().map(|log_id| log_id.index),
+                    metrics.purged.as_ref().map(|log_id| log_id.index),
+                );
                 let observations = self
                     .inner
                     .topology
@@ -451,8 +480,17 @@ impl ConsensusSessionStore {
                     log_id.map(|log_id| log_id.index),
                     observations,
                 )
+                .with_recovery_progress(recovery_progress)
             }
-            Err(_) => no_quorum(),
+            Err(_) => {
+                let progress = progress();
+                let state = if progress.state() == DurableRecoveryState::RecoveryRequired {
+                    DurableReadinessState::RecoveryRequired
+                } else {
+                    DurableReadinessState::NoQuorum
+                };
+                report_without_barrier(state, progress)
+            }
         }
     }
 
@@ -1231,6 +1269,14 @@ mod membership_tests {
         ));
     }
 
+    #[test]
+    fn corrupt_durable_state_is_typed_as_recovery_required() {
+        assert_eq!(
+            ConsensusSessionStoreOpenError::RecoveryRequired,
+            ConsensusSessionStoreOpenError::from(SessionConsensusStorageError::CorruptState)
+        );
+    }
+
     #[tokio::test]
     async fn store_and_forwarded_services_fail_closed_before_exact_admission() {
         let directory = tempfile::tempdir().expect("membership admission directory");
@@ -1245,9 +1291,11 @@ mod membership_tests {
         .await
         .expect("open uninitialized consensus store");
 
+        let uninitialized = store.probe_durable_readiness().await;
+        assert_eq!(uninitialized.state(), DurableReadinessState::NoQuorum);
         assert_eq!(
-            store.probe_durable_readiness().await.state(),
-            DurableReadinessState::NoQuorum
+            uninitialized.recovery_progress().state(),
+            DurableRecoveryState::AwaitingQuorum
         );
         assert!(matches!(
             store
@@ -1277,7 +1325,12 @@ mod membership_tests {
             .await
             .expect("admit exact singleton membership");
         assert!(store.exact_membership_is_admitted());
-        assert!(store.probe_durable_readiness().await.is_ready());
+        let initialized = store.probe_durable_readiness().await;
+        assert!(initialized.is_ready());
+        assert_eq!(
+            initialized.recovery_progress().state(),
+            DurableRecoveryState::Synchronized
+        );
     }
 }
 

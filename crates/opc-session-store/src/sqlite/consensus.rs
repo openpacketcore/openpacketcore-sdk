@@ -137,6 +137,7 @@ pub(crate) struct SqliteConsensusCore {
     pub(crate) snapshot_dir: Arc<PathBuf>,
     pub(crate) caps: BackendCapabilities,
     pub(crate) snapshot_gate: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) applied_progress: tokio::sync::watch::Sender<Option<LogId<SessionConsensusNodeId>>>,
     pub(crate) watchers: Arc<tokio::sync::Mutex<Vec<ConsensusWatcher>>>,
 }
 
@@ -156,10 +157,13 @@ impl SqliteConsensusCore {
             .await
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
 
-        {
+        let applied = {
             let conn = backend.conn.lock().await;
             initialize_schema(&conn, identity, &expected_members)?;
-        }
+            read_applied_sync(&conn, identity)
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?
+        };
+        let (applied_progress, _) = tokio::sync::watch::channel(applied);
 
         Ok(Self {
             conn: Arc::clone(&backend.conn),
@@ -168,6 +172,7 @@ impl SqliteConsensusCore {
             snapshot_dir: Arc::new(canonical_snapshot_dir),
             caps: backend.caps,
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
+            applied_progress,
             watchers: Arc::clone(&backend.watchers),
         })
     }
@@ -713,16 +718,31 @@ pub(crate) fn truncate_logs_sync(
     since: &LogId<SessionConsensusNodeId>,
 ) -> io::Result<()> {
     let (_, index) = validate_log_id(since)?;
-    if let Some(purged) = read_purged_sync(conn, identity)? {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
+    if let Some(committed) = read_committed_sync(&tx, identity)? {
+        if since.index <= committed.index {
+            return Err(invalid_data(
+                "session consensus truncate crosses committed log",
+            ));
+        }
+    }
+    if let Some(applied) = read_applied_sync(&tx, identity)? {
+        if since.index <= applied.index {
+            return Err(invalid_data(
+                "session consensus truncate crosses applied log",
+            ));
+        }
+    }
+    if let Some(purged) = read_purged_sync(&tx, identity)? {
         if since.index <= purged.index {
             return Err(invalid_data(
                 "session consensus truncate crosses purged log",
             ));
         }
     }
-    conn.execute("DELETE FROM consensus_log WHERE log_index >= ?1", [index])
+    tx.execute("DELETE FROM consensus_log WHERE log_index >= ?1", [index])
         .map_err(db_error)?;
-    Ok(())
+    tx.commit().map_err(db_error)
 }
 
 pub(crate) fn purge_logs_sync(
@@ -1545,6 +1565,8 @@ pub(crate) fn install_snapshot_database_sync(
     checksum: [u8; 32],
     byte_length: u64,
 ) -> io::Result<()> {
+    let incoming_last_log_id = meta.last_log_id.as_ref();
+    validate_snapshot_floor(conn, identity, incoming_last_log_id)?;
     validate_snapshot_database_sync(snapshot_db_path, identity, expected_members, meta)?;
     if final_file_name.is_empty()
         || final_file_name.contains('/')
@@ -1563,6 +1585,11 @@ pub(crate) fn install_snapshot_database_sync(
 
     let result = (|| {
         let tx = conn.unchecked_transaction().map_err(db_error)?;
+        // Re-check under the same transaction that swaps the state image. A
+        // second process must not be able to advance the durable floor between
+        // validation and replacement even though deployment admission already
+        // requires one writer per backing store.
+        validate_snapshot_floor(&tx, identity, incoming_last_log_id)?;
         for (table, columns) in [
             (
                 "session_records",
@@ -1626,6 +1653,32 @@ pub(crate) fn install_snapshot_database_sync(
         .execute("DETACH DATABASE consensus_incoming", [])
         .map_err(db_error);
     result.and(detach.map(|_| ()))
+}
+
+fn validate_snapshot_floor(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    incoming_last_log_id: Option<&LogId<SessionConsensusNodeId>>,
+) -> io::Result<()> {
+    for floor in [
+        read_committed_sync(conn, identity)?,
+        read_applied_sync(conn, identity)?,
+    ] {
+        let Some(floor) = floor else {
+            continue;
+        };
+        let Some(incoming) = incoming_last_log_id else {
+            return Err(invalid_data(
+                "session consensus snapshot regresses durable state",
+            ));
+        };
+        if incoming.index < floor.index || (incoming.index == floor.index && incoming != &floor) {
+            return Err(invalid_data(
+                "session consensus snapshot regresses durable state",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn save_current_snapshot_sync(

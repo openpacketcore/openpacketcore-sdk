@@ -47,6 +47,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accessor; and use typed, redaction-safe replica
   failure classes instead of raw errors. Capability declarations and
   `SessionStorePlatformProfile::Quorum` remain admission evidence only.
+- `opc-session-store`: Openraft-owned follower recovery now has a second
+  fail-closed SQLite boundary: truncation cannot cross the persisted committed
+  or applied index, and snapshot install cannot regress either floor or cross
+  cluster/configuration identity. Restart validates the referenced snapshot,
+  cleans a bounded set of interrupted SDK staging/orphan files, and rejects
+  corrupt state before engine admission. Covered-log purge now waits behind
+  asynchronous snapshot apply under one ten-second bound, fixing a lagging
+  follower failure that otherwise installed the state image and then stopped
+  before Openraft acknowledged recovery. Readiness adds redaction-safe
+  `synchronized`/`catching_up`/`awaiting_quorum`/`recovery_required` progress
+  with local log/applied/snapshot/purged counters. Deterministic tests replace
+  multiple uncommitted same-index tails while preserving the committed prefix,
+  reject stale/wrong-identity/corrupt snapshots, and prove restart continuity.
 - `opc-session-store`: immutable replica descriptors and
   `ValidatedQuorumTopology` admission with distinct logical ID, canonical
   endpoint, expected TLS identity, failure domain, backing identity, and exact
@@ -585,8 +598,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   AMF-lite now keeps traffic readiness behind a continuously supervised
   session-store gate, and low-cardinality metrics expose probe outcomes,
   configured/required counts, the committed barrier index, and bounded failure
-  reasons. #127 closes durable sequencing; operator-safe legacy-fork recovery
-  (#128/#129) and majority-authoritative restore (#133) remain blockers.
+  reasons. #127 closes durable sequencing; #128 hardens current-format
+  Openraft recovery; operator-safe legacy-fork recovery (#129) and
+  majority-authoritative restore (#133) remain blockers.
   Protocol-v4 wire stabilization is now
   implemented under #134; #135's
   scoped model/persistence admission is implemented above. Checked TTL and

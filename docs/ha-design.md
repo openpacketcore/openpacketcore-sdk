@@ -15,8 +15,8 @@ OpenPacketCore config and session persistence surfaces.
   protection wrapper.
 
 Historical closure language below refers only to scoped algorithms and test
-harnesses. The config migration (#177), session repair/recovery/restore
-(#128/#129/#133), and production networked qualification (#143 plus the
+harnesses. The config migration (#177), legacy session recovery/restore
+(#129/#133), and production networked qualification (#143 plus the
 credential-rotation chain) remain open; neither component is yet approved as a
 production deployment profile.
 
@@ -157,8 +157,9 @@ outcomes, a committed application journal, watch cursors, logical expiry time,
 and encryption-envelope admission.
 
 This is durable sequencing authority, but not yet a complete production
-deployment claim. Committed-state repair and legacy-fork recovery remain
-#128/#129, bounded majority-authoritative restore remains #133, watch and expiry
+deployment claim. Current-format follower recovery is Openraft-owned and
+hardened under #128; legacy-fork recovery remains #129, bounded
+majority-authoritative restore remains #133, watch and expiry
 hardening remain #145/#148, and network/resource/rotation qualification remains
 #143 and the #162 -> #161 -> #163 -> #158 -> #164 credential chain. Stable IDs,
 durable transaction IDs, and log-range cursors remain #167/#168/#171.
@@ -265,10 +266,21 @@ advertisement when it becomes `NoQuorum`. Diagnostics remain bounded and
 redacted; peer identities and peer-controlled errors are not labels or report
 payloads.
 
-Openraft reconciles normal follower log divergence. Recovery of an already
-forked legacy custom-coordinator database requires #128/#129 because the old
-format cannot prove which conflicting tail was committed. Readiness never
-guesses or performs an unaudited destructive rebuild.
+Openraft reconciles current-format follower log divergence. SQLite refuses a
+truncate at or below either persisted committed or applied index. Snapshot
+install validates checksum, exact cluster/configuration/epoch and membership,
+then refuses an image older than the local committed/applied floor before one
+transaction replaces application state. Restart validates the referenced
+snapshot and removes only bounded SDK staging/orphan names left by an
+interrupted receive/build/promote. Covered-log purge waits under one ten-second
+bound for the asynchronous snapshot apply worker, preventing a successfully
+installed image from being followed by a false purge-before-apply fatal error.
+Readiness reports typed local recovery posture and index counters without peer
+text or session identifiers.
+
+Recovery of an already forked legacy custom-coordinator database remains #129
+because the old format cannot prove which conflicting tail was committed.
+Readiness never guesses or performs an unaudited destructive rebuild.
 
 ### Bounded TTL inputs
 
@@ -507,7 +519,7 @@ backend/peer-controlled error text.
 This closes per-replica compatibility transport parity only. Restore
 selection/merge remains #133. Protocol v4 is not the production consensus
 protocol and does not establish authority; #127 uses the separate Openraft
-transport above, while legacy-fork repair remains #128/#129.
+transport above, while legacy-fork recovery remains #129.
 
 ### Log & Replication Model
 - **Openraft Log Authority**: Openraft allocates and commits its zero-based log
