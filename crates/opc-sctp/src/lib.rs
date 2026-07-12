@@ -24,6 +24,9 @@ use tokio::io::unix::AsyncFd;
 #[cfg(target_os = "linux")]
 const SCTP_RECV_CHUNK_BYTES: usize = 64 * 1024;
 
+/// Maximum number of addresses accepted in one static SCTP multihoming set.
+pub const MAX_STATIC_MULTIHOMING_ADDRESSES: usize = opc_libsctp_sys::MAX_SCTP_ADDRESSES;
+
 /// NGAP SCTP payload protocol identifier, per 3GPP N2 usage.
 pub const NGAP_PPID: PayloadProtocolIdentifier = PayloadProtocolIdentifier::new(60);
 
@@ -139,7 +142,7 @@ pub struct HeartbeatConfig {
 pub struct SctpEndpointConfig {
     /// Socket mode.
     pub mode: SctpMode,
-    /// Local bind addresses. Exactly one address is supported today.
+    /// Local bind addresses. Multiple addresses form one static multihoming set.
     pub local_addrs: Vec<SocketAddr>,
     /// INIT parameters.
     pub init: InitConfig,
@@ -174,7 +177,7 @@ impl SctpEndpointConfig {
         config
     }
 
-    /// Validate capability-honest v0.1 constraints.
+    /// Validate endpoint constraints before opening a socket.
     pub fn validate(&self) -> Result<(), SctpError> {
         validate_common(
             &self.local_addrs,
@@ -190,9 +193,10 @@ impl SctpEndpointConfig {
 /// SCTP client association configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SctpConnectConfig {
-    /// Optional local bind address. At most one address is supported today.
+    /// Optional local bind addresses for the association.
     pub local_addrs: Vec<SocketAddr>,
-    /// Remote peer addresses. Exactly one address is supported today.
+    /// Remote peer address set, passed to the kernel in the configured order.
+    /// Path selection within the set is owned by the SCTP stack.
     pub remote_addrs: Vec<SocketAddr>,
     /// INIT parameters.
     pub init: InitConfig,
@@ -220,7 +224,7 @@ impl SctpConnectConfig {
         }
     }
 
-    /// Validate capability-honest v0.1 constraints.
+    /// Validate association constraints before opening a socket.
     pub fn validate(&self) -> Result<(), SctpError> {
         validate_common(
             &self.remote_addrs,
@@ -230,10 +234,8 @@ impl SctpConnectConfig {
             self.heartbeat,
             "remote_addrs",
         )?;
-        if self.local_addrs.len() > 1 {
-            return Err(SctpError::UnsupportedFeature {
-                feature: "static multihoming local bind",
-            });
+        if !self.local_addrs.is_empty() {
+            validate_address_set(&self.local_addrs, "local_addrs")?;
         }
         if let (Some(local), Some(remote)) = (self.local_addrs.first(), self.remote_addrs.first()) {
             validate_same_family(local, remote)?;
@@ -738,6 +740,15 @@ pub enum SctpError {
         /// Stable feature label.
         feature: &'static str,
     },
+    /// The API supports a feature, but this kernel or namespace does not.
+    #[error("SCTP capability is unavailable: {capability}")]
+    CapabilityUnavailable {
+        /// Stable capability label suitable for fallback policy.
+        capability: &'static str,
+        /// Kernel error that established unavailability.
+        #[source]
+        source: io::Error,
+    },
     /// Configuration failed validation.
     #[error("invalid SCTP config field '{field}': {reason}")]
     InvalidConfig {
@@ -860,6 +871,29 @@ pub struct SctpHealth {
     pub mode: SctpMode,
 }
 
+/// Capabilities available from this build of the SCTP transport.
+///
+/// A Linux kernel or container policy can still reject multihoming for a
+/// particular socket. That case is returned as
+/// [`SctpError::CapabilityUnavailable`] so consumers can explicitly retry a
+/// single-address configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SctpCapabilities {
+    /// This build has a supported SCTP platform implementation.
+    pub platform_supported: bool,
+    /// This build exposes bounded static bindx/connectx support.
+    pub static_multihoming: bool,
+}
+
+/// Return SCTP capabilities for the current build target.
+#[must_use]
+pub const fn capabilities() -> SctpCapabilities {
+    SctpCapabilities {
+        platform_supported: cfg!(target_os = "linux"),
+        static_multihoming: cfg!(target_os = "linux"),
+    }
+}
+
 /// Bound SCTP endpoint.
 #[derive(Debug)]
 pub struct SctpEndpoint {
@@ -903,6 +937,11 @@ impl SctpEndpoint {
     pub fn metrics(&self) -> SctpMetricsSnapshot {
         self.imp.metrics()
     }
+
+    /// Return the addresses the kernel bound to this endpoint.
+    pub fn local_addresses(&self) -> Result<Vec<SocketAddr>, SctpError> {
+        self.imp.local_addresses()
+    }
 }
 
 impl SctpAssociation {
@@ -933,6 +972,16 @@ impl SctpAssociation {
     pub fn metrics(&self) -> SctpMetricsSnapshot {
         self.imp.metrics()
     }
+
+    /// Return the local addresses active on this association.
+    pub fn local_addresses(&self) -> Result<Vec<SocketAddr>, SctpError> {
+        self.imp.local_addresses()
+    }
+
+    /// Return the peer addresses active on this association.
+    pub fn peer_addresses(&self) -> Result<Vec<SocketAddr>, SctpError> {
+        self.imp.peer_addresses()
+    }
 }
 
 fn validate_common(
@@ -943,17 +992,7 @@ fn validate_common(
     heartbeat: HeartbeatConfig,
     address_field: &'static str,
 ) -> Result<(), SctpError> {
-    if addresses.is_empty() {
-        return Err(SctpError::InvalidConfig {
-            field: address_field,
-            reason: "at least one address is required",
-        });
-    }
-    if addresses.len() > 1 {
-        return Err(SctpError::UnsupportedFeature {
-            feature: "static multihoming",
-        });
-    }
+    validate_address_set(addresses, address_field)?;
     if init.outbound_streams == 0 {
         return Err(SctpError::InvalidConfig {
             field: "init.outbound_streams",
@@ -980,6 +1019,53 @@ fn validate_common(
     if heartbeat != HeartbeatConfig::default() {
         return Err(SctpError::UnsupportedFeature {
             feature: "custom heartbeat parameters",
+        });
+    }
+    Ok(())
+}
+
+fn validate_address_set(
+    addresses: &[SocketAddr],
+    address_field: &'static str,
+) -> Result<(), SctpError> {
+    let Some(first) = addresses.first() else {
+        return Err(SctpError::InvalidConfig {
+            field: address_field,
+            reason: "at least one address is required",
+        });
+    };
+    if addresses.len() > MAX_STATIC_MULTIHOMING_ADDRESSES {
+        return Err(SctpError::InvalidConfig {
+            field: address_field,
+            reason: "address count exceeds the bounded maximum",
+        });
+    }
+    if addresses
+        .iter()
+        .any(|address| address.is_ipv4() != first.is_ipv4())
+    {
+        return Err(SctpError::InvalidConfig {
+            field: "address_family",
+            reason: "all addresses must use the same IP family",
+        });
+    }
+    if addresses
+        .iter()
+        .any(|address| address.port() != first.port())
+    {
+        return Err(SctpError::InvalidConfig {
+            field: address_field,
+            reason: "all addresses must use the same port",
+        });
+    }
+    if addresses.len() > 1
+        && addresses
+            .iter()
+            .any(|address| address.ip().is_unspecified())
+    {
+        return Err(SctpError::InvalidConfig {
+            field: address_field,
+            reason: "wildcard addresses cannot be combined with an address set",
         });
     }
     Ok(())
@@ -1123,6 +1209,18 @@ fn io_err(operation: &'static str, source: io::Error) -> SctpError {
 }
 
 #[cfg(target_os = "linux")]
+fn multihoming_io_err(operation: &'static str, source: io::Error) -> SctpError {
+    if opc_libsctp_sys::is_multihoming_unavailable(&source) {
+        SctpError::CapabilityUnavailable {
+            capability: "static_multihoming",
+            source,
+        }
+    } else {
+        io_err(operation, source)
+    }
+}
+
+#[cfg(target_os = "linux")]
 mod platform {
     use super::*;
 
@@ -1151,7 +1249,12 @@ mod platform {
         let fd = opc_libsctp_sys::open_socket(sys_family(&local), sys_style(config.mode))
             .map_err(|source| io_err("socket", source))?;
         configure_fd(fd.as_fd(), config.init, config.nodelay)?;
-        opc_libsctp_sys::bind(fd.as_fd(), &local).map_err(|source| io_err("bind", source))?;
+        if config.local_addrs.len() == 1 {
+            opc_libsctp_sys::bind(fd.as_fd(), &local).map_err(|source| io_err("bind", source))?;
+        } else {
+            opc_libsctp_sys::bind_addresses(fd.as_fd(), &config.local_addrs)
+                .map_err(|source| multihoming_io_err("bind_addresses", source))?;
+        }
         opc_libsctp_sys::listen(fd.as_fd(), 128).map_err(|source| io_err("listen", source))?;
         let async_fd = AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))?;
         Ok(Endpoint {
@@ -1170,11 +1273,20 @@ mod platform {
         let fd = opc_libsctp_sys::open_socket(sys_family(&remote), sys_style(SctpMode::OneToOne))
             .map_err(|source| io_err("socket", source))?;
         configure_fd(fd.as_fd(), config.init, config.nodelay)?;
-        if let Some(local) = config.local_addrs.first() {
-            opc_libsctp_sys::bind(fd.as_fd(), local).map_err(|source| io_err("bind", source))?;
+        if config.local_addrs.len() == 1 {
+            opc_libsctp_sys::bind(fd.as_fd(), &config.local_addrs[0])
+                .map_err(|source| io_err("bind", source))?;
+        } else if !config.local_addrs.is_empty() {
+            opc_libsctp_sys::bind_addresses(fd.as_fd(), &config.local_addrs)
+                .map_err(|source| multihoming_io_err("bind_addresses", source))?;
         }
-        let status = opc_libsctp_sys::connect(fd.as_fd(), &remote)
-            .map_err(|source| io_err("connect", source))?;
+        let status = if config.remote_addrs.len() == 1 {
+            opc_libsctp_sys::connect(fd.as_fd(), &remote)
+                .map_err(|source| io_err("connect", source))?
+        } else {
+            opc_libsctp_sys::connect_addresses(fd.as_fd(), &config.remote_addrs)
+                .map_err(|source| multihoming_io_err("connect_addresses", source))?
+        };
         let async_fd = AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))?;
         let socket = Arc::new(SctpSocket {
             fd: async_fd,
@@ -1263,6 +1375,11 @@ mod platform {
         pub fn metrics(&self) -> SctpMetricsSnapshot {
             self.socket.metrics.snapshot()
         }
+
+        pub fn local_addresses(&self) -> Result<Vec<SocketAddr>, SctpError> {
+            opc_libsctp_sys::local_addresses(self.socket.fd.get_ref().as_fd(), 0)
+                .map_err(|source| io_err("local_addresses", source))
+        }
     }
 
     impl Association {
@@ -1284,6 +1401,16 @@ mod platform {
 
         pub fn metrics(&self) -> SctpMetricsSnapshot {
             self.socket.metrics.snapshot()
+        }
+
+        pub fn local_addresses(&self) -> Result<Vec<SocketAddr>, SctpError> {
+            opc_libsctp_sys::local_addresses(self.socket.fd.get_ref().as_fd(), 0)
+                .map_err(|source| io_err("local_addresses", source))
+        }
+
+        pub fn peer_addresses(&self) -> Result<Vec<SocketAddr>, SctpError> {
+            opc_libsctp_sys::peer_addresses(self.socket.fd.get_ref().as_fd(), 0)
+                .map_err(|source| io_err("peer_addresses", source))
         }
     }
 
@@ -1515,6 +1642,11 @@ mod platform {
             let _ = self;
             SctpMetricsSnapshot::default()
         }
+
+        pub fn local_addresses(&self) -> Result<Vec<SocketAddr>, SctpError> {
+            let _ = self;
+            Err(SctpError::UnsupportedPlatform)
+        }
     }
 
     impl Association {
@@ -1540,6 +1672,16 @@ mod platform {
         pub fn metrics(&self) -> SctpMetricsSnapshot {
             let _ = self;
             SctpMetricsSnapshot::default()
+        }
+
+        pub fn local_addresses(&self) -> Result<Vec<SocketAddr>, SctpError> {
+            let _ = self;
+            Err(SctpError::UnsupportedPlatform)
+        }
+
+        pub fn peer_addresses(&self) -> Result<Vec<SocketAddr>, SctpError> {
+            let _ = self;
+            Err(SctpError::UnsupportedPlatform)
         }
     }
 }
@@ -1839,15 +1981,71 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_config_rejects_multihoming_until_bindx_boundary_exists() {
+    fn endpoint_config_accepts_bounded_same_family_multihoming() {
         let mut config = SctpEndpointConfig::one_to_one("127.0.0.1:38412".parse().unwrap());
         config.local_addrs.push("127.0.0.2:38412".parse().unwrap());
+        assert!(config.validate().is_ok());
+
+        config.local_addrs.push("[::1]:38412".parse().unwrap());
         assert!(matches!(
             config.validate(),
-            Err(SctpError::UnsupportedFeature {
-                feature: "static multihoming"
+            Err(SctpError::InvalidConfig {
+                field: "address_family",
+                ..
             })
         ));
+    }
+
+    #[test]
+    fn config_rejects_mixed_ports_and_unbounded_address_sets() {
+        let mut mixed_ports = SctpEndpointConfig::one_to_one("127.0.0.1:38412".parse().unwrap());
+        mixed_ports
+            .local_addrs
+            .push("127.0.0.2:38413".parse().unwrap());
+        assert!(matches!(
+            mixed_ports.validate(),
+            Err(SctpError::InvalidConfig {
+                field: "local_addrs",
+                ..
+            })
+        ));
+
+        let mut wildcard = SctpEndpointConfig::one_to_one("0.0.0.0:38412".parse().unwrap());
+        wildcard
+            .local_addrs
+            .push("127.0.0.1:38412".parse().unwrap());
+        assert!(matches!(
+            wildcard.validate(),
+            Err(SctpError::InvalidConfig {
+                field: "local_addrs",
+                ..
+            })
+        ));
+
+        let mut unbounded = SctpEndpointConfig::one_to_one("127.0.0.1:38412".parse().unwrap());
+        unbounded.local_addrs = (1..=MAX_STATIC_MULTIHOMING_ADDRESSES)
+            .map(|last| {
+                SocketAddr::new(std::net::Ipv4Addr::new(127, 0, 0, last as u8).into(), 38412)
+            })
+            .collect();
+        assert!(unbounded.validate().is_ok());
+        unbounded
+            .local_addrs
+            .push("127.0.1.1:38412".parse().unwrap());
+        assert!(matches!(
+            unbounded.validate(),
+            Err(SctpError::InvalidConfig {
+                field: "local_addrs",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn capabilities_advertise_static_multihoming_on_linux() {
+        let capabilities = capabilities();
+        assert_eq!(capabilities.platform_supported, cfg!(target_os = "linux"));
+        assert_eq!(capabilities.static_multihoming, cfg!(target_os = "linux"));
     }
 
     #[test]
@@ -1875,6 +2073,26 @@ mod tests {
     fn connect_config_rejects_address_family_mismatch() {
         let mut config = SctpConnectConfig::new("[::1]:38412".parse().unwrap());
         config.local_addrs.push("127.0.0.1:0".parse().unwrap());
+        assert!(matches!(
+            config.validate(),
+            Err(SctpError::InvalidConfig {
+                field: "address_family",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn connect_config_validates_every_local_and_remote_address() {
+        let mut config = SctpConnectConfig::new("127.0.0.1:38412".parse().unwrap());
+        config.remote_addrs.push("127.0.0.2:38412".parse().unwrap());
+        config.local_addrs.extend([
+            "127.0.0.3:0".parse::<SocketAddr>().unwrap(),
+            "127.0.0.4:0".parse::<SocketAddr>().unwrap(),
+        ]);
+        assert!(config.validate().is_ok());
+
+        config.remote_addrs.push("[::1]:38412".parse().unwrap());
         assert!(matches!(
             config.validate(),
             Err(SctpError::InvalidConfig {
@@ -1932,6 +2150,98 @@ mod tests {
                 return message;
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct SctpPathDrop {
+        delete_rules: Vec<Vec<String>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl SctpPathDrop {
+        fn install(server_ip: &str, server_port: u16) -> Self {
+            let port = server_port.to_string();
+            let rules = [
+                vec![
+                    "-p",
+                    "sctp",
+                    "-s",
+                    server_ip,
+                    "--sport",
+                    port.as_str(),
+                    "-j",
+                    "DROP",
+                ],
+                vec![
+                    "-p",
+                    "sctp",
+                    "-d",
+                    server_ip,
+                    "--dport",
+                    port.as_str(),
+                    "-j",
+                    "DROP",
+                ],
+            ];
+            let mut guard = Self {
+                delete_rules: Vec::with_capacity(rules.len()),
+            };
+            for rule in rules {
+                let mut insert = vec!["-w", "5", "-I", "OUTPUT", "1"];
+                insert.extend(rule.iter().copied());
+                run_iptables(&insert);
+
+                let mut delete = vec![
+                    "-w".to_string(),
+                    "5".to_string(),
+                    "-D".to_string(),
+                    "OUTPUT".to_string(),
+                ];
+                delete.extend(rule.into_iter().map(str::to_string));
+                guard.delete_rules.push(delete);
+            }
+            guard
+        }
+
+        fn remove(mut self) {
+            while let Some(rule) = self.delete_rules.last() {
+                let status = std::process::Command::new("sudo")
+                    .arg("-n")
+                    .arg("iptables")
+                    .args(rule)
+                    .status()
+                    .expect("remove iptables SCTP qualification rule");
+                assert!(
+                    status.success(),
+                    "iptables SCTP qualification cleanup failed"
+                );
+                self.delete_rules.pop();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for SctpPathDrop {
+        fn drop(&mut self) {
+            for rule in self.delete_rules.iter().rev() {
+                let _ = std::process::Command::new("sudo")
+                    .arg("-n")
+                    .arg("iptables")
+                    .args(rule)
+                    .status();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_iptables(args: &[&str]) {
+        let status = std::process::Command::new("sudo")
+            .arg("-n")
+            .arg("iptables")
+            .args(args)
+            .status()
+            .expect("execute iptables for SCTP qualification");
+        assert!(status.success(), "iptables SCTP qualification rule failed");
     }
 
     #[cfg(target_os = "linux")]
@@ -2054,6 +2364,135 @@ mod tests {
         let received = recv_data(&accepted).await;
         assert_eq!(received.payload, Bytes::from_static(b"ngap"));
         assert_eq!(received.ppid, NGAP_PPID);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP multihoming support"]
+    async fn loopback_static_multihoming_binds_and_connects_full_sets() {
+        let mut server_config = SctpEndpointConfig::one_to_one("127.0.0.1:0".parse().unwrap());
+        server_config
+            .local_addrs
+            .push("127.0.0.2:0".parse().unwrap());
+        let server = SctpEndpoint::bind(server_config).unwrap();
+        let mut server_addresses = server.local_addresses().unwrap();
+        server_addresses.sort_unstable();
+        assert_eq!(server_addresses.len(), 2);
+        assert_eq!(server_addresses[0].ip().to_string(), "127.0.0.1");
+        assert_eq!(server_addresses[1].ip().to_string(), "127.0.0.2");
+        assert_ne!(server_addresses[0].port(), 0);
+        assert_eq!(server_addresses[0].port(), server_addresses[1].port());
+
+        let mut client_config = SctpConnectConfig::new(server_addresses[0]);
+        client_config.remote_addrs = server_addresses.clone();
+        client_config.local_addrs = vec![
+            "127.0.0.3:0".parse().unwrap(),
+            "127.0.0.4:0".parse().unwrap(),
+        ];
+        let client = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            SctpAssociation::connect(client_config),
+        )
+        .await
+        .expect("multihomed connect timed out")
+        .unwrap();
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), server.accept())
+            .await
+            .expect("multihomed accept timed out")
+            .unwrap();
+
+        let mut client_local = client.local_addresses().unwrap();
+        client_local.sort_unstable();
+        assert_eq!(client_local.len(), 2);
+        assert_eq!(client_local[0].ip().to_string(), "127.0.0.3");
+        assert_eq!(client_local[1].ip().to_string(), "127.0.0.4");
+
+        let mut client_peer = client.peer_addresses().unwrap();
+        client_peer.sort_unstable();
+        assert_eq!(client_peer, server_addresses);
+
+        client
+            .send(OutboundMessage::ordered(
+                Bytes::from_static(b"multihomed-sctp"),
+                0,
+                NGAP_PPID,
+            ))
+            .await
+            .unwrap();
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(5), recv_data(&accepted))
+                .await
+                .expect("multihomed payload timed out");
+        assert_eq!(received.payload, Bytes::from_static(b"multihomed-sctp"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux SCTP plus passwordless sudo for path isolation"]
+    async fn static_multihoming_survives_primary_path_drop() {
+        let mut server_config = SctpEndpointConfig::one_to_one("127.0.0.1:0".parse().unwrap());
+        server_config
+            .local_addrs
+            .push("127.0.0.2:0".parse().unwrap());
+        let server = SctpEndpoint::bind(server_config).unwrap();
+        let mut server_addresses = server.local_addresses().unwrap();
+        server_addresses.sort_unstable();
+        let server_port = server_addresses[0].port();
+
+        // Keep the secondary server address unreachable while the association
+        // forms, proving that the first address is the live initial path.
+        let secondary_block = SctpPathDrop::install("127.0.0.2", server_port);
+        let mut client_config = SctpConnectConfig::new(server_addresses[0]);
+        client_config.remote_addrs = server_addresses;
+        client_config.local_addrs = vec![
+            "127.0.0.3:0".parse().unwrap(),
+            "127.0.0.4:0".parse().unwrap(),
+        ];
+        let client = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            SctpAssociation::connect(client_config),
+        )
+        .await
+        .expect("primary SCTP path did not connect")
+        .unwrap();
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), server.accept())
+            .await
+            .expect("primary SCTP path was not accepted")
+            .unwrap();
+        client
+            .send(OutboundMessage::ordered(
+                Bytes::from_static(b"primary-path"),
+                0,
+                NGAP_PPID,
+            ))
+            .await
+            .unwrap();
+        let primary = tokio::time::timeout(std::time::Duration::from_secs(5), recv_data(&accepted))
+            .await
+            .expect("primary-path payload timed out");
+        assert_eq!(primary.payload, Bytes::from_static(b"primary-path"));
+
+        // Make the configured secondary address reachable, then remove the
+        // established primary. Delivery must continue on the same association.
+        secondary_block.remove();
+        let primary_block = SctpPathDrop::install("127.0.0.1", server_port);
+        client
+            .send(OutboundMessage::ordered(
+                Bytes::from_static(b"survived-path-failover"),
+                0,
+                NGAP_PPID,
+            ))
+            .await
+            .unwrap();
+        let failed_over =
+            tokio::time::timeout(std::time::Duration::from_secs(45), recv_data(&accepted))
+                .await
+                .expect("SCTP association did not fail over to the secondary path");
+        primary_block.remove();
+        assert_eq!(
+            failed_over.payload,
+            Bytes::from_static(b"survived-path-failover")
+        );
     }
 
     #[cfg(target_os = "linux")]
