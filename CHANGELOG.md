@@ -124,9 +124,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restore-scan, `InvalidReplicationSequence`, and `InvalidSessionTtl` variants,
   and `LeaseError` gains `InvalidSessionTtl`; external exhaustive matches must
   add arms for them. The new validation errors are serialized on v3 only in
-  response to malformed replication metadata or oversized TTLs. Valid v3
-  traffic is unchanged, but older v3 peers cannot decode a newly returned
-  variant and must be upgraded in the coordinated fleet rollout.
+  response to malformed replication metadata or oversized TTLs. Those changes
+  do not alter otherwise-valid v3 traffic, but older v3 peers cannot decode a
+  newly returned variant and must be upgraded in the coordinated fleet rollout.
+  The separate operation-tree contract below adds stricter v3 semantics.
+- **BREAKING — `opc-session-store`/`opc-session-net`:** replication operation
+  trees are now limited by public
+  `MAX_REPLICATION_OPERATION_DEPTH = 16` and
+  `MAX_REPLICATION_OPERATIONS_PER_ENTRY = 256`; the root is depth 1 and every
+  node, including `Batch`, counts toward the total. `StoreError` gains the
+  fieldless serialized `ReplicationOperationLimitExceeded` variant, so
+  exhaustive matches must add an arm and older v3 peers cannot decode it.
+  Mixed old/new v3 fleets are also not confidentiality-safe because an older
+  wrapper may forward a deeply nested CAS without encryption/sealing. Upgrade
+  every client, server, and wrapper participant as one coordinated fleet; do
+  not claim rolling compatibility. #134 must pin the limits and error encoding
+  in the versioned fixed-width DTO and handshake contract.
 - Documentation and package metadata now distinguish scoped implementation
   evidence, Cargo publication eligibility, and production maturity. Historical
   status snapshots, release-evidence primitives, and conditional
@@ -165,6 +178,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conditional codec candidate.
 
 ### Security
+- `opc-session-store`: `EncryptingSessionBackend` and
+  `RemoteSealingSessionBackend` now use bounded iterative traversal to protect
+  every nested replicated CAS before replicate/rebuild delegation and to
+  unprotect every nested CAS before log/watch exposure. Outbound entry/prefix
+  preflight occurs before provider/backend work; returned page/item preflight
+  occurs after the backend read but before transformation or caller exposure.
+  Both enforce depth 16 and 256 total operation nodes.
+  Provider calls are sequential and transformations are staged: a late provider
+  error may follow earlier provider calls, but causes no backend delegation on
+  writes and no partial entry/page exposure on reads. This closes #147's
+  traversal/confidentiality gap only; it does not establish consensus, wire
+  stabilization, or production HA.
+- `opc-session-store`/`opc-session-net`: existing replication logs are not
+  automatically scrubbed. Before the coordinated #147 upgrade, audit both tree
+  shape and nested payload encoding offline without logging payloads. An entry
+  within the new limits may be rewritten/rebuilt through the configured
+  protection wrapper. An over-depth/over-count historical entry fails closed
+  before transformation and is never clamped or split; it requires an audited
+  semantic-preserving offline migration or store replacement before the new SDK
+  reads it. Raw inner-backend rebuild does not add protection. #143 remains
+  mandatory and separately requires seamless SVID rotation,
+  payload-protection key rotation, and trust-bundle rotation evidence.
 - `opc-session-net`: bind every production connection's live certificate
   SPIFFE URI to the claimed stable `ReplicaId`, expected opposite replica,
   cluster, and complete-manifest configuration ID before backend dispatch; the
@@ -237,8 +272,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replication validation admits at most one microsecond of positive deadline
   drift solely for legacy `seconds_f64` rounding; new deadlines remain exact,
   the TTL maximum is unchanged, and larger mismatches fail closed.
-  Caller-authored absolute record expiry remains #148; recursively protecting
-  CAS payloads below multiple replicated-batch levels remains #147.
+  Caller-authored absolute record expiry remains #148; iterative protection of
+  CAS payloads below multiple replicated-batch levels is closed in the security
+  entry above under #147.
 - `opc-session-store`/`opc-session-net`/`opc-session-cache`: replication-log
   entries now reject sequence zero with the typed, redaction-safe
   `StoreError::InvalidReplicationSequence` before quorum assessment, state

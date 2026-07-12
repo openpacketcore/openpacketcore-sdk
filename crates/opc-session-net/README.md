@@ -46,6 +46,10 @@ connection to one authenticated member of one immutable replication manifest.
 - Replication append and rebuild calls validate sequence metadata before
   resolution or dispatch; malformed authenticated wire requests receive the
   typed store error without consuming the connection.
+- Replication entries, rebuild prefixes, returned log pages, and watch items
+  enforce `MAX_REPLICATION_OPERATION_DEPTH` (16) and
+  `MAX_REPLICATION_OPERATIONS_PER_ENTRY` (256). The root is depth 1 and every
+  operation node, including `Batch`, counts toward the per-entry total.
 - Acquire, renew, TTL refresh, batch, and nested replication requests enforce
   `opc_session_store::MAX_SESSION_TTL` (365 days) before resolution or backend
   dispatch. Zero remains valid and means immediate expiry.
@@ -143,15 +147,43 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 - TTL-bearing requests above 365 days are rejected with
   `StoreError::InvalidSessionTtl` or `LeaseError::InvalidSessionTtl` before
   dialing on the client and before backend dispatch on the server. The exact
-  maximum is accepted, zero means immediate expiry, and valid v3 wire traffic
-  is unchanged. The new serialized error variants require external exhaustive
-  matches and a coordinated same-v3 fleet upgrade; an older v3 peer cannot
-  decode a newly returned variant. Legacy persisted replication logs must be
+  maximum is accepted and zero means immediate expiry. The TTL request shape is
+  unchanged for entries within the operation-tree contract. The new serialized
+  error variants require external exhaustive matches and a coordinated same-v3
+  fleet upgrade; an older v3 peer cannot decode a newly returned variant.
+  Legacy persisted replication logs must be
   audited before upgrade because an entry carrying a larger TTL now fails
   closed during replay or rebuild rather than being clamped. Cross-field
   validation permits at most one microsecond of positive absolute-deadline
   drift solely for legacy `seconds_f64` rounding; new deadlines remain exact,
   the TTL maximum is unchanged, and larger mismatches fail closed.
+- Replication operation trees are validated iteratively and fail with the
+  fieldless `StoreError::ReplicationOperationLimitExceeded` when any entry
+  exceeds depth 16 or 256 total nodes. Outbound clients reject before
+  resolution/dialing; authenticated servers reject decoded requests before
+  backend dispatch; clients validate complete returned pages/items before
+  caller exposure. A typed rejection does not consume the connection.
+- Protection wrappers above the transport encrypt or remotely seal every
+  nested replicated CAS before replicate/rebuild delegation and decrypt or
+  unseal every nested CAS from log/watch reads. Provider calls are sequential,
+  and transformation is staged: a late provider failure may follow earlier
+  provider calls, but causes no backend delegation on writes and exposes no
+  partially transformed entry/page on reads.
+- This is a breaking same-v3 confidentiality boundary, not rolling-compatible
+  hardening. An older v3 peer cannot decode the new error, and an older wrapper
+  can still forward a deeply nested CAS without protection. Mixed SDK versions
+  are therefore not confidentiality-safe even though the protocol number is
+  still 3. Drain and upgrade every client, server, and wrapper participant as
+  one coordinated fleet before restoring traffic. #134 must pin the two limits
+  and error representation in the versioned fixed-width DTO and handshake
+  contract; this change does not claim wire stabilization.
+- Existing logs are not scrubbed automatically. Audit tree shape and payload
+  encoding offline before upgrade. A plaintext/unsealed nested CAS within the
+  new limits may use an explicit wrapper-mediated rewrite/rebuild. A historical
+  over-limit entry is rejected before transformation and cannot be ingested
+  unchanged; use a separately audited semantic-preserving offline migration or
+  replace the store before starting the new SDK. Never clamp or split the entry
+  ad hoc; a raw inner-backend rebuild preserves the protection gap.
 - Remote scan and fresh-probe transport parity do not by themselves qualify
   networked session HA for production. Protocol v3 authenticates membership;
   it does not establish consensus, durable sequence/commit authority,
@@ -161,9 +193,10 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 
 ## Roadmap
 
-- Close #127–#129, #133–#135, #145, #147, and #148; add distributed failure
-  and soak evidence, including the seamless certificate/trust-rotation
-  qualification in #143, before treating this as production transport.
+- Close #127–#129, #133–#135, #145, and #148; add distributed failure and soak
+  evidence, including seamless SVID rotation, payload-protection key rotation,
+  and trust-bundle rotation qualification in #143, before treating this as
+  production transport.
 - Keep plaintext transport limited to tests.
 - Keep the server wrapping `SessionStoreBackend` rather than owning storage.
 
@@ -174,8 +207,10 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 - `tests/authenticated_replica_identity.rs` covers exact identity, routing
   aliases, certificate/claim/scope mismatches, downgrade and malformed Hello,
   reconnect/rotation, relabeling, and replayed challenge responses over mTLS.
-- `tests/three_node_quorum.rs` covers typed TTL rejection before resolution and
-  authenticated server dispatch plus connection reuse after rejection.
+- `tests/three_node_quorum.rs` covers typed TTL and replication-tree-limit
+  rejection before resolution and authenticated server dispatch, plus
+  connection reuse after rejection. Client/server suites also cover malformed
+  log/watch output rejection before caller exposure.
 - Run with: `cargo test -p opc-session-net --all-features`.
 
 ## License

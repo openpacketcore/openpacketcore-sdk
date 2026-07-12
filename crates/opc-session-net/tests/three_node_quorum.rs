@@ -26,10 +26,11 @@ use opc_session_store::model::{
 use opc_session_store::quorum::{FencedSessionReplica, QuorumSessionStore, SessionStoreBackend};
 use opc_session_store::record::{EncryptedSessionPayload, StoredSessionRecord};
 use opc_session_store::{
-    DurableReadinessOptions, DurableReadinessState, QuorumReplicaDescriptor, QuorumReplicaMember,
-    QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
-    ReplicaReadinessFailure, ReplicaTlsIdentity, RestoreScanCursor, RestoreScanRequest,
-    RestoreScanScope, SqliteSessionBackend, StoreError, ValidatedQuorumTopology,
+    validate_replication_prefix_owned, DurableReadinessOptions, DurableReadinessState,
+    QuorumReplicaDescriptor, QuorumReplicaMember, QuorumTopologyConfig, ReplicaBackingIdentity,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaReadinessFailure, ReplicaTlsIdentity,
+    RestoreScanCursor, RestoreScanRequest, RestoreScanScope, SqliteSessionBackend, StoreError,
+    ValidatedQuorumTopology, MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
@@ -187,6 +188,35 @@ fn forged_refresh_deadline_entry(
     }
 }
 
+fn operation_tree_at_depth(depth: usize) -> ReplicationOp {
+    let mut op = ReplicationOp::Batch { ops: Vec::new() };
+    for _ in 1..depth {
+        op = ReplicationOp::Batch { ops: vec![op] };
+    }
+    op
+}
+
+fn over_depth_replication_entry(sequence: u64) -> ReplicationEntry {
+    ReplicationEntry {
+        sequence,
+        tx_id: format!("over-depth-{sequence}"),
+        op: operation_tree_at_depth(MAX_REPLICATION_OPERATION_DEPTH + 1),
+        timestamp: Timestamp::now_utc(),
+    }
+}
+
+fn over_count_replication_entry(sequence: u64) -> ReplicationEntry {
+    let ops = (0..MAX_REPLICATION_OPERATIONS_PER_ENTRY)
+        .map(|_| ReplicationOp::Batch { ops: Vec::new() })
+        .collect();
+    ReplicationEntry {
+        sequence,
+        tx_id: format!("over-count-{sequence}"),
+        op: ReplicationOp::Batch { ops },
+        timestamp: Timestamp::now_utc(),
+    }
+}
+
 #[derive(Clone)]
 struct ReplicationDispatchSpy {
     inner: FakeSessionBackend,
@@ -295,6 +325,108 @@ impl SessionLeaseManager for ReplicationDispatchSpy {
         ttl: Duration,
     ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
         self.renew_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.renew(lease, ttl).await
+    }
+
+    async fn release(
+        &self,
+        lease: opc_session_store::LeaseGuard,
+    ) -> Result<(), opc_session_store::LeaseError> {
+        self.inner.release(lease).await
+    }
+}
+
+#[derive(Clone)]
+struct MalformedReplicationOutputBackend {
+    inner: ReplicationDispatchSpy,
+    log_calls: Arc<AtomicUsize>,
+    watch_calls: Arc<AtomicUsize>,
+}
+
+impl MalformedReplicationOutputBackend {
+    fn new() -> Self {
+        Self {
+            inner: ReplicationDispatchSpy::new(),
+            log_calls: Arc::new(AtomicUsize::new(0)),
+            watch_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionBackend for MalformedReplicationOutputBackend {
+    async fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities().await
+    }
+
+    async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        self.inner.get(key).await
+    }
+
+    async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        self.inner.compare_and_set(op).await
+    }
+
+    async fn delete_fenced(&self, lease: &opc_session_store::LeaseGuard) -> Result<(), StoreError> {
+        self.inner.delete_fenced(lease).await
+    }
+
+    async fn refresh_ttl(
+        &self,
+        lease: &opc_session_store::LeaseGuard,
+        ttl: Duration,
+    ) -> Result<(), StoreError> {
+        self.inner.refresh_ttl(lease, ttl).await
+    }
+
+    async fn batch(
+        &self,
+        ops: Vec<opc_session_store::SessionOp>,
+    ) -> Result<Vec<opc_session_store::SessionOpResult>, StoreError> {
+        self.inner.batch(ops).await
+    }
+
+    async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
+        self.inner.max_replication_sequence().await
+    }
+
+    async fn get_replication_log(
+        &self,
+        _start: u64,
+        _limit: usize,
+    ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        self.log_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![over_depth_replication_entry(1)])
+    }
+
+    async fn watch(
+        &self,
+        _start_sequence: u64,
+    ) -> Result<
+        futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
+        StoreError,
+    > {
+        self.watch_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(futures_util::stream::iter(vec![Ok(over_count_replication_entry(1))]).boxed())
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionLeaseManager for MalformedReplicationOutputBackend {
+    async fn acquire(
+        &self,
+        key: &SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+    ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
+        self.inner.acquire(key, owner, ttl).await
+    }
+
+    async fn renew(
+        &self,
+        lease: &opc_session_store::LeaseGuard,
+        ttl: Duration,
+    ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
         self.inner.renew(lease, ttl).await
     }
 
@@ -605,6 +737,55 @@ async fn remote_client_rejects_zero_sequence_before_resolve_or_retry() {
 }
 
 #[tokio::test]
+async fn remote_client_rejects_operation_limits_before_resolve_or_dispatch() {
+    let mtls = mtls_configs();
+    let backend = ReplicationDispatchSpy::new();
+    let (addr, backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let resolve_calls = Arc::new(AtomicUsize::new(0));
+    let resolve_calls_for_request = Arc::clone(&resolve_calls);
+    let resolver: RemoteAddrResolver = Arc::new(move || {
+        let resolve_calls = Arc::clone(&resolve_calls_for_request);
+        Box::pin(async move {
+            resolve_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(addr)
+        })
+    });
+    let remote = RemoteSessionBackend::new_with_resolver(
+        mtls.remote_binding(1, 2),
+        resolver,
+        mtls.client_config(1),
+        Some(Duration::from_millis(500)),
+    );
+
+    for entry in [
+        over_depth_replication_entry(1),
+        over_count_replication_entry(1),
+    ] {
+        let error = remote
+            .replicate_entry(entry)
+            .await
+            .expect_err("an over-limit entry must be rejected locally");
+        assert_eq!(error, StoreError::ReplicationOperationLimitExceeded);
+    }
+
+    for entry in [
+        over_depth_replication_entry(1),
+        over_count_replication_entry(1),
+    ] {
+        let error = remote
+            .rebuild_replication_state(vec![entry])
+            .await
+            .expect_err("an over-limit rebuild must be rejected locally");
+        assert_eq!(error, StoreError::ReplicationOperationLimitExceeded);
+    }
+
+    assert_eq!(resolve_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.replicate_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.rebuild_calls.load(Ordering::SeqCst), 0);
+    handle.abort();
+}
+
+#[tokio::test]
 async fn remote_client_rejects_invalid_ttls_before_resolve_or_retry() {
     let mtls = mtls_configs();
     let backend = ReplicationDispatchSpy::new();
@@ -815,6 +996,197 @@ async fn authenticated_server_rejects_wire_zero_and_keeps_connection_usable() {
     let follow_up: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
         .await
         .expect("read follow-up on retained connection");
+    assert!(matches!(follow_up, Response::MaxReplicationSequence(Ok(0))));
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn authenticated_server_rejects_operation_limits_and_keeps_connection_usable() {
+    use opc_session_net::protocol::{
+        read_frame, write_frame, CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE, SESSION_NET_ALPN,
+    };
+    use opc_session_net::{Request, Response};
+
+    let mtls = mtls_configs();
+    let backend = ReplicationDispatchSpy::new();
+    let (addr, backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let mut client_config = mtls.client_config(1).rustls_config().as_ref().clone();
+    client_config.alpn_protocols = vec![SESSION_NET_ALPN.to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to replication server");
+    let server_name = rustls_pki_types::ServerName::IpAddress(addr.ip().into());
+    let mut stream = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("mutual TLS connection");
+
+    let binding = mtls.remote_binding(1, 2);
+    let nonce = uuid::Uuid::new_v4();
+    write_frame(
+        &mut stream,
+        &Request::Hello {
+            contract_version: CONTRACT_VERSION,
+            node_id: binding.local_replica_id().as_str().to_string(),
+            expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
+            cluster_id: Some(binding.cluster_id().as_str().to_string()),
+            configuration_id: Some(binding.configuration_id().to_hex()),
+            handshake_nonce: Some(nonce),
+        },
+    )
+    .await
+    .expect("write authenticated hello");
+    let hello: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read authenticated hello response");
+    assert!(matches!(
+        hello,
+        Response::HelloAck {
+            contract_version: CONTRACT_VERSION,
+            handshake_nonce: Some(echoed),
+            ..
+        } if echoed == nonce
+    ));
+
+    let request = Request::ReplicateEntry {
+        entry: over_depth_replication_entry(1),
+    };
+    write_frame(&mut stream, &request)
+        .await
+        .expect("write over-depth replication entry");
+    let Request::ReplicateEntry { entry } = request else {
+        unreachable!("test request shape is fixed")
+    };
+    drop(entry.into_validated());
+
+    let rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read typed depth-limit rejection");
+    assert!(matches!(
+        rejected,
+        Response::ReplicateEntry(Err(StoreError::ReplicationOperationLimitExceeded))
+    ));
+    assert_eq!(backend.replicate_calls.load(Ordering::SeqCst), 0);
+
+    let request = Request::RebuildReplicationState {
+        entries: vec![over_count_replication_entry(1)],
+    };
+    write_frame(&mut stream, &request)
+        .await
+        .expect("write over-count replication rebuild");
+    let Request::RebuildReplicationState { entries } = request else {
+        unreachable!("test request shape is fixed")
+    };
+    drop(validate_replication_prefix_owned(entries));
+
+    let rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read typed count-limit rejection");
+    assert!(matches!(
+        rejected,
+        Response::RebuildReplicationState(Err(StoreError::ReplicationOperationLimitExceeded))
+    ));
+    assert_eq!(backend.rebuild_calls.load(Ordering::SeqCst), 0);
+
+    write_frame(&mut stream, &Request::MaxReplicationSequence)
+        .await
+        .expect("write valid follow-up on retained connection");
+    let follow_up: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read valid follow-up on retained connection");
+    assert!(matches!(follow_up, Response::MaxReplicationSequence(Ok(0))));
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn authenticated_server_rejects_malformed_backend_log_and_watch_output() {
+    use opc_session_net::protocol::{
+        read_frame, write_frame, CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE, SESSION_NET_ALPN,
+    };
+    use opc_session_net::{Request, Response};
+
+    let mtls = mtls_configs();
+    let backend = MalformedReplicationOutputBackend::new();
+    let (addr, backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let mut client_config = mtls.client_config(1).rustls_config().as_ref().clone();
+    client_config.alpn_protocols = vec![SESSION_NET_ALPN.to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to replication server");
+    let server_name = rustls_pki_types::ServerName::IpAddress(addr.ip().into());
+    let mut stream = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("mutual TLS connection");
+
+    let binding = mtls.remote_binding(1, 2);
+    let nonce = uuid::Uuid::new_v4();
+    write_frame(
+        &mut stream,
+        &Request::Hello {
+            contract_version: CONTRACT_VERSION,
+            node_id: binding.local_replica_id().as_str().to_string(),
+            expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
+            cluster_id: Some(binding.cluster_id().as_str().to_string()),
+            configuration_id: Some(binding.configuration_id().to_hex()),
+            handshake_nonce: Some(nonce),
+        },
+    )
+    .await
+    .expect("write authenticated hello");
+    let hello: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read authenticated hello");
+    assert!(matches!(
+        hello,
+        Response::HelloAck {
+            contract_version: CONTRACT_VERSION,
+            handshake_nonce: Some(echoed),
+            ..
+        } if echoed == nonce
+    ));
+
+    write_frame(
+        &mut stream,
+        &Request::GetReplicationLog { start: 1, limit: 1 },
+    )
+    .await
+    .expect("request malformed backend log output");
+    let response: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read rejected backend log output");
+    assert!(matches!(
+        response,
+        Response::GetReplicationLog(Err(StoreError::ReplicationOperationLimitExceeded))
+    ));
+    assert_eq!(backend.log_calls.load(Ordering::SeqCst), 1);
+
+    write_frame(&mut stream, &Request::Watch { start_sequence: 1 })
+        .await
+        .expect("request malformed backend watch output");
+    let response: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read watch acknowledgement");
+    assert!(matches!(response, Response::WatchStream));
+    let response: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read rejected backend watch output");
+    assert!(matches!(
+        response,
+        Response::WatchEntry(Err(StoreError::ReplicationOperationLimitExceeded))
+    ));
+    assert_eq!(backend.watch_calls.load(Ordering::SeqCst), 1);
+
+    write_frame(&mut stream, &Request::MaxReplicationSequence)
+        .await
+        .expect("write valid follow-up on retained connection");
+    let follow_up: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read valid follow-up on retained connection");
     assert!(matches!(follow_up, Response::MaxReplicationSequence(Ok(0))));
 
     handle.abort();

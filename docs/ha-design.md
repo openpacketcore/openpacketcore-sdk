@@ -96,7 +96,8 @@ fork recovery (#127–#129), and bounded majority-authoritative restore (#133)
 remain open. Wire-width and shared model-decoding hardening remain #134/#135.
 Checked session TTL and replication-sequence handling now fail closed at
 direct, wrapper, cache, SQLite, quorum, and authenticated transport boundaries
-under #137/#138. These input-safety fixes do not provide durable authority.
+under #137/#138. Bounded iterative protection of every nested replicated CAS is
+implemented under #147. These boundary fixes do not provide durable authority.
 
 `QuorumSessionStore` coordinates session leases and CAS mutations across a set of `SessionStoreBackend` replicas using quorum-backed ordered replication. It is not a Raft implementation; its target safety contract is a durable committed log prefix where an entry is authoritative only after the same sequence entry is present on a majority of replicas.
 
@@ -170,8 +171,9 @@ application/backend mutation or provider work: clients reject before
 resolution/dialing, while servers reject after request receipt but before
 backend dispatch and may return the typed response. The new public and
 serialized error variants require external exhaustive matches and a
-coordinated same-v3 fleet upgrade; valid v3 wire traffic is unchanged. Operators
-must audit legacy persisted logs before upgrade because a TTL-bearing entry
+coordinated same-v3 fleet upgrade. The TTL wire shape is unchanged for entries
+admitted by the operation-tree contract below. Operators must audit legacy
+persisted logs before upgrade because a TTL-bearing entry
 above the bound now fails closed during replay/rebuild rather than being
 clamped or rewritten. Replicated deadline validation permits at most one
 microsecond above exact `entry.timestamp + ttl` for legacy `seconds_f64`
@@ -181,8 +183,47 @@ larger mismatches fail closed.
 This closes only the duration-input/process-availability gap in #137. It does
 not make a majority-visible entry committed and does not change the open
 consensus, repair, restore, or qualification work. Caller-authored absolute
-record expiry remains #148, and recursive encryption/sealing of deeply nested
-replicated CAS payloads remains #147.
+record expiry remains #148.
+
+### Bounded protected replication trees
+
+`MAX_REPLICATION_OPERATION_DEPTH` is 16 and
+`MAX_REPLICATION_OPERATIONS_PER_ENTRY` is 256. The root is depth 1, each child
+increments depth, and every operation node—including each `Batch`—counts toward
+the entry total. Validation and transformation use iterative traversal. An
+over-limit entry fails with the fieldless
+`StoreError::ReplicationOperationLimitExceeded`, without exposing count, depth,
+key, payload, provider detail, or nesting shape.
+
+Entry and complete rebuild-prefix preflight finishes before provider or backend
+work. Complete returned pages are validated before transformation or caller
+exposure. `EncryptingSessionBackend` and `RemoteSealingSessionBackend` protect
+every nested CAS on replicate/rebuild and unprotect every nested CAS on log and
+watch reads. Provider calls remain sequential and operation order/non-payload
+fields are preserved. A late provider error may follow earlier provider calls,
+but a write performs no backend delegation and a read exposes no partially
+transformed entry/page; earlier independent watch items may already have been
+yielded.
+
+This is a breaking confidentiality contract within protocol v3. An older peer
+cannot decode the new error, and an older wrapper may forward a deep CAS as
+plaintext/unsealed data. Mixed versions are not confidentiality-safe and must
+not be called rolling-compatible. Drain and upgrade all clients, servers, and
+wrapper participants together. #134 still owns a versioned fixed-width DTO and
+handshake contract that pins these two limits and the error encoding.
+
+Historical nested plaintext is not automatically scrubbed. Operators must
+audit persisted tree shape and payload encoding offline before upgrade. Entries
+within the new limits may be explicitly rewritten/rebuilt through the configured
+protection wrapper. Over-limit history fails before transformation and requires
+a separately reviewed atomicity-preserving offline migration or audited store
+replacement before the new SDK starts; it must not be clamped or split ad hoc.
+Raw inner-backend rebuild does not add protection.
+
+#147 closes only this bounded nested-payload path. The session profile remains
+experimental and blocked on #143 and its other dependencies. Seamless SVID
+rotation, payload-protection key rotation, and trust-bundle rotation remain
+separate mandatory production qualifications.
 
 ### Authenticated network transport (protocol v3)
 
@@ -206,6 +247,12 @@ The exact v3 ALPN and handshake have no production fallback to v2. A v2-to-v3
 change is a coordinated stop/upgrade/start of all clients and servers, not a
 mixed-version rolling deployment.
 
+The #147 confidentiality contract is also coordinated even though both old and
+new builds identify as v3: mixed builds cannot negotiate the new operation-tree
+limits and are not confidentiality-safe. #134 must make that contract explicit
+in the versioned DTO/handshake rather than relying on an SDK-version
+assumption.
+
 Session caches, tickets, resumption, early data, and 0-RTT are disabled, so a
 reconnect performs a full mutual-TLS certificate exchange. Production still
 requires seamless certificate and trust-bundle rotation without interrupting
@@ -221,7 +268,7 @@ Authenticated membership does not make protocol v3 a consensus algorithm and
 does not reconcile a divergent or forked log.
 
 ### Log & Replication Model
-- **Persisted Replica Logs**: The current coordinator assigns sequence numbers to replicated mutations (AcquireLease, RenewLease, ReleaseLease, CompareAndSet, DeleteFenced, RefreshTtl, Batch), and each accepting replica writes them to `session_replication_log`. Leader/term-gated global sequence authority remains #127.
+- **Persisted Replica Logs**: The current coordinator assigns sequence numbers to replicated mutations (AcquireLease, RenewLease, ReleaseLease, CompareAndSet, DeleteFenced, RefreshTtl, Batch), and each accepting replica writes them to `session_replication_log`. Operation trees are bounded to depth 16 and 256 total nodes, and protection wrappers iteratively transform every nested CAS before delegation/exposure. Leader/term-gated global sequence authority remains #127.
 - **Idempotency & Replay Semantics**: Duplicate delivery is handled safely. Before appending, replicas check whether the entry's sequence has already been applied. Only an exact full-entry match is accepted as an idempotent success; reusing the same transaction ID with a changed operation or timestamp fails closed as divergence. Replaying an exact entry does not mutate the state twice.
 - **Current Majority-Visible Prefix Heuristic**: The coordinator compares fresh logs visible from the configured majority. It may append a missing suffix to an exact strict-prefix replica, but a conflict or longer minority tail fails with `RecoveryRequired` and is not truncated. This remains a heuristic, not durable commit proof: without #127/#128, a later visible majority may still omit a previously acknowledged entry.
 - **Resume Tokens / Watch Cursors**: Exposes watches backed by sequence numbers, allowing consumers to supply sequence cursors and resume receiving updates from the exact sequence they left off.
@@ -288,3 +335,7 @@ distributed commit or repair proof (#127/#128).
   and `Duration::MAX` across direct, nested, persisted, quorum, and
   authenticated-wire paths, including no-partial-effect and near-maximum-clock
   cases.
+- **Nested payload protection**: Exercises depth/count edges, deep CAS
+  encryption/sealing round trips through replicate/rebuild/log/watch, complete
+  prefix/page preflight, sequential-provider failure, and no backend delegation
+  or partial entry/page exposure.

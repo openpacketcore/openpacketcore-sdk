@@ -27,8 +27,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::backend::{
-    next_replication_sequence, validate_replication_page, validate_session_ops_ttls, CompareAndSet,
-    CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend, SessionOp,
+    next_replication_sequence, validate_replication_page_owned, validate_session_ops_ttls,
+    CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend, SessionOp,
     SessionOpResult,
 };
 use crate::capability::BackendCapabilities;
@@ -370,13 +370,13 @@ impl QuorumSessionStore {
                     continue;
                 }
                 Ok(Err(_)) => return Err(ReplicaReadinessFailure::LogUnavailable),
-                Ok(Ok(page)) => page,
+                Ok(Ok(page)) => match validate_replication_page_owned(page) {
+                    Ok(page) => page,
+                    Err(_) => return Err(ReplicaReadinessFailure::Divergent),
+                },
             };
 
             if page.is_empty() || page.len() > request_limit {
-                return Err(ReplicaReadinessFailure::Divergent);
-            }
-            if page.iter().any(|entry| entry.validate().is_err()) {
                 return Err(ReplicaReadinessFailure::Divergent);
             }
             let page_is_contiguous = page.iter().enumerate().all(|(offset, entry)| {
@@ -836,12 +836,7 @@ impl QuorumSessionStore {
         for id in ready_ids {
             if let Ok(stream) = self.replica(id).inner.watch(start_sequence).await {
                 return Ok(stream
-                    .map(|result| {
-                        result.and_then(|entry| {
-                            entry.validate()?;
-                            Ok(entry)
-                        })
-                    })
+                    .map(|result| result.and_then(ReplicationEntry::into_validated))
                     .boxed());
             }
         }
@@ -1092,12 +1087,11 @@ impl SessionBackend for QuorumSessionStore {
             .filter(|entry| entry.sequence >= start)
             .take(limit)
             .collect::<Vec<_>>();
-        validate_replication_page(&entries)?;
-        Ok(entries)
+        validate_replication_page_owned(entries)
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate()?;
+        let entry = entry.into_validated()?;
         let (online_ids, committed_entries) = self.committed_and_repaired().await?;
         let committed_seq = committed_entries
             .last()

@@ -10,7 +10,7 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::Stream;
 use opc_session_store::backend::{
-    validate_replication_page, validate_replication_prefix, BackendInstanceIdentity,
+    validate_replication_page_owned, validate_replication_prefix_owned, BackendInstanceIdentity,
     BackendPeerBinding, CompareAndSet, CompareAndSetResult, ReplicationEntry, SessionBackend,
     SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
 };
@@ -309,7 +309,22 @@ where
             Ok(())
         }
         Response::HelloRejected { .. } => Err(ProtocolError::Authentication),
-        _ => Err(ProtocolError::UnexpectedResponse),
+        response => {
+            discard_replication_payloads_from_response(response);
+            Err(ProtocolError::UnexpectedResponse)
+        }
+    }
+}
+
+fn discard_replication_payloads_from_response(response: Response) {
+    match response {
+        Response::GetReplicationLog(Ok(entries)) => {
+            drop(validate_replication_page_owned(entries));
+        }
+        Response::WatchEntry(Ok(entry)) => {
+            drop(entry.into_validated());
+        }
+        _ => {}
     }
 }
 
@@ -616,7 +631,10 @@ impl SessionBackend for RemoteSessionBackend {
                 self.remember_capabilities(caps);
                 self.capabilities_for_transport(caps, true)
             }
-            Ok(_) => self.capabilities_after_probe_failure("unexpected_response"),
+            Ok(response) => {
+                discard_replication_payloads_from_response(response);
+                self.capabilities_after_probe_failure("unexpected_response")
+            }
             Err(err) => {
                 let reason = store_error_kind(&err);
                 self.capabilities_after_probe_failure(reason)
@@ -631,7 +649,10 @@ impl SessionBackend for RemoteSessionBackend {
         {
             Response::Get(res) => res,
             Response::Error { message } => Err(StoreError::BackendUnavailable(message)),
-            _ => Err(StoreError::BackendUnavailable("unexpected response".into())),
+            response => {
+                discard_replication_payloads_from_response(response);
+                Err(StoreError::BackendUnavailable("unexpected response".into()))
+            }
         }
     }
 
@@ -645,7 +666,10 @@ impl SessionBackend for RemoteSessionBackend {
         {
             Response::CompareAndSet(res) => res,
             Response::Error { message } => Err(StoreError::BackendUnavailable(message)),
-            _ => Err(StoreError::BackendUnavailable("unexpected response".into())),
+            response => {
+                discard_replication_payloads_from_response(response);
+                Err(StoreError::BackendUnavailable("unexpected response".into()))
+            }
         }
     }
 
@@ -658,7 +682,10 @@ impl SessionBackend for RemoteSessionBackend {
         {
             Response::DeleteFenced(res) => res,
             Response::Error { message } => Err(StoreError::BackendUnavailable(message)),
-            _ => Err(StoreError::BackendUnavailable("unexpected response".into())),
+            response => {
+                discard_replication_payloads_from_response(response);
+                Err(StoreError::BackendUnavailable("unexpected response".into()))
+            }
         }
     }
 
@@ -673,7 +700,10 @@ impl SessionBackend for RemoteSessionBackend {
         {
             Response::RefreshTtl(res) => res,
             Response::Error { message } => Err(StoreError::BackendUnavailable(message)),
-            _ => Err(StoreError::BackendUnavailable("unexpected response".into())),
+            response => {
+                discard_replication_payloads_from_response(response);
+                Err(StoreError::BackendUnavailable("unexpected response".into()))
+            }
         }
     }
 
@@ -684,7 +714,10 @@ impl SessionBackend for RemoteSessionBackend {
         match self.send_request_with_retry(Request::Batch { ops }).await? {
             Response::Batch(res) => res,
             Response::Error { message } => Err(StoreError::BackendUnavailable(message)),
-            _ => Err(StoreError::BackendUnavailable("unexpected response".into())),
+            response => {
+                discard_replication_payloads_from_response(response);
+                Err(StoreError::BackendUnavailable("unexpected response".into()))
+            }
         }
     }
 
@@ -751,7 +784,8 @@ impl SessionBackend for RemoteSessionBackend {
                     "remote restore scan returned a protocol error".to_string(),
                 ))
             }
-            _ => {
+            response => {
+                discard_replication_payloads_from_response(response);
                 self.discard_connection().await;
                 tracing::warn!(
                     target = %self.target,
@@ -770,7 +804,10 @@ impl SessionBackend for RemoteSessionBackend {
         {
             Response::MaxReplicationSequence(res) => res,
             Response::Error { message } => Err(StoreError::BackendUnavailable(message)),
-            _ => Err(StoreError::BackendUnavailable("unexpected response".into())),
+            response => {
+                discard_replication_payloads_from_response(response);
+                Err(StoreError::BackendUnavailable("unexpected response".into()))
+            }
         }
     }
 
@@ -786,7 +823,8 @@ impl SessionBackend for RemoteSessionBackend {
                 self.discard_connection().await;
                 Err(ReplicaReadinessFailure::Protocol)
             }
-            _ => {
+            response => {
+                discard_replication_payloads_from_response(response);
                 self.discard_connection().await;
                 Err(ReplicaReadinessFailure::Protocol)
             }
@@ -804,23 +842,28 @@ impl SessionBackend for RemoteSessionBackend {
         {
             Response::GetReplicationLog(res) => {
                 let entries = res?;
-                validate_replication_page(&entries)?;
-                Ok(entries)
+                validate_replication_page_owned(entries)
             }
             Response::Error { message } => Err(StoreError::BackendUnavailable(message)),
-            _ => Err(StoreError::BackendUnavailable("unexpected response".into())),
+            response => {
+                discard_replication_payloads_from_response(response);
+                Err(StoreError::BackendUnavailable("unexpected response".into()))
+            }
         }
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate()?;
+        let entry = entry.into_validated()?;
         match self
             .send_request_with_retry(Request::ReplicateEntry { entry })
             .await?
         {
             Response::ReplicateEntry(res) => res,
             Response::Error { message } => Err(StoreError::BackendUnavailable(message)),
-            _ => Err(StoreError::BackendUnavailable("unexpected response".into())),
+            response => {
+                discard_replication_payloads_from_response(response);
+                Err(StoreError::BackendUnavailable("unexpected response".into()))
+            }
         }
     }
 
@@ -828,14 +871,17 @@ impl SessionBackend for RemoteSessionBackend {
         &self,
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
-        validate_replication_prefix(&entries)?;
+        let entries = validate_replication_prefix_owned(entries)?;
         match self
             .send_request_with_retry(Request::RebuildReplicationState { entries })
             .await?
         {
             Response::RebuildReplicationState(res) => res,
             Response::Error { message } => Err(StoreError::BackendUnavailable(message)),
-            _ => Err(StoreError::BackendUnavailable("unexpected response".into())),
+            response => {
+                discard_replication_payloads_from_response(response);
+                Err(StoreError::BackendUnavailable("unexpected response".into()))
+            }
         }
     }
 
@@ -877,7 +923,10 @@ impl SessionBackend for RemoteSessionBackend {
         match self.send_request_with_retry(Request::NextLeaseInfo).await? {
             Response::NextLeaseInfo(res) => res,
             Response::Error { message } => Err(StoreError::BackendUnavailable(message)),
-            _ => Err(StoreError::BackendUnavailable("unexpected response".into())),
+            response => {
+                discard_replication_payloads_from_response(response);
+                Err(StoreError::BackendUnavailable("unexpected response".into()))
+            }
         }
     }
 }
@@ -901,7 +950,10 @@ impl SessionLeaseManager for RemoteSessionBackend {
         {
             Response::AcquireLease(res) => res,
             Response::Error { message } => Err(LeaseError::Backend(message)),
-            _ => Err(LeaseError::Backend("unexpected response".into())),
+            response => {
+                discard_replication_payloads_from_response(response);
+                Err(LeaseError::Backend("unexpected response".into()))
+            }
         }
     }
 
@@ -916,7 +968,10 @@ impl SessionLeaseManager for RemoteSessionBackend {
         {
             Response::RenewLease(res) => res,
             Response::Error { message } => Err(LeaseError::Backend(message)),
-            _ => Err(LeaseError::Backend("unexpected response".into())),
+            response => {
+                discard_replication_payloads_from_response(response);
+                Err(LeaseError::Backend("unexpected response".into()))
+            }
         }
     }
 
@@ -927,7 +982,10 @@ impl SessionLeaseManager for RemoteSessionBackend {
         {
             Response::ReleaseLease(res) => res,
             Response::Error { message } => Err(LeaseError::Backend(message)),
-            _ => Err(LeaseError::Backend("unexpected response".into())),
+            response => {
+                discard_replication_payloads_from_response(response);
+                Err(LeaseError::Backend("unexpected response".into()))
+            }
         }
     }
 }
@@ -951,7 +1009,10 @@ async fn watch_connect_and_read(
             Response::Error { .. } => Err(ProtocolError::BackendUnavailable(
                 "watch request rejected".to_string(),
             )),
-            _ => Err(ProtocolError::UnexpectedResponse),
+            response => {
+                discard_replication_payloads_from_response(response);
+                Err(ProtocolError::UnexpectedResponse)
+            }
         }
     };
     let mut reader = match tokio::time::timeout(deadline, open).await {
@@ -971,15 +1032,13 @@ async fn watch_connect_and_read(
     loop {
         match read_frame::<_, Response>(&mut reader, max_frame_size).await {
             Ok(Response::WatchEntry(item)) => {
-                let item = item.and_then(|entry| {
-                    entry.validate()?;
-                    Ok(entry)
-                });
+                let item = item.and_then(ReplicationEntry::into_validated);
                 if tx.send(item).await.is_err() {
                     break;
                 }
             }
-            Ok(_) => {
+            Ok(response) => {
+                discard_replication_payloads_from_response(response);
                 let _ = tx
                     .send(Err(StoreError::BackendUnavailable(
                         "unexpected watch frame".into(),
@@ -1014,6 +1073,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::BackendUnavailable(_) => "backend_unavailable",
         StoreError::InvalidKey(_) => "invalid_key",
         StoreError::InvalidReplicationSequence => "invalid_replication_sequence",
+        StoreError::ReplicationOperationLimitExceeded => "replication_operation_limit_exceeded",
         StoreError::InvalidSessionTtl => "invalid_session_ttl",
         StoreError::LeaseHeld => "lease_held",
         StoreError::LeaseExpired => "lease_expired",
@@ -1043,7 +1103,9 @@ impl Stream for WatchStream {
 mod tests {
     use super::*;
     use futures_util::{FutureExt, StreamExt};
-    use opc_session_store::BackendCapabilities;
+    use opc_session_store::{
+        BackendCapabilities, MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
 
@@ -1093,6 +1155,35 @@ mod tests {
                 expires_at,
             },
             timestamp,
+        }
+    }
+
+    fn operation_tree_at_depth(depth: usize) -> opc_session_store::ReplicationOp {
+        let mut op = opc_session_store::ReplicationOp::Batch { ops: Vec::new() };
+        for _ in 1..depth {
+            op = opc_session_store::ReplicationOp::Batch { ops: vec![op] };
+        }
+        op
+    }
+
+    fn over_depth_replication_entry() -> ReplicationEntry {
+        ReplicationEntry {
+            sequence: 1,
+            tx_id: "over-depth-response".to_string(),
+            op: operation_tree_at_depth(MAX_REPLICATION_OPERATION_DEPTH + 1),
+            timestamp: opc_types::Timestamp::now_utc(),
+        }
+    }
+
+    fn over_count_replication_entry() -> ReplicationEntry {
+        let ops = (0..MAX_REPLICATION_OPERATIONS_PER_ENTRY)
+            .map(|_| opc_session_store::ReplicationOp::Batch { ops: Vec::new() })
+            .collect();
+        ReplicationEntry {
+            sequence: 1,
+            tx_id: "over-count-response".to_string(),
+            op: opc_session_store::ReplicationOp::Batch { ops },
+            timestamp: opc_types::Timestamp::now_utc(),
         }
     }
 
@@ -1446,6 +1537,96 @@ mod tests {
             .expect("watch error item")
             .expect_err("forged watch deadline must fail closed");
         assert_eq!(error, StoreError::InvalidSessionTtl);
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn over_limit_replication_log_entry_is_rejected_before_return() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read hello");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write hello ack");
+            let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read replication-log request");
+            assert!(matches!(request, Request::GetReplicationLog { .. }));
+
+            let response = Response::GetReplicationLog(Ok(vec![over_depth_replication_entry()]));
+            write_frame(&mut stream, &response)
+                .await
+                .expect("write over-depth replication-log response");
+            let Response::GetReplicationLog(Ok(entries)) = response else {
+                unreachable!("test response shape is fixed")
+            };
+            drop(validate_replication_page_owned(entries));
+        });
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+
+        let error = match backend.get_replication_log(1, 1).await {
+            Err(error) => error,
+            Ok(entries) => {
+                drop(validate_replication_page_owned(entries));
+                panic!("an over-depth log entry must not be returned")
+            }
+        };
+        assert_eq!(error, StoreError::ReplicationOperationLimitExceeded);
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn over_limit_watch_entry_is_rejected_before_delivery() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read hello");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write hello ack");
+            let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read watch request");
+            assert!(matches!(request, Request::Watch { .. }));
+            write_frame(&mut stream, &Response::WatchStream)
+                .await
+                .expect("write watch acknowledgement");
+
+            let response = Response::WatchEntry(Ok(over_count_replication_entry()));
+            write_frame(&mut stream, &response)
+                .await
+                .expect("write over-count watch entry");
+            let Response::WatchEntry(Ok(entry)) = response else {
+                unreachable!("test response shape is fixed")
+            };
+            drop(entry.into_validated());
+        });
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        let mut watch = backend.watch(1).await.expect("create watch stream");
+
+        let item = tokio::time::timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("watch response deadline")
+            .expect("watch error item");
+        let error = match item {
+            Err(error) => error,
+            Ok(entry) => {
+                drop(entry.into_validated());
+                panic!("an over-count watch entry must not be delivered")
+            }
+        };
+        assert_eq!(error, StoreError::ReplicationOperationLimitExceeded);
         let _ = server.await;
     }
 

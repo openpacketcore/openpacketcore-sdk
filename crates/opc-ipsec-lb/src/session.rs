@@ -665,6 +665,10 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
             "session_store.replication",
             "session-store replication metadata rejected",
         ),
+        StoreError::ReplicationOperationLimitExceeded => IpsecLbError::invalid_config(
+            "session_store.replication",
+            "session-store replication operation limit exceeded",
+        ),
         StoreError::InvalidSessionTtl => IpsecLbError::invalid_config(
             "session_store.ttl",
             "session-store TTL is outside the supported range",
@@ -2004,9 +2008,13 @@ mod tests {
     }
 
     #[test]
-    fn invalid_session_ttl_maps_to_configuration_errors() {
+    fn invalid_session_boundaries_map_to_configuration_errors() {
         assert!(matches!(
             map_store_error(StoreError::InvalidSessionTtl),
+            IpsecLbError::InvalidConfig { .. }
+        ));
+        assert!(matches!(
+            map_store_error(StoreError::ReplicationOperationLimitExceeded),
             IpsecLbError::InvalidConfig { .. }
         ));
         assert!(matches!(

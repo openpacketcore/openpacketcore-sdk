@@ -43,11 +43,12 @@ pub mod topology;
 pub mod ttl;
 
 pub use backend::{
-    next_replication_sequence, validate_replication_page, validate_replication_prefix,
-    validate_session_ops_ttls, BackendInstanceIdentity, BackendPeerBinding,
-    BackendPeerScopeIdentity, CompareAndSet, CompareAndSetResult, EncryptingSessionBackend,
-    RemoteSealingSessionBackend, ReplicationEntry, ReplicationOp, SessionBackend, SessionOp,
-    SessionOpResult,
+    next_replication_sequence, validate_replication_page, validate_replication_page_owned,
+    validate_replication_prefix, validate_replication_prefix_owned, validate_session_ops_ttls,
+    BackendInstanceIdentity, BackendPeerBinding, BackendPeerScopeIdentity, CompareAndSet,
+    CompareAndSetResult, EncryptingSessionBackend, RemoteSealingSessionBackend, ReplicationEntry,
+    ReplicationOp, SessionBackend, SessionOp, SessionOpResult,
+    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
 };
 pub use capability::{
     assert_backend_suitable_for_profile, assert_suitable_for,

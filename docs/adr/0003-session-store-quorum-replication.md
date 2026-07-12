@@ -32,6 +32,10 @@ The target session-store contract includes:
   TTLs, with zero accepted as immediate expiry and exact checked deadline
   arithmetic at every direct, nested, persistence, quorum, and transport
   boundary.
+- Bounded iterative replication trees: depth 16 from a depth-1 root and 256
+  total operation nodes per entry, counting every node including `Batch`.
+- Encryption/sealing of every nested replicated CAS before delegation and
+  decryption/unsealing of every nested CAS before log/watch exposure.
 - Idempotent replay using log position, generation, fence, and transaction ID.
 - Commit-proven, majority-supported repair for stale or divergent replicas as
   a target contract; #128/#129 remain open and current automatic repair is
@@ -109,8 +113,9 @@ checked TTL rejection is implemented under #137, and malformed sequence zero,
 checked increment, rebuild-prefix, SQLite signed-boundary, cache, and
 authenticated wire rejection are implemented under #138. Production
 qualification, including seamless credential/trust rotation, remains #143.
-Watch handoff correctness (#145), recursively protected nested replicated CAS
-payloads (#147), and absolute-record-expiry admission (#148) also remain open.
+Watch handoff correctness (#145) and absolute-record-expiry admission (#148)
+also remain open. Bounded nested-CAS protection is implemented under #147;
+it does not change the profile's experimental status.
 
 ## Consequences
 
@@ -132,12 +137,48 @@ unwinding a process, but supplies no consensus or commit proof.
 
 The new public and serialized error variants require exhaustive callers and
 all session-net participants to upgrade as one same-v3 compatibility unit;
-valid v3 wire traffic is unchanged. Operators must first audit persisted legacy
+the TTL wire shape is unchanged for entries admitted by the operation-tree
+contract below. Operators must first audit persisted legacy
 replication logs: a TTL-bearing entry above 365 days now fails closed during
 replay/rebuild and is neither clamped nor rewritten automatically. Replicated
 deadline validation admits at most one microsecond above exact
 `entry.timestamp + ttl` solely for legacy `seconds_f64` rounding; new deadlines
 remain exact, the TTL maximum is unchanged, and larger mismatches fail closed.
+
+`MAX_REPLICATION_OPERATION_DEPTH` is 16 and
+`MAX_REPLICATION_OPERATIONS_PER_ENTRY` is 256. The root operation is depth 1,
+and every node—including `Batch`—counts once. Complete entries, rebuild
+prefixes, and returned pages are preflighted iteratively. A violation returns
+the fieldless `StoreError::ReplicationOperationLimitExceeded` without revealing
+the tree shape.
+
+Protection wrappers transform every nested CAS, not only the root or first
+batch level. Replicate/rebuild transformations are fully staged before backend
+delegation; log/watch transformations complete before an entry/page is exposed.
+Provider calls are sequential. A late provider failure may follow earlier
+provider calls, but it causes no backend delegation on writes and no partial
+entry/page exposure on reads.
+
+This adds a public and serialized error variant without changing the v3
+protocol number. An older peer cannot decode the error and, more critically,
+an older wrapper can forward deep plaintext/unsealed CAS payloads. Mixed v3
+fleets are not confidentiality-safe; all clients, servers, and wrapper
+participants require a coordinated upgrade, not a rolling compatibility claim.
+#134 must pin the limits and error representation in the versioned fixed-width
+DTO and handshake contract.
+
+Historical nested plaintext is not automatically scrubbed. Before upgrade,
+operators must audit persisted tree shape and payload encoding offline. An
+affected entry within the new limits may be explicitly rewritten/rebuilt
+through the configured protection wrapper. Over-limit history fails before
+transformation and requires a separately reviewed atomicity-preserving offline
+migration or audited store replacement before the new SDK starts; it must not
+be clamped or split ad hoc. A raw inner-backend rebuild is insufficient.
+
+These guarantees close #147's traversal/confidentiality boundary only. They do
+not establish consensus, durable authority, or production HA. #143 remains the
+production qualification owner, including separate proof of seamless SVID
+rotation, payload-protection key rotation, and trust-bundle rotation.
 
 Capability/profile validation and fresh readiness have different scopes. The
 former is static admission evidence. The latter is a bounded observation that
@@ -158,6 +199,8 @@ identity remain fixed by the manifest.
 - `crates/opc-session-store/src/topology.rs`
 - `crates/opc-session-store/tests/quorum_durable_readiness.rs`
 - `crates/opc-session-store/tests/quorum_topology.rs`
+- `crates/opc-session-store/tests/encryption.rs`
+- `crates/opc-session-store/tests/replication_structure_bounds.rs`
 - `crates/opc-session-net/tests/three_node_quorum.rs`
 - `crates/opc-session-net/tests/authenticated_replica_identity.rs`
 - `crates/opc-amf-lite/tests/amf_lite_tests.rs`

@@ -47,6 +47,12 @@ pub enum StoreError {
     /// carries no caller-controlled value so it is safe to expose to peers.
     #[error("invalid replication sequence")]
     InvalidReplicationSequence,
+    /// A replication operation tree exceeded the SDK-wide depth or node-count
+    /// limit. The error intentionally carries no observed count, depth, path,
+    /// key, or transaction data, so it is safe to expose to authenticated
+    /// peers without turning validation into a shape oracle.
+    #[error("replication operation limit exceeded")]
+    ReplicationOperationLimitExceeded,
     /// A lease or record-refresh TTL exceeded the SDK maximum, or its absolute
     /// deadline could not be represented. The error intentionally carries no
     /// caller-controlled duration or timestamp, so it is safe to expose to

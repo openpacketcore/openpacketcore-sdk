@@ -187,9 +187,7 @@ smaller operational limit.
 
 This section bounds `Duration` inputs. It does not yet define admission for a
 caller-authored absolute `StoredSessionRecord::expires_at`; that separate
-state-profile and migration contract is tracked by #148. Recursive protected
-payload transformation for deeply nested replicated CAS batches is tracked by
-#147.
+state-profile and migration contract is tracked by #148.
 
 `validate_session_ttl` defines the duration check and
 `checked_session_deadline` defines conversion and deadline calculation.
@@ -211,8 +209,8 @@ fail closed even if an outer layer omitted validation.
 The new errors are public enum and serialized protocol-v3 variants. External
 exhaustive matches MUST be updated, and a session-net deployment MUST treat the
 change as a coordinated same-v3 fleet upgrade because an older v3 decoder
-cannot interpret a newly returned variant. Valid v3 request/response shapes are
-unchanged.
+cannot interpret a newly returned variant. The TTL request/response shape is
+unchanged for entries admitted by the operation-tree contract in §11.2.1.
 
 ## 8. Record Format
 
@@ -404,6 +402,62 @@ validation MAY admit at most one microsecond above the exact
 New deadline construction MUST remain exact. This tolerance does not increase
 `MAX_SESSION_TTL`; a larger mismatch MUST fail closed.
 
+#### 11.2.1 Bounded Protected Operation Trees
+
+Each `ReplicationEntry` MUST contain at most
+`MAX_REPLICATION_OPERATIONS_PER_ENTRY` (256) operation nodes and MUST NOT exceed
+`MAX_REPLICATION_OPERATION_DEPTH` (16). The root operation is depth 1, and each
+child increases depth by one. Every node counts once toward the total,
+including each `Batch` container and every leaf operation. These rules apply to
+all variants, not only `Batch` and `CompareAndSet`.
+
+Validation of an outbound entry or complete rebuild prefix MUST be iterative
+and MUST finish before payload transformation or backend dispatch. Validation
+of a complete returned page or item MUST finish before read-side transformation
+or caller exposure; the backend has necessarily already produced that read. A
+limit violation MUST return the fieldless
+`StoreError::ReplicationOperationLimitExceeded`; diagnostics MUST NOT reveal
+the observed count, depth, record, key, payload, provider detail, or tree shape.
+By-value public/wire boundaries MUST also dismantle rejected trees iteratively
+so the error path cannot recurse while dropping hostile nesting.
+
+An encryption or remote-sealing wrapper MUST transform every
+`CompareAndSet.new_record.payload` at every permitted depth. Replicate and rebuild
+paths MUST stage the complete transformed entry or prefix before delegating to
+the backend. Replication-log and watch paths MUST decrypt or unseal each
+complete entry before exposing it. Traversal and reconstruction MUST be
+iterative and MUST preserve operation order and every non-payload field
+exactly.
+
+Provider calls MUST run sequentially. If a late write-side provider call fails,
+earlier provider calls MAY already have occurred, but the wrapper MUST NOT
+delegate any part of the entry/prefix to its backend. If a read-side provider
+call fails, the wrapper MUST return an error without exposing a partially
+transformed entry or page; earlier provider calls, and earlier independent
+watch items already yielded, MAY have occurred.
+
+This contract changes confidentiality semantics without changing the current
+protocol-v3 number. A v3 peer built before this rule cannot decode the new error
+and its wrapper may forward a deeply nested CAS in plaintext/unsealed form.
+Mixed old/new v3 fleets are therefore not confidentiality-safe and MUST NOT be
+deployed as a rolling upgrade. Operators MUST drain and upgrade every client,
+server, and protection-wrapper participant as one coordinated fleet. #134 MUST
+pin both limits and the error encoding in a versioned fixed-width wire DTO and
+handshake/compatibility contract; this section does not claim that work is
+complete.
+
+Persisted historical nested plaintext/unsealed payloads are not detected or
+scrubbed automatically. Before upgrade, an operator MUST audit operation-tree
+shape and payload encoding offline without emitting payloads into diagnostics.
+An affected entry already within the 16/256 limits MAY be explicitly rewritten
+or rebuilt through the configured encryption/sealing wrapper. An over-limit
+historical entry MUST fail before wrapper transformation and MUST NOT be fed to
+the new SDK unchanged, silently clamped, discarded, or split. It requires a
+separately reviewed offline migration that preserves the original atomic
+semantics, or store replacement under an audited product recovery procedure,
+before the new SDK reads the log. Rebuilding through the raw inner backend does
+not satisfy this requirement.
+
 Replicas MUST apply events only if `generation` and `fence` are newer according
 to the state class rules.
 
@@ -486,6 +540,12 @@ AAD MUST include:
 - fence
 - backend namespace
 
+The bounded iterative transformation in §11.2.1 is mandatory for replication
+wrappers. Protecting only the root or one `Batch` level is not conformant.
+Closing that traversal gap does not qualify key lifecycle operations: seamless
+SVID rotation, payload-protection key rotation, and trust-bundle rotation
+remain separate mandatory production requirements under #143.
+
 ### 14.2 Integrity
 
 AEAD integrity is required. Additional MAC fields MAY be used for backends that
@@ -567,6 +627,11 @@ fencing.
   rejected values must have no partial effect.
 - Serialization corrupt input rejection.
 - AEAD AAD mismatch rejection.
+- Nested replicated CAS protection at depths 1 through 16, rejection at depth
+  17, exact 256-node acceptance and 257-node rejection, and fieldless errors.
+- Replicate/rebuild/log/watch round trips through encryption and remote-sealing
+  wrappers, including late-provider failure with no backend delegation or
+  partial entry/page exposure.
 - Cache generation checks.
 
 ### 17.2 Integration Tests
@@ -617,3 +682,7 @@ This RFC is implemented when:
    maximum, rejects
    larger values with the appropriate typed error before application/backend
    effects, and performs exact checked deadline arithmetic without unwinding.
+10. Every replication operation tree is iteratively bounded to depth 16 and
+    256 total nodes; every nested CAS is protected on write and unprotected on
+    read; and transformation failure cannot delegate or expose a partial
+    entry/prefix/page.

@@ -7,7 +7,7 @@
 //! fencing rule that a write carrying a token lower than the key's recorded
 //! fence is rejected, so a stale owner can never overwrite a newer one.
 
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use futures_util::future::join_all;
@@ -31,6 +31,22 @@ use crate::{
 /// fan-out cannot grow memory without bound. Consumers should resume from the
 /// last processed sequence.
 pub const WATCH_CHANNEL_CAPACITY: usize = 64;
+
+/// Maximum depth of a replication operation tree, counting its root as one.
+///
+/// This fixed fleet-wide admission limit keeps post-decode validation,
+/// cryptographic-provider work, and the built-in replay adapters bounded. It
+/// is deliberately not configurable per replica because different limits
+/// could make replicas disagree about the same ordered log entry. Versioned
+/// pre-allocation wire decoding remains part of #134.
+pub const MAX_REPLICATION_OPERATION_DEPTH: usize = 16;
+
+/// Maximum number of operation nodes in one replication entry.
+///
+/// Every leaf and every [`ReplicationOp::Batch`] container counts as one node.
+/// The limit is fixed across the SDK so all replicas make the same admission
+/// decision and a nested entry cannot trigger unbounded provider calls.
+pub const MAX_REPLICATION_OPERATIONS_PER_ENTRY: usize = 256;
 
 /// Atomic compare-and-set operation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -158,7 +174,8 @@ pub struct ReplicationEntry {
 }
 
 impl ReplicationEntry {
-    /// Validate the entry's sequence and all nested TTL/deadline metadata.
+    /// Validate the entry's sequence, operation-tree bounds, and all nested
+    /// TTL/deadline metadata.
     ///
     /// A replicated absolute deadline may be earlier than the requested TTL
     /// (which is fail-closed), but it may not materially extend beyond
@@ -172,6 +189,23 @@ impl ReplicationEntry {
         self.op.validate_ttls_at(self.timestamp)
     }
 
+    /// Consume and return this entry only when all replication invariants hold.
+    ///
+    /// On rejection, the operation tree is dismantled iteratively before the
+    /// error is returned. Backend and protocol boundaries should prefer this
+    /// method for caller-owned entries so even an extremely deep value built
+    /// through the direct Rust API cannot overflow the stack while being
+    /// dropped.
+    pub fn into_validated(self) -> Result<Self, StoreError> {
+        match self.validate() {
+            Ok(()) => Ok(self),
+            Err(error) => {
+                self.discard_operation_iteratively();
+                Err(error)
+            }
+        }
+    }
+
     /// Validate the scalar replication-log position.
     ///
     /// Sequence zero is reserved for an empty log head and is never a valid
@@ -183,6 +217,30 @@ impl ReplicationEntry {
             return Err(StoreError::InvalidReplicationSequence);
         }
         Ok(())
+    }
+
+    fn discard_operation_iteratively(self) {
+        let Self { op, .. } = self;
+        discard_replication_op_iteratively(op);
+    }
+}
+
+fn discard_replication_op_iteratively(root: ReplicationOp) {
+    let mut pending = vec![vec![root].into_iter()];
+    while let Some(current) = pending.last_mut() {
+        match current.next() {
+            Some(ReplicationOp::Batch { ops }) => pending.push(ops.into_iter()),
+            Some(_) => {}
+            None => {
+                pending.pop();
+            }
+        }
+    }
+}
+
+fn discard_replication_entries_iteratively(entries: Vec<ReplicationEntry>) {
+    for entry in entries {
+        entry.discard_operation_iteratively();
     }
 }
 
@@ -219,6 +277,24 @@ pub fn validate_replication_prefix(entries: &[ReplicationEntry]) -> Result<(), S
     Ok(())
 }
 
+/// Consume and validate a complete replication-log prefix.
+///
+/// This is the by-value counterpart to [`validate_replication_prefix`]. On
+/// rejection it iteratively dismantles every supplied operation tree before
+/// returning the error, avoiding recursive drop exposure at public backend
+/// and wire boundaries.
+pub fn validate_replication_prefix_owned(
+    entries: Vec<ReplicationEntry>,
+) -> Result<Vec<ReplicationEntry>, StoreError> {
+    match validate_replication_prefix(&entries) {
+        Ok(()) => Ok(entries),
+        Err(error) => {
+            discard_replication_entries_iteratively(entries);
+            Err(error)
+        }
+    }
+}
+
 /// Validate a contiguous replication-log page returned by an adapter.
 ///
 /// Unlike [`validate_replication_prefix`], a page may begin at any non-zero
@@ -237,6 +313,22 @@ pub fn validate_replication_page(entries: &[ReplicationEntry]) -> Result<(), Sto
         previous = Some(entry.sequence);
     }
     Ok(())
+}
+
+/// Consume and validate a contiguous replication-log page.
+///
+/// This is the by-value counterpart to [`validate_replication_page`]. Invalid
+/// operation trees are dismantled iteratively before the error is returned.
+pub fn validate_replication_page_owned(
+    entries: Vec<ReplicationEntry>,
+) -> Result<Vec<ReplicationEntry>, StoreError> {
+    match validate_replication_page(&entries) {
+        Ok(()) => Ok(entries),
+        Err(error) => {
+            discard_replication_entries_iteratively(entries);
+            Err(error)
+        }
+    }
 }
 
 /// Mutation payload carried by a `ReplicationEntry`.
@@ -343,13 +435,61 @@ pub enum ReplicationOp {
 }
 
 impl ReplicationOp {
+    /// Validate the fixed fleet-wide depth and operation-count limits.
+    ///
+    /// Validation uses a bounded explicit stack. It accounts for already
+    /// scheduled siblings before extending that stack, so a wide untrusted
+    /// batch is rejected without allocating work proportional to its length.
+    pub fn validate_structure(&self) -> Result<(), StoreError> {
+        let mut pending = Vec::with_capacity(MAX_REPLICATION_OPERATION_DEPTH);
+        pending.push((self, 1_usize));
+        let mut visited = 0_usize;
+
+        while let Some((op, depth)) = pending.pop() {
+            visited = visited
+                .checked_add(1)
+                .ok_or(StoreError::ReplicationOperationLimitExceeded)?;
+            if visited > MAX_REPLICATION_OPERATIONS_PER_ENTRY
+                || depth > MAX_REPLICATION_OPERATION_DEPTH
+            {
+                return Err(StoreError::ReplicationOperationLimitExceeded);
+            }
+
+            let Self::Batch { ops } = op else {
+                continue;
+            };
+            if !ops.is_empty() && depth >= MAX_REPLICATION_OPERATION_DEPTH {
+                return Err(StoreError::ReplicationOperationLimitExceeded);
+            }
+
+            let scheduled = visited
+                .checked_add(pending.len())
+                .ok_or(StoreError::ReplicationOperationLimitExceeded)?;
+            let remaining = MAX_REPLICATION_OPERATIONS_PER_ENTRY
+                .checked_sub(scheduled)
+                .ok_or(StoreError::ReplicationOperationLimitExceeded)?;
+            if ops.len() > remaining {
+                return Err(StoreError::ReplicationOperationLimitExceeded);
+            }
+
+            let child_depth = depth
+                .checked_add(1)
+                .ok_or(StoreError::ReplicationOperationLimitExceeded)?;
+            pending.extend(ops.iter().rev().map(|child| (child, child_depth)));
+        }
+
+        Ok(())
+    }
+
     /// Validate all TTL-bearing operations, including arbitrarily nested
     /// batches, against their replication-entry timestamp.
     ///
     /// Validation is iterative so hostile nesting cannot consume the call
     /// stack. It completes before any replay or rebuild mutation begins.
     pub fn validate_ttls_at(&self, reference_timestamp: Timestamp) -> Result<(), StoreError> {
-        let mut pending = vec![self];
+        self.validate_structure()?;
+        let mut pending = Vec::with_capacity(MAX_REPLICATION_OPERATION_DEPTH);
+        pending.push(self);
         while let Some(op) = pending.pop() {
             match op {
                 Self::RefreshTtl {
@@ -383,6 +523,92 @@ impl ReplicationOp {
         }
         Ok(())
     }
+}
+
+#[allow(clippy::large_enum_variant)] // bounded to 256 nodes; boxing would allocate per node
+enum ReplicationTransformWork {
+    Visit(ReplicationOp),
+    FinishBatch { child_count: usize },
+}
+
+fn replication_transform_invariant_error() -> StoreError {
+    StoreError::Serialization("replication operation transform failed".to_string())
+}
+
+async fn transform_replication_op<F, Fut>(
+    root: ReplicationOp,
+    mut transform_record: F,
+) -> Result<ReplicationOp, StoreError>
+where
+    F: FnMut(StoredSessionRecord) -> Fut + Send,
+    Fut: Future<Output = Result<StoredSessionRecord, StoreError>> + Send,
+{
+    let mut work = Vec::with_capacity(MAX_REPLICATION_OPERATION_DEPTH);
+    let mut transformed = Vec::with_capacity(MAX_REPLICATION_OPERATION_DEPTH);
+    work.push(ReplicationTransformWork::Visit(root));
+
+    while let Some(item) = work.pop() {
+        match item {
+            ReplicationTransformWork::Visit(ReplicationOp::CompareAndSet {
+                key,
+                expected_generation,
+                credential_id,
+                guard_expires_at,
+                new_record,
+            }) => {
+                transformed.push(ReplicationOp::CompareAndSet {
+                    key,
+                    expected_generation,
+                    credential_id,
+                    guard_expires_at,
+                    new_record: transform_record(new_record).await?,
+                });
+            }
+            ReplicationTransformWork::Visit(ReplicationOp::Batch { ops }) => {
+                let child_count = ops.len();
+                work.push(ReplicationTransformWork::FinishBatch { child_count });
+                work.extend(ops.into_iter().rev().map(ReplicationTransformWork::Visit));
+            }
+            ReplicationTransformWork::Visit(other) => transformed.push(other),
+            ReplicationTransformWork::FinishBatch { child_count } => {
+                let start = transformed
+                    .len()
+                    .checked_sub(child_count)
+                    .ok_or_else(replication_transform_invariant_error)?;
+                let ops = transformed.split_off(start);
+                transformed.push(ReplicationOp::Batch { ops });
+            }
+        }
+    }
+
+    if transformed.len() != 1 {
+        return Err(replication_transform_invariant_error());
+    }
+    transformed
+        .pop()
+        .ok_or_else(replication_transform_invariant_error)
+}
+
+async fn transform_replication_entry<F, Fut>(
+    entry: ReplicationEntry,
+    transform_record: F,
+) -> Result<ReplicationEntry, StoreError>
+where
+    F: FnMut(StoredSessionRecord) -> Fut + Send,
+    Fut: Future<Output = Result<StoredSessionRecord, StoreError>> + Send,
+{
+    let ReplicationEntry {
+        sequence,
+        tx_id,
+        op,
+        timestamp,
+    } = entry;
+    Ok(ReplicationEntry {
+        sequence,
+        tx_id,
+        op: transform_replication_op(op, transform_record).await?,
+        timestamp,
+    })
 }
 
 /// Storage backend trait for session state.
@@ -526,7 +752,7 @@ pub trait SessionBackend: Send + Sync {
     /// Implementations must reject invalid sequence and TTL/deadline metadata
     /// before locking, mutating, or invoking an external provider.
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate()?;
+        let _entry = entry.into_validated()?;
         Err(StoreError::CapabilityNotSupported(
             "ordered_replication_log".into(),
         ))
@@ -541,7 +767,7 @@ pub trait SessionBackend: Send + Sync {
         &self,
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
-        validate_replication_prefix(&entries)?;
+        let _entries = validate_replication_prefix_owned(entries)?;
         Err(StoreError::CapabilityNotSupported(
             "ordered_replication_log".into(),
         ))
@@ -822,100 +1048,6 @@ where
             SessionOpResult::RefreshTtl(result) => SessionOpResult::RefreshTtl(result),
         }
     }
-
-    async fn encrypt_op(&self, op: ReplicationOp) -> Result<ReplicationOp, StoreError> {
-        match op {
-            ReplicationOp::CompareAndSet {
-                key,
-                expected_generation,
-                credential_id,
-                guard_expires_at,
-                new_record,
-            } => {
-                let encrypted = self.encrypt_record(new_record).await?;
-                Ok(ReplicationOp::CompareAndSet {
-                    key,
-                    expected_generation,
-                    credential_id,
-                    guard_expires_at,
-                    new_record: encrypted,
-                })
-            }
-            ReplicationOp::Batch { ops } => {
-                let mut encrypted_ops = Vec::with_capacity(ops.len());
-                for o in ops {
-                    match o {
-                        ReplicationOp::CompareAndSet {
-                            key,
-                            expected_generation,
-                            credential_id,
-                            guard_expires_at,
-                            new_record,
-                        } => {
-                            let encrypted = self.encrypt_record(new_record).await?;
-                            encrypted_ops.push(ReplicationOp::CompareAndSet {
-                                key,
-                                expected_generation,
-                                credential_id,
-                                guard_expires_at,
-                                new_record: encrypted,
-                            });
-                        }
-                        other => encrypted_ops.push(other),
-                    }
-                }
-                Ok(ReplicationOp::Batch { ops: encrypted_ops })
-            }
-            other => Ok(other),
-        }
-    }
-
-    async fn decrypt_op(&self, op: ReplicationOp) -> Result<ReplicationOp, StoreError> {
-        match op {
-            ReplicationOp::CompareAndSet {
-                key,
-                expected_generation,
-                credential_id,
-                guard_expires_at,
-                new_record,
-            } => {
-                let decrypted = self.decrypt_record(new_record).await?;
-                Ok(ReplicationOp::CompareAndSet {
-                    key,
-                    expected_generation,
-                    credential_id,
-                    guard_expires_at,
-                    new_record: decrypted,
-                })
-            }
-            ReplicationOp::Batch { ops } => {
-                let mut decrypted_ops = Vec::with_capacity(ops.len());
-                for o in ops {
-                    match o {
-                        ReplicationOp::CompareAndSet {
-                            key,
-                            expected_generation,
-                            credential_id,
-                            guard_expires_at,
-                            new_record,
-                        } => {
-                            let decrypted = self.decrypt_record(new_record).await?;
-                            decrypted_ops.push(ReplicationOp::CompareAndSet {
-                                key,
-                                expected_generation,
-                                credential_id,
-                                guard_expires_at,
-                                new_record: decrypted,
-                            });
-                        }
-                        other => decrypted_ops.push(other),
-                    }
-                }
-                Ok(ReplicationOp::Batch { ops: decrypted_ops })
-            }
-            other => Ok(other),
-        }
-    }
 }
 
 async fn decrypt_record_helper<P: KeyProvider + ?Sized>(
@@ -936,58 +1068,6 @@ async fn decrypt_record_helper<P: KeyProvider + ?Sized>(
         .await?;
     record.payload = EncryptedSessionPayload::new_zeroizing(plaintext);
     Ok(record)
-}
-
-async fn decrypt_op_helper<P: KeyProvider + ?Sized>(
-    provider: &P,
-    op: ReplicationOp,
-    backend_namespace: &str,
-) -> Result<ReplicationOp, StoreError> {
-    match op {
-        ReplicationOp::CompareAndSet {
-            key,
-            expected_generation,
-            credential_id,
-            guard_expires_at,
-            new_record,
-        } => {
-            let decrypted = decrypt_record_helper(provider, new_record, backend_namespace).await?;
-            Ok(ReplicationOp::CompareAndSet {
-                key,
-                expected_generation,
-                credential_id,
-                guard_expires_at,
-                new_record: decrypted,
-            })
-        }
-        ReplicationOp::Batch { ops } => {
-            let mut decrypted_ops = Vec::with_capacity(ops.len());
-            for o in ops {
-                match o {
-                    ReplicationOp::CompareAndSet {
-                        key,
-                        expected_generation,
-                        credential_id,
-                        guard_expires_at,
-                        new_record,
-                    } => {
-                        let decrypted =
-                            decrypt_record_helper(provider, new_record, backend_namespace).await?;
-                        decrypted_ops.push(ReplicationOp::CompareAndSet {
-                            key,
-                            expected_generation,
-                            credential_id,
-                            guard_expires_at,
-                            new_record: decrypted,
-                        });
-                    }
-                    other => decrypted_ops.push(other),
-                }
-            }
-            Ok(ReplicationOp::Batch { ops: decrypted_ops })
-        }
-        other => Ok(other),
-    }
 }
 
 enum EncryptedBatchSlot {
@@ -1156,29 +1236,36 @@ where
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
-        let mut entries = self.inner.get_replication_log(start, limit).await?;
-        validate_replication_page(&entries)?;
-        for entry in &mut entries {
-            entry.op = self.decrypt_op(entry.op.clone()).await?;
+        let entries =
+            validate_replication_page_owned(self.inner.get_replication_log(start, limit).await?)?;
+        let mut decrypted = Vec::with_capacity(entries.len());
+        for entry in entries {
+            decrypted.push(
+                transform_replication_entry(entry, |record| self.decrypt_record(record)).await?,
+            );
         }
-        Ok(entries)
+        Ok(decrypted)
     }
 
-    async fn replicate_entry(&self, mut entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate()?;
-        entry.op = self.encrypt_op(entry.op).await?;
+    async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
+        let entry = entry.into_validated()?;
+        let entry =
+            transform_replication_entry(entry, |record| self.encrypt_record(record)).await?;
         self.inner.replicate_entry(entry).await
     }
 
     async fn rebuild_replication_state(
         &self,
-        mut entries: Vec<ReplicationEntry>,
+        entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
-        validate_replication_prefix(&entries)?;
-        for entry in &mut entries {
-            entry.op = self.encrypt_op(entry.op.clone()).await?;
+        let entries = validate_replication_prefix_owned(entries)?;
+        let mut encrypted = Vec::with_capacity(entries.len());
+        for entry in entries {
+            encrypted.push(
+                transform_replication_entry(entry, |record| self.encrypt_record(record)).await?,
+            );
         }
-        self.inner.rebuild_replication_state(entries).await
+        self.inner.rebuild_replication_state(encrypted).await
     }
 
     fn watch<'life0, 'async_trait>(
@@ -1213,17 +1300,12 @@ where
                 let backend_namespace = backend_namespace.clone();
                 async move {
                     match res {
-                        Ok(mut entry) => {
-                            entry.validate()?;
-                            match decrypt_op_helper(provider.as_ref(), entry.op, &backend_namespace)
-                                .await
-                            {
-                                Ok(dec) => {
-                                    entry.op = dec;
-                                    Ok(entry)
-                                }
-                                Err(e) => Err(e),
-                            }
+                        Ok(entry) => {
+                            let entry = entry.into_validated()?;
+                            transform_replication_entry(entry, |record| {
+                                decrypt_record_helper(provider.as_ref(), record, &backend_namespace)
+                            })
+                            .await
                         }
                         Err(e) => Err(e),
                     }
@@ -1386,100 +1468,6 @@ where
             SessionOpResult::RefreshTtl(result) => SessionOpResult::RefreshTtl(result),
         }
     }
-
-    async fn seal_op(&self, op: ReplicationOp) -> Result<ReplicationOp, StoreError> {
-        match op {
-            ReplicationOp::CompareAndSet {
-                key,
-                expected_generation,
-                credential_id,
-                guard_expires_at,
-                new_record,
-            } => {
-                let sealed = self.seal_record(new_record).await?;
-                Ok(ReplicationOp::CompareAndSet {
-                    key,
-                    expected_generation,
-                    credential_id,
-                    guard_expires_at,
-                    new_record: sealed,
-                })
-            }
-            ReplicationOp::Batch { ops } => {
-                let mut sealed_ops = Vec::with_capacity(ops.len());
-                for o in ops {
-                    match o {
-                        ReplicationOp::CompareAndSet {
-                            key,
-                            expected_generation,
-                            credential_id,
-                            guard_expires_at,
-                            new_record,
-                        } => {
-                            let sealed = self.seal_record(new_record).await?;
-                            sealed_ops.push(ReplicationOp::CompareAndSet {
-                                key,
-                                expected_generation,
-                                credential_id,
-                                guard_expires_at,
-                                new_record: sealed,
-                            });
-                        }
-                        other => sealed_ops.push(other),
-                    }
-                }
-                Ok(ReplicationOp::Batch { ops: sealed_ops })
-            }
-            other => Ok(other),
-        }
-    }
-
-    async fn unseal_op(&self, op: ReplicationOp) -> Result<ReplicationOp, StoreError> {
-        match op {
-            ReplicationOp::CompareAndSet {
-                key,
-                expected_generation,
-                credential_id,
-                guard_expires_at,
-                new_record,
-            } => {
-                let unsealed = self.unseal_record(new_record).await?;
-                Ok(ReplicationOp::CompareAndSet {
-                    key,
-                    expected_generation,
-                    credential_id,
-                    guard_expires_at,
-                    new_record: unsealed,
-                })
-            }
-            ReplicationOp::Batch { ops } => {
-                let mut unsealed_ops = Vec::with_capacity(ops.len());
-                for o in ops {
-                    match o {
-                        ReplicationOp::CompareAndSet {
-                            key,
-                            expected_generation,
-                            credential_id,
-                            guard_expires_at,
-                            new_record,
-                        } => {
-                            let unsealed = self.unseal_record(new_record).await?;
-                            unsealed_ops.push(ReplicationOp::CompareAndSet {
-                                key,
-                                expected_generation,
-                                credential_id,
-                                guard_expires_at,
-                                new_record: unsealed,
-                            });
-                        }
-                        other => unsealed_ops.push(other),
-                    }
-                }
-                Ok(ReplicationOp::Batch { ops: unsealed_ops })
-            }
-            other => Ok(other),
-        }
-    }
 }
 
 async fn remote_unseal_record_helper<S: RemoteSealProvider + ?Sized>(
@@ -1500,60 +1488,6 @@ async fn remote_unseal_record_helper<S: RemoteSealProvider + ?Sized>(
         .await?;
     record.payload = EncryptedSessionPayload::new_zeroizing(plaintext);
     Ok(record)
-}
-
-async fn remote_unseal_op_helper<S: RemoteSealProvider + ?Sized>(
-    provider: &S,
-    op: ReplicationOp,
-    backend_namespace: &str,
-) -> Result<ReplicationOp, StoreError> {
-    match op {
-        ReplicationOp::CompareAndSet {
-            key,
-            expected_generation,
-            credential_id,
-            guard_expires_at,
-            new_record,
-        } => {
-            let unsealed =
-                remote_unseal_record_helper(provider, new_record, backend_namespace).await?;
-            Ok(ReplicationOp::CompareAndSet {
-                key,
-                expected_generation,
-                credential_id,
-                guard_expires_at,
-                new_record: unsealed,
-            })
-        }
-        ReplicationOp::Batch { ops } => {
-            let mut unsealed_ops = Vec::with_capacity(ops.len());
-            for o in ops {
-                match o {
-                    ReplicationOp::CompareAndSet {
-                        key,
-                        expected_generation,
-                        credential_id,
-                        guard_expires_at,
-                        new_record,
-                    } => {
-                        let unsealed =
-                            remote_unseal_record_helper(provider, new_record, backend_namespace)
-                                .await?;
-                        unsealed_ops.push(ReplicationOp::CompareAndSet {
-                            key,
-                            expected_generation,
-                            credential_id,
-                            guard_expires_at,
-                            new_record: unsealed,
-                        });
-                    }
-                    other => unsealed_ops.push(other),
-                }
-            }
-            Ok(ReplicationOp::Batch { ops: unsealed_ops })
-        }
-        other => Ok(other),
-    }
 }
 
 #[async_trait]
@@ -1717,29 +1651,34 @@ where
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
-        let mut entries = self.inner.get_replication_log(start, limit).await?;
-        validate_replication_page(&entries)?;
-        for entry in &mut entries {
-            entry.op = self.unseal_op(entry.op.clone()).await?;
+        let entries =
+            validate_replication_page_owned(self.inner.get_replication_log(start, limit).await?)?;
+        let mut unsealed = Vec::with_capacity(entries.len());
+        for entry in entries {
+            unsealed.push(
+                transform_replication_entry(entry, |record| self.unseal_record(record)).await?,
+            );
         }
-        Ok(entries)
+        Ok(unsealed)
     }
 
-    async fn replicate_entry(&self, mut entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate()?;
-        entry.op = self.seal_op(entry.op).await?;
+    async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
+        let entry = entry.into_validated()?;
+        let entry = transform_replication_entry(entry, |record| self.seal_record(record)).await?;
         self.inner.replicate_entry(entry).await
     }
 
     async fn rebuild_replication_state(
         &self,
-        mut entries: Vec<ReplicationEntry>,
+        entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
-        validate_replication_prefix(&entries)?;
-        for entry in &mut entries {
-            entry.op = self.seal_op(entry.op.clone()).await?;
+        let entries = validate_replication_prefix_owned(entries)?;
+        let mut sealed = Vec::with_capacity(entries.len());
+        for entry in entries {
+            sealed
+                .push(transform_replication_entry(entry, |record| self.seal_record(record)).await?);
         }
-        self.inner.rebuild_replication_state(entries).await
+        self.inner.rebuild_replication_state(sealed).await
     }
 
     fn watch<'life0, 'async_trait>(
@@ -1774,21 +1713,16 @@ where
                 let backend_namespace = backend_namespace.clone();
                 async move {
                     match res {
-                        Ok(mut entry) => {
-                            entry.validate()?;
-                            match remote_unseal_op_helper(
-                                provider.as_ref(),
-                                entry.op,
-                                &backend_namespace,
-                            )
+                        Ok(entry) => {
+                            let entry = entry.into_validated()?;
+                            transform_replication_entry(entry, |record| {
+                                remote_unseal_record_helper(
+                                    provider.as_ref(),
+                                    record,
+                                    &backend_namespace,
+                                )
+                            })
                             .await
-                            {
-                                Ok(dec) => {
-                                    entry.op = dec;
-                                    Ok(entry)
-                                }
-                                Err(e) => Err(e),
-                            }
                         }
                         Err(e) => Err(e),
                     }
