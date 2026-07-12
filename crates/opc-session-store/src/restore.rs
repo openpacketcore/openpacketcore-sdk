@@ -4,14 +4,23 @@
 //! and restore gates without decoding product payloads or making any packet
 //! forwarding claim.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+use std::str::FromStr;
+use std::sync::Arc;
 
+use aes_gcm_siv::{
+    aead::{generic_array::GenericArray, AeadInPlace, KeyInit},
+    Aes256GcmSiv,
+};
+use hmac::{Hmac, Mac};
+use opc_key::Zeroizing;
 use opc_redaction::{redact_text, RedactionSummary};
-use opc_types::{NetworkFunctionKind, TenantId};
+use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
-    hex::encode_lower, OwnerId, SessionKeyType, StateClass, StateType, StoreError,
+    hex::encode_lower, OwnerId, SessionKey, SessionKeyType, StateClass, StateType, StoreError,
     StoredSessionRecord,
 };
 
@@ -21,26 +30,612 @@ pub const RESTORE_SCAN_DEFAULT_PAGE_SIZE: usize = 256;
 /// Hard maximum restore scan page size.
 pub const RESTORE_SCAN_MAX_PAGE_SIZE: usize = 1024;
 
+/// Hard maximum combined payload bytes returned by one restore page.
+///
+/// Backends must stop before crossing this limit. A single record whose
+/// payload exceeds the limit is rejected rather than returned partially.
+pub const RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+
+/// Hard maximum logical bytes retained by one restore page.
+///
+/// This includes record structs, key and metadata allocations, payload bytes,
+/// page metadata, and the raw continuation cursor. Encoded transports apply
+/// their independent negotiated frame ceiling in addition to this in-memory
+/// bound.
+pub const RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+
+/// Hard maximum key and filter-metadata bytes examined for one SQLite page.
+///
+/// Payload blobs are not selected by the candidate query and therefore are
+/// counted only if their record is admitted to the retained page.
+pub const RESTORE_SCAN_MAX_EXAMINED_METADATA_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum SQLite virtual-machine instructions spent on one restore page.
+pub const RESTORE_SCAN_MAX_SQLITE_VM_STEPS: usize = 2_000_000;
+
+/// Maximum wall-clock milliseconds spent inside one SQLite restore query.
+pub const RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS: u64 = 1_000;
+
+/// Maximum live candidate rows examined while building one restore page.
+///
+/// A page may contain fewer records than requested (including zero) when a
+/// narrow scope excludes candidates. In that case an advancing cursor lets
+/// the caller continue without any page performing an unbounded sparse scan.
+pub const RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE: usize = 4_096;
+
+const RESTORE_SCAN_CURSOR_VERSION: u8 = 1;
+const RESTORE_SCAN_SCOPE_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-restore-scope/v1\0";
+const RESTORE_SCAN_CURSOR_AAD: &[u8] = b"openpacketcore/session-restore-cursor/v1";
+const RESTORE_SCAN_CURSOR_AEAD_KEY_DOMAIN: &[u8] =
+    b"openpacketcore/session-restore-cursor/aead-key/v1\0";
+const RESTORE_SCAN_CURSOR_NONCE_KEY_DOMAIN: &[u8] =
+    b"openpacketcore/session-restore-cursor/nonce-key/v1\0";
+const RESTORE_SCAN_CURSOR_NONCE_BYTES: usize = 12;
+const RESTORE_SCAN_CURSOR_TENANT_BYTES: usize = 128;
+const RESTORE_SCAN_CURSOR_NF_KIND_BYTES: usize = 64;
+const RESTORE_SCAN_CURSOR_KEY_TYPE_BYTES: usize = 128;
+const RESTORE_SCAN_CURSOR_STABLE_ID_BYTES: usize = crate::SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES;
+const RESTORE_SCAN_CURSOR_FIELD_LENGTH_BYTES: usize = 4;
+const RESTORE_SCAN_CURSOR_EXAMINED_BYTES: usize = 8;
+const RESTORE_SCAN_CURSOR_TAG_BYTES: usize = 16;
+const RESTORE_SCAN_CURSOR_LEGACY_BYTES: usize = 1 + RESTORE_SCAN_CURSOR_EXAMINED_BYTES;
+const RESTORE_SCAN_CURSOR_PLAINTEXT_FIXED_BYTES: usize = 16
+    + 8
+    + 16
+    + 32
+    + RESTORE_SCAN_CURSOR_EXAMINED_BYTES
+    + (4 * RESTORE_SCAN_CURSOR_FIELD_LENGTH_BYTES);
+const RESTORE_SCAN_CURSOR_MIN_PLAINTEXT_BYTES: usize = RESTORE_SCAN_CURSOR_PLAINTEXT_FIXED_BYTES;
+const RESTORE_SCAN_CURSOR_MAX_PLAINTEXT_BYTES: usize = RESTORE_SCAN_CURSOR_PLAINTEXT_FIXED_BYTES
+    + RESTORE_SCAN_CURSOR_TENANT_BYTES
+    + RESTORE_SCAN_CURSOR_NF_KIND_BYTES
+    + RESTORE_SCAN_CURSOR_KEY_TYPE_BYTES
+    + RESTORE_SCAN_CURSOR_STABLE_ID_BYTES;
+const RESTORE_SCAN_CURSOR_ENVELOPE_BYTES: usize = 1
+    + RESTORE_SCAN_CURSOR_EXAMINED_BYTES
+    + RESTORE_SCAN_CURSOR_NONCE_BYTES
+    + RESTORE_SCAN_CURSOR_TAG_BYTES;
+const RESTORE_SCAN_CURSOR_MIN_DURABLE_BYTES: usize =
+    RESTORE_SCAN_CURSOR_ENVELOPE_BYTES + RESTORE_SCAN_CURSOR_MIN_PLAINTEXT_BYTES;
+const RESTORE_SCAN_CURSOR_MAX_DURABLE_BYTES: usize =
+    RESTORE_SCAN_CURSOR_ENVELOPE_BYTES + RESTORE_SCAN_CURSOR_MAX_PLAINTEXT_BYTES;
+const RESTORE_SCAN_CURSOR_MAX_HEX_CHARS: usize = RESTORE_SCAN_CURSOR_MAX_DURABLE_BYTES * 2;
+const RESTORE_SCAN_CURSOR_AAD_BYTES: usize =
+    RESTORE_SCAN_CURSOR_AAD.len() + 1 + RESTORE_SCAN_CURSOR_EXAMINED_BYTES;
+
 /// Opaque cursor for paged restore scans.
 ///
-/// The current SDK cursor is an offset into the backend's deterministic live
-/// record ordering. It intentionally carries no session key bytes or product
-/// payload identifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// The token binds a backend position to one durable backend incarnation,
+/// record revision, logical-time snapshot, and request scope. Its only clear
+/// metadata is a cumulative examined-row position bound into authentication,
+/// used to validate the issuer's claimed pagination step. It contains no plaintext session-key,
+/// time, or product payload identifiers through its wire or debug form.
+/// Backends reject tokens issued for another store or for state that changed
+/// between pages.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RestoreScanCursor {
-    offset: usize,
+    token: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for RestoreScanCursor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RestoreScanCursor")
+            .field("version", &self.token.first().copied())
+            .field("token", &"[redacted]")
+            .finish()
+    }
 }
 
 impl RestoreScanCursor {
-    /// Build a cursor from a backend-supplied offset.
-    pub const fn from_offset(offset: usize) -> Self {
-        Self { offset }
+    /// Build a legacy offset cursor for compatibility-only backends.
+    ///
+    /// Production durable backends return versioned snapshot-bound cursors.
+    pub fn from_offset(offset: usize) -> Self {
+        let mut token = [0_u8; RESTORE_SCAN_CURSOR_LEGACY_BYTES];
+        // Rust supports targets whose pointer width is at most 64 bits.
+        let offset = (offset as u64).to_be_bytes();
+        token[1..].copy_from_slice(&offset);
+        Self {
+            token: Arc::from(token),
+        }
     }
 
-    /// Return the offset represented by this cursor.
-    pub const fn offset(self) -> usize {
-        self.offset
+    /// Return the backend-neutral numeric position represented by this cursor.
+    ///
+    /// This accessor remains for compatibility with the legacy protocol. It
+    /// does not reveal a session identifier. Durable cursors expose the same
+    /// cumulative examined-row position so a peer page can be checked for a
+    /// structurally consistent claimed step without decrypting the seek key.
+    /// The issuing backend authenticates that position when it consumes the
+    /// cursor; a receiver cannot infer page completeness from it.
+    pub fn offset(&self) -> usize {
+        let offset = self.examined_position().unwrap_or(u64::MAX);
+        if offset > usize::MAX as u64 {
+            usize::MAX
+        } else {
+            offset as usize
+        }
     }
+
+    pub(crate) fn retained_token_bytes(&self) -> usize {
+        self.token.len()
+    }
+
+    pub(crate) fn durable_retained_token_bytes_for_key(
+        seek_key: &SessionKey,
+    ) -> Result<usize, StoreError> {
+        let plaintext_bytes = RESTORE_SCAN_CURSOR_PLAINTEXT_FIXED_BYTES
+            .checked_add(seek_key.tenant.as_str().len())
+            .and_then(|value| value.checked_add(seek_key.nf_kind.as_str().len()))
+            .and_then(|value| value.checked_add(seek_key.key_type.as_str().len()))
+            .and_then(|value| value.checked_add(seek_key.stable_id.len()))
+            .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
+        if plaintext_bytes > RESTORE_SCAN_CURSOR_MAX_PLAINTEXT_BYTES {
+            return Err(StoreError::RestoreScanWorkBudgetExceeded);
+        }
+        RESTORE_SCAN_CURSOR_ENVELOPE_BYTES
+            .checked_add(plaintext_bytes)
+            .ok_or(StoreError::RestoreScanWorkBudgetExceeded)
+    }
+
+    pub(crate) fn durable(
+        authentication_key: &[u8; 32],
+        backend_epoch: [u8; 16],
+        snapshot_revision: u64,
+        snapshot_time: Timestamp,
+        scope: &RestoreScanScope,
+        seek_key: &SessionKey,
+        examined_position: u64,
+    ) -> Result<Self, StoreError> {
+        let plaintext_capacity = Self::durable_retained_token_bytes_for_key(seek_key)?
+            .checked_sub(RESTORE_SCAN_CURSOR_ENVELOPE_BYTES)
+            .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
+        let mut plaintext = Zeroizing::new(Vec::with_capacity(plaintext_capacity));
+        plaintext.extend_from_slice(&backend_epoch);
+        plaintext.extend_from_slice(&snapshot_revision.to_be_bytes());
+        plaintext.extend_from_slice(
+            &snapshot_time
+                .as_offset_datetime()
+                .unix_timestamp_nanos()
+                .to_be_bytes(),
+        );
+        plaintext.extend_from_slice(&restore_scope_digest(scope));
+        plaintext.extend_from_slice(&examined_position.to_be_bytes());
+        append_cursor_field(
+            &mut plaintext,
+            seek_key.tenant.as_str().as_bytes(),
+            RESTORE_SCAN_CURSOR_TENANT_BYTES,
+        )?;
+        append_cursor_field(
+            &mut plaintext,
+            seek_key.nf_kind.as_str().as_bytes(),
+            RESTORE_SCAN_CURSOR_NF_KIND_BYTES,
+        )?;
+        append_cursor_field(
+            &mut plaintext,
+            seek_key.key_type.as_str().as_bytes(),
+            RESTORE_SCAN_CURSOR_KEY_TYPE_BYTES,
+        )?;
+        append_cursor_field(
+            &mut plaintext,
+            seek_key.stable_id.as_ref(),
+            RESTORE_SCAN_CURSOR_STABLE_ID_BYTES,
+        )?;
+        if plaintext.len() != plaintext_capacity {
+            return Err(StoreError::BackendUnavailable(
+                "session restore cursor failed".into(),
+            ));
+        }
+
+        let aad = restore_cursor_aad(examined_position);
+        let aead_key =
+            derive_restore_cursor_subkey(authentication_key, RESTORE_SCAN_CURSOR_AEAD_KEY_DOMAIN)?;
+        let nonce_key =
+            derive_restore_cursor_subkey(authentication_key, RESTORE_SCAN_CURSOR_NONCE_KEY_DOMAIN)?;
+        let nonce = synthetic_restore_cursor_nonce(&nonce_key, &aad, &plaintext)?;
+        let cipher = Aes256GcmSiv::new(GenericArray::from_slice(aead_key.as_ref()));
+        let tag = cipher
+            .encrypt_in_place_detached(GenericArray::from_slice(&nonce), &aad, &mut plaintext)
+            .map_err(|_| StoreError::BackendUnavailable("session restore cursor failed".into()))?;
+
+        let token_capacity = RESTORE_SCAN_CURSOR_ENVELOPE_BYTES
+            .checked_add(plaintext.len())
+            .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
+        let mut token = Vec::with_capacity(token_capacity);
+        token.push(RESTORE_SCAN_CURSOR_VERSION);
+        token.extend_from_slice(&examined_position.to_be_bytes());
+        token.extend_from_slice(&nonce);
+        token.extend_from_slice(&plaintext);
+        token.extend_from_slice(tag.as_slice());
+        if token.len() != token_capacity {
+            return Err(StoreError::BackendUnavailable(
+                "session restore cursor failed".into(),
+            ));
+        }
+        Ok(Self {
+            token: Arc::from(token),
+        })
+    }
+
+    pub(crate) fn authenticated_parts(
+        &self,
+        scope: &RestoreScanScope,
+        authentication_key: &[u8; 32],
+    ) -> Result<([u8; 16], u64, Timestamp, SessionKey, u64), StoreError> {
+        if self.token.first().copied() != Some(RESTORE_SCAN_CURSOR_VERSION)
+            || !(RESTORE_SCAN_CURSOR_MIN_DURABLE_BYTES..=RESTORE_SCAN_CURSOR_MAX_DURABLE_BYTES)
+                .contains(&self.token.len())
+        {
+            return Err(StoreError::RestoreScanCursorStale);
+        }
+        let examined_position = self
+            .examined_position()
+            .ok_or(StoreError::RestoreScanCursorStale)?;
+        let nonce_start = 1 + RESTORE_SCAN_CURSOR_EXAMINED_BYTES;
+        let ciphertext_start = nonce_start + RESTORE_SCAN_CURSOR_NONCE_BYTES;
+        let tag_start = self
+            .token
+            .len()
+            .checked_sub(RESTORE_SCAN_CURSOR_TAG_BYTES)
+            .ok_or(StoreError::RestoreScanCursorStale)?;
+        if tag_start < ciphertext_start {
+            return Err(StoreError::RestoreScanCursorStale);
+        }
+        let mut plaintext = Zeroizing::new(Vec::with_capacity(tag_start - ciphertext_start));
+        plaintext.extend_from_slice(&self.token[ciphertext_start..tag_start]);
+        let aad = restore_cursor_aad(examined_position);
+        let aead_key =
+            derive_restore_cursor_subkey(authentication_key, RESTORE_SCAN_CURSOR_AEAD_KEY_DOMAIN)
+                .map_err(|_| StoreError::RestoreScanCursorStale)?;
+        let cipher = Aes256GcmSiv::new(GenericArray::from_slice(aead_key.as_ref()));
+        cipher
+            .decrypt_in_place_detached(
+                GenericArray::from_slice(&self.token[nonce_start..ciphertext_start]),
+                &aad,
+                &mut plaintext,
+                GenericArray::from_slice(&self.token[tag_start..]),
+            )
+            .map_err(|_| StoreError::RestoreScanCursorStale)?;
+        let nonce_key =
+            derive_restore_cursor_subkey(authentication_key, RESTORE_SCAN_CURSOR_NONCE_KEY_DOMAIN)
+                .map_err(|_| StoreError::RestoreScanCursorStale)?;
+        let expected_nonce = synthetic_restore_cursor_nonce(&nonce_key, &aad, &plaintext)
+            .map_err(|_| StoreError::RestoreScanCursorStale)?;
+        if self.token[nonce_start..ciphertext_start] != expected_nonce {
+            return Err(StoreError::RestoreScanCursorStale);
+        }
+
+        let mut cursor = 0_usize;
+        let backend_epoch = take_array::<16>(&plaintext, &mut cursor)
+            .map_err(|_| StoreError::RestoreScanCursorStale)?;
+        let snapshot_revision = u64::from_be_bytes(
+            take_array::<8>(&plaintext, &mut cursor)
+                .map_err(|_| StoreError::RestoreScanCursorStale)?,
+        );
+        let snapshot_time_unix_nanos = i128::from_be_bytes(
+            take_array::<16>(&plaintext, &mut cursor)
+                .map_err(|_| StoreError::RestoreScanCursorStale)?,
+        );
+        let scope_digest = take_array::<32>(&plaintext, &mut cursor)
+            .map_err(|_| StoreError::RestoreScanCursorStale)?;
+        let authenticated_examined_position = u64::from_be_bytes(
+            take_array::<8>(&plaintext, &mut cursor)
+                .map_err(|_| StoreError::RestoreScanCursorStale)?,
+        );
+        if authenticated_examined_position != examined_position {
+            return Err(StoreError::RestoreScanCursorStale);
+        }
+        let tenant = take_cursor_field(&plaintext, &mut cursor, RESTORE_SCAN_CURSOR_TENANT_BYTES)?;
+        let nf_kind =
+            take_cursor_field(&plaintext, &mut cursor, RESTORE_SCAN_CURSOR_NF_KIND_BYTES)?;
+        let key_type =
+            take_cursor_field(&plaintext, &mut cursor, RESTORE_SCAN_CURSOR_KEY_TYPE_BYTES)?;
+        let stable_id =
+            take_cursor_field(&plaintext, &mut cursor, RESTORE_SCAN_CURSOR_STABLE_ID_BYTES)?;
+        if cursor != plaintext.len() {
+            return Err(StoreError::RestoreScanCursorStale);
+        }
+        if backend_epoch == [0; 16] || scope_digest != restore_scope_digest(scope) {
+            return Err(StoreError::RestoreScanCursorStale);
+        }
+        let snapshot_time =
+            time::OffsetDateTime::from_unix_timestamp_nanos(snapshot_time_unix_nanos)
+                .map(Timestamp::from_offset_datetime)
+                .map_err(|_| StoreError::RestoreScanCursorStale)?;
+        let tenant =
+            std::str::from_utf8(&tenant).map_err(|_| StoreError::RestoreScanCursorStale)?;
+        let nf_kind =
+            std::str::from_utf8(&nf_kind).map_err(|_| StoreError::RestoreScanCursorStale)?;
+        let key_type =
+            std::str::from_utf8(&key_type).map_err(|_| StoreError::RestoreScanCursorStale)?;
+        let seek_key = SessionKey {
+            tenant: TenantId::new(tenant.to_owned())
+                .map_err(|_| StoreError::RestoreScanCursorStale)?,
+            nf_kind: NetworkFunctionKind::new(nf_kind.to_owned())
+                .map_err(|_| StoreError::RestoreScanCursorStale)?,
+            key_type: SessionKeyType::from_str(key_type)
+                .map_err(|_| StoreError::RestoreScanCursorStale)?,
+            stable_id: bytes::Bytes::from(stable_id),
+        };
+        Ok((
+            backend_epoch,
+            snapshot_revision,
+            snapshot_time,
+            seek_key,
+            examined_position,
+        ))
+    }
+
+    pub(crate) fn is_legacy(&self) -> bool {
+        self.token.first().copied() == Some(0)
+    }
+
+    /// Whether this is a compatibility-only numeric cursor.
+    ///
+    /// Remote production adapters must reject this profile; it exists only
+    /// for deterministic in-process test backends.
+    pub fn is_legacy_compatibility(&self) -> bool {
+        self.is_legacy()
+    }
+
+    fn validate_for_scope(&self, _scope: &RestoreScanScope) -> Result<(), StoreError> {
+        if self.is_legacy() {
+            if self.token.len() != RESTORE_SCAN_CURSOR_LEGACY_BYTES {
+                return Err(StoreError::RestoreScanCursorStale);
+            }
+            return Ok(());
+        }
+        if self.token.first().copied() != Some(RESTORE_SCAN_CURSOR_VERSION)
+            || !(RESTORE_SCAN_CURSOR_MIN_DURABLE_BYTES..=RESTORE_SCAN_CURSOR_MAX_DURABLE_BYTES)
+                .contains(&self.token.len())
+        {
+            return Err(StoreError::RestoreScanCursorStale);
+        }
+        Ok(())
+    }
+
+    fn examined_position(&self) -> Option<u64> {
+        self.token
+            .get(1..1 + RESTORE_SCAN_CURSOR_EXAMINED_BYTES)?
+            .try_into()
+            .ok()
+            .map(u64::from_be_bytes)
+    }
+
+    fn encode_token(&self) -> String {
+        encode_lower(&self.token[..])
+    }
+
+    fn decode_token(value: &str) -> Result<Self, &'static str> {
+        if value.len() > RESTORE_SCAN_CURSOR_MAX_HEX_CHARS {
+            return Err("restore scan cursor exceeds the maximum length");
+        }
+        if value.len() < RESTORE_SCAN_CURSOR_LEGACY_BYTES * 2 || !value.len().is_multiple_of(2) {
+            return Err("restore scan cursor has an invalid length");
+        }
+        if !value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        {
+            return Err("restore scan cursor is not lowercase hexadecimal");
+        }
+        let first = value.as_bytes();
+        let version =
+            (decode_hex_nibble(first[0]).ok_or("restore scan cursor is not hexadecimal")? << 4)
+                | decode_hex_nibble(first[1]).ok_or("restore scan cursor is not hexadecimal")?;
+        let decoded_len = value.len() / 2;
+        match version {
+            0 if decoded_len == RESTORE_SCAN_CURSOR_LEGACY_BYTES => {}
+            RESTORE_SCAN_CURSOR_VERSION
+                if (RESTORE_SCAN_CURSOR_MIN_DURABLE_BYTES
+                    ..=RESTORE_SCAN_CURSOR_MAX_DURABLE_BYTES)
+                    .contains(&decoded_len) => {}
+            0 | RESTORE_SCAN_CURSOR_VERSION => {
+                return Err("restore scan cursor has an invalid length")
+            }
+            _ => return Err("restore scan cursor version is unsupported"),
+        }
+        let mut bytes = Vec::with_capacity(decoded_len);
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let high =
+                decode_hex_nibble(pair[0]).ok_or("restore scan cursor is not hexadecimal")?;
+            let low = decode_hex_nibble(pair[1]).ok_or("restore scan cursor is not hexadecimal")?;
+            debug_assert_eq!(index, bytes.len());
+            bytes.push((high << 4) | low);
+        }
+
+        Ok(Self {
+            token: Arc::from(bytes),
+        })
+    }
+}
+
+fn append_cursor_field(output: &mut Vec<u8>, value: &[u8], max: usize) -> Result<(), StoreError> {
+    if value.len() > max {
+        return Err(StoreError::RestoreScanWorkBudgetExceeded);
+    }
+    let length =
+        u32::try_from(value.len()).map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)?;
+    output.extend_from_slice(&length.to_be_bytes());
+    output.extend_from_slice(value);
+    Ok(())
+}
+
+fn take_cursor_field(
+    plaintext: &[u8],
+    cursor: &mut usize,
+    max: usize,
+) -> Result<Vec<u8>, StoreError> {
+    let length = usize::try_from(u32::from_be_bytes(
+        take_array::<4>(plaintext, cursor).map_err(|_| StoreError::RestoreScanCursorStale)?,
+    ))
+    .map_err(|_| StoreError::RestoreScanCursorStale)?;
+    if length > max {
+        return Err(StoreError::RestoreScanCursorStale);
+    }
+    let end = cursor
+        .checked_add(length)
+        .ok_or(StoreError::RestoreScanCursorStale)?;
+    let value = plaintext
+        .get(*cursor..end)
+        .ok_or(StoreError::RestoreScanCursorStale)?
+        .to_vec();
+    *cursor = end;
+    Ok(value)
+}
+
+impl Serialize for RestoreScanCursor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.encode_token())
+    }
+}
+
+impl<'de> Deserialize<'de> for RestoreScanCursor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CursorVisitor;
+
+        impl serde::de::Visitor<'_> for CursorVisitor {
+            type Value = RestoreScanCursor;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a bounded lowercase-hex restore scan cursor")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                RestoreScanCursor::decode_token(value).map_err(E::custom)
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'_ str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(value)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.len() > RESTORE_SCAN_CURSOR_MAX_HEX_CHARS {
+                    return Err(E::custom("restore scan cursor exceeds the maximum length"));
+                }
+                self.visit_str(&value)
+            }
+        }
+
+        deserializer.deserialize_str(CursorVisitor)
+    }
+}
+
+fn restore_cursor_aad(examined_position: u64) -> [u8; RESTORE_SCAN_CURSOR_AAD_BYTES] {
+    let mut aad = [0_u8; RESTORE_SCAN_CURSOR_AAD_BYTES];
+    aad[..RESTORE_SCAN_CURSOR_AAD.len()].copy_from_slice(RESTORE_SCAN_CURSOR_AAD);
+    aad[RESTORE_SCAN_CURSOR_AAD.len()] = RESTORE_SCAN_CURSOR_VERSION;
+    aad[RESTORE_SCAN_CURSOR_AAD.len() + 1..].copy_from_slice(&examined_position.to_be_bytes());
+    aad
+}
+
+fn derive_restore_cursor_subkey(
+    authentication_key: &[u8; 32],
+    domain: &[u8],
+) -> Result<Zeroizing<[u8; 32]>, StoreError> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(authentication_key)
+        .map_err(|_| StoreError::BackendUnavailable("session restore cursor failed".into()))?;
+    mac.update(domain);
+    Ok(Zeroizing::new(mac.finalize().into_bytes().into()))
+}
+
+fn synthetic_restore_cursor_nonce(
+    nonce_key: &[u8; 32],
+    aad: &[u8],
+    canonical_plaintext: &[u8],
+) -> Result<[u8; RESTORE_SCAN_CURSOR_NONCE_BYTES], StoreError> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(nonce_key)
+        .map_err(|_| StoreError::BackendUnavailable("session restore cursor failed".into()))?;
+    mac.update(aad);
+    mac.update(canonical_plaintext);
+    let digest = Zeroizing::new(<[u8; 32]>::from(mac.finalize().into_bytes()));
+    let mut nonce = [0_u8; RESTORE_SCAN_CURSOR_NONCE_BYTES];
+    nonce.copy_from_slice(&digest[..RESTORE_SCAN_CURSOR_NONCE_BYTES]);
+    Ok(nonce)
+}
+
+fn decode_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn take_array<const N: usize>(bytes: &[u8], cursor: &mut usize) -> Result<[u8; N], &'static str> {
+    let end = cursor
+        .checked_add(N)
+        .ok_or("restore scan cursor length overflowed")?;
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or("restore scan cursor ended unexpectedly")?
+        .try_into()
+        .map_err(|_| "restore scan cursor field has an invalid length")?;
+    *cursor = end;
+    Ok(value)
+}
+
+fn restore_scope_digest(scope: &RestoreScanScope) -> [u8; 32] {
+    fn update_optional(hasher: &mut Sha256, value: Option<&[u8]>) {
+        match value {
+            Some(value) => {
+                hasher.update([1]);
+                // Rust targets supported by this crate have pointers no wider
+                // than the fixed u64 digest length field.
+                let length = value.len() as u64;
+                hasher.update(length.to_be_bytes());
+                hasher.update(value);
+            }
+            None => hasher.update([0]),
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(RESTORE_SCAN_SCOPE_DIGEST_DOMAIN);
+    update_optional(
+        &mut hasher,
+        scope.tenant.as_ref().map(|value| value.as_str().as_bytes()),
+    );
+    update_optional(
+        &mut hasher,
+        scope
+            .nf_kind
+            .as_ref()
+            .map(|value| value.as_str().as_bytes()),
+    );
+    let key_type = scope.key_type.as_ref().map(ToString::to_string);
+    update_optional(&mut hasher, key_type.as_deref().map(str::as_bytes));
+    let state_class = scope.state_class.map(|value| value.to_string());
+    update_optional(&mut hasher, state_class.as_deref().map(str::as_bytes));
+    update_optional(
+        &mut hasher,
+        scope
+            .state_type
+            .as_ref()
+            .map(|value| value.as_str().as_bytes()),
+    );
+    update_optional(
+        &mut hasher,
+        scope.owner.as_ref().map(|value| value.as_str().as_bytes()),
+    );
+    hasher.finalize().into()
 }
 
 /// Typed scope for backend-neutral restore scans.
@@ -134,6 +729,9 @@ impl RestoreScanRequest {
                 max: RESTORE_SCAN_MAX_PAGE_SIZE,
             });
         }
+        if let Some(cursor) = &self.cursor {
+            cursor.validate_for_scope(&self.scope)?;
+        }
         Ok(())
     }
 }
@@ -144,6 +742,16 @@ impl Default for RestoreScanRequest {
     }
 }
 
+/// Pagination/evidence profile for a restore page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestoreScanCursorProfile {
+    /// Compatibility-only numeric offsets used by deterministic local fakes.
+    LegacyCompatibility,
+    /// Confidential, authenticated, snapshot-bound durable seek cursors.
+    DurableOpaqueV1,
+}
+
 /// One page of a backend restore scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreScanPage {
@@ -151,11 +759,16 @@ pub struct RestoreScanPage {
     pub records: Vec<StoredSessionRecord>,
     /// Number of records returned in this page.
     pub loaded_count: usize,
-    /// Live records excluded by the supplied scope while building this page.
+    /// Records examined and excluded by the supplied scope while building
+    /// this page. Backends that push the complete scope into their storage
+    /// query report zero rather than running an unbounded global count.
     pub excluded_count: usize,
-    /// Cursor for the next page, or `None` when the scan is complete.
+    /// Cursor for the next page, or `None` when the issuing backend reports
+    /// the scan complete.
     pub next_cursor: Option<RestoreScanCursor>,
-    /// Whether this page completed the scan.
+    /// Cursor/evidence profile used to build this page.
+    pub cursor_profile: RestoreScanCursorProfile,
+    /// Whether the issuing backend reports that this page completed the scan.
     pub complete: bool,
 }
 
@@ -167,13 +780,26 @@ impl RestoreScanPage {
         next_cursor: Option<RestoreScanCursor>,
     ) -> Self {
         let loaded_count = records.len();
+        let complete = next_cursor.is_none();
         Self {
             records,
             loaded_count,
             excluded_count,
             next_cursor,
-            complete: next_cursor.is_none(),
+            cursor_profile: RestoreScanCursorProfile::LegacyCompatibility,
+            complete,
         }
+    }
+
+    /// Build a page backed by durable opaque cursor authority.
+    pub(crate) fn new_durable(
+        records: Vec<StoredSessionRecord>,
+        excluded_count: usize,
+        next_cursor: Option<RestoreScanCursor>,
+    ) -> Self {
+        let mut page = Self::new(records, excluded_count, next_cursor);
+        page.cursor_profile = RestoreScanCursorProfile::DurableOpaqueV1;
+        page
     }
 
     /// Header-only restore summary for this page.
@@ -181,16 +807,57 @@ impl RestoreScanPage {
         RestoreRecordSummary::from_records(&self.records, self.excluded_count)
     }
 
+    /// Logical memory retained by this page's records, metadata, payloads,
+    /// and raw continuation cursor.
+    pub fn retained_bytes(&self) -> Result<usize, StoreError> {
+        restore_page_retained_bytes(&self.records, self.next_cursor.as_ref())
+    }
+
     /// Validate this page against the request that produced it.
     ///
     /// Network adapters must call this on untrusted peer responses before
-    /// exposing records to a quorum or restore consumer.
+    /// exposing records to a compatibility consumer. This validates bounds,
+    /// ordering, scope, cursor shape, and claimed progress only. It cannot
+    /// prove that an authenticated server did not omit a record or falsely
+    /// report a terminal page. Production restore completeness comes from the
+    /// local Openraft-applied state after a linearizable barrier.
     pub fn validate_for_request(&self, request: &RestoreScanRequest) -> Result<(), StoreError> {
         request.validate()?;
 
         if self.records.len() > request.limit {
             return Err(StoreError::InvalidRestoreScanResponse(
                 "restore scan returned more records than requested".to_string(),
+            ));
+        }
+        let payload_bytes = self.records.iter().try_fold(0_usize, |total, record| {
+            total.checked_add(record.payload.len()).ok_or_else(|| {
+                StoreError::InvalidRestoreScanResponse(
+                    "restore scan payload byte count overflowed".to_string(),
+                )
+            })
+        })?;
+        if payload_bytes > RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES {
+            return Err(StoreError::InvalidRestoreScanResponse(
+                "restore scan exceeded the page payload-byte limit".to_string(),
+            ));
+        }
+        if self
+            .records
+            .iter()
+            .any(|record| record.key.stable_id.len() > RESTORE_SCAN_CURSOR_STABLE_ID_BYTES)
+        {
+            return Err(StoreError::InvalidRestoreScanResponse(
+                "restore scan record key exceeds the local consensus ceiling".to_string(),
+            ));
+        }
+        if self.retained_bytes().map_err(|_| {
+            StoreError::InvalidRestoreScanResponse(
+                "restore scan retained-byte count overflowed".to_string(),
+            )
+        })? > RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES
+        {
+            return Err(StoreError::InvalidRestoreScanResponse(
+                "restore scan exceeded the retained-page byte limit".to_string(),
             ));
         }
         if self.loaded_count != self.records.len() {
@@ -203,6 +870,38 @@ impl RestoreScanPage {
                 "restore scan completion flag and next cursor disagree".to_string(),
             ));
         }
+        match self.cursor_profile {
+            RestoreScanCursorProfile::LegacyCompatibility => {
+                if request
+                    .cursor
+                    .as_ref()
+                    .is_some_and(|cursor| !cursor.is_legacy())
+                    || self
+                        .next_cursor
+                        .as_ref()
+                        .is_some_and(|cursor| !cursor.is_legacy())
+                {
+                    return Err(StoreError::InvalidRestoreScanResponse(
+                        "legacy restore page mixed cursor profiles".to_string(),
+                    ));
+                }
+            }
+            RestoreScanCursorProfile::DurableOpaqueV1 => {
+                if request
+                    .cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.is_legacy())
+                    || self
+                        .next_cursor
+                        .as_ref()
+                        .is_some_and(|cursor| cursor.is_legacy())
+                {
+                    return Err(StoreError::InvalidRestoreScanResponse(
+                        "durable restore page mixed cursor profiles".to_string(),
+                    ));
+                }
+            }
+        }
         if self
             .records
             .iter()
@@ -213,45 +912,143 @@ impl RestoreScanPage {
             ));
         }
 
-        let mut keys = HashSet::with_capacity(self.records.len());
-        for record in &self.records {
-            if !keys.insert(record.key.clone()) {
+        for pair in self.records.windows(2) {
+            if pair[0].key == pair[1].key {
                 return Err(StoreError::InvalidRestoreScanResponse(
                     "restore scan returned a duplicate session key".to_string(),
                 ));
             }
+            if compare_restore_records(&pair[0], &pair[1]).is_ge() {
+                return Err(StoreError::InvalidRestoreScanResponse(
+                    "restore scan records are not in deterministic order".to_string(),
+                ));
+            }
         }
-        if self
+
+        let examined_records = self
             .records
-            .windows(2)
-            .any(|pair| compare_restore_records(&pair[0], &pair[1]).is_ge())
-        {
+            .len()
+            .checked_add(self.excluded_count)
+            .ok_or_else(|| {
+                StoreError::InvalidRestoreScanResponse(
+                    "restore scan examined-row count overflowed".to_string(),
+                )
+            })?;
+        if examined_records > RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE {
             return Err(StoreError::InvalidRestoreScanResponse(
-                "restore scan records are not in deterministic order".to_string(),
+                "restore scan exceeded the examined-row page limit".to_string(),
             ));
         }
 
-        if let Some(next_cursor) = self.next_cursor {
-            if self.records.is_empty() {
+        if let Some(next_cursor) = &self.next_cursor {
+            if examined_records == 0 {
                 return Err(StoreError::InvalidRestoreScanResponse(
-                    "incomplete restore scan page contains no records".to_string(),
+                    "incomplete restore scan page made no progress".to_string(),
                 ));
             }
-            let start = request.cursor.map(RestoreScanCursor::offset).unwrap_or(0);
-            let expected = start.checked_add(self.records.len()).ok_or_else(|| {
+            next_cursor
+                .validate_for_scope(&request.scope)
+                .map_err(|_| {
+                    StoreError::InvalidRestoreScanResponse(
+                        "restore scan cursor is malformed or belongs to another scope".to_string(),
+                    )
+                })?;
+            let previous_position = match request.cursor.as_ref() {
+                Some(cursor) => cursor.examined_position().ok_or_else(|| {
+                    StoreError::InvalidRestoreScanResponse(
+                        "restore scan request cursor position is malformed".to_string(),
+                    )
+                })?,
+                None => 0,
+            };
+            let examined_records = u64::try_from(examined_records).map_err(|_| {
                 StoreError::InvalidRestoreScanResponse(
-                    "restore scan cursor offset overflowed".to_string(),
+                    "restore scan examined-row position is not representable".to_string(),
                 )
             })?;
-            if next_cursor.offset() != expected {
+            let expected_position =
+                previous_position
+                    .checked_add(examined_records)
+                    .ok_or_else(|| {
+                        StoreError::InvalidRestoreScanResponse(
+                            "restore scan cursor position overflowed".to_string(),
+                        )
+                    })?;
+            if next_cursor.examined_position() != Some(expected_position) {
                 return Err(StoreError::InvalidRestoreScanResponse(
-                    "restore scan cursor did not advance by the returned record count".to_string(),
+                    "restore scan cursor did not advance by the examined-row count".to_string(),
+                ));
+            }
+            if next_cursor.is_legacy() && (self.records.is_empty() || self.excluded_count != 0) {
+                return Err(StoreError::InvalidRestoreScanResponse(
+                    "legacy restore page lacks bounded progress evidence".to_string(),
                 ));
             }
         }
 
         Ok(())
     }
+}
+
+pub(crate) fn restore_record_retained_bytes(
+    record: &StoredSessionRecord,
+) -> Result<usize, StoreError> {
+    restore_record_retained_bytes_from_lengths(
+        record.key.tenant.as_str().len(),
+        record.key.nf_kind.as_str().len(),
+        record.key.key_type.as_str().len(),
+        record.key.stable_id.len(),
+        record.owner.as_str().len(),
+        record.state_type.as_str().len(),
+        record.payload.len(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn restore_record_retained_bytes_from_lengths(
+    tenant_bytes: usize,
+    nf_kind_bytes: usize,
+    key_type_bytes: usize,
+    stable_id_bytes: usize,
+    owner_bytes: usize,
+    state_type_bytes: usize,
+    payload_bytes: usize,
+) -> Result<usize, StoreError> {
+    [
+        std::mem::size_of::<StoredSessionRecord>(),
+        tenant_bytes,
+        nf_kind_bytes,
+        key_type_bytes,
+        stable_id_bytes,
+        owner_bytes,
+        state_type_bytes,
+        payload_bytes,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, value| {
+        total
+            .checked_add(value)
+            .ok_or(StoreError::RestoreScanWorkBudgetExceeded)
+    })
+}
+
+pub(crate) fn restore_page_retained_bytes(
+    records: &[StoredSessionRecord],
+    next_cursor: Option<&RestoreScanCursor>,
+) -> Result<usize, StoreError> {
+    let records_bytes = records.iter().try_fold(0_usize, |total, record| {
+        total
+            .checked_add(restore_record_retained_bytes(record)?)
+            .ok_or(StoreError::RestoreScanWorkBudgetExceeded)
+    })?;
+    std::mem::size_of::<RestoreScanPage>()
+        .checked_add(records_bytes)
+        .and_then(|total| {
+            next_cursor.map_or(Some(total), |cursor| {
+                total.checked_add(cursor.retained_token_bytes())
+            })
+        })
+        .ok_or(StoreError::RestoreScanWorkBudgetExceeded)
 }
 
 /// Deterministic ordering shared by restore-scan backends.
@@ -574,4 +1371,176 @@ pub fn summarize_restore_records(
 fn redact_restore_message(message: &str) -> String {
     let mut summary = RedactionSummary::default();
     redact_text(message, &mut summary)
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+    use bytes::Bytes;
+    use proptest::prelude::*;
+
+    fn test_cursor() -> (RestoreScanCursor, [u8; 32], RestoreScanScope) {
+        let authentication_key = [0x5a; 32];
+        let scope = RestoreScanScope {
+            tenant: Some(TenantId::from_static("tenant-secret")),
+            ..RestoreScanScope::all()
+        };
+        let seek_key = SessionKey {
+            tenant: TenantId::from_static("tenant-secret"),
+            nf_kind: NetworkFunctionKind::upf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"subscriber-derived-secret"),
+        };
+        let snapshot_time = Timestamp::from_offset_datetime(
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(987_654),
+        );
+        let cursor = RestoreScanCursor::durable(
+            &authentication_key,
+            [0x33; 16],
+            42,
+            snapshot_time,
+            &scope,
+            &seek_key,
+            4_096,
+        )
+        .expect("build test cursor");
+        (cursor, authentication_key, scope)
+    }
+
+    proptest! {
+        #[test]
+        fn every_single_bit_cursor_edit_fails_authentication(
+            candidate_bit in 0_usize..4_096
+        ) {
+            let (mut cursor, authentication_key, scope) = test_cursor();
+            let bit = candidate_bit % (cursor.token.len() * 8);
+            Arc::make_mut(&mut cursor.token)[bit / 8] ^= 1_u8 << (bit % 8);
+            prop_assert_eq!(
+                cursor.authenticated_parts(&scope, &authentication_key),
+                Err(StoreError::RestoreScanCursorStale)
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_wire_and_debug_are_bounded_opaque_and_round_trip() {
+        let (cursor, authentication_key, scope) = test_cursor();
+        let encoded = serde_json::to_string(&cursor).expect("encode cursor");
+        assert!(encoded.len() <= RESTORE_SCAN_CURSOR_MAX_HEX_CHARS + 2);
+        assert!(!encoded.contains("tenant-secret"));
+        assert!(!encoded.contains("subscriber-derived-secret"));
+        assert!(!encoded.contains("1970"));
+        assert!(!format!("{cursor:?}").contains("tenant-secret"));
+
+        let decoded: RestoreScanCursor = serde_json::from_str(&encoded).expect("decode cursor");
+        assert_eq!(decoded, cursor);
+        decoded
+            .authenticated_parts(&scope, &authentication_key)
+            .expect("round-tripped cursor authenticates");
+    }
+
+    #[test]
+    fn durable_cursor_encoding_is_canonical_and_progress_is_exact() {
+        let (_, authentication_key, scope) = test_cursor();
+        let seek_key = SessionKey {
+            tenant: TenantId::from_static("tenant-secret"),
+            nf_kind: NetworkFunctionKind::upf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"subscriber-derived-secret"),
+        };
+        let snapshot_time = Timestamp::from_offset_datetime(
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(987_654),
+        );
+        let make_cursor = |examined_position| {
+            RestoreScanCursor::durable(
+                &authentication_key,
+                [0x33; 16],
+                42,
+                snapshot_time,
+                &scope,
+                &seek_key,
+                examined_position,
+            )
+            .expect("build deterministic cursor")
+        };
+        let request_cursor = make_cursor(4_096);
+        assert_eq!(request_cursor, make_cursor(4_096));
+
+        let request = RestoreScanRequest {
+            scope: scope.clone(),
+            cursor: Some(request_cursor),
+            limit: 1,
+        };
+        RestoreScanPage::new_durable(Vec::new(), 1, Some(make_cursor(4_097)))
+            .validate_for_request(&request)
+            .expect("exact durable progress");
+        for invalid in [make_cursor(4_096), make_cursor(4_095), make_cursor(4_098)] {
+            assert!(matches!(
+                RestoreScanPage::new_durable(Vec::new(), 1, Some(invalid))
+                    .validate_for_request(&request),
+                Err(StoreError::InvalidRestoreScanResponse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn cursor_represents_consensus_bounded_stable_ids() {
+        let authentication_key = [0x5a; 32];
+        let scope = RestoreScanScope::all();
+        let mut seek_key = SessionKey {
+            tenant: TenantId::from_static("tenant-a"),
+            nf_kind: NetworkFunctionKind::upf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from(vec![0x6a; RESTORE_SCAN_CURSOR_STABLE_ID_BYTES]),
+        };
+        let snapshot_time = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let cursor = RestoreScanCursor::durable(
+            &authentication_key,
+            [0x33; 16],
+            42,
+            snapshot_time,
+            &scope,
+            &seek_key,
+            1,
+        )
+        .expect("consensus-bounded key fits the cursor");
+        assert!(cursor.token.len() <= RESTORE_SCAN_CURSOR_MAX_DURABLE_BYTES);
+        cursor
+            .authenticated_parts(&scope, &authentication_key)
+            .expect("maximum cursor authenticates");
+
+        seek_key.stable_id = Bytes::from(vec![0x6a; RESTORE_SCAN_CURSOR_STABLE_ID_BYTES + 1]);
+        assert_eq!(
+            RestoreScanCursor::durable(
+                &authentication_key,
+                [0x33; 16],
+                42,
+                snapshot_time,
+                &scope,
+                &seek_key,
+                1,
+            ),
+            Err(StoreError::RestoreScanWorkBudgetExceeded)
+        );
+    }
+
+    #[test]
+    fn cursor_decoder_rejects_hostile_token_shapes() {
+        let (cursor, _, _) = test_cursor();
+        let encoded_cursor = cursor.encode_token();
+        let unsupported_maximum =
+            format!("02{}", "0".repeat(RESTORE_SCAN_CURSOR_MAX_HEX_CHARS - 2));
+        for token in [
+            String::new(),
+            "00".to_string(),
+            "0".repeat(RESTORE_SCAN_CURSOR_LEGACY_BYTES * 2 + 1),
+            "g".repeat(encoded_cursor.len()),
+            "A".repeat(encoded_cursor.len()),
+            "0".repeat(RESTORE_SCAN_CURSOR_MAX_HEX_CHARS + 2),
+            unsupported_maximum,
+        ] {
+            let encoded = serde_json::to_string(&token).expect("encode hostile token");
+            assert!(serde_json::from_str::<RestoreScanCursor>(&encoded).is_err());
+        }
+    }
 }

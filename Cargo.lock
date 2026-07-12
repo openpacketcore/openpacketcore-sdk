@@ -3156,6 +3156,7 @@ dependencies = [
  "futures-util",
  "opc-consensus",
  "opc-identity",
+ "opc-key",
  "opc-persist",
  "opc-session-store",
  "opc-tls",
@@ -3178,6 +3179,7 @@ dependencies = [
 name = "opc-session-store"
 version = "0.2.0"
 dependencies = [
+ "aes-gcm-siv",
  "async-trait",
  "bytes",
  "futures-util",
@@ -3188,6 +3190,7 @@ dependencies = [
  "opc-redaction",
  "opc-types",
  "proptest",
+ "rand 0.10.1",
  "rusqlite",
  "serde",
  "serde_json",

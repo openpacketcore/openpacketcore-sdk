@@ -50,9 +50,9 @@ The 9 MiB minimum is proven to hold the worst JSON expansion of the shared
 2 MiB opaque RPC ceiling plus its bounded envelope. Private Openraft RPCs are
 compact-encoded by the session-store adapter; the transport does not interpret
 or authorize engine decisions. On a production #127 endpoint the consensus
-ALPN replaces the legacy backend ALPN. Consequently #133 must consume
-consensus-authoritative restore evidence rather than reopening raw mutation or
-rebuild authority beside Openraft.
+ALPN replaces the legacy backend ALPN. Restore now consumes the local
+Openraft-applied state after a linearizable barrier rather than reopening raw
+mutation or rebuild authority beside Openraft.
 
 ## API Shape
 
@@ -95,10 +95,22 @@ rebuild authority beside Openraft.
   each response's final bounded encode, prefix, payload, and flush, and
   `with_restore_scan_timeout` bounds cancellable backend scan work.
 - `RemoteSessionBackend::scan_restore_records` validates requests and peer
-  pages. The server may return fewer records than requested so the encoded
-  response fits the smaller client/server frame limit; callers continue from
-  `next_cursor` until `complete`. The wire omits redundant `loaded_count` and
-  `complete` values and recomputes both from the records and cursor.
+  pages against the exact request limit actually dispatched after frame
+  narrowing. Only `DurableOpaqueV1` pages are transportable: compatibility
+  offset pages from the in-process fake are rejected before they can be used
+  as remote restore evidence. Validation bounds page bytes, record order,
+  scope, cursor shape, and the server's claimed progress; it cannot prove that
+  an authenticated server did not omit records or falsely report completion.
+  Production completeness is the local Openraft-applied scan after a
+  linearizable barrier, not this compatibility RPC. Backends may return fewer records than requested
+  (including an empty advancing sparse page) to stay within the fixed 4 MiB
+  payload, 8 MiB retained-page, 8 MiB examined-metadata, and 4,096
+  examined-candidate budgets; callers continue from the
+  confidential authenticated `next_cursor` until `complete`. A server does not
+  rewrite a backend cursor to fit a smaller wire frame: it returns
+  `RestoreScanResponseTooLarge`, allowing the caller to retry from the same
+  cursor with a smaller record limit. The wire omits redundant `loaded_count`
+  and `complete` values and recomputes both from records and cursor.
 - `SessionBackend::probe_replication_head` performs a fresh, deadline-bounded
   wire request. It does not consult the client's capability cache and reports
   transport, authentication, timeout, protocol, and backend failures through
@@ -114,7 +126,8 @@ rebuild authority beside Openraft.
   `MAX_REPLICATION_OPERATIONS_PER_ENTRY` (256). The root is depth 1 and every
   operation node, including `Batch`, counts toward the per-entry total.
 - Independent protocol work limits admit at most 256 batch operations, 1,024
-  restore records, 65,536 replication-log entries, and 65,536 rebuild entries.
+  restore records and 4 MiB of restore payload, 65,536 replication-log
+  entries, and 65,536 rebuild entries.
   These limits apply in addition to the configured encoded-frame bound.
 - Every post-bootstrap server response and watch item is fully bounded-encoded
   before any length prefix is written. Common successes use one bounded encode;
@@ -169,13 +182,18 @@ build.
 
 ### Outbound response contract
 
-Protocol v4 contract-profile wire-schema revision 2 makes response budgets part
+Protocol v4 contract-profile wire-schema revision 3 retains revision 2's
+response budgets and adds the confidential authenticated snapshot-bound
+restore cursor, explicit durable-page profile, fixed 4 MiB restore payload and
+8 MiB retained-page, 8 MiB examined-metadata, and 4,096 examined-candidate
+budgets, and error-set revision 2. Directional budgets are
+part
 of the exact handshake. `requested_response_frame_size`,
 `accepted_response_frame_size`, and `server_request_frame_size` are public
-`Option<u32>` bootstrap fields so a revision-2 decoder can classify an otherwise
+`Option<u32>` bootstrap fields so an older decoder can classify an otherwise
 decodable legacy minimal bootstrap. This is not bidirectional mismatch
-negotiation: a revision-1 decoder may reject unknown revision-2 fields by simply
-closing. Exact revision-2 v4 admission requires each to be `Some`, at least
+negotiation: an older decoder may reject unknown fields by simply closing.
+Exact revision-3 v4 admission requires each to be `Some`, at least
 `MIN_NEGOTIATED_FRAME_SIZE` (8 KiB, or 8,192 bytes), and at most
 `MAX_NEGOTIATED_FRAME_SIZE` (16 MiB, or 16,777,216 bytes). The profile pins
 both as `min_frame_size = 8192` and `max_frame_size = 16777216`.
@@ -184,8 +202,25 @@ second independently configurable limit. The accepted response size is the
 smaller of the client's receive limit and the server's configured frame limit;
 the server request size independently bounds frames sent by that client. This
 supports unequal client/server settings without assuming either configured
-limit applies in both directions. A revision-1 v4 peer is incompatible even
+limit applies in both directions. A revision-2 or older v4 peer is incompatible even
 though the ALPN remains `opc-session-net/4`.
+
+The cursor's seek key and snapshot metadata remain confidential. Its one clear
+cumulative examined-row position is bound into cursor authentication and lets
+the client reject structurally inconsistent claimed progress before issuing
+another request; the issuer authenticates it when consuming that cursor. This
+does not prove page completeness or an authenticated server's honesty. Cursor encoding
+is deterministic for an identical semantic position, so a response retry
+reuses the same token. The cursor is backend-incarnation/node-bound: same-PVC
+restart can resume it, but another node or an installed snapshot returns typed
+`RestoreScanCursorStale`; restart at the first page instead of merging pages.
+The maximum local consensus-key cursor serializes to roughly 4 MiB of hex and
+therefore exceeds the 1 MiB default legacy session-net frame while remaining
+below the 16 MiB negotiated ceiling. Response sizing is exact and bounded: an
+insufficient negotiated frame returns typed `RestoreScanResponseTooLarge`
+without a prefix or partial cursor. Configure a larger frame only when an
+approved compatibility deployment actually needs it; session-net records
+remain independently limited to 64-byte stable IDs.
 
 The existing restore request's `max_response_frame_size` remains an additional
 per-call cap; it may reduce, never enlarge, that connection's accepted response
@@ -293,7 +328,8 @@ campaigns.
 - The wire contract version is `4`; the default max frame size is 1 MiB and the
   exact negotiated ceiling is 16 MiB.
 - Protocol v4 uses `u32` for restore/log request limits and the client restore
-  response budget; `u64` for restore cursors, excluded counts,
+  response budget; a confidential authenticated strictly bounded restore cursor;
+  `u64` excluded counts,
   `max_value_bytes`, and size-bearing `StoreError` fields; and checked
   conversion at both domain boundaries. Non-representable values fail before
   backend dispatch or caller exposure. The negotiated frame-size limit remains
@@ -333,7 +369,9 @@ campaigns.
   adds public `ContractProfile::max_frame_size`, so external profile struct
   literals and exhaustive destructuring must be updated in the same
   coordinated change.
-- The v4 profile pins wire-schema revision 2 and error-set revision 1;
+- The v4 profile pins wire-schema revision 3 and error-set revision 2;
+  `max_restore_scan_page_payload_bytes = 4194304`;
+  `max_restore_scan_examined_rows = 4096`;
   `min_frame_size = 8192`; `max_frame_size = 16777216`; the 128-byte
   owner/custom-key/state-type rules;
   `stable_id_max_bytes = 64`; `replication_tx_id_max_bytes = 128`;
@@ -353,14 +391,15 @@ campaigns.
   pre-v4 peer built before #135 can still send an empty or oversized value
   that a new peer rejects before dispatch, so unchanged valid JSON shape is not
   a rolling-compatibility claim.
-- Treat the v4 migration, including wire-schema revision 1 to revision 2, as a
+- Treat the v4 migration, including revision 2 to revision 3, as a
   coordinated stop/upgrade/start boundary. Drain
   traffic and writers, audit every persisted SQLite replica with the count-only
   `opc-session-store-audit identity-invariants` command, and separately
   preflight every live/replayable handover payload and nested payload-protection
   boundary. Upgrade all clients, servers, protection wrappers, and product
   handover readers/writers together; verify authenticated handshakes and
-  representative v4 restore/log reads; and only then restore traffic. The
+  representative v4 restore/log reads, including an empty advancing sparse
+  page and rejection of a modified cursor; and only then restore traffic. The
   fixed-width DTO and handshake now state the #135 admission contract
   explicitly, and revision 2 adds the exact directional response/request
   budgets and wire-only stable-ID, replication-transaction-ID, and CAS-request-ID
@@ -425,7 +464,8 @@ campaigns.
   maximum is accepted and zero means immediate expiry. The TTL request shape is
   unchanged for entries within the operation-tree contract. The new serialized
   error variants require external exhaustive matches. Their wire representation
-  is pinned by v4 error revision 1; a v3 peer is rejected during negotiation.
+  was introduced by v4 error revision 1 and is retained by current error
+  revision 2; a v3 peer is rejected during negotiation.
   Legacy persisted replication logs must be
   audited before upgrade because an entry carrying a larger TTL now fails
   closed during replay or rebuild rather than being clamped. Cross-field
@@ -462,9 +502,9 @@ campaigns.
 - Remote scan and fresh-probe transport parity do not by themselves qualify
   networked session HA for production. Protocol v4 authenticates membership;
   it does not establish consensus, fork reconciliation, or
-  majority-authoritative restore. The separate consensus ALPN now supplies
-  durable sequence/commit authority under #127; recovery and restore remain
-  #128/#129/#133. #134's fixed-width v4 boundary and #135's
+  majority-authoritative restore. The separate consensus ALPN supplies durable
+  sequence/commit authority under #127 and bounded applied-state restore under
+  #133; recovery remains #128/#129. #134's fixed-width v4 boundary and #135's
   model-level decode boundary are implemented but do not provide any of those
   distributed properties.
 - #159 contains stable IDs and replication transaction IDs at the wire boundary
@@ -477,7 +517,7 @@ campaigns.
 
 ## Roadmap
 
-- Close #128/#129, #133, #145, #148, and the model/persistence work in
+- Close #128/#129, #145, #148, and the model/persistence work in
   #167/#168/#171; and add distributed
   failure and soak evidence. A renewed SVID on a subsequent new call/full
   handshake and wrong-scope rejection now have scoped real-mTLS qualification;

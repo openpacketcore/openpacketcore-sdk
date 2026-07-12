@@ -100,6 +100,10 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         self.backend.peer_binding()
     }
 
+    fn restore_scan_cursor_profile(&self) -> Option<crate::RestoreScanCursorProfile> {
+        self.backend.restore_scan_cursor_profile()
+    }
+
     async fn capabilities(&self) -> BackendCapabilities {
         self.backend.capabilities().await
     }

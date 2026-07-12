@@ -1,10 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
+use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_persist::{
     AuditKey, ConfigConsensusRequestId, ConfigConsensusTopology, ConfigStore, ConsensusConfigStore,
     PersistErrorKind, SqliteBackend,
@@ -18,12 +21,17 @@ use opc_session_net::{
 #[cfg(feature = "legacy-session-net-compat")]
 use opc_session_store::ReplicaReadinessFailure;
 use opc_session_store::{
-    QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, SessionConsensusPeer, SessionConsensusPeerError,
+    CompareAndSet, CompareAndSetResult, ConsensusSessionStore, EncryptedSessionPayload,
+    EncryptingSessionBackend, Generation, OwnerId, QuorumReplicaDescriptor, QuorumTopologyConfig,
+    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    RestoreScanRequest, SessionBackend, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
-    SessionConsensusWireResponse, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+    SessionConsensusWireResponse, SessionKey, SessionKeyType, SessionLeaseManager,
+    SqliteSessionBackend, StateClass, StateType, StoredSessionRecord, SystemClock,
+    ValidatedQuorumTopology, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
+use opc_types::{NetworkFunctionKind, TenantId};
 
 const SERVER_REPLICA: u16 = 2;
 
@@ -133,6 +141,202 @@ fn manifest(
 
 fn resolver(addr: SocketAddr) -> RemoteAddrResolver {
     Arc::new(move || Box::pin(async move { Ok(addr) }))
+}
+
+fn deferred_resolver(
+    address: Arc<StdRwLock<Option<SocketAddr>>>,
+    enabled: Arc<AtomicBool>,
+) -> RemoteAddrResolver {
+    Arc::new(move || {
+        let address = Arc::clone(&address);
+        let enabled = Arc::clone(&enabled);
+        Box::pin(async move {
+            if !enabled.load(Ordering::Acquire) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "consensus test path disabled",
+                ));
+            }
+            address
+                .read()
+                .map_err(|_| std::io::Error::other("consensus address lock poisoned"))?
+                .as_ref()
+                .copied()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "consensus server is not listening",
+                    )
+                })
+        })
+    })
+}
+
+fn restore_key(label: &'static [u8]) -> SessionKey {
+    SessionKey {
+        tenant: TenantId::from_static("mtls-restore-tenant"),
+        nf_kind: NetworkFunctionKind::from_static("smf"),
+        key_type: SessionKeyType::PduSession,
+        stable_id: Bytes::from_static(label),
+    }
+}
+
+fn restore_record(
+    key: SessionKey,
+    lease: &opc_session_store::LeaseGuard,
+    payload: &'static [u8],
+) -> StoredSessionRecord {
+    StoredSessionRecord {
+        key,
+        generation: Generation::new(1),
+        owner: lease.owner().clone(),
+        fence: lease.fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("mtls-restore-session"),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new(payload),
+    }
+}
+
+async fn wait_for_ready_nodes(
+    stores: &[ConsensusSessionStore],
+    nodes: &[usize],
+    failure_message: &'static str,
+    transport_stats: &BTreeMap<(usize, usize), Arc<TransportStats>>,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut attempts = 0_usize;
+    loop {
+        attempts += 1;
+        let reports = futures_util::future::join_all(
+            nodes
+                .iter()
+                .map(|index| stores[*index].probe_durable_readiness()),
+        )
+        .await;
+        if reports.iter().all(|report| report.is_ready()) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{failure_message}: attempts={attempts}, reports={reports:?}, transport={:?}",
+            transport_stats
+                .iter()
+                .map(|(path, stats)| (*path, stats.snapshot()))
+                .collect::<BTreeMap<_, _>>()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[derive(Debug, Default)]
+struct TransportStats {
+    outcomes: StdMutex<BTreeMap<String, usize>>,
+}
+
+impl TransportStats {
+    fn record(&self, outcome: String) {
+        let mut outcomes = self
+            .outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *outcomes.entry(outcome).or_default() += 1;
+    }
+
+    fn snapshot(&self) -> BTreeMap<String, usize> {
+        self.outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn count(&self, outcome: &str) -> usize {
+        self.outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(outcome)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InstrumentedConsensusPeer {
+    inner: RemoteSessionConsensusPeer,
+    stats: Arc<TransportStats>,
+}
+
+#[async_trait]
+impl SessionConsensusPeer for InstrumentedConsensusPeer {
+    fn node_id(&self) -> opc_session_store::SessionConsensusNodeId {
+        self.inner.node_id()
+    }
+
+    async fn call(
+        &self,
+        request: SessionConsensusWireRequest,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        let family = request.family.as_str();
+        let result = self.inner.call(request).await;
+        let status = match &result {
+            Ok(response) if response.result.is_ok() => "ok",
+            Ok(response) => match response.result {
+                Err(SessionConsensusPeerError::Unavailable) => "remote_unavailable",
+                Err(SessionConsensusPeerError::Timeout) => "remote_timeout",
+                Err(SessionConsensusPeerError::Authentication) => "remote_authentication",
+                Err(SessionConsensusPeerError::ScopeMismatch) => "remote_scope_mismatch",
+                Err(SessionConsensusPeerError::Protocol) => "remote_protocol",
+                Err(SessionConsensusPeerError::Rejected) => "remote_rejected",
+                Err(_) => "remote_other",
+                Ok(_) => "ok",
+            },
+            Err(SessionConsensusPeerError::Unavailable) => "unavailable",
+            Err(SessionConsensusPeerError::Timeout) => "timeout",
+            Err(SessionConsensusPeerError::Authentication) => "authentication",
+            Err(SessionConsensusPeerError::ScopeMismatch) => "scope_mismatch",
+            Err(SessionConsensusPeerError::Protocol) => "protocol",
+            Err(SessionConsensusPeerError::Rejected) => "rejected",
+            Err(_) => "other",
+        };
+        self.stats.record(format!("{family}:{status}"));
+        result
+    }
+}
+
+async fn wait_for_observed_leader(
+    stats: &BTreeMap<(usize, usize), Arc<TransportStats>>,
+    members: usize,
+) -> usize {
+    let baseline = stats
+        .iter()
+        .map(|(path, value)| (*path, value.count("append_entries:ok")))
+        .collect::<BTreeMap<_, _>>();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        for source in 0..members {
+            let observed_all_targets =
+                (0..members)
+                    .filter(|target| *target != source)
+                    .all(|target| {
+                        stats.get(&(source, target)).is_some_and(|value| {
+                            value.count("append_entries:ok")
+                                > baseline.get(&(source, target)).copied().unwrap_or(0)
+                        })
+                    });
+            if observed_all_targets {
+                return source;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no current leader emitted successful heartbeats: {:?}",
+            stats
+                .iter()
+                .map(|(path, value)| (*path, value.snapshot()))
+                .collect::<BTreeMap<_, _>>()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[derive(Debug)]
@@ -402,6 +606,278 @@ async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_mtls_openraft_sqlite_boot_restore_and_live_survivor_scan() {
+    const REPLICAS: [u16; 3] = [1, 2, 3];
+    const CONSENSUS_TIMEOUT: Duration = Duration::from_secs(3);
+
+    let pki = TestPki::new();
+    let manifest = manifest("mtls-openraft-restore", 17, 1);
+    let descriptors = REPLICAS
+        .iter()
+        .map(|replica| descriptor(*replica, 1))
+        .collect::<Vec<_>>();
+    let topologies = REPLICAS
+        .iter()
+        .map(|replica| {
+            ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                replica_id(*replica),
+                descriptors.clone(),
+                manifest.consensus_identity(),
+            ))
+            .expect("validated mTLS consensus topology")
+        })
+        .collect::<Vec<_>>();
+    let directory = tempfile::tempdir().expect("mTLS consensus directory");
+    let backends = REPLICAS
+        .iter()
+        .map(|replica| {
+            SqliteSessionBackend::open(directory.path().join(format!("replica-{replica}.sqlite")))
+                .expect("file-backed SQLite replica")
+        })
+        .collect::<Vec<_>>();
+    let addresses = REPLICAS
+        .iter()
+        .map(|_| Arc::new(StdRwLock::new(None)))
+        .collect::<Vec<_>>();
+    let mut path_enabled = BTreeMap::new();
+    let mut transport_stats = BTreeMap::new();
+    let mut probe_peers = BTreeMap::new();
+    for source in 0..REPLICAS.len() {
+        for target in 0..REPLICAS.len() {
+            if source != target {
+                path_enabled.insert((source, target), Arc::new(AtomicBool::new(true)));
+            }
+        }
+    }
+
+    let mut stores = Vec::with_capacity(REPLICAS.len());
+    for (source, replica) in REPLICAS.iter().copied().enumerate() {
+        let local = manifest
+            .bind_local(replica_id(replica))
+            .expect("local consensus binding");
+        let mut peers = BTreeMap::<_, Arc<dyn SessionConsensusPeer>>::new();
+        for (target, remote_replica) in REPLICAS.iter().copied().enumerate() {
+            if source == target {
+                continue;
+            }
+            let binding = local
+                .bind_remote(replica_id(remote_replica))
+                .expect("remote consensus binding");
+            let node_id = binding.remote_consensus_node_id();
+            let remote = RemoteSessionConsensusPeer::new_with_resolver(
+                binding,
+                deferred_resolver(
+                    Arc::clone(&addresses[target]),
+                    Arc::clone(
+                        path_enabled
+                            .get(&(source, target))
+                            .expect("consensus path flag"),
+                    ),
+                ),
+                pki.client_config(replica),
+                Some(CONSENSUS_TIMEOUT),
+            );
+            let stats = Arc::new(TransportStats::default());
+            let remote = Arc::new(InstrumentedConsensusPeer {
+                inner: remote,
+                stats: Arc::clone(&stats),
+            });
+            transport_stats.insert((source, target), stats);
+            probe_peers.insert((source, target), Arc::clone(&remote));
+            peers.insert(node_id, remote);
+        }
+        stores.push(
+            ConsensusSessionStore::open_with_clock(
+                topologies[source].clone(),
+                backends[source].clone(),
+                directory.path().join(format!("snapshots-{replica}")),
+                peers,
+                Arc::new(SystemClock),
+                CONSENSUS_TIMEOUT,
+            )
+            .await
+            .expect("open mTLS consensus store"),
+        );
+    }
+
+    let mut servers = Vec::with_capacity(REPLICAS.len());
+    for (index, replica) in REPLICAS.iter().copied().enumerate() {
+        let binding = manifest
+            .bind_local(replica_id(replica))
+            .expect("server consensus binding");
+        let (server, address) = SessionConsensusServer::new(
+            stores[index].rpc_handler(),
+            pki.server_config(replica),
+            binding,
+        )
+        .listen("127.0.0.1:0".parse().expect("listen address"))
+        .await
+        .expect("start mTLS consensus listener");
+        *addresses[index].write().expect("consensus address lock") = Some(address);
+        servers.push(Some(server));
+    }
+
+    // Prove every directional resolver/TCP/mTLS/manifest path is executable
+    // before starting election timers. The deliberately empty Vote payload is
+    // rejected by the engine codec only after the authenticated transport has
+    // completed its full request/response exchange.
+    let transport_probes =
+        futures_util::future::join_all(probe_peers.iter().map(|((source, target), peer)| {
+            let manifest = Arc::clone(&manifest);
+            async move {
+                (
+                    (*source, *target),
+                    peer.call(request(&manifest, REPLICAS[*source], Vec::new()))
+                        .await,
+                )
+            }
+        }))
+        .await;
+    for (path, result) in transport_probes {
+        assert!(
+            result.is_ok(),
+            "directional mTLS consensus preflight failed: path={path:?}, result={result:?}"
+        );
+    }
+
+    let initialized = futures_util::future::join_all(
+        stores.iter().map(ConsensusSessionStore::initialize_cluster),
+    )
+    .await;
+    for result in initialized {
+        result.expect("initialize real mTLS Openraft fleet");
+    }
+    wait_for_ready_nodes(
+        &stores,
+        &[0, 1, 2],
+        "initial mTLS consensus fleet becomes durably ready",
+        &transport_stats,
+    )
+    .await;
+    let leader = wait_for_observed_leader(&transport_stats, REPLICAS.len()).await;
+
+    let provider = Arc::new(MemoryKeyProvider::new());
+    provider
+        .insert_active_key(
+            KeyId::new("mtls-restore-key").expect("key ID"),
+            KeyPurpose::Session,
+            TenantId::from_static("mtls-restore-tenant"),
+            Zeroizing::new([0x5a; AES_256_GCM_SIV_KEY_LEN]),
+        )
+        .expect("install restore key");
+    let writer = EncryptingSessionBackend::new(
+        Arc::new(stores[leader].clone()),
+        Arc::clone(&provider),
+        "mtls-openraft-restore",
+    );
+    for (label, payload) in [
+        (b"restore-a".as_slice(), b"boot-state-a".as_slice()),
+        (b"restore-b".as_slice(), b"boot-state-b".as_slice()),
+    ] {
+        let key = restore_key(label);
+        let lease = writer
+            .acquire(
+                &key,
+                OwnerId::new("mtls-restore-owner").expect("owner"),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("acquire restore lease through mTLS Openraft");
+        assert_eq!(
+            writer
+                .compare_and_set(CompareAndSet {
+                    key: key.clone(),
+                    lease: lease.clone(),
+                    expected_generation: None,
+                    new_record: restore_record(key, &lease, payload),
+                })
+                .await
+                .expect("commit restore state through mTLS Openraft"),
+            CompareAndSetResult::Success
+        );
+    }
+
+    let restore_reader = (0..REPLICAS.len())
+        .find(|candidate| *candidate != leader)
+        .expect("three-node fleet has a follower reader");
+    let reader = EncryptingSessionBackend::new(
+        Arc::new(stores[restore_reader].clone()),
+        Arc::clone(&provider),
+        "mtls-openraft-restore",
+    );
+    let first_request = RestoreScanRequest::all(1);
+    let first = reader
+        .scan_restore_records(first_request.clone())
+        .await
+        .expect("boot restore first page through real mTLS Openraft");
+    first
+        .validate_for_request(&first_request)
+        .expect("boot restore first-page contract");
+    assert_eq!(first.records[0].payload.as_bytes(), b"boot-state-a");
+    let second_request = RestoreScanRequest {
+        cursor: first.next_cursor,
+        ..first_request
+    };
+    let second = reader
+        .scan_restore_records(second_request.clone())
+        .await
+        .expect("boot restore continuation through real mTLS Openraft");
+    second
+        .validate_for_request(&second_request)
+        .expect("boot restore continuation contract");
+    assert_eq!(second.records[0].payload.as_bytes(), b"boot-state-b");
+    assert!(second.complete);
+
+    // #133 qualifies bounded applied-state restore while one voter is absent;
+    // leader-loss/election qualification belongs to #143. Select a follower
+    // from observed successful heartbeats so this test does not randomly
+    // become an unrelated two-survivor election-liveness campaign.
+    let isolated = (0..REPLICAS.len())
+        .find(|candidate| *candidate != leader)
+        .expect("three-node fleet has a follower");
+    let survivors = (0..REPLICAS.len())
+        .filter(|candidate| *candidate != isolated)
+        .collect::<Vec<_>>();
+    for ((source, target), enabled) in &path_enabled {
+        if *source == isolated || *target == isolated {
+            enabled.store(false, Ordering::Release);
+        }
+    }
+    servers[isolated]
+        .take()
+        .expect("isolated follower consensus server")
+        .abort_and_wait()
+        .await;
+    wait_for_ready_nodes(
+        &stores,
+        &survivors,
+        "surviving mTLS consensus majority becomes durably ready",
+        &transport_stats,
+    )
+    .await;
+
+    let survivor = EncryptingSessionBackend::new(
+        Arc::new(stores[leader].clone()),
+        provider,
+        "mtls-openraft-restore",
+    );
+    let adoption_request = RestoreScanRequest::all(16);
+    let adoption = survivor
+        .scan_restore_records(adoption_request.clone())
+        .await
+        .expect("live-survivor adoption scan through remaining mTLS quorum");
+    adoption
+        .validate_for_request(&adoption_request)
+        .expect("live-survivor restore contract");
+    assert_eq!(adoption.records.len(), 2);
+    assert!(adoption.complete);
+
+    for server in servers.into_iter().flatten() {
+        server.abort_and_wait().await;
+    }
+}
+
 #[tokio::test]
 async fn certificate_sender_cluster_configuration_and_epoch_mismatches_fail_closed() {
     let pki = TestPki::new();
@@ -458,94 +934,6 @@ async fn certificate_sender_cluster_configuration_and_epoch_mismatches_fail_clos
             Err(SessionConsensusPeerError::ScopeMismatch)
         );
     }
-
-    handle.abort_and_wait().await;
-}
-
-#[tokio::test]
-async fn new_consensus_handshakes_reauthenticate_after_svid_rotation() {
-    let pki = TestPki::new();
-    let manifest = manifest("cluster-a", 7, 1);
-    let server_binding = manifest
-        .bind_local(replica_id(SERVER_REPLICA))
-        .expect("server binding");
-    let (server_identity_tx, server_identity_rx) =
-        tokio::sync::watch::channel(Some(pki.identity_state(SERVER_REPLICA)));
-    let server_tls = TlsConfigBuilder::new(server_identity_rx)
-        .allow_any_trusted_peer()
-        .build_authenticated_server_config()
-        .expect("rotating authenticated server config");
-    let (handle, addr) = SessionConsensusServer::new(
-        Arc::new(EchoHandler {
-            delay: Duration::ZERO,
-        }),
-        server_tls,
-        server_binding,
-    )
-    .listen("127.0.0.1:0".parse().expect("listen address"))
-    .await
-    .expect("consensus listen");
-
-    let client_binding = manifest
-        .bind_local(replica_id(1))
-        .expect("client binding")
-        .bind_remote(replica_id(SERVER_REPLICA))
-        .expect("remote binding");
-    let (client_identity_tx, client_identity_rx) =
-        tokio::sync::watch::channel(Some(pki.identity_state(1)));
-    let client_tls = TlsConfigBuilder::new(client_identity_rx)
-        .allow_any_trusted_peer()
-        .build_authenticated_client_config()
-        .expect("rotating authenticated client config");
-    let peer = RemoteSessionConsensusPeer::new_with_resolver(
-        client_binding,
-        resolver(addr),
-        client_tls,
-        Some(Duration::from_secs(1)),
-    );
-
-    assert_eq!(
-        peer.call(request(&manifest, 1, b"before-rotation".to_vec()))
-            .await,
-        Ok(SessionConsensusWireResponse {
-            result: Ok(b"before-rotation".to_vec()),
-        })
-    );
-
-    server_identity_tx
-        .send(Some(pki.identity_state(SERVER_REPLICA)))
-        .expect("rotate server SVID in place");
-    client_identity_tx
-        .send(Some(pki.identity_state(1)))
-        .expect("rotate client SVID in place");
-    assert_eq!(
-        peer.call(request(&manifest, 1, b"after-rotation".to_vec()))
-            .await,
-        Ok(SessionConsensusWireResponse {
-            result: Ok(b"after-rotation".to_vec()),
-        })
-    );
-
-    server_identity_tx
-        .send(Some(pki.identity_state(3)))
-        .expect("rotate server to wrong SPIFFE identity");
-    assert_eq!(
-        peer.call(request(&manifest, 1, b"wrong-server".to_vec()))
-            .await,
-        Err(SessionConsensusPeerError::Authentication)
-    );
-
-    server_identity_tx
-        .send(Some(pki.identity_state(SERVER_REPLICA)))
-        .expect("restore server identity");
-    client_identity_tx
-        .send(Some(pki.identity_state(3)))
-        .expect("rotate client to wrong SPIFFE identity");
-    assert_eq!(
-        peer.call(request(&manifest, 1, b"wrong-client".to_vec()))
-            .await,
-        Err(SessionConsensusPeerError::Authentication)
-    );
 
     handle.abort_and_wait().await;
 }

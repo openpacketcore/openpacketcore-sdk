@@ -105,6 +105,15 @@ pub enum StoreError {
         /// Maximum supported page size.
         max: usize,
     },
+    /// A restore cursor belongs to another backend incarnation, request
+    /// scope, logical-time snapshot, or record revision. The caller must
+    /// restart the bounded scan from the first page.
+    #[error("restore scan cursor is stale")]
+    RestoreScanCursorStale,
+    /// A backend stopped a restore scan after reaching its fixed work budget.
+    /// The request performed no partial externally visible mutation.
+    #[error("restore scan work budget was exceeded")]
+    RestoreScanWorkBudgetExceeded,
     /// A restore-scan response could not fit within the configured response
     /// budget, either because the budget is below the protocol minimum or one
     /// record is too large. Increase the frame limit or reduce the stored value.

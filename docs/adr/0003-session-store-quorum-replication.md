@@ -143,8 +143,10 @@ The current networked profile remains experimental, not yet a production HA
 qualification claim. #127 establishes durable commit/sequencing authority with
 Openraft and removes the custom session quorum algorithm. #128 hardens and
 qualifies current-format Openraft follower recovery without adding another
-repair authority. Operator-safe legacy-fork recovery and bounded
-majority-authoritative restore remain #129 and #133.
+repair authority. #133 adds bounded local applied-state restore with an
+AEAD-sealed composite-key seek cursor, bounded candidate work, and prompt
+SQLite cancellation. It adds no remote quorum, digest comparison, or Merkle
+authority. Operator-safe legacy-fork recovery remains #129.
 Fixed-width private wire DTOs and checked domain conversion are implemented
 under #134. Invariant-safe owner/key model decoding, bounded count-only SQLite
 admission, and typed-invalid handover rejection are
@@ -162,13 +164,16 @@ implemented under #159. Distributed failure/resource qualification remains
 profile experimental.
 
 The v4 wire uses `u32` for restore/log request limits and the client restore
-response budget; `u64` for restore cursors, excluded counts,
+response budget; a confidential authenticated strictly bounded restore cursor;
+`u64` excluded counts,
 `max_value_bytes`, and size-bearing store errors; and checked conversion before
 backend dispatch or caller exposure. It omits restore `loaded_count` and
 `complete` and recomputes them after decode. Independent limits admit 256 batch
 operations, 1,024 restore records, 65,536 replication-log entries, and 65,536
 rebuild entries, in addition to the configured frame-size bound. The exact
-profile pins wire-schema revision 2, error-set revision 1, 128-byte
+profile pins wire-schema revision 3, error-set revision 2, a 4 MiB restore
+payload bound, 8 MiB retained-page and examined key/filter-metadata bounds,
+`max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, depth-16/256-node replication trees, and the
 31,536,000-second TTL maximum. Revision 2 additionally pins
 `min_frame_size = 8192`, `max_frame_size = 16777216`,
@@ -183,6 +188,15 @@ new field. The public `ContractProfile::max_frame_size` field is also a Rust
 source break for external literals/destructuring and shares the coordinated
 revision-2 deployment boundary.
 
+The cursor is variable-length up to the consensus RPC/key ceiling. Separate
+HMAC-derived AEAD and synthetic-nonce keys make identical semantic positions
+canonical. Only its cumulative examined-row position is clear and bound into
+cursor authentication. That permits a structural check of claimed progress,
+not proof of peer completeness; seek and snapshot fields remain confidential.
+Cursors survive a same-PVC
+restart but are node/incarnation-bound, so another node or installed snapshot
+returns typed stale state and requires a first-page restart.
+
 Wire-schema revision 2 adds directional response-budget admission to the exact
 v4 handshake. Hello carries the client's requested response frame size; HelloAck
 returns the accepted response size (the client/server minimum) and the server's
@@ -190,8 +204,9 @@ independent request-frame size. Each is a checked `u32` between
 `MIN_NEGOTIATED_FRAME_SIZE` (8 KiB, or 8,192 bytes) and
 `MAX_NEGOTIATED_FRAME_SIZE` (16 MiB, or 16,777,216 bytes), and
 `MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE` aliases that same minimum.
-This makes unequal client/server limits explicit and makes revision-1 and
-revision-2 v4 peers incompatible even though both use `opc-session-net/4` ALPN.
+This makes unequal client/server limits explicit. Revision-1, revision-2, and
+current revision-3 v4 profiles are mutually incompatible even though all use
+the `opc-session-net/4` ALPN.
 
 Every response and watch item is fully bounded-encoded before any frame prefix
 is emitted. Common non-pageable and complete-page successes use one bounded
@@ -245,9 +260,10 @@ integer operations rather than floating point or panicking timestamp
   arithmetic. This prevents an oversized direct or authenticated input from
   unwinding a process; Openraft supplies commit proof independently.
 
-The new public error variants require exhaustive callers. Protocol v4 carries
-them through private fixed-width error DTOs under pinned error revision 1, and
-rejects a v3 peer during negotiation. Operators must first audit persisted legacy
+The new public error variants require exhaustive callers. Protocol v4
+introduced their private fixed-width DTOs in error revision 1; current error
+revision 2 retains those encodings and rejects a v3 peer during negotiation.
+Operators must first audit persisted legacy
 replication logs: a TTL-bearing entry above 365 days now fails closed during
 replay/rebuild and is neither clamped nor rewritten automatically. Replicated
 deadline validation admits at most one microsecond above exact

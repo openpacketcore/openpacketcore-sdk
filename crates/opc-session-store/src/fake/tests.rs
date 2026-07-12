@@ -6,9 +6,9 @@ use opc_types::{NetworkFunctionKind, TenantId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FakeBackendDataSnapshot {
-    records: HashMap<String, StoredSessionRecord>,
-    leases: HashMap<String, LeaseEntry>,
-    key_fences: HashMap<String, FenceToken>,
+    records: BTreeMap<FakeMapKey, StoredSessionRecord>,
+    leases: HashMap<FakeMapKey, LeaseEntry>,
+    key_fences: HashMap<FakeMapKey, FenceToken>,
     next_fence: u64,
     next_credential_id: u64,
     compacted_replication_sequence: u64,
