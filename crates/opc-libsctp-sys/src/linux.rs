@@ -6,8 +6,17 @@ use std::ptr;
 
 use crate::{
     AddressFamily, ConnectStatus, EventSubscriptions, InitMsg, Received, RecvFlags, RecvInfo,
-    SendInfo, SocketStyle,
+    SendInfo, SocketStyle, MAX_SCTP_ADDRESSES,
 };
+
+// Linux UAPI values from include/uapi/linux/sctp.h. libc intentionally does
+// not expose the internal options used by the lksctp bindx/connectx helpers.
+const SCTP_SOCKOPT_BINDX_ADD: libc::c_int = 100;
+const SCTP_SOCKOPT_CONNECTX_OLD: libc::c_int = 107;
+const SCTP_GET_PEER_ADDRS: libc::c_int = 108;
+const SCTP_GET_LOCAL_ADDRS: libc::c_int = 109;
+const SCTP_SOCKOPT_CONNECTX: libc::c_int = 110;
+const SCTP_GETADDRS_HEADER_BYTES: usize = mem::size_of::<i32>() + mem::size_of::<u32>();
 
 pub const SCTP_UNORDERED_FLAG: u16 = libc::SCTP_UNORDERED as u16;
 pub const SCTP_NOTIFICATION_FLAG: i32 = libc::SCTP_NOTIFICATION;
@@ -66,6 +75,11 @@ pub fn bind(fd: BorrowedFd<'_>, addr: &SocketAddr) -> io::Result<()> {
     })
 }
 
+pub fn bind_addresses(fd: BorrowedFd<'_>, addrs: &[SocketAddr]) -> io::Result<()> {
+    let packed = pack_socket_addresses(addrs)?;
+    raw_setsockopt(fd, SCTP_SOCKOPT_BINDX_ADD, &packed).map(|_| ())
+}
+
 pub fn listen(fd: BorrowedFd<'_>, backlog: i32) -> io::Result<()> {
     // SAFETY: `listen` only observes the borrowed live descriptor and scalar
     // backlog value.
@@ -110,6 +124,36 @@ pub fn connect(fd: BorrowedFd<'_>, addr: &SocketAddr) -> io::Result<ConnectStatu
     classify_connect_result(rc, Some(io::Error::last_os_error()))
 }
 
+pub fn connect_addresses(fd: BorrowedFd<'_>, addrs: &[SocketAddr]) -> io::Result<ConnectStatus> {
+    let packed = pack_socket_addresses(addrs)?;
+    match raw_setsockopt(fd, SCTP_SOCKOPT_CONNECTX, &packed) {
+        Ok(_) => Ok(ConnectStatus::Connected),
+        Err(error) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => {
+            classify_raw_connectx(raw_setsockopt(fd, SCTP_SOCKOPT_CONNECTX_OLD, &packed))
+        }
+        result => classify_raw_connectx(result),
+    }
+}
+
+pub fn local_addresses(fd: BorrowedFd<'_>, assoc_id: i32) -> io::Result<Vec<SocketAddr>> {
+    get_addresses(fd, assoc_id, SCTP_GET_LOCAL_ADDRS)
+}
+
+pub fn peer_addresses(fd: BorrowedFd<'_>, assoc_id: i32) -> io::Result<Vec<SocketAddr>> {
+    get_addresses(fd, assoc_id, SCTP_GET_PEER_ADDRS)
+}
+
+pub fn is_multihoming_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(errno)
+            if errno == libc::ENOPROTOOPT
+                || errno == libc::EOPNOTSUPP
+                || errno == libc::EPROTONOSUPPORT
+                || errno == libc::ENOSYS
+    )
+}
+
 fn classify_connect_result(rc: libc::c_int, error: Option<io::Error>) -> io::Result<ConnectStatus> {
     if rc == 0 {
         return Ok(ConnectStatus::Connected);
@@ -123,6 +167,24 @@ fn classify_connect_result(rc: libc::c_int, error: Option<io::Error>) -> io::Res
         Ok(ConnectStatus::InProgress)
     } else {
         Err(err)
+    }
+}
+
+fn classify_raw_connectx(result: io::Result<libc::c_int>) -> io::Result<ConnectStatus> {
+    match result {
+        Ok(_) => Ok(ConnectStatus::Connected),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(errno)
+                    if errno == libc::EINPROGRESS
+                        || errno == libc::EINTR
+                        || errno == libc::EALREADY
+            ) =>
+        {
+            Ok(ConnectStatus::InProgress)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -331,6 +393,233 @@ fn set_sockopt<T>(
     })
 }
 
+fn raw_setsockopt(fd: BorrowedFd<'_>, name: libc::c_int, value: &[u8]) -> io::Result<libc::c_int> {
+    let value_len = libc::socklen_t::try_from(value.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SCTP socket option payload is too large",
+        )
+    })?;
+    // SAFETY: `value` is an initialized byte buffer that remains live for the
+    // call; its exact checked length is provided to the kernel. `fd` is a live
+    // borrowed SCTP descriptor.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_SCTP,
+            name,
+            value.as_ptr().cast::<libc::c_void>(),
+            value_len,
+        )
+    };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(rc)
+    }
+}
+
+fn validate_socket_address_set(addrs: &[SocketAddr]) -> io::Result<()> {
+    let Some(first) = addrs.first() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SCTP address set is empty",
+        ));
+    };
+    if addrs.len() > MAX_SCTP_ADDRESSES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SCTP address set exceeds the bounded maximum",
+        ));
+    }
+    if addrs
+        .iter()
+        .any(|address| address.is_ipv4() != first.is_ipv4())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SCTP address set mixes address families",
+        ));
+    }
+    if addrs.iter().any(|address| address.port() != first.port()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SCTP address set mixes ports",
+        ));
+    }
+    if addrs.len() > 1 && addrs.iter().any(|address| address.ip().is_unspecified()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SCTP wildcard addresses cannot be combined with an address set",
+        ));
+    }
+    Ok(())
+}
+
+fn pack_socket_addresses(addrs: &[SocketAddr]) -> io::Result<Vec<u8>> {
+    validate_socket_address_set(addrs)?;
+    let capacity = addrs.iter().try_fold(0_usize, |total, address| {
+        let address_bytes = if address.is_ipv4() {
+            mem::size_of::<libc::sockaddr_in>()
+        } else {
+            mem::size_of::<libc::sockaddr_in6>()
+        };
+        total.checked_add(address_bytes).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SCTP address set size overflowed",
+            )
+        })
+    })?;
+    let mut packed = Vec::with_capacity(capacity);
+    for address in addrs {
+        let (storage, len) = socket_addr_to_raw(address);
+        let len = usize::try_from(len).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid SCTP address length")
+        })?;
+        // SAFETY: `storage` is fully initialized and `len` is the concrete
+        // sockaddr prefix written by `socket_addr_to_raw`, never larger than
+        // `sockaddr_storage`. The bytes are copied before `storage` is dropped.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&storage as *const libc::sockaddr_storage).cast::<u8>(),
+                len,
+            )
+        };
+        packed.extend_from_slice(bytes);
+    }
+    debug_assert_eq!(packed.len(), capacity);
+    Ok(packed)
+}
+
+fn get_addresses(
+    fd: BorrowedFd<'_>,
+    assoc_id: i32,
+    option: libc::c_int,
+) -> io::Result<Vec<SocketAddr>> {
+    let maximum_address_bytes = MAX_SCTP_ADDRESSES
+        .checked_mul(mem::size_of::<libc::sockaddr_in6>())
+        .and_then(|bytes| bytes.checked_add(SCTP_GETADDRS_HEADER_BYTES))
+        .ok_or_else(|| io::Error::other("SCTP address response size overflowed"))?;
+    let word_bytes = mem::size_of::<u64>();
+    let word_count = maximum_address_bytes.div_ceil(word_bytes);
+    let mut aligned = vec![0_u64; word_count];
+    // SAFETY: `aligned` owns `word_count * size_of::<u64>()` initialized bytes.
+    // The byte view has the same lifetime and is not used while `aligned` is
+    // accessed through another reference.
+    let buffer = unsafe {
+        std::slice::from_raw_parts_mut(
+            aligned.as_mut_ptr().cast::<u8>(),
+            aligned.len() * word_bytes,
+        )
+    };
+    buffer[..mem::size_of::<i32>()].copy_from_slice(&assoc_id.to_ne_bytes());
+    let mut option_len = libc::socklen_t::try_from(buffer.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SCTP address response buffer is too large",
+        )
+    })?;
+    // SAFETY: `buffer` is aligned, initialized, writable for `option_len`, and
+    // remains live for the call. The kernel recognizes the bounded getaddrs
+    // header followed by packed sockaddr output space.
+    cvt(unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_SCTP,
+            option,
+            buffer.as_mut_ptr().cast::<libc::c_void>(),
+            &mut option_len,
+        )
+    })?;
+
+    let count = u32::from_ne_bytes(
+        buffer[mem::size_of::<i32>()..SCTP_GETADDRS_HEADER_BYTES]
+            .try_into()
+            .map_err(|_| io::Error::other("invalid SCTP address response header"))?,
+    ) as usize;
+    if count > MAX_SCTP_ADDRESSES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SCTP address response exceeds the bounded maximum",
+        ));
+    }
+
+    let mut addresses = Vec::with_capacity(count);
+    let mut cursor = SCTP_GETADDRS_HEADER_BYTES;
+    for _ in 0..count {
+        let family_end = cursor
+            .checked_add(mem::size_of::<libc::sa_family_t>())
+            .ok_or_else(|| io::Error::other("SCTP address response overflowed"))?;
+        let family = libc::sa_family_t::from_ne_bytes(
+            buffer
+                .get(cursor..family_end)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "truncated SCTP address response",
+                    )
+                })?
+                .try_into()
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid SCTP address family")
+                })?,
+        ) as libc::c_int;
+        let address_len = match family {
+            libc::AF_INET => mem::size_of::<libc::sockaddr_in>(),
+            libc::AF_INET6 => mem::size_of::<libc::sockaddr_in6>(),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported SCTP address family",
+                ))
+            }
+        };
+        let end = cursor
+            .checked_add(address_len)
+            .ok_or_else(|| io::Error::other("SCTP address response overflowed"))?;
+        let raw = buffer.get(cursor..end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated SCTP address response",
+            )
+        })?;
+        // SAFETY: A zeroed sockaddr_storage is a valid backing buffer.
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        // SAFETY: `raw` is at most sockaddr_in6-sized and `storage` is larger,
+        // non-overlapping, aligned destination storage.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                raw.as_ptr(),
+                (&mut storage as *mut libc::sockaddr_storage).cast::<u8>(),
+                raw.len(),
+            );
+        }
+        addresses.push(raw_to_socket_addr(
+            &storage,
+            address_len as libc::socklen_t,
+        )?);
+        cursor = end;
+    }
+    let reported_bytes = usize::try_from(option_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid SCTP address response length",
+        )
+    })?;
+    let address_bytes = cursor - SCTP_GETADDRS_HEADER_BYTES;
+    // Linux's local-address option historically reports only address bytes,
+    // while the peer-address option reports header plus address bytes. Accept
+    // those two documented kernel behaviors and reject any other shape.
+    if reported_bytes != address_bytes && reported_bytes != cursor {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inconsistent SCTP address response length",
+        ));
+    }
+    Ok(addresses)
+}
+
 fn cvt(rc: libc::c_int) -> io::Result<()> {
     if rc < 0 {
         Err(io::Error::last_os_error())
@@ -509,6 +798,95 @@ mod tests {
     }
 
     #[test]
+    fn packed_address_sets_are_contiguous_and_bounded() {
+        let v4 = [
+            "127.0.0.1:38412".parse().unwrap(),
+            "127.0.0.2:38412".parse().unwrap(),
+        ];
+        let packed = pack_socket_addresses(&v4).unwrap();
+        let v4_bytes = size_of::<libc::sockaddr_in>();
+        assert_eq!(packed.len(), 2 * v4_bytes);
+        assert_eq!(
+            libc::sa_family_t::from_ne_bytes(
+                packed[..size_of::<libc::sa_family_t>()].try_into().unwrap()
+            ) as libc::c_int,
+            libc::AF_INET
+        );
+        assert_eq!(
+            libc::sa_family_t::from_ne_bytes(
+                packed[v4_bytes..v4_bytes + size_of::<libc::sa_family_t>()]
+                    .try_into()
+                    .unwrap()
+            ) as libc::c_int,
+            libc::AF_INET
+        );
+
+        let v6 = [
+            "[::1]:38412".parse().unwrap(),
+            "[::2]:38412".parse().unwrap(),
+        ];
+        let packed_v6 = pack_socket_addresses(&v6).unwrap();
+        let v6_bytes = size_of::<libc::sockaddr_in6>();
+        assert_eq!(packed_v6.len(), 2 * v6_bytes);
+        assert_eq!(
+            libc::sa_family_t::from_ne_bytes(
+                packed_v6[v6_bytes..v6_bytes + size_of::<libc::sa_family_t>()]
+                    .try_into()
+                    .unwrap()
+            ) as libc::c_int,
+            libc::AF_INET6
+        );
+
+        assert!(pack_socket_addresses(&[]).is_err());
+        assert!(pack_socket_addresses(&[
+            "127.0.0.1:38412".parse().unwrap(),
+            "[::1]:38412".parse().unwrap(),
+        ])
+        .is_err());
+        assert!(pack_socket_addresses(&[
+            "127.0.0.1:38412".parse().unwrap(),
+            "127.0.0.2:38413".parse().unwrap(),
+        ])
+        .is_err());
+        assert!(pack_socket_addresses(&[
+            "0.0.0.0:38412".parse().unwrap(),
+            "127.0.0.1:38412".parse().unwrap(),
+        ])
+        .is_err());
+        let mut maximum = (1..=MAX_SCTP_ADDRESSES)
+            .map(|last| {
+                SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::new(127, 0, 0, last as u8),
+                    38412,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pack_socket_addresses(&maximum).unwrap().len(),
+            MAX_SCTP_ADDRESSES * v4_bytes
+        );
+        maximum.push("127.0.1.1:38412".parse().unwrap());
+        assert!(pack_socket_addresses(&maximum).is_err());
+    }
+
+    #[test]
+    fn multihoming_unavailable_errno_classification_is_narrow() {
+        for errno in [
+            libc::ENOPROTOOPT,
+            libc::EOPNOTSUPP,
+            libc::EPROTONOSUPPORT,
+            libc::ENOSYS,
+        ] {
+            assert!(is_multihoming_unavailable(&io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+        assert!(!is_multihoming_unavailable(&io::Error::from_raw_os_error(
+            libc::EINVAL
+        )));
+    }
+
+    #[test]
     fn socket_open_failure_is_reported_without_panic() {
         match open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne) {
             Ok(fd) => drop(fd),
@@ -589,6 +967,71 @@ mod tests {
         let info = received.info.expect("SCTP_RCVINFO control message missing");
         assert_eq!(info.stream_id, 1);
         assert_eq!(info.ppid_network_order, ppid_network_order);
+    }
+
+    #[test]
+    #[ignore = "requires Linux kernel SCTP multihoming support"]
+    fn loopback_bindx_connectx_reports_all_addresses() {
+        let listener = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne).unwrap();
+        set_initmsg(listener.as_fd(), TEST_INIT).unwrap();
+        bind_addresses(
+            listener.as_fd(),
+            &[
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.2:0".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        listen(listener.as_fd(), 8).unwrap();
+        let mut listener_addresses = local_addresses(listener.as_fd(), 0).unwrap();
+        listener_addresses.sort_unstable();
+        assert_eq!(listener_addresses.len(), 2);
+        assert_eq!(
+            listener_addresses[0].ip(),
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            listener_addresses[1].ip(),
+            "127.0.0.2".parse::<std::net::IpAddr>().unwrap()
+        );
+        let port = listener_addresses[0].port();
+        assert_ne!(port, 0);
+        assert_eq!(listener_addresses[1].port(), port);
+
+        let client = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne).unwrap();
+        set_initmsg(client.as_fd(), TEST_INIT).unwrap();
+        bind_addresses(
+            client.as_fd(),
+            &[
+                "127.0.0.3:0".parse().unwrap(),
+                "127.0.0.4:0".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        if connect_addresses(client.as_fd(), &listener_addresses).unwrap()
+            == ConnectStatus::InProgress
+        {
+            wait_fd(client.as_fd(), libc::POLLOUT);
+            assert!(socket_error(client.as_fd()).unwrap().is_none());
+        }
+        wait_fd(listener.as_fd(), libc::POLLIN);
+        let (_accepted, _peer) = accept(listener.as_fd()).unwrap();
+
+        let mut client_local = local_addresses(client.as_fd(), 0).unwrap();
+        client_local.sort_unstable();
+        assert_eq!(client_local.len(), 2);
+        assert_eq!(
+            client_local[0].ip(),
+            "127.0.0.3".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            client_local[1].ip(),
+            "127.0.0.4".parse::<std::net::IpAddr>().unwrap()
+        );
+
+        let mut client_peer = peer_addresses(client.as_fd(), 0).unwrap();
+        client_peer.sort_unstable();
+        assert_eq!(client_peer, listener_addresses);
     }
 
     #[test]

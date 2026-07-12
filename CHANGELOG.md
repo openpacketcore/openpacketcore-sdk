@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-sctp`/`opc-libsctp-sys`: bounded static SCTP multihoming through the
+  Linux bindx/connectx socket UAPI. Multi-address local and peer sets are
+  validated for count, family, and port; one-address configurations keep the
+  existing `bind(2)`/`connect(2)` path; kernel-reported local/peer address
+  inspection and typed capability-unavailable errors make fallback explicit.
+  Live Linux tests prove full-set bind/connect and delivery after the
+  established primary path is removed.
 - `opc-consensus`: the workspace's single exact-pinned Openraft integration
   boundary, with bounded Postcard codecs, cluster/configuration/epoch identity,
   stable SQLite-safe node IDs, request identities, and transport-neutral RPC
