@@ -57,6 +57,11 @@ connection to one authenticated member of one immutable replication manifest.
   `StoreError::RestoreScanResponseTooLarge` instead of retrying indefinitely.
 - `listen(bind_addr).await` starts the listener and returns a server handle and
   bound address.
+- `ServerHandle::abort()` schedules non-blocking listener/connection
+  cancellation. `abort_and_wait().await` consumes the handle and returns only
+  after the listener and every registered connection handler have stopped;
+  use that barrier before deterministic restart or post-shutdown probes.
+  `shutdown()` remains a graceful request, not a completion barrier.
 - `Request`, `Response`, `ProtocolError`, and protocol constants live in the
   public protocol layer.
 
@@ -127,9 +132,12 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 - DNS names and resolver overrides select only where to dial. FQDN, short-name,
   IP, and alias changes do not alter the expected `ReplicaId`, certificate
   SPIFFE identity, or manifest scope.
-- `capabilities()` is descriptive admission evidence and may fall back to a
-  previously successful negotiation after a disconnect. It is not a liveness
-  or durable-readiness signal; replicated callers must use the fresh
+- `capabilities()` is descriptive admission evidence. Clean transport loss or
+  timeout may fall back to a previously successful negotiation while masking
+  operations such as restore scan that require a fresh v3 handshake.
+  A fresh negotiation that fails authentication, reports an explicit version
+  mismatch, or is malformed or relabelled clears the entire cache instead.
+  Either outcome is non-authoritative: replicated callers must use the fresh
   replication-head probe and require a distinct agreeing majority.
 - Remote adapters expose redaction-safe peer-binding evidence to
   `ValidatedQuorumTopology`. Admission verifies the local and remote IDs,
@@ -209,8 +217,11 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
   reconnect/rotation, relabeling, and replayed challenge responses over mTLS.
 - `tests/three_node_quorum.rs` covers typed TTL and replication-tree-limit
   rejection before resolution and authenticated server dispatch, plus
-  connection reuse after rejection. Client/server suites also cover malformed
-  log/watch output rejection before caller exposure.
+  connection reuse after rejection, deterministic listener/handler teardown,
+  and cached descriptive capabilities that cannot authorize operations after
+  fresh quorum loss. Client/server suites also cover malformed log/watch output
+  rejection before caller exposure and cache clearing after invalid fresh
+  negotiation.
 - Run with: `cargo test -p opc-session-net --all-features`.
 
 ## License

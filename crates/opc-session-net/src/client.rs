@@ -1354,7 +1354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_version_mismatch_clears_cached_restore_capability() {
+    async fn explicit_version_mismatch_clears_all_cached_capabilities() {
         let (compatible_addr, compatible_handle) =
             capability_server(BackendCapabilities::all_enabled()).await;
         let (incompatible_addr, incompatible_handle) = version_mismatch_server().await;
@@ -1379,12 +1379,50 @@ mod tests {
         assert!(backend.capabilities().await.restore_scan);
         let _ = compatible_handle.await;
 
-        let incompatible = backend.capabilities().await;
-        assert!(
-            !incompatible.restore_scan,
-            "an explicitly incompatible protocol must not retain restore support"
+        assert_eq!(
+            backend.capabilities().await,
+            BackendCapabilities::minimal(),
+            "an explicitly incompatible protocol must clear the entire negotiated cache"
         );
         let _ = incompatible_handle.await;
+    }
+
+    #[tokio::test]
+    async fn invalid_hello_ack_clears_all_cached_capabilities() {
+        for stale_nonce in [true, false] {
+            let (compatible_addr, compatible_handle) =
+                capability_server(BackendCapabilities::all_enabled()).await;
+            let (invalid_addr, invalid_handle) = invalid_ack_server(stale_nonce).await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let resolver_calls = calls.clone();
+            let resolver: RemoteAddrResolver = Arc::new(move || {
+                let call = resolver_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call == 0 {
+                        Ok(compatible_addr)
+                    } else {
+                        Ok(invalid_addr)
+                    }
+                }
+                .boxed()
+            });
+            let backend = RemoteSessionBackend::new_insecure_with_resolver(
+                resolver,
+                Some(Duration::from_secs(1)),
+            );
+
+            assert_eq!(
+                backend.capabilities().await,
+                BackendCapabilities::all_enabled()
+            );
+            let _ = compatible_handle.await;
+            assert_eq!(
+                backend.capabilities().await,
+                BackendCapabilities::minimal(),
+                "an invalid fresh HelloAck must clear every cached capability"
+            );
+            let _ = invalid_handle.await;
+        }
     }
 
     #[tokio::test]
@@ -1414,14 +1452,12 @@ mod tests {
         assert!(warmed.restore_scan);
         let _ = compatible_handle.await;
 
-        let legacy = backend.capabilities().await;
-        assert!(
-            legacy.atomic_compare_and_set,
-            "cached backend operation was lost"
-        );
-        assert!(
-            !legacy.restore_scan,
-            "negotiated restore support must be masked when fresh v3 negotiation fails"
+        let mut expected = warmed;
+        expected.restore_scan = false;
+        assert_eq!(
+            backend.capabilities().await,
+            expected,
+            "clean transport EOF may retain descriptive operations, but fresh-negotiation capabilities must be masked"
         );
         let _ = legacy_handle.await;
     }

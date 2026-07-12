@@ -260,6 +260,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   successful compound entries preserve child order and publish exactly one
   outer log event, while rebuild preserves existing watchers without replaying
   history to them. A shared Fake/SQLite conformance suite covers the contract.
+- `opc-session-net`: `ServerHandle::abort_and_wait` now provides a deterministic
+  listener-and-connection teardown barrier, and connection tasks are registered
+  without a spawn-before-tracking cancellation window. Quorum capability tests
+  no longer race abrupt asynchronous teardown; they preserve cached descriptive
+  operations only after clean transport loss, mask fresh-negotiation features,
+  clear the entire cache after authentication, version, or malformed-handshake
+  rejection, and continue to require fresh quorum evidence for every real
+  operation.
 - `opc-session-store`/`opc-session-net`/`opc-session-cache`/
   `opc-session-testkit`: all public `Duration` inputs used for session refresh
   and lease TTLs now use `MAX_SESSION_TTL` (exactly 365 days) and exact checked
