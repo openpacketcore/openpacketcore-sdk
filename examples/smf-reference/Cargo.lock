@@ -1530,6 +1530,7 @@ dependencies = [
 name = "opc-session-store"
 version = "0.2.0"
 dependencies = [
+ "aes-gcm-siv",
  "async-trait",
  "bytes",
  "futures-util",
@@ -1539,6 +1540,7 @@ dependencies = [
  "opc-key",
  "opc-redaction",
  "opc-types",
+ "rand 0.10.1",
  "rusqlite",
  "serde",
  "serde_json",
