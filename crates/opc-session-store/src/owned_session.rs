@@ -373,6 +373,9 @@ impl OwnedSessionMutationError {
             StoreError::BackendUnavailable(_) => Self::BackendUnavailable,
             StoreError::PayloadTooLarge { actual, max } => Self::PayloadTooLarge { actual, max },
             StoreError::InvalidKey(_) => Self::InvalidRecord("backend rejected record shape"),
+            StoreError::InvalidReplicationSequence => Self::StoreRejected {
+                code: "invalid-replication-sequence",
+            },
             StoreError::NotFound => Self::StoreRejected { code: "not-found" },
             StoreError::CasConflict => Self::StoreRejected {
                 code: "cas-conflict",

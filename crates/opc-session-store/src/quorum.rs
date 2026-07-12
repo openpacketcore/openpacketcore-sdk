@@ -26,8 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::backend::{
-    CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend, SessionOp,
-    SessionOpResult,
+    next_replication_sequence, CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp,
+    SessionBackend, SessionOp, SessionOpResult,
 };
 use crate::capability::BackendCapabilities;
 use crate::clock::{Clock, SystemClock};
@@ -181,17 +181,6 @@ struct QuorumAssessment {
 }
 
 const DURABLE_READINESS_LOG_PAGE_ENTRIES: usize = 16;
-
-fn next_replication_sequence(committed_entries: &[ReplicationEntry]) -> Result<u64, StoreError> {
-    committed_entries
-        .last()
-        .map(|entry| {
-            entry.sequence.checked_add(1).ok_or_else(|| {
-                StoreError::BackendUnavailable("replication sequence exhausted".into())
-            })
-        })
-        .unwrap_or(Ok(1))
-}
 
 impl QuorumSessionStore {
     /// Build an operational coordinator from topology that already passed HA
@@ -712,7 +701,11 @@ impl QuorumSessionStore {
     async fn replicate_mutation(&self, op: ReplicationOp) -> Result<(), StoreError> {
         let (online_ids, committed_entries) = self.committed_and_repaired().await?;
         let quorum = self.quorum_size();
-        let next_seq = next_replication_sequence(&committed_entries)?;
+        let committed_sequence = committed_entries
+            .last()
+            .map(|entry| entry.sequence)
+            .unwrap_or(0);
+        let next_seq = next_replication_sequence(committed_sequence)?;
         let tx_id = uuid::Uuid::new_v4().to_string();
         let entry = ReplicationEntry {
             sequence: next_seq,
@@ -1081,6 +1074,7 @@ impl SessionBackend for QuorumSessionStore {
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
+        entry.validate_sequence()?;
         let (online_ids, committed_entries) = self.committed_and_repaired().await?;
         let committed_seq = committed_entries
             .last()
@@ -1089,7 +1083,8 @@ impl SessionBackend for QuorumSessionStore {
 
         if entry.sequence <= committed_seq {
             let committed_entry = committed_entries
-                .get((entry.sequence - 1) as usize)
+                .iter()
+                .find(|committed| committed.sequence == entry.sequence)
                 .ok_or_else(|| {
                     StoreError::BackendUnavailable("replication log sequence gap".into())
                 })?;
@@ -1101,7 +1096,7 @@ impl SessionBackend for QuorumSessionStore {
             ));
         }
 
-        if entry.sequence != committed_seq + 1 {
+        if entry.sequence != next_replication_sequence(committed_seq)? {
             return Err(StoreError::BackendUnavailable(
                 "replication log sequence gap".into(),
             ));
@@ -1300,7 +1295,8 @@ mod tests {
             timestamp: Timestamp::now_utc(),
         };
 
-        let err = next_replication_sequence(&[entry]).expect_err("sequence overflow must error");
+        let err =
+            next_replication_sequence(entry.sequence).expect_err("sequence overflow must error");
         assert_eq!(
             err,
             StoreError::BackendUnavailable("replication sequence exhausted".into())

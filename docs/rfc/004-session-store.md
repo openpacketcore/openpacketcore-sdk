@@ -335,6 +335,13 @@ pub struct ReplicationEvent {
 }
 ```
 
+Replication positions are 1-based and gap-free. Sequence zero is reserved for
+the empty-log head and MUST be rejected as an entry before mutation, external
+provider work, persistence, or transport dispatch. Rebuild input MUST be
+validated as one complete contiguous prefix before existing state is replaced.
+Sequence arithmetic and persistence-width conversions MUST be checked and
+fail closed without exposing entry contents in diagnostics.
+
 Replicas MUST apply events only if `generation` and `fence` are newer according
 to the state class rules.
 

@@ -7,10 +7,27 @@ use super::ops::{
     insert_or_replace_record_sync,
 };
 use crate::{
-    backend::{ReplicationEntry, ReplicationOp},
+    backend::{
+        next_replication_sequence, validate_replication_prefix, ReplicationEntry, ReplicationOp,
+    },
     capability::BackendCapabilities,
     error::StoreError,
 };
+
+pub(crate) fn sqlite_replication_sequence(sequence: u64) -> Result<i64, StoreError> {
+    if sequence == 0 {
+        return Err(StoreError::InvalidReplicationSequence);
+    }
+    i64::try_from(sequence).map_err(|_| StoreError::InvalidReplicationSequence)
+}
+
+pub(crate) fn stored_replication_sequence(sequence: i64) -> Result<u64, StoreError> {
+    let sequence = u64::try_from(sequence).map_err(|_| StoreError::InvalidReplicationSequence)?;
+    if sequence == 0 {
+        return Err(StoreError::InvalidReplicationSequence);
+    }
+    Ok(sequence)
+}
 
 pub(crate) fn apply_replicated_op_sync(
     conn: &Connection,
@@ -318,6 +335,8 @@ pub(crate) fn replicate_entry_sync(
     caps: &BackendCapabilities,
     now: Timestamp,
 ) -> Result<bool, StoreError> {
+    entry.validate_sequence()?;
+    let sqlite_sequence = sqlite_replication_sequence(entry.sequence)?;
     let tx = conn
         .unchecked_transaction()
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
@@ -331,20 +350,27 @@ pub(crate) fn replicate_entry_sync(
         )
         .optional()
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-    let max_seq = max_seq.flatten().unwrap_or(0) as u64;
+    let max_seq = max_seq
+        .flatten()
+        .map(stored_replication_sequence)
+        .transpose()?
+        .unwrap_or(0);
 
     if entry.sequence <= max_seq {
         // Check for duplicate delivery and idempotency
-        let existing_tx_id: Option<String> = tx
+        let existing_entry_json: Option<String> = tx
             .query_row(
-                "SELECT tx_id FROM session_replication_log WHERE sequence = ?1",
-                params![entry.sequence as i64],
+                "SELECT entry_json FROM session_replication_log WHERE sequence = ?1",
+                params![sqlite_sequence],
                 |row| row.get(0),
             )
             .optional()
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        if let Some(tx_id) = existing_tx_id {
-            if tx_id == entry.tx_id {
+        if let Some(existing_entry_json) = existing_entry_json {
+            let existing: ReplicationEntry = serde_json::from_str(&existing_entry_json)
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            existing.validate_sequence()?;
+            if existing == *entry {
                 return Ok(false); // Already applied, do not notify watchers again
             }
         }
@@ -353,7 +379,7 @@ pub(crate) fn replicate_entry_sync(
         ));
     }
 
-    if entry.sequence > max_seq + 1 {
+    if entry.sequence != next_replication_sequence(max_seq)? {
         return Err(StoreError::BackendUnavailable(
             "replication log sequence gap".into(),
         ));
@@ -369,7 +395,7 @@ pub(crate) fn replicate_entry_sync(
 
     tx.execute(
         "INSERT INTO session_replication_log (sequence, tx_id, entry_json, timestamp) VALUES (?1, ?2, ?3, ?4)",
-        params![entry.sequence as i64, entry.tx_id, entry_json, timestamp_str],
+        params![sqlite_sequence, entry.tx_id, entry_json, timestamp_str],
     )
     .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
@@ -384,6 +410,7 @@ pub(crate) fn rebuild_replication_state_sync(
     entries: &[ReplicationEntry],
     caps: &BackendCapabilities,
 ) -> Result<(), StoreError> {
+    validate_replication_prefix(entries)?;
     let tx = conn
         .unchecked_transaction()
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
@@ -407,13 +434,7 @@ pub(crate) fn rebuild_replication_state_sync(
     )
     .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
-    for (expected_sequence, entry) in (1_u64..).zip(entries.iter()) {
-        if entry.sequence != expected_sequence {
-            return Err(StoreError::BackendUnavailable(
-                "replication log sequence gap".into(),
-            ));
-        }
-
+    for entry in entries {
         apply_replicated_op_sync(&tx, entry.op.clone(), caps, entry.timestamp)?;
 
         let entry_json =
@@ -421,7 +442,12 @@ pub(crate) fn rebuild_replication_state_sync(
         let timestamp_str = format_rfc3339_normalized(entry.timestamp);
         tx.execute(
             "INSERT INTO session_replication_log (sequence, tx_id, entry_json, timestamp) VALUES (?1, ?2, ?3, ?4)",
-            params![entry.sequence as i64, entry.tx_id, entry_json, timestamp_str],
+            params![
+                sqlite_replication_sequence(entry.sequence)?,
+                entry.tx_id,
+                entry_json,
+                timestamp_str
+            ],
         )
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
     }

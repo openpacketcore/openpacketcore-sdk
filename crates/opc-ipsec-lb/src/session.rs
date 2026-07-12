@@ -657,6 +657,10 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
         StoreError::InvalidKey(_) => {
             IpsecLbError::invalid_config("session_store.key", "session-store key rejected")
         }
+        StoreError::InvalidReplicationSequence => IpsecLbError::invalid_config(
+            "session_store.replication",
+            "session-store replication metadata rejected",
+        ),
         StoreError::CapabilityNotSupported(_) => IpsecLbError::Unsupported,
         StoreError::BackendUnavailable(_) => IpsecLbError::io(
             "session_store_get",

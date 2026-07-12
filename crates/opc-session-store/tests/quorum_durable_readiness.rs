@@ -31,6 +31,7 @@ enum HeadBehavior {
 struct ControlledBackend {
     inner: FakeSessionBackend,
     head_behavior: Mutex<HeadBehavior>,
+    head_probe_calls: AtomicUsize,
     reject_repairs: AtomicBool,
     replicate_calls: AtomicUsize,
     rebuild_calls: AtomicUsize,
@@ -41,6 +42,7 @@ impl ControlledBackend {
         Self {
             inner: FakeSessionBackend::new(),
             head_behavior: Mutex::new(HeadBehavior::Normal),
+            head_probe_calls: AtomicUsize::new(0),
             reject_repairs: AtomicBool::new(false),
             replicate_calls: AtomicUsize::new(0),
             rebuild_calls: AtomicUsize::new(0),
@@ -113,6 +115,7 @@ impl SessionBackend for ControlledBackend {
     }
 
     async fn probe_replication_head(&self) -> Result<u64, ReplicaReadinessFailure> {
+        self.head_probe_calls.fetch_add(1, Ordering::SeqCst);
         match *self.head_behavior.lock().await {
             HeadBehavior::Normal => self
                 .inner
@@ -223,6 +226,63 @@ fn test_key() -> SessionKey {
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
         stable_id: Bytes::from_static(b"durable-readiness"),
+    }
+}
+
+#[tokio::test]
+async fn quorum_rejects_zero_before_readiness_or_replica_dispatch() {
+    let backends = backends();
+    let store = quorum(&backends, &[0, 1, 2]);
+    let malformed = entry(0, "untrusted-transaction-canary");
+
+    let error = store
+        .replicate_entry(malformed)
+        .await
+        .expect_err("sequence zero must be rejected");
+
+    assert_eq!(error, StoreError::InvalidReplicationSequence);
+    assert_eq!(error.to_string(), "invalid replication sequence");
+    assert!(!format!("{error:?}").contains("untrusted-transaction-canary"));
+    assert!(backends.iter().all(|backend| {
+        backend.head_probe_calls.load(Ordering::SeqCst) == 0
+            && backend.replicate_calls.load(Ordering::SeqCst) == 0
+            && backend.rebuild_calls.load(Ordering::SeqCst) == 0
+    }));
+    for backend in &backends {
+        assert!(backend.replication_log().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn quorum_sequence_one_duplicate_gap_and_max_remain_bounded() {
+    let backends = backends();
+    let store = quorum(&backends, &[0, 1, 2]);
+    let first = entry(1, "tx-1");
+
+    store
+        .replicate_entry(first.clone())
+        .await
+        .expect("sequence one must append");
+    store
+        .replicate_entry(first.clone())
+        .await
+        .expect("an exact duplicate must be idempotent");
+
+    for rejected in [
+        entry(1, "divergent-tx"),
+        entry(3, "gap"),
+        entry(u64::MAX, "maximum"),
+    ] {
+        assert!(matches!(
+            store.replicate_entry(rejected).await,
+            Err(StoreError::BackendUnavailable(_))
+        ));
+    }
+
+    for backend in &backends {
+        assert_eq!(backend.replication_log().await, vec![first.clone()]);
+        assert_eq!(backend.replicate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.rebuild_calls.load(Ordering::SeqCst), 0);
     }
 }
 

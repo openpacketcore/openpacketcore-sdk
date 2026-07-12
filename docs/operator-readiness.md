@@ -231,8 +231,8 @@ and continuous gate. Do not use quorum restore as authority before
 #127/#133, treat current divergence repair as authoritative before #128, or
 auto-resolve a legacy fork before #129. Protocol v3 identity binding is not
 consensus or fork recovery. Fixed-width wire DTOs and invariant-safe model
-decoding remain #134/#135. Oversized-TTL and zero-replication-sequence panic
-elimination remain #137/#138.
+decoding remain #134/#135. Oversized-TTL panic elimination remains #137;
+sequence-zero and adjacent overflow boundaries now fail closed under #138.
 
 ## Operator-facing SDK surfaces available now
 

@@ -8,11 +8,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::stream::BoxStream;
+use futures_util::{stream::BoxStream, StreamExt};
 
 use crate::backend::{
-    BackendInstanceIdentity, BackendPeerBinding, CompareAndSet, CompareAndSetResult,
-    ReplicationEntry, SessionBackend, SessionOp, SessionOpResult,
+    validate_replication_page, validate_replication_prefix, BackendInstanceIdentity,
+    BackendPeerBinding, CompareAndSet, CompareAndSetResult, ReplicationEntry, SessionBackend,
+    SessionOp, SessionOpResult,
 };
 use crate::capability::BackendCapabilities;
 use crate::error::{LeaseError, StoreError};
@@ -151,10 +152,13 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
-        self.backend.get_replication_log(start, limit).await
+        let entries = self.backend.get_replication_log(start, limit).await?;
+        validate_replication_page(&entries)?;
+        Ok(entries)
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
+        entry.validate_sequence()?;
         self.backend.replicate_entry(entry).await
     }
 
@@ -162,6 +166,7 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         &self,
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
+        validate_replication_prefix(&entries)?;
         self.backend.rebuild_replication_state(entries).await
     }
 
@@ -169,7 +174,15 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         &self,
         start_sequence: u64,
     ) -> Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError> {
-        self.backend.watch(start_sequence).await
+        let stream = self.backend.watch(start_sequence).await?;
+        Ok(stream
+            .map(|result| {
+                result.and_then(|entry| {
+                    entry.validate_sequence()?;
+                    Ok(entry)
+                })
+            })
+            .boxed())
     }
 
     async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {

@@ -10,8 +10,9 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::Stream;
 use opc_session_store::backend::{
-    BackendInstanceIdentity, BackendPeerBinding, CompareAndSet, CompareAndSetResult,
-    ReplicationEntry, SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
+    validate_replication_page, validate_replication_prefix, BackendInstanceIdentity,
+    BackendPeerBinding, CompareAndSet, CompareAndSetResult, ReplicationEntry, SessionBackend,
+    SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
 };
 use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::error::{LeaseError, StoreError};
@@ -795,13 +796,18 @@ impl SessionBackend for RemoteSessionBackend {
             .send_request_with_retry(Request::GetReplicationLog { start, limit })
             .await?
         {
-            Response::GetReplicationLog(res) => res,
+            Response::GetReplicationLog(res) => {
+                let entries = res?;
+                validate_replication_page(&entries)?;
+                Ok(entries)
+            }
             Response::Error { message } => Err(StoreError::BackendUnavailable(message)),
             _ => Err(StoreError::BackendUnavailable("unexpected response".into())),
         }
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
+        entry.validate_sequence()?;
         match self
             .send_request_with_retry(Request::ReplicateEntry { entry })
             .await?
@@ -816,6 +822,7 @@ impl SessionBackend for RemoteSessionBackend {
         &self,
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
+        validate_replication_prefix(&entries)?;
         match self
             .send_request_with_retry(Request::RebuildReplicationState { entries })
             .await?
@@ -956,6 +963,10 @@ async fn watch_connect_and_read(
     loop {
         match read_frame::<_, Response>(&mut reader, max_frame_size).await {
             Ok(Response::WatchEntry(item)) => {
+                let item = item.and_then(|entry| {
+                    entry.validate_sequence()?;
+                    Ok(entry)
+                });
                 if tx.send(item).await.is_err() {
                     break;
                 }
@@ -994,6 +1005,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
         StoreError::BackendUnavailable(_) => "backend_unavailable",
         StoreError::InvalidKey(_) => "invalid_key",
+        StoreError::InvalidReplicationSequence => "invalid_replication_sequence",
         StoreError::LeaseHeld => "lease_held",
         StoreError::LeaseExpired => "lease_expired",
         StoreError::Crypto(_) => "crypto",

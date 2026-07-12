@@ -43,6 +43,9 @@ connection to one authenticated member of one immutable replication manifest.
   wire request. It does not consult the client's capability cache and reports
   transport, authentication, timeout, protocol, and backend failures through
   redaction-safe `ReplicaReadinessFailure` variants.
+- Replication append and rebuild calls validate sequence metadata before
+  resolution or dispatch; malformed authenticated wire requests receive the
+  typed store error without consuming the connection.
 - If one record cannot fit, the call returns
   `StoreError::RestoreScanResponseTooLarge` instead of retrying indefinitely.
 - `listen(bind_addr).await` starts the listener and returns a server handle and
@@ -122,6 +125,11 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 - Peer binding is static admission evidence, not current health. Capability
   declarations and a successful handshake do not replace
   `QuorumSessionStore::probe_durable_readiness` or continuous traffic gating.
+- Replication entry sequence zero and malformed rebuild prefixes are rejected
+  before dialing on the client and before backend dispatch on the server. The
+  unit `InvalidReplicationSequence` error contains no peer-controlled data;
+  an authenticated server returns it as a typed v3 response and keeps the
+  connection usable. This is input-boundary safety, not sequence authority.
 - Remote scan and fresh-probe transport parity do not by themselves qualify
   networked session HA for production. Protocol v3 authenticates membership;
   it does not establish consensus, durable sequence/commit authority,

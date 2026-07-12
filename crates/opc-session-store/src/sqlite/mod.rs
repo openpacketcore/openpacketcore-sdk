@@ -18,8 +18,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
     backend::{
-        BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry,
-        SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
+        validate_replication_page, validate_replication_prefix, BackendInstanceIdentity,
+        CompareAndSet, CompareAndSetResult, ReplicationEntry, SessionBackend, SessionOp,
+        SessionOpResult, WATCH_CHANNEL_CAPACITY,
     },
     capability::BackendCapabilities,
     clock::Clock,
@@ -160,7 +161,7 @@ impl SqliteSessionBackend {
         conn.execute(
             r#"
             CREATE TABLE IF NOT EXISTS session_replication_log (
-                sequence INTEGER PRIMARY KEY,
+                sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
                 tx_id TEXT NOT NULL,
                 entry_json TEXT NOT NULL,
                 timestamp TEXT NOT NULL
@@ -380,7 +381,10 @@ impl SessionBackend for SqliteSessionBackend {
             )
             .optional()
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        Ok(seq.flatten().unwrap_or(0) as u64)
+        seq.flatten()
+            .map(replication::stored_replication_sequence)
+            .transpose()
+            .map(|sequence| sequence.unwrap_or(0))
     }
 
     async fn get_replication_log(
@@ -388,29 +392,42 @@ impl SessionBackend for SqliteSessionBackend {
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        let Ok(sqlite_start) = i64::try_from(start) else {
+            return Ok(Vec::new());
+        };
+        let sqlite_limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT entry_json FROM session_replication_log WHERE sequence >= ?1 ORDER BY sequence ASC LIMIT ?2"
+            "SELECT sequence, entry_json FROM session_replication_log WHERE sequence >= ?1 ORDER BY sequence ASC LIMIT ?2"
         )
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
         let entries = stmt
-            .query_map(params![start as i64, limit as i64], |row| {
-                let json: String = row.get(0)?;
-                Ok(json)
+            .query_map(params![sqlite_start, sqlite_limit], |row| {
+                let sequence: i64 = row.get(0)?;
+                let json: String = row.get(1)?;
+                Ok((sequence, json))
             })
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
         let mut res = Vec::new();
         for item in entries {
-            let json = item.map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            let (stored_sequence, json) =
+                item.map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            let stored_sequence = replication::stored_replication_sequence(stored_sequence)?;
             let entry: ReplicationEntry = serde_json::from_str(&json)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            entry.validate_sequence()?;
+            if entry.sequence != stored_sequence {
+                return Err(StoreError::InvalidReplicationSequence);
+            }
             res.push(entry);
         }
+        validate_replication_page(&res)?;
         Ok(res)
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
+        entry.validate_sequence()?;
         let should_notify = {
             let conn = self.conn.lock().await;
             let now = self.clock.now_utc();
@@ -429,6 +446,7 @@ impl SessionBackend for SqliteSessionBackend {
         &self,
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
+        validate_replication_prefix(&entries)?;
         let conn = self.conn.lock().await;
         replication::rebuild_replication_state_sync(&conn, &entries, &self.caps)
     }

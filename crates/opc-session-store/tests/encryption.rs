@@ -2,18 +2,25 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use opc_crypto::CryptoEnvelopeV1;
 use opc_key::{
-    KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose, MemoryKeyProvider,
-    MemoryRemoteSealProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN,
+    EncryptedPayload, EnvelopeAad, KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose,
+    MemoryKeyProvider, MemoryRemoteSealProvider, RemoteSealProvider, Zeroizing,
+    AES_256_GCM_SIV_KEY_LEN,
 };
 use opc_session_store::{
     BackendCapabilities, CompareAndSet, CompareAndSetResult, EncryptedSessionPayload,
-    EncryptingSessionBackend, FakeSessionBackend, FenceToken, Generation, OwnerId,
+    EncryptingSessionBackend, FakeSessionBackend, FenceToken, Generation, LeaseGuard, OwnerId,
     RemoteSealingSessionBackend, ReplicationEntry, ReplicationOp, RestoreScanRequest,
     SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult,
     SessionPayloadEncoding, StateClass, StateType, StoreError, StoredSessionRecord,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::sync::Barrier;
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -72,9 +79,190 @@ fn test_record(
     }
 }
 
+fn test_replication_entry(sequence: u64, tx_id: &str) -> ReplicationEntry {
+    let key = test_key();
+    ReplicationEntry {
+        sequence,
+        tx_id: tx_id.to_string(),
+        op: ReplicationOp::CompareAndSet {
+            key: key.clone(),
+            expected_generation: None,
+            credential_id: 1,
+            guard_expires_at: Timestamp::now_utc(),
+            new_record: StoredSessionRecord {
+                key,
+                generation: Generation::new(1),
+                owner: OwnerId::new("owner-a").expect("owner"),
+                fence: FenceToken::new(1),
+                state_class: StateClass::AuthoritativeSession,
+                state_type: StateType::new("smf-pdu-context").expect("state type"),
+                expires_at: None,
+                payload: EncryptedSessionPayload::new(Bytes::from_static(b"plain-session")),
+            },
+        },
+        timestamp: Timestamp::now_utc(),
+    }
+}
+
 struct BarrierKeyProvider {
     inner: Arc<MemoryKeyProvider>,
     read_barrier: Arc<Barrier>,
+}
+
+struct CountingKeyProvider {
+    inner: Arc<MemoryKeyProvider>,
+    calls: AtomicUsize,
+}
+
+impl CountingKeyProvider {
+    fn new(inner: Arc<MemoryKeyProvider>) -> Self {
+        Self {
+            inner,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl KeyProvider for CountingKeyProvider {
+    async fn get_active_key(
+        &self,
+        purpose: KeyPurpose,
+        tenant: &TenantId,
+    ) -> Result<KeyHandle, KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_active_key(purpose, tenant).await
+    }
+
+    async fn get_key_by_id(&self, key_id: &KeyId) -> Result<KeyHandle, KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_key_by_id(key_id).await
+    }
+
+    async fn rotate_key(&self, purpose: KeyPurpose, tenant: &TenantId) -> Result<KeyId, KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.rotate_key(purpose, tenant).await
+    }
+}
+
+struct CountingRemoteSealProvider {
+    inner: Arc<MemoryRemoteSealProvider>,
+    calls: AtomicUsize,
+}
+
+impl CountingRemoteSealProvider {
+    fn new(inner: Arc<MemoryRemoteSealProvider>) -> Self {
+        Self {
+            inner,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl RemoteSealProvider for CountingRemoteSealProvider {
+    async fn seal(
+        &self,
+        aad: &EnvelopeAad,
+        plaintext: &[u8],
+    ) -> Result<EncryptedPayload, KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.seal(aad, plaintext).await
+    }
+
+    async fn unseal(
+        &self,
+        aad: &EnvelopeAad,
+        ciphertext_and_tag: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.unseal(aad, ciphertext_and_tag).await
+    }
+}
+
+struct ReplicationBoundarySpy {
+    returned_entries: Vec<ReplicationEntry>,
+    log_reads: AtomicUsize,
+    replicate_calls: AtomicUsize,
+    rebuild_calls: AtomicUsize,
+}
+
+impl ReplicationBoundarySpy {
+    fn returning(returned_entries: Vec<ReplicationEntry>) -> Self {
+        Self {
+            returned_entries,
+            log_reads: AtomicUsize::new(0),
+            replicate_calls: AtomicUsize::new(0),
+            rebuild_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionBackend for ReplicationBoundarySpy {
+    async fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::minimal()
+    }
+
+    async fn get(&self, _key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "test backend get".into(),
+        ))
+    }
+
+    async fn compare_and_set(&self, _op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "test backend compare_and_set".into(),
+        ))
+    }
+
+    async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "test backend delete_fenced".into(),
+        ))
+    }
+
+    async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "test backend refresh_ttl".into(),
+        ))
+    }
+
+    async fn batch(&self, _ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "test backend batch".into(),
+        ))
+    }
+
+    async fn get_replication_log(
+        &self,
+        _start: u64,
+        _limit: usize,
+    ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        self.log_reads.fetch_add(1, Ordering::SeqCst);
+        Ok(self.returned_entries.clone())
+    }
+
+    async fn replicate_entry(&self, _entry: ReplicationEntry) -> Result<(), StoreError> {
+        self.replicate_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn rebuild_replication_state(
+        &self,
+        _entries: Vec<ReplicationEntry>,
+    ) -> Result<(), StoreError> {
+        self.rebuild_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -445,6 +633,140 @@ async fn remote_sealing_replication_log_seals_and_unseals_nested_batch_cas_recor
         },
         other => panic!("unexpected replication op: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn encrypting_wrapper_rejects_invalid_replication_sequences_before_crypto_or_delegation() {
+    let key_provider = test_provider();
+    let mut invalid_returned = vec![
+        test_replication_entry(1, "returned-one"),
+        test_replication_entry(3, "returned-gap"),
+    ];
+    for entry in &mut invalid_returned {
+        let ReplicationOp::CompareAndSet { new_record, .. } = &mut entry.op else {
+            panic!("test entry must contain compare-and-set");
+        };
+        new_record.payload =
+            EncryptedSessionPayload::encrypt(key_provider.as_ref(), new_record, "regional-cache-a")
+                .await
+                .expect("encrypt returned log fixture");
+    }
+
+    let provider = Arc::new(CountingKeyProvider::new(key_provider));
+    let inner = Arc::new(ReplicationBoundarySpy::returning(invalid_returned));
+    let backend = EncryptingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+        "regional-cache-a",
+    );
+
+    let zero_error = backend
+        .replicate_entry(test_replication_entry(0, "invalid-zero"))
+        .await
+        .expect_err("sequence zero must be rejected");
+    assert_eq!(zero_error, StoreError::InvalidReplicationSequence);
+    assert_eq!(provider.calls(), 0, "invalid entry reached key provider");
+    assert_eq!(
+        inner.replicate_calls.load(Ordering::SeqCst),
+        0,
+        "invalid entry reached wrapped backend"
+    );
+
+    let prefix_error = backend
+        .rebuild_replication_state(vec![
+            test_replication_entry(1, "prefix-one"),
+            test_replication_entry(3, "prefix-gap"),
+        ])
+        .await
+        .expect_err("gapped rebuild prefix must be rejected");
+    assert_eq!(prefix_error, StoreError::InvalidReplicationSequence);
+    assert_eq!(provider.calls(), 0, "invalid prefix reached key provider");
+    assert_eq!(
+        inner.rebuild_calls.load(Ordering::SeqCst),
+        0,
+        "invalid prefix reached wrapped backend"
+    );
+
+    let returned_error = backend
+        .get_replication_log(1, 2)
+        .await
+        .expect_err("a gapped returned page must be rejected");
+    assert_eq!(returned_error, StoreError::InvalidReplicationSequence);
+    assert_eq!(inner.log_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        provider.calls(),
+        0,
+        "invalid returned entry reached decrypt provider"
+    );
+}
+
+#[tokio::test]
+async fn remote_sealing_wrapper_rejects_invalid_replication_sequences_before_provider_or_delegation(
+) {
+    let seal_provider = test_remote_seal_provider();
+    let mut invalid_returned = vec![
+        test_replication_entry(1, "returned-one"),
+        test_replication_entry(3, "returned-gap"),
+    ];
+    for entry in &mut invalid_returned {
+        let ReplicationOp::CompareAndSet { new_record, .. } = &mut entry.op else {
+            panic!("test entry must contain compare-and-set");
+        };
+        new_record.payload = EncryptedSessionPayload::remote_seal(
+            seal_provider.as_ref(),
+            new_record,
+            "regional-cache-a",
+        )
+        .await
+        .expect("seal returned log fixture");
+    }
+
+    let provider = Arc::new(CountingRemoteSealProvider::new(seal_provider));
+    let inner = Arc::new(ReplicationBoundarySpy::returning(invalid_returned));
+    let backend = RemoteSealingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+        "regional-cache-a",
+    );
+
+    let zero_error = backend
+        .replicate_entry(test_replication_entry(0, "invalid-zero"))
+        .await
+        .expect_err("sequence zero must be rejected");
+    assert_eq!(zero_error, StoreError::InvalidReplicationSequence);
+    assert_eq!(provider.calls(), 0, "invalid entry reached seal provider");
+    assert_eq!(
+        inner.replicate_calls.load(Ordering::SeqCst),
+        0,
+        "invalid entry reached wrapped backend"
+    );
+
+    let prefix_error = backend
+        .rebuild_replication_state(vec![
+            test_replication_entry(1, "prefix-one"),
+            test_replication_entry(3, "prefix-gap"),
+        ])
+        .await
+        .expect_err("gapped rebuild prefix must be rejected");
+    assert_eq!(prefix_error, StoreError::InvalidReplicationSequence);
+    assert_eq!(provider.calls(), 0, "invalid prefix reached seal provider");
+    assert_eq!(
+        inner.rebuild_calls.load(Ordering::SeqCst),
+        0,
+        "invalid prefix reached wrapped backend"
+    );
+
+    let returned_error = backend
+        .get_replication_log(1, 2)
+        .await
+        .expect_err("a gapped returned page must be rejected");
+    assert_eq!(returned_error, StoreError::InvalidReplicationSequence);
+    assert_eq!(inner.log_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        provider.calls(),
+        0,
+        "invalid returned entry reached unseal provider"
+    );
 }
 
 #[tokio::test]

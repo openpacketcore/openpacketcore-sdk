@@ -138,6 +138,74 @@ pub struct ReplicationEntry {
     pub timestamp: Timestamp,
 }
 
+impl ReplicationEntry {
+    /// Validate the scalar replication-log position.
+    ///
+    /// Sequence zero is reserved for an empty log head and is never a valid
+    /// entry position. This check is deliberately cheap so adapters can call
+    /// it before locking state, invoking cryptography, or performing I/O.
+    /// It does not prove contiguity, uniqueness, leadership, or commitment.
+    pub fn validate_sequence(&self) -> Result<(), StoreError> {
+        if self.sequence == 0 {
+            return Err(StoreError::InvalidReplicationSequence);
+        }
+        Ok(())
+    }
+}
+
+/// Return the position immediately after `current` without wrapping.
+///
+/// `current == 0` represents an empty log and therefore yields sequence one.
+/// Exhaustion is a backend availability failure: no further ordered mutation
+/// can be represented until the replication design introduces a new epoch.
+/// This arithmetic helper neither reserves a position nor grants write
+/// authority.
+pub fn next_replication_sequence(current: u64) -> Result<u64, StoreError> {
+    current
+        .checked_add(1)
+        .ok_or_else(|| StoreError::BackendUnavailable("replication sequence exhausted".to_string()))
+}
+
+/// Validate a complete replication-log prefix before rebuilding state.
+///
+/// Empty input is valid. Non-empty input must start at one and contain every
+/// subsequent position exactly once, in order.
+pub fn validate_replication_prefix(entries: &[ReplicationEntry]) -> Result<(), StoreError> {
+    let mut expected = 1_u64;
+    let mut entries = entries.iter().peekable();
+    while let Some(entry) = entries.next() {
+        entry.validate_sequence()?;
+        if entry.sequence != expected {
+            return Err(StoreError::InvalidReplicationSequence);
+        }
+        if entries.peek().is_some() {
+            expected = next_replication_sequence(expected)
+                .map_err(|_| StoreError::InvalidReplicationSequence)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate a contiguous replication-log page returned by an adapter.
+///
+/// Unlike [`validate_replication_prefix`], a page may begin at any non-zero
+/// sequence. Empty pages are valid.
+pub fn validate_replication_page(entries: &[ReplicationEntry]) -> Result<(), StoreError> {
+    let mut previous = None;
+    for entry in entries {
+        entry.validate_sequence()?;
+        if let Some(sequence) = previous {
+            let expected = next_replication_sequence(sequence)
+                .map_err(|_| StoreError::InvalidReplicationSequence)?;
+            if entry.sequence != expected {
+                return Err(StoreError::InvalidReplicationSequence);
+            }
+        }
+        previous = Some(entry.sequence);
+    }
+    Ok(())
+}
+
 /// Mutation payload carried by a `ReplicationEntry`.
 ///
 /// Each variant captures everything a replica needs to re-validate the write
@@ -373,8 +441,14 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
-    /// Append a replication log entry and apply its mutation locally in a single atomic transaction.
-    async fn replicate_entry(&self, _entry: ReplicationEntry) -> Result<(), StoreError> {
+    /// Append a replication log entry and apply its mutation locally in a
+    /// single atomic transaction.
+    ///
+    /// Implementations must reject sequence zero with
+    /// [`StoreError::InvalidReplicationSequence`] before locking, mutating, or
+    /// invoking an external provider.
+    async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
+        entry.validate_sequence()?;
         Err(StoreError::CapabilityNotSupported(
             "ordered_replication_log".into(),
         ))
@@ -387,8 +461,9 @@ pub trait SessionBackend: Send + Sync {
     /// both durable state and the local replication log from the supplied entries.
     async fn rebuild_replication_state(
         &self,
-        _entries: Vec<ReplicationEntry>,
+        entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
+        validate_replication_prefix(&entries)?;
         Err(StoreError::CapabilityNotSupported(
             "ordered_replication_log".into(),
         ))
@@ -1002,6 +1077,7 @@ where
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
         let mut entries = self.inner.get_replication_log(start, limit).await?;
+        validate_replication_page(&entries)?;
         for entry in &mut entries {
             entry.op = self.decrypt_op(entry.op.clone()).await?;
         }
@@ -1009,6 +1085,7 @@ where
     }
 
     async fn replicate_entry(&self, mut entry: ReplicationEntry) -> Result<(), StoreError> {
+        entry.validate_sequence()?;
         entry.op = self.encrypt_op(entry.op).await?;
         self.inner.replicate_entry(entry).await
     }
@@ -1017,6 +1094,7 @@ where
         &self,
         mut entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
+        validate_replication_prefix(&entries)?;
         for entry in &mut entries {
             entry.op = self.encrypt_op(entry.op.clone()).await?;
         }
@@ -1056,6 +1134,7 @@ where
                 async move {
                     match res {
                         Ok(mut entry) => {
+                            entry.validate_sequence()?;
                             match decrypt_op_helper(provider.as_ref(), entry.op, &backend_namespace)
                                 .await
                             {
@@ -1555,6 +1634,7 @@ where
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
         let mut entries = self.inner.get_replication_log(start, limit).await?;
+        validate_replication_page(&entries)?;
         for entry in &mut entries {
             entry.op = self.unseal_op(entry.op.clone()).await?;
         }
@@ -1562,6 +1642,7 @@ where
     }
 
     async fn replicate_entry(&self, mut entry: ReplicationEntry) -> Result<(), StoreError> {
+        entry.validate_sequence()?;
         entry.op = self.seal_op(entry.op).await?;
         self.inner.replicate_entry(entry).await
     }
@@ -1570,6 +1651,7 @@ where
         &self,
         mut entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
+        validate_replication_prefix(&entries)?;
         for entry in &mut entries {
             entry.op = self.seal_op(entry.op.clone()).await?;
         }
@@ -1609,6 +1691,7 @@ where
                 async move {
                     match res {
                         Ok(mut entry) => {
+                            entry.validate_sequence()?;
                             match remote_unseal_op_helper(
                                 provider.as_ref(),
                                 entry.op,

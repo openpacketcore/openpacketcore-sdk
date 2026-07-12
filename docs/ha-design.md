@@ -94,8 +94,9 @@ topology admission and fresh durable readiness are implemented. Authenticated
 identity binding is implemented in protocol v3; durable sequencing and safe
 fork recovery (#127–#129), and bounded majority-authoritative restore (#133)
 remain open. Wire-width and shared model-decoding hardening remain #134/#135,
-while oversized-TTL and
-zero-replication-sequence panic elimination remain #137/#138.
+while oversized-TTL panic elimination remains #137. Sequence-zero and adjacent
+overflow handling now fail closed at direct, wrapper, cache, SQLite, quorum,
+and authenticated transport boundaries under #138.
 
 `QuorumSessionStore` coordinates session leases and CAS mutations across a set of `SessionStoreBackend` replicas using quorum-backed ordered replication. It is not a Raft implementation; its target safety contract is a durable committed log prefix where an entry is authoritative only after the same sequence entry is present on a majority of replicas.
 
@@ -181,7 +182,7 @@ does not reconcile a divergent or forked log.
 
 ### Log & Replication Model
 - **Persisted Replica Logs**: The current coordinator assigns sequence numbers to replicated mutations (AcquireLease, RenewLease, ReleaseLease, CompareAndSet, DeleteFenced, RefreshTtl, Batch), and each accepting replica writes them to `session_replication_log`. Leader/term-gated global sequence authority remains #127.
-- **Idempotency & Replay Semantics**: Duplicate delivery is handled safely. Before appending, replicas check if the entry's sequence has already been applied. If the transaction ID (`tx_id`) matches, the duplicate is accepted as an idempotent success; if it differs, the replica fails closed on sequence divergence. Replaying operations does not mutate the state twice.
+- **Idempotency & Replay Semantics**: Duplicate delivery is handled safely. Before appending, replicas check whether the entry's sequence has already been applied. Only an exact full-entry match is accepted as an idempotent success; reusing the same transaction ID with a changed operation or timestamp fails closed as divergence. Replaying an exact entry does not mutate the state twice.
 - **Current Majority-Visible Prefix Heuristic**: The coordinator compares fresh logs visible from the configured majority. It may append a missing suffix to an exact strict-prefix replica, but a conflict or longer minority tail fails with `RecoveryRequired` and is not truncated. This remains a heuristic, not durable commit proof: without #127/#128, a later visible majority may still omit a previously acknowledged entry.
 - **Resume Tokens / Watch Cursors**: Exposes watches backed by sequence numbers, allowing consumers to supply sequence cursors and resume receiving updates from the exact sequence they left off.
 - **Replica Catch-Up & Read Repair Prototype**: The coordinator freshly queries replica log progress on every write or read and uses the same bounded assessment path as the readiness probe. Reads require identical records on a majority quorum and fail closed if no quorum result exists, but commit and repair authority remain unproven until #127/#128.

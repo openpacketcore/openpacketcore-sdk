@@ -44,6 +44,11 @@ async fn cache() {
   bypassed and operations read through to the backend.
 - If `max_replication_sequence` shows the watch cursor is lagging, the cache is
   cleared and local reads are bypassed.
+- Sequence-zero watch/mutation entries and malformed rebuild prefixes fail
+  before cache invalidation or backend delegation. If a backend reports the
+  terminal `u64::MAX` head, the checked next-cursor calculation clears and
+  bypasses the cache while retrying; it never wraps or terminates the watch
+  task with a panic.
 - Expired records are evicted on read.
 - The cache is not a durability layer.
 

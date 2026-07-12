@@ -122,6 +122,37 @@ async fn fake_backend_get_miss() {
 }
 
 #[tokio::test]
+async fn exhausted_direct_replication_sequence_rejects_before_lease_mutation() {
+    let backend = FakeSessionBackend::new();
+    {
+        let mut state = backend.inner.lock().await;
+        state.last_replication_sequence = u64::MAX;
+    }
+    let key = test_key("t1", b"sequence-exhausted");
+
+    let error = backend
+        .acquire(
+            &key,
+            OwnerId::new("owner-a").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect_err("an exhausted direct log must reject before mutation");
+
+    assert_eq!(
+        error,
+        LeaseError::Backend("backend unavailable: replication sequence exhausted".to_string())
+    );
+    let state = backend.inner.lock().await;
+    assert!(!state
+        .leases
+        .contains_key(&FakeSessionBackend::map_key(&key)));
+    assert!(state.replication_log.is_empty());
+    assert_eq!(state.next_fence, 1);
+    assert_eq!(state.next_credential_id, 1);
+}
+
+#[tokio::test]
 async fn direct_successful_cas_emits_ordered_replication_entry_and_watch_event() {
     let backend = FakeSessionBackend::new();
     let key = test_key("t1", b"direct-cas");
