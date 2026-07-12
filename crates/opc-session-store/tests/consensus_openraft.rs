@@ -1,0 +1,1181 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use opc_consensus::{
+    derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
+};
+use opc_crypto::CryptoEnvelopeV1;
+use opc_key::{
+    serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyError, KeyHandle, KeyId, KeyProvider,
+    KeyPurpose, MemoryKeyProvider, SessionAad, Zeroizing, AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN,
+    AES_256_GCM_SIV_NONCE_LEN,
+};
+use opc_session_store::{
+    CompareAndSet, CompareAndSetResult, ConsensusSessionStore, DurableReadinessState,
+    EncryptedSessionPayload, EncryptingSessionBackend, Generation, LeaseError, OwnerId,
+    QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
+    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicationOp, RestoreScanRequest,
+    SessionBackend, SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
+    SessionConsensusWireResponse, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    SessionPayloadEncoding, SqliteSessionBackend, StateClass, StateType, StoreError,
+    StoredSessionRecord, SystemClock, ValidatedQuorumTopology,
+};
+use opc_types::{NetworkFunctionKind, TenantId};
+use tempfile::TempDir;
+
+const MEMBER_COUNT: usize = 3;
+const OPERATION_TIMEOUT: Duration = Duration::from_millis(750);
+const CLUSTER_START_TIMEOUT: Duration = Duration::from_secs(12);
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(8);
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+const MAX_CAPTURED_CONSENSUS_PAYLOADS: usize = 4_096;
+const ENCRYPTION_NAMESPACE: &str = "consensus-boundary-qualification";
+const PLAINTEXT_CANARY_BEFORE_ROTATION: &[u8] =
+    b"opc-session-consensus-plaintext-canary-before-key-rotation";
+const PLAINTEXT_CANARY_AFTER_ROTATION: &[u8] =
+    b"opc-session-consensus-plaintext-canary-after-key-rotation";
+const RAW_KEY_MATERIAL_CANARY: &[u8; AES_256_GCM_SIV_KEY_LEN] = &[0x5a; AES_256_GCM_SIV_KEY_LEN];
+
+#[derive(Clone)]
+struct LoopbackPeer {
+    target: SessionConsensusNodeId,
+    handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
+    enabled: Arc<AtomicBool>,
+    forward_responses_to_drop: Arc<AtomicUsize>,
+    dropped_forward_responses: Arc<AtomicUsize>,
+    captured_payloads: Arc<StdMutex<Vec<Bytes>>>,
+}
+
+impl LoopbackPeer {
+    fn new(target: SessionConsensusNodeId) -> Self {
+        Self {
+            target,
+            handler: Arc::new(tokio::sync::RwLock::new(None)),
+            enabled: Arc::new(AtomicBool::new(true)),
+            forward_responses_to_drop: Arc::new(AtomicUsize::new(0)),
+            dropped_forward_responses: Arc::new(AtomicUsize::new(0)),
+            captured_payloads: Arc::new(StdMutex::new(Vec::new())),
+        }
+    }
+
+    async fn install(&self, handler: Arc<dyn SessionConsensusRpcHandler>) {
+        *self.handler.write().await = Some(handler);
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    fn drop_forward_responses(&self, count: usize) {
+        self.forward_responses_to_drop
+            .store(count, Ordering::SeqCst);
+    }
+
+    fn stop_dropping_forward_responses(&self) {
+        self.forward_responses_to_drop.store(0, Ordering::SeqCst);
+    }
+
+    fn dropped_forward_responses(&self) -> usize {
+        self.dropped_forward_responses.load(Ordering::SeqCst)
+    }
+
+    fn clear_captured_payloads(&self) {
+        self.captured_payloads
+            .lock()
+            .expect("consensus capture mutex")
+            .clear();
+    }
+
+    fn captured_payloads(&self) -> Vec<Bytes> {
+        let captured = self
+            .captured_payloads
+            .lock()
+            .expect("consensus capture mutex")
+            .clone();
+        assert!(
+            captured.len() < MAX_CAPTURED_CONSENSUS_PAYLOADS,
+            "consensus payload qualification capture was saturated"
+        );
+        captured
+    }
+}
+
+impl fmt::Debug for LoopbackPeer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoopbackPeer")
+            .field("target", &self.target)
+            .field("enabled", &self.enabled.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl SessionConsensusPeer for LoopbackPeer {
+    fn node_id(&self) -> SessionConsensusNodeId {
+        self.target
+    }
+
+    async fn call(
+        &self,
+        request: SessionConsensusWireRequest,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        if !self.enabled.load(Ordering::SeqCst) {
+            return Err(SessionConsensusPeerError::Unavailable);
+        }
+
+        {
+            let mut captured = self
+                .captured_payloads
+                .lock()
+                .expect("consensus capture mutex");
+            if captured.len() < MAX_CAPTURED_CONSENSUS_PAYLOADS {
+                captured.push(request.payload.clone().into());
+            }
+        }
+
+        let handler = self
+            .handler
+            .read()
+            .await
+            .clone()
+            .ok_or(SessionConsensusPeerError::Unavailable)?;
+        let sender = request.sender;
+        let family = request.family;
+        let response = handler.handle(sender, request).await;
+
+        if family == SessionConsensusRpcFamily::ForwardMutation
+            && self
+                .forward_responses_to_drop
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            self.dropped_forward_responses
+                .fetch_add(1, Ordering::SeqCst);
+            return Err(SessionConsensusPeerError::Unavailable);
+        }
+
+        Ok(response)
+    }
+}
+
+struct TestCluster {
+    _directory: TempDir,
+    _backends: Vec<SqliteSessionBackend>,
+    stores: Vec<ConsensusSessionStore>,
+    paths: BTreeMap<(usize, usize), Arc<LoopbackPeer>>,
+}
+
+impl TestCluster {
+    async fn start() -> Self {
+        let directory = tempfile::tempdir().expect("create fleet directory");
+        let backends = (0..MEMBER_COUNT)
+            .map(|index| {
+                SqliteSessionBackend::open(directory.path().join(format!("node-{index}.sqlite")))
+                    .expect("open file-backed SQLite node")
+            })
+            .collect::<Vec<_>>();
+        let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
+        let identity = consensus_identity(&members);
+        let topologies = (0..MEMBER_COUNT)
+            .map(|index| {
+                ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                    replica_id(index),
+                    members.clone(),
+                    identity,
+                ))
+                .expect("validate consensus topology")
+            })
+            .collect::<Vec<_>>();
+        let node_ids = topologies
+            .iter()
+            .map(|topology| {
+                topology
+                    .local_consensus_node_id()
+                    .expect("consensus node ID")
+            })
+            .collect::<Vec<_>>();
+
+        let mut paths = BTreeMap::new();
+        for source in 0..MEMBER_COUNT {
+            for (target, node_id) in node_ids.iter().copied().enumerate() {
+                if source != target {
+                    paths.insert((source, target), Arc::new(LoopbackPeer::new(node_id)));
+                }
+            }
+        }
+
+        let mut stores = Vec::with_capacity(MEMBER_COUNT);
+        for index in 0..MEMBER_COUNT {
+            let peers = (0..MEMBER_COUNT)
+                .filter(|target| *target != index)
+                .map(|target| {
+                    let peer: Arc<dyn SessionConsensusPeer> =
+                        paths.get(&(index, target)).expect("loopback path").clone();
+                    (node_ids[target], peer)
+                })
+                .collect::<BTreeMap<_, _>>();
+            let store = ConsensusSessionStore::open_with_clock(
+                topologies[index].clone(),
+                backends[index].clone(),
+                directory.path().join(format!("snapshots-{index}")),
+                peers,
+                Arc::new(SystemClock),
+                OPERATION_TIMEOUT,
+            )
+            .await
+            .expect("open consensus node");
+            stores.push(store);
+        }
+
+        for ((_, target), path) in &paths {
+            path.install(stores[*target].rpc_handler()).await;
+        }
+
+        let initialize = stores
+            .iter()
+            .map(ConsensusSessionStore::initialize_cluster)
+            .collect::<Vec<_>>();
+        let results = futures_util::future::join_all(initialize).await;
+        for result in results {
+            result.expect("initialize identical membership concurrently");
+        }
+
+        let cluster = Self {
+            _directory: directory,
+            _backends: backends,
+            stores,
+            paths,
+        };
+        cluster
+            .wait_all_ready(CLUSTER_START_TIMEOUT)
+            .await
+            .expect("fresh cluster reaches durable readiness");
+        cluster
+    }
+
+    async fn wait_all_ready(&self, deadline: Duration) -> Result<(), ()> {
+        tokio::time::timeout(deadline, async {
+            loop {
+                let reports = futures_util::future::join_all(
+                    self.stores
+                        .iter()
+                        .map(ConsensusSessionStore::probe_durable_readiness),
+                )
+                .await;
+                if reports.iter().all(|report| report.is_ready()) {
+                    return;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .map_err(|_| ())
+    }
+
+    fn isolate(&self, node: usize) {
+        for peer in 0..MEMBER_COUNT {
+            if peer != node {
+                self.paths
+                    .get(&(node, peer))
+                    .expect("outbound path")
+                    .set_enabled(false);
+                self.paths
+                    .get(&(peer, node))
+                    .expect("inbound path")
+                    .set_enabled(false);
+            }
+        }
+    }
+
+    fn heal(&self, node: usize) {
+        for peer in 0..MEMBER_COUNT {
+            if peer != node {
+                self.paths
+                    .get(&(node, peer))
+                    .expect("outbound path")
+                    .set_enabled(true);
+                self.paths
+                    .get(&(peer, node))
+                    .expect("inbound path")
+                    .set_enabled(true);
+            }
+        }
+    }
+
+    fn arm_forward_response_loss(&self, source: usize, count: usize) -> usize {
+        let before = self.dropped_forward_responses(source);
+        for target in 0..MEMBER_COUNT {
+            if source != target {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .drop_forward_responses(count);
+            }
+        }
+        before
+    }
+
+    fn stop_forward_response_loss(&self, source: usize) {
+        for target in 0..MEMBER_COUNT {
+            if source != target {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .stop_dropping_forward_responses();
+            }
+        }
+    }
+
+    fn dropped_forward_responses(&self, source: usize) -> usize {
+        (0..MEMBER_COUNT)
+            .filter(|target| *target != source)
+            .map(|target| {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .dropped_forward_responses()
+            })
+            .sum()
+    }
+
+    fn clear_captured_payloads(&self) {
+        for path in self.paths.values() {
+            path.clear_captured_payloads();
+        }
+    }
+
+    fn captured_payloads(&self) -> Vec<Bytes> {
+        self.paths
+            .values()
+            .flat_map(|path| path.captured_payloads())
+            .collect()
+    }
+}
+
+struct CountingKeyProvider {
+    inner: Arc<MemoryKeyProvider>,
+    active_key_calls: AtomicUsize,
+    key_by_id_calls: AtomicUsize,
+    rotation_calls: AtomicUsize,
+}
+
+impl CountingKeyProvider {
+    fn new(inner: Arc<MemoryKeyProvider>) -> Self {
+        Self {
+            inner,
+            active_key_calls: AtomicUsize::new(0),
+            key_by_id_calls: AtomicUsize::new(0),
+            rotation_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn call_counts(&self) -> (usize, usize, usize) {
+        (
+            self.active_key_calls.load(Ordering::SeqCst),
+            self.key_by_id_calls.load(Ordering::SeqCst),
+            self.rotation_calls.load(Ordering::SeqCst),
+        )
+    }
+}
+
+#[async_trait]
+impl KeyProvider for CountingKeyProvider {
+    async fn get_active_key(
+        &self,
+        purpose: KeyPurpose,
+        tenant: &TenantId,
+    ) -> Result<KeyHandle, KeyError> {
+        self.active_key_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_active_key(purpose, tenant).await
+    }
+
+    async fn get_key_by_id(&self, key_id: &KeyId) -> Result<KeyHandle, KeyError> {
+        self.key_by_id_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_key_by_id(key_id).await
+    }
+
+    async fn rotate_key(&self, purpose: KeyPurpose, tenant: &TenantId) -> Result<KeyId, KeyError> {
+        self.rotation_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.rotate_key(purpose, tenant).await
+    }
+}
+
+fn replica_id(index: usize) -> ReplicaId {
+    ReplicaId::new(format!("consensus-test-{index}")).expect("replica ID")
+}
+
+fn member(index: usize) -> QuorumReplicaDescriptor {
+    QuorumReplicaDescriptor::new(
+        replica_id(index),
+        ReplicaEndpoint::new(format!("consensus-test-{index}.invalid"), 7443)
+            .expect("replica endpoint"),
+        ReplicaTlsIdentity::new(format!("spiffe://test/session/consensus/{index}"))
+            .expect("TLS identity"),
+        ReplicaFailureDomain::new(format!("consensus-test-zone-{index}")).expect("failure domain"),
+        ReplicaBackingIdentity::new(format!("consensus-test-disk-{index}"))
+            .expect("backing identity"),
+    )
+}
+
+fn consensus_identity(members: &[QuorumReplicaDescriptor]) -> ConsensusIdentity {
+    let cluster_id = ConsensusClusterId::new("session-openraft-integration-tests")
+        .expect("consensus cluster ID");
+    let epoch = ConsensusConfigurationEpoch::new(1).expect("consensus epoch");
+    let fingerprints = members
+        .iter()
+        .map(QuorumReplicaDescriptor::configuration_fingerprint)
+        .collect::<Vec<_>>();
+    let configuration_id = derive_configuration_id(cluster_id, epoch, &fingerprints);
+    ConsensusIdentity::new(cluster_id, configuration_id, epoch)
+}
+
+fn session_key(label: impl AsRef<[u8]>) -> SessionKey {
+    SessionKey {
+        tenant: TenantId::new("consensus-test-tenant").expect("tenant"),
+        nf_kind: NetworkFunctionKind::from_static("smf"),
+        key_type: SessionKeyType::PduSession,
+        stable_id: Bytes::copy_from_slice(label.as_ref()),
+    }
+}
+
+fn owner(label: impl Into<String>) -> OwnerId {
+    OwnerId::new(label).expect("owner")
+}
+
+fn plaintext_record(
+    key: SessionKey,
+    generation: u64,
+    lease: &opc_session_store::LeaseGuard,
+    plaintext: &[u8],
+) -> StoredSessionRecord {
+    StoredSessionRecord {
+        key,
+        generation: Generation::new(generation),
+        owner: lease.owner().clone(),
+        fence: lease.fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("consensus-encryption-boundary"),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new(plaintext),
+    }
+}
+
+fn encryption_provider() -> Arc<CountingKeyProvider> {
+    let provider = Arc::new(MemoryKeyProvider::new());
+    provider
+        .insert_active_key(
+            KeyId::new("consensus-boundary-key-2026-07").expect("key ID"),
+            KeyPurpose::Session,
+            TenantId::new("consensus-test-tenant").expect("tenant"),
+            Zeroizing::new([0x5a; AES_256_GCM_SIV_KEY_LEN]),
+        )
+        .expect("install qualification key");
+    Arc::new(CountingKeyProvider::new(provider))
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn json_contains_bytes(value: &serde_json::Value, needle: &[u8]) -> bool {
+    match value {
+        serde_json::Value::Array(values) => {
+            let encoded_bytes = values
+                .iter()
+                .map(|value| value.as_u64().and_then(|byte| u8::try_from(byte).ok()))
+                .collect::<Option<Vec<_>>>();
+            encoded_bytes
+                .as_deref()
+                .is_some_and(|bytes| contains_bytes(bytes, needle))
+                || values
+                    .iter()
+                    .any(|value| json_contains_bytes(value, needle))
+        }
+        serde_json::Value::Object(values) => values
+            .values()
+            .any(|value| json_contains_bytes(value, needle)),
+        serde_json::Value::String(value) => contains_bytes(value.as_bytes(), needle),
+        _ => false,
+    }
+}
+
+fn assert_artifact_bytes_are_sealed(label: &str, bytes: &[u8]) {
+    for canary in [
+        PLAINTEXT_CANARY_BEFORE_ROTATION,
+        PLAINTEXT_CANARY_AFTER_ROTATION,
+        RAW_KEY_MATERIAL_CANARY.as_slice(),
+    ] {
+        assert!(
+            !contains_bytes(bytes, canary),
+            "plaintext session payload crossed the encryption boundary into {label}"
+        );
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+            assert!(
+                !json_contains_bytes(&value, canary),
+                "JSON-encoded plaintext session payload crossed the encryption boundary into {label}"
+            );
+        }
+    }
+}
+
+fn assert_file_tree_is_sealed(root: &Path) {
+    let entries = std::fs::read_dir(root).expect("read durable artifact directory");
+    for entry in entries {
+        let path = entry.expect("durable artifact entry").path();
+        if path.is_dir() {
+            assert_file_tree_is_sealed(&path);
+        } else if path.is_file() {
+            let bytes = std::fs::read(&path).expect("read durable artifact");
+            assert_artifact_bytes_are_sealed("durable file", &bytes);
+        }
+    }
+}
+
+fn assert_sqlite_authority_is_sealed(database: &Path) {
+    let connection = rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open consensus database for qualification");
+    for (table, column, is_json) in [
+        ("session_records", "payload", false),
+        ("session_replication_log", "entry_json", true),
+        ("consensus_log", "entry_json", true),
+        ("consensus_request_outcomes", "response_json", true),
+    ] {
+        let query = format!("SELECT CAST({column} AS BLOB) FROM {table}");
+        let mut statement = connection.prepare(&query).expect("prepare authority scan");
+        let values = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .expect("query authority bytes");
+        for value in values {
+            let bytes = value.expect("read authority bytes");
+            assert_artifact_bytes_are_sealed("SQLite consensus authority", &bytes);
+            if is_json {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("authority JSON");
+                for canary in [
+                    PLAINTEXT_CANARY_BEFORE_ROTATION,
+                    PLAINTEXT_CANARY_AFTER_ROTATION,
+                    RAW_KEY_MATERIAL_CANARY.as_slice(),
+                ] {
+                    assert!(
+                        !json_contains_bytes(&value, canary),
+                        "plaintext session payload was encoded into SQLite consensus authority"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn sealed_record(
+    key: SessionKey,
+    generation: u64,
+    lease: &opc_session_store::LeaseGuard,
+    payload: &'static [u8],
+) -> StoredSessionRecord {
+    let mut record = StoredSessionRecord {
+        key,
+        generation: Generation::new(generation),
+        owner: lease.owner().clone(),
+        fence: lease.fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("consensus-test-session"),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([]),
+    };
+    let key_id = KeyId::new("synthetic-consensus-test-key").expect("key ID");
+    let aad = EnvelopeAad::session(
+        record.key.tenant.clone(),
+        1,
+        SessionAad::new(
+            record.key.nf_kind.as_str(),
+            "synthetic-keyed-session-digest",
+            record.state_type.as_str(),
+            record.generation.get(),
+            record.fence.get(),
+            "synthetic-consensus-test-backend",
+        )
+        .expect("session AAD"),
+    );
+    let mut ciphertext_and_tag = payload.to_vec();
+    ciphertext_and_tag.extend_from_slice(&[0xA5; AEAD_TAG_LEN]);
+    let envelope = CryptoEnvelopeV1 {
+        algorithm: AeadAlgorithm::Aes256GcmSiv,
+        key_id: key_id.clone(),
+        nonce: vec![0x42; AES_256_GCM_SIV_NONCE_LEN],
+        aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+        ciphertext_and_tag,
+    }
+    .encode()
+    .expect("test envelope");
+    record.payload = EncryptedSessionPayload::try_envelope(envelope).expect("valid envelope");
+    record
+}
+
+async fn replication_logs(cluster: &TestCluster) -> Vec<Vec<opc_session_store::ReplicationEntry>> {
+    futures_util::future::join_all(
+        cluster
+            .stores
+            .iter()
+            .map(|store| store.get_replication_log(1, 128)),
+    )
+    .await
+    .into_iter()
+    .map(|result| result.expect("read committed replication log"))
+    .collect()
+}
+
+fn assert_raw_consensus_guard<T>(result: Result<T, StoreError>) {
+    assert!(matches!(
+        result,
+        Err(StoreError::CapabilityNotSupported(capability))
+            if capability == "consensus_authority_required"
+    ));
+}
+
+fn assert_raw_consensus_lease_guard<T>(result: Result<T, LeaseError>) {
+    assert!(matches!(
+        result,
+        Err(LeaseError::Backend(message))
+            if message.contains("consensus_authority_required")
+    ));
+}
+
+#[tokio::test]
+async fn consensus_claim_fences_retained_and_reopened_raw_sqlite_handles() {
+    let cluster = TestCluster::start().await;
+    let raw = &cluster._backends[0];
+    let store = &cluster.stores[0];
+    let key = session_key(b"raw-authority-bypass");
+
+    let raw_capabilities = raw.capabilities().await;
+    assert_eq!(
+        raw_capabilities,
+        opc_session_store::BackendCapabilities::minimal()
+    );
+    let consensus_capabilities = store.capabilities().await;
+    assert!(consensus_capabilities.atomic_compare_and_set);
+    assert!(consensus_capabilities.monotonic_fencing_token);
+    assert!(consensus_capabilities.ordered_replication_log);
+    assert!(consensus_capabilities.restore_scan);
+
+    assert_raw_consensus_guard(raw.get(&key).await);
+    assert_raw_consensus_guard(
+        raw.scan_restore_records(RestoreScanRequest::default())
+            .await,
+    );
+    assert_raw_consensus_guard(raw.max_replication_sequence().await);
+    assert_raw_consensus_guard(raw.get_replication_log(1, 16).await);
+    assert_raw_consensus_guard(raw.rebuild_replication_state(Vec::new()).await);
+    assert_raw_consensus_guard(raw.next_lease_info().await);
+    assert_raw_consensus_guard(raw.watch(1).await);
+    assert_raw_consensus_lease_guard(
+        raw.acquire(&key, owner("raw-owner"), Duration::from_secs(30))
+            .await,
+    );
+
+    let lease = store
+        .acquire(&key, owner("consensus-owner"), Duration::from_secs(30))
+        .await
+        .expect("consensus lease");
+    let record = sealed_record(key.clone(), 1, &lease, b"opaque-authoritative-value");
+    assert_raw_consensus_guard(
+        raw.compare_and_set(CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: record.clone(),
+        })
+        .await,
+    );
+    assert_raw_consensus_guard(raw.delete_fenced(&lease).await);
+    assert_raw_consensus_guard(raw.refresh_ttl(&lease, Duration::from_secs(30)).await);
+    assert_raw_consensus_lease_guard(raw.renew(&lease, Duration::from_secs(30)).await);
+    assert_raw_consensus_lease_guard(raw.release(lease.clone()).await);
+
+    let batch = raw
+        .batch(vec![SessionOp::Get { key: key.clone() }])
+        .await
+        .expect("batch retains per-slot result contract");
+    assert!(matches!(
+        batch.as_slice(),
+        [opc_session_store::SessionOpResult::Get(Err(
+            StoreError::CapabilityNotSupported(capability)
+        ))] if capability == "consensus_authority_required"
+    ));
+
+    store
+        .compare_and_set(CompareAndSet {
+            key: key.clone(),
+            lease,
+            expected_generation: None,
+            new_record: record,
+        })
+        .await
+        .expect("consensus mutation remains available");
+    let entry = store
+        .get_replication_log(1, 128)
+        .await
+        .expect("committed application journal")
+        .into_iter()
+        .next()
+        .expect("journal entry");
+    assert_raw_consensus_guard(raw.replicate_entry(entry).await);
+
+    let reopened = SqliteSessionBackend::open(cluster._directory.path().join("node-0.sqlite"))
+        .expect("reopen consensus-owned SQLite file");
+    assert_raw_consensus_guard(reopened.get(&key).await);
+    assert_raw_consensus_lease_guard(
+        reopened
+            .acquire(&key, owner("reopened-owner"), Duration::from_secs(30))
+            .await,
+    );
+
+    let committed = store
+        .get(&key)
+        .await
+        .expect("linearizable read")
+        .expect("committed record");
+    assert_eq!(committed.generation, Generation::new(1));
+}
+
+#[tokio::test]
+async fn batch_preflight_rejects_unsealed_payload_before_any_slot_commits() {
+    let cluster = TestCluster::start().await;
+    let store = &cluster.stores[0];
+    let first_key = session_key(b"batch-sealed-first");
+    let second_key = session_key(b"batch-unsealed-second");
+    let first_lease = store
+        .acquire(
+            &first_key,
+            owner("batch-owner-first"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("first lease");
+    let second_lease = store
+        .acquire(
+            &second_key,
+            owner("batch-owner-second"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("second lease");
+    let before = store
+        .max_replication_sequence()
+        .await
+        .expect("journal head before rejected batch");
+
+    let error = store
+        .batch(vec![
+            SessionOp::CompareAndSet(CompareAndSet {
+                key: first_key.clone(),
+                lease: first_lease.clone(),
+                expected_generation: None,
+                new_record: sealed_record(first_key.clone(), 1, &first_lease, b"sealed-first-slot"),
+            }),
+            SessionOp::CompareAndSet(CompareAndSet {
+                key: second_key.clone(),
+                lease: second_lease.clone(),
+                expected_generation: None,
+                new_record: plaintext_record(second_key, 1, &second_lease, b"unsealed-second-slot"),
+            }),
+        ])
+        .await
+        .expect_err("an unsealed later slot rejects the complete raw batch");
+    assert!(matches!(error, StoreError::Crypto(_)));
+    assert_eq!(
+        store.get(&first_key).await.expect("read first key"),
+        None,
+        "preflight must run before the first slot reaches Openraft"
+    );
+    assert_eq!(
+        store
+            .max_replication_sequence()
+            .await
+            .expect("journal head after rejected batch"),
+        before
+    );
+}
+
+#[tokio::test]
+async fn encryption_wrapper_keeps_plaintext_above_consensus_and_durable_authority() {
+    let cluster = TestCluster::start().await;
+    let provider = encryption_provider();
+    let writer = EncryptingSessionBackend::new(
+        Arc::new(cluster.stores[0].clone()),
+        Arc::clone(&provider),
+        ENCRYPTION_NAMESPACE,
+    );
+
+    let before_key = session_key(b"encryption-boundary-before-rotation");
+    let before_lease = writer
+        .acquire(
+            &before_key,
+            owner("encryption-boundary-owner-before"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("acquire pre-rotation lease");
+    cluster.clear_captured_payloads();
+    assert_eq!(
+        writer
+            .compare_and_set(CompareAndSet {
+                key: before_key.clone(),
+                lease: before_lease.clone(),
+                expected_generation: None,
+                new_record: plaintext_record(
+                    before_key.clone(),
+                    1,
+                    &before_lease,
+                    PLAINTEXT_CANARY_BEFORE_ROTATION,
+                ),
+            })
+            .await
+            .expect("write plaintext through encryption adapter"),
+        CompareAndSetResult::Success
+    );
+
+    provider
+        .rotate_key(
+            KeyPurpose::Session,
+            &TenantId::new("consensus-test-tenant").expect("tenant"),
+        )
+        .await
+        .expect("rotate active data key");
+
+    let after_key = session_key(b"encryption-boundary-after-rotation");
+    let after_lease = writer
+        .acquire(
+            &after_key,
+            owner("encryption-boundary-owner-after"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("acquire post-rotation lease");
+    assert_eq!(
+        writer
+            .compare_and_set(CompareAndSet {
+                key: after_key.clone(),
+                lease: after_lease.clone(),
+                expected_generation: None,
+                new_record: plaintext_record(
+                    after_key.clone(),
+                    1,
+                    &after_lease,
+                    PLAINTEXT_CANARY_AFTER_ROTATION,
+                ),
+            })
+            .await
+            .expect("write with rotated data key"),
+        CompareAndSetResult::Success
+    );
+    assert_eq!(provider.call_counts(), (2, 0, 1));
+
+    for store in &cluster.stores {
+        for (key, plaintext) in [
+            (&before_key, PLAINTEXT_CANARY_BEFORE_ROTATION),
+            (&after_key, PLAINTEXT_CANARY_AFTER_ROTATION),
+        ] {
+            let record = store
+                .get(key)
+                .await
+                .expect("linearizable raw read")
+                .expect("raw record");
+            assert_eq!(
+                record.payload.encoding(),
+                SessionPayloadEncoding::EnvelopeV1
+            );
+            assert!(!contains_bytes(record.payload.as_bytes(), plaintext));
+        }
+    }
+    assert_eq!(
+        provider.call_counts(),
+        (2, 0, 1),
+        "consensus and raw durable reads must not call the key provider"
+    );
+
+    for store in &cluster.stores {
+        let reader = EncryptingSessionBackend::new(
+            Arc::new(store.clone()),
+            Arc::clone(&provider),
+            ENCRYPTION_NAMESPACE,
+        );
+        for (key, expected) in [
+            (&before_key, PLAINTEXT_CANARY_BEFORE_ROTATION),
+            (&after_key, PLAINTEXT_CANARY_AFTER_ROTATION),
+        ] {
+            let record = reader
+                .get(key)
+                .await
+                .expect("decrypt through outer adapter")
+                .expect("decrypted record");
+            assert_eq!(record.payload.encoding(), SessionPayloadEncoding::Plaintext);
+            assert_eq!(record.payload.as_bytes(), expected);
+        }
+    }
+    assert_eq!(provider.call_counts(), (2, MEMBER_COUNT * 2, 1));
+
+    let captured_payloads = cluster.captured_payloads();
+    assert!(
+        !captured_payloads.is_empty(),
+        "qualification must observe replicated consensus traffic"
+    );
+    for payload in captured_payloads {
+        assert_artifact_bytes_are_sealed("consensus RPC payload", &payload);
+    }
+    for index in 0..MEMBER_COUNT {
+        assert_sqlite_authority_is_sealed(
+            &cluster
+                ._directory
+                .path()
+                .join(format!("node-{index}.sqlite")),
+        );
+    }
+    assert_file_tree_is_sealed(cluster._directory.path());
+}
+
+#[tokio::test]
+async fn writes_leases_and_cas_converge_with_linearizable_reads() {
+    let cluster = TestCluster::start().await;
+    let key = session_key(b"cross-node-cas");
+    let lease = cluster.stores[1]
+        .acquire(&key, owner("owner-a"), Duration::from_secs(30))
+        .await
+        .expect("acquire through node 1");
+    let initial = sealed_record(key.clone(), 1, &lease, b"sealed-v1");
+
+    assert_eq!(
+        cluster.stores[2]
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: None,
+                new_record: initial,
+            })
+            .await
+            .expect("CAS through node 2"),
+        CompareAndSetResult::Success
+    );
+
+    let renewed = cluster.stores[0]
+        .renew(&lease, Duration::from_secs(30))
+        .await
+        .expect("renew through node 0");
+    let updated = sealed_record(key.clone(), 2, &renewed, b"sealed-v2");
+    assert_eq!(
+        cluster.stores[1]
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: renewed,
+                expected_generation: Some(Generation::new(1)),
+                new_record: updated.clone(),
+            })
+            .await
+            .expect("update through node 1"),
+        CompareAndSetResult::Success
+    );
+
+    let reads =
+        futures_util::future::join_all(cluster.stores.iter().map(|store| store.get(&key))).await;
+    for read in reads {
+        assert_eq!(
+            read.expect("linearizable read from every node"),
+            Some(updated.clone())
+        );
+    }
+
+    let logs = replication_logs(&cluster).await;
+    assert!(logs.windows(2).all(|pair| pair[0] == pair[1]));
+    let authoritative_entry = logs[0][0].clone();
+    assert!(matches!(
+        cluster.stores[0]
+            .replicate_entry(authoritative_entry)
+            .await,
+        Err(StoreError::CapabilityNotSupported(capability))
+            if capability == "direct_replication_authority"
+    ));
+    assert!(matches!(
+        cluster.stores[0]
+            .rebuild_replication_state(logs[0].clone())
+            .await,
+        Err(StoreError::CapabilityNotSupported(capability))
+            if capability == "direct_rebuild_authority"
+    ));
+}
+
+#[tokio::test]
+async fn cold_start_concurrent_mutations_share_one_gap_free_committed_sequence() {
+    let cluster = TestCluster::start().await;
+    let keys = [
+        session_key(b"cold-start-a"),
+        session_key(b"cold-start-b"),
+        session_key(b"cold-start-c"),
+    ];
+    let acquisitions = futures_util::future::join_all((0..MEMBER_COUNT).map(|index| {
+        cluster.stores[index].acquire(
+            &keys[index],
+            owner(format!("cold-owner-{index}")),
+            Duration::from_secs(30),
+        )
+    }))
+    .await;
+    let leases = acquisitions
+        .into_iter()
+        .map(|result| result.expect("concurrent cold-start lease"))
+        .collect::<Vec<_>>();
+
+    let writes = futures_util::future::join_all((0..MEMBER_COUNT).map(|index| {
+        cluster.stores[(index + 1) % MEMBER_COUNT].compare_and_set(CompareAndSet {
+            key: keys[index].clone(),
+            lease: leases[index].clone(),
+            expected_generation: None,
+            new_record: sealed_record(keys[index].clone(), 1, &leases[index], b"sealed-cold-start"),
+        })
+    }))
+    .await;
+    for result in writes {
+        assert_eq!(
+            result.expect("concurrent cold-start CAS"),
+            CompareAndSetResult::Success
+        );
+    }
+
+    let logs = replication_logs(&cluster).await;
+    assert_eq!(logs[0].len(), MEMBER_COUNT * 2);
+    assert!(logs.windows(2).all(|pair| pair[0] == pair[1]));
+    for (offset, entry) in logs[0].iter().enumerate() {
+        assert_eq!(
+            entry.sequence,
+            u64::try_from(offset + 1).expect("test index")
+        );
+    }
+    let transaction_ids = logs[0]
+        .iter()
+        .map(|entry| entry.tx_id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(transaction_ids.len(), logs[0].len());
+}
+
+#[tokio::test]
+async fn isolated_node_fails_closed_and_recovers_after_both_peer_paths_heal() {
+    let cluster = TestCluster::start().await;
+    cluster.isolate(0);
+
+    let probe_started = Instant::now();
+    let report = tokio::time::timeout(
+        Duration::from_secs(2),
+        cluster.stores[0].probe_durable_readiness(),
+    )
+    .await
+    .expect("readiness probe is bounded");
+    assert_eq!(report.state(), DurableReadinessState::NoQuorum);
+    assert!(probe_started.elapsed() < Duration::from_secs(2));
+
+    let key = session_key(b"partitioned-write");
+    let mutation_started = Instant::now();
+    let mutation = tokio::time::timeout(
+        Duration::from_secs(2),
+        cluster.stores[0].acquire(&key, owner("isolated-owner"), Duration::from_secs(30)),
+    )
+    .await
+    .expect("partitioned mutation is bounded");
+    assert!(
+        mutation.is_err(),
+        "isolated node must not acknowledge a write"
+    );
+    assert!(mutation_started.elapsed() < Duration::from_secs(2));
+
+    cluster.heal(0);
+    cluster
+        .wait_all_ready(RECOVERY_TIMEOUT)
+        .await
+        .expect("healed node rejoins fresh readiness");
+    cluster.stores[0]
+        .acquire(&key, owner("healed-owner"), Duration::from_secs(30))
+        .await
+        .expect("mutation succeeds after healing");
+}
+
+#[tokio::test]
+async fn repeated_lost_forward_responses_retry_one_request_without_duplicate_event() {
+    let cluster = TestCluster::start().await;
+
+    for source in 0..MEMBER_COUNT {
+        let key = session_key(format!("lost-response-{source}").as_bytes());
+        let lease = cluster.stores[source]
+            .acquire(
+                &key,
+                owner(format!("lost-response-owner-{source}")),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("prepare lease before response loss");
+        let before = cluster.stores[source]
+            .max_replication_sequence()
+            .await
+            .expect("replication head before response loss");
+        // More losses than the admitted member count proves retries are
+        // deadline/backoff bounded rather than prematurely attempt bounded.
+        let dropped_before = cluster.arm_forward_response_loss(source, MEMBER_COUNT + 1);
+
+        let result = cluster.stores[source]
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: None,
+                new_record: sealed_record(key.clone(), 1, &lease, b"sealed-after-loss"),
+            })
+            .await;
+        cluster.stop_forward_response_loss(source);
+        let response_was_lost = cluster.dropped_forward_responses(source) > dropped_before;
+
+        if response_was_lost {
+            assert_eq!(
+                result.expect("retry after delivered response loss"),
+                CompareAndSetResult::Success
+            );
+            let after = cluster.stores[source]
+                .max_replication_sequence()
+                .await
+                .expect("replication head after response loss");
+            assert_eq!(after, before + 1);
+
+            let logs = replication_logs(&cluster).await;
+            assert!(logs.windows(2).all(|pair| pair[0] == pair[1]));
+            let matching_events = logs[0]
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        &entry.op,
+                        ReplicationOp::CompareAndSet { key: event_key, .. }
+                            if event_key == &key
+                    )
+                })
+                .count();
+            assert_eq!(matching_events, 1);
+            return;
+        }
+
+        assert_eq!(
+            result.expect("local leader CAS"),
+            CompareAndSetResult::Success
+        );
+    }
+
+    panic!("no follower path was exercised while response loss was armed");
+}

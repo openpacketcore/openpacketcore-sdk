@@ -546,14 +546,40 @@ pub fn serialize_bound_aad(aad: &EnvelopeAad, key_id: &KeyId) -> Result<Vec<u8>,
 /// from a remote sealing provider and need to store the selected remote key id
 /// in an envelope header without parsing the full private AAD representation.
 pub fn key_id_from_bound_aad(bound_aad: &[u8]) -> Result<KeyId, KeyError> {
+    decode_bound_aad(bound_aad).map(|(_, key_id)| key_id)
+}
+
+/// Decode and validate the exact canonical bound-AAD representation.
+///
+/// Unknown fields, malformed domain metadata, and non-canonical encodings are
+/// rejected. This lets persistence boundaries validate that an opaque crypto
+/// envelope carries the complete SDK AAD shape without resolving a key or
+/// decrypting its payload.
+pub fn decode_bound_aad(bound_aad: &[u8]) -> Result<(EnvelopeAad, KeyId), KeyError> {
     #[derive(Deserialize)]
-    struct BoundEnvelopeAadKeyId {
+    #[serde(deny_unknown_fields)]
+    struct BoundEnvelopeAadOwned {
+        tenant: TenantId,
+        purpose: KeyPurpose,
+        version: u64,
         key_id: KeyId,
+        metadata: EnvelopeMetadata,
     }
 
-    let parsed: BoundEnvelopeAadKeyId = serde_json::from_slice(bound_aad)
+    let parsed: BoundEnvelopeAadOwned = serde_json::from_slice(bound_aad)
         .map_err(|_| KeyError::invalid_metadata("aad", "failed to deserialize"))?;
-    Ok(parsed.key_id)
+    let aad = EnvelopeAad {
+        tenant: parsed.tenant,
+        purpose: parsed.purpose,
+        version: parsed.version,
+        metadata: parsed.metadata,
+    };
+    aad.validate()?;
+    let canonical = serialize_bound_aad(&aad, &parsed.key_id)?;
+    if canonical.as_slice() != bound_aad {
+        return Err(KeyError::invalid_metadata("aad", "must be canonical"));
+    }
+    Ok((aad, parsed.key_id))
 }
 
 pub(crate) fn validate_key_id(value: &str) -> Result<(), KeyError> {

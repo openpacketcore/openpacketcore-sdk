@@ -476,7 +476,16 @@ fn corrupt_nth_nested_cas(op: &mut ReplicationOp, target: usize, canary: &'stati
             ReplicationOp::CompareAndSet { new_record, .. } => {
                 seen += 1;
                 if seen == target {
-                    new_record.payload = EncryptedSessionPayload::envelope(canary);
+                    let mut envelope = CryptoEnvelopeV1::decode(new_record.payload.as_bytes())
+                        .expect("captured payload is an envelope");
+                    envelope.ciphertext_and_tag = canary.to_vec();
+                    envelope
+                        .ciphertext_and_tag
+                        .extend_from_slice(&[0xA5; opc_key::AEAD_TAG_LEN]);
+                    new_record.payload = EncryptedSessionPayload::try_envelope(
+                        envelope.encode().expect("encode corrupt test envelope"),
+                    )
+                    .expect("structurally valid corrupt test envelope");
                     return;
                 }
             }
@@ -1866,55 +1875,34 @@ async fn legacy_plaintext_marker_bypasses_envelope_probe_for_envelope_shaped_byt
     assert_eq!(restored.payload.as_bytes(), envelope_bytes.as_slice());
 }
 
-#[tokio::test]
-async fn malformed_session_envelope_magic_is_not_treated_as_legacy_plaintext() {
-    let inner = Arc::new(FakeSessionBackend::new());
-    let provider = test_provider();
-    let backend = EncryptingSessionBackend::new(
-        Arc::clone(&inner),
-        Arc::clone(&provider),
-        "regional-cache-a",
-    );
-    let key = test_key();
-    let lease = inner
-        .acquire(
-            &key,
-            OwnerId::new("owner-a").expect("owner"),
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("lease");
-
-    inner
-        .compare_and_set(CompareAndSet {
-            key: key.clone(),
-            lease: lease.clone(),
-            expected_generation: None,
-            new_record: StoredSessionRecord {
-                payload: EncryptedSessionPayload::envelope(Bytes::from_static(b"OPCE")),
-                ..test_record(key.clone(), 1, &lease)
-            },
-        })
-        .await
-        .expect("write malformed envelope");
-
-    let err = backend.get(&key).await.expect_err("malformed envelope");
+#[test]
+fn malformed_session_envelope_magic_is_rejected_at_construction() {
+    let err = EncryptedSessionPayload::try_envelope(Bytes::from_static(b"OPCE"))
+        .expect_err("malformed envelope");
     assert_eq!(
         err,
-        StoreError::Crypto("session envelope decryption failed".into())
+        StoreError::Crypto("session envelope is invalid".into())
     );
+}
+
+#[test]
+fn envelope_marker_cannot_be_forged_through_deserialization() {
+    let forged = serde_json::json!({
+        "bytes": b"plaintext-mislabeled-as-envelope",
+        "encoding": "EnvelopeV1"
+    });
+    let error = serde_json::from_value::<EncryptedSessionPayload>(forged)
+        .expect_err("deserialization must validate envelope bytes");
+    assert!(!error
+        .to_string()
+        .contains("plaintext-mislabeled-as-envelope"));
 }
 
 #[tokio::test]
 async fn corrupted_session_envelope_header_byte_is_not_treated_as_legacy_plaintext() {
-    let inner = Arc::new(FakeSessionBackend::new());
     let provider = test_provider();
-    let backend = EncryptingSessionBackend::new(
-        Arc::clone(&inner),
-        Arc::clone(&provider),
-        "regional-cache-a",
-    );
     let key = test_key();
+    let inner = FakeSessionBackend::new();
     let lease = inner
         .acquire(
             &key,
@@ -1924,7 +1912,7 @@ async fn corrupted_session_envelope_header_byte_is_not_treated_as_legacy_plainte
         .await
         .expect("lease");
 
-    let mut encrypted = EncryptedSessionPayload::encrypt(
+    let encrypted = EncryptedSessionPayload::encrypt(
         provider.as_ref(),
         &test_record(key.clone(), 1, &lease),
         "regional-cache-a",
@@ -1933,64 +1921,20 @@ async fn corrupted_session_envelope_header_byte_is_not_treated_as_legacy_plainte
     .expect("encrypt");
     let mut corrupted = encrypted.as_bytes().to_vec();
     corrupted[0] ^= 0x01;
-    encrypted = EncryptedSessionPayload::envelope(Bytes::from(corrupted));
-
-    inner
-        .compare_and_set(CompareAndSet {
-            key: key.clone(),
-            lease: lease.clone(),
-            expected_generation: None,
-            new_record: StoredSessionRecord {
-                payload: encrypted,
-                ..test_record(key.clone(), 1, &lease)
-            },
-        })
-        .await
-        .expect("seed corrupted envelope");
-
-    let err = backend.get(&key).await.expect_err("corrupted envelope");
+    let err = EncryptedSessionPayload::try_envelope(Bytes::from(corrupted))
+        .expect_err("corrupted header");
     assert_eq!(
         err,
-        StoreError::Crypto("session envelope decryption failed".into())
+        StoreError::Crypto("session envelope is invalid".into())
     );
 }
 
-#[tokio::test]
-async fn empty_session_envelope_ciphertext_is_rejected() {
-    let inner = Arc::new(FakeSessionBackend::new());
-    let provider = test_provider();
-    let backend = EncryptingSessionBackend::new(
-        Arc::clone(&inner),
-        Arc::clone(&provider),
-        "regional-cache-a",
-    );
-    let key = test_key();
-    let lease = inner
-        .acquire(
-            &key,
-            OwnerId::new("owner-a").expect("owner"),
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("lease");
-
-    inner
-        .compare_and_set(CompareAndSet {
-            key: key.clone(),
-            lease: lease.clone(),
-            expected_generation: None,
-            new_record: StoredSessionRecord {
-                payload: EncryptedSessionPayload::envelope(Bytes::new()),
-                ..test_record(key.clone(), 1, &lease)
-            },
-        })
-        .await
-        .expect("seed empty envelope");
-
-    let err = backend.get(&key).await.expect_err("empty envelope");
+#[test]
+fn empty_session_envelope_ciphertext_is_rejected() {
+    let err = EncryptedSessionPayload::try_envelope(Bytes::new()).expect_err("empty envelope");
     assert_eq!(
         err,
-        StoreError::Crypto("session envelope ciphertext is missing".into())
+        StoreError::Crypto("session envelope is invalid".into())
     );
 }
 
@@ -2340,7 +2284,8 @@ async fn test_refactored_zeroizing_decrypt_hygiene() {
     if let Some(last) = corrupted_bytes.last_mut() {
         *last ^= 0x55;
     }
-    raw_record.payload = EncryptedSessionPayload::envelope(corrupted_bytes);
+    raw_record.payload = EncryptedSessionPayload::try_envelope(corrupted_bytes)
+        .expect("corrupted ciphertext remains structurally valid");
     raw_record.generation = Generation::new(2); // monotonic increment
     inner
         .compare_and_set(CompareAndSet {
@@ -2489,27 +2434,15 @@ async fn test_classification_seam_regression() {
     let restored = backend.get(&key).await.unwrap().unwrap();
     assert_eq!(restored.payload.as_bytes(), envelope_bytes);
 
-    // 4. EnvelopeV1 row with malformed envelope bytes -> fails closed!
-    inner
-        .compare_and_set(CompareAndSet {
-            key: key.clone(),
-            lease: lease.clone(),
-            expected_generation: Some(Generation::new(3)),
-            new_record: StoredSessionRecord {
-                payload: EncryptedSessionPayload::envelope(envelope_bytes),
-                ..test_record(key.clone(), 4, &lease)
-            },
-        })
-        .await
-        .expect("write envelope row");
-
-    let err = backend.get(&key).await.unwrap_err();
+    // 4. Malformed bytes cannot be labelled EnvelopeV1 at all.
+    let err = EncryptedSessionPayload::try_envelope(envelope_bytes)
+        .expect_err("malformed envelope must fail at construction");
     assert!(matches!(err, StoreError::Crypto(_)));
 
     // 5. Unclassified row with VALID envelope bytes -> decrypts correctly!
     let correct_envelope = EncryptedSessionPayload::encrypt(
         provider.as_ref(),
-        &test_record(key.clone(), 5, &lease),
+        &test_record(key.clone(), 4, &lease),
         "regional-cache-a",
     )
     .await
@@ -2519,10 +2452,10 @@ async fn test_classification_seam_regression() {
         .compare_and_set(CompareAndSet {
             key: key.clone(),
             lease: lease.clone(),
-            expected_generation: Some(Generation::new(4)),
+            expected_generation: Some(Generation::new(3)),
             new_record: StoredSessionRecord {
                 payload: EncryptedSessionPayload::unclassified(correct_envelope.as_bytes()),
-                ..test_record(key.clone(), 5, &lease)
+                ..test_record(key.clone(), 4, &lease)
             },
         })
         .await

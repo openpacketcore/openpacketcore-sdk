@@ -27,6 +27,6 @@ pub use provider::{
 };
 pub use remote::{MemoryRemoteSealProvider, RemoteSealProvider};
 pub use scope::{
-    key_id_from_bound_aad, serialize_bound_aad, AeadAlgorithm, ConfigAad, EnvelopeAad,
-    EnvelopeMetadata, KeyId, KeyPurpose, SessionAad, ShadowSecurityAad,
+    decode_bound_aad, key_id_from_bound_aad, serialize_bound_aad, AeadAlgorithm, ConfigAad,
+    EnvelopeAad, EnvelopeMetadata, KeyId, KeyPurpose, SessionAad, ShadowSecurityAad,
 };

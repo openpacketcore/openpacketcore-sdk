@@ -1,58 +1,74 @@
 # opc-session-testkit
 
-Internal chaos and restore-evidence fixtures for session-store tests.
+Internal Openraft and restore-evidence fixtures for session-store tests.
 
 ## Purpose
 
-`opc-session-testkit` provides reusable test utilities for clock skew, quorum
-partitioning, replica lag, and restore-evidence assertions around
-`opc-session-store`.
+`opc-session-testkit` provides reusable test utilities for deterministic clock
+skew, controllable in-process consensus paths, and restore-evidence assertions
+around `opc-session-store`. It exercises the production
+`ConsensusSessionStore` adapter; it does not implement a second quorum,
+sequencing, or repair algorithm.
 
 ## API Shape
 
-- `SkewableClock::new()` and `with_base` wrap a virtual clock and allow
-  positive or negative skew through `set_skew`.
-- `ChaosTestkit::new(num_replicas)` builds fake fenced replicas with shared
-  virtual time.
-- `build_coordinator(local_replica_id, reached_replica_ids)` creates a
-  validated `QuorumSessionStore` view where one explicit logical member is
-  local and only selected replicas are reachable.
-- `validated_topology(local_replica_id)` supplies immutable test topology to a
-  production-shaped consumer without discarding replica identity metadata.
-- `set_lag`, `set_online`, and `set_clock_skew` inject replica faults.
+- `SkewableClock::new()` and `with_base` wrap a virtual clock. `set_skew`
+  applies checked positive or negative skew, including saturation at timestamp
+  limits.
+- `ConsensusTestCluster::start(1)` forms an explicit Openraft lab singleton.
+  `ConsensusTestCluster::start(3)` forms a descriptor-only, three-member
+  Openraft fleet with one distinct file-backed SQLite database per member.
+- `store(index)` returns a clone of that member's production
+  `ConsensusSessionStore` adapter.
+- `set_node_online(index, online)` enables or disables every in-process
+  consensus path to and from one member. `wait_node_durable_ready(index)` waits
+  for that member to complete a fresh Openraft linearizable barrier.
 - `RestoreEvidenceAsserter::new(block_reasons)` exposes fluent assertions for
   stale-owner rejection, traffic blocking, and redaction-safe messages.
 
 ```rust,no_run
-use opc_session_testkit::ChaosTestkit;
-use std::time::Duration;
+use opc_session_testkit::ConsensusTestCluster;
 
-async fn partition() {
-    let kit = ChaosTestkit::new(3);
-    kit.set_lag(1, Some(Duration::from_millis(50))).await;
-    let _coordinator = kit.build_coordinator(0, &[0, 2]).unwrap();
+async fn partition_and_recover() {
+    let cluster = ConsensusTestCluster::start(3).await;
+
+    cluster.set_node_online(2, false);
+    let store = cluster.store(0);
+    assert_eq!(store.topology().configured_members(), 3);
+
+    cluster.set_node_online(2, true);
+    cluster.wait_node_durable_ready(2).await;
 }
 ```
 
 ## Relationships
 
-- Built on `opc-session-store` fake backends, fenced replicas, quorum store, and
-  restore block reasons.
-- Used by AMF-lite and session HA tests.
+- Builds descriptor-only `ValidatedQuorumTopology` values and supplies each
+  node's local SQLite backend and exact remote `SessionConsensusPeer` map
+  separately.
+- Uses controllable in-process peer adapters, not `opc-session-net`, mTLS, DNS,
+  or a second consensus implementation.
+- Used by AMF-lite, IPsec ownership, cache, and session-store tests.
 
 ## Status Notes
 
-- `publish = false`.
-- Intended for tests only.
-- Synthetic `.invalid` endpoints and SPIFFE-like IDs are test metadata, not
-  live authenticated membership evidence.
-- Clock skew is deterministic and based on `TokioVirtualClock`.
+- `publish = false`; this crate is test-only.
+- Synthetic `.invalid` endpoints and SPIFFE-like IDs are descriptor metadata,
+  not live authenticated network membership evidence.
+- Node isolation exercises Openraft quorum loss and healing after a fleet has
+  formed. It does not by itself qualify cold-start races, multi-process
+  restart/rejoin, legacy-fork repair, real mTLS transport, or carrier failover.
+- Long-running network, resource, and soak qualification remains #143. Watch
+  handoff semantics remain #145, and bounded replication-log cursor/retention
+  work remains #171.
 - Restore assertions panic like normal test assertions.
 
 ## Roadmap
 
-- Add chaos knobs only when session-store or CNF tests need them.
-- Keep restore assertions focused on externally visible safety properties.
+- Add fault controls only when a session-store or CNF acceptance test needs a
+  specific observable safety property.
+- Keep consensus faults at the peer boundary so tests continue to exercise
+  Openraft as the only authority.
 - Keep the crate unpublished and test-only.
 
 ## Verification

@@ -1497,7 +1497,7 @@ pub fn export_prometheus_text() -> String {
         &mut out,
         "opc_session_store_durable_readiness_fresh_reachable_voters",
         "gauge",
-        "Distinct session-store voters freshly reached by the most recent durable-readiness probe",
+        "Minimum session-store voters whose reachability was proven by the latest Openraft barrier",
         readiness_fresh_reachable_voters as f64,
     );
 
@@ -1508,7 +1508,7 @@ pub fn export_prometheus_text() -> String {
         &mut out,
         "opc_session_store_durable_readiness_agreeing_voters",
         "gauge",
-        "Distinct session-store voters agreeing on the majority-visible prefix in the most recent probe",
+        "Minimum session-store voters whose agreement was proven by the latest Openraft commit barrier",
         readiness_agreeing_voters as f64,
     );
 
@@ -1530,7 +1530,7 @@ pub fn export_prometheus_text() -> String {
         &mut out,
         "opc_session_store_durable_readiness_majority_visible_prefix",
         "gauge",
-        "Highest majority-visible session-store prefix freshly observed by a configured majority",
+        "Openraft committed barrier index from the latest ready probe (compatibility metric name)",
         readiness_majority_visible_prefix as f64,
     );
 
@@ -2283,7 +2283,7 @@ mod tests {
         assert!(exported.contains("opc_session_store_durable_readiness_agreeing_voters 2\n"));
         assert!(exported.contains("opc_session_store_durable_readiness_required_quorum 2\n"));
         assert!(exported.contains(
-            "# HELP opc_session_store_durable_readiness_majority_visible_prefix Highest majority-visible session-store prefix freshly observed by a configured majority\n"
+            "# HELP opc_session_store_durable_readiness_majority_visible_prefix Openraft committed barrier index from the latest ready probe (compatibility metric name)\n"
         ));
         assert!(
             exported.contains("opc_session_store_durable_readiness_majority_visible_prefix 42\n")

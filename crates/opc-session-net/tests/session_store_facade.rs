@@ -1,4 +1,5 @@
 #![cfg(feature = "insecure-test")]
+#![cfg(feature = "legacy-session-net-compat")]
 
 //! Smoke test that the test-only plaintext `RemoteSessionBackend` slots into
 //! the `SessionStore` facade.

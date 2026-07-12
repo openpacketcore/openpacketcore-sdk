@@ -3,18 +3,17 @@
 //! Intended for single-node and edge/single-replica profiles: it provides
 //! transactional fenced CAS, monotonic per-key fences, server-side lease
 //! expiry, and per-key TTL on one local database file (WAL mode, full sync).
-//! Replication-log application and watch are implemented so a SQLite node
-//! can serve as a quorum replica, but the backend deliberately does not
-//! advertise `ordered_replication_log`/`watch` capabilities and therefore
-//! fails validation for the `replicated-disaster-recovery` profile on its
-//! own.
+//! Application-journal replay and watch remain for standalone compatibility.
+//! Once the durable consensus identity claims a database, every public raw
+//! backend operation fails closed; Openraft's internal state-machine adapter
+//! is the only mutation and read-authority path.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{
     backend::{
@@ -33,12 +32,43 @@ use crate::{
 };
 
 pub mod audit;
+pub(crate) mod consensus;
 pub(crate) mod lease;
 pub(crate) mod ops;
 pub(crate) mod replication;
 pub(crate) mod watch;
 
 const SQLITE_SESSION_MAX_VALUE_BYTES: usize = 1_048_576;
+const CONSENSUS_AUTHORITY_REQUIRED: &str = "consensus_authority_required";
+
+/// Begin one standalone operation while holding SQLite's write reservation.
+///
+/// The immediate transaction is the hand-off fence between the standalone
+/// backend and consensus admission, including when another process opens the
+/// same database through a distinct `Connection`. If consensus admission wins
+/// first, the durable identity marker is visible and this operation fails. If
+/// this operation wins first, admission waits and then either observes an
+/// empty compatible database or rejects its newly written legacy authority.
+fn standalone_transaction(conn: &Connection) -> Result<Transaction<'_>, StoreError> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|_| StoreError::BackendUnavailable("session store operation failed".into()))?;
+    let consensus_owned = consensus_identity_exists(&tx)?;
+    if consensus_owned {
+        return Err(StoreError::CapabilityNotSupported(
+            CONSENSUS_AUTHORITY_REQUIRED.into(),
+        ));
+    }
+    Ok(tx)
+}
+
+fn consensus_identity_exists(conn: &Connection) -> Result<bool, StoreError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'consensus_identity')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|_| StoreError::BackendUnavailable("session store operation failed".into()))
+}
 
 /// SQLite-backed durable session backend and lease manager.
 ///
@@ -191,6 +221,126 @@ impl SqliteSessionBackend {
         self.clock = clock;
         self
     }
+
+    /// Capabilities consumed by the consensus adapter that owns this backend.
+    pub(crate) const fn consensus_capabilities(&self) -> BackendCapabilities {
+        self.caps
+    }
+
+    /// Read at a logical timestamp already committed by the consensus state
+    /// machine. This path is read-only: expiry affects visibility but never
+    /// prunes physical rows outside a committed command.
+    pub(crate) async fn consensus_get_at(
+        &self,
+        key: &SessionKey,
+        logical_time: opc_types::Timestamp,
+    ) -> Result<Option<StoredSessionRecord>, StoreError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+        let result = ops::get_sync(&tx, key, logical_time)?;
+        tx.commit()
+            .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+        Ok(result)
+    }
+
+    /// Restore scan at one persisted consensus logical timestamp.
+    pub(crate) async fn consensus_scan_restore_records_at(
+        &self,
+        request: RestoreScanRequest,
+        logical_time: opc_types::Timestamp,
+    ) -> Result<RestoreScanPage, StoreError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| StoreError::BackendUnavailable("session store scan failed".into()))?;
+        let result = ops::scan_restore_records_sync(&tx, request, logical_time)?;
+        tx.commit()
+            .map_err(|_| StoreError::BackendUnavailable("session store scan failed".into()))?;
+        Ok(result)
+    }
+
+    /// Read the committed application-journal head after the caller has
+    /// completed its Openraft linearizable barrier and local apply wait.
+    pub(crate) async fn consensus_max_replication_sequence(&self) -> Result<u64, StoreError> {
+        let conn = self.conn.lock().await;
+        let seq: Option<Option<i64>> = conn
+            .query_row(
+                "SELECT MAX(sequence) FROM session_replication_log",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+        seq.flatten()
+            .map(replication::stored_replication_sequence)
+            .transpose()
+            .map(|sequence| sequence.unwrap_or(0))
+    }
+
+    /// Read committed application-journal entries after the caller's Openraft
+    /// barrier. This internal path cannot allocate sequencing authority.
+    pub(crate) async fn consensus_get_replication_log(
+        &self,
+        start: u64,
+        limit: usize,
+    ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        let Ok(sqlite_start) = i64::try_from(start) else {
+            return Ok(Vec::new());
+        };
+        let sqlite_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT sequence, entry_json FROM session_replication_log WHERE sequence >= ?1 ORDER BY sequence ASC LIMIT ?2",
+            )
+            .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+        let entries = stmt
+            .query_map(params![sqlite_start, sqlite_limit], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+        let mut result = Vec::new();
+        for item in entries {
+            let (stored_sequence, json) = item
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let stored_sequence = replication::stored_replication_sequence(stored_sequence)?;
+            let entry: ReplicationEntry = serde_json::from_str(&json).map_err(|_| {
+                StoreError::Serialization("session journal entry is invalid".into())
+            })?;
+            let entry = entry.into_validated()?;
+            if entry.sequence != stored_sequence {
+                return Err(StoreError::InvalidReplicationSequence);
+            }
+            result.push(entry);
+        }
+        validate_replication_page_owned(result)
+    }
+
+    /// Subscribe to the committed application journal. The caller must first
+    /// complete an Openraft barrier; this function only reads already-applied
+    /// state and registers for later state-machine notifications.
+    pub(crate) async fn consensus_watch(
+        &self,
+        start_sequence: u64,
+    ) -> Result<
+        futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
+        StoreError,
+    > {
+        let existing = self
+            .consensus_get_replication_log(start_sequence, 10_000)
+            .await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(WATCH_CHANNEL_CAPACITY);
+        for entry in existing {
+            if tx.try_send(Ok(entry)).is_err() {
+                break;
+            }
+        }
+        self.watchers.lock().await.push(tx);
+        use futures_util::StreamExt;
+        Ok(watch::SqliteWatchStream { rx }.boxed())
+    }
 }
 
 fn sqlite_capabilities() -> BackendCapabilities {
@@ -266,16 +416,22 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     async fn capabilities(&self) -> BackendCapabilities {
-        self.caps
+        let conn = self.conn.lock().await;
+        match consensus_identity_exists(&conn) {
+            Ok(false) => self.caps,
+            Ok(true) | Err(_) => BackendCapabilities::minimal(),
+        }
     }
 
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
         let conn = self.conn.lock().await;
         let now = self.clock.now_utc();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        let tx = standalone_transaction(&conn)?;
         let result = ops::get_sync(&tx, key, now)?;
+        // Standalone SQLite owns its local monotonic clock and may physically
+        // prune on reads. Consensus reads use `consensus_get_at` instead and
+        // never mutate outside an Openraft-applied command.
+        ops::prune_sync(&tx, now)?;
         tx.commit()
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
         Ok(result)
@@ -284,9 +440,7 @@ impl SessionBackend for SqliteSessionBackend {
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
         let conn = self.conn.lock().await;
         let now = self.clock.now_utc();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        let tx = standalone_transaction(&conn)?;
         let res = ops::compare_and_set_sync(&tx, op, &self.caps, now)?;
         tx.commit()
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
@@ -296,9 +450,7 @@ impl SessionBackend for SqliteSessionBackend {
     async fn delete_fenced(&self, lease: &LeaseGuard) -> Result<(), StoreError> {
         let conn = self.conn.lock().await;
         let now = self.clock.now_utc();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        let tx = standalone_transaction(&conn)?;
         ops::delete_fenced_sync(&tx, lease, &self.caps, now)?;
         tx.commit()
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
@@ -310,9 +462,7 @@ impl SessionBackend for SqliteSessionBackend {
         let now = self.clock.now_utc();
         checked_session_deadline(now, ttl)?;
         let conn = self.conn.lock().await;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        let tx = standalone_transaction(&conn)?;
         ops::refresh_ttl_sync(&tx, lease, ttl, &self.caps, now)?;
         tx.commit()
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
@@ -337,9 +487,7 @@ impl SessionBackend for SqliteSessionBackend {
             let res = match op {
                 SessionOp::Get { key } => {
                     let run_get = || {
-                        let tx = conn
-                            .unchecked_transaction()
-                            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                        let tx = standalone_transaction(&conn)?;
                         let result = ops::get_sync(&tx, &key, now)?;
                         tx.commit()
                             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
@@ -349,9 +497,7 @@ impl SessionBackend for SqliteSessionBackend {
                 }
                 SessionOp::CompareAndSet(cas) => {
                     let run_cas = || {
-                        let tx = conn
-                            .unchecked_transaction()
-                            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                        let tx = standalone_transaction(&conn)?;
                         let res = ops::compare_and_set_sync(&tx, cas, &self.caps, now)?;
                         tx.commit()
                             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
@@ -361,9 +507,7 @@ impl SessionBackend for SqliteSessionBackend {
                 }
                 SessionOp::DeleteFenced { lease } => {
                     let run_del = || {
-                        let tx = conn
-                            .unchecked_transaction()
-                            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                        let tx = standalone_transaction(&conn)?;
                         ops::delete_fenced_sync(&tx, &lease, &self.caps, now)?;
                         tx.commit()
                             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
@@ -373,9 +517,7 @@ impl SessionBackend for SqliteSessionBackend {
                 }
                 SessionOp::RefreshTtl { lease, ttl } => {
                     let run_ref = || {
-                        let tx = conn
-                            .unchecked_transaction()
-                            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                        let tx = standalone_transaction(&conn)?;
                         ops::refresh_ttl_sync(&tx, &lease, ttl, &self.caps, now)?;
                         tx.commit()
                             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
@@ -395,10 +537,9 @@ impl SessionBackend for SqliteSessionBackend {
     ) -> Result<RestoreScanPage, StoreError> {
         let conn = self.conn.lock().await;
         let now = self.clock.now_utc();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        let tx = standalone_transaction(&conn)?;
         let result = ops::scan_restore_records_sync(&tx, request, now)?;
+        ops::prune_sync(&tx, now)?;
         tx.commit()
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
         Ok(result)
@@ -406,7 +547,8 @@ impl SessionBackend for SqliteSessionBackend {
 
     async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
         let conn = self.conn.lock().await;
-        let seq: Option<Option<i64>> = conn
+        let tx = standalone_transaction(&conn)?;
+        let seq: Option<Option<i64>> = tx
             .query_row(
                 "SELECT MAX(sequence) FROM session_replication_log",
                 [],
@@ -414,10 +556,14 @@ impl SessionBackend for SqliteSessionBackend {
             )
             .optional()
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        seq.flatten()
+        let sequence = seq
+            .flatten()
             .map(replication::stored_replication_sequence)
             .transpose()
-            .map(|sequence| sequence.unwrap_or(0))
+            .map(|sequence| sequence.unwrap_or(0))?;
+        tx.commit()
+            .map_err(|_| StoreError::BackendUnavailable("session store operation failed".into()))?;
+        Ok(sequence)
     }
 
     async fn get_replication_log(
@@ -430,32 +576,38 @@ impl SessionBackend for SqliteSessionBackend {
         };
         let sqlite_limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT sequence, entry_json FROM session_replication_log WHERE sequence >= ?1 ORDER BY sequence ASC LIMIT ?2"
-        )
-        .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        let entries = stmt
-            .query_map(params![sqlite_start, sqlite_limit], |row| {
-                let sequence: i64 = row.get(0)?;
-                let json: String = row.get(1)?;
-                Ok((sequence, json))
-            })
+        let tx = standalone_transaction(&conn)?;
+        let res = {
+            let mut stmt = tx.prepare(
+                "SELECT sequence, entry_json FROM session_replication_log WHERE sequence >= ?1 ORDER BY sequence ASC LIMIT ?2"
+            )
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            let entries = stmt
+                .query_map(params![sqlite_start, sqlite_limit], |row| {
+                    let sequence: i64 = row.get(0)?;
+                    let json: String = row.get(1)?;
+                    Ok((sequence, json))
+                })
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
-        let mut res = Vec::new();
-        for item in entries {
-            let (stored_sequence, json) =
-                item.map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-            let stored_sequence = replication::stored_replication_sequence(stored_sequence)?;
-            let entry: ReplicationEntry = serde_json::from_str(&json)
-                .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            let entry = entry.into_validated()?;
-            if entry.sequence != stored_sequence {
-                return Err(StoreError::InvalidReplicationSequence);
+            let mut res = Vec::new();
+            for item in entries {
+                let (stored_sequence, json) =
+                    item.map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                let stored_sequence = replication::stored_replication_sequence(stored_sequence)?;
+                let entry: ReplicationEntry = serde_json::from_str(&json)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                let entry = entry.into_validated()?;
+                if entry.sequence != stored_sequence {
+                    return Err(StoreError::InvalidReplicationSequence);
+                }
+                res.push(entry);
             }
-            res.push(entry);
-        }
-        validate_replication_page_owned(res)
+            validate_replication_page_owned(res)?
+        };
+        tx.commit()
+            .map_err(|_| StoreError::BackendUnavailable("session store operation failed".into()))?;
+        Ok(res)
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
@@ -510,16 +662,26 @@ impl SessionBackend for SqliteSessionBackend {
 
     async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
         let conn = self.conn.lock().await;
-        let mut global_stmt = conn
-            .prepare("SELECT val FROM lease_globals WHERE key = ?1")
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        let next_fence: i64 = global_stmt
-            .query_row(["next_fence"], |row| row.get(0))
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        let next_credential_id: i64 = global_stmt
-            .query_row(["next_credential_id"], |row| row.get(0))
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        Ok((next_fence as u64, next_credential_id as u64))
+        let tx = standalone_transaction(&conn)?;
+        let (next_fence, next_credential_id) = {
+            let mut global_stmt = tx
+                .prepare("SELECT val FROM lease_globals WHERE key = ?1")
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            let next_fence: i64 = global_stmt
+                .query_row(["next_fence"], |row| row.get(0))
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            let next_credential_id: i64 = global_stmt
+                .query_row(["next_credential_id"], |row| row.get(0))
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            (next_fence, next_credential_id)
+        };
+        let result = (
+            ops::persisted_u64(next_fence)?,
+            ops::persisted_u64(next_credential_id)?,
+        );
+        tx.commit()
+            .map_err(|_| StoreError::BackendUnavailable("session store operation failed".into()))?;
+        Ok(result)
     }
 }
 
@@ -539,9 +701,7 @@ impl SessionLeaseManager for SqliteSessionBackend {
         let now = self.clock.now_utc();
         checked_session_deadline(now, ttl).map_err(LeaseError::from)?;
         let conn = self.conn.lock().await;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| LeaseError::Backend(e.to_string()))?;
+        let tx = standalone_transaction(&conn).map_err(LeaseError::from)?;
         let res = lease::acquire_sync(&tx, key, owner, ttl, now)?;
         tx.commit()
             .map_err(|e| LeaseError::Backend(e.to_string()))?;
@@ -553,9 +713,7 @@ impl SessionLeaseManager for SqliteSessionBackend {
         let now = self.clock.now_utc();
         checked_session_deadline(now, ttl).map_err(LeaseError::from)?;
         let conn = self.conn.lock().await;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| LeaseError::Backend(e.to_string()))?;
+        let tx = standalone_transaction(&conn).map_err(LeaseError::from)?;
         let res = lease::renew_sync(&tx, lease, ttl, now)?;
         tx.commit()
             .map_err(|e| LeaseError::Backend(e.to_string()))?;
@@ -565,9 +723,7 @@ impl SessionLeaseManager for SqliteSessionBackend {
     async fn release(&self, lease: LeaseGuard) -> Result<(), LeaseError> {
         let conn = self.conn.lock().await;
         let now = self.clock.now_utc();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| LeaseError::Backend(e.to_string()))?;
+        let tx = standalone_transaction(&conn).map_err(LeaseError::from)?;
         lease::release_sync(&tx, lease, now)?;
         tx.commit()
             .map_err(|e| LeaseError::Backend(e.to_string()))?;

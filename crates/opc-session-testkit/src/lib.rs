@@ -3,14 +3,22 @@
 //! Provides clock skew, network partition, and fault injection fixtures.
 //! This is an internal testkit crate and is not published.
 
+use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use futures_util::future::join_all;
 use opc_session_store::{
-    Clock, FakeSessionBackend, FencedSessionReplica, QuorumReplicaDescriptor, QuorumReplicaMember,
-    QuorumSessionStore, QuorumTopologyConfig, QuorumTopologyError, ReplicaBackingIdentity,
-    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreBlockReason,
-    RestoreBlockReasonCode, TokioVirtualClock, ValidatedQuorumTopology,
+    Clock, ConsensusSessionStore, DurableReadinessState, QuorumReplicaDescriptor,
+    QuorumTopologyConfig, QuorumTopologyError, ReplicaBackingIdentity, ReplicaEndpoint,
+    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreBlockReason,
+    RestoreBlockReasonCode, SessionConsensusNodeId, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusRpcHandler, SessionConsensusWireRequest,
+    SessionConsensusWireResponse, SqliteSessionBackend, SystemClock, TokioVirtualClock,
+    ValidatedQuorumTopology, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
 };
 use opc_types::Timestamp;
 
@@ -113,118 +121,266 @@ fn maximum_utc() -> time::OffsetDateTime {
     time::PrimitiveDateTime::MAX.assume_utc()
 }
 
-/// Testkit for HA and chaos testing of the Session Store.
-pub struct ChaosTestkit {
-    pub replicas: Vec<FencedSessionReplica>,
-    pub clocks: Vec<SkewableClock>,
+#[derive(Clone)]
+struct InProcessConsensusPeer {
+    node_id: SessionConsensusNodeId,
+    handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
+    online: Arc<AtomicBool>,
 }
 
-impl ChaosTestkit {
-    /// Create a new testkit with a cluster of `num_replicas` fake backends.
-    pub fn new(num_replicas: usize) -> Self {
-        let base_clock = Arc::new(TokioVirtualClock::new());
-        let mut replicas = Vec::with_capacity(num_replicas);
-        let mut clocks = Vec::with_capacity(num_replicas);
-
-        for i in 0..num_replicas {
-            let clock = SkewableClock::with_base(base_clock.clone());
-            clocks.push(clock.clone());
-
-            let raw_backend = FakeSessionBackend::new().with_clock(Arc::new(clock));
-            replicas.push(FencedSessionReplica::new(i, Arc::new(raw_backend)));
+impl InProcessConsensusPeer {
+    fn new(node_id: SessionConsensusNodeId) -> Self {
+        Self {
+            node_id,
+            handler: Arc::new(tokio::sync::RwLock::new(None)),
+            online: Arc::new(AtomicBool::new(true)),
         }
-
-        Self { replicas, clocks }
     }
 
-    /// Build a QuorumSessionStore coordinator client.
-    /// You can specify which replica IDs this client is capable of reaching. Replicas not in
-    /// `reached_replica_ids` will be marked offline from this client's point of view.
-    pub fn build_coordinator(
+    async fn install(&self, handler: Arc<dyn SessionConsensusRpcHandler>) {
+        *self.handler.write().await = Some(handler);
+    }
+
+    fn set_online(&self, online: bool) {
+        self.online.store(online, Ordering::SeqCst);
+    }
+}
+
+impl fmt::Debug for InProcessConsensusPeer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InProcessConsensusPeer")
+            .field("node_id", &self.node_id)
+            .field("online", &self.online.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl SessionConsensusPeer for InProcessConsensusPeer {
+    fn node_id(&self) -> SessionConsensusNodeId {
+        self.node_id
+    }
+
+    async fn call(
         &self,
-        local_replica_id: usize,
-        reached_replica_ids: &[usize],
-    ) -> Result<QuorumSessionStore, QuorumTopologyError> {
-        let mut view_replicas = Vec::new();
-        for replica in &self.replicas {
-            let mut wrapped_replica = replica.clone();
-            let reached = reached_replica_ids.contains(&replica.id);
-            wrapped_replica.client_online = Arc::new(tokio::sync::Mutex::new(reached));
-            view_replicas.push(test_member(wrapped_replica)?);
+        request: SessionConsensusWireRequest,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        if !self.online.load(Ordering::SeqCst) {
+            return Err(SessionConsensusPeerError::Unavailable);
         }
-        let topology = build_topology(local_replica_id, view_replicas)?;
-        Ok(QuorumSessionStore::from_validated_topology(topology))
+        let handler = self
+            .handler
+            .read()
+            .await
+            .clone()
+            .ok_or(SessionConsensusPeerError::Unavailable)?;
+        Ok(handler.handle(request.sender, request).await)
+    }
+}
+
+/// A real in-process Openraft fleet for downstream SDK qualification tests.
+///
+/// Every member owns a distinct file-backed SQLite database. Network faults
+/// affect only authenticated consensus RPC paths; no test-only majority or
+/// sequencing implementation is involved.
+pub struct ConsensusTestCluster {
+    _directory: tempfile::TempDir,
+    stores: Vec<ConsensusSessionStore>,
+    paths: BTreeMap<(usize, usize), Arc<InProcessConsensusPeer>>,
+}
+
+impl ConsensusTestCluster {
+    /// Form a one-member Openraft lab node or a production-shaped HA fleet.
+    ///
+    /// This internal test helper panics on fixture construction failure so
+    /// call sites retain the original failure rather than silently falling
+    /// back to a fake coordinator.
+    pub async fn start(member_count: usize) -> Self {
+        assert!(
+            member_count == 1 || member_count >= 3,
+            "consensus test fleets require one or at least three members"
+        );
+        let directory = tempfile::tempdir().expect("create consensus test directory");
+        let backends = (0..member_count)
+            .map(|index| {
+                SqliteSessionBackend::open(directory.path().join(format!("node-{index}.sqlite")))
+                    .expect("open consensus test SQLite backend")
+            })
+            .collect::<Vec<_>>();
+        let members = (0..member_count)
+            .map(|index| test_member(index).expect("build consensus test member descriptor"))
+            .collect::<Vec<_>>();
+        let cluster_id = opc_consensus::ConsensusClusterId::new("session-consensus-testkit")
+            .expect("valid consensus test cluster ID");
+        let epoch =
+            opc_consensus::ConsensusConfigurationEpoch::new(1).expect("valid consensus test epoch");
+        let fingerprints = members
+            .iter()
+            .map(QuorumReplicaDescriptor::configuration_fingerprint)
+            .collect::<Vec<_>>();
+        let configuration_id =
+            opc_consensus::derive_configuration_id(cluster_id, epoch, &fingerprints);
+        let identity = opc_consensus::ConsensusIdentity::new(cluster_id, configuration_id, epoch);
+        let topologies = (0..member_count)
+            .map(|index| {
+                if member_count == 1 {
+                    ValidatedQuorumTopology::try_new_consensus_lab_singleton(
+                        test_replica_id(index).expect("valid consensus test replica ID"),
+                        members.clone(),
+                        identity,
+                    )
+                } else {
+                    ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                        test_replica_id(index).expect("valid consensus test replica ID"),
+                        members.clone(),
+                        identity,
+                    ))
+                }
+                .expect("validate consensus test topology")
+            })
+            .collect::<Vec<_>>();
+        let node_ids = topologies
+            .iter()
+            .map(|topology| {
+                topology
+                    .local_consensus_node_id()
+                    .expect("consensus test node ID")
+            })
+            .collect::<Vec<_>>();
+
+        let mut paths = BTreeMap::new();
+        for source in 0..member_count {
+            for (target, node_id) in node_ids.iter().copied().enumerate() {
+                if source != target {
+                    paths.insert(
+                        (source, target),
+                        Arc::new(InProcessConsensusPeer::new(node_id)),
+                    );
+                }
+            }
+        }
+
+        let mut stores = Vec::with_capacity(member_count);
+        for index in 0..member_count {
+            let peers = (0..member_count)
+                .filter(|target| *target != index)
+                .map(|target| {
+                    let peer: Arc<dyn SessionConsensusPeer> = paths
+                        .get(&(index, target))
+                        .expect("consensus test path")
+                        .clone();
+                    (node_ids[target], peer)
+                })
+                .collect();
+            stores.push(
+                ConsensusSessionStore::open_with_clock(
+                    topologies[index].clone(),
+                    backends[index].clone(),
+                    directory.path().join(format!("snapshots-{index}")),
+                    peers,
+                    Arc::new(SystemClock),
+                    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+                )
+                .await
+                .expect("open consensus test node"),
+            );
+        }
+
+        for ((_, target), path) in &paths {
+            path.install(stores[*target].rpc_handler()).await;
+        }
+        for result in join_all(stores.iter().map(ConsensusSessionStore::initialize_cluster)).await {
+            result.expect("initialize consensus test fleet");
+        }
+
+        let cluster = Self {
+            _directory: directory,
+            stores,
+            paths,
+        };
+        cluster.wait_ready().await;
+        cluster
     }
 
-    /// Build validated topology for a production-shaped consumer under test.
-    pub fn validated_topology(
-        &self,
-        local_replica_id: usize,
-    ) -> Result<ValidatedQuorumTopology, QuorumTopologyError> {
-        let members = self
-            .replicas
-            .iter()
-            .cloned()
-            .map(test_member)
-            .collect::<Result<Vec<_>, _>>()?;
-        build_topology(local_replica_id, members)
+    /// Clone one fleet member's production consensus store adapter.
+    pub fn store(&self, index: usize) -> ConsensusSessionStore {
+        self.stores
+            .get(index)
+            .unwrap_or_else(|| panic!("consensus test node {index} does not exist"))
+            .clone()
     }
 
-    /// Set replication lag (delayed responses) on a specific replica.
-    pub async fn set_lag(&self, replica_id: usize, lag: Option<Duration>) {
-        if let Some(r) = self
-            .replicas
-            .iter()
-            .find(|replica| replica.id == replica_id)
-        {
-            r.set_lag(lag).await;
+    /// Connect or isolate every consensus path to and from one member.
+    pub fn set_node_online(&self, index: usize, online: bool) {
+        assert!(
+            index < self.stores.len(),
+            "consensus test node does not exist"
+        );
+        for ((source, target), path) in &self.paths {
+            if *source == index || *target == index {
+                path.set_online(online);
+            }
         }
     }
 
-    /// Set whether a replica is online or offline.
-    pub async fn set_online(&self, replica_id: usize, online: bool) {
-        if let Some(r) = self
-            .replicas
-            .iter()
-            .find(|replica| replica.id == replica_id)
-        {
-            r.set_node_online(online).await;
+    /// Wait until one member proves a fresh linearizable barrier.
+    ///
+    /// This lets failure tests separate election convergence from the
+    /// authoritative operation whose quorum semantics they are asserting.
+    pub async fn wait_node_durable_ready(&self, index: usize) {
+        let store = self
+            .stores
+            .get(index)
+            .unwrap_or_else(|| panic!("consensus test node {index} does not exist"));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if store.probe_durable_readiness().await.is_ready() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "consensus test node did not become durable-ready"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
-    /// Adjust the clock skew on a specific replica.
-    pub fn set_clock_skew(&self, replica_id: usize, skew: Duration, negative: bool) {
-        if replica_id < self.clocks.len() {
-            self.clocks[replica_id].set_skew(skew, negative);
+    async fn wait_ready(&self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        loop {
+            let reports = join_all(
+                self.stores
+                    .iter()
+                    .map(ConsensusSessionStore::probe_durable_readiness),
+            )
+            .await;
+            if reports
+                .iter()
+                .all(|report| report.state() == DurableReadinessState::Ready)
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "consensus test fleet did not become durable-ready"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 }
 
 fn test_replica_id(index: usize) -> Result<ReplicaId, QuorumTopologyError> {
-    ReplicaId::new(format!("chaos-replica-{index}"))
+    ReplicaId::new(format!("consensus-test-replica-{index}"))
 }
 
-fn test_member(replica: FencedSessionReplica) -> Result<QuorumReplicaMember, QuorumTopologyError> {
-    let index = replica.id;
-    Ok(QuorumReplicaMember::new(
-        QuorumReplicaDescriptor::new(
-            test_replica_id(index)?,
-            ReplicaEndpoint::new(format!("chaos-replica-{index}.invalid"), 7443)?,
-            ReplicaTlsIdentity::new(format!("spiffe://test/chaos/replica/{index}"))?,
-            ReplicaFailureDomain::new(format!("chaos-failure-domain-{index}"))?,
-            ReplicaBackingIdentity::new(format!("chaos-backing-{index}"))?,
-        ),
-        replica,
-    ))
-}
-
-fn build_topology(
-    local_replica_id: usize,
-    members: Vec<QuorumReplicaMember>,
-) -> Result<ValidatedQuorumTopology, QuorumTopologyError> {
-    ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new(
-        test_replica_id(local_replica_id)?,
-        members,
+fn test_member(index: usize) -> Result<QuorumReplicaDescriptor, QuorumTopologyError> {
+    Ok(QuorumReplicaDescriptor::new(
+        test_replica_id(index)?,
+        ReplicaEndpoint::new(format!("consensus-test-replica-{index}.invalid"), 7443)?,
+        ReplicaTlsIdentity::new(format!("spiffe://test/consensus/replica/{index}"))?,
+        ReplicaFailureDomain::new(format!("consensus-test-failure-domain-{index}"))?,
+        ReplicaBackingIdentity::new(format!("consensus-test-backing-{index}"))?,
     ))
 }
 
@@ -365,5 +521,17 @@ mod tests {
 
         clock.set_skew(Duration::MAX, true);
         assert_eq!(*clock.now_utc().as_offset_datetime(), minimum_utc());
+    }
+
+    #[tokio::test]
+    async fn three_node_cluster_forms_from_descriptors_and_consensus_peers() {
+        let cluster = ConsensusTestCluster::start(3).await;
+
+        for index in 0..3 {
+            let store = cluster.store(index);
+            assert_eq!(store.topology().configured_members(), 3);
+            assert_eq!(store.topology().required_quorum(), 2);
+            assert!(store.probe_durable_readiness().await.is_ready());
+        }
     }
 }

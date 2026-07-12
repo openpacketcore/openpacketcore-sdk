@@ -1,3 +1,9 @@
+#![cfg_attr(not(feature = "legacy-session-net-compat"), allow(dead_code))]
+// The consensus transport reuses the bounded framing core below. The legacy
+// protocol-v4 DTO/conversion graph remains compiled but private in production
+// so the shared framing code does not fork; its unused compatibility-only
+// branches are intentionally dead unless `legacy-session-net-compat` is set.
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fmt, marker::PhantomData, time::Duration};
 
@@ -14,8 +20,10 @@ use opc_session_store::model::{
 };
 use opc_session_store::record::StoredSessionRecord;
 use opc_session_store::{
-    RestoreScanCursor, RestoreScanPage, RestoreScanRequest, RestoreScanScope, MAX_SESSION_TTL,
-    RESTORE_SCAN_MAX_PAGE_SIZE,
+    RestoreScanCursor, RestoreScanPage, RestoreScanRequest, RestoreScanScope,
+    SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeerError,
+    SessionConsensusWireRequest, SessionConsensusWireResponse, MAX_SESSION_TTL,
+    RESTORE_SCAN_MAX_PAGE_SIZE, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
 };
 use opc_types::Timestamp;
 use serde::de::{IgnoredAny, SeqAccess, Visitor};
@@ -35,6 +43,12 @@ pub const MAX_HANDSHAKE_FRAME_SIZE: usize = 8 * 1024;
 /// identifier at its worst JSON expansion. The power-of-two headroom avoids
 /// making compatibility depend on one exact serde byte count.
 pub const MIN_NEGOTIATED_FRAME_SIZE: usize = 8 * 1024;
+/// Smallest encoded frame budget accepted by the consensus-only profile.
+///
+/// A worst-case JSON byte-array representation of the shared 2 MiB opaque RPC
+/// ceiling consumes about 8 MiB. This bound leaves deterministic envelope
+/// headroom while remaining below the global per-frame ceiling.
+pub const MIN_SESSION_CONSENSUS_FRAME_SIZE: usize = 9 * 1024 * 1024;
 /// Largest post-bootstrap frame budget accepted by protocol v4.
 ///
 /// This ceiling bounds one encoded JSON frame independently of the wire's
@@ -53,6 +67,52 @@ pub const MAX_SESSION_NET_REPLICATION_TX_ID_BYTES: usize = 128;
 /// Canonical hyphenated UUID width used by CAS idempotency request IDs.
 pub const SESSION_NET_CAS_REQUEST_ID_BYTES: usize = 36;
 pub const SESSION_NET_ALPN: &[u8] = b"opc-session-net/4";
+/// Dedicated ALPN for the least-authority consensus-only transport.
+pub const SESSION_CONSENSUS_ALPN: &[u8] = b"opc-session-consensus/1";
+/// Fixed revision of the consensus-only bootstrap and operation DTOs.
+pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 1;
+
+/// Exact resource and semantic profile for consensus-only connections.
+///
+/// There is no subset negotiation. A mismatch is rejected before any
+/// consensus request is decoded or dispatched.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConsensusContractProfile {
+    /// Revision of the dedicated consensus wire DTOs.
+    pub wire_schema_revision: u16,
+    /// Revision of the fixed [`SessionConsensusPeerError`] set.
+    pub error_set_revision: u16,
+    /// Largest decoded private consensus payload accepted in either direction.
+    pub max_rpc_payload_bytes: u32,
+    /// Smallest negotiated encoded frame budget.
+    pub min_frame_size: u32,
+    /// Largest negotiated encoded frame budget.
+    pub max_frame_size: u32,
+}
+
+impl SessionConsensusContractProfile {
+    /// Whether this is the exact profile implemented by this SDK build.
+    pub const fn is_current(self) -> bool {
+        self.wire_schema_revision == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.wire_schema_revision
+            && self.error_set_revision
+                == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.error_set_revision
+            && self.max_rpc_payload_bytes
+                == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.max_rpc_payload_bytes
+            && self.min_frame_size == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.min_frame_size
+            && self.max_frame_size == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.max_frame_size
+    }
+}
+
+/// One exact consensus-only transport profile.
+pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractProfile =
+    SessionConsensusContractProfile {
+        wire_schema_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
+        error_set_revision: 1,
+        max_rpc_payload_bytes: SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES as u32,
+        min_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE as u32,
+        max_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
+    };
 
 const WIRE_SCHEMA_REVISION: u16 = 2;
 const ERROR_SET_REVISION: u16 = 1;
@@ -139,6 +199,7 @@ pub const CURRENT_CONTRACT_PROFILE: ContractProfile = ContractProfile {
 };
 
 const _: () = {
+    assert!(SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES <= u32::MAX as usize);
     assert!(RESTORE_SCAN_MAX_PAGE_SIZE <= u32::MAX as usize);
     assert!(MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES <= u32::MAX as usize);
     assert!(MAX_SESSION_NET_BATCH_OPERATIONS <= u32::MAX as usize);
@@ -149,6 +210,7 @@ const _: () = {
     assert!(MAX_NEGOTIATED_FRAME_SIZE <= u32::MAX as usize);
     assert!(MIN_NEGOTIATED_FRAME_SIZE <= DEFAULT_MAX_FRAME_SIZE);
     assert!(DEFAULT_MAX_FRAME_SIZE <= MAX_NEGOTIATED_FRAME_SIZE);
+    assert!(MIN_SESSION_CONSENSUS_FRAME_SIZE <= MAX_NEGOTIATED_FRAME_SIZE);
     assert!(OWNER_ID_MAX_BYTES <= u16::MAX as usize);
     assert!(SESSION_KEY_TYPE_MAX_BYTES <= u16::MAX as usize);
     assert!(STATE_TYPE_MAX_BYTES <= u16::MAX as usize);
@@ -290,6 +352,70 @@ pub(crate) enum BootstrapRequest {
 pub(crate) enum BootstrapResponse {
     HelloAck(BootstrapHelloAck),
     HelloRejected { reason: HelloRejectReason },
+}
+
+/// First frame on a dedicated consensus-only connection.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionConsensusBootstrapHello {
+    pub transport_revision: u16,
+    pub contract_profile: SessionConsensusContractProfile,
+    pub sender_replica_id: String,
+    pub expected_server_replica_id: String,
+    pub identity: SessionConsensusIdentity,
+    pub sender_node_id: SessionConsensusNodeId,
+    pub expected_server_node_id: SessionConsensusNodeId,
+    pub handshake_nonce: uuid::Uuid,
+    pub requested_response_frame_size: u32,
+}
+
+/// Authenticated acknowledgement for a consensus-only connection.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionConsensusBootstrapAck {
+    pub transport_revision: u16,
+    pub contract_profile: SessionConsensusContractProfile,
+    pub identity: SessionConsensusIdentity,
+    pub server_node_id: SessionConsensusNodeId,
+    pub accepted_sender_node_id: SessionConsensusNodeId,
+    pub handshake_nonce: uuid::Uuid,
+    pub accepted_response_frame_size: u32,
+    pub server_request_frame_size: u32,
+}
+
+/// Only bootstrap request admitted by the consensus ALPN.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) enum SessionConsensusBootstrapRequest {
+    Hello(SessionConsensusBootstrapHello),
+}
+
+/// Fixed, redaction-safe consensus bootstrap result.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) enum SessionConsensusBootstrapResponse {
+    Accepted(SessionConsensusBootstrapAck),
+    Rejected(SessionConsensusPeerError),
+}
+
+/// The only post-bootstrap request shape admitted on the consensus ALPN.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) enum SessionConsensusTransportRequest {
+    Call {
+        call_id: uuid::Uuid,
+        request: SessionConsensusWireRequest,
+    },
+}
+
+/// The only post-bootstrap response shape emitted on the consensus ALPN.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) enum SessionConsensusTransportResponse {
+    Call {
+        call_id: uuid::Uuid,
+        response: SessionConsensusWireResponse,
+    },
 }
 
 /// Architecture-independent semantic restore-scan request carried by protocol v4.
@@ -3567,6 +3693,74 @@ mod tests {
         let mut legacy = encoded_value;
         legacy["ScanRestoreRecords"]["Ok"]["loaded_count"] = serde_json::json!(0);
         assert!(serde_json::from_value::<Response>(legacy).is_err());
+    }
+
+    #[test]
+    fn consensus_profile_fits_the_exact_worst_case_bounded_outer_frames() {
+        let cluster = opc_consensus::ConsensusClusterId::new("frame-proof").expect("cluster");
+        let epoch = opc_consensus::ConsensusConfigurationEpoch::new(1).expect("epoch");
+        let identity = opc_consensus::ConsensusIdentity::new(
+            cluster,
+            opc_consensus::derive_configuration_id(cluster, epoch, &[[7; 32]]),
+            epoch,
+        );
+        let sender = opc_consensus::derive_node_id(cluster, b"replica-a").expect("node ID");
+        let request = SessionConsensusWireRequest::try_new(
+            identity,
+            sender,
+            opc_consensus::ConsensusRpcFamily::AppendEntries,
+            vec![u8::MAX; SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES],
+        )
+        .expect("maximum bounded request");
+        let request = SessionConsensusTransportRequest::Call {
+            call_id: uuid::Uuid::nil(),
+            request,
+        };
+        ensure_frame_fits(&request, MIN_SESSION_CONSENSUS_FRAME_SIZE)
+            .expect("consensus minimum must fit the worst byte request");
+
+        let response = SessionConsensusTransportResponse::Call {
+            call_id: uuid::Uuid::nil(),
+            response: SessionConsensusWireResponse {
+                result: Ok(vec![u8::MAX; SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES]),
+            },
+        };
+        ensure_frame_fits(&response, MIN_SESSION_CONSENSUS_FRAME_SIZE)
+            .expect("consensus minimum must fit the worst byte response");
+        assert!(CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.is_current());
+        assert_eq!(
+            CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.min_frame_size,
+            MIN_SESSION_CONSENSUS_FRAME_SIZE as u32
+        );
+    }
+
+    #[test]
+    fn consensus_wire_rejects_hostile_zero_sender_and_epoch_during_decode() {
+        let cluster = opc_consensus::ConsensusClusterId::new("zero-proof").expect("cluster");
+        let epoch = opc_consensus::ConsensusConfigurationEpoch::new(1).expect("epoch");
+        let identity = opc_consensus::ConsensusIdentity::new(
+            cluster,
+            opc_consensus::derive_configuration_id(cluster, epoch, &[[8; 32]]),
+            epoch,
+        );
+        let sender = opc_consensus::derive_node_id(cluster, b"replica-a").expect("node ID");
+        let frame = SessionConsensusTransportRequest::Call {
+            call_id: uuid::Uuid::nil(),
+            request: SessionConsensusWireRequest::try_new(
+                identity,
+                sender,
+                opc_consensus::ConsensusRpcFamily::Vote,
+                Vec::new(),
+            )
+            .expect("request"),
+        };
+        let mut zero_sender = serde_json::to_value(&frame).expect("frame JSON");
+        zero_sender["Call"]["request"]["sender"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<SessionConsensusTransportRequest>(zero_sender).is_err());
+
+        let mut zero_epoch = serde_json::to_value(frame).expect("frame JSON");
+        zero_epoch["Call"]["request"]["identity"]["configuration_epoch"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<SessionConsensusTransportRequest>(zero_epoch).is_err());
     }
 
     #[test]

@@ -25,6 +25,7 @@
 pub mod backend;
 pub mod capability;
 pub mod clock;
+pub mod consensus;
 pub mod error;
 pub mod fake;
 pub mod handover;
@@ -57,6 +58,17 @@ pub use capability::{
     SessionStoreHaCompatibility, SessionStorePlatformProfile,
 };
 pub use clock::{Clock, MonotonicClock, SystemClock, TokioVirtualClock};
+pub use consensus::{
+    ConsensusSessionStore, ConsensusSessionStoreOpenError, SessionConsensusClusterId,
+    SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+    SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusIdentityError,
+    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpc,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
+    SessionConsensusWireResponse, SessionMutationIntent, SessionMutationOutcome,
+    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,
+    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
+};
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;
 pub use handover::{
@@ -77,12 +89,10 @@ pub use payload_codec::{
     validate_session_payload_size_for_backend, SessionPayloadCodecError, SessionPayloadEnvelope,
     SessionPayloadFormat, SessionPayloadVersion, SESSION_PAYLOAD_JSON_CONTENT_TYPE,
 };
-pub use quorum::{FencedSessionReplica, QuorumSessionStore, SessionStoreBackend};
+pub use quorum::{QuorumSessionStore, SessionStoreBackend};
 pub use readiness::{
-    DurableReadinessOptions, DurableReadinessReport, DurableReadinessState,
-    ReplicaReadinessFailure, ReplicaReadinessObservation, ReplicaReadinessOutcome,
-    DEFAULT_DURABLE_READINESS_MAX_LOG_ENTRIES, DEFAULT_DURABLE_READINESS_TIMEOUT,
-    MAX_DURABLE_READINESS_LOG_ENTRIES, MAX_DURABLE_READINESS_TIMEOUT,
+    DurableReadinessReport, DurableReadinessState, ReplicaReadinessFailure,
+    ReplicaReadinessObservation, ReplicaReadinessOutcome,
 };
 pub use record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 pub use restore::{
@@ -94,10 +104,10 @@ pub use restore::{
 pub use sqlite::SqliteSessionBackend;
 pub use store::SessionStore;
 pub use topology::{
-    BackendPeerBindingField, QuorumReplicaDescriptor, QuorumReplicaMember, QuorumTopologyConfig,
-    QuorumTopologyError, QuorumTopologyMode, QuorumTopologySummary, ReplicaBackingIdentity,
-    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicaTopologyField,
-    ReplicaTopologyFieldError, ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
-    REPLICA_IDENTITY_MAX_BYTES, REPLICA_ID_MAX_BYTES,
+    QuorumReplicaDescriptor, QuorumTopologyConfig, QuorumTopologyError, QuorumTopologyMode,
+    QuorumTopologySummary, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
+    ReplicaId, ReplicaTlsIdentity, ReplicaTopologyField, ReplicaTopologyFieldError,
+    ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS, REPLICA_IDENTITY_MAX_BYTES,
+    REPLICA_ID_MAX_BYTES,
 };
 pub use ttl::{checked_session_deadline, validate_session_ttl, MAX_SESSION_TTL};

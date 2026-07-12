@@ -11,8 +11,9 @@ use opc_crypto::{
     decrypt_decoded_envelope_with_handle, encrypt_envelope_with_handle, CryptoEnvelopeV1,
 };
 use opc_key::{
-    key_id_from_bound_aad, serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyHandle, KeyProvider,
-    KeyPurpose, RemoteSealProvider, SessionAad, Zeroizing, AEAD_TAG_LEN,
+    decode_bound_aad, key_id_from_bound_aad, serialize_bound_aad, AeadAlgorithm, EnvelopeAad,
+    EnvelopeMetadata, KeyHandle, KeyProvider, KeyPurpose, RemoteSealProvider, SessionAad,
+    Zeroizing, AEAD_TAG_LEN,
 };
 use opc_types::Timestamp;
 
@@ -28,6 +29,11 @@ const SESSION_ENVELOPE_AAD_FAILED_MESSAGE: &str = "session envelope AAD construc
 const SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE: &str = "session envelope encryption failed";
 const SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE: &str = "session envelope decryption failed";
 const SESSION_ENVELOPE_MISSING_CIPHERTEXT_MESSAGE: &str = "session envelope ciphertext is missing";
+const SESSION_ENVELOPE_INVALID_MESSAGE: &str = "session envelope is invalid";
+
+fn invalid_session_envelope() -> StoreError {
+    StoreError::Crypto(SESSION_ENVELOPE_INVALID_MESSAGE.into())
+}
 
 use serde::{Deserialize, Serialize};
 
@@ -67,7 +73,7 @@ pub enum SessionPayloadEncoding {
 /// Durable adapters that reconstruct [`StoredSessionRecord`] from persisted
 /// bytes MUST preserve payload encoding explicitly:
 ///
-/// - use [`EncryptedSessionPayload::envelope`] for RFC 003 ciphertext rows
+/// - use [`EncryptedSessionPayload::try_envelope`] for RFC 003 ciphertext rows
 /// - use [`EncryptedSessionPayload::legacy_plaintext`] only for intentional
 ///   one-time migrations of pre-envelope plaintext rows
 ///
@@ -99,12 +105,14 @@ impl<'de> serde::Deserialize<'de> for EncryptedSessionPayload {
         D: serde::Deserializer<'de>,
     {
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Helper {
             bytes: Vec<u8>,
             encoding: SessionPayloadEncoding,
         }
         let helper = Helper::deserialize(deserializer)?;
-        Ok(Self::from_vec_with_encoding(helper.bytes, helper.encoding))
+        Self::try_from_vec_with_encoding(helper.bytes, helper.encoding)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -113,9 +121,9 @@ impl EncryptedSessionPayload {
     ///
     /// This is intended for data above the persistence boundary before
     /// [`crate::backend::EncryptingSessionBackend`] seals it. Durable adapters
-    /// must use [`Self::envelope`] or [`Self::legacy_plaintext`] instead.
+    /// must use [`Self::try_envelope`] or [`Self::legacy_plaintext`] instead.
     pub fn new(data: impl AsRef<[u8]>) -> Self {
-        Self::from_vec_with_encoding(data.as_ref().to_vec(), SessionPayloadEncoding::Plaintext)
+        Self::from_vec_unchecked(data.as_ref().to_vec(), SessionPayloadEncoding::Plaintext)
     }
 
     /// Construct caller-facing plaintext payload bytes from a Zeroizing wrapper.
@@ -126,14 +134,20 @@ impl EncryptedSessionPayload {
         }
     }
 
-    /// Construct already-encrypted RFC 003 envelope bytes for backend-facing records.
-    pub fn envelope(data: impl AsRef<[u8]>) -> Self {
-        Self::from_vec_with_encoding(data.as_ref().to_vec(), SessionPayloadEncoding::EnvelopeV1)
+    /// Validate and construct already-encrypted RFC 003 envelope bytes for a
+    /// backend-facing record.
+    ///
+    /// The exact canonical envelope, algorithm nonce, session AAD, embedded
+    /// key ID, and authentication-tag shape are checked without resolving a
+    /// key or decrypting the ciphertext. Record-specific AAD fields are
+    /// checked again at the consensus boundary.
+    pub fn try_envelope(data: impl AsRef<[u8]>) -> Result<Self, StoreError> {
+        Self::try_from_vec_with_encoding(data.as_ref().to_vec(), SessionPayloadEncoding::EnvelopeV1)
     }
 
     /// Construct a legacy plaintext payload row that predates envelope writes.
     pub fn legacy_plaintext(data: impl AsRef<[u8]>) -> Self {
-        Self::from_vec_with_encoding(
+        Self::from_vec_unchecked(
             data.as_ref().to_vec(),
             SessionPayloadEncoding::LegacyPlaintext,
         )
@@ -141,10 +155,24 @@ impl EncryptedSessionPayload {
 
     /// Construct a payload for migration/probing of unclassified legacy database rows.
     pub fn unclassified(data: impl AsRef<[u8]>) -> Self {
-        Self::from_vec_with_encoding(data.as_ref().to_vec(), SessionPayloadEncoding::Unclassified)
+        Self::from_vec_unchecked(data.as_ref().to_vec(), SessionPayloadEncoding::Unclassified)
     }
 
-    pub(crate) fn from_vec_with_encoding(bytes: Vec<u8>, encoding: SessionPayloadEncoding) -> Self {
+    pub(crate) fn try_from_vec_with_encoding(
+        bytes: Vec<u8>,
+        encoding: SessionPayloadEncoding,
+    ) -> Result<Self, StoreError> {
+        let payload = Self {
+            bytes: Zeroizing::new(bytes),
+            encoding,
+        };
+        if encoding == SessionPayloadEncoding::EnvelopeV1 {
+            payload.decode_valid_session_envelope()?;
+        }
+        Ok(payload)
+    }
+
+    fn from_vec_unchecked(bytes: Vec<u8>, encoding: SessionPayloadEncoding) -> Self {
         Self {
             bytes: Zeroizing::new(bytes),
             encoding,
@@ -175,6 +203,64 @@ impl EncryptedSessionPayload {
         self.bytes.is_empty()
     }
 
+    /// Validate that this payload is one canonical RFC 003 session envelope.
+    pub fn validate_envelope(&self) -> Result<(), StoreError> {
+        self.decode_valid_session_envelope().map(|_| ())
+    }
+
+    /// Validate the envelope and every record field visible without a key.
+    ///
+    /// The tenant, NF kind, state type, generation, and fence embedded in AAD
+    /// must match the record header. The keyed session digest and backend
+    /// namespace remain authenticated ciphertext metadata and are verified
+    /// during decrypt by the outer protection adapter.
+    pub(crate) fn validate_envelope_for_record(
+        &self,
+        record: &StoredSessionRecord,
+    ) -> Result<(), StoreError> {
+        let (_, aad) = self.decode_valid_session_envelope()?;
+        let EnvelopeMetadata::Session(session) = aad.metadata() else {
+            return Err(invalid_session_envelope());
+        };
+        if aad.tenant() != &record.key.tenant
+            || session.nf_kind() != record.key.nf_kind.as_str()
+            || session.state_type() != record.state_type.as_str()
+            || session.generation() != record.generation.get()
+            || session.fence() != record.fence.get()
+        {
+            return Err(invalid_session_envelope());
+        }
+        Ok(())
+    }
+
+    fn decode_valid_session_envelope(&self) -> Result<(CryptoEnvelopeV1, EnvelopeAad), StoreError> {
+        if self.encoding != SessionPayloadEncoding::EnvelopeV1 || self.bytes.is_empty() {
+            return Err(invalid_session_envelope());
+        }
+        let envelope =
+            CryptoEnvelopeV1::decode(&self.bytes).map_err(|_| invalid_session_envelope())?;
+        if envelope.nonce.len() != envelope.algorithm.nonce_len()
+            || envelope.ciphertext_and_tag.len() < AEAD_TAG_LEN
+            || envelope
+                .encode()
+                .map_err(|_| invalid_session_envelope())?
+                .as_slice()
+                != self.bytes.as_slice()
+        {
+            return Err(invalid_session_envelope());
+        }
+        let (aad, aad_key_id) =
+            decode_bound_aad(&envelope.aad).map_err(|_| invalid_session_envelope())?;
+        if aad_key_id != envelope.key_id
+            || aad.purpose() != KeyPurpose::Session
+            || aad.version() != SESSION_ENVELOPE_VERSION
+            || !matches!(aad.metadata(), EnvelopeMetadata::Session(_))
+        {
+            return Err(invalid_session_envelope());
+        }
+        Ok((envelope, aad))
+    }
+
     /// Seal `record`'s payload into an RFC 003 AEAD envelope using the
     /// tenant's active session key from `provider`.
     ///
@@ -195,10 +281,8 @@ impl EncryptedSessionPayload {
         let aad = build_session_envelope_aad(record, backend_namespace, &handle)?;
         let ciphertext = encrypt_envelope_with_handle(&handle, &aad, record.payload.as_bytes())
             .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))?;
-        Ok(Self::from_vec_with_encoding(
-            ciphertext,
-            SessionPayloadEncoding::EnvelopeV1,
-        ))
+        Self::try_envelope(ciphertext)
+            .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))
     }
 
     /// Seal `record`'s payload through a remote KMS/HSM provider.
@@ -244,10 +328,8 @@ impl EncryptedSessionPayload {
         .encode()
         .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))?;
 
-        Ok(Self::from_vec_with_encoding(
-            envelope,
-            SessionPayloadEncoding::EnvelopeV1,
-        ))
+        Self::try_envelope(envelope)
+            .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))
     }
 
     /// Recover the plaintext payload according to the declared encoding.

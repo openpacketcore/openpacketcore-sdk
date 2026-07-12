@@ -1,25 +1,78 @@
 # opc-session-net
 
-Experimental network transport for remote session-store replicas.
+Authenticated network transport for session consensus peers. Legacy direct
+session-backend networking is retained only as an opt-in migration surface.
 
 ## Purpose
 
-`opc-session-net` exposes a length-prefixed JSON protocol between
-`RemoteSessionBackend` clients and `SessionReplicationServer` instances. It
-lets a `SessionBackend` or quorum coordinator call a remote replica using the
-same session-store traits. Protocol v4 carries cursor-paged
-`SessionBackend::scan_restore_records` calls and binds every production
-connection to one authenticated member of one immutable replication manifest.
+The default crate surface exposes `RemoteSessionConsensusPeer` and
+`SessionConsensusServer`. It does not expose a client, listener, or public wire
+DTO capable of direct session mutation, raw replication-log append, or rebuild.
+Every production connection is bound to one authenticated member of one
+immutable replication manifest.
+
+## Consensus production profile
+
+Issue #127 introduces a separate least-authority transport for the shared
+Openraft engine. `SessionConsensusServer` advertises only
+`opc-session-consensus/1` and owns only an
+`Arc<dyn SessionConsensusRpcHandler>`; it cannot dispatch `SessionBackend`,
+lease, raw replication-log append, or rebuild operations.
+`RemoteSessionConsensusPeer` implements only `SessionConsensusPeer`.
+
+The legacy `RemoteSessionBackend`, `SessionReplicationServer`, and protocol-v4
+`Request`/`Response` surface compile only with the non-default
+`legacy-session-net-compat` feature. That feature grants direct mutation and raw
+replication/rebuild authority. It is for controlled migration and compatibility
+testing only; it must not be enabled in a production Openraft build or served on
+a production consensus endpoint. The `insecure-test` feature does not enable it
+implicitly.
+
+`SessionReplicationManifest::try_new_with_epoch` is the production manifest
+constructor. It derives the exact shared consensus identity from the hashed
+cluster ID, positive numeric configuration epoch, and complete descriptor
+fingerprints. Stable non-zero Openraft node IDs are domain-separated hashes of
+the cluster identity and immutable logical `ReplicaId`; they survive member
+reordering, addition, removal, and epoch changes. Derived collisions are
+rejected during admission. The legacy `try_new` constructor is deprecated and
+fixes the epoch to 1 only for source compatibility with protocol-v4 callers.
+
+Every consensus connection performs a fresh mutual-TLS handshake and binds the
+certificate SPIFFE identity, logical replica ID, stable node ID, expected
+server, cluster/configuration/epoch, exact transport profile, and a fresh
+handshake nonce before decoding one operation. Each call also carries a fresh
+correlation ID. The client applies one absolute logical deadline to gate
+acquisition, DNS, TCP, TLS, bootstrap, bounded encoding, write, and response
+read; cancellation drops the connection, so a late response cannot be reused.
+
+The consensus profile accepts encoded frame budgets from 9 MiB through 16 MiB.
+The 9 MiB minimum is proven to hold the worst JSON expansion of the shared
+2 MiB opaque RPC ceiling plus its bounded envelope. Private Openraft RPCs are
+compact-encoded by the session-store adapter; the transport does not interpret
+or authorize engine decisions. On a production #127 endpoint the consensus
+ALPN replaces the legacy backend ALPN. Consequently #133 must consume
+consensus-authoritative restore evidence rather than reopening raw mutation or
+rebuild authority beside Openraft.
 
 ## API Shape
 
-- `SessionReplicationManifest::try_new` validates one cluster ID, one
+- `SessionReplicationManifest::try_new_with_epoch` validates one cluster ID,
+  positive consensus configuration epoch, one legacy protocol-v4
   operator-controlled configuration generation, and the complete replica
-  descriptor set. It derives an order-independent configuration ID from the
-  cluster, generation, and every descriptor field.
+  descriptor set. The deprecated `try_new` compatibility constructor uses
+  epoch 1.
 - `SessionReplicationManifest::bind_local` selects the exact local
   `ReplicaId`; `LocalReplicaBinding::bind_remote` derives the only supported
   production client binding for an admitted peer.
+- `RemoteSessionConsensusPeer::new` and `new_with_resolver` create the
+  authenticated outbound consensus-only port. One absolute deadline covers
+  admission, resolution, connection, TLS, framing, and response receipt.
+- `SessionConsensusServer::new` accepts only an
+  `Arc<dyn SessionConsensusRpcHandler>` and serves only the dedicated consensus
+  ALPN.
+
+### Legacy compatibility API (`legacy-session-net-compat` only)
+
 - `RemoteSessionBackend::new(binding, tls_config, deadline)` creates an mTLS
   client that implements `SessionBackend` and `SessionLeaseManager`. The
   endpoint comes from the binding; `new_with_resolver` may override address
@@ -108,7 +161,13 @@ let remote = RemoteSessionBackend::new(
 let _remote = remote.with_max_frame_size(1024 * 1024);
 ```
 
-## Outbound response contract
+## Legacy protocol-v4 details (`legacy-session-net-compat` only)
+
+Everything below this heading documents the quarantined compatibility
+protocol. None of these APIs or public DTOs are present in a default production
+build.
+
+### Outbound response contract
 
 Protocol v4 contract-profile wire-schema revision 2 makes response budgets part
 of the exact handshake. `requested_response_frame_size`,
@@ -208,14 +267,19 @@ campaigns.
 
 ## Relationships
 
-- Implements `opc-session-store` backend and lease traits over the wire.
+- The default consensus transport implements `SessionConsensusPeer` and serves
+  only a `SessionConsensusRpcHandler`. It supplies remote peers to
+  `ConsensusSessionStore`; it is not a backend nested under that store.
+- The feature-gated legacy `RemoteSessionBackend` implements session backend
+  and lease traits only for controlled migration and compatibility work. It
+  cannot become a member or vote in descriptor-only Openraft topology.
 - Uses the opaque authenticated client/server configs from `opc-tls` for
-  production mTLS transport. The session transport sets and requires its exact
-  v4 ALPN value.
-- Intended to be composed under `QuorumSessionStore` or other store callers.
-- HA-shaped composition must use `ValidatedQuorumTopology`; logical replica
-  ID, dial endpoint, expected TLS identity, failure domain, backing identity,
-  and exact local self remain independent descriptor fields.
+  production mTLS transport. The consensus and legacy compatibility profiles
+  set and require separate exact ALPN values.
+- HA-shaped composition admits descriptor-only `ValidatedQuorumTopology` and
+  separately supplies the local SQLite backend plus exact consensus peer map.
+  Logical replica ID, dial endpoint, expected TLS identity, failure domain,
+  backing identity, and exact local self remain independent descriptor fields.
 
 ## Status Notes
 
@@ -339,14 +403,15 @@ campaigns.
   cleared capabilities authorize an operation or readiness: replicated callers
   must use the fresh replication-head probe and require a distinct agreeing
   majority.
-- Remote adapters expose redaction-safe peer-binding evidence to
-  `ValidatedQuorumTopology`. Admission verifies the local and remote IDs,
-  expected TLS identity, local and remote descriptor fingerprints, configured
-  member count, and one shared configuration scope before counting the adapter
-  as a vote. A local in-process backend need not present network-peer evidence.
-- Peer binding is static admission evidence, not current health. Capability
-  declarations and a successful handshake do not replace
-  `QuorumSessionStore::probe_durable_readiness` or continuous traffic gating.
+- Legacy remote adapters bind local/remote IDs, expected TLS identity,
+  descriptor fingerprints, member count, and compatibility configuration
+  scope during their own handshake. That binding never grants an Openraft vote
+  and is not consumed by `ValidatedQuorumTopology`.
+- Consensus peer binding is static admission evidence, not current health.
+  Capability declarations and a successful handshake do not replace
+  `ConsensusSessionStore::probe_durable_readiness` or continuous traffic
+  gating. Long-running network/resource qualification remains #143; watch
+  handoff remains #145, and bounded journal cursors/retention remain #171.
 - Replication entry sequence zero and malformed rebuild prefixes are rejected
   before dialing on the client and before backend dispatch on the server. The
   unit `InvalidReplicationSequence` error contains no peer-controlled data;
@@ -394,29 +459,29 @@ campaigns.
   ad hoc; a raw inner-backend rebuild preserves the protection gap.
 - Remote scan and fresh-probe transport parity do not by themselves qualify
   networked session HA for production. Protocol v4 authenticates membership;
-  it does not establish consensus, durable sequence/commit authority,
-  fork reconciliation, or majority-authoritative restore. Those properties
-  remain open in #127–#129 and #133. #134's fixed-width v4 boundary and #135's
+  it does not establish consensus, fork reconciliation, or
+  majority-authoritative restore. The separate consensus ALPN now supplies
+  durable sequence/commit authority under #127; recovery and restore remain
+  #128/#129/#133. #134's fixed-width v4 boundary and #135's
   model-level decode boundary are implemented but do not provide any of those
   distributed properties.
 - #159 contains stable IDs and replication transaction IDs at the wire boundary
   only. The production model/persistence stable-ID contract, privacy policy,
   audit, and migration remain #167. A canonical durable `ReplicationEntry`
   transaction-ID type plus persistence migration remains #168 and must be
-  coordinated with #127/#128/#143. Session-net's absolute response deadline also
-  does not change `opc-persist`'s `TcpPeer::timeout`, which is still applied per
-  I/O stage across up to three attempts with backoff, and #169 owns one atomic end-to-end
-  logical-RPC deadline, safe retry policy, and metrics.
+  coordinated with #128/#143. `opc-persist` peer RPCs now use their own atomic
+  end-to-end logical deadline under #169.
 
 ## Roadmap
 
-- Close #127–#129, #133, #145, #148, and the model/persistence work in
-  #167/#168; complete #169 for persist peer RPC deadlines; and add distributed
+- Close #128/#129, #133, #145, #148, and the model/persistence work in
+  #167/#168/#171; and add distributed
   failure and soak evidence. Seamless SVID/trust-bundle lifecycle is #158;
   payload-protection-key rotation and the complete production qualification
   remain #143. Close those before treating this as production transport.
 - Keep plaintext transport limited to tests.
-- Keep the server wrapping `SessionStoreBackend` rather than owning storage.
+- Keep the compatibility server wrapping `SessionStoreBackend` rather than
+  owning storage; production authority uses only `SessionConsensusServer`.
 
 ## Verification
 

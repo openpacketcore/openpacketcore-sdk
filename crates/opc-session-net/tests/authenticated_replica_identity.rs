@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-session-net-compat")]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,8 +11,8 @@ use opc_session_net::protocol::{
 };
 use opc_session_net::{
     RemoteAddrResolver, RemoteReplicaBinding, RemoteSessionBackend, Request, Response,
-    SessionClusterId, SessionConfigurationGeneration, SessionReplicationManifest,
-    SessionReplicationServer,
+    SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
+    SessionReplicationManifest, SessionReplicationServer,
 };
 use opc_session_store::fake::FakeSessionBackend;
 use opc_session_store::{
@@ -104,9 +106,10 @@ fn descriptor(replica: u16) -> QuorumReplicaDescriptor {
 
 fn manifest(cluster: &str, generation: &str) -> Arc<SessionReplicationManifest> {
     Arc::new(
-        SessionReplicationManifest::try_new(
+        SessionReplicationManifest::try_new_with_epoch(
             SessionClusterId::new(cluster).expect("cluster ID"),
             SessionConfigurationGeneration::new(generation).expect("configuration generation"),
+            SessionConfigurationEpoch::new(1).expect("configuration epoch"),
             vec![descriptor(1), descriptor(2), descriptor(3)],
         )
         .expect("replication manifest"),

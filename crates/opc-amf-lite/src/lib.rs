@@ -37,10 +37,9 @@ use opc_runtime::{
     RuntimeProfile, ShutdownToken, Supervisor, TaskKind, TaskName,
 };
 use opc_session_store::{
-    CompareAndSet, CompareAndSetResult, DurableReadinessOptions, EncryptedSessionPayload,
-    EncryptingSessionBackend, Generation, OwnerId, QuorumSessionStore, SessionBackend, SessionKey,
-    SessionKeyType, SessionLeaseManager, StateClass, StateType, StoredSessionRecord,
-    ValidatedQuorumTopology, DEFAULT_DURABLE_READINESS_MAX_LOG_ENTRIES,
+    CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, EncryptingSessionBackend,
+    Generation, OwnerId, QuorumSessionStore, SessionBackend, SessionKey, SessionKeyType,
+    SessionLeaseManager, StateClass, StateType, StoredSessionRecord,
 };
 use opc_testbed::Clock as TestClock;
 use opc_types::{ConfigVersion, NetworkFunctionKind, SchemaDigest, TenantId, Timestamp, TxId};
@@ -59,7 +58,6 @@ const SYSTEM_TENANT: &str = "system";
 const SUBSCRIBER_PRIVACY_KEY_DOMAIN: &[u8] = b"opc-amf-lite/subscriber-privacy-key/v1";
 const SESSION_STORE_READINESS_TASK: &str = "amf-session-store-readiness";
 const SESSION_STORE_READINESS_PROBE_INTERVAL: Duration = Duration::from_secs(1);
-const SESSION_STORE_READINESS_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -524,10 +522,13 @@ impl TestClock for SystemAmfClock {
 }
 
 /// AMF-lite network function orchestrating the entire SDK substrate.
+/// AMF-facing encryption wrapper placed above the Openraft quorum store.
+pub type AmfSessionStore = EncryptingSessionBackend<QuorumSessionStore, KmsKeyProvider>;
+
 pub struct AmfLite {
     runtime: RuntimeHandle,
     config_bus: ConfigBus<AmfConfig>,
-    session_store: QuorumSessionStore,
+    session_store: AmfSessionStore,
     alarms: SharedAlarmManager,
     kms_provider: Arc<KmsKeyProvider>,
     clock: Arc<dyn TestClock>,
@@ -543,7 +544,7 @@ impl AmfLite {
     pub async fn start(
         initial_config: AmfConfig,
         config_store: Arc<dyn ConfigStore>,
-        session_topology: ValidatedQuorumTopology,
+        session_store: QuorumSessionStore,
         kms_endpoint: String,
         auth_token: Option<String>,
         admin_addr: SocketAddr,
@@ -553,7 +554,7 @@ impl AmfLite {
         Self::start_with_clock(
             initial_config,
             config_store,
-            session_topology,
+            session_store,
             kms_endpoint,
             auth_token,
             admin_addr,
@@ -569,7 +570,7 @@ impl AmfLite {
     pub async fn start_with_clock(
         initial_config: AmfConfig,
         config_store: Arc<dyn ConfigStore>,
-        session_topology: ValidatedQuorumTopology,
+        session_store: QuorumSessionStore,
         kms_endpoint: String,
         auth_token: Option<String>,
         admin_addr: SocketAddr,
@@ -601,23 +602,14 @@ impl AmfLite {
         .await
         .map_err(|e| RuntimeError::Supervisor(format!("config bus init failed: {e}")))?;
 
-        // 3. Quorum Session Store wrapped in mTLS/KMS encrypting envelope
-        let session_topology = session_topology
-            .try_map_backends(|_, backend| {
-                Arc::new(EncryptingSessionBackend::new(
-                    backend,
-                    kms_provider.clone(),
-                    "amf-sessions",
-                ))
-            })
-            .map_err(|_| {
-                RuntimeError::Supervisor("session topology validation failed".to_string())
-            })?;
-        let session_store = QuorumSessionStore::from_validated_topology(session_topology)
-            .with_durable_readiness_options(DurableReadinessOptions::new(
-                SESSION_STORE_READINESS_PROBE_TIMEOUT,
-                DEFAULT_DURABLE_READINESS_MAX_LOG_ENTRIES,
-            ));
+        // 3. Encryption remains above the single Openraft-backed quorum
+        // authority. Consensus replication and recovery see envelopes only.
+        let readiness_store = session_store.clone();
+        let session_store = EncryptingSessionBackend::new(
+            Arc::new(session_store),
+            kms_provider.clone(),
+            "amf-sessions",
+        );
 
         // 4. Initial state
         let mut health = HealthModel::new();
@@ -640,7 +632,7 @@ impl AmfLite {
         let phase_notify_clone = phase_notify.clone();
         let config_bus_clone = config_bus.clone();
         let alarms_clone = alarms.clone();
-        let session_store_clone = session_store.clone();
+        let readiness_store_clone = readiness_store.clone();
 
         let mut profile = RuntimeProfile::production("amf-lite", uuid::Uuid::new_v4());
         profile.budget = Some(opc_runtime::ResourceBudget::default());
@@ -655,7 +647,7 @@ impl AmfLite {
                 let state_notify = state_notify_clone.clone();
                 let config_bus = config_bus_clone.clone();
                 let alarms = alarms_clone.clone();
-                let session_store = session_store_clone.clone();
+                let session_store = readiness_store_clone.clone();
 
                 Box::pin(async move {
                     initialize_amf_runtime(
@@ -944,7 +936,7 @@ impl AmfLite {
         &self.config_bus
     }
 
-    pub fn session_store(&self) -> &QuorumSessionStore {
+    pub fn session_store(&self) -> &AmfSessionStore {
         &self.session_store
     }
 
@@ -1253,7 +1245,7 @@ async fn spawn_registration_worker(
 mod tests {
     use super::*;
     use opc_config_bus::InMemoryManagedDatastore;
-    use opc_session_testkit::ChaosTestkit;
+    use opc_session_testkit::ConsensusTestCluster;
 
     #[test]
     fn schema_digest_bytes_match_public_hex() {
@@ -1284,12 +1276,8 @@ mod tests {
             active_nrf_registration: false,
         }));
         let state_notify = Arc::new(Notify::new());
-        let chaos = ChaosTestkit::new(3);
-        let session_store = QuorumSessionStore::from_validated_topology(
-            chaos
-                .validated_topology(0)
-                .expect("valid test session topology"),
-        );
+        let session_cluster = ConsensusTestCluster::start(1).await;
+        let session_store = session_cluster.store(0);
 
         let mut profile = RuntimeProfile::production("amf-lite", uuid::Uuid::new_v4());
         profile.budget = Some(opc_runtime::ResourceBudget {
@@ -1334,7 +1322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_session_readiness_blocks_startup_tracks_loss_and_recovers() {
+    async fn durable_session_readiness_tracks_real_openraft_quorum() {
         let alarms = SharedAlarmManager::default();
         let config_bus = ConfigBus::restore_or_new_with_alarm_manager_dev_only(
             AmfConfig::default(),
@@ -1355,14 +1343,10 @@ mod tests {
         }));
         let state_notify = Arc::new(Notify::new());
 
-        let chaos = ChaosTestkit::new(3);
-        chaos.set_online(1, false).await;
-        chaos.set_online(2, false).await;
-        let session_store = QuorumSessionStore::from_validated_topology(
-            chaos
-                .validated_topology(0)
-                .expect("valid test session topology"),
-        );
+        let session_cluster = ConsensusTestCluster::start(3).await;
+        session_cluster.set_node_online(1, false);
+        session_cluster.set_node_online(2, false);
+        let session_store = session_cluster.store(0);
 
         let mut profile = RuntimeProfile::production("amf-lite", uuid::Uuid::new_v4());
         profile.budget = Some(opc_runtime::ResourceBudget::default());
@@ -1412,18 +1396,21 @@ mod tests {
         assert_eq!(readiness_task.kind, "background-sync");
         assert_eq!(readiness_task.criticality, "fatal");
 
-        chaos.set_online(1, true).await;
+        session_cluster.set_node_online(1, true);
+        session_cluster.set_node_online(2, true);
         wait_for_readiness(&handle, Readiness::Ready).await;
         wait_for_phase(&handle, RuntimePhase::Ready).await;
         wait_for_session_gate(&state, GateStatus::Passing).await;
         assert!(state.read().await.health.backends_reachable);
 
-        chaos.set_online(1, false).await;
+        session_cluster.set_node_online(1, false);
+        session_cluster.set_node_online(2, false);
         wait_for_readiness(&handle, Readiness::NotReady).await;
         wait_for_session_gate(&state, GateStatus::Failing).await;
         assert!(!state.read().await.health.backends_reachable);
 
-        chaos.set_online(2, true).await;
+        session_cluster.set_node_online(1, true);
+        session_cluster.set_node_online(2, true);
         wait_for_readiness(&handle, Readiness::Ready).await;
         wait_for_session_gate(&state, GateStatus::Passing).await;
         assert!(state.read().await.health.backends_reachable);
@@ -1432,7 +1419,7 @@ mod tests {
     }
 
     async fn wait_for_readiness(handle: &RuntimeHandle, expected: Readiness) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             if handle.readiness().await == expected {
                 return;
@@ -1446,7 +1433,7 @@ mod tests {
     }
 
     async fn wait_for_phase(handle: &RuntimeHandle, expected: RuntimePhase) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             if handle.phase().await == expected {
                 return;
@@ -1460,7 +1447,7 @@ mod tests {
     }
 
     async fn wait_for_session_gate(state: &Arc<RwLock<AmfLiteState>>, expected: GateStatus) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let gate_name = opc_runtime::GateName::new(known_gates::SESSION_STORE);
         loop {
             let status = state

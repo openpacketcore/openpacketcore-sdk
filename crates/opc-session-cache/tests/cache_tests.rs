@@ -3,6 +3,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{stream, StreamExt};
+use opc_crypto::CryptoEnvelopeV1;
+use opc_key::{
+    serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
+    AES_256_GCM_SIV_NONCE_LEN,
+};
 use opc_session_cache::SessionCache;
 use opc_session_store::{
     BackendCapabilities, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
@@ -10,7 +15,7 @@ use opc_session_store::{
     SessionLeaseManager, SessionOp, SessionOpResult, StateClass, StateType, StoreError,
     StoredSessionRecord,
 };
-use opc_session_testkit::ChaosTestkit;
+use opc_session_testkit::ConsensusTestCluster;
 
 fn test_session_key() -> SessionKey {
     SessionKey {
@@ -38,7 +43,7 @@ fn make_record(
     generation: u64,
     lease: &opc_session_store::LeaseGuard,
 ) -> StoredSessionRecord {
-    StoredSessionRecord {
+    let mut record = StoredSessionRecord {
         key: key.clone(),
         generation: Generation::new(generation),
         owner: lease.owner().clone(),
@@ -46,10 +51,36 @@ fn make_record(
         state_class: StateClass::AuthoritativeSession,
         state_type: StateType::from_str("amf-state").unwrap(),
         expires_at: None,
-        payload: opc_session_store::EncryptedSessionPayload::new_zeroizing(
-            zeroize::Zeroizing::new(b"session data".to_vec()),
-        ),
+        payload: opc_session_store::EncryptedSessionPayload::new([]),
+    };
+    let key_id = KeyId::new("cache-test-key").expect("key ID");
+    let aad = EnvelopeAad::session(
+        record.key.tenant.clone(),
+        1,
+        SessionAad::new(
+            record.key.nf_kind.as_str(),
+            "cache-test-keyed-session-digest",
+            record.state_type.as_str(),
+            record.generation.get(),
+            record.fence.get(),
+            "cache-test-backend",
+        )
+        .expect("session AAD"),
+    );
+    let mut ciphertext_and_tag = b"opaque-cache-fixture".to_vec();
+    ciphertext_and_tag.extend_from_slice(&[0xA5; AEAD_TAG_LEN]);
+    let envelope = CryptoEnvelopeV1 {
+        algorithm: AeadAlgorithm::Aes256GcmSiv,
+        key_id: key_id.clone(),
+        nonce: vec![0x42; AES_256_GCM_SIV_NONCE_LEN],
+        aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+        ciphertext_and_tag,
     }
+    .encode()
+    .expect("test envelope");
+    record.payload =
+        opc_session_store::EncryptedSessionPayload::try_envelope(envelope).expect("valid envelope");
+    record
 }
 
 async fn wait_for_watch_ready(cache: &SessionCache) {
@@ -189,12 +220,8 @@ impl SessionBackend for WatchModeBackend {
 
 #[tokio::test]
 async fn test_cache_miss_and_populate() {
-    let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(
-        testkit
-            .build_coordinator(0, &[0, 1, 2])
-            .expect("valid cache test topology"),
-    );
+    let cluster = ConsensusTestCluster::start(1).await;
+    let coord = Arc::new(cluster.store(0));
     let cache = SessionCache::new(coord.clone());
     wait_for_watch_ready(&cache).await;
 
@@ -231,12 +258,8 @@ async fn test_cache_miss_and_populate() {
 
 #[tokio::test]
 async fn test_update_invalidates_cache() {
-    let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(
-        testkit
-            .build_coordinator(0, &[0, 1, 2])
-            .expect("valid cache test topology"),
-    );
+    let cluster = ConsensusTestCluster::start(1).await;
+    let coord = Arc::new(cluster.store(0));
     let cache = SessionCache::new(coord.clone());
     wait_for_watch_ready(&cache).await;
 
@@ -286,12 +309,8 @@ async fn test_update_invalidates_cache() {
 
 #[tokio::test]
 async fn test_delete_invalidates_cache() {
-    let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(
-        testkit
-            .build_coordinator(0, &[0, 1, 2])
-            .expect("valid cache test topology"),
-    );
+    let cluster = ConsensusTestCluster::start(1).await;
+    let coord = Arc::new(cluster.store(0));
     let cache = SessionCache::new(coord.clone());
     wait_for_watch_ready(&cache).await;
 
@@ -331,12 +350,8 @@ async fn test_delete_invalidates_cache() {
 
 #[tokio::test]
 async fn test_ttl_refresh_invalidates_cache() {
-    let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(
-        testkit
-            .build_coordinator(0, &[0, 1, 2])
-            .expect("valid cache test topology"),
-    );
+    let cluster = ConsensusTestCluster::start(1).await;
+    let coord = Arc::new(cluster.store(0));
     let cache = SessionCache::new(coord.clone());
     wait_for_watch_ready(&cache).await;
 
@@ -375,12 +390,8 @@ async fn test_ttl_refresh_invalidates_cache() {
 
 #[tokio::test]
 async fn test_manual_resync() {
-    let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(
-        testkit
-            .build_coordinator(0, &[0, 1, 2])
-            .expect("valid cache test topology"),
-    );
+    let cluster = ConsensusTestCluster::start(1).await;
+    let coord = Arc::new(cluster.store(0));
     let cache = SessionCache::new(coord.clone());
     wait_for_watch_ready(&cache).await;
 
@@ -415,12 +426,8 @@ async fn test_manual_resync() {
 
 #[tokio::test]
 async fn test_no_watch_backend_bypasses_local_cache() {
-    let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(
-        testkit
-            .build_coordinator(0, &[0, 1, 2])
-            .expect("valid cache test topology"),
-    );
+    let cluster = ConsensusTestCluster::start(1).await;
+    let coord = Arc::new(cluster.store(0));
 
     let key = test_session_key();
     let owner = OwnerId::from_str("owner").unwrap();
@@ -453,12 +460,8 @@ async fn test_no_watch_backend_bypasses_local_cache() {
 
 #[tokio::test]
 async fn test_lagging_watch_bypasses_stale_cached_record() {
-    let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(
-        testkit
-            .build_coordinator(0, &[0, 1, 2])
-            .expect("valid cache test topology"),
-    );
+    let cluster = ConsensusTestCluster::start(1).await;
+    let coord = Arc::new(cluster.store(0));
 
     let key = test_session_key();
     let owner = OwnerId::from_str("owner").unwrap();
@@ -506,12 +509,8 @@ async fn test_lagging_watch_bypasses_stale_cached_record() {
 
 #[tokio::test]
 async fn test_wrapper_compare_and_set_invalidates_immediately() {
-    let testkit = ChaosTestkit::new(3);
-    let coord = Arc::new(
-        testkit
-            .build_coordinator(0, &[0, 1, 2])
-            .expect("valid cache test topology"),
-    );
+    let cluster = ConsensusTestCluster::start(1).await;
+    let coord = Arc::new(cluster.store(0));
     let cache = SessionCache::new(coord.clone());
     wait_for_watch_ready(&cache).await;
 

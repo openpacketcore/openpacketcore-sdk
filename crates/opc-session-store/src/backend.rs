@@ -152,15 +152,14 @@ pub enum SessionOpResult {
 
 /// One position in the ordered replication log (RFC 004 §11.2).
 ///
-/// Replicated coordinators (see the `quorum` module) treat the log as their
-/// source of truth and derive a majority-visible prefix from identical entries
-/// at each `sequence`. That observation is not a durable consensus commit
-/// proof; term/leader authority remains a separate production-readiness gap.
+/// The Openraft state machine emits this application journal only after commit;
+/// caches, watches, and restore consumers use it as a domain cursor. It is not
+/// a second election or consensus log.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReplicationEntry {
-    /// 1-based, gap-free position in the log. Majority agreement is assessed
-    /// per sequence; replicas reject entries that would create a gap or
-    /// diverge from an already-applied sequence.
+    /// 1-based, gap-free committed application position. Local adapters reject
+    /// entries that would create a gap or diverge from an already-applied
+    /// sequence.
     pub sequence: u64,
     /// Unique id of the originating write, used to tell idempotent
     /// re-delivery of the same entry apart from a divergent entry that
@@ -182,9 +181,10 @@ impl ReplicationEntry {
     /// (which is fail-closed), but it may not materially extend beyond
     /// `entry.timestamp + ttl`. A one-microsecond compatibility tolerance
     /// admits nanosecond rounding from legacy floating-point entries. This
-    /// prevents a peer from pairing a bounded audit TTL with a deadline far
-    /// beyond its claimed entry timestamp; durable authority for that
-    /// timestamp remains part of #127.
+    /// prevents a compatibility peer from pairing a bounded audit TTL with a
+    /// deadline far beyond its claimed entry timestamp. In the production
+    /// profile Openraft commits the application entry and its effective
+    /// logical time.
     pub fn validate(&self) -> Result<(), StoreError> {
         self.validate_sequence()?;
         self.op.validate_ttls_at(self.timestamp)
@@ -629,28 +629,23 @@ where
 ///
 /// Durable adapters that reconstruct [`StoredSessionRecord`] from persisted
 /// bytes MUST preserve payload encoding explicitly: use
-/// [`EncryptedSessionPayload::envelope`] for RFC 003 ciphertext rows and
+/// [`EncryptedSessionPayload::try_envelope`] for RFC 003 ciphertext rows and
 /// [`EncryptedSessionPayload::legacy_plaintext`] only for intentional
 /// migrations of pre-envelope plaintext rows.
 ///
-/// Backend adapters used in validated quorum topology must opt in by returning
-/// a stable process-local instance root from
-/// [`Self::backend_instance_identity`]. Forwarding wrappers must delegate to
-/// their inner backend. Topology admission rejects an absent identity and uses
-/// a present identity to prevent one conforming SDK backend instance from
-/// receiving multiple configured votes through wrappers. It does not prove
-/// remote physical-store identity; that remains separate declared and
-/// authenticated topology metadata.
+/// Standalone forwarding/compatibility adapters may expose a process-local
+/// instance root and an authenticated legacy peer binding. Production
+/// consensus topology is descriptor-only and never derives votes, membership,
+/// or peer identity from these adapter tokens.
 #[async_trait]
 pub trait SessionBackend: Send + Sync {
     /// Process-local instance root declared by this backend adapter.
     ///
-    /// The default deliberately returns `None`, which makes validated topology
-    /// admission fail closed. Eligible adapters must return a stable identity;
-    /// clone-sharing backends and forwarding wrappers must share or delegate
-    /// it. Remote clients identify their local client instance, not the remote
-    /// store. This value is never serialized, displayed, or used as a
-    /// distributed/authenticated replica identity.
+    /// Clone-sharing standalone backends and forwarding wrappers should share
+    /// or delegate this token when callers need to detect adapter aliasing.
+    /// Remote clients identify their local client instance, not the remote
+    /// store. This value is never serialized, displayed, or used as an
+    /// Openraft node, vote, membership, or authenticated peer identity.
     fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
         None
     }
@@ -662,9 +657,9 @@ pub trait SessionBackend: Send + Sync {
     /// peer before exposing backend operations. Forwarding wrappers must
     /// delegate this value unchanged.
     ///
-    /// This is composition evidence, not a cached liveness result. Validated
-    /// topology compares it with the member descriptor, while fresh readiness
-    /// still performs a real backend request.
+    /// This is legacy remote-backend composition evidence, not a cached
+    /// liveness result. The dedicated consensus transport binds its own exact
+    /// descriptor identity and does not consult this value.
     fn peer_binding(&self) -> Option<BackendPeerBinding> {
         None
     }
@@ -761,14 +756,13 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
-    /// Replace local replicated state with a verified committed log prefix.
+    /// Replace a standalone/legacy compatibility backend from a caller-verified
+    /// application-journal prefix.
     ///
-    /// Replicated coordinators use this to repair stale replicas and to discard
-    /// uncommitted tails after failed quorum writes. Implementations must rebuild
-    /// both durable state and the local replication log from the supplied entries
-    /// and replace the prior state only after the entire replay succeeds. A
-    /// failed replay must preserve the complete prior state, log, counters, and
-    /// existing watch subscriptions without publishing partial replay events.
+    /// Production Openraft recovery and snapshots never use this authority and
+    /// [`crate::ConsensusSessionStore`] rejects it. Compatibility implementations
+    /// must replace both durable state and the journal only after complete replay;
+    /// failure preserves prior state, counters, and subscriptions.
     async fn rebuild_replication_state(
         &self,
         entries: Vec<ReplicationEntry>,
@@ -798,7 +792,7 @@ pub trait SessionBackend: Send + Sync {
     }
 }
 
-/// Opaque process-local adapter identity used only for duplicate admission.
+/// Opaque process-local identity for standalone adapter-alias detection.
 ///
 /// Debug output is redacted because the value is derived from an allocation
 /// address. It is intentionally not hashable, persistent, network-visible, or
@@ -937,11 +931,20 @@ impl std::fmt::Debug for BackendPeerBinding {
 
 /// Session-backend wrapper that encrypts payloads before persistence and
 /// decrypts them on reads using `opc-crypto` / `opc-key`.
-#[derive(Clone)]
 pub struct EncryptingSessionBackend<B: ?Sized, P: ?Sized> {
     inner: Arc<B>,
     provider: Arc<P>,
     backend_namespace: Arc<str>,
+}
+
+impl<B: ?Sized, P: ?Sized> Clone for EncryptingSessionBackend<B, P> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            provider: Arc::clone(&self.provider),
+            backend_namespace: Arc::clone(&self.backend_namespace),
+        }
+    }
 }
 
 impl<B: ?Sized, P: ?Sized> EncryptingSessionBackend<B, P> {
@@ -958,12 +961,6 @@ impl<B: ?Sized, P: ?Sized> EncryptingSessionBackend<B, P> {
             provider,
             backend_namespace: Arc::<str>::from(backend_namespace.into()),
         }
-    }
-
-    /// The wrapped backend. Records obtained through it directly carry
-    /// ciphertext payloads — bypassing this wrapper skips decryption.
-    pub fn inner(&self) -> &Arc<B> {
-        &self.inner
     }
 
     /// The key provider used to resolve the tenant's active session key for
@@ -1380,12 +1377,6 @@ impl<B: ?Sized, S: ?Sized> RemoteSealingSessionBackend<B, S> {
             provider,
             backend_namespace: Arc::<str>::from(backend_namespace.into()),
         }
-    }
-
-    /// The wrapped backend. Records obtained through it directly carry
-    /// remotely sealed envelope payloads.
-    pub fn inner(&self) -> &Arc<B> {
-        &self.inner
     }
 
     /// The remote seal provider used for payload seal/unseal.

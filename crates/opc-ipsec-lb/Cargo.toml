@@ -32,6 +32,8 @@ tokio = { workspace = true, features = ["rt", "time"] }
 aya = { version = "0.14" }
 
 [dev-dependencies]
+opc-key = { path = "../opc-key", version = "0.2.0" }
+opc-session-testkit = { path = "../opc-session-testkit", version = "0.2.0" }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
