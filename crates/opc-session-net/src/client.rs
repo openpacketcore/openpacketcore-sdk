@@ -20,7 +20,8 @@ use opc_session_store::model::{OwnerId, SessionKey};
 
 use opc_session_store::record::StoredSessionRecord;
 use opc_session_store::{
-    validate_session_ttl, ReplicaId, ReplicaReadinessFailure, RestoreScanPage, RestoreScanRequest,
+    validate_session_ttl, ReplicaId, ReplicaReadinessFailure, RestoreScanCursorProfile,
+    RestoreScanPage, RestoreScanRequest,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -858,6 +859,10 @@ impl RemoteSessionBackend {
 
 #[async_trait]
 impl SessionBackend for RemoteSessionBackend {
+    fn restore_scan_cursor_profile(&self) -> Option<RestoreScanCursorProfile> {
+        Some(RestoreScanCursorProfile::DurableOpaqueV1)
+    }
+
     fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
         Some(BackendInstanceIdentity::for_shared(&self.conn))
     }
@@ -991,6 +996,15 @@ impl SessionBackend for RemoteSessionBackend {
         request: RestoreScanRequest,
     ) -> Result<RestoreScanPage, StoreError> {
         request.validate()?;
+        if request
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.is_legacy_compatibility())
+        {
+            return Err(StoreError::CapabilityNotSupported(
+                "legacy_remote_restore_scan".to_string(),
+            ));
+        }
         if self.max_frame_size < MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE {
             return Err(StoreError::RestoreScanResponseTooLarge {
                 max_bytes: self.max_frame_size,
@@ -1021,6 +1035,13 @@ impl SessionBackend for RemoteSessionBackend {
 
         match response {
             Response::ScanRestoreRecords(Ok(page)) => {
+                if page.cursor_profile != RestoreScanCursorProfile::DurableOpaqueV1 {
+                    self.discard_connection().await;
+                    self.clear_cached_capabilities();
+                    return Err(StoreError::CapabilityNotSupported(
+                        "legacy_remote_restore_scan".to_string(),
+                    ));
+                }
                 if let Err(error) = page.validate_for_request(&request) {
                     self.discard_connection().await;
                     self.clear_cached_capabilities();
@@ -1377,6 +1398,8 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::InvalidRestoreScanRequest(_) => "invalid_restore_scan_request",
         StoreError::InvalidRestoreScanResponse(_) => "invalid_restore_scan_response",
         StoreError::RestoreScanPageTooLarge { .. } => "restore_scan_page_too_large",
+        StoreError::RestoreScanCursorStale => "restore_scan_cursor_stale",
+        StoreError::RestoreScanWorkBudgetExceeded => "restore_scan_work_budget_exceeded",
         StoreError::RestoreScanResponseTooLarge { .. } => "restore_scan_response_too_large",
     }
 }
@@ -3074,6 +3097,25 @@ mod tests {
             .await
             .expect_err("zero limit must fail validation");
         assert!(matches!(error, StoreError::InvalidRestoreScanRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn legacy_restore_cursor_fails_before_connecting() {
+        let backend = RemoteSessionBackend::new_insecure(
+            "127.0.0.1:1".parse().expect("address"),
+            Some(Duration::from_secs(1)),
+        );
+        let error = backend
+            .scan_restore_records(RestoreScanRequest {
+                cursor: Some(opc_session_store::RestoreScanCursor::from_offset(0)),
+                ..RestoreScanRequest::all(1)
+            })
+            .await
+            .expect_err("legacy cursor is local-test evidence only");
+        assert_eq!(
+            error,
+            StoreError::CapabilityNotSupported("legacy_remote_restore_scan".to_string())
+        );
     }
 
     #[tokio::test]

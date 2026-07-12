@@ -20,8 +20,8 @@ use opc_session_store::model::{
 };
 use opc_session_store::record::StoredSessionRecord;
 use opc_session_store::{
-    RestoreScanCursor, RestoreScanPage, RestoreScanRequest, RestoreScanScope,
-    SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeerError,
+    RestoreScanCursor, RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest,
+    RestoreScanScope, SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeerError,
     SessionConsensusWireRequest, SessionConsensusWireResponse, MAX_SESSION_TTL,
     RESTORE_SCAN_MAX_PAGE_SIZE, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
 };
@@ -114,8 +114,8 @@ pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractPr
         max_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
     };
 
-const WIRE_SCHEMA_REVISION: u16 = 2;
-const ERROR_SET_REVISION: u16 = 1;
+const WIRE_SCHEMA_REVISION: u16 = 3;
+const ERROR_SET_REVISION: u16 = 2;
 
 /// Exact semantic and resource-bound contract required by protocol v4.
 ///
@@ -128,6 +128,10 @@ pub struct ContractProfile {
     pub wire_schema_revision: u16,
     pub error_set_revision: u16,
     pub max_restore_scan_page_records: u32,
+    pub max_restore_scan_page_payload_bytes: u32,
+    pub max_restore_scan_page_retained_bytes: u32,
+    pub max_restore_scan_examined_rows: u32,
+    pub max_restore_scan_examined_metadata_bytes: u32,
     pub max_replication_log_page_entries: u32,
     pub max_batch_operations: u32,
     pub max_rebuild_entries: u32,
@@ -156,6 +160,14 @@ impl ContractProfile {
             && self.error_set_revision == CURRENT_CONTRACT_PROFILE.error_set_revision
             && self.max_restore_scan_page_records
                 == CURRENT_CONTRACT_PROFILE.max_restore_scan_page_records
+            && self.max_restore_scan_page_payload_bytes
+                == CURRENT_CONTRACT_PROFILE.max_restore_scan_page_payload_bytes
+            && self.max_restore_scan_page_retained_bytes
+                == CURRENT_CONTRACT_PROFILE.max_restore_scan_page_retained_bytes
+            && self.max_restore_scan_examined_rows
+                == CURRENT_CONTRACT_PROFILE.max_restore_scan_examined_rows
+            && self.max_restore_scan_examined_metadata_bytes
+                == CURRENT_CONTRACT_PROFILE.max_restore_scan_examined_metadata_bytes
             && self.max_replication_log_page_entries
                 == CURRENT_CONTRACT_PROFILE.max_replication_log_page_entries
             && self.max_batch_operations == CURRENT_CONTRACT_PROFILE.max_batch_operations
@@ -182,6 +194,14 @@ pub const CURRENT_CONTRACT_PROFILE: ContractProfile = ContractProfile {
     wire_schema_revision: WIRE_SCHEMA_REVISION,
     error_set_revision: ERROR_SET_REVISION,
     max_restore_scan_page_records: RESTORE_SCAN_MAX_PAGE_SIZE as u32,
+    max_restore_scan_page_payload_bytes: opc_session_store::RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES
+        as u32,
+    max_restore_scan_page_retained_bytes: opc_session_store::RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES
+        as u32,
+    max_restore_scan_examined_rows: opc_session_store::RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE
+        as u32,
+    max_restore_scan_examined_metadata_bytes:
+        opc_session_store::RESTORE_SCAN_MAX_EXAMINED_METADATA_BYTES as u32,
     max_replication_log_page_entries: MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES as u32,
     max_batch_operations: MAX_SESSION_NET_BATCH_OPERATIONS as u32,
     max_rebuild_entries: MAX_SESSION_NET_REBUILD_ENTRIES as u32,
@@ -201,6 +221,10 @@ pub const CURRENT_CONTRACT_PROFILE: ContractProfile = ContractProfile {
 const _: () = {
     assert!(SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES <= u32::MAX as usize);
     assert!(RESTORE_SCAN_MAX_PAGE_SIZE <= u32::MAX as usize);
+    assert!(opc_session_store::RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES <= u32::MAX as usize);
+    assert!(opc_session_store::RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES <= u32::MAX as usize);
+    assert!(opc_session_store::RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE <= u32::MAX as usize);
+    assert!(opc_session_store::RESTORE_SCAN_MAX_EXAMINED_METADATA_BYTES <= u32::MAX as usize);
     assert!(MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES <= u32::MAX as usize);
     assert!(MAX_SESSION_NET_BATCH_OPERATIONS <= u32::MAX as usize);
     assert!(MAX_SESSION_NET_REBUILD_ENTRIES <= u32::MAX as usize);
@@ -350,7 +374,7 @@ pub(crate) enum BootstrapRequest {
 /// The only frame shapes decoded by a client during bootstrap.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BootstrapResponse {
-    HelloAck(BootstrapHelloAck),
+    HelloAck(Box<BootstrapHelloAck>),
     HelloRejected { reason: HelloRejectReason },
 }
 
@@ -422,7 +446,7 @@ pub(crate) enum SessionConsensusTransportResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreScanWireRequest {
     scope: RestoreScanScope,
-    cursor: Option<u64>,
+    cursor: Option<RestoreScanCursor>,
     limit: u32,
 }
 
@@ -431,16 +455,6 @@ impl TryFrom<&RestoreScanRequest> for RestoreScanWireRequest {
 
     fn try_from(request: &RestoreScanRequest) -> Result<Self, Self::Error> {
         request.validate()?;
-        let cursor = request
-            .cursor
-            .map(RestoreScanCursor::offset)
-            .map(u64::try_from)
-            .transpose()
-            .map_err(|_| {
-                StoreError::InvalidRestoreScanRequest(
-                    "restore scan cursor exceeds the protocol range".to_string(),
-                )
-            })?;
         let limit = u32::try_from(request.limit).map_err(|_| {
             StoreError::InvalidRestoreScanRequest(
                 "restore scan limit exceeds the protocol range".to_string(),
@@ -448,7 +462,7 @@ impl TryFrom<&RestoreScanRequest> for RestoreScanWireRequest {
         })?;
         Ok(Self {
             scope: request.scope.clone(),
-            cursor,
+            cursor: request.cursor.clone(),
             limit,
         })
     }
@@ -458,16 +472,6 @@ impl TryFrom<RestoreScanWireRequest> for RestoreScanRequest {
     type Error = StoreError;
 
     fn try_from(request: RestoreScanWireRequest) -> Result<Self, Self::Error> {
-        let cursor = request
-            .cursor
-            .map(usize::try_from)
-            .transpose()
-            .map_err(|_| {
-                StoreError::InvalidRestoreScanRequest(
-                    "restore scan cursor is not representable on this server".to_string(),
-                )
-            })?
-            .map(RestoreScanCursor::from_offset);
         let limit = usize::try_from(request.limit).map_err(|_| {
             StoreError::InvalidRestoreScanRequest(
                 "restore scan limit is not representable on this server".to_string(),
@@ -475,7 +479,7 @@ impl TryFrom<RestoreScanWireRequest> for RestoreScanRequest {
         })?;
         let request = Self {
             scope: request.scope,
-            cursor,
+            cursor: request.cursor.clone(),
             limit,
         };
         request.validate()?;
@@ -1139,7 +1143,7 @@ where
 #[serde(deny_unknown_fields)]
 struct WireRestoreScanRequestRef<'a> {
     scope: &'a RestoreScanScope,
-    cursor: Option<u64>,
+    cursor: Option<RestoreScanCursor>,
     limit: u32,
 }
 
@@ -1147,7 +1151,7 @@ struct WireRestoreScanRequestRef<'a> {
 #[serde(deny_unknown_fields)]
 struct WireRestoreScanRequest {
     scope: RestoreScanScope,
-    cursor: Option<u64>,
+    cursor: Option<RestoreScanCursor>,
     limit: u32,
 }
 
@@ -1162,7 +1166,7 @@ impl<'a> TryFrom<&'a RestoreScanWireRequest> for WireRestoreScanRequestRef<'a> {
             .map_err(|_| WireConversionError("restore scan request violates the v4 contract"))?;
         Ok(Self {
             scope: &request.scope,
-            cursor: request.cursor,
+            cursor: request.cursor.clone(),
             limit: request.limit,
         })
     }
@@ -1185,7 +1189,8 @@ impl TryFrom<WireRestoreScanRequest> for RestoreScanWireRequest {
 struct WireRestoreScanPageRef<'a> {
     records: &'a [StoredSessionRecord],
     excluded_count: u64,
-    next_cursor: Option<u64>,
+    next_cursor: Option<RestoreScanCursor>,
+    cursor_profile: RestoreScanCursorProfile,
 }
 
 #[derive(Deserialize)]
@@ -1193,7 +1198,8 @@ struct WireRestoreScanPageRef<'a> {
 struct WireRestoreScanPage {
     records: BoundedVec<StoredSessionRecord, RESTORE_SCAN_MAX_PAGE_SIZE>,
     excluded_count: u64,
-    next_cursor: Option<u64>,
+    next_cursor: Option<RestoreScanCursor>,
+    cursor_profile: RestoreScanCursorProfile,
 }
 
 impl<'a> TryFrom<&'a RestoreScanPage> for WireRestoreScanPageRef<'a> {
@@ -1203,6 +1209,10 @@ impl<'a> TryFrom<&'a RestoreScanPage> for WireRestoreScanPageRef<'a> {
         if page.records.len() > RESTORE_SCAN_MAX_PAGE_SIZE
             || page.loaded_count != page.records.len()
             || page.complete != page.next_cursor.is_none()
+            || !matches!(
+                page.retained_bytes(),
+                Ok(bytes) if bytes <= opc_session_store::RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES
+            )
         {
             return Err(WireConversionError(
                 "restore scan page violates the v4 contract",
@@ -1215,11 +1225,8 @@ impl<'a> TryFrom<&'a RestoreScanPage> for WireRestoreScanPageRef<'a> {
                 page.excluded_count,
                 "restore excluded count exceeds the v4 wire range",
             )?,
-            next_cursor: page
-                .next_cursor
-                .map(RestoreScanCursor::offset)
-                .map(|value| wire_u64_from_usize(value, "restore cursor exceeds the v4 wire range"))
-                .transpose()?,
+            next_cursor: page.next_cursor.clone(),
+            cursor_profile: page.cursor_profile,
         })
     }
 }
@@ -1232,18 +1239,9 @@ impl TryFrom<WireRestoreScanPage> for RestoreScanPage {
             page.excluded_count,
             "restore excluded count is not representable on this peer",
         )?;
-        let next_cursor = page
-            .next_cursor
-            .map(|value| {
-                usize_from_wire_u64(value, "restore cursor is not representable on this peer")
-            })
-            .transpose()?
-            .map(RestoreScanCursor::from_offset);
-        Ok(Self::new(
-            page.records.into_inner(),
-            excluded_count,
-            next_cursor,
-        ))
+        let mut result = Self::new(page.records.into_inner(), excluded_count, page.next_cursor);
+        result.cursor_profile = page.cursor_profile;
+        Ok(result)
     }
 }
 
@@ -1323,6 +1321,8 @@ enum WireStoreError {
     InvalidRestoreScanRequest(String),
     InvalidRestoreScanResponse(String),
     RestoreScanPageTooLarge { requested: u64, max: u64 },
+    RestoreScanCursorStale,
+    RestoreScanWorkBudgetExceeded,
     RestoreScanResponseTooLarge { max_bytes: u64 },
 }
 
@@ -1347,6 +1347,8 @@ enum WireStoreErrorRef<'a> {
     InvalidRestoreScanRequest(&'a str),
     InvalidRestoreScanResponse(&'a str),
     RestoreScanPageTooLarge { requested: u64, max: u64 },
+    RestoreScanCursorStale,
+    RestoreScanWorkBudgetExceeded,
     RestoreScanResponseTooLarge { max_bytes: u64 },
 }
 
@@ -1405,6 +1407,8 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
                     max: wire_u64_from_usize(*max, "restore page limit exceeds the v4 wire range")?,
                 }
             }
+            StoreError::RestoreScanCursorStale => Self::RestoreScanCursorStale,
+            StoreError::RestoreScanWorkBudgetExceeded => Self::RestoreScanWorkBudgetExceeded,
             StoreError::RestoreScanResponseTooLarge { max_bytes } => {
                 Self::RestoreScanResponseTooLarge {
                     max_bytes: wire_u64_from_usize(
@@ -1468,6 +1472,8 @@ impl TryFrom<WireStoreError> for StoreError {
                     )?,
                 }
             }
+            WireStoreError::RestoreScanCursorStale => Self::RestoreScanCursorStale,
+            WireStoreError::RestoreScanWorkBudgetExceeded => Self::RestoreScanWorkBudgetExceeded,
             WireStoreError::RestoreScanResponseTooLarge { max_bytes } => {
                 Self::RestoreScanResponseTooLarge {
                     max_bytes: usize_from_wire_u64(
@@ -2845,7 +2851,7 @@ impl TryFrom<&Response> for BootstrapResponse {
                 contract_profile,
                 accepted_response_frame_size,
                 server_request_frame_size,
-            } => Ok(Self::HelloAck(BootstrapHelloAck {
+            } => Ok(Self::HelloAck(Box::new(BootstrapHelloAck {
                 contract_version: *contract_version,
                 server_replica_id: server_replica_id.clone(),
                 accepted_client_replica_id: accepted_client_replica_id.clone(),
@@ -2855,7 +2861,7 @@ impl TryFrom<&Response> for BootstrapResponse {
                 contract_profile: *contract_profile,
                 accepted_response_frame_size: *accepted_response_frame_size,
                 server_request_frame_size: *server_request_frame_size,
-            })),
+            }))),
             Response::HelloRejected { reason } => Ok(Self::HelloRejected { reason: *reason }),
             _ => Err(WireConversionError(
                 "expected a bootstrap acknowledgement frame",
@@ -2867,17 +2873,20 @@ impl TryFrom<&Response> for BootstrapResponse {
 impl From<BootstrapResponse> for Response {
     fn from(response: BootstrapResponse) -> Self {
         match response {
-            BootstrapResponse::HelloAck(hello) => Self::HelloAck {
-                contract_version: hello.contract_version,
-                server_replica_id: hello.server_replica_id,
-                accepted_client_replica_id: hello.accepted_client_replica_id,
-                cluster_id: hello.cluster_id,
-                configuration_id: hello.configuration_id,
-                handshake_nonce: hello.handshake_nonce,
-                contract_profile: hello.contract_profile,
-                accepted_response_frame_size: hello.accepted_response_frame_size,
-                server_request_frame_size: hello.server_request_frame_size,
-            },
+            BootstrapResponse::HelloAck(hello) => {
+                let hello = *hello;
+                Self::HelloAck {
+                    contract_version: hello.contract_version,
+                    server_replica_id: hello.server_replica_id,
+                    accepted_client_replica_id: hello.accepted_client_replica_id,
+                    cluster_id: hello.cluster_id,
+                    configuration_id: hello.configuration_id,
+                    handshake_nonce: hello.handshake_nonce,
+                    contract_profile: hello.contract_profile,
+                    accepted_response_frame_size: hello.accepted_response_frame_size,
+                    server_request_frame_size: hello.server_request_frame_size,
+                }
+            }
             BootstrapResponse::HelloRejected { reason } => Self::HelloRejected { reason },
         }
     }
@@ -3679,6 +3688,7 @@ mod tests {
         assert!(page.get("complete").is_none());
         assert_eq!(page["excluded_count"], 0);
         assert!(page.get("next_cursor").is_some());
+        assert_eq!(page["cursor_profile"], "legacy-compatibility");
 
         let decoded: Response = serde_json::from_slice(&encoded).expect("decode response");
         assert!(matches!(
@@ -3767,7 +3777,7 @@ mod tests {
     fn contract_profile_and_bootstrap_frames_are_exact_and_version_tolerant() {
         assert_eq!(SESSION_NET_ALPN, b"opc-session-net/4");
         assert!(CURRENT_CONTRACT_PROFILE.is_current());
-        assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 1);
+        assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 2);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_frame_size, 16_777_216);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_session_ttl_seconds, 31_536_000);
 
@@ -3775,9 +3785,13 @@ mod tests {
         assert_eq!(
             profile,
             serde_json::json!({
-                "wire_schema_revision": 2,
-                "error_set_revision": 1,
+                "wire_schema_revision": 3,
+                "error_set_revision": 2,
                 "max_restore_scan_page_records": 1024,
+                "max_restore_scan_page_payload_bytes": 4194304,
+                "max_restore_scan_page_retained_bytes": 8388608,
+                "max_restore_scan_examined_rows": 4096,
+                "max_restore_scan_examined_metadata_bytes": 8388608,
                 "max_replication_log_page_entries": 65536,
                 "max_batch_operations": 256,
                 "max_rebuild_entries": 65536,
@@ -3825,7 +3839,7 @@ mod tests {
         unknown_bootstrap["Hello"]["future_field"] = serde_json::json!(true);
         assert!(serde_json::from_value::<BootstrapRequest>(unknown_bootstrap).is_err());
 
-        let acknowledgement = BootstrapResponse::HelloAck(BootstrapHelloAck {
+        let acknowledgement = BootstrapResponse::HelloAck(Box::new(BootstrapHelloAck {
             contract_version: CONTRACT_VERSION,
             server_replica_id: Some("replica-b".to_string()),
             accepted_client_replica_id: Some("replica-a".to_string()),
@@ -3835,7 +3849,7 @@ mod tests {
             contract_profile: Some(CURRENT_CONTRACT_PROFILE),
             accepted_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
             server_request_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
-        });
+        }));
         let acknowledgement = serde_json::to_value(acknowledgement).expect("acknowledgement JSON");
         assert_eq!(
             acknowledgement["HelloAck"]["contract_version"],
@@ -3928,6 +3942,8 @@ mod tests {
                 requested: 2,
                 max: 1,
             },
+            StoreError::RestoreScanCursorStale,
+            StoreError::RestoreScanWorkBudgetExceeded,
             StoreError::RestoreScanResponseTooLarge { max_bytes: 512 },
         ];
 

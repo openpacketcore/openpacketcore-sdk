@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **BREAKING — `opc-session-store`:** bounded authoritative restore scans now read only the
+  local Openraft-applied state after a linearizable barrier, seek the existing
+  SQLite composite primary key, cap pages at 4,096 examined live candidates,
+  1,024 returned records, 4 MiB payload, 8 MiB retained bytes, and 8 MiB
+  examined key/filter metadata, and enforce one absolute entry-to-task SQLite
+  operation deadline plus fixed VM-step and drop-cancellation budgets. Candidate
+  and lookahead SQL omit payload blobs. Strictly bounded variable-length
+  AES-256-GCM-SIV cursor tokens keep the seek key, backend epoch, record
+  revision, logical time, and scope confidential and authenticated, while an
+  clear cumulative position is bound into cursor authentication and supports a
+  structural check of claimed progress without claiming peer completeness;
+  stale, edited, mutated, or
+  cross-scope reuse fails typed instead of skipping or merging state. Existing
+  stores receive an O(1) cursor-key metadata migration without record backfill.
+  `RestoreScanCursor` changes to a confidential bounded token and
+  `RestoreScanPage` adds `cursor_profile`; exhaustive construction and matching
+  must be updated.
+- **BREAKING — `opc-session-net`:** the quarantined v4 compatibility profile
+  advances to wire-schema revision 3 and error-set revision 2 for the
+  confidential restore token, explicit durable-page profile, examined/payload
+  contracts, and typed stale-cursor/work-budget errors. Local fake offset
+  cursors are rejected remotely. Servers validate against the narrowed request
+  actually dispatched and no longer fabricate shortened-page cursors when a
+  backend page exceeds the negotiated frame; callers retry the same cursor with
+  a smaller record limit.
 - `opc-sctp`/`opc-libsctp-sys`: bounded static SCTP multihoming through the
   Linux bindx/connectx socket UAPI. Multi-address local and peer sets are
   validated for count, family, and port; one-address configurations keep the

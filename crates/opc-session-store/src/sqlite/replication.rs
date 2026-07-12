@@ -3,9 +3,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::str::FromStr;
 
 use super::ops::{
-    current_fence_sync, format_rfc3339_normalized, get_sync, insert_or_replace_fence_sync,
-    insert_or_replace_record_sync, persisted_owner_id, persisted_u64, sqlite_u64,
-    timestamp_unix_millis,
+    advance_restore_scan_revision_sync, current_fence_sync, format_rfc3339_normalized, get_sync,
+    insert_or_replace_fence_sync, insert_or_replace_record_sync, persisted_owner_id, persisted_u64,
+    sqlite_u64, timestamp_unix_millis,
 };
 use crate::{
     backend::{
@@ -133,19 +133,23 @@ pub(crate) fn apply_replicated_op_sync(
             if fence.get() < current_fence {
                 return Err(StoreError::StaleFence);
             }
-            conn.execute(
-                r#"
+            let removed = conn
+                .execute(
+                    r#"
                 DELETE FROM session_records
                 WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4
                 "#,
-                params![
-                    key.tenant.as_str(),
-                    key.nf_kind.as_str(),
-                    key.key_type.to_string(),
-                    key.stable_id.as_ref(),
-                ],
-            )
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                    params![
+                        key.tenant.as_str(),
+                        key.nf_kind.as_str(),
+                        key.key_type.to_string(),
+                        key.stable_id.as_ref(),
+                    ],
+                )
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            if removed > 0 {
+                advance_restore_scan_revision_sync(conn)?;
+            }
             insert_or_replace_fence_sync(conn, &key, fence.get())?;
             Ok(())
         }
@@ -419,8 +423,12 @@ pub(crate) fn rebuild_replication_state_sync(
     validate_replication_prefix(entries)?;
     let tx = super::standalone_transaction(conn)?;
 
-    tx.execute("DELETE FROM session_records", [])
+    let removed_records = tx
+        .execute("DELETE FROM session_records", [])
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+    if removed_records > 0 {
+        advance_restore_scan_revision_sync(&tx)?;
+    }
     tx.execute("DELETE FROM leases", [])
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
     tx.execute("DELETE FROM key_fences", [])

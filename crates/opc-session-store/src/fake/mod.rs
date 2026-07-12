@@ -8,9 +8,14 @@
 //! I/O or real waiting. Suitable for tests and single-replica development
 //! only; nothing is persisted.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use opc_types::Timestamp;
 use tokio::sync::{mpsc, Mutex};
 
@@ -24,11 +29,14 @@ use crate::{
     capability::BackendCapabilities,
     clock::{Clock, TokioVirtualClock},
     error::{LeaseError, StoreError},
-    hex::encode_lower,
     lease::{LeaseGuard, SessionLeaseManager},
-    model::{FenceToken, OwnerId, SessionKey},
+    model::{FenceToken, OwnerId, SessionKey, SessionKeyType},
     record::StoredSessionRecord,
-    restore::{compare_restore_records, RestoreScanCursor, RestoreScanPage, RestoreScanRequest},
+    restore::{
+        compare_restore_records, restore_record_retained_bytes, RestoreScanCursor, RestoreScanPage,
+        RestoreScanRequest, RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
+        RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES,
+    },
     ttl::{checked_session_deadline, validate_session_ttl},
 };
 
@@ -44,9 +52,9 @@ pub struct FakeSessionBackend {
 }
 
 struct FakeBackendState {
-    records: HashMap<String, StoredSessionRecord>,
-    leases: HashMap<String, LeaseEntry>,
-    key_fences: HashMap<String, FenceToken>,
+    records: BTreeMap<FakeMapKey, StoredSessionRecord>,
+    leases: HashMap<FakeMapKey, LeaseEntry>,
+    key_fences: HashMap<FakeMapKey, FenceToken>,
     next_fence: u64,
     next_credential_id: u64,
     compacted_replication_sequence: u64,
@@ -55,10 +63,22 @@ struct FakeBackendState {
     watchers: Vec<mpsc::Sender<Result<ReplicationEntry, StoreError>>>,
 }
 
+/// Canonical raw tuple used for fake-backend lookup and restore ordering.
+///
+/// A typed tuple avoids the delimiter-ordering and collision hazards of a
+/// formatted string while retaining the same private in-memory lookup role.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct FakeMapKey {
+    tenant: String,
+    nf_kind: String,
+    key_type: SessionKeyType,
+    stable_id: Bytes,
+}
+
 impl FakeBackendState {
     fn empty() -> Self {
         Self {
-            records: HashMap::new(),
+            records: BTreeMap::new(),
             leases: HashMap::new(),
             key_fences: HashMap::new(),
             next_fence: 1,
@@ -163,19 +183,18 @@ impl FakeSessionBackend {
         self
     }
 
-    /// Return a simple string key for HashMap lookups.
-    fn map_key(key: &SessionKey) -> String {
-        format!(
-            "{}/{}/{}/{}",
-            key.tenant.as_str(),
-            key.nf_kind.as_str(),
-            key.key_type,
-            encode_lower(key.stable_id.as_ref())
-        )
+    /// Return the canonical composite key for bounded map lookups.
+    fn map_key(key: &SessionKey) -> FakeMapKey {
+        FakeMapKey {
+            tenant: key.tenant.as_str().to_owned(),
+            nf_kind: key.nf_kind.as_str().to_owned(),
+            key_type: key.key_type.clone(),
+            stable_id: key.stable_id.clone(),
+        }
     }
 
     /// Get the current recorded fence for a key.
-    fn current_fence(state: &FakeBackendState, map_key: &str) -> FenceToken {
+    fn current_fence(state: &FakeBackendState, map_key: &FakeMapKey) -> FenceToken {
         state
             .key_fences
             .get(map_key)
@@ -185,7 +204,7 @@ impl FakeSessionBackend {
 
     fn ensure_key_capacity(
         state: &FakeBackendState,
-        map_key: &str,
+        map_key: &FakeMapKey,
         max_tracked_keys: usize,
     ) -> Result<(), StoreError> {
         if state.key_fences.contains_key(map_key) || state.key_fences.len() < max_tracked_keys {
@@ -254,7 +273,7 @@ impl FakeSessionBackend {
         state: &FakeBackendState,
         lease: &LeaseGuard,
         now: Timestamp,
-    ) -> Result<String, StoreError> {
+    ) -> Result<FakeMapKey, StoreError> {
         let map_key = Self::map_key(lease.key());
         let current_fence = Self::current_fence(state, &map_key);
         if lease.fence() < current_fence {
@@ -697,6 +716,12 @@ impl Default for FakeSessionBackend {
 
 #[async_trait]
 impl SessionBackend for FakeSessionBackend {
+    fn restore_scan_cursor_profile(&self) -> Option<crate::RestoreScanCursorProfile> {
+        self.caps
+            .restore_scan
+            .then_some(crate::RestoreScanCursorProfile::LegacyCompatibility)
+    }
+
     fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
         Some(BackendInstanceIdentity::for_shared(&self.inner))
     }
@@ -822,35 +847,83 @@ impl SessionBackend for FakeSessionBackend {
             return Err(StoreError::CapabilityNotSupported("restore_scan".into()));
         }
         request.validate()?;
+        if request
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| !cursor.is_legacy())
+        {
+            return Err(StoreError::RestoreScanCursorStale);
+        }
 
         let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
 
-        let mut matching = Vec::new();
-        let mut excluded_count = 0;
-        for record in state.records.values() {
-            if record.is_expired_at(now) {
-                continue;
-            }
-            if request.scope.matches_record(record) {
-                matching.push(record.clone());
-            } else {
-                excluded_count += 1;
-            }
-        }
-        matching.sort_by(compare_restore_records);
-
         let start = request
             .cursor
+            .as_ref()
             .map(RestoreScanCursor::offset)
-            .unwrap_or(0)
-            .min(matching.len());
-        let end = start.saturating_add(request.limit).min(matching.len());
-        let next_cursor = (end < matching.len()).then(|| RestoreScanCursor::from_offset(end));
-        let records = matching[start..end].to_vec();
+            .unwrap_or(0);
+        let mut records = Vec::with_capacity(request.limit.min(64));
+        let mut payload_bytes = 0_usize;
+        let mut retained_page_bytes = std::mem::size_of::<RestoreScanPage>();
+        let continuation_bytes = RestoreScanCursor::from_offset(0).retained_token_bytes();
+        let mut matching_position = 0_usize;
+        let mut has_more = false;
+        for record in state.records.values() {
+            if record.is_expired_at(now) || !request.scope.matches_record(record) {
+                continue;
+            }
+            if matching_position < start {
+                matching_position += 1;
+                continue;
+            }
+            if records.len() == request.limit {
+                has_more = true;
+                break;
+            }
+            let next_payload_bytes = payload_bytes
+                .checked_add(record.payload.len())
+                .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
+            if next_payload_bytes > RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES {
+                if records.is_empty() {
+                    return Err(StoreError::RestoreScanResponseTooLarge {
+                        max_bytes: RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
+                    });
+                }
+                has_more = true;
+                break;
+            }
+            if record.key.stable_id.len() > crate::SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES {
+                return Err(StoreError::RestoreScanWorkBudgetExceeded);
+            }
+            let next_retained_page_bytes = retained_page_bytes
+                .checked_add(restore_record_retained_bytes(record)?)
+                .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
+            if next_retained_page_bytes
+                .checked_add(continuation_bytes)
+                .is_none_or(|bytes| bytes > RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES)
+            {
+                if records.is_empty() {
+                    return Err(StoreError::RestoreScanResponseTooLarge {
+                        max_bytes: RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES,
+                    });
+                }
+                has_more = true;
+                break;
+            }
+            payload_bytes = next_payload_bytes;
+            retained_page_bytes = next_retained_page_bytes;
+            records.push(record.clone());
+            matching_position += 1;
+        }
+        let end = start
+            .checked_add(records.len())
+            .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
+        let next_cursor = has_more.then(|| RestoreScanCursor::from_offset(end));
 
-        Ok(RestoreScanPage::new(records, excluded_count, next_cursor))
+        records.sort_by(compare_restore_records);
+        Ok(RestoreScanPage::new(records, 0, next_cursor))
     }
 
     async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
