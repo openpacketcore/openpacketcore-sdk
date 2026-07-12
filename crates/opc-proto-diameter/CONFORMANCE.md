@@ -95,14 +95,47 @@ downstream product work.
 
 The SWm DEA parse matches vendor-specific AVPs by (vendor-id, code); only
 genuinely unknown AVPs fall through to the unknown-AVP policy (mandatory
-unknown AVPs remain fail-closed). The DEA additionally decodes and encodes
-the TS 29.273 subscription AVPs `Service-Selection` (RFC 5778) and
-`APN-Configuration` (TS 29.272 §7.3.35) with the child subset
-`Context-Identifier`, `Service-Selection`, `PDN-Type`,
-`EPS-Subscribed-QoS-Profile` (QCI + Allocation-Retention-Priority), and
-`AMBR`. The remaining APN-Configuration children (for example
-`VPLMN-Dynamic-Address-Allowed`, `PDN-GW-Allocation-Type`, `MIP6-Agent-Info`,
-and `3GPP-Charging-Characteristics`) are deliberately not modeled yet and are
+unknown AVPs remain fail-closed). The typed DEA surface decodes and encodes
+`APN-Configuration` (TS 29.272 §7.3.35), top-level `Service-Selection` (RFC
+5778), and an optional top-level `Context-Identifier`.
+
+The top-level default pointer is an explicit interoperability extension, not a
+baseline SWm conformance claim. TS 29.273's SWm DEA command ABNF enumerates one
+optional `APN-Configuration` and a trailing extension-AVP wildcard; it does not
+enumerate a top-level `Context-Identifier`. TS 29.272 instead defines that
+pointer inside `APN-Configuration-Profile`. The SDK accepts profiles that
+project the pointer and repeated APN configurations into the DEA extension
+surface, but products must enable emission only when peer support is part of
+their deployment contract. Generated round trips for this extension are
+regression/interoperability evidence, not independently authored SWm
+conformance evidence.
+
+Top-level `Service-Selection` is not interpreted as the subscription default.
+`SwmDiameterEapAnswer::default_apn_configuration` resolves the top-level
+Context-Identifier to its exact child APN configuration.
+
+Context identifiers and APN Service-Selection values are validated at both
+encode and parse boundaries. Child identifiers must be nonzero and unique,
+child Service-Selection values must be nonempty and unique, and a present
+nonzero default identifier must resolve to a supplied configuration. APN
+profile material is accepted only when Result-Code is exactly
+`DIAMETER_SUCCESS` (2001), not merely another 2xxx result. A missing default
+remains `None`; an unresolved or ambiguous profile fails closed, and the
+resolver independently returns `None` for any invalid profile.
+
+Until #131 makes duplicate rejection command-cardinality aware, the generic
+`DecodeContext::conservative()` pre-scan treats this profile's repeated
+`APN-Configuration` extension AVPs as duplicates. Consumers of the repeated
+extension must explicitly use `DuplicateIePolicy::Last`; the typed parser still
+rejects every duplicated singleton with `set_once`. This exception is scoped to
+the opt-in projection profile and is not a baseline SWm cardinality claim.
+
+The modeled APN-Configuration child subset is `Context-Identifier`,
+`Service-Selection`, `PDN-Type`, `EPS-Subscribed-QoS-Profile` (QCI +
+Allocation-Retention-Priority), and `AMBR`. The remaining APN-Configuration
+children (for example `VPLMN-Dynamic-Address-Allowed`,
+`PDN-GW-Allocation-Type`, `MIP6-Agent-Info`, and
+`3GPP-Charging-Characteristics`) are deliberately not modeled yet and are
 handled by the unknown-AVP policy.
 
 ### 6. Redaction
@@ -120,7 +153,8 @@ Covered redacted fields:
   `EAP-Payload`, `EAP-Reissued-Payload`, `EAP-Master-Session-Key`,
   `Service-Selection` (top level and inside
   `ApnConfiguration::service_selection`). `SwmDiameterEapAnswer` debug output
-  shows only the count of `apn_configurations`, never their contents.
+  shows only the count of `apn_configurations`, never their contents. Context
+  identifiers are numeric selectors and are not treated as subscriber data.
 
 Raw AVP bytes are **not** redacted: the raw layer is intentionally a
 byte-preserving forwarding surface, and redaction is a typed-layer policy.
@@ -193,7 +227,7 @@ evidence only.
    ADR 0015 conformance evidence for the base header and AVP layer.
 2. **3GPP-authored fixtures** (`tests/fixture_provenance.rs` and the spec-valid
    seeds in `fuzz/corpus/*/`) — hand-built from RFC 6733 wire framing plus
-   3GPP TS 32.299 §5.1/§7.1 (Rf) and 3GPP TS 29.273 §6.1 (SWm) command/AVP
+   3GPP TS 32.299 §5.1/§7.1 (Rf) and 3GPP TS 29.273 §7.2 (SWm) command/AVP
    codes. They are application-dictionary evidence, not full
    application-conformance evidence.
 3. **ePDG parity bytes** — *not imported*. The source plan references ePDG

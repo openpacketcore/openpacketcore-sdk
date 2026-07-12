@@ -103,6 +103,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed fuzz corpora for the GTP-U, NAS, Diameter, and IKEv2 targets.
 
 ### Changed
+- **BREAKING — `opc-proto-diameter`:** `SwmDiameterEapAnswer` gains
+  `default_context_identifier: Option<u32>` and
+  `default_apn_configuration()` so SWm DEA consumers can resolve an opt-in
+  subscription-profile default extension to one exact `APN-Configuration`;
+  top-level `Service-Selection` is no longer documented as the default APN.
+  Struct literals must initialize the new field (`None` preserves the previous
+  wire shape). Encode and parse now reject zero or duplicate child
+  Context-Identifier values, duplicate child Service-Selection values, and a
+  default pointer that does not resolve to a supplied configuration; APN
+  profile material requires exact `DIAMETER_SUCCESS` (2001). The baseline SWm
+  DEA ABNF does not enumerate this pointer; it is accepted under the extension
+  wildcard for deployments projecting TS 29.272 profile semantics. Older SDK
+  decoders reject its required M-bit as unknown, so deploy upgraded decoders
+  before enabling `Some(id)` on encoders. Repeated projected APN configurations
+  require `DuplicateIePolicy::Last` until #131 replaces the conservative
+  blanket duplicate pre-scan; typed singleton duplicate checks remain enforced.
 - **BREAKING — `opc-session-net`:** the wire contract is now v4. Public
   `Request` and `Response` remain available, but their Serde implementations
   delegate to private fixed-width DTOs; `Hello`/`HelloAck` gain an optional
