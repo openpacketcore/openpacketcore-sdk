@@ -2,6 +2,151 @@
 
 use thiserror::Error;
 
+/// Bounded consensus RPC families used in timeout diagnostics.
+///
+/// These values are intentionally independent of request data so they are safe
+/// to use as low-cardinality telemetry labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsensusRpcFamily {
+    /// Raft vote request.
+    RequestVote,
+    /// Raft log replication or heartbeat request.
+    AppendEntries,
+    /// Raft snapshot installation request.
+    InstallSnapshot,
+    /// Read the latest committed configuration.
+    LoadLatest,
+    /// Read a selected rollback configuration.
+    LoadRollback,
+    /// Raft leadership-transfer trigger.
+    TimeoutNow,
+}
+
+impl ConsensusRpcFamily {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::RequestVote,
+        Self::AppendEntries,
+        Self::InstallSnapshot,
+        Self::LoadLatest,
+        Self::LoadRollback,
+        Self::TimeoutNow,
+    ];
+
+    pub(crate) const fn metric_index(self) -> usize {
+        match self {
+            Self::RequestVote => 0,
+            Self::AppendEntries => 1,
+            Self::InstallSnapshot => 2,
+            Self::LoadLatest => 3,
+            Self::LoadRollback => 4,
+            Self::TimeoutNow => 5,
+        }
+    }
+
+    /// Returns the stable, low-cardinality telemetry label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RequestVote => "request_vote",
+            Self::AppendEntries => "append_entries",
+            Self::InstallSnapshot => "install_snapshot",
+            Self::LoadLatest => "load_latest",
+            Self::LoadRollback => "load_rollback",
+            Self::TimeoutNow => "timeout_now",
+        }
+    }
+}
+
+impl std::fmt::Display for ConsensusRpcFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Bounded consensus transport stages used in timeout diagnostics.
+///
+/// Values do not contain endpoints, identities, request fields, or other
+/// untrusted/high-cardinality data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsensusRpcStage {
+    /// Establish and validate the absolute deadline.
+    DeadlineSetup,
+    /// Read the peer authentication configuration.
+    AuthenticationSetup,
+    /// Serialize and frame the request.
+    RequestSerialization,
+    /// Read or build the current client TLS configuration.
+    TlsConfiguration,
+    /// Establish the TCP connection.
+    TcpConnect,
+    /// Complete the mutual-TLS handshake.
+    TlsHandshake,
+    /// Write the framed request.
+    RequestWrite,
+    /// Read the response frame length.
+    ResponseLength,
+    /// Read the response frame body.
+    ResponseBody,
+    /// Decode the authenticated response.
+    ResponseDecode,
+    /// Wait before a retry.
+    RetryBackoff,
+}
+
+impl ConsensusRpcStage {
+    pub(crate) const ALL: [Self; 11] = [
+        Self::DeadlineSetup,
+        Self::AuthenticationSetup,
+        Self::RequestSerialization,
+        Self::TlsConfiguration,
+        Self::TcpConnect,
+        Self::TlsHandshake,
+        Self::RequestWrite,
+        Self::ResponseLength,
+        Self::ResponseBody,
+        Self::ResponseDecode,
+        Self::RetryBackoff,
+    ];
+
+    pub(crate) const fn metric_index(self) -> usize {
+        match self {
+            Self::DeadlineSetup => 0,
+            Self::AuthenticationSetup => 1,
+            Self::RequestSerialization => 2,
+            Self::TlsConfiguration => 3,
+            Self::TcpConnect => 4,
+            Self::TlsHandshake => 5,
+            Self::RequestWrite => 6,
+            Self::ResponseLength => 7,
+            Self::ResponseBody => 8,
+            Self::ResponseDecode => 9,
+            Self::RetryBackoff => 10,
+        }
+    }
+
+    /// Returns the stable, low-cardinality telemetry label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeadlineSetup => "deadline_setup",
+            Self::AuthenticationSetup => "authentication_setup",
+            Self::RequestSerialization => "request_serialization",
+            Self::TlsConfiguration => "tls_configuration",
+            Self::TcpConnect => "tcp_connect",
+            Self::TlsHandshake => "tls_handshake",
+            Self::RequestWrite => "request_write",
+            Self::ResponseLength => "response_length",
+            Self::ResponseBody => "response_body",
+            Self::ResponseDecode => "response_decode",
+            Self::RetryBackoff => "retry_backoff",
+        }
+    }
+}
+
+impl std::fmt::Display for ConsensusRpcStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Persistent error kinds that survive serialization to logs and telemetry.
 #[derive(Debug, Clone, Error)]
 pub enum PersistErrorKind {
@@ -41,6 +186,14 @@ pub enum PersistErrorKind {
     /// An I/O error occurred (fsync, read, write).
     #[error("I/O error: {0}")]
     Io(String),
+    /// One logical consensus RPC exhausted its single end-to-end deadline.
+    #[error("consensus RPC logical timeout family={family} stage={stage}")]
+    ConsensusRpcTimeout {
+        /// Bounded request family for diagnostics.
+        family: ConsensusRpcFamily,
+        /// Bounded stage at which the deadline was observed.
+        stage: ConsensusRpcStage,
+    },
     /// The schema version in the database does not match the expected version.
     #[error("schema version mismatch: expected {expected}, found {found}")]
     SchemaVersionMismatch { expected: String, found: String },
@@ -248,6 +401,24 @@ impl PersistError {
         Self::new(PersistErrorKind::Io(msg.into()))
     }
 
+    /// Construct a typed logical consensus RPC timeout.
+    pub fn consensus_rpc_timeout(family: ConsensusRpcFamily, stage: ConsensusRpcStage) -> Self {
+        Self::new(PersistErrorKind::ConsensusRpcTimeout { family, stage })
+    }
+
+    /// Returns the bounded family/stage labels for a logical RPC timeout.
+    pub fn consensus_rpc_timeout_context(&self) -> Option<(ConsensusRpcFamily, ConsensusRpcStage)> {
+        match self.kind() {
+            PersistErrorKind::ConsensusRpcTimeout { family, stage } => Some((*family, *stage)),
+            _ => None,
+        }
+    }
+
+    /// Returns whether this error represents expiry of one logical RPC deadline.
+    pub fn is_consensus_rpc_timeout(&self) -> bool {
+        self.consensus_rpc_timeout_context().is_some()
+    }
+
     pub fn schema_version_mismatch(expected: impl Into<String>, found: impl Into<String>) -> Self {
         Self::new(PersistErrorKind::SchemaVersionMismatch {
             expected: expected.into(),
@@ -306,7 +477,7 @@ impl From<std::io::Error> for PersistError {
 
 #[cfg(test)]
 mod tests {
-    use super::PersistError;
+    use super::{ConsensusRpcFamily, ConsensusRpcStage, PersistError};
 
     #[test]
     fn display_redacts_sensitive_storage_details() {
@@ -343,6 +514,19 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "persist error: inconsistent state: majority consensus quorum not reached"
+        );
+    }
+
+    #[test]
+    fn logical_rpc_timeout_exposes_only_bounded_safe_labels() {
+        let err = PersistError::consensus_rpc_timeout(
+            ConsensusRpcFamily::InstallSnapshot,
+            ConsensusRpcStage::ResponseBody,
+        );
+
+        assert_eq!(
+            err.to_string(),
+            "persist error: consensus RPC logical timeout family=install_snapshot stage=response_body"
         );
     }
 }

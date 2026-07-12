@@ -260,20 +260,41 @@ pub(super) fn consensus_peer_policy(
 }
 
 impl ConsensusConfigStore {
+    /// Replace the local server identity/acceptor pair, then refresh every peer connector.
+    ///
+    /// Local publication is cancellation-atomic: the peer-serialization,
+    /// identity, and acceptor locks are acquired before either local value
+    /// changes, and readers use the same identity-before-acceptor order. The
+    /// peer lock is retained through propagation, so concurrent rotations
+    /// cannot finish adapters out of order and registration cannot publish an
+    /// adapter carrying an older generation. If any adapter rejects the update,
+    /// all remaining adapters are still attempted and this method returns a
+    /// fixed error; callers must retry and keep trust overlap/readiness gating
+    /// in place while peers converge.
     pub async fn set_identity(&self, identity: NodeIdentity) -> Result<(), PersistError> {
         let acceptor = build_server_tls_acceptor(&identity)?;
-        {
-            let mut guard = self.identity.write().await;
-            *guard = Some(identity.clone());
+        let peers_guard = self.peers.write().await;
+        let mut identity_guard = self.identity.write().await;
+        let mut acceptor_guard = self.tls_acceptor.write().await;
+
+        *identity_guard = Some(identity.clone());
+        *acceptor_guard = Some(acceptor);
+        drop(acceptor_guard);
+        drop(identity_guard);
+
+        let peers = peers_guard.values().cloned().collect::<Vec<_>>();
+        let mut propagation_failed = false;
+        for peer in peers {
+            if peer.set_identity(identity.clone()).await.is_err() {
+                propagation_failed = true;
+            }
         }
-        {
-            let mut guard = self.tls_acceptor.write().await;
-            *guard = Some(acceptor);
+        if propagation_failed {
+            return Err(PersistError::io(
+                "failed to propagate consensus peer identity",
+            ));
         }
-        let peers = self.peers.read().await;
-        for peer in peers.values() {
-            let _ = peer.set_identity(identity.clone()).await;
-        }
+        drop(peers_guard);
         Ok(())
     }
 
@@ -286,11 +307,13 @@ impl ConsensusConfigStore {
     }
 
     pub async fn build_tls_acceptor(&self) -> Result<tokio_rustls::TlsAcceptor, PersistError> {
-        let guard = self.tls_acceptor.read().await;
-        if let Some(ref acceptor) = *guard {
+        // Keep the same identity -> acceptor lock order as `set_identity`.
+        // Holding both reads prevents a caller from combining generations.
+        let identity_guard = self.identity.read().await;
+        let acceptor_guard = self.tls_acceptor.read().await;
+        if let Some(ref acceptor) = *acceptor_guard {
             Ok(acceptor.clone())
         } else {
-            let identity_guard = self.identity.read().await;
             let identity = identity_guard.as_ref().ok_or_else(|| {
                 PersistError::inconsistent_state("local identity not initialized")
             })?;

@@ -1,6 +1,7 @@
 use super::{
     ConsensusConfigStore, InstallSnapshotRequest, InstallSnapshotResponse, Role, SnapshotPayload,
 };
+use crate::backend::SqliteBackend;
 use crate::error::PersistError;
 use crate::types::ConfigStore;
 use std::sync::atomic::Ordering;
@@ -60,14 +61,20 @@ impl ConsensusConfigStore {
             return Err(PersistError::io("node offline"));
         }
 
+        // SQLite stores every Raft coordinate as a signed INTEGER. Validate
+        // all request coordinates before changing the in-memory term or any
+        // durable config/membership state; otherwise a one-over-boundary
+        // snapshot could wrap only after destructive snapshot installation.
+        SqliteBackend::consensus_term_to_sqlite(req.term)?;
+        SqliteBackend::consensus_node_id_to_sqlite(req.leader_id)?;
+        SqliteBackend::consensus_index_to_sqlite(req.last_included_index)?;
+        SqliteBackend::consensus_term_to_sqlite(req.last_included_term)?;
         if req.term > state.current_term {
+            self.inner.consensus_set_state(req.term, None).await?;
             state.current_term = req.term;
             state.voted_for = None;
             state.role = Role::Follower;
             state.leader_id = Some(req.leader_id);
-            self.inner
-                .consensus_set_state(state.current_term, state.voted_for)
-                .await?;
         }
 
         if req.term >= state.current_term {
@@ -178,20 +185,20 @@ impl ConsensusConfigStore {
             )));
         }
 
-        // Install state
-        self.inner
-            .consensus_install_snapshot_state(payload.config)
-            .await?;
-        let mut follower_membership = payload.membership.clone();
+        // Install the state-machine data and every Raft snapshot marker as one
+        // SQLite transaction. A failure at any stage leaves the follower's
+        // prior config, audit chain, membership, snapshot, applied index, and
+        // log intact for an unambiguous retry.
+        let mut follower_membership = payload.membership;
         follower_membership.node_id = self.node_id;
         self.inner
-            .consensus_set_membership(&follower_membership)
-            .await?;
-        self.inner
-            .consensus_set_snapshot(req.last_included_index, req.last_included_term, &req.data)
-            .await?;
-        self.inner
-            .consensus_compact_logs(req.last_included_index)
+            .consensus_install_snapshot_bundle(
+                payload.config,
+                &follower_membership,
+                req.last_included_index,
+                req.last_included_term,
+                &req.data,
+            )
             .await?;
 
         state.commit_index = req.last_included_index;

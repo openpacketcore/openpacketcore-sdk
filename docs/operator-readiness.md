@@ -117,6 +117,54 @@ coordination; its production network path depends on the experimental
 `opc-session-net` transport. Neither is a production-profile claim until its
 documented graduation requirements and downstream distributed/soak gates pass.
 
+### Config consensus RPC and identity-lifecycle contract
+
+For `opc-persist` config consensus, configure every `TcpPeer` timeout (or the
+test-node `--rpc-timeout` value) as one end-to-end logical RPC deadline. The
+same absolute budget covers local authentication/TLS setup locks, bounded
+cooperative serialization, TCP connect, mTLS, request write, response
+length/body reads and decode, all attempts, and 50/100 ms retry backoff. Zero
+expires before I/O; an unrepresentable monotonic-clock duration fails closed.
+Do not multiply this value by transport stages or retries when sizing an
+election: voting-peer requests fan out concurrently. Do budget as much as
+`128 * rpc-timeout`, plus local database/scheduling overhead, for one lagging
+peer's bounded catch-up pass: there are 64 rounds and a rejected snapshot can
+fall through to one append in the same round. A later trigger resumes from
+`next_index` after the 64-round ceiling.
+
+Treat this as a coordinated upgrade setting. Earlier SDKs reset the configured
+timeout for each I/O stage; the same numeric value can therefore produce a much
+shorter failure window after this change. Retune it as an end-to-end budget,
+update election/failover/drain thresholds, and roll out the selected value
+coherently across cluster members. Rust integrations that exhaustively match
+the public `PersistErrorKind` must add `ConsensusRpcTimeout`.
+
+Retries preserve the request's safety semantics. RequestVote, AppendEntries,
+InstallSnapshot, LoadLatest, and LoadRollback may replay after ambiguous
+delivery. TimeoutNow may already have launched a campaign, so it is not replayed
+after any bytes may have reached the peer. Invalid local identity/TLS setup and
+certificate-verification failures are permanent for the call and must not be
+reported as logical timeouts.
+
+Operators should alert from `rpc_timeouts` and its fixed
+`rpc_timeouts_by_family`/`rpc_timeouts_by_stage` dimensions. Those maps use
+bounded request-family and stage keys; do not add replica IDs, endpoints,
+SPIFFE identities, tenants, or request fields as labels. A timeout on the
+client closes that attempt, but it does not create a server-wide post-handshake
+I/O deadline. `TcpRpcServer` currently applies five seconds only to TLS
+acceptance; request reads and response writes are frame-bounded and need a
+separate server-side slow-client bound before that property can be claimed.
+
+A production CNF must also own seamless identity rotation. Watch the live SVID
+and trust bundle and call `set_identity`; the `opc-consensus-node` test binary
+loads PEM files only at startup. Roll out old/new trust overlap first, then
+rotate leaves while preserving the exact SPIFFE workload profile and node
+instance, drain old connections, verify fresh handshakes across the quorum, and
+remove old trust only after the maximum authentication age. Gate traffic and
+readiness through the transition and bound reconnect storms. Replacing leaf and
+trust material simultaneously without overlap is not a supported seamless
+rotation procedure.
+
 ### Session topology admission
 
 Construct HA-shaped session stores only from `ValidatedQuorumTopology`. The SDK
@@ -638,7 +686,20 @@ The SDK includes a config-store consensus hardening prototype (`ConsensusConfigS
 
 The standard SQLite-backed config and session store profiles (`SqliteBackend` and `SqliteSessionBackend`) are single-node only. They are acceptable only for development, conformance, lab, or explicitly accepted edge/single-replica deployments, and must not be used to claim carrier HA without a production consensus/replication layer.
 
-- **Config Store Consensus Hardening**: `ConsensusConfigStore` provides durable membership, TCP RPC framing over real mTLS transport with SPIFFE identity verification bound to the configured workload profile and active membership, election/heartbeats, no-op commit safety, snapshot HMAC verification, controlled TCP server lifecycle (bounded concurrency/timeout/oneshot shutdown), membership-change guardrails, and consensus metrics dump hooks. Checked via the out-of-process multi-process campaigns, failovers, network partitioning, and pending commits surviving restarts.
+- **Config Store Consensus Hardening**: `ConsensusConfigStore` provides durable
+  membership, TCP RPC framing over real mTLS transport with SPIFFE identity
+  verification bound to the configured workload profile and active membership,
+  one absolute client logical-RPC deadline, request-aware retry ambiguity
+  handling, concurrent peer fan-out, bounded/resumable 64-round per-peer
+  catch-up (at most two RPCs per round), no-op commit safety, snapshot HMAC
+  verification, a server lifecycle with 100-handler concurrency and a
+  five-second TLS-accept timeout, membership-change guardrails, and
+  fixed-family/stage timeout metrics. Post-handshake server reads/writes remain
+  frame-bounded without an independent server I/O deadline, and production
+  CNFs must supply live identity watching plus trust-overlap rotation. Checked
+  via out-of-process campaigns, failovers, network partitioning, pending
+  commits surviving restarts, deterministic transport stalls/cancellation, and
+  catch-up resume tests.
 - **Session Store Quorum Replication Prototype**: `QuorumSessionStore` exercises session leases and CAS mutations across a majority of replicas using an ordered log with watch/change-stream resume cursors, strict-prefix catch-up, and partial-write fail-closed fixtures. Durable authority and repair claims remain conditional on #127/#128.
 - **Session Topology, Identity, and Readiness**: HA-shaped construction requires an immutable validated set of distinct declared votes and exactly one explicit local member. Protocol v4 retains v3's authenticated peer binding from one cluster/configuration manifest and requires the live certificate SPIFFE identity to match the stable `ReplicaId`; DNS aliases remain routing only. The lab singleton reports `single-replica`; raw unvalidated construction reports `unknown` and refuses operations. Topology, identity binding, and capabilities are admission evidence. `probe_durable_readiness` separately provides fresh bounded majority evidence.
 - **Fault Coverage**: Reusable chaos test fixtures and tests cover split-brain, stale leader writes, replication lag, stale fences, restart/rejoin behavior, divergent read fail-closed behavior, clock skew, and multi-writer rejection. They also cover session-store durable rejoin/catch-up, strict-prefix append, ordered-log replay, duplicate delivery, partial-write fail-closed behavior, and no-destructive-repair evidence for an already-visible ambiguous tail. This is not proof of automatic fork reconciliation or failed-write resurrection safety before #127/#128.

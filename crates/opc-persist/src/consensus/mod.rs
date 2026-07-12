@@ -159,19 +159,53 @@ impl ConsensusConfigStore {
     }
 
     pub async fn add_peer(&self, peer_id: usize, peer: Arc<dyn ConsensusPeer>) {
-        if let Ok(Some(m)) = self.inner.consensus_get_active_membership().await {
-            let _ = peer
-                .set_auth(self.node_id, m.cluster_id, self.get_client_cert_pem())
-                .await;
+        // Compatibility wrapper for the original infallible API. Setup errors
+        // never publish the peer; callers that need the reason should use
+        // `try_add_peer`, which returns fixed, non-secret failure messages.
+        if self.try_add_peer(peer_id, peer).await.is_err() {
+            tracing::warn!("consensus peer registration failed");
         }
-        {
-            let identity_guard = self.identity.read().await;
-            if let Some(ref identity) = *identity_guard {
-                let _ = peer.set_identity(identity.clone()).await;
-            }
+    }
+
+    /// Configure and publish a peer, failing closed if adapter setup fails.
+    pub async fn try_add_peer(
+        &self,
+        peer_id: usize,
+        peer: Arc<dyn ConsensusPeer>,
+    ) -> Result<(), PersistError> {
+        if peer_id == self.node_id || peer.node_id() != peer_id {
+            return Err(PersistError::inconsistent_state(
+                "consensus peer id does not match registration",
+            ));
         }
-        let mut guard = self.peers.write().await;
-        guard.insert(peer_id, peer);
+        SqliteBackend::consensus_node_id_to_sqlite(peer_id)?;
+        let membership = self
+            .inner
+            .consensus_get_active_membership()
+            .await
+            .map_err(|_| PersistError::io("failed to load consensus membership"))?
+            .ok_or_else(|| PersistError::inconsistent_state("consensus membership missing"))?;
+        peer.set_auth(
+            self.node_id,
+            membership.cluster_id,
+            self.get_client_cert_pem(),
+        )
+        .await
+        .map_err(|_| PersistError::io("failed to configure consensus peer authentication"))?;
+
+        // This write lock is also the identity-rotation serialization gate.
+        // Applying the current identity and inserting the adapter while it is
+        // held prevents a rotation from missing this peer, and prevents two
+        // rotations from completing peer propagation out of order.
+        let mut peers_guard = self.peers.write().await;
+        let identity = self.identity.read().await.clone();
+        if let Some(identity) = identity {
+            peer.set_identity(identity)
+                .await
+                .map_err(|_| PersistError::io("failed to configure consensus peer identity"))?;
+        }
+        peers_guard.insert(peer_id, peer);
+        Ok(())
     }
 
     pub async fn set_partition(&self, peer_id: usize, partitioned: bool) {
@@ -186,6 +220,20 @@ impl ConsensusConfigStore {
     pub async fn is_partitioned(&self, peer_id: usize) -> bool {
         let state = self.state.lock().await;
         state.partitioned_peers.contains(&peer_id)
+    }
+
+    pub(crate) async fn is_voting_member(&self, node_id: usize) -> Result<bool, PersistError> {
+        let membership = self
+            .inner
+            .consensus_get_active_membership()
+            .await?
+            .ok_or_else(|| PersistError::inconsistent_state("consensus membership missing"))?;
+        Ok(membership.voting_members.contains(&node_id)
+            || membership
+                .old_voting_members
+                .as_ref()
+                .map(|old| old.contains(&node_id))
+                .unwrap_or(false))
     }
 
     pub async fn set_online(&self, online: bool) {

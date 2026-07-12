@@ -174,6 +174,31 @@ async fn test_metrics_rpc_status_counters() {
         .unwrap();
     let rpc_failures = m["data"]["rpc_failures"].as_u64().unwrap();
     assert!(rpc_failures >= 1);
+    for family in [
+        "request_vote",
+        "append_entries",
+        "install_snapshot",
+        "load_latest",
+        "load_rollback",
+        "timeout_now",
+    ] {
+        assert!(m["data"]["rpc_timeouts_by_family"][family].is_u64());
+    }
+    for stage in [
+        "deadline_setup",
+        "authentication_setup",
+        "request_serialization",
+        "tls_configuration",
+        "tcp_connect",
+        "tls_handshake",
+        "request_write",
+        "response_length",
+        "response_body",
+        "response_decode",
+        "retry_backoff",
+    ] {
+        assert!(m["data"]["rpc_timeouts_by_stage"][stage].is_u64());
+    }
 }
 
 #[tokio::test]

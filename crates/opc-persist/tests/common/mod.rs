@@ -714,22 +714,12 @@ pub struct AutomaticLeaderObservation {
     pub diagnostics: Vec<NodeMetricsDiagnostic>,
 }
 
-fn automatic_election_wait_budget(
-    cluster: &TestCluster,
-    candidate_ids: &[usize],
-) -> std::time::Duration {
-    let peer_rpcs_per_round = candidate_ids
-        .iter()
-        .filter_map(|node_id| cluster.nodes.get(node_id))
-        .map(|node| u32::try_from(node.peers.len()).unwrap_or(u32::MAX))
-        .max()
-        .unwrap_or(0);
+fn automatic_election_wait_budget(cluster: &TestCluster) -> std::time::Duration {
     let election_timeout = std::time::Duration::from_millis(cluster.election_timeout_max);
     let rpc_timeout = std::time::Duration::from_millis(cluster.rpc_timeout);
-    let sequential_peer_rpc_budget =
-        consensus_rpc_timing::rpc_io_timeout_and_backoff_budget(rpc_timeout)
-            .saturating_mul(peer_rpcs_per_round);
-    let election_round_budget = election_timeout.saturating_add(sequential_peer_rpc_budget);
+    let election_round_budget = election_timeout.saturating_add(
+        consensus_rpc_timing::rpc_logical_deadline_budget(rpc_timeout),
+    );
 
     election_round_budget.saturating_mul(AUTOMATIC_ELECTION_ROUNDS)
 }
@@ -737,7 +727,7 @@ fn automatic_election_wait_budget(
 /// Waits for a leader elected by the running nodes' timers, without triggering a campaign.
 ///
 /// The finite test deadline budgets four rounds of the configured maximum election timeout plus
-/// every peer's cumulative configured RPC I/O-stage timeouts and retry backoff. It is not a
+/// one end-to-end logical RPC deadline for the concurrent voting-peer fan-out. It is not a
 /// protocol wall-clock guarantee. A timeout reports the latest successful metrics snapshot and
 /// the latest command error for every candidate node.
 pub async fn wait_for_automatic_leader(
@@ -750,7 +740,7 @@ pub async fn wait_for_automatic_leader(
         "{context}: automatic election requires at least one candidate"
     );
 
-    let wait_budget = automatic_election_wait_budget(cluster, candidate_ids);
+    let wait_budget = automatic_election_wait_budget(cluster);
     let deadline = tokio::time::Instant::now()
         .checked_add(wait_budget)
         .expect("automatic-election wait budget should fit within tokio's instant range");

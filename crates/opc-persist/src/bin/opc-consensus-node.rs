@@ -9,6 +9,33 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
+const USAGE: &str = r#"Usage: opc-consensus-node [OPTIONS]
+
+Required:
+  --node-id <ID>
+  --db-path <PATH>
+  --addr <HOST:PORT>
+  --audit-key-hex <64 HEX CHARS>
+
+Cluster and identity:
+  --cluster-id <ID>
+  --voting-members <ID,ID,...>
+  --peer <ID=HOST:PORT>             Repeat for each remote peer
+  --cert-chain-path <PATH>
+  --private-key-path <PATH>
+  --ca-cert-path <PATH>
+
+Timing (milliseconds):
+  --election-timeout-min <MS>       Default: 150
+  --election-timeout-max <MS>       Default: 300
+  --rpc-timeout <MS>                One end-to-end logical peer-RPC deadline;
+                                    includes setup, TCP, mTLS, write/read,
+                                    response decoding, retries, and backoff.
+                                    Default: 150
+
+  -h, --help                        Print this help
+"#;
+
 fn decode_hex(hex_str: &str) -> Result<Vec<u8>, String> {
     let hex_str = hex_str.trim_start_matches("0x");
     if !hex_str.len().is_multiple_of(2) {
@@ -398,6 +425,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rpc_timeout = 150;
 
     let args_vec: Vec<String> = std::env::args().skip(1).collect();
+    if args_vec.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print!("{USAGE}");
+        return Ok(());
+    }
     let mut i = 0;
     while i < args_vec.len() {
         let arg = &args_vec[i];
@@ -547,7 +578,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             peer_addr,
             std::time::Duration::from_millis(rpc_timeout),
         );
-        store.add_peer(peer_id, Arc::new(peer)).await;
+        store.try_add_peer(peer_id, Arc::new(peer)).await?;
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
