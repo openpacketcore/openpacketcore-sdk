@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-identity`: a production `ProjectedSvidSource` for Kubernetes projected
+  Secrets. It resolves one immutable `..data` target, detects and boundedly
+  retries every mid-read generation switch, enforces exact file/total/
+  certificate/trust/retry limits, retains only unexpired last-known-good
+  material, and publishes an opaque monotonic generation with typed,
+  redaction-safe availability/reason status. Existing file/socket source APIs
+  and reload events remain source compatible.
 - `opc-consensus`: the workspace's single exact-pinned Openraft integration
   boundary, with bounded Postcard codecs, cluster/configuration/epoch identity,
   stable SQLite-safe node IDs, request identities, and transport-neutral RPC

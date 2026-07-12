@@ -160,8 +160,9 @@ This is durable sequencing authority, but not yet a complete production
 deployment claim. Committed-state repair and legacy-fork recovery remain
 #128/#129, bounded majority-authoritative restore remains #133, watch and expiry
 hardening remain #145/#148, and network/resource/rotation qualification remains
-#143 and the #162 -> #161 -> #163 -> #158 -> #164 credential chain. Stable IDs,
-durable transaction IDs, and log-range cursors remain #167/#168/#171.
+#143 and the #161 -> #162 -> #163 -> #164 credential chain under umbrella
+#158. Stable IDs, durable transaction IDs, and log-range cursors remain
+#167/#168/#171.
 
 ### Configured topology admission
 
@@ -491,8 +492,13 @@ reconnect performs a full mutual-TLS certificate exchange. Production still
 requires seamless certificate and trust-bundle rotation without interrupting
 session service, including trust overlap, revocation, long-lived-connection
 retirement, reconnect storms, and a documented maximum authentication age.
-The seamless lifecycle remains #158 and distributed qualification remains
-#143. Session TTL is application-state lifetime; the 365-day bound is not a
+For Kubernetes mounts, `ProjectedSvidSource` now publishes only a bounded,
+validated candidate read from one immutable `..data` target and retains a
+failed candidate's predecessor only until expiry. That closes source-level
+atomicity, not connection continuity: #162 still owns coherent handshake
+epochs, #163 owns retirement/reauthentication, #164 owns fleet evidence, and
+#158 remains their umbrella. Distributed qualification remains #143. Session
+TTL is application-state lifetime; the 365-day bound is not a
 certificate-expiry, trust-validity, or authentication-age policy.
 
 Response delivery is not atomic with backend mutation. A CAS, batch slot, lease

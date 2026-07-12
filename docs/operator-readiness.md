@@ -528,12 +528,27 @@ bounded for the shared compact Openraft payload; transport code does not decode
 commands or make consensus decisions.
 
 Fresh handshakes make renewed credentials observable, but seamless operation
-during rotation is not yet qualified. The remaining dependency order is #162
-(bounded material epochs), #161 (atomic identity/trust reload), #163 (peer
-reauthentication across an epoch), #158 (seamless rotation), and #164
-(rotation qualification). A production CNF must keep old/new trust overlapped,
-retire old connections, enforce revocation and maximum authentication age, and
-bound reconnect storms; #143 still owns the wider distributed qualification.
+during rotation is not yet qualified. The implementation order is #161
+(atomic identity/trust reload), #162 (bounded material epochs), and #163 (peer
+reauthentication across an epoch), followed by #164 rotation qualification.
+#158 remains the umbrella until that evidence passes. A production CNF must
+keep old/new trust overlapped, retire old connections, enforce revocation and
+maximum authentication age, and bound reconnect storms; #143 still owns the
+wider distributed qualification.
+
+When TLS material is mounted as a Kubernetes projected Secret, construct
+`ProjectedSvidSource` with the mount root and relative Secret-key paths. Do not
+point the independent-file source at the user-facing `tls.crt`, `tls.key`, and
+bundle symlinks: those links can cross generations during `..data` replacement.
+Gate startup on a `Ready` typed status and non-empty identity state. A
+`RetainingLastGood` status permits existing unexpired material to remain active
+while the candidate is repaired; `Unavailable` must gate new traffic. Never
+retain last-good material past its leaf expiry.
+
+Alert on the fixed projected reload reason codes, not the legacy free-form
+event field. Generation numbers are process-local evidence: rollback advances
+the number, and process restart resets it. Do not use them as a persisted
+cluster epoch or membership identity.
 
 ### Legacy direct-backend session-net v4 rollout boundary
 
@@ -550,9 +565,10 @@ and 0-RTT; budget every reconnect as a full mutual-TLS handshake so the live
 SVID is revalidated after rotation.
 
 Full handshakes make renewed credentials observable, but they are not proof of
-seamless rotation. The #162 -> #161 -> #163 -> #158 -> #164 rotation chain and
-#143 distributed qualification apply before this compatibility surface could
-be admitted to a production migration. `MAX_SESSION_TTL` controls
+seamless rotation. The #161 -> #162 -> #163 -> #164 implementation and
+qualification chain, under umbrella #158, and #143 distributed qualification
+apply before this compatibility surface could be admitted to a production
+migration. `MAX_SESSION_TTL` controls
 session/lease state only; it does not define
 certificate expiry, trust-bundle validity, or authentication age.
 
@@ -691,9 +707,9 @@ remain #168 and must be coordinated with #127/#128/#143. Session-net's response
 deadline is independent of `opc-persist`'s already-implemented #169
 `TcpPeer::timeout` contract: one atomic end-to-end logical-RPC deadline covers
 its attempts and backoff, with safe retry and bounded metrics. Seamless
-SVID/trust-bundle lifecycle remains
-#162 -> #161 -> #163 -> #158 -> #164, while the remaining
-distributed/payload-key production evidence stays open in #143.
+SVID/trust-bundle lifecycle remains #161 -> #162 -> #163 -> #164 under umbrella
+#158, while the remaining distributed/payload-key production evidence stays
+open in #143.
 
 #159 does not rewrite persisted session-store bytes. In-profile stores need no
 format conversion, but a retained empty/over-64-byte stable ID or

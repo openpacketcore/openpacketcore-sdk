@@ -153,9 +153,9 @@ Watch handoff correctness (#145) and absolute-record-expiry admission (#148)
 also remain open. Bounded nested-CAS protection is implemented under #147;
 outbound response allocation/frame bounds and slow-reader deadlines are
 implemented under #159. Distributed failure/resource qualification remains
-#143, and seamless credential/trust lifecycle remains the #162 -> #161 -> #163
--> #158 -> #164 dependency chain. These remaining gates keep the networked
-profile experimental.
+#143, and seamless credential/trust lifecycle remains the #161 -> #162 -> #163
+-> #164 dependency chain under umbrella #158. These remaining gates keep the
+networked profile experimental.
 
 The v4 wire uses `u32` for restore/log request limits and the client restore
 response budget; `u64` for restore cursors, excluded counts,

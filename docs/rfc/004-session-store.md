@@ -235,7 +235,8 @@ boundary. Protocol-v4 fixed-width wire admission is implemented under #134,
 and #127 now supplies Openraft durable commit authority. Those changes do not
 provide divergence or legacy-fork recovery (#128/#129), majority-authoritative
 restore (#133), or production qualification (#143). Seamless certificate and
-trust-bundle lifecycle remains the #162 -> #161 -> #163 -> #158 -> #164 chain;
+trust-bundle lifecycle remains the #161 -> #162 -> #163 -> #164 chain under
+umbrella #158;
 payload-protection-key rotation and distributed production evidence remain
 #143.
 
@@ -932,7 +933,7 @@ migration requirement.
 
 #159 establishes only session-net response/write and wire-containment bounds.
 It does not close #167 or #168, does not implement seamless SVID/trust-bundle
-rotation (#162 -> #161 -> #163 -> #158 -> #164), and does not provide #143's
+rotation (#161 -> #162 -> #163 -> #164 under umbrella #158), and does not provide #143's
 payload-key/distributed production qualification. It also does not change
 `opc-persist`'s already-implemented #169 `TcpPeer::timeout` contract, whose one
 atomic end-to-end logical-RPC deadline covers attempts and backoff with safe
@@ -980,9 +981,10 @@ production qualification. #133 MUST provide bounded majority-authoritative
 restore behavior without reopening a direct backend/rebuild port. #128 and
 #129 remain the divergence and legacy-fork recovery gates, and #143 remains the
 distributed partition/restart/resource/soak and payload-key gate. Seamless
-transport credential rotation MUST complete, in dependency order, #162
-(material epochs), #161 (atomic reload), #163 (reauthentication across an
-epoch), #158 (seamless rotation), and #164 (qualification). Implementations
+transport credential rotation MUST complete, in dependency order, #161
+(atomic reload), #162 (material epochs), #163 (reauthentication across an
+epoch), and #164 (qualification), with #158 remaining open as the umbrella
+until that evidence passes. Implementations
 MUST overlap old/new trust, retire old connections, enforce revocation and a
 documented maximum authentication age, and bound reconnect storms; a fresh
 handshake by itself is not seamless-rotation evidence.
@@ -1083,7 +1085,7 @@ and trust bundles without interrupting service, while still enforcing
 revocation and a documented maximum authentication age on long-lived
 connections. Consensus reconnects perform a full mutual-TLS handshake, but
 seamless certificate/trust rotation remains the
-#162 -> #161 -> #163 -> #158 -> #164 dependency chain; reconnect-storm and
+#161 -> #162 -> #163 -> #164 dependency chain under umbrella #158; reconnect-storm and
 wider distributed production evidence remain #143.
 
 ## 15. Observability
@@ -1270,5 +1272,6 @@ This RFC is implemented when:
     documented payload-envelope versus full-database boundary is qualified.
 15. Divergence recovery (#128), operator-safe legacy-fork recovery (#129),
     bounded majority-authoritative restore (#133), distributed production
-    qualification (#143), and the #162 -> #161 -> #163 -> #158 -> #164
-    credential-rotation chain have passed their own acceptance gates.
+    qualification (#143), and the #161 -> #162 -> #163 -> #164
+    credential-rotation chain under umbrella #158 have passed their own
+    acceptance gates.

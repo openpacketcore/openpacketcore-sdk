@@ -172,6 +172,30 @@ Rotation requirements:
 - Bundle removal revokes future handshakes.
 - Rotation failures emit critical telemetry.
 
+For Kubernetes projected Secrets, production consumers MUST resolve one
+relative `..data` target and read the leaf chain, key, intermediates, and trust
+bundles directly from that immutable generation directory. Independently
+following each user-facing file symlink is forbidden because an atomic
+`..data` replacement can otherwise produce mixed material. A source MUST check
+the generation after every read, discard a candidate if it changes, and stop
+after a fixed retry and work budget.
+
+`ProjectedSvidSource` implements this boundary with public exact limits: 1 MiB
+for the chain file, 64 KiB for the key, 1 MiB per trust-bundle file, 4 MiB
+total, 16 bundle files, 16 chain certificates, 128 trust anchors, and three
+retries after the initial attempt. Each attempt has a five-second deadline.
+Polling cannot be configured below 100 milliseconds. Paths must be normalized
+relative paths below the projected generation. The source rejects non-regular
+material files and never places paths, PEM, SPIFFE IDs, keys, or parser text in
+status or events.
+
+A validated candidate is published with a process-local monotonic generation.
+Rollback is another publication and therefore advances that generation. An
+invalid candidate retains the exact last-known-good identity, but never beyond
+the leaf's expiry; expiry clears the identity and reports a typed unavailable
+state. This source-level publication contract precedes #162's coherent
+per-handshake TLS epoch and #163's bounded connection reauthentication.
+
 ## 5. Transport Security
 
 ### 5.1 gRPC Transports
@@ -537,6 +561,10 @@ should have deterministic test fixtures and no hidden global state.
 ### 15.2 Integration Tests
 
 - SVID rotation without process restart.
+- Kubernetes `..data` replacement during every projected-material read phase,
+  proving that no mixed generation is published.
+- Projected-material exact-limit/one-over, last-good retention, expiry,
+  rollback-generation, and redaction tests.
 - Trust bundle rotation revokes removed trust domain.
 - gNSI policy staging and rollback.
 - Management commit rejected after NACM policy update removes permission.
