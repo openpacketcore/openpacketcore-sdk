@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use opc_session_store::backend::{
-    validate_replication_page, validate_replication_prefix, CompareAndSetResult,
+    validate_replication_page_owned, validate_replication_prefix_owned, CompareAndSetResult,
 };
 use opc_session_store::error::{LeaseError, StoreError};
 use opc_session_store::quorum::SessionStoreBackend;
@@ -114,6 +114,18 @@ fn bounded_restore_scan_response(
             }
             Err(other) => return Err(other),
         }
+    }
+}
+
+fn discard_replication_payloads_from_request(request: Request) {
+    match request {
+        Request::ReplicateEntry { entry } => {
+            drop(entry.into_validated());
+        }
+        Request::RebuildReplicationState { entries } => {
+            drop(validate_replication_prefix_owned(entries));
+        }
+        _ => {}
     }
 }
 
@@ -571,7 +583,8 @@ where
             )
             .await?;
         }
-        _ => {
+        request => {
+            discard_replication_payloads_from_request(request);
             return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
         }
     }
@@ -699,21 +712,21 @@ where
             }
             Request::GetReplicationLog { start, limit } => {
                 let res = match backend.get_replication_log(start, limit).await {
-                    Ok(entries) => validate_replication_page(&entries).map(|()| entries),
+                    Ok(entries) => validate_replication_page_owned(entries),
                     Err(error) => Err(error),
                 };
                 write_frame(writer, &Response::GetReplicationLog(res)).await?;
             }
             Request::ReplicateEntry { entry } => {
-                let res = match entry.validate() {
-                    Ok(()) => backend.replicate_entry(entry).await,
+                let res = match entry.into_validated() {
+                    Ok(entry) => backend.replicate_entry(entry).await,
                     Err(error) => Err(error),
                 };
                 write_frame(writer, &Response::ReplicateEntry(res)).await?;
             }
             Request::RebuildReplicationState { entries } => {
-                let res = match validate_replication_prefix(&entries) {
-                    Ok(()) => backend.rebuild_replication_state(entries).await,
+                let res = match validate_replication_prefix_owned(entries) {
+                    Ok(entries) => backend.rebuild_replication_state(entries).await,
                     Err(error) => Err(error),
                 };
                 write_frame(writer, &Response::RebuildReplicationState(res)).await?;
@@ -722,10 +735,8 @@ where
                 Ok(mut stream) => {
                     write_frame(writer, &Response::WatchStream).await?;
                     while let Some(item) = stream.next().await {
-                        let item = item.and_then(|entry| {
-                            entry.validate()?;
-                            Ok(entry)
-                        });
+                        let item =
+                            item.and_then(opc_session_store::ReplicationEntry::into_validated);
                         if write_frame(writer, &Response::WatchEntry(item))
                             .await
                             .is_err()

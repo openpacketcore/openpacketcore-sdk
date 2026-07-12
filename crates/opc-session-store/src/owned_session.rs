@@ -376,6 +376,9 @@ impl OwnedSessionMutationError {
             StoreError::InvalidReplicationSequence => Self::StoreRejected {
                 code: "invalid-replication-sequence",
             },
+            StoreError::ReplicationOperationLimitExceeded => Self::StoreRejected {
+                code: "replication-operation-limit-exceeded",
+            },
             StoreError::InvalidSessionTtl => Self::StoreRejected {
                 code: "invalid-session-ttl",
             },

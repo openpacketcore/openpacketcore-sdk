@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::{stream, StreamExt};
 use opc_crypto::CryptoEnvelopeV1;
 use opc_key::{
     EncryptedPayload, EnvelopeAad, KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose,
@@ -12,13 +13,13 @@ use opc_session_store::{
     RemoteSealingSessionBackend, ReplicationEntry, ReplicationOp, RestoreScanRequest,
     SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult,
     SessionPayloadEncoding, StateClass, StateType, StoreError, StoredSessionRecord,
-    MAX_SESSION_TTL,
+    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH, MAX_SESSION_TTL,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::Duration,
 };
@@ -128,6 +129,828 @@ fn crypto_then_invalid_ttl_entry(sequence: u64, tx_id: &str) -> ReplicationEntry
             ],
         },
     }
+}
+
+fn nested_replication_entry(sequence: u64, tag: &str) -> ReplicationEntry {
+    let timestamp = Timestamp::now_utc();
+    let key = test_key();
+    let owner = OwnerId::new("owner-a").expect("owner");
+    let cas = |ordinal: u64| ReplicationOp::CompareAndSet {
+        key: key.clone(),
+        expected_generation: None,
+        credential_id: ordinal,
+        guard_expires_at: timestamp,
+        new_record: StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(sequence * 10 + ordinal),
+            owner: owner.clone(),
+            fence: FenceToken::new(ordinal),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::new("smf-pdu-context").expect("state type"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(Bytes::from(format!("{tag}-plain-{ordinal}"))),
+        },
+    };
+
+    ReplicationEntry {
+        sequence,
+        tx_id: format!("{tag}-tx-{sequence}"),
+        timestamp,
+        op: ReplicationOp::Batch {
+            ops: vec![
+                ReplicationOp::DeleteFenced {
+                    key: key.clone(),
+                    owner: owner.clone(),
+                    fence: FenceToken::new(1),
+                },
+                ReplicationOp::Batch {
+                    ops: vec![
+                        cas(1),
+                        ReplicationOp::Batch {
+                            ops: vec![
+                                ReplicationOp::ReleaseLease {
+                                    key: key.clone(),
+                                    owner: owner.clone(),
+                                    fence: FenceToken::new(2),
+                                    credential_id: 2,
+                                },
+                                cas(2),
+                                ReplicationOp::Batch { ops: Vec::new() },
+                            ],
+                        },
+                    ],
+                },
+                cas(3),
+            ],
+        },
+    }
+}
+
+fn boundary_cas_op(sequence: u64, tag: &str) -> ReplicationOp {
+    let mut op = test_replication_entry(sequence, tag).op;
+    let ReplicationOp::CompareAndSet { new_record, .. } = &mut op else {
+        panic!("boundary fixture must be a CAS");
+    };
+    new_record.payload = EncryptedSessionPayload::new(Bytes::from(format!("{tag}-plaintext")));
+    op
+}
+
+fn wrap_operation_to_depth(mut op: ReplicationOp, depth: usize) -> ReplicationOp {
+    assert!(depth > 0, "root depth is one");
+    for _ in 1..depth {
+        op = ReplicationOp::Batch { ops: vec![op] };
+    }
+    op
+}
+
+fn boundary_depth_entry(sequence: u64, depth: usize, tag: &str) -> ReplicationEntry {
+    ReplicationEntry {
+        sequence,
+        tx_id: format!("{tag}-tx"),
+        op: wrap_operation_to_depth(boundary_cas_op(sequence, tag), depth),
+        timestamp: Timestamp::now_utc(),
+    }
+}
+
+fn boundary_count_entry(sequence: u64, node_count: usize, tag: &str) -> ReplicationEntry {
+    assert!(node_count >= 2, "fixture needs a root and CAS child");
+    let mut ops = Vec::with_capacity(node_count - 1);
+    ops.push(boundary_cas_op(sequence, tag));
+    ops.extend((1..(node_count - 1)).map(|_| ReplicationOp::Batch { ops: Vec::new() }));
+    ReplicationEntry {
+        sequence,
+        tx_id: format!("{tag}-tx"),
+        op: ReplicationOp::Batch { ops },
+        timestamp: Timestamp::now_utc(),
+    }
+}
+
+fn replication_cas_records(op: &ReplicationOp) -> Vec<&StoredSessionRecord> {
+    let mut pending = vec![op];
+    let mut records = Vec::new();
+    while let Some(op) = pending.pop() {
+        match op {
+            ReplicationOp::CompareAndSet { new_record, .. } => records.push(new_record),
+            ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
+            ReplicationOp::DeleteFenced { .. }
+            | ReplicationOp::RefreshTtl { .. }
+            | ReplicationOp::AcquireLease { .. }
+            | ReplicationOp::RenewLease { .. }
+            | ReplicationOp::ReleaseLease { .. } => {}
+        }
+    }
+    records
+}
+
+#[derive(Default)]
+struct CapturingReplicationBackend {
+    entries: StdMutex<Vec<ReplicationEntry>>,
+    replicate_calls: AtomicUsize,
+    rebuild_calls: AtomicUsize,
+}
+
+impl CapturingReplicationBackend {
+    fn entries(&self) -> Vec<ReplicationEntry> {
+        self.entries.lock().expect("capture lock").clone()
+    }
+}
+
+#[async_trait]
+impl SessionBackend for CapturingReplicationBackend {
+    async fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::minimal()
+    }
+
+    async fn get(&self, _key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "test backend get".into(),
+        ))
+    }
+
+    async fn compare_and_set(&self, _op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "test backend compare_and_set".into(),
+        ))
+    }
+
+    async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "test backend delete_fenced".into(),
+        ))
+    }
+
+    async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "test backend refresh_ttl".into(),
+        ))
+    }
+
+    async fn batch(&self, _ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "test backend batch".into(),
+        ))
+    }
+
+    async fn get_replication_log(
+        &self,
+        start: u64,
+        limit: usize,
+    ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        Ok(self
+            .entries()
+            .into_iter()
+            .filter(|entry| entry.sequence >= start)
+            .take(limit)
+            .collect())
+    }
+
+    async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
+        self.replicate_calls.fetch_add(1, Ordering::SeqCst);
+        self.entries.lock().expect("capture lock").push(entry);
+        Ok(())
+    }
+
+    async fn rebuild_replication_state(
+        &self,
+        entries: Vec<ReplicationEntry>,
+    ) -> Result<(), StoreError> {
+        self.rebuild_calls.fetch_add(1, Ordering::SeqCst);
+        *self.entries.lock().expect("capture lock") = entries;
+        Ok(())
+    }
+
+    async fn watch(
+        &self,
+        start_sequence: u64,
+    ) -> Result<
+        futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
+        StoreError,
+    > {
+        let entries = self
+            .entries()
+            .into_iter()
+            .filter(move |entry| entry.sequence >= start_sequence)
+            .map(Ok);
+        Ok(stream::iter(entries).boxed())
+    }
+}
+
+struct FailOnCallKeyProvider {
+    inner: Arc<MemoryKeyProvider>,
+    fail_on: usize,
+    calls: AtomicUsize,
+}
+
+impl FailOnCallKeyProvider {
+    fn new(inner: Arc<MemoryKeyProvider>, fail_on: usize) -> Self {
+        Self {
+            inner,
+            fail_on,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn fail_this_call(&self) -> bool {
+        self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_on
+    }
+}
+
+#[async_trait]
+impl KeyProvider for FailOnCallKeyProvider {
+    async fn get_active_key(
+        &self,
+        purpose: KeyPurpose,
+        tenant: &TenantId,
+    ) -> Result<KeyHandle, KeyError> {
+        if self.fail_this_call() {
+            return Err(KeyError::Unavailable);
+        }
+        self.inner.get_active_key(purpose, tenant).await
+    }
+
+    async fn get_key_by_id(&self, key_id: &KeyId) -> Result<KeyHandle, KeyError> {
+        if self.fail_this_call() {
+            return Err(KeyError::Unavailable);
+        }
+        self.inner.get_key_by_id(key_id).await
+    }
+
+    async fn rotate_key(&self, purpose: KeyPurpose, tenant: &TenantId) -> Result<KeyId, KeyError> {
+        if self.fail_this_call() {
+            return Err(KeyError::Unavailable);
+        }
+        self.inner.rotate_key(purpose, tenant).await
+    }
+}
+
+struct FailOnCallRemoteSealProvider {
+    inner: Arc<MemoryRemoteSealProvider>,
+    fail_on: usize,
+    calls: AtomicUsize,
+}
+
+impl FailOnCallRemoteSealProvider {
+    fn new(inner: Arc<MemoryRemoteSealProvider>, fail_on: usize) -> Self {
+        Self {
+            inner,
+            fail_on,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn fail_this_call(&self) -> bool {
+        self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_on
+    }
+}
+
+#[async_trait]
+impl RemoteSealProvider for FailOnCallRemoteSealProvider {
+    async fn seal(
+        &self,
+        aad: &EnvelopeAad,
+        plaintext: &[u8],
+    ) -> Result<EncryptedPayload, KeyError> {
+        if self.fail_this_call() {
+            return Err(KeyError::Unavailable);
+        }
+        self.inner.seal(aad, plaintext).await
+    }
+
+    async fn unseal(
+        &self,
+        aad: &EnvelopeAad,
+        ciphertext_and_tag: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+        if self.fail_this_call() {
+            return Err(KeyError::Unavailable);
+        }
+        self.inner.unseal(aad, ciphertext_and_tag).await
+    }
+}
+
+fn assert_nested_entry_protected(
+    original: &ReplicationEntry,
+    protected: &ReplicationEntry,
+    algorithm: opc_key::AeadAlgorithm,
+) {
+    assert_eq!(protected.sequence, original.sequence);
+    assert_eq!(protected.tx_id, original.tx_id);
+    assert_eq!(protected.timestamp, original.timestamp);
+
+    let original_records = replication_cas_records(&original.op);
+    let protected_records = replication_cas_records(&protected.op);
+    assert_eq!(protected_records.len(), original_records.len());
+
+    for (original_record, protected_record) in original_records.into_iter().zip(protected_records) {
+        assert_eq!(
+            protected_record.payload.encoding(),
+            SessionPayloadEncoding::EnvelopeV1
+        );
+        assert_ne!(
+            protected_record.payload.as_bytes(),
+            original_record.payload.as_bytes()
+        );
+        let envelope = CryptoEnvelopeV1::decode(protected_record.payload.as_bytes())
+            .expect("protected nested payload envelope");
+        assert_eq!(envelope.algorithm, algorithm);
+
+        let mut normalized = protected_record.clone();
+        normalized.payload = original_record.payload.clone();
+        assert_eq!(&normalized, original_record);
+    }
+}
+
+fn corrupt_nth_nested_cas(op: &mut ReplicationOp, target: usize, canary: &'static [u8]) {
+    let mut pending = vec![op];
+    let mut seen = 0_usize;
+    while let Some(op) = pending.pop() {
+        match op {
+            ReplicationOp::CompareAndSet { new_record, .. } => {
+                seen += 1;
+                if seen == target {
+                    new_record.payload = EncryptedSessionPayload::envelope(canary);
+                    return;
+                }
+            }
+            ReplicationOp::Batch { ops } => pending.extend(ops.iter_mut().rev()),
+            ReplicationOp::DeleteFenced { .. }
+            | ReplicationOp::RefreshTtl { .. }
+            | ReplicationOp::AcquireLease { .. }
+            | ReplicationOp::RenewLease { .. }
+            | ReplicationOp::ReleaseLease { .. } => {}
+        }
+    }
+    panic!("test fixture did not contain requested nested CAS");
+}
+
+async fn collect_watch_entries<B: SessionBackend + ?Sized>(
+    backend: &B,
+    start_sequence: u64,
+    expected: usize,
+) -> Vec<ReplicationEntry> {
+    let mut watch = backend.watch(start_sequence).await.expect("watch");
+    let mut entries = Vec::with_capacity(expected);
+    for _ in 0..expected {
+        entries.push(
+            watch
+                .next()
+                .await
+                .expect("watch entry")
+                .expect("valid watch entry"),
+        );
+    }
+    entries
+}
+
+#[tokio::test]
+async fn encrypting_wrapper_protects_every_nested_cas_across_replication_paths() {
+    let inner = Arc::new(CapturingReplicationBackend::default());
+    let backend = EncryptingSessionBackend::new(
+        Arc::clone(&inner),
+        test_provider(),
+        "recursive-local-boundary",
+    );
+    let first = nested_replication_entry(1, "local-first-canary");
+    let second = nested_replication_entry(2, "local-second-canary");
+
+    backend
+        .replicate_entry(first.clone())
+        .await
+        .expect("replicate nested entry");
+    let captured = inner.entries();
+    assert_eq!(inner.replicate_calls.load(Ordering::SeqCst), 1);
+    assert_nested_entry_protected(&first, &captured[0], opc_key::AeadAlgorithm::Aes256GcmSiv);
+    assert_eq!(
+        backend
+            .get_replication_log(1, 1)
+            .await
+            .expect("decrypted log"),
+        vec![first.clone()]
+    );
+    assert_eq!(
+        collect_watch_entries(&backend, 1, 1).await,
+        vec![first.clone()]
+    );
+
+    let expected = vec![first, second];
+    backend
+        .rebuild_replication_state(expected.clone())
+        .await
+        .expect("rebuild nested entries");
+    assert_eq!(inner.rebuild_calls.load(Ordering::SeqCst), 1);
+    let captured = inner.entries();
+    for (original, protected) in expected.iter().zip(&captured) {
+        assert_nested_entry_protected(original, protected, opc_key::AeadAlgorithm::Aes256GcmSiv);
+    }
+    assert_eq!(
+        backend
+            .get_replication_log(1, expected.len())
+            .await
+            .expect("decrypted rebuilt log"),
+        expected
+    );
+    assert_eq!(collect_watch_entries(&backend, 1, 2).await, expected);
+}
+
+#[tokio::test]
+async fn remote_sealing_wrapper_protects_every_nested_cas_across_replication_paths() {
+    let inner = Arc::new(CapturingReplicationBackend::default());
+    let backend = RemoteSealingSessionBackend::new(
+        Arc::clone(&inner),
+        test_remote_seal_provider(),
+        "recursive-remote-boundary",
+    );
+    let first = nested_replication_entry(1, "remote-first-canary");
+    let second = nested_replication_entry(2, "remote-second-canary");
+
+    backend
+        .replicate_entry(first.clone())
+        .await
+        .expect("replicate nested entry");
+    let captured = inner.entries();
+    assert_eq!(inner.replicate_calls.load(Ordering::SeqCst), 1);
+    assert_nested_entry_protected(&first, &captured[0], opc_key::AeadAlgorithm::RemoteSeal);
+    assert_eq!(
+        backend
+            .get_replication_log(1, 1)
+            .await
+            .expect("unsealed log"),
+        vec![first.clone()]
+    );
+    assert_eq!(
+        collect_watch_entries(&backend, 1, 1).await,
+        vec![first.clone()]
+    );
+
+    let expected = vec![first, second];
+    backend
+        .rebuild_replication_state(expected.clone())
+        .await
+        .expect("rebuild nested entries");
+    assert_eq!(inner.rebuild_calls.load(Ordering::SeqCst), 1);
+    let captured = inner.entries();
+    for (original, protected) in expected.iter().zip(&captured) {
+        assert_nested_entry_protected(original, protected, opc_key::AeadAlgorithm::RemoteSeal);
+    }
+    assert_eq!(
+        backend
+            .get_replication_log(1, expected.len())
+            .await
+            .expect("unsealed rebuilt log"),
+        expected
+    );
+    assert_eq!(collect_watch_entries(&backend, 1, 2).await, expected);
+}
+
+#[tokio::test]
+async fn both_wrappers_transform_cas_at_the_exact_depth_and_count_limits() {
+    let mut expected = (1..=MAX_REPLICATION_OPERATION_DEPTH)
+        .map(|depth| {
+            boundary_depth_entry(
+                u64::try_from(depth).expect("test depth fits u64"),
+                depth,
+                &format!("depth-{depth}-canary"),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected.push(boundary_count_entry(
+        u64::try_from(expected.len() + 1).expect("test sequence fits u64"),
+        MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+        "exact-count-canary",
+    ));
+
+    let local_inner = Arc::new(CapturingReplicationBackend::default());
+    let local = EncryptingSessionBackend::new(
+        Arc::clone(&local_inner),
+        test_provider(),
+        "exact-local-boundary",
+    );
+    local
+        .rebuild_replication_state(expected.clone())
+        .await
+        .expect("local wrapper accepts exact structural limits");
+    for (original, protected) in expected.iter().zip(local_inner.entries()) {
+        assert_nested_entry_protected(original, &protected, opc_key::AeadAlgorithm::Aes256GcmSiv);
+    }
+    assert_eq!(
+        local
+            .get_replication_log(1, expected.len())
+            .await
+            .expect("local exact-limit round trip"),
+        expected
+    );
+
+    let remote_inner = Arc::new(CapturingReplicationBackend::default());
+    let remote = RemoteSealingSessionBackend::new(
+        Arc::clone(&remote_inner),
+        test_remote_seal_provider(),
+        "exact-remote-boundary",
+    );
+    remote
+        .rebuild_replication_state(expected.clone())
+        .await
+        .expect("remote wrapper accepts exact structural limits");
+    for (original, protected) in expected.iter().zip(remote_inner.entries()) {
+        assert_nested_entry_protected(original, &protected, opc_key::AeadAlgorithm::RemoteSeal);
+    }
+    assert_eq!(
+        remote
+            .get_replication_log(1, expected.len())
+            .await
+            .expect("remote exact-limit round trip"),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn encrypting_wrapper_rejects_structure_limits_before_provider_or_backend_effects() {
+    let returned = boundary_depth_entry(
+        1,
+        MAX_REPLICATION_OPERATION_DEPTH + 1,
+        "local-returned-over-depth",
+    );
+    let provider = Arc::new(CountingKeyProvider::new(test_provider()));
+    let inner = Arc::new(ReplicationBoundarySpy::returning(vec![returned]));
+    let backend = EncryptingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+        "local-structure-rejection",
+    );
+
+    let error = backend
+        .replicate_entry(boundary_depth_entry(
+            1,
+            MAX_REPLICATION_OPERATION_DEPTH + 1,
+            "local-input-over-depth",
+        ))
+        .await
+        .expect_err("over-depth replicate must fail before encryption");
+    assert_eq!(error, StoreError::ReplicationOperationLimitExceeded);
+    let error = backend
+        .rebuild_replication_state(vec![
+            boundary_depth_entry(1, MAX_REPLICATION_OPERATION_DEPTH, "local-prefix-valid"),
+            boundary_count_entry(
+                2,
+                MAX_REPLICATION_OPERATIONS_PER_ENTRY + 1,
+                "local-prefix-over-count",
+            ),
+        ])
+        .await
+        .expect_err("whole over-count prefix must fail before encryption");
+    assert_eq!(error, StoreError::ReplicationOperationLimitExceeded);
+    let error = backend
+        .get_replication_log(1, 1)
+        .await
+        .expect_err("over-depth returned log must fail before decryption");
+    assert_eq!(error, StoreError::ReplicationOperationLimitExceeded);
+    assert_eq!(provider.calls(), 0);
+    assert_eq!(inner.replicate_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(inner.rebuild_calls.load(Ordering::SeqCst), 0);
+
+    let watch_inner = Arc::new(CapturingReplicationBackend::default());
+    watch_inner
+        .entries
+        .lock()
+        .expect("capture lock")
+        .push(boundary_count_entry(
+            1,
+            MAX_REPLICATION_OPERATIONS_PER_ENTRY + 1,
+            "local-watch-over-count",
+        ));
+    let watch_backend = EncryptingSessionBackend::new(
+        watch_inner,
+        Arc::clone(&provider),
+        "local-watch-structure-rejection",
+    );
+    let mut watch = watch_backend.watch(1).await.expect("watch");
+    assert_eq!(
+        watch.next().await.expect("watch item"),
+        Err(StoreError::ReplicationOperationLimitExceeded)
+    );
+    assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn remote_wrapper_rejects_structure_limits_before_provider_or_backend_effects() {
+    let returned = boundary_depth_entry(
+        1,
+        MAX_REPLICATION_OPERATION_DEPTH + 1,
+        "remote-returned-over-depth",
+    );
+    let provider = Arc::new(CountingRemoteSealProvider::new(test_remote_seal_provider()));
+    let inner = Arc::new(ReplicationBoundarySpy::returning(vec![returned]));
+    let backend = RemoteSealingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+        "remote-structure-rejection",
+    );
+
+    let error = backend
+        .replicate_entry(boundary_depth_entry(
+            1,
+            MAX_REPLICATION_OPERATION_DEPTH + 1,
+            "remote-input-over-depth",
+        ))
+        .await
+        .expect_err("over-depth replicate must fail before sealing");
+    assert_eq!(error, StoreError::ReplicationOperationLimitExceeded);
+    let error = backend
+        .rebuild_replication_state(vec![
+            boundary_depth_entry(1, MAX_REPLICATION_OPERATION_DEPTH, "remote-prefix-valid"),
+            boundary_count_entry(
+                2,
+                MAX_REPLICATION_OPERATIONS_PER_ENTRY + 1,
+                "remote-prefix-over-count",
+            ),
+        ])
+        .await
+        .expect_err("whole over-count prefix must fail before sealing");
+    assert_eq!(error, StoreError::ReplicationOperationLimitExceeded);
+    let error = backend
+        .get_replication_log(1, 1)
+        .await
+        .expect_err("over-depth returned log must fail before unsealing");
+    assert_eq!(error, StoreError::ReplicationOperationLimitExceeded);
+    assert_eq!(provider.calls(), 0);
+    assert_eq!(inner.replicate_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(inner.rebuild_calls.load(Ordering::SeqCst), 0);
+
+    let watch_inner = Arc::new(CapturingReplicationBackend::default());
+    watch_inner
+        .entries
+        .lock()
+        .expect("capture lock")
+        .push(boundary_count_entry(
+            1,
+            MAX_REPLICATION_OPERATIONS_PER_ENTRY + 1,
+            "remote-watch-over-count",
+        ));
+    let watch_backend = RemoteSealingSessionBackend::new(
+        watch_inner,
+        Arc::clone(&provider),
+        "remote-watch-structure-rejection",
+    );
+    let mut watch = watch_backend.watch(1).await.expect("watch");
+    assert_eq!(
+        watch.next().await.expect("watch item"),
+        Err(StoreError::ReplicationOperationLimitExceeded)
+    );
+    assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn late_local_provider_failure_never_delegates_nested_replication() {
+    let inner = Arc::new(CapturingReplicationBackend::default());
+    let provider = Arc::new(FailOnCallKeyProvider::new(test_provider(), 3));
+    let backend = EncryptingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+        "late-local-failure",
+    );
+    let error = backend
+        .replicate_entry(nested_replication_entry(1, "local-late-secret-canary"))
+        .await
+        .expect_err("third nested CAS must fail");
+    assert!(matches!(error, StoreError::Crypto(_)));
+    assert_eq!(provider.calls(), 3);
+    assert_eq!(inner.replicate_calls.load(Ordering::SeqCst), 0);
+    assert!(inner.entries().is_empty());
+    let rendered = format!("{error} {error:?}");
+    assert!(!rendered.contains("local-late-secret-canary"));
+
+    let inner = Arc::new(CapturingReplicationBackend::default());
+    let provider = Arc::new(FailOnCallKeyProvider::new(test_provider(), 4));
+    let backend = EncryptingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+        "late-local-rebuild-failure",
+    );
+    let error = backend
+        .rebuild_replication_state(vec![
+            test_replication_entry(1, "local-rebuild-first"),
+            nested_replication_entry(2, "local-rebuild-secret-canary"),
+        ])
+        .await
+        .expect_err("final nested CAS must fail rebuild staging");
+    assert!(matches!(error, StoreError::Crypto(_)));
+    assert_eq!(provider.calls(), 4);
+    assert_eq!(inner.rebuild_calls.load(Ordering::SeqCst), 0);
+    assert!(inner.entries().is_empty());
+    let rendered = format!("{error} {error:?}");
+    assert!(!rendered.contains("local-rebuild-secret-canary"));
+}
+
+#[tokio::test]
+async fn late_remote_provider_failure_never_delegates_nested_replication() {
+    let inner = Arc::new(CapturingReplicationBackend::default());
+    let provider = Arc::new(FailOnCallRemoteSealProvider::new(
+        test_remote_seal_provider(),
+        3,
+    ));
+    let backend = RemoteSealingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+        "late-remote-failure",
+    );
+    let error = backend
+        .replicate_entry(nested_replication_entry(1, "remote-late-secret-canary"))
+        .await
+        .expect_err("third nested CAS must fail");
+    assert!(matches!(error, StoreError::Crypto(_)));
+    assert_eq!(provider.calls(), 3);
+    assert_eq!(inner.replicate_calls.load(Ordering::SeqCst), 0);
+    assert!(inner.entries().is_empty());
+    let rendered = format!("{error} {error:?}");
+    assert!(!rendered.contains("remote-late-secret-canary"));
+
+    let inner = Arc::new(CapturingReplicationBackend::default());
+    let provider = Arc::new(FailOnCallRemoteSealProvider::new(
+        test_remote_seal_provider(),
+        4,
+    ));
+    let backend = RemoteSealingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+        "late-remote-rebuild-failure",
+    );
+    let error = backend
+        .rebuild_replication_state(vec![
+            test_replication_entry(1, "remote-rebuild-first"),
+            nested_replication_entry(2, "remote-rebuild-secret-canary"),
+        ])
+        .await
+        .expect_err("final nested CAS must fail rebuild staging");
+    assert!(matches!(error, StoreError::Crypto(_)));
+    assert_eq!(provider.calls(), 4);
+    assert_eq!(inner.rebuild_calls.load(Ordering::SeqCst), 0);
+    assert!(inner.entries().is_empty());
+    let rendered = format!("{error} {error:?}");
+    assert!(!rendered.contains("remote-rebuild-secret-canary"));
+}
+
+#[tokio::test]
+async fn nested_read_failure_never_returns_partially_unprotected_entries() {
+    let local_inner = Arc::new(CapturingReplicationBackend::default());
+    let local = EncryptingSessionBackend::new(
+        Arc::clone(&local_inner),
+        test_provider(),
+        "local-read-failure",
+    );
+    local
+        .replicate_entry(nested_replication_entry(1, "local-read-secret-canary"))
+        .await
+        .expect("seed protected local entry");
+    corrupt_nth_nested_cas(
+        &mut local_inner.entries.lock().expect("capture lock")[0].op,
+        3,
+        b"local-corrupt-envelope-canary",
+    );
+    let error = local
+        .get_replication_log(1, 1)
+        .await
+        .expect_err("late corrupt local CAS must reject whole page");
+    assert!(matches!(error, StoreError::Crypto(_)));
+    assert!(!format!("{error} {error:?}").contains("local-corrupt-envelope-canary"));
+    let mut watch = local.watch(1).await.expect("local watch");
+    assert!(matches!(
+        watch.next().await.expect("local watch item"),
+        Err(StoreError::Crypto(_))
+    ));
+
+    let remote_inner = Arc::new(CapturingReplicationBackend::default());
+    let remote = RemoteSealingSessionBackend::new(
+        Arc::clone(&remote_inner),
+        test_remote_seal_provider(),
+        "remote-read-failure",
+    );
+    remote
+        .replicate_entry(nested_replication_entry(1, "remote-read-secret-canary"))
+        .await
+        .expect("seed protected remote entry");
+    corrupt_nth_nested_cas(
+        &mut remote_inner.entries.lock().expect("capture lock")[0].op,
+        3,
+        b"remote-corrupt-envelope-canary",
+    );
+    let error = remote
+        .get_replication_log(1, 1)
+        .await
+        .expect_err("late corrupt remote CAS must reject whole page");
+    assert!(matches!(error, StoreError::Crypto(_)));
+    assert!(!format!("{error} {error:?}").contains("remote-corrupt-envelope-canary"));
+    let mut watch = remote.watch(1).await.expect("remote watch");
+    assert!(matches!(
+        watch.next().await.expect("remote watch item"),
+        Err(StoreError::Crypto(_))
+    ));
 }
 
 struct BarrierKeyProvider {

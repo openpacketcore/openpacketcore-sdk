@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use futures_util::{stream::BoxStream, StreamExt};
 
 use crate::backend::{
-    validate_replication_page, validate_replication_prefix, validate_session_ops_ttls,
+    validate_replication_page_owned, validate_replication_prefix_owned, validate_session_ops_ttls,
     BackendInstanceIdentity, BackendPeerBinding, CompareAndSet, CompareAndSetResult,
     ReplicationEntry, SessionBackend, SessionOp, SessionOpResult,
 };
@@ -155,13 +155,11 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
-        let entries = self.backend.get_replication_log(start, limit).await?;
-        validate_replication_page(&entries)?;
-        Ok(entries)
+        validate_replication_page_owned(self.backend.get_replication_log(start, limit).await?)
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate()?;
+        let entry = entry.into_validated()?;
         self.backend.replicate_entry(entry).await
     }
 
@@ -169,7 +167,7 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         &self,
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
-        validate_replication_prefix(&entries)?;
+        let entries = validate_replication_prefix_owned(entries)?;
         self.backend.rebuild_replication_state(entries).await
     }
 
@@ -179,12 +177,7 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
     ) -> Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError> {
         let stream = self.backend.watch(start_sequence).await?;
         Ok(stream
-            .map(|result| {
-                result.and_then(|entry| {
-                    entry.validate()?;
-                    Ok(entry)
-                })
-            })
+            .map(|result| result.and_then(ReplicationEntry::into_validated))
             .boxed())
     }
 

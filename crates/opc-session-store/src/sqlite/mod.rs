@@ -18,9 +18,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
     backend::{
-        validate_replication_page, validate_replication_prefix, validate_session_ops_ttls,
-        BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry,
-        SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
+        validate_replication_page_owned, validate_replication_prefix_owned,
+        validate_session_ops_ttls, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
+        ReplicationEntry, SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
     },
     capability::BackendCapabilities,
     clock::Clock,
@@ -425,18 +425,17 @@ impl SessionBackend for SqliteSessionBackend {
             let stored_sequence = replication::stored_replication_sequence(stored_sequence)?;
             let entry: ReplicationEntry = serde_json::from_str(&json)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            entry.validate()?;
+            let entry = entry.into_validated()?;
             if entry.sequence != stored_sequence {
                 return Err(StoreError::InvalidReplicationSequence);
             }
             res.push(entry);
         }
-        validate_replication_page(&res)?;
-        Ok(res)
+        validate_replication_page_owned(res)
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate()?;
+        let entry = entry.into_validated()?;
         let should_notify = {
             let conn = self.conn.lock().await;
             let now = self.clock.now_utc();
@@ -455,7 +454,7 @@ impl SessionBackend for SqliteSessionBackend {
         &self,
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
-        validate_replication_prefix(&entries)?;
+        let entries = validate_replication_prefix_owned(entries)?;
         let conn = self.conn.lock().await;
         replication::rebuild_replication_state_sync(&conn, &entries, &self.caps)
     }

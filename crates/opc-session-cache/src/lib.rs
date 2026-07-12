@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use opc_session_store::{
-    next_replication_sequence, validate_replication_page, validate_replication_prefix,
+    next_replication_sequence, validate_replication_page_owned, validate_replication_prefix_owned,
     validate_session_ttl, BackendCapabilities, BackendInstanceIdentity, BackendPeerBinding,
     CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend,
     SessionKey, SessionOp, SessionOpResult, StoreError, StoredSessionRecord,
@@ -350,16 +350,19 @@ impl SessionCache {
                     res = watch_stream.next() => {
                     match res {
                         Some(Ok(entry)) => {
-                            if let Err(err) = entry.validate() {
-                                warn!(
-                                    "Invalid replication watch entry. Triggering resync: {}",
-                                    store_error_kind(&err)
-                                );
-                                watch_error_count.fetch_add(1, Ordering::Relaxed);
-                                watch_ready.store(false, Ordering::Release);
-                                should_resync = true;
-                                break;
-                            }
+                            let entry = match entry.into_validated() {
+                                Ok(entry) => entry,
+                                Err(err) => {
+                                    warn!(
+                                        "Invalid replication watch entry. Triggering resync: {}",
+                                        store_error_kind(&err)
+                                    );
+                                    watch_error_count.fetch_add(1, Ordering::Relaxed);
+                                    watch_ready.store(false, Ordering::Release);
+                                    should_resync = true;
+                                    break;
+                                }
+                            };
                             let entry_seq = entry.sequence;
                             let current_last = last_sequence.load(Ordering::Acquire);
 
@@ -580,12 +583,11 @@ impl SessionBackend for SessionCache {
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
         let entries = self.backend.get_replication_log(start, limit).await?;
-        validate_replication_page(&entries)?;
-        Ok(entries)
+        validate_replication_page_owned(entries)
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate()?;
+        let entry = entry.into_validated()?;
         self.invalidate_replication_op(&entry.op).await;
         let result = self.backend.replicate_entry(entry.clone()).await;
         if result.is_ok() {
@@ -598,7 +600,7 @@ impl SessionBackend for SessionCache {
         &self,
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
-        validate_replication_prefix(&entries)?;
+        let entries = validate_replication_prefix_owned(entries)?;
         self.clear().await;
         let result = self.backend.rebuild_replication_state(entries).await;
         self.clear().await;
@@ -615,12 +617,7 @@ impl SessionBackend for SessionCache {
         let stream = self.backend.watch(start_sequence).await?;
         use futures_util::StreamExt;
         Ok(stream
-            .map(|result| {
-                result.and_then(|entry| {
-                    entry.validate()?;
-                    Ok(entry)
-                })
-            })
+            .map(|result| result.and_then(ReplicationEntry::into_validated))
             .boxed())
     }
 
@@ -681,6 +678,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::BackendUnavailable(_) => "backend_unavailable",
         StoreError::InvalidKey(_) => "invalid_key",
         StoreError::InvalidReplicationSequence => "invalid_replication_sequence",
+        StoreError::ReplicationOperationLimitExceeded => "replication_operation_limit_exceeded",
         StoreError::InvalidSessionTtl => "invalid_session_ttl",
         StoreError::LeaseHeld => "lease_held",
         StoreError::LeaseExpired => "lease_expired",
@@ -702,7 +700,8 @@ mod tests {
     use futures_util::{stream, StreamExt};
     use opc_session_store::{
         EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation, OwnerId,
-        SessionKeyType, SessionLeaseManager, StateClass, StateType, MAX_SESSION_TTL,
+        SessionKeyType, SessionLeaseManager, StateClass, StateType,
+        MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH, MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
     use std::sync::atomic::Ordering;
@@ -900,6 +899,46 @@ mod tests {
                 expires_at: timestamp,
             },
             timestamp,
+        }
+    }
+
+    fn delete_op(key: SessionKey) -> ReplicationOp {
+        ReplicationOp::DeleteFenced {
+            key,
+            owner: OwnerId::new("owner-a").expect("owner"),
+            fence: FenceToken::new(1),
+        }
+    }
+
+    fn operation_tree_at_depth(depth: usize, key: SessionKey) -> ReplicationOp {
+        let mut op = delete_op(key);
+        for _ in 1..depth {
+            op = ReplicationOp::Batch { ops: vec![op] };
+        }
+        op
+    }
+
+    fn over_depth_entry(sequence: u64, key: SessionKey) -> ReplicationEntry {
+        ReplicationEntry {
+            sequence,
+            tx_id: format!("over-depth-{sequence}"),
+            op: operation_tree_at_depth(MAX_REPLICATION_OPERATION_DEPTH + 1, key),
+            timestamp: Timestamp::now_utc(),
+        }
+    }
+
+    fn over_count_entry(sequence: u64, key: SessionKey) -> ReplicationEntry {
+        let mut ops = Vec::with_capacity(MAX_REPLICATION_OPERATIONS_PER_ENTRY);
+        ops.push(delete_op(key));
+        ops.extend(
+            (1..MAX_REPLICATION_OPERATIONS_PER_ENTRY)
+                .map(|_| ReplicationOp::Batch { ops: Vec::new() }),
+        );
+        ReplicationEntry {
+            sequence,
+            tx_id: format!("over-count-{sequence}"),
+            op: ReplicationOp::Batch { ops },
+            timestamp: Timestamp::now_utc(),
         }
     }
 
@@ -1107,6 +1146,146 @@ mod tests {
         assert_eq!(error, StoreError::InvalidSessionTtl);
         assert_eq!(backend.replicate_calls.load(Ordering::Relaxed), 0);
         assert_eq!(cache.cache.read().await.get(&key), Some(&record));
+    }
+
+    #[tokio::test]
+    async fn operation_limits_are_rejected_before_invalidation_clear_or_delegation() {
+        let backend = idle_scripted_backend(0);
+        let cache = cache_without_watch(backend.clone());
+        let key = test_key();
+        let record = test_record(key.clone(), 1);
+        cache
+            .cache
+            .write()
+            .await
+            .insert(key.clone(), record.clone());
+
+        let replicate_error = cache
+            .replicate_entry(over_depth_entry(1, key.clone()))
+            .await
+            .expect_err("an over-depth entry must be rejected");
+        assert_eq!(
+            replicate_error,
+            StoreError::ReplicationOperationLimitExceeded
+        );
+        assert_eq!(backend.replicate_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.cache.read().await.get(&key), Some(&record));
+
+        let rebuild_error = cache
+            .rebuild_replication_state(vec![over_count_entry(1, key.clone())])
+            .await
+            .expect_err("an over-count rebuild must be rejected");
+        assert_eq!(rebuild_error, StoreError::ReplicationOperationLimitExceeded);
+        assert_eq!(backend.rebuild_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.cache.read().await.get(&key), Some(&record));
+    }
+
+    #[tokio::test]
+    async fn operation_limits_are_not_exposed_by_log_or_public_watch() {
+        let backend = idle_scripted_backend(0);
+        let cache = cache_without_watch(backend.clone());
+        let key = test_key();
+        backend
+            .log_entries
+            .lock()
+            .await
+            .push(over_depth_entry(1, key.clone()));
+
+        let log_error = match cache.get_replication_log(1, 1).await {
+            Err(error) => error,
+            Ok(entries) => {
+                drop(validate_replication_page_owned(entries));
+                panic!("an over-depth log entry must not be exposed")
+            }
+        };
+        assert_eq!(log_error, StoreError::ReplicationOperationLimitExceeded);
+        let retained_entries = std::mem::take(&mut *backend.log_entries.lock().await);
+        drop(validate_replication_page_owned(retained_entries));
+
+        let (entry_tx, entry_rx) = mpsc::unbounded_channel();
+        let (yielded_tx, _yielded_rx) = mpsc::unbounded_channel();
+        let watch_backend = Arc::new(ScriptedWatchBackend {
+            max_sequence: AtomicU64::new(0),
+            watch_rx: Mutex::new(Some(entry_rx)),
+            yielded_tx,
+            watch_calls: AtomicU64::new(0),
+            refresh_calls: AtomicU64::new(0),
+            batch_calls: AtomicU64::new(0),
+            log_entries: Mutex::new(Vec::new()),
+            replicate_calls: AtomicU64::new(0),
+            rebuild_calls: AtomicU64::new(0),
+        });
+        let watch_cache = cache_without_watch(watch_backend);
+        let mut stream = watch_cache.watch(1).await.expect("watch stream");
+        entry_tx
+            .send(Ok(over_count_entry(1, key)))
+            .expect("send over-count watch entry");
+
+        let item = stream.next().await.expect("watch item");
+        let watch_error = match item {
+            Err(error) => error,
+            Ok(entry) => {
+                drop(entry.into_validated());
+                panic!("an over-count watch entry must not be exposed")
+            }
+        };
+        assert_eq!(watch_error, StoreError::ReplicationOperationLimitExceeded);
+    }
+
+    #[tokio::test]
+    async fn background_watch_rejects_operation_limit_before_touching_cached_state() {
+        let key = test_key();
+        let record = test_record(key.clone(), 1);
+        let cache = Arc::new(RwLock::new(HashMap::from([(key.clone(), record.clone())])));
+        let last_sequence = Arc::new(AtomicU64::new(0));
+        let watch_ready = Arc::new(AtomicBool::new(false));
+        let is_syncing = Arc::new(AtomicBool::new(false));
+        let watch_error_count = Arc::new(AtomicU64::new(0));
+        let (_resync_tx, resync_rx) = mpsc::unbounded_channel();
+        let (entry_tx, entry_rx) = mpsc::unbounded_channel();
+        let (yielded_tx, mut yielded_rx) = mpsc::unbounded_channel();
+        let backend = Arc::new(ScriptedWatchBackend {
+            max_sequence: AtomicU64::new(0),
+            watch_rx: Mutex::new(Some(entry_rx)),
+            yielded_tx,
+            watch_calls: AtomicU64::new(0),
+            refresh_calls: AtomicU64::new(0),
+            batch_calls: AtomicU64::new(0),
+            log_entries: Mutex::new(Vec::new()),
+            replicate_calls: AtomicU64::new(0),
+            rebuild_calls: AtomicU64::new(0),
+        });
+
+        let handle = tokio::spawn(SessionCache::run_watch_loop(
+            backend.clone(),
+            cache.clone(),
+            last_sequence.clone(),
+            watch_ready.clone(),
+            resync_rx,
+            is_syncing,
+            watch_error_count.clone(),
+        ));
+        wait_until_watch_ready(&watch_ready).await;
+
+        let read_guard = cache.read().await;
+        backend.max_sequence.store(1, Ordering::Release);
+        entry_tx
+            .send(Ok(over_depth_entry(1, key.clone())))
+            .expect("send over-depth watch entry");
+        yielded_rx.recv().await.expect("watch entry yielded");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while watch_error_count.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("operation limit must be observed before waiting for the cache write lock");
+
+        assert_eq!(last_sequence.load(Ordering::Acquire), 0);
+        assert_eq!(read_guard.get(&key), Some(&record));
+        assert!(!watch_ready.load(Ordering::Acquire));
+        handle.abort();
+        drop(read_guard);
     }
 
     #[tokio::test]

@@ -21,6 +21,14 @@ evidence.
 - `ReplicationEntry::validate_sequence`, `validate_replication_prefix`,
   `validate_replication_page`, and `next_replication_sequence` define the
   checked 1-based log-position contract shared by adapters and consumers.
+- `ReplicationEntry::into_validated`, `validate_replication_prefix_owned`, and
+  `validate_replication_page_owned` consume caller-owned values and dismantle a
+  rejected operation tree iteratively, avoiding recursive-drop exposure on the
+  error path.
+- `MAX_REPLICATION_OPERATION_DEPTH` (16) and
+  `MAX_REPLICATION_OPERATIONS_PER_ENTRY` (256) bound every replication
+  operation tree. The root is depth 1, and every operation node, including
+  each `Batch`, counts toward the per-entry total.
 - `MAX_SESSION_TTL` (365 days), `validate_session_ttl`, and
   `checked_session_deadline` define the common checked TTL/deadline contract.
 - `SessionKey`, `SessionKeyType`, `StateClass`, `StateType`, `Generation`,
@@ -216,8 +224,9 @@ This is a compatibility boundary. The two public error enums gain new variants,
 and those variants can appear in protocol-v3 error responses. External
 exhaustive matches must add arms, and a session-net fleet must be upgraded as
 one coordinated same-v3 compatibility unit before relying on the typed wire
-error; valid v3 requests and responses are unchanged. Before upgrading a store
-created by an older SDK, audit its persisted replication log for TTL-bearing
+error. For the TTL change alone, requests within the operation-tree contract
+retain their v3 shape. Before upgrading a store created by an older SDK, audit
+its persisted replication log for TTL-bearing
 operations above 365 days. Such legacy entries now fail closed during replay or
 rebuild; the SDK does not silently clamp or rewrite them. Replicated
 absolute-deadline validation permits at most one microsecond above the exact
@@ -232,8 +241,70 @@ for the networked production profile remains a qualification requirement in
 
 The duration contract does not yet bound a caller-authored absolute
 `StoredSessionRecord::expires_at`; that separate admission/migration invariant
-is tracked by #148. Deeply nested replicated CAS payload transformation through
-the encryption/sealing wrappers is tracked by #147.
+is tracked by #148.
+
+### Bounded protected replication trees
+
+Every `ReplicationEntry` is validated iteratively against the public depth and
+count limits above. A root operation is at depth 1; each child is one level
+deeper. Every node counts once, whether it is a `Batch`, `CompareAndSet`, or any
+other `ReplicationOp`. An empty root `Batch` therefore has depth 1 and count 1;
+the deepest permitted node is at depth 16, and an entry may contain at most 256
+nodes. A violation returns the fieldless, redaction-safe
+`StoreError::ReplicationOperationLimitExceeded` without reporting the observed
+shape or values.
+
+Validation of an outbound entry or complete rebuild prefix finishes before
+payload transformation, provider work, or backend delegation. Validation of a
+complete returned page or watch item finishes before read-side transformation
+or caller exposure; the backend has necessarily already produced that read.
+Post-decode traversal and tree reassembly are iterative, and rejected owned
+trees are dismantled iteratively, so accepted transformation and consuming
+rejection do not recurse through the operation tree. Pre-allocation wire
+decoding still depends on the current frame/serde recursion guards; #134 must
+move the same limits into versioned DTO decoding before this becomes a complete
+wire-decoder work bound.
+`EncryptingSessionBackend` and `RemoteSealingSessionBackend` then transform
+every nested `CompareAndSet` record: replicate/rebuild paths encrypt or seal
+before backend delegation, while replication-log and watch paths decrypt or
+unseal before caller exposure. Non-payload fields and operation order are
+preserved exactly.
+
+Provider calls are sequential. A write-side transformation is staged in full,
+so a failure at a late nested CAS causes no backend delegation or mutation;
+earlier provider calls may already have occurred. A read-side page or watch
+item is likewise exposed only after its complete operation tree has been
+successfully transformed. Failure returns an error instead of a partially
+decrypted/unsealed entry or page, although earlier provider calls—and earlier,
+separate watch items already yielded by the stream—may have occurred.
+
+This changes the confidentiality contract without changing the protocol-v3
+number. `StoreError` gains a serialized public variant, so exhaustive matches
+must add an arm and an older v3 peer cannot decode the new error. More
+importantly, an older wrapper does not protect deeply nested CAS records; a
+mixed old/new v3 fleet is therefore not confidentiality-safe. Upgrade every
+session-net client, server, and protection-wrapper participant as one
+coordinated fleet. Do not claim rolling compatibility. #134 must carry these
+limits and the error encoding into the versioned fixed-width DTO and handshake
+contract.
+
+The SDK does not discover or scrub historical nested plaintext automatically.
+Before upgrading, perform an offline audit of both operation-tree shape and
+payload encoding without logging payloads. An entry already within the 16/256
+limits whose nested CAS crossed a protection boundary as plaintext/unsealed may
+be explicitly rewritten or rebuilt through the configured encryption/sealing
+wrapper. A historical over-limit entry is rejected before wrapper
+transformation and cannot use that path unchanged; it is never clamped or split
+automatically. Replace the store under the product's audited recovery procedure,
+or use a separately reviewed offline migrator that preserves the original
+atomic semantics before the new SDK reads the log. Calling a raw inner-backend
+rebuild does not add protection.
+
+This closes #147's nested-wrapper traversal gap only. The networked profile
+remains experimental and blocked on #143 and its other dependencies. Seamless
+SVID rotation, payload-protection key rotation, and trust-bundle rotation
+remain separate mandatory production qualifications; the operation-tree limits
+do not provide rotation evidence.
 
 ## Relationships
 
@@ -283,6 +354,9 @@ the encryption/sealing wrappers is tracked by #147.
   the oversized-duration panic and input-safety boundary only; it does not
   establish consensus, durable commit authority, fork recovery, or production
   networked HA.
+- Nested replicated CAS payloads are protected under the bounded iterative
+  contract above. This is confidentiality and input-boundary hardening, not
+  consensus, durable authority, wire stabilization, or production HA.
 
 ## Roadmap
 
@@ -291,9 +365,8 @@ the encryption/sealing wrappers is tracked by #147.
 - Complete durable sequencing and safe fork repair/recovery (#127–#129),
   bounded majority-authoritative restore (#133), fixed-width wire stabilization
   (#134), invariant-safe model decoding (#135), watch handoff correctness
-  (#145), recursive protected-payload traversal (#147), and absolute-expiry
-  admission (#148), then complete the production qualification profile and
-  distributed evidence in #143.
+  (#145), and absolute-expiry admission (#148), then complete the production
+  qualification profile and distributed evidence in #143.
 - Keep encryption AAD bound to namespace, NF kind, state type, generation,
   fence, and session-key digest.
 
@@ -306,9 +379,16 @@ the encryption/sealing wrappers is tracked by #147.
 - `tests/replication_sequence_bounds.rs` covers direct Fake/SQLite append,
   rebuild atomicity, signed persistence boundaries, and corrupt-row rejection;
   quorum, encryption, cache, and session-net suites cover their own boundaries.
+- `tests/replication_structure_bounds.rs` covers exact depth/count admission,
+  fieldless error serialization/redaction, owned entry/prefix/page validation,
+  small-stack rejection, and Fake/SQLite no-effect failures.
 - TTL, lease, refresh, batch, replicated-operation, clock, cache, testkit, and
   real-mTLS suites cover zero, the exact maximum, over-limit inputs, deadline
   overflow, redacted typed errors, and no-partial-effect rejection.
+- Encryption and remote-sealing suites cover deep nested-CAS replicate,
+  rebuild, log, and watch round trips; depth/count boundaries; no plaintext or
+  protected-byte exposure; and late-provider failure without backend
+  delegation or partial entry/page exposure.
 - Run with: `cargo test -p opc-session-store`.
 
 ## License

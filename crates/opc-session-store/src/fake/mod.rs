@@ -16,10 +16,10 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::{
     backend::{
-        next_replication_sequence, validate_replication_page, validate_replication_prefix,
-        validate_session_ops_ttls, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
-        ReplicationEntry, ReplicationOp, SessionBackend, SessionOp, SessionOpResult,
-        WATCH_CHANNEL_CAPACITY,
+        next_replication_sequence, validate_replication_page_owned, validate_replication_prefix,
+        validate_replication_prefix_owned, validate_session_ops_ttls, BackendInstanceIdentity,
+        CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend,
+        SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
     },
     capability::BackendCapabilities,
     clock::{Clock, TokioVirtualClock},
@@ -861,12 +861,11 @@ impl SessionBackend for FakeSessionBackend {
             .take(limit)
             .cloned()
             .collect();
-        validate_replication_page(&entries)?;
-        Ok(entries)
+        validate_replication_page_owned(entries)
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate()?;
+        let entry = entry.into_validated()?;
         let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
@@ -927,7 +926,7 @@ impl SessionBackend for FakeSessionBackend {
         &self,
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
-        validate_replication_prefix(&entries)?;
+        let entries = validate_replication_prefix_owned(entries)?;
         let mut state = self.inner.lock().await;
         self.rebuild_replication_state_with_entries(&mut state, entries)
     }

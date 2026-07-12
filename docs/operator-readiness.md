@@ -179,8 +179,52 @@ fail closed.
 The two new public error variants also extend protocol-v3 serialized errors.
 Update exhaustive matches and upgrade all session-net participants as one
 coordinated same-v3 compatibility unit before relying on the typed response;
-an older v3 decoder cannot consume a newly returned variant. Valid v3 traffic
-is otherwise byte/shape compatible.
+an older v3 decoder cannot consume a newly returned variant. The TTL wire shape
+is otherwise compatible for entries admitted by the operation-tree contract
+below.
+
+### Nested replication payload admission and upgrade
+
+Replication trees now have two public per-entry limits:
+`MAX_REPLICATION_OPERATION_DEPTH = 16` and
+`MAX_REPLICATION_OPERATIONS_PER_ENTRY = 256`. The root is depth 1; each child
+increments depth; and every operation node, including each `Batch`, counts
+toward the total. Validation and transformation are iterative. An over-limit
+entry returns the fieldless, redaction-safe
+`StoreError::ReplicationOperationLimitExceeded`.
+
+Complete entries and rebuild prefixes are preflighted before provider/backend
+work, and complete returned pages are preflighted before transformation or
+caller exposure. Encryption and remote-sealing wrappers protect every nested
+CAS on replicate/rebuild and unprotect every nested CAS on log/watch reads.
+Provider calls are sequential. If a late provider call fails, earlier provider
+calls may already have occurred, but no write is delegated to the backend and
+no partially transformed entry/page is exposed. An earlier independent watch
+item may already have been delivered.
+
+Treat this as a coordinated fleet migration, not a rolling upgrade. The
+protocol number remains v3, but an older peer cannot decode the new error and
+an older wrapper may forward a deeply nested CAS as plaintext/unsealed data.
+Mixed old/new v3 fleets are not confidentiality-safe. Drain traffic and
+writers, upgrade every client, server, and wrapper participant together, and
+only then restore service. #134 must pin these limits and the error encoding in
+the versioned fixed-width DTO and handshake contract; #147 does not establish
+wire-version compatibility by itself.
+
+Before rollout, audit persisted replication-log tree shape and payload encoding
+offline without emitting payloads in logs or metrics. The SDK does not
+automatically discover or scrub historical nested plaintext. An affected entry
+within the 16/256 limits may be rewritten/rebuilt through the configured
+encryption/sealing wrapper. An over-limit historical entry fails before
+transformation and cannot be ingested unchanged: use a separately reviewed
+offline migration that preserves atomic semantics, or replace the store under
+an explicit audited recovery procedure before starting the new SDK. Do not
+clamp/split entries ad hoc or use the raw inner backend as protection.
+
+This closes the #147 traversal/confidentiality gap only. It does not qualify
+networked session HA. #143 and the remaining dependencies still block the
+experimental profile. Seamless SVID rotation, payload-protection key rotation,
+and trust-bundle rotation remain separate mandatory production gates.
 
 ### Session durable readiness
 
@@ -233,6 +277,7 @@ not an ownership lease.
 3. **Resume Cursors**: Exposes change-stream watches backed by the ordered log, allowing client streams to resume and catch up after disconnects.
 4. **Stale Replica Recovery Heuristic**: The readiness/operation assessment may append a missing suffix only when a replica's complete log is a strict prefix of the majority-visible log. Conflicts and longer minority tails yield `RecoveryRequired` without truncation or destructive rebuild. This is still not commit-proven recovery; #127/#128 must prevent a later majority from omitting a previously acknowledged entry.
 5. **Declared Feature Envelope**: `QuorumSessionStore` advertises `ordered_replication_log = true` and `watch = true`, while standalone SQLite reports `false`. These bits describe available methods, not fresh peer-quorum evidence or production qualification. Use `probe_durable_readiness` for the current point-in-time result.
+6. **Bounded Protected Replication Trees**: Entry/prefix/page preflight enforces depth 16 and 256 total nodes, while encryption/sealing wrappers iteratively transform every nested CAS and stage writes before delegation. This is protection-boundary evidence, not durable commit or HA qualification.
 
 ### Session transport v3 rollout boundary
 
@@ -267,6 +312,12 @@ participant, upgrade them together, verify v3 authenticated handshakes and
 empty/multi-page scans on each replica, then restore traffic. There is no
 production v2 fallback; do not perform a mixed-version rolling upgrade.
 
+The #147 limit/protection contract also requires a coordinated rollout even
+though both builds report v3. Mixed builds cannot negotiate the new limits, an
+old decoder cannot consume the typed limit error, and an old wrapper can leak a
+deep CAS payload. Do not treat this as same-v3 rolling compatibility; #134 must
+make the contract explicit in the versioned handshake/DTO model.
+
 DNS, FQDN, IP, and resolver aliases control only the dial address. They must
 not be used to derive or rewrite the logical `ReplicaId` or expected SPIFFE
 identity. Rotate a certificate only to another SVID carrying the same exact
@@ -281,10 +332,11 @@ and continuous gate. Do not use quorum restore as authority before
 auto-resolve a legacy fork before #129. Protocol v3 identity binding is not
 consensus or fork recovery. Fixed-width wire DTOs and invariant-safe model
 decoding remain #134/#135. Checked TTL and sequence boundaries now fail closed
-under #137/#138. Watch handoff, nested protected-payload traversal, and
-absolute-record-expiry admission remain #145/#147/#148; seamless
-certificate/trust rotation and the remaining distributed production evidence
-stay open in #143.
+under #137/#138, and bounded nested protected-payload traversal is implemented
+under #147. Watch handoff and absolute-record-expiry admission remain
+#145/#148; seamless SVID rotation, payload-protection key rotation, and
+trust-bundle rotation plus the remaining distributed production evidence stay
+open in #143.
 
 ## Operator-facing SDK surfaces available now
 
@@ -293,10 +345,10 @@ stay open in #143.
 | Runtime profile and bootstrap | `RuntimeProfile` defaults to production mode. `BootstrapConfig::from_env` reads `NF_KIND`, `INSTANCE_ID`, `RUNTIME_MODE`, `ADMIN_BIND`, `LOG_LEVEL`, and `CONFIG_SOURCE`; `BootstrapConfig::apply_fail_closed` rejects production startup without an explicit config source. | `crates/opc-runtime/src/profile.rs`, `crates/opc-runtime/src/bootstrap.rs`, `docs/rfc/008-cnf-runtime-chassis.md` |
 | Health and readiness model | The SDK provides the RFC 008 health model for `/livez`, `/readyz`, and `/startupz` semantics, along with gated debug/admin routes `/debug/runtime`, `/debug/tasks`, and `/debug/config-version`. The HTTP admin/probe/debug routes are fully authorized under token authorization in Production/Lab mode. | `crates/opc-runtime/src/health.rs`, `crates/opc-runtime/src/admin.rs`, `docs/implementation-status.md#known-gaps` (`GAP-008-002`) |
 | Config authorization & apply example | `opc-config-bus` implements `ConfigAuthorizer` checking at the admission boundary, and the toy config integration registers a custom `NacmAuthorizer` hook to enforce NACM policy before validation, persistence, or subscriber notification. | `crates/opc-config-bus/src/lib.rs`, `crates/opc-config-fixture/tests/config_fixture_commit.rs` |
-| Config persistence encryption and audit integrity | `EncryptingManagedDatastore` seals persisted config records with shared envelope helpers and AAD-bound tenant/schema/version metadata. Durable `SqliteBackend` opens require an explicit non-zero `AuditKey`, and stored audit chains are verified on load after sensitive audit values are redacted before storage. | `crates/opc-config-bus/src/lib.rs`, `crates/opc-config-bus/tests/encryption.rs`, `crates/opc-persist/src/backend.rs`, `crates/opc-persist/tests/persist.rs` |
+| Config persistence encryption and audit integrity | `EncryptingManagedDatastore` seals persisted config records with shared envelope helpers and AAD-bound tenant/schema/version metadata. Durable `SqliteBackend` opens require an explicit non-zero `AuditKey`, and stored audit chains are verified on load after sensitive audit values are redacted before storage. | `crates/opc-config-bus/src/lib.rs`, `crates/opc-config-bus/tests/encryption.rs`, `crates/opc-persist/src/backend/mod.rs`, `crates/opc-persist/tests/persist_sqlite.rs`, `crates/opc-persist/tests/persist_ops.rs`, `crates/opc-persist/tests/persist_audit.rs` |
 | Alarm admin authorization & auditing | `opc-alarm` provides `NacmAlarmAuthorizer` and `PersistAlarmAuditSink` adapters to authorize alarm ack/suppress actions against NACM policy and an explicit operator-principal allowlist, then log audit events durably to the persistence SQLite database with automatic sensitive data redaction. | `crates/opc-alarm/src/nacm_adapter.rs`, `crates/opc-alarm/src/persist_adapter.rs`, `crates/opc-alarm/tests/adapters.rs` |
-| Session persistence encryption | `EncryptingSessionBackend` wraps a durable SQLite backend (`SqliteSessionBackend`) or `FakeSessionBackend`. It seals session payloads, decrypts reads and CAS conflicts, preserves legacy migration markers, and fails closed on corrupt envelopes. | `crates/opc-session-store/src/backend.rs`, `crates/opc-session-store/src/sqlite.rs`, `crates/opc-session-store/tests/sqlite.rs` |
-| Runtime alarms | `SharedAlarmManager` is used by runtime supervision and config-bus failure paths; toy NF integration uses the runtime-owned manager rather than separate toy glue. | `crates/opc-runtime/src/supervisor.rs`, `crates/opc-config-bus/src/lib.rs`, `crates/opc-sdk-integration/tests/toy_runtime.rs` |
+| Session persistence encryption | `EncryptingSessionBackend` wraps a durable SQLite backend (`SqliteSessionBackend`) or `FakeSessionBackend`. It seals session payloads, decrypts reads and CAS conflicts, iteratively protects every nested replicated CAS within the depth-16/256-node limits, preserves legacy migration markers, and fails closed on corrupt envelopes. Historical in-limit plaintext may use wrapper-mediated rewrite/rebuild; over-limit history requires audited offline migration or store replacement. | `crates/opc-session-store/src/backend.rs`, `crates/opc-session-store/src/sqlite/mod.rs`, `crates/opc-session-store/tests/encryption.rs`, `crates/opc-session-store/tests/sqlite.rs` |
+| Runtime alarms | `SharedAlarmManager` is used by runtime supervision and config-bus failure paths; toy NF integration uses the runtime-owned manager rather than separate toy glue. | `crates/opc-runtime/src/supervisor/mod.rs`, `crates/opc-config-bus/src/lib.rs`, `crates/opc-sdk-integration/tests/toy_runtime.rs` |
 | Graceful drain | `DrainHook` and `NrfDrainHook` provide the shared SIGTERM/NRF drain integration point. Hook timeouts and hook errors raise drain-incomplete alarms, and `NrfRuntimeBuilderExt` gives first NF adopters a one-call registration path. | `crates/opc-runtime/src/shutdown.rs`, `crates/opc-sbi/src/nrf/mod.rs`, `crates/opc-runtime/tests/graceful_shutdown.rs` |
 | Evidence format | `opc-evidence` provides tested RFC 006 record, manifest, gap, SBOM/VEX, provenance, performance, bundle, and policy-evaluation library primitives. Embedded bundle blobs are signature-covered, but separately supplied `GateEvaluator` artifact arguments are not cross-checked against that verified bundle. Repository workflows do not yet invoke the evaluator or wire a production signer/verifier and complete artifact set. | `crates/opc-evidence/src/extract.rs`, `crates/opc-evidence/src/sbom.rs`, `crates/opc-evidence/src/vex.rs`, `crates/opc-evidence/src/provenance.rs`, `crates/opc-evidence/src/bundle.rs`, `crates/opc-evidence/src/performance.rs`, `crates/opc-evidence/src/policy.rs`, `crates/opc-evidence/tests/evidence_bundle.rs`, `crates/opc-evidence/tests/evidence_policy.rs`, `docs/implementation-status.md#known-gaps` (`GAP-006-*`) |
 | Data governance and privacy | Provides support-bundle redaction API scrubbing SUPI, secrets, IPs, and paths (`opc-redaction`), declarative `RetentionPolicy` models with legal hold enforcement (`opc-data-governance`), classification-preserving export metadata validation (`opc-export`), k-anonymity validation and cohort binning (`opc-privacy`), and data governance evidence gates (`opc-evidence`). | `crates/opc-redaction/src/support_bundle.rs`, `crates/opc-data-governance/src/retention.rs`, `crates/opc-export/src/lib.rs`, `crates/opc-privacy/src/lib.rs`, `crates/opc-evidence/src/data_governance.rs`, `crates/opc-sdk-integration/tests/privacy_governance.rs` |

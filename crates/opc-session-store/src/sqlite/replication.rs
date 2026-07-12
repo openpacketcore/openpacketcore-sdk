@@ -369,7 +369,7 @@ pub(crate) fn replicate_entry_sync(
         if let Some(existing_entry_json) = existing_entry_json {
             let existing: ReplicationEntry = serde_json::from_str(&existing_entry_json)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            existing.validate()?;
+            let existing = existing.into_validated()?;
             if existing == *entry {
                 return Ok(false); // Already applied, do not notify watchers again
             }
