@@ -3,7 +3,8 @@
 This note is the operator-facing handoff for the foundation hardening pass
 `T-9be95f92` on May 30, 2026, updated on June 6, 2026 for the follow-on
 session-store, runtime drain, and ConfigBus authorization seams, and on June 28,
-2026 for the final EPC/untrusted-access SDK hardening pass `T-8c57ecee`. It
+2026 for the final EPC/untrusted-access SDK hardening pass `T-8c57ecee`, with a
+July 11, 2026 addendum for checked session-TTL admission and upgrade handling. It
 summarizes what the current SDK foundation can support, what was validated, and
 what must not be claimed as implemented, since the Go operator remains a
 reference-only harness and production-grade controllers are the responsibility
@@ -142,6 +143,45 @@ and `SessionStorePlatformProfile::Quorum` are also admission evidence only. A
 production operator must separately require fresh durable readiness before
 traffic readiness.
 
+### Session TTL admission and upgrade
+
+The SDK now applies one public limit to `Duration`-based session refresh and
+lease TTL inputs:
+`MAX_SESSION_TTL`, exactly 365 days. Zero is accepted as immediate expiry and
+the exact maximum is accepted. A larger duration returns the redaction-safe
+`StoreError::InvalidSessionTtl` or `LeaseError::InvalidSessionTtl`. Deadline
+calculation uses exact checked integer conversion and checked timestamp
+addition; it does not use floating-point conversion or panic on an oversized
+duration.
+A zero-duration acquire may still consume a fence, credential, and log
+position; use explicit release for revocation rather than zero TTL as rollback.
+
+The rule is repeated across direct calls, nested batch and replication
+operations, wrappers, quorum dispatch, Fake/SQLite backends, and session-net
+client/server admission. Rejection occurs before lease/record/log/watch,
+cryptographic-provider, database, or other application/backend effects. The
+client rejects before resolution or dialing; the server necessarily receives
+the request, then rejects before backend dispatch and may send the typed error
+on the same connection. This closes an input-validation and
+process-availability boundary only; it does not add durable commit authority,
+consensus, fork recovery, or production HA.
+
+Before rolling this change onto a store written by an older SDK, audit every
+persisted replication-log operation that carries a TTL. Values above 365 days
+now fail closed during replay or rebuild and are never silently clamped. Stop
+the rollout and use an audited product recovery/migration procedure if such an
+entry exists; do not truncate or rewrite presumed history ad hoc. Replicated
+deadline validation accepts at most one microsecond above the exact
+`entry.timestamp + ttl` for legacy `seconds_f64` rounding only. New deadlines
+remain exact, this does not enlarge the 365-day bound, and larger mismatches
+fail closed.
+
+The two new public error variants also extend protocol-v3 serialized errors.
+Update exhaustive matches and upgrade all session-net participants as one
+coordinated same-v3 compatibility unit before relying on the typed response;
+an older v3 decoder cannot consume a newly returned variant. Valid v3 traffic
+is otherwise byte/shape compatible.
+
 ### Session durable readiness
 
 `QuorumSessionStore::probe_durable_readiness` performs a fresh, bounded
@@ -208,6 +248,15 @@ Session-net deliberately disables TLS resumption, session tickets, early data,
 and 0-RTT; budget every reconnect as a full mutual-TLS handshake so the live
 SVID is revalidated after rotation.
 
+Full handshakes make renewed credentials observable, but they are not proof of
+seamless rotation. A production CNF/operator profile must rotate certificates
+and trust bundles without interrupting session service, including overlap of
+old/new trust, revocation, retirement of long-lived connections, reconnect
+storms, and a documented maximum authentication age. That distributed
+qualification remains #143. `MAX_SESSION_TTL` controls session/lease state
+only; it does not define certificate expiry, trust-bundle validity, or
+authentication age.
+
 A successful restore page may be shorter than requested to fit the effective
 client/server frame limit; follow `next_cursor` until `complete`. A single
 record that cannot fit returns `RestoreScanResponseTooLarge`.
@@ -231,8 +280,11 @@ and continuous gate. Do not use quorum restore as authority before
 #127/#133, treat current divergence repair as authoritative before #128, or
 auto-resolve a legacy fork before #129. Protocol v3 identity binding is not
 consensus or fork recovery. Fixed-width wire DTOs and invariant-safe model
-decoding remain #134/#135. Oversized-TTL panic elimination remains #137;
-sequence-zero and adjacent overflow boundaries now fail closed under #138.
+decoding remain #134/#135. Checked TTL and sequence boundaries now fail closed
+under #137/#138. Watch handoff, nested protected-payload traversal, and
+absolute-record-expiry admission remain #145/#147/#148; seamless
+certificate/trust rotation and the remaining distributed production evidence
+stay open in #143.
 
 ## Operator-facing SDK surfaces available now
 

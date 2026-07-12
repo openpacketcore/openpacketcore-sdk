@@ -335,7 +335,7 @@ pub(crate) fn replicate_entry_sync(
     caps: &BackendCapabilities,
     now: Timestamp,
 ) -> Result<bool, StoreError> {
-    entry.validate_sequence()?;
+    entry.validate()?;
     let sqlite_sequence = sqlite_replication_sequence(entry.sequence)?;
     let tx = conn
         .unchecked_transaction()
@@ -369,7 +369,7 @@ pub(crate) fn replicate_entry_sync(
         if let Some(existing_entry_json) = existing_entry_json {
             let existing: ReplicationEntry = serde_json::from_str(&existing_entry_json)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            existing.validate_sequence()?;
+            existing.validate()?;
             if existing == *entry {
                 return Ok(false); // Already applied, do not notify watchers again
             }

@@ -138,19 +138,76 @@ fn test_record(
     }
 }
 
+fn nested_refresh_replication_entry(
+    sequence: u64,
+    key: SessionKey,
+    owner: OwnerId,
+    fence: FenceToken,
+    ttl: Duration,
+) -> ReplicationEntry {
+    ReplicationEntry {
+        sequence,
+        tx_id: format!("ttl-boundary-{sequence}"),
+        op: ReplicationOp::Batch {
+            ops: vec![ReplicationOp::RefreshTtl {
+                key,
+                owner,
+                fence,
+                ttl,
+                expires_at: Timestamp::now_utc(),
+            }],
+        },
+        timestamp: Timestamp::now_utc(),
+    }
+}
+
+fn forged_refresh_deadline_entry(
+    sequence: u64,
+    key: SessionKey,
+    owner: OwnerId,
+    fence: FenceToken,
+) -> ReplicationEntry {
+    let timestamp = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+    let expires_at = Timestamp::from_offset_datetime(
+        time::OffsetDateTime::UNIX_EPOCH
+            .checked_add(time::Duration::seconds(61))
+            .expect("representable test deadline"),
+    );
+    ReplicationEntry {
+        sequence,
+        tx_id: format!("forged-deadline-{sequence}"),
+        op: ReplicationOp::RefreshTtl {
+            key,
+            owner,
+            fence,
+            ttl: Duration::from_secs(60),
+            expires_at,
+        },
+        timestamp,
+    }
+}
+
 #[derive(Clone)]
 struct ReplicationDispatchSpy {
     inner: FakeSessionBackend,
+    refresh_calls: Arc<AtomicUsize>,
+    batch_calls: Arc<AtomicUsize>,
     replicate_calls: Arc<AtomicUsize>,
     rebuild_calls: Arc<AtomicUsize>,
+    acquire_calls: Arc<AtomicUsize>,
+    renew_calls: Arc<AtomicUsize>,
 }
 
 impl ReplicationDispatchSpy {
     fn new() -> Self {
         Self {
             inner: FakeSessionBackend::new(),
+            refresh_calls: Arc::new(AtomicUsize::new(0)),
+            batch_calls: Arc::new(AtomicUsize::new(0)),
             replicate_calls: Arc::new(AtomicUsize::new(0)),
             rebuild_calls: Arc::new(AtomicUsize::new(0)),
+            acquire_calls: Arc::new(AtomicUsize::new(0)),
+            renew_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -178,6 +235,7 @@ impl SessionBackend for ReplicationDispatchSpy {
         lease: &opc_session_store::LeaseGuard,
         ttl: Duration,
     ) -> Result<(), StoreError> {
+        self.refresh_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.refresh_ttl(lease, ttl).await
     }
 
@@ -185,6 +243,7 @@ impl SessionBackend for ReplicationDispatchSpy {
         &self,
         ops: Vec<opc_session_store::SessionOp>,
     ) -> Result<Vec<opc_session_store::SessionOpResult>, StoreError> {
+        self.batch_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.batch(ops).await
     }
 
@@ -226,6 +285,7 @@ impl SessionLeaseManager for ReplicationDispatchSpy {
         owner: OwnerId,
         ttl: Duration,
     ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
+        self.acquire_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.acquire(key, owner, ttl).await
     }
 
@@ -234,6 +294,7 @@ impl SessionLeaseManager for ReplicationDispatchSpy {
         lease: &opc_session_store::LeaseGuard,
         ttl: Duration,
     ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
+        self.renew_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.renew(lease, ttl).await
     }
 
@@ -544,6 +605,109 @@ async fn remote_client_rejects_zero_sequence_before_resolve_or_retry() {
 }
 
 #[tokio::test]
+async fn remote_client_rejects_invalid_ttls_before_resolve_or_retry() {
+    let mtls = mtls_configs();
+    let backend = ReplicationDispatchSpy::new();
+    let (addr, backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let key = test_key_with_stable_id(b"client-invalid-ttl-canary");
+    let owner = OwnerId::new("client-invalid-ttl-owner").expect("test owner");
+    let lease = backend
+        .inner
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .expect("seed lease directly in backend");
+    let initial_sequence = backend.max_replication_sequence().await.unwrap();
+    let resolve_calls = Arc::new(AtomicUsize::new(0));
+    let resolve_calls_for_request = Arc::clone(&resolve_calls);
+    let resolver: RemoteAddrResolver = Arc::new(move || {
+        let resolve_calls = Arc::clone(&resolve_calls_for_request);
+        Box::pin(async move {
+            resolve_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(addr)
+        })
+    });
+    let remote = RemoteSessionBackend::new_with_resolver(
+        mtls.remote_binding(1, 2),
+        resolver,
+        mtls.client_config(1),
+        Some(Duration::from_millis(500)),
+    );
+
+    let acquire_error = remote
+        .acquire(&key, owner.clone(), Duration::MAX)
+        .await
+        .expect_err("invalid acquire TTL must be rejected locally");
+    assert_eq!(
+        acquire_error,
+        opc_session_store::LeaseError::InvalidSessionTtl
+    );
+    let renew_error = remote
+        .renew(&lease, Duration::MAX)
+        .await
+        .expect_err("invalid renew TTL must be rejected locally");
+    assert_eq!(
+        renew_error,
+        opc_session_store::LeaseError::InvalidSessionTtl
+    );
+    let refresh_error = remote
+        .refresh_ttl(&lease, Duration::MAX)
+        .await
+        .expect_err("invalid refresh TTL must be rejected locally");
+    assert_eq!(refresh_error, StoreError::InvalidSessionTtl);
+    let batch_error = remote
+        .batch(vec![opc_session_store::SessionOp::RefreshTtl {
+            lease: lease.clone(),
+            ttl: Duration::MAX,
+        }])
+        .await
+        .expect_err("invalid batched TTL must be rejected locally");
+    assert_eq!(batch_error, StoreError::InvalidSessionTtl);
+
+    let nested = nested_refresh_replication_entry(
+        1,
+        key.clone(),
+        owner.clone(),
+        lease.fence(),
+        Duration::MAX,
+    );
+    let replicate_error = remote
+        .replicate_entry(nested.clone())
+        .await
+        .expect_err("invalid nested replicated TTL must be rejected locally");
+    assert_eq!(replicate_error, StoreError::InvalidSessionTtl);
+    let rebuild_error = remote
+        .rebuild_replication_state(vec![nested])
+        .await
+        .expect_err("invalid nested rebuild TTL must be rejected locally");
+    assert_eq!(rebuild_error, StoreError::InvalidSessionTtl);
+    let forged = forged_refresh_deadline_entry(1, key, owner, lease.fence());
+    let forged_error = remote
+        .replicate_entry(forged)
+        .await
+        .expect_err("a forged replicated deadline must be rejected locally");
+    assert_eq!(forged_error, StoreError::InvalidSessionTtl);
+
+    assert_eq!(resolve_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.acquire_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.renew_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.refresh_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.batch_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.replicate_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.rebuild_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        backend.max_replication_sequence().await.unwrap(),
+        initial_sequence
+    );
+
+    assert_eq!(
+        remote.max_replication_sequence().await.unwrap(),
+        initial_sequence
+    );
+    assert_eq!(resolve_calls.load(Ordering::SeqCst), 1);
+    handle.abort();
+}
+
+#[tokio::test]
 async fn authenticated_server_rejects_wire_zero_and_keeps_connection_usable() {
     use opc_session_net::protocol::{
         read_frame, write_frame, CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE, SESSION_NET_ALPN,
@@ -652,6 +816,220 @@ async fn authenticated_server_rejects_wire_zero_and_keeps_connection_usable() {
         .await
         .expect("read follow-up on retained connection");
     assert!(matches!(follow_up, Response::MaxReplicationSequence(Ok(0))));
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn authenticated_server_rejects_wire_invalid_ttls_and_keeps_connection_usable() {
+    use opc_session_net::protocol::{
+        read_frame, write_frame, CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE, SESSION_NET_ALPN,
+    };
+    use opc_session_net::{Request, Response};
+
+    let mtls = mtls_configs();
+    let backend = ReplicationDispatchSpy::new();
+    let (addr, backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let mut client_config = mtls.client_config(1).rustls_config().as_ref().clone();
+    client_config.alpn_protocols = vec![SESSION_NET_ALPN.to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to replication server");
+    let server_name = rustls_pki_types::ServerName::IpAddress(addr.ip().into());
+    let mut stream = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("mutual TLS connection");
+
+    let binding = mtls.remote_binding(1, 2);
+    let nonce = uuid::Uuid::new_v4();
+    write_frame(
+        &mut stream,
+        &Request::Hello {
+            contract_version: CONTRACT_VERSION,
+            node_id: binding.local_replica_id().as_str().to_string(),
+            expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
+            cluster_id: Some(binding.cluster_id().as_str().to_string()),
+            configuration_id: Some(binding.configuration_id().to_hex()),
+            handshake_nonce: Some(nonce),
+        },
+    )
+    .await
+    .expect("write authenticated hello");
+    let hello: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read authenticated hello response");
+    assert!(matches!(
+        hello,
+        Response::HelloAck {
+            contract_version: CONTRACT_VERSION,
+            handshake_nonce: Some(echoed),
+            ..
+        } if echoed == nonce
+    ));
+
+    let key = test_key_with_stable_id(b"wire-invalid-ttl-canary");
+    let owner = OwnerId::new("wire-invalid-ttl-owner").expect("test owner");
+    write_frame(
+        &mut stream,
+        &Request::AcquireLease {
+            key: key.clone(),
+            owner: owner.clone(),
+            ttl: Duration::MAX,
+        },
+    )
+    .await
+    .expect("write invalid acquire TTL");
+    let acquire_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read typed acquire TTL rejection");
+    assert!(matches!(
+        acquire_rejected,
+        Response::AcquireLease(Err(opc_session_store::LeaseError::InvalidSessionTtl))
+    ));
+    assert_eq!(backend.acquire_calls.load(Ordering::SeqCst), 0);
+
+    write_frame(
+        &mut stream,
+        &Request::AcquireLease {
+            key: key.clone(),
+            owner: owner.clone(),
+            ttl: Duration::from_secs(60),
+        },
+    )
+    .await
+    .expect("write valid acquire on retained connection");
+    let lease = match read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read valid acquire response")
+    {
+        Response::AcquireLease(Ok(lease)) => lease,
+        response => panic!("unexpected valid acquire response: {response:?}"),
+    };
+    assert_eq!(backend.acquire_calls.load(Ordering::SeqCst), 1);
+
+    write_frame(
+        &mut stream,
+        &Request::RenewLease {
+            lease: lease.clone(),
+            ttl: Duration::MAX,
+        },
+    )
+    .await
+    .expect("write invalid renew TTL");
+    let renew_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read typed renew TTL rejection");
+    assert!(matches!(
+        renew_rejected,
+        Response::RenewLease(Err(opc_session_store::LeaseError::InvalidSessionTtl))
+    ));
+    assert_eq!(backend.renew_calls.load(Ordering::SeqCst), 0);
+
+    write_frame(
+        &mut stream,
+        &Request::RefreshTtl {
+            lease: lease.clone(),
+            ttl: Duration::MAX,
+        },
+    )
+    .await
+    .expect("write invalid refresh TTL");
+    let refresh_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read typed refresh TTL rejection");
+    assert!(matches!(
+        refresh_rejected,
+        Response::RefreshTtl(Err(StoreError::InvalidSessionTtl))
+    ));
+    assert_eq!(backend.refresh_calls.load(Ordering::SeqCst), 0);
+
+    write_frame(
+        &mut stream,
+        &Request::Batch {
+            ops: vec![opc_session_store::SessionOp::RefreshTtl {
+                lease: lease.clone(),
+                ttl: Duration::MAX,
+            }],
+        },
+    )
+    .await
+    .expect("write invalid batched TTL");
+    let batch_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read typed batch TTL rejection");
+    assert!(matches!(
+        batch_rejected,
+        Response::Batch(Err(StoreError::InvalidSessionTtl))
+    ));
+    assert_eq!(backend.batch_calls.load(Ordering::SeqCst), 0);
+
+    let nested = nested_refresh_replication_entry(
+        1,
+        key.clone(),
+        owner.clone(),
+        lease.fence(),
+        Duration::MAX,
+    );
+    write_frame(
+        &mut stream,
+        &Request::ReplicateEntry {
+            entry: nested.clone(),
+        },
+    )
+    .await
+    .expect("write invalid nested replicated TTL");
+    let replicate_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read typed replicated TTL rejection");
+    assert!(matches!(
+        replicate_rejected,
+        Response::ReplicateEntry(Err(StoreError::InvalidSessionTtl))
+    ));
+    assert_eq!(backend.replicate_calls.load(Ordering::SeqCst), 0);
+
+    write_frame(
+        &mut stream,
+        &Request::RebuildReplicationState {
+            entries: vec![nested],
+        },
+    )
+    .await
+    .expect("write invalid nested rebuild TTL");
+    let rebuild_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read typed rebuild TTL rejection");
+    assert!(matches!(
+        rebuild_rejected,
+        Response::RebuildReplicationState(Err(StoreError::InvalidSessionTtl))
+    ));
+    assert_eq!(backend.rebuild_calls.load(Ordering::SeqCst), 0);
+
+    write_frame(
+        &mut stream,
+        &Request::ReplicateEntry {
+            entry: forged_refresh_deadline_entry(1, key, owner, lease.fence()),
+        },
+    )
+    .await
+    .expect("write forged replicated deadline");
+    let forged_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read typed forged-deadline rejection");
+    assert!(matches!(
+        forged_rejected,
+        Response::ReplicateEntry(Err(StoreError::InvalidSessionTtl))
+    ));
+    assert_eq!(backend.replicate_calls.load(Ordering::SeqCst), 0);
+
+    write_frame(&mut stream, &Request::MaxReplicationSequence)
+        .await
+        .expect("write follow-up on retained connection");
+    let follow_up: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read follow-up on retained connection");
+    assert!(matches!(follow_up, Response::MaxReplicationSequence(Ok(_))));
 
     handle.abort();
 }
@@ -1997,7 +2375,7 @@ async fn durable_readiness_adaptively_pages_a_log_larger_than_one_wire_frame() {
                 owner: owner.clone(),
                 fence: FenceToken::new(sequence),
                 credential_id: sequence,
-                ttl: Duration::from_secs(60),
+                ttl: Duration::from_secs(60 * 60),
                 expires_at,
             },
             timestamp: Timestamp::now_utc(),

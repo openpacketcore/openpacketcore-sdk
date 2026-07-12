@@ -11,9 +11,9 @@ use async_trait::async_trait;
 use futures_util::{stream::BoxStream, StreamExt};
 
 use crate::backend::{
-    validate_replication_page, validate_replication_prefix, BackendInstanceIdentity,
-    BackendPeerBinding, CompareAndSet, CompareAndSetResult, ReplicationEntry, SessionBackend,
-    SessionOp, SessionOpResult,
+    validate_replication_page, validate_replication_prefix, validate_session_ops_ttls,
+    BackendInstanceIdentity, BackendPeerBinding, CompareAndSet, CompareAndSetResult,
+    ReplicationEntry, SessionBackend, SessionOp, SessionOpResult,
 };
 use crate::capability::BackendCapabilities;
 use crate::error::{LeaseError, StoreError};
@@ -21,6 +21,7 @@ use crate::lease::{LeaseGuard, SessionLeaseManager};
 use crate::model::{OwnerId, SessionKey};
 use crate::record::StoredSessionRecord;
 use crate::restore::{RestoreScanPage, RestoreScanRequest};
+use crate::ttl::validate_session_ttl;
 
 /// A single handle that owns one backend and exposes both storage and lease
 /// operations.
@@ -116,10 +117,12 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
     }
 
     async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
+        validate_session_ttl(ttl)?;
         self.backend.refresh_ttl(lease, ttl).await
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        validate_session_ops_ttls(&ops)?;
         self.backend.batch(ops).await
     }
 
@@ -158,7 +161,7 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate_sequence()?;
+        entry.validate()?;
         self.backend.replicate_entry(entry).await
     }
 
@@ -178,7 +181,7 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         Ok(stream
             .map(|result| {
                 result.and_then(|entry| {
-                    entry.validate_sequence()?;
+                    entry.validate()?;
                     Ok(entry)
                 })
             })
@@ -198,10 +201,12 @@ impl<B: SessionBackend + SessionLeaseManager> SessionLeaseManager for SessionSto
         owner: OwnerId,
         ttl: Duration,
     ) -> Result<LeaseGuard, LeaseError> {
+        validate_session_ttl(ttl).map_err(LeaseError::from)?;
         self.backend.acquire(key, owner, ttl).await
     }
 
     async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
+        validate_session_ttl(ttl).map_err(LeaseError::from)?;
         self.backend.renew(lease, ttl).await
     }
 

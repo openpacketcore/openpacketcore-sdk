@@ -40,12 +40,14 @@ pub mod restore;
 pub mod sqlite;
 pub mod store;
 pub mod topology;
+pub mod ttl;
 
 pub use backend::{
     next_replication_sequence, validate_replication_page, validate_replication_prefix,
-    BackendInstanceIdentity, BackendPeerBinding, BackendPeerScopeIdentity, CompareAndSet,
-    CompareAndSetResult, EncryptingSessionBackend, RemoteSealingSessionBackend, ReplicationEntry,
-    ReplicationOp, SessionBackend, SessionOp, SessionOpResult,
+    validate_session_ops_ttls, BackendInstanceIdentity, BackendPeerBinding,
+    BackendPeerScopeIdentity, CompareAndSet, CompareAndSetResult, EncryptingSessionBackend,
+    RemoteSealingSessionBackend, ReplicationEntry, ReplicationOp, SessionBackend, SessionOp,
+    SessionOpResult,
 };
 pub use capability::{
     assert_backend_suitable_for_profile, assert_suitable_for,
@@ -92,3 +94,4 @@ pub use topology::{
     ReplicaTopologyFieldError, ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
     REPLICA_IDENTITY_MAX_BYTES, REPLICA_ID_MAX_BYTES,
 };
+pub use ttl::{checked_session_deadline, validate_session_ttl, MAX_SESSION_TTL};

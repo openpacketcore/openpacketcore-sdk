@@ -635,6 +635,10 @@ fn map_lease_error(error: LeaseError) -> IpsecLbError {
         LeaseError::AlreadyHeld | LeaseError::Expired | LeaseError::StaleFence => {
             IpsecLbError::ownership_conflict("session-store ownership lease is contended")
         }
+        LeaseError::InvalidSessionTtl => IpsecLbError::invalid_config(
+            "session_store.ttl",
+            "session-store TTL is outside the supported range",
+        ),
         LeaseError::NotFound | LeaseError::Backend(_) => IpsecLbError::io(
             "session_store_ownership_lease",
             io::Error::new(
@@ -660,6 +664,10 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
         StoreError::InvalidReplicationSequence => IpsecLbError::invalid_config(
             "session_store.replication",
             "session-store replication metadata rejected",
+        ),
+        StoreError::InvalidSessionTtl => IpsecLbError::invalid_config(
+            "session_store.ttl",
+            "session-store TTL is outside the supported range",
         ),
         StoreError::CapabilityNotSupported(_) => IpsecLbError::Unsupported,
         StoreError::BackendUnavailable(_) => IpsecLbError::io(
@@ -1993,5 +2001,17 @@ mod tests {
                 IpsecLbError::OwnershipConflict { .. }
             ));
         }
+    }
+
+    #[test]
+    fn invalid_session_ttl_maps_to_configuration_errors() {
+        assert!(matches!(
+            map_store_error(StoreError::InvalidSessionTtl),
+            IpsecLbError::InvalidConfig { .. }
+        ));
+        assert!(matches!(
+            map_lease_error(LeaseError::InvalidSessionTtl),
+            IpsecLbError::InvalidConfig { .. }
+        ));
     }
 }

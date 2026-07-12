@@ -18,9 +18,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
     backend::{
-        validate_replication_page, validate_replication_prefix, BackendInstanceIdentity,
-        CompareAndSet, CompareAndSetResult, ReplicationEntry, SessionBackend, SessionOp,
-        SessionOpResult, WATCH_CHANNEL_CAPACITY,
+        validate_replication_page, validate_replication_prefix, validate_session_ops_ttls,
+        BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry,
+        SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
     },
     capability::BackendCapabilities,
     clock::Clock,
@@ -29,6 +29,7 @@ use crate::{
     model::{OwnerId, SessionKey},
     record::StoredSessionRecord,
     restore::{RestoreScanPage, RestoreScanRequest},
+    ttl::{checked_session_deadline, validate_session_ttl},
 };
 
 pub(crate) mod lease;
@@ -298,8 +299,10 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
-        let conn = self.conn.lock().await;
+        validate_session_ttl(ttl)?;
         let now = self.clock.now_utc();
+        checked_session_deadline(now, ttl)?;
+        let conn = self.conn.lock().await;
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
@@ -310,12 +313,18 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        validate_session_ops_ttls(&ops)?;
+        let now = self.clock.now_utc();
+        for op in &ops {
+            if let SessionOp::RefreshTtl { ttl, .. } = op {
+                checked_session_deadline(now, *ttl)?;
+            }
+        }
         if !self.caps.batch_write {
             return Err(StoreError::CapabilityNotSupported("batch_write".into()));
         }
 
         let conn = self.conn.lock().await;
-        let now = self.clock.now_utc();
         let mut results = Vec::with_capacity(ops.len());
         for op in ops {
             let res = match op {
@@ -416,7 +425,7 @@ impl SessionBackend for SqliteSessionBackend {
             let stored_sequence = replication::stored_replication_sequence(stored_sequence)?;
             let entry: ReplicationEntry = serde_json::from_str(&json)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            entry.validate_sequence()?;
+            entry.validate()?;
             if entry.sequence != stored_sequence {
                 return Err(StoreError::InvalidReplicationSequence);
             }
@@ -427,7 +436,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate_sequence()?;
+        entry.validate()?;
         let should_notify = {
             let conn = self.conn.lock().await;
             let now = self.clock.now_utc();
@@ -503,8 +512,10 @@ impl SessionLeaseManager for SqliteSessionBackend {
         owner: OwnerId,
         ttl: Duration,
     ) -> Result<LeaseGuard, LeaseError> {
-        let conn = self.conn.lock().await;
+        validate_session_ttl(ttl).map_err(LeaseError::from)?;
         let now = self.clock.now_utc();
+        checked_session_deadline(now, ttl).map_err(LeaseError::from)?;
+        let conn = self.conn.lock().await;
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| LeaseError::Backend(e.to_string()))?;
@@ -515,8 +526,10 @@ impl SessionLeaseManager for SqliteSessionBackend {
     }
 
     async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
-        let conn = self.conn.lock().await;
+        validate_session_ttl(ttl).map_err(LeaseError::from)?;
         let now = self.clock.now_utc();
+        checked_session_deadline(now, ttl).map_err(LeaseError::from)?;
+        let conn = self.conn.lock().await;
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| LeaseError::Backend(e.to_string()))?;

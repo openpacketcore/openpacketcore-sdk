@@ -802,12 +802,20 @@ async fn deprecated_raw_constructor_is_non_operational_and_non_ha() {
     );
     assert_eq!(
         store.refresh_ttl(&lease, Duration::MAX).await,
+        Err(StoreError::InvalidSessionTtl)
+    );
+    assert_eq!(
+        store.refresh_ttl(&lease, Duration::from_secs(60)).await,
         Err(StoreError::BackendUnavailable(
             "session-store topology is not validated".into()
         ))
     );
     assert_eq!(
         store.renew(&lease, Duration::MAX).await,
+        Err(LeaseError::InvalidSessionTtl)
+    );
+    assert_eq!(
+        store.renew(&lease, Duration::from_secs(60)).await,
         Err(LeaseError::Backend(
             "backend unavailable: session-store topology is not validated".into()
         ))
@@ -815,6 +823,16 @@ async fn deprecated_raw_constructor_is_non_operational_and_non_ha() {
     assert_eq!(
         store
             .acquire(&key, OwnerId::new("owner-b").expect("owner"), Duration::MAX,)
+            .await,
+        Err(LeaseError::InvalidSessionTtl)
+    );
+    assert_eq!(
+        store
+            .acquire(
+                &key,
+                OwnerId::new("owner-b").expect("owner"),
+                Duration::from_secs(60),
+            )
             .await,
         Err(LeaseError::Backend(
             "backend unavailable: session-store topology is not validated".into()

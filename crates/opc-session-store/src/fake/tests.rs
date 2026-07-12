@@ -1411,7 +1411,7 @@ async fn test_ttl_expiration_fake_backend() {
 
     // Set expires_at in the past
     let now = Timestamp::now_utc();
-    let past = *now.as_offset_datetime() - time::Duration::seconds_f64(10.0);
+    let past = *now.as_offset_datetime() - time::Duration::seconds(10);
     record.expires_at = Some(Timestamp::from_offset_datetime(past));
 
     // Verify is_expired() directly on the record

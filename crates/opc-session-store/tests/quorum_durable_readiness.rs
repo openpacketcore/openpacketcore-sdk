@@ -10,11 +10,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use opc_session_store::{
     BackendCapabilities, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
-    DurableReadinessOptions, DurableReadinessState, FakeSessionBackend, FencedSessionReplica,
-    LeaseError, LeaseGuard, OwnerId, QuorumSessionStore, ReplicaReadinessFailure,
-    ReplicaReadinessOutcome, ReplicationEntry, ReplicationOp, SessionBackend, SessionKey,
-    SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult, StoreError,
-    StoredSessionRecord,
+    DurableReadinessOptions, DurableReadinessState, FakeSessionBackend, FenceToken,
+    FencedSessionReplica, LeaseError, LeaseGuard, OwnerId, QuorumSessionStore,
+    ReplicaReadinessFailure, ReplicaReadinessOutcome, ReplicationEntry, ReplicationOp,
+    SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult,
+    StoreError, StoredSessionRecord, MAX_SESSION_TTL,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use tokio::sync::Mutex;
@@ -33,8 +33,13 @@ struct ControlledBackend {
     head_behavior: Mutex<HeadBehavior>,
     head_probe_calls: AtomicUsize,
     reject_repairs: AtomicBool,
+    refresh_calls: AtomicUsize,
+    batch_calls: AtomicUsize,
     replicate_calls: AtomicUsize,
     rebuild_calls: AtomicUsize,
+    lease_info_calls: AtomicUsize,
+    acquire_calls: AtomicUsize,
+    renew_calls: AtomicUsize,
 }
 
 impl ControlledBackend {
@@ -44,8 +49,13 @@ impl ControlledBackend {
             head_behavior: Mutex::new(HeadBehavior::Normal),
             head_probe_calls: AtomicUsize::new(0),
             reject_repairs: AtomicBool::new(false),
+            refresh_calls: AtomicUsize::new(0),
+            batch_calls: AtomicUsize::new(0),
             replicate_calls: AtomicUsize::new(0),
             rebuild_calls: AtomicUsize::new(0),
+            lease_info_calls: AtomicUsize::new(0),
+            acquire_calls: AtomicUsize::new(0),
+            renew_calls: AtomicUsize::new(0),
         }
     }
 
@@ -55,6 +65,28 @@ impl ControlledBackend {
 
     fn reject_repairs(&self, reject: bool) {
         self.reject_repairs.store(reject, Ordering::SeqCst);
+    }
+
+    fn reset_boundary_calls(&self) {
+        self.head_probe_calls.store(0, Ordering::SeqCst);
+        self.refresh_calls.store(0, Ordering::SeqCst);
+        self.batch_calls.store(0, Ordering::SeqCst);
+        self.replicate_calls.store(0, Ordering::SeqCst);
+        self.rebuild_calls.store(0, Ordering::SeqCst);
+        self.lease_info_calls.store(0, Ordering::SeqCst);
+        self.acquire_calls.store(0, Ordering::SeqCst);
+        self.renew_calls.store(0, Ordering::SeqCst);
+    }
+
+    fn boundary_calls(&self) -> usize {
+        self.head_probe_calls.load(Ordering::SeqCst)
+            + self.refresh_calls.load(Ordering::SeqCst)
+            + self.batch_calls.load(Ordering::SeqCst)
+            + self.replicate_calls.load(Ordering::SeqCst)
+            + self.rebuild_calls.load(Ordering::SeqCst)
+            + self.lease_info_calls.load(Ordering::SeqCst)
+            + self.acquire_calls.load(Ordering::SeqCst)
+            + self.renew_calls.load(Ordering::SeqCst)
     }
 
     async fn seed(&self, entries: &[ReplicationEntry]) {
@@ -103,10 +135,12 @@ impl SessionBackend for ControlledBackend {
     }
 
     async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
+        self.refresh_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.refresh_ttl(lease, ttl).await
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        self.batch_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.batch(ops).await
     }
 
@@ -160,6 +194,7 @@ impl SessionBackend for ControlledBackend {
     }
 
     async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
+        self.lease_info_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.next_lease_info().await
     }
 }
@@ -172,10 +207,12 @@ impl SessionLeaseManager for ControlledBackend {
         owner: OwnerId,
         ttl: Duration,
     ) -> Result<LeaseGuard, LeaseError> {
+        self.acquire_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.acquire(key, owner, ttl).await
     }
 
     async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
+        self.renew_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.renew(lease, ttl).await
     }
 
@@ -229,6 +266,12 @@ fn test_key() -> SessionKey {
     }
 }
 
+fn max_ttl_plus_one_nanosecond() -> Duration {
+    MAX_SESSION_TTL
+        .checked_add(Duration::from_nanos(1))
+        .expect("SDK TTL maximum has headroom")
+}
+
 #[tokio::test]
 async fn quorum_rejects_zero_before_readiness_or_replica_dispatch() {
     let backends = backends();
@@ -251,6 +294,100 @@ async fn quorum_rejects_zero_before_readiness_or_replica_dispatch() {
     for backend in &backends {
         assert!(backend.replication_log().await.is_empty());
     }
+}
+
+#[tokio::test]
+async fn quorum_rejects_malformed_ttls_before_readiness_lease_info_or_replica_dispatch() {
+    let backends = backends();
+    let store = quorum(&backends, &[0, 1, 2]);
+    let key = test_key();
+    let lease = store
+        .acquire(
+            &key,
+            OwnerId::new("owner-a").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("seed quorum lease");
+    let committed =
+        futures_util::future::join_all(backends.iter().map(|backend| backend.replication_log()))
+            .await;
+    for backend in &backends {
+        backend.reset_boundary_calls();
+    }
+
+    let acquire_error = store
+        .acquire(
+            &test_key(),
+            OwnerId::new("invalid-acquire").expect("owner"),
+            max_ttl_plus_one_nanosecond(),
+        )
+        .await
+        .expect_err("oversized acquire must fail before quorum work");
+    assert_eq!(acquire_error, LeaseError::InvalidSessionTtl);
+
+    let renew_error = store
+        .renew(&lease, Duration::MAX)
+        .await
+        .expect_err("oversized renew must fail before quorum work");
+    assert_eq!(renew_error, LeaseError::InvalidSessionTtl);
+
+    let refresh_error = store
+        .refresh_ttl(&lease, max_ttl_plus_one_nanosecond())
+        .await
+        .expect_err("oversized refresh must fail before quorum work");
+    assert_eq!(refresh_error, StoreError::InvalidSessionTtl);
+
+    let batch_error = store
+        .batch(vec![SessionOp::RefreshTtl {
+            lease: lease.clone(),
+            ttl: Duration::MAX,
+        }])
+        .await
+        .expect_err("oversized batch TTL must fail before quorum work");
+    assert_eq!(batch_error, StoreError::InvalidSessionTtl);
+
+    let timestamp = Timestamp::now_utc();
+    let replicated_error = store
+        .replicate_entry(ReplicationEntry {
+            sequence: 2,
+            tx_id: "malformed-ttl-must-not-dispatch".into(),
+            timestamp,
+            op: ReplicationOp::Batch {
+                ops: vec![
+                    ReplicationOp::AcquireLease {
+                        key: key.clone(),
+                        owner: OwnerId::new("owner-a").expect("owner"),
+                        fence: FenceToken::new(2),
+                        credential_id: 2,
+                        ttl: Duration::from_secs(1),
+                        expires_at: timestamp,
+                    },
+                    ReplicationOp::RenewLease {
+                        key,
+                        owner: OwnerId::new("owner-a").expect("owner"),
+                        fence: FenceToken::new(2),
+                        credential_id: 2,
+                        ttl: Duration::MAX,
+                        expires_at: timestamp,
+                    },
+                ],
+            },
+        })
+        .await
+        .expect_err("nested malformed replicated TTL must fail before quorum work");
+    assert_eq!(replicated_error, StoreError::InvalidSessionTtl);
+    assert_eq!(replicated_error.to_string(), "invalid session TTL");
+    assert!(!format!("{replicated_error:?}").contains("malformed-ttl"));
+
+    assert!(
+        backends.iter().all(|backend| backend.boundary_calls() == 0),
+        "malformed TTL reached readiness, lease-info, or replica dispatch"
+    );
+    let after =
+        futures_util::future::join_all(backends.iter().map(|backend| backend.replication_log()))
+            .await;
+    assert_eq!(after, committed);
 }
 
 #[tokio::test]

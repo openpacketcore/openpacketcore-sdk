@@ -22,6 +22,7 @@ use crate::{
     record::{EncryptedSessionPayload, StoredSessionRecord},
     restore::{RestoreScanPage, RestoreScanRequest},
     topology::{ReplicaId, ReplicaTlsIdentity},
+    ttl::{checked_session_deadline, validate_session_ttl},
 };
 
 /// Per-watcher buffer size for replication watch streams.
@@ -95,6 +96,24 @@ pub enum SessionOp {
     },
 }
 
+impl SessionOp {
+    /// Validate every caller-supplied TTL carried by this operation.
+    ///
+    /// Adapters should preflight an entire batch before performing any slot so
+    /// a malformed later TTL cannot leave an earlier mutation committed.
+    pub fn validate_ttls(&self) -> Result<(), StoreError> {
+        match self {
+            Self::RefreshTtl { ttl, .. } => validate_session_ttl(*ttl),
+            Self::Get { .. } | Self::CompareAndSet(_) | Self::DeleteFenced { .. } => Ok(()),
+        }
+    }
+}
+
+/// Validate all TTL-bearing operations in a batch before executing any slot.
+pub fn validate_session_ops_ttls(ops: &[SessionOp]) -> Result<(), StoreError> {
+    ops.iter().try_for_each(SessionOp::validate_ttls)
+}
+
 /// Result of a single batched operation.
 ///
 /// `SessionBackend::batch` returns one entry per submitted op, in submission
@@ -139,6 +158,20 @@ pub struct ReplicationEntry {
 }
 
 impl ReplicationEntry {
+    /// Validate the entry's sequence and all nested TTL/deadline metadata.
+    ///
+    /// A replicated absolute deadline may be earlier than the requested TTL
+    /// (which is fail-closed), but it may not materially extend beyond
+    /// `entry.timestamp + ttl`. A one-microsecond compatibility tolerance
+    /// admits nanosecond rounding from legacy floating-point entries. This
+    /// prevents a peer from pairing a bounded audit TTL with a deadline far
+    /// beyond its claimed entry timestamp; durable authority for that
+    /// timestamp remains part of #127.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.validate_sequence()?;
+        self.op.validate_ttls_at(self.timestamp)
+    }
+
     /// Validate the scalar replication-log position.
     ///
     /// Sequence zero is reserved for an empty log head and is never a valid
@@ -174,7 +207,7 @@ pub fn validate_replication_prefix(entries: &[ReplicationEntry]) -> Result<(), S
     let mut expected = 1_u64;
     let mut entries = entries.iter().peekable();
     while let Some(entry) = entries.next() {
-        entry.validate_sequence()?;
+        entry.validate()?;
         if entry.sequence != expected {
             return Err(StoreError::InvalidReplicationSequence);
         }
@@ -193,7 +226,7 @@ pub fn validate_replication_prefix(entries: &[ReplicationEntry]) -> Result<(), S
 pub fn validate_replication_page(entries: &[ReplicationEntry]) -> Result<(), StoreError> {
     let mut previous = None;
     for entry in entries {
-        entry.validate_sequence()?;
+        entry.validate()?;
         if let Some(sequence) = previous {
             let expected = next_replication_sequence(sequence)
                 .map_err(|_| StoreError::InvalidReplicationSequence)?;
@@ -309,6 +342,49 @@ pub enum ReplicationOp {
     },
 }
 
+impl ReplicationOp {
+    /// Validate all TTL-bearing operations, including arbitrarily nested
+    /// batches, against their replication-entry timestamp.
+    ///
+    /// Validation is iterative so hostile nesting cannot consume the call
+    /// stack. It completes before any replay or rebuild mutation begins.
+    pub fn validate_ttls_at(&self, reference_timestamp: Timestamp) -> Result<(), StoreError> {
+        let mut pending = vec![self];
+        while let Some(op) = pending.pop() {
+            match op {
+                Self::RefreshTtl {
+                    ttl, expires_at, ..
+                }
+                | Self::AcquireLease {
+                    ttl, expires_at, ..
+                }
+                | Self::RenewLease {
+                    ttl, expires_at, ..
+                } => {
+                    let latest = checked_session_deadline(reference_timestamp, *ttl)?;
+                    let latest_with_legacy_tolerance = latest
+                        .as_offset_datetime()
+                        .checked_add(time::Duration::microseconds(1))
+                        .map(Timestamp::from_offset_datetime)
+                        .unwrap_or_else(|| {
+                            Timestamp::from_offset_datetime(
+                                time::PrimitiveDateTime::MAX.assume_utc(),
+                            )
+                        });
+                    if *expires_at > latest_with_legacy_tolerance {
+                        return Err(StoreError::InvalidSessionTtl);
+                    }
+                }
+                Self::Batch { ops } => pending.extend(ops),
+                Self::CompareAndSet { .. }
+                | Self::DeleteFenced { .. }
+                | Self::ReleaseLease { .. } => {}
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Storage backend trait for session state.
 ///
 /// Implementations MUST enforce their declared [`BackendCapabilities`]. In
@@ -383,8 +459,11 @@ pub trait SessionBackend: Send + Sync {
     /// Refresh the TTL of a record using the caller's current lease credential.
     async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError>;
 
-    /// Execute a batch of operations. The batch is processed sequentially; partial
-    /// failure is represented by individual [`SessionOpResult`] variants.
+    /// Execute a batch of operations. TTL-bearing slots are all validated
+    /// before any slot executes; an invalid TTL returns an outer
+    /// [`StoreError::InvalidSessionTtl`] with no partial mutation. A valid batch
+    /// is processed sequentially and operational failures are represented by
+    /// individual [`SessionOpResult`] variants.
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError>;
 
     /// Scan live session records for startup/failover restore.
@@ -444,11 +523,10 @@ pub trait SessionBackend: Send + Sync {
     /// Append a replication log entry and apply its mutation locally in a
     /// single atomic transaction.
     ///
-    /// Implementations must reject sequence zero with
-    /// [`StoreError::InvalidReplicationSequence`] before locking, mutating, or
-    /// invoking an external provider.
+    /// Implementations must reject invalid sequence and TTL/deadline metadata
+    /// before locking, mutating, or invoking an external provider.
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate_sequence()?;
+        entry.validate()?;
         Err(StoreError::CapabilityNotSupported(
             "ordered_replication_log".into(),
         ))
@@ -959,10 +1037,12 @@ where
     }
 
     async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
+        validate_session_ttl(ttl)?;
         self.inner.refresh_ttl(lease, ttl).await
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        validate_session_ops_ttls(&ops)?;
         if !self.inner.capabilities().await.batch_write {
             return Err(StoreError::CapabilityNotSupported("batch_write".into()));
         }
@@ -1085,7 +1165,7 @@ where
     }
 
     async fn replicate_entry(&self, mut entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate_sequence()?;
+        entry.validate()?;
         entry.op = self.encrypt_op(entry.op).await?;
         self.inner.replicate_entry(entry).await
     }
@@ -1134,7 +1214,7 @@ where
                 async move {
                     match res {
                         Ok(mut entry) => {
-                            entry.validate_sequence()?;
+                            entry.validate()?;
                             match decrypt_op_helper(provider.as_ref(), entry.op, &backend_namespace)
                                 .await
                             {
@@ -1170,10 +1250,12 @@ where
         owner: crate::model::OwnerId,
         ttl: Duration,
     ) -> Result<LeaseGuard, LeaseError> {
+        validate_session_ttl(ttl).map_err(LeaseError::from)?;
         self.inner.acquire(key, owner, ttl).await
     }
 
     async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
+        validate_session_ttl(ttl).map_err(LeaseError::from)?;
         self.inner.renew(lease, ttl).await
     }
 
@@ -1516,10 +1598,12 @@ where
     }
 
     async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
+        validate_session_ttl(ttl)?;
         self.inner.refresh_ttl(lease, ttl).await
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        validate_session_ops_ttls(&ops)?;
         if !self.inner.capabilities().await.batch_write {
             return Err(StoreError::CapabilityNotSupported("batch_write".into()));
         }
@@ -1642,7 +1726,7 @@ where
     }
 
     async fn replicate_entry(&self, mut entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate_sequence()?;
+        entry.validate()?;
         entry.op = self.seal_op(entry.op).await?;
         self.inner.replicate_entry(entry).await
     }
@@ -1691,7 +1775,7 @@ where
                 async move {
                     match res {
                         Ok(mut entry) => {
-                            entry.validate_sequence()?;
+                            entry.validate()?;
                             match remote_unseal_op_helper(
                                 provider.as_ref(),
                                 entry.op,
@@ -1731,10 +1815,12 @@ where
         owner: crate::model::OwnerId,
         ttl: Duration,
     ) -> Result<LeaseGuard, LeaseError> {
+        validate_session_ttl(ttl).map_err(LeaseError::from)?;
         self.inner.acquire(key, owner, ttl).await
     }
 
     async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
+        validate_session_ttl(ttl).map_err(LeaseError::from)?;
         self.inner.renew(lease, ttl).await
     }
 

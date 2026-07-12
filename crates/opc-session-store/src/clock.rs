@@ -10,7 +10,15 @@ use std::time::Instant;
 
 use opc_types::Timestamp;
 
+use crate::ttl::saturating_add_elapsed;
+
 /// Injectable clock source for session expiration and leases.
+///
+/// Implementations are trusted process-local components and must be panic-free
+/// for every call. Production clocks must also be nondecreasing; test clocks
+/// may intentionally step to exercise skew handling. The SDK's built-in clocks
+/// use checked integer arithmetic and clamp unrepresentable forward elapsed
+/// time to the largest supported timestamp.
 pub trait Clock: Send + Sync + std::fmt::Debug {
     /// Return the current UTC timestamp.
     fn now_utc(&self) -> Timestamp;
@@ -52,7 +60,7 @@ impl Default for MonotonicClock {
 impl Clock for MonotonicClock {
     fn now_utc(&self) -> Timestamp {
         let elapsed = self.anchor_instant.elapsed();
-        let current_time = self.anchor_time + time::Duration::seconds_f64(elapsed.as_secs_f64());
+        let current_time = saturating_add_elapsed(self.anchor_time, elapsed);
         Timestamp::from_offset_datetime(current_time)
     }
 }
@@ -102,7 +110,30 @@ impl Default for TokioVirtualClock {
 impl Clock for TokioVirtualClock {
     fn now_utc(&self) -> Timestamp {
         let elapsed = tokio::time::Instant::now().duration_since(self.base_instant);
-        let current_time = self.base_time + time::Duration::seconds_f64(elapsed.as_secs_f64());
+        let current_time = saturating_add_elapsed(self.base_time, elapsed);
         Timestamp::from_offset_datetime(current_time)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monotonic_clock_at_maximum_saturates_without_panicking() {
+        let maximum = time::PrimitiveDateTime::MAX.assume_utc();
+        let clock = MonotonicClock::anchored_at(Timestamp::from_offset_datetime(maximum));
+        assert_eq!(clock.now_utc(), Timestamp::from_offset_datetime(maximum));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn virtual_clock_at_maximum_saturates_after_external_advance() {
+        let maximum = time::PrimitiveDateTime::MAX.assume_utc();
+        let clock = TokioVirtualClock {
+            base_time: maximum,
+            base_instant: tokio::time::Instant::now(),
+        };
+        tokio::time::advance(std::time::Duration::from_nanos(1)).await;
+        assert_eq!(clock.now_utc(), Timestamp::from_offset_datetime(maximum));
     }
 }
