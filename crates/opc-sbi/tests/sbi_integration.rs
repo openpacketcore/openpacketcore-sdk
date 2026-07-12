@@ -147,7 +147,23 @@ async fn test_client_circuit_breaker_flow() {
 async fn test_client_records_one_breaker_failure_per_logical_send() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
+    // Keep the address reserved while closing every accepted connection, so
+    // each retry gets a deterministic transport failure without a port race.
+    let rejected_connections = Arc::new(AtomicUsize::new(0));
+    let rejected_by_server = rejected_connections.clone();
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+    let rejecting_server = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.unwrap();
+                    rejected_by_server.fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                }
+            }
+        }
+    });
 
     let breakers = Arc::new(opc_sbi::client::circuit_breaker::CircuitBreakers::new(
         2,
@@ -176,7 +192,11 @@ async fn test_client_records_one_breaker_failure_per_logical_send() {
         .unwrap();
 
     let result = client.send(request).await;
+    stop_tx.send(()).unwrap();
+    rejecting_server.await.unwrap();
+
     assert!(result.is_err());
+    assert_eq!(rejected_connections.load(Ordering::SeqCst), 3);
 
     let breaker = breakers.get("127.0.0.1", "nnrf-disc");
     let state = breaker.lock().unwrap().state();
