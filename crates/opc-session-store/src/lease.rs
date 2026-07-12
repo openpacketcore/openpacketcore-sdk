@@ -85,7 +85,12 @@ impl LeaseGuard {
         self.expires_at
     }
 
-    pub(crate) fn credential_id(&self) -> u64 {
+    /// Opaque credential identifier retained across renewal.
+    ///
+    /// Reading this identifier does not permit callers to mint a valid guard:
+    /// guard construction remains crate-private. Transport and backend adapters
+    /// use it to reject renewal responses that silently replace credentials.
+    pub fn credential_id(&self) -> u64 {
         self.credential_id
     }
 }

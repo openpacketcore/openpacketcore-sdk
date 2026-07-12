@@ -24,8 +24,10 @@ pub use identity::{
     SessionConfigurationId, SessionManifestError, SessionReplicationManifest,
 };
 pub use protocol::{
-    ContractProfile, HelloRejectReason, Request, Response, CURRENT_CONTRACT_PROFILE,
-    MAX_SESSION_NET_BATCH_OPERATIONS, MAX_SESSION_NET_REBUILD_ENTRIES,
-    MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES,
+    conservative_payload_budget, ContractProfile, HelloRejectReason, Request, Response,
+    CURRENT_CONTRACT_PROFILE, MAX_NEGOTIATED_FRAME_SIZE, MAX_SESSION_NET_BATCH_OPERATIONS,
+    MAX_SESSION_NET_REBUILD_ENTRIES, MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES,
+    MAX_SESSION_NET_REPLICATION_TX_ID_BYTES, MAX_SESSION_NET_STABLE_ID_BYTES,
+    MIN_NEGOTIATED_FRAME_SIZE, SESSION_NET_CAS_REQUEST_ID_BYTES,
 };
 pub use server::SessionReplicationServer;

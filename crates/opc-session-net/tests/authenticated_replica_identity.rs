@@ -167,6 +167,7 @@ fn successful_hello_ack(hello: &Request) -> Response {
         cluster_id,
         configuration_id,
         handshake_nonce,
+        requested_response_frame_size,
         ..
     } = hello
     else {
@@ -180,6 +181,8 @@ fn successful_hello_ack(hello: &Request) -> Response {
         cluster_id: cluster_id.clone(),
         configuration_id: configuration_id.clone(),
         handshake_nonce: *handshake_nonce,
+        accepted_response_frame_size: *requested_response_frame_size,
+        server_request_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
     }
 }
 
@@ -192,6 +195,7 @@ fn hello_for(binding: &RemoteReplicaBinding) -> Request {
         cluster_id: Some(binding.cluster_id().as_str().to_string()),
         configuration_id: Some(binding.configuration_id().to_hex()),
         handshake_nonce: Some(uuid::Uuid::new_v4()),
+        requested_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
     }
 }
 
@@ -359,6 +363,7 @@ async fn downgrade_and_malformed_hello_are_rejected_before_dispatch() {
             cluster_id: None,
             configuration_id: None,
             handshake_nonce: None,
+            requested_response_frame_size: None,
         },
     )
     .await
@@ -409,6 +414,7 @@ async fn downgrade_and_malformed_hello_are_rejected_before_dispatch() {
                 cluster_id: None,
                 configuration_id: None,
                 handshake_nonce: None,
+                ..
             }
         ));
     }
@@ -424,6 +430,7 @@ async fn downgrade_and_malformed_hello_are_rejected_before_dispatch() {
             cluster_id: None,
             configuration_id: None,
             handshake_nonce: None,
+            requested_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
         },
     )
     .await

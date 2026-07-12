@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fmt, marker::PhantomData, time::Duration};
 
 use opc_session_store::backend::{
@@ -27,13 +28,33 @@ use crate::error::ProtocolError;
 pub const CONTRACT_VERSION: u32 = 4;
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_HANDSHAKE_FRAME_SIZE: usize = 8 * 1024;
-pub const MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE: usize = 512;
+/// Smallest post-bootstrap frame budget accepted by protocol v4.
+///
+/// This leaves room for every fixed, redaction-safe terminal response while
+/// also carrying a zero-payload CAS/Get envelope with every bounded profile
+/// identifier at its worst JSON expansion. The power-of-two headroom avoids
+/// making compatibility depend on one exact serde byte count.
+pub const MIN_NEGOTIATED_FRAME_SIZE: usize = 8 * 1024;
+/// Largest post-bootstrap frame budget accepted by protocol v4.
+///
+/// This ceiling bounds one encoded JSON frame independently of the wire's
+/// wider `u32` length prefix. At the conservative one-eighth payload ratio it
+/// advertises 2,096,128 payload bytes, enough for the SQLite backend's 1 MiB
+/// value limit while keeping per-connection response storage finite.
+pub const MAX_NEGOTIATED_FRAME_SIZE: usize = 16 * 1024 * 1024;
+pub const MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE: usize = MIN_NEGOTIATED_FRAME_SIZE;
 pub const MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES: usize = 65_536;
 pub const MAX_SESSION_NET_BATCH_OPERATIONS: usize = 256;
 pub const MAX_SESSION_NET_REBUILD_ENTRIES: usize = 65_536;
+/// Maximum transport width for a digest-oriented session stable identifier.
+pub const MAX_SESSION_NET_STABLE_ID_BYTES: usize = 64;
+/// Maximum UTF-8 width retained for a durable replication transaction ID.
+pub const MAX_SESSION_NET_REPLICATION_TX_ID_BYTES: usize = 128;
+/// Canonical hyphenated UUID width used by CAS idempotency request IDs.
+pub const SESSION_NET_CAS_REQUEST_ID_BYTES: usize = 36;
 pub const SESSION_NET_ALPN: &[u8] = b"opc-session-net/4";
 
-const WIRE_SCHEMA_REVISION: u16 = 1;
+const WIRE_SCHEMA_REVISION: u16 = 2;
 const ERROR_SET_REVISION: u16 = 1;
 
 /// Exact semantic and resource-bound contract required by protocol v4.
@@ -52,10 +73,15 @@ pub struct ContractProfile {
     pub max_rebuild_entries: u32,
     pub max_replication_operation_depth: u16,
     pub max_replication_operations_per_entry: u32,
+    pub min_frame_size: u32,
+    pub max_frame_size: u32,
     pub max_session_ttl_seconds: u64,
     pub owner_id_max_bytes: u16,
     pub session_key_type_max_bytes: u16,
     pub state_type_max_bytes: u16,
+    pub stable_id_max_bytes: u16,
+    pub replication_tx_id_max_bytes: u16,
+    pub cas_request_id_bytes: u16,
 }
 
 impl ContractProfile {
@@ -78,11 +104,17 @@ impl ContractProfile {
                 == CURRENT_CONTRACT_PROFILE.max_replication_operation_depth
             && self.max_replication_operations_per_entry
                 == CURRENT_CONTRACT_PROFILE.max_replication_operations_per_entry
+            && self.min_frame_size == CURRENT_CONTRACT_PROFILE.min_frame_size
+            && self.max_frame_size == CURRENT_CONTRACT_PROFILE.max_frame_size
             && self.max_session_ttl_seconds == CURRENT_CONTRACT_PROFILE.max_session_ttl_seconds
             && self.owner_id_max_bytes == CURRENT_CONTRACT_PROFILE.owner_id_max_bytes
             && self.session_key_type_max_bytes
                 == CURRENT_CONTRACT_PROFILE.session_key_type_max_bytes
             && self.state_type_max_bytes == CURRENT_CONTRACT_PROFILE.state_type_max_bytes
+            && self.stable_id_max_bytes == CURRENT_CONTRACT_PROFILE.stable_id_max_bytes
+            && self.replication_tx_id_max_bytes
+                == CURRENT_CONTRACT_PROFILE.replication_tx_id_max_bytes
+            && self.cas_request_id_bytes == CURRENT_CONTRACT_PROFILE.cas_request_id_bytes
     }
 }
 
@@ -95,10 +127,15 @@ pub const CURRENT_CONTRACT_PROFILE: ContractProfile = ContractProfile {
     max_rebuild_entries: MAX_SESSION_NET_REBUILD_ENTRIES as u32,
     max_replication_operation_depth: MAX_REPLICATION_OPERATION_DEPTH as u16,
     max_replication_operations_per_entry: MAX_REPLICATION_OPERATIONS_PER_ENTRY as u32,
+    min_frame_size: MIN_NEGOTIATED_FRAME_SIZE as u32,
+    max_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
     max_session_ttl_seconds: MAX_SESSION_TTL.as_secs(),
     owner_id_max_bytes: OWNER_ID_MAX_BYTES as u16,
     session_key_type_max_bytes: SESSION_KEY_TYPE_MAX_BYTES as u16,
     state_type_max_bytes: STATE_TYPE_MAX_BYTES as u16,
+    stable_id_max_bytes: MAX_SESSION_NET_STABLE_ID_BYTES as u16,
+    replication_tx_id_max_bytes: MAX_SESSION_NET_REPLICATION_TX_ID_BYTES as u16,
+    cas_request_id_bytes: SESSION_NET_CAS_REQUEST_ID_BYTES as u16,
 };
 
 const _: () = {
@@ -108,10 +145,62 @@ const _: () = {
     assert!(MAX_SESSION_NET_REBUILD_ENTRIES <= u32::MAX as usize);
     assert!(MAX_REPLICATION_OPERATION_DEPTH <= u16::MAX as usize);
     assert!(MAX_REPLICATION_OPERATIONS_PER_ENTRY <= u32::MAX as usize);
+    assert!(MIN_NEGOTIATED_FRAME_SIZE <= u32::MAX as usize);
+    assert!(MAX_NEGOTIATED_FRAME_SIZE <= u32::MAX as usize);
+    assert!(MIN_NEGOTIATED_FRAME_SIZE <= DEFAULT_MAX_FRAME_SIZE);
+    assert!(DEFAULT_MAX_FRAME_SIZE <= MAX_NEGOTIATED_FRAME_SIZE);
     assert!(OWNER_ID_MAX_BYTES <= u16::MAX as usize);
     assert!(SESSION_KEY_TYPE_MAX_BYTES <= u16::MAX as usize);
     assert!(STATE_TYPE_MAX_BYTES <= u16::MAX as usize);
+    assert!(MAX_SESSION_NET_STABLE_ID_BYTES <= u16::MAX as usize);
+    assert!(MAX_SESSION_NET_REPLICATION_TX_ID_BYTES <= u16::MAX as usize);
+    assert!(SESSION_NET_CAS_REQUEST_ID_BYTES <= u16::MAX as usize);
 };
+
+/// Convert a local frame budget into the fixed-width v4 wire representation.
+///
+/// Only budgets in
+/// [`MIN_NEGOTIATED_FRAME_SIZE`]..=[`MAX_NEGOTIATED_FRAME_SIZE`] implement the
+/// post-bootstrap resource contract.
+pub(crate) fn checked_wire_frame_size(size: usize) -> Result<u32, ProtocolError> {
+    if !(MIN_NEGOTIATED_FRAME_SIZE..=MAX_NEGOTIATED_FRAME_SIZE).contains(&size) {
+        return Err(ProtocolError::InvalidWireValue);
+    }
+    u32::try_from(size).map_err(|_| ProtocolError::InvalidWireValue)
+}
+
+/// Validate and convert a frame budget received from a v4 peer.
+pub(crate) fn checked_frame_size(size: u32) -> Result<usize, ProtocolError> {
+    let size = usize::try_from(size).map_err(|_| ProtocolError::InvalidWireValue)?;
+    if !(MIN_NEGOTIATED_FRAME_SIZE..=MAX_NEGOTIATED_FRAME_SIZE).contains(&size) {
+        return Err(ProtocolError::InvalidWireValue);
+    }
+    Ok(size)
+}
+
+/// Select the response budget enforced by a server for one v4 connection.
+pub(crate) fn negotiate_response_frame_size(
+    requested: u32,
+    server_max_frame_size: usize,
+) -> Result<u32, ProtocolError> {
+    let requested = checked_frame_size(requested)?;
+    let server_max = checked_frame_size(checked_wire_frame_size(server_max_frame_size)?)?;
+    checked_wire_frame_size(requested.min(server_max))
+}
+
+/// Conservative application-payload budget executable over a response frame.
+///
+/// Session payload bytes serialize as a JSON byte array, where a worst-case
+/// byte plus delimiter consumes four bytes. Reserving one bootstrap-minimum
+/// block and dividing the remainder by eight leaves at least the same amount
+/// again for bounded record/key metadata and the `Get`/CAS JSON envelopes.
+/// Servers clamp backend `max_value_bytes` to this value; protocol tests
+/// exercise the returned budget through exact `Get` and CAS wire
+/// representations with every profile identifier at its maximum and
+/// worst-case (`255`) payload bytes.
+pub const fn conservative_payload_budget(frame_size: usize) -> usize {
+    frame_size.saturating_sub(MIN_NEGOTIATED_FRAME_SIZE) / 8
+}
 
 /// Redaction-safe reason a Hello was rejected before backend dispatch.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +232,9 @@ pub struct BootstrapHello {
     pub handshake_nonce: Option<uuid::Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract_profile: Option<ContractProfile>,
+    /// Largest encoded post-bootstrap response frame the client will accept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_response_frame_size: Option<u32>,
 }
 
 /// Frozen bootstrap payload for a server acknowledgement.
@@ -162,6 +254,29 @@ pub struct BootstrapHelloAck {
     pub handshake_nonce: Option<uuid::Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract_profile: Option<ContractProfile>,
+    /// Response-frame budget selected by the server for this connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_response_frame_size: Option<u32>,
+    /// Largest encoded post-bootstrap request frame the server will accept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_request_frame_size: Option<u32>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapHelloAckRef<'a> {
+    contract_version: u32,
+    server_replica_id: Option<&'a str>,
+    accepted_client_replica_id: Option<&'a str>,
+    cluster_id: Option<&'a str>,
+    configuration_id: Option<&'a str>,
+    handshake_nonce: Option<uuid::Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contract_profile: Option<ContractProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accepted_response_frame_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_request_frame_size: Option<u32>,
 }
 
 /// The only frame shape decoded before a server authenticates a connection.
@@ -254,6 +369,7 @@ pub enum Request {
         configuration_id: Option<String>,
         handshake_nonce: Option<uuid::Uuid>,
         contract_profile: Option<ContractProfile>,
+        requested_response_frame_size: Option<u32>,
     },
     Capabilities,
     Get {
@@ -316,6 +432,8 @@ pub enum Response {
         configuration_id: Option<String>,
         handshake_nonce: Option<uuid::Uuid>,
         contract_profile: Option<ContractProfile>,
+        accepted_response_frame_size: Option<u32>,
+        server_request_frame_size: Option<u32>,
     },
     HelloRejected {
         reason: HelloRejectReason,
@@ -345,6 +463,444 @@ pub enum Response {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionOpExpectation {
+    Get(SessionKey),
+    CompareAndSet(SessionKey),
+    DeleteFenced,
+    RefreshTtl,
+}
+
+pub(crate) fn bounded_session_op_expectations(
+    ops: &[SessionOp],
+) -> Result<Vec<SessionOpExpectation>, StoreError> {
+    if ops.len() > MAX_SESSION_NET_BATCH_OPERATIONS {
+        return Err(StoreError::ReplicationOperationLimitExceeded);
+    }
+    Ok(ops
+        .iter()
+        .map(|op| match op {
+            SessionOp::Get { key } => SessionOpExpectation::Get(key.clone()),
+            SessionOp::CompareAndSet(op) => SessionOpExpectation::CompareAndSet(op.key.clone()),
+            SessionOp::DeleteFenced { .. } => SessionOpExpectation::DeleteFenced,
+            SessionOp::RefreshTtl { .. } => SessionOpExpectation::RefreshTtl,
+        })
+        .collect())
+}
+
+pub(crate) fn get_result_matches_key(
+    expected_key: &SessionKey,
+    result: &Result<Option<StoredSessionRecord>, StoreError>,
+) -> bool {
+    !matches!(result, Ok(Some(record)) if record.key != *expected_key)
+}
+
+pub(crate) fn compare_and_set_result_matches_key(
+    expected_key: &SessionKey,
+    result: &Result<CompareAndSetResult, StoreError>,
+) -> bool {
+    !matches!(
+        result,
+        Ok(CompareAndSetResult::Conflict {
+            current: Some(record)
+        }) if record.key != *expected_key
+    )
+}
+
+pub(crate) fn session_op_results_match_expectations(
+    expected: &[SessionOpExpectation],
+    results: &[SessionOpResult],
+) -> bool {
+    expected.len() == results.len()
+        && expected
+            .iter()
+            .zip(results)
+            .all(|(expected, result)| match (expected, result) {
+                (SessionOpExpectation::Get(key), SessionOpResult::Get(result)) => {
+                    get_result_matches_key(key, result)
+                }
+                (
+                    SessionOpExpectation::CompareAndSet(key),
+                    SessionOpResult::CompareAndSet(result),
+                ) => compare_and_set_result_matches_key(key, result),
+                (SessionOpExpectation::DeleteFenced, SessionOpResult::DeleteFenced(_))
+                | (SessionOpExpectation::RefreshTtl, SessionOpResult::RefreshTtl(_)) => true,
+                _ => false,
+            })
+}
+
+fn validate_session_key_profile(key: &SessionKey) -> Result<(), WireConversionError> {
+    if key.stable_id.is_empty() || key.stable_id.len() > MAX_SESSION_NET_STABLE_ID_BYTES {
+        return Err(WireConversionError(
+            "session stable ID violates the v4 transport profile",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_record_profile(record: &StoredSessionRecord) -> Result<(), WireConversionError> {
+    validate_session_key_profile(&record.key)
+}
+
+fn validate_record_payload_limit(
+    record: &StoredSessionRecord,
+    max: usize,
+) -> Result<(), StoreError> {
+    let actual = record.payload.len();
+    if actual > max {
+        return Err(StoreError::PayloadTooLarge { actual, max });
+    }
+    Ok(())
+}
+
+fn validate_replication_payload_limit(
+    entry: &ReplicationEntry,
+    max: usize,
+) -> Result<(), StoreError> {
+    let mut pending = vec![std::slice::from_ref(&entry.op).iter()];
+    while let Some(current) = pending.last_mut() {
+        match current.next() {
+            Some(ReplicationOp::CompareAndSet { new_record, .. }) => {
+                validate_record_payload_limit(new_record, max)?;
+            }
+            Some(ReplicationOp::Batch { ops }) => pending.push(ops.iter()),
+            Some(
+                ReplicationOp::DeleteFenced { .. }
+                | ReplicationOp::RefreshTtl { .. }
+                | ReplicationOp::AcquireLease { .. }
+                | ReplicationOp::RenewLease { .. }
+                | ReplicationOp::ReleaseLease { .. },
+            ) => {}
+            None => {
+                pending.pop();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate every record payload carried by a request against one transport value limit.
+///
+/// Nested replication batches use an iterator stack, so traversal allocates with depth rather
+/// than attacker-controlled batch width. The whole request is checked before any dispatch.
+pub(crate) fn validate_request_payload_limit(
+    request: &Request,
+    max: usize,
+) -> Result<(), StoreError> {
+    match request {
+        Request::CompareAndSet { op, .. } => validate_record_payload_limit(&op.new_record, max),
+        Request::Batch { ops } => ops.iter().try_for_each(|op| match op {
+            SessionOp::CompareAndSet(op) => validate_record_payload_limit(&op.new_record, max),
+            SessionOp::Get { .. }
+            | SessionOp::DeleteFenced { .. }
+            | SessionOp::RefreshTtl { .. } => Ok(()),
+        }),
+        Request::ReplicateEntry { entry } => validate_replication_payload_limit(entry, max),
+        Request::RebuildReplicationState { entries } => entries
+            .iter()
+            .try_for_each(|entry| validate_replication_payload_limit(entry, max)),
+        Request::Hello { .. }
+        | Request::Capabilities
+        | Request::Get { .. }
+        | Request::DeleteFenced { .. }
+        | Request::RefreshTtl { .. }
+        | Request::ScanRestoreRecords { .. }
+        | Request::MaxReplicationSequence
+        | Request::GetReplicationLog { .. }
+        | Request::Watch { .. }
+        | Request::NextLeaseInfo
+        | Request::AcquireLease { .. }
+        | Request::RenewLease { .. }
+        | Request::ReleaseLease { .. } => Ok(()),
+    }
+}
+
+fn validate_lease_profile(lease: &LeaseGuard) -> Result<(), WireConversionError> {
+    validate_session_key_profile(lease.key())
+}
+
+fn validate_compare_and_set_profile(op: &CompareAndSet) -> Result<(), WireConversionError> {
+    validate_session_key_profile(&op.key)?;
+    validate_lease_profile(&op.lease)?;
+    validate_record_profile(&op.new_record)
+}
+
+fn validate_compare_and_set_result_profile(
+    result: &CompareAndSetResult,
+) -> Result<(), WireConversionError> {
+    if let CompareAndSetResult::Conflict {
+        current: Some(record),
+    } = result
+    {
+        validate_record_profile(record)?;
+    }
+    Ok(())
+}
+
+fn validate_session_op_profile(op: &SessionOp) -> Result<(), WireConversionError> {
+    op.validate_ttls()
+        .map_err(|_| WireConversionError("session TTL violates the v4 transport profile"))?;
+    validate_session_op_retained_profile(op)
+}
+
+fn validate_session_op_retained_profile(op: &SessionOp) -> Result<(), WireConversionError> {
+    match op {
+        SessionOp::Get { key } => validate_session_key_profile(key),
+        SessionOp::CompareAndSet(op) => validate_compare_and_set_profile(op),
+        SessionOp::DeleteFenced { lease } | SessionOp::RefreshTtl { lease, .. } => {
+            validate_lease_profile(lease)
+        }
+    }
+}
+
+/// Validate only request fields that may be retained or dispatched without a
+/// family-specific typed rejection.
+///
+/// Known semantic failures such as an invalid TTL or replication sequence are
+/// deliberately left for the authenticated server dispatcher. That preserves
+/// the protocol's typed error and keeps the connection usable, while local
+/// callers still receive the stricter pre-I/O validation in
+/// [`validate_request_profile`].
+fn validate_inbound_request_profile(request: &Request) -> Result<(), WireConversionError> {
+    match request {
+        Request::Get { key } | Request::AcquireLease { key, .. } => {
+            validate_session_key_profile(key)
+        }
+        Request::CompareAndSet { op, .. } => validate_compare_and_set_profile(op),
+        Request::DeleteFenced { lease }
+        | Request::RefreshTtl { lease, .. }
+        | Request::RenewLease { lease, .. }
+        | Request::ReleaseLease { lease } => validate_lease_profile(lease),
+        Request::Batch { ops } => ops
+            .iter()
+            .try_for_each(validate_session_op_retained_profile),
+        Request::ReplicateEntry { entry } => validate_replication_retained_profile(entry),
+        Request::RebuildReplicationState { entries } => entries
+            .iter()
+            .try_for_each(validate_replication_retained_profile),
+        Request::Hello { .. }
+        | Request::Capabilities
+        | Request::ScanRestoreRecords { .. }
+        | Request::MaxReplicationSequence
+        | Request::GetReplicationLog { .. }
+        | Request::Watch { .. }
+        | Request::NextLeaseInfo => Ok(()),
+    }
+}
+
+fn validate_session_op_result_profile(result: &SessionOpResult) -> Result<(), WireConversionError> {
+    match result {
+        SessionOpResult::Get(Ok(Some(record))) => validate_record_profile(record),
+        SessionOpResult::CompareAndSet(Ok(result)) => {
+            validate_compare_and_set_result_profile(result)
+        }
+        SessionOpResult::Get(Ok(None) | Err(_))
+        | SessionOpResult::CompareAndSet(Err(_))
+        | SessionOpResult::DeleteFenced(_)
+        | SessionOpResult::RefreshTtl(_) => Ok(()),
+    }
+}
+
+fn validate_replication_entry_profile(entry: &ReplicationEntry) -> Result<(), WireConversionError> {
+    entry
+        .validate()
+        .map_err(|_| WireConversionError("replication entry violates the v4 contract"))?;
+    validate_replication_retained_profile(entry)
+}
+
+fn validate_replication_retained_profile(
+    entry: &ReplicationEntry,
+) -> Result<(), WireConversionError> {
+    if entry.tx_id.is_empty() || entry.tx_id.len() > MAX_SESSION_NET_REPLICATION_TX_ID_BYTES {
+        return Err(WireConversionError(
+            "replication transaction ID violates the v4 transport profile",
+        ));
+    }
+
+    let mut pending = Vec::with_capacity(MAX_REPLICATION_OPERATION_DEPTH);
+    pending.push(&entry.op);
+    while let Some(op) = pending.pop() {
+        match op {
+            ReplicationOp::CompareAndSet {
+                key, new_record, ..
+            } => {
+                validate_session_key_profile(key)?;
+                validate_record_profile(new_record)?;
+            }
+            ReplicationOp::DeleteFenced { key, .. }
+            | ReplicationOp::RefreshTtl { key, .. }
+            | ReplicationOp::AcquireLease { key, .. }
+            | ReplicationOp::RenewLease { key, .. }
+            | ReplicationOp::ReleaseLease { key, .. } => validate_session_key_profile(key)?,
+            ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
+        }
+    }
+    Ok(())
+}
+
+fn discard_replication_entry_iteratively(entry: ReplicationEntry) {
+    let ReplicationEntry { op, .. } = entry;
+    let mut pending = vec![vec![op].into_iter()];
+    while let Some(current) = pending.last_mut() {
+        match current.next() {
+            Some(ReplicationOp::Batch { ops }) => pending.push(ops.into_iter()),
+            Some(_) => {}
+            None => {
+                pending.pop();
+            }
+        }
+    }
+}
+
+fn discard_replication_entries_iteratively(entries: Vec<ReplicationEntry>) {
+    entries
+        .into_iter()
+        .for_each(discard_replication_entry_iteratively);
+}
+
+fn into_profile_validated_replication_entry(
+    entry: ReplicationEntry,
+) -> Result<ReplicationEntry, WireConversionError> {
+    let entry = entry
+        .into_validated()
+        .map_err(|_| WireConversionError("replication entry violates the v4 contract"))?;
+    match validate_replication_retained_profile(&entry) {
+        Ok(()) => Ok(entry),
+        Err(error) => {
+            discard_replication_entry_iteratively(entry);
+            Err(error)
+        }
+    }
+}
+
+fn parse_canonical_cas_request_id(value: &str) -> Result<uuid::Uuid, WireConversionError> {
+    if value.len() != SESSION_NET_CAS_REQUEST_ID_BYTES {
+        return Err(WireConversionError(
+            "CAS request ID must be a canonical UUID",
+        ));
+    }
+    let request_id = uuid::Uuid::parse_str(value)
+        .map_err(|_| WireConversionError("CAS request ID must be a canonical UUID"))?;
+    if request_id.hyphenated().to_string() != value {
+        return Err(WireConversionError(
+            "CAS request ID must be a canonical UUID",
+        ));
+    }
+    Ok(request_id)
+}
+
+/// Validate bounded retained identifiers and scalar/collection profile fields without encoding.
+///
+/// The serializer performs the same checks again. Clients use this allocation-light pass before
+/// DNS or connection work so malformed local requests fail without observable network activity.
+pub(crate) fn validate_request_profile(request: &Request) -> Result<(), WireConversionError> {
+    match request {
+        Request::Get { key } => validate_session_key_profile(key),
+        Request::AcquireLease { key, ttl, .. } => {
+            validate_session_key_profile(key)?;
+            opc_session_store::validate_session_ttl(*ttl)
+                .map_err(|_| WireConversionError("session TTL violates the v4 transport profile"))
+        }
+        Request::CompareAndSet { op, request_id } => {
+            validate_compare_and_set_profile(op)?;
+            if let Some(request_id) = request_id {
+                parse_canonical_cas_request_id(request_id)?;
+            }
+            Ok(())
+        }
+        Request::DeleteFenced { lease } | Request::ReleaseLease { lease } => {
+            validate_lease_profile(lease)
+        }
+        Request::RefreshTtl { lease, ttl } | Request::RenewLease { lease, ttl } => {
+            validate_lease_profile(lease)?;
+            opc_session_store::validate_session_ttl(*ttl)
+                .map_err(|_| WireConversionError("session TTL violates the v4 transport profile"))
+        }
+        Request::Batch { ops } => {
+            if ops.len() > MAX_SESSION_NET_BATCH_OPERATIONS {
+                return Err(WireConversionError("batch exceeds the v4 operation limit"));
+            }
+            ops.iter().try_for_each(validate_session_op_profile)
+        }
+        Request::ScanRestoreRecords {
+            request,
+            max_response_frame_size,
+        } => {
+            RestoreScanRequest::try_from(request.clone()).map_err(|_| {
+                WireConversionError("restore scan request violates the v4 contract")
+            })?;
+            checked_frame_size(*max_response_frame_size).map_err(|_| {
+                WireConversionError("restore scan frame size violates the v4 contract")
+            })?;
+            Ok(())
+        }
+        Request::GetReplicationLog { limit, .. } => {
+            wire_u32_from_usize(
+                *limit,
+                MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES,
+                "replication log page exceeds the v4 operation limit",
+            )?;
+            Ok(())
+        }
+        Request::ReplicateEntry { entry } => validate_replication_entry_profile(entry),
+        Request::RebuildReplicationState { entries } => {
+            if entries.len() > MAX_SESSION_NET_REBUILD_ENTRIES {
+                return Err(WireConversionError(
+                    "replication rebuild exceeds the v4 entry limit",
+                ));
+            }
+            entries
+                .iter()
+                .try_for_each(validate_replication_entry_profile)
+        }
+        Request::Hello { .. }
+        | Request::Capabilities
+        | Request::MaxReplicationSequence
+        | Request::Watch { .. }
+        | Request::NextLeaseInfo => Ok(()),
+    }
+}
+
+fn validate_response_profile(response: &Response) -> Result<(), WireConversionError> {
+    match response {
+        Response::Get(Ok(Some(record))) => validate_record_profile(record),
+        Response::CompareAndSet(Ok(result)) => validate_compare_and_set_result_profile(result),
+        Response::Batch(Ok(results)) => results
+            .iter()
+            .try_for_each(validate_session_op_result_profile),
+        Response::ScanRestoreRecords(Ok(page)) => {
+            page.records.iter().try_for_each(validate_record_profile)
+        }
+        Response::GetReplicationLog(Ok(entries)) => entries
+            .iter()
+            .try_for_each(validate_replication_entry_profile),
+        Response::WatchEntry(Ok(entry)) => validate_replication_entry_profile(entry),
+        Response::AcquireLease(Ok(lease)) | Response::RenewLease(Ok(lease)) => {
+            validate_lease_profile(lease)
+        }
+        Response::HelloAck { .. }
+        | Response::HelloRejected { .. }
+        | Response::Capabilities(_)
+        | Response::Get(Ok(None) | Err(_))
+        | Response::CompareAndSet(Err(_))
+        | Response::DeleteFenced(_)
+        | Response::RefreshTtl(_)
+        | Response::Batch(Err(_))
+        | Response::ScanRestoreRecords(Err(_))
+        | Response::MaxReplicationSequence(_)
+        | Response::GetReplicationLog(Err(_))
+        | Response::ReplicateEntry(_)
+        | Response::RebuildReplicationState(_)
+        | Response::WatchStream
+        | Response::WatchEntry(Err(_))
+        | Response::NextLeaseInfo(_)
+        | Response::AcquireLease(Err(_))
+        | Response::RenewLease(Err(_))
+        | Response::ReleaseLease(_)
+        | Response::Error { .. } => Ok(()),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -526,6 +1082,7 @@ impl<'a> TryFrom<&'a RestoreScanPage> for WireRestoreScanPageRef<'a> {
                 "restore scan page violates the v4 contract",
             ));
         }
+        page.records.iter().try_for_each(validate_record_profile)?;
         Ok(Self {
             records: &page.records,
             excluded_count: wire_u64_from_usize(
@@ -621,6 +1178,7 @@ impl TryFrom<WireBackendCapabilities> for BackendCapabilities {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 enum WireStoreError {
     NotFound,
     StaleFence,
@@ -642,19 +1200,57 @@ enum WireStoreError {
     RestoreScanResponseTooLarge { max_bytes: u64 },
 }
 
-impl TryFrom<&StoreError> for WireStoreError {
+/// Borrowed outbound form so serializing backend errors never clones
+/// peer-controlled or backend-provided strings.
+#[derive(Serialize)]
+enum WireStoreErrorRef<'a> {
+    NotFound,
+    StaleFence,
+    CasConflict,
+    CapabilityNotSupported(&'a str),
+    BackendUnavailable(&'a str),
+    InvalidKey(&'a str),
+    InvalidReplicationSequence,
+    ReplicationOperationLimitExceeded,
+    InvalidSessionTtl,
+    LeaseHeld,
+    LeaseExpired,
+    Crypto(&'a str),
+    Serialization(&'a str),
+    PayloadTooLarge { actual: u64, max: u64 },
+    InvalidRestoreScanRequest(&'a str),
+    InvalidRestoreScanResponse(&'a str),
+    RestoreScanPageTooLarge { requested: u64, max: u64 },
+    RestoreScanResponseTooLarge { max_bytes: u64 },
+}
+
+fn safe_capability_name(value: &str) -> &'static str {
+    match value {
+        "atomic_compare_and_set" => "atomic_compare_and_set",
+        "monotonic_fencing_token" => "monotonic_fencing_token",
+        "per_key_ttl" => "per_key_ttl",
+        "batch_write" => "batch_write",
+        "ordered_replication_log" => "ordered_replication_log",
+        "restore_scan" => "restore_scan",
+        "watch" => "watch",
+        "lease_coordination" => "lease_coordination",
+        _ => "unknown_capability",
+    }
+}
+
+impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
     type Error = WireConversionError;
 
-    fn try_from(error: &StoreError) -> Result<Self, Self::Error> {
+    fn try_from(error: &'a StoreError) -> Result<Self, Self::Error> {
         Ok(match error {
             StoreError::NotFound => Self::NotFound,
             StoreError::StaleFence => Self::StaleFence,
             StoreError::CasConflict => Self::CasConflict,
             StoreError::CapabilityNotSupported(message) => {
-                Self::CapabilityNotSupported(message.clone())
+                Self::CapabilityNotSupported(safe_capability_name(message))
             }
-            StoreError::BackendUnavailable(message) => Self::BackendUnavailable(message.clone()),
-            StoreError::InvalidKey(message) => Self::InvalidKey(message.clone()),
+            StoreError::BackendUnavailable(_) => Self::BackendUnavailable("backend unavailable"),
+            StoreError::InvalidKey(_) => Self::InvalidKey("invalid key"),
             StoreError::InvalidReplicationSequence => Self::InvalidReplicationSequence,
             StoreError::ReplicationOperationLimitExceeded => {
                 Self::ReplicationOperationLimitExceeded
@@ -662,17 +1258,17 @@ impl TryFrom<&StoreError> for WireStoreError {
             StoreError::InvalidSessionTtl => Self::InvalidSessionTtl,
             StoreError::LeaseHeld => Self::LeaseHeld,
             StoreError::LeaseExpired => Self::LeaseExpired,
-            StoreError::Crypto(message) => Self::Crypto(message.clone()),
-            StoreError::Serialization(message) => Self::Serialization(message.clone()),
+            StoreError::Crypto(_) => Self::Crypto("cryptographic operation failed"),
+            StoreError::Serialization(_) => Self::Serialization("serialization failed"),
             StoreError::PayloadTooLarge { actual, max } => Self::PayloadTooLarge {
                 actual: wire_u64_from_usize(*actual, "payload size exceeds the v4 wire range")?,
                 max: wire_u64_from_usize(*max, "payload limit exceeds the v4 wire range")?,
             },
-            StoreError::InvalidRestoreScanRequest(message) => {
-                Self::InvalidRestoreScanRequest(message.clone())
+            StoreError::InvalidRestoreScanRequest(_) => {
+                Self::InvalidRestoreScanRequest("restore scan request rejected")
             }
-            StoreError::InvalidRestoreScanResponse(message) => {
-                Self::InvalidRestoreScanResponse(message.clone())
+            StoreError::InvalidRestoreScanResponse(_) => {
+                Self::InvalidRestoreScanResponse("restore scan response rejected")
             }
             StoreError::RestoreScanPageTooLarge { requested, max } => {
                 Self::RestoreScanPageTooLarge {
@@ -704,10 +1300,12 @@ impl TryFrom<WireStoreError> for StoreError {
             WireStoreError::StaleFence => Self::StaleFence,
             WireStoreError::CasConflict => Self::CasConflict,
             WireStoreError::CapabilityNotSupported(message) => {
-                Self::CapabilityNotSupported(message)
+                Self::CapabilityNotSupported(safe_capability_name(&message).to_string())
             }
-            WireStoreError::BackendUnavailable(message) => Self::BackendUnavailable(message),
-            WireStoreError::InvalidKey(message) => Self::InvalidKey(message),
+            WireStoreError::BackendUnavailable(_) => {
+                Self::BackendUnavailable("backend unavailable".to_string())
+            }
+            WireStoreError::InvalidKey(_) => Self::InvalidKey("invalid key".to_string()),
             WireStoreError::InvalidReplicationSequence => Self::InvalidReplicationSequence,
             WireStoreError::ReplicationOperationLimitExceeded => {
                 Self::ReplicationOperationLimitExceeded
@@ -715,8 +1313,10 @@ impl TryFrom<WireStoreError> for StoreError {
             WireStoreError::InvalidSessionTtl => Self::InvalidSessionTtl,
             WireStoreError::LeaseHeld => Self::LeaseHeld,
             WireStoreError::LeaseExpired => Self::LeaseExpired,
-            WireStoreError::Crypto(message) => Self::Crypto(message),
-            WireStoreError::Serialization(message) => Self::Serialization(message),
+            WireStoreError::Crypto(_) => Self::Crypto("cryptographic operation failed".to_string()),
+            WireStoreError::Serialization(_) => {
+                Self::Serialization("serialization failed".to_string())
+            }
             WireStoreError::PayloadTooLarge { actual, max } => Self::PayloadTooLarge {
                 actual: usize_from_wire_u64(
                     actual,
@@ -724,11 +1324,11 @@ impl TryFrom<WireStoreError> for StoreError {
                 )?,
                 max: usize_from_wire_u64(max, "payload limit is not representable on this peer")?,
             },
-            WireStoreError::InvalidRestoreScanRequest(message) => {
-                Self::InvalidRestoreScanRequest(message)
+            WireStoreError::InvalidRestoreScanRequest(_) => {
+                Self::InvalidRestoreScanRequest("restore scan request rejected".to_string())
             }
-            WireStoreError::InvalidRestoreScanResponse(message) => {
-                Self::InvalidRestoreScanResponse(message)
+            WireStoreError::InvalidRestoreScanResponse(_) => {
+                Self::InvalidRestoreScanResponse("restore scan response rejected".to_string())
             }
             WireStoreError::RestoreScanPageTooLarge { requested, max } => {
                 Self::RestoreScanPageTooLarge {
@@ -752,6 +1352,67 @@ impl TryFrom<WireStoreError> for StoreError {
             }
         })
     }
+}
+
+#[derive(Serialize)]
+enum WireLeaseErrorRef<'a> {
+    AlreadyHeld,
+    Expired,
+    StaleFence,
+    NotFound,
+    InvalidSessionTtl,
+    Backend(&'a str),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+enum WireLeaseError {
+    AlreadyHeld,
+    Expired,
+    StaleFence,
+    NotFound,
+    InvalidSessionTtl,
+    Backend(String),
+}
+
+impl<'a> From<&'a LeaseError> for WireLeaseErrorRef<'a> {
+    fn from(error: &'a LeaseError) -> Self {
+        match error {
+            LeaseError::AlreadyHeld => Self::AlreadyHeld,
+            LeaseError::Expired => Self::Expired,
+            LeaseError::StaleFence => Self::StaleFence,
+            LeaseError::NotFound => Self::NotFound,
+            LeaseError::InvalidSessionTtl => Self::InvalidSessionTtl,
+            LeaseError::Backend(_) => Self::Backend("lease backend unavailable"),
+        }
+    }
+}
+
+impl From<WireLeaseError> for LeaseError {
+    fn from(error: WireLeaseError) -> Self {
+        match error {
+            WireLeaseError::AlreadyHeld => Self::AlreadyHeld,
+            WireLeaseError::Expired => Self::Expired,
+            WireLeaseError::StaleFence => Self::StaleFence,
+            WireLeaseError::NotFound => Self::NotFound,
+            WireLeaseError::InvalidSessionTtl => Self::InvalidSessionTtl,
+            WireLeaseError::Backend(message) => {
+                drop(message);
+                Self::Backend("lease backend unavailable".to_string())
+            }
+        }
+    }
+}
+
+fn wire_lease_result_ref<T>(result: &Result<T, LeaseError>) -> Result<&T, WireLeaseErrorRef<'_>> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => Err(WireLeaseErrorRef::from(error)),
+    }
+}
+
+fn domain_lease_result<T>(result: Result<T, WireLeaseError>) -> Result<T, LeaseError> {
+    result.map_err(LeaseError::from)
 }
 
 #[derive(Serialize)]
@@ -803,6 +1464,7 @@ enum WireReplicationNodeRef<'a> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 enum WireReplicationNode {
     CompareAndSet {
         key: SessionKey,
@@ -1023,9 +1685,7 @@ impl<'a> TryFrom<&'a ReplicationEntry> for WireReplicationEntryRef<'a> {
     type Error = WireConversionError;
 
     fn try_from(entry: &'a ReplicationEntry) -> Result<Self, Self::Error> {
-        entry
-            .validate()
-            .map_err(|_| WireConversionError("replication entry violates the v4 contract"))?;
+        validate_replication_entry_profile(entry)?;
 
         let mut pending = Vec::with_capacity(MAX_REPLICATION_OPERATION_DEPTH);
         let mut operation_nodes = Vec::with_capacity(MAX_REPLICATION_OPERATION_DEPTH);
@@ -1185,9 +1845,7 @@ impl TryFrom<WireReplicationEntry> for ReplicationEntry {
 fn validated_replication_entry_from_wire(
     entry: WireReplicationEntry,
 ) -> Result<ReplicationEntry, WireConversionError> {
-    ReplicationEntry::try_from(entry)?
-        .into_validated()
-        .map_err(|_| WireConversionError("replication entry violates the v4 contract"))
+    into_profile_validated_replication_entry(ReplicationEntry::try_from(entry)?)
 }
 
 fn validate_wire_replication_tree(
@@ -1251,6 +1909,49 @@ fn validate_wire_replication_tree(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WireCasRequestId(uuid::Uuid);
+
+impl Serialize for WireCasRequestId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0.hyphenated().to_string())
+    }
+}
+
+struct WireCasRequestIdVisitor;
+
+impl Visitor<'_> for WireCasRequestIdVisitor {
+    type Value = WireCasRequestId;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a canonical lowercase hyphenated UUID")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if value.len() != SESSION_NET_CAS_REQUEST_ID_BYTES {
+            return Err(E::custom("CAS request ID must be a canonical UUID"));
+        }
+        let request_id = parse_canonical_cas_request_id(value)
+            .map_err(|_| E::custom("CAS request ID must be a canonical UUID"))?;
+        Ok(WireCasRequestId(request_id))
+    }
+}
+
+impl<'de> Deserialize<'de> for WireCasRequestId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_str(WireCasRequestIdVisitor)
+    }
+}
+
 #[derive(Serialize)]
 enum WireRequestRef<'a> {
     Hello(BootstrapHello),
@@ -1260,7 +1961,7 @@ enum WireRequestRef<'a> {
     },
     CompareAndSet {
         op: &'a CompareAndSet,
-        request_id: &'a Option<String>,
+        request_id: Option<WireCasRequestId>,
     },
     DeleteFenced {
         lease: &'a LeaseGuard,
@@ -1285,7 +1986,7 @@ enum WireRequestRef<'a> {
         entry: WireReplicationEntryRef<'a>,
     },
     RebuildReplicationState {
-        entries: Vec<WireReplicationEntryRef<'a>>,
+        entries: WireReplicationEntriesRef<'a>,
     },
     Watch {
         start_sequence: u64,
@@ -1307,6 +2008,7 @@ enum WireRequestRef<'a> {
 
 #[derive(Deserialize)]
 #[allow(clippy::large_enum_variant)] // one frame is independently bounded before decode
+#[serde(deny_unknown_fields)]
 enum WireRequest {
     Hello(BootstrapHello),
     Capabilities,
@@ -1316,7 +2018,7 @@ enum WireRequest {
     CompareAndSet {
         op: CompareAndSet,
         #[serde(default)]
-        request_id: Option<String>,
+        request_id: Option<WireCasRequestId>,
     },
     DeleteFenced {
         lease: LeaseGuard,
@@ -1365,6 +2067,7 @@ impl<'a> TryFrom<&'a Request> for WireRequestRef<'a> {
     type Error = WireConversionError;
 
     fn try_from(request: &'a Request) -> Result<Self, Self::Error> {
+        validate_request_profile(request)?;
         Ok(match request {
             Request::Hello {
                 contract_version,
@@ -1374,6 +2077,7 @@ impl<'a> TryFrom<&'a Request> for WireRequestRef<'a> {
                 configuration_id,
                 handshake_nonce,
                 contract_profile,
+                requested_response_frame_size,
             } => Self::Hello(BootstrapHello {
                 contract_version: *contract_version,
                 node_id: node_id.clone(),
@@ -1382,10 +2086,19 @@ impl<'a> TryFrom<&'a Request> for WireRequestRef<'a> {
                 configuration_id: configuration_id.clone(),
                 handshake_nonce: *handshake_nonce,
                 contract_profile: *contract_profile,
+                requested_response_frame_size: *requested_response_frame_size,
             }),
             Request::Capabilities => Self::Capabilities,
             Request::Get { key } => Self::Get { key },
-            Request::CompareAndSet { op, request_id } => Self::CompareAndSet { op, request_id },
+            Request::CompareAndSet { op, request_id } => Self::CompareAndSet {
+                op,
+                request_id: request_id
+                    .as_deref()
+                    .map(parse_canonical_cas_request_id)
+                    .transpose()
+                    .map_err(|_| WireConversionError("CAS request ID must be a valid UUID"))?
+                    .map(WireCasRequestId),
+            },
             Request::DeleteFenced { lease } => Self::DeleteFenced { lease },
             Request::RefreshTtl { lease, ttl } => Self::RefreshTtl { lease, ttl },
             Request::Batch { ops } => {
@@ -1419,11 +2132,9 @@ impl<'a> TryFrom<&'a Request> for WireRequestRef<'a> {
                         "replication rebuild exceeds the v4 entry limit",
                     ));
                 }
-                let entries = entries
-                    .iter()
-                    .map(WireReplicationEntryRef::try_from)
-                    .collect::<Result<Vec<_>, _>>()?;
-                Self::RebuildReplicationState { entries }
+                Self::RebuildReplicationState {
+                    entries: WireReplicationEntriesRef(entries),
+                }
             }
             Request::Watch { start_sequence } => Self::Watch {
                 start_sequence: *start_sequence,
@@ -1457,12 +2168,14 @@ impl TryFrom<WireRequest> for InboundRequest {
                 configuration_id: hello.configuration_id,
                 handshake_nonce: hello.handshake_nonce,
                 contract_profile: hello.contract_profile,
+                requested_response_frame_size: hello.requested_response_frame_size,
             },
             WireRequest::Capabilities => Request::Capabilities,
             WireRequest::Get { key } => Request::Get { key },
-            WireRequest::CompareAndSet { op, request_id } => {
-                Request::CompareAndSet { op, request_id }
-            }
+            WireRequest::CompareAndSet { op, request_id } => Request::CompareAndSet {
+                op,
+                request_id: request_id.map(|request_id| request_id.0.hyphenated().to_string()),
+            },
             WireRequest::DeleteFenced { lease } => Request::DeleteFenced { lease },
             WireRequest::RefreshTtl { lease, ttl } => Request::RefreshTtl { lease, ttl },
             WireRequest::Batch { ops } => Request::Batch {
@@ -1485,7 +2198,13 @@ impl TryFrom<WireRequest> for InboundRequest {
                 )?,
             },
             WireRequest::ReplicateEntry { entry } => match ReplicationEntry::try_from(entry) {
-                Ok(entry) => Request::ReplicateEntry { entry },
+                Ok(entry) => {
+                    if let Err(error) = validate_replication_retained_profile(&entry) {
+                        discard_replication_entry_iteratively(entry);
+                        return Err(error);
+                    }
+                    Request::ReplicateEntry { entry }
+                }
                 Err(_) => return Ok(Self::ReplicateEntryOperationLimitExceeded),
             },
             WireRequest::RebuildReplicationState { entries } => {
@@ -1493,8 +2212,14 @@ impl TryFrom<WireRequest> for InboundRequest {
                 let mut decoded = Vec::with_capacity(entries.len());
                 for entry in entries {
                     let Ok(entry) = ReplicationEntry::try_from(entry) else {
+                        discard_replication_entries_iteratively(decoded);
                         return Ok(Self::RebuildReplicationStateOperationLimitExceeded);
                     };
+                    if let Err(error) = validate_replication_retained_profile(&entry) {
+                        discard_replication_entries_iteratively(decoded);
+                        discard_replication_entry_iteratively(entry);
+                        return Err(error);
+                    }
                     decoded.push(entry);
                 }
                 Request::RebuildReplicationState { entries: decoded }
@@ -1507,6 +2232,7 @@ impl TryFrom<WireRequest> for InboundRequest {
             WireRequest::RenewLease { lease, ttl } => Request::RenewLease { lease, ttl },
             WireRequest::ReleaseLease { lease } => Request::ReleaseLease { lease },
         };
+        validate_inbound_request_profile(&request)?;
         Ok(Self::Operation(request))
     }
 }
@@ -1516,7 +2242,10 @@ impl TryFrom<WireRequest> for Request {
 
     fn try_from(request: WireRequest) -> Result<Self, Self::Error> {
         match InboundRequest::try_from(request)? {
-            InboundRequest::Operation(request) => Ok(request),
+            InboundRequest::Operation(request) => {
+                validate_request_profile(&request)?;
+                Ok(request)
+            }
             InboundRequest::ReplicateEntryOperationLimitExceeded
             | InboundRequest::RebuildReplicationStateOperationLimitExceeded => Err(
                 WireConversionError("replication operation tree violates the v4 contract"),
@@ -1558,6 +2287,7 @@ impl TryFrom<&Request> for BootstrapRequest {
                 configuration_id,
                 handshake_nonce,
                 contract_profile,
+                requested_response_frame_size,
             } => Ok(Self::Hello(BootstrapHello {
                 contract_version: *contract_version,
                 node_id: node_id.clone(),
@@ -1566,6 +2296,7 @@ impl TryFrom<&Request> for BootstrapRequest {
                 configuration_id: configuration_id.clone(),
                 handshake_nonce: *handshake_nonce,
                 contract_profile: *contract_profile,
+                requested_response_frame_size: *requested_response_frame_size,
             })),
             _ => Err(WireConversionError("expected a bootstrap Hello frame")),
         }
@@ -1583,6 +2314,7 @@ impl From<BootstrapRequest> for Request {
                 configuration_id: hello.configuration_id,
                 handshake_nonce: hello.handshake_nonce,
                 contract_profile: hello.contract_profile,
+                requested_response_frame_size: hello.requested_response_frame_size,
             },
         }
     }
@@ -1590,10 +2322,10 @@ impl From<BootstrapRequest> for Request {
 
 fn wire_store_result_ref<T>(
     result: &Result<T, StoreError>,
-) -> Result<Result<&T, WireStoreError>, WireConversionError> {
+) -> Result<Result<&T, WireStoreErrorRef<'_>>, WireConversionError> {
     match result {
         Ok(value) => Ok(Ok(value)),
-        Err(error) => Ok(Err(WireStoreError::try_from(error)?)),
+        Err(error) => Ok(Err(WireStoreErrorRef::try_from(error)?)),
     }
 }
 
@@ -1608,13 +2340,14 @@ fn domain_store_result<T>(
 
 #[derive(Serialize)]
 enum WireSessionOpResultRef<'a> {
-    Get(Result<&'a Option<StoredSessionRecord>, WireStoreError>),
-    CompareAndSet(Result<&'a CompareAndSetResult, WireStoreError>),
-    DeleteFenced(Result<&'a (), WireStoreError>),
-    RefreshTtl(Result<&'a (), WireStoreError>),
+    Get(Result<&'a Option<StoredSessionRecord>, WireStoreErrorRef<'a>>),
+    CompareAndSet(Result<&'a CompareAndSetResult, WireStoreErrorRef<'a>>),
+    DeleteFenced(Result<&'a (), WireStoreErrorRef<'a>>),
+    RefreshTtl(Result<&'a (), WireStoreErrorRef<'a>>),
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 enum WireSessionOpResult {
     Get(Result<Option<StoredSessionRecord>, WireStoreError>),
     CompareAndSet(Result<CompareAndSetResult, WireStoreError>),
@@ -1626,6 +2359,7 @@ impl<'a> TryFrom<&'a SessionOpResult> for WireSessionOpResultRef<'a> {
     type Error = WireConversionError;
 
     fn try_from(result: &'a SessionOpResult) -> Result<Self, Self::Error> {
+        validate_session_op_result_profile(result)?;
         Ok(match result {
             SessionOpResult::Get(result) => Self::Get(wire_store_result_ref(result)?),
             SessionOpResult::CompareAndSet(result) => {
@@ -1658,31 +2392,80 @@ impl TryFrom<WireSessionOpResult> for SessionOpResult {
     }
 }
 
+struct WireSessionOpResultsRef<'a>(&'a [SessionOpResult]);
+
+impl Serialize for WireSessionOpResultsRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+
+        if self.0.len() > MAX_SESSION_NET_BATCH_OPERATIONS {
+            return Err(serde::ser::Error::custom(
+                "batch response exceeds the v4 operation limit",
+            ));
+        }
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for result in self.0 {
+            let wire =
+                WireSessionOpResultRef::try_from(result).map_err(serde::ser::Error::custom)?;
+            sequence.serialize_element(&wire)?;
+        }
+        sequence.end()
+    }
+}
+
+struct WireReplicationEntriesRef<'a>(&'a [ReplicationEntry]);
+
+impl Serialize for WireReplicationEntriesRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+
+        if self.0.len() > MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES {
+            return Err(serde::ser::Error::custom(
+                "replication log response exceeds the v4 entry limit",
+            ));
+        }
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for entry in self.0 {
+            let wire =
+                WireReplicationEntryRef::try_from(entry).map_err(serde::ser::Error::custom)?;
+            sequence.serialize_element(&wire)?;
+        }
+        sequence.end()
+    }
+}
+
 #[derive(Serialize)]
 enum WireResponseRef<'a> {
-    HelloAck(BootstrapHelloAck),
+    HelloAck(BootstrapHelloAckRef<'a>),
     HelloRejected { reason: HelloRejectReason },
     Capabilities(WireBackendCapabilities),
-    Get(Result<&'a Option<StoredSessionRecord>, WireStoreError>),
-    CompareAndSet(Result<&'a CompareAndSetResult, WireStoreError>),
-    DeleteFenced(Result<&'a (), WireStoreError>),
-    RefreshTtl(Result<&'a (), WireStoreError>),
-    Batch(Result<Vec<WireSessionOpResultRef<'a>>, WireStoreError>),
-    ScanRestoreRecords(Result<WireRestoreScanPageRef<'a>, WireStoreError>),
-    MaxReplicationSequence(Result<&'a u64, WireStoreError>),
-    GetReplicationLog(Result<Vec<WireReplicationEntryRef<'a>>, WireStoreError>),
-    ReplicateEntry(Result<&'a (), WireStoreError>),
-    RebuildReplicationState(Result<&'a (), WireStoreError>),
+    Get(Result<&'a Option<StoredSessionRecord>, WireStoreErrorRef<'a>>),
+    CompareAndSet(Result<&'a CompareAndSetResult, WireStoreErrorRef<'a>>),
+    DeleteFenced(Result<&'a (), WireStoreErrorRef<'a>>),
+    RefreshTtl(Result<&'a (), WireStoreErrorRef<'a>>),
+    Batch(Result<WireSessionOpResultsRef<'a>, WireStoreErrorRef<'a>>),
+    ScanRestoreRecords(Result<WireRestoreScanPageRef<'a>, WireStoreErrorRef<'a>>),
+    MaxReplicationSequence(Result<&'a u64, WireStoreErrorRef<'a>>),
+    GetReplicationLog(Result<WireReplicationEntriesRef<'a>, WireStoreErrorRef<'a>>),
+    ReplicateEntry(Result<&'a (), WireStoreErrorRef<'a>>),
+    RebuildReplicationState(Result<&'a (), WireStoreErrorRef<'a>>),
     WatchStream,
-    WatchEntry(Result<WireReplicationEntryRef<'a>, WireStoreError>),
-    NextLeaseInfo(Result<&'a (u64, u64), WireStoreError>),
-    AcquireLease(&'a Result<LeaseGuard, LeaseError>),
-    RenewLease(&'a Result<LeaseGuard, LeaseError>),
-    ReleaseLease(&'a Result<(), LeaseError>),
+    WatchEntry(Result<WireReplicationEntryRef<'a>, WireStoreErrorRef<'a>>),
+    NextLeaseInfo(Result<&'a (u64, u64), WireStoreErrorRef<'a>>),
+    AcquireLease(Result<&'a LeaseGuard, WireLeaseErrorRef<'a>>),
+    RenewLease(Result<&'a LeaseGuard, WireLeaseErrorRef<'a>>),
+    ReleaseLease(Result<&'a (), WireLeaseErrorRef<'a>>),
     Error { message: &'a str },
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 enum WireResponse {
     HelloAck(BootstrapHelloAck),
     HelloRejected {
@@ -1709,26 +2492,12 @@ enum WireResponse {
     WatchStream,
     WatchEntry(Result<WireReplicationEntry, WireStoreError>),
     NextLeaseInfo(Result<(u64, u64), WireStoreError>),
-    AcquireLease(Result<LeaseGuard, LeaseError>),
-    RenewLease(Result<LeaseGuard, LeaseError>),
-    ReleaseLease(Result<(), LeaseError>),
+    AcquireLease(Result<LeaseGuard, WireLeaseError>),
+    RenewLease(Result<LeaseGuard, WireLeaseError>),
+    ReleaseLease(Result<(), WireLeaseError>),
     Error {
         message: String,
     },
-}
-
-fn wire_replication_entries_ref<'a>(
-    entries: &'a [ReplicationEntry],
-    max: usize,
-    message: &'static str,
-) -> Result<Vec<WireReplicationEntryRef<'a>>, WireConversionError> {
-    if entries.len() > max {
-        return Err(WireConversionError(message));
-    }
-    entries
-        .iter()
-        .map(WireReplicationEntryRef::try_from)
-        .collect()
 }
 
 impl<'a> TryFrom<&'a Response> for WireResponseRef<'a> {
@@ -1744,51 +2513,65 @@ impl<'a> TryFrom<&'a Response> for WireResponseRef<'a> {
                 configuration_id,
                 handshake_nonce,
                 contract_profile,
-            } => Self::HelloAck(BootstrapHelloAck {
+                accepted_response_frame_size,
+                server_request_frame_size,
+            } => Self::HelloAck(BootstrapHelloAckRef {
                 contract_version: *contract_version,
-                server_replica_id: server_replica_id.clone(),
-                accepted_client_replica_id: accepted_client_replica_id.clone(),
-                cluster_id: cluster_id.clone(),
-                configuration_id: configuration_id.clone(),
+                server_replica_id: server_replica_id.as_deref(),
+                accepted_client_replica_id: accepted_client_replica_id.as_deref(),
+                cluster_id: cluster_id.as_deref(),
+                configuration_id: configuration_id.as_deref(),
                 handshake_nonce: *handshake_nonce,
                 contract_profile: *contract_profile,
+                accepted_response_frame_size: *accepted_response_frame_size,
+                server_request_frame_size: *server_request_frame_size,
             }),
             Response::HelloRejected { reason } => Self::HelloRejected { reason: *reason },
             Response::Capabilities(capabilities) => {
                 Self::Capabilities(WireBackendCapabilities::try_from(capabilities)?)
             }
-            Response::Get(result) => Self::Get(wire_store_result_ref(result)?),
-            Response::CompareAndSet(result) => Self::CompareAndSet(wire_store_result_ref(result)?),
+            Response::Get(result) => {
+                if let Ok(Some(record)) = result {
+                    validate_record_profile(record)?;
+                }
+                Self::Get(wire_store_result_ref(result)?)
+            }
+            Response::CompareAndSet(result) => {
+                if let Ok(result) = result {
+                    validate_compare_and_set_result_profile(result)?;
+                }
+                Self::CompareAndSet(wire_store_result_ref(result)?)
+            }
             Response::DeleteFenced(result) => Self::DeleteFenced(wire_store_result_ref(result)?),
             Response::RefreshTtl(result) => Self::RefreshTtl(wire_store_result_ref(result)?),
             Response::Batch(result) => Self::Batch(match result {
-                Ok(results) => {
-                    if results.len() > MAX_SESSION_NET_BATCH_OPERATIONS {
-                        return Err(WireConversionError(
-                            "batch response exceeds the v4 operation limit",
-                        ));
-                    }
-                    Ok(results
-                        .iter()
-                        .map(WireSessionOpResultRef::try_from)
-                        .collect::<Result<Vec<_>, _>>()?)
+                Ok(results) if results.len() <= MAX_SESSION_NET_BATCH_OPERATIONS => {
+                    Ok(WireSessionOpResultsRef(results))
                 }
-                Err(error) => Err(WireStoreError::try_from(error)?),
+                Ok(_) => {
+                    return Err(WireConversionError(
+                        "batch response exceeds the v4 operation limit",
+                    ));
+                }
+                Err(error) => Err(WireStoreErrorRef::try_from(error)?),
             }),
             Response::ScanRestoreRecords(result) => Self::ScanRestoreRecords(match result {
                 Ok(page) => Ok(WireRestoreScanPageRef::try_from(page)?),
-                Err(error) => Err(WireStoreError::try_from(error)?),
+                Err(error) => Err(WireStoreErrorRef::try_from(error)?),
             }),
             Response::MaxReplicationSequence(result) => {
                 Self::MaxReplicationSequence(wire_store_result_ref(result)?)
             }
             Response::GetReplicationLog(result) => Self::GetReplicationLog(match result {
-                Ok(entries) => Ok(wire_replication_entries_ref(
-                    entries,
-                    MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES,
-                    "replication log response exceeds the v4 entry limit",
-                )?),
-                Err(error) => Err(WireStoreError::try_from(error)?),
+                Ok(entries) if entries.len() <= MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES => {
+                    Ok(WireReplicationEntriesRef(entries))
+                }
+                Ok(_) => {
+                    return Err(WireConversionError(
+                        "replication log response exceeds the v4 entry limit",
+                    ));
+                }
+                Err(error) => Err(WireStoreErrorRef::try_from(error)?),
             }),
             Response::ReplicateEntry(result) => {
                 Self::ReplicateEntry(wire_store_result_ref(result)?)
@@ -1799,13 +2582,25 @@ impl<'a> TryFrom<&'a Response> for WireResponseRef<'a> {
             Response::WatchStream => Self::WatchStream,
             Response::WatchEntry(result) => Self::WatchEntry(match result {
                 Ok(entry) => Ok(WireReplicationEntryRef::try_from(entry)?),
-                Err(error) => Err(WireStoreError::try_from(error)?),
+                Err(error) => Err(WireStoreErrorRef::try_from(error)?),
             }),
             Response::NextLeaseInfo(result) => Self::NextLeaseInfo(wire_store_result_ref(result)?),
-            Response::AcquireLease(result) => Self::AcquireLease(result),
-            Response::RenewLease(result) => Self::RenewLease(result),
-            Response::ReleaseLease(result) => Self::ReleaseLease(result),
-            Response::Error { message } => Self::Error { message },
+            Response::AcquireLease(result) => {
+                if let Ok(lease) = result {
+                    validate_lease_profile(lease)?;
+                }
+                Self::AcquireLease(wire_lease_result_ref(result))
+            }
+            Response::RenewLease(result) => {
+                if let Ok(lease) = result {
+                    validate_lease_profile(lease)?;
+                }
+                Self::RenewLease(wire_lease_result_ref(result))
+            }
+            Response::ReleaseLease(result) => Self::ReleaseLease(wire_lease_result_ref(result)),
+            Response::Error { .. } => Self::Error {
+                message: "remote protocol error",
+            },
         })
     }
 }
@@ -1814,7 +2609,7 @@ impl TryFrom<WireResponse> for Response {
     type Error = WireConversionError;
 
     fn try_from(response: WireResponse) -> Result<Self, WireConversionError> {
-        Ok(match response {
+        let response = match response {
             WireResponse::HelloAck(hello) => Self::HelloAck {
                 contract_version: hello.contract_version,
                 server_replica_id: hello.server_replica_id,
@@ -1823,6 +2618,8 @@ impl TryFrom<WireResponse> for Response {
                 configuration_id: hello.configuration_id,
                 handshake_nonce: hello.handshake_nonce,
                 contract_profile: hello.contract_profile,
+                accepted_response_frame_size: hello.accepted_response_frame_size,
+                server_request_frame_size: hello.server_request_frame_size,
             },
             WireResponse::HelloRejected { reason } => Self::HelloRejected { reason },
             WireResponse::Capabilities(capabilities) => {
@@ -1871,11 +2668,18 @@ impl TryFrom<WireResponse> for Response {
             WireResponse::NextLeaseInfo(result) => {
                 Self::NextLeaseInfo(domain_store_result(result)?)
             }
-            WireResponse::AcquireLease(result) => Self::AcquireLease(result),
-            WireResponse::RenewLease(result) => Self::RenewLease(result),
-            WireResponse::ReleaseLease(result) => Self::ReleaseLease(result),
-            WireResponse::Error { message } => Self::Error { message },
-        })
+            WireResponse::AcquireLease(result) => Self::AcquireLease(domain_lease_result(result)),
+            WireResponse::RenewLease(result) => Self::RenewLease(domain_lease_result(result)),
+            WireResponse::ReleaseLease(result) => Self::ReleaseLease(domain_lease_result(result)),
+            WireResponse::Error { message } => {
+                drop(message);
+                Self::Error {
+                    message: "remote protocol error".to_string(),
+                }
+            }
+        };
+        validate_response_profile(&response)?;
+        Ok(response)
     }
 }
 
@@ -1913,6 +2717,8 @@ impl TryFrom<&Response> for BootstrapResponse {
                 configuration_id,
                 handshake_nonce,
                 contract_profile,
+                accepted_response_frame_size,
+                server_request_frame_size,
             } => Ok(Self::HelloAck(BootstrapHelloAck {
                 contract_version: *contract_version,
                 server_replica_id: server_replica_id.clone(),
@@ -1921,6 +2727,8 @@ impl TryFrom<&Response> for BootstrapResponse {
                 configuration_id: configuration_id.clone(),
                 handshake_nonce: *handshake_nonce,
                 contract_profile: *contract_profile,
+                accepted_response_frame_size: *accepted_response_frame_size,
+                server_request_frame_size: *server_request_frame_size,
             })),
             Response::HelloRejected { reason } => Ok(Self::HelloRejected { reason: *reason }),
             _ => Err(WireConversionError(
@@ -1941,6 +2749,8 @@ impl From<BootstrapResponse> for Response {
                 configuration_id: hello.configuration_id,
                 handshake_nonce: hello.handshake_nonce,
                 contract_profile: hello.contract_profile,
+                accepted_response_frame_size: hello.accepted_response_frame_size,
+                server_request_frame_size: hello.server_request_frame_size,
             },
             BootstrapResponse::HelloRejected { reason } => Self::HelloRejected { reason },
         }
@@ -1976,23 +2786,320 @@ where
     W: tokio::io::AsyncWrite + Unpin,
     T: Serialize,
 {
-    match tokio::time::timeout(timeout, write_frame(writer, frame)).await {
-        Ok(result) => result,
-        Err(_elapsed) => Err(ProtocolError::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "timed out writing frame to peer",
-        ))),
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or(ProtocolError::InvalidWireValue)?;
+    write_frame_bounded_until(writer, frame, MAX_NEGOTIATED_FRAME_SIZE, deadline).await
+}
+
+const INITIAL_ENCODED_FRAME_CHUNK_SIZE: usize = 8 * 1024;
+const ENCODED_FRAME_CHUNK_SIZE: usize = 64 * 1024;
+static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncodingHalt {
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Clone, Copy)]
+struct EncodingControl<'a> {
+    deadline: Option<tokio::time::Instant>,
+    cancellation: &'a AtomicBool,
+}
+
+impl EncodingControl<'_> {
+    fn check(self) -> Result<(), EncodingHalt> {
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(EncodingHalt::Cancelled);
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            return Err(EncodingHalt::TimedOut);
+        }
+        Ok(())
     }
 }
 
-struct BoundedFrameCounter {
+struct EncodedFrameChunk {
+    bytes: Box<[u8]>,
+    initialized: usize,
+}
+
+impl EncodedFrameChunk {
+    fn initialized_bytes(&self) -> &[u8] {
+        &self.bytes[..self.initialized]
+    }
+}
+
+struct EncodedFrame {
+    chunks: Vec<EncodedFrameChunk>,
+    encoded_len: usize,
+    retained_byte_capacity: usize,
+}
+
+struct BoundedFrameBuffer<'a> {
+    frame: EncodedFrame,
+    max_frame_size: usize,
+    exceeded_at: Option<usize>,
+    halted: Option<EncodingHalt>,
+    control: EncodingControl<'a>,
+}
+
+impl<'a> BoundedFrameBuffer<'a> {
+    fn new(max_frame_size: usize, control: EncodingControl<'a>) -> Self {
+        Self {
+            frame: EncodedFrame {
+                chunks: Vec::new(),
+                encoded_len: 0,
+                retained_byte_capacity: 0,
+            },
+            max_frame_size,
+            exceeded_at: None,
+            halted: None,
+            control,
+        }
+    }
+
+    fn check_control(&mut self) -> std::io::Result<()> {
+        self.control.check().map_err(|halted| {
+            self.halted = Some(halted);
+            encoding_halt_sink_error(halted)
+        })
+    }
+
+    fn allocate_chunk(&mut self) {
+        let remaining_capacity = self
+            .max_frame_size
+            .saturating_sub(self.frame.retained_byte_capacity);
+        let preferred_size = if self.frame.chunks.is_empty() {
+            INITIAL_ENCODED_FRAME_CHUNK_SIZE
+        } else {
+            ENCODED_FRAME_CHUNK_SIZE
+        };
+        let chunk_size = preferred_size.min(remaining_capacity);
+        debug_assert!(chunk_size > 0);
+        self.frame.chunks.push(EncodedFrameChunk {
+            // Converting to a boxed slice discards Vec's spare capacity. Each
+            // retained byte allocation therefore has exactly this logical
+            // length; allocator slab/RSS overhead is intentionally outside the
+            // negotiated encoded-JSON storage contract.
+            bytes: vec![0_u8; chunk_size].into_boxed_slice(),
+            initialized: 0,
+        });
+        self.frame.retained_byte_capacity += chunk_size;
+    }
+}
+
+impl std::io::Write for BoundedFrameBuffer<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.check_control()?;
+        let Some(attempted) = self.frame.encoded_len.checked_add(buf.len()) else {
+            self.exceeded_at = Some(usize::MAX);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encoded frame length overflowed",
+            ));
+        };
+        if attempted > self.max_frame_size {
+            self.exceeded_at = Some(attempted);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encoded frame exceeds configured limit",
+            ));
+        }
+        let mut remaining = buf;
+        while !remaining.is_empty() {
+            self.check_control()?;
+            let needs_chunk = self
+                .frame
+                .chunks
+                .last()
+                .is_none_or(|chunk| chunk.initialized == chunk.bytes.len());
+            if needs_chunk {
+                self.allocate_chunk();
+            }
+            let Some(chunk) = self.frame.chunks.last_mut() else {
+                return Err(std::io::Error::other(
+                    "encoded frame chunk allocation did not retain storage",
+                ));
+            };
+            let available = chunk.bytes.len() - chunk.initialized;
+            let copied = available.min(remaining.len());
+            chunk.bytes[chunk.initialized..chunk.initialized + copied]
+                .copy_from_slice(&remaining[..copied]);
+            chunk.initialized += copied;
+            remaining = &remaining[copied..];
+        }
+        self.frame.encoded_len = attempted;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encoding_halt_sink_error(halted: EncodingHalt) -> std::io::Error {
+    let (kind, message) = match halted {
+        EncodingHalt::TimedOut => (
+            std::io::ErrorKind::TimedOut,
+            "timed out preparing frame for peer",
+        ),
+        EncodingHalt::Cancelled => (
+            // `std::io::Write::write_all` retries `Interrupted` forever. Use a
+            // non-retryable private sentinel here and map the retained halt
+            // state to public `Interrupted` only after serde returns.
+            std::io::ErrorKind::Other,
+            "frame preparation cancelled",
+        ),
+    };
+    std::io::Error::new(kind, message)
+}
+
+fn encoding_halt_protocol_error(halted: EncodingHalt) -> ProtocolError {
+    let (kind, message) = match halted {
+        EncodingHalt::TimedOut => (
+            std::io::ErrorKind::TimedOut,
+            "timed out preparing frame for peer",
+        ),
+        EncodingHalt::Cancelled => (
+            std::io::ErrorKind::Interrupted,
+            "frame preparation cancelled",
+        ),
+    };
+    ProtocolError::Io(std::io::Error::new(kind, message))
+}
+
+fn encode_frame_bounded<T>(
+    frame: &T,
+    max_frame_size: usize,
+    control: EncodingControl<'_>,
+) -> Result<EncodedFrame, ProtocolError>
+where
+    T: Serialize,
+{
+    if max_frame_size > MAX_NEGOTIATED_FRAME_SIZE {
+        return Err(ProtocolError::InvalidWireValue);
+    }
+    let mut buffer = BoundedFrameBuffer::new(max_frame_size, control);
+    if let Err(halted) = control.check() {
+        return Err(encoding_halt_protocol_error(halted));
+    }
+    match serde_json::to_writer(&mut buffer, frame) {
+        Ok(()) => {
+            control.check().map_err(encoding_halt_protocol_error)?;
+            Ok(buffer.frame)
+        }
+        Err(error) => {
+            if let Some(halted) = buffer.halted {
+                Err(encoding_halt_protocol_error(halted))
+            } else if let Some(exceeded_at) = buffer.exceeded_at {
+                Err(ProtocolError::FrameTooLarge(exceeded_at))
+            } else {
+                Err(ProtocolError::Serialization(error))
+            }
+        }
+    }
+}
+
+fn write_timeout_error() -> ProtocolError {
+    ProtocolError::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out preparing or writing frame to peer",
+    ))
+}
+
+/// Encode and write one complete frame under a negotiated size budget and one
+/// absolute deadline.
+///
+/// Encoding is single-pass into lazy exact-length boxed chunks whose total
+/// retained JSON-byte capacity never exceeds `max_frame_size`; the chunks are
+/// not coalesced. Chunk-vector metadata and allocator slab/RSS overhead are
+/// outside the encoded-byte contract. The length prefix is not emitted until
+/// encoding succeeds, so oversize, timeout, cancellation, and serialization
+/// failures leave the stream untouched. The same absolute deadline covers
+/// encoding, prefix, payload, and flush.
+pub(crate) async fn write_frame_bounded_until<W, T>(
+    writer: &mut W,
+    frame: &T,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+) -> Result<(), ProtocolError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: Serialize,
+{
+    write_frame_bounded_until_cancellable(writer, frame, max_frame_size, deadline, &NEVER_CANCELLED)
+        .await
+}
+
+/// Cancellable counterpart to [`write_frame_bounded_until`].
+///
+/// Cancellation is cooperative while synchronous JSON serialization is in
+/// progress: the sink checks it before every serializer write and between
+/// retained chunks. The bounded wire DTO fields keep the interval between
+/// checks finite; Tokio task abortion alone cannot preempt synchronous Rust.
+pub(crate) async fn write_frame_bounded_until_cancellable<W, T>(
+    writer: &mut W,
+    frame: &T,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+    cancellation: &AtomicBool,
+) -> Result<(), ProtocolError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let control = EncodingControl {
+        deadline: Some(deadline),
+        cancellation,
+    };
+    let json = encode_frame_bounded(frame, max_frame_size, control)?;
+    control.check().map_err(encoding_halt_protocol_error)?;
+    let len = u32::try_from(json.encoded_len)
+        .map_err(|_| ProtocolError::FrameTooLarge(json.encoded_len))?;
+    let write = async {
+        writer
+            .write_all(&len.to_be_bytes())
+            .await
+            .map_err(ProtocolError::Io)?;
+        for chunk in &json.chunks {
+            writer
+                .write_all(chunk.initialized_bytes())
+                .await
+                .map_err(ProtocolError::Io)?;
+        }
+        writer.flush().await.map_err(ProtocolError::Io)
+    };
+    match tokio::time::timeout_at(deadline, write).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(write_timeout_error()),
+    }
+}
+
+struct BoundedFrameCounter<'a> {
     encoded_len: usize,
     max_frame_size: usize,
     exceeded_at: Option<usize>,
+    halted: Option<EncodingHalt>,
+    control: EncodingControl<'a>,
 }
 
-impl std::io::Write for BoundedFrameCounter {
+impl BoundedFrameCounter<'_> {
+    fn check_control(&mut self) -> std::io::Result<()> {
+        self.control.check().map_err(|halted| {
+            self.halted = Some(halted);
+            encoding_halt_sink_error(halted)
+        })
+    }
+}
+
+impl std::io::Write for BoundedFrameCounter<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.check_control()?;
         let Some(attempted) = self.encoded_len.checked_add(buf.len()) else {
             self.exceeded_at = Some(usize::MAX);
             return Err(std::io::Error::new(
@@ -2017,30 +3124,107 @@ impl std::io::Write for BoundedFrameCounter {
 }
 
 /// Validate an encoded frame size without allocating the encoded payload.
+#[cfg(test)]
 pub(crate) fn ensure_frame_fits<T>(frame: &T, max_frame_size: usize) -> Result<(), ProtocolError>
 where
     T: Serialize,
 {
+    ensure_frame_fits_controlled(
+        frame,
+        max_frame_size,
+        EncodingControl {
+            deadline: None,
+            cancellation: &NEVER_CANCELLED,
+        },
+    )
+}
+
+fn ensure_frame_fits_controlled<T>(
+    frame: &T,
+    max_frame_size: usize,
+    control: EncodingControl<'_>,
+) -> Result<(), ProtocolError>
+where
+    T: Serialize,
+{
+    if max_frame_size > MAX_NEGOTIATED_FRAME_SIZE {
+        return Err(ProtocolError::InvalidWireValue);
+    }
+    control.check().map_err(encoding_halt_protocol_error)?;
     let mut counter = BoundedFrameCounter {
         encoded_len: 0,
         max_frame_size,
         exceeded_at: None,
+        halted: None,
+        control,
     };
     match serde_json::to_writer(&mut counter, frame) {
-        Ok(()) => Ok(()),
-        Err(_) if counter.exceeded_at.is_some() => Err(ProtocolError::FrameTooLarge(
-            counter
-                .exceeded_at
-                .unwrap_or(max_frame_size.saturating_add(1)),
-        )),
-        Err(error) => Err(ProtocolError::Serialization(error)),
+        Ok(()) => control.check().map_err(encoding_halt_protocol_error),
+        Err(error) => {
+            if let Some(halted) = counter.halted {
+                Err(encoding_halt_protocol_error(halted))
+            } else if let Some(exceeded_at) = counter.exceeded_at {
+                Err(ProtocolError::FrameTooLarge(exceeded_at))
+            } else {
+                Err(ProtocolError::Serialization(error))
+            }
+        }
     }
+}
+
+/// Validate an encoded frame size under one absolute deadline and cooperative
+/// server cancellation signal, without allocating the encoded payload.
+pub(crate) fn ensure_frame_fits_until<T>(
+    frame: &T,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+    cancellation: &AtomicBool,
+) -> Result<(), ProtocolError>
+where
+    T: Serialize,
+{
+    ensure_frame_fits_controlled(
+        frame,
+        max_frame_size,
+        EncodingControl {
+            deadline: Some(deadline),
+            cancellation,
+        },
+    )
+}
+
+/// Size one successful point-read response using the exact borrowed v4 DTO.
+#[cfg(test)]
+pub(crate) fn ensure_get_success_frame_fits(
+    record: &Option<StoredSessionRecord>,
+    max_frame_size: usize,
+) -> Result<(), ProtocolError> {
+    ensure_frame_fits(&WireResponseRef::Get(Ok(record)), max_frame_size)
+}
+
+/// Deadline- and cancellation-aware replication-log response sizing.
+pub(crate) fn ensure_replication_log_success_frame_fits_until(
+    entries: &[ReplicationEntry],
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+    cancellation: &AtomicBool,
+) -> Result<(), ProtocolError> {
+    if entries.len() > MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES {
+        return Err(ProtocolError::InvalidWireValue);
+    }
+    ensure_frame_fits_until(
+        &WireResponseRef::GetReplicationLog(Ok(WireReplicationEntriesRef(entries))),
+        max_frame_size,
+        deadline,
+        cancellation,
+    )
 }
 
 /// Size one successful restore response using the exact borrowed v4 wire DTO.
 ///
 /// This avoids cloning record payloads while the server progressively trims a
 /// page to the caller's response budget.
+#[cfg(test)]
 pub(crate) fn ensure_restore_scan_success_frame_fits(
     page: &RestoreScanPage,
     max_frame_size: usize,
@@ -2050,6 +3234,27 @@ pub(crate) fn ensure_restore_scan_success_frame_fits(
     ensure_frame_fits(
         &WireResponseRef::ScanRestoreRecords(Ok(page)),
         max_frame_size,
+    )
+}
+
+/// Deadline- and cancellation-aware restore-scan response sizing.
+pub(crate) fn ensure_restore_scan_success_frame_fits_until(
+    page: &RestoreScanPage,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+    cancellation: &AtomicBool,
+) -> Result<(), ProtocolError> {
+    let control = EncodingControl {
+        deadline: Some(deadline),
+        cancellation,
+    };
+    control.check().map_err(encoding_halt_protocol_error)?;
+    let page =
+        WireRestoreScanPageRef::try_from(page).map_err(|_| ProtocolError::InvalidWireValue)?;
+    ensure_frame_fits_controlled(
+        &WireResponseRef::ScanRestoreRecords(Ok(page)),
+        max_frame_size,
+        control,
     )
 }
 
@@ -2194,6 +3399,32 @@ mod tests {
         }
     }
 
+    fn replace_json_field(
+        value: &mut serde_json::Value,
+        field: &str,
+        replacement: &serde_json::Value,
+    ) -> usize {
+        match value {
+            serde_json::Value::Array(values) => values
+                .iter_mut()
+                .map(|value| replace_json_field(value, field, replacement))
+                .sum(),
+            serde_json::Value::Object(fields) => {
+                let mut replaced = 0;
+                if let Some(value) = fields.get_mut(field) {
+                    *value = replacement.clone();
+                    replaced += 1;
+                }
+                replaced
+                    + fields
+                        .values_mut()
+                        .map(|value| replace_json_field(value, field, replacement))
+                        .sum::<usize>()
+            }
+            _ => 0,
+        }
+    }
+
     fn json<T: Serialize>(frame: T) -> serde_json::Value {
         serde_json::to_value(frame).expect("serialize valid protocol frame")
     }
@@ -2250,6 +3481,12 @@ mod tests {
         }
     }
 
+    fn test_session_key_with_stable_id_len(len: usize) -> SessionKey {
+        let mut key = test_session_key();
+        key.stable_id = Bytes::from(vec![u8::MAX; len]);
+        key
+    }
+
     fn test_record(key: SessionKey, owner: OwnerId, fence: FenceToken) -> StoredSessionRecord {
         StoredSessionRecord {
             key,
@@ -2295,15 +3532,10 @@ mod tests {
         let mut invalid_request: serde_json::Value =
             serde_json::from_slice(&encoded).expect("request JSON");
         invalid_request["ScanRestoreRecords"]["request"]["limit"] = serde_json::json!(0);
-        let invalid_request: Request =
-            serde_json::from_value(invalid_request).expect("representable request frame");
-        let Request::ScanRestoreRecords { request, .. } = invalid_request else {
-            panic!("unexpected restore request variant");
-        };
-        assert!(matches!(
-            RestoreScanRequest::try_from(request),
-            Err(StoreError::InvalidRestoreScanRequest(_))
-        ));
+        assert!(
+            serde_json::from_value::<Request>(invalid_request).is_err(),
+            "invalid restore scalars must fail during protocol decode"
+        );
 
         let page = RestoreScanPage::new(Vec::new(), 0, None);
         let response = Response::ScanRestoreRecords(Ok(page.clone()));
@@ -2342,13 +3574,14 @@ mod tests {
         assert_eq!(SESSION_NET_ALPN, b"opc-session-net/4");
         assert!(CURRENT_CONTRACT_PROFILE.is_current());
         assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 1);
+        assert_eq!(CURRENT_CONTRACT_PROFILE.max_frame_size, 16_777_216);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_session_ttl_seconds, 31_536_000);
 
         let profile = serde_json::to_value(CURRENT_CONTRACT_PROFILE).expect("profile JSON");
         assert_eq!(
             profile,
             serde_json::json!({
-                "wire_schema_revision": 1,
+                "wire_schema_revision": 2,
                 "error_set_revision": 1,
                 "max_restore_scan_page_records": 1024,
                 "max_replication_log_page_entries": 65536,
@@ -2356,10 +3589,15 @@ mod tests {
                 "max_rebuild_entries": 65536,
                 "max_replication_operation_depth": 16,
                 "max_replication_operations_per_entry": 256,
+                "min_frame_size": 8192,
+                "max_frame_size": 16777216,
                 "max_session_ttl_seconds": 31536000,
                 "owner_id_max_bytes": 128,
                 "session_key_type_max_bytes": 128,
-                "state_type_max_bytes": 128
+                "state_type_max_bytes": 128,
+                "stable_id_max_bytes": 64,
+                "replication_tx_id_max_bytes": 128,
+                "cas_request_id_bytes": 36
             })
         );
 
@@ -2401,6 +3639,8 @@ mod tests {
             configuration_id: Some("00".repeat(32)),
             handshake_nonce: Some(uuid::Uuid::nil()),
             contract_profile: Some(CURRENT_CONTRACT_PROFILE),
+            accepted_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
+            server_request_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
         });
         let acknowledgement = serde_json::to_value(acknowledgement).expect("acknowledgement JSON");
         assert_eq!(
@@ -2408,6 +3648,14 @@ mod tests {
             CONTRACT_VERSION
         );
         assert_eq!(acknowledgement["HelloAck"]["contract_profile"], profile);
+        assert_eq!(
+            acknowledgement["HelloAck"]["accepted_response_frame_size"],
+            DEFAULT_MAX_FRAME_SIZE as u32
+        );
+        assert_eq!(
+            acknowledgement["HelloAck"]["server_request_frame_size"],
+            DEFAULT_MAX_FRAME_SIZE as u32
+        );
     }
 
     #[test]
@@ -2493,7 +3741,31 @@ mod tests {
             let encoded = serde_json::to_vec(&Response::Get(Err(expected.clone())))
                 .expect("encode StoreError");
             let decoded: Response = serde_json::from_slice(&encoded).expect("decode StoreError");
-            assert!(matches!(decoded, Response::Get(Err(actual)) if actual == expected));
+            let sanitized = match expected {
+                StoreError::CapabilityNotSupported(ref capability) => {
+                    StoreError::CapabilityNotSupported(safe_capability_name(capability).to_string())
+                }
+                StoreError::BackendUnavailable(_) => {
+                    StoreError::BackendUnavailable("backend unavailable".to_string())
+                }
+                StoreError::InvalidKey(_) => StoreError::InvalidKey("invalid key".to_string()),
+                StoreError::Crypto(_) => {
+                    StoreError::Crypto("cryptographic operation failed".to_string())
+                }
+                StoreError::Serialization(_) => {
+                    StoreError::Serialization("serialization failed".to_string())
+                }
+                StoreError::InvalidRestoreScanRequest(_) => StoreError::InvalidRestoreScanRequest(
+                    "restore scan request rejected".to_string(),
+                ),
+                StoreError::InvalidRestoreScanResponse(_) => {
+                    StoreError::InvalidRestoreScanResponse(
+                        "restore scan response rejected".to_string(),
+                    )
+                }
+                other => other,
+            };
+            assert!(matches!(decoded, Response::Get(Err(actual)) if actual == sanitized));
         }
 
         assert_eq!(
@@ -2519,6 +3791,43 @@ mod tests {
                     results.as_slice(),
                     [SessionOpResult::Get(Err(StoreError::ReplicationOperationLimitExceeded))]
                 )
+        ));
+    }
+
+    #[test]
+    fn hostile_peer_error_strings_are_normalized_and_not_retained() {
+        const SECRET: &str = "secret-provider-path/token";
+        let cases = [
+            serde_json::json!({"Get": {"Err": {"BackendUnavailable": SECRET}}}),
+            serde_json::json!({"Get": {"Err": {"InvalidKey": SECRET}}}),
+            serde_json::json!({"Get": {"Err": {"Crypto": SECRET}}}),
+            serde_json::json!({"Get": {"Err": {"Serialization": SECRET}}}),
+            serde_json::json!({"Get": {"Err": {"CapabilityNotSupported": SECRET}}}),
+            serde_json::json!({
+                "Batch": {"Ok": [{"Get": {"Err": {"BackendUnavailable": SECRET}}}]}
+            }),
+            serde_json::json!({"AcquireLease": {"Err": {"Backend": SECRET}}}),
+            serde_json::json!({"Error": {"message": SECRET}}),
+        ];
+
+        for wire in cases {
+            let decoded: Response =
+                serde_json::from_value(wire).expect("valid hostile error shape");
+            let debug = format!("{decoded:?}");
+            assert!(
+                !debug.contains(SECRET),
+                "peer error text was retained: {debug}"
+            );
+        }
+
+        let allowed: Response = serde_json::from_value(serde_json::json!({
+            "Get": {"Err": {"CapabilityNotSupported": "watch"}}
+        }))
+        .expect("allowlisted capability");
+        assert!(matches!(
+            allowed,
+            Response::Get(Err(StoreError::CapabilityNotSupported(capability)))
+                if capability == "watch"
         ));
     }
 
@@ -2725,6 +4034,47 @@ mod tests {
     }
 
     #[test]
+    fn exact_wire_containers_reject_unknown_top_level_and_nested_fields() {
+        let mut get = serde_json::to_value(Request::Get {
+            key: test_session_key(),
+        })
+        .expect("encode Get request");
+        get["Get"]["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Request>(get).is_err());
+
+        let mut generic = serde_json::to_value(Response::Error {
+            message: "ignored".to_string(),
+        })
+        .expect("encode generic response");
+        generic["Error"]["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Response>(generic).is_err());
+
+        let key = test_session_key();
+        let owner = OwnerId::new("unknown-field-owner").expect("owner");
+        let entry = replication_entry(replication_leaf(&key, &owner));
+        let mut replication = serde_json::to_value(Request::ReplicateEntry { entry })
+            .expect("encode replication request");
+        replication["ReplicateEntry"]["entry"]["operation_nodes"][0]["DeleteFenced"]["unknown"] =
+            serde_json::json!(true);
+        assert!(serde_json::from_value::<Request>(replication).is_err());
+
+        let mut store_error =
+            serde_json::to_value(Response::Get(Err(StoreError::PayloadTooLarge {
+                actual: 2,
+                max: 1,
+            })))
+            .expect("encode store error");
+        store_error["Get"]["Err"]["PayloadTooLarge"]["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Response>(store_error).is_err());
+
+        let mut batch =
+            serde_json::to_value(Response::Batch(Ok(vec![SessionOpResult::Get(Ok(None))])))
+                .expect("encode batch response");
+        batch["Batch"]["Ok"][0]["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Response>(batch).is_err());
+    }
+
+    #[test]
     fn batch_collection_bound_is_independent_of_the_frame_limit() {
         let key = test_session_key();
         let operation = SessionOp::Get { key };
@@ -2815,8 +4165,14 @@ mod tests {
 
     #[test]
     fn bounded_encoder_rejects_oversized_restore_frame() {
+        let mut record = test_record(
+            test_session_key(),
+            OwnerId::new("bounded-owner").expect("owner"),
+            FenceToken::new(1),
+        );
+        record.payload = EncryptedSessionPayload::new(vec![7; 1024]);
         let response =
-            Response::ScanRestoreRecords(Err(StoreError::BackendUnavailable("x".repeat(1024))));
+            Response::ScanRestoreRecords(Ok(RestoreScanPage::new(vec![record], 0, None)));
         assert!(matches!(
             ensure_frame_fits(&response, 128),
             Err(ProtocolError::FrameTooLarge(_))
@@ -2827,6 +4183,654 @@ mod tests {
         }));
         ensure_frame_fits(&terminal, MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE)
             .expect("minimum response budget must fit the terminal error");
+    }
+
+    #[test]
+    fn negotiated_frame_sizes_are_checked_without_truncation() {
+        assert_eq!(
+            MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE,
+            MIN_NEGOTIATED_FRAME_SIZE
+        );
+        assert_eq!(
+            checked_wire_frame_size(MIN_NEGOTIATED_FRAME_SIZE).expect("minimum wire budget"),
+            MIN_NEGOTIATED_FRAME_SIZE as u32
+        );
+        assert_eq!(
+            checked_wire_frame_size(MAX_NEGOTIATED_FRAME_SIZE).expect("maximum wire budget"),
+            MAX_NEGOTIATED_FRAME_SIZE as u32
+        );
+        assert_eq!(
+            checked_frame_size(MAX_NEGOTIATED_FRAME_SIZE as u32).expect("maximum local budget"),
+            MAX_NEGOTIATED_FRAME_SIZE
+        );
+        assert_eq!(
+            negotiate_response_frame_size(16_384, MIN_NEGOTIATED_FRAME_SIZE)
+                .expect("negotiated minimum"),
+            MIN_NEGOTIATED_FRAME_SIZE as u32
+        );
+        assert_eq!(
+            negotiate_response_frame_size(
+                MAX_NEGOTIATED_FRAME_SIZE as u32,
+                MAX_NEGOTIATED_FRAME_SIZE,
+            )
+            .expect("negotiated maximum"),
+            MAX_NEGOTIATED_FRAME_SIZE as u32
+        );
+        assert!(matches!(
+            checked_wire_frame_size(MIN_NEGOTIATED_FRAME_SIZE - 1),
+            Err(ProtocolError::InvalidWireValue)
+        ));
+        assert!(matches!(
+            checked_frame_size((MIN_NEGOTIATED_FRAME_SIZE - 1) as u32),
+            Err(ProtocolError::InvalidWireValue)
+        ));
+        assert!(matches!(
+            checked_wire_frame_size(MAX_NEGOTIATED_FRAME_SIZE + 1),
+            Err(ProtocolError::InvalidWireValue)
+        ));
+        assert!(matches!(
+            checked_frame_size((MAX_NEGOTIATED_FRAME_SIZE + 1) as u32),
+            Err(ProtocolError::InvalidWireValue)
+        ));
+        assert!(matches!(
+            negotiate_response_frame_size(
+                (MAX_NEGOTIATED_FRAME_SIZE + 1) as u32,
+                MAX_NEGOTIATED_FRAME_SIZE,
+            ),
+            Err(ProtocolError::InvalidWireValue)
+        ));
+        assert!(matches!(
+            negotiate_response_frame_size(
+                MAX_NEGOTIATED_FRAME_SIZE as u32,
+                MAX_NEGOTIATED_FRAME_SIZE + 1,
+            ),
+            Err(ProtocolError::InvalidWireValue)
+        ));
+        assert_eq!(conservative_payload_budget(DEFAULT_MAX_FRAME_SIZE), 130_048);
+        assert_eq!(
+            conservative_payload_budget(MAX_NEGOTIATED_FRAME_SIZE),
+            2_096_128
+        );
+        assert!(
+            conservative_payload_budget(MAX_NEGOTIATED_FRAME_SIZE) >= 1024 * 1024,
+            "the negotiated ceiling must carry SQLite's 1 MiB value limit"
+        );
+        #[cfg(target_pointer_width = "64")]
+        assert!(matches!(
+            checked_wire_frame_size((u32::MAX as usize) + 1),
+            Err(ProtocolError::InvalidWireValue)
+        ));
+    }
+
+    #[test]
+    fn stable_id_transport_boundaries_are_exact_for_encode_and_decode() {
+        for (len, accepted) in [
+            (0, false),
+            (1, true),
+            (MAX_SESSION_NET_STABLE_ID_BYTES, true),
+            (MAX_SESSION_NET_STABLE_ID_BYTES + 1, false),
+        ] {
+            let request = Request::Get {
+                key: test_session_key_with_stable_id_len(len),
+            };
+            assert_eq!(
+                serde_json::to_vec(&request).is_ok(),
+                accepted,
+                "outbound stable_id length {len}"
+            );
+        }
+
+        let valid = serde_json::to_value(Request::Get {
+            key: test_session_key_with_stable_id_len(MAX_SESSION_NET_STABLE_ID_BYTES),
+        })
+        .expect("maximum stable ID request");
+        for (len, accepted) in [
+            (0, false),
+            (1, true),
+            (MAX_SESSION_NET_STABLE_ID_BYTES, true),
+            (MAX_SESSION_NET_STABLE_ID_BYTES + 1, false),
+        ] {
+            let mut wire = valid.clone();
+            let replacements = replace_json_field(
+                &mut wire,
+                "stable_id",
+                &serde_json::json!(vec![u8::MAX; len]),
+            );
+            assert_eq!(replacements, 1);
+            assert_eq!(
+                serde_json::from_value::<Request>(wire).is_ok(),
+                accepted,
+                "inbound stable_id length {len}"
+            );
+        }
+
+        let nested = Request::Batch {
+            ops: vec![SessionOp::Get {
+                key: test_session_key_with_stable_id_len(MAX_SESSION_NET_STABLE_ID_BYTES + 1),
+            }],
+        };
+        assert!(serde_json::to_vec(&nested).is_err());
+    }
+
+    #[test]
+    fn replication_transaction_id_boundaries_are_exact_and_nested() {
+        let key = test_session_key_with_stable_id_len(MAX_SESSION_NET_STABLE_ID_BYTES);
+        let owner = OwnerId::new("replica-a").expect("owner");
+        let base = replication_entry(replication_leaf(&key, &owner));
+
+        for (len, accepted) in [
+            (0, false),
+            (1, true),
+            (MAX_SESSION_NET_REPLICATION_TX_ID_BYTES, true),
+            (MAX_SESSION_NET_REPLICATION_TX_ID_BYTES + 1, false),
+        ] {
+            let mut entry = base.clone();
+            entry.tx_id = "t".repeat(len);
+            assert_eq!(
+                serde_json::to_vec(&Response::WatchEntry(Ok(entry.clone()))).is_ok(),
+                accepted,
+                "outbound tx_id length {len}"
+            );
+            assert_eq!(
+                serde_json::to_vec(&Request::ReplicateEntry { entry }).is_ok(),
+                accepted,
+                "outbound retained request tx_id length {len}"
+            );
+        }
+
+        let mut valid = base;
+        valid.tx_id = "t".repeat(MAX_SESSION_NET_REPLICATION_TX_ID_BYTES);
+        let valid = serde_json::to_value(Response::WatchEntry(Ok(valid)))
+            .expect("maximum transaction ID response");
+        for (len, accepted) in [
+            (0, false),
+            (1, true),
+            (MAX_SESSION_NET_REPLICATION_TX_ID_BYTES, true),
+            (MAX_SESSION_NET_REPLICATION_TX_ID_BYTES + 1, false),
+        ] {
+            let mut wire = valid.clone();
+            let replacements =
+                replace_json_field(&mut wire, "tx_id", &serde_json::json!("t".repeat(len)));
+            assert_eq!(replacements, 1);
+            assert_eq!(
+                serde_json::from_value::<Response>(wire).is_ok(),
+                accepted,
+                "inbound tx_id length {len}"
+            );
+        }
+
+        let mut request_entry = replication_entry(replication_leaf(&key, &owner));
+        request_entry.tx_id = "t".repeat(MAX_SESSION_NET_REPLICATION_TX_ID_BYTES);
+        let request = serde_json::to_value(Request::RebuildReplicationState {
+            entries: vec![request_entry],
+        })
+        .expect("maximum transaction ID rebuild");
+        for (len, accepted) in [
+            (0, false),
+            (1, true),
+            (MAX_SESSION_NET_REPLICATION_TX_ID_BYTES, true),
+            (MAX_SESSION_NET_REPLICATION_TX_ID_BYTES + 1, false),
+        ] {
+            let mut wire = request.clone();
+            assert_eq!(
+                replace_json_field(&mut wire, "tx_id", &serde_json::json!("t".repeat(len)),),
+                1
+            );
+            assert_eq!(
+                serde_json::from_value::<Request>(wire).is_ok(),
+                accepted,
+                "inbound retained request tx_id length {len}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_identifier_profiles_cover_nested_requests_and_response_carriers() {
+        let valid_key = test_session_key_with_stable_id_len(MAX_SESSION_NET_STABLE_ID_BYTES);
+        let invalid_key = test_session_key_with_stable_id_len(MAX_SESSION_NET_STABLE_ID_BYTES + 1);
+        let owner = OwnerId::new("replica-a").expect("owner");
+        let backend = FakeSessionBackend::new();
+        let valid_lease = backend
+            .acquire(&valid_key, owner.clone(), Duration::from_secs(60))
+            .await
+            .expect("valid lease");
+        let invalid_lease = backend
+            .acquire(&invalid_key, owner.clone(), Duration::from_secs(60))
+            .await
+            .expect("model permits transport-oversized stable IDs");
+        let valid_record = test_record(valid_key.clone(), owner.clone(), valid_lease.fence());
+        let invalid_record = test_record(invalid_key.clone(), owner.clone(), invalid_lease.fence());
+
+        let valid_nested_entry = replication_entry(operation_at_depth(
+            replication_leaf(&valid_key, &owner),
+            MAX_REPLICATION_OPERATION_DEPTH,
+        ));
+        let invalid_nested_entry = replication_entry(operation_at_depth(
+            replication_leaf(&invalid_key, &owner),
+            MAX_REPLICATION_OPERATION_DEPTH,
+        ));
+
+        let valid_responses = vec![
+            Response::Get(Ok(Some(valid_record.clone()))),
+            Response::Batch(Ok(vec![
+                SessionOpResult::Get(Ok(Some(valid_record.clone()))),
+                SessionOpResult::CompareAndSet(Ok(CompareAndSetResult::Conflict {
+                    current: Some(valid_record.clone()),
+                })),
+            ])),
+            Response::ScanRestoreRecords(Ok(RestoreScanPage::new(
+                vec![valid_record.clone()],
+                0,
+                None,
+            ))),
+            Response::AcquireLease(Ok(valid_lease.clone())),
+            Response::RenewLease(Ok(valid_lease.clone())),
+            Response::GetReplicationLog(Ok(vec![valid_nested_entry.clone()])),
+            Response::WatchEntry(Ok(valid_nested_entry.clone())),
+        ];
+        for response in valid_responses {
+            let mut wire = serde_json::to_value(response).expect("valid response carrier");
+            let replacements = replace_json_field(
+                &mut wire,
+                "stable_id",
+                &serde_json::json!(vec![u8::MAX; MAX_SESSION_NET_STABLE_ID_BYTES + 1]),
+            );
+            assert!(replacements > 0);
+            assert!(
+                serde_json::from_value::<Response>(wire).is_err(),
+                "transport-oversized stable ID must not reach the client"
+            );
+        }
+
+        let invalid_responses = vec![
+            Response::Get(Ok(Some(invalid_record.clone()))),
+            Response::Batch(Ok(vec![SessionOpResult::CompareAndSet(Ok(
+                CompareAndSetResult::Conflict {
+                    current: Some(invalid_record.clone()),
+                },
+            ))])),
+            Response::ScanRestoreRecords(Ok(RestoreScanPage::new(vec![invalid_record], 0, None))),
+            Response::AcquireLease(Ok(invalid_lease.clone())),
+            Response::RenewLease(Ok(invalid_lease)),
+            Response::GetReplicationLog(Ok(vec![invalid_nested_entry.clone()])),
+            Response::WatchEntry(Ok(invalid_nested_entry.clone())),
+        ];
+        for response in invalid_responses {
+            assert!(
+                serde_json::to_vec(&response).is_err(),
+                "transport-oversized stable ID must not be emitted"
+            );
+        }
+
+        assert!(serde_json::to_vec(&Request::RebuildReplicationState {
+            entries: vec![invalid_nested_entry]
+        })
+        .is_err());
+        let mut valid_rebuild = serde_json::to_value(Request::RebuildReplicationState {
+            entries: vec![valid_nested_entry],
+        })
+        .expect("valid nested rebuild");
+        assert!(
+            replace_json_field(
+                &mut valid_rebuild,
+                "stable_id",
+                &serde_json::json!(vec![u8::MAX; MAX_SESSION_NET_STABLE_ID_BYTES + 1]),
+            ) > 0
+        );
+        assert!(serde_json::from_value::<Request>(valid_rebuild).is_err());
+    }
+
+    #[tokio::test]
+    async fn cas_request_ids_are_canonical_uuid_values_before_dispatch() {
+        let key = test_session_key_with_stable_id_len(1);
+        let owner = OwnerId::new("replica-a").expect("owner");
+        let backend = FakeSessionBackend::new();
+        let lease = backend
+            .acquire(&key, owner.clone(), Duration::from_secs(60))
+            .await
+            .expect("lease");
+        let op = CompareAndSet {
+            key: key.clone(),
+            lease,
+            expected_generation: None,
+            new_record: test_record(key, owner, FenceToken::new(1)),
+        };
+        let canonical = uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+            .expect("test UUID")
+            .hyphenated()
+            .to_string();
+        assert_eq!(canonical.len(), SESSION_NET_CAS_REQUEST_ID_BYTES);
+
+        let canonical_request = Request::CompareAndSet {
+            op: op.clone(),
+            request_id: Some(canonical.clone()),
+        };
+        let encoded = serde_json::to_value(&canonical_request).expect("canonical request ID");
+        let decoded: Request =
+            serde_json::from_value(encoded.clone()).expect("decode canonical request ID");
+        assert!(matches!(
+            decoded,
+            Request::CompareAndSet { request_id: Some(ref value), .. } if value == &canonical
+        ));
+
+        let simple = canonical.replace('-', "");
+        assert_eq!(simple.len(), 32);
+        assert!(
+            serde_json::to_value(Request::CompareAndSet {
+                op: op.clone(),
+                request_id: Some(simple),
+            })
+            .is_err(),
+            "non-canonical outbound UUID forms must fail closed"
+        );
+
+        for (value, accepted) in [
+            (String::new(), false),
+            ("x".to_string(), false),
+            (canonical.clone(), true),
+            (format!("{canonical}x"), false),
+            (canonical.to_uppercase(), false),
+        ] {
+            let mut wire = encoded.clone();
+            wire["CompareAndSet"]["request_id"] = serde_json::json!(value);
+            assert_eq!(
+                serde_json::from_value::<Request>(wire).is_ok(),
+                accepted,
+                "wire CAS request ID boundary"
+            );
+        }
+
+        for invalid in [String::new(), "x".repeat(37), "not-a-uuid".to_string()] {
+            assert!(serde_json::to_vec(&Request::CompareAndSet {
+                op: op.clone(),
+                request_id: Some(invalid),
+            })
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_writer_accepts_exact_limit_and_emits_nothing_one_over() {
+        const NON_POWER_BUDGET: usize = 10_000;
+        let response = "x".repeat(NON_POWER_BUDGET - 2);
+        let encoded = serde_json::to_vec(&response).expect("reference frame encoding");
+        assert_eq!(encoded.len(), NON_POWER_BUDGET);
+        assert!(encoded.len() > INITIAL_ENCODED_FRAME_CHUNK_SIZE);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("test deadline");
+
+        let mut exact = Vec::new();
+        write_frame_bounded_until(&mut exact, &response, encoded.len(), deadline)
+            .await
+            .expect("exact-limit frame must be written");
+        assert_eq!(
+            &exact[..4],
+            &(u32::try_from(encoded.len()).expect("test frame size")).to_be_bytes()
+        );
+        assert_eq!(&exact[4..], encoded);
+
+        let mut rejected = Vec::new();
+        let error =
+            write_frame_bounded_until(&mut rejected, &response, encoded.len() - 1, deadline)
+                .await
+                .expect_err("one-byte-over frame must be rejected");
+        assert!(matches!(error, ProtocolError::FrameTooLarge(_)));
+        assert!(rejected.is_empty(), "no length prefix may be emitted");
+
+        let mut exact_buffer = BoundedFrameBuffer::new(
+            NON_POWER_BUDGET,
+            EncodingControl {
+                deadline: None,
+                cancellation: &NEVER_CANCELLED,
+            },
+        );
+        serde_json::to_writer(&mut exact_buffer, &response)
+            .expect("exact non-power-of-two allocation must encode");
+        assert_eq!(exact_buffer.frame.encoded_len, NON_POWER_BUDGET);
+        assert!(exact_buffer.frame.chunks.len() >= 2);
+        assert_eq!(
+            exact_buffer
+                .frame
+                .chunks
+                .iter()
+                .map(|chunk| chunk.bytes.len())
+                .sum::<usize>(),
+            exact_buffer.frame.retained_byte_capacity
+        );
+        assert_eq!(exact_buffer.frame.retained_byte_capacity, NON_POWER_BUDGET);
+
+        let mut rejected_buffer = BoundedFrameBuffer::new(
+            NON_POWER_BUDGET - 1,
+            EncodingControl {
+                deadline: None,
+                cancellation: &NEVER_CANCELLED,
+            },
+        );
+        assert!(serde_json::to_writer(&mut rejected_buffer, &response).is_err());
+        assert!(rejected_buffer.frame.encoded_len < encoded.len());
+        assert!(rejected_buffer.frame.retained_byte_capacity < NON_POWER_BUDGET);
+    }
+
+    struct CancelMidSerialization<'a> {
+        cancellation: &'a AtomicBool,
+    }
+
+    impl Serialize for CancelMidSerialization<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut sequence = serializer.serialize_seq(Some(2))?;
+            serde::ser::SerializeSeq::serialize_element(&mut sequence, &0_u8)?;
+            self.cancellation.store(true, Ordering::Release);
+            serde::ser::SerializeSeq::serialize_element(&mut sequence, &1_u8)?;
+            serde::ser::SerializeSeq::end(sequence)
+        }
+    }
+
+    struct PauseMidSerialization;
+
+    impl Serialize for PauseMidSerialization {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut sequence = serializer.serialize_seq(Some(2))?;
+            serde::ser::SerializeSeq::serialize_element(&mut sequence, &0_u8)?;
+            std::thread::sleep(Duration::from_millis(5));
+            serde::ser::SerializeSeq::serialize_element(&mut sequence, &1_u8)?;
+            serde::ser::SerializeSeq::end(sequence)
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_storage_and_counter_stop_cooperatively_with_distinct_errors() {
+        let storage_cancellation = AtomicBool::new(false);
+        let mut output = Vec::new();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("test deadline");
+        let error = write_frame_bounded_until_cancellable(
+            &mut output,
+            &CancelMidSerialization {
+                cancellation: &storage_cancellation,
+            },
+            MIN_NEGOTIATED_FRAME_SIZE,
+            deadline,
+            &storage_cancellation,
+        )
+        .await
+        .expect_err("cancellation during encoding must stop before the prefix");
+        assert!(matches!(
+            error,
+            ProtocolError::Io(ref error) if error.kind() == std::io::ErrorKind::Interrupted
+        ));
+        assert!(output.is_empty());
+
+        let counter_cancellation = AtomicBool::new(false);
+        let error = ensure_frame_fits_until(
+            &CancelMidSerialization {
+                cancellation: &counter_cancellation,
+            },
+            MIN_NEGOTIATED_FRAME_SIZE,
+            deadline,
+            &counter_cancellation,
+        )
+        .expect_err("counter cancellation must not be reported as serialization failure");
+        assert!(matches!(
+            error,
+            ProtocolError::Io(ref error) if error.kind() == std::io::ErrorKind::Interrupted
+        ));
+
+        let deadline_cancellation = AtomicBool::new(false);
+        let short_deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(1))
+            .expect("short test deadline");
+        let error = ensure_frame_fits_until(
+            &PauseMidSerialization,
+            MIN_NEGOTIATED_FRAME_SIZE,
+            short_deadline,
+            &deadline_cancellation,
+        )
+        .expect_err("counter must notice a deadline that expires during serialization");
+        assert!(matches!(
+            error,
+            ProtocolError::Io(ref error) if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_bounded_write_deadline_emits_nothing() {
+        let mut writer = Vec::new();
+        let error = write_frame_bounded_until(
+            &mut writer,
+            &Response::WatchStream,
+            MIN_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now(),
+        )
+        .await
+        .expect_err("expired deadline must fail");
+        assert!(matches!(
+            error,
+            ProtocolError::Io(ref error) if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(writer.is_empty());
+
+        let error = write_frame_within(&mut writer, &Response::WatchStream, Duration::MAX)
+            .await
+            .expect_err("unrepresentable relative deadline must fail without panicking");
+        assert!(matches!(error, ProtocolError::InvalidWireValue));
+        assert!(writer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn conservative_payload_budget_traverses_exact_get_and_cas_envelopes() {
+        assert_eq!(conservative_payload_budget(MIN_NEGOTIATED_FRAME_SIZE), 0);
+        let minimum_record = StoredSessionRecord {
+            key: SessionKey {
+                tenant: TenantId::new("t").expect("minimum tenant"),
+                nf_kind: NetworkFunctionKind::new("x").expect("minimum NF kind"),
+                key_type: SessionKeyType::PduSession,
+                stable_id: Bytes::from_static(&[0]),
+            },
+            generation: Generation::new(1),
+            owner: OwnerId::new("r").expect("minimum owner"),
+            fence: FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::new("s").expect("minimum state type"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([]),
+        };
+        ensure_get_success_frame_fits(&Some(minimum_record), MIN_NEGOTIATED_FRAME_SIZE)
+            .expect("minimum negotiated frame must carry an empty-payload Get response");
+
+        let max_key = SessionKey {
+            tenant: TenantId::new("t".repeat(128)).expect("maximum tenant"),
+            nf_kind: NetworkFunctionKind::new("n".repeat(64)).expect("maximum NF kind"),
+            key_type: SessionKeyType::other("\u{1}".repeat(SESSION_KEY_TYPE_MAX_BYTES))
+                .expect("maximum escaped key type"),
+            // Use the complete digest-oriented transport allowance and
+            // worst-case JSON byte values.
+            stable_id: Bytes::from(vec![u8::MAX; MAX_SESSION_NET_STABLE_ID_BYTES]),
+        };
+        let max_owner =
+            OwnerId::new("\u{1}".repeat(OWNER_ID_MAX_BYTES)).expect("maximum escaped owner");
+        let backend = FakeSessionBackend::new();
+        let lease = backend
+            .acquire(&max_key, max_owner.clone(), Duration::from_secs(60))
+            .await
+            .expect("maximum-metadata lease");
+
+        let frame_size = DEFAULT_MAX_FRAME_SIZE;
+        let payload_budget = conservative_payload_budget(frame_size);
+        assert!(payload_budget > 0);
+        let max_record = StoredSessionRecord {
+            key: max_key.clone(),
+            generation: Generation::new(1),
+            owner: max_owner.clone(),
+            fence: lease.fence(),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::new("\u{1}".repeat(STATE_TYPE_MAX_BYTES))
+                .expect("maximum escaped state type"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(vec![u8::MAX; payload_budget]),
+        };
+        ensure_get_success_frame_fits(&Some(max_record.clone()), frame_size).expect(
+            "published worst-byte payload budget must cross the maximum-metadata Get envelope",
+        );
+        ensure_frame_fits(
+            &Request::CompareAndSet {
+                op: CompareAndSet {
+                    key: max_key.clone(),
+                    lease: lease.clone(),
+                    expected_generation: None,
+                    new_record: max_record,
+                },
+                request_id: Some(uuid::Uuid::nil().to_string()),
+            },
+            frame_size,
+        )
+        .expect("published worst-byte payload budget must cross the maximum-metadata CAS envelope");
+
+        let unequal_payload_budget = conservative_payload_budget(MIN_NEGOTIATED_FRAME_SIZE)
+            .min(conservative_payload_budget(DEFAULT_MAX_FRAME_SIZE));
+        assert_eq!(unequal_payload_budget, 0);
+        let unequal_record = StoredSessionRecord {
+            key: max_key.clone(),
+            generation: Generation::new(2),
+            owner: max_owner,
+            fence: lease.fence(),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::new("\u{1}".repeat(STATE_TYPE_MAX_BYTES))
+                .expect("maximum escaped state type"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(vec![u8::MAX; unequal_payload_budget]),
+        };
+        ensure_get_success_frame_fits(&Some(unequal_record.clone()), MIN_NEGOTIATED_FRAME_SIZE)
+            .expect("minimum frame must carry maximum-metadata empty-payload Get response");
+        let minimum_cas = Request::CompareAndSet {
+            op: CompareAndSet {
+                key: max_key,
+                lease,
+                expected_generation: Some(Generation::new(1)),
+                new_record: unequal_record,
+            },
+            request_id: Some(uuid::Uuid::nil().to_string()),
+        };
+        let minimum_cas_len = serde_json::to_vec(&minimum_cas)
+            .expect("size minimum CAS")
+            .len();
+        ensure_frame_fits(&minimum_cas, MIN_NEGOTIATED_FRAME_SIZE).unwrap_or_else(|error| {
+            panic!(
+                "minimum frame must carry maximum-metadata zero-payload CAS ({minimum_cas_len} bytes): {error}"
+            )
+        });
+        ensure_frame_fits(
+            &Response::CompareAndSet(Ok(CompareAndSetResult::Success)),
+            MIN_NEGOTIATED_FRAME_SIZE,
+        )
+        .expect("unequal-limit CAS acknowledgement must fit the minimum response direction");
     }
 
     #[tokio::test]
@@ -2901,7 +4905,7 @@ mod tests {
                 "CAS request",
                 json(Request::CompareAndSet {
                     op: cas.clone(),
-                    request_id: Some("protocol-invariant-request".to_owned()),
+                    request_id: Some(uuid::Uuid::nil().to_string()),
                 }),
                 true,
             ),

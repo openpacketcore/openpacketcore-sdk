@@ -416,14 +416,67 @@ Full handshakes make renewed credentials observable, but they are not proof of
 seamless rotation. A production CNF/operator profile must rotate certificates
 and trust bundles without interrupting session service, including overlap of
 old/new trust, revocation, retirement of long-lived connections, reconnect
-storms, and a documented maximum authentication age. That distributed
-qualification remains #143. `MAX_SESSION_TTL` controls session/lease state
-only; it does not define certificate expiry, trust-bundle validity, or
-authentication age.
+storms, and a documented maximum authentication age. That work is split: the
+seamless session-net lifecycle remains #158, while its
+distributed qualification remains #143. `MAX_SESSION_TTL` controls
+session/lease state only; it does not define
+certificate expiry, trust-bundle validity, or authentication age.
 
 A successful restore page may be shorter than requested to fit the effective
 client/server frame limit; follow `next_cursor` until `complete`. A single
 record that cannot fit returns `RestoreScanResponseTooLarge`.
+
+Wire-schema revision 2 negotiates the response budget explicitly. The client
+Hello requests its response-frame limit; HelloAck returns the accepted
+client/server minimum and the server's separate request-frame limit. All three
+values are checked `u32` values of at least
+`MIN_NEGOTIATED_FRAME_SIZE` (8 KiB, or 8,192 bytes) and at most
+`MAX_NEGOTIATED_FRAME_SIZE` (16 MiB, or 16,777,216 bytes).
+`MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE` aliases that minimum. Configure each side
+for its real receive capacity; unequal limits are supported and must not be
+silently treated as symmetric. The server's configured idle timeout is one
+absolute deadline for response preparation and delivery.
+Server startup rejects invalid resource configuration before bind/spawn:
+frame limits outside 8 KiB..=16 MiB, zero/unsupported connection-slot
+counts, and unrepresentable idle/restore timeouts return `InvalidInput`. Zero
+timeouts are valid immediate-fail settings.
+
+Every response and watch item is fully bounded-encoded before the prefix is
+written. Common non-pageable and complete-page successes use one bounded encode
+without a sizing preflight. An oversized pageable direct attempt emits no
+prefix; bounded logarithmic sizing probes and the final encode reuse the same
+absolute deadline established before the first encode/probe and continuing
+through socket delivery. This SDK uses lazy exact-length boxed chunks without a
+coalescing copy; retained encoded-JSON byte storage stays within the negotiated
+cap, while chunk metadata and allocator slab/RSS overhead remain separate.
+Storage/sizing sinks check deadline and server-abort cancellation cooperatively
+between serializer writes/chunks; one bounded synchronous serializer callback
+is not asynchronously preemptible.
+Operationally:
+
+- never expect get/CAS records or positional batch results to be truncated;
+- continue restore pages by `next_cursor` and log pages by the next contiguous
+  sequence when the server returns a shortened complete prefix;
+- treat an over-limit watch item as a stream-ending gap, reconnecting from the
+  last delivered sequence rather than skipping it; and
+- treat a fixed SDK-owned fallback or a connection close as fail-closed. If a
+  fallback cannot fit, the server emits no oversized/partial frame.
+
+Capabilities clamp `max_value_bytes` to the backend maximum and
+`(frame - 8192) / 8` for both the accepted response and server request frames.
+The reserve and factor cover the record/key/error envelope, worst-case JSON
+byte-array expansion, and equal escaping/metadata headroom. Admission tests must
+prove a value at exactly the advertised maximum can be written and read across
+unequal limits. At the exact 8 KiB minimum the conservative payload maximum is
+zero; use a larger configured frame for payload-bearing traffic. Raw frame size
+is not an acceptable payload-capability value. The 1 MiB default advertises
+130,048 bytes and the 16 MiB ceiling advertises 2,096,128. SQLite's full 1 MiB
+limit needs at least 8,396,800 frame bytes, so configure 16 MiB for that
+profile. This is a per-frame limit: at the server's default 128 connection
+slots, simultaneous ceiling-sized encodes can retain about 2 GiB before
+metadata/TLS/runtime overhead. The aggregate scales with
+`with_max_connections`; #143 owns aggregate byte permits and distributed
+resource/soak qualification.
 
 The exact `opc-session-net/4` ALPN, version, and contract profile have no v3
 fallback or highest-common-version downgrade. Treat v3-to-v4 as a coordinated
@@ -431,7 +484,8 @@ outage: drain session traffic and writers; run the identity audit and complete
 handover/nested-payload preflights; stop every session-net client, server, and
 protection wrapper plus every product handover reader/writer; upgrade them
 together; verify v4 authenticated handshakes, empty/multi-page restore scans,
-bounded log/rebuild traffic, and fresh quorum evidence on each replica; then
+bounded maximum-payload get/CAS/batch/log/restore/watch traffic, slow-reader slot
+recovery, and fresh quorum evidence on each replica; then
 restore traffic. Do not perform a mixed-version rolling upgrade.
 
 Public `Request`/`Response` remain, but `Hello`/`HelloAck` gain an optional
@@ -442,10 +496,36 @@ client restore response budget; `u64` for restore cursors/excluded counts,
 dispatch/exposure. Restore `loaded_count` and `complete` are recomputed rather
 than trusted from the peer. Independent limits are 256 batch operations, 1,024
 restore records, 65,536 log entries, and 65,536 rebuild entries; the configured
-frame bound remains separate. Enforcing it and a write deadline across every
-ordinary response/watch item remains #159. The profile pins wire-schema/error-set revisions
-1, 128-byte owner/custom-key/state-type bounds, the 31,536,000-second TTL
-maximum, and depth-16/256-node trees.
+frame bound remains separate. #159 now enforces that negotiated bound and one
+absolute write deadline across every ordinary response/watch item. The profile
+pins wire-schema revision 2, error-set revision 1,
+`min_frame_size = 8192`, `max_frame_size = 16777216`, 128-byte
+owner/custom-key/state-type bounds,
+`stable_id_max_bytes = 64`, `replication_tx_id_max_bytes = 128`,
+`cas_request_id_bytes = 36`, the 31,536,000-second TTL maximum, and
+depth-16/256-node trees. Stable IDs contain 1 through 64 bytes, replication
+transaction IDs contain 1 through 128 UTF-8 bytes, and CAS request IDs, when
+present, are canonical lowercase hyphenated UUIDs with the exact 36-byte encoding. A
+revision-1 v4 participant is incompatible despite
+sharing the same ALPN, so that profile transition also requires the coordinated
+stop/upgrade/start above. `ContractProfile::max_frame_size` is a public Rust
+source break for external struct literals/destructuring and must be updated in
+that same transition.
+
+A mutation may commit before response encoding or delivery fails. A disconnect,
+oversize fallback, or write timeout is an ambiguous result, not rollback proof.
+CNFs must recover through request-ID/idempotency and fencing semantics, then
+authoritatively re-read before retrying; blindly replaying lease or mutation
+requests is unsafe.
+
+Alert and metric dimensions for outbound delivery must use the finite response
+families and fixed reasons `frame_too_large`, `page_shortened`, `write_timeout`,
+`transport`, and `encoding`. Do not log or label keys, payloads, owners,
+transaction/request IDs, SPIFFE IDs, backend error strings, or peer-controlled
+text. Qualification must demonstrate repeated
+oversize and authenticated slow-reader campaigns keep memory, tasks, file
+descriptors, CPU, and connection slots bounded and that shutdown barriers still
+complete.
 
 A fresh version/profile/authentication or malformed-handshake failure clears
 the capability cache and reports every boolean false with
@@ -464,14 +544,36 @@ success, static profiles, or cached capabilities; use the fresh bounded probe
 and continuous gate. Do not use quorum restore as authority before
 #127/#133, treat current divergence repair as authoritative before #128, or
 auto-resolve a legacy fork before #129. Protocol v4 identity/fixed-width
-binding is not consensus or fork recovery. #135's invariant-safe model decoding and bounded
-offline identity audit and #134's fixed-width v4 DTOs are implemented.
+binding is not consensus or fork recovery. #135's invariant-safe model decoding
+and bounded offline identity audit and #134's fixed-width v4 DTOs are implemented.
 Checked TTL and sequence boundaries now fail closed under #137/#138, and
 bounded nested protected-payload traversal is implemented under #147. Watch
 handoff and absolute-record-expiry admission remain
-#145/#148; seamless SVID/trust-bundle lifecycle is #158, outbound slow-reader
-and response-frame enforcement is #159, and the remaining distributed
-production evidence stays open in #143.
+#145/#148. Outbound slow-reader and response-frame enforcement is implemented
+under #159, but its stable-ID and transaction-ID limits are wire containment
+only. The production stable-ID model/persistence/privacy/audit/migration remains
+#167; the canonical durable `ReplicationEntry` transaction-ID type and migration
+remain #168 and must be coordinated with #127/#128/#143. Session-net's response
+deadline does not change `opc-persist`'s `TcpPeer::timeout` per-I/O-stage
+behavior over up to three attempts with backoff; #169 owns one atomic end-to-end logical-RPC deadline,
+safe retry, and metrics work. Seamless SVID/trust-bundle lifecycle remains
+#158, while the remaining distributed/payload-key production evidence stays
+open in #143.
+
+#159 does not rewrite persisted session-store bytes. In-profile stores need no
+format conversion, but a retained empty/over-64-byte stable ID or
+empty/over-128-byte UTF-8 transaction ID cannot cross strict revision-2
+transport. Before startup, quiesce writers and inventory all records, logs,
+snapshots, restore sources, and replay sources. Any violation needs a
+decoder-first, product-aware migration or coherent store replacement under
+#167/#168: the migration reader must decode the legacy representation before
+rewrite, must not truncate/hash/rename durable identities, and the strict
+decoder must verify the result before writers restart. Rollback must first
+install a decoder capable of reading the retained target representation, or use
+a coherent checkpoint/reviewed reverse migration. Every session-net participant
+still returns together to one exact revision-1 profile; mixed revisions fail
+closed. Rollback across `OPCH`/#135 retains its independent checkpoint/reverse-
+migration requirement.
 
 ## Operator-facing SDK surfaces available now
 
@@ -538,7 +640,7 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
 
 - **Config Store Consensus Hardening**: `ConsensusConfigStore` provides durable membership, TCP RPC framing over real mTLS transport with SPIFFE identity verification bound to the configured workload profile and active membership, election/heartbeats, no-op commit safety, snapshot HMAC verification, controlled TCP server lifecycle (bounded concurrency/timeout/oneshot shutdown), membership-change guardrails, and consensus metrics dump hooks. Checked via the out-of-process multi-process campaigns, failovers, network partitioning, and pending commits surviving restarts.
 - **Session Store Quorum Replication Prototype**: `QuorumSessionStore` exercises session leases and CAS mutations across a majority of replicas using an ordered log with watch/change-stream resume cursors, strict-prefix catch-up, and partial-write fail-closed fixtures. Durable authority and repair claims remain conditional on #127/#128.
-- **Session Topology, Identity, and Readiness**: HA-shaped construction requires an immutable validated set of distinct declared votes and exactly one explicit local member. Protocol v3 derives authenticated peer bindings from one cluster/configuration manifest and requires the live certificate SPIFFE identity to match the stable `ReplicaId`; DNS aliases remain routing only. The lab singleton reports `single-replica`; raw unvalidated construction reports `unknown` and refuses operations. Topology, identity binding, and capabilities are admission evidence. `probe_durable_readiness` separately provides fresh bounded majority evidence.
+- **Session Topology, Identity, and Readiness**: HA-shaped construction requires an immutable validated set of distinct declared votes and exactly one explicit local member. Protocol v4 retains v3's authenticated peer binding from one cluster/configuration manifest and requires the live certificate SPIFFE identity to match the stable `ReplicaId`; DNS aliases remain routing only. The lab singleton reports `single-replica`; raw unvalidated construction reports `unknown` and refuses operations. Topology, identity binding, and capabilities are admission evidence. `probe_durable_readiness` separately provides fresh bounded majority evidence.
 - **Fault Coverage**: Reusable chaos test fixtures and tests cover split-brain, stale leader writes, replication lag, stale fences, restart/rejoin behavior, divergent read fail-closed behavior, clock skew, and multi-writer rejection. They also cover session-store durable rejoin/catch-up, strict-prefix append, ordered-log replay, duplicate delivery, partial-write fail-closed behavior, and no-destructive-repair evidence for an already-visible ambiguous tail. This is not proof of automatic fork reconciliation or failed-write resurrection safety before #127/#128.
 - **SQLite Writer Envelope**: Each replica still serializes local durable writes through SQLite. `ConsensusConfigStore` and `QuorumSessionStore` provide the tested consensus and ordered-replication mechanisms described above; neither constitutes production HA qualification, and standalone SQLite is not HA.
 - **Capability Envelope**: `SqliteSessionBackend` reports CAS, fencing, TTL, lease-expiry, and batch support without `watch` or `ordered_replication_log` support. `QuorumSessionStore` reports `watch = true` and `ordered_replication_log = true`, but those feature declarations remain static admission evidence. Use `validate_backend_for_profile` or `StateClass::required_profile()` before binding a backend, and use `probe_durable_readiness` plus continuous traffic gating for current quorum evidence.

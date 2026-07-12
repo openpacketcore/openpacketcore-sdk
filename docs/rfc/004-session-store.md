@@ -224,8 +224,9 @@ or store replacement before startup; automatic guessing/truncation is forbidden.
 This bounded identity admission closes #135's scoped model/persistence
 boundary. Protocol-v4 fixed-width wire admission is implemented under #134,
 but neither change proves durable commit authority (#127) or production
-qualification and seamless certificate,
-payload-protection-key, and trust-bundle rotation (#158/#143).
+qualification. Seamless certificate/trust-bundle lifecycle remains #158;
+payload-protection-key rotation and distributed production evidence remain
+#143.
 
 ## 6. Backend Capability Model
 
@@ -673,13 +674,25 @@ The public semantic `Request` and `Response` types remain available, but their
 Serde boundary MUST delegate to private fixed-width v4 DTOs. `Hello` and
 `HelloAck` add an optional `contract_profile`; exhaustive Rust construction and
 matching MUST account for the new field. The profile pins wire-schema and
-error-set revisions 1; owner, custom-key, and state-type bounds of 128 UTF-8
-bytes; the
-31,536,000-second session TTL maximum, restore-page maximum 1,024, and the
-depth-16/256-node replication-tree rules.
+error-set revisions 2 and 1 respectively; owner, custom-key, and state-type
+bounds of 128 UTF-8 bytes; `min_frame_size = 8192`;
+`max_frame_size = 16777216`;
+`stable_id_max_bytes = 64`; `replication_tx_id_max_bytes = 128`;
+`cas_request_id_bytes = 36`; the 31,536,000-second session TTL maximum;
+restore-page maximum 1,024; and the depth-16/256-node replication-tree rules.
+Every transported stable ID MUST contain 1 through 64 bytes. Every transported
+replication transaction ID MUST contain 1 through 128 UTF-8 bytes. Every CAS
+request ID that is present MUST use the canonical lowercase hyphenated UUID
+representation and therefore contain exactly 36 bytes.
+The public profile's `max_frame_size` addition is a Rust source break for
+external struct literals and exhaustive destructuring and MUST be deployed in
+the same coordinated revision-2 fleet transition.
 
 The fixed-width mapping is:
 
+- Hello `requested_response_frame_size`, HelloAck
+  `accepted_response_frame_size`, and HelloAck `server_request_frame_size`:
+  `u32`;
 - restore/log request limits and the client restore-response budget: `u32`;
 - restore request/response cursors and restore excluded count: `u64`;
 - backend `max_value_bytes`: `u64`; and
@@ -694,25 +707,168 @@ backend dispatch or caller exposure. Collection work MUST be bounded
 independently from encoded frame size: at most 256 batch operations, 1,024
 restore records, 65,536 replication-log entries, and 65,536 rebuild entries.
 The configured frame limit remains a separate encoded-byte bound.
-Protocol v4 width/collection stabilization does not yet enforce that budget or
-a write deadline on every ordinary server response/watch item; #159 owns that
-outbound resource and slow-reader contract.
+
+Wire-schema revision 2 MUST negotiate directional frame budgets during the
+frozen bootstrap. The client's requested response size, the server's accepted
+response size, and the server's request size MUST each be at least
+`MIN_NEGOTIATED_FRAME_SIZE` (8 KiB, or 8,192 bytes), at most
+`MAX_NEGOTIATED_FRAME_SIZE` (16 MiB, or 16,777,216 bytes), and representable as
+`u32`. Their public bootstrap fields are `Option<u32>` so a revision-2 decoder
+can classify an otherwise decodable legacy minimal bootstrap. This MUST NOT be
+treated as bidirectional mismatch negotiation: a revision-1 decoder MAY reject
+unknown revision-2 fields by closing without a typed response. Revision-2
+admission MUST require all three as `Some`. The accepted
+response size MUST be no greater than either the client's receive limit or the
+server's configured frame limit. The server request size independently states
+the maximum operation frame the server will accept. Peers MUST use these values
+for the lifetime of that connection and MUST NOT infer equal limits in both
+directions.
+`MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE` MUST alias
+`MIN_NEGOTIATED_FRAME_SIZE`; it is not a second negotiable minimum.
+The restore request's existing `max_response_frame_size` MUST remain an
+additional per-call cap and MUST NOT enlarge the negotiated response budget.
+Before binding or spawning, a server MUST reject a configured frame size below
+8 KiB or above 16 MiB, a zero/runtime-unrepresentable connection-slot count,
+or an unrepresentable idle/restore timeout with `InvalidInput`. A zero timeout
+MAY remain an intentional immediate-fail policy.
+Before DNS, socket allocation, or watch-task spawning, a client MUST reject a
+configured frame size outside the same range. Bootstrap output MUST use the
+separate 8 KiB `MAX_HANDSHAKE_FRAME_SIZE` cap.
+
+Every post-bootstrap response and watch item MUST be fully bounded-encoded into
+retained byte storage capped at the accepted response size before a length
+prefix is written.
+The common non-pageable and complete-page success path MUST perform one bounded
+encode without a separate sizing serialization. If the complete pageable
+response is oversized, that direct encode MUST emit no prefix; prefix selection
+MAY then perform bounded logarithmic sizing probes followed by one final bounded
+encode. No retained encoded-JSON byte storage may exceed the negotiated cap.
+The retained/requested encoded-JSON byte storage MUST remain no greater than the
+cap, including for non-power-of-two budgets. An implementation MUST NOT
+coalesce or create a temporary payload buffer when doing so would exceed that
+bound. This SDK satisfies the contract with lazy exact-length boxed chunks and
+no coalescing copy. Chunk-pointer metadata and allocator slab/RSS overhead are
+not encoded JSON bytes and MUST be accounted for separately by runtime resource
+qualification.
+One absolute deadline MUST be established before the first direct encode or
+sizing probe and reused through every probe, the final encode, length prefix,
+complete payload, and flush. Implementations MUST NOT restart the deadline per
+probe, phase, write, or chunk. Deadline expiry MUST terminate the connection and
+release its task and connection permits.
+Synchronous storage and sizing sinks MUST check the deadline and the server's
+abort cancellation signal cooperatively between serializer writes and retained
+chunks. Task abortion cannot preempt one synchronous serializer callback;
+therefore every wire field and collection processed between checks MUST remain
+bounded, and shutdown claims MUST include that finite callback interval.
+
+Outbound behavior is family-specific:
+
+- The fixed-width Capabilities envelope MUST fit within the 8 KiB protocol
+  minimum; an encoding failure MUST close without emitting an oversized frame.
+  Scalar mutation results, replication/rebuild acknowledgements, and lease
+  results MUST use an SDK-owned fixed, redaction-safe fallback when a
+  backend-provided result cannot fit. If the fallback cannot fit, the connection
+  MUST close without emitting an oversized frame.
+- Get results and CAS conflicts MUST NOT truncate a record. They MUST replace
+  the complete record-bearing result with the fixed fallback or close.
+- Batch results MUST preserve exact request cardinality and order. They MUST NOT
+  be truncated; an oversized complete result becomes one fixed batch error or a
+  connection close.
+- Restore results MAY return a complete record prefix that fits, but
+  MUST preserve `next_cursor` and excluded-count semantics. A record MUST NOT be
+  split. When the first record cannot fit, the server MUST return the fixed
+  restore-size error if representable or close.
+- Replication-log results MAY return only the largest complete contiguous entry
+  prefix that fits. An entry MUST NOT be split, reordered, or skipped. If no
+  requested entry fits, the server MUST use its fixed fallback or close.
+- Watch acknowledgement and each watch item MUST be bounded independently. The
+  server MUST NOT skip an oversized entry because that would conceal a sequence
+  gap. It MUST send a fixed error item when representable and then terminate the
+  stream/connection, or close immediately when the fallback cannot fit.
+
+Fallback text MUST be static SDK-owned text. It MUST NOT contain a key, owner,
+payload, transaction/request ID, peer identity, backend error string, or other
+peer-controlled text. Consuming rejection of nested replication operations MUST
+retain iterative disposal and the existing depth/node work bounds.
+
+`BackendCapabilities::max_value_bytes` transported over session-net MUST be no
+greater than the backend limit,
+`conservative_payload_budget(accepted_response_frame_size)`, or
+`conservative_payload_budget(server_request_frame_size)`. That function MUST
+compute `frame_size.saturating_sub(8192) / 8`: the 8 KiB block reserves the
+record/key/error envelope, while the factor of eight covers four-byte worst-case
+JSON byte-array expansion plus equal escaping/metadata headroom. The advertised
+maximum MUST complete a real write/read round trip under unequal limits.
+At exactly 8 KiB, the conservative payload budget is zero: that minimum MUST
+fit maximum-profile metadata/envelopes but does not promise a non-zero
+application payload. Capability evidence remains descriptive and MUST NOT
+authorize quorum or traffic readiness.
+The 1 MiB default yields 130,048 payload bytes and the 16 MiB ceiling yields
+2,096,128. Advertising SQLite's full 1 MiB value limit requires at least
+8,396,800 frame bytes; 16 MiB is the recommended configured frame size for that
+profile. This is a per-frame limit, not aggregate admission: at the server's
+default 128 connection slots, simultaneous ceiling-sized encoded stores can
+retain about 2 GiB before chunk metadata, TLS, and runtime overhead. The
+aggregate scales with the configured connection limit. #143 owns aggregate
+byte permits and distributed resource/soak qualification.
+
+Backend mutation and response delivery are not one transaction. A mutation MAY
+commit before response encoding, write, or flush fails. A client that receives
+no valid response MUST treat the outcome as ambiguous, use existing request-ID,
+idempotency, and fencing semantics, and perform an authoritative re-read before
+retrying; it MUST NOT infer rollback from an outbound rejection or timeout.
+
+Outbound diagnostics SHOULD expose only bounded `response_family` categories
+and fixed reasons such as `frame_too_large`, `page_shortened`, `write_timeout`,
+`transport`, and `encoding`. They MUST NOT label or log session keys, payloads,
+transaction IDs, owners, SPIFFE IDs, backend/peer-controlled error text, or
+other high-cardinality identifiers. This requirement does not establish a new
+public metrics API.
 
 A fresh version/profile/authentication or malformed-handshake failure MUST clear
 the cached capabilities and report all capability booleans false with
 `max_value_bytes = 0`. A cache retained after transient transport loss is
 descriptive only and MUST NOT authorize a store operation, durable readiness,
-or traffic admission. Callers MUST use fresh bounded quorum evidence.
+or traffic admission. A cache MUST be keyed by the exact profile and negotiated
+directional limits and cleared when a successful reconnect changes either
+limit. Callers MUST use fresh bounded quorum evidence.
 
-The v3-to-v4 transition is a coordinated stop/upgrade/start, not a rolling
-deployment. Operators MUST drain traffic and writers; run the #135 identity
-audit and complete product-aware handover/nested-payload preflights; stop every
-session-net client, server, and protection wrapper plus every handover
-reader/writer; upgrade them together; verify exact-v4 authenticated restore/log
-traffic and fresh quorum evidence; and only then restore traffic. Once an
+The v3-to-v4 transition, and the same-v4 wire-schema revision-1 to revision-2
+transition, are coordinated stop/upgrade/start boundaries, not rolling
+deployments. Operators MUST drain traffic and writers; run the #135 identity
+audit; inventory every retained record, replication log, snapshot, restore
+source, and replay source for the stable-ID and transaction-ID bounds; and
+complete product-aware handover/nested-payload preflights. A retained-value
+migration MUST be decoder-first: while writers remain quiesced, every migration
+reader MUST be able to decode the legacy representation before any rewrite or
+replacement occurs. Stable IDs MUST follow the product-aware #167
+model/persistence/privacy/audit policy, and durable transaction IDs MUST follow
+the canonical-type/migration policy in #168 coordinated with #127/#128/#143. The
+migration MUST NOT silently truncate, hash, or rename a key or idempotency
+identity. Operators MUST verify that the strict revision-2 decoder accepts the
+result; then they MUST stop every session-net client, server, and protection
+wrapper plus every handover reader/writer; upgrade them together; verify
+exact-v4 authenticated restore/log traffic and fresh quorum evidence; and only
+then restore traffic. Once an
 `OPCH` value has been written, v3 rollback additionally requires a coherent
 drained checkpoint restore or reviewed reverse migration of every live and
 replayable record, log, snapshot, and restore source.
+Revision 2 does not itself rewrite persisted session-store bytes. In-profile
+data needs no format conversion, but out-of-profile retained values MUST be
+migrated or replaced before strict transport starts. Binary rollback MUST
+restore one exact drained fleet profile and install a rollback-side decoder that
+can read the retained target representation before old writers restart;
+otherwise it MUST restore a coherent checkpoint or run a reviewed reverse
+migration. Mixed revision-1 and revision-2 participants fail closed. Rollback
+across the independent `OPCH`/#135 boundary retains its checkpoint/reverse-
+migration requirement.
+
+#159 establishes only session-net response/write and wire-containment bounds.
+It does not close #167 or #168, does not implement seamless SVID/trust-bundle
+rotation (#158), and does not provide #143's payload-key/distributed production
+qualification. It also does not change `opc-persist`'s `TcpPeer::timeout`, which
+applies per I/O stage across up to three attempts with backoff; #169 owns the future atomic
+logical-RPC deadline, safe retry policy, and metrics coordinated with #127/#143.
 
 ## 13. Local Cache
 
@@ -754,8 +910,9 @@ AAD MUST include:
 The bounded iterative transformation in §11.2.1 is mandatory for replication
 wrappers. Protecting only the root or one `Batch` level is not conformant.
 Closing that traversal gap does not qualify key lifecycle operations: seamless
-SVID rotation, payload-protection key rotation, and trust-bundle rotation
-remain separate mandatory production requirements under #143.
+SVID/trust-bundle rotation remains #158, while payload-protection key rotation
+and distributed qualification remain separate mandatory requirements under
+#143.
 
 ### 14.2 Integrity
 
@@ -775,8 +932,8 @@ production networked session-store profile MUST rotate workload certificates
 and trust bundles without interrupting service, while still enforcing
 revocation and a documented maximum authentication age on long-lived
 connections. `opc-session-net` reconnects perform a full mutual-TLS handshake,
-but seamless certificate/trust rotation and reconnect-storm behavior remain a
-production-qualification requirement tracked by #143.
+but seamless certificate/trust rotation remains #158; reconnect-storm and
+distributed production evidence remain #143.
 
 ## 15. Observability
 
@@ -840,12 +997,28 @@ fencing.
 - Protocol-v4 golden frames with no target-width integer fields; checked
   fixed-width maximum/overflow conversion; exact collection limits; omitted
   restore fields recomputed; and size errors nested in batch results.
+- Revision-2 negotiation with equal and unequal client/server limits, rejection
+  below `MIN_NEGOTIATED_FRAME_SIZE` (8,192 bytes), the restore-minimum alias,
+  executable conservative maximum-payload round trips, and
+  fail-closed revision-1/revision-2 profile mismatch.
+- Exact-limit and one-byte-over outbound encoding for every response/watch
+  family; no oversized allocation or emitted prefix on rejection; non-truncated
+  record/batch behavior; contiguous log and cursor-correct restore prefixes;
+  fixed fallback redaction; and iterative consuming rejection of nested trees.
+- One absolute write deadline for prefix/payload/flush; authenticated slow-reader
+  reaping; handler/connection-slot return to baseline; repeated reconnect bounds
+  on memory/tasks/file descriptors/CPU; and deterministic shutdown/abort while
+  response serialization or socket writes are blocked.
 - Exact-v4 handshake success plus v3 ALPN/version, profile, authentication,
   malformed acknowledgement, and replay rejection before backend dispatch;
   incompatible peers clear cached capabilities to all false/zero.
 - Exact 1-byte and 128-byte owner/custom-key acceptance, empty and 129-byte
   rejection, canonical reserved-name handling, string ordering, and hostile
   Serde/session-net decode rejection without raw-value disclosure.
+- Exact stable-ID 1/64-byte and replication-transaction-ID 1/128-UTF-8-byte
+  acceptance/rejection, plus canonical lowercase hyphenated 36-byte CAS UUID
+  admission across requests, responses, batches, nested replication carriers,
+  log pages, and watch items.
 - Valid legacy SQLite hydration; hostile owner/key types in records, active
   leases, key fences, and nested replication logs; no-effect rejection; and
   the bounded count-only audit's budgets, status/exit codes, and redaction.
@@ -871,6 +1044,9 @@ fencing.
 - Cache invalidation after remote update.
 - Coordinated v4 multi-replica admission and fresh-readiness behavior, including
   fail-closed mixed-v3/v4 peers and non-authoritative cached capabilities.
+- Ambiguous mutation outcomes under response rejection/write timeout, proving
+  callers recover through idempotency, fencing, and authoritative re-read rather
+  than assuming rollback or blindly replaying the operation.
 
 ### 17.3 Fault Injection
 

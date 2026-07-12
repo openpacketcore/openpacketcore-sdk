@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-session-store`: a read-only `LeaseGuard::credential_id()` accessor lets
+  transport adapters verify that renewal responses preserve the opaque
+  credential; guard construction remains crate-private.
 - `opc-session-store`: `probe_durable_readiness` and stable readiness report
   types for fresh, deadline- and log-work-bounded quorum evidence. Reports
   distinguish `Ready`, `NoQuorum`, `TopologyInvalid`, and `RecoveryRequired`;
@@ -130,7 +133,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   256, restore pages at 1,024 records, and replication-log pages and rebuild
   prefixes at 65,536 entries, while the contract profile pins the existing
   depth-16/256-node replication tree, 128-byte owner/custom-key/state-type
-  bounds, 31,536,000-second TTL maximum, and wire-schema/error-set revisions 1.
+  bounds and 31,536,000-second TTL maximum. The initial profile used
+  wire-schema/error-set revisions 1; #159 below advances only the schema
+  revision.
   The exact `opc-session-net/4` ALPN,
   version, and profile have no v3 fallback or downgrade negotiation: drain and
   stop every client, server, and protection-wrapper participant, complete the
@@ -139,8 +144,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restore traffic. Version/profile/authentication/malformed-handshake failures
   clear cached capabilities and report every boolean false with
   `max_value_bytes = 0`; any cache retained after transient transport loss is
-  descriptive only and cannot authorize a store operation or readiness. This
-  does not close #159's ordinary outbound-response frame/write-deadline gap.
+  descriptive only and cannot authorize a store operation or readiness. #159's
+  follow-up outbound contract is described below.
+- **BREAKING — `opc-session-net`:** protocol v4's exact contract profile advances
+  to wire-schema revision 2 (error-set revision remains 1) and negotiates
+  directional frame budgets. Hello gains
+  `requested_response_frame_size: Option<u32>`; HelloAck gains
+  `accepted_response_frame_size: Option<u32>` and
+  `server_request_frame_size: Option<u32>`; exact revision-2 admission requires
+  all three as `Some` checked values with
+  `min_frame_size = MIN_NEGOTIATED_FRAME_SIZE = 8192` and
+  `max_frame_size = MAX_NEGOTIATED_FRAME_SIZE = 16777216` (16 MiB).
+  `MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE` aliases the same 8 KiB minimum.
+  The profile also pins `stable_id_max_bytes = 64`,
+  `replication_tx_id_max_bytes = 128`, and `cas_request_id_bytes = 36`:
+  transported stable IDs are 1 through 64 bytes, replication transaction IDs
+  are 1 through 128 UTF-8 bytes, and CAS request IDs, when present, are
+  canonical lowercase hyphenated UUIDs. The new public `ContractProfile` field
+  and exhaustive public frame construction/matching are Rust source breaks.
+  Revision-1 and revision-2 peers share the `opc-session-net/4`
+  ALPN but deliberately reject one another, so drain and stop every
+  client/server and protection wrapper, upgrade the whole fleet, verify unequal-limit maximum
+  payload round trips and slow-reader slot recovery, then restore traffic. Do
+  not perform a same-v4 rolling upgrade.
+- `opc-session-net`: every post-bootstrap response and watch item is fully
+  bounded-encoded before a length prefix is emitted; no individual sizing or
+  retained encoded-JSON byte store exceeds the negotiated response budget.
+  Encoding uses lazy exact-length boxed chunks and never coalesces them; chunk
+  metadata and allocator slab/RSS overhead are outside the wire-byte budget.
+  Common non-pageable and
+  complete-page successes use one bounded encode without a sizing preflight.
+  An oversized pageable attempt emits no prefix, then may use bounded
+  logarithmic sizing probes plus one final encode. One absolute deadline starts
+  before the first direct encode/probe and is reused through every probe, final
+  encode, prefix, payload, and flush; a slow reader is closed and its handler
+  slot is released. Deadline and server-abort cancellation are also checked
+  cooperatively by synchronous storage and sizing sinks between serializer
+  writes/chunks; Tokio task abortion cannot preempt one synchronous serializer
+  callback, so the bounded wire-field contract remains part of the shutdown
+  interval.
+  Server admission now returns `InvalidInput` before binding or spawning when
+  the frame limit is outside 8 KiB..=16 MiB, the connection-slot count is
+  zero or outside Tokio's supported range, or a configured timeout cannot be
+  represented. A zero timeout remains an intentional immediate-fail policy.
+  Get/CAS records and positional batch results are never truncated. Restore and
+  replication-log results may return only complete cursor/contiguous-sequence
+  prefixes; watch never skips an over-limit entry. A fixed SDK-owned,
+  redaction-safe fallback is sent when representable, otherwise the connection
+  closes without an oversized/partial frame. Rejected nested entries retain
+  bounded iterative disposal.
+- `opc-session-net`: transported `max_value_bytes` now uses the backend limit and
+  `conservative_payload_budget(frame) = frame.saturating_sub(8192) / 8`, reserving
+  record/key/error-envelope space, worst-case JSON byte-array expansion, and
+  equal escaping/metadata headroom. The clamp takes the backend, accepted
+  response, and server request minima so it covers both directions.
+  The advertised value is executable across unequal client/server frame limits,
+  but remains descriptive rather than readiness. It is zero at the exact 8 KiB
+  minimum, 130,048 bytes at the 1 MiB default, and 2,096,128 bytes at the
+  16 MiB ceiling. Advertising SQLite's full 1 MiB value limit requires a frame
+  of at least 8,396,800 bytes; 16 MiB is the recommended setting. This is a
+  per-frame bound: at the default 128 connection slots, simultaneous
+  ceiling-sized encodes can retain about 2 GiB before metadata/TLS/runtime
+  overhead. The aggregate scales with `with_max_connections`, so aggregate byte
+  permits and distributed resource/soak evidence remain #143. A
+  mutation may commit before response encoding/delivery fails; no response is
+  an ambiguous outcome that requires request-ID/idempotency, fencing, and an
+  authoritative re-read rather than an assumed rollback or blind retry. Diagnostics use finite
+  `response_family` values and fixed `frame_too_large`, `page_shortened`,
+  `write_timeout`, `transport`, and `encoding` reasons, and exclude keys,
+  payloads, owners, transaction IDs, peer identities, and backend/peer-controlled
+  error text.
+  #159 does not rewrite the persisted store format, but its stable-ID and
+  replication-transaction-ID limits are wire containment only. #167 owns the
+  production stable-ID model/persistence/privacy/audit/migration contract;
+  #168 owns a canonical durable transaction-ID type and migration coordinated
+  with #127/#128/#143. Before revision 2, quiesce writers and use a reviewed
+  decoder-first migration for any out-of-profile retained record, log,
+  snapshot, restore source, or replay source; never truncate or rename an
+  identity to make it fit. Binary rollback requires a drained coordinated fleet
+  at one exact revision and a rollback decoder that can read the retained target
+  representation before old writers restart, or a coherent checkpoint/reverse
+  migration; the separate `OPCH`/#135 rollback barrier still applies.
+  Session-net's one response deadline does not change `opc-persist`'s
+  `TcpPeer::timeout` per-I/O-stage behavior across up to three attempts with backoff; #169 owns one atomic
+  end-to-end logical-RPC deadline, safe-retry policy, and metrics. Seamless
+  credential/trust rotation remains #158, while distributed
+  resource/failover/soak plus payload-key
+  rotation qualification remains #143.
 - **BREAKING — `opc-session-store`:** the deprecated raw-vector
   `QuorumSessionStore::new` remains source-compatible but is now deliberately
   non-operational: it advertises `unknown`, masks capabilities, and rejects
