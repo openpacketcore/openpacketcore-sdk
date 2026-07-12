@@ -3186,9 +3186,13 @@ dependencies = [
  "bytes",
  "futures-util",
  "hmac 0.12.1",
+ "libc",
+ "nix",
+ "opc-config-model",
  "opc-consensus",
  "opc-crypto",
  "opc-key",
+ "opc-mgmt-audit",
  "opc-redaction",
  "opc-types",
  "proptest",
@@ -3202,6 +3206,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

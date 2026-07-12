@@ -23,10 +23,10 @@ The #127 implementation uses one shared Openraft engine for intra-cluster
 election, voting, log matching, commitment, membership, snapshots, and
 linearizable-read authority. `ConsensusSessionStore` is the operational store;
 `QuorumSessionStore` is a compatibility alias, not a second quorum algorithm.
-This RFC does not claim production qualification: divergence recovery (#128),
-operator-safe legacy-fork recovery (#129), majority-authoritative bounded
-restore (#133), distributed qualification (#143), and seamless credential
-rotation remain gates.
+This RFC does not claim production qualification: #128 supplies
+current-format recovery and #129 supplies the audited offline legacy-fork
+campaign, while majority-authoritative bounded restore (#133), distributed
+qualification (#143), and seamless credential rotation remain gates.
 
 ## 2. Scope
 
@@ -232,9 +232,10 @@ or store replacement before startup; automatic guessing/truncation is forbidden.
 
 This bounded identity admission closes #135's scoped model/persistence
 boundary. Protocol-v4 fixed-width wire admission is implemented under #134,
-and #127 now supplies Openraft durable commit authority. Those changes do not
-provide divergence or legacy-fork recovery (#128/#129), majority-authoritative
-restore (#133), or production qualification (#143). Seamless certificate and
+and #127 now supplies Openraft durable commit authority. #128 supplies
+current-format divergence recovery and #129 supplies explicit offline
+legacy-fork recovery; majority-authoritative restore (#133) and production
+qualification (#143) remain open. Seamless certificate and
 trust-bundle lifecycle remains the #162 -> #161 -> #163 -> #158 -> #164 chain;
 payload-protection-key rotation and distributed production evidence remain
 #143.
@@ -561,8 +562,9 @@ successful appends remain observable normally. These are
 backend-local atomicity requirements. In the production HA profile, a caller
 MUST NOT invoke rebuild or append as an alternative authority path; only an
 Openraft-committed command or snapshot installation may replace authoritative
-state. #127 supplies that commit gate, while #128/#129 own reconciliation and
-operator-directed legacy recovery.
+state. #127 supplies that commit gate, #128 owns current-format reconciliation,
+and #129 provides the offline operator-directed legacy campaign documented in
+the [recovery runbook](../session-store-legacy-recovery.md).
 
 An operator upgrading persisted state from an older SDK MUST audit every
 TTL-bearing replication entry before rollout. A legacy entry above 365 days
@@ -666,8 +668,9 @@ and lease sequencing MUST be rejected by this production adapter.
 Snapshots MUST be bounded, checksummed, tied to the exact consensus identity,
 and installed atomically as one coherent state-machine image. They MUST contain
 only payloads already admitted by the protection wrapper described in §14.1.
-Automatic reconciliation of a divergent replica remains #128, and an
-operator-safe path for pre-#127 persisted forks remains #129.
+Automatic current-format reconciliation is supplied by #128. Pre-#127
+persisted forks use #129's full-fleet, backup-before-mutation procedure and
+remain readiness-fenced until Openraft commits the recovery epoch.
 
 `probe_durable_readiness` MUST use the same bounded authority path as an
 authoritative read: discover or follow the current leader, execute Openraft's
@@ -976,9 +979,9 @@ repair. An identity, authentication, schema, payload-bound, or sender mismatch
 MUST fail before Openraft dispatch with redaction-safe diagnostics.
 
 This authenticated transport plus #127 commit authority is still not a
-production qualification. #133 MUST provide bounded majority-authoritative
-restore behavior without reopening a direct backend/rebuild port. #128 and
-#129 remain the divergence and legacy-fork recovery gates, and #143 remains the
+production qualification. #128 and #129 supply current-format and offline
+legacy recovery without reopening a runtime consensus path. #133 MUST provide
+bounded majority-authoritative restore behavior, and #143 remains the
 distributed partition/restart/resource/soak and payload-key gate. Seamless
 transport credential rotation MUST complete, in dependency order, #162
 (material epochs), #161 (atomic reload), #163 (reauthentication across an

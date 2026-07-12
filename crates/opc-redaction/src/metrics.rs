@@ -505,6 +505,12 @@ pub struct SdkMetrics {
     pub session_durable_readiness_transport_failures: AtomicU64,
     pub session_durable_readiness_divergent_failures: AtomicU64,
     pub session_durable_readiness_recovery_required_failures: AtomicU64,
+    pub session_operator_recovery_attempts: AtomicU64,
+    pub session_operator_recovery_failures: AtomicU64,
+    pub session_operator_recovery_required: AtomicI64,
+    pub session_operator_recovery_audit_pending: AtomicI64,
+    pub session_operator_recovery_epoch: AtomicU64,
+    pub session_operator_recovery_rejoins: AtomicU64,
 
     // === NACM / Authz ===
     pub nacm_eval_allow: AtomicU64,
@@ -640,6 +646,12 @@ impl SdkMetrics {
             session_durable_readiness_transport_failures: AtomicU64::new(0),
             session_durable_readiness_divergent_failures: AtomicU64::new(0),
             session_durable_readiness_recovery_required_failures: AtomicU64::new(0),
+            session_operator_recovery_attempts: AtomicU64::new(0),
+            session_operator_recovery_failures: AtomicU64::new(0),
+            session_operator_recovery_required: AtomicI64::new(0),
+            session_operator_recovery_audit_pending: AtomicI64::new(0),
+            session_operator_recovery_epoch: AtomicU64::new(0),
+            session_operator_recovery_rejoins: AtomicU64::new(0),
 
             nacm_eval_allow: AtomicU64::new(0),
             nacm_eval_deny: AtomicU64::new(0),
@@ -796,6 +808,18 @@ impl SdkMetrics {
         self.session_durable_readiness_divergent_failures
             .store(0, Ordering::Relaxed);
         self.session_durable_readiness_recovery_required_failures
+            .store(0, Ordering::Relaxed);
+        self.session_operator_recovery_attempts
+            .store(0, Ordering::Relaxed);
+        self.session_operator_recovery_failures
+            .store(0, Ordering::Relaxed);
+        self.session_operator_recovery_required
+            .store(0, Ordering::Relaxed);
+        self.session_operator_recovery_audit_pending
+            .store(0, Ordering::Relaxed);
+        self.session_operator_recovery_epoch
+            .store(0, Ordering::Relaxed);
+        self.session_operator_recovery_rejoins
             .store(0, Ordering::Relaxed);
 
         self.nacm_eval_allow.store(0, Ordering::Relaxed);
@@ -1568,6 +1592,67 @@ pub fn export_prometheus_text() -> String {
     out.push_str(&format!(
         "opc_session_store_durable_readiness_failures_total{{reason=\"recovery_required\"}} {readiness_recovery_required_failures}\n"
     ));
+
+    let operator_recovery_attempts = METRICS
+        .session_operator_recovery_attempts
+        .load(Ordering::Relaxed);
+    let operator_recovery_failures = METRICS
+        .session_operator_recovery_failures
+        .load(Ordering::Relaxed);
+    let operator_recovery_required = METRICS
+        .session_operator_recovery_required
+        .load(Ordering::Relaxed);
+    let operator_recovery_audit_pending = METRICS
+        .session_operator_recovery_audit_pending
+        .load(Ordering::Relaxed);
+    let operator_recovery_epoch = METRICS
+        .session_operator_recovery_epoch
+        .load(Ordering::Relaxed);
+    let operator_recovery_rejoins = METRICS
+        .session_operator_recovery_rejoins
+        .load(Ordering::Relaxed);
+    write_metric(
+        &mut out,
+        "opc_session_store_operator_recovery_attempts_total",
+        "counter",
+        "Authorized operator recovery actions attempted",
+        operator_recovery_attempts as f64,
+    );
+    write_metric(
+        &mut out,
+        "opc_session_store_operator_recovery_failures_total",
+        "counter",
+        "Operator recovery actions that failed closed",
+        operator_recovery_failures as f64,
+    );
+    write_metric(
+        &mut out,
+        "opc_session_store_operator_recovery_required",
+        "gauge",
+        "Whether an operator recovery workflow is blocking readiness",
+        operator_recovery_required as f64,
+    );
+    write_metric(
+        &mut out,
+        "opc_session_store_operator_recovery_audit_pending",
+        "gauge",
+        "Whether successful operator recovery is blocked on durable audit",
+        operator_recovery_audit_pending as f64,
+    );
+    write_metric(
+        &mut out,
+        "opc_session_store_operator_recovery_epoch",
+        "gauge",
+        "Latest Openraft-committed operator recovery epoch",
+        operator_recovery_epoch as f64,
+    );
+    write_metric(
+        &mut out,
+        "opc_session_store_operator_recovery_rejoins_total",
+        "counter",
+        "Operator recovery workflows that completed a fresh rejoin barrier",
+        operator_recovery_rejoins as f64,
+    );
 
     // --- NACM / Authz ---
     let nacm_allow = METRICS.nacm_eval_allow.load(Ordering::Relaxed);

@@ -6,7 +6,9 @@
 
 use std::collections::BTreeSet;
 use std::io;
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -19,9 +21,10 @@ use crate::backend::{CompareAndSetResult, ReplicationEntry, ReplicationOp};
 use crate::capability::BackendCapabilities;
 use crate::consensus::storage::SessionConsensusStorageError;
 use crate::consensus::types::{
-    SessionConsensusCommand, SessionConsensusEntryDigest, SessionConsensusIdentity,
-    SessionConsensusNodeId, SessionConsensusRequestId, SessionConsensusResponse,
-    SessionMutationIntent, SessionMutationOutcome, SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+    SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusNodeId,
+    SessionConsensusRequestId, SessionConsensusResponse, SessionMutationIntent,
+    SessionMutationOutcome, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::consensus::SessionRaftTypeConfig;
 use crate::error::{LeaseError, StoreError};
@@ -31,6 +34,208 @@ use super::{lease, ops, SqliteSessionBackend};
 
 const CONSENSUS_LOG_ENTRY_MAX_BYTES: usize = 16 * 1024 * 1024;
 const OUTCOME_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/outcome-payload/v1\0";
+const OPERATOR_RECOVERY_LATCH_MAGIC: &[u8; 8] = b"OPCRL001";
+const OPERATOR_RECOVERY_LATCH_BYTES: usize = 8 + 32 + 32 + 8 + 8 + 32 + 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OperatorRecoveryLatch {
+    pub(crate) identity: SessionConsensusIdentity,
+    pub(crate) recovery_epoch: u64,
+    pub(crate) plan_digest: [u8; 32],
+    pub(crate) audit_pending: bool,
+}
+
+pub(crate) fn operator_recovery_latch_path(database: &Path) -> io::Result<PathBuf> {
+    let name = database
+        .file_name()
+        .ok_or_else(|| invalid_data("session recovery database path has no file name"))?;
+    let mut latch_name = name.to_os_string();
+    latch_name.push(".opc-recovery-latch");
+    Ok(database.with_file_name(latch_name))
+}
+
+fn encode_operator_recovery_latch(latch: OperatorRecoveryLatch) -> [u8; OPERATOR_RECOVERY_LATCH_BYTES] {
+    let mut encoded = [0_u8; OPERATOR_RECOVERY_LATCH_BYTES];
+    encoded[..8].copy_from_slice(OPERATOR_RECOVERY_LATCH_MAGIC);
+    encoded[8..40].copy_from_slice(latch.identity.cluster_id().as_bytes());
+    encoded[40..72].copy_from_slice(latch.identity.configuration_id().as_bytes());
+    encoded[72..80].copy_from_slice(&latch.identity.configuration_epoch().get().to_be_bytes());
+    encoded[80..88].copy_from_slice(&latch.recovery_epoch.to_be_bytes());
+    encoded[88..120].copy_from_slice(&latch.plan_digest);
+    encoded[120] = u8::from(latch.audit_pending);
+    encoded
+}
+
+fn decode_operator_recovery_latch(
+    encoded: &[u8; OPERATOR_RECOVERY_LATCH_BYTES],
+) -> io::Result<OperatorRecoveryLatch> {
+    if &encoded[..8] != OPERATOR_RECOVERY_LATCH_MAGIC || encoded[120] > 1 {
+        return Err(invalid_data("session operator recovery latch is invalid"));
+    }
+    let cluster = encoded[8..40]
+        .try_into()
+        .map_err(|_| invalid_data("session operator recovery latch is invalid"))?;
+    let configuration = encoded[40..72]
+        .try_into()
+        .map_err(|_| invalid_data("session operator recovery latch is invalid"))?;
+    let configuration_epoch = u64::from_be_bytes(
+        encoded[72..80]
+            .try_into()
+            .map_err(|_| invalid_data("session operator recovery latch is invalid"))?,
+    );
+    let recovery_epoch = u64::from_be_bytes(
+        encoded[80..88]
+            .try_into()
+            .map_err(|_| invalid_data("session operator recovery latch is invalid"))?,
+    );
+    let plan_digest = encoded[88..120]
+        .try_into()
+        .map_err(|_| invalid_data("session operator recovery latch is invalid"))?;
+    if recovery_epoch == 0 || plan_digest == [0; 32] {
+        return Err(invalid_data("session operator recovery latch is invalid"));
+    }
+    let epoch = SessionConsensusConfigurationEpoch::new(configuration_epoch)
+        .map_err(|_| invalid_data("session operator recovery latch is invalid"))?;
+    Ok(OperatorRecoveryLatch {
+        identity: SessionConsensusIdentity::new(
+            crate::consensus::SessionConsensusClusterId::from_bytes(cluster),
+            SessionConsensusConfigurationId::from_bytes(configuration),
+            epoch,
+        ),
+        recovery_epoch,
+        plan_digest,
+        audit_pending: encoded[120] == 1,
+    })
+}
+
+fn open_latch_read(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    options.open(path)
+}
+
+pub(crate) fn read_operator_recovery_latch_sync(
+    database: &Path,
+) -> io::Result<Option<OperatorRecoveryLatch>> {
+    let path = operator_recovery_latch_path(database)?;
+    let mut file = match open_latch_read(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != OPERATOR_RECOVERY_LATCH_BYTES as u64 {
+        return Err(invalid_data("session operator recovery latch is invalid"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(invalid_data("session operator recovery latch permissions are invalid"));
+        }
+    }
+    let mut encoded = [0_u8; OPERATOR_RECOVERY_LATCH_BYTES];
+    file.read_exact(&mut encoded)?;
+    let mut trailing = [0_u8; 1];
+    if file.read(&mut trailing)? != 0 {
+        return Err(invalid_data("session operator recovery latch is oversized"));
+    }
+    decode_operator_recovery_latch(&encoded).map(Some)
+}
+
+fn write_latch_file(path: &Path, latch: OperatorRecoveryLatch, create_new: bool) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(!create_new).create_new(create_new);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(&encode_operator_recovery_latch(latch))?;
+    file.flush()?;
+    file.sync_all()?;
+    std::fs::File::open(
+        path.parent()
+            .ok_or_else(|| invalid_data("session recovery latch has no parent"))?,
+    )?
+    .sync_all()
+}
+
+pub(crate) fn ensure_operator_recovery_latch_sync(
+    database: &Path,
+    expected: OperatorRecoveryLatch,
+) -> io::Result<()> {
+    match read_operator_recovery_latch_sync(database)? {
+        Some(observed) if observed == expected || (observed == OperatorRecoveryLatch { audit_pending: !expected.audit_pending, ..expected }) => Ok(()),
+        Some(_) => Err(invalid_data("a different session operator recovery latch is active")),
+        None => write_latch_file(&operator_recovery_latch_path(database)?, expected, true),
+    }
+}
+
+pub(crate) fn set_operator_recovery_latch_audit_pending_sync(
+    database: &Path,
+    expected: OperatorRecoveryLatch,
+    audit_pending: bool,
+) -> io::Result<()> {
+    let observed = read_operator_recovery_latch_sync(database)?
+        .ok_or_else(|| invalid_data("session operator recovery latch is missing"))?;
+    if observed.identity != expected.identity
+        || observed.recovery_epoch != expected.recovery_epoch
+        || observed.plan_digest != expected.plan_digest
+    {
+        return Err(invalid_data("session operator recovery latch does not match"));
+    }
+    let path = operator_recovery_latch_path(database)?;
+    let temporary = path.with_extension("opc-recovery-latch.tmp");
+    match std::fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    write_latch_file(
+        &temporary,
+        OperatorRecoveryLatch {
+            audit_pending,
+            ..observed
+        },
+        true,
+    )?;
+    std::fs::rename(&temporary, &path)?;
+    std::fs::File::open(
+        path.parent()
+            .ok_or_else(|| invalid_data("session recovery latch has no parent"))?,
+    )?
+    .sync_all()
+}
+
+pub(crate) fn clear_operator_recovery_latch_sync(
+    database: &Path,
+    expected: OperatorRecoveryLatch,
+) -> io::Result<()> {
+    let Some(observed) = read_operator_recovery_latch_sync(database)? else {
+        return Ok(());
+    };
+    if observed.identity != expected.identity
+        || observed.recovery_epoch != expected.recovery_epoch
+        || observed.plan_digest != expected.plan_digest
+        || observed.audit_pending
+    {
+        return Err(invalid_data("session operator recovery latch cannot be cleared"));
+    }
+    let path = operator_recovery_latch_path(database)?;
+    std::fs::remove_file(&path)?;
+    std::fs::File::open(
+        path.parent()
+            .ok_or_else(|| invalid_data("session recovery latch has no parent"))?,
+    )?
+    .sync_all()
+}
 
 type ConsensusWatcher = tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>;
 type ConsensusAppliedMembership = (
@@ -123,6 +328,23 @@ CREATE TABLE consensus_snapshot (
     file_name TEXT NOT NULL CHECK (length(file_name) > 0),
     checksum BLOB NOT NULL CHECK (length(checksum) = 32),
     byte_length INTEGER NOT NULL CHECK (byte_length > 0),
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);
+
+CREATE TABLE consensus_operator_recovery (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    recovery_epoch INTEGER NOT NULL CHECK (recovery_epoch >= 0),
+    last_plan_digest BLOB NOT NULL CHECK (length(last_plan_digest) = 32),
+    pending_epoch INTEGER CHECK (pending_epoch > recovery_epoch),
+    pending_plan_digest BLOB CHECK (
+        pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
+    ),
+    watch_cursor_invalidation_floor INTEGER NOT NULL CHECK (watch_cursor_invalidation_floor >= 0),
+    CHECK (
+        (pending_epoch IS NULL AND pending_plan_digest IS NULL)
+        OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)
+    ),
     FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
 );
 "#;
@@ -222,7 +444,11 @@ fn initialize_schema(
             params![epoch, SessionConsensusEntryDigest::GENESIS.as_bytes().as_slice()],
         )
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
-    } else {
+    }
+
+    ensure_operator_recovery_schema_sync(&tx, identity)
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    if identity_table_exists {
         validate_existing_schema(&tx, identity, expected_members)?;
     }
 
@@ -274,6 +500,7 @@ fn validate_existing_schema(
         "consensus_machine",
         "consensus_request_outcomes",
         "consensus_snapshot",
+        "consensus_operator_recovery",
     ] {
         if !table_exists(conn, table)
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
@@ -328,6 +555,404 @@ fn validate_existing_schema(
     validate_persisted_membership_sync(conn, identity, expected_members)
         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
     Ok(())
+}
+
+const OPERATOR_RECOVERY_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS consensus_operator_recovery (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    recovery_epoch INTEGER NOT NULL CHECK (recovery_epoch >= 0),
+    last_plan_digest BLOB NOT NULL CHECK (length(last_plan_digest) = 32),
+    pending_epoch INTEGER CHECK (pending_epoch > recovery_epoch),
+    pending_plan_digest BLOB CHECK (
+        pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
+    ),
+    watch_cursor_invalidation_floor INTEGER NOT NULL DEFAULT 0 CHECK (watch_cursor_invalidation_floor >= 0),
+    CHECK (
+        (pending_epoch IS NULL AND pending_plan_digest IS NULL)
+        OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)
+    ),
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);
+"#;
+
+pub(crate) fn ensure_operator_recovery_schema_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<()> {
+    conn.execute_batch(OPERATOR_RECOVERY_SCHEMA)
+        .map_err(db_error)?;
+    let has_cursor_floor: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_operator_recovery') WHERE name = 'watch_cursor_invalidation_floor')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if !has_cursor_floor {
+        conn.execute_batch(
+            "ALTER TABLE consensus_operator_recovery ADD COLUMN watch_cursor_invalidation_floor INTEGER NOT NULL DEFAULT 0 CHECK (watch_cursor_invalidation_floor >= 0);",
+        )
+        .map_err(db_error)?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor) VALUES (1, ?1, 0, ?2, NULL, NULL, 0)",
+        params![epoch_i64(identity)?, [0_u8; 32].as_slice()],
+    )
+    .map_err(db_error)?;
+    let (stored_epoch, rows): (i64, i64) = conn
+        .query_row(
+            "SELECT configuration_epoch, (SELECT COUNT(*) FROM consensus_operator_recovery) FROM consensus_operator_recovery WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(db_error)?;
+    validate_epoch(stored_epoch, identity)?;
+    if rows != 1 {
+        return Err(invalid_data(
+            "session consensus operator recovery state is invalid",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OperatorRecoveryState {
+    pub(crate) recovery_epoch: u64,
+    pub(crate) last_plan_digest: [u8; 32],
+    pub(crate) pending_epoch: Option<u64>,
+    pub(crate) pending_plan_digest: Option<[u8; 32]>,
+    pub(crate) watch_cursor_invalidation_floor: u64,
+}
+
+type StoredOperatorRecoveryRow = (i64, i64, Vec<u8>, Option<i64>, Option<Vec<u8>>, i64);
+
+pub(crate) fn read_operator_recovery_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<OperatorRecoveryState> {
+    if !table_exists(conn, "consensus_operator_recovery").map_err(db_error)? {
+        return Ok(OperatorRecoveryState {
+            recovery_epoch: 0,
+            last_plan_digest: [0; 32],
+            pending_epoch: None,
+            pending_plan_digest: None,
+            watch_cursor_invalidation_floor: 0,
+        });
+    }
+    let row: StoredOperatorRecoveryRow = if operator_recovery_cursor_column_exists(conn)? {
+        conn.query_row(
+            "SELECT configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor FROM consensus_operator_recovery WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )
+        .map_err(db_error)?
+    } else {
+        let legacy: (i64, i64, Vec<u8>, Option<i64>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest FROM consensus_operator_recovery WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .map_err(db_error)?;
+        (legacy.0, legacy.1, legacy.2, legacy.3, legacy.4, 0)
+    };
+    let (stored_epoch, recovery_epoch, last_digest, pending_epoch, pending_digest, cursor_floor) =
+        row;
+    validate_epoch(stored_epoch, identity)?;
+    let recovery_epoch = checked_u64(recovery_epoch)?;
+    let last_plan_digest = last_digest
+        .try_into()
+        .map_err(|_| invalid_data("session consensus recovery plan digest has invalid length"))?;
+    let pending_epoch = pending_epoch.map(checked_positive_u64).transpose()?;
+    let pending_plan_digest = pending_digest
+        .map(|value| {
+            value.try_into().map_err(|_| {
+                invalid_data("session consensus pending recovery digest has invalid length")
+            })
+        })
+        .transpose()?;
+    if pending_epoch.is_some() != pending_plan_digest.is_some()
+        || pending_epoch.is_some_and(|pending| pending <= recovery_epoch)
+    {
+        return Err(invalid_data(
+            "session consensus pending recovery state is invalid",
+        ));
+    }
+    Ok(OperatorRecoveryState {
+        recovery_epoch,
+        last_plan_digest,
+        pending_epoch,
+        pending_plan_digest,
+        watch_cursor_invalidation_floor: checked_u64(cursor_floor)?,
+    })
+}
+
+pub(crate) fn read_watch_cursor_invalidation_floor_sync(conn: &Connection) -> io::Result<u64> {
+    if !table_exists(conn, "consensus_operator_recovery").map_err(db_error)?
+        || !operator_recovery_cursor_column_exists(conn)?
+    {
+        return Ok(0);
+    }
+    let floor: i64 = conn
+        .query_row(
+            "SELECT watch_cursor_invalidation_floor FROM consensus_operator_recovery WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    checked_u64(floor)
+}
+
+fn operator_recovery_cursor_column_exists(conn: &Connection) -> io::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_operator_recovery') WHERE name = 'watch_cursor_invalidation_floor')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(db_error)
+}
+
+pub(crate) fn mark_operator_recovery_pending_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    pending_epoch: u64,
+    plan_digest: [u8; 32],
+) -> io::Result<()> {
+    ensure_operator_recovery_schema_sync(conn, identity)?;
+    let current = read_operator_recovery_sync(conn, identity)?;
+    match (current.pending_epoch, current.pending_plan_digest) {
+        (Some(epoch), Some(digest)) if epoch == pending_epoch && digest == plan_digest => {
+            return Ok(());
+        }
+        (Some(_), Some(_)) => {
+            return Err(invalid_data(
+                "a different session operator recovery workflow is already pending",
+            ));
+        }
+        (None, None) => {}
+        _ => {
+            return Err(invalid_data(
+                "session operator recovery pending state is incomplete",
+            ));
+        }
+    }
+    if pending_epoch <= current.recovery_epoch {
+        return Err(invalid_data(
+            "session consensus pending recovery epoch did not advance",
+        ));
+    }
+    conn.execute(
+        "UPDATE consensus_operator_recovery SET pending_epoch = ?1, pending_plan_digest = ?2 WHERE singleton = 1 AND configuration_epoch = ?3",
+        params![
+            checked_positive_i64(pending_epoch)?,
+            plan_digest.as_slice(),
+            epoch_i64(identity)?,
+        ],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OperatorRecoveryApply {
+    Applied,
+    Idempotent,
+    Rejected,
+}
+
+pub(crate) fn finalize_operator_recovery_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    recovery_epoch: u64,
+    plan_digest: [u8; 32],
+    fence_high_water: u64,
+    credential_high_water: u64,
+) -> io::Result<OperatorRecoveryApply> {
+    ensure_operator_recovery_schema_sync(conn, identity)?;
+    let current = read_operator_recovery_sync(conn, identity)?;
+    if let (Some(pending_epoch), Some(pending_digest)) =
+        (current.pending_epoch, current.pending_plan_digest)
+    {
+        if pending_epoch != recovery_epoch || pending_digest != plan_digest {
+            return Ok(OperatorRecoveryApply::Rejected);
+        }
+    }
+    if current.recovery_epoch == recovery_epoch {
+        return Ok(if current.last_plan_digest == plan_digest {
+            OperatorRecoveryApply::Idempotent
+        } else {
+            OperatorRecoveryApply::Rejected
+        });
+    }
+    if recovery_epoch <= current.recovery_epoch {
+        return Ok(OperatorRecoveryApply::Rejected);
+    }
+
+    let observed_fence = observed_fence_high_water_sync(conn)?;
+    let observed_credential = observed_credential_high_water_sync(conn)?;
+    if fence_high_water < observed_fence || credential_high_water < observed_credential {
+        return Ok(OperatorRecoveryApply::Rejected);
+    }
+    let next_fence = fence_high_water
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session recovery fence high-water exhausted"))?;
+    let next_credential = credential_high_water
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session recovery credential high-water exhausted"))?;
+
+    conn.execute("UPDATE leases SET active = 0", [])
+        .map_err(db_error)?;
+    conn.execute(
+        "UPDATE lease_globals SET val = ?1 WHERE key = 'next_fence'",
+        [checked_positive_i64(next_fence)?],
+    )
+    .map_err(db_error)?;
+    conn.execute(
+        "UPDATE lease_globals SET val = ?1 WHERE key = 'next_credential_id'",
+        [checked_positive_i64(next_credential)?],
+    )
+    .map_err(db_error)?;
+    let changed = conn
+        .execute(
+            "UPDATE consensus_operator_recovery SET recovery_epoch = ?1, last_plan_digest = ?2, pending_epoch = NULL, pending_plan_digest = NULL WHERE singleton = 1 AND configuration_epoch = ?3",
+            params![
+                checked_positive_i64(recovery_epoch)?,
+                plan_digest.as_slice(),
+                epoch_i64(identity)?,
+            ],
+        )
+        .map_err(db_error)?;
+    if changed != 1 {
+        return Err(invalid_data(
+            "session consensus recovery state was not updated",
+        ));
+    }
+    Ok(OperatorRecoveryApply::Applied)
+}
+
+pub(crate) fn observed_fence_high_water_sync(conn: &Connection) -> io::Result<u64> {
+    let mut high = 0_u64;
+    for sql in [
+        "SELECT MAX(fence) FROM session_records",
+        "SELECT MAX(fence) FROM leases",
+        "SELECT MAX(fence) FROM key_fences",
+    ] {
+        let value: Option<i64> = conn
+            .query_row(sql, [], |row| row.get(0))
+            .map_err(db_error)?;
+        if let Some(value) = value {
+            high = high.max(checked_u64(value)?);
+        }
+    }
+    let next: i64 = conn
+        .query_row(
+            "SELECT val FROM lease_globals WHERE key = 'next_fence'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    let next = checked_positive_u64(next)?;
+    Ok(high.max(next.saturating_sub(1)))
+}
+
+pub(crate) fn observed_credential_high_water_sync(conn: &Connection) -> io::Result<u64> {
+    let mut high = conn
+        .query_row("SELECT MAX(credential_id) FROM leases", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })
+        .map_err(db_error)?
+        .map(checked_u64)
+        .transpose()?
+        .unwrap_or(0);
+    let next: i64 = conn
+        .query_row(
+            "SELECT val FROM lease_globals WHERE key = 'next_credential_id'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    let next = checked_positive_u64(next)?;
+    high = high.max(next.saturating_sub(1));
+    Ok(high)
+}
+
+pub(crate) fn claim_legacy_checkpoint_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    checkpoint_digest: [u8; 32],
+    pending_recovery_epoch: u64,
+    plan_digest: [u8; 32],
+    application_sequence_high_water: u64,
+    watch_cursor_invalidation_floor: u64,
+) -> io::Result<()> {
+    validate_expected_members(expected_members)?;
+    if table_exists(conn, "consensus_identity").map_err(db_error)? {
+        return Err(invalid_data(
+            "session recovery checkpoint is already consensus-owned",
+        ));
+    }
+    validate_sealed_state_sync(conn)?;
+    let logical_time: Option<String> = conn
+        .query_row(
+            "SELECT timestamp FROM session_replication_log ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    if let Some(value) = &logical_time {
+        Timestamp::from_str(value)
+            .map_err(|_| invalid_data("legacy checkpoint logical time is invalid"))?;
+    }
+
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
+    tx.execute_batch(CONSENSUS_SCHEMA).map_err(db_error)?;
+    let epoch = epoch_i64(identity)?;
+    tx.execute(
+        "INSERT INTO consensus_identity (singleton, schema_version, cluster_id, configuration_id, configuration_epoch) VALUES (1, ?1, ?2, ?3, ?4)",
+        params![
+            i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
+            identity.cluster_id().as_bytes().as_slice(),
+            identity.configuration_id().as_bytes().as_slice(),
+            epoch,
+        ],
+    )
+    .map_err(db_error)?;
+    tx.execute(
+        "INSERT INTO consensus_membership (singleton, configuration_epoch, membership_json) VALUES (1, ?1, ?2)",
+        params![
+            epoch,
+            encode_json(&StoredMembership::<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>::default())?,
+        ],
+    )
+    .map_err(db_error)?;
+    tx.execute(
+        "INSERT INTO consensus_machine (singleton, configuration_epoch, application_sequence, last_digest, logical_time, watch_sequence) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        params![
+            epoch,
+            checked_i64(application_sequence_high_water)?,
+            checkpoint_digest.as_slice(),
+            logical_time,
+            checked_i64(watch_cursor_invalidation_floor)?,
+        ],
+    )
+    .map_err(db_error)?;
+    tx.execute(
+        "INSERT INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor) VALUES (1, ?1, 0, ?2, ?3, ?4, ?5)",
+        params![
+            epoch,
+            [0_u8; 32].as_slice(),
+            checked_positive_i64(pending_recovery_epoch)?,
+            plan_digest.as_slice(),
+            checked_i64(watch_cursor_invalidation_floor)?,
+        ],
+    )
+    .map_err(db_error)?;
+    tx.execute("DELETE FROM session_replication_log", [])
+        .map_err(db_error)?;
+    tx.commit().map_err(db_error)
 }
 
 pub(crate) fn checked_i64(value: u64) -> io::Result<i64> {
@@ -397,6 +1022,23 @@ pub(crate) fn validate_command_for_log(
     }
     if command.identity != identity {
         return Err(invalid_data("session consensus command identity mismatch"));
+    }
+    if let SessionMutationIntent::FinalizeOperatorRecovery {
+        recovery_epoch,
+        plan_digest,
+        fence_high_water,
+        credential_high_water,
+    } = &command.intent
+    {
+        if *recovery_epoch == 0
+            || plan_digest.iter().all(|byte| *byte == 0)
+            || *fence_high_water == u64::MAX
+            || *credential_high_water == u64::MAX
+        {
+            return Err(invalid_data(
+                "session consensus operator recovery command is invalid",
+            ));
+        }
     }
     if let SessionMutationIntent::CompareAndSet(op) = &command.intent {
         if op.new_record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 {
@@ -1132,7 +1774,63 @@ fn execute_intent_sync(
                 }),
             ))
         }
+        SessionMutationIntent::FinalizeOperatorRecovery {
+            recovery_epoch,
+            plan_digest,
+            fence_high_water,
+            credential_high_water,
+        } => match finalize_operator_recovery_sync(
+            conn,
+            // The identity is validated before this function and all state
+            // machine writes use the same fixed configuration epoch.
+            read_identity_for_recovery_sync(conn)?,
+            *recovery_epoch,
+            *plan_digest,
+            *fence_high_water,
+            *credential_high_water,
+        )
+        .map_err(|_| {
+            StoreError::BackendUnavailable("session consensus recovery application failed".into())
+        })? {
+            OperatorRecoveryApply::Applied | OperatorRecoveryApply::Idempotent => {
+                Ok((SessionMutationOutcome::Unit, None))
+            }
+            OperatorRecoveryApply::Rejected => Err(StoreError::InvalidKey(
+                "operator_recovery_epoch_rejected".into(),
+            )),
+        },
     }
+}
+
+fn read_identity_for_recovery_sync(
+    conn: &Connection,
+) -> Result<SessionConsensusIdentity, StoreError> {
+    let (cluster, configuration, epoch): (Vec<u8>, Vec<u8>, i64) = conn
+        .query_row(
+            "SELECT cluster_id, configuration_id, configuration_epoch FROM consensus_identity WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| StoreError::BackendUnavailable(
+            "session consensus recovery identity read failed".into(),
+        ))?;
+    let cluster: [u8; 32] = cluster.try_into().map_err(|_| {
+        StoreError::BackendUnavailable("session consensus recovery identity is invalid".into())
+    })?;
+    let configuration: [u8; 32] = configuration.try_into().map_err(|_| {
+        StoreError::BackendUnavailable("session consensus recovery identity is invalid".into())
+    })?;
+    let epoch = checked_positive_u64(epoch).map_err(|_| {
+        StoreError::BackendUnavailable("session consensus recovery identity is invalid".into())
+    })?;
+    let epoch = crate::consensus::SessionConsensusConfigurationEpoch::new(epoch).map_err(|_| {
+        StoreError::BackendUnavailable("session consensus recovery identity is invalid".into())
+    })?;
+    Ok(SessionConsensusIdentity::new(
+        crate::consensus::SessionConsensusClusterId::from_bytes(cluster),
+        crate::consensus::SessionConsensusConfigurationId::from_bytes(configuration),
+        epoch,
+    ))
 }
 
 fn store_replication_notification_sync(
@@ -1337,7 +2035,7 @@ pub(crate) fn apply_entries_sync(
     })
 }
 
-fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
+pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
     let mut record_stmt = conn
         .prepare(
             r#"
@@ -1412,7 +2110,9 @@ fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(db_error)?;
-    let mut expected = 1_u64;
+    let mut expected = read_watch_cursor_invalidation_floor_sync(conn)?
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
     for row in rows {
         let encoded = row.map_err(db_error)?;
         let entry: ReplicationEntry = serde_json::from_str(&encoded)
@@ -1427,10 +2127,27 @@ fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
             .checked_add(1)
             .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
     }
+    let observed_head = expected
+        .checked_sub(1)
+        .ok_or_else(|| invalid_data("session replication sequence underflow"))?;
+    if table_exists(conn, "consensus_machine").map_err(db_error)? {
+        let watch_sequence: i64 = conn
+            .query_row(
+                "SELECT watch_sequence FROM consensus_machine WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if checked_u64(watch_sequence)? != observed_head {
+            return Err(invalid_data(
+                "session replication cursor does not match the persisted log",
+            ));
+        }
+    }
     Ok(())
 }
 
-fn validate_sealed_replication_op(root: &ReplicationOp) -> io::Result<()> {
+pub(crate) fn validate_sealed_replication_op(root: &ReplicationOp) -> io::Result<()> {
     let mut pending = vec![root];
     let mut visited = 0_usize;
     while let Some(op) = pending.pop() {
@@ -1511,9 +2228,12 @@ fn validate_snapshot_database_sync(
     validate_fixed_membership(&meta.last_membership, expected_members)?;
     let conn = Connection::open_with_flags(
         path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(db_error)?;
+    ensure_operator_recovery_schema_sync(&conn, identity)?;
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(db_error)?;
@@ -1623,6 +2343,10 @@ pub(crate) fn install_snapshot_database_sync(
             (
                 "consensus_applied",
                 "singleton, configuration_epoch, term, log_index, log_id_json",
+            ),
+            (
+                "consensus_operator_recovery",
+                "singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor",
             ),
         ] {
             tx.execute(&format!("DELETE FROM {table}"), [])

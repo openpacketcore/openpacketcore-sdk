@@ -69,6 +69,19 @@ pub enum SessionMutationIntent {
     },
     /// Release an existing lease.
     ReleaseLease(LeaseGuard),
+    /// SDK-internal operator recovery fence committed only through the local
+    /// leader's authorized admin boundary.
+    #[doc(hidden)]
+    FinalizeOperatorRecovery {
+        /// Monotonic operator recovery epoch.
+        recovery_epoch: u64,
+        /// Digest of the exact inspected and confirmed recovery plan.
+        plan_digest: [u8; 32],
+        /// Highest fence observed across every inspected replica.
+        fence_high_water: u64,
+        /// Highest credential ID observed across every inspected replica.
+        credential_high_water: u64,
+    },
 }
 
 /// Application command carried by one normal Openraft log entry.

@@ -16,6 +16,7 @@ pub use network::{
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
     SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
 };
+pub(crate) use store::OperatorRecoveryCommitError;
 pub use store::{
     ConsensusSessionStore, ConsensusSessionStoreOpenError,
     DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,

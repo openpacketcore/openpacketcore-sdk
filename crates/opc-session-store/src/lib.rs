@@ -17,6 +17,7 @@
 //! | [`record`] | Stored record format and encrypted payloads |
 //! | [`topology`] | Validated quorum membership and replica identity |
 //! | [`readiness`] | Fresh, bounded durable-quorum readiness evidence |
+//! | [`recovery`] | Authorized offline legacy-fork inspection and recovery |
 //! | [`fake`] | In-memory backend and lease manager for tests |
 //! | [`error`] | `StoreError` and `LeaseError` |
 
@@ -37,6 +38,7 @@ pub mod payload_codec;
 pub mod quorum;
 pub mod readiness;
 pub mod record;
+pub mod recovery;
 pub mod restore;
 pub mod sqlite;
 pub mod store;
@@ -95,6 +97,13 @@ pub use readiness::{
     ReplicaReadinessFailure, ReplicaReadinessObservation, ReplicaReadinessOutcome,
 };
 pub use record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
+pub use recovery::{
+    LegacyForkRecovery, RecoveryAction, RecoveryAlarm, RecoveryAuthorizationDenied,
+    RecoveryAuthorizationScope, RecoveryAuthorizer, RecoveryConfirmation, RecoveryContext,
+    RecoveryDecisionBasis, RecoveryDigest, RecoveryError, RecoveryExecutionReport,
+    RecoveryExecutionState, RecoveryIntegrityKey, RecoveryLimits, RecoveryObserver, RecoveryPlan,
+    RecoveryReplica, RecoveryReplicaEvidence, RecoveryReplicaFormat, RecoverySignal,
+};
 pub use restore::{
     summarize_restore_records, OwnerFenceMetadata, RestoreBlockReason, RestoreBlockReasonCode,
     RestoreRecordSummary, RestoreScanCursor, RestoreScanPage, RestoreScanRequest, RestoreScanScope,

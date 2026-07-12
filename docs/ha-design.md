@@ -15,8 +15,8 @@ OpenPacketCore config and session persistence surfaces.
   protection wrapper.
 
 Historical closure language below refers only to scoped algorithms and test
-harnesses. The config migration (#177), legacy session recovery/restore
-(#129/#133), and production networked qualification (#143 plus the
+harnesses. The config migration (#177), majority-authoritative restore (#133),
+and production networked qualification (#143 plus the
 credential-rotation chain) remain open; neither component is yet approved as a
 production deployment profile.
 
@@ -158,7 +158,10 @@ and encryption-envelope admission.
 
 This is durable sequencing authority, but not yet a complete production
 deployment claim. Current-format follower recovery is Openraft-owned and
-hardened under #128; legacy-fork recovery remains #129, bounded
+hardened under #128. #129 supplies an offline, audited whole-fleet legacy-fork
+campaign that quarantines every selected PVC and resumes from one immutable
+operator-selected checkpoint without becoming a second runtime authority; see
+the [recovery runbook](session-store-legacy-recovery.md). Bounded
 majority-authoritative restore remains #133, watch and expiry
 hardening remain #145/#148, and network/resource/rotation qualification remains
 #143 and the #162 -> #161 -> #163 -> #158 -> #164 credential chain. Stable IDs,
@@ -278,9 +281,10 @@ installed image from being followed by a false purge-before-apply fatal error.
 Readiness reports typed local recovery posture and index counters without peer
 text or session identifiers.
 
-Recovery of an already forked legacy custom-coordinator database remains #129
-because the old format cannot prove which conflicting tail was committed.
-Readiness never guesses or performs an unaudited destructive rebuild.
+Recovery of an already forked legacy custom-coordinator database uses #129's
+[audited offline campaign](session-store-legacy-recovery.md) because the old
+format cannot prove which conflicting tail was committed. Readiness never
+guesses or performs an unaudited destructive rebuild.
 
 ### Bounded TTL inputs
 
@@ -519,7 +523,8 @@ backend/peer-controlled error text.
 This closes per-replica compatibility transport parity only. Restore
 selection/merge remains #133. Protocol v4 is not the production consensus
 protocol and does not establish authority; #127 uses the separate Openraft
-transport above, while legacy-fork recovery remains #129.
+transport above, while #129 legacy-fork recovery remains an offline,
+operator-authorized campaign.
 
 ### Log & Replication Model
 - **Openraft Log Authority**: Openraft allocates and commits its zero-based log

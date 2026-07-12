@@ -95,6 +95,13 @@ pub enum ConsensusSessionStoreOpenError {
     ClusterFormationRejected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OperatorRecoveryCommitError {
+    NotLocalLeader,
+    Rejected,
+    Unavailable,
+}
+
 impl From<SessionConsensusStorageError> for ConsensusSessionStoreOpenError {
     fn from(error: SessionConsensusStorageError) -> Self {
         match error {
@@ -343,6 +350,14 @@ impl ConsensusSessionStore {
         &self.inner.topology
     }
 
+    pub(crate) fn recovery_identity(&self) -> SessionConsensusIdentity {
+        self.inner.identity
+    }
+
+    pub(crate) fn recovery_members(&self) -> &BTreeSet<SessionConsensusNodeId> {
+        &self.inner.members
+    }
+
     /// This adapter is the only store allowed to claim the quorum profile.
     pub fn platform_profile(&self) -> SessionStorePlatformProfile {
         self.inner.topology.mode().platform_profile()
@@ -437,6 +452,27 @@ impl ConsensusSessionStore {
                 metrics.purged.as_ref().map(|log_id| log_id.index),
             )
         };
+        if self
+            .inner
+            .backend
+            .consensus_operator_recovery_pending(self.inner.identity)
+            .await
+            .unwrap_or(true)
+        {
+            let metrics = self.inner.raft.metrics();
+            let metrics = metrics.borrow();
+            let recovery_progress = DurableRecoveryProgress::new(
+                DurableRecoveryState::RecoveryRequired,
+                metrics.last_log_index,
+                metrics.last_applied.as_ref().map(|log_id| log_id.index),
+                metrics.snapshot.as_ref().map(|log_id| log_id.index),
+                metrics.purged.as_ref().map(|log_id| log_id.index),
+            );
+            return report_without_barrier(
+                DurableReadinessState::RecoveryRequired,
+                recovery_progress,
+            );
+        }
         if !self.exact_membership_is_admitted() {
             let progress = progress();
             let state = if progress.state() == DurableRecoveryState::RecoveryRequired {
@@ -508,6 +544,15 @@ impl ConsensusSessionStore {
         intent: SessionMutationIntent,
     ) -> Result<SessionConsensusResponse, StoreError> {
         self.require_exact_membership_admission()?;
+        if self
+            .inner
+            .backend
+            .consensus_operator_recovery_pending(self.inner.identity)
+            .await
+            .unwrap_or(true)
+        {
+            return Err(consensus_unavailable());
+        }
         validate_consensus_intent(&intent)?;
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
@@ -566,10 +611,32 @@ impl ConsensusSessionStore {
         request: ForwardMutationRequest,
         deadline: tokio::time::Instant,
     ) -> ForwardMutationReply {
+        self.apply_on_local_leader_inner(request, deadline, false)
+            .await
+    }
+
+    async fn apply_on_local_leader_inner(
+        &self,
+        request: ForwardMutationRequest,
+        deadline: tokio::time::Instant,
+        allow_operator_recovery: bool,
+    ) -> ForwardMutationReply {
         if self.require_exact_membership_admission().is_err() {
             return ForwardMutationReply::Unavailable;
         }
-        if let Err(error) = validate_consensus_intent(&request.intent) {
+        if !allow_operator_recovery
+            && self
+                .inner
+                .backend
+                .consensus_operator_recovery_pending(self.inner.identity)
+                .await
+                .unwrap_or(true)
+        {
+            return ForwardMutationReply::Unavailable;
+        }
+        if let Err(error) =
+            validate_consensus_intent_with_recovery(&request.intent, allow_operator_recovery)
+        {
             return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
                 error,
             )));
@@ -630,6 +697,89 @@ impl ConsensusSessionStore {
                 leader: client_write_leader(&error),
             },
         }
+    }
+
+    pub(crate) async fn commit_operator_recovery(
+        &self,
+        request_id: SessionConsensusRequestId,
+        recovery_epoch: u64,
+        plan_digest: [u8; 32],
+        fence_high_water: u64,
+        credential_high_water: u64,
+    ) -> Result<(), OperatorRecoveryCommitError> {
+        self.require_exact_membership_admission()
+            .map_err(|_| OperatorRecoveryCommitError::Unavailable)?;
+        if recovery_epoch == 0 {
+            return Err(OperatorRecoveryCommitError::Rejected);
+        }
+        let metrics = self.inner.raft.metrics();
+        if metrics.borrow().current_leader != Some(self.inner.local_node_id) {
+            return Err(OperatorRecoveryCommitError::NotLocalLeader);
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or(OperatorRecoveryCommitError::Unavailable)?;
+        let reply = self
+            .apply_on_local_leader_inner(
+                ForwardMutationRequest {
+                    request_id,
+                    intent: SessionMutationIntent::FinalizeOperatorRecovery {
+                        recovery_epoch,
+                        plan_digest,
+                        fence_high_water,
+                        credential_high_water,
+                    },
+                },
+                deadline,
+                true,
+            )
+            .await;
+        match reply {
+            ForwardMutationReply::Applied(response) => match response.result {
+                Ok(SessionMutationOutcome::Unit) => Ok(()),
+                Err(StoreError::InvalidKey(reason))
+                    if reason == "operator_recovery_epoch_rejected" =>
+                {
+                    Err(OperatorRecoveryCommitError::Rejected)
+                }
+                _ => Err(OperatorRecoveryCommitError::Unavailable),
+            },
+            ForwardMutationReply::NotLeader { .. } => {
+                Err(OperatorRecoveryCommitError::NotLocalLeader)
+            }
+            ForwardMutationReply::Unavailable => Err(OperatorRecoveryCommitError::Unavailable),
+        }
+    }
+
+    pub(crate) async fn probe_operator_recovery_rejoin(
+        &self,
+        recovery_epoch: u64,
+        plan_digest: [u8; 32],
+    ) -> bool {
+        if self.require_exact_membership_admission().is_err() {
+            return false;
+        }
+        let deadline = match tokio::time::Instant::now().checked_add(self.inner.operation_timeout) {
+            Some(deadline) => deadline,
+            None => return false,
+        };
+        if !matches!(
+            tokio::time::timeout_at(deadline, self.inner.raft.ensure_linearizable()).await,
+            Ok(Ok(_))
+        ) {
+            return false;
+        }
+        self.exact_membership_is_admitted()
+            && self
+                .inner
+                .backend
+                .consensus_operator_recovery_committed(
+                    self.inner.identity,
+                    recovery_epoch,
+                    plan_digest,
+                )
+                .await
+                .unwrap_or(false)
     }
 
     async fn wait_for_known_leader(
@@ -710,6 +860,15 @@ impl ConsensusSessionStore {
 
     async fn local_read_barrier(&self, deadline: tokio::time::Instant) -> ReadBarrierReply {
         if self.require_exact_membership_admission().is_err() {
+            return ReadBarrierReply::Unavailable;
+        }
+        if self
+            .inner
+            .backend
+            .consensus_operator_recovery_pending(self.inner.identity)
+            .await
+            .unwrap_or(true)
+        {
             return ReadBarrierReply::Unavailable;
         }
         match tokio::time::timeout_at(deadline, self.inner.raft.ensure_linearizable()).await {
@@ -870,6 +1029,22 @@ fn exact_uniform_voter_membership(
 }
 
 fn validate_consensus_intent(intent: &SessionMutationIntent) -> Result<(), StoreError> {
+    validate_consensus_intent_with_recovery(intent, false)
+}
+
+fn validate_consensus_intent_with_recovery(
+    intent: &SessionMutationIntent,
+    allow_operator_recovery: bool,
+) -> Result<(), StoreError> {
+    if matches!(
+        intent,
+        SessionMutationIntent::FinalizeOperatorRecovery { .. }
+    ) && !allow_operator_recovery
+    {
+        return Err(StoreError::CapabilityNotSupported(
+            "operator_recovery_requires_local_admin_authority".into(),
+        ));
+    }
     if let SessionMutationIntent::CompareAndSet(op) = intent {
         validate_sealed_payload(op)?;
     }

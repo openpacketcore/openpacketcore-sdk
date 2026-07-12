@@ -64,6 +64,12 @@ evidence.
 - `ConsensusSessionStore::probe_durable_readiness` uses the same bounded
   Openraft linearizable-read barrier as real authoritative operations. It does
   not treat a bound listener or cached capabilities as quorum evidence.
+- `recovery::LegacyForkRecovery` is the default-deny offline administrative
+  boundary for a drained fleet. It creates a sealed, redaction-safe plan,
+  quarantines every explicit target before mutation, installs one immutable
+  checkpoint, journals crash-safe progress, and commits recovery fencing only
+  through the current local Openraft leader. See the
+  [operator runbook](../../docs/session-store-legacy-recovery.md).
 - `DurableReadinessReport` returns `Ready`, `NoQuorum`, `TopologyInvalid`, or
   `RecoveryRequired`, together with `configured_voters`,
   `fresh_reachable_voters`, `agreeing_voters`, `required_quorum`, the optional
@@ -377,9 +383,9 @@ Runbook: keep traffic and ownership publication closed unless readiness is
 reachability and let Openraft reconcile; do not invoke raw rebuild or edit a
 PVC. `recovery_required` blocks traffic and requires preserving the database,
 snapshot directory, and redacted report for operator analysis. A database from
-the removed pre-Openraft coordinator has no durable commit proof and remains
-the explicit #129 legacy-recovery workflow; current-format automatic recovery
-must never guess a legacy branch.
+the removed pre-Openraft coordinator has no durable commit proof and uses the
+explicit [#129 legacy-recovery workflow](../../docs/session-store-legacy-recovery.md);
+current-format automatic recovery must never guess a legacy branch.
 
 ### Encryption and HKMS boundary
 
@@ -572,8 +578,8 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
 - Configured topology validation proves only an odd, distinct voting set and
   one exact local member. Authenticated consensus peers add exact identity
   binding at admission. Openraft supplies durable commit and fresh linearizable
-  readiness; operator-safe legacy-fork recovery, bounded restore authority, and
-  production qualification remain separate gates.
+  readiness. #129 supplies operator-safe legacy-fork recovery; bounded restore
+  authority and production qualification remain separate gates.
 - A bare logical self ID such as `epdg-app-0` may select a member whose endpoint
   is the full `epdg-app-0.<headless-service>.<namespace>.svc.cluster.local`
   FQDN. The SDK never shortens endpoints or treats endpoint text as identity.
@@ -643,8 +649,7 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
 
 - Keep backend capabilities explicit so HA/profile suitability can fail closed.
 - Continue hardening restore evidence and traffic-blocking gates.
-- Complete operator-safe legacy recovery (#129), bounded
-  majority-authoritative restore (#133), watch handoff correctness
+- Complete bounded majority-authoritative restore (#133), watch handoff correctness
   (#145), absolute-expiry admission (#148), production stable-ID and
   transaction-ID persistence contracts (#167/#168), and persist peer
   logical-RPC deadlines (#169), then complete the production qualification
@@ -687,6 +692,12 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
   bounded/current-valid original-format round trips, the exact non-`OPCH`
   classifier including ambiguous bare rejection, and malformed/truncated/
   oversized/typed-invalid rejection without mutation.
+- Recovery unit tests use distinct file-backed databases for two- and
+  three-branch legacy campaigns and current-format minority repair. They cover
+  whole-fleet backup-before-mutation, immutable checkpoint installation,
+  source/target drift, corrupt artifacts, pending-workflow rejection,
+  backup/snapshot/epoch/rejoin failpoint resume, inspection budgets, cursor
+  invalidation, audit/readiness fencing, and exact legacy confirmation.
 - Run with: `cargo test -p opc-session-store`.
 
 ## License

@@ -60,8 +60,9 @@ The target session-store contract includes:
   rejects truncation at or below its persisted committed/applied floor,
   rejects stale or cross-identity snapshots, atomically installs one validated
   state-machine image, and cleans bounded interrupted staging on restart.
-  Persisted data created by the removed legacy coordinator remains #129
-  because that format cannot prove which divergent suffix was committed.
+  Persisted data created by the removed legacy coordinator uses #129's
+  explicit offline campaign because that format cannot prove which divergent
+  suffix was committed.
 - Watch/change-stream resume cursors.
 - Fail-closed no-quorum handling. Openraft may have committed before response
   delivery fails, so clients retry the same durable request ID or perform a
@@ -143,8 +144,12 @@ The current networked profile remains experimental, not yet a production HA
 qualification claim. #127 establishes durable commit/sequencing authority with
 Openraft and removes the custom session quorum algorithm. #128 hardens and
 qualifies current-format Openraft follower recovery without adding another
-repair authority. Operator-safe legacy-fork recovery and bounded
-majority-authoritative restore remain #129 and #133.
+repair authority. #129 adds a default-deny, audited offline legacy-fork
+campaign: it binds a full-fleet plan, quarantines every explicitly selected
+PVC, installs one immutable operator-selected checkpoint on the whole legacy
+voter set, and commits fencing only through Openraft. See the
+[legacy recovery runbook](../session-store-legacy-recovery.md). Bounded
+majority-authoritative restore remains #133.
 Fixed-width private wire DTOs and checked domain conversion are implemented
 under #134. Invariant-safe owner/key model decoding, bounded count-only SQLite
 admission, and typed-invalid handover rejection are

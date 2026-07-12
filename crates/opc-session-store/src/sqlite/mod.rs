@@ -8,7 +8,7 @@
 //! backend operation fails closed; Openraft's internal state-machine adapter
 //! is the only mutation and read-authority path.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,12 +53,28 @@ fn standalone_transaction(conn: &Connection) -> Result<Transaction<'_>, StoreErr
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|_| StoreError::BackendUnavailable("session store operation failed".into()))?;
     let consensus_owned = consensus_identity_exists(&tx)?;
-    if consensus_owned {
+    if consensus_owned || operator_recovery_latch_exists(&tx)? {
         return Err(StoreError::CapabilityNotSupported(
             CONSENSUS_AUTHORITY_REQUIRED.into(),
         ));
     }
     Ok(tx)
+}
+
+fn operator_recovery_latch_exists(conn: &Connection) -> Result<bool, StoreError> {
+    let database_path: String = conn
+        .query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StoreError::BackendUnavailable("session store operation failed".into()))?;
+    if database_path.is_empty() {
+        return Ok(false);
+    }
+    consensus::read_operator_recovery_latch_sync(Path::new(&database_path))
+        .map(|latch| latch.is_some())
+        .map_err(|_| StoreError::BackendUnavailable("session store operation failed".into()))
 }
 
 fn consensus_identity_exists(conn: &Connection) -> Result<bool, StoreError> {
@@ -80,6 +96,7 @@ fn consensus_identity_exists(conn: &Connection) -> Result<bool, StoreError> {
 #[allow(clippy::type_complexity)]
 pub struct SqliteSessionBackend {
     conn: Arc<tokio::sync::Mutex<Connection>>,
+    database_path: Option<Arc<PathBuf>>,
     caps: BackendCapabilities,
     clock: Arc<dyn Clock>,
     watchers: Arc<
@@ -90,19 +107,26 @@ pub struct SqliteSessionBackend {
 impl SqliteSessionBackend {
     /// Open (or create) a SQLite database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let conn =
-            Connection::open(path).map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        Self::new_with_conn(conn, false)
+        let path = path.as_ref();
+        let conn = Connection::open(path)
+            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        Self::new_with_conn(conn, false, Some(canonical))
     }
 
     /// Open an ephemeral in-memory SQLite database.
     pub fn in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        Self::new_with_conn(conn, true)
+        Self::new_with_conn(conn, true, None)
     }
 
-    fn new_with_conn(conn: Connection, in_memory: bool) -> Result<Self, StoreError> {
+    fn new_with_conn(
+        conn: Connection,
+        in_memory: bool,
+        database_path: Option<PathBuf>,
+    ) -> Result<Self, StoreError> {
         apply_pragma_profile(&conn, in_memory)?;
 
         // Create table for storing session records
@@ -205,6 +229,7 @@ impl SqliteSessionBackend {
 
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            database_path: database_path.map(Arc::new),
             caps: sqlite_capabilities(),
             clock: Arc::new(crate::clock::SystemClock),
             watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -265,18 +290,84 @@ impl SqliteSessionBackend {
     /// completed its Openraft linearizable barrier and local apply wait.
     pub(crate) async fn consensus_max_replication_sequence(&self) -> Result<u64, StoreError> {
         let conn = self.conn.lock().await;
-        let seq: Option<Option<i64>> = conn
+        let seq: i64 = conn
             .query_row(
-                "SELECT MAX(sequence) FROM session_replication_log",
+                "SELECT MAX(machine.watch_sequence, recovery.watch_cursor_invalidation_floor)
+                 FROM consensus_machine AS machine
+                 JOIN consensus_operator_recovery AS recovery ON recovery.singleton = machine.singleton
+                 WHERE machine.singleton = 1",
                 [],
                 |row| row.get(0),
             )
-            .optional()
             .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
-        seq.flatten()
-            .map(replication::stored_replication_sequence)
+        consensus::checked_u64(seq)
+            .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))
+    }
+
+    /// Whether an offline operator reset is awaiting its Openraft-committed
+    /// recovery epoch. A pending replica may exchange Raft traffic and rejoin,
+    /// but must not admit ordinary session operations or advertise readiness.
+    pub(crate) async fn consensus_operator_recovery_pending(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+    ) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().await;
+        let database_latch = self
+            .database_path
+            .as_deref()
+            .map(|path| consensus::read_operator_recovery_latch_sync(path))
             .transpose()
-            .map(|sequence| sequence.unwrap_or(0))
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "session operator recovery latch is unavailable".into(),
+                )
+            })?
+            .flatten();
+        if let Some(latch) = database_latch {
+            if latch.identity != identity {
+                return Err(StoreError::BackendUnavailable(
+                    "session operator recovery latch identity does not match".into(),
+                ));
+            }
+            opc_redaction::metrics::METRICS
+                .session_operator_recovery_required
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            opc_redaction::metrics::METRICS
+                .session_operator_recovery_epoch
+                .fetch_max(latch.recovery_epoch, std::sync::atomic::Ordering::Relaxed);
+            if latch.audit_pending {
+                opc_redaction::metrics::METRICS
+                    .session_operator_recovery_audit_pending
+                    .store(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        consensus::read_operator_recovery_sync(&conn, identity)
+            .map(|state| state.pending_epoch.is_some() || database_latch.is_some())
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "session operator recovery state is unavailable".into(),
+                )
+            })
+    }
+
+    pub(crate) async fn consensus_operator_recovery_committed(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        recovery_epoch: u64,
+        plan_digest: [u8; 32],
+    ) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().await;
+        consensus::read_operator_recovery_sync(&conn, identity)
+            .map(|state| {
+                state.pending_epoch.is_none()
+                    && state.recovery_epoch == recovery_epoch
+                    && state.last_plan_digest == plan_digest
+            })
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "session operator recovery state is unavailable".into(),
+                )
+            })
     }
 
     /// Read committed application-journal entries after the caller's Openraft
@@ -291,6 +382,13 @@ impl SqliteSessionBackend {
         };
         let sqlite_limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let conn = self.conn.lock().await;
+        let invalidation_floor = consensus::read_watch_cursor_invalidation_floor_sync(&conn)
+            .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+        if invalidation_floor != 0 && start <= invalidation_floor {
+            return Err(StoreError::BackendUnavailable(
+                "replication log invalidated before requested start".into(),
+            ));
+        }
         let mut stmt = conn
             .prepare(
                 "SELECT sequence, entry_json FROM session_replication_log WHERE sequence >= ?1 ORDER BY sequence ASC LIMIT ?2",
@@ -417,9 +515,12 @@ impl SessionBackend for SqliteSessionBackend {
 
     async fn capabilities(&self) -> BackendCapabilities {
         let conn = self.conn.lock().await;
-        match consensus_identity_exists(&conn) {
-            Ok(false) => self.caps,
-            Ok(true) | Err(_) => BackendCapabilities::minimal(),
+        match (
+            consensus_identity_exists(&conn),
+            operator_recovery_latch_exists(&conn),
+        ) {
+            (Ok(false), Ok(false)) => self.caps,
+            _ => BackendCapabilities::minimal(),
         }
     }
 
