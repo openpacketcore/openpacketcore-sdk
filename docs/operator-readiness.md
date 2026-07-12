@@ -129,10 +129,18 @@ advertises `single-replica`. The deprecated raw-vector constructor advertises
 `unknown` and is non-operational. Logical self must be configured explicitly;
 do not derive it by shortening an FQDN or comparing endpoint strings.
 
+For production network adapters, build one immutable
+`SessionReplicationManifest` from the cluster ID, an operator-controlled
+configuration generation, and the complete descriptor set. Derive all local
+and remote bindings from that manifest. Topology admission verifies each
+remote adapter's local/remote IDs, expected TLS identity, descriptor
+fingerprints, configured member count, and shared configuration scope. A local
+in-process backend may remain unbound.
+
 This admission result is not a durable-ready signal. Capability declarations
 and `SessionStorePlatformProfile::Quorum` are also admission evidence only. A
-production operator must separately require fresh durable readiness and
-authenticated membership binding (#125) before traffic readiness.
+production operator must separately require fresh durable readiness before
+traffic readiness.
 
 ### Session durable readiness
 
@@ -186,27 +194,45 @@ not an ownership lease.
 4. **Stale Replica Recovery Heuristic**: The readiness/operation assessment may append a missing suffix only when a replica's complete log is a strict prefix of the majority-visible log. Conflicts and longer minority tails yield `RecoveryRequired` without truncation or destructive rebuild. This is still not commit-proven recovery; #127/#128 must prevent a later majority from omitting a previously acknowledged entry.
 5. **Declared Feature Envelope**: `QuorumSessionStore` advertises `ordered_replication_log = true` and `watch = true`, while standalone SQLite reports `false`. These bits describe available methods, not fresh peer-quorum evidence or production qualification. Use `probe_durable_readiness` for the current point-in-time result.
 
-### Session transport v2 rollout boundary
+### Session transport v3 rollout boundary
 
-`opc-session-net` v2 adds cursor-paged remote restore scans. A successful page
-may be shorter than requested to fit the effective client/server frame limit;
-follow `next_cursor` until `complete`. A single record that cannot fit returns
-`RestoreScanResponseTooLarge`.
+`opc-session-net` v3 carries cursor-paged remote restore scans and authenticated
+replica identity. Production constructors accept only opaque authenticated TLS
+configs. Both sides extract the canonical SPIFFE URI from the live peer
+certificate and require an exact match with the manifest's claimed stable
+`ReplicaId`, expected opposite replica, cluster, and configuration ID before
+backend dispatch. The client verifies its fresh challenge is echoed by the
+server. The configuration ID digests the cluster,
+explicit generation, and complete descriptor set.
+Session-net deliberately disables TLS resumption, session tickets, early data,
+and 0-RTT; budget every reconnect as a full mutual-TLS handshake so the live
+SVID is revalidated after rotation.
 
-The Hello handshake requires an exact version match. Treat v1-to-v2 as a
+A successful restore page may be shorter than requested to fit the effective
+client/server frame limit; follow `next_cursor` until `complete`. A single
+record that cannot fit returns `RestoreScanResponseTooLarge`.
+
+The Hello handshake and ALPN require an exact version match. Treat v2-to-v3 as a
 coordinated outage: drain session traffic and writers, stop every session-net
-participant, upgrade them together, verify v2 handshakes and empty/multi-page
-scans on each replica, then restore traffic. Do not perform a mixed-version
-rolling upgrade.
+participant, upgrade them together, verify v3 authenticated handshakes and
+empty/multi-page scans on each replica, then restore traffic. There is no
+production v2 fallback; do not perform a mixed-version rolling upgrade.
+
+DNS, FQDN, IP, and resolver aliases control only the dial address. They must
+not be used to derive or rewrite the logical `ReplicaId` or expected SPIFFE
+identity. Rotate a certificate only to another SVID carrying the same exact
+manifest identity. A descriptor change produces a new configuration ID; bump
+the generation for security-relevant configuration outside the descriptor set.
+Either scope change requires another coordinated rollout.
 
 This is not production HA qualification. Do not infer readiness from bind
 success, static profiles, or cached capabilities; use the fresh bounded probe
 and continuous gate. Do not use quorum restore as authority before
 #127/#133, treat current divergence repair as authoritative before #128, or
-auto-resolve a legacy fork before #129. Authenticated replica identity (#125)
-is also a prerequisite; fixed-width wire DTOs and invariant-safe model decoding
-remain #134/#135. Oversized-TTL and zero-replication-sequence panic elimination
-remain #137/#138.
+auto-resolve a legacy fork before #129. Protocol v3 identity binding is not
+consensus or fork recovery. Fixed-width wire DTOs and invariant-safe model
+decoding remain #134/#135. Oversized-TTL and zero-replication-sequence panic
+elimination remain #137/#138.
 
 ## Operator-facing SDK surfaces available now
 
@@ -273,7 +299,7 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
 
 - **Config Store Consensus Hardening**: `ConsensusConfigStore` provides durable membership, TCP RPC framing over real mTLS transport with SPIFFE identity verification bound to the configured workload profile and active membership, election/heartbeats, no-op commit safety, snapshot HMAC verification, controlled TCP server lifecycle (bounded concurrency/timeout/oneshot shutdown), membership-change guardrails, and consensus metrics dump hooks. Checked via the out-of-process multi-process campaigns, failovers, network partitioning, and pending commits surviving restarts.
 - **Session Store Quorum Replication Prototype**: `QuorumSessionStore` exercises session leases and CAS mutations across a majority of replicas using an ordered log with watch/change-stream resume cursors, strict-prefix catch-up, and partial-write fail-closed fixtures. Durable authority and repair claims remain conditional on #127/#128.
-- **Session Topology and Readiness**: HA-shaped construction requires an immutable validated set of distinct declared votes and exactly one explicit local member. The lab singleton reports `single-replica`; raw unvalidated construction reports `unknown` and refuses operations. Topology and capabilities are admission evidence. `probe_durable_readiness` separately provides fresh bounded majority evidence, while authenticated membership remains #125.
+- **Session Topology, Identity, and Readiness**: HA-shaped construction requires an immutable validated set of distinct declared votes and exactly one explicit local member. Protocol v3 derives authenticated peer bindings from one cluster/configuration manifest and requires the live certificate SPIFFE identity to match the stable `ReplicaId`; DNS aliases remain routing only. The lab singleton reports `single-replica`; raw unvalidated construction reports `unknown` and refuses operations. Topology, identity binding, and capabilities are admission evidence. `probe_durable_readiness` separately provides fresh bounded majority evidence.
 - **Fault Coverage**: Reusable chaos test fixtures and tests cover split-brain, stale leader writes, replication lag, stale fences, restart/rejoin behavior, divergent read fail-closed behavior, clock skew, and multi-writer rejection. They also cover session-store durable rejoin/catch-up, strict-prefix append, ordered-log replay, duplicate delivery, partial-write fail-closed behavior, and no-destructive-repair evidence for an already-visible ambiguous tail. This is not proof of automatic fork reconciliation or failed-write resurrection safety before #127/#128.
 - **SQLite Writer Envelope**: Each replica still serializes local durable writes through SQLite. `ConsensusConfigStore` and `QuorumSessionStore` provide the tested consensus and ordered-replication mechanisms described above; neither constitutes production HA qualification, and standalone SQLite is not HA.
 - **Capability Envelope**: `SqliteSessionBackend` reports CAS, fencing, TTL, lease-expiry, and batch support without `watch` or `ordered_replication_log` support. `QuorumSessionStore` reports `watch = true` and `ordered_replication_log = true`, but those feature declarations remain static admission evidence. Use `validate_backend_for_profile` or `StateClass::required_profile()` before binding a backend, and use `probe_durable_readiness` plus continuous traffic gating for current quorum evidence.

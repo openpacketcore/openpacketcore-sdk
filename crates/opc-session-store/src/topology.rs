@@ -68,6 +68,43 @@ pub enum ReplicaTopologyFieldError {
     Malformed,
 }
 
+/// Field of a configured authenticated-backend binding rejected by topology.
+///
+/// Values are deliberately categorical so errors never disclose identities,
+/// descriptor fingerprints, endpoints, or cluster/configuration scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum BackendPeerBindingField {
+    /// The adapter was configured from a different local logical member.
+    LocalReplicaId,
+    /// The adapter targets a different remote logical member.
+    RemoteReplicaId,
+    /// The adapter expects a different remote TLS identity.
+    RemoteTlsIdentity,
+    /// The adapter was configured from a different local descriptor.
+    LocalDescriptorFingerprint,
+    /// The adapter was configured from a different remote descriptor.
+    RemoteDescriptorFingerprint,
+    /// The adapter used a different configured voting-set size.
+    ConfiguredMemberCount,
+    /// Peer adapters do not share one cluster/configuration scope.
+    Scope,
+}
+
+impl fmt::Display for BackendPeerBindingField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::LocalReplicaId => "local-replica-id",
+            Self::RemoteReplicaId => "remote-replica-id",
+            Self::RemoteTlsIdentity => "remote-tls-identity",
+            Self::LocalDescriptorFingerprint => "local-descriptor-fingerprint",
+            Self::RemoteDescriptorFingerprint => "remote-descriptor-fingerprint",
+            Self::ConfiguredMemberCount => "configured-member-count",
+            Self::Scope => "scope",
+        })
+    }
+}
+
 impl fmt::Display for ReplicaTopologyFieldError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -150,6 +187,16 @@ pub enum QuorumTopologyError {
     /// Two member records expose the same process-local adapter identity.
     #[error("configured members contain a duplicate backend instance")]
     DuplicateBackendInstance,
+    /// One network-bound topology omitted composition evidence for a remote
+    /// member.
+    #[error("configured remote member is missing an authenticated backend peer binding")]
+    MissingBackendPeerBinding,
+    /// One configured adapter binding disagreed with immutable topology.
+    #[error("configured backend peer binding does not match topology field {field}")]
+    BackendPeerBindingMismatch {
+        /// Stable redaction-safe mismatch category.
+        field: BackendPeerBindingField,
+    },
 }
 
 fn validate_opaque(
@@ -392,6 +439,17 @@ pub struct QuorumReplicaDescriptor {
     backing_identity: ReplicaBackingIdentity,
 }
 
+const REPLICA_DESCRIPTOR_FINGERPRINT_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/quorum-replica-descriptor/v1\0";
+
+fn update_configuration_fingerprint_field(hasher: &mut Sha256, tag: u8, value: &[u8]) {
+    // Each variable-width field is independently hashed before entering the
+    // outer domain-separated digest. This gives every field a fixed-width
+    // boundary without target-width length encodings or delimiter ambiguity.
+    hasher.update([tag]);
+    hasher.update(Sha256::digest(value));
+}
+
 impl QuorumReplicaDescriptor {
     /// Construct a descriptor from independently validated identity fields.
     pub fn new(
@@ -447,6 +505,25 @@ impl QuorumReplicaDescriptor {
     /// Opaque caller-declared physical backing-store identity.
     pub fn backing_identity(&self) -> &ReplicaBackingIdentity {
         &self.backing_identity
+    }
+
+    /// Deterministic fixed-width fingerprint of every descriptor field.
+    ///
+    /// The digest is domain-separated and architecture-independent. It covers
+    /// the logical replica ID, canonical endpoint host and port, TLS identity,
+    /// failure domain, and already-digested physical backing identity. It is
+    /// suitable for detecting composition drift, but it is not proof that the
+    /// caller-declared physical placement or backing store is genuine.
+    pub fn configuration_fingerprint(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(REPLICA_DESCRIPTOR_FINGERPRINT_DOMAIN);
+        update_configuration_fingerprint_field(&mut hasher, 1, self.replica_id.0.as_bytes());
+        update_configuration_fingerprint_field(&mut hasher, 2, self.endpoint.host.as_bytes());
+        update_configuration_fingerprint_field(&mut hasher, 3, &self.endpoint.port.to_be_bytes());
+        update_configuration_fingerprint_field(&mut hasher, 4, self.tls_identity.0.as_bytes());
+        update_configuration_fingerprint_field(&mut hasher, 5, self.failure_domain.0.as_bytes());
+        update_configuration_fingerprint_field(&mut hasher, 6, &self.backing_identity.0);
+        hasher.finalize().into()
     }
 }
 
@@ -747,6 +824,73 @@ fn validate_topology(
     }
 
     let configured_members = members.len();
+    let local_descriptor_fingerprint = members
+        .iter()
+        .find(|member| member.descriptor.replica_id == local_replica_id)
+        .map(|member| member.descriptor.configuration_fingerprint())
+        .ok_or(QuorumTopologyError::MissingLocalReplica)?;
+    let peer_bindings = members
+        .iter()
+        .map(|member| member.replica.inner.peer_binding())
+        .collect::<Vec<_>>();
+
+    if peer_bindings.iter().any(Option::is_some) {
+        let mut shared_scope = None;
+        for (member, binding) in members.iter().zip(&peer_bindings) {
+            let Some(binding) = binding else {
+                if member.descriptor.replica_id == local_replica_id {
+                    // An in-process local backend does not traverse an
+                    // authenticated peer connection and may remain unbound.
+                    continue;
+                }
+                return Err(QuorumTopologyError::MissingBackendPeerBinding);
+            };
+
+            if binding.local_replica_id() != &local_replica_id {
+                return Err(QuorumTopologyError::BackendPeerBindingMismatch {
+                    field: BackendPeerBindingField::LocalReplicaId,
+                });
+            }
+            if binding.local_descriptor_fingerprint() != &local_descriptor_fingerprint {
+                return Err(QuorumTopologyError::BackendPeerBindingMismatch {
+                    field: BackendPeerBindingField::LocalDescriptorFingerprint,
+                });
+            }
+            if binding.remote_replica_id() != member.descriptor.replica_id() {
+                return Err(QuorumTopologyError::BackendPeerBindingMismatch {
+                    field: BackendPeerBindingField::RemoteReplicaId,
+                });
+            }
+            if binding.remote_tls_identity() != member.descriptor.tls_identity() {
+                return Err(QuorumTopologyError::BackendPeerBindingMismatch {
+                    field: BackendPeerBindingField::RemoteTlsIdentity,
+                });
+            }
+            if binding.remote_descriptor_fingerprint()
+                != &member.descriptor.configuration_fingerprint()
+            {
+                return Err(QuorumTopologyError::BackendPeerBindingMismatch {
+                    field: BackendPeerBindingField::RemoteDescriptorFingerprint,
+                });
+            }
+            if usize::from(binding.configured_member_count()) != configured_members {
+                return Err(QuorumTopologyError::BackendPeerBindingMismatch {
+                    field: BackendPeerBindingField::ConfiguredMemberCount,
+                });
+            }
+
+            if let Some(expected_scope) = shared_scope {
+                if binding.scope() != &expected_scope {
+                    return Err(QuorumTopologyError::BackendPeerBindingMismatch {
+                        field: BackendPeerBindingField::Scope,
+                    });
+                }
+            } else {
+                shared_scope = Some(*binding.scope());
+            }
+        }
+    }
+
     let required_quorum = (configured_members / 2) + 1;
     Ok(ValidatedQuorumTopology {
         summary: QuorumTopologySummary {

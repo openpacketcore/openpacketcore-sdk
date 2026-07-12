@@ -183,6 +183,7 @@ pub mod prelude {
     #[cfg(feature = "session")]
     pub use opc_session_store::{
         model::{SessionKey, SessionKeyType},
+        BackendPeerBinding, BackendPeerBindingField, BackendPeerScopeIdentity,
         DurableReadinessOptions, DurableReadinessReport, DurableReadinessState,
         QuorumReplicaDescriptor, QuorumReplicaMember, QuorumSessionStore, QuorumTopologyConfig,
         QuorumTopologyError, QuorumTopologyMode, QuorumTopologySummary, ReplicaBackingIdentity,

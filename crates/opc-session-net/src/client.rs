@@ -10,8 +10,8 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::Stream;
 use opc_session_store::backend::{
-    BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry, SessionBackend,
-    SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
+    BackendInstanceIdentity, BackendPeerBinding, CompareAndSet, CompareAndSetResult,
+    ReplicationEntry, SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
 };
 use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::error::{LeaseError, StoreError};
@@ -19,15 +19,17 @@ use opc_session_store::lease::{LeaseGuard, SessionLeaseManager};
 use opc_session_store::model::{OwnerId, SessionKey};
 
 use opc_session_store::record::StoredSessionRecord;
-use opc_session_store::{ReplicaReadinessFailure, RestoreScanPage, RestoreScanRequest};
+use opc_session_store::{ReplicaId, ReplicaReadinessFailure, RestoreScanPage, RestoreScanRequest};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::error::ProtocolError;
+use crate::identity::RemoteReplicaBinding;
 use crate::protocol::{
     ensure_frame_fits, read_frame, write_frame, Request, Response, RestoreScanWireRequest,
-    CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE, MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE,
+    CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE,
+    MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE, SESSION_NET_ALPN,
 };
 
 /// Resolver callback used by [`RemoteSessionBackend::new_with_resolver`].
@@ -36,11 +38,12 @@ pub type RemoteAddrResolver =
 
 /// Persistent transport connection to a remote session backend.
 ///
-/// The v0 client keeps a single connection and allows one in-flight request at
+/// The client keeps a single connection and allows one in-flight request at
 /// a time; clones of [`RemoteSessionBackend`] share this connection.
 struct Connection {
     reader: Box<dyn AsyncRead + Unpin + Send>,
     writer: Box<dyn AsyncWrite + Unpin + Send>,
+    authenticated_peer: Option<ReplicaId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,16 +85,19 @@ impl RemoteRequestFailure {
 }
 
 fn classify_tls_connect_error(error: io::Error) -> ProtocolError {
-    let is_rustls_failure = error.get_ref().is_some_and(|source| {
-        source
-            .downcast_ref::<tokio_rustls::rustls::Error>()
-            .is_some()
-    });
-    if is_rustls_failure {
-        ProtocolError::Authentication
-    } else {
-        ProtocolError::Io(error)
+    if let Some(rustls_error) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<tokio_rustls::rustls::Error>())
+    {
+        return match rustls_error {
+            tokio_rustls::rustls::Error::NoApplicationProtocol
+            | tokio_rustls::rustls::Error::AlertReceived(
+                tokio_rustls::rustls::AlertDescription::NoApplicationProtocol,
+            ) => ProtocolError::UnexpectedResponse,
+            _ => ProtocolError::Authentication,
+        };
     }
+    ProtocolError::Io(error)
 }
 
 impl From<RemoteRequestFailure> for ReplicaReadinessFailure {
@@ -108,6 +114,7 @@ impl From<RemoteRequestFailure> for ReplicaReadinessFailure {
 
 #[derive(Clone)]
 enum RemoteTarget {
+    #[cfg(feature = "insecure-test")]
     Pinned(SocketAddr),
     Resolved {
         server_name: Option<Arc<str>>,
@@ -116,6 +123,7 @@ enum RemoteTarget {
 }
 
 impl RemoteTarget {
+    #[cfg(feature = "insecure-test")]
     fn pinned(addr: SocketAddr) -> Self {
         Self::Pinned(addr)
     }
@@ -127,8 +135,26 @@ impl RemoteTarget {
         }
     }
 
+    fn configured(binding: &RemoteReplicaBinding) -> Self {
+        let endpoint = binding.remote_endpoint();
+        let server_name = endpoint.host().to_string();
+        let host = Arc::<str>::from(endpoint.host());
+        let port = endpoint.port();
+        let resolve: RemoteAddrResolver = Arc::new(move || {
+            let host = host.clone();
+            Box::pin(async move {
+                let mut addresses = tokio::net::lookup_host((host.as_ref(), port)).await?;
+                addresses.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "replica endpoint did not resolve")
+                })
+            })
+        });
+        Self::resolved(Some(server_name), resolve)
+    }
+
     async fn resolve(&self) -> io::Result<SocketAddr> {
         match self {
+            #[cfg(feature = "insecure-test")]
             Self::Pinned(addr) => Ok(*addr),
             Self::Resolved { resolve, .. } => resolve().await,
         }
@@ -139,6 +165,7 @@ impl RemoteTarget {
         resolved_addr: SocketAddr,
     ) -> Result<rustls_pki_types::ServerName<'static>, ProtocolError> {
         match self {
+            #[cfg(feature = "insecure-test")]
             Self::Pinned(_) => Ok(rustls_pki_types::ServerName::IpAddress(
                 resolved_addr.ip().into(),
             )),
@@ -158,28 +185,128 @@ impl RemoteTarget {
 
 impl std::fmt::Debug for RemoteTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Pinned(addr) => f.debug_tuple("Pinned").field(addr).finish(),
-            Self::Resolved { server_name, .. } => f
-                .debug_struct("Resolved")
-                .field("server_name", server_name)
-                .finish_non_exhaustive(),
-        }
+        f.write_str("RemoteTarget(<redacted>)")
     }
 }
 
 impl std::fmt::Display for RemoteTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Pinned(addr) => write!(f, "{addr}"),
-            Self::Resolved {
-                server_name: Some(server_name),
-                ..
-            } => write!(f, "{server_name}"),
-            Self::Resolved {
-                server_name: None, ..
-            } => f.write_str("<resolver>"),
+        f.write_str("<redacted-target>")
+    }
+}
+
+fn session_client_tls_config(
+    config: &opc_tls::AuthenticatedClientConfig,
+) -> Arc<opc_tls::ClientConfig> {
+    let mut config = config.rustls_config().as_ref().clone();
+    config.alpn_protocols = vec![SESSION_NET_ALPN.to_vec()];
+    // Session identity is defined by the certificate presented on this exact
+    // connection. A resumed TLS session can carry cached peer certificates and
+    // skip verification of a rotated SVID, so replication deliberately pays
+    // for a full mutually authenticated handshake on every reconnect.
+    config.resumption = tokio_rustls::rustls::client::Resumption::disabled();
+    config.enable_early_data = false;
+    Arc::new(config)
+}
+
+async fn open_connection(
+    target: RemoteTarget,
+    tls_config: Option<Arc<opc_tls::ClientConfig>>,
+    binding: RemoteReplicaBinding,
+) -> Result<Connection, ProtocolError> {
+    let addr = target.resolve().await.map_err(ProtocolError::Io)?;
+    let tcp = TcpStream::connect(addr).await.map_err(ProtocolError::Io)?;
+
+    if let Some(tls_config) = tls_config {
+        let connector = tokio_rustls::TlsConnector::from(tls_config);
+        let server_name = target.tls_server_name(addr)?;
+        let tls_stream = connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(classify_tls_connect_error)?;
+        if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_NET_ALPN) {
+            return Err(ProtocolError::UnexpectedResponse);
         }
+        let peer_spiffe = opc_tls::peer_spiffe_id_from_client_connection(tls_stream.get_ref().1)
+            .map_err(|_| ProtocolError::Authentication)?;
+        if peer_spiffe.as_str() != binding.remote_spiffe_id().as_str() {
+            return Err(ProtocolError::Authentication);
+        }
+
+        let (mut reader, mut writer) = tokio::io::split(tls_stream);
+        perform_client_handshake(&mut reader, &mut writer, &binding).await?;
+        Ok(Connection {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            authenticated_peer: Some(binding.remote_replica_id().clone()),
+        })
+    } else {
+        let (mut reader, mut writer) = tokio::io::split(tcp);
+        perform_client_handshake(&mut reader, &mut writer, &binding).await?;
+        Ok(Connection {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            authenticated_peer: None,
+        })
+    }
+}
+
+async fn perform_client_handshake<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    binding: &RemoteReplicaBinding,
+) -> Result<(), ProtocolError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let handshake_nonce = uuid::Uuid::new_v4();
+    let configuration_id = binding.configuration_id().to_hex();
+    write_frame(
+        writer,
+        &Request::Hello {
+            contract_version: CONTRACT_VERSION,
+            node_id: binding.local_replica_id().as_str().to_string(),
+            expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
+            cluster_id: Some(binding.cluster_id().as_str().to_string()),
+            configuration_id: Some(configuration_id.clone()),
+            handshake_nonce: Some(handshake_nonce),
+        },
+    )
+    .await?;
+
+    let ack: Response = read_frame(reader, MAX_HANDSHAKE_FRAME_SIZE).await?;
+    match ack {
+        Response::HelloAck {
+            contract_version,
+            server_replica_id,
+            accepted_client_replica_id,
+            cluster_id,
+            configuration_id: accepted_configuration_id,
+            handshake_nonce: accepted_nonce,
+        } => {
+            if contract_version != CONTRACT_VERSION {
+                return Err(ProtocolError::VersionMismatch {
+                    local: CONTRACT_VERSION,
+                    remote: contract_version,
+                });
+            }
+            let identity_matches = server_replica_id.as_deref()
+                == Some(binding.remote_replica_id().as_str())
+                && accepted_client_replica_id.as_deref()
+                    == Some(binding.local_replica_id().as_str())
+                && cluster_id.as_deref() == Some(binding.cluster_id().as_str())
+                && accepted_configuration_id.as_deref() == Some(configuration_id.as_str());
+            if !identity_matches {
+                return Err(ProtocolError::Authentication);
+            }
+            if accepted_nonce != Some(handshake_nonce) {
+                return Err(ProtocolError::UnexpectedResponse);
+            }
+            Ok(())
+        }
+        Response::HelloRejected { .. } => Err(ProtocolError::Authentication),
+        _ => Err(ProtocolError::UnexpectedResponse),
     }
 }
 
@@ -188,9 +315,9 @@ impl std::fmt::Display for RemoteTarget {
 pub struct RemoteSessionBackend {
     target: RemoteTarget,
     tls_config: Option<Arc<opc_tls::ClientConfig>>,
+    binding: RemoteReplicaBinding,
     deadline: Duration,
     max_frame_size: usize,
-    node_id: String,
     conn: Arc<Mutex<Option<Connection>>>,
     cached_capabilities: Arc<RwLock<Option<BackendCapabilities>>>,
 }
@@ -202,7 +329,7 @@ impl std::fmt::Debug for RemoteSessionBackend {
             .field("tls_config", &self.tls_config.is_some())
             .field("deadline", &self.deadline)
             .field("max_frame_size", &self.max_frame_size)
-            .field("node_id", &self.node_id)
+            .field("binding", &self.binding)
             .finish_non_exhaustive()
     }
 }
@@ -210,16 +337,29 @@ impl std::fmt::Debug for RemoteSessionBackend {
 impl RemoteSessionBackend {
     /// Create a new mTLS remote backend client.
     ///
+    /// `binding` supplies the exact local and remote replica IDs, expected peer
+    /// SPIFFE identity, dial endpoint, and cluster/configuration scope. The
+    /// endpoint may resolve to different addresses across reconnects, but every
+    /// new connection revalidates the same authenticated member identity.
+    /// Session resumption and early data are disabled so a reconnect must
+    /// present and verify the peer's current certificate.
+    ///
     /// `deadline` bounds every backend method end-to-end, including connection
     /// retries with backoff (default 2s when `None`). On expiry the method
     /// returns the store's unavailable error so a quorum layer treats this
     /// replica as offline instead of stalling.
     pub fn new(
-        addr: SocketAddr,
-        tls_config: Arc<opc_tls::ClientConfig>,
+        binding: RemoteReplicaBinding,
+        tls_config: opc_tls::AuthenticatedClientConfig,
         deadline: Option<Duration>,
     ) -> Self {
-        Self::from_transport(RemoteTarget::pinned(addr), Some(tls_config), deadline)
+        let target = RemoteTarget::configured(&binding);
+        Self::from_transport(
+            target,
+            Some(session_client_tls_config(&tls_config)),
+            binding,
+            deadline,
+        )
     }
 
     /// Create a new mTLS remote backend client that re-resolves before each
@@ -227,17 +367,20 @@ impl RemoteSessionBackend {
     ///
     /// Existing live connections are reused. When a connection is dropped,
     /// the next retry calls `resolve` and connects to the returned address.
-    /// TLS verification keeps using `server_name`; it is not changed to the
-    /// resolved IP address.
+    /// TLS routing keeps using the binding endpoint as `server_name`; neither
+    /// that name nor the resolved IP can replace the binding's expected
+    /// `ReplicaId` and certificate SPIFFE identity.
     pub fn new_with_resolver(
-        server_name: String,
+        binding: RemoteReplicaBinding,
         resolve: RemoteAddrResolver,
-        tls_config: Arc<opc_tls::ClientConfig>,
+        tls_config: opc_tls::AuthenticatedClientConfig,
         deadline: Option<Duration>,
     ) -> Self {
+        let server_name = binding.remote_endpoint().host().to_string();
         Self::from_transport(
             RemoteTarget::resolved(Some(server_name), resolve),
-            Some(tls_config),
+            Some(session_client_tls_config(&tls_config)),
+            binding,
             deadline,
         )
     }
@@ -247,7 +390,12 @@ impl RemoteSessionBackend {
     /// Production replication clients must use [`RemoteSessionBackend::new`].
     #[cfg(feature = "insecure-test")]
     pub fn new_insecure(addr: SocketAddr, deadline: Option<Duration>) -> Self {
-        Self::from_transport(RemoteTarget::pinned(addr), None, deadline)
+        Self::from_transport(
+            RemoteTarget::pinned(addr),
+            None,
+            crate::identity::insecure_test_client_binding(),
+            deadline,
+        )
     }
 
     /// Create a plaintext remote backend client with re-resolution for tests.
@@ -256,20 +404,26 @@ impl RemoteSessionBackend {
         resolve: RemoteAddrResolver,
         deadline: Option<Duration>,
     ) -> Self {
-        Self::from_transport(RemoteTarget::resolved(None, resolve), None, deadline)
+        Self::from_transport(
+            RemoteTarget::resolved(None, resolve),
+            None,
+            crate::identity::insecure_test_client_binding(),
+            deadline,
+        )
     }
 
     fn from_transport(
         target: RemoteTarget,
         tls_config: Option<Arc<opc_tls::ClientConfig>>,
+        binding: RemoteReplicaBinding,
         deadline: Option<Duration>,
     ) -> Self {
         Self {
             target,
             tls_config,
+            binding,
             deadline: deadline.unwrap_or(Duration::from_secs(2)),
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
-            node_id: format!("opc-session-net/{}", std::process::id()),
             conn: Arc::new(Mutex::new(None)),
             cached_capabilities: Arc::new(RwLock::new(None)),
         }
@@ -353,56 +507,25 @@ impl RemoteSessionBackend {
     }
 
     async fn connect(&self) -> Result<Connection, ProtocolError> {
-        let addr = self.target.resolve().await.map_err(ProtocolError::Io)?;
-        let tcp = TcpStream::connect(addr).await.map_err(ProtocolError::Io)?;
-
-        let (mut reader, mut writer): (
-            Box<dyn AsyncRead + Unpin + Send>,
-            Box<dyn AsyncWrite + Unpin + Send>,
-        ) = if let Some(tls_config) = &self.tls_config {
-            let connector = tokio_rustls::TlsConnector::from(tls_config.clone());
-            let server_name = self.target.tls_server_name(addr)?;
-            let tls_stream = connector
-                .connect(server_name, tcp)
-                .await
-                .map_err(classify_tls_connect_error)?;
-            let (r, w) = tokio::io::split(tls_stream);
-            (Box::new(r), Box::new(w))
-        } else {
-            let (r, w) = tokio::io::split(tcp);
-            (Box::new(r), Box::new(w))
-        };
-
-        // Hello handshake
-        write_frame(
-            &mut writer,
-            &Request::Hello {
-                contract_version: CONTRACT_VERSION,
-                node_id: self.node_id.clone(),
-            },
+        let result = open_connection(
+            self.target.clone(),
+            self.tls_config.clone(),
+            self.binding.clone(),
         )
-        .await?;
-
-        let ack: Response = read_frame(&mut reader, self.max_frame_size).await?;
-        match ack {
-            Response::HelloAck { contract_version } => {
-                if contract_version != CONTRACT_VERSION {
-                    self.clear_cached_capabilities();
-                    return Err(ProtocolError::VersionMismatch {
-                        local: CONTRACT_VERSION,
-                        remote: contract_version,
-                    });
-                }
-            }
-            Response::Error { message } => {
-                return Err(ProtocolError::BackendUnavailable(message));
-            }
-            _ => {
-                return Err(ProtocolError::UnexpectedResponse);
-            }
+        .await;
+        if result.as_ref().is_err_and(|error| {
+            matches!(
+                error,
+                ProtocolError::Authentication
+                    | ProtocolError::VersionMismatch { .. }
+                    | ProtocolError::UnexpectedResponse
+                    | ProtocolError::FrameTooLarge(_)
+                    | ProtocolError::Serialization(_)
+            )
+        }) {
+            self.clear_cached_capabilities();
         }
-
-        Ok(Connection { reader, writer })
+        result
     }
 
     async fn exchange(
@@ -410,6 +533,11 @@ impl RemoteSessionBackend {
         req: &Request,
         conn: &mut Connection,
     ) -> Result<Response, ProtocolError> {
+        if self.tls_config.is_some()
+            && conn.authenticated_peer.as_ref() != Some(self.binding.remote_replica_id())
+        {
+            return Err(ProtocolError::Authentication);
+        }
         write_frame(&mut conn.writer, req).await?;
         read_frame(&mut conn.reader, self.max_frame_size).await
     }
@@ -436,9 +564,9 @@ impl RemoteSessionBackend {
     fn capabilities_for_transport(
         &self,
         mut caps: BackendCapabilities,
-        fresh_v2_negotiation: bool,
+        fresh_v3_negotiation: bool,
     ) -> BackendCapabilities {
-        if !fresh_v2_negotiation || self.max_frame_size < MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE {
+        if !fresh_v3_negotiation || self.max_frame_size < MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE {
             caps.restore_scan = false;
         }
         caps
@@ -471,6 +599,12 @@ impl RemoteSessionBackend {
 impl SessionBackend for RemoteSessionBackend {
     fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
         Some(BackendInstanceIdentity::for_shared(&self.conn))
+    }
+
+    fn peer_binding(&self) -> Option<BackendPeerBinding> {
+        self.tls_config
+            .as_ref()
+            .map(|_| self.binding.backend_peer_binding())
     }
 
     async fn capabilities(&self) -> BackendCapabilities {
@@ -699,7 +833,7 @@ impl SessionBackend for RemoteSessionBackend {
         let target = self.target.clone();
         let tls_config = self.tls_config.clone();
         let max_frame_size = self.max_frame_size;
-        let node_id = self.node_id.clone();
+        let binding = self.binding.clone();
         let deadline = self.deadline;
 
         let (tx, rx) = tokio::sync::mpsc::channel(WATCH_CHANNEL_CAPACITY);
@@ -709,14 +843,17 @@ impl SessionBackend for RemoteSessionBackend {
                 target,
                 tls_config,
                 max_frame_size,
-                node_id,
+                binding,
                 start_sequence,
                 deadline,
                 tx,
             )
             .await;
             if let Err(e) = result {
-                tracing::debug!(error = ?e, "watch stream ended");
+                tracing::debug!(
+                    failure = RemoteRequestFailure::from_protocol_error(&e).reason_code(),
+                    "watch stream ended"
+                );
             }
         });
 
@@ -784,7 +921,7 @@ async fn watch_connect_and_read(
     target: RemoteTarget,
     tls_config: Option<Arc<opc_tls::ClientConfig>>,
     max_frame_size: usize,
-    node_id: String,
+    binding: RemoteReplicaBinding,
     start_sequence: u64,
     deadline: Duration,
     tx: tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>,
@@ -792,34 +929,23 @@ async fn watch_connect_and_read(
     // Bound connect + handshake by the client deadline. After the handshake,
     // bounded channel sends backpressure socket reads when consumers lag.
     let open = async {
-        let addr = target.resolve().await.map_err(ProtocolError::Io)?;
-        let tcp = TcpStream::connect(addr).await.map_err(ProtocolError::Io)?;
-
-        let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
-            if let Some(tls_config) = &tls_config {
-                let connector = tokio_rustls::TlsConnector::from(tls_config.clone());
-                let server_name = target.tls_server_name(addr)?;
-                let tls_stream = connector
-                    .connect(server_name, tcp)
-                    .await
-                    .map_err(classify_tls_connect_error)?;
-                let (mut r, mut w) = tokio::io::split(tls_stream);
-                watch_handshake(&mut r, &mut w, max_frame_size, &node_id, start_sequence).await?;
-                Box::new(r)
-            } else {
-                let (mut r, mut w) = tokio::io::split(tcp);
-                watch_handshake(&mut r, &mut w, max_frame_size, &node_id, start_sequence).await?;
-                Box::new(r)
-            };
-        Ok::<_, ProtocolError>(reader)
+        let mut connection = open_connection(target, tls_config, binding).await?;
+        write_frame(&mut connection.writer, &Request::Watch { start_sequence }).await?;
+        match read_frame::<_, Response>(&mut connection.reader, max_frame_size).await? {
+            Response::WatchStream => Ok::<_, ProtocolError>(connection.reader),
+            Response::Error { .. } => Err(ProtocolError::BackendUnavailable(
+                "watch request rejected".to_string(),
+            )),
+            _ => Err(ProtocolError::UnexpectedResponse),
+        }
     };
     let mut reader = match tokio::time::timeout(deadline, open).await {
         Ok(res) => res?,
         Err(_) => {
             let _ = tx
-                .send(Err(StoreError::BackendUnavailable(format!(
-                    "watch handshake to {target} timed out after {deadline:?}"
-                ))))
+                .send(Err(StoreError::BackendUnavailable(
+                    "remote session watch handshake timed out".to_string(),
+                )))
                 .await;
             return Err(ProtocolError::BackendUnavailable(
                 "watch handshake timed out".into(),
@@ -846,61 +972,14 @@ async fn watch_connect_and_read(
                 break;
             }
             Err(e) => {
+                let reason = RemoteRequestFailure::from_protocol_error(&e).reason_code();
                 let _ = tx
-                    .send(Err(StoreError::BackendUnavailable(e.to_string())))
+                    .send(Err(StoreError::BackendUnavailable(format!(
+                        "remote session watch failed: {reason}"
+                    ))))
                     .await;
                 break;
             }
-        }
-    }
-
-    Ok(())
-}
-
-async fn watch_handshake<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    max_frame_size: usize,
-    node_id: &str,
-    start_sequence: u64,
-) -> Result<(), ProtocolError>
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    write_frame(
-        writer,
-        &Request::Hello {
-            contract_version: CONTRACT_VERSION,
-            node_id: node_id.to_string(),
-        },
-    )
-    .await?;
-    let ack: Response = read_frame(reader, max_frame_size).await?;
-    match ack {
-        Response::HelloAck { contract_version } => {
-            if contract_version != CONTRACT_VERSION {
-                return Err(ProtocolError::VersionMismatch {
-                    local: CONTRACT_VERSION,
-                    remote: contract_version,
-                });
-            }
-        }
-        _ => {
-            return Err(ProtocolError::UnexpectedResponse);
-        }
-    }
-
-    write_frame(writer, &Request::Watch { start_sequence }).await?;
-
-    let ack: Response = read_frame(reader, max_frame_size).await?;
-    match ack {
-        Response::WatchStream => {}
-        Response::Error { message } => {
-            return Err(ProtocolError::BackendUnavailable(message));
-        }
-        _ => {
-            return Err(ProtocolError::UnexpectedResponse);
         }
     }
 
@@ -947,6 +1026,28 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
 
+    fn successful_hello_ack(hello: &Request) -> Response {
+        let Request::Hello {
+            node_id,
+            expected_server_replica_id,
+            cluster_id,
+            configuration_id,
+            handshake_nonce,
+            ..
+        } = hello
+        else {
+            panic!("expected Hello request");
+        };
+        Response::HelloAck {
+            contract_version: CONTRACT_VERSION,
+            server_replica_id: expected_server_replica_id.clone(),
+            accepted_client_replica_id: Some(node_id.clone()),
+            cluster_id: cluster_id.clone(),
+            configuration_id: configuration_id.clone(),
+            handshake_nonce: *handshake_nonce,
+        }
+    }
+
     async fn capability_server(
         caps: BackendCapabilities,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -959,15 +1060,9 @@ mod tests {
             let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
                 .await
                 .expect("read hello");
-            assert!(matches!(hello, Request::Hello { .. }));
-            write_frame(
-                &mut stream,
-                &Response::HelloAck {
-                    contract_version: CONTRACT_VERSION,
-                },
-            )
-            .await
-            .expect("write hello ack");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write hello ack");
 
             let req: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
                 .await
@@ -995,6 +1090,11 @@ mod tests {
                 &mut stream,
                 &Response::HelloAck {
                     contract_version: CONTRACT_VERSION - 1,
+                    server_replica_id: None,
+                    accepted_client_replica_id: None,
+                    cluster_id: None,
+                    configuration_id: None,
+                    handshake_nonce: None,
                 },
             )
             .await
@@ -1016,6 +1116,37 @@ mod tests {
             assert!(matches!(hello, Request::Hello { .. }));
             // Protocol v1 closed immediately when the peer version differed;
             // it did not send a HelloAck that disclosed its version.
+        });
+        (addr, handle)
+    }
+
+    async fn invalid_ack_server(stale_nonce: bool) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read hello");
+            let mut ack = successful_hello_ack(&hello);
+            let Response::HelloAck {
+                server_replica_id,
+                handshake_nonce,
+                ..
+            } = &mut ack
+            else {
+                unreachable!("helper always returns HelloAck");
+            };
+            if stale_nonce {
+                *handshake_nonce = Some(uuid::Uuid::nil());
+            } else {
+                *server_replica_id = Some("different-server".to_string());
+            }
+            write_frame(&mut stream, &ack)
+                .await
+                .expect("write invalid hello ack");
         });
         (addr, handle)
     }
@@ -1050,6 +1181,23 @@ mod tests {
         assert_eq!(backend.capabilities().await, caps_b);
         let _ = handle_b.await;
         assert!(calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn replayed_or_relabelled_hello_ack_is_rejected() {
+        for stale_nonce in [true, false] {
+            let (addr, handle) = invalid_ack_server(stale_nonce).await;
+            let backend =
+                RemoteSessionBackend::new_insecure(addr, Some(Duration::from_millis(250)));
+
+            let expected = if stale_nonce {
+                ReplicaReadinessFailure::Protocol
+            } else {
+                ReplicaReadinessFailure::Authentication
+            };
+            assert_eq!(backend.probe_replication_head().await, Err(expected));
+            let _ = handle.await;
+        }
     }
 
     #[tokio::test]
@@ -1130,11 +1278,11 @@ mod tests {
         let legacy = backend.capabilities().await;
         assert!(
             legacy.atomic_compare_and_set,
-            "cached v1 operation was lost"
+            "cached backend operation was lost"
         );
         assert!(
             !legacy.restore_scan,
-            "v2-only restore support must be masked when fresh negotiation fails"
+            "negotiated restore support must be masked when fresh v3 negotiation fails"
         );
         let _ = legacy_handle.await;
     }
@@ -1150,15 +1298,9 @@ mod tests {
             let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
                 .await
                 .expect("read hello");
-            assert!(matches!(hello, Request::Hello { .. }));
-            write_frame(
-                &mut stream,
-                &Response::HelloAck {
-                    contract_version: CONTRACT_VERSION,
-                },
-            )
-            .await
-            .expect("write hello ack");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write hello ack");
             let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
                 .await
                 .expect("read restore request");
@@ -1195,15 +1337,9 @@ mod tests {
             let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
                 .await
                 .expect("read hello");
-            assert!(matches!(hello, Request::Hello { .. }));
-            write_frame(
-                &mut stream,
-                &Response::HelloAck {
-                    contract_version: CONTRACT_VERSION,
-                },
-            )
-            .await
-            .expect("write hello ack");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write hello ack");
             let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
                 .await
                 .expect("read restore request");

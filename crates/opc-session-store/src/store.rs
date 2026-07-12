@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 
 use crate::backend::{
-    BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry, SessionBackend,
-    SessionOp, SessionOpResult,
+    BackendInstanceIdentity, BackendPeerBinding, CompareAndSet, CompareAndSetResult,
+    ReplicationEntry, SessionBackend, SessionOp, SessionOpResult,
 };
 use crate::capability::BackendCapabilities;
 use crate::error::{LeaseError, StoreError};
@@ -92,6 +92,10 @@ impl<B: SessionBackend + SessionLeaseManager> SessionStore<B> {
 impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B> {
     fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
         self.backend.backend_instance_identity()
+    }
+
+    fn peer_binding(&self) -> Option<BackendPeerBinding> {
+        self.backend.peer_binding()
     }
 
     async fn capabilities(&self) -> BackendCapabilities {

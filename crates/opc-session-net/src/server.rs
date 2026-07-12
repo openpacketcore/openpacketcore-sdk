@@ -7,16 +7,19 @@ use futures_util::StreamExt;
 use opc_session_store::backend::CompareAndSetResult;
 use opc_session_store::error::StoreError;
 use opc_session_store::quorum::SessionStoreBackend;
-use opc_session_store::{RestoreScanCursor, RestoreScanPage, RestoreScanRequest};
+use opc_session_store::{ReplicaId, RestoreScanCursor, RestoreScanPage, RestoreScanRequest};
+use opc_types::SpiffeId;
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
 use tracing;
 
 use crate::error::ProtocolError;
+use crate::identity::{LocalReplicaBinding, SessionClusterId};
 use crate::protocol::{
-    ensure_frame_fits, read_frame_within, write_frame, write_frame_within, Request, Response,
-    CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE, MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE,
+    ensure_frame_fits, read_frame_within, write_frame, write_frame_within, HelloRejectReason,
+    Request, Response, CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE,
+    MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE, SESSION_NET_ALPN,
 };
 
 /// Handle to a running [`SessionReplicationServer`].
@@ -54,6 +57,7 @@ const CAS_IDEMPOTENCY_CACHE_CAPACITY: usize = 4096;
 
 #[derive(Clone)]
 struct DispatchConfig {
+    binding: LocalReplicaBinding,
     max_frame_size: usize,
     idle_timeout: std::time::Duration,
     restore_scan_timeout: std::time::Duration,
@@ -186,6 +190,7 @@ impl CasIdempotencyCache {
 pub struct SessionReplicationServer {
     backend: Arc<dyn SessionStoreBackend>,
     tls_config: Option<Arc<opc_tls::ServerConfig>>,
+    binding: LocalReplicaBinding,
     max_connections: usize,
     max_frame_size: usize,
     idle_timeout: std::time::Duration,
@@ -197,6 +202,7 @@ impl fmt::Debug for SessionReplicationServer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionReplicationServer")
             .field("tls_config", &self.tls_config.is_some())
+            .field("binding", &self.binding)
             .field("max_connections", &self.max_connections)
             .field("max_frame_size", &self.max_frame_size)
             .field("restore_scan_timeout", &self.restore_scan_timeout)
@@ -207,16 +213,25 @@ impl fmt::Debug for SessionReplicationServer {
 impl SessionReplicationServer {
     /// Create a new mTLS server.
     ///
+    /// `binding` selects this server's exact stable replica ID and immutable
+    /// authorized member manifest. Each accepted connection must present a
+    /// canonical SPIFFE identity mapped to its claimed client `ReplicaId` and
+    /// must agree on this server ID and manifest scope before backend dispatch.
+    /// Session caches and tickets are disabled so every accepted connection
+    /// performs a full mutual-TLS certificate exchange.
+    ///
     /// Production session replication must run over authenticated TLS. Use
     /// [`SessionReplicationServer::new_insecure`] only in test builds that
     /// explicitly enable the `insecure-test` feature.
     pub fn new(
         backend: Arc<dyn SessionStoreBackend>,
-        tls_config: Arc<opc_tls::ServerConfig>,
+        tls_config: opc_tls::AuthenticatedServerConfig,
+        binding: LocalReplicaBinding,
     ) -> Self {
         Self {
             backend,
-            tls_config: Some(tls_config),
+            tls_config: Some(session_server_tls_config(&tls_config)),
+            binding,
             max_connections: 128,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
@@ -231,6 +246,7 @@ impl SessionReplicationServer {
         Self {
             backend,
             tls_config: None,
+            binding: crate::identity::insecure_test_server_binding(),
             max_connections: 128,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
@@ -280,6 +296,7 @@ impl SessionReplicationServer {
         let backend = self.backend.clone();
         let cas_idempotency_cache = self.cas_idempotency_cache.clone();
         let dispatch_config = DispatchConfig {
+            binding: self.binding.clone(),
             max_frame_size: self.max_frame_size,
             idle_timeout: self.idle_timeout,
             restore_scan_timeout: self.restore_scan_timeout,
@@ -343,6 +360,49 @@ impl SessionReplicationServer {
     }
 }
 
+fn session_server_tls_config(
+    config: &opc_tls::AuthenticatedServerConfig,
+) -> Arc<opc_tls::ServerConfig> {
+    let mut config = config.rustls_config().as_ref().clone();
+    config.alpn_protocols = vec![SESSION_NET_ALPN.to_vec()];
+    // A resumed session may authenticate from cached state rather than the
+    // certificate currently selected by the reloadable SVID resolver. Disable
+    // every server-side resumption mechanism so reconnect always observes and
+    // verifies the live peer certificate.
+    config.session_storage = Arc::new(tokio_rustls::rustls::server::NoServerSessionStorage {});
+    config.ticketer = Arc::new(DisabledSessionTickets);
+    config.send_tls13_tickets = 0;
+    config.max_early_data_size = 0;
+    config.send_half_rtt_data = false;
+    Arc::new(config)
+}
+
+#[derive(Debug)]
+struct DisabledSessionTickets;
+
+impl tokio_rustls::rustls::server::ProducesTickets for DisabledSessionTickets {
+    fn enabled(&self) -> bool {
+        false
+    }
+
+    fn lifetime(&self) -> u32 {
+        0
+    }
+
+    fn encrypt(&self, _plain: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn decrypt(&self, _cipher: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+enum ConnectionPeerIdentity {
+    Authenticated(SpiffeId),
+    InsecureTest,
+}
+
 async fn handle_connection(
     backend: Arc<dyn SessionStoreBackend>,
     stream: TcpStream,
@@ -362,12 +422,18 @@ async fn handle_connection(
                 ))
             })?
             .map_err(ProtocolError::Io)?;
+        if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_NET_ALPN) {
+            return Err(ProtocolError::Authentication);
+        }
+        let peer_spiffe = opc_tls::peer_spiffe_id_from_server_connection(tls_stream.get_ref().1)
+            .map_err(|_| ProtocolError::Authentication)?;
         let (mut r, mut w) = tokio::io::split(tls_stream);
         dispatch(
             backend,
             cas_idempotency_cache,
             &mut r,
             &mut w,
+            ConnectionPeerIdentity::Authenticated(peer_spiffe),
             dispatch_config,
         )
         .await
@@ -378,6 +444,7 @@ async fn handle_connection(
             cas_idempotency_cache,
             &mut r,
             &mut w,
+            ConnectionPeerIdentity::InsecureTest,
             dispatch_config,
         )
         .await
@@ -389,6 +456,7 @@ async fn dispatch<R, W>(
     cas_idempotency_cache: Arc<Mutex<CasIdempotencyCache>>,
     reader: &mut R,
     writer: &mut W,
+    peer_identity: ConnectionPeerIdentity,
     dispatch_config: DispatchConfig,
 ) -> Result<(), ProtocolError>
 where
@@ -396,6 +464,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let DispatchConfig {
+        binding,
         max_frame_size,
         idle_timeout,
         restore_scan_timeout,
@@ -403,16 +472,31 @@ where
     } = dispatch_config;
 
     // Hello handshake — bounded so a peer that connects and stalls is reaped.
-    let hello: Request = read_frame_within(reader, max_frame_size, idle_timeout).await?;
+    let hello: Request = read_frame_within(
+        reader,
+        max_frame_size.min(MAX_HANDSHAKE_FRAME_SIZE),
+        idle_timeout,
+    )
+    .await?;
     match hello {
         Request::Hello {
-            contract_version, ..
+            contract_version,
+            node_id,
+            expected_server_replica_id,
+            cluster_id,
+            configuration_id,
+            handshake_nonce,
         } => {
             if contract_version != CONTRACT_VERSION {
                 write_frame_within(
                     writer,
                     &Response::HelloAck {
                         contract_version: CONTRACT_VERSION,
+                        server_replica_id: None,
+                        accepted_client_replica_id: None,
+                        cluster_id: None,
+                        configuration_id: None,
+                        handshake_nonce: None,
                     },
                     idle_timeout,
                 )
@@ -422,19 +506,69 @@ where
                     remote: contract_version,
                 });
             }
+
+            let Some(expected_server_replica_id) = expected_server_replica_id else {
+                return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
+            };
+            let Some(cluster_id) = cluster_id else {
+                return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
+            };
+            let Some(configuration_id) = configuration_id else {
+                return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
+            };
+            let Some(handshake_nonce) = handshake_nonce else {
+                return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
+            };
+
+            let client_replica_id = match ReplicaId::new(node_id) {
+                Ok(replica_id) => replica_id,
+                Err(_) => {
+                    return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
+                }
+            };
+            let expected_server_replica_id = match ReplicaId::new(expected_server_replica_id) {
+                Ok(replica_id) => replica_id,
+                Err(_) => {
+                    return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
+                }
+            };
+            if SessionClusterId::new(cluster_id.clone()).is_err()
+                || !is_configuration_id(&configuration_id)
+            {
+                return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
+            }
+
+            let configured_client_spiffe = binding.member_spiffe_id(&client_replica_id);
+            let authenticated_client_matches = match (&peer_identity, configured_client_spiffe) {
+                (ConnectionPeerIdentity::Authenticated(actual), Some(configured)) => {
+                    actual.as_str() == configured.as_str()
+                }
+                (ConnectionPeerIdentity::InsecureTest, Some(_)) => true,
+                _ => false,
+            };
+            let scope_matches = expected_server_replica_id == *binding.local_replica_id()
+                && cluster_id == binding.cluster_id().as_str()
+                && configuration_id == binding.configuration_id().to_hex();
+            if !authenticated_client_matches || !scope_matches {
+                return reject_hello(writer, HelloRejectReason::Authentication, idle_timeout).await;
+            }
+
             write_frame_within(
                 writer,
                 &Response::HelloAck {
                     contract_version: CONTRACT_VERSION,
+                    server_replica_id: Some(binding.local_replica_id().as_str().to_string()),
+                    accepted_client_replica_id: Some(client_replica_id.as_str().to_string()),
+                    cluster_id: Some(binding.cluster_id().as_str().to_string()),
+                    configuration_id: Some(binding.configuration_id().to_hex()),
+                    handshake_nonce: Some(handshake_nonce),
                 },
                 idle_timeout,
             )
             .await?;
         }
         _ => {
-            return Err(ProtocolError::BackendUnavailable(
-                "expected Hello request".into(),
-            ));
+            return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
         }
     }
 
@@ -598,18 +732,28 @@ where
                 write_frame(writer, &Response::ReleaseLease(res)).await?;
             }
             Request::Hello { .. } => {
-                write_frame(
-                    writer,
-                    &Response::Error {
-                        message: "duplicate Hello".into(),
-                    },
-                )
-                .await?;
+                return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
             }
         }
     }
 
     Ok(())
+}
+
+fn is_configuration_id(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+async fn reject_hello<W>(
+    writer: &mut W,
+    reason: HelloRejectReason,
+    timeout: std::time::Duration,
+) -> Result<(), ProtocolError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    write_frame_within(writer, &Response::HelloRejected { reason }, timeout).await?;
+    Err(ProtocolError::Authentication)
 }
 
 #[cfg(test)]

@@ -29,6 +29,10 @@ evidence.
 - `ReplicaId`, `ReplicaEndpoint`, `ReplicaTlsIdentity`,
   `ReplicaFailureDomain`, and `ReplicaBackingIdentity` keep logical, network,
   authentication, placement, and physical-store identities distinct.
+- `BackendPeerBinding` is redaction-safe composition evidence from an
+  authenticated network adapter. It binds local/remote logical IDs, the exact
+  expected remote TLS identity, both descriptor fingerprints, member count,
+  and one opaque cluster/configuration scope.
 - `QuorumTopologyConfig::new` records an unvalidated request.
   `ValidatedQuorumTopology::try_from` performs admission: an odd HA membership
   from 3 through `QUORUM_TOPOLOGY_MAX_MEMBERS` (31), exactly one exact local
@@ -52,8 +56,8 @@ evidence.
 - Restore APIs include `RestoreScanRequest`, `RestoreScanPage`,
   `RestoreBlockReason`, summaries, page-size constants, and
   `summarize_restore_records`.
-- `opc-session-net` protocol v2 lets an individual remote backend execute the
-  same validated cursor-paged restore scan as a local backend.
+- `opc-session-net` protocol v3 lets an individual authenticated remote backend
+  execute the same validated cursor-paged restore scan as a local backend.
 - `SessionStore<B>` wraps a backend in a typed store handle.
 
 ```rust,no_run
@@ -107,13 +111,13 @@ fn build_store(
     let local_id = ReplicaId::new("epdg-app-0")?;
     let members = vec![
         member(0, "epdg-app-0", "epdg-app-0.quorum.ns.svc.cluster.local",
-            "spiffe://cluster/ns/epdg-app-0", "node/worker-a", "pvc-uid/1111",
+            "spiffe://cluster/tenant/epdg/ns/gateway/sa/epdg-app/nf/epdg/instance/0", "node/worker-a", "pvc-uid/1111",
             local_backend)?,
         member(1, "epdg-app-1", "epdg-app-1.quorum.ns.svc.cluster.local",
-            "spiffe://cluster/ns/epdg-app-1", "node/worker-b", "pvc-uid/2222",
+            "spiffe://cluster/tenant/epdg/ns/gateway/sa/epdg-app/nf/epdg/instance/1", "node/worker-b", "pvc-uid/2222",
             peer_1_backend)?,
         member(2, "epdg-app-2", "epdg-app-2.quorum.ns.svc.cluster.local",
-            "spiffe://cluster/ns/epdg-app-2", "node/worker-c", "pvc-uid/3333",
+            "spiffe://cluster/tenant/epdg/ns/gateway/sa/epdg-app/nf/epdg/instance/2", "node/worker-c", "pvc-uid/3333",
             peer_2_backend)?,
     ];
     let topology = ValidatedQuorumTopology::try_from(
@@ -123,15 +127,27 @@ fn build_store(
 }
 ```
 
-Use the same source configuration to build each remote backend and its
-descriptor; the current SDK cannot prove that independently declared metadata
-matches the live peer until #125. The numeric `FencedSessionReplica::id` is a
-fault-injection/test-control slot and is never the logical `ReplicaId` or a
-vote identity. A backend adapter used as a vote must return
+Build one immutable `SessionReplicationManifest` from the cluster ID, an
+operator-controlled configuration generation, and the complete descriptor
+set. Bind its exact local `ReplicaId`, then derive each
+`RemoteSessionBackend` from that local binding. Protocol v3 requires the live
+certificate's canonical SPIFFE URI, claimed `ReplicaId`, opposite replica ID,
+cluster, and configuration digest to agree before backend dispatch. Resolver
+or DNS aliases change only the dial address; they do not change voting
+identity.
+
+The numeric `FencedSessionReplica::id` is a fault-injection/test-control slot
+and is never the logical `ReplicaId` or a vote identity. A backend adapter used
+as a vote must return
 `Some(BackendInstanceIdentity)` from `SessionBackend::backend_instance_identity`;
 forwarding wrappers must delegate that identity. The default `None` fails
 admission with `MissingBackendInstanceIdentity`. The token describes a local
 adapter instance only; it does not authenticate a remote physical store.
+Remote network adapters additionally return `BackendPeerBinding`. Once any
+member supplies peer-binding evidence, every remote member must supply a
+binding whose IDs, TLS identity, descriptor fingerprints, member count, and
+scope match the admitted topology; an in-process local member may remain
+unbound.
 
 ### Fresh durable readiness
 
@@ -177,23 +193,23 @@ destructively rebuild the fork.
 - SQLite file backends use WAL in tests and persist across restart.
 - `FakeSessionBackend` is for tests.
 - Configured topology validation proves only an odd, distinct voting set and
-  one exact local member. Fresh readiness separately proves a point-in-time
-  reachable and agreeing majority, but neither result proves authenticated
-  membership, durable commit authority, operator-safe fork recovery, restore
-  authority, or production HA qualification.
+  one exact local member. Authenticated network adapters add manifest-derived
+  peer-binding evidence at admission. Fresh readiness separately proves a
+  point-in-time reachable and agreeing majority. None of these results proves
+  durable commit authority, operator-safe fork recovery, restore authority, or
+  production HA qualification.
 - A bare logical self ID such as `epdg-app-0` may select a member whose endpoint
   is the full `epdg-app-0.<headless-service>.<namespace>.svc.cluster.local`
   FQDN. The SDK never shortens endpoints or treats endpoint text as identity.
 - The local ID declares the coordinator's own configured replica. Admission
-  proves an exact descriptor match, but cannot yet prove that the paired
-  adapter reaches the local physical store. Products must bind composition to
-  their own member configuration, and #125 must bind remote declarations to
-  authenticated peers.
-- Endpoint DNS names are canonicalized for case and one trailing dot.
-  TLS/failure-domain values are exact caller-provided identities; callers must
-  use canonical deployment values. Backing identities are caller-provided
-  stable physical IDs retained only as SHA-256 digests, not verified storage
+  proves an exact descriptor match. The local in-process adapter remains a
+  product composition boundary; a peer manifest does not prove physical-store
   provenance.
+- Endpoint DNS names are canonicalized for case and one trailing dot.
+  Endpoint text is routing, never replica identity. TLS/failure-domain values
+  are exact caller-provided identities; callers must use canonical deployment
+  values. Backing identities are caller-provided stable physical IDs retained
+  only as SHA-256 digests, not verified storage provenance.
 - Remote transport parity does not make `QuorumSessionStore` restore a
   production authority: its current aggregation still materializes replica
   scans and resolves records without durable majority/commit proof (#127,
@@ -203,11 +219,10 @@ destructively rebuild the fork.
 
 - Keep backend capabilities explicit so HA/profile suitability can fail closed.
 - Continue hardening restore evidence and traffic-blocking gates.
-- Complete authenticated peer identity (#125), durable sequencing and safe
-  fork repair/recovery (#127–#129), and bounded
-  majority-authoritative restore (#133), fixed-width wire stabilization (#134),
-  invariant-safe model decoding (#135), plus oversized-TTL and zero-sequence
-  panic elimination (#137/#138).
+- Complete durable sequencing and safe fork repair/recovery (#127–#129),
+  bounded majority-authoritative restore (#133), fixed-width wire stabilization
+  (#134), invariant-safe model decoding (#135), plus oversized-TTL and
+  zero-sequence panic elimination (#137/#138).
 - Keep encryption AAD bound to namespace, NF kind, state type, generation,
   fence, and session-key digest.
 
@@ -215,6 +230,8 @@ destructively rebuild the fork.
 
 - Source checked: `Cargo.toml`, `src/lib.rs`, backend, lease, model, record,
   sqlite, topology, quorum, restore, and tests.
+- `tests/quorum_topology.rs` covers descriptor fingerprinting, complete
+  remote-binding admission, typed mismatch classes, and redacted diagnostics.
 - Run with: `cargo test -p opc-session-store`.
 
 ## License
