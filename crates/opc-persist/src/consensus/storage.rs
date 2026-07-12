@@ -150,6 +150,12 @@ type OpenedConfigStorage = (
     Arc<ConfigDurableProgress>,
 );
 
+pub(crate) struct AdmittedSnapshotDirectory {
+    pub(crate) path: PathBuf,
+    pub(crate) binding_path: PathBuf,
+    pub(crate) guard: Arc<std::fs::File>,
+}
+
 pub(crate) async fn open(
     backend: &SqliteBackend,
     snapshot_dir: impl Into<PathBuf>,
@@ -166,8 +172,7 @@ pub(crate) async fn open_with_recovery(
     expected_members: std::collections::BTreeSet<ConsensusNodeId>,
     recovery: Option<ApprovedLegacyConfigRecovery>,
 ) -> Result<OpenedConfigStorage, ConfigConsensusStorageError> {
-    let (snapshot_dir, snapshot_binding_path, snapshot_dir_guard) =
-        admit_snapshot_directory(backend, snapshot_dir.into())?;
+    let snapshot_directory = admit_snapshot_directory(backend, snapshot_dir.into())?;
     let already_completed = if let Some(approval) = recovery.as_ref() {
         let conn = backend.conn();
         let approval = approval.clone();
@@ -188,7 +193,7 @@ pub(crate) async fn open_with_recovery(
         Some(approval) if !already_completed => Some(
             tokio::time::timeout(
                 SNAPSHOT_OPERATION_TIMEOUT,
-                stage_legacy_recovery_snapshot(&snapshot_dir, approval),
+                stage_legacy_recovery_snapshot(&snapshot_directory.path, approval),
             )
             .await
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)??,
@@ -198,11 +203,9 @@ pub(crate) async fn open_with_recovery(
     let progress = Arc::new(ConfigDurableProgress::default());
     let core = sqlite::ConfigConsensusCore::initialize(
         backend,
-        snapshot_dir,
+        snapshot_directory,
         identity,
         expected_members,
-        snapshot_dir_guard,
-        snapshot_binding_path,
         progress.clone(),
         staged,
     )
@@ -225,7 +228,7 @@ pub(crate) async fn open_with_recovery(
 fn admit_snapshot_directory(
     backend: &SqliteBackend,
     path: PathBuf,
-) -> Result<(PathBuf, PathBuf, Arc<std::fs::File>), ConfigConsensusStorageError> {
+) -> Result<AdmittedSnapshotDirectory, ConfigConsensusStorageError> {
     let created = match std::fs::create_dir(&path) {
         Ok(()) => true,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
@@ -269,14 +272,18 @@ fn admit_snapshot_directory(
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
     let directory = Arc::new(directory);
     let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-    Ok((descriptor_path, canonical, directory))
+    Ok(AdmittedSnapshotDirectory {
+        path: descriptor_path,
+        binding_path: canonical,
+        guard: directory,
+    })
 }
 
 #[cfg(not(unix))]
 fn admit_snapshot_directory(
     _backend: &SqliteBackend,
     _path: PathBuf,
-) -> Result<(PathBuf, PathBuf, Arc<std::fs::File>), ConfigConsensusStorageError> {
+) -> Result<AdmittedSnapshotDirectory, ConfigConsensusStorageError> {
     Err(ConfigConsensusStorageError::InvalidIdentity)
 }
 
@@ -388,9 +395,7 @@ async fn stage_legacy_recovery_snapshot(
     })
 }
 
-fn ensure_legacy_wal_is_offline(
-    source: &Path,
-) -> Result<(), ConfigConsensusStorageError> {
+fn ensure_legacy_wal_is_offline(source: &Path) -> Result<(), ConfigConsensusStorageError> {
     let mut wal_name = source.as_os_str().to_os_string();
     wal_name.push("-wal");
     match std::fs::symlink_metadata(PathBuf::from(wal_name)) {
@@ -640,7 +645,7 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
     ) -> Result<(), StorageError<ConsensusNodeId>> {
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
-        let vote = vote.clone();
+        let vote = *vote;
         self.core
             .run_sqlite(move |conn| sqlite::save_vote_sync(conn, identity, &members, &vote))
             .await
@@ -1135,7 +1140,7 @@ async fn envelope_snapshot_database(
     Ok((checksum, total, cleanup))
 }
 
-async fn verify_snapshot_envelope(path: &PathBuf) -> io::Result<(u64, [u8; 32], u64)> {
+async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64)> {
     let source = open_read_nofollow(path)?;
     let metadata = source.metadata()?;
     let total = metadata.len();
@@ -1276,6 +1281,7 @@ async fn remove_old_snapshot(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::time::Duration;
 
     use opc_consensus::engine::{CommittedLeaderId, EntryPayload, Membership, RaftSnapshotBuilder};
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -1361,16 +1367,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_progress_does_not_mirror_unapplied_state() {
+        let temp = tempfile::tempdir().expect("snapshot tempdir");
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
+        let (mut log, mut machine, progress) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(),
+            members(),
+        )
+        .await
+        .expect("storage");
+        let entry = Entry {
+            log_id: log_id(0),
+            payload: EntryPayload::Blank,
+        };
+        let expected_members = log.core.expected_members.clone();
+        log.core
+            .run_sqlite(move |conn| {
+                sqlite::append_logs_sync(conn, identity(), &expected_members, &[entry])
+            })
+            .await
+            .expect("durable log entry");
+        log.save_committed(Some(log_id(0)))
+            .await
+            .expect("durable committed pointer");
+
+        assert_eq!(Some(0), progress.committed_index());
+        let (applied, _) = machine.applied_state().await.expect("applied state");
+        assert_eq!(None, applied, "committed must not be reported as applied");
+    }
+
+    #[tokio::test]
+    async fn sqlite_deadline_cancels_work_and_releases_the_single_worker() {
+        let temp = tempfile::tempdir().expect("snapshot tempdir");
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
+        let (log, _, _) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(),
+            members(),
+        )
+        .await
+        .expect("storage");
+        let started = std::time::Instant::now();
+        let interrupted = log
+            .core
+            .run_sqlite_with_test_timeout(Duration::from_millis(25), |conn| {
+                conn.query_row(
+                    "WITH RECURSIVE counter(value) AS (VALUES(0) UNION ALL SELECT value + 1 FROM counter WHERE value < 100000000) SELECT sum(value) FROM counter",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|_| ())
+                .map_err(|_| sqlite::invalid_data("bounded SQLite test query interrupted"))
+            })
+            .await;
+        assert!(interrupted.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let follow_up = tokio::time::timeout(
+            Duration::from_secs(2),
+            log.core.run_sqlite(|conn| {
+                conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                    .map_err(|_| sqlite::invalid_data("follow-up SQLite query failed"))
+            }),
+        )
+        .await
+        .expect("canceled worker releases admission")
+        .expect("follow-up query");
+        assert_eq!(1, follow_up);
+    }
+
+    #[tokio::test]
     async fn file_snapshot_install_is_checksummed_atomic_and_replaces_applied_state() {
         let temp = tempfile::tempdir().expect("snapshot tempdir");
-        let source_backend = SqliteBackend::open_with_audit_key(
-            ":memory:",
-            true,
-            0,
-            shared_audit_key(),
-        )
-            .await
-            .expect("source backend");
+        let source_backend =
+            SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+                .await
+                .expect("source backend");
         let (_, mut source_machine, _) = open(
             &source_backend,
             temp.path().join("source"),
@@ -1391,14 +1470,10 @@ mod tests {
             .expect("source snapshot");
         assert_eq!(Some(log_id(1)), snapshot.meta.last_log_id);
 
-        let rejected_backend = SqliteBackend::open_with_audit_key(
-            ":memory:",
-            true,
-            0,
-            shared_audit_key(),
-        )
-            .await
-            .expect("rejected destination backend");
+        let rejected_backend =
+            SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+                .await
+                .expect("rejected destination backend");
         let (_, mut rejected_machine, _) = open(
             &rejected_backend,
             temp.path().join("rejected"),
@@ -1440,14 +1515,10 @@ mod tests {
             .seek(std::io::SeekFrom::Start(0))
             .await
             .expect("rewind source snapshot");
-        let destination_backend = SqliteBackend::open_with_audit_key(
-            ":memory:",
-            true,
-            0,
-            shared_audit_key(),
-        )
-            .await
-            .expect("destination backend");
+        let destination_backend =
+            SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+                .await
+                .expect("destination backend");
         let (_, mut destination_machine, _) = open(
             &destination_backend,
             temp.path().join("destination"),
@@ -1564,6 +1635,19 @@ mod tests {
             .await
             .expect("restart cleans interrupted artifacts");
         assert!(snapshot_dir.join(&current).is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                0,
+                std::fs::metadata(snapshot_dir.join(&current))
+                    .expect("snapshot metadata")
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                "durable snapshot artifacts must not be group/world accessible"
+            );
+        }
         for artifact in artifacts {
             assert!(
                 !snapshot_dir.join(artifact).exists(),
@@ -1599,6 +1683,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_envelope_revision_is_exact() {
+        use std::io::{Seek as _, Write as _};
+
+        let temp = tempfile::tempdir().expect("snapshot tempdir");
+        let snapshot_dir = temp.path().join("snapshots");
+        let backend = SqliteBackend::in_memory_for_test()
+            .await
+            .expect("config backend");
+        let current = create_referenced_snapshot(&backend, &snapshot_dir).await;
+        let path = snapshot_dir.join(current);
+        let length = std::fs::metadata(&path).expect("snapshot metadata").len();
+        let revision_offset = length
+            .checked_sub(SNAPSHOT_FOOTER_BYTES)
+            .and_then(|footer| footer.checked_add(SNAPSHOT_FOOTER_MAGIC.len() as u64))
+            .expect("revision offset");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open snapshot for revision injection");
+        file.seek(std::io::SeekFrom::Start(revision_offset))
+            .expect("seek revision");
+        file.write_all(&(super::super::types::CONFIG_CONSENSUS_SNAPSHOT_VERSION + 1).to_be_bytes())
+            .expect("write future revision");
+        file.sync_all().expect("sync future revision");
+
+        let error = verify_snapshot_envelope(&path)
+            .await
+            .expect_err("future snapshot revision must fail closed");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[tokio::test]
     async fn startup_rejects_unsafe_staging_types() {
         let temp = tempfile::tempdir().expect("snapshot tempdir");
         let snapshot_dir = temp.path().join("snapshots");
@@ -1624,14 +1740,9 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().expect("snapshot tempdir");
-        let backend = SqliteBackend::open_with_audit_key(
-            ":memory:",
-            true,
-            0,
-            shared_audit_key(),
-        )
-        .await
-        .expect("backend");
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
         assert!(matches!(
             open(&backend, temp.path(), identity(), members()).await,
             Err(ConfigConsensusStorageError::InvalidIdentity)

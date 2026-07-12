@@ -289,11 +289,14 @@ impl AuditKey {
         &self.material
     }
 
-    pub(crate) const fn epoch(&self) -> u64 {
+    /// Non-secret deployment rotation epoch used by durable/peer admission.
+    pub const fn epoch(&self) -> u64 {
         self.epoch
     }
 
-    pub(crate) fn fingerprint(&self) -> [u8; 32] {
+    /// Purpose-separated, non-secret fingerprint for fleet compatibility
+    /// checks. This is an HMAC output and does not reveal the key material.
+    pub fn fingerprint(&self) -> [u8; 32] {
         type HmacSha256 = Hmac<Sha256>;
         let mut mac = HmacSha256::new_from_slice(self.as_bytes())
             .expect("HMAC-SHA-256 accepts a 32-byte key");

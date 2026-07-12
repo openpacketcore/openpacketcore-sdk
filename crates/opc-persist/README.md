@@ -128,8 +128,10 @@ reinterpreted at startup. Normal `open` returns
    `DiscardUnknownAppendedSuffix` disposition.
 4. Use `open_with_legacy_recovery` only while the old authority is stopped.
    The source must be a complete SQLite file with no nonempty WAL. Recovery
-   verifies SQLite integrity, the required tables, the exact checksum, and the
-   complete linear history before the approved chain head. The first retained
+   opens it without following symlinks, consumes the exact opened descriptor,
+   and rechecks path/device/inode and WAL state after staging. It verifies
+   SQLite integrity, the required tables, the exact checksum, and the complete
+   linear history before the approved chain head. The first retained
    record may start at any positive version but has no parent; every subsequent
    record must name the prior transaction and increment its version by exactly
    one. Audit integrity and sealed config envelopes are also verified before
@@ -181,7 +183,8 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   recent 4,096 applications, so steady-state snapshot size is bounded. Reusing
   a retained ID for a different payload returns the stable
   `PersistErrorKind::RequestIdCollision` outcome and leaves the original result
-  recoverable.
+  recoverable while retained. After expiry, callers must perform a fresh
+  authoritative read.
 - `dangerous-test-hooks` exposes fault injection only for explicitly gated
   test profiles. It is not a production feature.
 

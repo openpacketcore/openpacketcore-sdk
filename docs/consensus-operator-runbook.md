@@ -101,7 +101,8 @@ readiness evidence:
 - a successful standalone preflight from before the authority claim.
 
 `status()` is a redaction-safe observation containing node, term, leader,
-applied/committed index, and admission state. Use it for routing and
+independently persisted committed index, applied index, non-secret audit-key
+epoch/fingerprint, and admission state. Use it for routing and
 diagnostics, but keep readiness gated by the fresh probe.
 
 ## 3. Normal write and response-loss handling
@@ -120,7 +121,9 @@ logical operation/ID within that finite horizon or perform a fresh authoritative
 read. Reusing a retained request ID for different content fails closed.
 It returns the stable `PersistErrorKind::RequestIdCollision`, never the
 original successful result or an ordinary config-version conflict. The
-original request/payload pair remains retryable.
+original request/payload pair remains retryable while its outcome is retained;
+after expiry, recover through a fresh authoritative read rather than assuming
+the old response is still cached.
 
 After the Openraft authority marker exists, direct mutation through
 `SqliteBackend` is fenced, including through clones freshly opened or retained
@@ -176,9 +179,11 @@ For each nonempty legacy target database being converted:
    databases have either converted successfully or the rollout has been
    abandoned and restored from backup.
 
-The adapter stages and hashes the complete source, verifies SQLite integrity
-and required tables, rejects an Openraft source, checks the exact latest
-transaction/version and complete linear parent/version history, verifies
+The adapter opens the source without following symlinks, binds the copy to that
+exact file descriptor, checks the path/device/inode and offline WAL state both
+before and after staging, and hashes the complete source. It verifies SQLite
+integrity and required tables, rejects an Openraft source, checks the exact
+latest transaction/version and complete linear parent/version history, verifies
 stored audit chains and every sealed config envelope, and requires the explicit
 suffix disposition. It then replaces the target config/audit state, redacts
 and reseals imported audit data, removes the legacy consensus tables under the

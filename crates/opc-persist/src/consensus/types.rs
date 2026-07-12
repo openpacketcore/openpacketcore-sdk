@@ -44,7 +44,6 @@ const OUTCOME_DIGEST_DOMAIN: &[u8] = b"openpacketcore/config-consensus/outcome/v
 const REDACTED_AUDIT_VALUE: &str = "\"<redacted>\"";
 const AUDIT_PATH_TOKEN_DOMAIN: &[u8] = b"openpacketcore/config-consensus/audit-path/v1\0";
 const AUDIT_PATH_TOKEN_PREFIX: &str = "hmac-sha256:";
-const AUDIT_IDENTITY_DOMAIN: &[u8] = b"openpacketcore/config-consensus/audit-identity/v1\0";
 pub(crate) const CONFIG_PRINCIPAL_MAX_BYTES: usize = 16 * 1024;
 pub(crate) const CONFIG_AUDIT_RECORDS_MAX: usize = 16_384;
 pub(crate) const CONFIG_AUDIT_PATH_MAX_BYTES: usize = 8 * 1024;
@@ -641,22 +640,6 @@ pub(crate) fn audit_path_is_safe(path: &str) -> bool {
     !remainder.contains(']')
 }
 
-pub(crate) fn bind_audit_identity(
-    identity: ConfigConsensusIdentity,
-    audit_key: &crate::types::AuditKey,
-) -> ConfigConsensusIdentity {
-    let mut hasher = Sha256::new();
-    hasher.update(AUDIT_IDENTITY_DOMAIN);
-    hasher.update(identity.configuration_id().as_bytes());
-    hasher.update(audit_key.epoch().to_be_bytes());
-    hasher.update(audit_key.fingerprint());
-    ConfigConsensusIdentity::new(
-        identity.cluster_id(),
-        ConfigConsensusConfigurationId::from_bytes(hasher.finalize().into()),
-        identity.configuration_epoch(),
-    )
-}
-
 /// Shared transport peer used by config consensus.
 pub type ConfigConsensusPeer = dyn opc_consensus::ConsensusPeer;
 
@@ -704,22 +687,41 @@ mod tests {
             tokenize_audit_path(sensitive, &key).expect("deterministic token")
         );
         assert!(tokenize_audit_path("/interfaces/interface[name='unterminated]", &key).is_err());
-        assert!(ValidatedRollbackLabel::try_new("x".repeat(CONFIG_ROLLBACK_LABEL_MAX_BYTES)).is_ok());
-        assert!(ValidatedRollbackLabel::try_new(
-            "x".repeat(CONFIG_ROLLBACK_LABEL_MAX_BYTES + 1)
-        )
-        .is_err());
+        assert!(
+            ValidatedRollbackLabel::try_new("x".repeat(CONFIG_ROLLBACK_LABEL_MAX_BYTES)).is_ok()
+        );
+        assert!(
+            ValidatedRollbackLabel::try_new("x".repeat(CONFIG_ROLLBACK_LABEL_MAX_BYTES + 1))
+                .is_err()
+        );
     }
 
     #[test]
     fn config_wire_revision_is_independent_and_exact() {
         let current = encode_config_wire(&7_u64).expect("current wire");
-        assert_eq!(7, decode_config_wire::<u64>(&current).expect("current reader"));
+        assert_eq!(
+            7,
+            decode_config_wire::<u64>(&current).expect("current reader")
+        );
         let future = opc_consensus::encode_bounded(&ConfigWirePayload {
             revision: CONFIG_CONSENSUS_WIRE_VERSION + 1,
             value: 7_u64,
         })
         .expect("future fixture");
         assert!(decode_config_wire::<u64>(&future).is_err());
+
+        let identity = ConfigConsensusIdentity::new(
+            ConfigConsensusClusterId::new("config-command-revision-test").expect("cluster"),
+            ConfigConsensusConfigurationId::from_bytes([0xA4; 32]),
+            ConfigConsensusConfigurationEpoch::new(1).expect("epoch"),
+        );
+        let future_command = ConfigConsensusCommand {
+            schema_version: CONFIG_CONSENSUS_COMMAND_VERSION + 1,
+            identity,
+            request_id: ConfigConsensusRequestId::from_bytes([0xA5; 16]),
+            logical_time: Timestamp::now_utc(),
+            intent: ConfigMutationIntent::MarkConfirmed { tx_id: TxId::new() },
+        };
+        assert!(future_command.validate(identity).is_err());
     }
 }

@@ -22,10 +22,9 @@ pub use types::{
     ConfigConsensusIdentity, ConfigConsensusIdentityError, ConfigConsensusNodeId,
     ConfigConsensusPeer, ConfigConsensusRequestId, ConfigConsensusRpcHandler,
     ConfigConsensusTopology, ConfigConsensusTopologyError, LegacyConfigTailDisposition,
-    SharedConfigConsensusClock, SystemConfigConsensusClock, CONFIG_CONSENSUS_MAX_MEMBERS,
-    CONFIG_CONSENSUS_COMMAND_VERSION,
-    CONFIG_CONSENSUS_SNAPSHOT_VERSION, CONFIG_CONSENSUS_STORAGE_VERSION,
-    CONFIG_CONSENSUS_WIRE_VERSION,
+    SharedConfigConsensusClock, SystemConfigConsensusClock, CONFIG_CONSENSUS_COMMAND_VERSION,
+    CONFIG_CONSENSUS_MAX_MEMBERS, CONFIG_CONSENSUS_SNAPSHOT_VERSION,
+    CONFIG_CONSENSUS_STORAGE_VERSION, CONFIG_CONSENSUS_WIRE_VERSION,
 };
 pub(crate) use types::{
     ConfigConsensusCommand, ConfigConsensusResponse, ConfigMutationFailure, ConfigMutationIntent,

@@ -29,7 +29,9 @@ yet approved as a production deployment profile.
 `ConsensusConfigStore` coordinates config commits, confirmations, and rollback
 points through the shared Openraft engine and a deterministic SQLite state
 machine. Openraft alone owns elections, votes/terms, log matching, quorum
-commit, membership changes, linearizable barriers, and snapshot lineage.
+commit, the persisted membership primitive, linearizable barriers, and
+snapshot lineage. The config profile admits only the exact immutable voter set
+within an epoch; a topology change requires a coordinated new epoch.
 
 ### Authority and protection boundary
 
@@ -38,8 +40,11 @@ application -> HKMS-backed encryption -> ConsensusConfigStore
             -> Openraft -> SQLite and Openraft snapshots
 ```
 
-The application seals config before proposal. The adapter validates the AEAD
-envelope and config AAD, masks audit values, and finalizes their HMAC chain.
+The application seals config before proposal and receives one-shot evidence
+bound to the exact encrypted bytes and plaintext digest. The adapter consumes
+that evidence, validates the canonical AEAD envelope and config AAD, masks
+audit values, tokenizes sensitive predicate values, and finalizes their HMAC
+chain.
 Openraft persists and replicates sealed ciphertext, deterministic metadata,
 and redacted finalized audit only. Plaintext, provider objects, key handles,
 and raw key material never enter an Openraft command, RPC, log, outcome, or

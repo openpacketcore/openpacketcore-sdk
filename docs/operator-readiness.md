@@ -128,11 +128,17 @@ application -> HKMS-backed encryption -> ConsensusConfigStore
             -> Openraft -> SQLite and Openraft snapshots
 ```
 
-Only sealed config ciphertext, deterministic metadata, and redacted finalized
-audit records may cross into Openraft. Plaintext, providers, key handles, and
-raw key material stay above the consensus boundary. Creating the Openraft
+Only a config envelope carrying one-shot evidence from the real encryption
+adapter may cross into Openraft; the evidence is consumed before serialization.
+Sealed ciphertext, deterministic metadata, and redacted finalized audit records
+are replicated. Plaintext, providers, key handles, and raw key material stay
+above the consensus boundary. Creating the Openraft
 authority marker and checking or importing legacy state is one immediate
 per-database SQLite transaction; direct standalone mutations then fail closed.
+
+The config voter set is exact and immutable within one topology epoch. A
+subset/superset is never an admissible degraded mode; a reviewed topology
+change uses a coordinated new epoch.
 
 Configure one complete config operation timeout greater than zero and no more
 than 60 seconds. It bounds leader routing, the linearizable barrier, quorum
@@ -146,13 +152,18 @@ listener before cluster initialization, and require
 `probe_durable_readiness()` before traffic. Listener bind, TLS setup, cached
 capabilities, status observation, or a local SQLite read is not durable
 readiness. Retain each mutation's request ID across response loss so a retry
-recovers the original durable outcome rather than creating a second write.
+within the newest 4,096 outcomes recovers the original durable result rather
+than creating a second write. After that finite horizon, use a fresh
+authoritative read.
 
 Nonempty legacy authority must be migrated offline. Preserve untouched
 pre-migration backups, select one externally proven applied SQLite snapshot,
 checkpoint it, and bind its exact SHA-256, latest transaction ID/version, and
 the explicit `DiscardUnknownAppendedSuffix` decision. Unknown target suffixes
-are discarded; they are never inferred committed. Atomicity is per database,
+are discarded; they are never inferred committed. Recovery opens the source
+without following symlinks and binds verification/consumption to the same file
+descriptor while rechecking the path identity and offline WAL state. Atomicity
+is per database,
 so the fleet must be drained and coordinated. Rollback is only a full restore
 from the preserved pre-migration backups; deleting `config_raft_*` state or
 reconstructing the removed engine is prohibited.

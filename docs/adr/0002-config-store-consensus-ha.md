@@ -34,6 +34,11 @@ state. It exclusively owns election, term/vote persistence, leader authority,
 log matching, quorum commit, membership transitions, linearizable read
 barriers, log compaction, and snapshot lineage/install authority.
 
+For the config profile, the admitted voter set is immutable within one
+configuration epoch. The adapter requires exact equality with the configured
+set and exposes no subset/superset transition; a reviewed fleet transition
+uses a new coordinated topology epoch rather than a second membership policy.
+
 The SDK continues to own the deterministic config command and SQLite adapter:
 sealed commit application, confirmed-commit and rollback-point semantics,
 redacted audit finalization, durable idempotent request outcomes, bounded
@@ -54,8 +59,10 @@ application -> HKMS-backed encryption -> ConsensusConfigStore
             -> Openraft -> SQLite and Openraft snapshots
 ```
 
-The outer application layer encrypts configuration first. Before proposal,
-the config adapter validates the authenticated AEAD envelope and config AAD,
+The outer application layer encrypts configuration first. A successful
+encryption operation mints a one-shot, non-serializable claim bound to the
+exact envelope bytes and plaintext digest. Before proposal, the config adapter
+consumes that claim, validates the canonical AEAD envelope and config AAD,
 replaces every present audit value with the redaction marker, and finalizes the
 audit chain. Openraft RPCs, logs, outcomes, follower apply, replay, catch-up,
 SQLite state, and snapshots contain only sealed ciphertext, deterministic
@@ -80,8 +87,18 @@ remains a deployment filesystem-permission boundary.
 
 The SQLite log adapter accepts only contiguous appends and caps each encoded
 entry at 16 MiB. Committed, applied, and purged floors are immutable; reads and
-startup reject persisted holes, while Openraft may explicitly truncate and
-replace only an uncommitted suffix. Startup verifies the referenced snapshot
+startup require exact log or snapshot lineage and reject persisted holes,
+while Openraft may explicitly truncate and replace only an uncommitted suffix.
+The command, config wire, storage schema, and snapshot envelope have distinct
+revision checks. Startup rejects unknown config-owned schema objects or a
+manifest/digest mismatch, verifies current audit HMACs using the deployment
+audit-key epoch/fingerprint, and bounds retained durable outcomes to the newest
+4,096 application sequences.
+
+The snapshot root is an exact private `0700`, non-symlink directory on the
+SQLite durable device. The adapter holds its opened directory descriptor,
+creates snapshot artifacts private, and rejects path/device/inode replacement
+before authority-affecting work. Startup verifies the referenced snapshot
 before a bounded directory scan removes recognized canceled staging,
 sidecars, approved-recovery staging, and unreferenced snapshots. Drop guards
 also remove staging files when async snapshot work is canceled.
@@ -134,9 +151,12 @@ The only legacy admission path is offline
 - `DiscardUnknownAppendedSuffix`, an explicit decision to discard every
   unprovable suffix in the target legacy database.
 
-Before replacement, the adapter stages and hashes the complete source, checks
-SQLite integrity and required tables, rejects a source already claimed by
-Openraft, verifies the exact chain head and complete parent/version lineage,
+Before replacement, the adapter opens the source without following symlinks,
+binds verification and consumption to that exact descriptor, rechecks the
+path/device/inode and offline WAL state after staging, and hashes the complete
+source. It checks SQLite integrity and required tables, rejects a source
+already claimed by Openraft, verifies the exact chain head and complete
+parent/version lineage,
 loads and verifies every audit chain, and validates every sealed config
 envelope. The first retained version need not be version 1, but it has no
 parent and every next record names the prior transaction at version +1. The

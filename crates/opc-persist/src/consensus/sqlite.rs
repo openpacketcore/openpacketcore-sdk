@@ -183,11 +183,9 @@ pub(crate) struct ConfigConsensusCore {
 impl ConfigConsensusCore {
     pub(crate) async fn initialize(
         backend: &SqliteBackend,
-        snapshot_dir: PathBuf,
+        snapshot_directory: super::storage::AdmittedSnapshotDirectory,
         identity: ConsensusIdentity,
         expected_members: BTreeSet<ConsensusNodeId>,
-        snapshot_dir_guard: Arc<std::fs::File>,
-        snapshot_binding_path: PathBuf,
         durable_progress: Arc<super::storage::ConfigDurableProgress>,
         recovery: Option<StagedLegacyRecovery>,
     ) -> Result<Self, ConfigConsensusStorageError> {
@@ -211,6 +209,11 @@ impl ConfigConsensusCore {
             .await
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)??;
+        let super::storage::AdmittedSnapshotDirectory {
+            path: snapshot_dir,
+            binding_path: snapshot_binding_path,
+            guard: snapshot_dir_guard,
+        } = snapshot_directory;
         Ok(Self {
             conn,
             identity,
@@ -230,9 +233,35 @@ impl ConfigConsensusCore {
         T: Send + 'static,
         F: FnOnce(&Connection) -> io::Result<T> + Send + 'static,
     {
-        const SQLITE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+        self.run_sqlite_with_timeout(Duration::from_secs(30), operation)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn run_sqlite_with_test_timeout<T, F>(
+        &self,
+        timeout: Duration,
+        operation: F,
+    ) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> io::Result<T> + Send + 'static,
+    {
+        self.run_sqlite_with_timeout(timeout, operation).await
+    }
+
+    async fn run_sqlite_with_timeout<T, F>(&self, timeout: Duration, operation: F) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> io::Result<T> + Send + 'static,
+    {
+        if timeout.is_zero() {
+            return Err(invalid_data(
+                "config consensus SQLite timeout must be positive",
+            ));
+        }
         let deadline = tokio::time::Instant::now()
-            .checked_add(SQLITE_OPERATION_TIMEOUT)
+            .checked_add(timeout)
             .ok_or_else(|| invalid_data("config consensus SQLite deadline overflow"))?;
         let permit =
             tokio::time::timeout_at(deadline, self.sqlite_worker_gate.clone().acquire_owned())
@@ -243,7 +272,7 @@ impl ConfigConsensusCore {
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = cancelled.clone();
         let std_deadline = std::time::Instant::now()
-            .checked_add(SQLITE_OPERATION_TIMEOUT)
+            .checked_add(timeout)
             .ok_or_else(|| invalid_data("config consensus SQLite deadline overflow"))?;
         let mut worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -2008,25 +2037,19 @@ fn validate_sealed_state_sync(conn: &Connection, audit_key: &AuditKey) -> io::Re
             ))
         })
         .map_err(db_error)?;
-    let mut commits = Vec::new();
     for row in rows {
-        commits.push(row.map_err(db_error)?);
-    }
-    drop(statement);
-
-    for (
-        tx_id,
-        parent_tx_id,
-        version,
-        committed_at,
-        principal,
-        schema_digest,
-        plaintext_digest,
-        encrypted_blob,
-        audit_count,
-        terminal_hash,
-    ) in commits
-    {
+        let (
+            tx_id,
+            parent_tx_id,
+            version,
+            committed_at,
+            principal,
+            schema_digest,
+            plaintext_digest,
+            encrypted_blob,
+            audit_count,
+            terminal_hash,
+        ) = row.map_err(db_error)?;
         if tx_id.len() != 16
             || parent_tx_id
                 .as_ref()
@@ -2085,6 +2108,11 @@ fn validate_sealed_state_sync(conn: &Connection, audit_key: &AuditKey) -> io::Re
         }
         let audit_count = usize::try_from(audit_count)
             .map_err(|_| invalid_data("config consensus audit count is invalid"))?;
+        if audit_count > super::types::CONFIG_AUDIT_RECORDS_MAX {
+            return Err(invalid_data(
+                "config consensus audit count exceeds durable bound",
+            ));
+        }
         let mut audit = conn
             .prepare(
                 "SELECT sequence, yang_path, op_type, previous_value, new_value, redaction_applied, previous_hash, entry_hmac FROM audit_trail WHERE tx_id = ?1 ORDER BY sequence ASC",
@@ -2914,9 +2942,12 @@ mod tests {
 
     #[tokio::test]
     async fn preproposal_label_bound_is_stricter_than_log_storage_ceiling() {
-        let accepted = rollback_label_entry(crate::consensus::types::CONFIG_ROLLBACK_LABEL_MAX_BYTES);
-        assert!(encode_json(&accepted).expect("bounded encoding").len()
-            < CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES);
+        let accepted =
+            rollback_label_entry(crate::consensus::types::CONFIG_ROLLBACK_LABEL_MAX_BYTES);
+        assert!(
+            encode_json(&accepted).expect("bounded encoding").len()
+                < CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES
+        );
         let backend = initialized_backend().await;
         let shared_conn = backend.conn();
         let conn = shared_conn.lock().await;
@@ -2931,9 +2962,8 @@ mod tests {
         drop(shared_conn);
         drop(backend);
 
-        let rejected = rollback_label_entry(
-            crate::consensus::types::CONFIG_ROLLBACK_LABEL_MAX_BYTES + 1,
-        );
+        let rejected =
+            rollback_label_entry(crate::consensus::types::CONFIG_ROLLBACK_LABEL_MAX_BYTES + 1);
         let backend = initialized_backend().await;
         let shared_conn = backend.conn();
         let conn = shared_conn.lock().await;

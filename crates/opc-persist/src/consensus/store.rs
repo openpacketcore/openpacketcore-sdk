@@ -20,9 +20,7 @@ use thiserror::Error;
 
 use super::raft_adapter::{ConfigRaftAdapterError, ConfigRaftNetworkFactory, ConfigRaftRpcHandler};
 use super::storage::{self, ConfigConsensusStorageError};
-use super::types::{
-    bind_audit_identity, decode_config_wire, encode_config_wire, ValidatedRollbackLabel,
-};
+use super::types::{decode_config_wire, encode_config_wire, ValidatedRollbackLabel};
 use super::{
     ApprovedLegacyConfigRecovery, ConfigConsensusClock, ConfigConsensusResponse,
     ConfigConsensusTopology, ConfigMutationIntent, ConfigRaft, PreparedConfigCommit,
@@ -149,6 +147,7 @@ impl ForwardedBudget {
 struct ForwardMutationRequest {
     request_id: opc_consensus::ConsensusRequestId,
     intent: ConfigMutationIntent,
+    compatibility: ConfigPeerCompatibility,
     budget: ForwardedBudget,
 }
 
@@ -162,11 +161,21 @@ enum ForwardMutationReply {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadBarrierRequest {
+    compatibility: ConfigPeerCompatibility,
+    compatibility_probe: bool,
     budget: ForwardedBudget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigPeerCompatibility {
+    audit_key_epoch: u64,
+    audit_key_fingerprint: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ReadBarrierReply {
+    Compatible,
     Ready(Option<LogId<ConsensusNodeId>>),
     NotLeader { leader: Option<ConsensusNodeId> },
     Unavailable,
@@ -301,7 +310,7 @@ impl ConsensusConfigStore {
         if operation_timeout.is_zero() || operation_timeout > Duration::from_secs(60) {
             return Err(ConfigConsensusOpenError::InvalidRuntimeConfiguration);
         }
-        let identity = bind_audit_identity(topology.identity(), backend.audit_key());
+        let identity = topology.identity();
         let local_node_id = topology.local_node_id();
         let members = topology.members().clone();
         let expected_peers = members
@@ -381,6 +390,7 @@ impl ConsensusConfigStore {
             Err(RaftError::Fatal(_)) => return Err(ConfigConsensusOpenError::EngineUnavailable),
         }
         self.wait_for_admissible_membership(deadline).await?;
+        self.verify_fleet_compatibility(deadline).await?;
         self.inner.admitted.store(true, Ordering::Release);
         if !self.exact_membership_is_admitted() {
             return Err(ConfigConsensusOpenError::ClusterFormationRejected);
@@ -555,6 +565,39 @@ impl ConsensusConfigStore {
         }
     }
 
+    fn peer_compatibility(&self) -> ConfigPeerCompatibility {
+        ConfigPeerCompatibility {
+            audit_key_epoch: self.inner.backend.audit_key().epoch(),
+            audit_key_fingerprint: self.inner.backend.audit_key().fingerprint(),
+        }
+    }
+
+    async fn verify_fleet_compatibility(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ConfigConsensusOpenError> {
+        for target in self.inner.peers.keys().copied() {
+            let reply = self
+                .call_peer::<_, ReadBarrierReply>(
+                    target,
+                    ConsensusRpcFamily::ReadBarrier,
+                    &ReadBarrierRequest {
+                        compatibility: self.peer_compatibility(),
+                        compatibility_probe: true,
+                        budget: ForwardedBudget::from_deadline(deadline)
+                            .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?,
+                    },
+                    deadline,
+                )
+                .await
+                .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?;
+            if reply != ReadBarrierReply::Compatible {
+                return Err(ConfigConsensusOpenError::ClusterFormationRejected);
+            }
+        }
+        Ok(())
+    }
+
     fn is_live_voter(&self, node_id: ConsensusNodeId) -> bool {
         self.inner
             .raft
@@ -600,6 +643,7 @@ impl ConsensusConfigStore {
             let request = ForwardMutationRequest {
                 request_id,
                 intent: intent.clone(),
+                compatibility: self.peer_compatibility(),
                 budget: ForwardedBudget::from_deadline(deadline)?,
             };
             let reply = if leader == self.inner.local_node_id {
@@ -825,6 +869,8 @@ impl ConsensusConfigStore {
                         leader,
                         ConsensusRpcFamily::ReadBarrier,
                         &ReadBarrierRequest {
+                            compatibility: self.peer_compatibility(),
+                            compatibility_probe: false,
                             budget: ForwardedBudget::from_deadline(deadline)?,
                         },
                         deadline,
@@ -839,6 +885,7 @@ impl ConsensusConfigStore {
                 }
             };
             match reply {
+                ReadBarrierReply::Compatible => return Err(consensus_unavailable()),
                 ReadBarrierReply::Ready(log_id) => {
                     if let Some(log_id) = log_id {
                         self.wait_for_local_apply(log_id.index, deadline).await?;
@@ -1047,6 +1094,11 @@ impl ConsensusRpcHandler for ConfigConsensusService {
                     Ok(forwarded) => forwarded,
                     Err(_) => return protocol_rejection(),
                 };
+                if forwarded.compatibility != self.store.peer_compatibility() {
+                    return ConsensusWireResponse {
+                        result: Err(ConsensusPeerError::ScopeMismatch),
+                    };
+                }
                 let Some(deadline) = forwarded
                     .budget
                     .inbound_deadline(self.store.inner.operation_timeout)
@@ -1056,15 +1108,23 @@ impl ConsensusRpcHandler for ConfigConsensusService {
                 encode_service_reply(&self.store.apply_on_local_leader(forwarded, deadline).await)
             }
             ConsensusRpcFamily::ReadBarrier => {
+                let read: ReadBarrierRequest = match decode_config_wire(&request.payload) {
+                    Ok(read) => read,
+                    Err(_) => return protocol_rejection(),
+                };
+                if read.compatibility != self.store.peer_compatibility() {
+                    return ConsensusWireResponse {
+                        result: Err(ConsensusPeerError::ScopeMismatch),
+                    };
+                }
+                if read.compatibility_probe {
+                    return encode_service_reply(&ReadBarrierReply::Compatible);
+                }
                 if !self.store.is_live_voter(authenticated_sender) {
                     return ConsensusWireResponse {
                         result: Err(ConsensusPeerError::ScopeMismatch),
                     };
                 }
-                let read: ReadBarrierRequest = match decode_config_wire(&request.payload) {
-                    Ok(read) => read,
-                    Err(_) => return protocol_rejection(),
-                };
                 let Some(deadline) = read
                     .budget
                     .inbound_deadline(self.store.inner.operation_timeout)
@@ -1196,12 +1256,16 @@ mod tests {
         (store, snapshots)
     }
 
-    fn forwarded_mutation(budget: ForwardedBudget) -> ForwardMutationRequest {
+    fn forwarded_mutation(
+        store: &ConsensusConfigStore,
+        budget: ForwardedBudget,
+    ) -> ForwardMutationRequest {
         ForwardMutationRequest {
             request_id: opc_consensus::ConsensusRequestId::from_bytes([0xC2; 16]),
             intent: ConfigMutationIntent::MarkConfirmed {
                 tx_id: opc_types::TxId::new(),
             },
+            compatibility: store.peer_compatibility(),
             budget,
         }
     }
@@ -1235,9 +1299,12 @@ mod tests {
     async fn inbound_forward_uses_remaining_budget_instead_of_fresh_local_timeout() {
         let (store, _snapshots) = singleton_store().await;
         let _gate = store.inner.proposal_gate.lock().await;
-        let request = forwarded_mutation(ForwardedBudget {
-            remaining_nanos: 50_000_000,
-        });
+        let request = forwarded_mutation(
+            &store,
+            ForwardedBudget {
+                remaining_nanos: 50_000_000,
+            },
+        );
         let started = tokio::time::Instant::now();
         let response = service_call(
             &store,
@@ -1274,22 +1341,28 @@ mod tests {
             let response = service_call(
                 &store,
                 ConsensusRpcFamily::ForwardMutation,
-                encode_config_wire(&forwarded_mutation(budget)).expect("invalid budget request"),
+                encode_config_wire(&forwarded_mutation(&store, budget))
+                    .expect("invalid budget request"),
             )
             .await;
             assert_eq!(Err(ConsensusPeerError::Protocol), response.result);
             assert!(started.elapsed() < Duration::from_millis(100));
         }
 
-        let mut malformed = encode_config_wire(&forwarded_mutation(ForwardedBudget {
-            remaining_nanos: 50_000_000,
-        }))
+        let mut malformed = encode_config_wire(&forwarded_mutation(
+            &store,
+            ForwardedBudget {
+                remaining_nanos: 50_000_000,
+            },
+        ))
         .expect("valid request");
         malformed.push(0);
         let response = service_call(&store, ConsensusRpcFamily::ForwardMutation, malformed).await;
         assert_eq!(Err(ConsensusPeerError::Protocol), response.result);
 
         let read = ReadBarrierRequest {
+            compatibility: store.peer_compatibility(),
+            compatibility_probe: false,
             budget: ForwardedBudget { remaining_nanos: 0 },
         };
         let response = service_call(
@@ -1299,6 +1372,24 @@ mod tests {
         )
         .await;
         assert_eq!(Err(ConsensusPeerError::Protocol), response.result);
+
+        let incompatible = ReadBarrierRequest {
+            compatibility: ConfigPeerCompatibility {
+                audit_key_epoch: store.peer_compatibility().audit_key_epoch,
+                audit_key_fingerprint: [0; 32],
+            },
+            compatibility_probe: false,
+            budget: ForwardedBudget {
+                remaining_nanos: 50_000_000,
+            },
+        };
+        let response = service_call(
+            &store,
+            ConsensusRpcFamily::ReadBarrier,
+            encode_config_wire(&incompatible).expect("incompatible read request"),
+        )
+        .await;
+        assert_eq!(Err(ConsensusPeerError::ScopeMismatch), response.result);
         store.shutdown().await.expect("shutdown");
     }
 }

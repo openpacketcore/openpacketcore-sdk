@@ -479,6 +479,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_envelope_claim_is_exact_and_one_shot_across_clones() {
+        let provider = provider_with_active_key(KeyPurpose::Config, "config-key-2026-01", 0x41);
+        let plaintext = br#"{"hostname":"amf-01"}"#;
+        let aad = config_aad();
+        let envelope = encrypt_attested_envelope(&provider, &aad, plaintext)
+            .await
+            .expect("attested encryption");
+        let clone = envelope.clone();
+        let encoded = envelope.encoded().to_vec();
+        let claim = clone.claim().expect("first claim");
+
+        assert!(claim.matches(&encoded));
+        assert!(!claim.matches(b"different envelope"));
+        assert!(claim.matches_plaintext_digest(&Sha256::digest(plaintext)));
+        assert!(!claim.matches_plaintext_digest(&[0; 32]));
+        assert_eq!(
+            CryptoError::EncryptionFailed,
+            envelope.claim().expect_err("second claim must fail")
+        );
+    }
+
+    #[tokio::test]
     async fn decoded_envelope_round_trips_with_prefetched_handle() {
         let provider = provider_with_active_key(KeyPurpose::Session, "session-key-2026-01", 0x33);
         let plaintext = b"amf session snapshot";

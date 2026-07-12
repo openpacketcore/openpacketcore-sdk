@@ -154,6 +154,20 @@ struct ThreeNodeCluster {
 
 impl ThreeNodeCluster {
     async fn start() -> Self {
+        let cluster = Self::build([[0x55; 32]; 3]).await;
+        let (one, two, three) = tokio::join!(
+            cluster.stores[0].initialize_cluster(),
+            cluster.stores[1].initialize_cluster(),
+            cluster.stores[2].initialize_cluster(),
+        );
+        one.expect("initialize node one");
+        two.expect("initialize node two");
+        three.expect("initialize node three");
+        cluster.wait_ready().await;
+        cluster
+    }
+
+    async fn build(audit_key_material: [[u8; 32]; 3]) -> Self {
         let directory = tempfile::tempdir().expect("cluster directory");
         let nodes = [1_u64, 2, 3].map(|value| ConfigConsensusNodeId::new(value).expect("node ID"));
         let members = nodes.into_iter().collect::<BTreeSet<_>>();
@@ -182,7 +196,7 @@ impl ThreeNodeCluster {
                 directory.path().join(format!("node-{index}.sqlite")),
                 true,
                 0,
-                audit_key(),
+                AuditKey::new(audit_key_material[index]).expect("audit key"),
             )
             .await
             .expect("backend");
@@ -209,21 +223,11 @@ impl ThreeNodeCluster {
         for ((_, target), path) in &paths {
             path.install(stores[*target].rpc_handler()).await;
         }
-        let (one, two, three) = tokio::join!(
-            stores[0].initialize_cluster(),
-            stores[1].initialize_cluster(),
-            stores[2].initialize_cluster(),
-        );
-        one.expect("initialize node one");
-        two.expect("initialize node two");
-        three.expect("initialize node three");
-        let cluster = Self {
+        Self {
             _directory: directory,
             stores,
             paths,
-        };
-        cluster.wait_ready().await;
-        cluster
+        }
     }
 
     async fn wait_ready(&self) {
@@ -473,9 +477,13 @@ fn file_sha256(path: &std::path::Path) -> [u8; 32] {
     Sha256::digest(std::fs::read(path).expect("snapshot bytes")).into()
 }
 
-fn deterministic_authority_row_ids(
-    database: &std::path::Path,
-) -> (Vec<(i64, Vec<u8>, i64)>, Vec<(i64, Vec<u8>, String)>) {
+#[derive(Debug, PartialEq, Eq)]
+struct DeterministicAuthorityRowIds {
+    audit: Vec<(i64, Vec<u8>, i64)>,
+    lifecycle: Vec<(i64, Vec<u8>, String)>,
+}
+
+fn deterministic_authority_row_ids(database: &std::path::Path) -> DeterministicAuthorityRowIds {
     let conn = rusqlite::Connection::open(database).expect("open authority database");
     let mut audit = conn
         .prepare("SELECT id, tx_id, sequence FROM audit_trail ORDER BY tx_id, sequence")
@@ -487,16 +495,17 @@ fn deterministic_authority_row_ids(
         .expect("collect audit IDs");
     drop(audit);
     let mut lifecycle = conn
-        .prepare(
-            "SELECT id, tx_id, action FROM config_lifecycle_audit ORDER BY tx_id, action, id",
-        )
+        .prepare("SELECT id, tx_id, action FROM config_lifecycle_audit ORDER BY tx_id, action, id")
         .expect("prepare lifecycle IDs");
     let lifecycle_ids = lifecycle
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .expect("query lifecycle IDs")
         .collect::<Result<Vec<_>, _>>()
         .expect("collect lifecycle IDs");
-    (audit_ids, lifecycle_ids)
+    DeterministicAuthorityRowIds {
+        audit: audit_ids,
+        lifecycle: lifecycle_ids,
+    }
 }
 
 fn assert_legacy_target_unclaimed(path: &std::path::Path, expected_tx_id: TxId) {
@@ -708,10 +717,26 @@ async fn raw_append_and_wrong_audit_key_fail_before_consensus_authority() {
     )
     .await
     .expect("base SQLite open does not claim consensus authority");
+    let error = ConsensusConfigStore::open(topology(), wrong_backend, &snapshots, BTreeMap::new())
+        .await
+        .expect_err("wrong audit key fingerprint must reject durable authority");
+    assert_eq!(
+        opc_persist::ConfigConsensusOpenError::DurableIdentityMismatch,
+        error
+    );
+
+    let wrong_epoch_backend = SqliteBackend::open_with_audit_key(
+        &database,
+        true,
+        0,
+        AuditKey::new_with_epoch([0x55; 32], 2).expect("wrong audit epoch"),
+    )
+    .await
+    .expect("base SQLite open");
     let error =
-        ConsensusConfigStore::open(topology(), wrong_backend, &snapshots, BTreeMap::new())
+        ConsensusConfigStore::open(topology(), wrong_epoch_backend, &snapshots, BTreeMap::new())
             .await
-            .expect_err("wrong audit key fingerprint must reject durable authority");
+            .expect_err("wrong audit key epoch must reject durable authority");
     assert_eq!(
         opc_persist::ConfigConsensusOpenError::DurableIdentityMismatch,
         error
@@ -1113,6 +1138,59 @@ async fn legacy_recovery_rejects_online_wal_and_invalid_audit_without_claiming_t
     assert_legacy_target_unclaimed(&corrupt_target_path, corrupt_tail);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn legacy_recovery_rejects_symlinked_source_without_claiming_target() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source_path = temp.path().join("source.sqlite");
+    let source_tx = TxId::new();
+    drop(create_checkpointed_legacy(&source_path, source_tx, 0x48).await);
+    let linked_source = temp.path().join("linked-source.sqlite");
+    symlink(&source_path, &linked_source).expect("legacy source symlink");
+
+    let target_path = temp.path().join("target.sqlite");
+    let target_tail = TxId::new();
+    let target = create_checkpointed_legacy(&target_path, target_tail, 0x49).await;
+    let approval = ApprovedLegacyConfigRecovery::new(
+        &linked_source,
+        file_sha256(&source_path),
+        source_tx,
+        ConfigVersion::new(1),
+        LegacyConfigTailDisposition::DiscardUnknownAppendedSuffix,
+    )
+    .expect("symlink approval shape");
+    ConsensusConfigStore::open_with_legacy_recovery(
+        topology(),
+        target,
+        temp.path().join("snapshots"),
+        BTreeMap::new(),
+        approval,
+    )
+    .await
+    .expect_err("legacy source symlink must fail before target mutation");
+    assert_legacy_target_unclaimed(&target_path, target_tail);
+}
+
+#[tokio::test]
+async fn fresh_fleet_rejects_mismatched_audit_key_compatibility() {
+    let cluster = ThreeNodeCluster::build([[0x55; 32], [0x55; 32], [0x56; 32]]).await;
+    let (one, two, three) = tokio::join!(
+        cluster.stores[0].initialize_cluster(),
+        cluster.stores[1].initialize_cluster(),
+        cluster.stores[2].initialize_cluster(),
+    );
+    for result in [one, two, three] {
+        assert_eq!(
+            Err(opc_persist::ConfigConsensusOpenError::ClusterFormationRejected),
+            result
+        );
+    }
+    assert!(cluster.stores.iter().all(|store| !store.status().admitted));
+    cluster.shutdown().await;
+}
+
 #[tokio::test]
 async fn three_nodes_fail_over_replay_lost_responses_and_converge() {
     let cluster = ThreeNodeCluster::start().await;
@@ -1265,8 +1343,8 @@ async fn three_nodes_fail_over_replay_lost_responses_and_converge() {
         }
     }
     let reference_ids = deterministic_authority_row_ids(&cluster.database_path(0));
-    assert!(!reference_ids.0.is_empty());
-    assert_eq!(2, reference_ids.1.len());
+    assert!(!reference_ids.audit.is_empty());
+    assert_eq!(2, reference_ids.lifecycle.len());
     for node in 1..3 {
         assert_eq!(
             reference_ids,

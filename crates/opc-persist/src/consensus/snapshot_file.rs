@@ -3,7 +3,7 @@
 use std::fmt;
 use std::io;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
