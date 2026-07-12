@@ -17,23 +17,27 @@ use opc_key::{
     AES_256_GCM_SIV_NONCE_LEN,
 };
 use opc_session_store::{
-    CompareAndSet, CompareAndSetResult, ConsensusSessionStore, DurableReadinessState,
-    EncryptedSessionPayload, EncryptingSessionBackend, Generation, LeaseError, OwnerId,
-    QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
-    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicationOp, RestoreScanRequest,
-    SessionBackend, SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
-    SessionConsensusWireResponse, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
-    SessionPayloadEncoding, SqliteSessionBackend, StateClass, StateType, StoreError,
-    StoredSessionRecord, SystemClock, ValidatedQuorumTopology,
+    CompareAndSet, CompareAndSetResult, ConsensusSessionStore, DurableReadinessReport,
+    DurableReadinessState, DurableRecoveryState, EncryptedSessionPayload, EncryptingSessionBackend,
+    Generation, LeaseError, OwnerId, QuorumReplicaDescriptor, QuorumTopologyConfig,
+    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    ReplicationOp, RestoreScanRequest, SessionBackend, SessionConsensusNodeId,
+    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
+    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionPayloadEncoding,
+    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord, SystemClock,
+    ValidatedQuorumTopology,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
+use rusqlite::OptionalExtension;
 use tempfile::TempDir;
 
 const MEMBER_COUNT: usize = 3;
 const OPERATION_TIMEOUT: Duration = Duration::from_millis(750);
 const CLUSTER_START_TIMEOUT: Duration = Duration::from_secs(12);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(8);
+const SNAPSHOT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const SNAPSHOT_CATCH_UP_COMMANDS: usize = 4_300;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_CAPTURED_CONSENSUS_PAYLOADS: usize = 4_096;
 const ENCRYPTION_NAMESPACE: &str = "consensus-boundary-qualification";
@@ -581,6 +585,36 @@ fn assert_sqlite_authority_is_sealed(database: &Path) {
     }
 }
 
+fn consensus_sqlite_progress(database: &Path) -> (Option<u64>, Option<u64>, Option<u64>, u64, u64) {
+    let connection = rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open consensus database progress");
+    let optional_index = |sql: &str| {
+        connection
+            .query_row(sql, [], |row| row.get::<_, i64>(0))
+            .optional()
+            .expect("read optional consensus index")
+            .and_then(|value| u64::try_from(value).ok())
+    };
+    (
+        optional_index("SELECT log_index FROM consensus_committed WHERE singleton = 1"),
+        optional_index("SELECT log_index FROM consensus_applied WHERE singleton = 1"),
+        optional_index("SELECT log_index FROM consensus_purged WHERE singleton = 1"),
+        connection
+            .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .expect("read consensus log row count"),
+        connection
+            .query_row("SELECT COUNT(*) FROM consensus_snapshot", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .expect("read consensus snapshot row count"),
+    )
+}
+
 fn sealed_record(
     key: SessionKey,
     generation: u64,
@@ -1084,6 +1118,15 @@ async fn isolated_node_fails_closed_and_recovers_after_both_peer_paths_heal() {
     .await
     .expect("readiness probe is bounded");
     assert_eq!(report.state(), DurableReadinessState::NoQuorum);
+    assert_eq!(
+        report.recovery_progress().state(),
+        DurableRecoveryState::AwaitingQuorum
+    );
+    assert_eq!(report.recovery_progress().reason_code(), "awaiting_quorum");
+    assert!(
+        report.recovery_progress().local_applied_index()
+            <= report.recovery_progress().local_log_index()
+    );
     assert!(probe_started.elapsed() < Duration::from_secs(2));
 
     let key = session_key(b"partitioned-write");
@@ -1105,10 +1148,130 @@ async fn isolated_node_fails_closed_and_recovers_after_both_peer_paths_heal() {
         .wait_all_ready(RECOVERY_TIMEOUT)
         .await
         .expect("healed node rejoins fresh readiness");
+    let healed_report = cluster.stores[0].probe_durable_readiness().await;
+    assert_eq!(healed_report.state(), DurableReadinessState::Ready);
+    assert_eq!(
+        healed_report.recovery_progress().state(),
+        DurableRecoveryState::Synchronized
+    );
+    assert!(
+        healed_report.recovery_progress().local_applied_index()
+            >= healed_report.committed_barrier_index()
+    );
     cluster.stores[0]
         .acquire(&key, owner("healed-owner"), Duration::from_secs(30))
         .await
         .expect("mutation succeeds after healing");
+}
+
+#[tokio::test]
+async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_state() {
+    let cluster = TestCluster::start().await;
+    let lagging_before = cluster.stores[0]
+        .probe_durable_readiness()
+        .await
+        .recovery_progress()
+        .local_applied_index()
+        .expect("lagging node initial applied index");
+    cluster.isolate(0);
+    tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
+        loop {
+            let reports = futures_util::future::join_all(
+                cluster.stores[1..]
+                    .iter()
+                    .map(ConsensusSessionStore::probe_durable_readiness),
+            )
+            .await;
+            if reports.iter().all(DurableReadinessReport::is_ready) {
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("surviving majority elects a current leader");
+
+    let key = session_key(b"snapshot-catch-up-committed-record");
+    let lease = cluster.stores[1]
+        .acquire(
+            &key,
+            owner("snapshot-catch-up-owner"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("majority commits lease while follower is isolated");
+    let committed_record = sealed_record(key.clone(), 1, &lease, b"sealed-snapshot-catch-up");
+    assert_eq!(
+        CompareAndSetResult::Success,
+        cluster.stores[2]
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease,
+                expected_generation: None,
+                new_record: committed_record.clone(),
+            })
+            .await
+            .expect("majority commits record while follower is isolated")
+    );
+
+    for _ in 0..SNAPSHOT_CATCH_UP_COMMANDS {
+        cluster.stores[1]
+            .max_replication_sequence()
+            .await
+            .expect("advance committed logical time toward snapshot compaction");
+    }
+
+    let compacted = tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
+        loop {
+            let progress = cluster.stores[1]
+                .probe_durable_readiness()
+                .await
+                .recovery_progress();
+            if progress
+                .purged_index()
+                .is_some_and(|index| index > lagging_before)
+                && progress.snapshot_index().is_some()
+            {
+                break progress;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("majority compacts beyond the isolated follower");
+
+    cluster.heal(0);
+    if cluster
+        .wait_all_ready(SNAPSHOT_RECOVERY_TIMEOUT)
+        .await
+        .is_err()
+    {
+        let reports = futures_util::future::join_all(
+            cluster
+                .stores
+                .iter()
+                .map(ConsensusSessionStore::probe_durable_readiness),
+        )
+        .await;
+        let sqlite = consensus_sqlite_progress(&cluster._directory.path().join("node-0.sqlite"));
+        panic!(
+            "lagging follower did not rejoin after snapshot install: {reports:?}; sqlite={sqlite:?}"
+        );
+    }
+    let recovered = cluster.stores[0]
+        .get(&key)
+        .await
+        .expect("linearizable read after snapshot catch-up");
+    assert_eq!(Some(committed_record), recovered);
+    let recovered_progress = cluster.stores[0]
+        .probe_durable_readiness()
+        .await
+        .recovery_progress();
+    assert_eq!(
+        DurableRecoveryState::Synchronized,
+        recovered_progress.state()
+    );
+    assert!(recovered_progress.local_applied_index() >= compacted.snapshot_index());
 }
 
 #[tokio::test]

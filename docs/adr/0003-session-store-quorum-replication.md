@@ -56,9 +56,12 @@ The target session-store contract includes:
 - Durable request IDs and semantic request digests. A response-loss retry,
   including after leader change, returns the original committed outcome;
   reusing an ID for different intent fails closed.
-- Openraft log reconciliation from committed authority. Recovery of persisted
-  data created by the removed legacy coordinator remains #128/#129 because that
-  format cannot prove which divergent suffix was committed.
+- Openraft log reconciliation from committed authority. The SQLite adapter
+  rejects truncation at or below its persisted committed/applied floor,
+  rejects stale or cross-identity snapshots, atomically installs one validated
+  state-machine image, and cleans bounded interrupted staging on restart.
+  Persisted data created by the removed legacy coordinator remains #129
+  because that format cannot prove which divergent suffix was committed.
 - Watch/change-stream resume cursors.
 - Fail-closed no-quorum handling. Openraft may have committed before response
   delivery fails, so clients retry the same durable request ID or perform a
@@ -138,9 +141,10 @@ replicated state machine.
 
 The current networked profile remains experimental, not yet a production HA
 qualification claim. #127 establishes durable commit/sequencing authority with
-Openraft and removes the custom session quorum algorithm. Committed-state
-divergence repair, operator-safe legacy-fork recovery, and bounded
-majority-authoritative restore remain #128, #129, and #133.
+Openraft and removes the custom session quorum algorithm. #128 hardens and
+qualifies current-format Openraft follower recovery without adding another
+repair authority. Operator-safe legacy-fork recovery and bounded
+majority-authoritative restore remain #129 and #133.
 Fixed-width private wire DTOs and checked domain conversion are implemented
 under #134. Invariant-safe owner/key model decoding, bounded count-only SQLite
 admission, and typed-invalid handover rejection are
