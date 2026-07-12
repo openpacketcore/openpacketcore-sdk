@@ -350,6 +350,16 @@ do not provide rotation evidence.
   agreement between each row position and serialized entry. These checks
   prevent malformed-input panics and partial replacement caused by malformed
   sequence metadata, but do not assign or prove distributed commit authority.
+- Fake and SQLite apply each complete replication operation tree atomically:
+  a late nested failure preserves records, leases, fence/credential counters,
+  the replication log and its compaction cursor, and watch-visible state.
+  Whole-state rebuild is staged and swapped only after every entry replays;
+  existing watch subscriptions survive the swap, rebuild does not synthesize
+  append events, and the next locally successful append is emitted exactly
+  once. The Fake obtains this test-double behavior by cloning its bounded
+  in-memory data into a watcher-free stage; SQLite uses a database transaction.
+  This is backend-local atomicity only; distributed commit-gated observation
+  remains part of #127.
 - Session and lease TTLs use the checked 365-day contract above. This closes
   the oversized-duration panic and input-safety boundary only; it does not
   establish consensus, durable commit authority, fork recovery, or production
@@ -376,9 +386,15 @@ do not provide rotation evidence.
   SQLite, topology, quorum, restore, and tests.
 - `tests/quorum_topology.rs` covers descriptor fingerprinting, complete
   remote-binding admission, typed mismatch classes, and redacted diagnostics.
-- `tests/replication_sequence_bounds.rs` covers direct Fake/SQLite append,
-  rebuild atomicity, signed persistence boundaries, and corrupt-row rejection;
-  quorum, encryption, cache, and session-net suites cover their own boundaries.
+- `tests/replication_sequence_bounds.rs` covers direct Fake/SQLite sequence and
+  rebuild-prefix admission, signed persistence boundaries, and corrupt-row
+  rejection; quorum, encryption, cache, and session-net suites cover their own
+  boundaries.
+- `tests/replication_atomicity.rs` runs the shared Fake/SQLite contract for late
+  compound-append and rebuild rollback, ordered child application, duplicate
+  idempotency, exactly-one watch publication, and watcher survival across a
+  successful rebuild. Fake-private tests compare every internal state dimension
+  and prove error paths do not prune expired data or retain an early child.
 - `tests/replication_structure_bounds.rs` covers exact depth/count admission,
   fieldless error serialization/redaction, owned entry/prefix/page validation,
   small-stack rejection, and Fake/SQLite no-effect failures.
