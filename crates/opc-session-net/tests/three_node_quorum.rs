@@ -217,6 +217,35 @@ fn over_count_replication_entry(sequence: u64) -> ReplicationEntry {
     }
 }
 
+fn payload_replication_entry(sequence: u64, payload_len: usize) -> ReplicationEntry {
+    let key = test_key();
+    let owner = OwnerId::new("log-owner").expect("log owner");
+    let mut record = test_record(&key, &owner, FenceToken::new(sequence), Generation::new(1));
+    record.payload = EncryptedSessionPayload::new(vec![255; payload_len]);
+    let timestamp = Timestamp::now_utc();
+    ReplicationEntry {
+        sequence,
+        tx_id: format!("log-{sequence}"),
+        op: ReplicationOp::CompareAndSet {
+            key,
+            expected_generation: None,
+            credential_id: sequence,
+            guard_expires_at: timestamp,
+            new_record: record,
+        },
+        timestamp,
+    }
+}
+
+fn low_json_payload_replication_entry(sequence: u64, payload_len: usize) -> ReplicationEntry {
+    let mut entry = payload_replication_entry(sequence, 0);
+    let ReplicationOp::CompareAndSet { new_record, .. } = &mut entry.op else {
+        unreachable!("payload fixture is a CAS entry");
+    };
+    new_record.payload = EncryptedSessionPayload::new(vec![0; payload_len]);
+    entry
+}
+
 fn wire_operation_nodes_mut<'a>(
     request: &'a mut serde_json::Value,
     entry_pointer: &str,
@@ -241,6 +270,7 @@ fn wire_refresh_ttl_node_mut<'a>(
 #[derive(Clone)]
 struct ReplicationDispatchSpy {
     inner: FakeSessionBackend,
+    compare_and_set_calls: Arc<AtomicUsize>,
     refresh_calls: Arc<AtomicUsize>,
     batch_calls: Arc<AtomicUsize>,
     replicate_calls: Arc<AtomicUsize>,
@@ -253,6 +283,7 @@ impl ReplicationDispatchSpy {
     fn new() -> Self {
         Self {
             inner: FakeSessionBackend::new(),
+            compare_and_set_calls: Arc::new(AtomicUsize::new(0)),
             refresh_calls: Arc::new(AtomicUsize::new(0)),
             batch_calls: Arc::new(AtomicUsize::new(0)),
             replicate_calls: Arc::new(AtomicUsize::new(0)),
@@ -274,6 +305,7 @@ impl SessionBackend for ReplicationDispatchSpy {
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        self.compare_and_set_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.compare_and_set(op).await
     }
 
@@ -459,6 +491,213 @@ impl SessionLeaseManager for MalformedReplicationOutputBackend {
     }
 }
 
+#[derive(Clone)]
+struct OversizedOutputBackend {
+    inner: ReplicationDispatchSpy,
+    record: StoredSessionRecord,
+    log: Arc<Vec<ReplicationEntry>>,
+    watch_entry: ReplicationEntry,
+    get_calls: Arc<AtomicUsize>,
+}
+
+impl OversizedOutputBackend {
+    fn new(
+        record: StoredSessionRecord,
+        log: Vec<ReplicationEntry>,
+        watch_entry: ReplicationEntry,
+    ) -> Self {
+        Self {
+            inner: ReplicationDispatchSpy::new(),
+            record,
+            log: Arc::new(log),
+            watch_entry,
+            get_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionBackend for OversizedOutputBackend {
+    async fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::all_enabled()
+    }
+
+    async fn get(&self, _key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        self.get_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(self.record.clone()))
+    }
+
+    async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        self.inner.compare_and_set(op).await
+    }
+
+    async fn delete_fenced(&self, lease: &opc_session_store::LeaseGuard) -> Result<(), StoreError> {
+        self.inner.delete_fenced(lease).await
+    }
+
+    async fn refresh_ttl(
+        &self,
+        lease: &opc_session_store::LeaseGuard,
+        ttl: Duration,
+    ) -> Result<(), StoreError> {
+        self.inner.refresh_ttl(lease, ttl).await
+    }
+
+    async fn batch(
+        &self,
+        ops: Vec<opc_session_store::SessionOp>,
+    ) -> Result<Vec<opc_session_store::SessionOpResult>, StoreError> {
+        Ok(ops
+            .into_iter()
+            .map(|_| opc_session_store::SessionOpResult::Get(Ok(Some(self.record.clone()))))
+            .collect())
+    }
+
+    async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
+        Ok(self.log.last().map(|entry| entry.sequence).unwrap_or(0))
+    }
+
+    async fn get_replication_log(
+        &self,
+        start: u64,
+        limit: usize,
+    ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        Ok(self
+            .log
+            .iter()
+            .filter(|entry| entry.sequence >= start)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
+        self.inner.replicate_entry(entry).await
+    }
+
+    async fn rebuild_replication_state(
+        &self,
+        entries: Vec<ReplicationEntry>,
+    ) -> Result<(), StoreError> {
+        self.inner.rebuild_replication_state(entries).await
+    }
+
+    async fn watch(
+        &self,
+        _start_sequence: u64,
+    ) -> Result<
+        futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
+        StoreError,
+    > {
+        Ok(futures_util::stream::iter(vec![Ok(self.watch_entry.clone())]).boxed())
+    }
+
+    async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
+        self.inner.next_lease_info().await
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionLeaseManager for OversizedOutputBackend {
+    async fn acquire(
+        &self,
+        key: &SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+    ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
+        self.inner.acquire(key, owner, ttl).await
+    }
+
+    async fn renew(
+        &self,
+        lease: &opc_session_store::LeaseGuard,
+        ttl: Duration,
+    ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
+        self.inner.renew(lease, ttl).await
+    }
+
+    async fn release(
+        &self,
+        lease: opc_session_store::LeaseGuard,
+    ) -> Result<(), opc_session_store::LeaseError> {
+        self.inner.release(lease).await
+    }
+}
+
+#[derive(Clone)]
+struct SemanticViolationBackend {
+    inner: ReplicationDispatchSpy,
+    wrong_record: StoredSessionRecord,
+    wrong_acquire_lease: opc_session_store::LeaseGuard,
+    wrong_renew_lease: opc_session_store::LeaseGuard,
+}
+
+#[async_trait::async_trait]
+impl SessionBackend for SemanticViolationBackend {
+    async fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::all_enabled()
+    }
+
+    async fn get(&self, _key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        Ok(Some(self.wrong_record.clone()))
+    }
+
+    async fn compare_and_set(&self, _op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        Ok(CompareAndSetResult::Conflict {
+            current: Some(self.wrong_record.clone()),
+        })
+    }
+
+    async fn delete_fenced(&self, lease: &opc_session_store::LeaseGuard) -> Result<(), StoreError> {
+        self.inner.delete_fenced(lease).await
+    }
+
+    async fn refresh_ttl(
+        &self,
+        lease: &opc_session_store::LeaseGuard,
+        ttl: Duration,
+    ) -> Result<(), StoreError> {
+        self.inner.refresh_ttl(lease, ttl).await
+    }
+
+    async fn batch(
+        &self,
+        ops: Vec<opc_session_store::SessionOp>,
+    ) -> Result<Vec<opc_session_store::SessionOpResult>, StoreError> {
+        Ok(ops
+            .into_iter()
+            .map(|_| opc_session_store::SessionOpResult::Get(Ok(Some(self.wrong_record.clone()))))
+            .collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionLeaseManager for SemanticViolationBackend {
+    async fn acquire(
+        &self,
+        _key: &SessionKey,
+        _owner: OwnerId,
+        _ttl: Duration,
+    ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
+        Ok(self.wrong_acquire_lease.clone())
+    }
+
+    async fn renew(
+        &self,
+        _lease: &opc_session_store::LeaseGuard,
+        _ttl: Duration,
+    ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
+        Ok(self.wrong_renew_lease.clone())
+    }
+
+    async fn release(
+        &self,
+        lease: opc_session_store::LeaseGuard,
+    ) -> Result<(), opc_session_store::LeaseError> {
+        self.inner.release(lease).await
+    }
+}
+
 impl TestMtls {
     fn standard() -> Self {
         Self::from_descriptors((1..=3).map(topology_descriptor).collect())
@@ -582,6 +821,68 @@ fn remote_backend(
     )
 }
 
+async fn authenticated_raw_stream(
+    mtls: &TestMtls,
+    local_index: usize,
+    remote_index: usize,
+    addr: SocketAddr,
+    response_frame_size: usize,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    use opc_session_net::protocol::{
+        read_frame, write_frame, CONTRACT_VERSION, CURRENT_CONTRACT_PROFILE, SESSION_NET_ALPN,
+    };
+    use opc_session_net::{Request, Response};
+
+    let mut client_config = mtls
+        .client_config(local_index)
+        .rustls_config()
+        .as_ref()
+        .clone();
+    client_config.alpn_protocols = vec![SESSION_NET_ALPN.to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect authenticated raw client");
+    let server_name = rustls_pki_types::ServerName::IpAddress(addr.ip().into());
+    let mut stream = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("establish authenticated raw client");
+
+    let binding = mtls.remote_binding(local_index, remote_index);
+    let nonce = uuid::Uuid::new_v4();
+    let requested_response_frame_size =
+        u32::try_from(response_frame_size).expect("test response frame size fits the v4 wire");
+    write_frame(
+        &mut stream,
+        &Request::Hello {
+            contract_version: CONTRACT_VERSION,
+            contract_profile: Some(CURRENT_CONTRACT_PROFILE),
+            node_id: binding.local_replica_id().as_str().to_string(),
+            expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
+            cluster_id: Some(binding.cluster_id().as_str().to_string()),
+            configuration_id: Some(binding.configuration_id().to_hex()),
+            handshake_nonce: Some(nonce),
+            requested_response_frame_size: Some(requested_response_frame_size),
+        },
+    )
+    .await
+    .expect("write authenticated raw hello");
+    let hello: Response = read_frame(&mut stream, response_frame_size)
+        .await
+        .expect("read authenticated raw hello acknowledgement");
+    assert!(matches!(
+        hello,
+        Response::HelloAck {
+            contract_version: CONTRACT_VERSION,
+            handshake_nonce: Some(echoed),
+            accepted_response_frame_size: Some(accepted),
+            ..
+        } if echoed == nonce && accepted == requested_response_frame_size
+    ));
+    stream
+}
+
 #[cfg(feature = "insecure-test")]
 fn hello_ack_for(
     request: &opc_session_net::Request,
@@ -593,6 +894,7 @@ fn hello_ack_for(
         cluster_id,
         configuration_id,
         handshake_nonce,
+        requested_response_frame_size,
         ..
     } = request
     else {
@@ -607,6 +909,15 @@ fn hello_ack_for(
         cluster_id: cluster_id.clone(),
         configuration_id: configuration_id.clone(),
         handshake_nonce: *handshake_nonce,
+        accepted_response_frame_size: (contract_version
+            == opc_session_net::protocol::CONTRACT_VERSION)
+            .then_some(
+                requested_response_frame_size
+                    .unwrap_or(opc_session_net::protocol::DEFAULT_MAX_FRAME_SIZE as u32),
+            ),
+        server_request_frame_size: (contract_version
+            == opc_session_net::protocol::CONTRACT_VERSION)
+            .then_some(opc_session_net::protocol::DEFAULT_MAX_FRAME_SIZE as u32),
     }
 }
 
@@ -945,6 +1256,7 @@ async fn authenticated_server_rejects_wire_zero_and_keeps_connection_usable() {
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
             configuration_id: Some(binding.configuration_id().to_hex()),
             handshake_nonce: Some(nonce),
+            requested_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
         },
     )
     .await
@@ -1059,6 +1371,7 @@ async fn authenticated_server_rejects_operation_limits_and_keeps_connection_usab
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
             configuration_id: Some(binding.configuration_id().to_hex()),
             handshake_nonce: Some(nonce),
+            requested_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
         },
     )
     .await
@@ -1173,6 +1486,7 @@ async fn authenticated_server_rejects_malformed_backend_log_and_watch_output() {
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
             configuration_id: Some(binding.configuration_id().to_hex()),
             handshake_nonce: Some(nonce),
+            requested_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
         },
     )
     .await
@@ -1265,6 +1579,7 @@ async fn authenticated_server_rejects_wire_invalid_ttls_and_keeps_connection_usa
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
             configuration_id: Some(binding.configuration_id().to_hex()),
             handshake_nonce: Some(nonce),
+            requested_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
         },
     )
     .await
@@ -1283,16 +1598,17 @@ async fn authenticated_server_rejects_wire_invalid_ttls_and_keeps_connection_usa
 
     let key = test_key_with_stable_id(b"wire-invalid-ttl-canary");
     let owner = OwnerId::new("wire-invalid-ttl-owner").expect("test owner");
-    write_frame(
-        &mut stream,
-        &Request::AcquireLease {
-            key: key.clone(),
-            owner: owner.clone(),
-            ttl: Duration::MAX,
-        },
-    )
-    .await
-    .expect("write invalid acquire TTL");
+    let mut invalid_acquire = serde_json::to_value(Request::AcquireLease {
+        key: key.clone(),
+        owner: owner.clone(),
+        ttl: Duration::from_secs(60),
+    })
+    .expect("serialize valid acquire request");
+    invalid_acquire["AcquireLease"]["ttl"] =
+        serde_json::to_value(Duration::MAX).expect("serialize hostile TTL");
+    write_frame(&mut stream, &invalid_acquire)
+        .await
+        .expect("write invalid acquire TTL");
     let acquire_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
         .await
         .expect("read typed acquire TTL rejection");
@@ -1321,15 +1637,16 @@ async fn authenticated_server_rejects_wire_invalid_ttls_and_keeps_connection_usa
     };
     assert_eq!(backend.acquire_calls.load(Ordering::SeqCst), 1);
 
-    write_frame(
-        &mut stream,
-        &Request::RenewLease {
-            lease: lease.clone(),
-            ttl: Duration::MAX,
-        },
-    )
-    .await
-    .expect("write invalid renew TTL");
+    let mut invalid_renew = serde_json::to_value(Request::RenewLease {
+        lease: lease.clone(),
+        ttl: Duration::from_secs(60),
+    })
+    .expect("serialize valid renew request");
+    invalid_renew["RenewLease"]["ttl"] =
+        serde_json::to_value(Duration::MAX).expect("serialize hostile TTL");
+    write_frame(&mut stream, &invalid_renew)
+        .await
+        .expect("write invalid renew TTL");
     let renew_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
         .await
         .expect("read typed renew TTL rejection");
@@ -1339,15 +1656,16 @@ async fn authenticated_server_rejects_wire_invalid_ttls_and_keeps_connection_usa
     ));
     assert_eq!(backend.renew_calls.load(Ordering::SeqCst), 0);
 
-    write_frame(
-        &mut stream,
-        &Request::RefreshTtl {
-            lease: lease.clone(),
-            ttl: Duration::MAX,
-        },
-    )
-    .await
-    .expect("write invalid refresh TTL");
+    let mut invalid_refresh = serde_json::to_value(Request::RefreshTtl {
+        lease: lease.clone(),
+        ttl: Duration::from_secs(60),
+    })
+    .expect("serialize valid refresh request");
+    invalid_refresh["RefreshTtl"]["ttl"] =
+        serde_json::to_value(Duration::MAX).expect("serialize hostile TTL");
+    write_frame(&mut stream, &invalid_refresh)
+        .await
+        .expect("write invalid refresh TTL");
     let refresh_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
         .await
         .expect("read typed refresh TTL rejection");
@@ -1357,17 +1675,18 @@ async fn authenticated_server_rejects_wire_invalid_ttls_and_keeps_connection_usa
     ));
     assert_eq!(backend.refresh_calls.load(Ordering::SeqCst), 0);
 
-    write_frame(
-        &mut stream,
-        &Request::Batch {
-            ops: vec![opc_session_store::SessionOp::RefreshTtl {
-                lease: lease.clone(),
-                ttl: Duration::MAX,
-            }],
-        },
-    )
-    .await
-    .expect("write invalid batched TTL");
+    let mut invalid_batch = serde_json::to_value(Request::Batch {
+        ops: vec![opc_session_store::SessionOp::RefreshTtl {
+            lease: lease.clone(),
+            ttl: Duration::from_secs(60),
+        }],
+    })
+    .expect("serialize valid batch request");
+    invalid_batch["Batch"]["ops"][0]["RefreshTtl"]["ttl"] =
+        serde_json::to_value(Duration::MAX).expect("serialize hostile TTL");
+    write_frame(&mut stream, &invalid_batch)
+        .await
+        .expect("write invalid batched TTL");
     let batch_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
         .await
         .expect("read typed batch TTL rejection");
@@ -1522,7 +1841,8 @@ async fn remote_restore_scan_round_trips_scope_and_pagination_over_mtls() {
         large_lease.fence(),
         Generation::new(1),
     );
-    large_record.payload = EncryptedSessionPayload::new(vec![7; 2048]);
+    let minimum_frame_size = opc_session_net::protocol::MIN_NEGOTIATED_FRAME_SIZE;
+    large_record.payload = EncryptedSessionPayload::new(vec![255; minimum_frame_size]);
     assert_eq!(
         backend
             .compare_and_set(CompareAndSet {
@@ -1536,8 +1856,8 @@ async fn remote_restore_scan_round_trips_scope_and_pagination_over_mtls() {
         CompareAndSetResult::Success
     );
 
-    let small_frame_remote =
-        remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(1))).with_max_frame_size(512);
+    let small_frame_remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(1)))
+        .with_max_frame_size(minimum_frame_size);
     let oversized = small_frame_remote
         .scan_restore_records(RestoreScanRequest {
             scope: RestoreScanScope::all(),
@@ -1548,7 +1868,9 @@ async fn remote_restore_scan_round_trips_scope_and_pagination_over_mtls() {
         .expect_err("a single record larger than the peer frame must fail closed");
     assert_eq!(
         oversized,
-        StoreError::RestoreScanResponseTooLarge { max_bytes: 512 }
+        StoreError::RestoreScanResponseTooLarge {
+            max_bytes: minimum_frame_size
+        }
     );
 
     handle.abort();
@@ -1579,8 +1901,9 @@ async fn remote_restore_capability_matches_executable_backend_support() {
 async fn unusable_client_or_server_frame_bound_masks_restore_capability() {
     let mtls = mtls_configs();
     let (addr, _backend, handle) = start_server(&mtls, 2).await;
-    let constrained_client =
-        remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(1))).with_max_frame_size(511);
+    let below_minimum = opc_session_net::protocol::MIN_NEGOTIATED_FRAME_SIZE.saturating_sub(1);
+    let constrained_client = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(1)))
+        .with_max_frame_size(below_minimum);
 
     assert!(!constrained_client.capabilities().await.restore_scan);
     assert_eq!(
@@ -1588,7 +1911,9 @@ async fn unusable_client_or_server_frame_bound_masks_restore_capability() {
             .scan_restore_records(RestoreScanRequest::all(1))
             .await
             .expect_err("client frame below the protocol minimum must reject scans"),
-        StoreError::RestoreScanResponseTooLarge { max_bytes: 511 }
+        StoreError::RestoreScanResponseTooLarge {
+            max_bytes: below_minimum
+        }
     );
     handle.abort();
 
@@ -1598,12 +1923,846 @@ async fn unusable_client_or_server_frame_bound_masks_restore_capability() {
         mtls.server_config(2),
         mtls.local_binding(2),
     )
-    .with_max_frame_size(511);
-    let (server_handle, server_addr) = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
-    let default_client = remote_backend(&mtls, 1, 2, server_addr, Some(Duration::from_secs(1)));
+    .with_max_frame_size(below_minimum);
+    let error = server
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect_err("server frame bounds below the protocol minimum must fail admission");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
 
-    assert!(!default_client.capabilities().await.restore_scan);
-    server_handle.abort();
+#[tokio::test]
+async fn server_rejects_invalid_frame_and_timeout_configuration_before_binding() {
+    let mtls = mtls_configs();
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve test address");
+    let occupied_addr = occupied.local_addr().expect("reserved test address");
+
+    let below_minimum = opc_session_net::protocol::MIN_NEGOTIATED_FRAME_SIZE.saturating_sub(1);
+    let server = SessionReplicationServer::new(
+        Arc::new(FakeSessionBackend::new()),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_max_connections(0);
+    let error = server
+        .listen(occupied_addr)
+        .await
+        .expect_err("zero connection slots must fail admission");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+    let server = SessionReplicationServer::new(
+        Arc::new(FakeSessionBackend::new()),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_max_connections(tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1));
+    let error = server
+        .listen(occupied_addr)
+        .await
+        .expect_err("unrepresentable connection slots must fail admission");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+    let server = SessionReplicationServer::new(
+        Arc::new(FakeSessionBackend::new()),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_max_frame_size(below_minimum);
+    let error = server
+        .listen(occupied_addr)
+        .await
+        .expect_err("invalid frame size must win over bind failure");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+    let server = SessionReplicationServer::new(
+        Arc::new(FakeSessionBackend::new()),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_max_frame_size(opc_session_net::MAX_NEGOTIATED_FRAME_SIZE + 1);
+    let error = server
+        .listen(occupied_addr)
+        .await
+        .expect_err("a u32-representable frame above the profile ceiling must fail before bind");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+    #[cfg(target_pointer_width = "64")]
+    {
+        let server = SessionReplicationServer::new(
+            Arc::new(FakeSessionBackend::new()),
+            mtls.server_config(2),
+            mtls.local_binding(2),
+        )
+        .with_max_frame_size((u32::MAX as usize) + 1);
+        let error = server
+            .listen(occupied_addr)
+            .await
+            .expect_err("frame sizes outside the v4 wire range must fail admission");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    let server = SessionReplicationServer::new(
+        Arc::new(FakeSessionBackend::new()),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_idle_timeout(Duration::MAX);
+    let error = server
+        .listen(occupied_addr)
+        .await
+        .expect_err("unrepresentable write deadlines must fail admission");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[tokio::test]
+async fn negotiated_response_limit_contains_malicious_backend_outputs_by_family() {
+    let mtls = mtls_configs();
+    let key = test_key();
+    let owner = OwnerId::new("oversized-owner").expect("oversized owner");
+    let mut record = test_record(&key, &owner, FenceToken::new(1), Generation::new(1));
+    record.payload = EncryptedSessionPayload::new(vec![255; 4096]);
+    let backend =
+        OversizedOutputBackend::new(record, Vec::new(), payload_replication_entry(1, 4096));
+    let (addr, _backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let budget = opc_session_net::protocol::MIN_NEGOTIATED_FRAME_SIZE;
+    let remote =
+        remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(2))).with_max_frame_size(budget);
+
+    let get_error = remote
+        .get(&key)
+        .await
+        .expect_err("oversized Get output must fail in the Get family");
+    assert_eq!(
+        get_error,
+        StoreError::BackendUnavailable("backend unavailable".to_string())
+    );
+    assert_eq!(remote.max_replication_sequence().await.unwrap(), 0);
+
+    let batch_error = remote
+        .batch(vec![opc_session_store::SessionOp::Get { key: key.clone() }])
+        .await
+        .expect_err("an oversized batch must fail atomically rather than truncate results");
+    assert_eq!(
+        batch_error,
+        StoreError::BackendUnavailable("backend unavailable".to_string())
+    );
+    assert_eq!(remote.max_replication_sequence().await.unwrap(), 0);
+
+    let mut watch = remote.watch(1).await.expect("open oversized-output watch");
+    let watch_error = tokio::time::timeout(Duration::from_secs(2), watch.next())
+        .await
+        .expect("bounded watch response")
+        .expect("watch must emit its terminal typed error")
+        .expect_err("oversized watch item must not cross the response boundary");
+    assert_eq!(
+        watch_error,
+        StoreError::BackendUnavailable("backend unavailable".to_string())
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), watch.next())
+            .await
+            .expect("watch closes after the typed limit error")
+            .is_none(),
+        "the server must terminate an oversized watch stream"
+    );
+
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn hostile_cas_request_id_is_rejected_before_backend_or_idempotency_cache() {
+    use opc_session_net::protocol::{read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE};
+    use opc_session_net::{Request, Response};
+
+    let mtls = mtls_configs();
+    let backend = ReplicationDispatchSpy::new();
+    let key = test_key_with_stable_id(b"cas-request-id");
+    let owner = OwnerId::new("cas-request-owner").expect("CAS request owner");
+    let lease = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .expect("seed CAS request lease");
+    let operation = CompareAndSet {
+        key: key.clone(),
+        lease: lease.clone(),
+        expected_generation: None,
+        new_record: test_record(&key, &owner, FenceToken::new(1), Generation::new(1)),
+    };
+    backend.compare_and_set_calls.store(0, Ordering::SeqCst);
+    let (addr, backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+
+    let request_id = uuid::Uuid::new_v4().hyphenated().to_string();
+    let valid_request = Request::CompareAndSet {
+        op: operation,
+        request_id: Some(request_id),
+    };
+    let mut hostile_wire =
+        serde_json::to_value(&valid_request).expect("encode valid canonical CAS request");
+    hostile_wire["CompareAndSet"]["request_id"] = serde_json::Value::String("x".repeat(1024));
+
+    let mut hostile = authenticated_raw_stream(&mtls, 1, 2, addr, DEFAULT_MAX_FRAME_SIZE).await;
+    write_frame(&mut hostile, &hostile_wire)
+        .await
+        .expect("write hostile CAS request ID");
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_frame::<_, Response>(&mut hostile, DEFAULT_MAX_FRAME_SIZE),
+    )
+    .await
+    .expect("server must close a connection carrying a hostile CAS request ID");
+    assert!(rejected.is_err());
+    assert_eq!(backend.compare_and_set_calls.load(Ordering::SeqCst), 0);
+
+    let mut valid = authenticated_raw_stream(&mtls, 1, 2, addr, DEFAULT_MAX_FRAME_SIZE).await;
+    for expected_backend_calls in [1, 1] {
+        write_frame(&mut valid, &valid_request)
+            .await
+            .expect("write canonical CAS request");
+        let response: Response = read_frame(&mut valid, DEFAULT_MAX_FRAME_SIZE)
+            .await
+            .expect("read canonical CAS response");
+        assert!(matches!(
+            response,
+            Response::CompareAndSet(Ok(CompareAndSetResult::Success))
+        ));
+        assert_eq!(
+            backend.compare_and_set_calls.load(Ordering::SeqCst),
+            expected_backend_calls,
+            "only the canonical request may populate and hit the idempotency cache"
+        );
+    }
+
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn replication_log_returns_the_largest_contiguous_prefix_for_the_peer_budget() {
+    let mtls = mtls_configs();
+    let entries = vec![
+        payload_replication_entry(1, 4096),
+        payload_replication_entry(2, 4096),
+        payload_replication_entry(3, 4096),
+    ];
+    let one_entry_budget =
+        serde_json::to_vec(&opc_session_net::Response::GetReplicationLog(Ok(vec![
+            entries[0].clone(),
+        ])))
+        .expect("size one valid replication entry")
+        .len();
+    assert!(one_entry_budget >= opc_session_net::protocol::MIN_NEGOTIATED_FRAME_SIZE);
+    assert!(
+        serde_json::to_vec(&opc_session_net::Response::GetReplicationLog(Ok(entries
+            [..2]
+            .to_vec(),)))
+        .expect("size two valid replication entries")
+        .len()
+            > one_entry_budget
+    );
+
+    let key = test_key();
+    let owner = OwnerId::new("log-backend-owner").expect("log backend owner");
+    let record = test_record(&key, &owner, FenceToken::new(1), Generation::new(1));
+    let backend =
+        OversizedOutputBackend::new(record, entries.clone(), payload_replication_entry(4, 0));
+    let (addr, _backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(2)))
+        .with_max_frame_size(one_entry_budget);
+
+    let first = remote
+        .get_replication_log(0, 3)
+        .await
+        .expect("read first bounded log prefix");
+    assert_eq!(
+        first.iter().map(|entry| entry.sequence).collect::<Vec<_>>(),
+        vec![1]
+    );
+    let second = remote
+        .get_replication_log(2, 2)
+        .await
+        .expect("resume after the first bounded prefix");
+    assert_eq!(
+        second
+            .iter()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn advertised_payload_limit_is_executable_with_unequal_peer_budgets() {
+    let mtls = mtls_configs();
+    let client_budget = opc_session_net::protocol::MIN_NEGOTIATED_FRAME_SIZE
+        .saturating_mul(2)
+        .max(4096);
+    let server_budget = client_budget.saturating_mul(2);
+    let backend = FakeSessionBackend::new();
+    let server = SessionReplicationServer::new(
+        Arc::new(backend),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_max_frame_size(server_budget);
+    let (handle, addr) = server
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("listen with unequal frame budgets");
+    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(2)))
+        .with_max_frame_size(client_budget);
+
+    let capabilities = remote.capabilities().await;
+    let advertised = opc_session_net::protocol::conservative_payload_budget(client_budget);
+    assert_eq!(capabilities.max_value_bytes, advertised);
+    assert!(advertised > 0);
+
+    let key = test_key_with_stable_id(b"advertised-limit");
+    let owner = OwnerId::new("advertised-owner").expect("advertised owner");
+    let lease = remote
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .expect("acquire through the smaller peer budget");
+    let mut record = test_record(&key, &owner, lease.fence(), Generation::new(1));
+    record.payload = EncryptedSessionPayload::new(vec![255; advertised]);
+    assert_eq!(
+        remote
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease,
+                expected_generation: None,
+                new_record: record.clone(),
+            })
+            .await
+            .expect("write the exact advertised payload through the smaller request budget"),
+        CompareAndSetResult::Success
+    );
+    assert_eq!(
+        remote
+            .get(&key)
+            .await
+            .expect("read the exact advertised payload through the smaller response budget"),
+        Some(record)
+    );
+
+    let over_key = test_key_with_stable_id(b"advertised-limit-over");
+    let over_owner = OwnerId::new("advertised-over-owner").expect("over owner");
+    let over_lease = remote
+        .acquire(&over_key, over_owner.clone(), Duration::from_secs(60))
+        .await
+        .expect("acquire one-over lease");
+    let mut over_record = test_record(
+        &over_key,
+        &over_owner,
+        over_lease.fence(),
+        Generation::new(1),
+    );
+    over_record.payload = EncryptedSessionPayload::new(vec![0; advertised + 1]);
+    assert_eq!(
+        remote
+            .compare_and_set(CompareAndSet {
+                key: over_key.clone(),
+                lease: over_lease,
+                expected_generation: None,
+                new_record: over_record,
+            })
+            .await,
+        Err(StoreError::PayloadTooLarge {
+            actual: advertised + 1,
+            max: advertised,
+        })
+    );
+    assert_eq!(remote.get(&over_key).await.expect("one-over read"), None);
+
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn transport_payload_limit_preflights_all_mutation_families_atomically() {
+    use opc_session_net::protocol::{read_frame, write_frame};
+    use opc_session_net::{Request, Response};
+
+    let mtls = mtls_configs();
+    let frame_budget = 2 * opc_session_net::protocol::MIN_NEGOTIATED_FRAME_SIZE;
+    let max_payload = opc_session_net::protocol::conservative_payload_budget(frame_budget);
+    let backend = ReplicationDispatchSpy::new();
+    let key = test_key_with_stable_id(b"transport-payload-limit");
+    let owner = OwnerId::new("transport-payload-owner").expect("payload owner");
+    let lease = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .expect("seed payload lease");
+    backend.acquire_calls.store(0, Ordering::SeqCst);
+    let mut record = test_record(&key, &owner, lease.fence(), Generation::new(1));
+    record.payload = EncryptedSessionPayload::new(vec![0; max_payload + 1]);
+    let operation = CompareAndSet {
+        key: key.clone(),
+        lease,
+        expected_generation: None,
+        new_record: record,
+    };
+    let server = SessionReplicationServer::new(
+        Arc::new(backend.clone()),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_max_frame_size(frame_budget);
+    let (handle, addr) = server
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("listen for payload preflight");
+    let mut stream = authenticated_raw_stream(&mtls, 1, 2, addr, frame_budget).await;
+    let request_id = uuid::Uuid::new_v4().hyphenated().to_string();
+
+    write_frame(
+        &mut stream,
+        &Request::CompareAndSet {
+            op: operation.clone(),
+            request_id: Some(request_id.clone()),
+        },
+    )
+    .await
+    .expect("write one-over CAS");
+    let cas: Response = read_frame(&mut stream, frame_budget)
+        .await
+        .expect("read CAS rejection");
+    assert!(matches!(
+        cas,
+        Response::CompareAndSet(Err(StoreError::PayloadTooLarge { actual, max }))
+            if actual == max_payload + 1 && max == max_payload
+    ));
+
+    write_frame(
+        &mut stream,
+        &Request::Batch {
+            ops: vec![opc_session_store::SessionOp::CompareAndSet(
+                operation.clone(),
+            )],
+        },
+    )
+    .await
+    .expect("write one-over batch");
+    let batch: Response = read_frame(&mut stream, frame_budget)
+        .await
+        .expect("read batch rejection");
+    assert!(matches!(
+        batch,
+        Response::Batch(Err(StoreError::PayloadTooLarge { actual, max }))
+            if actual == max_payload + 1 && max == max_payload
+    ));
+
+    let entry = low_json_payload_replication_entry(1, max_payload + 1);
+    write_frame(
+        &mut stream,
+        &Request::ReplicateEntry {
+            entry: entry.clone(),
+        },
+    )
+    .await
+    .expect("write one-over replication entry");
+    let replicate: Response = read_frame(&mut stream, frame_budget)
+        .await
+        .expect("read replication rejection");
+    assert!(matches!(
+        replicate,
+        Response::ReplicateEntry(Err(StoreError::PayloadTooLarge { actual, max }))
+            if actual == max_payload + 1 && max == max_payload
+    ));
+
+    write_frame(
+        &mut stream,
+        &Request::RebuildReplicationState {
+            entries: vec![entry],
+        },
+    )
+    .await
+    .expect("write one-over rebuild");
+    let rebuild: Response = read_frame(&mut stream, frame_budget)
+        .await
+        .expect("read rebuild rejection");
+    assert!(matches!(
+        rebuild,
+        Response::RebuildReplicationState(Err(StoreError::PayloadTooLarge { actual, max }))
+            if actual == max_payload + 1 && max == max_payload
+    ));
+
+    assert_eq!(backend.compare_and_set_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.batch_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.replicate_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.rebuild_calls.load(Ordering::SeqCst), 0);
+
+    let mut exact = operation;
+    exact.new_record.payload = EncryptedSessionPayload::new(vec![0; max_payload]);
+    write_frame(
+        &mut stream,
+        &Request::CompareAndSet {
+            op: exact,
+            request_id: Some(request_id),
+        },
+    )
+    .await
+    .expect("write exact CAS after rejected idempotency key");
+    let exact: Response = read_frame(&mut stream, frame_budget)
+        .await
+        .expect("read exact CAS");
+    assert!(matches!(
+        exact,
+        Response::CompareAndSet(Ok(CompareAndSetResult::Success))
+    ));
+    assert_eq!(backend.compare_and_set_calls.load(Ordering::SeqCst), 1);
+
+    let batch_key = test_key_with_stable_id(b"transport-payload-batch-exact");
+    let batch_owner = OwnerId::new("transport-batch-owner").expect("batch owner");
+    let batch_lease = backend
+        .acquire(&batch_key, batch_owner.clone(), Duration::from_secs(60))
+        .await
+        .expect("seed exact batch lease");
+    let mut batch_record = test_record(
+        &batch_key,
+        &batch_owner,
+        batch_lease.fence(),
+        Generation::new(1),
+    );
+    batch_record.payload = EncryptedSessionPayload::new(vec![0; max_payload]);
+    write_frame(
+        &mut stream,
+        &Request::Batch {
+            ops: vec![opc_session_store::SessionOp::CompareAndSet(CompareAndSet {
+                key: batch_key,
+                lease: batch_lease,
+                expected_generation: None,
+                new_record: batch_record,
+            })],
+        },
+    )
+    .await
+    .expect("write exact batch");
+    let exact_batch: Response = read_frame(&mut stream, frame_budget)
+        .await
+        .expect("read exact batch");
+    assert!(matches!(
+        exact_batch,
+        Response::Batch(Ok(results))
+            if matches!(results.as_slice(), [opc_session_store::SessionOpResult::CompareAndSet(Ok(CompareAndSetResult::Success))])
+    ));
+    assert_eq!(backend.batch_calls.load(Ordering::SeqCst), 1);
+
+    let replication_key = test_key_with_stable_id(b"transport-payload-replication-exact");
+    let replication_owner = OwnerId::new("transport-replication-owner").expect("rep owner");
+    let replication_lease = backend
+        .acquire(
+            &replication_key,
+            replication_owner.clone(),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("seed exact replication lease");
+    let mut replication_record = test_record(
+        &replication_key,
+        &replication_owner,
+        replication_lease.fence(),
+        Generation::new(1),
+    );
+    replication_record.payload = EncryptedSessionPayload::new(vec![0; max_payload]);
+    let timestamp = Timestamp::now_utc();
+    let exact_entry = ReplicationEntry {
+        sequence: backend
+            .max_replication_sequence()
+            .await
+            .expect("read sequence before exact replication")
+            + 1,
+        tx_id: "transport-exact-replication".to_string(),
+        op: ReplicationOp::CompareAndSet {
+            key: replication_key,
+            expected_generation: None,
+            credential_id: replication_lease.credential_id(),
+            guard_expires_at: replication_lease.expires_at(),
+            new_record: replication_record,
+        },
+        timestamp,
+    };
+    write_frame(
+        &mut stream,
+        &Request::ReplicateEntry {
+            entry: exact_entry.clone(),
+        },
+    )
+    .await
+    .expect("write exact replication entry");
+    let exact_replicate: Response = read_frame(&mut stream, frame_budget)
+        .await
+        .expect("read exact replication response");
+    assert!(matches!(exact_replicate, Response::ReplicateEntry(Ok(()))));
+    assert_eq!(backend.replicate_calls.load(Ordering::SeqCst), 1);
+
+    let rebuild_entries = backend
+        .get_replication_log(1, usize::MAX)
+        .await
+        .expect("read coherent exact-payload log for rebuild");
+
+    write_frame(
+        &mut stream,
+        &Request::RebuildReplicationState {
+            entries: rebuild_entries,
+        },
+    )
+    .await
+    .expect("write exact rebuild");
+    let exact_rebuild: Response = read_frame(&mut stream, frame_budget)
+        .await
+        .expect("read exact rebuild response");
+    assert!(matches!(
+        exact_rebuild,
+        Response::RebuildReplicationState(Ok(()))
+    ));
+    assert_eq!(backend.rebuild_calls.load(Ordering::SeqCst), 1);
+
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn server_rejects_backend_outputs_bound_to_a_different_request() {
+    let mtls = mtls_configs();
+    let inner = ReplicationDispatchSpy::new();
+    let requested_key = test_key_with_stable_id(b"semantic-request-key");
+    let requested_owner = OwnerId::new("semantic-request-owner").expect("requested owner");
+    let valid_lease = inner
+        .acquire(
+            &requested_key,
+            requested_owner.clone(),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("seed valid request lease");
+    let wrong_key = test_key_with_stable_id(b"semantic-wrong-key");
+    let wrong_owner = OwnerId::new("semantic-wrong-owner").expect("wrong owner");
+    let wrong_lease = inner
+        .acquire(&wrong_key, wrong_owner.clone(), Duration::from_secs(60))
+        .await
+        .expect("seed wrong lease");
+    let wrong_record = test_record(
+        &wrong_key,
+        &wrong_owner,
+        wrong_lease.fence(),
+        Generation::new(1),
+    );
+    let mut forged_renewal = serde_json::to_value(&valid_lease).expect("serialize valid lease");
+    forged_renewal["credential_id"] = serde_json::json!(valid_lease.credential_id() + 1);
+    let wrong_renew_lease =
+        serde_json::from_value(forged_renewal).expect("forge renewal credential");
+    let backend = SemanticViolationBackend {
+        inner,
+        wrong_record,
+        wrong_acquire_lease: wrong_lease,
+        wrong_renew_lease,
+    };
+    let (addr, _backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(2)));
+    let expected_store = StoreError::BackendUnavailable("backend unavailable".to_string());
+    let expected_lease =
+        opc_session_store::LeaseError::Backend("lease backend unavailable".to_string());
+
+    assert_eq!(
+        remote.get(&requested_key).await,
+        Err(expected_store.clone())
+    );
+    let record = test_record(
+        &requested_key,
+        &requested_owner,
+        valid_lease.fence(),
+        Generation::new(1),
+    );
+    assert_eq!(
+        remote
+            .compare_and_set(CompareAndSet {
+                key: requested_key.clone(),
+                lease: valid_lease.clone(),
+                expected_generation: None,
+                new_record: record,
+            })
+            .await,
+        Err(expected_store.clone())
+    );
+    let batch_record = test_record(
+        &requested_key,
+        &requested_owner,
+        valid_lease.fence(),
+        Generation::new(2),
+    );
+    assert_eq!(
+        remote
+            .batch(vec![opc_session_store::SessionOp::CompareAndSet(
+                CompareAndSet {
+                    key: requested_key.clone(),
+                    lease: valid_lease.clone(),
+                    expected_generation: None,
+                    new_record: batch_record,
+                },
+            )])
+            .await,
+        Err(expected_store.clone())
+    );
+    assert_eq!(
+        remote
+            .batch(vec![opc_session_store::SessionOp::Get {
+                key: requested_key.clone(),
+            }])
+            .await,
+        Err(expected_store)
+    );
+    assert_eq!(
+        remote
+            .acquire(
+                &requested_key,
+                requested_owner.clone(),
+                Duration::from_secs(60),
+            )
+            .await,
+        Err(expected_lease.clone())
+    );
+    assert_eq!(
+        remote.renew(&valid_lease, Duration::from_secs(60)).await,
+        Err(expected_lease)
+    );
+
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn authenticated_continuous_slow_readers_release_slots_and_do_not_block_shutdown() {
+    use opc_session_net::protocol::write_frame;
+    use opc_session_net::{Request, Response};
+
+    let mtls = mtls_configs();
+    let server_budget = opc_session_net::protocol::MIN_NEGOTIATED_FRAME_SIZE.max(1024 * 1024);
+    let key = test_key_with_stable_id(b"slow-reader");
+    let owner = OwnerId::new("slow-reader-owner").expect("slow-reader owner");
+    let mut record = test_record(&key, &owner, FenceToken::new(1), Generation::new(1));
+    record.payload = EncryptedSessionPayload::new(vec![255; server_budget / 5]);
+    let encoded_response = serde_json::to_vec(&Response::Get(Ok(Some(record.clone()))))
+        .expect("encode near-limit response")
+        .len();
+    assert!(encoded_response < server_budget);
+    assert!(encoded_response > server_budget * 3 / 4);
+
+    let backend = OversizedOutputBackend::new(record, Vec::new(), payload_replication_entry(1, 0));
+    let server = SessionReplicationServer::new(
+        Arc::new(backend.clone()),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_max_frame_size(server_budget)
+    .with_max_connections(1)
+    .with_idle_timeout(Duration::from_millis(125));
+    let (handle, addr) = server
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("listen for slow-reader test");
+
+    for cycle in 0..3 {
+        let baseline_gets = backend.get_calls.load(Ordering::SeqCst);
+        let stalled = authenticated_raw_stream(&mtls, 1, 2, addr, server_budget).await;
+        let (stalled_reader, mut stalled_writer) = tokio::io::split(stalled);
+        let sent = Arc::new(AtomicUsize::new(0));
+        let sent_by_writer = Arc::clone(&sent);
+        let request_key = key.clone();
+        let flood = tokio::spawn(async move {
+            loop {
+                if write_frame(
+                    &mut stalled_writer,
+                    &Request::Get {
+                        key: request_key.clone(),
+                    },
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+                sent_by_writer.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let probe = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(4)))
+            .with_max_frame_size(server_budget);
+        let head = tokio::time::timeout(Duration::from_secs(5), probe.max_replication_sequence())
+            .await
+            .unwrap_or_else(|_| panic!("cycle {cycle}: stalled writer retained the only slot"))
+            .unwrap_or_else(|error| panic!("cycle {cycle}: recovery probe failed: {error}"));
+        assert_eq!(head, 0);
+        assert!(sent.load(Ordering::SeqCst) > 1);
+        assert!(backend.get_calls.load(Ordering::SeqCst) > baseline_gets);
+
+        flood.abort();
+        let _ = flood.await;
+        drop(stalled_reader);
+    }
+
+    handle.abort_and_wait().await;
+
+    let shutdown_server = SessionReplicationServer::new(
+        Arc::new(backend.clone()),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_max_frame_size(server_budget)
+    .with_max_connections(1)
+    .with_idle_timeout(Duration::from_secs(30));
+    let (shutdown_handle, shutdown_addr) = shutdown_server
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("listen for blocked-shutdown proof");
+    let baseline_gets = backend.get_calls.load(Ordering::SeqCst);
+    let stalled = authenticated_raw_stream(&mtls, 1, 2, shutdown_addr, server_budget).await;
+    let (stalled_reader, mut stalled_writer) = tokio::io::split(stalled);
+    let request_key = key;
+    let flood = tokio::spawn(async move {
+        loop {
+            if write_frame(
+                &mut stalled_writer,
+                &Request::Get {
+                    key: request_key.clone(),
+                },
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut previous = baseline_gets;
+        let mut plateau_samples = 0_u8;
+        loop {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let current = backend.get_calls.load(Ordering::SeqCst);
+            if current > baseline_gets && current == previous {
+                plateau_samples = plateau_samples.saturating_add(1);
+                if plateau_samples >= 4 {
+                    break;
+                }
+            } else {
+                plateau_samples = 0;
+            }
+            previous = current;
+        }
+    })
+    .await
+    .expect("near-limit writes must plateau while the authenticated reader remains idle");
+    assert!(
+        !flood.is_finished(),
+        "the request flood must remain live while the server writer is blocked"
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), shutdown_handle.abort_and_wait())
+        .await
+        .expect("abort_and_wait must cancel a handler blocked on a slow reader");
+    flood.abort();
+    let _ = flood.await;
+    drop(stalled_reader);
 }
 
 #[tokio::test]
@@ -1829,6 +2988,7 @@ async fn incompatible_client_receives_server_contract_before_disconnect() {
             cluster_id: None,
             configuration_id: None,
             handshake_nonce: None,
+            requested_response_frame_size: None,
         },
     )
     .await
@@ -1869,6 +3029,9 @@ async fn plaintext_rebuild_is_rejected_before_backend_dispatch() {
             cluster_id: None,
             configuration_id: None,
             handshake_nonce: None,
+            requested_response_frame_size: Some(
+                opc_session_net::protocol::DEFAULT_MAX_FRAME_SIZE as u32,
+            ),
         },
     )
     .await;
@@ -2848,23 +4011,40 @@ async fn durable_readiness_adaptively_pages_a_log_larger_than_one_wire_frame() {
         Timestamp::from_offset_datetime(time::OffsetDateTime::now_utc() + time::Duration::hours(1));
     let owner = OwnerId::new("large-log-owner").expect("test owner");
     let entries = (1_u64..=3)
-        .map(|sequence| ReplicationEntry {
-            sequence,
-            tx_id: format!("large-log-{sequence}-{}", "x".repeat(400_000)),
-            op: ReplicationOp::AcquireLease {
-                key: SessionKey {
-                    tenant: TenantId::new("tenant-a").expect("test tenant"),
-                    nf_kind: NetworkFunctionKind::from_static("smf"),
-                    key_type: SessionKeyType::PduSession,
-                    stable_id: Bytes::from(format!("large-log-key-{sequence}")),
+        .map(|sequence| {
+            let key = SessionKey {
+                tenant: TenantId::new("tenant-a").expect("test tenant"),
+                nf_kind: NetworkFunctionKind::from_static("smf"),
+                key_type: SessionKeyType::PduSession,
+                stable_id: Bytes::from(format!("large-log-key-{sequence}")),
+            };
+            let mut record =
+                test_record(&key, &owner, FenceToken::new(sequence), Generation::new(1));
+            record.payload = EncryptedSessionPayload::new(vec![255; 100_000]);
+            ReplicationEntry {
+                sequence,
+                tx_id: format!("large-log-{sequence}"),
+                op: ReplicationOp::Batch {
+                    ops: vec![
+                        ReplicationOp::AcquireLease {
+                            key: key.clone(),
+                            owner: owner.clone(),
+                            fence: FenceToken::new(sequence),
+                            credential_id: sequence,
+                            ttl: Duration::from_secs(60 * 60),
+                            expires_at,
+                        },
+                        ReplicationOp::CompareAndSet {
+                            key,
+                            expected_generation: None,
+                            credential_id: sequence,
+                            guard_expires_at: expires_at,
+                            new_record: record,
+                        },
+                    ],
                 },
-                owner: owner.clone(),
-                fence: FenceToken::new(sequence),
-                credential_id: sequence,
-                ttl: Duration::from_secs(60 * 60),
-                expires_at,
-            },
-            timestamp: Timestamp::now_utc(),
+                timestamp: Timestamp::now_utc(),
+            }
         })
         .collect::<Vec<_>>();
     let aggregate_frame = serde_json::to_vec(&Response::GetReplicationLog(Ok(entries.clone())))

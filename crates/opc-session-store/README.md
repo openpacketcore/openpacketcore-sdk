@@ -79,15 +79,60 @@ evidence.
   restore-response budget; `u64` restore cursors/counts, `max_value_bytes`, and
   size-bearing store errors; checked conversion at both domain boundaries; and
   independent 256-batch, 1,024-restore, 65,536-log, and 65,536-rebuild limits.
-  Its profile also pins wire-schema/error-set revisions 1 and the 128-byte
-  owner, custom-key, and state-type bounds.
+  Its profile pins wire-schema revision 2, error-set revision 1,
+  `min_frame_size = 8192`, `max_frame_size = 16777216`, the 128-byte
+  owner/custom-key/state-type bounds,
+  `stable_id_max_bytes = 64`, `replication_tx_id_max_bytes = 128`, and
+  `cas_request_id_bytes = 36`. Stable IDs contain 1 through 64 bytes,
+  replication transaction IDs contain 1 through 128 UTF-8 bytes, and CAS
+  request IDs, when present, use the canonical lowercase hyphenated 36-byte UUID encoding.
+  Revision 2 adds exact directional frame negotiation: Hello requests the
+  client's response limit, while HelloAck reports the accepted response limit
+  and server request limit;
+  all are fixed-width, at least `MIN_NEGOTIATED_FRAME_SIZE` (8 KiB, or
+  8,192 bytes), and at most `MAX_NEGOTIATED_FRAME_SIZE` (16 MiB, or
+  16,777,216 bytes). `MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE` aliases that minimum.
   Version/profile/authentication or malformed-handshake failure reports every
   capability boolean false with `max_value_bytes = 0`; cached capabilities are
   descriptive and never substitute for fresh quorum evidence.
 - The exact `opc-session-net/4` ALPN, version, and contract profile have no v3
   fallback or downgrade negotiation. Public session-net `Request`/`Response`
   remain, but `Hello`/`HelloAck` gain an optional `contract_profile`, so
-  exhaustive construction and matching must account for the new field.
+  exhaustive construction and matching must account for the new field. The
+  revision-2 public profile also adds `max_frame_size`, which is source-breaking
+  for external struct literals/destructuring and requires the same coordinated
+  fleet upgrade.
+- Every protocol-v4 response and watch item is fully bounded-encoded before its
+  length prefix is emitted. Common non-pageable and complete-page successes use
+  one bounded encode with no sizing preflight. If a complete pageable response
+  is too large, that direct attempt emits no prefix; bounded logarithmic sizing
+  probes and the final encode reuse the same absolute deadline established
+  before the first encode/probe. Lazy exact-length boxed chunks are not
+  coalesced and retained
+  encoded-JSON byte storage stays within the frame limit. Chunk metadata and
+  allocator slab/RSS overhead are separate. Deadline and server-abort
+  cancellation are checked cooperatively between synchronous serializer
+  writes/chunks, and the same deadline continues through prefix, payload, and
+  flush.
+  Get/CAS records and positional batches are never truncated;
+  restore/log pages may return only a complete cursor/sequence-preserving
+  prefix; watch cannot skip an oversized sequence. A small SDK-owned,
+  redaction-safe fallback is used when representable, otherwise the connection
+  closes fail-closed. Slow-reader timeout releases the connection slot.
+- Transport capabilities advertise
+  the minimum of the backend maximum and `(frame - 8192) / 8` for both the
+  accepted response and server request frames, rather than a raw frame size.
+  The 8 KiB reserve and factor of eight cover the record/key/error envelope,
+  worst-case JSON byte-array expansion, and equal escaping/metadata headroom. An
+  advertised `max_value_bytes` remains executable across unequal client/server
+  limits. At the exact 8 KiB minimum it is zero; the minimum fits the bounded
+  maximum-profile metadata/envelopes, not a non-zero application payload. The
+  1 MiB default advertises 130,048 bytes, while 16 MiB advertises 2,096,128;
+  SQLite's complete 1 MiB limit requires at least 8,396,800 frame bytes. The
+  ceiling is per frame: at the default 128 connection slots, concurrent
+  ceiling-sized encodes can retain about 2 GiB before metadata/TLS/runtime
+  overhead. The aggregate scales with `with_max_connections`, so aggregate
+  limiting and resource/soak qualification remain #143.
 - `SessionStore<B>` wraps a backend in a typed store handle.
 
 ```rust,no_run
@@ -293,7 +338,8 @@ fn build_store(
 Build one immutable `SessionReplicationManifest` from the cluster ID, an
 operator-controlled configuration generation, and the complete descriptor
 set. Bind its exact local `ReplicaId`, then derive each
-`RemoteSessionBackend` from that local binding. Protocol v3 requires the live
+`RemoteSessionBackend` from that local binding. Protocol v4 retains v3's
+requirement that the live
 certificate's canonical SPIFFE URI, claimed `ReplicaId`, opposite replica ID,
 cluster, and configuration digest to agree before backend dispatch. Resolver
 or DNS aliases change only the dial address; they do not change voting
@@ -412,7 +458,15 @@ rejection do not recurse through the operation tree. Protocol v4 carries the
 same depth-16/256-node rules in the exact contract profile and bounds its private
 DTO collections before domain construction. Batch requests admit at most 256
 operations; replication-log pages and rebuild prefixes admit at most 65,536
-entries. The configured frame limit remains a separate encoded-byte bound.
+entries. The negotiated frame limit remains a separate encoded-byte bound.
+Outbound sizing and emitted encoding use capped buffers and emit no prefix when
+the result cannot fit. Batch results retain exact positional cardinality and are
+never shortened. Replication-log results may expose only the largest complete
+contiguous prefix; restore pages may expose only a complete cursor
+prefix. An over-limit watch entry is not skipped because doing so would hide a
+sequence gap; the stream terminates after a representable fixed error or by
+closing the connection. Rejected owned operation trees continue to be
+dismantled iteratively.
 `EncryptingSessionBackend` and `RemoteSealingSessionBackend` then transform
 every nested `CompareAndSet` record: replicate/rebuild paths encrypt or seal
 before backend delegation, while replication-log and watch paths decrypt or
@@ -450,10 +504,19 @@ atomic semantics before the new SDK reads the log. Calling a raw inner-backend
 rebuild does not add protection.
 
 This closes #147's nested-wrapper traversal gap only. The networked profile
-remains experimental and blocked on #143 and its other dependencies. Seamless
-SVID rotation, payload-protection key rotation, and trust-bundle rotation
-remain separate mandatory production qualifications; the operation-tree limits
-do not provide rotation evidence.
+remains experimental. Seamless SVID/trust-bundle lifecycle remains #158;
+payload-protection-key rotation and distributed production qualification remain
+#143. These are separate mandatory gates, and the operation-tree limits do not
+provide rotation evidence.
+
+The outbound bound does not make backend effects transactional with response
+delivery. A compare-and-set, batch slot, lease operation, replicated append, or
+rebuild can complete before bounded encoding or the socket write fails. A
+missing response is therefore an ambiguous mutation outcome, not evidence of
+rollback; callers must follow the existing request-id/idempotency, fencing, and
+authoritative re-read rules before retrying. Diagnostics use fixed
+operation-family/reason categories and never record keys, owners, payloads,
+transaction IDs, peer identities, or backend/peer-controlled error text.
 
 ## Relationships
 
@@ -521,6 +584,26 @@ do not provide rotation evidence.
   but do not establish durable sequencing, fork recovery, restore authority,
   seamless rotation, or production HA. Fixed-width v4 wire admission is
   implemented under #134.
+- #159 closes per-connection outbound frame allocation and slow-reader write
+  bounds under protocol-v4 wire-schema revision 2. Revision 1 and revision 2
+  require a coordinated stop/upgrade/start and fail closed when mixed. This
+  does not rewrite persisted store bytes, but strict revision-2 transport rejects
+  empty/over-64-byte stable IDs and empty/over-128-byte UTF-8 transaction IDs in
+  retained records/logs. Before startup, use a decoder-first, product-aware
+  migration or coherent store replacement: quiesce writers, ensure the migration
+  reader can decode the legacy representation, migrate under #167/#168 without
+  truncating or renaming durable identities, then verify with the strict decoder
+  before enabling revision-2 writers. Rollback likewise installs a decoder for
+  the retained target representation before old writers restart, or restores a
+  coherent checkpoint/reverse migration. #167 owns the production stable-ID
+  model/persistence/privacy/audit contract; #168 owns the durable canonical
+  transaction-ID type and migration coordinated with #127/#128/#143. This
+  supplies no durable authority, seamless credential rotation (#158), or distributed and
+  payload-key qualification (#143). #169 separately owns `opc-persist`'s
+  replacement of `TcpPeer::timeout`'s per-stage behavior (up to three attempts
+  with backoff) with an
+  atomic end-to-end logical-RPC deadline, safe retry policy, and metrics; #159
+  does not change that behavior.
 
 ## Roadmap
 
@@ -528,10 +611,12 @@ do not provide rotation evidence.
 - Continue hardening restore evidence and traffic-blocking gates.
 - Complete durable sequencing and safe fork repair/recovery (#127–#129),
   bounded majority-authoritative restore (#133), watch handoff correctness
-  (#145), and absolute-expiry admission (#148), then complete the production
-  qualification profile and distributed
-  evidence—including seamless certificate, payload-protection-key, and
-  trust-bundle rotation—under #158, with production evidence in #143.
+  (#145), absolute-expiry admission (#148), production stable-ID and
+  transaction-ID persistence contracts (#167/#168), and persist peer
+  logical-RPC deadlines (#169), then complete the production qualification
+  profile. Seamless certificate/trust-bundle lifecycle is #158;
+  payload-protection-key rotation and the distributed production evidence
+  remain #143.
 - Keep encryption AAD bound to namespace, NF kind, state type, generation,
   fence, and session-key digest.
 

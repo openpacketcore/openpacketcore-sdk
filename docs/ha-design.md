@@ -101,7 +101,13 @@ and typed-invalid handover rejection are implemented. Checked session TTL and
 replication-sequence handling now fail closed at direct, wrapper, cache,
 SQLite, quorum, and authenticated transport boundaries under #137/#138.
 Bounded iterative protection of every nested replicated CAS is implemented
-under #147. These boundary fixes do not provide durable authority.
+under #147. Bounded outbound response/watch frames and slow-reader writes are
+implemented under #159. Its stable-ID and replication-transaction-ID checks are
+wire containment only: production model/persistence/audit/migration contracts
+remain #167/#168, with #168 coordinated with #127/#128/#143. `opc-persist`'s
+`TcpPeer::timeout` still applies per I/O stage across up to three attempts with backoff;
+#169 owns one atomic end-to-end logical-RPC deadline,
+safe retry policy, and metrics. These boundary fixes do not provide durable authority.
 
 `QuorumSessionStore` coordinates session leases and CAS mutations across a set of `SessionStoreBackend` replicas using quorum-backed ordered replication. It is not a Raft implementation; its target safety contract is a durable committed log prefix where an entry is authoritative only after the same sequence entry is present on a majority of replicas.
 
@@ -286,9 +292,9 @@ replacement before the new SDK starts; it must not be clamped or split ad hoc.
 Raw inner-backend rebuild does not add protection.
 
 #147 closes only this bounded nested-payload path. The session profile remains
-experimental and blocked on #143 and its other dependencies. Seamless SVID
-rotation, payload-protection key rotation, and trust-bundle rotation remain
-separate mandatory production qualifications.
+experimental. Seamless SVID/trust-bundle lifecycle remains #158;
+payload-protection-key rotation and distributed production qualification remain
+#143. These are separate mandatory gates.
 
 ### Authenticated network transport (protocol v4)
 
@@ -315,15 +321,65 @@ deployment or highest-common-version negotiation. Public `Request`/`Response`
 remain available, but `Hello`/`HelloAck` gain an optional `contract_profile`, so
 exhaustive construction and matching must account for the new field.
 
+Wire-schema revision 2 extends the exact v4 bootstrap with directional frame
+budgets. Hello sends `requested_response_frame_size`; HelloAck returns the
+client/server-minimum `accepted_response_frame_size` plus the independent
+`server_request_frame_size`. Each checked `u32` must be at least
+`MIN_NEGOTIATED_FRAME_SIZE` (8 KiB, or 8,192 bytes) and at most
+`MAX_NEGOTIATED_FRAME_SIZE` (16 MiB, or 16,777,216 bytes).
+`MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE` aliases the same minimum. Unequal
+client/server settings are therefore explicit. Revision-1 and revision-2 v4
+participants do not interoperate even though their ALPN text is the same.
+
 The private v4 DTOs use `u32` for restore/log request limits and the restore
 response budget, and `u64` for restore cursors/excluded counts,
 `max_value_bytes`, and size-bearing store errors. Restore `loaded_count` and
 `complete` are omitted and recomputed after decode. Independent work limits
 admit 256 batch operations, 1,024 restore records, 65,536 log entries, and
 65,536 rebuild entries; the configured frame bound remains separate. The exact
-profile also pins wire-schema/error-set revisions 1, 128-byte
+profile pins wire-schema revision 2, error-set revision 1, 128-byte
 owner/custom-key/state-type bounds, the 31,536,000-second TTL maximum, and
-depth-16/256-node replication trees.
+depth-16/256-node replication trees. Revision 2 also pins
+`min_frame_size = 8192`, `max_frame_size = 16777216`,
+`stable_id_max_bytes = 64`,
+`replication_tx_id_max_bytes = 128`, and `cas_request_id_bytes = 36`.
+Transported stable IDs contain 1 through 64 bytes, transaction IDs contain 1
+through 128 UTF-8 bytes, and CAS request IDs, when present, use the canonical
+lowercase hyphenated 36-byte UUID encoding.
+
+Every server response and watch item is fully bounded-encoded before a length
+prefix is emitted. Common non-pageable and complete-page successes use one
+bounded encode without a sizing preflight. An oversized pageable direct attempt
+emits no prefix; bounded logarithmic sizing probes and the final encode share
+one absolute deadline established before the first encode/probe and continuing
+through prefix, payload, and flush. Lazy exact-length boxed chunks are not
+coalesced and retained encoded-JSON
+byte storage stays within the limit; metadata and allocator slab/RSS overhead
+remain separate. Storage/sizing sinks check deadline and server-abort
+cancellation cooperatively between serializer writes/chunks. Tokio cannot
+preempt one synchronous serializer callback, whose input remains bounded by the
+profile. Expiry closes the connection and returns the handler/connection permit.
+Get/CAS records and positional batch vectors are never truncated. Restore may
+return a complete cursor-correct prefix; replication-log reads return the
+largest complete contiguous-sequence prefix that fits. Watch cannot skip an
+oversized entry; it emits a fixed SDK-owned error when representable and ends,
+or closes immediately. A fixed fallback that itself cannot fit also causes a
+fail-closed close. Rejected nested entries keep iterative disposal and bounded
+work.
+
+Transport `max_value_bytes` is clamped to the backend maximum and exactly
+`(frame - 8192) / 8` for both the accepted response and server request frames.
+The reserve and factor cover the record/key/error envelope, worst-case JSON
+byte-array expansion, and equal escaping/metadata headroom. The advertised
+maximum can perform a real write/read round trip under unequal limits. It
+is zero at the exact 8 KiB minimum; payload-bearing traffic requires a larger
+frame. The 1 MiB default advertises 130,048 bytes; the 16 MiB ceiling advertises
+2,096,128, and SQLite's full 1 MiB limit requires at least 8,396,800 frame
+bytes. A 16 MiB setting is recommended for that profile. This is per frame: at
+the default 128 connection slots, concurrent ceiling-sized encodes can retain
+about 2 GiB before metadata/TLS/runtime overhead. The aggregate scales with
+`with_max_connections`, so aggregate limiting and resource/soak evidence remain
+#143. It remains descriptive, not traffic or quorum authority.
 
 A version/profile/authentication or malformed-handshake failure clears cached
 capabilities and reports every boolean false with `max_value_bytes = 0`.
@@ -340,14 +396,38 @@ been written, rollback to a v3 binary additionally requires a coherent drained
 checkpoint restore or reviewed reverse migration of every live and replayable
 record, log, snapshot, and restore source.
 
+The revision-1 to revision-2 profile transition uses the same coordinated
+stop/upgrade/start and verification; it is not a same-ALPN rolling upgrade.
+#159 does not rewrite persisted store bytes. In-profile stores need no format
+conversion, but strict revision-2 transport rejects retained empty/over-64-byte
+stable IDs and empty/over-128-byte UTF-8 transaction IDs. Before startup,
+quiesce writers, inventory every record/log/snapshot/restore/replay source, and
+perform a decoder-first product-aware migration or coherent store replacement
+under #167/#168. The migration reader must decode the legacy representation
+before rewrite, must not truncate/hash/rename durable identities, and the strict
+decoder must verify the result before writers restart. Rollback must first
+install a decoder that reads the retained target representation, or restore a
+coherent checkpoint/run a reviewed reverse migration. Every participant still
+moves to one exact profile together. Rollback across `OPCH`/#135 retains its
+independent coherent-checkpoint or reverse-migration requirement.
+
 Session caches, tickets, resumption, early data, and 0-RTT are disabled, so a
 reconnect performs a full mutual-TLS certificate exchange. Production still
 requires seamless certificate and trust-bundle rotation without interrupting
 session service, including trust overlap, revocation, long-lived-connection
 retirement, reconnect storms, and a documented maximum authentication age.
-That distributed qualification remains #143. Session TTL is application-state
-lifetime; the 365-day bound is not a certificate-expiry, trust-validity, or
-authentication-age policy.
+The seamless lifecycle remains #158 and distributed qualification remains
+#143. Session TTL is application-state lifetime; the 365-day bound is not a
+certificate-expiry, trust-validity, or authentication-age policy.
+
+Response delivery is not atomic with backend mutation. A CAS, batch slot, lease
+change, replicated append, or rebuild may commit before bounded encoding or the
+socket write fails. Missing responses are ambiguous; clients recover through
+the operation's request-ID/idempotency and fencing rules plus authoritative
+re-read, never by assuming rollback and blindly replaying. Operational evidence
+uses bounded operation-family/reason categories for oversize/fallback/timeout
+without logging keys, payloads, owners, transaction IDs, peer identities, or
+backend/peer-controlled error text.
 
 This closes per-replica transport parity only. Quorum selection/merge remains
 #133, while durable sequencing and repair authority remain #127/#128.
@@ -426,3 +506,12 @@ distributed commit or repair proof (#127/#128).
   encryption/sealing round trips through replicate/rebuild/log/watch, complete
   prefix/page preflight, sequential-provider failure, and no backend delegation
   or partial entry/page exposure.
+- **Required bounded-response qualification**: Must exercise equal/unequal revision-2 budgets,
+  8 KiB/16 MiB/MAX+1 admission, a non-power-of-two retained-chunk allocation,
+  exact-limit and one-byte-over response families, conservative maximum-payload
+  round trips, cursor/sequence-preserving prefixes, non-truncated batches,
+  fixed redaction-safe fallbacks, authenticated slow-reader reaping, connection
+  slot recovery, ambiguous mutation outcomes, and deterministic shutdown.
+  Passing those tests demonstrates the #159 transport boundary only; it does
+  not close #167/#168 retained-identity work, #169 persist RPC deadlines, #158
+  seamless credential lifecycle, or #143 production qualification.

@@ -59,8 +59,8 @@ process-local adapter instances before I/O.
 separate one-replica profile that reports `single-replica`, never HA. The
 deprecated raw-vector constructor is non-operational and reports `unknown`.
 
-Protocol v3 adds authenticated replica identity. One immutable
-`SessionReplicationManifest` combines a cluster ID, an operator-controlled
+Protocol v4 retains the authenticated replica identity introduced by v3. One
+immutable `SessionReplicationManifest` combines a cluster ID, an operator-controlled
 configuration generation, and the complete descriptor set into an
 order-independent SHA-256 configuration ID. Production client and server
 constructors accept only opaque authenticated TLS configs. Before backend
@@ -119,11 +119,12 @@ admission, and typed-invalid handover rejection are
 implemented under #135; checked TTL rejection is implemented under #137, and
 malformed sequence zero, checked increment, rebuild-prefix, SQLite
 signed-boundary, cache, and authenticated wire rejection are implemented under
-#138. Production qualification, including seamless credential/trust rotation,
-remains #143.
+#138. Seamless session-net credential/trust lifecycle remains #158, and its
+distributed production qualification remains #143.
 Watch handoff correctness (#145) and absolute-record-expiry admission (#148)
 also remain open. Bounded nested-CAS protection is implemented under #147;
-it does not change the profile's experimental status.
+outbound response allocation/frame bounds and slow-reader deadlines are
+implemented under #159. These do not change the profile's experimental status.
 
 The v4 wire uses `u32` for restore/log request limits and the client restore
 response budget; `u64` for restore cursors, excluded counts,
@@ -132,12 +133,64 @@ backend dispatch or caller exposure. It omits restore `loaded_count` and
 `complete` and recomputes them after decode. Independent limits admit 256 batch
 operations, 1,024 restore records, 65,536 replication-log entries, and 65,536
 rebuild entries, in addition to the configured frame-size bound. The exact
-profile also pins wire-schema/error-set revisions 1, 128-byte
+profile pins wire-schema revision 2, error-set revision 1, 128-byte
 owner/custom-key/state-type bounds, depth-16/256-node replication trees, and the
-31,536,000-second TTL maximum. Public
+31,536,000-second TTL maximum. Revision 2 additionally pins
+`min_frame_size = 8192`, `max_frame_size = 16777216`,
+`stable_id_max_bytes = 64`,
+`replication_tx_id_max_bytes = 128`, and `cas_request_id_bytes = 36`.
+Transported stable IDs contain 1 through 64 bytes, transaction IDs contain 1
+through 128 UTF-8 bytes, and CAS request IDs, when present, are canonical
+lowercase hyphenated UUIDs with the exact 36-byte encoding. Public
 `Request`/`Response` remain, but `Hello`/`HelloAck` gain an optional
 `contract_profile`; exhaustive construction and matching must account for the
-new field.
+new field. The public `ContractProfile::max_frame_size` field is also a Rust
+source break for external literals/destructuring and shares the coordinated
+revision-2 deployment boundary.
+
+Wire-schema revision 2 adds directional response-budget admission to the exact
+v4 handshake. Hello carries the client's requested response frame size; HelloAck
+returns the accepted response size (the client/server minimum) and the server's
+independent request-frame size. Each is a checked `u32` between
+`MIN_NEGOTIATED_FRAME_SIZE` (8 KiB, or 8,192 bytes) and
+`MAX_NEGOTIATED_FRAME_SIZE` (16 MiB, or 16,777,216 bytes), and
+`MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE` aliases that same minimum.
+This makes unequal client/server limits explicit and makes revision-1 and
+revision-2 v4 peers incompatible even though both use `opc-session-net/4` ALPN.
+
+Every response and watch item is fully bounded-encoded before any frame prefix
+is emitted. Common non-pageable and complete-page successes use one bounded
+encode without a sizing preflight. An oversized pageable direct attempt emits
+no prefix; bounded logarithmic sizing probes and the final encode reuse one
+absolute deadline established before the first encode/probe and continuing
+through prefix, payload, and flush. Lazy exact-length boxed chunks are not
+coalesced; their total retained encoded-JSON byte storage never exceeds the
+negotiated cap. Chunk metadata and allocator slab/RSS overhead remain separate.
+The synchronous storage/sizing sinks check deadline and server-abort
+cancellation cooperatively between serializer writes/chunks; one bounded
+serializer callback is not asynchronously preemptible. A slow reader is
+disconnected and its slot is recovered.
+Records and positional batch results are never truncated. Restore and log reads
+may return only complete cursor/contiguous-sequence prefixes. Watch never skips
+an oversized entry; a fixed SDK-owned redaction-safe error is emitted when it
+fits and the stream ends, otherwise the connection closes. Nested rejected
+entries retain iterative consuming disposal.
+
+Transport capability clamping takes the backend maximum and `(frame - 8192) / 8`
+for both the accepted response and server request frames, rather than the raw
+frame size. The reserve and factor cover the record/key/error envelope,
+worst-case JSON byte-array expansion, and equal escaping/metadata headroom. The
+advertised `max_value_bytes` is executable for both directions with unequal
+limits. It is zero at the exact 8 KiB minimum; that minimum fits bounded
+metadata/envelopes, not a non-zero application payload. It remains
+static/descriptive evidence, not quorum readiness.
+The 1 MiB default advertises 130,048 bytes and the 16 MiB ceiling advertises
+2,096,128. SQLite's full 1 MiB value limit requires at least 8,396,800 frame
+bytes, so 16 MiB is the recommended setting for that profile. This remains a
+per-frame limit: at the default 128 connection slots, simultaneous
+ceiling-sized encodes can retain about 2 GiB before metadata/TLS/runtime
+overhead. The aggregate scales with `with_max_connections`; aggregate byte
+permits and distributed resource/soak qualification remain #143.
 
 ## Consequences
 
@@ -201,8 +254,8 @@ record/log/snapshot/restore copy across every handover reader/writer.
 
 This closes the scoped #135 boundary, not durable authority or production HA.
 #127 remains open; #134 closes the fixed-width v4 wire boundary only, and #143
-still requires distributed qualification, including seamless SVID,
-payload-protection-key, and trust-bundle rotation.
+still requires distributed and payload-protection-key qualification. Seamless
+SVID/trust-bundle lifecycle remains #158.
 
 `MAX_REPLICATION_OPERATION_DEPTH` is 16 and
 `MAX_REPLICATION_OPERATIONS_PER_ENTRY` is 256. The root operation is depth 1,
@@ -236,8 +289,8 @@ be clamped or split ad hoc. A raw inner-backend rebuild is insufficient.
 
 These guarantees close #147's traversal/confidentiality boundary only. They do
 not establish consensus, durable authority, or production HA. #143 remains the
-production qualification owner, including separate proof of seamless SVID
-rotation, payload-protection key rotation, and trust-bundle rotation.
+distributed and payload-protection-key qualification owner; seamless
+SVID/trust-bundle lifecycle remains #158.
 
 Capability/profile validation and fresh readiness have different scopes. The
 former is static admission evidence. A v4 version/profile/authentication or
@@ -246,6 +299,35 @@ boolean false with `max_value_bytes = 0`; a cache retained after transient
 transport loss remains descriptive only. Fresh readiness is a bounded
 observation that can become stale immediately, so a CNF must gate traffic
 continuously and each authoritative operation must reassess quorum.
+
+Bounded response delivery does not roll back backend work. A mutation may have
+committed before encoding, write, or flush fails; the client must treat a
+missing response as ambiguous and recover through existing idempotency/request
+IDs, fencing, and an authoritative re-read. Diagnostics are limited to bounded
+operation-family/reason categories and must not include keys, payloads, owners,
+transaction IDs, peer identities, or backend/peer-controlled error text.
+
+The revision-1 to revision-2 transition requires the same drained coordinated
+stop/upgrade/start as other exact-profile changes. #159 does not rewrite
+persisted record/log bytes, but its stable-ID and transaction-ID rules are
+wire-only containment, not a production persistence contract. Before strict
+revision-2 startup, quiesce writers and inventory every retained record, log,
+snapshot, restore source, and replay source. Any out-of-profile value requires a
+decoder-first, product-aware migration or coherent store replacement under
+#167/#168: the migration reader must decode the legacy representation before
+rewriting it, must not silently truncate/hash/rename durable identities, and the
+strict decoder must verify the result before writers restart. Rollback likewise
+installs a decoder for the retained target representation before old writers, or
+uses a coherent checkpoint/reviewed reverse migration. All participants must
+move together; independent `OPCH`/#135 rollback barriers still apply. #167 owns
+the production stable-ID model/persistence/privacy/audit contract; #168 owns the
+canonical durable transaction-ID type and migration coordinated with
+#127/#128/#143.
+Session-net's deadline does not fix `opc-persist`'s `TcpPeer::timeout`
+per-stage multiplication across up to three attempts with backoff; #169 owns one atomic
+end-to-end logical-RPC deadline, safe retry policy, and metrics.
+Seamless SVID and trust-bundle lifecycle remains #158; payload-key rotation plus
+distributed failure/soak/resource qualification remains #143.
 
 A product composes one descriptor per physical vote. For example, logical self
 `epdg-app-0` may select the member whose dial endpoint is the full
