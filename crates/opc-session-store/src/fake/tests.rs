@@ -4,6 +4,52 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use opc_types::{NetworkFunctionKind, TenantId};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FakeBackendDataSnapshot {
+    records: HashMap<String, StoredSessionRecord>,
+    leases: HashMap<String, LeaseEntry>,
+    key_fences: HashMap<String, FenceToken>,
+    next_fence: u64,
+    next_credential_id: u64,
+    compacted_replication_sequence: u64,
+    last_replication_sequence: u64,
+    replication_log: Vec<ReplicationEntry>,
+    watcher_count: usize,
+}
+
+fn data_snapshot(state: &FakeBackendState) -> FakeBackendDataSnapshot {
+    FakeBackendDataSnapshot {
+        records: state.records.clone(),
+        leases: state.leases.clone(),
+        key_fences: state.key_fences.clone(),
+        next_fence: state.next_fence,
+        next_credential_id: state.next_credential_id,
+        compacted_replication_sequence: state.compacted_replication_sequence,
+        last_replication_sequence: state.last_replication_sequence,
+        replication_log: state.replication_log.clone(),
+        watcher_count: state.watchers.len(),
+    }
+}
+
+async fn backend_data_snapshot(backend: &FakeSessionBackend) -> FakeBackendDataSnapshot {
+    let state = backend.inner.lock().await;
+    data_snapshot(&state)
+}
+
+fn replication_entry(
+    sequence: u64,
+    tx_id: &str,
+    timestamp: Timestamp,
+    op: ReplicationOp,
+) -> ReplicationEntry {
+    ReplicationEntry {
+        sequence,
+        tx_id: tx_id.to_owned(),
+        op,
+        timestamp,
+    }
+}
+
 fn test_key(tenant: &str, stable_id: &[u8]) -> SessionKey {
     SessionKey {
         tenant: TenantId::new(tenant).unwrap(),
@@ -111,6 +157,316 @@ where
         .expect("watch should receive replication entry")
         .expect("watch stream should remain open")
         .expect("replication entry should be ok")
+}
+
+async fn assert_no_replication_entry<S>(stream: &mut S)
+where
+    S: futures_util::Stream<Item = Result<ReplicationEntry, StoreError>> + Unpin,
+{
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), stream.next())
+            .await
+            .is_err(),
+        "watch must remain open without receiving an entry"
+    );
+}
+
+#[tokio::test]
+async fn failed_replication_preserves_expired_internal_state_and_watchers() {
+    let backend = FakeSessionBackend::new();
+    let key = test_key("t1", b"expired-before-rejection");
+    let map_key = FakeSessionBackend::map_key(&key);
+    let owner = OwnerId::new("owner-a").expect("owner");
+    let fence = FenceToken::new(7);
+    let now = backend.clock.now_utc();
+    let expired_at =
+        Timestamp::from_offset_datetime(*now.as_offset_datetime() - time::Duration::seconds(1));
+    let existing_entry =
+        replication_entry(1, "existing", now, ReplicationOp::Batch { ops: Vec::new() });
+
+    {
+        let mut state = backend.inner.lock().await;
+        let mut expired_record = test_record(key.clone(), 1, fence.get(), owner.as_str());
+        expired_record.expires_at = Some(expired_at);
+        state.records.insert(map_key.clone(), expired_record);
+        state.leases.insert(
+            map_key.clone(),
+            LeaseEntry {
+                active: true,
+                credential_id: 8,
+                owner,
+                fence,
+                expires_at: expired_at,
+                guard_expires_at: expired_at,
+            },
+        );
+        state.key_fences.insert(map_key, fence);
+        state.next_fence = 8;
+        state.next_credential_id = 9;
+        state.last_replication_sequence = 1;
+        state.replication_log.push(existing_entry);
+    }
+    let mut watch = backend.watch(2).await.expect("watch rejected append");
+    let before = backend_data_snapshot(&backend).await;
+
+    let error = backend
+        .replicate_entry(replication_entry(
+            1,
+            "divergent",
+            now,
+            ReplicationOp::Batch { ops: Vec::new() },
+        ))
+        .await
+        .expect_err("divergent duplicate must reject");
+    assert_eq!(
+        error,
+        StoreError::BackendUnavailable("divergent replication entry sequence".into())
+    );
+
+    assert_eq!(backend_data_snapshot(&backend).await, before);
+    assert_no_replication_entry(&mut watch).await;
+}
+
+#[tokio::test]
+async fn late_capacity_failure_rolls_back_batch_and_preserves_watcher() {
+    let backend = FakeSessionBackend::with_limits(FakeBackendLimits {
+        max_tracked_keys: 1,
+        max_replication_entries: 8,
+    });
+    let key_a = test_key("t1", b"capacity-a");
+    let key_b = test_key("t1", b"capacity-b");
+    let owner = OwnerId::new("owner-a").expect("owner");
+    let now = backend.clock.now_utc();
+    let mut watch = backend.watch(1).await.expect("watch rejected batch");
+    let before = backend_data_snapshot(&backend).await;
+    let rejected = replication_entry(
+        1,
+        "capacity-rejected",
+        now,
+        ReplicationOp::Batch {
+            ops: vec![
+                ReplicationOp::DeleteFenced {
+                    key: key_a.clone(),
+                    owner: owner.clone(),
+                    fence: FenceToken::new(1),
+                },
+                ReplicationOp::DeleteFenced {
+                    key: key_b,
+                    owner: owner.clone(),
+                    fence: FenceToken::new(2),
+                },
+            ],
+        },
+    );
+
+    assert_eq!(
+        backend
+            .replicate_entry(rejected)
+            .await
+            .expect_err("the final child must exceed the key limit"),
+        StoreError::BackendUnavailable("fake backend tracked-key limit reached".into())
+    );
+    assert_eq!(backend_data_snapshot(&backend).await, before);
+    assert_no_replication_entry(&mut watch).await;
+
+    let accepted = replication_entry(
+        1,
+        "capacity-accepted",
+        now,
+        ReplicationOp::DeleteFenced {
+            key: key_a,
+            owner,
+            fence: FenceToken::new(1),
+        },
+    );
+    backend
+        .replicate_entry(accepted.clone())
+        .await
+        .expect("a valid entry must remain appendable");
+    assert_eq!(next_replication_entry(&mut watch).await, accepted);
+    assert_no_replication_entry(&mut watch).await;
+    assert_eq!(backend.inner.lock().await.watchers.len(), 1);
+}
+
+#[tokio::test]
+async fn failed_rebuild_preserves_every_internal_state_dimension() {
+    let backend = FakeSessionBackend::new();
+    let original_key = test_key("t1", b"rebuild-original");
+    let lease = acquire_test_lease(&backend, &original_key, "owner-a").await;
+    backend
+        .compare_and_set(cas_for_lease(original_key, &lease, None, 1))
+        .await
+        .expect("seed record");
+    let watch_start = backend.max_replication_sequence().await.expect("head") + 1;
+    let mut watch = backend.watch(watch_start).await.expect("watch rebuild");
+    let before = backend_data_snapshot(&backend).await;
+
+    let owner = OwnerId::new("owner-b").expect("owner");
+    let replacement_key = test_key("t1", b"rebuild-replacement");
+    let missing_key = test_key("t1", b"rebuild-missing");
+    let now = backend.clock.now_utc();
+    let ttl = Duration::from_secs(60);
+    let expires_at =
+        Timestamp::from_offset_datetime(*now.as_offset_datetime() + time::Duration::seconds(60));
+    let replacement = vec![
+        replication_entry(
+            1,
+            "replacement-first",
+            now,
+            ReplicationOp::DeleteFenced {
+                key: replacement_key,
+                owner: owner.clone(),
+                fence: FenceToken::new(20),
+            },
+        ),
+        replication_entry(
+            2,
+            "replacement-failure",
+            now,
+            ReplicationOp::RefreshTtl {
+                key: missing_key,
+                owner,
+                fence: FenceToken::new(21),
+                ttl,
+                expires_at,
+            },
+        ),
+    ];
+
+    assert_eq!(
+        backend
+            .rebuild_replication_state(replacement)
+            .await
+            .expect_err("the final rebuild entry must reject"),
+        StoreError::NotFound
+    );
+    assert_eq!(backend_data_snapshot(&backend).await, before);
+    assert_no_replication_entry(&mut watch).await;
+}
+
+#[tokio::test]
+async fn staging_preserves_and_advances_nonzero_compaction_state() {
+    let backend = FakeSessionBackend::with_limits(FakeBackendLimits {
+        max_tracked_keys: 8,
+        max_replication_entries: 1,
+    });
+    let owner = OwnerId::new("owner-a").expect("owner");
+    let first_key = test_key("t1", b"compacted-first");
+    let second_key = test_key("t1", b"retained-second");
+    let third_key = test_key("t1", b"next-third");
+    let missing_key = test_key("t1", b"missing-final");
+    let now = backend.clock.now_utc();
+    let first = replication_entry(
+        1,
+        "compacted-first",
+        now,
+        ReplicationOp::DeleteFenced {
+            key: first_key,
+            owner: owner.clone(),
+            fence: FenceToken::new(1),
+        },
+    );
+    let second = replication_entry(
+        2,
+        "retained-second",
+        now,
+        ReplicationOp::DeleteFenced {
+            key: second_key,
+            owner: owner.clone(),
+            fence: FenceToken::new(2),
+        },
+    );
+    backend
+        .replicate_entry(first.clone())
+        .await
+        .expect("append first entry");
+    backend
+        .replicate_entry(second.clone())
+        .await
+        .expect("append second entry");
+    let mut watch = backend.watch(3).await.expect("watch after compaction");
+    let compacted = backend_data_snapshot(&backend).await;
+    assert_eq!(compacted.compacted_replication_sequence, 1);
+    assert_eq!(compacted.last_replication_sequence, 2);
+    assert_eq!(compacted.replication_log, vec![second]);
+
+    let expires_at =
+        Timestamp::from_offset_datetime(*now.as_offset_datetime() + time::Duration::seconds(60));
+    let rejected_ops = vec![
+        ReplicationOp::DeleteFenced {
+            key: third_key.clone(),
+            owner: owner.clone(),
+            fence: FenceToken::new(3),
+        },
+        ReplicationOp::RefreshTtl {
+            key: missing_key,
+            owner: owner.clone(),
+            fence: FenceToken::new(4),
+            ttl: Duration::from_secs(60),
+            expires_at,
+        },
+    ];
+    let rejected_append = replication_entry(
+        3,
+        "rejected-after-compaction",
+        now,
+        ReplicationOp::Batch {
+            ops: rejected_ops.clone(),
+        },
+    );
+    assert_eq!(
+        backend
+            .replicate_entry(rejected_append)
+            .await
+            .expect_err("late append child must reject"),
+        StoreError::NotFound
+    );
+    assert_eq!(backend_data_snapshot(&backend).await, compacted);
+    assert_no_replication_entry(&mut watch).await;
+
+    let rejected_rebuild = vec![
+        replication_entry(1, "rebuild-first", now, rejected_ops[0].clone()),
+        replication_entry(2, "rebuild-final", now, rejected_ops[1].clone()),
+    ];
+    assert_eq!(
+        backend
+            .rebuild_replication_state(rejected_rebuild)
+            .await
+            .expect_err("late rebuild entry must reject"),
+        StoreError::NotFound
+    );
+    assert_eq!(backend_data_snapshot(&backend).await, compacted);
+    assert_no_replication_entry(&mut watch).await;
+
+    backend
+        .replicate_entry(first)
+        .await
+        .expect("an already-compacted duplicate is idempotent");
+    assert_eq!(backend_data_snapshot(&backend).await, compacted);
+    assert_no_replication_entry(&mut watch).await;
+
+    let third = replication_entry(
+        3,
+        "accepted-after-compaction",
+        now,
+        ReplicationOp::DeleteFenced {
+            key: third_key,
+            owner,
+            fence: FenceToken::new(3),
+        },
+    );
+    backend
+        .replicate_entry(third.clone())
+        .await
+        .expect("next entry remains appendable");
+    assert_eq!(next_replication_entry(&mut watch).await, third.clone());
+    assert_no_replication_entry(&mut watch).await;
+
+    let advanced = backend_data_snapshot(&backend).await;
+    assert_eq!(advanced.compacted_replication_sequence, 2);
+    assert_eq!(advanced.last_replication_sequence, 3);
+    assert_eq!(advanced.replication_log, vec![third]);
+    assert_eq!(advanced.watcher_count, 1);
 }
 
 #[tokio::test]

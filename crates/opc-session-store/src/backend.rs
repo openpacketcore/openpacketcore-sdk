@@ -746,11 +746,13 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
-    /// Append a replication log entry and apply its mutation locally in a
-    /// single atomic transaction.
+    /// Append a replication log entry and apply its complete operation tree
+    /// locally in one atomic transaction.
     ///
     /// Implementations must reject invalid sequence and TTL/deadline metadata
-    /// before locking, mutating, or invoking an external provider.
+    /// before locking, mutating, or invoking an external provider. If any
+    /// nested operation fails, every record, lease, fence, counter, log
+    /// position, and watcher-visible event must remain unchanged.
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
         let _entry = entry.into_validated()?;
         Err(StoreError::CapabilityNotSupported(
@@ -762,7 +764,10 @@ pub trait SessionBackend: Send + Sync {
     ///
     /// Replicated coordinators use this to repair stale replicas and to discard
     /// uncommitted tails after failed quorum writes. Implementations must rebuild
-    /// both durable state and the local replication log from the supplied entries.
+    /// both durable state and the local replication log from the supplied entries
+    /// and replace the prior state only after the entire replay succeeds. A
+    /// failed replay must preserve the complete prior state, log, counters, and
+    /// existing watch subscriptions without publishing partial replay events.
     async fn rebuild_replication_state(
         &self,
         entries: Vec<ReplicationEntry>,

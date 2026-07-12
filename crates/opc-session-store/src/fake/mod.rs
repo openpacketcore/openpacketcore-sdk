@@ -55,6 +55,42 @@ struct FakeBackendState {
     watchers: Vec<mpsc::Sender<Result<ReplicationEntry, StoreError>>>,
 }
 
+impl FakeBackendState {
+    fn empty() -> Self {
+        Self {
+            records: HashMap::new(),
+            leases: HashMap::new(),
+            key_fences: HashMap::new(),
+            next_fence: 1,
+            next_credential_id: 1,
+            compacted_replication_sequence: 0,
+            last_replication_sequence: 0,
+            replication_log: Vec::new(),
+            watchers: Vec::new(),
+        }
+    }
+
+    fn stage_data(&self) -> Self {
+        Self {
+            records: self.records.clone(),
+            leases: self.leases.clone(),
+            key_fences: self.key_fences.clone(),
+            next_fence: self.next_fence,
+            next_credential_id: self.next_credential_id,
+            compacted_replication_sequence: self.compacted_replication_sequence,
+            last_replication_sequence: self.last_replication_sequence,
+            replication_log: self.replication_log.clone(),
+            watchers: Vec::new(),
+        }
+    }
+
+    fn commit_staged_data(&mut self, mut staged: Self) {
+        staged.watchers = std::mem::take(&mut self.watchers);
+        *self = staged;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LeaseEntry {
     active: bool,
     credential_id: u64,
@@ -110,17 +146,7 @@ impl FakeSessionBackend {
         limits: FakeBackendLimits,
     ) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(FakeBackendState {
-                records: HashMap::new(),
-                leases: HashMap::new(),
-                key_fences: HashMap::new(),
-                next_fence: 1,
-                next_credential_id: 1,
-                compacted_replication_sequence: 0,
-                last_replication_sequence: 0,
-                replication_log: Vec::new(),
-                watchers: Vec::new(),
-            })),
+            inner: Arc::new(Mutex::new(FakeBackendState::empty())),
             caps,
             limits,
             clock: Arc::new(TokioVirtualClock::new()),
@@ -640,34 +666,26 @@ impl FakeSessionBackend {
         Self::compact_replication_log(state, self.limits.max_replication_entries);
     }
 
-    fn rebuild_replication_state_with_entries(
+    fn stage_rebuilt_replication_state(
         &self,
-        state: &mut FakeBackendState,
         entries: Vec<ReplicationEntry>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<FakeBackendState, StoreError> {
         validate_replication_prefix(&entries)?;
-        state.records.clear();
-        state.leases.clear();
-        state.key_fences.clear();
-        state.next_fence = 1;
-        state.next_credential_id = 1;
-        state.compacted_replication_sequence = 0;
-        state.last_replication_sequence = 0;
-        state.replication_log.clear();
+        let mut staged = FakeBackendState::empty();
 
         for entry in entries {
             Self::apply_replicated_op_with_state(
-                state,
+                &mut staged,
                 entry.op.clone(),
                 entry.timestamp,
                 self.limits.max_tracked_keys,
             )?;
-            state.last_replication_sequence = entry.sequence;
-            state.replication_log.push(entry);
-            Self::compact_replication_log(state, self.limits.max_replication_entries);
+            staged.last_replication_sequence = entry.sequence;
+            staged.replication_log.push(entry);
+            Self::compact_replication_log(&mut staged, self.limits.max_replication_entries);
         }
 
-        Ok(())
+        Ok(staged)
     }
 }
 
@@ -867,23 +885,26 @@ impl SessionBackend for FakeSessionBackend {
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
         let entry = entry.into_validated()?;
         let mut state = self.inner.lock().await;
+        let mut staged = state.stage_data();
         let now = self.clock.now_utc();
-        Self::prune_state(&mut state, now);
+        Self::prune_state(&mut staged, now);
 
-        let max_seq = state.last_replication_sequence;
+        let max_seq = staged.last_replication_sequence;
 
         // Check if we already have it
         if entry.sequence <= max_seq {
-            if entry.sequence <= state.compacted_replication_sequence {
+            if entry.sequence <= staged.compacted_replication_sequence {
+                state.commit_staged_data(staged);
                 return Ok(());
             }
             // Check for duplicate delivery and idempotency
-            if let Some(existing) = state
+            if let Some(existing) = staged
                 .replication_log
                 .iter()
                 .find(|e| e.sequence == entry.sequence)
             {
                 if existing == &entry {
+                    state.commit_staged_data(staged);
                     return Ok(()); // Idempotent success
                 } else {
                     return Err(StoreError::BackendUnavailable(
@@ -905,19 +926,21 @@ impl SessionBackend for FakeSessionBackend {
 
         // Apply mutation
         Self::apply_replicated_op_with_state(
-            &mut state,
+            &mut staged,
             entry.op.clone(),
             now,
             self.limits.max_tracked_keys,
         )?;
 
         // Append to replication log
-        state.last_replication_sequence = entry.sequence;
-        state.replication_log.push(entry.clone());
+        staged.last_replication_sequence = entry.sequence;
+        staged.replication_log.push(entry.clone());
+        Self::compact_replication_log(&mut staged, self.limits.max_replication_entries);
+
+        state.commit_staged_data(staged);
 
         // Notify watchers
         Self::notify_watchers(&mut state, &entry);
-        Self::compact_replication_log(&mut state, self.limits.max_replication_entries);
 
         Ok(())
     }
@@ -927,8 +950,10 @@ impl SessionBackend for FakeSessionBackend {
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
         let entries = validate_replication_prefix_owned(entries)?;
+        let staged = self.stage_rebuilt_replication_state(entries)?;
         let mut state = self.inner.lock().await;
-        self.rebuild_replication_state_with_entries(&mut state, entries)
+        state.commit_staged_data(staged);
+        Ok(())
     }
 
     async fn watch(

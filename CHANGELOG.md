@@ -253,6 +253,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- `opc-session-store`: `FakeSessionBackend` now stages compound replicated
+  entries and whole-state rebuilds before atomically swapping live data. A late
+  child/replay failure no longer leaves partial records, leases, fences,
+  credential counters, pruning effects, log state, or watch events behind;
+  successful compound entries preserve child order and publish exactly one
+  outer log event, while rebuild preserves existing watchers without replaying
+  history to them. A shared Fake/SQLite conformance suite covers the contract.
 - `opc-session-store`/`opc-session-net`/`opc-session-cache`/
   `opc-session-testkit`: all public `Duration` inputs used for session refresh
   and lease TTLs now use `MAX_SESSION_TTL` (exactly 365 days) and exact checked

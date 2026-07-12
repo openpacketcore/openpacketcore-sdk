@@ -389,6 +389,23 @@ validated as one complete contiguous prefix before existing state is replaced.
 Sequence arithmetic and persistence-width conversions MUST be checked and
 fail closed without exposing entry contents in diagnostics.
 
+Application of one replication entry is all-or-nothing across its complete
+operation tree. A failure in any later child MUST leave records, leases,
+fence/credential high-water marks, the log head and retained log, compaction
+state, and watcher-visible state exactly as they were before the entry. A
+successful compound entry MUST preserve child order, append the submitted outer
+entry once, and publish that outer entry to each eligible watcher only after the
+local backend transaction or atomic swap succeeds.
+
+Whole-state rebuild MUST replay into an isolated stage or database transaction
+and replace prior state only after every supplied entry succeeds. Replay
+failure MUST preserve the complete prior state and established watch
+subscriptions. A successful rebuild MUST preserve those subscriptions but MUST
+NOT publish replayed history as new live append events; later locally
+successful appends remain observable normally. These are
+backend-local atomicity requirements, not distributed commitment authority;
+commit-gated quorum observation remains part of #127.
+
 An operator upgrading persisted state from an older SDK MUST audit every
 TTL-bearing replication entry before rollout. A legacy entry above 365 days
 fails closed during replay or rebuild under this contract; implementations MUST
