@@ -9,6 +9,12 @@
 //! `Ok` without writing, which makes the procedure safe to retry after NF
 //! restarts. NF-specific AMF/SMF/UPF logic maps 3GPP procedure messages onto
 //! these generic transitions.
+//!
+//! The versioned envelope is a one-way persisted-format migration: an SDK that
+//! predates the `OPCH` header treats it as an opaque legacy `Stable` payload.
+//! Upgrade every reader and writer together, and do not roll back after an
+//! `OPCH` write without restoring a pre-upgrade snapshot or reverse-migrating
+//! every affected payload while the fleet is drained.
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -22,6 +28,56 @@ use crate::{
     record::{EncryptedSessionPayload, StoredSessionRecord},
 };
 
+/// Magic prefix written by the versioned handover-envelope format.
+pub const HANDOVER_ENVELOPE_MAGIC: [u8; 4] = *b"OPCH";
+
+/// Current version of the handover-envelope header written by this SDK.
+pub const HANDOVER_ENVELOPE_VERSION: u8 = 1;
+
+/// Maximum encoded JSON phase-header size accepted from persisted state.
+pub const HANDOVER_PHASE_HEADER_MAX_BYTES: usize = 1_024;
+
+const VERSIONED_ENVELOPE_PREFIX_BYTES: usize = HANDOVER_ENVELOPE_MAGIC.len() + 1 + 4;
+
+/// Syntactic format selected while decoding a handover payload.
+///
+/// This is migration evidence, not provenance evidence. In a snapshot known to
+/// predate `OPCH`, [`HandoverEnvelopeFormat::VersionedV1`] means a bare-payload
+/// prefix collision and requires product-owned migration. Likewise, a value
+/// classified as [`HandoverEnvelopeFormat::OriginalLengthPrefixed`] can still
+/// be historical bare data that happens to contain a valid-looking phase; the
+/// product must verify that classification against its payload semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HandoverEnvelopeFormat {
+    /// Current `OPCH` envelope with format version 1.
+    VersionedV1,
+    /// Original untagged four-byte-length-prefixed envelope.
+    OriginalLengthPrefixed,
+    /// Untagged payload interpreted as legacy `Stable` state.
+    Bare,
+}
+
+/// Redaction-safe failure to decode a typed handover envelope.
+///
+/// The error deliberately carries no submitted phase, owner, transaction, or
+/// payload text. Some bare payloads written before handover-envelope support
+/// remain readable as `Stable` under the exact compatibility classifier on
+/// [`HandoverEnvelope::unpack_raw`]; ambiguous bytes fail closed instead of
+/// allowing corrupted typed state to become legacy state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum HandoverEnvelopeDecodeError {
+    /// A claimed envelope prefix, version, length, or header bound was invalid.
+    #[error("handover envelope header is invalid")]
+    InvalidHeader,
+    /// Phase JSON was malformed or violated the handover model.
+    #[error("handover envelope phase header is invalid")]
+    InvalidPhase,
+    /// A JSON-packed envelope contained an invalid payload.
+    #[error("handover envelope payload is invalid")]
+    InvalidPayload,
+}
+
 /// Errors from handover state transitions.
 ///
 /// The conflict variants (`PhaseRegression`, `TransactionConflict`,
@@ -30,6 +86,11 @@ use crate::{
 /// surviving phase and decide whether to continue, abort, or stand down.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HandoverError {
+    /// A stored payload looked like a typed handover envelope but its phase or
+    /// JSON payload failed validation. The record was not modified.
+    #[error(transparent)]
+    InvalidEnvelope(#[from] HandoverEnvelopeDecodeError),
+
     /// The attempted transition would move the state machine backwards or
     /// skip a phase (e.g. activating a session that was never prepared). The
     /// record was not modified.
@@ -97,11 +158,12 @@ pub enum HandoverError {
 /// Pairing of a handover phase header with the NF's session payload, stored
 /// together inside the session record's payload bytes.
 ///
-/// The packed wire form is a 4-byte big-endian length prefix, the
-/// JSON-encoded `HandoverPhase`, then the payload bytes. Keeping the phase
-/// inside the (encrypted) payload means every phase transition is itself a
-/// fenced, generation-checked CAS — there is no side channel a stale owner
-/// could update without going through fencing.
+/// The current packed form is [`HANDOVER_ENVELOPE_MAGIC`], one version byte, a
+/// 4-byte big-endian phase length, the JSON-encoded `HandoverPhase`, then the
+/// payload bytes. Decoding also accepts the original length-prefixed format
+/// and unframed legacy payloads under the explicit compatibility rules on
+/// [`HandoverEnvelope::unpack_raw`]. Keeping the phase inside the (encrypted)
+/// payload means every transition is a fenced, generation-checked CAS.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HandoverEnvelope<P> {
     /// Current position in the handover state machine for this session.
@@ -111,16 +173,20 @@ pub struct HandoverEnvelope<P> {
 }
 
 impl<P> HandoverEnvelope<P> {
-    /// Encode as the length-prefixed wire form with the payload's bytes
-    /// appended verbatim (no payload serialization). Fails only if the phase
-    /// header cannot be JSON-encoded.
+    /// Encode as the versioned `OPCH` form with the payload's bytes appended
+    /// verbatim (no payload serialization). Fails only if the phase header
+    /// cannot be JSON-encoded.
     pub fn pack_raw(&self) -> Result<Vec<u8>, serde_json::Error>
     where
         P: AsRef<[u8]>,
     {
         let phase_bytes = serde_json::to_vec(&self.phase)?;
         let n = phase_bytes.len() as u32;
-        let mut out = Vec::with_capacity(4 + phase_bytes.len() + self.payload.as_ref().len());
+        let mut out = Vec::with_capacity(
+            VERSIONED_ENVELOPE_PREFIX_BYTES + phase_bytes.len() + self.payload.as_ref().len(),
+        );
+        out.extend_from_slice(&HANDOVER_ENVELOPE_MAGIC);
+        out.push(HANDOVER_ENVELOPE_VERSION);
         out.extend_from_slice(&n.to_be_bytes());
         out.extend_from_slice(&phase_bytes);
         out.extend_from_slice(self.payload.as_ref());
@@ -129,34 +195,55 @@ impl<P> HandoverEnvelope<P> {
 
     /// Decode the wire form produced by `pack_raw`.
     ///
-    /// Infallible by design: bytes that do not parse as an envelope are
-    /// treated as a bare payload in phase `Stable`, so records written before
-    /// handover support (or by NFs that never hand over) remain readable.
-    pub fn unpack_raw(bytes: &[u8]) -> Self
+    /// Versioned envelopes are always decoded strictly. For non-`OPCH` input,
+    /// the first four bytes are interpreted as a potential original-format
+    /// big-endian phase length. Fewer than four bytes are bare `Stable` data.
+    /// A zero length or a length from 1 through
+    /// [`HANDOVER_PHASE_HEADER_MAX_BYTES`] that exceeds the remaining bytes is
+    /// an invalid header. A complete in-bound slice is an original envelope
+    /// when it decodes as `HandoverPhase`; a JSON-looking but invalid slice is
+    /// an invalid phase, while a non-JSON-looking slice falls back to bare
+    /// `Stable` data. A larger length is invalid when the bytes after its
+    /// prefix look like JSON and otherwise falls back to bare `Stable` data.
+    ///
+    /// This classifier deliberately rejects ambiguous historical bare bytes.
+    /// Products must preflight their decrypted payload population before an
+    /// upgrade and explicitly re-pack any authoritatively identified bare
+    /// value that the classifier rejects.
+    pub fn unpack_raw(bytes: &[u8]) -> Result<Self, HandoverEnvelopeDecodeError>
     where
         P: From<Vec<u8>>,
     {
-        if bytes.len() >= 4 {
-            let mut prefix = [0u8; 4];
-            prefix.copy_from_slice(&bytes[0..4]);
-            let n = u32::from_be_bytes(prefix) as usize;
-            if n + 4 <= bytes.len() {
-                let phase_slice = &bytes[4..4 + n];
-                if let Ok(phase) = serde_json::from_slice::<HandoverPhase>(phase_slice) {
-                    let payload = bytes[4 + n..].to_vec().into();
-                    return Self { phase, payload };
-                }
-            }
-        }
-        Self {
-            phase: HandoverPhase::Stable,
-            payload: bytes.to_vec().into(),
-        }
+        Self::unpack_raw_with_format(bytes).map(|(_, envelope)| envelope)
     }
 
-    /// Encode as the length-prefixed wire form with the payload
-    /// JSON-serialized, for typed (non-byte-slice) payloads. Pair with
-    /// `unpack_json`; the two byte formats are otherwise identical.
+    /// Decode raw payload bytes and return the syntactic source format.
+    ///
+    /// Products should use this variant for legacy preflight. A successful
+    /// classification is not proof of provenance: apply the rules documented
+    /// on [`HandoverEnvelopeFormat`] before accepting or migrating old state.
+    pub fn unpack_raw_with_format(
+        bytes: &[u8],
+    ) -> Result<(HandoverEnvelopeFormat, Self), HandoverEnvelopeDecodeError>
+    where
+        P: From<Vec<u8>>,
+    {
+        if let Some((format, phase, payload_start)) = decode_envelope_header(bytes)? {
+            let payload = bytes[payload_start..].to_vec().into();
+            return Ok((format, Self { phase, payload }));
+        }
+        Ok((
+            HandoverEnvelopeFormat::Bare,
+            Self {
+                phase: HandoverPhase::Stable,
+                payload: bytes.to_vec().into(),
+            },
+        ))
+    }
+
+    /// Encode as the versioned `OPCH` form with the payload JSON-serialized,
+    /// for typed (non-byte-slice) payloads. Pair with `unpack_json`; the two
+    /// byte formats are otherwise identical.
     pub fn pack_json(&self) -> Result<Vec<u8>, serde_json::Error>
     where
         P: Serialize,
@@ -164,7 +251,11 @@ impl<P> HandoverEnvelope<P> {
         let phase_bytes = serde_json::to_vec(&self.phase)?;
         let n = phase_bytes.len() as u32;
         let payload_bytes = serde_json::to_vec(&self.payload)?;
-        let mut out = Vec::with_capacity(4 + phase_bytes.len() + payload_bytes.len());
+        let mut out = Vec::with_capacity(
+            VERSIONED_ENVELOPE_PREFIX_BYTES + phase_bytes.len() + payload_bytes.len(),
+        );
+        out.extend_from_slice(&HANDOVER_ENVELOPE_MAGIC);
+        out.push(HANDOVER_ENVELOPE_VERSION);
         out.extend_from_slice(&n.to_be_bytes());
         out.extend_from_slice(&phase_bytes);
         out.extend_from_slice(&payload_bytes);
@@ -173,31 +264,124 @@ impl<P> HandoverEnvelope<P> {
 
     /// Decode the wire form produced by `pack_json`.
     ///
-    /// Bytes without a parseable phase header are interpreted as a bare
-    /// JSON payload in phase `Stable` (pre-handover compatibility); the
-    /// error case is payload JSON that fails to deserialize as `P`.
-    pub fn unpack_json(bytes: &[u8]) -> Result<Self, serde_json::Error>
+    /// A bare legacy JSON value accepted by the exact classifier documented on
+    /// [`HandoverEnvelope::unpack_raw`] remains readable as phase `Stable`.
+    /// Versioned envelopes and plausible original-format envelope claims are
+    /// decoded strictly; an invalid phase or payload returns a fieldless error.
+    pub fn unpack_json(bytes: &[u8]) -> Result<Self, HandoverEnvelopeDecodeError>
     where
         P: for<'de> Deserialize<'de>,
     {
-        if bytes.len() >= 4 {
-            let mut prefix = [0u8; 4];
-            prefix.copy_from_slice(&bytes[0..4]);
-            let n = u32::from_be_bytes(prefix) as usize;
-            if n + 4 <= bytes.len() {
-                let phase_slice = &bytes[4..4 + n];
-                if let Ok(phase) = serde_json::from_slice::<HandoverPhase>(phase_slice) {
-                    let payload = serde_json::from_slice(&bytes[4 + n..])?;
-                    return Ok(Self { phase, payload });
-                }
-            }
-        }
-        let payload = serde_json::from_slice(bytes)?;
-        Ok(Self {
-            phase: HandoverPhase::Stable,
-            payload,
-        })
+        Self::unpack_json_with_format(bytes).map(|(_, envelope)| envelope)
     }
+
+    /// Decode a JSON payload and return the syntactic source format.
+    ///
+    /// Use the returned [`HandoverEnvelopeFormat`] together with snapshot
+    /// provenance and product payload semantics; format detection alone cannot
+    /// distinguish every historical bare-prefix collision.
+    pub fn unpack_json_with_format(
+        bytes: &[u8],
+    ) -> Result<(HandoverEnvelopeFormat, Self), HandoverEnvelopeDecodeError>
+    where
+        P: for<'de> Deserialize<'de>,
+    {
+        if let Some((format, phase, payload_start)) = decode_envelope_header(bytes)? {
+            let payload = serde_json::from_slice(&bytes[payload_start..])
+                .map_err(|_| HandoverEnvelopeDecodeError::InvalidPayload)?;
+            return Ok((format, Self { phase, payload }));
+        }
+        let payload = serde_json::from_slice(bytes)
+            .map_err(|_| HandoverEnvelopeDecodeError::InvalidPayload)?;
+        Ok((
+            HandoverEnvelopeFormat::Bare,
+            Self {
+                phase: HandoverPhase::Stable,
+                payload,
+            },
+        ))
+    }
+}
+
+fn decode_envelope_header(
+    bytes: &[u8],
+) -> Result<Option<(HandoverEnvelopeFormat, HandoverPhase, usize)>, HandoverEnvelopeDecodeError> {
+    if bytes.starts_with(&HANDOVER_ENVELOPE_MAGIC) {
+        if bytes.len() < VERSIONED_ENVELOPE_PREFIX_BYTES
+            || bytes[HANDOVER_ENVELOPE_MAGIC.len()] != HANDOVER_ENVELOPE_VERSION
+        {
+            return Err(HandoverEnvelopeDecodeError::InvalidHeader);
+        }
+        let length_start = HANDOVER_ENVELOPE_MAGIC.len() + 1;
+        let phase_len = read_phase_length(&bytes[length_start..length_start + 4])?;
+        let phase_start = VERSIONED_ENVELOPE_PREFIX_BYTES;
+        let phase_end = checked_phase_end(phase_start, phase_len, bytes.len())?;
+        let phase = serde_json::from_slice(&bytes[phase_start..phase_end])
+            .map_err(|_| HandoverEnvelopeDecodeError::InvalidPhase)?;
+        return Ok(Some((
+            HandoverEnvelopeFormat::VersionedV1,
+            phase,
+            phase_end,
+        )));
+    }
+
+    if bytes.len() < 4 {
+        return Ok(None);
+    }
+    let phase_len = read_phase_length(&bytes[..4])?;
+    if phase_len > HANDOVER_PHASE_HEADER_MAX_BYTES {
+        return if looks_like_json(bytes.get(4..).unwrap_or_default()) {
+            Err(HandoverEnvelopeDecodeError::InvalidHeader)
+        } else {
+            Ok(None)
+        };
+    }
+    let phase_end = checked_phase_end(4, phase_len, bytes.len())?;
+    let phase_bytes = &bytes[4..phase_end];
+    match serde_json::from_slice::<HandoverPhase>(phase_bytes) {
+        Ok(phase) => Ok(Some((
+            HandoverEnvelopeFormat::OriginalLengthPrefixed,
+            phase,
+            phase_end,
+        ))),
+        Err(_) if looks_like_json(phase_bytes) => Err(HandoverEnvelopeDecodeError::InvalidPhase),
+        Err(_) => Ok(None),
+    }
+}
+
+fn read_phase_length(bytes: &[u8]) -> Result<usize, HandoverEnvelopeDecodeError> {
+    let prefix: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| HandoverEnvelopeDecodeError::InvalidHeader)?;
+    let phase_len = u32::from_be_bytes(prefix) as usize;
+    if phase_len == 0 {
+        return Err(HandoverEnvelopeDecodeError::InvalidHeader);
+    }
+    Ok(phase_len)
+}
+
+fn checked_phase_end(
+    phase_start: usize,
+    phase_len: usize,
+    total_len: usize,
+) -> Result<usize, HandoverEnvelopeDecodeError> {
+    if phase_len > HANDOVER_PHASE_HEADER_MAX_BYTES {
+        return Err(HandoverEnvelopeDecodeError::InvalidHeader);
+    }
+    phase_start
+        .checked_add(phase_len)
+        .filter(|end| *end <= total_len)
+        .ok_or(HandoverEnvelopeDecodeError::InvalidHeader)
+}
+
+fn looks_like_json(bytes: &[u8]) -> bool {
+    matches!(
+        bytes
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace()),
+        Some(b'{' | b'[' | b'"' | b't' | b'f' | b'n' | b'-' | b'0'..=b'9')
+    )
 }
 
 /// A stored session record together with its decoded handover envelope.
@@ -218,24 +402,25 @@ pub struct HandoverSessionRecord<P> {
 
 impl<P> HandoverSessionRecord<P> {
     /// Decode a fetched record whose payload was packed with
-    /// `HandoverEnvelope::pack_raw`. Non-envelope payload bytes are reported
-    /// as phase `Stable` rather than failing.
-    pub fn unpack_raw(record: StoredSessionRecord) -> Self
+    /// `HandoverEnvelope::pack_raw`. Legacy non-envelope payload bytes accepted
+    /// by [`HandoverEnvelope::unpack_raw`]'s exact classifier are reported as
+    /// phase `Stable`; ambiguous or malformed claimed envelopes fail closed.
+    pub fn unpack_raw(record: StoredSessionRecord) -> Result<Self, HandoverEnvelopeDecodeError>
     where
         P: From<Vec<u8>>,
     {
-        let envelope = HandoverEnvelope::<P>::unpack_raw(record.payload.as_bytes());
-        Self {
+        let envelope = HandoverEnvelope::<P>::unpack_raw(record.payload.as_bytes())?;
+        Ok(Self {
             record,
             phase: envelope.phase,
             payload: envelope.payload,
-        }
+        })
     }
 
     /// Decode a fetched record whose payload was packed with
-    /// `HandoverEnvelope::pack_json`; fails if the payload JSON does not
-    /// deserialize as `P`.
-    pub fn unpack_json(record: StoredSessionRecord) -> Result<Self, serde_json::Error>
+    /// `HandoverEnvelope::pack_json`; fails with a fieldless error when a
+    /// claimed envelope or its payload is invalid.
+    pub fn unpack_json(record: StoredSessionRecord) -> Result<Self, HandoverEnvelopeDecodeError>
     where
         P: for<'de> Deserialize<'de>,
     {
@@ -284,7 +469,7 @@ impl<B: SessionBackend> HandoverManager<B> {
         let record = self.backend.get(key).await?;
         match record {
             Some(record) => {
-                let unpacked = HandoverSessionRecord::unpack_raw(record);
+                let unpacked = HandoverSessionRecord::unpack_raw(record)?;
                 Ok(Some(unpacked))
             }
             None => Ok(None),
@@ -292,8 +477,9 @@ impl<B: SessionBackend> HandoverManager<B> {
     }
 
     /// Fetch and decode the session's record and JSON-packed handover
-    /// envelope. Returns `Ok(None)` for a missing record and a
-    /// `Serialization` store error if the payload does not deserialize.
+    /// envelope. Returns `Ok(None)` for a missing record and
+    /// [`HandoverError::InvalidEnvelope`] if a claimed envelope or its JSON
+    /// payload is invalid.
     pub async fn get_record_json<P>(
         &self,
         key: &SessionKey,
@@ -304,8 +490,7 @@ impl<B: SessionBackend> HandoverManager<B> {
         let record = self.backend.get(key).await?;
         match record {
             Some(record) => {
-                let unpacked = HandoverSessionRecord::unpack_json(record)
-                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                let unpacked = HandoverSessionRecord::unpack_json(record)?;
                 Ok(Some(unpacked))
             }
             None => Ok(None),
@@ -340,7 +525,7 @@ impl<B: SessionBackend> HandoverManager<B> {
             .await?
             .ok_or(StoreError::NotFound)?;
 
-        let envelope = HandoverEnvelope::<Vec<u8>>::unpack_raw(record.payload.as_bytes());
+        let envelope = HandoverEnvelope::<Vec<u8>>::unpack_raw(record.payload.as_bytes())?;
 
         match &envelope.phase {
             HandoverPhase::Stable | HandoverPhase::Active { .. } => {
@@ -454,7 +639,7 @@ impl<B: SessionBackend> HandoverManager<B> {
             .await?
             .ok_or(StoreError::NotFound)?;
 
-        let envelope = HandoverEnvelope::<Vec<u8>>::unpack_raw(record.payload.as_bytes());
+        let envelope = HandoverEnvelope::<Vec<u8>>::unpack_raw(record.payload.as_bytes())?;
 
         let target = match &envelope.phase {
             HandoverPhase::Preparing {
@@ -586,7 +771,7 @@ impl<B: SessionBackend> HandoverManager<B> {
             .await?
             .ok_or(StoreError::NotFound)?;
 
-        let envelope = HandoverEnvelope::<Vec<u8>>::unpack_raw(record.payload.as_bytes());
+        let envelope = HandoverEnvelope::<Vec<u8>>::unpack_raw(record.payload.as_bytes())?;
 
         match &envelope.phase {
             HandoverPhase::Prepared {
@@ -717,7 +902,7 @@ impl<B: SessionBackend> HandoverManager<B> {
             .await?
             .ok_or(StoreError::NotFound)?;
 
-        let envelope = HandoverEnvelope::<Vec<u8>>::unpack_raw(record.payload.as_bytes());
+        let envelope = HandoverEnvelope::<Vec<u8>>::unpack_raw(record.payload.as_bytes())?;
 
         match &envelope.phase {
             HandoverPhase::Activating {
@@ -837,7 +1022,7 @@ impl<B: SessionBackend> HandoverManager<B> {
             .await?
             .ok_or(StoreError::NotFound)?;
 
-        let envelope = HandoverEnvelope::<Vec<u8>>::unpack_raw(record.payload.as_bytes());
+        let envelope = HandoverEnvelope::<Vec<u8>>::unpack_raw(record.payload.as_bytes())?;
 
         match &envelope.phase {
             HandoverPhase::Preparing { tx: cur_tx, .. }
@@ -951,7 +1136,7 @@ impl<B: SessionBackend> HandoverManager<B> {
             .await?
             .ok_or(StoreError::NotFound)?;
 
-        let envelope = HandoverEnvelope::<Vec<u8>>::unpack_raw(record.payload.as_bytes());
+        let envelope = HandoverEnvelope::<Vec<u8>>::unpack_raw(record.payload.as_bytes())?;
 
         match &envelope.phase {
             HandoverPhase::Aborting { tx: cur_tx } => {

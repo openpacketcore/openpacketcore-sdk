@@ -143,6 +143,129 @@ and `SessionStorePlatformProfile::Quorum` are also admission evidence only. A
 production operator must separately require fresh durable readiness before
 traffic readiness.
 
+### Session identity admission and #135 upgrade
+
+#135 makes owner and custom session-key identities structural and fail-closed.
+`OwnerId` and each deployment-specific `SessionKeyType` name must contain 1
+through 128 UTF-8 encoded bytes; this is a byte limit, not a character limit.
+The reserved names `subscriber-context`, `pdu-session`, `teid-mapping`,
+`pfcp-seid`, and `handover-transaction` always decode to the corresponding
+well-known variants and cannot be represented as custom values. Known and
+custom key types serialize and sort by that canonical persisted string.
+
+The same validation runs at public constructors and Serde decode, SQLite
+record/restore/lease/fenced-mutation/log hydration, and session-net request and
+response decoding. A malformed persisted owner or key type fails before the
+operation mutates the store; nested replication-log identities are validated
+as part of the complete entry. Diagnostics are fixed or fieldless and do not
+contain the rejected value. Newly written handover envelopes carry an exact
+`OPCH` magic/version header. Original envelopes remain readable only with a
+complete phase of at most `HANDOVER_PHASE_HEADER_MAX_BYTES` (1,024 bytes) that
+is valid under the current model. Non-`OPCH` bare compatibility is governed by
+the exact classifier below; it is not a promise for arbitrary historical bytes.
+
+Valid owner/key-type values keep their protocol-v3 JSON string shape. That is
+shape compatibility only: `SessionKeyType::Other(String)` changing to
+`Other(CustomSessionKeyType)` and the fallible `SessionKeyType::other` are Rust
+source breaks, while the new rejection of empty/oversized input is a semantic
+wire-admission break. An older v3 participant can send a value a new
+participant rejects. Do not roll mixed versions. Prefer combining #135 with
+#134's fixed-width DTO/handshake work; until that negotiation exists, use a
+coordinated stop/upgrade/start for every session-net client, server, and
+protection wrapper and every NF/product handover reader or writer.
+
+For every existing SQLite replica, the operator sequence is:
+
+1. Close the traffic/readiness gate, drain session traffic and all writers, and
+   take the product's normal backup or replacement checkpoint.
+2. Run the audit against the resulting point-in-time database with explicit
+   budgets:
+
+   ```text
+   opc-session-store-audit identity-invariants \
+     --database /path/to/session-store.db \
+     --max-rows N \
+     --max-entry-json-bytes N \
+     --max-total-json-bytes N
+   ```
+
+3. Require all three numeric budgets to be non-zero and require the per-entry
+   JSON budget not to exceed the total JSON budget or SQLite's signed `i64`
+   length range. Size `--max-rows` for the
+   combined row count across `session_records`, `leases`, `key_fences`, and
+   `session_replication_log`, not per table.
+4. Accept only report schema version 1 with `status = compliant` and process
+   exit 0. This means the complete drained snapshot fit the budgets and had no
+   observed invariant violations; it says nothing about quorum, commit
+   authority, or a different snapshot.
+5. Treat `violations_found` (stdout JSON, exit 1), `incomplete` (stdout JSON,
+   exit 2), and `error` (stderr JSON, exit 2) as upgrade blockers.
+6. Separately preflight every drained, decrypted handover payload through the
+   new `unpack_raw_with_format` or typed `unpack_json_with_format` path. Cover
+   live records plus recursively nested replication-log/snapshot records,
+   restore/rebuild sources, and every retained copy that can be replayed. Check
+   syntactic format against snapshot provenance and product payload semantics;
+   decoder success alone is not sufficient. Migrate or replace every value
+   whose classification cannot be proven.
+7. Upgrade every session-net client/server/protection wrapper and every
+   NF/product handover reader/writer together. Verify the new binaries,
+   authenticated v3 handshakes, restore/log reads, and fresh quorum gate, then
+   restore traffic.
+
+The command opens only an existing database in read-only/query-only mode and
+scans one consistent snapshot in fixed 256-row pages. `--max-rows` bounds all
+audited rows; `--max-entry-json-bytes` and `--max-total-json-bytes` bound strict
+decode of the individual and cumulative replication JSON. Version-1 output is
+count-only: supplied limits, per-table scanned counts, invalid-owner,
+invalid-key-type, and invalid-replication-entry counts, plus an optional bounded
+incomplete reason. It does not print the database path, row IDs, tenant, owner,
+key type, stable ID, transaction, payload, or raw JSON.
+
+An incomplete reason is one of `row_budget_exceeded`,
+`entry_json_budget_exceeded`, `total_json_budget_exceeded`,
+`unsupported_schema`, `database_read_failed`, or `counter_overflow`. Increase
+budgets and rerun when safe; for a violation, use a separately reviewed,
+product-owned migration that preserves identity and authoritative-history
+semantics, or replace the store and follow the product recovery procedure.
+Neither the audit nor runtime automatically truncates, renames, normalizes,
+deletes, repairs, or rewrites invalid state. Re-audit the final snapshot before
+starting the new SDK.
+
+The identity audit scans identity columns and replication JSON, but never
+classifies live payloads or payload bytes inside nested CAS log operations; its
+`compliant` result cannot certify handover compatibility. The separate
+provenance-aware preflight must apply this exact non-`OPCH` classifier to the
+complete live and replayable payload population:
+
+- fewer than four bytes are bare `Stable`;
+- a zero first-word, or a big-endian phase length from 1 through 1,024 that is
+  truncated, is `InvalidHeader`;
+- a complete in-bound phase is an original envelope only if it decodes as the
+  current `HandoverPhase`; JSON-looking invalid phase bytes are `InvalidPhase`,
+  while non-JSON-looking bytes fall back to bare `Stable`; and
+- a length above 1,024 is `InvalidHeader` if the remainder begins, after ASCII
+  whitespace, like JSON, and otherwise falls back to bare `Stable`.
+
+The fail-closed classifier intentionally rejects some ambiguous historical bare
+bytes and some envelopes accepted by the old unbounded reader. Successful
+syntax detection can also collide: for a checkpoint proven to predate `OPCH`, a
+`VersionedV1` result is historical bare data, and every
+`OriginalLengthPrefixed` result requires product/provenance confirmation. A
+product that can authoritatively identify a value as bare `Stable` may
+explicitly wrap the complete original value in `OPCH`; otherwise it must use a
+reviewed semantic migration or store replacement. Preserve generation, fencing,
+encryption, and NF payload meaning.
+
+The first new transition can persist `OPCH`. From then on this is a one-way
+format migration: an older SDK silently treats `OPCH` as an opaque bare
+`Stable` payload. Binary rollback is forbidden unless the drained fleet restores
+one coherent fleet-wide pre-upgrade checkpoint—accepting or reconciling loss of
+all post-checkpoint mutations—or reverse-migrates every affected live and
+replayable payload, including nested logs/snapshots/restore sources, under a
+reviewed procedure. #134's handshake does not make the opaque format backward
+readable, and every handover reader/writer—not only session-net members—must be
+upgraded together.
+
 ### Session TTL admission and upgrade
 
 The SDK now applies one public limit to `Duration`-based session refresh and
@@ -330,10 +453,11 @@ success, static profiles, or cached capabilities; use the fresh bounded probe
 and continuous gate. Do not use quorum restore as authority before
 #127/#133, treat current divergence repair as authoritative before #128, or
 auto-resolve a legacy fork before #129. Protocol v3 identity binding is not
-consensus or fork recovery. Fixed-width wire DTOs and invariant-safe model
-decoding remain #134/#135. Checked TTL and sequence boundaries now fail closed
-under #137/#138, and bounded nested protected-payload traversal is implemented
-under #147. Watch handoff and absolute-record-expiry admission remain
+consensus or fork recovery. #135's invariant-safe model decoding and bounded
+offline identity audit are implemented; fixed-width wire DTOs remain #134.
+Checked TTL and sequence boundaries now fail closed under #137/#138, and
+bounded nested protected-payload traversal is implemented under #147. Watch
+handoff and absolute-record-expiry admission remain
 #145/#148; seamless SVID rotation, payload-protection key rotation, and
 trust-bundle rotation plus the remaining distributed production evidence stay
 open in #143.

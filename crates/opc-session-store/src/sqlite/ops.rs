@@ -15,6 +15,11 @@ use crate::{
     ttl::checked_session_deadline,
 };
 
+pub(crate) fn persisted_owner_id(value: String) -> Result<OwnerId, StoreError> {
+    OwnerId::new(value)
+        .map_err(|_| StoreError::Serialization("persisted session owner is invalid".to_string()))
+}
+
 pub(crate) fn format_rfc3339_normalized(ts: Timestamp) -> String {
     let odt = ts.as_offset_datetime();
     format!(
@@ -100,7 +105,7 @@ pub(crate) fn validate_fenced_mutation_sync(
         return Err(StoreError::StaleFence);
     }
 
-    if owner_str != lease.owner().as_str() {
+    if persisted_owner_id(owner_str)? != *lease.owner() {
         return Err(StoreError::StaleFence);
     }
 
@@ -158,8 +163,6 @@ pub(crate) fn get_sync(
     key: &SessionKey,
     now: Timestamp,
 ) -> Result<Option<StoredSessionRecord>, StoreError> {
-    prune_sync(conn, now)?;
-
     let mut stmt = conn
         .prepare(
             r#"
@@ -205,10 +208,11 @@ pub(crate) fn get_sync(
         encoding,
     )) = row
     else {
+        prune_sync(conn, now)?;
         return Ok(None);
     };
 
-    let owner = OwnerId::new(owner_str).map_err(StoreError::Serialization)?;
+    let owner = persisted_owner_id(owner_str)?;
     let state_class = match state_class_str.as_str() {
         "authoritative-session" => StateClass::AuthoritativeSession,
         "dataplane-lookup" => StateClass::DataplaneLookup,
@@ -264,11 +268,13 @@ pub(crate) fn get_sync(
         payload,
     };
 
-    if record.is_expired_at(now) {
-        Ok(None)
+    let result = if record.is_expired_at(now) {
+        None
     } else {
-        Ok(Some(record))
-    }
+        Some(record)
+    };
+    prune_sync(conn, now)?;
+    Ok(result)
 }
 
 pub(crate) fn scan_restore_records_sync(
@@ -277,7 +283,6 @@ pub(crate) fn scan_restore_records_sync(
     now: Timestamp,
 ) -> Result<RestoreScanPage, StoreError> {
     request.validate()?;
-    prune_sync(conn, now)?;
 
     let mut stmt = conn
         .prepare(
@@ -352,6 +357,11 @@ pub(crate) fn scan_restore_records_sync(
         }
     }
 
+    // Validate every persisted row before pruning. The caller runs this
+    // routine in a transaction, so a corrupt row or a pruning failure cannot
+    // leave unrelated expiry cleanup committed behind an error.
+    prune_sync(conn, now)?;
+
     let start = request
         .cursor
         .map(RestoreScanCursor::offset)
@@ -385,7 +395,7 @@ fn stored_record_from_row(
         .map_err(|err| StoreError::Serialization(err.to_string()))?;
     let key_type =
         crate::SessionKeyType::from_str(&key_type_str).map_err(StoreError::Serialization)?;
-    let owner = OwnerId::new(owner_str).map_err(StoreError::Serialization)?;
+    let owner = persisted_owner_id(owner_str)?;
     let state_class = state_class_from_str(&state_class_str)?;
     let state_type = StateType::new(state_type_str).map_err(StoreError::Serialization)?;
     let expires_at = match &expires_at_str {

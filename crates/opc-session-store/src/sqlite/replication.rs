@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use super::ops::{
     current_fence_sync, format_rfc3339_normalized, get_sync, insert_or_replace_fence_sync,
-    insert_or_replace_record_sync,
+    insert_or_replace_record_sync, persisted_owner_id,
 };
 use crate::{
     backend::{
@@ -82,9 +82,10 @@ pub(crate) fn apply_replicated_op_sync(
             else {
                 return Err(StoreError::StaleFence);
             };
+            let stored_owner = persisted_owner_id(owner_str)?;
             if active == 0
                 || row_credential_id as u64 != credential_id
-                || owner_str != new_record.owner.as_str()
+                || stored_owner != new_record.owner
                 || fence_val as u64 != new_record.fence.get()
             {
                 return Err(StoreError::StaleFence);
@@ -208,7 +209,8 @@ pub(crate) fn apply_replicated_op_sync(
                 .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
             if let Some((active, owner_str, guard_expires_at_str)) = row {
-                if active != 0 && owner_str != owner.as_str() {
+                let stored_owner = persisted_owner_id(owner_str)?;
+                if active != 0 && stored_owner != owner {
                     let guard_expires_at = Timestamp::from_str(guard_expires_at_str.as_str())
                         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
                     if guard_expires_at > now {

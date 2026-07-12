@@ -195,7 +195,7 @@ impl Smf {
 
         let (ownership, ownership_failures) = OwnedSession::acquire(
             store.clone(),
-            ownership_key(&owner),
+            ownership_key(&owner)?,
             owner.clone(),
             Duration::from_secs(60),
             Duration::from_secs(30),
@@ -354,13 +354,13 @@ impl Smf {
     }
 }
 
-fn ownership_key(owner: &OwnerId) -> SessionKey {
-    SessionKey {
+fn ownership_key(owner: &OwnerId) -> Result<SessionKey, SmfError> {
+    Ok(SessionKey {
         tenant: TenantId::from_static("ref-smf"),
         nf_kind: NetworkFunctionKind::from_static("smf"),
-        key_type: SessionKeyType::Other("smf-ownership".to_string()),
+        key_type: SessionKeyType::other("smf-ownership").map_err(SmfError::SessionStore)?,
         stable_id: Bytes::copy_from_slice(owner.as_str().as_bytes()),
-    }
+    })
 }
 
 fn session_key(owner: &OwnerId, seid: u64) -> SessionKey {

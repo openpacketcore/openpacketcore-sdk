@@ -134,20 +134,6 @@ impl RestoreScanRequest {
                 max: RESTORE_SCAN_MAX_PAGE_SIZE,
             });
         }
-        if let Some(owner) = &self.scope.owner {
-            if owner.as_str().is_empty() || owner.as_str().len() > 128 {
-                return Err(StoreError::InvalidRestoreScanRequest(
-                    "restore scan owner filter is invalid".to_string(),
-                ));
-            }
-        }
-        if let Some(SessionKeyType::Other(key_type)) = &self.scope.key_type {
-            if key_type.is_empty() || key_type.len() > 128 {
-                return Err(StoreError::InvalidRestoreScanRequest(
-                    "restore scan key-type filter is invalid".to_string(),
-                ));
-            }
-        }
         Ok(())
     }
 }
@@ -229,18 +215,6 @@ impl RestoreScanPage {
 
         let mut keys = HashSet::with_capacity(self.records.len());
         for record in &self.records {
-            if record.owner.as_str().is_empty() || record.owner.as_str().len() > 128 {
-                return Err(StoreError::InvalidRestoreScanResponse(
-                    "restore scan returned a record with an invalid owner".to_string(),
-                ));
-            }
-            if let SessionKeyType::Other(key_type) = &record.key.key_type {
-                if key_type.is_empty() || key_type.len() > 128 {
-                    return Err(StoreError::InvalidRestoreScanResponse(
-                        "restore scan returned a record with an invalid key type".to_string(),
-                    ));
-                }
-            }
             if !keys.insert(record.key.clone()) {
                 return Err(StoreError::InvalidRestoreScanResponse(
                     "restore scan returned a duplicate session key".to_string(),

@@ -59,11 +59,16 @@ pub use capability::{
 pub use clock::{Clock, MonotonicClock, SystemClock, TokioVirtualClock};
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;
-pub use handover::{HandoverEnvelope, HandoverError, HandoverManager, HandoverSessionRecord};
+pub use handover::{
+    HandoverEnvelope, HandoverEnvelopeDecodeError, HandoverEnvelopeFormat, HandoverError,
+    HandoverManager, HandoverSessionRecord, HANDOVER_ENVELOPE_MAGIC, HANDOVER_ENVELOPE_VERSION,
+    HANDOVER_PHASE_HEADER_MAX_BYTES,
+};
 pub use lease::{LeaseGuard, SessionLeaseManager};
 pub use model::{
-    FenceToken, Generation, HandoverPhase, HandoverTxId, OwnerId, SessionKey, SessionKeyType,
-    StateClass, StateType,
+    CustomSessionKeyType, FenceToken, Generation, HandoverPhase, HandoverTxId, OwnerId, SessionKey,
+    SessionKeyType, StateClass, StateType, OWNER_ID_MAX_BYTES, SESSION_KEY_TYPE_MAX_BYTES,
+    STATE_TYPE_MAX_BYTES,
 };
 pub use owned_session::{OwnedSession, OwnedSessionMutationContext, OwnedSessionMutationError};
 pub use payload_codec::{

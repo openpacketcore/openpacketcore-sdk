@@ -93,11 +93,13 @@ yet durable distributed proof or a production deployment contract. Configured
 topology admission and fresh durable readiness are implemented. Authenticated
 identity binding is implemented in protocol v3; durable sequencing and safe
 fork recovery (#127–#129), and bounded majority-authoritative restore (#133)
-remain open. Wire-width and shared model-decoding hardening remain #134/#135.
-Checked session TTL and replication-sequence handling now fail closed at
-direct, wrapper, cache, SQLite, quorum, and authenticated transport boundaries
-under #137/#138. Bounded iterative protection of every nested replicated CAS is
-implemented under #147. These boundary fixes do not provide durable authority.
+remain open. Fixed-width wire DTOs remain #134. #135's structural owner/key
+model, persistence/transport decode validation, bounded offline SQLite audit,
+and typed-invalid handover rejection are implemented. Checked session TTL and
+replication-sequence handling now fail closed at direct, wrapper, cache,
+SQLite, quorum, and authenticated transport boundaries under #137/#138.
+Bounded iterative protection of every nested replicated CAS is implemented
+under #147. These boundary fixes do not provide durable authority.
 
 `QuorumSessionStore` coordinates session leases and CAS mutations across a set of `SessionStoreBackend` replicas using quorum-backed ordered replication. It is not a Raft implementation; its target safety contract is a durable committed log prefix where an entry is authoritative only after the same sequence entry is present on a majority of replicas.
 
@@ -123,6 +125,65 @@ configuration scope must match the admitted topology. An in-process local
 backend may remain unbound. This is composition evidence, not fresh peer
 reachability or physical-store provenance, and it does not establish durable
 commit/repair/restore authority (#127/#128/#133).
+
+### Structural identity and legacy persistence admission
+
+`OwnerId` and each deployment-specific session-key type name now contain 1
+through 128 UTF-8 encoded bytes. `SessionKeyType::Other` wraps a private
+`CustomSessionKeyType`; the five reserved canonical strings map only to their
+well-known variants. Known and custom values serialize, persist, hash, and sort
+by the canonical string, not enum declaration order.
+
+Serde, SQLite record/restore/active-lease/fenced-mutation/log hydration, and
+session-net request/response decoding apply the same invariant. A bad owner or
+key type—including one nested in a replication operation—fails closed before
+mutation or caller exposure with a fixed or fieldless error that omits the raw
+value. New handover envelopes use an exact `OPCH` magic/version header. The
+bounded non-`OPCH` classifier accepts current-valid original syntax and some
+bare payloads; ambiguous, truncated, oversized JSON-looking, unknown, or
+typed-invalid claims fail before mutation. Successful syntax detection is not
+provenance. The identity audit does not classify live or nested-log payloads, so
+products must run the complete provenance-aware replay preflight in RFC 004
+§5.2/§10.3.
+
+Existing valid v3 values keep their JSON string shape, but source construction
+and pattern matching change and admission is stricter. An older v3 member may
+emit an invalid value a new member rejects, so #135 is not a same-v3 rolling
+compatibility claim. Prefer deploying it together with #134. Until the
+fixed-width DTO and handshake negotiate the contract, drain and stop every
+client, server, and wrapper plus every product handover reader/writer, audit
+identities and handover payloads, upgrade the complete fleet, and restart it
+together. Once any live or replayable `OPCH` copy is written, rollback to an
+older SDK requires a drained coherent fleet-wide checkpoint restore (with
+post-checkpoint mutation handling) or reviewed reverse migration of every live,
+log, snapshot, and restore copy; #134 does not make the format backward-readable.
+
+The offline command is:
+
+```text
+opc-session-store-audit identity-invariants \
+  --database PATH \
+  --max-rows N \
+  --max-entry-json-bytes N \
+  --max-total-json-bytes N
+```
+
+All budgets are required and non-zero, with the per-entry JSON limit no larger
+than the total or SQLite's signed `i64` length range. The audit opens one drained SQLite snapshot read-only and
+query-only, scans the four identity-bearing tables in fixed 256-row pages, and
+emits version-1 count-only JSON. `compliant`/0 is the sole pass;
+`violations_found`/1, `incomplete`/2, and redacted command/setup `error`/2 all
+block upgrade. Reports contain version/status, limits, bounded scanned and
+violation counts, and an optional bounded `incomplete_reason` only—never a
+database path, row identity, owner, key type, session key,
+payload, transaction, or raw JSON. Neither the audit nor runtime truncates,
+renames, repairs, or rewrites an invalid value. Use a reviewed
+semantic-preserving product migration or audited store replacement, then
+re-audit before startup.
+
+This is #135 boundary evidence, not durable consensus or production HA. #127,
+#134, and #143 remain open; #143 includes seamless SVID,
+payload-protection-key, and trust-bundle rotation under live distributed load.
 
 ### Fresh durable readiness
 
@@ -246,6 +307,12 @@ routing only; they never redefine replica identity.
 The exact v3 ALPN and handshake have no production fallback to v2. A v2-to-v3
 change is a coordinated stop/upgrade/start of all clients and servers, not a
 mixed-version rolling deployment.
+
+#135 also requires that coordinated pattern even though accepted owner and key
+type values retain the v3 JSON shape. New model deserializers reject empty or
+oversized values before dispatch/exposure, while an older v3 peer can still
+emit them. Deploy #135 with #134 when possible; unchanged wire
+shape for valid values is not semantic negotiation.
 
 The #147 confidentiality contract is also coordinated even though both old and
 new builds identify as v3: mixed builds cannot negotiate the new operation-tree

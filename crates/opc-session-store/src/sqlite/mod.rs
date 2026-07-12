@@ -32,6 +32,7 @@ use crate::{
     ttl::{checked_session_deadline, validate_session_ttl},
 };
 
+pub mod audit;
 pub(crate) mod lease;
 pub(crate) mod ops;
 pub(crate) mod replication;
@@ -271,7 +272,13 @@ impl SessionBackend for SqliteSessionBackend {
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
         let conn = self.conn.lock().await;
         let now = self.clock.now_utc();
-        ops::get_sync(&conn, key, now)
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        let result = ops::get_sync(&tx, key, now)?;
+        tx.commit()
+            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        Ok(result)
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
@@ -328,7 +335,18 @@ impl SessionBackend for SqliteSessionBackend {
         let mut results = Vec::with_capacity(ops.len());
         for op in ops {
             let res = match op {
-                SessionOp::Get { key } => SessionOpResult::Get(ops::get_sync(&conn, &key, now)),
+                SessionOp::Get { key } => {
+                    let run_get = || {
+                        let tx = conn
+                            .unchecked_transaction()
+                            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                        let result = ops::get_sync(&tx, &key, now)?;
+                        tx.commit()
+                            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                        Ok(result)
+                    };
+                    SessionOpResult::Get(run_get())
+                }
                 SessionOp::CompareAndSet(cas) => {
                     let run_cas = || {
                         let tx = conn
@@ -377,7 +395,13 @@ impl SessionBackend for SqliteSessionBackend {
     ) -> Result<RestoreScanPage, StoreError> {
         let conn = self.conn.lock().await;
         let now = self.clock.now_utc();
-        ops::scan_restore_records_sync(&conn, request, now)
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        let result = ops::scan_restore_records_sync(&tx, request, now)?;
+        tx.commit()
+            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        Ok(result)
     }
 
     async fn max_replication_sequence(&self) -> Result<u64, StoreError> {

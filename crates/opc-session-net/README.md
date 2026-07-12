@@ -46,6 +46,9 @@ connection to one authenticated member of one immutable replication manifest.
 - Replication append and rebuild calls validate sequence metadata before
   resolution or dispatch; malformed authenticated wire requests receive the
   typed store error without consuming the connection.
+- Protocol decoding reuses `OwnerId` and `SessionKeyType`'s structural Serde
+  validation for every request, response, restore record, lease guard, batch,
+  and nested replication entry before backend dispatch or caller exposure.
 - Replication entries, rebuild prefixes, returned log pages, and watch items
   enforce `MAX_REPLICATION_OPERATION_DEPTH` (16) and
   `MAX_REPLICATION_OPERATIONS_PER_ENTRY` (256). The root is depth 1 and every
@@ -129,6 +132,25 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 - Protocol v3 has no production fallback to v2. The exact-version handshake
   and v3-only ALPN require a coordinated stop/upgrade/start of every
   session-net participant; mixed v2/v3 fleets are unsupported.
+- #135 keeps the JSON shape of valid v3 owner and session-key type values as a
+  string, but tightens semantic admission: owner IDs and custom key-type names
+  must contain 1 through 128 UTF-8 encoded bytes. The five reserved key-type
+  strings decode only to their canonical well-known variants; custom values
+  are structurally wrapped and ordered by canonical string. This is also a
+  Rust source break because `SessionKeyType::Other(String)` becomes
+  `Other(CustomSessionKeyType)` and `SessionKeyType::other` is fallible. A
+  same-v3 peer built before #135 can still send an empty or oversized value
+  that a new peer rejects before dispatch, so unchanged valid JSON shape is not
+  a rolling-compatibility claim.
+- Treat #135 as another coordinated stop/upgrade/start boundary. Drain traffic
+  and writers, audit every persisted SQLite replica with the count-only
+  `opc-session-store-audit identity-invariants` command, upgrade all clients,
+  servers, and protection wrappers together, verify authenticated handshakes
+  and representative restore/log reads, and only then restore traffic. Prefer
+  deploying #135 and #134 together so the fixed-width DTO and handshake can
+  state the admission contract explicitly. The audit and runtime never
+  truncate, rename, or rewrite rejected identities or log entries, and their
+  errors do not expose the rejected raw value.
 - DNS names and resolver overrides select only where to dial. FQDN, short-name,
   IP, and alias changes do not alter the expected `ReplicaId`, certificate
   SPIFFE identity, or manifest scope.
@@ -196,12 +218,13 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
   networked session HA for production. Protocol v3 authenticates membership;
   it does not establish consensus, durable sequence/commit authority,
   fork reconciliation, or majority-authoritative restore. Those properties,
-  fixed-width wire DTOs, and model-level decode invariants remain open in
-  #127–#129 and #133–#135.
+  fixed-width wire DTOs remain open in #127–#129, #133, and #134. #135's
+  model-level decode boundary is implemented but does not provide any of those
+  distributed properties.
 
 ## Roadmap
 
-- Close #127–#129, #133–#135, #145, and #148; add distributed failure and soak
+- Close #127–#129, #133–#134, #145, and #148; add distributed failure and soak
   evidence, including seamless SVID rotation, payload-protection key rotation,
   and trust-bundle rotation qualification in #143, before treating this as
   production transport.

@@ -16,6 +16,16 @@ use opc_types::{NetworkFunctionKind, TenantId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Maximum UTF-8 encoded length accepted for a [`StateType`].
+pub const STATE_TYPE_MAX_BYTES: usize = 128;
+
+/// Maximum UTF-8 encoded length accepted for a deployment-specific
+/// [`SessionKeyType`].
+pub const SESSION_KEY_TYPE_MAX_BYTES: usize = 128;
+
+/// Maximum UTF-8 encoded length accepted for an [`OwnerId`].
+pub const OWNER_ID_MAX_BYTES: usize = 128;
+
 /// Classification of session state by consistency requirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -75,18 +85,21 @@ impl StateClass {
 pub struct StateType(String);
 
 impl StateType {
+    /// Maximum UTF-8 encoded length accepted by [`StateType::new`].
+    pub const MAX_BYTES: usize = STATE_TYPE_MAX_BYTES;
+
     /// Validate and construct a state type.
     ///
-    /// Returns an error for the empty string or values longer than 128
-    /// characters; the bound keeps the value safe to embed in backend rows
-    /// and AEAD AAD without truncation.
+    /// Returns an error for the empty string or values longer than
+    /// [`STATE_TYPE_MAX_BYTES`] UTF-8 encoded bytes; the bound keeps the value
+    /// safe to embed in backend rows and AEAD AAD without truncation.
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
         if value.is_empty() {
             return Err("state type cannot be empty".into());
         }
-        if value.len() > 128 {
-            return Err("state type must be at most 128 characters".into());
+        if value.len() > STATE_TYPE_MAX_BYTES {
+            return Err("state type must be at most 128 bytes".into());
         }
         Ok(Self(value))
     }
@@ -95,9 +108,9 @@ impl StateType {
     ///
     /// # Panics
     ///
-    /// Panics if `value` is empty or longer than 128 characters. Intended for
-    /// deterministic literals in tests and reference code; use `new` for
-    /// runtime input.
+    /// Panics if `value` is empty or longer than [`STATE_TYPE_MAX_BYTES`]
+    /// UTF-8 encoded bytes. Intended for deterministic literals in tests and
+    /// reference code; use `new` for runtime input.
     pub fn from_static(value: &'static str) -> Self {
         Self::new(value).unwrap_or_else(|e| panic!("invalid state type: {e}"))
     }
@@ -142,8 +155,102 @@ impl<'de> Deserialize<'de> for StateType {
     }
 }
 
-/// Well-known categories of session key.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Validated name for a deployment-specific [`SessionKeyType`].
+///
+/// The private storage makes the non-empty, byte-length, and canonical-name
+/// invariants structural: callers cannot construct a custom value that
+/// serializes to the same persisted identity as a well-known variant.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CustomSessionKeyType(String);
+
+impl CustomSessionKeyType {
+    /// Maximum UTF-8 encoded length accepted by
+    /// [`CustomSessionKeyType::new`].
+    pub const MAX_BYTES: usize = SESSION_KEY_TYPE_MAX_BYTES;
+
+    /// Validate a deployment-specific session key type name.
+    ///
+    /// Names are non-empty UTF-8 strings of at most
+    /// [`SESSION_KEY_TYPE_MAX_BYTES`] encoded bytes. The five well-known
+    /// spellings are reserved so every persisted string has exactly one
+    /// in-memory representation.
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err("custom session key type cannot be empty".into());
+        }
+        if value.len() > SESSION_KEY_TYPE_MAX_BYTES {
+            return Err("custom session key type must be at most 128 bytes".into());
+        }
+        if is_well_known_session_key_type(&value) {
+            return Err("custom session key type must not use a reserved well-known name".into());
+        }
+        Ok(Self(value))
+    }
+
+    /// The validated custom name as persisted and included in key digests.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CustomSessionKeyType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CustomSessionKeyType([redacted])")
+    }
+}
+
+impl fmt::Display for CustomSessionKeyType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CustomSessionKeyType {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for CustomSessionKeyType {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for CustomSessionKeyType {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl Serialize for CustomSessionKeyType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CustomSessionKeyType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::new(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Well-known and validated deployment-specific categories of session key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SessionKeyType {
     /// Subscriber-level context keyed by a SUPI-derived identifier (the
     /// `stable_id` must be a derived digest, never the raw SUPI/GPSI).
@@ -158,22 +265,61 @@ pub enum SessionKeyType {
     /// Ephemeral handover transaction state, scoped to a `HandoverTxId` and
     /// normally stored with a TTL.
     HandoverTransaction,
-    /// Deployment-specific key category. The string is the wire form and must
-    /// be non-empty; it shares the namespace with the well-known kebab-case
-    /// names above, so avoid reusing them.
-    Other(String),
+    /// Deployment-specific key category. Construct it through
+    /// [`SessionKeyType::other`] so it cannot collide with a well-known
+    /// kebab-case name.
+    ///
+    /// ```compile_fail
+    /// use opc_session_store::SessionKeyType;
+    /// let _ = SessionKeyType::Other("unchecked".to_owned());
+    /// ```
+    Other(CustomSessionKeyType),
+}
+
+impl SessionKeyType {
+    /// Validate and construct a deployment-specific key category.
+    ///
+    /// ```
+    /// use opc_session_store::SessionKeyType;
+    /// # fn main() -> Result<(), String> {
+    /// let key_type = SessionKeyType::other("vendor-session")?;
+    /// assert_eq!(key_type.as_str(), "vendor-session");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn other(value: impl Into<String>) -> Result<Self, String> {
+        CustomSessionKeyType::new(value).map(Self::Other)
+    }
+
+    /// Canonical persisted form used for JSON, SQLite keys, ordering, and key
+    /// digest input.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::SubscriberContext => "subscriber-context",
+            Self::PduSession => "pdu-session",
+            Self::TeidMapping => "teid-mapping",
+            Self::PfcpSeid => "pfcp-seid",
+            Self::HandoverTransaction => "handover-transaction",
+            Self::Other(value) => value.as_str(),
+        }
+    }
 }
 
 impl fmt::Display for SessionKeyType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SessionKeyType::SubscriberContext => write!(f, "subscriber-context"),
-            SessionKeyType::PduSession => write!(f, "pdu-session"),
-            SessionKeyType::TeidMapping => write!(f, "teid-mapping"),
-            SessionKeyType::PfcpSeid => write!(f, "pfcp-seid"),
-            SessionKeyType::HandoverTransaction => write!(f, "handover-transaction"),
-            SessionKeyType::Other(s) => f.write_str(s),
-        }
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialOrd for SessionKeyType {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SessionKeyType {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
     }
 }
 
@@ -181,18 +327,10 @@ impl FromStr for SessionKeyType {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "subscriber-context" => Ok(Self::SubscriberContext),
-            "pdu-session" => Ok(Self::PduSession),
-            "teid-mapping" => Ok(Self::TeidMapping),
-            "pfcp-seid" => Ok(Self::PfcpSeid),
-            "handover-transaction" => Ok(Self::HandoverTransaction),
-            _ => {
-                if value.is_empty() {
-                    return Err("session key type cannot be empty".into());
-                }
-                Ok(Self::Other(value.to_owned()))
-            }
+        if let Some(well_known) = well_known_session_key_type(value) {
+            Ok(well_known)
+        } else {
+            Self::other(value)
         }
     }
 }
@@ -202,7 +340,22 @@ impl Serialize for SessionKeyType {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.to_string())
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+fn is_well_known_session_key_type(value: &str) -> bool {
+    well_known_session_key_type(value).is_some()
+}
+
+fn well_known_session_key_type(value: &str) -> Option<SessionKeyType> {
+    match value {
+        "subscriber-context" => Some(SessionKeyType::SubscriberContext),
+        "pdu-session" => Some(SessionKeyType::PduSession),
+        "teid-mapping" => Some(SessionKeyType::TeidMapping),
+        "pfcp-seid" => Some(SessionKeyType::PfcpSeid),
+        "handover-transaction" => Some(SessionKeyType::HandoverTransaction),
+        _ => None,
     }
 }
 
@@ -265,7 +418,7 @@ mod bytes_serde {
 
 impl SessionKey {
     pub(crate) fn canonical_digest_input(&self) -> Vec<u8> {
-        let key_type = self.key_type.to_string();
+        let key_type = self.key_type.as_str();
         let mut out = Vec::with_capacity(
             (4 * std::mem::size_of::<u64>())
                 + self.tenant.as_str().len()
@@ -362,23 +515,27 @@ impl fmt::Display for Generation {
 }
 
 /// Identifies the NF replica that owns a session record.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct OwnerId(String);
 
 impl OwnerId {
+    /// Maximum UTF-8 encoded length accepted by [`OwnerId::new`].
+    pub const MAX_BYTES: usize = OWNER_ID_MAX_BYTES;
+
     /// Validate and construct an owner identity.
     ///
-    /// Rejects the empty string and values over 128 characters. The value
-    /// must be stable for the lifetime of a replica and unique across
-    /// replicas: lease managers compare it verbatim to decide whether an
-    /// acquire attempt is a re-acquire by the holder or a conflict.
+    /// Rejects the empty string and values over [`OWNER_ID_MAX_BYTES`] UTF-8
+    /// encoded bytes. The value must be stable for the lifetime of a replica
+    /// and unique across replicas: lease managers compare it verbatim to
+    /// decide whether an acquire attempt is a re-acquire by the holder or a
+    /// conflict.
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
         if value.is_empty() {
             return Err("owner id cannot be empty".into());
         }
-        if value.len() > 128 {
-            return Err("owner id must be at most 128 characters".into());
+        if value.len() > OWNER_ID_MAX_BYTES {
+            return Err("owner id must be at most 128 bytes".into());
         }
         Ok(Self(value))
     }
@@ -387,6 +544,12 @@ impl OwnerId {
     /// in `StoredSessionRecord::owner`.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Debug for OwnerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OwnerId([redacted])")
     }
 }
 
@@ -401,6 +564,16 @@ impl FromStr for OwnerId {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for OwnerId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::new(raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -518,6 +691,7 @@ mod tests {
     };
     use bytes::Bytes;
     use opc_types::{NetworkFunctionKind, TenantId};
+    use proptest::prelude::*;
 
     fn test_key() -> SessionKey {
         SessionKey {
@@ -555,12 +729,169 @@ mod tests {
 
     #[test]
     fn session_key_type_serde_round_trips_unknown_variant() {
-        let value = SessionKeyType::Other("custom-session-key".into());
+        let value = SessionKeyType::other("custom-session-key").unwrap();
         let json = serde_json::to_string(&value).unwrap();
         assert_eq!(json, "\"custom-session-key\"");
 
         let round_trip: SessionKeyType = serde_json::from_str(&json).unwrap();
         assert_eq!(round_trip, value);
+    }
+
+    #[test]
+    fn session_identity_bounds_use_utf8_encoded_bytes() {
+        assert!(OwnerId::new("o".repeat(OWNER_ID_MAX_BYTES)).is_ok());
+        assert!(OwnerId::new("o".repeat(OWNER_ID_MAX_BYTES + 1)).is_err());
+        assert!(OwnerId::new("é".repeat(OWNER_ID_MAX_BYTES / 2)).is_ok());
+        assert!(OwnerId::new("é".repeat((OWNER_ID_MAX_BYTES / 2) + 1)).is_err());
+
+        assert!(SessionKeyType::other("k".repeat(SESSION_KEY_TYPE_MAX_BYTES)).is_ok());
+        assert!(SessionKeyType::other("k".repeat(SESSION_KEY_TYPE_MAX_BYTES + 1)).is_err());
+        assert!(SessionKeyType::other("é".repeat(SESSION_KEY_TYPE_MAX_BYTES / 2)).is_ok());
+        assert!(SessionKeyType::other("é".repeat((SESSION_KEY_TYPE_MAX_BYTES / 2) + 1)).is_err());
+
+        assert!(StateType::new("s".repeat(STATE_TYPE_MAX_BYTES)).is_ok());
+        assert!(StateType::new("s".repeat(STATE_TYPE_MAX_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn owner_deserialization_reuses_constructor_and_redacts_failures() {
+        for invalid in [String::new(), "owner-secret".repeat(16)] {
+            assert!(OwnerId::new(invalid.clone()).is_err());
+            let encoded = serde_json::to_string(&invalid).unwrap();
+            let error = serde_json::from_str::<OwnerId>(&encoded).unwrap_err();
+            let rendered = error.to_string();
+            if !invalid.is_empty() {
+                assert!(!rendered.contains(&invalid));
+            }
+        }
+
+        let owner = OwnerId::new("owner-secret").unwrap();
+        assert_eq!(serde_json::to_string(&owner).unwrap(), "\"owner-secret\"");
+        assert_eq!(format!("{owner:?}"), "OwnerId([redacted])");
+        assert!(!format!("{owner:?}").contains(owner.as_str()));
+    }
+
+    #[test]
+    fn custom_key_types_cannot_alias_well_known_variants() {
+        let cases = [
+            ("subscriber-context", SessionKeyType::SubscriberContext),
+            ("pdu-session", SessionKeyType::PduSession),
+            ("teid-mapping", SessionKeyType::TeidMapping),
+            ("pfcp-seid", SessionKeyType::PfcpSeid),
+            ("handover-transaction", SessionKeyType::HandoverTransaction),
+        ];
+
+        for (persisted, expected) in cases {
+            assert!(CustomSessionKeyType::new(persisted).is_err());
+            assert!(SessionKeyType::other(persisted).is_err());
+            assert_eq!(SessionKeyType::from_str(persisted).unwrap(), expected);
+            assert_eq!(expected.as_str(), persisted);
+            assert_eq!(
+                serde_json::to_string(&expected).unwrap(),
+                format!("\"{persisted}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn custom_key_type_deserialization_is_bounded_and_redacted() {
+        for invalid in [String::new(), "custom-secret".repeat(16)] {
+            assert!(SessionKeyType::from_str(&invalid).is_err());
+            let encoded = serde_json::to_string(&invalid).unwrap();
+            let error = serde_json::from_str::<SessionKeyType>(&encoded).unwrap_err();
+            let rendered = error.to_string();
+            if !invalid.is_empty() {
+                assert!(!rendered.contains(&invalid));
+            }
+        }
+
+        let custom = CustomSessionKeyType::new("custom-secret").unwrap();
+        assert_eq!(format!("{custom:?}"), "CustomSessionKeyType([redacted])");
+        assert!(!format!("{custom:?}").contains(custom.as_str()));
+    }
+
+    #[test]
+    fn session_key_type_order_matches_persisted_text_order() {
+        let mut values = [
+            SessionKeyType::SubscriberContext,
+            SessionKeyType::PduSession,
+            SessionKeyType::TeidMapping,
+            SessionKeyType::PfcpSeid,
+            SessionKeyType::HandoverTransaction,
+            SessionKeyType::other("aaa-custom").unwrap(),
+            SessionKeyType::other("zzz-custom").unwrap(),
+        ];
+        let mut persisted = values
+            .iter()
+            .map(|value| value.as_str().to_string())
+            .collect::<Vec<_>>();
+
+        values.sort();
+        persisted.sort();
+
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            persisted.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn custom_session_key_keeps_legacy_canonical_digest_input() {
+        let key = SessionKey {
+            key_type: SessionKeyType::other("custom-session-key").unwrap(),
+            ..test_key()
+        };
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&8_u64.to_be_bytes());
+        expected.extend_from_slice(b"tenant-a");
+        expected.extend_from_slice(&3_u64.to_be_bytes());
+        expected.extend_from_slice(b"smf");
+        expected.extend_from_slice(&18_u64.to_be_bytes());
+        expected.extend_from_slice(b"custom-session-key");
+        expected.extend_from_slice(&7_u64.to_be_bytes());
+        expected.extend_from_slice(b"same-id");
+
+        assert_eq!(key.canonical_digest_input(), expected);
+    }
+
+    proptest! {
+        #[test]
+        fn owner_constructor_and_serde_accept_the_same_strings(
+            chars in proptest::collection::vec(any::<char>(), 0..140),
+        ) {
+            let value = chars.into_iter().collect::<String>();
+            let constructed = OwnerId::new(value.clone());
+            let encoded = serde_json::to_string(&value).unwrap();
+            let decoded = serde_json::from_str::<OwnerId>(&encoded);
+            prop_assert_eq!(constructed.is_ok(), decoded.is_ok());
+            if let (Ok(constructed), Ok(decoded)) = (constructed, decoded) {
+                prop_assert_eq!(constructed, decoded);
+            }
+        }
+
+        #[test]
+        fn session_key_type_parse_and_serde_are_canonical(
+            left_chars in proptest::collection::vec(any::<char>(), 0..140),
+            right_chars in proptest::collection::vec(any::<char>(), 0..140),
+        ) {
+            let left_raw = left_chars.into_iter().collect::<String>();
+            let right_raw = right_chars.into_iter().collect::<String>();
+            let left = SessionKeyType::from_str(&left_raw);
+            let encoded = serde_json::to_string(&left_raw).unwrap();
+            let decoded = serde_json::from_str::<SessionKeyType>(&encoded);
+            prop_assert_eq!(left.is_ok(), decoded.is_ok());
+            if let (Ok(left), Ok(decoded)) = (&left, decoded) {
+                prop_assert_eq!(left, &decoded);
+                prop_assert_eq!(decoded.as_str(), left_raw.as_str());
+            }
+
+            if let (Ok(left), Ok(right)) = (left, SessionKeyType::from_str(&right_raw)) {
+                prop_assert_eq!(left == right, left.as_str() == right.as_str());
+            }
+        }
     }
 
     #[test]

@@ -119,6 +119,113 @@ Examples:
 Raw SUPI/GPSI MUST NOT be used directly as a backend key in production. The SDK
 SHOULD derive stable keys with a tenant-specific keyed hash.
 
+### 5.1 Owner and Session-Key Type Invariants
+
+An `OwnerId` and the name of a deployment-specific `SessionKeyType` MUST each
+contain 1 through 128 UTF-8 encoded bytes. The limit applies to encoded bytes,
+not characters. Empty and oversized values MUST be rejected at construction
+and decode boundaries without including the raw value in an error.
+
+`SessionKeyType::Other` MUST contain a structurally validated
+`CustomSessionKeyType`; callers MUST use the fallible
+`SessionKeyType::other` for runtime custom names. These canonical persisted
+strings are reserved for the corresponding well-known variants and MUST NOT be
+constructible as custom values:
+
+- `subscriber-context`
+- `pdu-session`
+- `teid-mapping`
+- `pfcp-seid`
+- `handover-transaction`
+
+Parsing a reserved string MUST produce the well-known variant. Display,
+serialization, SQLite identity, key-digest input, and ordering MUST use the
+same canonical string; ordering MUST therefore be string ordering across known
+and custom values, not enum declaration order.
+
+The invariant MUST be applied by Serde, SQLite record and restore hydration,
+active-lease reads before acquire/renew/release/fenced mutation,
+replication-log hydration including nested operations, and session-net request
+and response decode. Invalid persisted or remote data MUST fail closed before
+mutation or caller exposure. Diagnostics MUST be fieldless or fixed and MUST
+NOT expose the owner, key type, stable ID, row, transaction, or raw entry.
+
+Valid protocol-v3 values retain their JSON string shape. This does not make the
+change rolling-compatible: replacing `Other(String)` with
+`Other(CustomSessionKeyType)` and making `SessionKeyType::other` fallible is a
+Rust source break. Both `HandoverEnvelope::unpack_raw` and
+`HandoverSessionRecord::unpack_raw` now return a typed `Result`; both public
+`unpack_json` methods change their error type, and `HandoverError` adds an
+`InvalidEnvelope` variant. Packers now write the versioned `OPCH` form while
+readers retain a bounded original/bare migration path. Rejecting values an
+older v3 peer could emit is also a semantic-admission break. Until #134
+provides a versioned fixed-width DTO and
+handshake contract, operators MUST stop, upgrade, and restart every session-net
+client, server, and protection wrapper plus every NF/product handover reader or
+writer as one coordinated unit. The #134 and #135 changes SHOULD be deployed
+together, but #134 does not make persisted `OPCH` bytes readable by old code.
+
+### 5.2 Bounded Legacy SQLite Audit
+
+Before a new binary opens persisted SQLite state written by an older SDK, the
+operator MUST drain all writers and run:
+
+```text
+opc-session-store-audit identity-invariants \
+  --database PATH \
+  --max-rows N \
+  --max-entry-json-bytes N \
+  --max-total-json-bytes N
+```
+
+All limits MUST be explicit and non-zero, and the per-entry JSON-byte limit
+MUST NOT exceed the total JSON-byte limit or SQLite's signed `i64` length
+range. The command opens an existing
+database read-only/query-only, reads one consistent snapshot in fixed 256-row
+pages, applies the row budget across `session_records`, `leases`,
+`key_fences`, and `session_replication_log`, and bounds individual and
+cumulative replication JSON before strict typed decode and domain validation.
+
+Report schema version 1 is count-only. It contains the supplied limits,
+per-table scanned counts, counts for invalid owner fields, invalid session-key
+type fields, and invalid replication entries, and at most one bounded
+incomplete reason. It MUST NOT contain the database path, row identity, tenant,
+owner, key type, stable ID, payload, transaction, or raw JSON. The stable
+command outcomes are:
+
+- `compliant` on stdout with exit 0;
+- `violations_found` on stdout with exit 1;
+- `incomplete` on stdout with exit 2; or
+- redacted `error` on stderr with exit 2.
+
+Only `compliant` after a complete snapshot inspection permits the identity
+portion of the upgrade to continue. `violations_found`, `incomplete`, and
+`error` MUST block startup. An incomplete audit reports one of
+`row_budget_exceeded`, `entry_json_budget_exceeded`,
+`total_json_budget_exceeded`, `unsupported_schema`, `database_read_failed`, or
+`counter_overflow`. The operator MAY increase budgets and re-audit, but the SDK
+and audit MUST NOT truncate, rename, normalize, delete, repair, or rewrite
+invalid identity or replication state automatically. A violation requires a
+separately reviewed product migration that preserves authoritative identity and
+history, or audited store replacement, followed by another complete audit.
+
+The identity audit MUST NOT be treated as a handover-payload preflight. It does
+not classify live payloads or payload bytes inside nested CAS log operations,
+so `compliant` says nothing about legacy envelope/bare compatibility. Every
+product using `HandoverEnvelope` MUST separately preflight the complete drained
+and decrypted replay population: live records, recursively nested replication
+log and snapshot records, restore/rebuild sources, and every retained copy that
+can become authoritative. It MUST use `unpack_raw_with_format` or typed
+`unpack_json_with_format` and verify the syntactic result against snapshot
+provenance and product payload semantics; decoder success alone is insufficient.
+A rejected or unprovable value MUST be resolved by a reviewed product migration
+or store replacement before startup; automatic guessing/truncation is forbidden.
+
+This bounded identity admission closes #135's scoped model/persistence
+boundary. It does not prove durable commit authority (#127), fixed-width wire
+admission (#134), or production qualification and seamless certificate,
+payload-protection-key, and trust-bundle rotation (#143).
+
 ## 6. Backend Capability Model
 
 The initial `get/set/delete` trait is too weak. Backends MUST declare
@@ -342,6 +449,42 @@ The session store MUST support these generic steps:
 7. Abort performs a fenced CAS back to `Stable` if activation did not complete.
 
 All steps MUST be idempotent by `HandoverTxId`.
+
+New handover envelopes MUST start with the `OPCH` magic, an exact format
+version, a bounded phase length, and the typed JSON phase. Every versioned
+header and phase is decoded strictly. For non-`OPCH` input, readers MUST apply
+this exact migration classifier:
+
+1. Fewer than four bytes are an unframed `Stable` payload.
+2. The first four bytes are a big-endian potential phase length. Zero, or a
+   value from 1 through `HANDOVER_PHASE_HEADER_MAX_BYTES` (1,024) whose phase
+   slice is truncated, is `InvalidHeader`.
+3. A complete phase slice within that bound is an original envelope only when
+   it decodes as the current `HandoverPhase`. A JSON-looking invalid slice is
+   `InvalidPhase`; a non-JSON-looking slice falls back to unframed `Stable`.
+4. A length above 1,024 is `InvalidHeader` when the bytes after the first word
+   begin, after ASCII whitespace, like JSON. Otherwise it falls back to
+   unframed `Stable`.
+
+This bounded rule intentionally rejects ambiguous historical bare bytes and
+original envelopes whose phase is oversized or invalid under the current
+model. Syntax can also produce false positives: in a checkpoint known to
+predate `OPCH`, `VersionedV1` is a bare-prefix collision, and an
+`OriginalLengthPrefixed` result MUST be confirmed from product provenance and
+payload meaning. Products MUST run the complete live/replay payload preflight in
+§5.2 and explicitly wrap the complete bytes of an authoritatively identified
+bare `Stable` value, or perform a reviewed semantic migration/store replacement.
+A successful transition writes the versioned form.
+
+Writing the first `OPCH` record is a one-way migration barrier. A pre-`OPCH`
+reader silently interprets that record as opaque bare `Stable` data. Operators
+MUST NOT roll back binaries after the barrier unless the fleet remains drained
+and either one coherent fleet-wide pre-upgrade checkpoint is restored (with
+post-checkpoint mutations explicitly lost or reconciled) or every affected live
+and replayable payload—including nested logs, snapshots, and restore/rebuild
+sources—is reverse-migrated under a reviewed procedure. Every NF/product
+handover reader and writer MUST cross the barrier together; protocol negotiation
+alone cannot make the persisted payload backward-readable.
 
 ### 10.4 Packet Continuity
 
@@ -643,6 +786,16 @@ fencing.
   across direct, batch, replicated, persisted, and authenticated-wire paths;
   rejected values must have no partial effect.
 - Serialization corrupt input rejection.
+- Exact 1-byte and 128-byte owner/custom-key acceptance, empty and 129-byte
+  rejection, canonical reserved-name handling, string ordering, and hostile
+  Serde/session-net decode rejection without raw-value disclosure.
+- Valid legacy SQLite hydration; hostile owner/key types in records, active
+  leases, key fences, and nested replication logs; no-effect rejection; and
+  the bounded count-only audit's budgets, status/exit codes, and redaction.
+- Versioned and bounded/current-valid original handover-envelope round trips;
+  exact non-`OPCH` classifier cases (including ambiguous bare rejection); and
+  malformed, zero-length, truncated, oversized, and typed-invalid rejection
+  before mutation.
 - AEAD AAD mismatch rejection.
 - Nested replicated CAS protection at depths 1 through 16, rejection at depth
   17, exact 256-node acceptance and 257-node rejection, and fieldless errors.
@@ -703,3 +856,7 @@ This RFC is implemented when:
     256 total nodes; every nested CAS is protected on write and unprotected on
     read; and transformation failure cannot delegate or expose a partial
     entry/prefix/page.
+11. Owner IDs and custom session-key types have structural 1-through-128-byte
+    invariants at every model, persistence, and transport decode boundary;
+    legacy SQLite admission is bounded, count-only, read-only, and fail-closed;
+    and invalid state is never silently rewritten.
