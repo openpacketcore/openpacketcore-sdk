@@ -47,6 +47,12 @@ pub enum StoreError {
     /// carries no caller-controlled value so it is safe to expose to peers.
     #[error("invalid replication sequence")]
     InvalidReplicationSequence,
+    /// A lease or record-refresh TTL exceeded the SDK maximum, or its absolute
+    /// deadline could not be represented. The error intentionally carries no
+    /// caller-controlled duration or timestamp, so it is safe to expose to
+    /// authenticated peers.
+    #[error("invalid session TTL")]
+    InvalidSessionTtl,
     /// Another owner currently holds an unexpired lease on the key, so this
     /// caller cannot acquire single-writer authority for it.
     #[error("lease held by another owner")]
@@ -125,6 +131,10 @@ pub enum LeaseError {
     /// pruned after expiry). Re-acquire instead of renewing.
     #[error("lease not found")]
     NotFound,
+    /// The requested lease TTL exceeded the SDK maximum, or its absolute
+    /// deadline could not be represented. No lease state was changed.
+    #[error("invalid session TTL")]
+    InvalidSessionTtl,
     /// The underlying store failed (see the wrapped message). Treat as
     /// transient like `StoreError::BackendUnavailable`, but consider the lease
     /// state unknown — and therefore lost — until a renew succeeds.
@@ -139,6 +149,7 @@ impl From<StoreError> for LeaseError {
             StoreError::LeaseExpired => LeaseError::Expired,
             StoreError::StaleFence => LeaseError::StaleFence,
             StoreError::NotFound => LeaseError::NotFound,
+            StoreError::InvalidSessionTtl => LeaseError::InvalidSessionTtl,
             other => LeaseError::Backend(other.to_string()),
         }
     }

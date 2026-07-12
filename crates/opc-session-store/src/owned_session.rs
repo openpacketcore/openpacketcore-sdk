@@ -376,6 +376,9 @@ impl OwnedSessionMutationError {
             StoreError::InvalidReplicationSequence => Self::StoreRejected {
                 code: "invalid-replication-sequence",
             },
+            StoreError::InvalidSessionTtl => Self::StoreRejected {
+                code: "invalid-session-ttl",
+            },
             StoreError::NotFound => Self::StoreRejected { code: "not-found" },
             StoreError::CasConflict => Self::StoreRejected {
                 code: "cas-conflict",

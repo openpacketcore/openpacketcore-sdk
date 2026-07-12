@@ -28,8 +28,14 @@ The target session-store contract includes:
 - Monotonic fences and CAS for authoritative writes.
 - Durable ordered replication logs for lease acquire, renew, release, CAS,
   delete, TTL refresh, and batch operations.
+- One public 365-day maximum for `Duration`-based session refresh and lease
+  TTLs, with zero accepted as immediate expiry and exact checked deadline
+  arithmetic at every direct, nested, persistence, quorum, and transport
+  boundary.
 - Idempotent replay using log position, generation, fence, and transaction ID.
-- Majority-supported committed-prefix repair for stale or divergent replicas.
+- Commit-proven, majority-supported repair for stale or divergent replicas as
+  a target contract; #128/#129 remain open and current automatic repair is
+  limited to strict shorter prefixes.
 - Watch/change-stream resume cursors.
 - Fail-closed partial-quorum write handling that never treats a failed write as
   committed and requires recovery evidence before later catch-up.
@@ -58,6 +64,14 @@ aliases remain routing inputs only. There is no production v2 fallback.
 TLS session caches, tickets, resumption, early data, and 0-RTT are disabled;
 every reconnect performs a full mutual-TLS certificate exchange so rotated
 SVIDs cannot inherit cached replica authority.
+
+That reconnect rule is necessary but not sufficient for production rotation.
+The qualified CNF/operator profile must rotate workload certificates and trust
+bundles seamlessly, without interrupting session service, while proving trust
+overlap, revocation, retirement of long-lived connections, reconnect-storm
+behavior, and a documented maximum authentication age. This evidence remains
+open in #143. Session/lease TTL is an application-state lifetime and does not
+set certificate expiry, trust-bundle validity, or authentication age.
 
 Authenticated remote adapters expose a `BackendPeerBinding` to topology
 admission. The admitted member must match the binding's local and remote IDs,
@@ -91,9 +105,12 @@ supported. This identity binding is not consensus or fork recovery. Durable
 commit authority, commit-proven repair, operator-safe fork recovery, and
 bounded majority-authoritative restore remain open in #127–#129 and #133.
 Fixed-width wire DTOs and invariant-safe model decoding remain #134/#135;
-oversized-TTL panic elimination remains #137. Malformed sequence zero, checked
-increment, rebuild-prefix, SQLite signed-boundary, cache, and authenticated
-wire rejection are implemented under #138.
+checked TTL rejection is implemented under #137, and malformed sequence zero,
+checked increment, rebuild-prefix, SQLite signed-boundary, cache, and
+authenticated wire rejection are implemented under #138. Production
+qualification, including seamless credential/trust rotation, remains #143.
+Watch handoff correctness (#145), recursively protected nested replicated CAS
+payloads (#147), and absolute-record-expiry admission (#148) also remain open.
 
 ## Consequences
 
@@ -104,6 +121,23 @@ yet that profile.
 
 The SDK favors fail-closed reads over returning divergent session state when a
 majority cannot agree.
+
+`MAX_SESSION_TTL` is exactly 365 days. Zero remains valid as immediate expiry;
+larger values return `StoreError::InvalidSessionTtl` or
+`LeaseError::InvalidSessionTtl` before application/backend effects. The
+implementation converts seconds/nanoseconds and adds deadlines with checked
+integer operations rather than floating point or panicking timestamp
+arithmetic. This prevents an oversized direct or authenticated input from
+unwinding a process, but supplies no consensus or commit proof.
+
+The new public and serialized error variants require exhaustive callers and
+all session-net participants to upgrade as one same-v3 compatibility unit;
+valid v3 wire traffic is unchanged. Operators must first audit persisted legacy
+replication logs: a TTL-bearing entry above 365 days now fails closed during
+replay/rebuild and is neither clamped nor rewritten automatically. Replicated
+deadline validation admits at most one microsecond above exact
+`entry.timestamp + ttl` solely for legacy `seconds_f64` rounding; new deadlines
+remain exact, the TTL maximum is unchanged, and larger mismatches fail closed.
 
 Capability/profile validation and fresh readiness have different scopes. The
 former is static admission evidence. The latter is a bounded observation that

@@ -12,6 +12,7 @@ use crate::{
     model::{FenceToken, Generation, OwnerId, SessionKey, StateClass, StateType},
     record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord},
     restore::{RestoreScanCursor, RestoreScanPage, RestoreScanRequest},
+    ttl::checked_session_deadline,
 };
 
 pub(crate) fn format_rfc3339_normalized(ts: Timestamp) -> String {
@@ -640,6 +641,7 @@ pub(crate) fn refresh_ttl_sync(
     caps: &BackendCapabilities,
     now: Timestamp,
 ) -> Result<(), StoreError> {
+    let expires_at = checked_session_deadline(now, ttl)?;
     prune_sync(conn, now)?;
 
     if !caps.per_key_ttl {
@@ -663,8 +665,7 @@ pub(crate) fn refresh_ttl_sync(
         return Err(StoreError::NotFound);
     };
 
-    let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-    record.expires_at = Some(Timestamp::from_offset_datetime(expires));
+    record.expires_at = Some(expires_at);
 
     insert_or_replace_record_sync(conn, &record)?;
     insert_or_replace_fence_sync(conn, lease.key(), lease.fence().get())?;

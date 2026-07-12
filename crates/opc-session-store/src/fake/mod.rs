@@ -16,9 +16,10 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::{
     backend::{
-        next_replication_sequence, validate_replication_prefix, BackendInstanceIdentity,
-        CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend,
-        SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
+        next_replication_sequence, validate_replication_page, validate_replication_prefix,
+        validate_session_ops_ttls, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
+        ReplicationEntry, ReplicationOp, SessionBackend, SessionOp, SessionOpResult,
+        WATCH_CHANNEL_CAPACITY,
     },
     capability::BackendCapabilities,
     clock::{Clock, TokioVirtualClock},
@@ -28,6 +29,7 @@ use crate::{
     model::{FenceToken, OwnerId, SessionKey},
     record::StoredSessionRecord,
     restore::{compare_restore_records, RestoreScanCursor, RestoreScanPage, RestoreScanRequest},
+    ttl::{checked_session_deadline, validate_session_ttl},
 };
 
 /// In-memory session backend and lease manager for deterministic tests.
@@ -380,6 +382,7 @@ impl FakeSessionBackend {
         ttl: Duration,
         now: Timestamp,
     ) -> Result<Timestamp, StoreError> {
+        let expires_at = checked_session_deadline(now, ttl)?;
         if !self.caps.per_key_ttl {
             return Err(StoreError::CapabilityNotSupported("per_key_ttl".into()));
         }
@@ -405,8 +408,6 @@ impl FakeSessionBackend {
             return Err(StoreError::NotFound);
         }
 
-        let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-        let expires_at = Timestamp::from_offset_datetime(expires);
         record.expires_at = Some(expires_at);
         state.key_fences.insert(mk, lease.fence());
         Ok(expires_at)
@@ -737,8 +738,10 @@ impl SessionBackend for FakeSessionBackend {
     }
 
     async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
-        let mut state = self.inner.lock().await;
+        validate_session_ttl(ttl)?;
         let now = self.clock.now_utc();
+        checked_session_deadline(now, ttl)?;
+        let mut state = self.inner.lock().await;
         Self::prune_state(&mut state, now);
         let replication_sequence = self.next_direct_replication_sequence(&state)?;
         let expires_at = self.refresh_ttl_with_state(&mut state, lease, ttl, now)?;
@@ -758,12 +761,18 @@ impl SessionBackend for FakeSessionBackend {
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        validate_session_ops_ttls(&ops)?;
+        let now = self.clock.now_utc();
+        for op in &ops {
+            if let SessionOp::RefreshTtl { ttl, .. } = op {
+                checked_session_deadline(now, *ttl)?;
+            }
+        }
         if !self.caps.batch_write {
             return Err(StoreError::CapabilityNotSupported("batch_write".into()));
         }
 
         let mut state = self.inner.lock().await;
-        let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
         let mut results = Vec::with_capacity(ops.len());
         for op in ops {
@@ -852,11 +861,12 @@ impl SessionBackend for FakeSessionBackend {
             .take(limit)
             .cloned()
             .collect();
+        validate_replication_page(&entries)?;
         Ok(entries)
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate_sequence()?;
+        entry.validate()?;
         let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
@@ -985,8 +995,10 @@ impl SessionLeaseManager for FakeSessionBackend {
         owner: OwnerId,
         ttl: Duration,
     ) -> Result<LeaseGuard, LeaseError> {
-        let mut state = self.inner.lock().await;
+        validate_session_ttl(ttl).map_err(LeaseError::from)?;
         let now = self.clock.now_utc();
+        let expires_at = checked_session_deadline(now, ttl).map_err(LeaseError::from)?;
+        let mut state = self.inner.lock().await;
         Self::prune_state(&mut state, now);
         let replication_sequence = self
             .next_direct_replication_sequence(&state)
@@ -1015,9 +1027,6 @@ impl SessionLeaseManager for FakeSessionBackend {
         state.next_fence = next_fence.saturating_add(1);
         let credential_id = state.next_credential_id;
         state.next_credential_id = state.next_credential_id.saturating_add(1);
-
-        let expires_at = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-        let expires_at = Timestamp::from_offset_datetime(expires_at);
 
         state.leases.insert(
             mk.clone(),
@@ -1057,8 +1066,10 @@ impl SessionLeaseManager for FakeSessionBackend {
     }
 
     async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
-        let mut state = self.inner.lock().await;
+        validate_session_ttl(ttl).map_err(LeaseError::from)?;
         let now = self.clock.now_utc();
+        let expires_at = checked_session_deadline(now, ttl).map_err(LeaseError::from)?;
+        let mut state = self.inner.lock().await;
         Self::prune_state(&mut state, now);
         let replication_sequence = self
             .next_direct_replication_sequence(&state)
@@ -1097,8 +1108,6 @@ impl SessionLeaseManager for FakeSessionBackend {
         // Fence stays the same on renewal.
         let fence = lease.fence();
         let acquired_at = lease.acquired_at();
-        let expires_at = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-        let expires_at = Timestamp::from_offset_datetime(expires_at);
         let credential_id = entry.credential_id;
 
         entry.expires_at = expires_at;

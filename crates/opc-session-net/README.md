@@ -46,6 +46,9 @@ connection to one authenticated member of one immutable replication manifest.
 - Replication append and rebuild calls validate sequence metadata before
   resolution or dispatch; malformed authenticated wire requests receive the
   typed store error without consuming the connection.
+- Acquire, renew, TTL refresh, batch, and nested replication requests enforce
+  `opc_session_store::MAX_SESSION_TTL` (365 days) before resolution or backend
+  dispatch. Zero remains valid and means immediate expiry.
 - If one record cannot fit, the call returns
   `StoreError::RestoreScanResponseTooLarge` instead of retrying indefinitely.
 - `listen(bind_addr).await` starts the listener and returns a server handle and
@@ -103,6 +106,13 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 - Session-net disables TLS session caches, tickets, resumption, early data, and
   0-RTT. Every reconnect pays for a full mutual-TLS handshake so SVID rotation
   cannot reuse a cached peer certificate or authority decision.
+- That reconnect behavior is a safety primitive, not seamless-rotation
+  qualification. A production CNF must support certificate and trust-bundle
+  rotation without a service interruption, including trust overlap,
+  long-lived-connection retirement, revocation, reconnect storms, and a
+  documented maximum authentication age. Distributed evidence for that
+  profile remains open in #143. The 365-day session TTL bound is unrelated to
+  certificate lifetime, trust-bundle lifetime, or authentication age.
 - The configuration ID is a SHA-256 digest of the cluster ID, explicit
   generation, and the full sorted descriptor set. Changing a member ID,
   endpoint, TLS identity, failure domain, backing identity, cluster, or
@@ -130,6 +140,18 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
   unit `InvalidReplicationSequence` error contains no peer-controlled data;
   an authenticated server returns it as a typed v3 response and keeps the
   connection usable. This is input-boundary safety, not sequence authority.
+- TTL-bearing requests above 365 days are rejected with
+  `StoreError::InvalidSessionTtl` or `LeaseError::InvalidSessionTtl` before
+  dialing on the client and before backend dispatch on the server. The exact
+  maximum is accepted, zero means immediate expiry, and valid v3 wire traffic
+  is unchanged. The new serialized error variants require external exhaustive
+  matches and a coordinated same-v3 fleet upgrade; an older v3 peer cannot
+  decode a newly returned variant. Legacy persisted replication logs must be
+  audited before upgrade because an entry carrying a larger TTL now fails
+  closed during replay or rebuild rather than being clamped. Cross-field
+  validation permits at most one microsecond of positive absolute-deadline
+  drift solely for legacy `seconds_f64` rounding; new deadlines remain exact,
+  the TTL maximum is unchanged, and larger mismatches fail closed.
 - Remote scan and fresh-probe transport parity do not by themselves qualify
   networked session HA for production. Protocol v3 authenticates membership;
   it does not establish consensus, durable sequence/commit authority,
@@ -139,8 +161,9 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 
 ## Roadmap
 
-- Close #127–#129 and #133–#135; add distributed failure and soak
-  evidence before treating this as production transport.
+- Close #127–#129, #133–#135, #145, #147, and #148; add distributed failure
+  and soak evidence, including the seamless certificate/trust-rotation
+  qualification in #143, before treating this as production transport.
 - Keep plaintext transport limited to tests.
 - Keep the server wrapping `SessionStoreBackend` rather than owning storage.
 
@@ -151,6 +174,8 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 - `tests/authenticated_replica_identity.rs` covers exact identity, routing
   aliases, certificate/claim/scope mismatches, downgrade and malformed Hello,
   reconnect/rotation, relabeling, and replayed challenge responses over mTLS.
+- `tests/three_node_quorum.rs` covers typed TTL rejection before resolution and
+  authenticated server dispatch plus connection reuse after rejection.
 - Run with: `cargo test -p opc-session-net --all-features`.
 
 ## License

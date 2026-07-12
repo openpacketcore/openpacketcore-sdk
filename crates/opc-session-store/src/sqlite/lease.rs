@@ -10,6 +10,7 @@ use crate::{
     error::LeaseError,
     lease::LeaseGuard,
     model::{FenceToken, OwnerId, SessionKey},
+    ttl::checked_session_deadline,
 };
 
 pub(crate) fn acquire_sync(
@@ -19,6 +20,7 @@ pub(crate) fn acquire_sync(
     ttl: Duration,
     now: Timestamp,
 ) -> Result<LeaseGuard, LeaseError> {
+    let expires_at = checked_session_deadline(now, ttl).map_err(LeaseError::from)?;
     prune_sync(conn, now).map_err(|e| LeaseError::Backend(e.to_string()))?;
 
     // Query active lease
@@ -102,10 +104,8 @@ pub(crate) fn acquire_sync(
     .map_err(|e| LeaseError::Backend(e.to_string()))?;
 
     let acquired_at = now;
-    let expires =
-        *acquired_at.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-    let expires_at = Timestamp::from_offset_datetime(expires);
-    let expires_at_unix_ms = (expires.unix_timestamp_nanos() / 1_000_000) as i64;
+    let expires_at_unix_ms =
+        (expires_at.as_offset_datetime().unix_timestamp_nanos() / 1_000_000) as i64;
 
     // Save lease
     conn.execute(
@@ -148,6 +148,7 @@ pub(crate) fn renew_sync(
     ttl: Duration,
     now: Timestamp,
 ) -> Result<LeaseGuard, LeaseError> {
+    let expires_at = checked_session_deadline(now, ttl).map_err(LeaseError::from)?;
     if lease.expires_at() <= now {
         return Err(LeaseError::Expired);
     }
@@ -217,9 +218,8 @@ pub(crate) fn renew_sync(
 
     let fence_token = lease.fence();
     let acquired_at = lease.acquired_at();
-    let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-    let expires_at = Timestamp::from_offset_datetime(expires);
-    let expires_at_unix_ms = (expires.unix_timestamp_nanos() / 1_000_000) as i64;
+    let expires_at_unix_ms =
+        (expires_at.as_offset_datetime().unix_timestamp_nanos() / 1_000_000) as i64;
 
     conn.execute(
         r#"

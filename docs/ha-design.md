@@ -81,7 +81,7 @@ Rejoining replicas are caught up before they can participate as authoritative re
 - **Process-Level HA Test Harness (Milestone 4)**: The process-level HA test harness has been fully implemented and verified. This covers process campaigns, failovers, network partitions, and pending commits surviving process restarts.
 - **Out-of-Process Raft Joint Consensus Transitions**: Raft joint consensus transitions (voter membership changes) are fully implemented and verified out-of-process.
 
-Platform hardening concerns—including TLS/SPIFFE SVID and bundle watch/reload (`GAP-003-001`), KMS-backed durable key providers over mTLS TCP or local Unix-socket KMS agents (`GAP-003-004`), and storage-fault injection (`GAP-001-005`)—have been fully implemented, verified, and closed.
+Platform hardening concerns—including TLS/SPIFFE SVID and bundle watch/reload (`GAP-003-001`), KMS-backed durable key providers over mTLS TCP or local Unix-socket KMS agents (`GAP-003-004`), and storage-fault injection (`GAP-001-005`)—have been implemented and verified as reusable library mechanisms. That scoped closure does not qualify seamless session-net certificate/trust rotation; the service-level evidence remains #143.
 
 
 ---
@@ -93,10 +93,10 @@ yet durable distributed proof or a production deployment contract. Configured
 topology admission and fresh durable readiness are implemented. Authenticated
 identity binding is implemented in protocol v3; durable sequencing and safe
 fork recovery (#127–#129), and bounded majority-authoritative restore (#133)
-remain open. Wire-width and shared model-decoding hardening remain #134/#135,
-while oversized-TTL panic elimination remains #137. Sequence-zero and adjacent
-overflow handling now fail closed at direct, wrapper, cache, SQLite, quorum,
-and authenticated transport boundaries under #138.
+remain open. Wire-width and shared model-decoding hardening remain #134/#135.
+Checked session TTL and replication-sequence handling now fail closed at
+direct, wrapper, cache, SQLite, quorum, and authenticated transport boundaries
+under #137/#138. These input-safety fixes do not provide durable authority.
 
 `QuorumSessionStore` coordinates session leases and CAS mutations across a set of `SessionStoreBackend` replicas using quorum-backed ordered replication. It is not a Raft implementation; its target safety contract is a durable committed log prefix where an entry is authoritative only after the same sequence entry is present on a majority of replicas.
 
@@ -153,6 +153,37 @@ nor destructively rebuilds the replica. The observed index is deliberately
 called majority-visible rather than committed until #127/#128 establish durable
 commit and repair authority.
 
+### Bounded TTL inputs
+
+All `Duration` inputs used for session refresh and lease TTLs use the public
+`MAX_SESSION_TTL` bound of exactly 365 days. Zero is accepted as immediate
+expiry and the exact maximum is accepted. Larger values fail with
+`StoreError::InvalidSessionTtl` or
+`LeaseError::InvalidSessionTtl`. Conversion to the internal duration and
+addition to an injected/backend clock use exact checked integer arithmetic, so
+an oversized input or a near-maximum clock cannot unwind the process.
+
+Validation occurs before effects for direct acquire/renew/refresh calls,
+TTL-bearing batch and replication entries, wrappers, quorum dispatch, local
+backends, and authenticated client/server admission. Here, effects means
+application/backend mutation or provider work: clients reject before
+resolution/dialing, while servers reject after request receipt but before
+backend dispatch and may return the typed response. The new public and
+serialized error variants require external exhaustive matches and a
+coordinated same-v3 fleet upgrade; valid v3 wire traffic is unchanged. Operators
+must audit legacy persisted logs before upgrade because a TTL-bearing entry
+above the bound now fails closed during replay/rebuild rather than being
+clamped or rewritten. Replicated deadline validation permits at most one
+microsecond above exact `entry.timestamp + ttl` for legacy `seconds_f64`
+rounding only; new deadlines remain exact, the TTL bound is unchanged, and
+larger mismatches fail closed.
+
+This closes only the duration-input/process-availability gap in #137. It does
+not make a majority-visible entry committed and does not change the open
+consensus, repair, restore, or qualification work. Caller-authored absolute
+record expiry remains #148, and recursive encryption/sealing of deeply nested
+replicated CAS payloads remains #147.
+
 ### Authenticated network transport (protocol v3)
 
 `opc-session-net` protocol v3 carries validated restore-scan requests and pages
@@ -174,6 +205,15 @@ routing only; they never redefine replica identity.
 The exact v3 ALPN and handshake have no production fallback to v2. A v2-to-v3
 change is a coordinated stop/upgrade/start of all clients and servers, not a
 mixed-version rolling deployment.
+
+Session caches, tickets, resumption, early data, and 0-RTT are disabled, so a
+reconnect performs a full mutual-TLS certificate exchange. Production still
+requires seamless certificate and trust-bundle rotation without interrupting
+session service, including trust overlap, revocation, long-lived-connection
+retirement, reconnect storms, and a documented maximum authentication age.
+That distributed qualification remains #143. Session TTL is application-state
+lifetime; the 365-day bound is not a certificate-expiry, trust-validity, or
+authentication-age policy.
 
 This closes per-replica transport parity only. Quorum selection/merge remains
 #133, while durable sequencing and repair authority remain #127/#128.
@@ -244,3 +284,7 @@ distributed commit or repair proof (#127/#128).
   recovery and are not mutated.
 - **Restart/rejoin across profiles**: Exercises restart/rejoin behavior under fake, SQLite, and replicated profiles.
 - **No wall-clock LWW**: Observes that the tested ordering paths do not select authoritative state by wall-clock time.
+- **Bounded TTLs**: Exercises zero, the exact 365-day maximum, maximum plus one,
+  and `Duration::MAX` across direct, nested, persisted, quorum, and
+  authenticated-wire paths, including no-partial-effect and near-maximum-clock
+  cases.

@@ -168,6 +168,52 @@ pub trait SessionBackend: Send + Sync {
 `set` without fencing is allowed only for state classes that explicitly do not
 require authoritative ownership.
 
+### 7.1 TTL Admission and Deadline Arithmetic
+
+The SDK-wide maximum for a session or lease TTL is the public
+`MAX_SESSION_TTL`, exactly 365 days. `Duration::ZERO` MUST be accepted and means
+immediate expiry. The exact maximum MUST be accepted. Any larger value MUST be
+rejected with `StoreError::InvalidSessionTtl` for store operations or
+`LeaseError::InvalidSessionTtl` for lease operations.
+
+A zero-duration acquire MAY consume a fence, credential, and replication-log
+position before the lease is observed expired. Callers MUST use explicit
+release for revocation and MUST NOT treat a zero TTL as transaction rollback.
+
+The ceiling accommodates long-lived packet-core sessions and planned
+maintenance or disaster-recovery windows while preventing a malformed value
+from creating an effectively permanent lease. A product profile MAY enforce a
+smaller operational limit.
+
+This section bounds `Duration` inputs. It does not yet define admission for a
+caller-authored absolute `StoredSessionRecord::expires_at`; that separate
+state-profile and migration contract is tracked by #148. Recursive protected
+payload transformation for deeply nested replicated CAS batches is tracked by
+#147.
+
+`validate_session_ttl` defines the duration check and
+`checked_session_deadline` defines conversion and deadline calculation.
+Implementations MUST convert seconds and subsecond nanoseconds using checked
+integer arithmetic and MUST use checked timestamp addition. Floating-point
+duration conversion, saturating/clamping an invalid input, and panicking
+timestamp arithmetic are forbidden.
+
+Validation MUST occur before any application/backend effect for direct
+acquire, renew, or TTL-refresh calls; each TTL-bearing operation nested in a
+batch or replication entry; forwarding, encryption, cache, or quorum adapters;
+local Fake/SQLite backends; and session-net client/server admission. A client
+MUST reject before resolver or network work. A server necessarily receives and
+decodes the request, but MUST reject before backend dispatch and MAY return the
+typed error on that authenticated connection. Repeating the check at each
+public or trust boundary is intentional: direct callers and older peers must
+fail closed even if an outer layer omitted validation.
+
+The new errors are public enum and serialized protocol-v3 variants. External
+exhaustive matches MUST be updated, and a session-net deployment MUST treat the
+change as a coordinated same-v3 fleet upgrade because an older v3 decoder
+cannot interpret a newly returned variant. Valid v3 request/response shapes are
+unchanged.
+
 ## 8. Record Format
 
 ```rust
@@ -228,6 +274,9 @@ comes from fencing.
 
 Rules:
 
+- Lease TTLs MUST satisfy the 365-day bound in §7.1; zero is API-valid and
+  creates a guard whose deadline is immediate, but does not satisfy the
+  operational sizing rule below for an active owner.
 - Lease TTL MUST be longer than worst-case expected procedure pause plus backend
   failover detection time.
 - Renewals MUST happen before 50 percent of TTL elapsed by default.
@@ -342,6 +391,19 @@ validated as one complete contiguous prefix before existing state is replaced.
 Sequence arithmetic and persistence-width conversions MUST be checked and
 fail closed without exposing entry contents in diagnostics.
 
+An operator upgrading persisted state from an older SDK MUST audit every
+TTL-bearing replication entry before rollout. A legacy entry above 365 days
+fails closed during replay or rebuild under this contract; implementations MUST
+NOT silently clamp, discard, or rewrite it. Recovery or migration must follow a
+product-owned, audited procedure that preserves the authoritative-history
+contract.
+
+For migration compatibility only, replicated absolute-deadline cross-field
+validation MAY admit at most one microsecond above the exact
+`entry.timestamp + ttl` result produced by an older `seconds_f64` conversion.
+New deadline construction MUST remain exact. This tolerance does not increase
+`MAX_SESSION_TTL`; a larger mismatch MUST fail closed.
+
 Replicas MUST apply events only if `generation` and `fence` are newer according
 to the state class rules.
 
@@ -434,6 +496,17 @@ need independent integrity checks, but they do not replace AEAD.
 Logs and metrics MUST NOT expose raw subscriber identifiers. The SDK SHOULD use
 stable keyed digests for correlation when needed.
 
+### 14.4 Transport Credential Rotation
+
+Session TTL is application-state lifetime and MUST NOT be used as a certificate
+lifetime, trust-bundle lifetime, or maximum-authentication-age policy. A
+production networked session-store profile MUST rotate workload certificates
+and trust bundles without interrupting service, while still enforcing
+revocation and a documented maximum authentication age on long-lived
+connections. `opc-session-net` reconnects perform a full mutual-TLS handshake,
+but seamless certificate/trust rotation and reconnect-storm behavior remain a
+production-qualification requirement tracked by #143.
+
 ## 15. Observability
 
 Required metrics:
@@ -489,6 +562,9 @@ fencing.
 - Stale fence rejection.
 - Lease acquire/renew/release.
 - TTL refresh with valid and stale fences.
+- TTL zero, the exact 365-day maximum, maximum plus one, and `Duration::MAX`
+  across direct, batch, replicated, persisted, and authenticated-wire paths;
+  rejected values must have no partial effect.
 - Serialization corrupt input rejection.
 - AEAD AAD mismatch rejection.
 - Cache generation checks.
@@ -537,3 +613,7 @@ This RFC is implemented when:
 7. Local cache supports fast reads without compromising write correctness.
 8. Fault injection covers split-brain, failover, replication lag, and stale
    fences.
+9. Every `Duration`-based TTL boundary accepts zero and the exact 365-day
+   maximum, rejects
+   larger values with the appropriate typed error before application/backend
+   effects, and performs exact checked deadline arithmetic without unwinding.

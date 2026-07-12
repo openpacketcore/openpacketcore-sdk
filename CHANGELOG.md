@@ -121,10 +121,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fallback, so all clients and servers require a coordinated upgrade and mixed
   v2/v3 rolling upgrades are unsupported. Public `Request`/`Response` enums
   gain handshake and restore-scan variants, while `StoreError` gains
-  restore-scan and `InvalidReplicationSequence` variants, so external
-  exhaustive matches must add arms for them. The latter is serialized on v3
-  only in response to malformed replication metadata; older v3 peers cannot
-  decode that new error and must be upgraded in the coordinated fleet rollout.
+  restore-scan, `InvalidReplicationSequence`, and `InvalidSessionTtl` variants,
+  and `LeaseError` gains `InvalidSessionTtl`; external exhaustive matches must
+  add arms for them. The new validation errors are serialized on v3 only in
+  response to malformed replication metadata or oversized TTLs. Valid v3
+  traffic is unchanged, but older v3 peers cannot decode a newly returned
+  variant and must be upgraded in the coordinated fleet rollout.
 - Documentation and package metadata now distinguish scoped implementation
   evidence, Cargo publication eligibility, and production maturity. Historical
   status snapshots, release-evidence primitives, and conditional
@@ -174,7 +176,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resumption, early data, and 0-RTT are disabled so reconnects revalidate live
   SVIDs instead of cached certificates. This closes #125 identity
   binding only; it does not provide consensus, durable commit authority, or
-  fork recovery.
+  fork recovery. It also does not yet qualify seamless certificate/trust-bundle
+  rotation without service interruption; long-lived connection retirement,
+  trust overlap/revocation, reconnect storms, and maximum authentication age
+  remain distributed production evidence in #143. Session TTL is unrelated to
+  certificate or trust lifetime.
 - `opc-ipsec-lb`: require an RFC 6311-style outbound IV forward-jump for both
   persisted and live-mirrored same-SPI failover state, with protocol-matched
   64-bit counter evidence, explicit ESP peer receive-lag bounds, checked
@@ -212,6 +218,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- `opc-session-store`/`opc-session-net`/`opc-session-cache`/
+  `opc-session-testkit`: all public `Duration` inputs used for session refresh
+  and lease TTLs now use `MAX_SESSION_TTL` (exactly 365 days) and exact checked
+  deadline arithmetic.
+  Zero remains valid as immediate expiry and the exact maximum is accepted;
+  larger values return redaction-safe `StoreError::InvalidSessionTtl` or
+  `LeaseError::InvalidSessionTtl` before direct, batch, nested replication,
+  wrapper, cache, quorum, Fake/SQLite, database, log, watch, or
+  cryptographic-provider effects. Clients reject before resolution/dialing;
+  authenticated servers reject after receiving the request but before backend
+  dispatch and can keep the connection usable. This closes #137's
+  panic/input-safety boundary only, not the durable consensus or production-HA
+  work in #127/#143.
+  Before upgrading persisted state, audit legacy replication logs for
+  TTL-bearing entries above 365 days: they now fail closed during
+  replay/rebuild and are not silently clamped or rewritten. Cross-field
+  replication validation admits at most one microsecond of positive deadline
+  drift solely for legacy `seconds_f64` rounding; new deadlines remain exact,
+  the TTL maximum is unchanged, and larger mismatches fail closed.
+  Caller-authored absolute record expiry remains #148; recursively protecting
+  CAS payloads below multiple replicated-batch levels remains #147.
 - `opc-session-store`/`opc-session-net`/`opc-session-cache`: replication-log
   entries now reject sequence zero with the typed, redaction-safe
   `StoreError::InvalidReplicationSequence` before quorum assessment, state
@@ -247,8 +274,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefix, and bounded failure reasons. This closes #124 only; durable authority
   and operator-safe fork recovery (#127–#129), majority-authoritative restore
   (#133), and wire/model hardening (#134/#135) remain production blockers.
-  Oversized-TTL panic elimination remains tracked by #137; malformed
-  replication-sequence rejection is closed above under #138.
+  Checked TTL and replication-sequence rejection are closed above under
+  #137/#138; production qualification remains #143.
 - `opc-session-store`: quorum construction now rejects empty/undersized/even HA
   membership, missing or ambiguous self, duplicate logical IDs, canonical
   endpoints, declared TLS identities, failure domains, backing identities, and
@@ -260,8 +287,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mTLS SQLite regression proves that bare logical self is independent from FQDN
   endpoints. This closes #123 configured-topology admission only. Fresh
   durable readiness was scoped separately to #124 and is described above;
-  #127–#129, #133–#135, and #137 remain production blockers; #138 is closed
-  above.
+  #127–#129 and #133–#135 remain production blockers; #137/#138 input bounds
+  are closed above and the full qualification remains #143.
 - `opc-session-net`: remote backends and replication servers now carry
   validated cursor-paged restore scans, shorten multi-record pages to the
   effective client/server frame limit, and return a typed error when one

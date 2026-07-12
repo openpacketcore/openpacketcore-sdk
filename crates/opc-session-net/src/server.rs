@@ -7,9 +7,11 @@ use futures_util::StreamExt;
 use opc_session_store::backend::{
     validate_replication_page, validate_replication_prefix, CompareAndSetResult,
 };
-use opc_session_store::error::StoreError;
+use opc_session_store::error::{LeaseError, StoreError};
 use opc_session_store::quorum::SessionStoreBackend;
-use opc_session_store::{ReplicaId, RestoreScanCursor, RestoreScanPage, RestoreScanRequest};
+use opc_session_store::{
+    validate_session_ttl, ReplicaId, RestoreScanCursor, RestoreScanPage, RestoreScanRequest,
+};
 use opc_types::SpiffeId;
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
@@ -621,11 +623,17 @@ where
                 write_frame(writer, &Response::DeleteFenced(res)).await?;
             }
             Request::RefreshTtl { lease, ttl } => {
-                let res = backend.refresh_ttl(&lease, ttl).await;
+                let res = match validate_session_ttl(ttl) {
+                    Ok(()) => backend.refresh_ttl(&lease, ttl).await,
+                    Err(error) => Err(error),
+                };
                 write_frame(writer, &Response::RefreshTtl(res)).await?;
             }
             Request::Batch { ops } => {
-                let res = backend.batch(ops).await;
+                let res = match ops.iter().try_for_each(|op| op.validate_ttls()) {
+                    Ok(()) => backend.batch(ops).await,
+                    Err(error) => Err(error),
+                };
                 write_frame(writer, &Response::Batch(res)).await?;
             }
             Request::ScanRestoreRecords {
@@ -697,7 +705,7 @@ where
                 write_frame(writer, &Response::GetReplicationLog(res)).await?;
             }
             Request::ReplicateEntry { entry } => {
-                let res = match entry.validate_sequence() {
+                let res = match entry.validate() {
                     Ok(()) => backend.replicate_entry(entry).await,
                     Err(error) => Err(error),
                 };
@@ -715,7 +723,7 @@ where
                     write_frame(writer, &Response::WatchStream).await?;
                     while let Some(item) = stream.next().await {
                         let item = item.and_then(|entry| {
-                            entry.validate_sequence()?;
+                            entry.validate()?;
                             Ok(entry)
                         });
                         if write_frame(writer, &Response::WatchEntry(item))
@@ -735,11 +743,17 @@ where
                 write_frame(writer, &Response::NextLeaseInfo(res)).await?;
             }
             Request::AcquireLease { key, owner, ttl } => {
-                let res = backend.acquire(&key, owner, ttl).await;
+                let res = match validate_session_ttl(ttl) {
+                    Ok(()) => backend.acquire(&key, owner, ttl).await,
+                    Err(error) => Err(LeaseError::from(error)),
+                };
                 write_frame(writer, &Response::AcquireLease(res)).await?;
             }
             Request::RenewLease { lease, ttl } => {
-                let res = backend.renew(&lease, ttl).await;
+                let res = match validate_session_ttl(ttl) {
+                    Ok(()) => backend.renew(&lease, ttl).await,
+                    Err(error) => Err(LeaseError::from(error)),
+                };
                 write_frame(writer, &Response::RenewLease(res)).await?;
             }
             Request::ReleaseLease { lease } => {

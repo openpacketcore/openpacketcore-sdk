@@ -20,7 +20,9 @@ use opc_session_store::lease::{LeaseGuard, SessionLeaseManager};
 use opc_session_store::model::{OwnerId, SessionKey};
 
 use opc_session_store::record::StoredSessionRecord;
-use opc_session_store::{ReplicaId, ReplicaReadinessFailure, RestoreScanPage, RestoreScanRequest};
+use opc_session_store::{
+    validate_session_ttl, ReplicaId, ReplicaReadinessFailure, RestoreScanPage, RestoreScanRequest,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -661,6 +663,7 @@ impl SessionBackend for RemoteSessionBackend {
     }
 
     async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
+        validate_session_ttl(ttl)?;
         match self
             .send_request_with_retry(Request::RefreshTtl {
                 lease: lease.clone(),
@@ -675,6 +678,9 @@ impl SessionBackend for RemoteSessionBackend {
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        for op in &ops {
+            op.validate_ttls()?;
+        }
         match self.send_request_with_retry(Request::Batch { ops }).await? {
             Response::Batch(res) => res,
             Response::Error { message } => Err(StoreError::BackendUnavailable(message)),
@@ -807,7 +813,7 @@ impl SessionBackend for RemoteSessionBackend {
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate_sequence()?;
+        entry.validate()?;
         match self
             .send_request_with_retry(Request::ReplicateEntry { entry })
             .await?
@@ -884,6 +890,7 @@ impl SessionLeaseManager for RemoteSessionBackend {
         owner: OwnerId,
         ttl: Duration,
     ) -> Result<LeaseGuard, LeaseError> {
+        validate_session_ttl(ttl).map_err(LeaseError::from)?;
         match self
             .send_lease_request_with_retry(Request::AcquireLease {
                 key: key.clone(),
@@ -899,6 +906,7 @@ impl SessionLeaseManager for RemoteSessionBackend {
     }
 
     async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
+        validate_session_ttl(ttl).map_err(LeaseError::from)?;
         match self
             .send_lease_request_with_retry(Request::RenewLease {
                 lease: lease.clone(),
@@ -964,7 +972,7 @@ async fn watch_connect_and_read(
         match read_frame::<_, Response>(&mut reader, max_frame_size).await {
             Ok(Response::WatchEntry(item)) => {
                 let item = item.and_then(|entry| {
-                    entry.validate_sequence()?;
+                    entry.validate()?;
                     Ok(entry)
                 });
                 if tx.send(item).await.is_err() {
@@ -1006,6 +1014,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::BackendUnavailable(_) => "backend_unavailable",
         StoreError::InvalidKey(_) => "invalid_key",
         StoreError::InvalidReplicationSequence => "invalid_replication_sequence",
+        StoreError::InvalidSessionTtl => "invalid_session_ttl",
         StoreError::LeaseHeld => "lease_held",
         StoreError::LeaseExpired => "lease_expired",
         StoreError::Crypto(_) => "crypto",
@@ -1033,7 +1042,7 @@ impl Stream for WatchStream {
 #[cfg(all(test, feature = "insecure-test"))]
 mod tests {
     use super::*;
-    use futures_util::FutureExt;
+    use futures_util::{FutureExt, StreamExt};
     use opc_session_store::BackendCapabilities;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
@@ -1057,6 +1066,33 @@ mod tests {
             cluster_id: cluster_id.clone(),
             configuration_id: configuration_id.clone(),
             handshake_nonce: *handshake_nonce,
+        }
+    }
+
+    fn forged_deadline_entry() -> ReplicationEntry {
+        let timestamp =
+            opc_types::Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let expires_at = opc_types::Timestamp::from_offset_datetime(
+            time::OffsetDateTime::UNIX_EPOCH
+                .checked_add(time::Duration::seconds(61))
+                .expect("representable test deadline"),
+        );
+        ReplicationEntry {
+            sequence: 1,
+            tx_id: "forged-response-deadline".to_string(),
+            op: opc_session_store::ReplicationOp::RefreshTtl {
+                key: SessionKey {
+                    tenant: opc_types::TenantId::new("tenant-a").expect("test tenant"),
+                    nf_kind: opc_types::NetworkFunctionKind::from_static("smf"),
+                    key_type: opc_session_store::SessionKeyType::PduSession,
+                    stable_id: bytes::Bytes::from_static(b"forged-response"),
+                },
+                owner: OwnerId::new("forged-response-owner").expect("test owner"),
+                fence: opc_session_store::FenceToken::new(1),
+                ttl: Duration::from_secs(60),
+                expires_at,
+            },
+            timestamp,
         }
     }
 
@@ -1335,6 +1371,81 @@ mod tests {
             backend.conn.lock().await.is_none(),
             "a connection that returned a malformed page must not be reused"
         );
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn forged_replication_log_deadline_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read hello");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write hello ack");
+            let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read replication-log request");
+            assert!(matches!(request, Request::GetReplicationLog { .. }));
+            write_frame(
+                &mut stream,
+                &Response::GetReplicationLog(Ok(vec![forged_deadline_entry()])),
+            )
+            .await
+            .expect("write forged replication-log response");
+        });
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+
+        let error = backend
+            .get_replication_log(1, 1)
+            .await
+            .expect_err("forged response deadline must fail closed");
+        assert_eq!(error, StoreError::InvalidSessionTtl);
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn forged_watch_deadline_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read hello");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write hello ack");
+            let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read watch request");
+            assert!(matches!(request, Request::Watch { .. }));
+            write_frame(&mut stream, &Response::WatchStream)
+                .await
+                .expect("write watch acknowledgement");
+            write_frame(
+                &mut stream,
+                &Response::WatchEntry(Ok(forged_deadline_entry())),
+            )
+            .await
+            .expect("write forged watch entry");
+        });
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        let mut watch = backend.watch(1).await.expect("create watch stream");
+
+        let error = tokio::time::timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("watch response deadline")
+            .expect("watch error item")
+            .expect_err("forged watch deadline must fail closed");
+        assert_eq!(error, StoreError::InvalidSessionTtl);
         let _ = server.await;
     }
 

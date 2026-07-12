@@ -20,14 +20,16 @@
 
 use async_trait::async_trait;
 use futures_util::future::join_all;
+use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::backend::{
-    next_replication_sequence, CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp,
-    SessionBackend, SessionOp, SessionOpResult,
+    next_replication_sequence, validate_replication_page, validate_session_ops_ttls, CompareAndSet,
+    CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend, SessionOp,
+    SessionOpResult,
 };
 use crate::capability::BackendCapabilities;
 use crate::clock::{Clock, SystemClock};
@@ -47,8 +49,7 @@ use crate::topology::{
     QuorumReplicaMember, QuorumTopologyMode, QuorumTopologySummary, ReplicaId,
     ValidatedQuorumTopology,
 };
-use opc_types::Timestamp;
-
+use crate::ttl::{checked_session_deadline, validate_session_ttl};
 /// Helper trait combining SessionBackend and SessionLeaseManager
 pub trait SessionStoreBackend: SessionBackend + SessionLeaseManager {}
 impl<T: SessionBackend + SessionLeaseManager> SessionStoreBackend for T {}
@@ -375,6 +376,9 @@ impl QuorumSessionStore {
             if page.is_empty() || page.len() > request_limit {
                 return Err(ReplicaReadinessFailure::Divergent);
             }
+            if page.iter().any(|entry| entry.validate().is_err()) {
+                return Err(ReplicaReadinessFailure::Divergent);
+            }
             let page_is_contiguous = page.iter().enumerate().all(|(offset, entry)| {
                 u64::try_from(offset)
                     .ok()
@@ -699,6 +703,8 @@ impl QuorumSessionStore {
     }
 
     async fn replicate_mutation(&self, op: ReplicationOp) -> Result<(), StoreError> {
+        let timestamp = self.clock.now_utc();
+        op.validate_ttls_at(timestamp)?;
         let (online_ids, committed_entries) = self.committed_and_repaired().await?;
         let quorum = self.quorum_size();
         let committed_sequence = committed_entries
@@ -711,7 +717,7 @@ impl QuorumSessionStore {
             sequence: next_seq,
             tx_id,
             op,
-            timestamp: self.clock.now_utc(),
+            timestamp,
         };
 
         let mut successful_voters = HashSet::new();
@@ -829,7 +835,14 @@ impl QuorumSessionStore {
         let (ready_ids, _) = self.committed_and_repaired().await?;
         for id in ready_ids {
             if let Ok(stream) = self.replica(id).inner.watch(start_sequence).await {
-                return Ok(stream);
+                return Ok(stream
+                    .map(|result| {
+                        result.and_then(|entry| {
+                            entry.validate()?;
+                            Ok(entry)
+                        })
+                    })
+                    .boxed());
             }
         }
         Err(StoreError::BackendUnavailable(
@@ -959,10 +972,11 @@ impl SessionBackend for QuorumSessionStore {
     }
 
     async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
+        validate_session_ttl(ttl)?;
+        checked_session_deadline(self.clock.now_utc(), ttl)?;
         self.ensure_operational_topology()?;
         let now = self.clock.now_utc();
-        let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-        let expires_at = Timestamp::from_offset_datetime(expires);
+        let expires_at = checked_session_deadline(now, ttl)?;
         let op = ReplicationOp::RefreshTtl {
             key: lease.key().clone(),
             owner: lease.owner().clone(),
@@ -974,6 +988,13 @@ impl SessionBackend for QuorumSessionStore {
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        validate_session_ops_ttls(&ops)?;
+        let validation_now = self.clock.now_utc();
+        for op in &ops {
+            if let SessionOp::RefreshTtl { ttl, .. } = op {
+                checked_session_deadline(validation_now, *ttl)?;
+            }
+        }
         self.ensure_operational_topology()?;
         let mut results = Vec::with_capacity(ops.len());
         for op in ops {
@@ -1066,15 +1087,17 @@ impl SessionBackend for QuorumSessionStore {
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
         let (_, committed_entries) = self.committed_and_repaired().await?;
-        Ok(committed_entries
+        let entries = committed_entries
             .into_iter()
             .filter(|entry| entry.sequence >= start)
             .take(limit)
-            .collect())
+            .collect::<Vec<_>>();
+        validate_replication_page(&entries)?;
+        Ok(entries)
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate_sequence()?;
+        entry.validate()?;
         let (online_ids, committed_entries) = self.committed_and_repaired().await?;
         let committed_seq = committed_entries
             .last()
@@ -1170,6 +1193,8 @@ impl SessionLeaseManager for QuorumSessionStore {
         owner: OwnerId,
         ttl: Duration,
     ) -> Result<LeaseGuard, LeaseError> {
+        validate_session_ttl(ttl).map_err(LeaseError::from)?;
+        checked_session_deadline(self.clock.now_utc(), ttl).map_err(LeaseError::from)?;
         let (online_ids, _) = self
             .committed_and_repaired()
             .await
@@ -1201,8 +1226,7 @@ impl SessionLeaseManager for QuorumSessionStore {
         let fence = FenceToken::new(max_fence);
         let credential_id = max_cred_id;
         let now = self.clock.now_utc();
-        let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-        let expires_at = Timestamp::from_offset_datetime(expires);
+        let expires_at = checked_session_deadline(now, ttl).map_err(LeaseError::from)?;
 
         let op = ReplicationOp::AcquireLease {
             key: key.clone(),
@@ -1232,11 +1256,12 @@ impl SessionLeaseManager for QuorumSessionStore {
     }
 
     async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
+        validate_session_ttl(ttl).map_err(LeaseError::from)?;
+        checked_session_deadline(self.clock.now_utc(), ttl).map_err(LeaseError::from)?;
         self.ensure_operational_topology()
             .map_err(LeaseError::from)?;
         let now = self.clock.now_utc();
-        let expires = *now.as_offset_datetime() + time::Duration::seconds_f64(ttl.as_secs_f64());
-        let expires_at = Timestamp::from_offset_datetime(expires);
+        let expires_at = checked_session_deadline(now, ttl).map_err(LeaseError::from)?;
         let op = ReplicationOp::RenewLease {
             key: lease.key().clone(),
             owner: lease.owner().clone(),
@@ -1292,7 +1317,7 @@ mod tests {
             sequence: u64::MAX,
             tx_id: "max-sequence".into(),
             op: ReplicationOp::Batch { ops: Vec::new() },
-            timestamp: Timestamp::now_utc(),
+            timestamp: opc_types::Timestamp::now_utc(),
         };
 
         let err =

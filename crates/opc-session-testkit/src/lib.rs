@@ -18,31 +18,49 @@ use opc_types::Timestamp;
 #[derive(Debug, Clone)]
 pub struct SkewableClock {
     base: Arc<TokioVirtualClock>,
-    skew: Arc<std::sync::Mutex<Duration>>,
-    negative: Arc<std::sync::Mutex<bool>>,
+    skew: Arc<std::sync::Mutex<ClockSkew>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClockSkew {
+    duration: Duration,
+    negative: bool,
+}
+
+impl Default for ClockSkew {
+    fn default() -> Self {
+        Self {
+            duration: Duration::ZERO,
+            negative: false,
+        }
+    }
 }
 
 impl SkewableClock {
     pub fn new() -> Self {
         Self {
             base: Arc::new(TokioVirtualClock::new()),
-            skew: Arc::new(std::sync::Mutex::new(Duration::from_secs(0))),
-            negative: Arc::new(std::sync::Mutex::new(false)),
+            skew: Arc::new(std::sync::Mutex::new(ClockSkew::default())),
         }
     }
 
     pub fn with_base(base: Arc<TokioVirtualClock>) -> Self {
         Self {
             base,
-            skew: Arc::new(std::sync::Mutex::new(Duration::from_secs(0))),
-            negative: Arc::new(std::sync::Mutex::new(false)),
+            skew: Arc::new(std::sync::Mutex::new(ClockSkew::default())),
         }
     }
 
     /// Set positive or negative clock skew on this clock.
     pub fn set_skew(&self, skew: Duration, negative: bool) {
-        *self.skew.lock().unwrap() = skew;
-        *self.negative.lock().unwrap() = negative;
+        let mut current = self
+            .skew
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = ClockSkew {
+            duration: skew,
+            negative,
+        };
     }
 }
 
@@ -55,20 +73,44 @@ impl Default for SkewableClock {
 impl Clock for SkewableClock {
     fn now_utc(&self) -> Timestamp {
         let base_ts = self.base.now_utc();
-        let skew = *self.skew.lock().unwrap();
-        let neg = *self.negative.lock().unwrap();
-
-        let odt = *base_ts.as_offset_datetime();
-        let time_skew = time::Duration::seconds_f64(skew.as_secs_f64());
-        let skewed = if neg {
-            odt - time_skew
-        } else {
-            odt + time_skew
-        };
+        let skew = *self
+            .skew
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let skewed = apply_clock_skew(*base_ts.as_offset_datetime(), skew);
         // Truncate nanoseconds to 0 to align times across replicas during concurrent operations
-        let truncated = time::OffsetDateTime::from_unix_timestamp(skewed.unix_timestamp()).unwrap();
+        // while preserving exact saturation at the timestamp limits.
+        let truncated = if skewed == minimum_utc() || skewed == maximum_utc() {
+            skewed
+        } else {
+            time::OffsetDateTime::from_unix_timestamp(skewed.unix_timestamp()).unwrap_or(skewed)
+        };
         Timestamp::from(truncated)
     }
+}
+
+fn apply_clock_skew(base: time::OffsetDateTime, skew: ClockSkew) -> time::OffsetDateTime {
+    let Ok(delta) = time::Duration::try_from(skew.duration) else {
+        return if skew.negative {
+            minimum_utc()
+        } else {
+            maximum_utc()
+        };
+    };
+
+    if skew.negative {
+        base.checked_sub(delta).unwrap_or_else(minimum_utc)
+    } else {
+        base.checked_add(delta).unwrap_or_else(maximum_utc)
+    }
+}
+
+fn minimum_utc() -> time::OffsetDateTime {
+    time::PrimitiveDateTime::MIN.assume_utc()
+}
+
+fn maximum_utc() -> time::OffsetDateTime {
+    time::PrimitiveDateTime::MAX.assume_utc()
 }
 
 /// Testkit for HA and chaos testing of the Session Store.
@@ -233,5 +275,95 @@ impl<'a> RestoreEvidenceAsserter<'a> {
             self.block_reasons
         );
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clock_skew_uses_exact_checked_integer_arithmetic() {
+        let base = time::OffsetDateTime::UNIX_EPOCH;
+        let duration = Duration::new(7, 123_456_789);
+        let delta = time::Duration::new(7, 123_456_789);
+
+        assert_eq!(
+            apply_clock_skew(
+                base,
+                ClockSkew {
+                    duration,
+                    negative: false,
+                }
+            ),
+            base.checked_add(delta)
+                .expect("representable positive skew")
+        );
+        assert_eq!(
+            apply_clock_skew(
+                base,
+                ClockSkew {
+                    duration,
+                    negative: true,
+                }
+            ),
+            base.checked_sub(delta)
+                .expect("representable negative skew")
+        );
+    }
+
+    #[test]
+    fn clock_skew_saturates_at_timestamp_limits() {
+        assert_eq!(
+            apply_clock_skew(
+                maximum_utc(),
+                ClockSkew {
+                    duration: Duration::from_nanos(1),
+                    negative: false,
+                }
+            ),
+            maximum_utc()
+        );
+        assert_eq!(
+            apply_clock_skew(
+                minimum_utc(),
+                ClockSkew {
+                    duration: Duration::from_nanos(1),
+                    negative: true,
+                }
+            ),
+            minimum_utc()
+        );
+        assert_eq!(
+            apply_clock_skew(
+                time::OffsetDateTime::UNIX_EPOCH,
+                ClockSkew {
+                    duration: Duration::MAX,
+                    negative: false,
+                }
+            ),
+            maximum_utc()
+        );
+        assert_eq!(
+            apply_clock_skew(
+                time::OffsetDateTime::UNIX_EPOCH,
+                ClockSkew {
+                    duration: Duration::MAX,
+                    negative: true,
+                }
+            ),
+            minimum_utc()
+        );
+    }
+
+    #[tokio::test]
+    async fn externally_controlled_extreme_skew_cannot_panic() {
+        let clock = SkewableClock::new();
+
+        clock.set_skew(Duration::MAX, false);
+        assert_eq!(*clock.now_utc().as_offset_datetime(), maximum_utc());
+
+        clock.set_skew(Duration::MAX, true);
+        assert_eq!(*clock.now_utc().as_offset_datetime(), minimum_utc());
     }
 }

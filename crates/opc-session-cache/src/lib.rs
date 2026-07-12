@@ -12,9 +12,9 @@ use tracing::{debug, error, info, warn};
 
 use opc_session_store::{
     next_replication_sequence, validate_replication_page, validate_replication_prefix,
-    BackendCapabilities, BackendInstanceIdentity, BackendPeerBinding, CompareAndSet,
-    CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend, SessionKey, SessionOp,
-    SessionOpResult, StoreError, StoredSessionRecord,
+    validate_session_ttl, BackendCapabilities, BackendInstanceIdentity, BackendPeerBinding,
+    CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend,
+    SessionKey, SessionOp, SessionOpResult, StoreError, StoredSessionRecord,
 };
 
 /// A local, in-memory read-through session cache that stays coherent with the
@@ -350,7 +350,7 @@ impl SessionCache {
                     res = watch_stream.next() => {
                     match res {
                         Some(Ok(entry)) => {
-                            if let Err(err) = entry.validate_sequence() {
+                            if let Err(err) = entry.validate() {
                                 warn!(
                                     "Invalid replication watch entry. Triggering resync: {}",
                                     store_error_kind(&err)
@@ -459,35 +459,34 @@ impl SessionCache {
         lock: &mut HashMap<SessionKey, StoredSessionRecord>,
         op: ReplicationOp,
     ) {
-        match op {
-            ReplicationOp::CompareAndSet { key, .. } => {
-                debug!("Invalidating key from cache (CAS): {:?}", key);
-                lock.remove(&key);
-            }
-            ReplicationOp::DeleteFenced { key, .. } => {
-                debug!("Invalidating key from cache (Delete): {:?}", key);
-                lock.remove(&key);
-            }
-            ReplicationOp::RefreshTtl { key, .. } => {
-                debug!("Invalidating key from cache (RefreshTtl): {:?}", key);
-                lock.remove(&key);
-            }
-            ReplicationOp::AcquireLease { key, .. } => {
-                debug!("Invalidating key from cache (AcquireLease): {:?}", key);
-                lock.remove(&key);
-            }
-            ReplicationOp::RenewLease { key, .. } => {
-                debug!("Invalidating key from cache (RenewLease): {:?}", key);
-                lock.remove(&key);
-            }
-            ReplicationOp::ReleaseLease { key, .. } => {
-                debug!("Invalidating key from cache (ReleaseLease): {:?}", key);
-                lock.remove(&key);
-            }
-            ReplicationOp::Batch { ops } => {
-                for nested in ops {
-                    Self::apply_invalidation_op(lock, nested);
+        let mut pending = vec![op];
+        while let Some(op) = pending.pop() {
+            match op {
+                ReplicationOp::CompareAndSet { key, .. } => {
+                    debug!("Invalidating key from cache (CAS): {:?}", key);
+                    lock.remove(&key);
                 }
+                ReplicationOp::DeleteFenced { key, .. } => {
+                    debug!("Invalidating key from cache (Delete): {:?}", key);
+                    lock.remove(&key);
+                }
+                ReplicationOp::RefreshTtl { key, .. } => {
+                    debug!("Invalidating key from cache (RefreshTtl): {:?}", key);
+                    lock.remove(&key);
+                }
+                ReplicationOp::AcquireLease { key, .. } => {
+                    debug!("Invalidating key from cache (AcquireLease): {:?}", key);
+                    lock.remove(&key);
+                }
+                ReplicationOp::RenewLease { key, .. } => {
+                    debug!("Invalidating key from cache (RenewLease): {:?}", key);
+                    lock.remove(&key);
+                }
+                ReplicationOp::ReleaseLease { key, .. } => {
+                    debug!("Invalidating key from cache (ReleaseLease): {:?}", key);
+                    lock.remove(&key);
+                }
+                ReplicationOp::Batch { ops } => pending.extend(ops),
             }
         }
     }
@@ -546,6 +545,7 @@ impl SessionBackend for SessionCache {
         lease: &opc_session_store::LeaseGuard,
         ttl: Duration,
     ) -> Result<(), StoreError> {
+        validate_session_ttl(ttl)?;
         let key = lease.key().clone();
         self.invalidate(&key).await;
         let result = self.backend.refresh_ttl(lease, ttl).await;
@@ -556,6 +556,7 @@ impl SessionBackend for SessionCache {
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        ops.iter().try_for_each(SessionOp::validate_ttls)?;
         let results = self.backend.batch(ops.clone()).await?;
         for (op, result) in ops.iter().zip(results.iter()) {
             self.invalidate_successful_session_op(op, result).await;
@@ -584,7 +585,7 @@ impl SessionBackend for SessionCache {
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
-        entry.validate_sequence()?;
+        entry.validate()?;
         self.invalidate_replication_op(&entry.op).await;
         let result = self.backend.replicate_entry(entry.clone()).await;
         if result.is_ok() {
@@ -616,7 +617,7 @@ impl SessionBackend for SessionCache {
         Ok(stream
             .map(|result| {
                 result.and_then(|entry| {
-                    entry.validate_sequence()?;
+                    entry.validate()?;
                     Ok(entry)
                 })
             })
@@ -655,19 +656,18 @@ impl SessionCache {
 }
 
 fn collect_replication_op_keys(op: &ReplicationOp, keys: &mut Vec<SessionKey>) {
-    match op {
-        ReplicationOp::CompareAndSet { key, .. }
-        | ReplicationOp::DeleteFenced { key, .. }
-        | ReplicationOp::RefreshTtl { key, .. }
-        | ReplicationOp::AcquireLease { key, .. }
-        | ReplicationOp::RenewLease { key, .. }
-        | ReplicationOp::ReleaseLease { key, .. } => {
-            keys.push(key.clone());
-        }
-        ReplicationOp::Batch { ops } => {
-            for op in ops {
-                collect_replication_op_keys(op, keys);
+    let mut pending = vec![op];
+    while let Some(op) = pending.pop() {
+        match op {
+            ReplicationOp::CompareAndSet { key, .. }
+            | ReplicationOp::DeleteFenced { key, .. }
+            | ReplicationOp::RefreshTtl { key, .. }
+            | ReplicationOp::AcquireLease { key, .. }
+            | ReplicationOp::RenewLease { key, .. }
+            | ReplicationOp::ReleaseLease { key, .. } => {
+                keys.push(key.clone());
             }
+            ReplicationOp::Batch { ops } => pending.extend(ops),
         }
     }
 }
@@ -681,6 +681,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::BackendUnavailable(_) => "backend_unavailable",
         StoreError::InvalidKey(_) => "invalid_key",
         StoreError::InvalidReplicationSequence => "invalid_replication_sequence",
+        StoreError::InvalidSessionTtl => "invalid_session_ttl",
         StoreError::LeaseHeld => "lease_held",
         StoreError::LeaseExpired => "lease_expired",
         StoreError::Crypto(_) => "crypto",
@@ -700,8 +701,8 @@ mod tests {
     use bytes::Bytes;
     use futures_util::{stream, StreamExt};
     use opc_session_store::{
-        EncryptedSessionPayload, FenceToken, Generation, OwnerId, SessionKeyType, StateClass,
-        StateType,
+        EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation, OwnerId,
+        SessionKeyType, SessionLeaseManager, StateClass, StateType, MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
     use std::sync::atomic::Ordering;
@@ -712,6 +713,9 @@ mod tests {
         watch_rx: Mutex<Option<mpsc::UnboundedReceiver<Result<ReplicationEntry, StoreError>>>>,
         yielded_tx: mpsc::UnboundedSender<()>,
         watch_calls: AtomicU64,
+        refresh_calls: AtomicU64,
+        batch_calls: AtomicU64,
+        log_entries: Mutex<Vec<ReplicationEntry>>,
         replicate_calls: AtomicU64,
         rebuild_calls: AtomicU64,
     }
@@ -753,12 +757,14 @@ mod tests {
             _lease: &opc_session_store::LeaseGuard,
             _ttl: Duration,
         ) -> Result<(), StoreError> {
+            self.refresh_calls.fetch_add(1, Ordering::Relaxed);
             Err(StoreError::CapabilityNotSupported(
                 "refresh_ttl".to_string(),
             ))
         }
 
         async fn batch(&self, _ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+            self.batch_calls.fetch_add(1, Ordering::Relaxed);
             Err(StoreError::CapabilityNotSupported("batch".to_string()))
         }
 
@@ -771,7 +777,7 @@ mod tests {
             _start: u64,
             _limit: usize,
         ) -> Result<Vec<ReplicationEntry>, StoreError> {
-            Ok(Vec::new())
+            Ok(self.log_entries.lock().await.clone())
         }
 
         async fn replicate_entry(&self, _entry: ReplicationEntry) -> Result<(), StoreError> {
@@ -826,6 +832,9 @@ mod tests {
             watch_rx: Mutex::new(Some(entry_rx)),
             yielded_tx,
             watch_calls: AtomicU64::new(0),
+            refresh_calls: AtomicU64::new(0),
+            batch_calls: AtomicU64::new(0),
+            log_entries: Mutex::new(Vec::new()),
             replicate_calls: AtomicU64::new(0),
             rebuild_calls: AtomicU64::new(0),
         })
@@ -867,6 +876,33 @@ mod tests {
         }
     }
 
+    async fn test_lease(key: &SessionKey) -> opc_session_store::LeaseGuard {
+        FakeSessionBackend::new()
+            .acquire(
+                key,
+                OwnerId::new("owner-a").expect("owner"),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("test lease")
+    }
+
+    fn invalid_ttl_entry(sequence: u64, key: SessionKey) -> ReplicationEntry {
+        let timestamp = Timestamp::now_utc();
+        ReplicationEntry {
+            sequence,
+            tx_id: format!("invalid-ttl-{sequence}"),
+            op: ReplicationOp::RefreshTtl {
+                key,
+                owner: OwnerId::new("owner-a").expect("owner"),
+                fence: FenceToken::new(1),
+                ttl: MAX_SESSION_TTL + Duration::from_nanos(1),
+                expires_at: timestamp,
+            },
+            timestamp,
+        }
+    }
+
     async fn wait_until_watch_ready(watch_ready: &AtomicBool) {
         for _ in 0..50 {
             if watch_ready.load(Ordering::Acquire) {
@@ -896,6 +932,9 @@ mod tests {
             watch_rx: Mutex::new(Some(entry_rx)),
             yielded_tx,
             watch_calls: AtomicU64::new(0),
+            refresh_calls: AtomicU64::new(0),
+            batch_calls: AtomicU64::new(0),
+            log_entries: Mutex::new(Vec::new()),
             replicate_calls: AtomicU64::new(0),
             rebuild_calls: AtomicU64::new(0),
         });
@@ -979,6 +1018,221 @@ mod tests {
                 .is_finished(),
             "sequence exhaustion must not panic or terminate the watch task"
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_direct_refresh_is_rejected_before_invalidation_or_delegation() {
+        let backend = idle_scripted_backend(0);
+        let cache = cache_without_watch(backend.clone());
+        let key = test_key();
+        let record = test_record(key.clone(), 1);
+        let lease = test_lease(&key).await;
+        cache
+            .cache
+            .write()
+            .await
+            .insert(key.clone(), record.clone());
+
+        let error = cache
+            .refresh_ttl(&lease, Duration::MAX)
+            .await
+            .expect_err("an oversized direct refresh must be rejected");
+
+        assert_eq!(error, StoreError::InvalidSessionTtl);
+        assert_eq!(backend.refresh_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.cache.read().await.get(&key), Some(&record));
+    }
+
+    #[tokio::test]
+    async fn oversized_later_batch_ttl_is_rejected_before_any_delegation() {
+        let backend = idle_scripted_backend(0);
+        let cache = cache_without_watch(backend.clone());
+        let key = test_key();
+        let record = test_record(key.clone(), 1);
+        let lease = test_lease(&key).await;
+        cache
+            .cache
+            .write()
+            .await
+            .insert(key.clone(), record.clone());
+
+        let error = cache
+            .batch(vec![
+                SessionOp::Get { key: key.clone() },
+                SessionOp::RefreshTtl {
+                    lease,
+                    ttl: MAX_SESSION_TTL + Duration::from_nanos(1),
+                },
+            ])
+            .await
+            .expect_err("the entire batch must be preflighted");
+
+        assert_eq!(error, StoreError::InvalidSessionTtl);
+        assert_eq!(backend.batch_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.cache.read().await.get(&key), Some(&record));
+    }
+
+    #[tokio::test]
+    async fn nested_replication_ttl_is_rejected_before_invalidation_or_delegation() {
+        let backend = idle_scripted_backend(0);
+        let cache = cache_without_watch(backend.clone());
+        let key = test_key();
+        let record = test_record(key.clone(), 1);
+        cache
+            .cache
+            .write()
+            .await
+            .insert(key.clone(), record.clone());
+        let invalid_op = invalid_ttl_entry(1, key.clone()).op;
+
+        let error = cache
+            .replicate_entry(ReplicationEntry {
+                sequence: 1,
+                tx_id: "nested-invalid-ttl".to_string(),
+                op: ReplicationOp::Batch {
+                    ops: vec![
+                        ReplicationOp::DeleteFenced {
+                            key: key.clone(),
+                            owner: OwnerId::new("owner-a").expect("owner"),
+                            fence: FenceToken::new(1),
+                        },
+                        invalid_op,
+                    ],
+                },
+                timestamp: Timestamp::now_utc(),
+            })
+            .await
+            .expect_err("a nested oversized TTL must reject the whole entry");
+
+        assert_eq!(error, StoreError::InvalidSessionTtl);
+        assert_eq!(backend.replicate_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.cache.read().await.get(&key), Some(&record));
+    }
+
+    #[tokio::test]
+    async fn invalid_replication_ttl_is_not_exposed_by_log_or_watch() {
+        let backend = idle_scripted_backend(0);
+        let cache = cache_without_watch(backend.clone());
+        let key = test_key();
+        backend
+            .log_entries
+            .lock()
+            .await
+            .push(invalid_ttl_entry(1, key.clone()));
+
+        assert_eq!(
+            cache
+                .get_replication_log(1, 1)
+                .await
+                .expect_err("invalid log entry must not be exposed"),
+            StoreError::InvalidSessionTtl
+        );
+
+        let (entry_tx, entry_rx) = mpsc::unbounded_channel();
+        let (yielded_tx, _yielded_rx) = mpsc::unbounded_channel();
+        let watch_backend = Arc::new(ScriptedWatchBackend {
+            max_sequence: AtomicU64::new(0),
+            watch_rx: Mutex::new(Some(entry_rx)),
+            yielded_tx,
+            watch_calls: AtomicU64::new(0),
+            refresh_calls: AtomicU64::new(0),
+            batch_calls: AtomicU64::new(0),
+            log_entries: Mutex::new(Vec::new()),
+            replicate_calls: AtomicU64::new(0),
+            rebuild_calls: AtomicU64::new(0),
+        });
+        let watch_cache = cache_without_watch(watch_backend);
+        let mut stream = watch_cache.watch(1).await.expect("watch stream");
+        entry_tx
+            .send(Ok(invalid_ttl_entry(1, key)))
+            .expect("send invalid watch entry");
+
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .expect("watch item")
+                .expect_err("invalid watch entry must not be exposed"),
+            StoreError::InvalidSessionTtl
+        );
+    }
+
+    #[tokio::test]
+    async fn background_watch_validates_ttl_before_touching_cached_state() {
+        let key = test_key();
+        let record = test_record(key.clone(), 1);
+        let cache = Arc::new(RwLock::new(HashMap::from([(key.clone(), record.clone())])));
+        let last_sequence = Arc::new(AtomicU64::new(0));
+        let watch_ready = Arc::new(AtomicBool::new(false));
+        let is_syncing = Arc::new(AtomicBool::new(false));
+        let watch_error_count = Arc::new(AtomicU64::new(0));
+        let (_resync_tx, resync_rx) = mpsc::unbounded_channel();
+        let (entry_tx, entry_rx) = mpsc::unbounded_channel();
+        let (yielded_tx, mut yielded_rx) = mpsc::unbounded_channel();
+        let backend = Arc::new(ScriptedWatchBackend {
+            max_sequence: AtomicU64::new(0),
+            watch_rx: Mutex::new(Some(entry_rx)),
+            yielded_tx,
+            watch_calls: AtomicU64::new(0),
+            refresh_calls: AtomicU64::new(0),
+            batch_calls: AtomicU64::new(0),
+            log_entries: Mutex::new(Vec::new()),
+            replicate_calls: AtomicU64::new(0),
+            rebuild_calls: AtomicU64::new(0),
+        });
+
+        let handle = tokio::spawn(SessionCache::run_watch_loop(
+            backend.clone(),
+            cache.clone(),
+            last_sequence.clone(),
+            watch_ready.clone(),
+            resync_rx,
+            is_syncing,
+            watch_error_count.clone(),
+        ));
+        wait_until_watch_ready(&watch_ready).await;
+
+        let read_guard = cache.read().await;
+        backend.max_sequence.store(1, Ordering::Release);
+        entry_tx
+            .send(Ok(invalid_ttl_entry(1, key.clone())))
+            .expect("send invalid watch entry");
+        yielded_rx.recv().await.expect("watch entry yielded");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while watch_error_count.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("invalid TTL must be observed before waiting for the cache write lock");
+
+        assert_eq!(last_sequence.load(Ordering::Acquire), 0);
+        assert_eq!(read_guard.get(&key), Some(&record));
+        assert!(!watch_ready.load(Ordering::Acquire));
+        drop(read_guard);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_rebuild_ttl_is_rejected_before_delegation_or_cache_clear() {
+        let backend = idle_scripted_backend(0);
+        let cache = cache_without_watch(backend.clone());
+        let key = test_key();
+        let record = test_record(key.clone(), 1);
+        cache
+            .cache
+            .write()
+            .await
+            .insert(key.clone(), record.clone());
+
+        let error = cache
+            .rebuild_replication_state(vec![invalid_ttl_entry(1, key.clone())])
+            .await
+            .expect_err("an invalid TTL must reject the whole rebuild");
+
+        assert_eq!(error, StoreError::InvalidSessionTtl);
+        assert_eq!(backend.rebuild_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.cache.read().await.get(&key), Some(&record));
     }
 
     #[tokio::test]

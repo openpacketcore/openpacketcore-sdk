@@ -12,6 +12,7 @@ use opc_session_store::{
     RemoteSealingSessionBackend, ReplicationEntry, ReplicationOp, RestoreScanRequest,
     SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult,
     SessionPayloadEncoding, StateClass, StateType, StoreError, StoredSessionRecord,
+    MAX_SESSION_TTL,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use std::{
@@ -101,6 +102,31 @@ fn test_replication_entry(sequence: u64, tx_id: &str) -> ReplicationEntry {
             },
         },
         timestamp: Timestamp::now_utc(),
+    }
+}
+
+fn crypto_then_invalid_ttl_entry(sequence: u64, tx_id: &str) -> ReplicationEntry {
+    let crypto_op = test_replication_entry(sequence, "crypto-canary").op;
+    let timestamp = Timestamp::now_utc();
+    ReplicationEntry {
+        sequence,
+        tx_id: tx_id.to_owned(),
+        timestamp,
+        op: ReplicationOp::Batch {
+            ops: vec![
+                crypto_op,
+                ReplicationOp::AcquireLease {
+                    key: test_key(),
+                    owner: OwnerId::new("owner-a").expect("owner"),
+                    fence: FenceToken::new(1),
+                    credential_id: 1,
+                    ttl: MAX_SESSION_TTL
+                        .checked_add(Duration::from_nanos(1))
+                        .expect("SDK TTL maximum has headroom"),
+                    expires_at: timestamp,
+                },
+            ],
+        },
     }
 }
 
@@ -636,7 +662,7 @@ async fn remote_sealing_replication_log_seals_and_unseals_nested_batch_cas_recor
 }
 
 #[tokio::test]
-async fn encrypting_wrapper_rejects_invalid_replication_sequences_before_crypto_or_delegation() {
+async fn encrypting_wrapper_rejects_invalid_replication_metadata_before_crypto_or_delegation() {
     let key_provider = test_provider();
     let mut invalid_returned = vec![
         test_replication_entry(1, "returned-one"),
@@ -687,6 +713,37 @@ async fn encrypting_wrapper_rejects_invalid_replication_sequences_before_crypto_
         "invalid prefix reached wrapped backend"
     );
 
+    let ttl_error = backend
+        .replicate_entry(crypto_then_invalid_ttl_entry(1, "invalid-ttl"))
+        .await
+        .expect_err("nested oversized TTL must be rejected");
+    assert_eq!(ttl_error, StoreError::InvalidSessionTtl);
+    assert_eq!(provider.calls(), 0, "invalid TTL reached key provider");
+    assert_eq!(
+        inner.replicate_calls.load(Ordering::SeqCst),
+        0,
+        "invalid TTL reached wrapped backend"
+    );
+
+    let ttl_prefix_error = backend
+        .rebuild_replication_state(vec![
+            test_replication_entry(1, "ttl-prefix-valid"),
+            crypto_then_invalid_ttl_entry(2, "ttl-prefix-invalid"),
+        ])
+        .await
+        .expect_err("entire TTL prefix must be validated before encryption");
+    assert_eq!(ttl_prefix_error, StoreError::InvalidSessionTtl);
+    assert_eq!(
+        provider.calls(),
+        0,
+        "invalid TTL prefix reached key provider"
+    );
+    assert_eq!(
+        inner.rebuild_calls.load(Ordering::SeqCst),
+        0,
+        "invalid TTL prefix reached wrapped backend"
+    );
+
     let returned_error = backend
         .get_replication_log(1, 2)
         .await
@@ -701,8 +758,8 @@ async fn encrypting_wrapper_rejects_invalid_replication_sequences_before_crypto_
 }
 
 #[tokio::test]
-async fn remote_sealing_wrapper_rejects_invalid_replication_sequences_before_provider_or_delegation(
-) {
+async fn remote_sealing_wrapper_rejects_invalid_replication_metadata_before_provider_or_delegation()
+{
     let seal_provider = test_remote_seal_provider();
     let mut invalid_returned = vec![
         test_replication_entry(1, "returned-one"),
@@ -754,6 +811,37 @@ async fn remote_sealing_wrapper_rejects_invalid_replication_sequences_before_pro
         inner.rebuild_calls.load(Ordering::SeqCst),
         0,
         "invalid prefix reached wrapped backend"
+    );
+
+    let ttl_error = backend
+        .replicate_entry(crypto_then_invalid_ttl_entry(1, "invalid-ttl"))
+        .await
+        .expect_err("nested oversized TTL must be rejected");
+    assert_eq!(ttl_error, StoreError::InvalidSessionTtl);
+    assert_eq!(provider.calls(), 0, "invalid TTL reached seal provider");
+    assert_eq!(
+        inner.replicate_calls.load(Ordering::SeqCst),
+        0,
+        "invalid TTL reached wrapped backend"
+    );
+
+    let ttl_prefix_error = backend
+        .rebuild_replication_state(vec![
+            test_replication_entry(1, "ttl-prefix-valid"),
+            crypto_then_invalid_ttl_entry(2, "ttl-prefix-invalid"),
+        ])
+        .await
+        .expect_err("entire TTL prefix must be validated before sealing");
+    assert_eq!(ttl_prefix_error, StoreError::InvalidSessionTtl);
+    assert_eq!(
+        provider.calls(),
+        0,
+        "invalid TTL prefix reached seal provider"
+    );
+    assert_eq!(
+        inner.rebuild_calls.load(Ordering::SeqCst),
+        0,
+        "invalid TTL prefix reached wrapped backend"
     );
 
     let returned_error = backend

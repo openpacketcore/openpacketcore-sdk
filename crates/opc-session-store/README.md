@@ -21,6 +21,8 @@ evidence.
 - `ReplicationEntry::validate_sequence`, `validate_replication_prefix`,
   `validate_replication_page`, and `next_replication_sequence` define the
   checked 1-based log-position contract shared by adapters and consumers.
+- `MAX_SESSION_TTL` (365 days), `validate_session_ttl`, and
+  `checked_session_deadline` define the common checked TTL/deadline contract.
 - `SessionKey`, `SessionKeyType`, `StateClass`, `StateType`, `Generation`,
   `OwnerId`, and `FenceToken` describe session identity and ownership.
 - `StoredSessionRecord` carries key, generation, owner, fence, state class/type,
@@ -180,6 +182,59 @@ a strict prefix of the majority-visible log. A conflicting entry or longer
 minority tail yields `RecoveryRequired`; the readiness path does not truncate or
 destructively rebuild the fork.
 
+### TTL input contract
+
+Every public `Duration` supplied as a session refresh or lease TTL is bounded
+by `MAX_SESSION_TTL`, exactly 365 days. `Duration::ZERO` is valid and means
+immediate expiry; the exact maximum is valid; any larger duration fails with
+the redaction-safe
+`StoreError::InvalidSessionTtl` or `LeaseError::InvalidSessionTtl` as
+appropriate. The ceiling accommodates long-lived sessions and planned
+maintenance/recovery windows while preventing a malformed value from creating
+an effectively permanent lease; products may impose a smaller limit.
+A zero-duration acquire may still consume a fence, credential, and replication
+position before the lease is observed expired; callers must use `release` for
+explicit revocation rather than treating zero as a rollback primitive.
+`validate_session_ttl` enforces the duration bound, while
+`checked_session_deadline` converts seconds and subsecond nanoseconds with
+checked integer arithmetic and checks addition against the supplied clock. The
+deadline path does not use floating-point duration conversion or panicking
+timestamp addition.
+
+Direct acquire, renew, and TTL-refresh calls, nested batch operations, nested
+replication operations, forwarding/encryption/cache wrappers, quorum dispatch,
+Fake/SQLite backends, and the session-net client/server boundary all reject an
+invalid TTL before application/backend state, replication-log, watch,
+cryptographic-provider, or database effects. A session-net client rejects
+before resolver or network work; an authenticated server necessarily receives
+and decodes the request, then rejects before backend dispatch and may return the
+typed response on the same connection. The same checks remain in local backends
+so direct callers and peers that did not validate at their first boundary still
+fail closed.
+
+This is a compatibility boundary. The two public error enums gain new variants,
+and those variants can appear in protocol-v3 error responses. External
+exhaustive matches must add arms, and a session-net fleet must be upgraded as
+one coordinated same-v3 compatibility unit before relying on the typed wire
+error; valid v3 requests and responses are unchanged. Before upgrading a store
+created by an older SDK, audit its persisted replication log for TTL-bearing
+operations above 365 days. Such legacy entries now fail closed during replay or
+rebuild; the SDK does not silently clamp or rewrite them. Replicated
+absolute-deadline validation permits at most one microsecond above the exact
+`entry.timestamp + ttl` solely for compatibility with legacy `seconds_f64`
+rounding. New deadlines remain exact, the tolerance does not enlarge
+`MAX_SESSION_TTL`, and larger deadline mismatches still fail closed.
+
+This TTL is application-state lifetime, not certificate expiry, trust-bundle
+validity, or maximum authentication age. Seamless certificate/trust rotation
+for the networked production profile remains a qualification requirement in
+#143.
+
+The duration contract does not yet bound a caller-authored absolute
+`StoredSessionRecord::expires_at`; that separate admission/migration invariant
+is tracked by #148. Deeply nested replicated CAS payload transformation through
+the encryption/sealing wrappers is tracked by #147.
+
 ## Relationships
 
 - Uses `opc-types` for tenant/NF/time/version identifiers.
@@ -224,6 +279,10 @@ destructively rebuild the fork.
   agreement between each row position and serialized entry. These checks
   prevent malformed-input panics and partial replacement caused by malformed
   sequence metadata, but do not assign or prove distributed commit authority.
+- Session and lease TTLs use the checked 365-day contract above. This closes
+  the oversized-duration panic and input-safety boundary only; it does not
+  establish consensus, durable commit authority, fork recovery, or production
+  networked HA.
 
 ## Roadmap
 
@@ -231,20 +290,25 @@ destructively rebuild the fork.
 - Continue hardening restore evidence and traffic-blocking gates.
 - Complete durable sequencing and safe fork repair/recovery (#127–#129),
   bounded majority-authoritative restore (#133), fixed-width wire stabilization
-  (#134), invariant-safe model decoding (#135), plus oversized-TTL panic
-  elimination (#137).
+  (#134), invariant-safe model decoding (#135), watch handoff correctness
+  (#145), recursive protected-payload traversal (#147), and absolute-expiry
+  admission (#148), then complete the production qualification profile and
+  distributed evidence in #143.
 - Keep encryption AAD bound to namespace, NF kind, state type, generation,
   fence, and session-key digest.
 
 ## Verification
 
-- Source checked: `Cargo.toml`, `src/lib.rs`, backend, lease, model, record,
-  sqlite, topology, quorum, restore, and tests.
+- Source checked: `Cargo.toml`, `src/lib.rs`, backend, lease, TTL, model, record,
+  SQLite, topology, quorum, restore, and tests.
 - `tests/quorum_topology.rs` covers descriptor fingerprinting, complete
   remote-binding admission, typed mismatch classes, and redacted diagnostics.
 - `tests/replication_sequence_bounds.rs` covers direct Fake/SQLite append,
   rebuild atomicity, signed persistence boundaries, and corrupt-row rejection;
   quorum, encryption, cache, and session-net suites cover their own boundaries.
+- TTL, lease, refresh, batch, replicated-operation, clock, cache, testkit, and
+  real-mTLS suites cover zero, the exact maximum, over-limit inputs, deadline
+  overflow, redacted typed errors, and no-partial-effect rejection.
 - Run with: `cargo test -p opc-session-store`.
 
 ## License
