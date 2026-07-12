@@ -42,6 +42,7 @@ pub mod store;
 pub mod topology;
 
 pub use backend::{
+    next_replication_sequence, validate_replication_page, validate_replication_prefix,
     BackendInstanceIdentity, BackendPeerBinding, BackendPeerScopeIdentity, CompareAndSet,
     CompareAndSetResult, EncryptingSessionBackend, RemoteSealingSessionBackend, ReplicationEntry,
     ReplicationOp, SessionBackend, SessionOp, SessionOpResult,

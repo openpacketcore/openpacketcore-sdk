@@ -121,8 +121,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fallback, so all clients and servers require a coordinated upgrade and mixed
   v2/v3 rolling upgrades are unsupported. Public `Request`/`Response` enums
   gain handshake and restore-scan variants, while `StoreError` gains
-  restore-scan variants, so external exhaustive matches must add arms for
-  them.
+  restore-scan and `InvalidReplicationSequence` variants, so external
+  exhaustive matches must add arms for them. The latter is serialized on v3
+  only in response to malformed replication metadata; older v3 peers cannot
+  decode that new error and must be upgraded in the coordinated fleet rollout.
 - Documentation and package metadata now distinguish scoped implementation
   evidence, Cargo publication eligibility, and production maturity. Historical
   status snapshots, release-evidence primitives, and conditional
@@ -210,6 +212,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- `opc-session-store`/`opc-session-net`/`opc-session-cache`: replication-log
+  entries now reject sequence zero with the typed, redaction-safe
+  `StoreError::InvalidReplicationSequence` before quorum assessment, state
+  mutation, cryptographic provider work, database access, cache invalidation,
+  or network I/O. Rebuild sequence prefixes are fully validated before
+  replacement; sequence increments are checked; SQLite rejects signed-range
+  overflow, invalid positions when read, and row/payload disagreement; and
+  authenticated servers return the typed wire error without dropping the
+  connection. Direct,
+  wrapper, cache, SQLite-corruption, quorum, and real-mTLS regressions cover
+  zero, one, exact and forged duplicates, gaps, and `u64::MAX`. This closes the
+  malformed-sequence boundary tracked by #138; it does not provide the durable
+  sequence/commit authority still required by #127.
 - `opc-runtime`: wildcard-bound UDP listeners can now pair
   `recv_from_with_destination` with `send_to_from` so Linux/Android replies use
   the exact concrete destination address observed on receive as their source.
@@ -232,8 +247,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefix, and bounded failure reasons. This closes #124 only; durable authority
   and operator-safe fork recovery (#127–#129), majority-authoritative restore
   (#133), and wire/model hardening (#134/#135) remain production blockers.
-  Oversized-TTL and zero-replication-sequence panic elimination remain tracked
-  by #137/#138.
+  Oversized-TTL panic elimination remains tracked by #137; malformed
+  replication-sequence rejection is closed above under #138.
 - `opc-session-store`: quorum construction now rejects empty/undersized/even HA
   membership, missing or ambiguous self, duplicate logical IDs, canonical
   endpoints, declared TLS identities, failure domains, backing identities, and
@@ -245,7 +260,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mTLS SQLite regression proves that bare logical self is independent from FQDN
   endpoints. This closes #123 configured-topology admission only. Fresh
   durable readiness was scoped separately to #124 and is described above;
-  #127–#129, #133–#135, and #137/#138 remain production blockers.
+  #127–#129, #133–#135, and #137 remain production blockers; #138 is closed
+  above.
 - `opc-session-net`: remote backends and replication servers now carry
   validated cursor-paged restore scans, shorten multi-record pages to the
   effective client/server frame limit, and return a typed error when one

@@ -91,7 +91,9 @@ supported. This identity binding is not consensus or fork recovery. Durable
 commit authority, commit-proven repair, operator-safe fork recovery, and
 bounded majority-authoritative restore remain open in #127–#129 and #133.
 Fixed-width wire DTOs and invariant-safe model decoding remain #134/#135;
-oversized-TTL and zero-replication-sequence panic elimination remain #137/#138.
+oversized-TTL panic elimination remains #137. Malformed sequence zero, checked
+increment, rebuild-prefix, SQLite signed-boundary, cache, and authenticated
+wire rejection are implemented under #138.
 
 ## Consequences
 

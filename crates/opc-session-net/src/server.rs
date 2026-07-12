@@ -4,7 +4,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use opc_session_store::backend::CompareAndSetResult;
+use opc_session_store::backend::{
+    validate_replication_page, validate_replication_prefix, CompareAndSetResult,
+};
 use opc_session_store::error::StoreError;
 use opc_session_store::quorum::SessionStoreBackend;
 use opc_session_store::{ReplicaId, RestoreScanCursor, RestoreScanPage, RestoreScanRequest};
@@ -688,21 +690,34 @@ where
                 write_frame(writer, &Response::MaxReplicationSequence(res)).await?;
             }
             Request::GetReplicationLog { start, limit } => {
-                let res = backend.get_replication_log(start, limit).await;
+                let res = match backend.get_replication_log(start, limit).await {
+                    Ok(entries) => validate_replication_page(&entries).map(|()| entries),
+                    Err(error) => Err(error),
+                };
                 write_frame(writer, &Response::GetReplicationLog(res)).await?;
             }
             Request::ReplicateEntry { entry } => {
-                let res = backend.replicate_entry(entry).await;
+                let res = match entry.validate_sequence() {
+                    Ok(()) => backend.replicate_entry(entry).await,
+                    Err(error) => Err(error),
+                };
                 write_frame(writer, &Response::ReplicateEntry(res)).await?;
             }
             Request::RebuildReplicationState { entries } => {
-                let res = backend.rebuild_replication_state(entries).await;
+                let res = match validate_replication_prefix(&entries) {
+                    Ok(()) => backend.rebuild_replication_state(entries).await,
+                    Err(error) => Err(error),
+                };
                 write_frame(writer, &Response::RebuildReplicationState(res)).await?;
             }
             Request::Watch { start_sequence } => match backend.watch(start_sequence).await {
                 Ok(mut stream) => {
                     write_frame(writer, &Response::WatchStream).await?;
                     while let Some(item) = stream.next().await {
+                        let item = item.and_then(|entry| {
+                            entry.validate_sequence()?;
+                            Ok(entry)
+                        });
                         if write_frame(writer, &Response::WatchEntry(item))
                             .await
                             .is_err()

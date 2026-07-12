@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use opc_session_store::{
+    next_replication_sequence, validate_replication_page, validate_replication_prefix,
     BackendCapabilities, BackendInstanceIdentity, BackendPeerBinding, CompareAndSet,
     CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend, SessionKey, SessionOp,
     SessionOpResult, StoreError, StoredSessionRecord,
@@ -280,12 +281,30 @@ impl SessionCache {
                 }
             }
 
+            let watch_start = match next_replication_sequence(seq) {
+                Ok(sequence) => sequence,
+                Err(err) => {
+                    warn!(
+                        "Cannot advance the replication watch cursor. Retrying: {}",
+                        store_error_kind(&err)
+                    );
+                    watch_error_count.fetch_add(1, Ordering::Relaxed);
+                    watch_ready.store(false, Ordering::Release);
+                    is_syncing.store(true, Ordering::Release);
+                    cache.write().await.clear();
+                    is_syncing.store(false, Ordering::Release);
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    initialized = false;
+                    continue;
+                }
+            };
+
             watch_ready.store(false, Ordering::Release);
-            let mut watch_stream = match backend.watch(seq + 1).await {
+            let mut watch_stream = match backend.watch(watch_start).await {
                 Ok(stream) => {
                     info!(
                         "Successfully started watch stream from sequence {}",
-                        seq + 1
+                        watch_start
                     );
                     watch_ready.store(true, Ordering::Release);
                     stream
@@ -293,7 +312,7 @@ impl SessionCache {
                 Err(err) => {
                     warn!(
                         "Failed to start watch stream from sequence {}. Retrying after resync: {}",
-                        seq + 1,
+                        watch_start,
                         store_error_kind(&err)
                     );
                     watch_error_count.fetch_add(1, Ordering::Relaxed);
@@ -331,17 +350,41 @@ impl SessionCache {
                     res = watch_stream.next() => {
                     match res {
                         Some(Ok(entry)) => {
+                            if let Err(err) = entry.validate_sequence() {
+                                warn!(
+                                    "Invalid replication watch entry. Triggering resync: {}",
+                                    store_error_kind(&err)
+                                );
+                                watch_error_count.fetch_add(1, Ordering::Relaxed);
+                                watch_ready.store(false, Ordering::Release);
+                                should_resync = true;
+                                break;
+                            }
                             let entry_seq = entry.sequence;
                             let current_last = last_sequence.load(Ordering::Acquire);
 
                             if entry_seq <= current_last {
                                 debug!("Ignoring duplicate entry at seq {}", entry_seq);
                                 continue;
-                            } else if entry_seq > current_last + 1 {
+                            }
+                            let expected = match next_replication_sequence(current_last) {
+                                Ok(sequence) => sequence,
+                                Err(err) => {
+                                    warn!(
+                                        "Cannot advance the replication cursor. Triggering resync: {}",
+                                        store_error_kind(&err)
+                                    );
+                                    watch_error_count.fetch_add(1, Ordering::Relaxed);
+                                    watch_ready.store(false, Ordering::Release);
+                                    should_resync = true;
+                                    break;
+                                }
+                            };
+                            if entry_seq > expected {
                                 warn!(
                                     "Sequence gap detected: entry_seq={}, expected={}. Triggering resync.",
                                     entry_seq,
-                                    current_last + 1
+                                    expected
                                 );
                                 watch_error_count.fetch_add(1, Ordering::Relaxed);
                                 watch_ready.store(false, Ordering::Release);
@@ -535,10 +578,13 @@ impl SessionBackend for SessionCache {
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
-        self.backend.get_replication_log(start, limit).await
+        let entries = self.backend.get_replication_log(start, limit).await?;
+        validate_replication_page(&entries)?;
+        Ok(entries)
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
+        entry.validate_sequence()?;
         self.invalidate_replication_op(&entry.op).await;
         let result = self.backend.replicate_entry(entry.clone()).await;
         if result.is_ok() {
@@ -551,6 +597,7 @@ impl SessionBackend for SessionCache {
         &self,
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
+        validate_replication_prefix(&entries)?;
         self.clear().await;
         let result = self.backend.rebuild_replication_state(entries).await;
         self.clear().await;
@@ -564,7 +611,16 @@ impl SessionBackend for SessionCache {
         futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
         StoreError,
     > {
-        self.backend.watch(start_sequence).await
+        let stream = self.backend.watch(start_sequence).await?;
+        use futures_util::StreamExt;
+        Ok(stream
+            .map(|result| {
+                result.and_then(|entry| {
+                    entry.validate_sequence()?;
+                    Ok(entry)
+                })
+            })
+            .boxed())
     }
 
     async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
@@ -624,6 +680,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
         StoreError::BackendUnavailable(_) => "backend_unavailable",
         StoreError::InvalidKey(_) => "invalid_key",
+        StoreError::InvalidReplicationSequence => "invalid_replication_sequence",
         StoreError::LeaseHeld => "lease_held",
         StoreError::LeaseExpired => "lease_expired",
         StoreError::Crypto(_) => "crypto",
@@ -654,6 +711,9 @@ mod tests {
         max_sequence: AtomicU64,
         watch_rx: Mutex<Option<mpsc::UnboundedReceiver<Result<ReplicationEntry, StoreError>>>>,
         yielded_tx: mpsc::UnboundedSender<()>,
+        watch_calls: AtomicU64,
+        replicate_calls: AtomicU64,
+        rebuild_calls: AtomicU64,
     }
 
     #[async_trait]
@@ -715,18 +775,16 @@ mod tests {
         }
 
         async fn replicate_entry(&self, _entry: ReplicationEntry) -> Result<(), StoreError> {
-            Err(StoreError::CapabilityNotSupported(
-                "replicate_entry".to_string(),
-            ))
+            self.replicate_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
 
         async fn rebuild_replication_state(
             &self,
             _entries: Vec<ReplicationEntry>,
         ) -> Result<(), StoreError> {
-            Err(StoreError::CapabilityNotSupported(
-                "rebuild_replication_state".to_string(),
-            ))
+            self.rebuild_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
 
         async fn watch(
@@ -736,6 +794,7 @@ mod tests {
             futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
             StoreError,
         > {
+            self.watch_calls.fetch_add(1, Ordering::Relaxed);
             let rx = self
                 .watch_rx
                 .lock()
@@ -756,6 +815,33 @@ mod tests {
 
         async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
             Ok((1, 1))
+        }
+    }
+
+    fn idle_scripted_backend(max_sequence: u64) -> Arc<ScriptedWatchBackend> {
+        let (_entry_tx, entry_rx) = mpsc::unbounded_channel();
+        let (yielded_tx, _yielded_rx) = mpsc::unbounded_channel();
+        Arc::new(ScriptedWatchBackend {
+            max_sequence: AtomicU64::new(max_sequence),
+            watch_rx: Mutex::new(Some(entry_rx)),
+            yielded_tx,
+            watch_calls: AtomicU64::new(0),
+            replicate_calls: AtomicU64::new(0),
+            rebuild_calls: AtomicU64::new(0),
+        })
+    }
+
+    fn cache_without_watch(backend: Arc<dyn SessionBackend>) -> SessionCache {
+        let (resync_tx, _resync_rx) = mpsc::unbounded_channel();
+        SessionCache {
+            backend,
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            last_sequence: Arc::new(AtomicU64::new(0)),
+            watch_ready: Arc::new(AtomicBool::new(false)),
+            resync_tx,
+            is_syncing: Arc::new(AtomicBool::new(false)),
+            watch_error_count: Arc::new(AtomicU64::new(0)),
+            watch_task: Mutex::new(None),
         }
     }
 
@@ -809,6 +895,9 @@ mod tests {
             max_sequence: AtomicU64::new(0),
             watch_rx: Mutex::new(Some(entry_rx)),
             yielded_tx,
+            watch_calls: AtomicU64::new(0),
+            replicate_calls: AtomicU64::new(0),
+            rebuild_calls: AtomicU64::new(0),
         });
 
         let handle = tokio::spawn(SessionCache::run_watch_loop(
@@ -862,5 +951,100 @@ mod tests {
         }
         handle.abort();
         panic!("watch loop did not apply invalidation after cache lock was released");
+    }
+
+    #[tokio::test]
+    async fn exhausted_watch_sequence_stays_alive_and_fail_closed() {
+        let backend = idle_scripted_backend(u64::MAX);
+        let cache = SessionCache::new(backend.clone());
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cache.watch_error_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sequence exhaustion must be observed without killing the watch task");
+
+        assert_eq!(cache.last_sequence(), u64::MAX);
+        assert!(!cache.is_watch_ready());
+        assert_eq!(backend.watch_calls.load(Ordering::Relaxed), 0);
+        assert!(
+            !cache
+                .watch_task
+                .lock()
+                .await
+                .as_ref()
+                .expect("watch task")
+                .is_finished(),
+            "sequence exhaustion must not panic or terminate the watch task"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_replication_entry_is_rejected_before_delegation_or_invalidation() {
+        let backend = idle_scripted_backend(0);
+        let cache = cache_without_watch(backend.clone());
+        let key = test_key();
+        let record = test_record(key.clone(), 1);
+        cache
+            .cache
+            .write()
+            .await
+            .insert(key.clone(), record.clone());
+
+        let error = cache
+            .replicate_entry(ReplicationEntry {
+                sequence: 0,
+                tx_id: "zero-sequence".to_string(),
+                op: ReplicationOp::DeleteFenced {
+                    key: key.clone(),
+                    owner: OwnerId::new("owner-a").expect("owner"),
+                    fence: FenceToken::new(1),
+                },
+                timestamp: Timestamp::now_utc(),
+            })
+            .await
+            .expect_err("sequence zero must be rejected");
+
+        assert_eq!(error, StoreError::InvalidReplicationSequence);
+        assert_eq!(backend.replicate_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.cache.read().await.get(&key), Some(&record));
+    }
+
+    #[tokio::test]
+    async fn malformed_rebuild_prefix_is_rejected_before_delegation_or_cache_clear() {
+        let backend = idle_scripted_backend(0);
+        let cache = cache_without_watch(backend.clone());
+        let key = test_key();
+        let record = test_record(key.clone(), 1);
+        cache
+            .cache
+            .write()
+            .await
+            .insert(key.clone(), record.clone());
+        let timestamp = Timestamp::now_utc();
+
+        let error = cache
+            .rebuild_replication_state(vec![
+                ReplicationEntry {
+                    sequence: 1,
+                    tx_id: "prefix-one".to_string(),
+                    op: ReplicationOp::Batch { ops: Vec::new() },
+                    timestamp,
+                },
+                ReplicationEntry {
+                    sequence: 3,
+                    tx_id: "prefix-gap".to_string(),
+                    op: ReplicationOp::Batch { ops: Vec::new() },
+                    timestamp,
+                },
+            ])
+            .await
+            .expect_err("a gapped rebuild prefix must be rejected");
+
+        assert_eq!(error, StoreError::InvalidReplicationSequence);
+        assert_eq!(backend.rebuild_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.cache.read().await.get(&key), Some(&record));
     }
 }

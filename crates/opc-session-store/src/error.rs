@@ -42,6 +42,11 @@ pub enum StoreError {
     /// malformed. This indicates a caller bug, not a transient fault.
     #[error("invalid key: {0}")]
     InvalidKey(String),
+    /// A replication entry used sequence zero, or a replication prefix/page
+    /// was not strictly 1-based and contiguous. The error intentionally
+    /// carries no caller-controlled value so it is safe to expose to peers.
+    #[error("invalid replication sequence")]
+    InvalidReplicationSequence,
     /// Another owner currently holds an unexpired lease on the key, so this
     /// caller cannot acquire single-writer authority for it.
     #[error("lease held by another owner")]

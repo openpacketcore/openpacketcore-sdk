@@ -16,8 +16,9 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::{
     backend::{
-        BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry,
-        ReplicationOp, SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
+        next_replication_sequence, validate_replication_prefix, BackendInstanceIdentity,
+        CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend,
+        SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
     },
     capability::BackendCapabilities,
     clock::{Clock, TokioVirtualClock},
@@ -601,17 +602,27 @@ impl FakeSessionBackend {
         }
     }
 
+    fn next_direct_replication_sequence(
+        &self,
+        state: &FakeBackendState,
+    ) -> Result<Option<u64>, StoreError> {
+        if !self.caps.ordered_replication_log {
+            return Ok(None);
+        }
+        next_replication_sequence(state.last_replication_sequence).map(Some)
+    }
+
     fn append_direct_replication_entry(
         &self,
         state: &mut FakeBackendState,
+        sequence: Option<u64>,
         op: ReplicationOp,
         timestamp: Timestamp,
     ) {
-        if !self.caps.ordered_replication_log {
+        let Some(sequence) = sequence else {
             return;
-        }
+        };
 
-        let sequence = state.last_replication_sequence.saturating_add(1);
         state.last_replication_sequence = sequence;
         let entry = ReplicationEntry {
             sequence,
@@ -633,6 +644,7 @@ impl FakeSessionBackend {
         state: &mut FakeBackendState,
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
+        validate_replication_prefix(&entries)?;
         state.records.clear();
         state.leases.clear();
         state.key_fences.clear();
@@ -642,12 +654,7 @@ impl FakeSessionBackend {
         state.last_replication_sequence = 0;
         state.replication_log.clear();
 
-        for (expected_sequence, entry) in (1_u64..).zip(entries) {
-            if entry.sequence != expected_sequence {
-                return Err(StoreError::BackendUnavailable(
-                    "replication log sequence gap".into(),
-                ));
-            }
+        for entry in entries {
             Self::apply_replicated_op_with_state(
                 state,
                 entry.op.clone(),
@@ -690,6 +697,7 @@ impl SessionBackend for FakeSessionBackend {
         let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
+        let replication_sequence = self.next_direct_replication_sequence(&state)?;
         let replication_op = ReplicationOp::CompareAndSet {
             key: op.key.clone(),
             expected_generation: op.expected_generation,
@@ -699,7 +707,12 @@ impl SessionBackend for FakeSessionBackend {
         };
         let result = self.compare_and_set_with_state(&mut state, op, now)?;
         if result == CompareAndSetResult::Success {
-            self.append_direct_replication_entry(&mut state, replication_op, now);
+            self.append_direct_replication_entry(
+                &mut state,
+                replication_sequence,
+                replication_op,
+                now,
+            );
         }
         Ok(result)
     }
@@ -708,9 +721,11 @@ impl SessionBackend for FakeSessionBackend {
         let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
+        let replication_sequence = self.next_direct_replication_sequence(&state)?;
         self.delete_fenced_with_state(&mut state, lease, now)?;
         self.append_direct_replication_entry(
             &mut state,
+            replication_sequence,
             ReplicationOp::DeleteFenced {
                 key: lease.key().clone(),
                 owner: lease.owner().clone(),
@@ -725,9 +740,11 @@ impl SessionBackend for FakeSessionBackend {
         let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
+        let replication_sequence = self.next_direct_replication_sequence(&state)?;
         let expires_at = self.refresh_ttl_with_state(&mut state, lease, ttl, now)?;
         self.append_direct_replication_entry(
             &mut state,
+            replication_sequence,
             ReplicationOp::RefreshTtl {
                 key: lease.key().clone(),
                 owner: lease.owner().clone(),
@@ -839,6 +856,7 @@ impl SessionBackend for FakeSessionBackend {
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
+        entry.validate_sequence()?;
         let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
@@ -856,7 +874,7 @@ impl SessionBackend for FakeSessionBackend {
                 .iter()
                 .find(|e| e.sequence == entry.sequence)
             {
-                if existing.tx_id == entry.tx_id {
+                if existing == &entry {
                     return Ok(()); // Idempotent success
                 } else {
                     return Err(StoreError::BackendUnavailable(
@@ -870,7 +888,7 @@ impl SessionBackend for FakeSessionBackend {
         }
 
         // Check for log gap
-        if entry.sequence > max_seq + 1 {
+        if entry.sequence != next_replication_sequence(max_seq)? {
             return Err(StoreError::BackendUnavailable(
                 "replication log sequence gap".into(),
             ));
@@ -899,6 +917,7 @@ impl SessionBackend for FakeSessionBackend {
         &self,
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
+        validate_replication_prefix(&entries)?;
         let mut state = self.inner.lock().await;
         self.rebuild_replication_state_with_entries(&mut state, entries)
     }
@@ -969,6 +988,9 @@ impl SessionLeaseManager for FakeSessionBackend {
         let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
+        let replication_sequence = self
+            .next_direct_replication_sequence(&state)
+            .map_err(LeaseError::from)?;
         let mk = Self::map_key(key);
 
         if let Some(entry) = state.leases.get(&mk) {
@@ -1012,6 +1034,7 @@ impl SessionLeaseManager for FakeSessionBackend {
 
         self.append_direct_replication_entry(
             &mut state,
+            replication_sequence,
             ReplicationOp::AcquireLease {
                 key: key.clone(),
                 owner: owner.clone(),
@@ -1037,6 +1060,9 @@ impl SessionLeaseManager for FakeSessionBackend {
         let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
+        let replication_sequence = self
+            .next_direct_replication_sequence(&state)
+            .map_err(LeaseError::from)?;
 
         if lease.expires_at() <= now {
             return Err(LeaseError::Expired);
@@ -1080,6 +1106,7 @@ impl SessionLeaseManager for FakeSessionBackend {
 
         self.append_direct_replication_entry(
             &mut state,
+            replication_sequence,
             ReplicationOp::RenewLease {
                 key: lease.key().clone(),
                 owner: lease.owner().clone(),
@@ -1105,6 +1132,9 @@ impl SessionLeaseManager for FakeSessionBackend {
         let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
+        let replication_sequence = self
+            .next_direct_replication_sequence(&state)
+            .map_err(LeaseError::from)?;
 
         let mk = Self::map_key(lease.key());
         let Some(entry) = state.leases.get_mut(&mk) else {
@@ -1133,6 +1163,7 @@ impl SessionLeaseManager for FakeSessionBackend {
         // Fence is NOT reduced; it remains the current recorded token.
         self.append_direct_replication_entry(
             &mut state,
+            replication_sequence,
             ReplicationOp::ReleaseLease {
                 key: lease.key().clone(),
                 owner: lease.owner().clone(),

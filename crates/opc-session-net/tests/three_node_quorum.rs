@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -132,6 +135,113 @@ fn test_record(
         state_type: StateType::new("test").unwrap(),
         expires_at: None,
         payload: EncryptedSessionPayload::new(b"payload"),
+    }
+}
+
+#[derive(Clone)]
+struct ReplicationDispatchSpy {
+    inner: FakeSessionBackend,
+    replicate_calls: Arc<AtomicUsize>,
+    rebuild_calls: Arc<AtomicUsize>,
+}
+
+impl ReplicationDispatchSpy {
+    fn new() -> Self {
+        Self {
+            inner: FakeSessionBackend::new(),
+            replicate_calls: Arc::new(AtomicUsize::new(0)),
+            rebuild_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionBackend for ReplicationDispatchSpy {
+    async fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities().await
+    }
+
+    async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        self.inner.get(key).await
+    }
+
+    async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        self.inner.compare_and_set(op).await
+    }
+
+    async fn delete_fenced(&self, lease: &opc_session_store::LeaseGuard) -> Result<(), StoreError> {
+        self.inner.delete_fenced(lease).await
+    }
+
+    async fn refresh_ttl(
+        &self,
+        lease: &opc_session_store::LeaseGuard,
+        ttl: Duration,
+    ) -> Result<(), StoreError> {
+        self.inner.refresh_ttl(lease, ttl).await
+    }
+
+    async fn batch(
+        &self,
+        ops: Vec<opc_session_store::SessionOp>,
+    ) -> Result<Vec<opc_session_store::SessionOpResult>, StoreError> {
+        self.inner.batch(ops).await
+    }
+
+    async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
+        self.inner.max_replication_sequence().await
+    }
+
+    async fn get_replication_log(
+        &self,
+        start: u64,
+        limit: usize,
+    ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        self.inner.get_replication_log(start, limit).await
+    }
+
+    async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
+        self.replicate_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.replicate_entry(entry).await
+    }
+
+    async fn rebuild_replication_state(
+        &self,
+        entries: Vec<ReplicationEntry>,
+    ) -> Result<(), StoreError> {
+        self.rebuild_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.rebuild_replication_state(entries).await
+    }
+
+    async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
+        self.inner.next_lease_info().await
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionLeaseManager for ReplicationDispatchSpy {
+    async fn acquire(
+        &self,
+        key: &SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+    ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
+        self.inner.acquire(key, owner, ttl).await
+    }
+
+    async fn renew(
+        &self,
+        lease: &opc_session_store::LeaseGuard,
+        ttl: Duration,
+    ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
+        self.inner.renew(lease, ttl).await
+    }
+
+    async fn release(
+        &self,
+        lease: opc_session_store::LeaseGuard,
+    ) -> Result<(), opc_session_store::LeaseError> {
+        self.inner.release(lease).await
     }
 }
 
@@ -361,6 +471,189 @@ where
     );
     let (handle, addr) = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
     (addr, backend, handle)
+}
+
+#[tokio::test]
+async fn remote_client_rejects_zero_sequence_before_resolve_or_retry() {
+    let mtls = mtls_configs();
+    let backend = ReplicationDispatchSpy::new();
+    let (addr, backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let resolve_calls = Arc::new(AtomicUsize::new(0));
+    let resolve_calls_for_request = Arc::clone(&resolve_calls);
+    let resolver: RemoteAddrResolver = Arc::new(move || {
+        let resolve_calls = Arc::clone(&resolve_calls_for_request);
+        Box::pin(async move {
+            resolve_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(addr)
+        })
+    });
+    let remote = RemoteSessionBackend::new_with_resolver(
+        mtls.remote_binding(1, 2),
+        resolver,
+        mtls.client_config(1),
+        Some(Duration::from_millis(500)),
+    );
+
+    let error = tokio::time::timeout(
+        Duration::from_millis(100),
+        remote.replicate_entry(ReplicationEntry {
+            sequence: 0,
+            tx_id: "untrusted-transaction-canary".to_string(),
+            op: ReplicationOp::Batch { ops: Vec::new() },
+            timestamp: Timestamp::now_utc(),
+        }),
+    )
+    .await
+    .expect("local validation must not enter a retry loop")
+    .expect_err("sequence zero must be rejected");
+
+    assert_eq!(error, StoreError::InvalidReplicationSequence);
+    assert!(!format!("{error:?}").contains("untrusted-transaction-canary"));
+    assert_eq!(resolve_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.replicate_calls.load(Ordering::SeqCst), 0);
+    let rebuild_error = remote
+        .rebuild_replication_state(vec![
+            ReplicationEntry {
+                sequence: 1,
+                tx_id: "prefix-one".to_string(),
+                op: ReplicationOp::Batch { ops: Vec::new() },
+                timestamp: Timestamp::now_utc(),
+            },
+            ReplicationEntry {
+                sequence: 3,
+                tx_id: "prefix-gap".to_string(),
+                op: ReplicationOp::Batch { ops: Vec::new() },
+                timestamp: Timestamp::now_utc(),
+            },
+        ])
+        .await
+        .expect_err("a malformed rebuild must fail before resolution");
+    assert_eq!(rebuild_error, StoreError::InvalidReplicationSequence);
+    assert_eq!(resolve_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.rebuild_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.max_replication_sequence().await.unwrap(), 0);
+
+    assert_eq!(remote.max_replication_sequence().await.unwrap(), 0);
+    assert!(remote.get_replication_log(1, 1).await.unwrap().is_empty());
+    assert_eq!(
+        resolve_calls.load(Ordering::SeqCst),
+        1,
+        "a successful follow-up must reuse one authenticated connection"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn authenticated_server_rejects_wire_zero_and_keeps_connection_usable() {
+    use opc_session_net::protocol::{
+        read_frame, write_frame, CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE, SESSION_NET_ALPN,
+    };
+    use opc_session_net::{Request, Response};
+
+    let mtls = mtls_configs();
+    let backend = ReplicationDispatchSpy::new();
+    let (addr, backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let mut client_config = mtls.client_config(1).rustls_config().as_ref().clone();
+    client_config.alpn_protocols = vec![SESSION_NET_ALPN.to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to replication server");
+    let server_name = rustls_pki_types::ServerName::IpAddress(addr.ip().into());
+    let mut stream = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("mutual TLS connection");
+
+    let binding = mtls.remote_binding(1, 2);
+    let nonce = uuid::Uuid::new_v4();
+    write_frame(
+        &mut stream,
+        &Request::Hello {
+            contract_version: CONTRACT_VERSION,
+            node_id: binding.local_replica_id().as_str().to_string(),
+            expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
+            cluster_id: Some(binding.cluster_id().as_str().to_string()),
+            configuration_id: Some(binding.configuration_id().to_hex()),
+            handshake_nonce: Some(nonce),
+        },
+    )
+    .await
+    .expect("write authenticated hello");
+    let hello: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read authenticated hello response");
+    assert!(matches!(
+        hello,
+        Response::HelloAck {
+            contract_version: CONTRACT_VERSION,
+            handshake_nonce: Some(echoed),
+            ..
+        } if echoed == nonce
+    ));
+
+    write_frame(
+        &mut stream,
+        &Request::ReplicateEntry {
+            entry: ReplicationEntry {
+                sequence: 0,
+                tx_id: "wire-transaction-canary".to_string(),
+                op: ReplicationOp::Batch { ops: Vec::new() },
+                timestamp: Timestamp::now_utc(),
+            },
+        },
+    )
+    .await
+    .expect("write malformed replication entry");
+    let rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read typed sequence rejection");
+    assert!(matches!(
+        rejected,
+        Response::ReplicateEntry(Err(StoreError::InvalidReplicationSequence))
+    ));
+    assert_eq!(backend.replicate_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.max_replication_sequence().await.unwrap(), 0);
+
+    write_frame(
+        &mut stream,
+        &Request::RebuildReplicationState {
+            entries: vec![
+                ReplicationEntry {
+                    sequence: 1,
+                    tx_id: "wire-prefix-one".to_string(),
+                    op: ReplicationOp::Batch { ops: Vec::new() },
+                    timestamp: Timestamp::now_utc(),
+                },
+                ReplicationEntry {
+                    sequence: 3,
+                    tx_id: "wire-prefix-gap".to_string(),
+                    op: ReplicationOp::Batch { ops: Vec::new() },
+                    timestamp: Timestamp::now_utc(),
+                },
+            ],
+        },
+    )
+    .await
+    .expect("write malformed replication prefix");
+    let rebuild_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read typed rebuild rejection");
+    assert!(matches!(
+        rebuild_rejected,
+        Response::RebuildReplicationState(Err(StoreError::InvalidReplicationSequence))
+    ));
+    assert_eq!(backend.rebuild_calls.load(Ordering::SeqCst), 0);
+
+    write_frame(&mut stream, &Request::MaxReplicationSequence)
+        .await
+        .expect("write follow-up on retained connection");
+    let follow_up: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read follow-up on retained connection");
+    assert!(matches!(follow_up, Response::MaxReplicationSequence(Ok(0))));
+
+    handle.abort();
 }
 
 #[tokio::test]

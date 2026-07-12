@@ -18,6 +18,9 @@ evidence.
   writes.
 - `CompareAndSet`, `CompareAndSetResult`, `SessionOp`, and `SessionOpResult`
   model atomic mutation APIs.
+- `ReplicationEntry::validate_sequence`, `validate_replication_prefix`,
+  `validate_replication_page`, and `next_replication_sequence` define the
+  checked 1-based log-position contract shared by adapters and consumers.
 - `SessionKey`, `SessionKeyType`, `StateClass`, `StateType`, `Generation`,
   `OwnerId`, and `FenceToken` describe session identity and ownership.
 - `StoredSessionRecord` carries key, generation, owner, fence, state class/type,
@@ -214,6 +217,13 @@ destructively rebuild the fork.
   production authority: its current aggregation still materializes replica
   scans and resolves records without durable majority/commit proof (#127,
   #133).
+- Replication entries are strictly 1-based. Sequence zero is rejected with
+  `StoreError::InvalidReplicationSequence` before state, cryptography,
+  database, cache, or transport work; rebuild inputs must be a complete
+  contiguous prefix. SQLite also checks its signed integer boundary and the
+  agreement between each row position and serialized entry. These checks
+  prevent malformed-input panics and partial replacement caused by malformed
+  sequence metadata, but do not assign or prove distributed commit authority.
 
 ## Roadmap
 
@@ -221,8 +231,8 @@ destructively rebuild the fork.
 - Continue hardening restore evidence and traffic-blocking gates.
 - Complete durable sequencing and safe fork repair/recovery (#127–#129),
   bounded majority-authoritative restore (#133), fixed-width wire stabilization
-  (#134), invariant-safe model decoding (#135), plus oversized-TTL and
-  zero-sequence panic elimination (#137/#138).
+  (#134), invariant-safe model decoding (#135), plus oversized-TTL panic
+  elimination (#137).
 - Keep encryption AAD bound to namespace, NF kind, state type, generation,
   fence, and session-key digest.
 
@@ -232,6 +242,9 @@ destructively rebuild the fork.
   sqlite, topology, quorum, restore, and tests.
 - `tests/quorum_topology.rs` covers descriptor fingerprinting, complete
   remote-binding admission, typed mismatch classes, and redacted diagnostics.
+- `tests/replication_sequence_bounds.rs` covers direct Fake/SQLite append,
+  rebuild atomicity, signed persistence boundaries, and corrupt-row rejection;
+  quorum, encryption, cache, and session-net suites cover their own boundaries.
 - Run with: `cargo test -p opc-session-store`.
 
 ## License
