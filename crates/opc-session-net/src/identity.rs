@@ -4,11 +4,18 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
+pub use opc_consensus::ConsensusConfigurationEpoch as SessionConfigurationEpoch;
+use opc_consensus::{
+    derive_configuration_id, derive_node_id, ConsensusClusterId as SessionConsensusClusterId,
+    ConsensusIdentity as SessionConsensusIdentity, ConsensusNodeId as SessionConsensusNodeId,
+};
 #[cfg(any(feature = "insecure-test", test))]
 use opc_session_store::ReplicaBackingIdentity;
+#[cfg(any(feature = "legacy-session-net-compat", test))]
+use opc_session_store::{BackendPeerBinding, BackendPeerScopeIdentity};
 use opc_session_store::{
-    BackendPeerBinding, BackendPeerScopeIdentity, QuorumReplicaDescriptor, ReplicaEndpoint,
-    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, QUORUM_TOPOLOGY_MAX_MEMBERS,
+    QuorumReplicaDescriptor, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    QUORUM_TOPOLOGY_MAX_MEMBERS,
 };
 use opc_types::SpiffeId;
 use sha2::{Digest, Sha256};
@@ -33,6 +40,8 @@ pub enum SessionManifestError {
     TooManyMembers,
     #[error("session replication manifest contains a duplicate replica ID")]
     DuplicateReplicaId,
+    #[error("session replication manifest contains a duplicate consensus node ID")]
+    DuplicateConsensusNodeId,
     #[error("session replication manifest contains a duplicate TLS identity")]
     DuplicateTlsIdentity,
     #[error("session replication manifest contains a duplicate endpoint")]
@@ -82,11 +91,12 @@ impl fmt::Debug for SessionClusterId {
     }
 }
 
-/// Operator-controlled generation mixed into the deterministic manifest ID.
+/// Legacy operator-controlled generation mixed into the protocol-v4 backend
+/// manifest ID.
 ///
-/// Change this value when a security-relevant configuration outside the
-/// descriptor set changes. Descriptor mutations change the derived ID even if
-/// this generation is accidentally reused.
+/// New consensus composition must use [`SessionConfigurationEpoch`] for its
+/// monotonic authority boundary. This value remains only to preserve the
+/// legacy remote-backend handshake identity during migration.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionConfigurationGeneration(String);
 
@@ -146,14 +156,40 @@ struct ManifestMember {
 pub struct SessionReplicationManifest {
     cluster_id: SessionClusterId,
     configuration_id: SessionConfigurationId,
+    configuration_epoch: SessionConfigurationEpoch,
+    consensus_identity: SessionConsensusIdentity,
     members: BTreeMap<ReplicaId, ManifestMember>,
+    node_ids: BTreeMap<ReplicaId, SessionConsensusNodeId>,
 }
 
 impl SessionReplicationManifest {
     /// Validate a complete descriptor set and derive its configuration ID.
+    #[deprecated(
+        since = "0.2.0",
+        note = "use try_new_with_epoch; the compatibility constructor fixes epoch to 1"
+    )]
     pub fn try_new(
         cluster_id: SessionClusterId,
         generation: SessionConfigurationGeneration,
+        descriptors: Vec<QuorumReplicaDescriptor>,
+    ) -> Result<Self, SessionManifestError> {
+        Self::try_new_with_epoch(
+            cluster_id,
+            generation,
+            SessionConfigurationEpoch::new(1)
+                .expect("the fixed compatibility configuration epoch is non-zero"),
+            descriptors,
+        )
+    }
+
+    /// Validate a complete descriptor set and derive its consensus identity.
+    ///
+    /// Node IDs are stable cluster-scoped hashes of logical [`ReplicaId`] and
+    /// therefore do not change when another member is added or removed.
+    pub fn try_new_with_epoch(
+        cluster_id: SessionClusterId,
+        generation: SessionConfigurationGeneration,
+        configuration_epoch: SessionConfigurationEpoch,
         descriptors: Vec<QuorumReplicaDescriptor>,
     ) -> Result<Self, SessionManifestError> {
         if descriptors.is_empty() {
@@ -209,10 +245,41 @@ impl SessionReplicationManifest {
         }
         let configuration_id = SessionConfigurationId(hasher.finalize().into());
 
+        let consensus_cluster_id = SessionConsensusClusterId::new(cluster_id.as_str())
+            .map_err(|_| SessionManifestError::InvalidClusterId)?;
+        let consensus_epoch = configuration_epoch;
+        let component_fingerprints = members
+            .values()
+            .map(|member| member.descriptor.configuration_fingerprint())
+            .collect::<Vec<_>>();
+        let consensus_configuration_id = derive_configuration_id(
+            consensus_cluster_id,
+            consensus_epoch,
+            &component_fingerprints,
+        );
+        let consensus_identity = SessionConsensusIdentity::new(
+            consensus_cluster_id,
+            consensus_configuration_id,
+            consensus_epoch,
+        );
+        let mut node_ids = BTreeMap::new();
+        let mut admitted_node_ids = HashSet::with_capacity(members.len());
+        for replica_id in members.keys() {
+            let node_id = derive_node_id(consensus_cluster_id, replica_id.as_str().as_bytes())
+                .map_err(|_| SessionManifestError::DuplicateConsensusNodeId)?;
+            if !admitted_node_ids.insert(node_id) {
+                return Err(SessionManifestError::DuplicateConsensusNodeId);
+            }
+            node_ids.insert(replica_id.clone(), node_id);
+        }
+
         Ok(Self {
             cluster_id,
             configuration_id,
+            configuration_epoch,
+            consensus_identity,
             members,
+            node_ids,
         })
     }
 
@@ -222,6 +289,21 @@ impl SessionReplicationManifest {
 
     pub const fn configuration_id(&self) -> SessionConfigurationId {
         self.configuration_id
+    }
+
+    /// Monotonic operator-controlled consensus configuration epoch.
+    pub const fn configuration_epoch(&self) -> SessionConfigurationEpoch {
+        self.configuration_epoch
+    }
+
+    /// Exact cluster/configuration/epoch identity carried on consensus RPCs.
+    pub const fn consensus_identity(&self) -> SessionConsensusIdentity {
+        self.consensus_identity
+    }
+
+    /// Return the canonical consensus node ordinal for one admitted replica.
+    pub fn consensus_node_id(&self, replica_id: &ReplicaId) -> Option<SessionConsensusNodeId> {
+        self.node_ids.get(replica_id).copied()
     }
 
     pub fn configured_members(&self) -> usize {
@@ -252,6 +334,7 @@ impl fmt::Debug for SessionReplicationManifest {
         f.debug_struct("SessionReplicationManifest")
             .field("cluster_id", &self.cluster_id)
             .field("configuration_id", &self.configuration_id)
+            .field("configuration_epoch", &self.configuration_epoch)
             .field("configured_members", &self.members.len())
             .finish()
     }
@@ -285,6 +368,28 @@ impl LocalReplicaBinding {
         self.manifest.configured_members()
     }
 
+    /// Operator-controlled configuration epoch for this binding.
+    pub fn configuration_epoch(&self) -> SessionConfigurationEpoch {
+        self.manifest.configuration_epoch()
+    }
+
+    /// Exact consensus identity derived from the immutable manifest and epoch.
+    pub fn consensus_identity(&self) -> SessionConsensusIdentity {
+        self.manifest.consensus_identity()
+    }
+
+    /// Canonical non-zero node ordinal for this local replica.
+    pub fn local_consensus_node_id(&self) -> SessionConsensusNodeId {
+        self.manifest
+            .consensus_node_id(&self.local_replica_id)
+            .expect("validated local replica binding has a canonical node ID")
+    }
+
+    /// Canonical node ordinal for an admitted replica.
+    pub fn consensus_node_id(&self, replica_id: &ReplicaId) -> Option<SessionConsensusNodeId> {
+        self.manifest.consensus_node_id(replica_id)
+    }
+
     pub fn bind_remote(
         &self,
         remote_replica_id: ReplicaId,
@@ -304,6 +409,7 @@ impl LocalReplicaBinding {
             .map(|member| &member.spiffe_id)
     }
 
+    #[cfg(any(feature = "legacy-session-net-compat", test))]
     pub(crate) fn local_descriptor(&self) -> &QuorumReplicaDescriptor {
         &self.local_member().descriptor
     }
@@ -364,14 +470,39 @@ impl RemoteReplicaBinding {
         self.local.configured_members()
     }
 
+    /// Operator-controlled configuration epoch for this binding.
+    pub fn configuration_epoch(&self) -> SessionConfigurationEpoch {
+        self.local.configuration_epoch()
+    }
+
+    /// Exact consensus identity derived from the immutable manifest and epoch.
+    pub fn consensus_identity(&self) -> SessionConsensusIdentity {
+        self.local.consensus_identity()
+    }
+
+    /// Canonical node ordinal claimed by this authenticated client.
+    pub fn local_consensus_node_id(&self) -> SessionConsensusNodeId {
+        self.local.local_consensus_node_id()
+    }
+
+    /// Canonical node ordinal expected for the authenticated remote server.
+    pub fn remote_consensus_node_id(&self) -> SessionConsensusNodeId {
+        self.local
+            .consensus_node_id(&self.remote_replica_id)
+            .expect("validated remote replica binding has a canonical node ID")
+    }
+
+    #[cfg(any(feature = "legacy-session-net-compat", test))]
     pub(crate) fn local_descriptor(&self) -> &QuorumReplicaDescriptor {
         self.local.local_descriptor()
     }
 
+    #[cfg(any(feature = "legacy-session-net-compat", test))]
     pub(crate) fn remote_descriptor(&self) -> &QuorumReplicaDescriptor {
         &self.remote_member().descriptor
     }
 
+    #[cfg(any(feature = "legacy-session-net-compat", test))]
     pub(crate) fn backend_peer_binding(&self) -> BackendPeerBinding {
         BackendPeerBinding::new(
             self.local_replica_id().clone(),
@@ -427,9 +558,10 @@ fn insecure_test_manifest() -> Arc<SessionReplicationManifest> {
         )
     };
     Arc::new(
-        SessionReplicationManifest::try_new(
+        SessionReplicationManifest::try_new_with_epoch(
             SessionClusterId::new("insecure-test").expect("fixed insecure-test cluster"),
             SessionConfigurationGeneration::new("v3").expect("fixed insecure-test generation"),
+            SessionConfigurationEpoch::new(1).expect("fixed insecure-test epoch"),
             vec![
                 descriptor("insecure-client", "client", 1),
                 descriptor("insecure-server", "server", 2),
@@ -478,9 +610,19 @@ mod tests {
         generation: &str,
         descriptors: Vec<QuorumReplicaDescriptor>,
     ) -> SessionReplicationManifest {
-        SessionReplicationManifest::try_new(
+        manifest_with_epoch(cluster, generation, 1, descriptors)
+    }
+
+    fn manifest_with_epoch(
+        cluster: &str,
+        generation: &str,
+        epoch: u64,
+        descriptors: Vec<QuorumReplicaDescriptor>,
+    ) -> SessionReplicationManifest {
+        SessionReplicationManifest::try_new_with_epoch(
             SessionClusterId::new(cluster).expect("cluster ID"),
             SessionConfigurationGeneration::new(generation).expect("generation"),
+            SessionConfigurationEpoch::new(epoch).expect("configuration epoch"),
             descriptors,
         )
         .expect("manifest")
@@ -528,6 +670,90 @@ mod tests {
     }
 
     #[test]
+    fn consensus_identity_uses_shared_cluster_epoch_and_descriptor_derivation() {
+        let descriptors = vec![descriptor(1), descriptor(2), descriptor(3)];
+        let mut reordered = descriptors.clone();
+        reordered.reverse();
+        let original = manifest_with_epoch("cluster-a", "legacy-a", 7, descriptors.clone());
+        let same_scope = manifest_with_epoch("cluster-a", "legacy-b", 7, reordered);
+        assert_eq!(
+            original.consensus_identity(),
+            same_scope.consensus_identity()
+        );
+
+        let changed_epoch = manifest_with_epoch("cluster-a", "legacy-a", 8, descriptors.clone());
+        let changed_cluster = manifest_with_epoch("cluster-b", "legacy-a", 7, descriptors.clone());
+        let mut changed_descriptors = descriptors;
+        changed_descriptors[0] = QuorumReplicaDescriptor::new(
+            changed_descriptors[0].replica_id().clone(),
+            ReplicaEndpoint::new("replacement.session.invalid", 7443).expect("endpoint"),
+            changed_descriptors[0].tls_identity().clone(),
+            changed_descriptors[0].failure_domain().clone(),
+            changed_descriptors[0].backing_identity().clone(),
+        );
+        let changed_descriptor =
+            manifest_with_epoch("cluster-a", "legacy-a", 7, changed_descriptors);
+
+        assert_ne!(
+            original.consensus_identity(),
+            changed_epoch.consensus_identity()
+        );
+        assert_ne!(
+            original.consensus_identity(),
+            changed_cluster.consensus_identity()
+        );
+        assert_ne!(
+            original.consensus_identity(),
+            changed_descriptor.consensus_identity()
+        );
+    }
+
+    #[test]
+    fn consensus_node_ids_survive_reorder_add_remove_and_epoch_changes() {
+        let baseline = manifest_with_epoch(
+            "cluster-a",
+            "legacy-a",
+            7,
+            vec![descriptor(2), descriptor(3)],
+        );
+        let expanded = manifest_with_epoch(
+            "cluster-a",
+            "legacy-a",
+            8,
+            vec![descriptor(3), descriptor(1), descriptor(2)],
+        );
+        let reduced = manifest_with_epoch("cluster-a", "legacy-a", 9, vec![descriptor(2)]);
+        let replica_2 = ReplicaId::new("replica-2").expect("replica ID");
+        assert_eq!(
+            baseline.consensus_node_id(&replica_2),
+            expanded.consensus_node_id(&replica_2)
+        );
+        assert_eq!(
+            baseline.consensus_node_id(&replica_2),
+            reduced.consensus_node_id(&replica_2)
+        );
+        assert!(baseline
+            .consensus_node_id(&replica_2)
+            .is_some_and(|node_id| node_id.get() != 0));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_manifest_constructor_is_exactly_epoch_one() {
+        let descriptors = vec![descriptor(1), descriptor(2), descriptor(3)];
+        let legacy = SessionReplicationManifest::try_new(
+            SessionClusterId::new("cluster-a").expect("cluster"),
+            SessionConfigurationGeneration::new("legacy-a").expect("generation"),
+            descriptors.clone(),
+        )
+        .expect("legacy manifest");
+        let explicit = manifest_with_epoch("cluster-a", "legacy-a", 1, descriptors);
+
+        assert_eq!(legacy.configuration_epoch().get(), 1);
+        assert_eq!(legacy.consensus_identity(), explicit.consensus_identity());
+    }
+
+    #[test]
     fn manifest_scope_identifiers_enforce_exact_byte_bounds() {
         assert!(SessionClusterId::new("a".repeat(SESSION_CLUSTER_ID_MAX_BYTES)).is_ok());
         assert_eq!(
@@ -544,6 +770,10 @@ mod tests {
             ),
             Err(SessionManifestError::InvalidConfigurationGeneration)
         );
+        assert_eq!(
+            SessionConfigurationEpoch::new(0),
+            Err(opc_consensus::ConsensusIdentityError::InvalidConfigurationEpoch)
+        );
     }
 
     #[test]
@@ -557,9 +787,10 @@ mod tests {
             ReplicaBackingIdentity::new("disk-2").expect("backing identity"),
         );
         assert!(matches!(
-            SessionReplicationManifest::try_new(
+            SessionReplicationManifest::try_new_with_epoch(
                 SessionClusterId::new("cluster-a").expect("cluster ID"),
                 SessionConfigurationGeneration::new("generation-1").expect("generation"),
+                SessionConfigurationEpoch::new(1).expect("configuration epoch"),
                 vec![first, duplicate_id],
             ),
             Err(SessionManifestError::DuplicateReplicaId)
@@ -574,9 +805,10 @@ mod tests {
             ReplicaBackingIdentity::new("disk-2").expect("backing identity"),
         );
         assert!(matches!(
-            SessionReplicationManifest::try_new(
+            SessionReplicationManifest::try_new_with_epoch(
                 SessionClusterId::new("cluster-a").expect("cluster ID"),
                 SessionConfigurationGeneration::new("generation-1").expect("generation"),
+                SessionConfigurationEpoch::new(1).expect("configuration epoch"),
                 vec![first, duplicate_tls],
             ),
             Err(SessionManifestError::DuplicateTlsIdentity)
@@ -590,9 +822,10 @@ mod tests {
             ReplicaBackingIdentity::new("disk-malformed").expect("backing identity"),
         );
         assert!(matches!(
-            SessionReplicationManifest::try_new(
+            SessionReplicationManifest::try_new_with_epoch(
                 SessionClusterId::new("cluster-a").expect("cluster ID"),
                 SessionConfigurationGeneration::new("generation-1").expect("generation"),
+                SessionConfigurationEpoch::new(1).expect("configuration epoch"),
                 vec![malformed],
             ),
             Err(SessionManifestError::MalformedSpiffeIdentity)

@@ -1,0 +1,28 @@
+[package]
+name = "opc-consensus"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared exact-pinned Openraft substrate for OpenPacketCore durable state machines"
+readme = "README.md"
+documentation = "https://docs.rs/opc-consensus"
+keywords = ["5g", "cnf", "consensus", "telecom", "openraft"]
+categories = ["network-programming", "data-structures"]
+
+[dependencies]
+async-trait = { workspace = true }
+openraft = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,16 +1,15 @@
 use bytes::Bytes;
-mod support;
 
 use opc_session_store::{
     summarize_restore_records, BackendCapabilities, CompareAndSet, CompareAndSetResult,
     EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation, OwnerId,
-    QuorumSessionStore, RestoreBlockReason, RestoreBlockReasonCode, RestoreRecordSummary,
-    RestoreScanCursor, RestoreScanPage, RestoreScanRequest, RestoreScanScope, SessionBackend,
-    SessionKey, SessionKeyType, SessionLeaseManager, SessionStoreBackend, SqliteSessionBackend,
-    StateClass, StateType, StoreError, StoredSessionRecord, RESTORE_SCAN_MAX_PAGE_SIZE,
+    RestoreBlockReason, RestoreBlockReasonCode, RestoreRecordSummary, RestoreScanCursor,
+    RestoreScanPage, RestoreScanRequest, RestoreScanScope, SessionBackend, SessionKey,
+    SessionKeyType, SessionLeaseManager, StateClass, StateType, StoreError, StoredSessionRecord,
+    RESTORE_SCAN_MAX_PAGE_SIZE,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 fn record(
     owner: &str,
@@ -71,32 +70,6 @@ async fn write_record<B>(
     .await;
 }
 
-async fn write_record_generation<B>(
-    backend: &B,
-    key: SessionKey,
-    owner: &'static str,
-    state_class: StateClass,
-    state_type: &'static str,
-    payload: &'static [u8],
-    generation: u64,
-) where
-    B: SessionBackend + SessionLeaseManager,
-{
-    write_record_fields(
-        backend,
-        WriteRecordFields {
-            key,
-            owner,
-            state_class,
-            state_type,
-            payload,
-            expires_at: None,
-            generation,
-        },
-    )
-    .await;
-}
-
 struct WriteRecordFields {
     key: SessionKey,
     owner: &'static str,
@@ -135,22 +108,6 @@ where
         .await
         .expect("cas");
     assert_eq!(result, CompareAndSetResult::Success);
-}
-
-fn sqlite_quorum(size: usize) -> (QuorumSessionStore, Vec<Arc<SqliteSessionBackend>>) {
-    let backends = (0..size)
-        .map(|_| Arc::new(SqliteSessionBackend::in_memory().expect("sqlite replica")))
-        .collect::<Vec<_>>();
-    let replicas = backends
-        .iter()
-        .enumerate()
-        .map(|(idx, backend)| {
-            let backend: Arc<dyn SessionStoreBackend> = backend.clone();
-            support::member(idx, backend)
-        })
-        .collect();
-
-    (support::validated_ha(replicas), backends)
 }
 
 #[test]
@@ -371,7 +328,7 @@ fn restore_scan_page_validation_rejects_untrusted_contract_violations() {
 }
 
 #[tokio::test]
-async fn restore_scan_capability_is_enforced_and_quorum_aggregated() {
+async fn restore_scan_capability_is_enforced() {
     let mut caps = BackendCapabilities::all_enabled();
     caps.restore_scan = false;
     let backend = FakeSessionBackend::with_capabilities(caps);
@@ -384,14 +341,6 @@ async fn restore_scan_capability_is_enforced_and_quorum_aggregated() {
         err,
         StoreError::CapabilityNotSupported("restore_scan".into())
     );
-
-    let quorum = support::validated_ha(vec![
-        support::member(0, Arc::new(FakeSessionBackend::new())),
-        support::member(1, Arc::new(FakeSessionBackend::with_capabilities(caps))),
-        support::member(2, Arc::new(FakeSessionBackend::new())),
-    ]);
-
-    assert!(!quorum.capabilities().await.restore_scan);
 }
 
 #[tokio::test]
@@ -437,111 +386,4 @@ async fn restore_scan_sqlite_matches_live_scope_semantics() {
         StateType::from_static("teid-map")
     );
     assert!(page.complete);
-}
-
-#[tokio::test]
-async fn restore_scan_quorum_sqlite_merges_filters_pages_and_deduplicates_generations() {
-    let (quorum, replicas) = sqlite_quorum(3);
-    let scope = RestoreScanScope {
-        tenant: Some(TenantId::from_static("tenant-a")),
-        nf_kind: Some(NetworkFunctionKind::from_static("upf")),
-        state_class: Some(StateClass::DataplaneLookup),
-        ..RestoreScanScope::all()
-    };
-
-    for replica in &replicas {
-        write_record(
-            replica.as_ref(),
-            key("tenant-a", "upf", b"scan-a"),
-            "owner-a",
-            StateClass::DataplaneLookup,
-            "teid-map",
-            b"payload-a",
-            None,
-        )
-        .await;
-    }
-    write_record_generation(
-        replicas[0].as_ref(),
-        key("tenant-a", "upf", b"scan-b"),
-        "owner-old",
-        StateClass::DataplaneLookup,
-        "teid-map",
-        b"payload-old",
-        1,
-    )
-    .await;
-    write_record_generation(
-        replicas[1].as_ref(),
-        key("tenant-a", "upf", b"scan-b"),
-        "owner-new",
-        StateClass::DataplaneLookup,
-        "teid-map",
-        b"payload-new",
-        3,
-    )
-    .await;
-    write_record(
-        replicas[2].as_ref(),
-        key("tenant-a", "upf", b"scan-c"),
-        "owner-c",
-        StateClass::DataplaneLookup,
-        "teid-map",
-        b"payload-c",
-        None,
-    )
-    .await;
-    write_record(
-        replicas[0].as_ref(),
-        key("tenant-b", "upf", b"excluded-tenant"),
-        "owner-excluded",
-        StateClass::DataplaneLookup,
-        "teid-map",
-        b"payload-excluded",
-        None,
-    )
-    .await;
-    write_record(
-        replicas[1].as_ref(),
-        key("tenant-a", "upf", b"excluded-class"),
-        "owner-excluded",
-        StateClass::AuthoritativeSession,
-        "pdu-session",
-        b"payload-excluded",
-        None,
-    )
-    .await;
-
-    let request = RestoreScanRequest {
-        scope,
-        cursor: None,
-        limit: 2,
-    };
-    let first = quorum
-        .scan_restore_records(request.clone())
-        .await
-        .expect("first quorum restore-scan page");
-
-    assert_eq!(first.loaded_count, 2);
-    assert_eq!(first.excluded_count, 2);
-    assert!(!first.complete);
-    assert_eq!(first.next_cursor, Some(RestoreScanCursor::from_offset(2)));
-    assert_eq!(first.records[0].key.stable_id.as_ref(), b"scan-a");
-    assert_eq!(first.records[1].key.stable_id.as_ref(), b"scan-b");
-    assert_eq!(first.records[1].generation, Generation::new(3));
-    assert_eq!(first.records[1].owner, OwnerId::new("owner-new").unwrap());
-
-    let second = quorum
-        .scan_restore_records(RestoreScanRequest {
-            cursor: first.next_cursor,
-            ..request
-        })
-        .await
-        .expect("second quorum restore-scan page");
-
-    assert_eq!(second.loaded_count, 1);
-    assert_eq!(second.excluded_count, 2);
-    assert!(second.complete);
-    assert_eq!(second.next_cursor, None);
-    assert_eq!(second.records[0].key.stable_id.as_ref(), b"scan-c");
 }

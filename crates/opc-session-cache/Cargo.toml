@@ -22,10 +22,11 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["time", "sync", "test-util"] }
+opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
+opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-session-testkit = { path = "../opc-session-testkit", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 bytes = { workspace = true }
-zeroize = { workspace = true }
 
 [lints]
 workspace = true

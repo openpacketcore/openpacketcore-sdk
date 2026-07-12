@@ -701,15 +701,14 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing};
     use opc_session_store::{
         BackendCapabilities, BackendInstanceIdentity, BackendPeerBinding, CompareAndSet,
-        CompareAndSetResult, EncryptedSessionPayload, FakeSessionBackend, FenceToken,
-        FencedSessionReplica, Generation, LeaseGuard, OwnerId, QuorumReplicaDescriptor,
-        QuorumReplicaMember, QuorumSessionStore, QuorumTopologyConfig, ReplicaBackingIdentity,
-        ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionBackend,
-        SessionLeaseManager, SessionOp, SessionOpResult, SessionStore, StateType,
-        StoredSessionRecord, ValidatedQuorumTopology,
+        CompareAndSetResult, EncryptedSessionPayload, EncryptingSessionBackend, FakeSessionBackend,
+        FenceToken, Generation, LeaseGuard, OwnerId, SessionBackend, SessionLeaseManager,
+        SessionOp, SessionOpResult, SessionStore, StateType, StoredSessionRecord,
     };
+    use opc_session_testkit::ConsensusTestCluster;
     use tokio::sync::{Barrier, Notify};
 
     use super::*;
@@ -721,42 +720,25 @@ mod tests {
         )
     }
 
+    fn encryption_provider() -> Arc<MemoryKeyProvider> {
+        let provider = Arc::new(MemoryKeyProvider::new());
+        provider
+            .insert_active_key(
+                KeyId::new("ipsec-ownership-session-key").expect("test key ID"),
+                KeyPurpose::Session,
+                TenantId::new("tenant-a").expect("test tenant"),
+                Zeroizing::new([0x5a; 32]),
+            )
+            .expect("install test session key");
+        provider
+    }
+
     fn transition_id(value: u128) -> OwnershipTransitionId {
         OwnershipTransitionId::new(value).unwrap()
     }
 
     fn fingerprint(value: u8) -> OwnershipTransitionFingerprint {
         OwnershipTransitionFingerprint::from_bytes([value; 32])
-    }
-
-    fn validated_quorum(replicas: Vec<FencedSessionReplica>) -> QuorumSessionStore {
-        let members = replicas
-            .into_iter()
-            .map(|replica| {
-                let index = replica.id;
-                QuorumReplicaMember::new(
-                    QuorumReplicaDescriptor::new(
-                        ReplicaId::new(format!("ipsec-test-replica-{index}"))
-                            .expect("test replica ID"),
-                        ReplicaEndpoint::new(format!("ipsec-test-replica-{index}.invalid"), 7443)
-                            .expect("test endpoint"),
-                        ReplicaTlsIdentity::new(format!("spiffe://test/ipsec/replica/{index}"))
-                            .expect("test TLS identity"),
-                        ReplicaFailureDomain::new(format!("ipsec-test-domain-{index}"))
-                            .expect("test failure domain"),
-                        ReplicaBackingIdentity::new(format!("ipsec-test-backing-{index}"))
-                            .expect("test backing identity"),
-                    ),
-                    replica,
-                )
-            })
-            .collect();
-        let topology = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new(
-            ReplicaId::new("ipsec-test-replica-0").expect("test local ID"),
-            members,
-        ))
-        .expect("valid IPsec test topology");
-        QuorumSessionStore::from_validated_topology(topology)
     }
 
     async fn write_owner<B>(
@@ -1283,14 +1265,17 @@ mod tests {
 
     #[tokio::test]
     async fn quorum_fencer_returns_only_the_majority_committed_owner_and_fence() {
-        let replicas = (0..3)
-            .map(|id| FencedSessionReplica::new(id, Arc::new(FakeSessionBackend::new())))
-            .collect::<Vec<_>>();
+        let cluster = ConsensusTestCluster::start(3).await;
         // Exercise production quorum semantics while one configured replica
         // is unavailable: both lease acquisition and CAS still require the
         // two-replica majority before a grant can be returned.
-        replicas[2].set_client_online(false).await;
-        let quorum = validated_quorum(replicas);
+        cluster.set_node_online(2, false);
+        cluster.wait_node_durable_ready(0).await;
+        let quorum = EncryptingSessionBackend::new(
+            Arc::new(cluster.store(0)),
+            encryption_provider(),
+            "ipsec-ownership-test",
+        );
         let keyspace = keyspace();
         let sa = SaId::Ike {
             responder_spi: 0x1122_3344_5566_7788,
@@ -1446,10 +1431,12 @@ mod tests {
 
     #[tokio::test]
     async fn quorum_concurrent_promotions_have_exactly_one_committed_winner() {
-        let replicas = (0..3)
-            .map(|id| FencedSessionReplica::new(id, Arc::new(FakeSessionBackend::new())))
-            .collect::<Vec<_>>();
-        let quorum = validated_quorum(replicas);
+        let cluster = ConsensusTestCluster::start(3).await;
+        let quorum = EncryptingSessionBackend::new(
+            Arc::new(cluster.store(0)),
+            encryption_provider(),
+            "ipsec-ownership-test",
+        );
         let keyspace = keyspace();
         let sa = SaId::Esp { spi: 0x6677_8899 };
         let key = keyspace.sa_key(sa).unwrap();
@@ -1963,8 +1950,8 @@ mod tests {
             Err(IpsecLbError::InvalidConfig { .. })
         ));
 
+        assert!(EncryptedSessionPayload::try_envelope(b"").is_err());
         for payload in [
-            EncryptedSessionPayload::envelope(b""),
             EncryptedSessionPayload::legacy_plaintext(b""),
             EncryptedSessionPayload::unclassified(b""),
         ] {

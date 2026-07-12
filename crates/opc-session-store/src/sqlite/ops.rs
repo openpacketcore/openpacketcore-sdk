@@ -20,6 +20,23 @@ pub(crate) fn persisted_owner_id(value: String) -> Result<OwnerId, StoreError> {
         .map_err(|_| StoreError::Serialization("persisted session owner is invalid".to_string()))
 }
 
+pub(crate) fn persisted_u64(value: i64) -> Result<u64, StoreError> {
+    u64::try_from(value)
+        .map_err(|_| StoreError::Serialization("persisted session integer is negative".to_string()))
+}
+
+pub(crate) fn sqlite_u64(value: u64) -> Result<i64, StoreError> {
+    i64::try_from(value)
+        .map_err(|_| StoreError::Serialization("session integer exceeds SQLite range".to_string()))
+}
+
+pub(crate) fn timestamp_unix_millis(value: Timestamp) -> Result<i64, StoreError> {
+    let millis = value.as_offset_datetime().unix_timestamp_nanos() / 1_000_000;
+    i64::try_from(millis).map_err(|_| {
+        StoreError::Serialization("session timestamp exceeds SQLite range".to_string())
+    })
+}
+
 pub(crate) fn format_rfc3339_normalized(ts: Timestamp) -> String {
     let odt = ts.as_offset_datetime();
     format!(
@@ -101,7 +118,7 @@ pub(crate) fn validate_fenced_mutation_sync(
         return Err(StoreError::StaleFence);
     }
 
-    if credential_id as u64 != lease.credential_id() {
+    if persisted_u64(credential_id)? != lease.credential_id() {
         return Err(StoreError::StaleFence);
     }
 
@@ -109,7 +126,7 @@ pub(crate) fn validate_fenced_mutation_sync(
         return Err(StoreError::StaleFence);
     }
 
-    if fence as u64 != lease.fence().get() {
+    if persisted_u64(fence)? != lease.fence().get() {
         return Err(StoreError::StaleFence);
     }
 
@@ -155,7 +172,9 @@ pub(crate) fn current_fence_sync(conn: &Connection, key: &SessionKey) -> Result<
         .optional()
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
-    Ok(row.unwrap_or(0) as u64)
+    row.map(persisted_u64)
+        .transpose()
+        .map(Option::unwrap_or_default)
 }
 
 pub(crate) fn get_sync(
@@ -208,7 +227,6 @@ pub(crate) fn get_sync(
         encoding,
     )) = row
     else {
-        prune_sync(conn, now)?;
         return Ok(None);
     };
 
@@ -234,22 +252,22 @@ pub(crate) fn get_sync(
         None => None,
     };
     let payload = match encoding {
-        0 => EncryptedSessionPayload::from_vec_with_encoding(
+        0 => EncryptedSessionPayload::try_from_vec_with_encoding(
             payload_bytes,
             SessionPayloadEncoding::Plaintext,
-        ),
-        1 => EncryptedSessionPayload::from_vec_with_encoding(
+        )?,
+        1 => EncryptedSessionPayload::try_from_vec_with_encoding(
             payload_bytes,
             SessionPayloadEncoding::LegacyPlaintext,
-        ),
-        2 => EncryptedSessionPayload::from_vec_with_encoding(
+        )?,
+        2 => EncryptedSessionPayload::try_from_vec_with_encoding(
             payload_bytes,
             SessionPayloadEncoding::EnvelopeV1,
-        ),
-        3 => EncryptedSessionPayload::from_vec_with_encoding(
+        )?,
+        3 => EncryptedSessionPayload::try_from_vec_with_encoding(
             payload_bytes,
             SessionPayloadEncoding::Unclassified,
-        ),
+        )?,
         _ => {
             return Err(StoreError::Serialization(format!(
                 "unknown payload encoding: {encoding}"
@@ -259,9 +277,9 @@ pub(crate) fn get_sync(
 
     let record = StoredSessionRecord {
         key: key.clone(),
-        generation: Generation::new(generation as u64),
+        generation: Generation::new(persisted_u64(generation)?),
         owner,
-        fence: FenceToken::new(fence as u64),
+        fence: FenceToken::new(persisted_u64(fence)?),
         state_class,
         state_type,
         expires_at,
@@ -273,7 +291,6 @@ pub(crate) fn get_sync(
     } else {
         Some(record)
     };
-    prune_sync(conn, now)?;
     Ok(result)
 }
 
@@ -357,11 +374,6 @@ pub(crate) fn scan_restore_records_sync(
         }
     }
 
-    // Validate every persisted row before pruning. The caller runs this
-    // routine in a transaction, so a corrupt row or a pruning failure cannot
-    // leave unrelated expiry cleanup committed behind an error.
-    prune_sync(conn, now)?;
-
     let start = request
         .cursor
         .map(RestoreScanCursor::offset)
@@ -375,7 +387,7 @@ pub(crate) fn scan_restore_records_sync(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stored_record_from_row(
+pub(crate) fn stored_record_from_row(
     tenant_str: String,
     nf_kind_str: String,
     key_type_str: String,
@@ -414,9 +426,9 @@ fn stored_record_from_row(
             key_type,
             stable_id: Bytes::from(stable_id),
         },
-        generation: Generation::new(generation as u64),
+        generation: Generation::new(persisted_u64(generation)?),
         owner,
-        fence: FenceToken::new(fence as u64),
+        fence: FenceToken::new(persisted_u64(fence)?),
         state_class,
         state_type,
         expires_at,
@@ -442,22 +454,22 @@ fn payload_from_row(
     encoding: i64,
 ) -> Result<EncryptedSessionPayload, StoreError> {
     match encoding {
-        0 => Ok(EncryptedSessionPayload::from_vec_with_encoding(
+        0 => EncryptedSessionPayload::try_from_vec_with_encoding(
             payload_bytes,
             SessionPayloadEncoding::Plaintext,
-        )),
-        1 => Ok(EncryptedSessionPayload::from_vec_with_encoding(
+        ),
+        1 => EncryptedSessionPayload::try_from_vec_with_encoding(
             payload_bytes,
             SessionPayloadEncoding::LegacyPlaintext,
-        )),
-        2 => Ok(EncryptedSessionPayload::from_vec_with_encoding(
+        ),
+        2 => EncryptedSessionPayload::try_from_vec_with_encoding(
             payload_bytes,
             SessionPayloadEncoding::EnvelopeV1,
-        )),
-        3 => Ok(EncryptedSessionPayload::from_vec_with_encoding(
+        ),
+        3 => EncryptedSessionPayload::try_from_vec_with_encoding(
             payload_bytes,
             SessionPayloadEncoding::Unclassified,
-        )),
+        ),
         _ => Err(StoreError::Serialization(format!(
             "unknown payload encoding: {encoding}"
         ))),
@@ -487,9 +499,9 @@ pub(crate) fn insert_or_replace_record_sync(
             record.key.nf_kind.as_str(),
             record.key.key_type.to_string(),
             record.key.stable_id.as_ref(),
-            record.generation.get() as i64,
+            sqlite_u64(record.generation.get())?,
             record.owner.as_str(),
-            record.fence.get() as i64,
+            sqlite_u64(record.fence.get())?,
             record.state_class.to_string(),
             record.state_type.as_str(),
             expires_at_str,
@@ -518,7 +530,7 @@ pub(crate) fn insert_or_replace_fence_sync(
             key.nf_kind.as_str(),
             key.key_type.to_string(),
             key.stable_id.as_ref(),
-            fence as i64,
+            sqlite_u64(fence)?,
         ],
     )
     .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;

@@ -3,20 +3,21 @@
 This document details the High Availability (HA) architecture and implementation for the
 OpenPacketCore config and session persistence surfaces.
 
-- **Config Store**: `ConsensusConfigStore` is a durable config-consensus
-  prototype with durable membership, transport-level mTLS/SPIFFE identity checks,
-  Raft-like safety guards, snapshots, metrics hooks, and multi-process fault
-  tests. These are tested prototype properties, not carrier HA qualification.
-- **Session Store**: `QuorumSessionStore` is an in-process quorum ordered-log
-  adapter with fail-closed configured-topology admission, a
-  fresh bounded durable-readiness assessment, safe strict-prefix catch-up,
-  watch cursors, and chaos tests. Production networked HA depends on the
-  experimental `opc-session-net` transport and further safety and
-  distributed/soak evidence.
+- **Config Store**: the current `opc-persist` config-consensus implementation is
+  a transition-only custom prototype. ADR 0019 requires its replacement with
+  the shared Openraft engine under #177 before the workspace can claim one
+  production consensus architecture.
+- **Session Store**: `ConsensusSessionStore` (and its `QuorumSessionStore` type
+  alias) uses Openraft as the sole election, log, commit, membership, and
+  linearizable-read authority. The SDK supplies validated identity,
+  authenticated bounded transport, deterministic session semantics, committed
+  journal/watch output, and encrypted-envelope storage below the application
+  protection wrapper.
 
 Historical closure language below refers only to scoped algorithms and test
-harnesses. Config-store qualification (`GAP-001-006`) and production networked
-session HA (`GAP-004-004`) remain open; neither component is approved as a
+harnesses. The config migration (#177), session repair/recovery/restore
+(#128/#129/#133), and production networked qualification (#143 plus the
+credential-rotation chain) remain open; neither component is yet approved as a
 production deployment profile.
 
 ---
@@ -144,53 +145,49 @@ Platform hardening concerns—including TLS/SPIFFE SVID and bundle watch/reload 
 
 ---
 
-## 2. Replicated Session Store Ordered Log: `QuorumSessionStore`
+## 2. Openraft Session Store: `ConsensusSessionStore`
 
-The algorithm below describes intended and prototype-tested behavior; it is not
-yet durable distributed proof or a production deployment contract. Configured
-topology admission and fresh durable readiness are implemented. Authenticated
-identity binding and fixed-width admission are implemented in protocol v4;
-durable sequencing and safe
-fork recovery (#127–#129), and bounded majority-authoritative restore (#133)
-remain open. #134's private fixed-width wire DTOs and checked conversions are
-implemented. #135's structural owner/key
-model, persistence/transport decode validation, bounded offline SQLite audit,
-and typed-invalid handover rejection are implemented. Checked session TTL and
-replication-sequence handling now fail closed at direct, wrapper, cache,
-SQLite, quorum, and authenticated transport boundaries under #137/#138.
-Bounded iterative protection of every nested replicated CAS is implemented
-under #147. Bounded outbound response/watch frames and slow-reader writes are
-implemented under #159. Its stable-ID and replication-transaction-ID checks are
-wire containment only: production model/persistence/audit/migration contracts
-remain #167/#168, with #168 coordinated with #127/#128/#143. `opc-persist`'s
-`TcpPeer::timeout` still applies per I/O stage across up to three attempts with backoff;
-#169 owns one atomic end-to-end logical-RPC deadline,
-safe retry policy, and metrics. These boundary fixes do not provide durable authority.
+#127 replaces the custom majority-prefix coordinator with Openraft.
+`ConsensusSessionStore` is the implementation and `QuorumSessionStore` is an
+alias to it. Openraft alone elects leaders, persists votes, matches logs,
+commits entries, owns membership and snapshot lineage, and supplies
+linearizable read barriers. The SDK implements deterministic session commands,
+SQLite storage traits, bounded authenticated RPC adapters, idempotent request
+outcomes, a committed application journal, watch cursors, logical expiry time,
+and encryption-envelope admission.
 
-`QuorumSessionStore` coordinates session leases and CAS mutations across a set of `SessionStoreBackend` replicas using quorum-backed ordered replication. It is not a Raft implementation; its target safety contract is a durable committed log prefix where an entry is authoritative only after the same sequence entry is present on a majority of replicas.
+This is durable sequencing authority, but not yet a complete production
+deployment claim. Committed-state repair and legacy-fork recovery remain
+#128/#129, bounded majority-authoritative restore remains #133, watch and expiry
+hardening remain #145/#148, and network/resource/rotation qualification remains
+#143 and the #162 -> #161 -> #163 -> #158 -> #164 credential chain. Stable IDs,
+durable transaction IDs, and log-range cursors remain #167/#168/#171.
 
 ### Configured topology admission
 
 Operational construction consumes `ValidatedQuorumTopology`. HA admission
 requires an odd set of 3 through 31 members, one exact local `ReplicaId`, and
 unique logical IDs, canonical endpoints, expected TLS identities, failure
-domains, backing-store identities, and process-local adapter instances. The required
-quorum is precomputed from that immutable configured membership, and vote
-accounting is keyed by `ReplicaId` rather than raw vector entries.
+domains, backing-store identities, and derived stable node IDs. The topology is
+descriptor-only: the node's one local SQLite backend and exact remote
+consensus-peer map are supplied separately after admission. Admission also
+requires a cluster ID, monotonic configuration epoch, and an
+order-independent configuration digest that exactly matches the descriptors.
+Stable Openraft node IDs are derived from cluster plus logical `ReplicaId`, fit
+SQLite's positive signed-64-bit domain, and do not change when other members
+are reordered, added, or removed. Openraft owns vote accounting and quorum.
 
 Logical identity, endpoint, TLS identity, failure domain, and backing identity
 are independent. A bare local ID can belong to a member with an FQDN endpoint;
 no hostname shortening or endpoint-as-identity inference occurs. The explicit
-lab singleton reports `single-replica`. The deprecated raw-vector constructor
-reports `unknown`, masks capabilities, and refuses operations.
+consensus lab singleton uses the same engine but reports `single-replica`.
 
-For authenticated network adapters, admission also verifies
-`BackendPeerBinding`: the configured local and remote IDs, exact remote TLS
-identity, both descriptor fingerprints, member count, and one shared opaque
-configuration scope must match the admitted topology. An in-process local
-backend may remain unbound. This is composition evidence, not fresh peer
-reachability or physical-store provenance, and it does not establish durable
-commit/repair/restore authority (#127/#128/#133).
+Production peers use the dedicated `opc-session-consensus/1` ALPN. Every RPC
+binds the live SPIFFE identity, configured local and remote logical IDs, stable
+node IDs, cluster/configuration/epoch, sender field, expected server profile,
+and a fresh challenge before Openraft dispatch. This is authentication and
+composition evidence, not physical-store provenance. A CNF must still map each
+logical voter to exactly one durable backing volume.
 
 ### Structural identity and legacy persistence admission
 
@@ -247,40 +244,31 @@ renames, repairs, or rewrites an invalid value. Use a reviewed
 semantic-preserving product migration or audited store replacement, then
 re-audit before startup.
 
-This is #135 boundary evidence, not durable consensus or production HA. #127
-and #143 remain open; #134 closes only fixed-width v4 admission. #143 includes
-seamless SVID, payload-protection-key, and trust-bundle rotation under live
-distributed load.
+This is #135 boundary evidence, not production HA. #127 now supplies durable
+consensus independently; #134 closes only fixed-width legacy-v4 admission.
+#143 still includes distributed load and payload-protection-key qualification,
+while seamless SVID/trust rotation follows the dedicated rotation issue chain.
 
 ### Fresh durable readiness
 
 Capability declarations and `SessionStorePlatformProfile::Quorum` remain
 admission evidence only. `QuorumSessionStore::probe_durable_readiness` bypasses
-cached capabilities and performs a fresh, deadline- and log-work-bounded
-assessment of the admitted voters. `DurableReadinessReport` exposes these stable
-states: `Ready`, `NoQuorum`, `TopologyInvalid`, and `RecoveryRequired`;
-configured, freshly reachable, agreeing, and required voter counts
-(`configured_voters`, `fresh_reachable_voters`, `agreeing_voters`, and
-`required_quorum`); an optional `majority_visible_prefix_index`; and one typed
-observation per configured voter.
+cached capabilities and invokes Openraft's bounded linearizable-read barrier,
+then waits until the local state machine has applied through that log ID.
+`Ready` therefore proves the same fresh quorum path required by real reads, not
+merely that a listener was bound. Writes use bounded `client_write`; reads use
+the barrier every time and never trust a prior readiness result.
 
-The limits are configured once on the store and are shared by explicit probes
-and authoritative operations. Log evidence is fetched in bounded adaptive
-pages, so a healthy log larger than one network frame remains assessable.
+The report remains point-in-time evidence rather than an ownership lease.
+Products must continuously close ownership publication and traffic
+advertisement when it becomes `NoQuorum`. Diagnostics remain bounded and
+redacted; peer identities and peer-controlled errors are not labels or report
+payloads.
 
-Per-replica failure classes are `Transport`, `Authentication`, `Timeout`,
-`Protocol`, `Backend`, `LogUnavailable`, `Divergent`, `RepairFailed`, and
-`ProbeBudgetExceeded`. These are bounded reason codes rather than raw peer,
-transport, or backend errors. The report is point-in-time evidence rather than
-a lease, and each authoritative operation repeats the same fail-closed
-assessment.
-
-Automatic readiness repair is limited to appending a majority-visible suffix
-to a replica whose complete log is a strict shorter prefix. A conflict or
-longer minority tail produces `RecoveryRequired`; this path neither truncates
-nor destructively rebuilds the replica. The observed index is deliberately
-called majority-visible rather than committed until #127/#128 establish durable
-commit and repair authority.
+Openraft reconciles normal follower log divergence. Recovery of an already
+forked legacy custom-coordinator database requires #128/#129 because the old
+format cannot prove which conflicting tail was committed. Readiness never
+guesses or performs an unaudited destructive rebuild.
 
 ### Bounded TTL inputs
 
@@ -308,10 +296,9 @@ microsecond above exact `entry.timestamp + ttl` for legacy `seconds_f64`
 rounding only; new deadlines remain exact, the TTL bound is unchanged, and
 larger mismatches fail closed.
 
-This closes only the duration-input/process-availability gap in #137. It does
-not make a majority-visible entry committed and does not change the open
-consensus, repair, restore, or qualification work. Caller-authored absolute
-record expiry remains #148.
+This closes only the duration-input/process-availability gap in #137. Openraft
+commit authority is independent; repair, restore, and qualification work remain
+open. Caller-authored absolute record expiry remains #148.
 
 ### Bounded protected replication trees
 
@@ -350,11 +337,41 @@ replacement before the new SDK starts; it must not be clamped or split ad hoc.
 Raw inner-backend rebuild does not add protection.
 
 #147 closes only this bounded nested-payload path. The session profile remains
-experimental. Seamless SVID/trust-bundle lifecycle remains #158;
-payload-protection-key rotation and distributed production qualification remain
-#143. These are separate mandatory gates.
+experimental until the remaining non-consensus gates pass. Seamless SVID/trust-bundle lifecycle remains #158;
+remote-seal historical-key rotation remains #179, while distributed
+payload-protection and production qualification remain #143. These are
+separate mandatory gates.
 
-### Authenticated network transport (protocol v4)
+### Consensus transport and encryption boundary
+
+The production authority path uses `SessionConsensusServer` and
+`RemoteSessionConsensusPeer` over the exact `opc-session-consensus/1` ALPN.
+Consensus DTOs carry only bounded Openraft RPC families and application
+forward/read-barrier requests. Sender identity is checked against both the
+authenticated peer and the inner Openraft vote/log sender before dispatch.
+The legacy writable backend protocol cannot negotiate on this listener.
+
+Payload protection remains outside consensus:
+
+```text
+application -> EncryptingSessionBackend / RemoteSealingSessionBackend
+            -> ConsensusSessionStore -> Openraft -> SQLite and snapshots
+```
+
+New plaintext writes are sealed before `client_write`. Openraft, consensus RPC
+encoding, follower apply, replay, outcomes, snapshots, and restart have no key
+provider and see only opaque envelopes. Historical-key lookup occurs only when
+a read crosses the outer wrapper. Tests prove plaintext and raw key canaries are
+absent from RPC frames, state/log/outcome tables, WAL/SHM, and snapshot files;
+provider call counts stay unchanged during replication, snapshot, and restart.
+Missing historical keys fail reads closed without preventing already-sealed
+quorum recovery.
+
+This is payload-envelope encryption, not full-database encryption. Membership,
+indexes, routing fields, owners, fences, timestamps, and envelope key IDs remain
+visible unless a separate approved storage layer protects them.
+
+### Legacy backend and restore transport (protocol v4)
 
 `opc-session-net` protocol v4 carries validated restore-scan requests and pages
 to individual remote replicas. A server may shorten a multi-record page to the
@@ -487,20 +504,35 @@ uses bounded operation-family/reason categories for oversize/fallback/timeout
 without logging keys, payloads, owners, transaction IDs, peer identities, or
 backend/peer-controlled error text.
 
-This closes per-replica transport parity only. Quorum selection/merge remains
-#133, while durable sequencing and repair authority remain #127/#128.
-Authenticated membership does not make protocol v4 a consensus algorithm and
-does not reconcile a divergent or forked log.
+This closes per-replica compatibility transport parity only. Restore
+selection/merge remains #133. Protocol v4 is not the production consensus
+protocol and does not establish authority; #127 uses the separate Openraft
+transport above, while legacy-fork repair remains #128/#129.
 
 ### Log & Replication Model
-- **Persisted Replica Logs**: The current coordinator assigns sequence numbers to replicated mutations (AcquireLease, RenewLease, ReleaseLease, CompareAndSet, DeleteFenced, RefreshTtl, Batch), and each accepting replica writes them to `session_replication_log`. Operation trees are bounded to depth 16 and 256 total nodes, and protection wrappers iteratively transform every nested CAS before delegation/exposure. Leader/term-gated global sequence authority remains #127.
-- **Idempotency & Replay Semantics**: Duplicate delivery is handled safely. Before appending, replicas check whether the entry's sequence has already been applied. Only an exact full-entry match is accepted as an idempotent success; reusing the same transaction ID with a changed operation or timestamp fails closed as divergence. Replaying an exact entry does not mutate the state twice.
-- **Current Majority-Visible Prefix Heuristic**: The coordinator compares fresh logs visible from the configured majority. It may append a missing suffix to an exact strict-prefix replica, but a conflict or longer minority tail fails with `RecoveryRequired` and is not truncated. This remains a heuristic, not durable commit proof: without #127/#128, a later visible majority may still omit a previously acknowledged entry.
-- **Resume Tokens / Watch Cursors**: Exposes watches backed by sequence numbers, allowing consumers to supply sequence cursors and resume receiving updates from the exact sequence they left off.
-- **Replica Catch-Up & Read Repair Prototype**: The coordinator freshly queries replica log progress on every write or read and uses the same bounded assessment path as the readiness probe. Reads require identical records on a majority quorum and fail closed if no quorum result exists, but commit and repair authority remain unproven until #127/#128.
-- **Failed-Write Fail-Closed Fixture**: If a new replication entry reaches fewer than a majority of replicas, the operation fails closed and the existing write path attempts a best-effort rollback of the partial suffix. Separately, an already-visible ambiguous minority tail returns `RecoveryRequired` without mutation. These fixtures do not establish durable repair authority or prove resurrection safety across partitions/restarts before #127/#128.
+- **Openraft Log Authority**: Openraft allocates and commits its zero-based log
+  indexes. No SDK coordinator assigns an authoritative distributed sequence or
+  performs majority-prefix rollback. Vote, log, committed/applied/purged,
+  membership, and snapshot metadata persist transactionally in SQLite.
+- **Deterministic Application Journal**: Committed mutations (AcquireLease,
+  RenewLease, ReleaseLease, CompareAndSet, DeleteFenced, RefreshTtl, Batch) are
+  applied in order and produce the existing 1-based
+  `session_replication_log` as a state-machine output for watches/restores. It
+  is not a second consensus log.
+- **Idempotent Outcomes**: Durable request IDs bind to a digest of semantic
+  intent. Exact retries return the original logical time, journal sequence,
+  Raft index, and result, including after leader change; a changed intent under
+  the same ID fails closed.
+- **Logical Expiry Time**: Expiry-sensitive reads first commit monotonic
+  logical time, preventing clock rollback or leader failover from resurrecting
+  an expired record or lease.
+- **Resume Tokens / Watch Cursors**: Watches publish only committed application
+  entries and allow consumers to resume from the 1-based sequence cursor.
+- **Raw Authority Rejection**: Direct `replicate_entry`, whole-state rebuild,
+  and caller-selected lease metadata operations are rejected by
+  `ConsensusSessionStore`.
 - **Feature Declarations**: Replicated adapters declare `ordered_replication_log = true` and `watch = true`, while standalone SQLite reports `false`. These bits describe implemented methods; they are not fresh-quorum readiness or production qualification. Consumers must use `probe_durable_readiness` for current evidence.
-- **Low-Cardinality Readiness Telemetry**: Metrics expose probe success/failure, the latest ready state, configured/freshly-reachable/agreeing/required voter counts, the majority-visible prefix, and bounded failure reasons (`timeout`, `authentication`, `transport`, `divergent`, and `recovery_required`) without replica IDs, endpoints, or raw errors as labels.
+- **Low-Cardinality Readiness Telemetry**: Metrics expose probe success/failure and bounded Openraft state without replica IDs, endpoints, SPIFFE IDs, tenants, keys, or raw errors as labels.
 
 ---
 
@@ -537,25 +569,29 @@ does not reconcile a divergent or forked log.
 - **Snapshot regression**: Confirms stale snapshot installation cannot move a follower back to older applied state.
 - **Compaction appendability**: Confirms compacted leaders retain the snapshot index/term needed to append later committed entries.
 
-### Session Store HA Failure Tests (Ordered Replication)
+### Session Store HA Failure Tests (Openraft)
 
-These in-process fixtures exercise observed behavior; they are not durable
-distributed commit or repair proof (#127/#128).
+The fleet tests use three distinct file-backed SQLite databases and real
+Openraft RPC handlers over controllable in-process paths; the testkit does not
+implement a second quorum algorithm.
 
-- **Fresh durable readiness**: Exercises ready/no-quorum/recovery-required
-  outcomes, bounded probe work, strict-prefix append, and typed replica
-  failures independently of cached capabilities.
-- **Split-brain healing**: Exercises coordinator recovery after simulated partitions are resolved.
-- **Durable catch-up**: Rejoining replicas are caught up automatically with log replication.
-- **Duplicate delivery**: Duplicate entries are resolved idempotently without duplicate mutations.
-- **Partial-write fail-closed evidence**: Failing mid-flight writes are rejected;
-  the fixtures do not claim automatic destructive reconciliation.
+- **Cold-start concurrency**: Concurrent first writes form one gap-free
+  committed journal without equal-sequence forks.
+- **Cross-node authority**: Lease/CAS writes converge, follower reads pass a
+  linearizable barrier, and only Openraft-backed stores claim quorum.
+- **Partition and healing**: A node isolation causes bounded readiness/write
+  failure where quorum is unavailable; healed paths catch up and rejoin.
+- **Ambiguous response retry**: A delivered-but-lost forwarded response can be
+  retried with the same durable request identity and produces exactly one
+  committed application event.
+- **Raw authority rejection**: Direct replication/rebuild/lease-sequence
+  surfaces cannot bypass Openraft.
+- **Encryption/HKMS isolation**: Real outer-wrapper writes, key rotation,
+  snapshots, restart, and missing historical keys prove only sealed envelopes
+  enter consensus and no provider calls occur below the wrapper.
 - **Stale-fence replay**: Stale fence updates are rejected monotonically.
-- **Strict-prefix repair**: A stale strict-prefix replica may be appended and
-  verified on read; divergent or longer-tail replicas instead require
-  recovery and are not mutated.
-- **Restart/rejoin across profiles**: Exercises restart/rejoin behavior under fake, SQLite, and replicated profiles.
-- **No wall-clock LWW**: Observes that the tested ordering paths do not select authoritative state by wall-clock time.
+- **No wall-clock LWW**: Leader-selected monotonic logical time, not replica
+  wall-clock last-writer-wins, drives expiry state.
 - **Bounded TTLs**: Exercises zero, the exact 365-day maximum, maximum plus one,
   and `Duration::MAX` across direct, nested, persisted, quorum, and
   authenticated-wire paths, including no-partial-effect and near-maximum-clock

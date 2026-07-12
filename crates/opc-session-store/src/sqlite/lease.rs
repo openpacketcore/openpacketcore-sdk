@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use super::ops::{
     current_fence_sync, format_rfc3339_normalized, insert_or_replace_fence_sync,
-    persisted_owner_id, prune_sync,
+    persisted_owner_id, persisted_u64, prune_sync, sqlite_u64, timestamp_unix_millis,
 };
 use crate::{
     error::LeaseError,
@@ -86,29 +86,48 @@ pub(crate) fn acquire_sync(
         .query_row(["next_credential_id"], |row| row.get(0))
         .map_err(|e| LeaseError::Backend(e.to_string()))?;
 
-    let next_fence = (global_next_fence as u64).max(next_for_key);
+    let global_next_fence =
+        persisted_u64(global_next_fence).map_err(|error| LeaseError::Backend(error.to_string()))?;
+    if global_next_fence == 0 {
+        return Err(LeaseError::Backend(
+            "persisted next fence is invalid".to_string(),
+        ));
+    }
+    let next_fence = global_next_fence.max(next_for_key);
     let fence = FenceToken::new(next_fence);
 
-    let next_fence_global = next_fence.saturating_add(1);
-    let next_credential_id = global_next_credential_id as u64;
-    let next_credential_id_global = next_credential_id.saturating_add(1);
+    let next_fence_global = next_fence
+        .checked_add(1)
+        .ok_or_else(|| LeaseError::Backend("fence token exhausted".into()))?;
+    let next_credential_id = persisted_u64(global_next_credential_id)
+        .map_err(|error| LeaseError::Backend(error.to_string()))?;
+    if next_credential_id == 0 {
+        return Err(LeaseError::Backend(
+            "persisted next credential ID is invalid".to_string(),
+        ));
+    }
+    let next_credential_id_global = next_credential_id
+        .checked_add(1)
+        .ok_or_else(|| LeaseError::Backend("lease credential ID exhausted".into()))?;
 
     // Update globals
     conn.execute(
         "UPDATE lease_globals SET val = ?1 WHERE key = 'next_fence'",
-        params![next_fence_global as i64],
+        params![sqlite_u64(next_fence_global)
+            .map_err(|error| LeaseError::Backend(error.to_string()))?],
     )
     .map_err(|e| LeaseError::Backend(e.to_string()))?;
 
     conn.execute(
         "UPDATE lease_globals SET val = ?1 WHERE key = 'next_credential_id'",
-        params![next_credential_id_global as i64],
+        params![sqlite_u64(next_credential_id_global)
+            .map_err(|error| LeaseError::Backend(error.to_string()))?],
     )
     .map_err(|e| LeaseError::Backend(e.to_string()))?;
 
     let acquired_at = now;
-    let expires_at_unix_ms =
-        (expires_at.as_offset_datetime().unix_timestamp_nanos() / 1_000_000) as i64;
+    let expires_at_unix_ms = timestamp_unix_millis(expires_at)
+        .map_err(|error| LeaseError::Backend(error.to_string()))?;
 
     // Save lease
     conn.execute(
@@ -122,9 +141,10 @@ pub(crate) fn acquire_sync(
             key.nf_kind.as_str(),
             key.key_type.to_string(),
             key.stable_id.as_ref(),
-            next_credential_id as i64,
+            sqlite_u64(next_credential_id)
+                .map_err(|error| LeaseError::Backend(error.to_string()))?,
             owner.as_str(),
-            fence.get() as i64,
+            sqlite_u64(fence.get()).map_err(|error| LeaseError::Backend(error.to_string()))?,
             expires_at_unix_ms,
             format_rfc3339_normalized(expires_at),
         ],
@@ -201,7 +221,9 @@ pub(crate) fn renew_sync(
     if active == 0 {
         return Err(LeaseError::StaleFence);
     }
-    if credential_id as u64 != lease.credential_id() {
+    if persisted_u64(credential_id).map_err(|error| LeaseError::Backend(error.to_string()))?
+        != lease.credential_id()
+    {
         return Err(LeaseError::StaleFence);
     }
     let stored_owner = persisted_owner_id(owner_str)
@@ -213,7 +235,10 @@ pub(crate) fn renew_sync(
     let guard_expires_at = Timestamp::from_str(guard_expires_at_str.as_str())
         .map_err(|e| LeaseError::Backend(e.to_string()))?;
 
-    if fence as u64 != lease.fence().get() || guard_expires_at != lease.expires_at() {
+    if persisted_u64(fence).map_err(|error| LeaseError::Backend(error.to_string()))?
+        != lease.fence().get()
+        || guard_expires_at != lease.expires_at()
+    {
         return Err(LeaseError::StaleFence);
     }
 
@@ -223,8 +248,8 @@ pub(crate) fn renew_sync(
 
     let fence_token = lease.fence();
     let acquired_at = lease.acquired_at();
-    let expires_at_unix_ms =
-        (expires_at.as_offset_datetime().unix_timestamp_nanos() / 1_000_000) as i64;
+    let expires_at_unix_ms = timestamp_unix_millis(expires_at)
+        .map_err(|error| LeaseError::Backend(error.to_string()))?;
 
     conn.execute(
         r#"
@@ -249,7 +274,7 @@ pub(crate) fn renew_sync(
         fence_token,
         acquired_at,
         expires_at,
-        credential_id as u64,
+        persisted_u64(credential_id).map_err(|error| LeaseError::Backend(error.to_string()))?,
     ))
 }
 
@@ -303,7 +328,9 @@ pub(crate) fn release_sync(
     if active == 0 {
         return Err(LeaseError::StaleFence);
     }
-    if credential_id as u64 != lease.credential_id() {
+    if persisted_u64(credential_id).map_err(|error| LeaseError::Backend(error.to_string()))?
+        != lease.credential_id()
+    {
         return Err(LeaseError::StaleFence);
     }
     let stored_owner = persisted_owner_id(owner_str)
@@ -315,7 +342,10 @@ pub(crate) fn release_sync(
     let guard_expires_at = Timestamp::from_str(guard_expires_at_str.as_str())
         .map_err(|e| LeaseError::Backend(e.to_string()))?;
 
-    if fence as u64 != lease.fence().get() || guard_expires_at != lease.expires_at() {
+    if persisted_u64(fence).map_err(|error| LeaseError::Backend(error.to_string()))?
+        != lease.fence().get()
+        || guard_expires_at != lease.expires_at()
+    {
         return Err(LeaseError::StaleFence);
     }
 

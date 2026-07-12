@@ -15,7 +15,7 @@ accepted.
 |:---|:---|
 | [0001](0001-secure-config-management.md) | Config management is secure by default, commit-confirmed, audited, and explicitly authorized. |
 | [0002](0002-config-store-consensus-ha.md) | Config persistence HA uses `ConsensusConfigStore` with Raft-style quorum safety, authenticated transport, durable membership, and snapshot integrity. |
-| [0003](0003-session-store-quorum-replication.md) | Authoritative session HA targets validated quorum membership and durable ordered-log consensus; current majority-visible repair remains experimental, and standalone SQLite is not HA. |
+| [0003](0003-session-store-quorum-replication.md) | Authoritative session HA uses one Openraft-backed store with validated identity, committed state-machine application, and envelope encryption above consensus; standalone SQLite is not HA. |
 | [0004](0004-security-identity-keying-audit.md) | Production identity, TLS, keys, and audit integrity are explicit SDK substrates with fail-closed adapters. |
 | [0005](0005-runtime-observability-admin-probes.md) | Runtime health, admin/probe routes, metrics, and alarms are shared SDK surfaces with production authorization and redaction. |
 | [0006](0006-fault-injection-fail-closed-validation.md) | Storage, security, runtime, HA, and release evidence are validated through fail-closed fault injection. |
@@ -31,3 +31,4 @@ accepted.
 | [0016](0016-northbound-grpc-stack-exception.md) | _(proposed)_ `tonic`/`prost` are permitted only for `opc-gnmi-server` as the ADR 0014 §3 exception; core SDK crates stay gRPC-free. |
 | [0017](0017-sctp-transport-ffi-boundary.md) | Explicitly allowlisted Linux kernel UAPI sys crates, including `opc-libsctp-sys`, `opc-linux-xfrm-sys`, and `opc-linux-gtpu-sys`, hold all `unsafe` UAPI FFI; this OS-transport exception to ADR 0014 §8 does not reopen ADR 0013's rejection of foreign C codec FFI. |
 | [0018](0018-epc-untrusted-access-sdk-boundary.md) | EPC and untrusted-access additions are limited to SDK-owned reusable mechanisms; product policy, deployment defaults, ePDG orchestration, and carrier-readiness claims remain product-owned. |
+| [0019](0019-one-openraft-consensus-engine.md) | Openraft is the only distributed-persistence consensus authority; domain state machines remain SDK-owned and the `opc-persist` migration is required before the workspace can claim a unified profile. |

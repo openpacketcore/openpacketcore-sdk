@@ -16,7 +16,7 @@ use opc_session_store::{
     CompareAndSet, OwnerId, SessionBackend, SessionLeaseManager, StateClass, StateType, StoreError,
     StoredSessionRecord,
 };
-use opc_session_testkit::ChaosTestkit;
+use opc_session_testkit::ConsensusTestCluster;
 use opc_testbed::VirtualClock;
 use opc_types::{TenantId, Timestamp};
 
@@ -46,7 +46,7 @@ async fn wait_for_shutdown(amf: &AmfLite) {
 }
 
 async fn wait_for_amf_readiness(amf: &AmfLite, expected: opc_runtime::Readiness) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         if amf.readiness().await == expected {
             return;
@@ -55,7 +55,7 @@ async fn wait_for_amf_readiness(amf: &AmfLite, expected: opc_runtime::Readiness)
             tokio::time::Instant::now() < deadline,
             "timed out waiting for AMF readiness {expected:?}"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -286,9 +286,9 @@ async fn test_amf_lite_e2e_happy_path() {
         .unwrap();
     let config_store = Arc::new(backend);
 
-    // 3. Quorum Session Store Setup
-    println!("[E2E] Setting up ChaosTestkit");
-    let chaos = ChaosTestkit::new(3);
+    // 3. Real three-member Openraft Session Store Setup.
+    println!("[E2E] Starting Openraft session fleet");
+    let session_cluster = ConsensusTestCluster::start(3).await;
 
     // 4. NACM setup
     println!("[E2E] Setting up NACM module and policy");
@@ -326,7 +326,7 @@ async fn test_amf_lite_e2e_happy_path() {
     let amf = AmfLite::start_with_clock(
         AmfConfig::default(),
         config_store,
-        chaos.validated_topology(0).expect("valid AMF topology"),
+        session_cluster.store(0),
         kms_endpoint,
         Some(auth_token.clone()),
         admin_addr,
@@ -359,15 +359,15 @@ async fn test_amf_lite_e2e_happy_path() {
     assert_eq!(status_unauth, 401);
 
     println!("[E2E] Removing the durable session-store quorum");
-    chaos.set_online(1, false).await;
-    chaos.set_online(2, false).await;
+    session_cluster.set_node_online(1, false);
+    session_cluster.set_node_online(2, false);
     wait_for_amf_readiness(&amf, opc_runtime::Readiness::NotReady).await;
     let (status_no_quorum, _) = query_admin(admin_addr, "/readyz", Some(&auth_token)).await;
     assert_eq!(status_no_quorum, 503);
 
     println!("[E2E] Restoring the durable session-store quorum");
-    chaos.set_online(1, true).await;
-    chaos.set_online(2, true).await;
+    session_cluster.set_node_online(1, true);
+    session_cluster.set_node_online(2, true);
     wait_for_amf_readiness(&amf, opc_runtime::Readiness::Ready).await;
     let (status_quorum_restored, _) = query_admin(admin_addr, "/readyz", Some(&auth_token)).await;
     assert_eq!(status_quorum_restored, 200);
@@ -496,8 +496,8 @@ async fn test_amf_lite_e2e_happy_path() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_amf_lite_ha_failover_and_recovery() {
-    println!("[HA] Starting test_amf_lite_ha_failover_and_recovery");
+async fn test_amf_lite_config_ha_failover_and_session_recovery() {
+    println!("[HA] Starting test_amf_lite_config_ha_failover_and_session_recovery");
     let temp_dir = TempDir::new().unwrap();
 
     // 1. KMS Setup
@@ -525,9 +525,9 @@ async fn test_amf_lite_ha_failover_and_recovery() {
     group[0].campaign().await.unwrap();
     assert_eq!(group[0].get_role().await, opc_persist::Role::Leader);
 
-    // 3. Quorum Session Store Setup (3 nodes)
-    println!("[HA] Initializing ChaosTestkit");
-    let chaos = ChaosTestkit::new(3);
+    // 3. Real three-member Openraft session fleet.
+    println!("[HA] Starting Openraft session fleet");
+    let session_cluster = ConsensusTestCluster::start(3).await;
 
     // 4. NACM setup
     let mut modules = ModuleRegistry::new();
@@ -560,9 +560,7 @@ async fn test_amf_lite_ha_failover_and_recovery() {
     let amf_0 = AmfLite::start(
         AmfConfig::default(),
         group[0].clone(),
-        chaos
-            .validated_topology(0)
-            .expect("valid AMF node 0 topology"),
+        session_cluster.store(0),
         kms_endpoint.clone(),
         Some(auth_token.clone()),
         admin_addr,
@@ -611,19 +609,15 @@ async fn test_amf_lite_ha_failover_and_recovery() {
     assert_eq!(confirmed.status, CommitStatus::Committed);
     group[0].sync().await.unwrap();
 
-    // 7. Make session replica 2 offline (simulate network issue)
-    println!("[HA] Simulating network drop for session replica 2");
-    chaos.set_online(2, false).await;
-
-    // Register a UE context (writes to replica 0 and 1, forming quorum)
+    // 7. Commit through one member of the Openraft session fleet.
     let imsi = "208960000000002";
-    println!("[HA] Registering UE IMSI context with session replica 2 offline");
+    println!("[HA] Registering UE context through Openraft session member 0");
     amf_0
         .register_ue(imsi, 202, Duration::from_secs(10))
         .await
         .unwrap();
 
-    // Verify state in session replica 0 and 1
+    // Verify the persisted key does not expose the subscriber identity.
     let key = amf_0.session_key_for_subscriber(imsi).await.unwrap();
     assert!(
         !key.stable_id
@@ -643,10 +637,6 @@ async fn test_amf_lite_ha_failover_and_recovery() {
     group[1].campaign().await.unwrap();
     assert_eq!(group[1].get_role().await, opc_persist::Role::Leader);
 
-    // Rejoin session replica 2
-    println!("[HA] Bringing session replica 2 back online");
-    chaos.set_online(2, true).await;
-
     // Start a new AMF-lite instance targeting the new consensus leader
     let admin_ports_new = get_free_ports(1);
     let admin_addr_new: SocketAddr = format!("127.0.0.1:{}", admin_ports_new[0]).parse().unwrap();
@@ -656,12 +646,11 @@ async fn test_amf_lite_ha_failover_and_recovery() {
         group[1].load_latest().await
     );
     println!("[HA] Launching new AMF node 1 on consensus node 1 store");
+    let recovered_session_store = session_cluster.store(1);
     let amf_1 = AmfLite::start(
         AmfConfig::default(),
         group[1].clone(),
-        chaos
-            .validated_topology(1)
-            .expect("valid AMF node 1 topology"),
+        recovered_session_store,
         kms_endpoint.clone(),
         Some(auth_token.clone()),
         admin_addr_new,
@@ -669,7 +658,7 @@ async fn test_amf_lite_ha_failover_and_recovery() {
         nacm_modules.clone(),
     )
     .await
-    .unwrap();
+    .expect("AMF node 1 starts on the recovered config authority");
 
     // Verify recovery: the new instance recovered the last committed config from node 1!
     println!("[HA] Verifying recovered config hostname on node 1");
@@ -681,32 +670,31 @@ async fn test_amf_lite_ha_failover_and_recovery() {
     assert_eq!(recovered_snap.config.hostname, "amf-ha-node0");
     assert_eq!(recovered_snap.config.capacity, 4000);
 
-    // Read UE state from the new AMF-lite coordinator.
-    // This will trigger read-repair on replica 2!
-    println!("[HA] Querying UE state from new AMF node 1 (triggering read-repair)");
+    // Read the encrypted UE state through the newly started AMF process.
+    println!("[HA] Querying UE state from new AMF node 1");
     let retrieved = amf_1.session_store().get(&key).await.unwrap().unwrap();
     let ctx: opc_amf_lite::UeSessionContext =
         serde_json::from_slice(retrieved.payload.as_bytes()).unwrap();
     assert!(!ctx.subscriber_pseudonym.contains(imsi));
     assert_eq!(ctx.amf_ue_ngap_id, 202);
 
-    // Verify session replica 2 got read-repaired
-    println!("[HA] Verifying session replica 2 was read-repaired");
-    let rep2 = &chaos.replicas[2];
+    // An independent follower serves the same committed encrypted record
+    // through a linearizable read after its state machine catches up.
+    println!("[HA] Verifying session follower 2 serves committed state");
     let kms_provider = Arc::new(opc_key::KmsKeyProvider::new(
         kms_endpoint.clone(),
         None,
         Duration::from_secs(2),
     ));
-    let decrypted_backend = opc_session_store::EncryptingSessionBackend::new(
-        rep2.inner.clone(),
+    let follower_backend = opc_session_store::EncryptingSessionBackend::new(
+        Arc::new(session_cluster.store(2)),
         kms_provider,
         "amf-sessions",
     );
-    let rep2_record = decrypted_backend.get(&key).await.unwrap().unwrap();
-    let rep2_ctx: opc_amf_lite::UeSessionContext =
-        serde_json::from_slice(rep2_record.payload.as_bytes()).unwrap();
-    assert_eq!(rep2_ctx.amf_ue_ngap_id, 202);
+    let follower_record = follower_backend.get(&key).await.unwrap().unwrap();
+    let follower_ctx: opc_amf_lite::UeSessionContext =
+        serde_json::from_slice(follower_record.payload.as_bytes()).unwrap();
+    assert_eq!(follower_ctx.amf_ue_ngap_id, 202);
 
     // 9. Stale fence / session replay rejection
     // Let's create a client write with a stale lease/fence token
@@ -756,7 +744,9 @@ async fn test_amf_lite_ha_failover_and_recovery() {
 
     // Clean up
     wait_for_shutdown(&amf_1).await;
-    println!("[HA] Test test_amf_lite_ha_failover_and_recovery passed successfully!");
+    println!(
+        "[HA] Test test_amf_lite_config_ha_failover_and_session_recovery passed successfully!"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -788,8 +778,8 @@ async fn test_amf_lite_security_and_redaction() {
         .unwrap();
     let config_store = Arc::new(backend);
 
-    // 3. Quorum Session Store Setup
-    let chaos = ChaosTestkit::new(3);
+    // 3. Openraft Session Store Setup
+    let session_cluster = ConsensusTestCluster::start(1).await;
 
     // 4. NACM setup
     println!("[Security] Setting up NACM module and policy");
@@ -823,7 +813,7 @@ async fn test_amf_lite_security_and_redaction() {
     let amf = AmfLite::start(
         AmfConfig::default(),
         config_store,
-        chaos.validated_topology(0).expect("valid AMF topology"),
+        session_cluster.store(0),
         kms_endpoint.clone(),
         Some(auth_token.clone()),
         admin_addr,

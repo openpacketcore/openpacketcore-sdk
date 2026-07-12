@@ -6,7 +6,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::Stream;
 use opc_session_store::backend::{
@@ -27,6 +26,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+pub use crate::consensus::RemoteAddrResolver;
 use crate::error::ProtocolError;
 use crate::identity::RemoteReplicaBinding;
 use crate::protocol::{
@@ -40,10 +40,6 @@ use crate::protocol::{
     MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES, MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE,
     SESSION_NET_ALPN,
 };
-
-/// Resolver callback used by [`RemoteSessionBackend::new_with_resolver`].
-pub type RemoteAddrResolver =
-    Arc<dyn Fn() -> BoxFuture<'static, io::Result<SocketAddr>> + Send + Sync>;
 
 /// Persistent transport connection to a remote session backend.
 ///

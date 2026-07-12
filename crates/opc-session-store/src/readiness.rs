@@ -1,82 +1,20 @@
 //! Fresh, bounded durable-readiness evidence for replicated session stores.
 //!
 //! Capability declarations and validated topology are admission evidence. They
-//! do not prove that a distinct majority is reachable or agrees on a
-//! replication-log prefix now. The types in this module deliberately expose
-//! only stable reason codes, counts, and redaction-safe replica identities.
-
-use std::time::Duration;
+//! do not prove that Openraft can complete a linearizable barrier now. The
+//! types in this module deliberately expose only stable reason codes, counts,
+//! committed-barrier indexes, and redaction-safe replica identities.
 
 use crate::topology::ReplicaId;
-
-/// Default end-to-end deadline for one durable-readiness assessment.
-pub const DEFAULT_DURABLE_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Default maximum number of replication entries inspected per replica.
-///
-/// The limit bounds memory and CPU until the replication protocol grows a
-/// bounded prefix-proof primitive. Exceeding it fails closed.
-pub const DEFAULT_DURABLE_READINESS_MAX_LOG_ENTRIES: usize = 65_536;
-
-/// Hard end-to-end timeout ceiling accepted by [`DurableReadinessOptions`].
-pub const MAX_DURABLE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Hard per-replica log-entry ceiling accepted by
-/// [`DurableReadinessOptions`].
-pub const MAX_DURABLE_READINESS_LOG_ENTRIES: usize = 65_536;
-
-/// Work and time limits for one fresh durable-readiness assessment.
-///
-/// Apply these limits with
-/// [`crate::QuorumSessionStore::with_durable_readiness_options`]; that one
-/// store-level policy governs both explicit probes and operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DurableReadinessOptions {
-    timeout: Duration,
-    max_log_entries: usize,
-}
-
-impl DurableReadinessOptions {
-    /// Construct probe limits.
-    ///
-    /// A zero timeout or zero entry budget is accepted and fails closed when
-    /// the corresponding work cannot complete. Oversized values are capped at
-    /// the SDK's fixed work ceilings, so this constructor never panics or
-    /// creates unbounded work from operator-provided values.
-    pub fn new(timeout: Duration, max_log_entries: usize) -> Self {
-        Self {
-            timeout: timeout.min(MAX_DURABLE_READINESS_TIMEOUT),
-            max_log_entries: max_log_entries.min(MAX_DURABLE_READINESS_LOG_ENTRIES),
-        }
-    }
-
-    /// End-to-end deadline for the assessment.
-    pub const fn timeout(self) -> Duration {
-        self.timeout
-    }
-
-    /// Maximum replication entries that may be loaded from one replica.
-    pub const fn max_log_entries(self) -> usize {
-        self.max_log_entries
-    }
-}
-
-impl Default for DurableReadinessOptions {
-    fn default() -> Self {
-        Self::new(
-            DEFAULT_DURABLE_READINESS_TIMEOUT,
-            DEFAULT_DURABLE_READINESS_MAX_LOG_ENTRIES,
-        )
-    }
-}
 
 /// Point-in-time result of a fresh durable-readiness assessment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DurableReadinessState {
-    /// A distinct configured majority is reachable and agrees on one prefix.
+    /// Openraft completed a linearizable barrier and local apply wait against
+    /// the admitted voting configuration.
     Ready,
-    /// Fewer than the required distinct voters supplied usable fresh evidence.
+    /// Openraft could not complete the barrier before the operation deadline.
     NoQuorum,
     /// The coordinator was not built from an admitted topology.
     TopologyInvalid,
@@ -112,9 +50,9 @@ pub enum ReplicaReadinessFailure {
     Backend,
     /// A fresh head was observed but its ordered log could not be loaded.
     LogUnavailable,
-    /// The replica log conflicts with the majority-visible prefix.
+    /// Legacy compatibility code observed a divergent application log.
     Divergent,
-    /// Safe strict-prefix catch-up failed.
+    /// Legacy compatibility repair failed.
     RepairFailed,
     /// The bounded replication-log work budget was exceeded.
     ProbeBudgetExceeded,
@@ -141,12 +79,12 @@ impl ReplicaReadinessFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ReplicaReadinessOutcome {
-    /// A usable fresh log was observed, but this replica was not proven or
-    /// caught up to the report's majority-visible prefix.
+    /// The local Openraft state machine applied through the fresh linearizable
+    /// barrier, or a compatibility adapter supplied fresh evidence.
     Fresh,
-    /// The replica already matched the majority-visible prefix.
+    /// A compatibility adapter's replica matched its admitted authority.
     Ready,
-    /// The replica was safely caught up from a strict shorter prefix.
+    /// A compatibility adapter repaired a stale replica.
     Repaired,
     /// The replica could not contribute usable evidence.
     Failed(ReplicaReadinessFailure),
@@ -178,7 +116,7 @@ impl ReplicaReadinessObservation {
         &self.replica_id
     }
 
-    /// Freshly observed local replication head, when one was obtained.
+    /// Freshly observed committed barrier/application index, when available.
     pub const fn observed_sequence(&self) -> Option<u64> {
         self.observed_sequence
     }
@@ -247,12 +185,16 @@ impl DurableReadinessReport {
         self.configured_voters
     }
 
-    /// Distinct voters that supplied a fresh replication head.
+    /// Minimum distinct voters proven reachable by the Openraft barrier.
+    ///
+    /// Openraft does not expose peer identities through this stable report, so
+    /// a ready result reports the quorum lower bound rather than guessing a
+    /// larger reachability count.
     pub const fn fresh_reachable_voters(&self) -> usize {
         self.fresh_reachable_voters
     }
 
-    /// Distinct voters that agree with the majority-visible prefix.
+    /// Minimum distinct voters whose agreement was proven by Openraft commit.
     pub const fn agreeing_voters(&self) -> usize {
         self.agreeing_voters
     }
@@ -262,15 +204,22 @@ impl DurableReadinessReport {
         self.required_quorum
     }
 
-    /// Highest contiguous log index supported by a configured majority.
-    ///
-    /// This is intentionally not called a committed index: the current
-    /// coordinator has no durable term/commit proof.
+    /// Openraft log index returned by the successful linearizable barrier.
+    #[deprecated(
+        since = "0.2.0",
+        note = "use committed_barrier_index; this compatibility name predates Openraft"
+    )]
     pub const fn majority_visible_prefix_index(&self) -> Option<u64> {
         self.majority_visible_prefix_index
     }
 
-    /// Per-voter typed observations in configured topology order.
+    /// Openraft log index returned by the successful linearizable barrier.
+    pub const fn committed_barrier_index(&self) -> Option<u64> {
+        self.majority_visible_prefix_index
+    }
+
+    /// Bounded typed observations. The Openraft adapter reports only its local
+    /// apply observation and does not expose peer identities.
     pub fn replica_observations(&self) -> &[ReplicaReadinessObservation] {
         &self.replica_observations
     }

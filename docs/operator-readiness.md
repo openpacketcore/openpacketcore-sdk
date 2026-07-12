@@ -4,7 +4,8 @@ This note is the operator-facing handoff for the foundation hardening pass
 `T-9be95f92` on May 30, 2026, updated on June 6, 2026 for the follow-on
 session-store, runtime drain, and ConfigBus authorization seams, and on June 28,
 2026 for the final EPC/untrusted-access SDK hardening pass `T-8c57ecee`, with a
-July 11, 2026 addendum for checked session-TTL admission and upgrade handling. It
+July 11, 2026 addendum for checked session-TTL admission and upgrade handling,
+and a July 12, 2026 addendum for the #127 Openraft session-store authority. It
 summarizes what the current SDK foundation can support, what was validated, and
 what must not be claimed as implemented, since the Go operator remains a
 reference-only harness and production-grade controllers are the responsibility
@@ -111,11 +112,14 @@ tests, and release evidence in the downstream CNF operator repository.
 ## HA hardening scope
 
 The June 8 review closed the listed algorithmic and test-harness tasks, not
-carrier HA qualification. `ConsensusConfigStore` remains a durable
-config-consensus prototype. `QuorumSessionStore` provides in-process quorum
-coordination; its production network path depends on the experimental
-`opc-session-net` transport. Neither is a production-profile claim until its
-documented graduation requirements and downstream distributed/soak gates pass.
+carrier HA qualification. `ConsensusConfigStore` remains a separate durable
+config-consensus prototype. For session state, #127 replaces the former custom
+majority-visible-log coordinator with `ConsensusSessionStore`, backed by the
+workspace's shared Openraft engine; `QuorumSessionStore` is a compatibility
+type alias for that implementation, not a second authority path. This closes
+the durable sequencing/commit-authority implementation gap, but it is not a
+production-profile claim until the recovery, restore, lifecycle, and
+distributed qualification gates listed below pass.
 
 ### Config consensus RPC and identity-lifecycle contract
 
@@ -167,24 +171,34 @@ rotation procedure.
 
 ### Session topology admission
 
-Construct HA-shaped session stores only from `ValidatedQuorumTopology`. The SDK
+Construct HA-shaped session stores only from `ValidatedQuorumTopology` created
+from `QuorumTopologyConfig::new_consensus`. The SDK
 rejects membership outside the odd 3-through-31 bound, missing/ambiguous local
 self, duplicate logical IDs/endpoints/TLS identities/failure domains/backing
-identities, and duplicate process-local adapter instances before server readiness. The quorum
-denominator is the admitted configured membership, not current reachability.
+identities, a missing or zero consensus epoch, configuration-digest mismatch,
+and stable-node-ID collision before server readiness. The quorum denominator is
+the admitted configured membership, not current reachability.
 
-`ValidatedQuorumTopology::try_new_lab_singleton` is an explicit lab path and
-advertises `single-replica`. The deprecated raw-vector constructor advertises
-`unknown` and is non-operational. Logical self must be configured explicitly;
-do not derive it by shortening an FQDN or comparing endpoint strings.
+`ValidatedQuorumTopology::try_new_consensus_lab_singleton` is an explicit lab
+path and advertises `single-replica`. Logical self must be configured explicitly;
+do not derive it by shortening an FQDN or comparing endpoint strings. For
+example, logical self `epdg-app-0` can identify a descriptor whose dial route is
+`epdg-app-0.epdg-app-quorum.epdg-gateway.svc.cluster.local:7443`: the explicit
+`ReplicaId` selects self, while the FQDN is only the endpoint. The stable
+Openraft node ID is derived from cluster identity plus that logical
+`ReplicaId`, never from DNS ordering or endpoint spelling.
 
-For production network adapters, build one immutable
-`SessionReplicationManifest` from the cluster ID, an operator-controlled
-configuration generation, and the complete descriptor set. Derive all local
-and remote bindings from that manifest. Topology admission verifies each
-remote adapter's local/remote IDs, expected TLS identity, descriptor
-fingerprints, configured member count, and shared configuration scope. A local
-in-process backend may remain unbound.
+Build one immutable `ConsensusIdentity` from the cluster ID, a positive
+monotonic configuration epoch, and the exact order-independent configuration
+digest over that cluster, epoch, and complete descriptor-fingerprint set.
+The topology contains only those member descriptors. Supply the node's one
+local SQLite backend separately to `ConsensusSessionStore::open`, and build
+the exact consensus-peer map plus `SessionReplicationManifest` bindings from
+the same admitted data; remote votes require no dummy or legacy backend.
+Topology and transport admission verify each local/remote logical ID, stable
+node ID, expected TLS identity, descriptor fingerprints, configured member
+count, cluster, configuration digest, and epoch. Route aliases remain outside
+this identity.
 
 This admission result is not a durable-ready signal. Capability declarations
 and `SessionStorePlatformProfile::Quorum` are also admission evidence only. A
@@ -333,8 +347,8 @@ cryptographic-provider, database, or other application/backend effects. The
 client rejects before resolution or dialing; the server necessarily receives
 the request, then rejects before backend dispatch and may send the typed error
 on the same connection. This closes an input-validation and
-process-availability boundary only; it does not add durable commit authority,
-consensus, fork recovery, or production HA.
+process-availability boundary only; it is not evidence for Openraft commit
+authority, fork recovery, or production HA.
 
 Before rolling this change onto a store written by an older SDK, audit every
 persisted replication-log operation that carries a TTL. Values above 365 days
@@ -395,32 +409,28 @@ and trust-bundle rotation remain separate mandatory production gates.
 
 ### Session durable readiness
 
-`QuorumSessionStore::probe_durable_readiness` performs a fresh, bounded
-point-in-time assessment without consulting cached capabilities. Require
-`DurableReadinessState::Ready`; the other stable states are `NoQuorum`,
-`TopologyInvalid`, and `RecoveryRequired`. The report includes
-`configured_voters`, `fresh_reachable_voters`, `agreeing_voters`,
-`required_quorum`, an optional `majority_visible_prefix_index`, and per-replica
-typed observations.
+`ConsensusSessionStore::probe_durable_readiness` (and the compatibility alias
+`QuorumSessionStore::probe_durable_readiness`) performs a fresh, bounded
+Openraft linearizable-read barrier. It discovers or follows the current leader,
+runs `ensure_linearizable` against the admitted voting configuration, and does
+not return `Ready` until the local state machine has applied through the
+barrier's log index. This is the same authority path used by real linearizable
+reads; listener bind, successful TLS setup, cached capabilities, and a local
+SQLite read cannot satisfy it.
 
-Configure timeout and log-work limits once with
-`with_durable_readiness_options`; probes and authoritative operations share
-that exact policy. Log evidence is fetched in bounded adaptive pages rather
-than requiring the complete log to fit one wire frame.
+Require `DurableReadinessState::Ready`; a barrier, leader-discovery, peer RPC,
+or local-apply timeout reports `NoQuorum`. `TopologyInvalid` and
+`RecoveryRequired` remain stable compatibility states for admission/recovery
+failures. The report retains its bounded compatibility fields, including the
+configured and required voter counts and an optional index accessor historically
+named `majority_visible_prefix_index`; under `ConsensusSessionStore` that index
+is Openraft barrier/committed-apply evidence, not a custom majority-log-prefix
+calculation. Do not reconstruct authority from the individual report counters
+or observations.
 
-The bounded failure classes are `Transport`, `Authentication`, `Timeout`,
-`Protocol`, `Backend`, `LogUnavailable`, `Divergent`, `RepairFailed`, and
-`ProbeBudgetExceeded`.
-Do not log raw peer errors or turn replica IDs/endpoints into metric labels.
-The exported metrics intentionally use only fixed names and bounded reasons for
-probe outcome, current readiness,
-configured/freshly-reachable/agreeing/required voter counts, majority-visible
-prefix, and bounded
-timeout/authentication/transport/divergent/recovery-required failures.
-The only labels on this readiness surface are bounded `status` values
-(`success`/`failure`) and bounded `reason` values (`timeout`, `authentication`,
-`transport`, `divergent`, and `recovery_required`); its gauges carry no identity
-labels.
+The store's one bounded operation deadline applies to the complete leader,
+network, barrier, and local-apply path. Do not log raw peer errors or turn
+replica IDs, endpoints, DNS names, or SPIFFE identities into metric labels.
 
 Readiness evidence can become stale immediately. AMF-lite therefore starts
 with its session-store gate closed, probes immediately and continuously, and
@@ -439,18 +449,97 @@ not an ownership lease.
 
 ### Tested HA algorithm and prototype features
 
-1. **Persisted Ordered-Log Prototype**: Exercises replication of mutations (lease acquire, renew, release, compare-and-set, delete, TTL refresh, and batch operations) across replicas using a sequence-numbered log. Durable sequence/commit authority remains #127.
-2. **Local Idempotency & Replay Checks**: Fixtures exercise duplicate handling by log position, generation, fence, and transaction identity without wall-clock last-writer-wins. Cross-partition authority remains conditional on #127/#128.
-3. **Resume Cursors**: Exposes change-stream watches backed by the ordered log, allowing client streams to resume and catch up after disconnects.
-4. **Stale Replica Recovery Heuristic**: The readiness/operation assessment may append a missing suffix only when a replica's complete log is a strict prefix of the majority-visible log. Conflicts and longer minority tails yield `RecoveryRequired` without truncation or destructive rebuild. This is still not commit-proven recovery; #127/#128 must prevent a later majority from omitting a previously acknowledged entry.
-5. **Declared Feature Envelope**: `QuorumSessionStore` advertises `ordered_replication_log = true` and `watch = true`, while standalone SQLite reports `false`. These bits describe available methods, not fresh peer-quorum evidence or production qualification. Use `probe_durable_readiness` for the current point-in-time result.
-6. **Bounded Protected Replication Trees**: Entry/prefix/page preflight enforces depth 16 and 256 total nodes, while encryption/sealing wrappers iteratively transform every nested CAS and stage writes before delegation. This is protection-boundary evidence, not durable commit or HA qualification.
+1. **One Consensus Authority**: `ConsensusSessionStore` delegates election,
+   voting, log matching, commitment, membership, snapshot coordination, and
+   linearizable-read authority to the shared, pinned Openraft engine. The old
+   majority-visible-prefix coordinator is not an alternate production path.
+2. **Deterministic Session State Machine**: Committed commands drive lease,
+   compare-and-set, delete, TTL, batching, fencing, logical expiry time,
+   idempotent request outcomes, journal, and watch-cursor state. Application
+   state is exposed only after committed apply.
+3. **Ambiguous-Response Idempotency**: A delivered mutation whose response is
+   lost can be retried with the same request identity; the durable outcome is
+   returned once, while reuse of that identity for a different semantic intent
+   fails closed.
+4. **No Parallel Raw Authority**: Production consensus rejects caller-selected
+   replication append, whole-state rebuild, and lease sequencing. The dedicated
+   network listener can dispatch only authenticated consensus RPCs.
+5. **Bounded Snapshots and Logs**: SQLite-backed Openraft storage persists vote,
+   log, committed/applied/purged positions, membership, request outcomes, and
+   the application chain; bounded checksummed snapshots carry only one coherent
+   sealed state-machine image.
+6. **Remaining Qualification**: #128 must reconcile a diverged replica from
+   committed authority; #129 must provide operator-safe legacy-fork recovery;
+   #133 must make restore scans bounded and majority-authoritative; and #143
+   must supply distributed partition/restart/resource/soak and payload-key
+   qualification. Until those land, this is implemented commit authority, not
+   production HA qualification.
 
-### Session transport v4 rollout boundary
+### Session payload protection boundary
 
-`opc-session-net` v4 carries cursor-paged remote restore scans and authenticated
-replica identity. Production constructors accept only opaque authenticated TLS
-configs. Both sides extract the canonical SPIFFE URI from the live peer
+The required production composition places protection above consensus:
+
+```text
+application -> EncryptingSessionBackend / RemoteSealingSessionBackend
+            -> ConsensusSessionStore -> Openraft -> SQLite/snapshots
+```
+
+The wrapper seals a payload before `client_write`. Openraft log replication,
+follower apply, replay, request-outcome persistence, and snapshot build/install
+therefore handle opaque RFC 003 envelope bytes; they do not receive plaintext,
+an HKMS/KMS provider, raw key material, or a key handle. Reads cross the wrapper
+in the opposite direction, and historical envelopes select their decryption
+key by key ID. A provider outage blocks new plaintext protection or decryption,
+but it must not move provider calls into deterministic Raft apply or make sealed
+log replay depend on provider availability.
+
+This is payload-envelope encryption, not full-database encryption. Session
+payload bytes are sealed, while host-visible SQLite/Openraft metadata includes
+membership, terms and indexes, request and key routing fields, tenant/owner,
+generation/fence, timestamps, and envelope key IDs. A product requiring
+metadata or full-file encryption must add an approved database/volume layer and
+qualify it without bypassing the wrapper. #179 owns seamless remote-seal
+historical-key selection; #143 owns distributed payload-protection evidence;
+the transport certificate rotation chain is separate.
+
+### Session consensus transport and identity
+
+The production #127 path uses `SessionConsensusServer` and
+`RemoteSessionConsensusPeer` on the exact `opc-session-consensus/1` ALPN. This
+listener owns only a `SessionConsensusRpcHandler`: it cannot dispatch direct
+session-backend mutation, raw replication-log append, restore rebuild, or lease
+sequencing. Legacy `opc-session-net/4` direct-backend networking is a
+non-default compatibility feature and must not share the production consensus
+listener.
+
+Every connection performs a fresh mutual-TLS handshake. Before an Openraft RPC
+is dispatched, both sides bind the canonical certificate SPIFFE URI, logical
+`ReplicaId`, derived stable node ID, expected opposite peer, cluster ID,
+configuration digest, configuration epoch, consensus role, exact transport
+profile, and a fresh challenge. The authenticated sender in the outer request
+must also match the sender encoded in the bounded Openraft payload. DNS, FQDN,
+short hostname, IP, and resolver aliases select only the dial route. They never
+select self, a vote, or a certificate identity.
+
+Each call has one absolute deadline covering admission, resolution, connect,
+TLS, handshake, bounded encoding, write, and response read. Authentication or
+identity mismatch fails before engine dispatch. The outer consensus frame is
+bounded for the shared compact Openraft payload; transport code does not decode
+commands or make consensus decisions.
+
+Fresh handshakes make renewed credentials observable, but seamless operation
+during rotation is not yet qualified. The remaining dependency order is #162
+(bounded material epochs), #161 (atomic identity/trust reload), #163 (peer
+reauthentication across an epoch), #158 (seamless rotation), and #164
+(rotation qualification). A production CNF must keep old/new trust overlapped,
+retire old connections, enforce revocation and maximum authentication age, and
+bound reconnect storms; #143 still owns the wider distributed qualification.
+
+### Legacy direct-backend session-net v4 rollout boundary
+
+The opt-in legacy `opc-session-net` v4 surface carries cursor-paged remote
+restore scans and authenticated replica identity. Its authenticated constructors
+accept opaque TLS configs. Both sides extract the canonical SPIFFE URI from the live peer
 certificate and require an exact match with the manifest's claimed stable
 `ReplicaId`, expected opposite replica, cluster, and configuration ID before
 backend dispatch. The client verifies its fresh challenge is echoed by the
@@ -461,12 +550,9 @@ and 0-RTT; budget every reconnect as a full mutual-TLS handshake so the live
 SVID is revalidated after rotation.
 
 Full handshakes make renewed credentials observable, but they are not proof of
-seamless rotation. A production CNF/operator profile must rotate certificates
-and trust bundles without interrupting session service, including overlap of
-old/new trust, revocation, retirement of long-lived connections, reconnect
-storms, and a documented maximum authentication age. That work is split: the
-seamless session-net lifecycle remains #158, while its
-distributed qualification remains #143. `MAX_SESSION_TTL` controls
+seamless rotation. The #162 -> #161 -> #163 -> #158 -> #164 rotation chain and
+#143 distributed qualification apply before this compatibility surface could
+be admitted to a production migration. `MAX_SESSION_TTL` controls
 session/lease state only; it does not define
 certificate expiry, trust-bundle validity, or authentication age.
 
@@ -589,10 +675,10 @@ Either scope change requires another coordinated rollout.
 
 This is not production HA qualification. Do not infer readiness from bind
 success, static profiles, or cached capabilities; use the fresh bounded probe
-and continuous gate. Do not use quorum restore as authority before
-#127/#133, treat current divergence repair as authoritative before #128, or
-auto-resolve a legacy fork before #129. Protocol v4 identity/fixed-width
-binding is not consensus or fork recovery. #135's invariant-safe model decoding
+and continuous gate. #127 now provides Openraft commit authority, but do not use
+restore results as majority authority before #133, treat divergence repair as
+implemented before #128, or auto-resolve a legacy fork before #129. Protocol
+identity/fixed-width binding is not fork recovery. #135's invariant-safe model decoding
 and bounded offline identity audit and #134's fixed-width v4 DTOs are implemented.
 Checked TTL and sequence boundaries now fail closed under #137/#138, and
 bounded nested protected-payload traversal is implemented under #147. Watch
@@ -602,11 +688,12 @@ under #159, but its stable-ID and transaction-ID limits are wire containment
 only. The production stable-ID model/persistence/privacy/audit/migration remains
 #167; the canonical durable `ReplicationEntry` transaction-ID type and migration
 remain #168 and must be coordinated with #127/#128/#143. Session-net's response
-deadline does not change `opc-persist`'s `TcpPeer::timeout` per-I/O-stage
-behavior over up to three attempts with backoff; #169 owns one atomic end-to-end logical-RPC deadline,
-safe retry, and metrics work. Seamless SVID/trust-bundle lifecycle remains
-#158, while the remaining distributed/payload-key production evidence stays
-open in #143.
+deadline is independent of `opc-persist`'s already-implemented #169
+`TcpPeer::timeout` contract: one atomic end-to-end logical-RPC deadline covers
+its attempts and backoff, with safe retry and bounded metrics. Seamless
+SVID/trust-bundle lifecycle remains
+#162 -> #161 -> #163 -> #158 -> #164, while the remaining
+distributed/payload-key production evidence stays open in #143.
 
 #159 does not rewrite persisted session-store bytes. In-profile stores need no
 format conversion, but a retained empty/over-64-byte stable ID or
@@ -632,7 +719,7 @@ migration requirement.
 | Config authorization & apply example | `opc-config-bus` implements `ConfigAuthorizer` checking at the admission boundary, and the toy config integration registers a custom `NacmAuthorizer` hook to enforce NACM policy before validation, persistence, or subscriber notification. | `crates/opc-config-bus/src/lib.rs`, `crates/opc-config-fixture/tests/config_fixture_commit.rs` |
 | Config persistence encryption and audit integrity | `EncryptingManagedDatastore` seals persisted config records with shared envelope helpers and AAD-bound tenant/schema/version metadata. Durable `SqliteBackend` opens require an explicit non-zero `AuditKey`, and stored audit chains are verified on load after sensitive audit values are redacted before storage. | `crates/opc-config-bus/src/lib.rs`, `crates/opc-config-bus/tests/encryption.rs`, `crates/opc-persist/src/backend/mod.rs`, `crates/opc-persist/tests/persist_sqlite.rs`, `crates/opc-persist/tests/persist_ops.rs`, `crates/opc-persist/tests/persist_audit.rs` |
 | Alarm admin authorization & auditing | `opc-alarm` provides `NacmAlarmAuthorizer` and `PersistAlarmAuditSink` adapters to authorize alarm ack/suppress actions against NACM policy and an explicit operator-principal allowlist, then log audit events durably to the persistence SQLite database with automatic sensitive data redaction. | `crates/opc-alarm/src/nacm_adapter.rs`, `crates/opc-alarm/src/persist_adapter.rs`, `crates/opc-alarm/tests/adapters.rs` |
-| Session persistence encryption | `EncryptingSessionBackend` wraps a durable SQLite backend (`SqliteSessionBackend`) or `FakeSessionBackend`. It seals session payloads, decrypts reads and CAS conflicts, iteratively protects every nested replicated CAS within the depth-16/256-node limits, preserves legacy migration markers, and fails closed on corrupt envelopes. Historical in-limit plaintext may use wrapper-mediated rewrite/rebuild; over-limit history requires audited offline migration or store replacement. | `crates/opc-session-store/src/backend.rs`, `crates/opc-session-store/src/sqlite/mod.rs`, `crates/opc-session-store/tests/encryption.rs`, `crates/opc-session-store/tests/sqlite.rs` |
+| Session persistence encryption | `EncryptingSessionBackend` or `RemoteSealingSessionBackend` must wrap `ConsensusSessionStore`, so payloads are sealed before Openraft submission and decrypted only above consensus. Raft logs, state, outcomes, peer frames, and snapshots carry opaque envelopes; HKMS/KMS provider calls and key handles stay outside deterministic apply. This is payload-envelope protection, not full SQLite metadata/file encryption. | `crates/opc-session-store/src/backend.rs`, `crates/opc-session-store/src/consensus/store.rs`, `crates/opc-session-store/src/sqlite/consensus.rs`, `crates/opc-session-store/tests/consensus_openraft.rs`, `crates/opc-session-store/src/consensus/store/encryption_tests.rs` |
 | Runtime alarms | `SharedAlarmManager` is used by runtime supervision and config-bus failure paths; toy NF integration uses the runtime-owned manager rather than separate toy glue. | `crates/opc-runtime/src/supervisor/mod.rs`, `crates/opc-config-bus/src/lib.rs`, `crates/opc-sdk-integration/tests/toy_runtime.rs` |
 | Graceful drain | `DrainHook` and `NrfDrainHook` provide the shared SIGTERM/NRF drain integration point. Hook timeouts and hook errors raise drain-incomplete alarms, and `NrfRuntimeBuilderExt` gives first NF adopters a one-call registration path. | `crates/opc-runtime/src/shutdown.rs`, `crates/opc-sbi/src/nrf/mod.rs`, `crates/opc-runtime/tests/graceful_shutdown.rs` |
 | Evidence format | `opc-evidence` provides tested RFC 006 record, manifest, gap, SBOM/VEX, provenance, performance, bundle, and policy-evaluation library primitives. Embedded bundle blobs are signature-covered, but separately supplied `GateEvaluator` artifact arguments are not cross-checked against that verified bundle. Repository workflows do not yet invoke the evaluator or wire a production signer/verifier and complete artifact set. | `crates/opc-evidence/src/extract.rs`, `crates/opc-evidence/src/sbom.rs`, `crates/opc-evidence/src/vex.rs`, `crates/opc-evidence/src/provenance.rs`, `crates/opc-evidence/src/bundle.rs`, `crates/opc-evidence/src/performance.rs`, `crates/opc-evidence/src/policy.rs`, `crates/opc-evidence/tests/evidence_bundle.rs`, `crates/opc-evidence/tests/evidence_policy.rs`, `docs/implementation-status.md#known-gaps` (`GAP-006-*`) |
@@ -682,7 +769,13 @@ operator glue:
 
 ## HA Persistence & Replication Adapters
 
-The SDK includes a config-store consensus hardening prototype (`ConsensusConfigStore` in crate `opc-persist`), an ordered-log quorum replicated session store (`QuorumSessionStore` in crate `opc-session-store`), and a session chaos simulation testkit (`opc-session-testkit`).
+The SDK includes a config-store consensus hardening prototype
+(`ConsensusConfigStore` in crate `opc-persist`) and an Openraft-backed session
+authority (`ConsensusSessionStore` in crate `opc-session-store`;
+`QuorumSessionStore` is its compatibility alias). These are currently distinct
+authority implementations; migrating config HA to the shared `opc-consensus`
+engine is tracked separately and must be completed before claiming a
+workspace-wide one-engine production profile.
 
 The standard SQLite-backed config and session store profiles (`SqliteBackend` and `SqliteSessionBackend`) are single-node only. They are acceptable only for development, conformance, lab, or explicitly accepted edge/single-replica deployments, and must not be used to claim carrier HA without a production consensus/replication layer.
 
@@ -700,11 +793,33 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
   via out-of-process campaigns, failovers, network partitioning, pending
   commits surviving restarts, deterministic transport stalls/cancellation, and
   catch-up resume tests.
-- **Session Store Quorum Replication Prototype**: `QuorumSessionStore` exercises session leases and CAS mutations across a majority of replicas using an ordered log with watch/change-stream resume cursors, strict-prefix catch-up, and partial-write fail-closed fixtures. Durable authority and repair claims remain conditional on #127/#128.
-- **Session Topology, Identity, and Readiness**: HA-shaped construction requires an immutable validated set of distinct declared votes and exactly one explicit local member. Protocol v4 retains v3's authenticated peer binding from one cluster/configuration manifest and requires the live certificate SPIFFE identity to match the stable `ReplicaId`; DNS aliases remain routing only. The lab singleton reports `single-replica`; raw unvalidated construction reports `unknown` and refuses operations. Topology, identity binding, and capabilities are admission evidence. `probe_durable_readiness` separately provides fresh bounded majority evidence.
-- **Fault Coverage**: Reusable chaos test fixtures and tests cover split-brain, stale leader writes, replication lag, stale fences, restart/rejoin behavior, divergent read fail-closed behavior, clock skew, and multi-writer rejection. They also cover session-store durable rejoin/catch-up, strict-prefix append, ordered-log replay, duplicate delivery, partial-write fail-closed behavior, and no-destructive-repair evidence for an already-visible ambiguous tail. This is not proof of automatic fork reconciliation or failed-write resurrection safety before #127/#128.
-- **SQLite Writer Envelope**: Each replica still serializes local durable writes through SQLite. `ConsensusConfigStore` and `QuorumSessionStore` provide the tested consensus and ordered-replication mechanisms described above; neither constitutes production HA qualification, and standalone SQLite is not HA.
-- **Capability Envelope**: `SqliteSessionBackend` reports CAS, fencing, TTL, lease-expiry, and batch support without `watch` or `ordered_replication_log` support. `QuorumSessionStore` reports `watch = true` and `ordered_replication_log = true`, but those feature declarations remain static admission evidence. Use `validate_backend_for_profile` or `StateClass::required_profile()` before binding a backend, and use `probe_durable_readiness` plus continuous traffic gating for current quorum evidence.
+- **Session Store Commit Authority**: `ConsensusSessionStore` uses the shared
+  Openraft engine for elections, voting, log matching, committed membership,
+  snapshot coordination, and linearizable reads. Its SQLite state machine owns
+  deterministic session semantics and exposes journal/watch changes only after
+  apply. #127 is implemented; #128/#129/#133/#143 remain qualification and
+  recovery gates.
+- **Session Topology, Identity, and Readiness**: HA construction requires one
+  immutable descriptor set, explicit logical self, configuration digest, and
+  positive epoch. Stable node IDs derive from cluster plus logical
+  `ReplicaId`; endpoints and FQDNs are routing only. The dedicated
+  `opc-session-consensus/1` mTLS profile binds SPIFFE, logical/stable IDs,
+  cluster/configuration/epoch, peer role, and nonce. `probe_durable_readiness`
+  uses an Openraft linearizable barrier and local-apply wait, not bind or cached
+  capability evidence.
+- **Fault Coverage**: Tests cover concurrent pristine formation, cross-node
+  lease/CAS visibility, follower linearizable reads, partition-bounded failure
+  and rejoin, restart, and delivered-but-lost response idempotency. These are
+  implementation tests, not #143 distributed production qualification, and
+  they do not implement #128 divergence repair or #129 legacy-fork recovery.
+- **SQLite Writer Envelope**: Each node persists Openraft vote/log/membership,
+  committed/applied positions, deterministic state, outcomes, and bounded
+  snapshots in its own SQLite-backed store. Standalone `SqliteSessionBackend`
+  remains single-node and is not HA.
+- **Capability Envelope**: Static backend feature declarations remain
+  admission evidence only. Require the Openraft readiness barrier plus
+  continuous traffic gating; do not derive authority from `capabilities()` or
+  the availability of a restore-scan method.
 - **Payload Bound**: The backend enforces a 1 MiB payload limit through `BackendCapabilities::max_value_bytes`; state types that need larger values require an explicit profile decision.
 - **Storage Fault-Injection**: Reusable `FaultInjectingStore` and `FaultType` adapters under `opc-persist` allow injecting disk-full, fsync/write failure, corrupt database/WAL, failed rollback target load, failed rollback point creation, audit-chain corruption, and startup recovery fencing. These hooks are compiled only with the `dangerous-test-hooks` feature and must not be enabled in production profiles. They cover all RFC 001 §14.3 failures, asserting fail-closed config publication/notifications, redacting SQL internals/raw paths/secrets from client-visible errors, raising alarms, and updating metrics.
 

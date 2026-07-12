@@ -42,6 +42,32 @@ fn session_aad() -> EnvelopeAad {
     )
 }
 
+#[test]
+fn bound_aad_decode_requires_complete_canonical_shape() {
+    let aad = session_aad();
+    let key_id = KeyId::new("session-key-2026-07").expect("key ID");
+    let canonical = serialize_bound_aad(&aad, &key_id).expect("bound AAD");
+    let (decoded_aad, decoded_key_id) = decode_bound_aad(&canonical).expect("decode bound AAD");
+    assert_eq!(decoded_aad, aad);
+    assert_eq!(decoded_key_id, key_id);
+
+    let mut with_unknown: serde_json::Value = serde_json::from_slice(&canonical).expect("AAD JSON");
+    with_unknown
+        .as_object_mut()
+        .expect("AAD object")
+        .insert("unexpected".into(), serde_json::Value::Bool(true));
+    assert!(decode_bound_aad(
+        &serde_json::to_vec(&with_unknown).expect("encode unknown-field AAD")
+    )
+    .is_err());
+
+    let noncanonical = serde_json::to_vec_pretty(
+        &serde_json::from_slice::<serde_json::Value>(&canonical).expect("AAD JSON"),
+    )
+    .expect("pretty AAD");
+    assert!(decode_bound_aad(&noncanonical).is_err());
+}
+
 fn config_aad_with_store_kind(store_kind: &str) -> EnvelopeAad {
     EnvelopeAad::config(
         tenant(),

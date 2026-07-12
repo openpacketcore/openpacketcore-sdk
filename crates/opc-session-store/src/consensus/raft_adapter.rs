@@ -1,0 +1,692 @@
+//! Private Openraft transport adapter for the session consensus service.
+//!
+//! The authenticated transport carries only bounded, identity-scoped engine
+//! RPCs. It deliberately does not implement any session-backend operation or
+//! alternate replication/repair authority.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::Arc;
+
+use opc_consensus::engine::error::{
+    InstallSnapshotError, PayloadTooLarge, RPCError, RaftError, RemoteError, Timeout, Unreachable,
+};
+use opc_consensus::engine::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+use opc_consensus::engine::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
+};
+use opc_consensus::engine::{EmptyNode, Vote};
+use opc_consensus::{decode_bounded, encode_bounded, ConsensusCodecError};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use thiserror::Error;
+
+use super::{
+    SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
+    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionRaft, SessionRaftTypeConfig,
+    SESSION_CONSENSUS_SCHEMA_VERSION,
+};
+
+type EngineRpcError<E = opc_consensus::engine::error::Infallible> =
+    RPCError<SessionConsensusNodeId, EmptyNode, RaftError<SessionConsensusNodeId, E>>;
+
+/// Fail-closed construction error for the private Openraft network factory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum SessionRaftAdapterError {
+    /// A peer was registered under a node ID different from its authenticated
+    /// transport identity.
+    #[error("session consensus peer node identity does not match its routing key")]
+    PeerNodeIdMismatch,
+}
+
+/// Openraft network factory backed exclusively by consensus-only peers.
+#[derive(Clone)]
+pub(crate) struct SessionRaftNetworkFactory {
+    identity: SessionConsensusIdentity,
+    local_node_id: SessionConsensusNodeId,
+    peers: Arc<BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>>,
+}
+
+impl SessionRaftNetworkFactory {
+    /// Bind the engine network to one immutable cluster scope and canonical
+    /// node-ID routing table.
+    pub(crate) fn try_new(
+        identity: SessionConsensusIdentity,
+        local_node_id: SessionConsensusNodeId,
+        peers: BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
+    ) -> Result<Self, SessionRaftAdapterError> {
+        if peers
+            .iter()
+            .any(|(node_id, peer)| peer.node_id() != *node_id)
+        {
+            return Err(SessionRaftAdapterError::PeerNodeIdMismatch);
+        }
+
+        Ok(Self {
+            identity,
+            local_node_id,
+            peers: Arc::new(peers),
+        })
+    }
+}
+
+impl fmt::Debug for SessionRaftNetworkFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionRaftNetworkFactory")
+            .field("identity", &self.identity)
+            .field("local_node_id", &self.local_node_id)
+            .field("peer_count", &self.peers.len())
+            .finish()
+    }
+}
+
+impl RaftNetworkFactory<SessionRaftTypeConfig> for SessionRaftNetworkFactory {
+    type Network = SessionRaftNetwork;
+
+    async fn new_client(
+        &mut self,
+        target: SessionConsensusNodeId,
+        _node: &EmptyNode,
+    ) -> Self::Network {
+        let peer = self
+            .peers
+            .get(&target)
+            .filter(|peer| peer.node_id() == target)
+            .cloned();
+
+        SessionRaftNetwork {
+            identity: self.identity,
+            local_node_id: self.local_node_id,
+            target,
+            peer,
+        }
+    }
+}
+
+/// One target-bound private Openraft connection.
+pub(crate) struct SessionRaftNetwork {
+    identity: SessionConsensusIdentity,
+    local_node_id: SessionConsensusNodeId,
+    target: SessionConsensusNodeId,
+    peer: Option<Arc<dyn SessionConsensusPeer>>,
+}
+
+impl fmt::Debug for SessionRaftNetwork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionRaftNetwork")
+            .field("identity", &self.identity)
+            .field("local_node_id", &self.local_node_id)
+            .field("target", &self.target)
+            .field("peer_configured", &self.peer.is_some())
+            .finish()
+    }
+}
+
+impl SessionRaftNetwork {
+    async fn call<Resp, E>(
+        &self,
+        family: SessionConsensusRpcFamily,
+        action: opc_consensus::engine::RPCTypes,
+        payload: Vec<u8>,
+        option: RPCOption,
+    ) -> Result<Resp, EngineRpcError<E>>
+    where
+        Resp: DeserializeOwned,
+        E: std::error::Error + DeserializeOwned,
+    {
+        let peer = self
+            .peer
+            .as_ref()
+            .ok_or_else(|| EngineRpcError::Unreachable(Unreachable::new(&MissingConsensusPeer)))?;
+        if peer.node_id() != self.target {
+            return Err(EngineRpcError::Unreachable(Unreachable::new(
+                &PeerIdentityChanged,
+            )));
+        }
+
+        let wire = SessionConsensusWireRequest::try_new(
+            self.identity,
+            self.local_node_id,
+            family,
+            payload,
+        )
+        .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
+
+        let ttl = option.hard_ttl();
+        let call = tokio::time::timeout(ttl, peer.call(wire)).await;
+        let response = match call {
+            Err(_) => {
+                return Err(EngineRpcError::Timeout(Timeout {
+                    action,
+                    id: self.local_node_id,
+                    target: self.target,
+                    timeout: ttl,
+                }));
+            }
+            Ok(Err(error)) => return Err(map_peer_error(error, action, self, ttl)),
+            Ok(Ok(response)) => response,
+        };
+
+        response
+            .validate()
+            .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
+        let payload = response
+            .result
+            .map_err(|error| map_peer_error(error, action, self, ttl))?;
+        let result: Result<Resp, RaftError<SessionConsensusNodeId, E>> = decode_bounded(&payload)
+            .map_err(|error| {
+            EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
+        })?;
+        result.map_err(|error| EngineRpcError::RemoteError(RemoteError::new(self.target, error)))
+    }
+
+    async fn append(
+        &self,
+        request: &AppendEntriesRequest<SessionRaftTypeConfig>,
+        option: RPCOption,
+    ) -> Result<AppendEntriesResponse<SessionConsensusNodeId>, EngineRpcError> {
+        let entry_count = request.entries.len();
+        let payload = match encode_bounded(request) {
+            Ok(payload) => payload,
+            Err(ConsensusCodecError::TooLarge) if entry_count > 0 => {
+                let entries_hint = u64::try_from((entry_count / 2).max(1)).unwrap_or(u64::MAX);
+                return Err(EngineRpcError::PayloadTooLarge(
+                    PayloadTooLarge::new_entries_hint(entries_hint),
+                ));
+            }
+            Err(error) => {
+                return Err(EngineRpcError::Unreachable(Unreachable::new(
+                    &CodecTransportError(error),
+                )));
+            }
+        };
+        self.call(
+            SessionConsensusRpcFamily::AppendEntries,
+            opc_consensus::engine::RPCTypes::AppendEntries,
+            payload,
+            option,
+        )
+        .await
+    }
+}
+
+impl RaftNetwork<SessionRaftTypeConfig> for SessionRaftNetwork {
+    async fn append_entries(
+        &mut self,
+        rpc: AppendEntriesRequest<SessionRaftTypeConfig>,
+        option: RPCOption,
+    ) -> Result<AppendEntriesResponse<SessionConsensusNodeId>, EngineRpcError> {
+        self.append(&rpc, option).await
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        rpc: InstallSnapshotRequest<SessionRaftTypeConfig>,
+        option: RPCOption,
+    ) -> Result<InstallSnapshotResponse<SessionConsensusNodeId>, EngineRpcError<InstallSnapshotError>>
+    {
+        let payload = encode_bounded(&rpc).map_err(|error| {
+            EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
+        })?;
+        self.call(
+            SessionConsensusRpcFamily::InstallSnapshot,
+            opc_consensus::engine::RPCTypes::InstallSnapshot,
+            payload,
+            option,
+        )
+        .await
+    }
+
+    async fn vote(
+        &mut self,
+        rpc: VoteRequest<SessionConsensusNodeId>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<SessionConsensusNodeId>, EngineRpcError> {
+        let payload = encode_bounded(&rpc).map_err(|error| {
+            EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
+        })?;
+        self.call(
+            SessionConsensusRpcFamily::Vote,
+            opc_consensus::engine::RPCTypes::Vote,
+            payload,
+            option,
+        )
+        .await
+    }
+}
+
+fn map_peer_error<E>(
+    error: SessionConsensusPeerError,
+    action: opc_consensus::engine::RPCTypes,
+    network: &SessionRaftNetwork,
+    ttl: std::time::Duration,
+) -> EngineRpcError<E>
+where
+    E: std::error::Error,
+{
+    match error {
+        SessionConsensusPeerError::Timeout => EngineRpcError::Timeout(Timeout {
+            action,
+            id: network.local_node_id,
+            target: network.target,
+            timeout: ttl,
+        }),
+        _ => EngineRpcError::Unreachable(Unreachable::new(&error)),
+    }
+}
+
+/// Engine-only inbound RPC handler. SDK-owned command forwarding and read
+/// barriers are composed by the coordinator outside this type.
+#[derive(Clone)]
+pub(crate) struct SessionRaftRpcHandler {
+    raft: SessionRaft,
+    identity: SessionConsensusIdentity,
+    local_node_id: SessionConsensusNodeId,
+}
+
+impl SessionRaftRpcHandler {
+    pub(crate) fn new(
+        raft: SessionRaft,
+        identity: SessionConsensusIdentity,
+        local_node_id: SessionConsensusNodeId,
+    ) -> Self {
+        Self {
+            raft,
+            identity,
+            local_node_id,
+        }
+    }
+}
+
+impl fmt::Debug for SessionRaftRpcHandler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionRaftRpcHandler")
+            .field("identity", &self.identity)
+            .field("local_node_id", &self.local_node_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionConsensusRpcHandler for SessionRaftRpcHandler {
+    async fn handle(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        if let Err(error) = validate_envelope(self.identity, authenticated_sender, &request) {
+            return rejected_response(error);
+        }
+        if !is_engine_rpc_family(request.family) {
+            return rejected_response(SessionConsensusPeerError::Rejected);
+        }
+
+        let result = match request.family {
+            SessionConsensusRpcFamily::AppendEntries => {
+                let rpc = match decode_and_bind_sender::<AppendEntriesRequest<SessionRaftTypeConfig>>(
+                    &request.payload,
+                    request.sender,
+                ) {
+                    Ok(rpc) => rpc,
+                    Err(error) => return rejected_response(error),
+                };
+                encode_engine_result(&self.raft.append_entries(rpc).await)
+            }
+            SessionConsensusRpcFamily::Vote => {
+                let rpc = match decode_and_bind_sender::<VoteRequest<SessionConsensusNodeId>>(
+                    &request.payload,
+                    request.sender,
+                ) {
+                    Ok(rpc) => rpc,
+                    Err(error) => return rejected_response(error),
+                };
+                encode_engine_result(&self.raft.vote(rpc).await)
+            }
+            SessionConsensusRpcFamily::InstallSnapshot => {
+                let rpc = match decode_and_bind_sender::<
+                    InstallSnapshotRequest<SessionRaftTypeConfig>,
+                >(&request.payload, request.sender)
+                {
+                    Ok(rpc) => rpc,
+                    Err(error) => return rejected_response(error),
+                };
+                encode_engine_result(&self.raft.install_snapshot(rpc).await)
+            }
+            SessionConsensusRpcFamily::ForwardMutation | SessionConsensusRpcFamily::ReadBarrier => {
+                return rejected_response(SessionConsensusPeerError::Rejected);
+            }
+            _ => return rejected_response(SessionConsensusPeerError::Rejected),
+        };
+
+        match result {
+            Ok(payload) => SessionConsensusWireResponse {
+                result: Ok(payload),
+            },
+            Err(error) => rejected_response(error),
+        }
+    }
+}
+
+fn validate_envelope(
+    expected_identity: SessionConsensusIdentity,
+    authenticated_sender: SessionConsensusNodeId,
+    request: &SessionConsensusWireRequest,
+) -> Result<(), SessionConsensusPeerError> {
+    request.validate()?;
+    if request.schema_version != SESSION_CONSENSUS_SCHEMA_VERSION
+        || request.identity != expected_identity
+        || authenticated_sender != request.sender
+    {
+        return Err(SessionConsensusPeerError::ScopeMismatch);
+    }
+    Ok(())
+}
+
+fn is_engine_rpc_family(family: SessionConsensusRpcFamily) -> bool {
+    matches!(
+        family,
+        SessionConsensusRpcFamily::Vote
+            | SessionConsensusRpcFamily::AppendEntries
+            | SessionConsensusRpcFamily::InstallSnapshot
+    )
+}
+
+trait EngineRequestSender {
+    fn vote(&self) -> &Vote<SessionConsensusNodeId>;
+}
+
+impl EngineRequestSender for AppendEntriesRequest<SessionRaftTypeConfig> {
+    fn vote(&self) -> &Vote<SessionConsensusNodeId> {
+        &self.vote
+    }
+}
+
+impl EngineRequestSender for VoteRequest<SessionConsensusNodeId> {
+    fn vote(&self) -> &Vote<SessionConsensusNodeId> {
+        &self.vote
+    }
+}
+
+impl EngineRequestSender for InstallSnapshotRequest<SessionRaftTypeConfig> {
+    fn vote(&self) -> &Vote<SessionConsensusNodeId> {
+        &self.vote
+    }
+}
+
+fn decode_and_bind_sender<T>(
+    payload: &[u8],
+    sender: SessionConsensusNodeId,
+) -> Result<T, SessionConsensusPeerError>
+where
+    T: DeserializeOwned + EngineRequestSender,
+{
+    let request: T = decode_bounded(payload).map_err(|_| SessionConsensusPeerError::Protocol)?;
+    if request.vote().leader_id.voted_for() != Some(sender) {
+        return Err(SessionConsensusPeerError::ScopeMismatch);
+    }
+    Ok(request)
+}
+
+fn encode_engine_result<T, E>(result: &Result<T, E>) -> Result<Vec<u8>, SessionConsensusPeerError>
+where
+    T: Serialize,
+    E: Serialize,
+{
+    encode_bounded(result).map_err(|_| SessionConsensusPeerError::Protocol)
+}
+
+fn rejected_response(error: SessionConsensusPeerError) -> SessionConsensusWireResponse {
+    SessionConsensusWireResponse { result: Err(error) }
+}
+
+#[derive(Debug, Error)]
+#[error("consensus peer is not configured")]
+struct MissingConsensusPeer;
+
+#[derive(Debug, Error)]
+#[error("consensus peer identity changed")]
+struct PeerIdentityChanged;
+
+#[derive(Debug, Error)]
+#[error("consensus codec rejected the engine payload")]
+struct CodecTransportError(#[source] ConsensusCodecError);
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use opc_consensus::engine::{Entry, EntryPayload};
+    use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+
+    use super::*;
+    use crate::consensus::{
+        SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
+        SessionConsensusConfigurationId, SessionConsensusRequestId, SessionMutationIntent,
+    };
+    use crate::model::{OwnerId, SessionKey, SessionKeyType};
+
+    #[derive(Debug)]
+    struct MockPeer {
+        node_id: SessionConsensusNodeId,
+        response: SessionConsensusWireResponse,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionConsensusPeer for MockPeer {
+        fn node_id(&self) -> SessionConsensusNodeId {
+            self.node_id
+        }
+
+        async fn call(
+            &self,
+            _request: SessionConsensusWireRequest,
+        ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+            Ok(self.response.clone())
+        }
+    }
+
+    fn node_id(value: u64) -> SessionConsensusNodeId {
+        SessionConsensusNodeId::new(value).expect("non-zero test node ID")
+    }
+
+    fn identity(seed: u8) -> SessionConsensusIdentity {
+        SessionConsensusIdentity::new(
+            SessionConsensusClusterId::from_bytes([seed; 32]),
+            SessionConsensusConfigurationId::from_bytes([seed.wrapping_add(1); 32]),
+            SessionConsensusConfigurationEpoch::new(1).expect("non-zero test epoch"),
+        )
+    }
+
+    fn vote_request(sender: SessionConsensusNodeId) -> VoteRequest<SessionConsensusNodeId> {
+        VoteRequest::new(Vote::new(7, sender), None)
+    }
+
+    #[test]
+    fn factory_rejects_a_peer_registered_under_another_node_id() {
+        let mut peers: BTreeMap<_, Arc<dyn SessionConsensusPeer>> = BTreeMap::new();
+        peers.insert(
+            node_id(1),
+            Arc::new(MockPeer {
+                node_id: node_id(2),
+                response: rejected_response(SessionConsensusPeerError::Rejected),
+            }),
+        );
+
+        assert!(matches!(
+            SessionRaftNetworkFactory::try_new(identity(1), node_id(3), peers),
+            Err(SessionRaftAdapterError::PeerNodeIdMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_target_and_malformed_response_fail_as_unreachable() {
+        let mut factory =
+            SessionRaftNetworkFactory::try_new(identity(1), node_id(1), BTreeMap::new())
+                .expect("valid empty routing table");
+        let mut missing = factory.new_client(node_id(2), &EmptyNode::default()).await;
+        assert!(matches!(
+            missing
+                .vote(
+                    vote_request(node_id(1)),
+                    RPCOption::new(Duration::from_secs(1))
+                )
+                .await,
+            Err(EngineRpcError::Unreachable(_))
+        ));
+
+        let mut peers: BTreeMap<_, Arc<dyn SessionConsensusPeer>> = BTreeMap::new();
+        peers.insert(
+            node_id(2),
+            Arc::new(MockPeer {
+                node_id: node_id(2),
+                response: SessionConsensusWireResponse {
+                    result: Ok(vec![0xff, 0xff]),
+                },
+            }),
+        );
+        let mut factory = SessionRaftNetworkFactory::try_new(identity(1), node_id(1), peers)
+            .expect("matching routing table");
+        let mut malformed = factory.new_client(node_id(2), &EmptyNode::default()).await;
+        assert!(matches!(
+            malformed
+                .vote(
+                    vote_request(node_id(1)),
+                    RPCOption::new(Duration::from_secs(1))
+                )
+                .await,
+            Err(EngineRpcError::Unreachable(_))
+        ));
+    }
+
+    #[test]
+    fn envelope_scope_schema_and_bounds_are_fail_closed() {
+        let expected_identity = identity(1);
+        let sender = node_id(1);
+        let payload = encode_bounded(&vote_request(sender)).expect("bounded vote");
+        let mut request = SessionConsensusWireRequest::try_new(
+            expected_identity,
+            sender,
+            SessionConsensusRpcFamily::Vote,
+            payload,
+        )
+        .expect("valid envelope");
+
+        assert_eq!(
+            validate_envelope(expected_identity, sender, &request),
+            Ok(())
+        );
+        assert_eq!(
+            validate_envelope(expected_identity, node_id(2), &request),
+            Err(SessionConsensusPeerError::ScopeMismatch)
+        );
+
+        request.identity = identity(2);
+        assert_eq!(
+            validate_envelope(expected_identity, sender, &request),
+            Err(SessionConsensusPeerError::ScopeMismatch)
+        );
+        request.identity = expected_identity;
+        request.schema_version = SESSION_CONSENSUS_SCHEMA_VERSION + 1;
+        assert_eq!(
+            validate_envelope(expected_identity, sender, &request),
+            Err(SessionConsensusPeerError::Protocol)
+        );
+        request.schema_version = SESSION_CONSENSUS_SCHEMA_VERSION;
+        request.payload = vec![0; opc_consensus::CONSENSUS_MAX_RPC_PAYLOAD_BYTES + 1];
+        assert_eq!(
+            validate_envelope(expected_identity, sender, &request),
+            Err(SessionConsensusPeerError::Protocol)
+        );
+    }
+
+    #[test]
+    fn inner_vote_is_bound_to_authenticated_envelope_sender() {
+        let sender = node_id(1);
+        let mut payload = encode_bounded(&vote_request(sender)).expect("bounded vote");
+        let decoded =
+            decode_and_bind_sender::<VoteRequest<SessionConsensusNodeId>>(&payload, sender)
+                .expect("matching sender");
+        assert_eq!(decoded.vote.leader_id.voted_for(), Some(sender));
+        assert_eq!(
+            decode_and_bind_sender::<VoteRequest<SessionConsensusNodeId>>(&payload, node_id(2)),
+            Err(SessionConsensusPeerError::ScopeMismatch)
+        );
+
+        payload.push(0);
+        assert_eq!(
+            decode_and_bind_sender::<VoteRequest<SessionConsensusNodeId>>(&payload, sender),
+            Err(SessionConsensusPeerError::Protocol)
+        );
+    }
+
+    #[test]
+    fn consumer_rpc_families_are_not_engine_authority() {
+        assert!(is_engine_rpc_family(SessionConsensusRpcFamily::Vote));
+        assert!(is_engine_rpc_family(
+            SessionConsensusRpcFamily::AppendEntries
+        ));
+        assert!(is_engine_rpc_family(
+            SessionConsensusRpcFamily::InstallSnapshot
+        ));
+        assert!(!is_engine_rpc_family(
+            SessionConsensusRpcFamily::ForwardMutation
+        ));
+        assert!(!is_engine_rpc_family(
+            SessionConsensusRpcFamily::ReadBarrier
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_append_asks_openraft_to_split_entries() {
+        let local_node_id = node_id(1);
+        let identity = identity(1);
+        let command = super::super::SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity,
+            request_id: SessionConsensusRequestId::from_bytes([3; 16]),
+            logical_time: Timestamp::now_utc(),
+            intent: SessionMutationIntent::AcquireLease {
+                key: SessionKey {
+                    tenant: TenantId::from_static("test-tenant"),
+                    nf_kind: NetworkFunctionKind::smf(),
+                    key_type: SessionKeyType::PduSession,
+                    stable_id: Bytes::from(vec![
+                        0xa5;
+                        opc_consensus::CONSENSUS_MAX_RPC_PAYLOAD_BYTES + 1
+                    ]),
+                },
+                owner: OwnerId::new("replica-1").expect("valid test owner"),
+                ttl: Duration::from_secs(30),
+            },
+        };
+        let request = AppendEntriesRequest {
+            vote: Vote::new_committed(7, local_node_id),
+            prev_log_id: None,
+            entries: vec![Entry::<SessionRaftTypeConfig> {
+                log_id: Default::default(),
+                payload: EntryPayload::Normal(command),
+            }],
+            leader_commit: None,
+        };
+        let factory = SessionRaftNetworkFactory::try_new(identity, local_node_id, BTreeMap::new())
+            .expect("valid empty routing table");
+        let network = SessionRaftNetwork {
+            identity: factory.identity,
+            local_node_id,
+            target: node_id(2),
+            peer: None,
+        };
+
+        let error = network
+            .append(&request, RPCOption::new(Duration::from_secs(1)))
+            .await
+            .expect_err("oversized append must be split");
+        match error {
+            EngineRpcError::PayloadTooLarge(error) => assert_eq!(error.entries_hint(), 1),
+            other => panic!("unexpected oversized append error: {other}"),
+        }
+    }
+}

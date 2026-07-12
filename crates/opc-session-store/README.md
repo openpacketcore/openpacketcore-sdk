@@ -46,30 +46,32 @@ evidence.
 - `ReplicaId`, `ReplicaEndpoint`, `ReplicaTlsIdentity`,
   `ReplicaFailureDomain`, and `ReplicaBackingIdentity` keep logical, network,
   authentication, placement, and physical-store identities distinct.
-- `BackendPeerBinding` is redaction-safe composition evidence from an
-  authenticated network adapter. It binds local/remote logical IDs, the exact
-  expected remote TLS identity, both descriptor fingerprints, member count,
-  and one opaque cluster/configuration scope.
-- `QuorumTopologyConfig::new` records an unvalidated request.
-  `ValidatedQuorumTopology::try_from` performs admission: an odd HA membership
-  from 3 through `QUORUM_TOPOLOGY_MAX_MEMBERS` (31), exactly one exact local
-  logical ID, and unique declared vote identities before any backend I/O.
-- `QuorumSessionStore::from_validated_topology` is the operational construction
-  path.
-- `QuorumSessionStore::probe_durable_readiness` performs a fresh, bounded
-  point-in-time assessment of distinct voter reachability, majority-prefix
-  agreement, and safe strict-prefix catch-up. It does not consult cached
-  capabilities.
+- `BackendPeerBinding` is redaction-safe composition evidence retained for the
+  legacy remote-backend compatibility transport. Production Openraft topology
+  does not contain backend adapters; its consensus peer map performs live
+  authenticated routing separately.
+- `QuorumTopologyConfig::new_consensus` requires a cluster ID, exact
+  configuration digest, and monotonic configuration epoch. Stable Openraft
+  node IDs are derived from the cluster and logical `ReplicaId`; endpoint text
+  is never identity. `ValidatedQuorumTopology::try_from` performs admission:
+  an odd HA membership from 3 through `QUORUM_TOPOLOGY_MAX_MEMBERS` (31), one
+  exact local logical ID, unique declared identities, and a descriptor digest
+  matching the supplied configuration before any backend I/O.
+- `ConsensusSessionStore::open` is the operational construction path.
+  `QuorumSessionStore` is a compatibility type alias to that same Openraft
+  implementation, not a second quorum algorithm. Callers install its
+  consensus RPC handler, then call `initialize_cluster` for pristine storage.
+- `ConsensusSessionStore::probe_durable_readiness` uses the same bounded
+  Openraft linearizable-read barrier as real authoritative operations. It does
+  not treat a bound listener or cached capabilities as quorum evidence.
 - `DurableReadinessReport` returns `Ready`, `NoQuorum`, `TopologyInvalid`, or
   `RecoveryRequired`, together with `configured_voters`,
   `fresh_reachable_voters`, `agreeing_voters`, `required_quorum`, the optional
-  `majority_visible_prefix_index`, and typed per-replica observations.
-- `ValidatedQuorumTopology::try_new_lab_singleton` is the explicit one-replica
-  lab path. Its topology mode is `lab-singleton`; its platform profile is
-  `single-replica`, never quorum HA.
-- The deprecated raw-vector `QuorumSessionStore::new` is intentionally
-  non-operational: it reports `unknown`, masks capabilities, and fails store
-  operations until the caller migrates to validated topology.
+  committed/applied index, and typed observations without peer-controlled
+  diagnostic text.
+- `ValidatedQuorumTopology::try_new_consensus_lab_singleton` is the explicit
+  one-replica Openraft lab path. Its platform profile is `single-replica`,
+  never quorum HA; it still exercises the same log and state machine.
 - Restore APIs include `RestoreScanRequest`, `RestoreScanPage`,
   `RestoreBlockReason`, summaries, page-size constants, and
   `summarize_restore_records`.
@@ -281,110 +283,106 @@ handshake does not make an opaque `OPCH` payload readable by an older binary.
 
 ### Validated HA construction
 
-```rust
-use std::sync::Arc;
-use opc_session_store::{
-    FencedSessionReplica, QuorumReplicaDescriptor, QuorumReplicaMember,
-    QuorumSessionStore, QuorumTopologyConfig, QuorumTopologyError,
-    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
-    ReplicaTlsIdentity, SessionStoreBackend, ValidatedQuorumTopology,
-};
+Build the complete descriptor set first, derive its order-independent
+configuration digest with `opc_consensus::derive_configuration_id`, and pass
+the resulting `ConsensusIdentity` to `QuorumTopologyConfig::new_consensus`.
+Open each node with its own file-backed `SqliteSessionBackend`, snapshot
+directory, and an exact map of every other stable node ID to a
+`SessionConsensusPeer`. Install `rpc_handler()` on the dedicated authenticated
+consensus listener before concurrently calling `initialize_cluster()` on a
+pristine fleet. Do not form membership from DNS order or start a local writer
+while peers are still unidentified.
 
-fn member(
-    slot: usize,
-    logical_id: &str,
-    host: &str,
-    tls_identity: &str,
-    failure_domain: &str,
-    backing_identity: &str,
-    backend: Arc<dyn SessionStoreBackend>,
-) -> Result<QuorumReplicaMember, QuorumTopologyError> {
-    Ok(QuorumReplicaMember::new(
-        QuorumReplicaDescriptor::new(
-            ReplicaId::new(logical_id)?,
-            ReplicaEndpoint::new(host, 7443)?,
-            ReplicaTlsIdentity::new(tls_identity)?,
-            ReplicaFailureDomain::new(failure_domain)?,
-            ReplicaBackingIdentity::new(backing_identity)?,
-        ),
-        FencedSessionReplica::new(slot, backend),
-    ))
-}
+The topology member vector contains only `QuorumReplicaDescriptor` values.
+The node's one local SQLite backend is supplied separately to
+`ConsensusSessionStore::open`; remote members are represented only by their
+descriptors and consensus-only peers. No dummy local database or legacy
+`RemoteSessionBackend` is constructed for a remote vote.
 
-fn build_store(
-    local_backend: Arc<dyn SessionStoreBackend>,
-    peer_1_backend: Arc<dyn SessionStoreBackend>,
-    peer_2_backend: Arc<dyn SessionStoreBackend>,
-) -> Result<QuorumSessionStore, QuorumTopologyError> {
-    let local_id = ReplicaId::new("epdg-app-0")?;
-    let members = vec![
-        member(0, "epdg-app-0", "epdg-app-0.quorum.ns.svc.cluster.local",
-            "spiffe://cluster/tenant/epdg/ns/gateway/sa/epdg-app/nf/epdg/instance/0", "node/worker-a", "pvc-uid/1111",
-            local_backend)?,
-        member(1, "epdg-app-1", "epdg-app-1.quorum.ns.svc.cluster.local",
-            "spiffe://cluster/tenant/epdg/ns/gateway/sa/epdg-app/nf/epdg/instance/1", "node/worker-b", "pvc-uid/2222",
-            peer_1_backend)?,
-        member(2, "epdg-app-2", "epdg-app-2.quorum.ns.svc.cluster.local",
-            "spiffe://cluster/tenant/epdg/ns/gateway/sa/epdg-app/nf/epdg/instance/2", "node/worker-c", "pvc-uid/3333",
-            peer_2_backend)?,
-    ];
-    let topology = ValidatedQuorumTopology::try_from(
-        QuorumTopologyConfig::new(local_id, members),
-    )?;
-    Ok(QuorumSessionStore::from_validated_topology(topology))
-}
-```
+Production replication uses `SessionConsensusServer` and
+`RemoteSessionConsensusPeer` on the exact `opc-session-consensus/1` ALPN. The
+live certificate's canonical SPIFFE URI, logical `ReplicaId`, stable node ID,
+cluster, configuration digest, epoch, peer role, and fresh challenge must all
+agree before an Openraft RPC is dispatched. Resolver or DNS aliases change
+only the dial address; a bare self ID such as `epdg-app-0` can correctly name
+the member whose route is an FQDN because the SDK never compares those strings.
 
-Build one immutable `SessionReplicationManifest` from the cluster ID, an
-operator-controlled configuration generation, and the complete descriptor
-set. Bind its exact local `ReplicaId`, then derive each
-`RemoteSessionBackend` from that local binding. Protocol v4 retains v3's
-requirement that the live
-certificate's canonical SPIFFE URI, claimed `ReplicaId`, opposite replica ID,
-cluster, and configuration digest to agree before backend dispatch. Resolver
-or DNS aliases change only the dial address; they do not change voting
-identity.
-
-The numeric `FencedSessionReplica::id` is a fault-injection/test-control slot
-and is never the logical `ReplicaId` or a vote identity. A backend adapter used
-as a vote must return
-`Some(BackendInstanceIdentity)` from `SessionBackend::backend_instance_identity`;
-forwarding wrappers must delegate that identity. The default `None` fails
-admission with `MissingBackendInstanceIdentity`. The token describes a local
-adapter instance only; it does not authenticate a remote physical store.
-Remote network adapters additionally return `BackendPeerBinding`. Once any
-member supplies peer-binding evidence, every remote member must supply a
-binding whose IDs, TLS identity, descriptor fingerprints, member count, and
-scope match the admitted topology; an in-process local member may remain
-unbound.
+Topology admission validates the complete descriptor set, its exact local
+logical member, configuration digest, and stable derived node IDs without
+holding a storage or network adapter. The dedicated consensus transport then
+binds each descriptor's logical ID, node ID, endpoint, TLS identity, cluster,
+configuration, and epoch to the live authenticated connection. Declared
+failure-domain and backing identities remain operator-supplied placement
+evidence rather than storage discovery.
 
 ### Fresh durable readiness
 
 `BackendCapabilities` and `SessionStorePlatformProfile::Quorum` are admission
 evidence. They describe implemented methods and configured shape, but do not
 prove that peers are reachable now. Before opening traffic, call
-`probe_durable_readiness()` and require `DurableReadinessState::Ready`. Set
-custom limits once with `with_durable_readiness_options`; explicit probes and
-authoritative operations always use that same store-level policy.
+`probe_durable_readiness()` and require `DurableReadinessState::Ready`. The
+probe uses the same complete operation deadline configured when opening the
+store; it does not scan replica application logs or run a second majority
+algorithm. Openraft performs leader discovery and the quorum barrier, then the
+adapter waits for local apply through the returned index. The report's `Debug`
+output redacts replica identities and contains no raw transport, backend, or
+peer-controlled error text.
 
-The report is bounded by an end-to-end timeout and a per-replica log-entry
-budget. Log evidence is loaded in bounded adaptive pages rather than one
-whole-log wire frame. Its stable replica failure classes are `Transport`, `Authentication`,
-`Timeout`, `Protocol`, `Backend`, `LogUnavailable`, `Divergent`,
-`RepairFailed`, and `ProbeBudgetExceeded`. The report's `Debug` output redacts
-replica identities, and the report contains no raw transport or backend error.
-
-`Ready` means a distinct configured majority freshly supplied usable evidence
-and agrees on one majority-visible prefix. It is point-in-time evidence, not a
-lease or durable commit proof. Every authoritative quorum operation repeats the
-same fail-closed assessment rather than relying on an earlier probe result.
+`Ready` means Openraft completed a fresh linearizable barrier against the
+admitted voting configuration and this node applied through that barrier. It
+is point-in-time evidence, not an ownership lease. Every authoritative read or
+write uses Openraft again rather than relying on an earlier probe result.
 Consumers must keep ownership publication and traffic advertisement behind the
 same continuously refreshed gate; a readiness report is not an ownership
 lease.
-Safe automatic repair only appends the missing suffix to a replica whose log is
-a strict prefix of the majority-visible log. A conflicting entry or longer
-minority tail yields `RecoveryRequired`; the readiness path does not truncate or
-destructively rebuild the fork.
+
+Openraft owns election, voting, log matching, commitment, and linearizable
+read authority. The SDK state machine owns deterministic session semantics,
+the committed 1-based application journal, fencing, expiry logical time,
+idempotent request outcomes, bounded snapshots, and watch cursors. Raw
+`replicate_entry`, whole-state rebuild, and caller-selected lease sequencing
+are rejected by the production consensus adapter; those are not alternate
+ways to establish authority.
+
+### Encryption and HKMS boundary
+
+The required production composition is:
+
+```text
+application -> EncryptingSessionBackend / RemoteSealingSessionBackend
+            -> ConsensusSessionStore -> Openraft -> SQLite/snapshots
+```
+
+Encryption or remote sealing completes before `client_write`. Openraft, peer
+RPCs, follower apply, replay, and snapshot build/install receive only opaque
+RFC 003 envelopes and never receive plaintext, key material, an HKMS provider,
+or a key handle. Reads cross the wrapper in the opposite direction and use the
+envelope key ID for historical-key lookup. A provider outage therefore blocks
+a new plaintext write before consensus submission but does not prevent already
+sealed Raft traffic, replay, or quorum formation.
+
+`EnvelopeV1` is a validated boundary, not a caller assertion. Construction and
+deserialization require the canonical RFC 003 envelope and session AAD; the
+consensus adapter additionally matches the visible tenant, NF kind, state
+type, generation, and fence fields to the record header. The protection
+wrappers do not expose a raw-inner escape hatch. Once consensus claims a
+SQLite file, retained clones and separately reopened raw handles fail closed;
+they cannot bypass Openraft for reads, leases, mutation, rebuild, pruning, or
+journal access, and their capability declaration collapses to the minimal
+non-authoritative profile. The owning consensus adapter reports its own exact
+capabilities separately.
+
+This is payload-envelope encryption, not whole-database encryption. Session
+payload bytes are sealed; SQLite/Raft metadata such as membership, log indexes,
+tenant/key routing fields, owners, fences, timestamps, and key IDs remain
+visible to the host storage boundary. Products requiring metadata or full-file
+encryption must add an approved volume/database layer without moving HKMS into
+the deterministic state machine. Qualification tests assert plaintext canaries
+are absent from Raft logs, state/outcome tables, WAL/SHM files, captured
+consensus frames, and snapshots, and that restart plus active-key rotation
+with retained historical local keys preserves decryptability. Seamless
+remote-seal historical-key selection is tracked by #179 and remains required
+before remote-seal rotation can be claimed.
 
 ### TTL input contract
 
@@ -503,11 +501,12 @@ or use a separately reviewed offline migrator that preserves the original
 atomic semantics before the new SDK reads the log. Calling a raw inner-backend
 rebuild does not add protection.
 
-This closes #147's nested-wrapper traversal gap only. The networked profile
-remains experimental. Seamless SVID/trust-bundle lifecycle remains #158;
-payload-protection-key rotation and distributed production qualification remain
-#143. These are separate mandatory gates, and the operation-tree limits do not
-provide rotation evidence.
+This closes #147's nested-wrapper traversal gap only. Durable sequencing now
+uses Openraft under #127, but the networked profile remains experimental until
+the remaining qualification gates pass. Seamless SVID/trust-bundle lifecycle remains #158;
+remote-seal historical-key rotation remains #179, while distributed
+payload-protection qualification remains #143. These are separate mandatory
+gates, and the operation-tree limits do not provide rotation evidence.
 
 The outbound bound does not make backend effects transactional with response
 delivery. A compare-and-set, batch slot, lease operation, replicated append, or
@@ -534,34 +533,32 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
 - SQLite file backends use WAL in tests and persist across restart.
 - `FakeSessionBackend` is for tests.
 - Configured topology validation proves only an odd, distinct voting set and
-  one exact local member. Authenticated network adapters add manifest-derived
-  peer-binding evidence at admission. Fresh readiness separately proves a
-  point-in-time reachable and agreeing majority. None of these results proves
-  durable commit authority, operator-safe fork recovery, restore authority, or
-  production HA qualification.
+  one exact local member. Authenticated consensus peers add exact identity
+  binding at admission. Openraft supplies durable commit and fresh linearizable
+  readiness; operator-safe legacy-fork recovery, bounded restore authority, and
+  production qualification remain separate gates.
 - A bare logical self ID such as `epdg-app-0` may select a member whose endpoint
   is the full `epdg-app-0.<headless-service>.<namespace>.svc.cluster.local`
   FQDN. The SDK never shortens endpoints or treats endpoint text as identity.
-- The local ID declares the coordinator's own configured replica. Admission
-  proves an exact descriptor match. The local in-process adapter remains a
-  product composition boundary; a peer manifest does not prove physical-store
+- The local ID declares the node's own configured replica. Admission proves an
+  exact descriptor match. The separately supplied local SQLite backend remains
+  a product composition boundary; a peer manifest does not prove physical-store
   provenance.
 - Endpoint DNS names are canonicalized for case and one trailing dot.
   Endpoint text is routing, never replica identity. TLS/failure-domain values
   are exact caller-provided identities; callers must use canonical deployment
   values. Backing identities are caller-provided stable physical IDs retained
   only as SHA-256 digests, not verified storage provenance.
-- Remote transport parity does not make `QuorumSessionStore` restore a
-  production authority: its current aggregation still materializes replica
-  scans and resolves records without durable majority/commit proof (#127,
-  #133).
+- Restore-scan RPC parity does not by itself make restore
+  majority-authoritative; bounded committed-state restore policy remains #133.
 - Replication entries are strictly 1-based. Sequence zero is rejected with
   `StoreError::InvalidReplicationSequence` before state, cryptography,
   database, cache, or transport work; rebuild inputs must be a complete
   contiguous prefix. SQLite also checks its signed integer boundary and the
   agreement between each row position and serialized entry. These checks
   prevent malformed-input panics and partial replacement caused by malformed
-  sequence metadata, but do not assign or prove distributed commit authority.
+  sequence metadata. Openraft, rather than this application sequence, assigns
+  and proves distributed commit authority.
 - Fake and SQLite apply each complete replication operation tree atomically:
   a late nested failure preserves records, leases, fence/credential counters,
   the replication log and its compaction cursor, and watch-visible state.
@@ -570,8 +567,8 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
   append events, and the next locally successful append is emitted exactly
   once. The Fake obtains this test-double behavior by cloning its bounded
   in-memory data into a watcher-free stage; SQLite uses a database transaction.
-  This is backend-local atomicity only; distributed commit-gated observation
-  remains part of #127.
+  This is backend-local atomicity only. The Openraft-backed production adapter
+  publishes journal/watch entries only after committed state-machine apply.
 - Session and lease TTLs use the checked 365-day contract above. This closes
   the oversized-duration panic and input-safety boundary only; it does not
   establish consensus, durable commit authority, fork recovery, or production
@@ -609,14 +606,14 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
 
 - Keep backend capabilities explicit so HA/profile suitability can fail closed.
 - Continue hardening restore evidence and traffic-blocking gates.
-- Complete durable sequencing and safe fork repair/recovery (#127–#129),
-  bounded majority-authoritative restore (#133), watch handoff correctness
+- Complete committed-state divergence repair and operator-safe legacy recovery
+  (#128/#129), bounded majority-authoritative restore (#133), watch handoff correctness
   (#145), absolute-expiry admission (#148), production stable-ID and
   transaction-ID persistence contracts (#167/#168), and persist peer
   logical-RPC deadlines (#169), then complete the production qualification
   profile. Seamless certificate/trust-bundle lifecycle is #158;
-  payload-protection-key rotation and the distributed production evidence
-  remain #143.
+  remote-seal historical-key rotation is #179, and distributed
+  payload-protection evidence remains #143.
 - Keep encryption AAD bound to namespace, NF kind, state type, generation,
   fence, and session-key digest.
 
@@ -624,8 +621,8 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
 
 - Source checked: `Cargo.toml`, `src/lib.rs`, backend, lease, TTL, model, record,
   SQLite, topology, quorum, restore, and tests.
-- `tests/quorum_topology.rs` covers descriptor fingerprinting, complete
-  remote-binding admission, typed mismatch classes, and redacted diagnostics.
+- `tests/quorum_topology.rs` covers descriptor fingerprinting, descriptor-only
+  three-node construction, identity uniqueness, and redacted diagnostics.
 - `tests/replication_sequence_bounds.rs` covers direct Fake/SQLite sequence and
   rebuild-prefix admission, signed persistence boundaries, and corrupt-row
   rejection; quorum, encryption, cache, and session-net suites cover their own

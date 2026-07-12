@@ -5,16 +5,15 @@
 //! exactly one member is the local replica; it does not prove reachability,
 //! authenticated peer identity, durable commit authority, or repair safety.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
-use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::capability::SessionStorePlatformProfile;
-use crate::quorum::{FencedSessionReplica, SessionStoreBackend};
+use crate::consensus::{SessionConsensusIdentity, SessionConsensusNodeId};
 
 /// Maximum encoded length of a logical replica ID.
 pub const REPLICA_ID_MAX_BYTES: usize = 253;
@@ -66,43 +65,6 @@ pub enum ReplicaTopologyFieldError {
     TooLong,
     /// The field was not in the canonical format required by its type.
     Malformed,
-}
-
-/// Field of a configured authenticated-backend binding rejected by topology.
-///
-/// Values are deliberately categorical so errors never disclose identities,
-/// descriptor fingerprints, endpoints, or cluster/configuration scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum BackendPeerBindingField {
-    /// The adapter was configured from a different local logical member.
-    LocalReplicaId,
-    /// The adapter targets a different remote logical member.
-    RemoteReplicaId,
-    /// The adapter expects a different remote TLS identity.
-    RemoteTlsIdentity,
-    /// The adapter was configured from a different local descriptor.
-    LocalDescriptorFingerprint,
-    /// The adapter was configured from a different remote descriptor.
-    RemoteDescriptorFingerprint,
-    /// The adapter used a different configured voting-set size.
-    ConfiguredMemberCount,
-    /// Peer adapters do not share one cluster/configuration scope.
-    Scope,
-}
-
-impl fmt::Display for BackendPeerBindingField {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::LocalReplicaId => "local-replica-id",
-            Self::RemoteReplicaId => "remote-replica-id",
-            Self::RemoteTlsIdentity => "remote-tls-identity",
-            Self::LocalDescriptorFingerprint => "local-descriptor-fingerprint",
-            Self::RemoteDescriptorFingerprint => "remote-descriptor-fingerprint",
-            Self::ConfiguredMemberCount => "configured-member-count",
-            Self::Scope => "scope",
-        })
-    }
 }
 
 impl fmt::Display for ReplicaTopologyFieldError {
@@ -180,23 +142,18 @@ pub enum QuorumTopologyError {
     /// Two votes target the same declared physical backing identity.
     #[error("configured members contain a duplicate backing identity")]
     DuplicateBackingIdentity,
-    /// A backend did not provide the stable process-local identity required
-    /// for duplicate-allocation admission checks.
-    #[error("configured member backend does not provide an instance identity")]
-    MissingBackendInstanceIdentity,
-    /// Two member records expose the same process-local adapter identity.
-    #[error("configured members contain a duplicate backend instance")]
-    DuplicateBackendInstance,
-    /// One network-bound topology omitted composition evidence for a remote
-    /// member.
-    #[error("configured remote member is missing an authenticated backend peer binding")]
-    MissingBackendPeerBinding,
-    /// One configured adapter binding disagreed with immutable topology.
-    #[error("configured backend peer binding does not match topology field {field}")]
-    BackendPeerBindingMismatch {
-        /// Stable redaction-safe mismatch category.
-        field: BackendPeerBindingField,
-    },
+    /// An HA topology omitted the identity that scopes persisted consensus
+    /// state and authenticated RPCs.
+    #[error("validated HA topology is missing a consensus identity")]
+    MissingConsensusIdentity,
+    /// The supplied configuration digest did not cover the admitted member
+    /// descriptor set under the supplied cluster and epoch.
+    #[error("consensus configuration identity does not match admitted topology")]
+    ConsensusConfigurationIdMismatch,
+    /// Two logical member identities derived the same fixed-width Openraft
+    /// node ID. Admission fails rather than aliasing votes.
+    #[error("configured members contain a duplicate consensus node ID")]
+    DuplicateConsensusNodeId,
 }
 
 fn validate_opaque(
@@ -468,20 +425,6 @@ impl QuorumReplicaDescriptor {
         }
     }
 
-    pub(crate) fn unvalidated_legacy(index: usize) -> Self {
-        let backing = format!("legacy-backing-{index}");
-        Self {
-            replica_id: ReplicaId(format!("legacy-{index}")),
-            endpoint: ReplicaEndpoint {
-                host: format!("legacy-{index}.invalid"),
-                port: 1,
-            },
-            tls_identity: ReplicaTlsIdentity(format!("legacy-tls-{index}")),
-            failure_domain: ReplicaFailureDomain(format!("legacy-failure-domain-{index}")),
-            backing_identity: ReplicaBackingIdentity(Sha256::digest(backing.as_bytes()).into()),
-        }
-    }
-
     /// Stable logical member identity.
     pub fn replica_id(&self) -> &ReplicaId {
         &self.replica_id
@@ -539,53 +482,42 @@ impl fmt::Debug for QuorumReplicaDescriptor {
     }
 }
 
-/// A declared member paired with the backend adapter used to reach it.
-#[derive(Clone)]
-pub struct QuorumReplicaMember {
-    descriptor: QuorumReplicaDescriptor,
-    replica: FencedSessionReplica,
-}
-
-impl QuorumReplicaMember {
-    /// Pair immutable topology metadata with a backend replica wrapper.
-    pub fn new(descriptor: QuorumReplicaDescriptor, replica: FencedSessionReplica) -> Self {
-        Self {
-            descriptor,
-            replica,
-        }
-    }
-
-    /// Declared immutable identity of this member.
-    pub fn descriptor(&self) -> &QuorumReplicaDescriptor {
-        &self.descriptor
-    }
-
-    /// Backend and fault-injection wrapper for this member.
-    pub fn replica(&self) -> &FencedSessionReplica {
-        &self.replica
-    }
-
-    /// Replace the backend adapter while retaining topology and fault controls.
-    #[must_use]
-    pub fn with_backend(mut self, backend: Arc<dyn SessionStoreBackend>) -> Self {
-        self.replica.inner = backend;
-        self
-    }
-}
-
 /// Unvalidated requested HA topology.
 #[derive(Clone)]
 pub struct QuorumTopologyConfig {
     local_replica_id: ReplicaId,
-    members: Vec<QuorumReplicaMember>,
+    members: Vec<QuorumReplicaDescriptor>,
+    consensus_identity: Option<SessionConsensusIdentity>,
 }
 
 impl QuorumTopologyConfig {
-    /// Define an HA membership set and its exact local logical replica ID.
-    pub fn new(local_replica_id: ReplicaId, members: Vec<QuorumReplicaMember>) -> Self {
+    /// Define a legacy membership set without durable consensus scope.
+    ///
+    /// Conversion to validated HA fails closed. This constructor remains only
+    /// so older callers receive a typed admission error instead of silently
+    /// entering the retired per-replica sequencing protocol.
+    #[deprecated(
+        since = "0.2.0",
+        note = "use QuorumTopologyConfig::new_consensus for HA"
+    )]
+    pub fn new(local_replica_id: ReplicaId, members: Vec<QuorumReplicaDescriptor>) -> Self {
         Self {
             local_replica_id,
             members,
+            consensus_identity: None,
+        }
+    }
+
+    /// Define an HA membership set scoped to one exact consensus identity.
+    pub fn new_consensus(
+        local_replica_id: ReplicaId,
+        members: Vec<QuorumReplicaDescriptor>,
+        consensus_identity: SessionConsensusIdentity,
+    ) -> Self {
+        Self {
+            local_replica_id,
+            members,
+            consensus_identity: Some(consensus_identity),
         }
     }
 }
@@ -599,8 +531,6 @@ pub enum QuorumTopologyMode {
     ValidatedHa,
     /// Explicit one-member lab profile; never an HA claim.
     LabSingleton,
-    /// Deprecated raw-vector construction with no identity evidence.
-    UnvalidatedLegacy,
 }
 
 impl QuorumTopologyMode {
@@ -609,7 +539,6 @@ impl QuorumTopologyMode {
         match self {
             Self::ValidatedHa => "validated-ha",
             Self::LabSingleton => "lab-singleton",
-            Self::UnvalidatedLegacy => "unvalidated-legacy",
         }
     }
 
@@ -618,7 +547,6 @@ impl QuorumTopologyMode {
         match self {
             Self::ValidatedHa => SessionStorePlatformProfile::Quorum,
             Self::LabSingleton => SessionStorePlatformProfile::SingleReplica,
-            Self::UnvalidatedLegacy => SessionStorePlatformProfile::Unknown,
         }
     }
 }
@@ -648,38 +576,43 @@ impl QuorumTopologySummary {
         self.required_quorum
     }
 
-    /// Exact local logical ID, absent only for deprecated raw construction.
+    /// Exact local logical ID. Validated constructors always populate it; the
+    /// optional shape is retained for source compatibility with readiness code.
     pub fn local_replica_id(&self) -> Option<&ReplicaId> {
         self.local_replica_id.as_ref()
     }
-
-    pub(crate) fn unvalidated_legacy(configured_members: usize) -> Self {
-        Self {
-            mode: QuorumTopologyMode::UnvalidatedLegacy,
-            configured_members,
-            required_quorum: 0,
-            local_replica_id: None,
-        }
-    }
 }
 
-/// Immutable topology that passed HA or explicit singleton admission.
+/// Immutable descriptor-only topology that passed HA or singleton admission.
+///
+/// Storage backends and network clients are deliberately absent. A consensus
+/// node receives its one local backend and exact remote peer map separately,
+/// so topology data cannot expose a second mutation surface.
 #[derive(Clone)]
 pub struct ValidatedQuorumTopology {
     summary: QuorumTopologySummary,
-    members: Vec<QuorumReplicaMember>,
+    members: Vec<QuorumReplicaDescriptor>,
+    consensus_identity: Option<SessionConsensusIdentity>,
+    consensus_node_ids: BTreeMap<ReplicaId, SessionConsensusNodeId>,
 }
 
 impl ValidatedQuorumTopology {
-    /// Validate an explicit one-member lab topology.
+    /// Validate an explicit one-member lab topology backed by Openraft.
     ///
-    /// This profile is operational for tests and labs but advertises
-    /// [`SessionStorePlatformProfile::SingleReplica`], never quorum HA.
-    pub fn try_new_lab_singleton(
+    /// This remains a single-replica platform profile, but exercises the same
+    /// consensus engine, durable metadata, and deterministic state machine as
+    /// HA instead of a second sequencing implementation.
+    pub fn try_new_consensus_lab_singleton(
         local_replica_id: ReplicaId,
-        members: Vec<QuorumReplicaMember>,
+        members: Vec<QuorumReplicaDescriptor>,
+        consensus_identity: SessionConsensusIdentity,
     ) -> Result<Self, QuorumTopologyError> {
-        validate_topology(local_replica_id, members, QuorumTopologyMode::LabSingleton)
+        validate_topology(
+            local_replica_id,
+            members,
+            QuorumTopologyMode::LabSingleton,
+            Some(consensus_identity),
+        )
     }
 
     /// Redaction-safe admitted shape.
@@ -692,43 +625,28 @@ impl ValidatedQuorumTopology {
         self.summary.mode.platform_profile()
     }
 
-    /// Validated configured members.
-    pub fn members(&self) -> &[QuorumReplicaMember] {
+    /// Validated configured member descriptors.
+    pub fn members(&self) -> &[QuorumReplicaDescriptor] {
         &self.members
     }
 
-    /// Map backend adapters without discarding or mutating topology identity.
-    ///
-    /// The mapped topology is revalidated, so a wrapper that omits the backend
-    /// identity contract or aliases an existing physical instance fails closed.
-    /// Callers must also preserve each member's canonical backing identity;
-    /// authenticated backend binding remains a separate requirement.
-    pub fn try_map_backends<F>(self, mut map: F) -> Result<Self, QuorumTopologyError>
-    where
-        F: FnMut(
-            &QuorumReplicaDescriptor,
-            Arc<dyn SessionStoreBackend>,
-        ) -> Arc<dyn SessionStoreBackend>,
-    {
-        let mode = self.summary.mode;
-        let local_replica_id = self
-            .summary
-            .local_replica_id
-            .clone()
-            .ok_or(QuorumTopologyError::MissingLocalReplica)?;
-        let members = self
-            .members
-            .into_iter()
-            .map(|member| {
-                let backend = map(&member.descriptor, member.replica.inner.clone());
-                member.with_backend(backend)
-            })
-            .collect();
-        validate_topology(local_replica_id, members, mode)
+    /// Consensus cluster/configuration/epoch scope, when this topology uses
+    /// the production sequencing engine.
+    pub const fn consensus_identity(&self) -> Option<SessionConsensusIdentity> {
+        self.consensus_identity
     }
 
-    pub(crate) fn into_parts(self) -> (QuorumTopologySummary, Vec<QuorumReplicaMember>) {
-        (self.summary, self.members)
+    /// Stable cluster-scoped Openraft node ID for one admitted logical member.
+    pub fn consensus_node_id(&self, replica_id: &ReplicaId) -> Option<SessionConsensusNodeId> {
+        self.consensus_node_ids.get(replica_id).copied()
+    }
+
+    /// Stable Openraft node ID of the exact admitted local member.
+    pub fn local_consensus_node_id(&self) -> Option<SessionConsensusNodeId> {
+        self.summary
+            .local_replica_id
+            .as_ref()
+            .and_then(|replica_id| self.consensus_node_id(replica_id))
     }
 }
 
@@ -740,14 +658,16 @@ impl TryFrom<QuorumTopologyConfig> for ValidatedQuorumTopology {
             config.local_replica_id,
             config.members,
             QuorumTopologyMode::ValidatedHa,
+            config.consensus_identity,
         )
     }
 }
 
 fn validate_topology(
     local_replica_id: ReplicaId,
-    members: Vec<QuorumReplicaMember>,
+    members: Vec<QuorumReplicaDescriptor>,
     mode: QuorumTopologyMode,
+    consensus_identity: Option<SessionConsensusIdentity>,
 ) -> Result<ValidatedQuorumTopology, QuorumTopologyError> {
     if members.len() > QUORUM_TOPOLOGY_MAX_MEMBERS {
         return Err(QuorumTopologyError::MemberCountTooLarge {
@@ -772,15 +692,12 @@ fn validate_topology(
                 configured: members.len(),
             });
         }
-        QuorumTopologyMode::UnvalidatedLegacy => {
-            return Err(QuorumTopologyError::MissingLocalReplica);
-        }
         _ => {}
     }
 
     let self_matches = members
         .iter()
-        .filter(|member| member.descriptor.replica_id == local_replica_id)
+        .filter(|descriptor| descriptor.replica_id == local_replica_id)
         .count();
     match self_matches {
         0 => return Err(QuorumTopologyError::MissingLocalReplica),
@@ -793,10 +710,7 @@ fn validate_topology(
     let mut tls_identities = HashSet::with_capacity(members.len());
     let mut failure_domains = HashSet::with_capacity(members.len());
     let mut backing_identities = HashSet::with_capacity(members.len());
-    let mut backend_instances = Vec::with_capacity(members.len());
-
-    for member in &members {
-        let descriptor = &member.descriptor;
+    for descriptor in &members {
         if !replica_ids.insert(descriptor.replica_id.clone()) {
             return Err(QuorumTopologyError::DuplicateReplicaId);
         }
@@ -812,83 +726,38 @@ fn validate_topology(
         if !backing_identities.insert(descriptor.backing_identity.clone()) {
             return Err(QuorumTopologyError::DuplicateBackingIdentity);
         }
-        let backend_instance = member
-            .replica
-            .inner
-            .backend_instance_identity()
-            .ok_or(QuorumTopologyError::MissingBackendInstanceIdentity)?;
-        if backend_instances.contains(&backend_instance) {
-            return Err(QuorumTopologyError::DuplicateBackendInstance);
-        }
-        backend_instances.push(backend_instance);
     }
 
     let configured_members = members.len();
-    let local_descriptor_fingerprint = members
-        .iter()
-        .find(|member| member.descriptor.replica_id == local_replica_id)
-        .map(|member| member.descriptor.configuration_fingerprint())
-        .ok_or(QuorumTopologyError::MissingLocalReplica)?;
-    let peer_bindings = members
-        .iter()
-        .map(|member| member.replica.inner.peer_binding())
-        .collect::<Vec<_>>();
-
-    if peer_bindings.iter().any(Option::is_some) {
-        let mut shared_scope = None;
-        for (member, binding) in members.iter().zip(&peer_bindings) {
-            let Some(binding) = binding else {
-                if member.descriptor.replica_id == local_replica_id {
-                    // An in-process local backend does not traverse an
-                    // authenticated peer connection and may remain unbound.
-                    continue;
-                }
-                return Err(QuorumTopologyError::MissingBackendPeerBinding);
-            };
-
-            if binding.local_replica_id() != &local_replica_id {
-                return Err(QuorumTopologyError::BackendPeerBindingMismatch {
-                    field: BackendPeerBindingField::LocalReplicaId,
-                });
-            }
-            if binding.local_descriptor_fingerprint() != &local_descriptor_fingerprint {
-                return Err(QuorumTopologyError::BackendPeerBindingMismatch {
-                    field: BackendPeerBindingField::LocalDescriptorFingerprint,
-                });
-            }
-            if binding.remote_replica_id() != member.descriptor.replica_id() {
-                return Err(QuorumTopologyError::BackendPeerBindingMismatch {
-                    field: BackendPeerBindingField::RemoteReplicaId,
-                });
-            }
-            if binding.remote_tls_identity() != member.descriptor.tls_identity() {
-                return Err(QuorumTopologyError::BackendPeerBindingMismatch {
-                    field: BackendPeerBindingField::RemoteTlsIdentity,
-                });
-            }
-            if binding.remote_descriptor_fingerprint()
-                != &member.descriptor.configuration_fingerprint()
-            {
-                return Err(QuorumTopologyError::BackendPeerBindingMismatch {
-                    field: BackendPeerBindingField::RemoteDescriptorFingerprint,
-                });
-            }
-            if usize::from(binding.configured_member_count()) != configured_members {
-                return Err(QuorumTopologyError::BackendPeerBindingMismatch {
-                    field: BackendPeerBindingField::ConfiguredMemberCount,
-                });
-            }
-
-            if let Some(expected_scope) = shared_scope {
-                if binding.scope() != &expected_scope {
-                    return Err(QuorumTopologyError::BackendPeerBindingMismatch {
-                        field: BackendPeerBindingField::Scope,
-                    });
-                }
-            } else {
-                shared_scope = Some(*binding.scope());
-            }
+    let mut consensus_node_ids = BTreeMap::new();
+    if let Some(identity) = consensus_identity {
+        let component_fingerprints = members
+            .iter()
+            .map(QuorumReplicaDescriptor::configuration_fingerprint)
+            .collect::<Vec<_>>();
+        let expected_configuration_id = opc_consensus::derive_configuration_id(
+            identity.cluster_id(),
+            identity.configuration_epoch(),
+            &component_fingerprints,
+        );
+        if identity.configuration_id() != expected_configuration_id {
+            return Err(QuorumTopologyError::ConsensusConfigurationIdMismatch);
         }
+
+        let mut admitted_node_ids = HashSet::with_capacity(members.len());
+        for descriptor in &members {
+            let node_id = opc_consensus::derive_node_id(
+                identity.cluster_id(),
+                descriptor.replica_id().as_str().as_bytes(),
+            )
+            .map_err(|_| QuorumTopologyError::DuplicateConsensusNodeId)?;
+            if !admitted_node_ids.insert(node_id) {
+                return Err(QuorumTopologyError::DuplicateConsensusNodeId);
+            }
+            consensus_node_ids.insert(descriptor.replica_id().clone(), node_id);
+        }
+    } else if mode == QuorumTopologyMode::ValidatedHa {
+        return Err(QuorumTopologyError::MissingConsensusIdentity);
     }
 
     let required_quorum = (configured_members / 2) + 1;
@@ -900,5 +769,7 @@ fn validate_topology(
             local_replica_id: Some(local_replica_id),
         },
         members,
+        consensus_identity,
+        consensus_node_ids,
     })
 }

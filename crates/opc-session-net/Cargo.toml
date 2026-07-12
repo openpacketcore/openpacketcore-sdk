@@ -16,8 +16,13 @@ publish = false # experimental: not published until graduation
 [features]
 default = []
 insecure-test = []
+# Quarantined protocol-v4 remote-backend RPCs. This compatibility surface
+# includes direct mutations and raw replication-log/rebuild authority and must
+# not be enabled on a production Openraft endpoint.
+legacy-session-net-compat = []
 
 [dependencies]
+opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
 opc-tls = { path = "../opc-tls", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }

@@ -1,18 +1,12 @@
-use std::{sync::Arc, time::Duration};
-
-use bytes::Bytes;
+use opc_consensus::{
+    derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
+};
 use opc_session_store::{
-    BackendCapabilities, BackendInstanceIdentity, BackendPeerBinding, BackendPeerBindingField,
-    BackendPeerScopeIdentity, CompareAndSet, CompareAndSetResult, FakeSessionBackend,
-    FencedSessionReplica, LeaseError, LeaseGuard, OwnerId, QuorumReplicaDescriptor,
-    QuorumReplicaMember, QuorumSessionStore, QuorumTopologyConfig, QuorumTopologyError,
-    QuorumTopologyMode, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
-    ReplicaTlsIdentity, ReplicaTopologyField, ReplicaTopologyFieldError, SessionBackend,
-    SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult, SessionStore,
-    SessionStoreBackend, SessionStorePlatformProfile, StoreError, StoredSessionRecord,
+    QuorumReplicaDescriptor, QuorumTopologyConfig, QuorumTopologyError, QuorumTopologyMode,
+    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    ReplicaTopologyField, ReplicaTopologyFieldError, SessionStorePlatformProfile,
     ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
 };
-use opc_types::{NetworkFunctionKind, TenantId};
 use proptest::prelude::*;
 
 fn replica_id(index: usize) -> ReplicaId {
@@ -39,136 +33,40 @@ fn descriptor(
     )
 }
 
-fn member_with_backend(index: usize, backend: Arc<dyn SessionStoreBackend>) -> QuorumReplicaMember {
-    QuorumReplicaMember::new(
-        descriptor(replica_id(index), index, index, index, index),
-        FencedSessionReplica::new(index, backend),
-    )
+fn member(index: usize) -> QuorumReplicaDescriptor {
+    descriptor(replica_id(index), index, index, index, index)
 }
 
-fn member(index: usize) -> QuorumReplicaMember {
-    member_with_backend(index, Arc::new(FakeSessionBackend::new()))
-}
-
-fn members(count: usize) -> Vec<QuorumReplicaMember> {
+fn members(count: usize) -> Vec<QuorumReplicaDescriptor> {
     (0..count).map(member).collect()
 }
 
 fn validate_ha(
     local_replica_id: ReplicaId,
-    members: Vec<QuorumReplicaMember>,
+    members: Vec<QuorumReplicaDescriptor>,
 ) -> Result<ValidatedQuorumTopology, QuorumTopologyError> {
-    ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new(local_replica_id, members))
+    let identity = consensus_identity(&members);
+    ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+        local_replica_id,
+        members,
+        identity,
+    ))
 }
 
-#[derive(Clone)]
-struct PeerBoundBackend {
-    inner: FakeSessionBackend,
-    binding: BackendPeerBinding,
-}
-
-impl PeerBoundBackend {
-    fn new(binding: BackendPeerBinding) -> Self {
-        Self {
-            inner: FakeSessionBackend::new(),
-            binding,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl SessionBackend for PeerBoundBackend {
-    fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
-        self.inner.backend_instance_identity()
-    }
-
-    fn peer_binding(&self) -> Option<BackendPeerBinding> {
-        Some(self.binding.clone())
-    }
-
-    async fn capabilities(&self) -> BackendCapabilities {
-        self.inner.capabilities().await
-    }
-
-    async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
-        self.inner.get(key).await
-    }
-
-    async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
-        self.inner.compare_and_set(op).await
-    }
-
-    async fn delete_fenced(&self, lease: &LeaseGuard) -> Result<(), StoreError> {
-        self.inner.delete_fenced(lease).await
-    }
-
-    async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
-        self.inner.refresh_ttl(lease, ttl).await
-    }
-
-    async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
-        self.inner.batch(ops).await
-    }
-}
-
-#[async_trait::async_trait]
-impl SessionLeaseManager for PeerBoundBackend {
-    async fn acquire(
-        &self,
-        key: &SessionKey,
-        owner: OwnerId,
-        ttl: Duration,
-    ) -> Result<LeaseGuard, LeaseError> {
-        self.inner.acquire(key, owner, ttl).await
-    }
-
-    async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
-        self.inner.renew(lease, ttl).await
-    }
-
-    async fn release(&self, lease: LeaseGuard) -> Result<(), LeaseError> {
-        self.inner.release(lease).await
-    }
+fn consensus_identity(members: &[QuorumReplicaDescriptor]) -> ConsensusIdentity {
+    let cluster_id = ConsensusClusterId::new("session-store-topology-tests").expect("cluster ID");
+    let epoch = ConsensusConfigurationEpoch::new(1).expect("configuration epoch");
+    let fingerprints = members
+        .iter()
+        .map(QuorumReplicaDescriptor::configuration_fingerprint)
+        .collect::<Vec<_>>();
+    let configuration_id = derive_configuration_id(cluster_id, epoch, &fingerprints);
+    ConsensusIdentity::new(cluster_id, configuration_id, epoch)
 }
 
 fn test_descriptors() -> Vec<QuorumReplicaDescriptor> {
     (0..3)
         .map(|index| descriptor(replica_id(index), index, index, index, index))
-        .collect()
-}
-
-fn valid_peer_binding(
-    descriptors: &[QuorumReplicaDescriptor],
-    remote_index: usize,
-    scope: BackendPeerScopeIdentity,
-) -> BackendPeerBinding {
-    BackendPeerBinding::new(
-        descriptors[0].replica_id().clone(),
-        descriptors[remote_index].replica_id().clone(),
-        descriptors[remote_index].tls_identity().clone(),
-        descriptors[0].configuration_fingerprint(),
-        descriptors[remote_index].configuration_fingerprint(),
-        3,
-        scope,
-    )
-}
-
-fn members_with_peer_bindings(
-    descriptors: &[QuorumReplicaDescriptor],
-    bindings: Vec<Option<BackendPeerBinding>>,
-) -> Vec<QuorumReplicaMember> {
-    descriptors
-        .iter()
-        .cloned()
-        .zip(bindings)
-        .enumerate()
-        .map(|(index, (descriptor, binding))| {
-            let backend: Arc<dyn SessionStoreBackend> = match binding {
-                Some(binding) => Arc::new(PeerBoundBackend::new(binding)),
-                None => Arc::new(FakeSessionBackend::new()),
-            };
-            QuorumReplicaMember::new(descriptor, FencedSessionReplica::new(index, backend))
-        })
         .collect()
 }
 
@@ -244,169 +142,15 @@ fn descriptor_configuration_fingerprint_is_fixed_deterministic_and_covers_every_
 }
 
 #[test]
-fn authenticated_peer_bindings_admit_with_an_unbound_in_process_local_member() {
+fn three_node_consensus_topology_needs_only_member_descriptors() {
     let descriptors = test_descriptors();
-    let scope = BackendPeerScopeIdentity::new([7; 32]);
-    let bindings = vec![
-        None,
-        Some(valid_peer_binding(&descriptors, 1, scope)),
-        Some(valid_peer_binding(&descriptors, 2, scope)),
-    ];
+    let local = descriptors[0].replica_id().clone();
 
-    let topology = validate_ha(
-        descriptors[0].replica_id().clone(),
-        members_with_peer_bindings(&descriptors, bindings),
-    )
-    .expect("matching peer bindings must pass topology admission");
+    let topology = validate_ha(local, descriptors.clone())
+        .expect("descriptor-only production topology must pass admission");
+
+    assert_eq!(topology.members(), descriptors.as_slice());
     assert_eq!(topology.summary().configured_members(), 3);
-}
-
-#[test]
-fn one_peer_binding_requires_composition_evidence_for_every_remote_member() {
-    let descriptors = test_descriptors();
-    let scope = BackendPeerScopeIdentity::new([7; 32]);
-    let bindings = vec![None, Some(valid_peer_binding(&descriptors, 1, scope)), None];
-
-    assert_eq!(
-        validate_ha(
-            descriptors[0].replica_id().clone(),
-            members_with_peer_bindings(&descriptors, bindings),
-        )
-        .err(),
-        Some(QuorumTopologyError::MissingBackendPeerBinding)
-    );
-}
-
-#[test]
-fn peer_binding_mismatch_categories_are_typed_and_redacted() {
-    let descriptors = test_descriptors();
-    let scope = BackendPeerScopeIdentity::new([7; 32]);
-    let alternate_scope = BackendPeerScopeIdentity::new([8; 32]);
-    let local_fingerprint = descriptors[0].configuration_fingerprint();
-    let remote_fingerprint = descriptors[1].configuration_fingerprint();
-    let valid_second = valid_peer_binding(&descriptors, 2, scope);
-    let build = |local_id: ReplicaId,
-                 remote_id: ReplicaId,
-                 tls_identity: ReplicaTlsIdentity,
-                 local_descriptor_fingerprint: [u8; 32],
-                 remote_descriptor_fingerprint: [u8; 32],
-                 configured_member_count: u16,
-                 binding_scope: BackendPeerScopeIdentity| {
-        BackendPeerBinding::new(
-            local_id,
-            remote_id,
-            tls_identity,
-            local_descriptor_fingerprint,
-            remote_descriptor_fingerprint,
-            configured_member_count,
-            binding_scope,
-        )
-    };
-    let cases = vec![
-        (
-            build(
-                replica_id(9),
-                descriptors[1].replica_id().clone(),
-                descriptors[1].tls_identity().clone(),
-                local_fingerprint,
-                remote_fingerprint,
-                3,
-                scope,
-            ),
-            BackendPeerBindingField::LocalReplicaId,
-        ),
-        (
-            build(
-                descriptors[0].replica_id().clone(),
-                replica_id(9),
-                descriptors[1].tls_identity().clone(),
-                local_fingerprint,
-                remote_fingerprint,
-                3,
-                scope,
-            ),
-            BackendPeerBindingField::RemoteReplicaId,
-        ),
-        (
-            build(
-                descriptors[0].replica_id().clone(),
-                descriptors[1].replica_id().clone(),
-                ReplicaTlsIdentity::new("spiffe://private/wrong-peer").expect("wrong TLS ID"),
-                local_fingerprint,
-                remote_fingerprint,
-                3,
-                scope,
-            ),
-            BackendPeerBindingField::RemoteTlsIdentity,
-        ),
-        (
-            build(
-                descriptors[0].replica_id().clone(),
-                descriptors[1].replica_id().clone(),
-                descriptors[1].tls_identity().clone(),
-                [1; 32],
-                remote_fingerprint,
-                3,
-                scope,
-            ),
-            BackendPeerBindingField::LocalDescriptorFingerprint,
-        ),
-        (
-            build(
-                descriptors[0].replica_id().clone(),
-                descriptors[1].replica_id().clone(),
-                descriptors[1].tls_identity().clone(),
-                local_fingerprint,
-                [2; 32],
-                3,
-                scope,
-            ),
-            BackendPeerBindingField::RemoteDescriptorFingerprint,
-        ),
-        (
-            build(
-                descriptors[0].replica_id().clone(),
-                descriptors[1].replica_id().clone(),
-                descriptors[1].tls_identity().clone(),
-                local_fingerprint,
-                remote_fingerprint,
-                5,
-                scope,
-            ),
-            BackendPeerBindingField::ConfiguredMemberCount,
-        ),
-        (
-            build(
-                descriptors[0].replica_id().clone(),
-                descriptors[1].replica_id().clone(),
-                descriptors[1].tls_identity().clone(),
-                local_fingerprint,
-                remote_fingerprint,
-                3,
-                alternate_scope,
-            ),
-            BackendPeerBindingField::Scope,
-        ),
-    ];
-
-    for (first_binding, field) in cases {
-        let debug = format!("{first_binding:?}");
-        assert!(!debug.contains("private"));
-        let error = validate_ha(
-            descriptors[0].replica_id().clone(),
-            members_with_peer_bindings(
-                &descriptors,
-                vec![None, Some(first_binding), Some(valid_second.clone())],
-            ),
-        )
-        .err()
-        .expect("mismatched peer binding must fail topology admission");
-        assert_eq!(
-            error,
-            QuorumTopologyError::BackendPeerBindingMismatch { field }
-        );
-        assert!(!error.to_string().contains("spiffe://"));
-    }
 }
 
 proptest! {
@@ -443,19 +187,16 @@ proptest! {
 #[test]
 fn logical_self_is_exact_and_independent_from_fqdn_endpoint() {
     let bare_self = ReplicaId::new("epdg-app-0").expect("bare logical self");
-    let local = QuorumReplicaMember::new(
-        QuorumReplicaDescriptor::new(
-            bare_self.clone(),
-            ReplicaEndpoint::new(
-                "epdg-app-0.epdg-app-quorum.epdg-gateway.svc.cluster.local",
-                7443,
-            )
-            .expect("local FQDN endpoint"),
-            ReplicaTlsIdentity::new("spiffe://cluster/epdg/replica/0").expect("local TLS identity"),
-            ReplicaFailureDomain::new("pod/epdg-app-0").expect("local failure domain"),
-            ReplicaBackingIdentity::new("pvc/session-store-0").expect("local backing"),
-        ),
-        FencedSessionReplica::new(0, Arc::new(FakeSessionBackend::new())),
+    let local = QuorumReplicaDescriptor::new(
+        bare_self.clone(),
+        ReplicaEndpoint::new(
+            "epdg-app-0.epdg-app-quorum.epdg-gateway.svc.cluster.local",
+            7443,
+        )
+        .expect("local FQDN endpoint"),
+        ReplicaTlsIdentity::new("spiffe://cluster/epdg/replica/0").expect("local TLS identity"),
+        ReplicaFailureDomain::new("pod/epdg-app-0").expect("local failure domain"),
+        ReplicaBackingIdentity::new("pvc/session-store-0").expect("local backing"),
     );
     let topology = validate_ha(bare_self.clone(), vec![member(1), local, member(2)])
         .expect("bare self maps by logical ID only");
@@ -467,10 +208,10 @@ fn logical_self_is_exact_and_independent_from_fqdn_endpoint() {
     let local_member = topology
         .members()
         .iter()
-        .find(|member| member.descriptor().replica_id() == &bare_self)
+        .find(|descriptor| descriptor.replica_id() == &bare_self)
         .expect("validated local member");
     assert_eq!(
-        local_member.descriptor().endpoint().host(),
+        local_member.endpoint().host(),
         "epdg-app-0.epdg-app-quorum.epdg-gateway.svc.cluster.local"
     );
 }
@@ -483,14 +224,7 @@ fn missing_and_ambiguous_local_members_fail_with_distinct_errors() {
     );
 
     let local = replica_id(0);
-    let ambiguous = vec![
-        member(0),
-        QuorumReplicaMember::new(
-            descriptor(local.clone(), 1, 1, 1, 1),
-            FencedSessionReplica::new(1, Arc::new(FakeSessionBackend::new())),
-        ),
-        member(2),
-    ];
+    let ambiguous = vec![member(0), descriptor(local.clone(), 1, 1, 1, 1), member(2)];
     assert_eq!(
         validate_ha(local, ambiguous).err(),
         Some(QuorumTopologyError::AmbiguousLocalReplica { matches: 2 })
@@ -501,58 +235,23 @@ fn missing_and_ambiguous_local_members_fail_with_distinct_errors() {
 fn every_vote_identity_dimension_must_be_distinct() {
     let cases = [
         (
-            vec![
-                member(0),
-                member(1),
-                QuorumReplicaMember::new(
-                    descriptor(replica_id(1), 2, 2, 2, 2),
-                    FencedSessionReplica::new(2, Arc::new(FakeSessionBackend::new())),
-                ),
-            ],
+            vec![member(0), member(1), descriptor(replica_id(1), 2, 2, 2, 2)],
             QuorumTopologyError::DuplicateReplicaId,
         ),
         (
-            vec![
-                member(0),
-                member(1),
-                QuorumReplicaMember::new(
-                    descriptor(replica_id(2), 1, 2, 2, 2),
-                    FencedSessionReplica::new(2, Arc::new(FakeSessionBackend::new())),
-                ),
-            ],
+            vec![member(0), member(1), descriptor(replica_id(2), 1, 2, 2, 2)],
             QuorumTopologyError::DuplicateEndpoint,
         ),
         (
-            vec![
-                member(0),
-                member(1),
-                QuorumReplicaMember::new(
-                    descriptor(replica_id(2), 2, 1, 2, 2),
-                    FencedSessionReplica::new(2, Arc::new(FakeSessionBackend::new())),
-                ),
-            ],
+            vec![member(0), member(1), descriptor(replica_id(2), 2, 1, 2, 2)],
             QuorumTopologyError::DuplicateTlsIdentity,
         ),
         (
-            vec![
-                member(0),
-                member(1),
-                QuorumReplicaMember::new(
-                    descriptor(replica_id(2), 2, 2, 1, 2),
-                    FencedSessionReplica::new(2, Arc::new(FakeSessionBackend::new())),
-                ),
-            ],
+            vec![member(0), member(1), descriptor(replica_id(2), 2, 2, 1, 2)],
             QuorumTopologyError::DuplicateFailureDomain,
         ),
         (
-            vec![
-                member(0),
-                member(1),
-                QuorumReplicaMember::new(
-                    descriptor(replica_id(2), 2, 2, 2, 1),
-                    FencedSessionReplica::new(2, Arc::new(FakeSessionBackend::new())),
-                ),
-            ],
+            vec![member(0), member(1), descriptor(replica_id(2), 2, 2, 2, 1)],
             QuorumTopologyError::DuplicateBackingIdentity,
         ),
     ];
@@ -564,26 +263,20 @@ fn every_vote_identity_dimension_must_be_distinct() {
 
 #[test]
 fn dns_case_and_trailing_dot_cannot_alias_two_endpoint_votes() {
-    let first = QuorumReplicaMember::new(
-        QuorumReplicaDescriptor::new(
-            replica_id(1),
-            ReplicaEndpoint::new("PEER.SESSIONS.TEST.INVALID.", 7443)
-                .expect("absolute uppercase endpoint"),
-            ReplicaTlsIdentity::new("spiffe://test/session/replica/1").expect("TLS identity"),
-            ReplicaFailureDomain::new("test-failure-domain-1").expect("failure domain"),
-            ReplicaBackingIdentity::new("test-backing-1").expect("backing identity"),
-        ),
-        FencedSessionReplica::new(1, Arc::new(FakeSessionBackend::new())),
+    let first = QuorumReplicaDescriptor::new(
+        replica_id(1),
+        ReplicaEndpoint::new("PEER.SESSIONS.TEST.INVALID.", 7443)
+            .expect("absolute uppercase endpoint"),
+        ReplicaTlsIdentity::new("spiffe://test/session/replica/1").expect("TLS identity"),
+        ReplicaFailureDomain::new("test-failure-domain-1").expect("failure domain"),
+        ReplicaBackingIdentity::new("test-backing-1").expect("backing identity"),
     );
-    let alias = QuorumReplicaMember::new(
-        QuorumReplicaDescriptor::new(
-            replica_id(2),
-            ReplicaEndpoint::new("peer.sessions.test.invalid", 7443).expect("lowercase endpoint"),
-            ReplicaTlsIdentity::new("spiffe://test/session/replica/2").expect("TLS identity"),
-            ReplicaFailureDomain::new("test-failure-domain-2").expect("failure domain"),
-            ReplicaBackingIdentity::new("test-backing-2").expect("backing identity"),
-        ),
-        FencedSessionReplica::new(2, Arc::new(FakeSessionBackend::new())),
+    let alias = QuorumReplicaDescriptor::new(
+        replica_id(2),
+        ReplicaEndpoint::new("peer.sessions.test.invalid", 7443).expect("lowercase endpoint"),
+        ReplicaTlsIdentity::new("spiffe://test/session/replica/2").expect("TLS identity"),
+        ReplicaFailureDomain::new("test-failure-domain-2").expect("failure domain"),
+        ReplicaBackingIdentity::new("test-backing-2").expect("backing identity"),
     );
 
     assert_eq!(
@@ -638,55 +331,6 @@ fn legacy_numeric_ipv4_aliases_are_rejected() {
 }
 
 #[test]
-fn one_backend_wrapped_as_three_votes_is_rejected() {
-    let backend: Arc<dyn SessionStoreBackend> = Arc::new(FakeSessionBackend::new());
-    let aliased = (0..3)
-        .map(|index| member_with_backend(index, backend.clone()))
-        .collect();
-
-    assert_eq!(
-        validate_ha(replica_id(0), aliased).err(),
-        Some(QuorumTopologyError::DuplicateBackendInstance)
-    );
-}
-
-#[test]
-fn distinct_sdk_wrappers_around_one_backend_cannot_create_three_votes() {
-    let shared = Arc::new(FakeSessionBackend::new());
-    let wrapped = (0..3)
-        .map(|index| {
-            let backend: Arc<dyn SessionStoreBackend> =
-                Arc::new(SessionStore::from_arc(shared.clone()));
-            member_with_backend(index, backend)
-        })
-        .collect();
-
-    assert_eq!(
-        validate_ha(replica_id(0), wrapped).err(),
-        Some(QuorumTopologyError::DuplicateBackendInstance)
-    );
-}
-
-#[test]
-fn nested_quorum_coordinators_cannot_be_admitted_as_replica_votes() {
-    let coordinator = QuorumSessionStore::from_validated_topology(
-        validate_ha(replica_id(0), members(3)).expect("inner validated topology"),
-    );
-    assert!(coordinator.backend_instance_identity().is_none());
-
-    let nested = (0..3)
-        .map(|index| {
-            let backend: Arc<dyn SessionStoreBackend> = Arc::new(coordinator.clone());
-            member_with_backend(index, backend)
-        })
-        .collect();
-    assert_eq!(
-        validate_ha(replica_id(0), nested).err(),
-        Some(QuorumTopologyError::MissingBackendInstanceIdentity)
-    );
-}
-
-#[test]
 fn member_order_does_not_change_admission_or_quorum() {
     let mut forward = members(5);
     let mut reverse = members(5);
@@ -698,39 +342,43 @@ fn member_order_does_not_change_admission_or_quorum() {
 }
 
 #[test]
-fn lab_singleton_is_operational_but_never_advertises_ha() {
+fn lab_singleton_topology_never_advertises_ha() {
     let local = replica_id(0);
-    let topology = ValidatedQuorumTopology::try_new_lab_singleton(local.clone(), vec![member(0)])
-        .expect("explicit singleton");
-    let store = QuorumSessionStore::from_validated_topology(topology);
-
-    assert_eq!(store.topology().mode(), QuorumTopologyMode::LabSingleton);
-    assert_eq!(store.topology().required_quorum(), 1);
+    let configured = vec![member(0)];
+    let topology = ValidatedQuorumTopology::try_new_consensus_lab_singleton(
+        local.clone(),
+        configured.clone(),
+        consensus_identity(&configured),
+    )
+    .expect("explicit consensus singleton");
+    assert_eq!(topology.summary().mode(), QuorumTopologyMode::LabSingleton);
+    assert_eq!(topology.summary().required_quorum(), 1);
     assert_eq!(
-        store.platform_profile(),
+        topology.platform_profile(),
         SessionStorePlatformProfile::SingleReplica
     );
-    assert_eq!(store.topology().local_replica_id(), Some(&local));
+    assert_eq!(topology.summary().local_replica_id(), Some(&local));
 
+    let empty = Vec::new();
     assert_eq!(
-        ValidatedQuorumTopology::try_new_lab_singleton(replica_id(0), Vec::new()).err(),
+        ValidatedQuorumTopology::try_new_consensus_lab_singleton(
+            replica_id(0),
+            empty.clone(),
+            consensus_identity(&empty),
+        )
+        .err(),
         Some(QuorumTopologyError::LabMemberCount { configured: 0 })
     );
+    let two = members(2);
     assert_eq!(
-        ValidatedQuorumTopology::try_new_lab_singleton(replica_id(0), members(2)).err(),
+        ValidatedQuorumTopology::try_new_consensus_lab_singleton(
+            replica_id(0),
+            two.clone(),
+            consensus_identity(&two),
+        )
+        .err(),
         Some(QuorumTopologyError::LabMemberCount { configured: 2 })
     );
-}
-
-#[test]
-fn mapping_backends_revalidates_allocation_distinctness() {
-    let topology = validate_ha(replica_id(0), members(3)).expect("valid topology");
-    let alias: Arc<dyn SessionStoreBackend> = Arc::new(FakeSessionBackend::new());
-    let error = topology
-        .try_map_backends(|_, _| alias.clone())
-        .err()
-        .expect("mapped aliases must fail");
-    assert_eq!(error, QuorumTopologyError::DuplicateBackendInstance);
 }
 
 #[test]
@@ -753,89 +401,4 @@ fn topology_errors_and_debug_output_redact_declared_values() {
         .expect_err("non-canonical endpoint");
     let display = invalid.to_string();
     assert!(!display.contains(endpoint_canary));
-}
-
-#[tokio::test]
-#[allow(deprecated)]
-async fn deprecated_raw_constructor_is_non_operational_and_non_ha() {
-    let backend = Arc::new(FakeSessionBackend::new());
-    let key = SessionKey {
-        tenant: TenantId::new("tenant-a").expect("tenant"),
-        nf_kind: NetworkFunctionKind::from_static("epdg"),
-        key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from_static(b"legacy-topology"),
-    };
-    let lease = backend
-        .acquire(
-            &key,
-            OwnerId::new("owner-a").expect("owner"),
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("fixture lease");
-    let store = QuorumSessionStore::new(vec![
-        FencedSessionReplica::new(0, backend),
-        FencedSessionReplica::new(1, Arc::new(FakeSessionBackend::new())),
-        FencedSessionReplica::new(2, Arc::new(FakeSessionBackend::new())),
-    ]);
-
-    assert_eq!(
-        store.topology().mode(),
-        QuorumTopologyMode::UnvalidatedLegacy
-    );
-    assert_eq!(
-        store.platform_profile(),
-        SessionStorePlatformProfile::Unknown
-    );
-    assert!(!store.capabilities().await.restore_scan);
-    assert_eq!(
-        store.max_replication_sequence().await,
-        Err(StoreError::BackendUnavailable(
-            "session-store topology is not validated".into()
-        ))
-    );
-    assert_eq!(
-        store.batch(Vec::new()).await,
-        Err(StoreError::BackendUnavailable(
-            "session-store topology is not validated".into()
-        ))
-    );
-    assert_eq!(
-        store.refresh_ttl(&lease, Duration::MAX).await,
-        Err(StoreError::InvalidSessionTtl)
-    );
-    assert_eq!(
-        store.refresh_ttl(&lease, Duration::from_secs(60)).await,
-        Err(StoreError::BackendUnavailable(
-            "session-store topology is not validated".into()
-        ))
-    );
-    assert_eq!(
-        store.renew(&lease, Duration::MAX).await,
-        Err(LeaseError::InvalidSessionTtl)
-    );
-    assert_eq!(
-        store.renew(&lease, Duration::from_secs(60)).await,
-        Err(LeaseError::Backend(
-            "backend unavailable: session-store topology is not validated".into()
-        ))
-    );
-    assert_eq!(
-        store
-            .acquire(&key, OwnerId::new("owner-b").expect("owner"), Duration::MAX,)
-            .await,
-        Err(LeaseError::InvalidSessionTtl)
-    );
-    assert_eq!(
-        store
-            .acquire(
-                &key,
-                OwnerId::new("owner-b").expect("owner"),
-                Duration::from_secs(60),
-            )
-            .await,
-        Err(LeaseError::Backend(
-            "backend unavailable: session-store topology is not validated".into()
-        ))
-    );
 }

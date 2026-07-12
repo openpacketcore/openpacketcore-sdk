@@ -4,7 +4,8 @@ use std::str::FromStr;
 
 use super::ops::{
     current_fence_sync, format_rfc3339_normalized, get_sync, insert_or_replace_fence_sync,
-    insert_or_replace_record_sync, persisted_owner_id,
+    insert_or_replace_record_sync, persisted_owner_id, persisted_u64, sqlite_u64,
+    timestamp_unix_millis,
 };
 use crate::{
     backend::{
@@ -84,9 +85,9 @@ pub(crate) fn apply_replicated_op_sync(
             };
             let stored_owner = persisted_owner_id(owner_str)?;
             if active == 0
-                || row_credential_id as u64 != credential_id
+                || persisted_u64(row_credential_id)? != credential_id
                 || stored_owner != new_record.owner
-                || fence_val as u64 != new_record.fence.get()
+                || persisted_u64(fence_val)? != new_record.fence.get()
             {
                 return Err(StoreError::StaleFence);
             }
@@ -219,8 +220,7 @@ pub(crate) fn apply_replicated_op_sync(
                 }
             }
 
-            let expires_at_unix_ms =
-                (expires_at.as_offset_datetime().unix_timestamp_nanos() / 1_000_000) as i64;
+            let expires_at_unix_ms = timestamp_unix_millis(expires_at)?;
 
             conn.execute(
                 r#"
@@ -233,9 +233,9 @@ pub(crate) fn apply_replicated_op_sync(
                     key.nf_kind.as_str(),
                     key.key_type.to_string(),
                     key.stable_id.as_ref(),
-                    credential_id as i64,
+                    sqlite_u64(credential_id)?,
                     owner.as_str(),
-                    fence.get() as i64,
+                    sqlite_u64(fence.get())?,
                     expires_at_unix_ms,
                     format_rfc3339_normalized(expires_at),
                 ],
@@ -244,14 +244,21 @@ pub(crate) fn apply_replicated_op_sync(
 
             insert_or_replace_fence_sync(conn, &key, fence.get())?;
 
+            let next_fence = fence
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| StoreError::BackendUnavailable("fence token exhausted".into()))?;
             conn.execute(
-                "UPDATE lease_globals SET val = val + 1 WHERE key = 'next_fence'",
-                [],
+                "UPDATE lease_globals SET val = MAX(val, ?1) WHERE key = 'next_fence'",
+                [sqlite_u64(next_fence)?],
             )
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            let next_credential_id = credential_id.checked_add(1).ok_or_else(|| {
+                StoreError::BackendUnavailable("lease credential ID exhausted".into())
+            })?;
             conn.execute(
-                "UPDATE lease_globals SET val = val + 1 WHERE key = 'next_credential_id'",
-                [],
+                "UPDATE lease_globals SET val = MAX(val, ?1) WHERE key = 'next_credential_id'",
+                [sqlite_u64(next_credential_id)?],
             )
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
             Ok(())
@@ -268,8 +275,7 @@ pub(crate) fn apply_replicated_op_sync(
             if fence.get() < current_fence {
                 return Err(StoreError::StaleFence);
             }
-            let expires_at_unix_ms =
-                (expires_at.as_offset_datetime().unix_timestamp_nanos() / 1_000_000) as i64;
+            let expires_at_unix_ms = timestamp_unix_millis(expires_at)?;
 
             conn.execute(
                 r#"
@@ -282,9 +288,9 @@ pub(crate) fn apply_replicated_op_sync(
                     key.nf_kind.as_str(),
                     key.key_type.to_string(),
                     key.stable_id.as_ref(),
-                    credential_id as i64,
+                    sqlite_u64(credential_id)?,
                     owner.as_str(),
-                    fence.get() as i64,
+                    sqlite_u64(fence.get())?,
                     expires_at_unix_ms,
                     format_rfc3339_normalized(expires_at),
                 ],
@@ -315,7 +321,7 @@ pub(crate) fn apply_replicated_op_sync(
                     key.nf_kind.as_str(),
                     key.key_type.to_string(),
                     key.stable_id.as_ref(),
-                    credential_id as i64,
+                    sqlite_u64(credential_id)?,
                 ],
             )
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
@@ -339,9 +345,7 @@ pub(crate) fn replicate_entry_sync(
 ) -> Result<bool, StoreError> {
     entry.validate()?;
     let sqlite_sequence = sqlite_replication_sequence(entry.sequence)?;
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+    let tx = super::standalone_transaction(conn)?;
 
     // 1. Get max sequence
     let max_seq: Option<Option<i64>> = tx
@@ -413,9 +417,7 @@ pub(crate) fn rebuild_replication_state_sync(
     caps: &BackendCapabilities,
 ) -> Result<(), StoreError> {
     validate_replication_prefix(entries)?;
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+    let tx = super::standalone_transaction(conn)?;
 
     tx.execute("DELETE FROM session_records", [])
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;

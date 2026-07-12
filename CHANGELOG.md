@@ -8,25 +8,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-consensus`: the workspace's single exact-pinned Openraft integration
+  boundary, with bounded Postcard codecs, cluster/configuration/epoch identity,
+  stable SQLite-safe node IDs, request identities, and transport-neutral RPC
+  contracts. ADR 0019 prohibits domain crates from importing Openraft directly
+  or implementing a competing election/commit/read-authority algorithm.
+- `opc-session-store`/`opc-session-net`: an Openraft-backed
+  `ConsensusSessionStore` and dedicated `opc-session-consensus/1` authenticated
+  transport. Durable vote/log/commit/application/membership/outcome state,
+  bounded atomic snapshots, linearizable readiness/reads, idempotent
+  response-loss retries, committed-only journals/watches, monotonic logical
+  expiry time, and three-node cold-start/partition/heal/restart tests replace
+  the custom majority-visible-prefix coordinator under #127.
+- `opc-session-store`: end-to-end encryption-boundary qualification passes
+  plaintext and raw-key canaries through the real `EncryptingSessionBackend`,
+  rotates the active key, snapshots/restarts, and verifies only opaque
+  envelopes enter consensus RPCs, SQLite/Raft logs and outcomes, WAL/SHM, and
+  snapshots. Openraft never owns or calls HKMS; this remains payload-envelope
+  encryption rather than full-database metadata encryption.
+- `opc-session-store`/`opc-key`: consensus admission now validates the exact
+  canonical RFC 003 envelope, session AAD shape, embedded key ID, algorithm
+  nonce, tag bound, and record-visible tenant/NF/state/generation/fence fields.
+  `EnvelopeV1` can no longer be forged by attaching the enum marker to
+  arbitrary bytes, including through deserialization.
+- `opc-session-store`: claiming a SQLite database for Openraft is an atomic
+  authority hand-off. Retained clones and freshly reopened raw SQLite handles
+  reject reads, leases, CAS, journal append/rebuild, watch, restore, and prune
+  paths; private committed-journal reads remain available only after the
+  consensus adapter's linearizable barrier.
 - `opc-session-store`: a read-only `LeaseGuard::credential_id()` accessor lets
   transport adapters verify that renewal responses preserve the opaque
   credential; guard construction remains crate-private.
 - `opc-session-store`: `probe_durable_readiness` and stable readiness report
-  types for fresh, deadline- and log-work-bounded quorum evidence. Reports
+  types for fresh, bounded Openraft linearizable-read evidence. Reports
   distinguish `Ready`, `NoQuorum`, `TopologyInvalid`, and `RecoveryRequired`;
   expose configured, freshly reachable, agreeing, and required voter counts
-  plus the majority-visible prefix; and use typed, redaction-safe replica
+  plus the committed barrier index through the compatibility-named index
+  accessor; and use typed, redaction-safe replica
   failure classes instead of raw errors. Capability declarations and
   `SessionStorePlatformProfile::Quorum` remain admission evidence only.
 - `opc-session-store`: immutable replica descriptors and
   `ValidatedQuorumTopology` admission with distinct logical ID, canonical
   endpoint, expected TLS identity, failure domain, backing identity, and exact
-  local-self selection. An explicit lab singleton reports `single-replica`,
-  never quorum HA.
+  local-self selection. Production topology is descriptor-only: the one local
+  SQLite backend and consensus-only remote peer map are supplied separately,
+  so remote votes require no dummy backend or legacy remote-backend client. An
+  explicit lab singleton reports `single-replica`, never quorum HA.
 - `opc-session-store`/`opc-session-net`: redaction-safe authenticated peer
-  bindings connect each remote adapter to the local and remote descriptor
-  fingerprints, exact TLS identity, configured member count, and one immutable
-  cluster/configuration scope during topology admission.
+  bindings connect legacy compatibility adapters to exact peer scope, while the
+  production Openraft transport binds descriptor identity and stable node IDs
+  directly on every consensus connection.
 - `opc-sa-mirror` (RFC 015): experimental live SA keymat mirroring for
   near-hitless IPsec failover in which keys never persist — producer/sink/
   takeover ports, an in-memory standby holder with epoch anti-rollback and
@@ -48,8 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-ipsec-lb`: `SessionStoreOwnershipFencer`, an ownership
   promotion adapter that acquires the session-store lease, commits a
   generation-guarded owner change, and projects the committed store fence into
-  the re-pin grant; production HA wiring requires durable majority authority,
-  which the current session quorum prototype does not establish before #127.
+  the re-pin grant. #127 now supplies the required Openraft authority; #143
+  still owns networked production qualification.
 - RFC 014 and `opc-mgmt-command`: the model-driven interactive operational
   console contract plus a transport-neutral, bounded command catalog with
   schema-validated reads, subscriptions, allowlisted actions, presentation
@@ -106,6 +137,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed fuzz corpora for the GTP-U, NAS, Diameter, and IKEv2 targets.
 
 ### Changed
+- **BREAKING — `opc-session-store`:** production HA construction now requires
+  `QuorumTopologyConfig::new_consensus`, a file-backed local SQLite adapter,
+  exact consensus peer routes, handler installation, and cluster
+  initialization. `QuorumSessionStore` aliases `ConsensusSessionStore`; the
+  former custom coordinator constructors and testkit majority controls are
+  removed. Direct replication/rebuild/lease-sequence authority fails closed.
+- **BREAKING — `opc-session-store`:** `EncryptedSessionPayload::envelope` is
+  replaced by fallible `try_envelope`, and the encryption wrappers no longer
+  expose their raw inner backend. This prevents marker-only payloads and
+  accidental mutation around the required protection boundary.
+- **BREAKING — `opc-session-store`:** the retired log-scan
+  `DurableReadinessOptions` and related constants are removed. Configure the
+  single complete Openraft operation deadline with
+  `ConsensusSessionStore::open_with_operation_timeout`; readiness and real
+  operations use that same deadline and consensus barrier.
+- **BREAKING — `opc-session-net`:** production HA uses the consensus-only ALPN
+  and RPC types. The writable protocol-v4 backend façade is a compatibility
+  surface, not a quorum member or consensus authority.
 - **BREAKING — `opc-proto-diameter`:** `SwmDiameterEapAnswer` gains
   `default_context_identifier: Option<u32>` and
   `default_apn_configuration()` so SWm DEA consumers can resolve an opt-in
@@ -228,19 +277,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Session-net's one response deadline does not change `opc-persist`'s
   `TcpPeer::timeout` per-I/O-stage behavior across up to three attempts with backoff; #169 owns one atomic
   end-to-end logical-RPC deadline, safe-retry policy, and metrics. Seamless
-  credential/trust rotation remains #158, while distributed
-  resource/failover/soak plus payload-key
-  rotation qualification remains #143.
-- **BREAKING — `opc-session-store`:** the deprecated raw-vector
-  `QuorumSessionStore::new` remains source-compatible but is now deliberately
-  non-operational: it advertises `unknown`, masks capabilities, and rejects
-  operations. Migrate HA callers through `QuorumTopologyConfig` and
-  `ValidatedQuorumTopology`; migrate one-replica tests/labs through
-  `try_new_lab_singleton`. AMF-lite and the session testkit now require an
-  explicit validated local member and preserve topology while wrapping
-  backends. External backend adapters used as votes must return
-  `Some(BackendInstanceIdentity)`; forwarding wrappers must delegate it, and
-  the default `None` fails topology admission.
+  credential/trust rotation remains #158, remote-seal historical-key rotation
+  remains #179, and distributed resource/failover/soak plus payload-protection
+  qualification remains #143.
+- **BREAKING — `opc-session-store`:** the old backend-bearing quorum member and
+  raw-vector coordinator surfaces are removed. Migrate HA callers through a
+  descriptor-only `QuorumTopologyConfig`/`ValidatedQuorumTopology`; migrate
+  one-replica tests and labs through `try_new_consensus_lab_singleton`. Supply
+  exactly one local SQLite backend and the remote consensus-peer map when
+  opening each node.
 - **BREAKING — `opc-session-net`:** protocol v3 introduced remote restore scans
   and authenticated replica identity before the v4 boundary above. Production
   constructors
@@ -535,17 +580,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   peer observes its floating VIP as the source.
 - `opc-session-store`/`opc-amf-lite`: durable readiness no longer succeeds from
   a bound server or cached capabilities while real quorum operations fail.
-  Probes and operations use one store-level policy and the same fresh
-  fail-closed majority assessment; adaptive bounded paging keeps log evidence
-  usable when the aggregate log exceeds one wire frame;
-  strict shorter prefixes are caught up by append only, while conflicts and
-  longer minority tails return `RecoveryRequired` without destructive rebuild.
+  Probes and reads now use the same Openraft linearizable barrier, while writes
+  use `client_write`; the earlier custom majority-prefix assessment is removed.
   AMF-lite now keeps traffic readiness behind a continuously supervised
   session-store gate, and low-cardinality metrics expose probe outcomes,
-  configured/freshly-reachable/agreeing/required counts, the majority-visible
-  prefix, and bounded failure reasons. This closes #124 only; durable authority
-  and operator-safe fork recovery (#127–#129), majority-authoritative restore
-  (#133) remain production blockers. Protocol-v4 wire stabilization is now
+  configured/required counts, the committed barrier index, and bounded failure
+  reasons. #127 closes durable sequencing; operator-safe legacy-fork recovery
+  (#128/#129) and majority-authoritative restore (#133) remain blockers.
+  Protocol-v4 wire stabilization is now
   implemented under #134; #135's
   scoped model/persistence admission is implemented above. Checked TTL and
   replication-sequence rejection are closed under #137/#138; production
