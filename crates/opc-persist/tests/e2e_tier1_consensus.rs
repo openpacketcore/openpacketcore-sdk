@@ -1,6 +1,9 @@
 mod common;
 
-use common::{bootstrap_4_nodes, connect_raw_tls, AuthenticatedRequest, TestCluster, TestNode};
+use common::{
+    bootstrap_4_nodes, connect_raw_tls, wait_for_automatic_leader, AuthenticatedRequest,
+    TestCluster, TestNode,
+};
 use opc_persist::{AppendEntriesRequest, ClusterMembership, ConsensusOp, LogEntry};
 use opc_types::TxId;
 use serde_json::json;
@@ -236,33 +239,12 @@ async fn test_election_split_vote_resolution() {
     cluster.heal(0, 2);
     cluster.heal(1, 2);
 
-    let mut leader_elected = false;
-    for _ in 0..25 {
-        for i in 0..3 {
-            if let Ok(resp) = cluster
-                .nodes
-                .get_mut(&i)
-                .unwrap()
-                .send_command(json!({
-                    "command": "DumpMetrics"
-                }))
-                .await
-            {
-                if resp["success"].as_bool().unwrap_or(false)
-                    && resp["data"]["role"].as_str() == Some("Leader")
-                {
-                    leader_elected = true;
-                    break;
-                }
-            }
-        }
-        if leader_elected {
-            break;
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
-
-    assert!(leader_elected);
+    wait_for_automatic_leader(
+        &mut cluster,
+        &[0, 1, 2],
+        "split-vote resolution after healing the cluster",
+    )
+    .await;
 }
 
 #[tokio::test]

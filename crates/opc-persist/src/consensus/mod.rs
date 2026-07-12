@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod pem;
 pub mod read_index;
 pub mod replication;
+mod rpc_timing;
 pub mod snapshot;
 pub mod transport;
 pub mod types;

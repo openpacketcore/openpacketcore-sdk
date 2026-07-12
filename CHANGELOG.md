@@ -344,6 +344,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- `opc-persist`: automatic leader-failover and split-vote recovery coverage now
+  uses one shared finite observer instead of undersized fixed polling counts.
+  Its test deadline derives four rounds from the configured maximum election
+  timeout plus the transport's current staged I/O timeout, retry, backoff, and
+  peer fan-out budget; success never forces a campaign, while failures report
+  each candidate's last complete role/term/election metrics and latest command
+  error. The shared internal retry constants prevent test/transport drift. This
+  makes CI evidence deterministic for the current implementation; it is not a
+  production RPC deadline guarantee, which remains tracked in #169.
 - `opc-session-store`: `FakeSessionBackend` now stages compound replicated
   entries and whole-state rebuilds before atomically swapping live data. A late
   child/replay failure no longer leaves partial records, leases, fences,

@@ -1,5 +1,8 @@
 #![allow(dead_code, unused_variables)]
 
+#[path = "../../src/consensus/rpc_timing.rs"]
+mod consensus_rpc_timing;
+
 use opc_persist::NodeIdentity;
 use rustls::pki_types::pem::PemObject;
 use std::collections::HashMap;
@@ -626,6 +629,196 @@ pub struct TestCluster {
     // the struct directly can attach it; read only via Drop.
     #[allow(dead_code)]
     pub serial_guard: Option<tokio::sync::MutexGuard<'static, ()>>,
+}
+
+const AUTOMATIC_ELECTION_ROUNDS: u32 = 4;
+const AUTOMATIC_ELECTION_METRICS_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(200);
+
+#[derive(Debug)]
+pub struct NodeMetricsDiagnostic {
+    pub node_id: usize,
+    // Metrics fields retain the latest successful snapshot when a later command fails.
+    pub role: Option<String>,
+    pub term: Option<u64>,
+    pub election_count: Option<u64>,
+    pub leader_changes: Option<u64>,
+    // This is the outcome of the latest command attempt, not the snapshot above.
+    pub command_error: Option<String>,
+}
+
+impl NodeMetricsDiagnostic {
+    pub(super) fn new(node_id: usize) -> Self {
+        Self {
+            node_id,
+            role: None,
+            term: None,
+            election_count: None,
+            leader_changes: None,
+            command_error: None,
+        }
+    }
+
+    pub(super) fn observe_response(&mut self, response: &serde_json::Value) {
+        if response["success"].as_bool() == Some(true) {
+            let role = response["data"]["role"].as_str();
+            let term = response["data"]["term"].as_u64();
+            let election_count = response["data"]["election_count"].as_u64();
+            let leader_changes = response["data"]["leader_changes"].as_u64();
+
+            if let (Some(role), Some(term), Some(election_count), Some(leader_changes)) =
+                (role, term, election_count, leader_changes)
+            {
+                self.role = Some(role.to_owned());
+                self.term = Some(term);
+                self.election_count = Some(election_count);
+                self.leader_changes = Some(leader_changes);
+                self.command_error = None;
+            } else {
+                let mut missing_fields = Vec::new();
+                if role.is_none() {
+                    missing_fields.push("role");
+                }
+                if term.is_none() {
+                    missing_fields.push("term");
+                }
+                if election_count.is_none() {
+                    missing_fields.push("election_count");
+                }
+                if leader_changes.is_none() {
+                    missing_fields.push("leader_changes");
+                }
+                self.command_error = Some(format!(
+                    "DumpMetrics success response is missing required field(s): {}",
+                    missing_fields.join(", ")
+                ));
+            }
+        } else {
+            self.command_error = Some(
+                response["error"]
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("DumpMetrics returned an error: {response}")),
+            );
+        }
+    }
+
+    fn is_leader(&self) -> bool {
+        self.role.as_deref() == Some("Leader") && self.command_error.is_none()
+    }
+}
+
+#[derive(Debug)]
+pub struct AutomaticLeaderObservation {
+    pub leader_id: usize,
+    pub diagnostics: Vec<NodeMetricsDiagnostic>,
+}
+
+fn automatic_election_wait_budget(
+    cluster: &TestCluster,
+    candidate_ids: &[usize],
+) -> std::time::Duration {
+    let peer_rpcs_per_round = candidate_ids
+        .iter()
+        .filter_map(|node_id| cluster.nodes.get(node_id))
+        .map(|node| u32::try_from(node.peers.len()).unwrap_or(u32::MAX))
+        .max()
+        .unwrap_or(0);
+    let election_timeout = std::time::Duration::from_millis(cluster.election_timeout_max);
+    let rpc_timeout = std::time::Duration::from_millis(cluster.rpc_timeout);
+    let sequential_peer_rpc_budget =
+        consensus_rpc_timing::rpc_io_timeout_and_backoff_budget(rpc_timeout)
+            .saturating_mul(peer_rpcs_per_round);
+    let election_round_budget = election_timeout.saturating_add(sequential_peer_rpc_budget);
+
+    election_round_budget.saturating_mul(AUTOMATIC_ELECTION_ROUNDS)
+}
+
+/// Waits for a leader elected by the running nodes' timers, without triggering a campaign.
+///
+/// The finite test deadline budgets four rounds of the configured maximum election timeout plus
+/// every peer's cumulative configured RPC I/O-stage timeouts and retry backoff. It is not a
+/// protocol wall-clock guarantee. A timeout reports the latest successful metrics snapshot and
+/// the latest command error for every candidate node.
+pub async fn wait_for_automatic_leader(
+    cluster: &mut TestCluster,
+    candidate_ids: &[usize],
+    context: &str,
+) -> AutomaticLeaderObservation {
+    assert!(
+        !candidate_ids.is_empty(),
+        "{context}: automatic election requires at least one candidate"
+    );
+
+    let wait_budget = automatic_election_wait_budget(cluster, candidate_ids);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(wait_budget)
+        .expect("automatic-election wait budget should fit within tokio's instant range");
+    let mut diagnostics = candidate_ids
+        .iter()
+        .copied()
+        .map(NodeMetricsDiagnostic::new)
+        .collect::<Vec<_>>();
+
+    loop {
+        let mut command_timed_out_at = None;
+
+        for index in 0..diagnostics.len() {
+            let diagnostic = &mut diagnostics[index];
+            let command = cluster
+                .nodes
+                .get_mut(&diagnostic.node_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{context}: candidate node {} should exist",
+                        diagnostic.node_id
+                    )
+                })
+                .send_command(serde_json::json!({
+                    "command": "DumpMetrics"
+                }));
+
+            match tokio::time::timeout_at(deadline, command).await {
+                Ok(Ok(response)) => diagnostic.observe_response(&response),
+                Ok(Err(error)) => diagnostic.command_error = Some(error),
+                Err(_) => {
+                    diagnostic.command_error = Some(format!(
+                        "DumpMetrics did not complete before the {wait_budget:?} automatic-election deadline ({context})"
+                    ));
+                    command_timed_out_at = Some(index);
+                    break;
+                }
+            }
+
+            // Stop before issuing another command once leadership is observed. If a later
+            // command were cancelled at the deadline, its delayed response could desynchronize
+            // that node's stdout command stream.
+            if diagnostic.is_leader() {
+                return AutomaticLeaderObservation {
+                    leader_id: diagnostic.node_id,
+                    diagnostics,
+                };
+            }
+        }
+
+        if let Some(timed_out_at) = command_timed_out_at {
+            for diagnostic in diagnostics.iter_mut().skip(timed_out_at + 1) {
+                diagnostic.command_error = Some(format!(
+                    "DumpMetrics was not attempted because the {wait_budget:?} automatic-election deadline elapsed ({context})"
+                ));
+            }
+        }
+
+        if command_timed_out_at.is_some() || tokio::time::Instant::now() >= deadline {
+            panic!(
+                "{context}: leader should be elected automatically within {wait_budget:?}; \
+                 candidate metrics diagnostics: {diagnostics:#?}"
+            );
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(AUTOMATIC_ELECTION_METRICS_POLL_INTERVAL.min(remaining)).await;
+    }
 }
 
 impl TestCluster {
