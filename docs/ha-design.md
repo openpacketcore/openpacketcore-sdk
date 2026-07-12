@@ -50,10 +50,44 @@ To prevent split-brain issues:
 
 - When the leader receives a read, it verifies its leadership by obtaining current-term responses from a majority of the cluster before serving the read. This prevents minority reads and ensures linearizability.
 
+### Consensus RPC Deadline, Retry, and Fan-Out Contract
+
+The `TcpPeer` timeout (the `opc-consensus-node --rpc-timeout` value in
+milliseconds) is one absolute deadline for a logical RPC. It covers local
+authentication/TLS-connector locks, bounded cooperative request encoding, TCP
+connect, mTLS, request writes, response length/body reads, bounded cooperative
+decode, every attempt, and the 50/100 ms retry backoffs. Zero is immediate
+expiry, unrepresentable monotonic-clock durations fail closed, and no new stage
+or retry begins after expiry.
+
+Raft vote/append/snapshot requests replay the same term/log coordinates and
+read requests are side-effect free, so those families may retry after an
+ambiguous write. `TimeoutNow` is different: delivery may already have launched
+a campaign, so it is not replayed once request bytes may have reached the peer.
+Permanent local identity/connector failures and certificate-verification
+failures also fail immediately instead of being retried into a timeout.
+
+Election votes and replication fan out concurrently across peers. A catch-up
+pass within one peer is sequential but bounded to 64 snapshot/append RPC
+rounds. A rejected snapshot can fall through to one append in the same round,
+so a pass issues at most 128 logical RPCs and its maximum transport wait is
+`128 * peer timeout`, plus local database and scheduling work, rather than one
+RPC timeout. A later synchronous pass or background trigger resumes from the
+stored `next_index`; large gaps should converge through snapshot installation
+or repeated bounded passes.
+
+The logical-deadline interpretation is a breaking change from the former
+per-stage timeout reset. An upgrade must retune the timeout as an end-to-end
+budget and coordinate that value across cluster members; downstream exhaustive
+matches on `PersistErrorKind` must also handle `ConsensusRpcTimeout`.
+
 ### Replica Catch-Up & Rejoin
 Rejoining replicas are caught up before they can participate as authoritative readers/writers:
 - The leader tracks the log progress of peers.
-- If a peer's log is stale or it has missed commits, the leader performs log probing to find the last common log entry and replicates all missing entries sequentially.
+- If a peer's log is stale or it has missed commits, the leader performs at
+  most 64 log-probe/snapshot/append rounds (at most two logical RPCs per round)
+  in one trigger. If the common prefix is still not found, a later trigger
+  resumes from `next_index` rather than leaving one unbounded task alive.
 - A newly elected leader does not automatically apply every local log entry. It
   only applies entries through the committed/applied path, preventing failed
   local no-quorum writes from becoming visible just because the node later wins
@@ -66,17 +100,41 @@ Rejoining replicas are caught up before they can participate as authoritative re
   the SQLite schema (`consensus_membership` table). Controlled voter changes use
   the joint-consensus path, quorum cannot shrink accidentally, and startup is
   rejected when the configured node ID differs from the persisted identity.
+- **Live Identity Lifecycle**: `set_identity` atomically replaces the local
+  server identity/acceptor pair and atomically invalidates each adapter's
+  cached client connector for new attempts, while in-flight attempts may
+  complete with the old connector. Multi-peer propagation is serialized but
+  can be partial on error or cancellation, so the caller must retry under trust
+  overlap and fresh-handshake readiness. A production CNF must watch
+  workload identity/trust-bundle updates, distribute old/new trust overlap
+  before rotating leaves, preserve the exact SPIFFE/node identity, drain old
+  connections, verify new handshakes, and remove old trust only after the
+  maximum authentication age. The `opc-consensus-node` test binary reads PEM
+  files only at startup and does not provide that rotation controller.
 
 ### Config-store consensus prototype evidence (`GAP-001-006`)
 
 `ConsensusConfigStore` has these validated prototype properties:
 
 - **Transport-level mTLS & SPIFFE Peer Identity**: RPC communication is secured over transport-level mTLS using `rustls`. Client and server certificates are verified against the configured CA bundle, certificate SAN SPIFFE IDs are parsed with `x509-parser`, and peer identity is bound to the local node's configured SPIFFE workload profile, the expected node ID, the request cluster ID, and active cluster membership. The legacy JSON certificate fields are ignored for trust decisions.
-- **Controlled Server Concurrency & Lifecycle**: The TCP server handles connection binding with `SO_REUSEADDR` socket option enablement, implements an explicit oneshot shutdown hook, limits server-side concurrency to 100 connections via semaphore, and enforces connection handshake, read, and write timeouts (5s).
+- **Controlled Server Concurrency & Lifecycle**: The TCP server handles
+  connection binding with `SO_REUSEADDR`, implements an explicit oneshot
+  listener-shutdown hook, limits server-side concurrency to 100 handlers, and
+  applies a fixed five-second timeout to TLS acceptance. Post-handshake request
+  length/body reads and the response write are 16 MiB frame-bounded but do not
+  currently have an independent server-side I/O deadline; the client logical
+  RPC deadline must not be described as a server slow-client bound.
 - **Raft Safety & No-Op Commits**: Newly elected leaders block client operations until they commit and apply a `NoOp` log entry in the current term, enforcing complete Raft commit rules.
 - **Caught-up Non-voter Promotion**: Non-voting members can be promoted only after catching up to the leader's log index. Node removal rejects self-removal and preserves replica node identities.
 - **Snapshot HMAC Validation**: Compacted snapshots are cryptographically validated using HMAC-SHA256 keyed by the local `AuditKey`.
-- **Operator Metrics Hooks**: Detailed atomic counters and dump output track elections, leader changes, RPC failures/timeouts, snapshot installs/failures, peer lag, active connections, authentication failures, and read/write quorum failures. Prometheus/runtime telemetry export (`GAP-001-004`) has been fully implemented.
+- **Operator Metrics Hooks**: Detailed atomic counters and dump output track
+  elections, leader changes, RPC failures, typed logical timeouts, snapshot
+  installs/failures, peer lag, active connections, authentication failures,
+  and read/write quorum failures. `rpc_timeouts_by_family` and
+  `rpc_timeouts_by_stage` use fixed bounded keys and never use endpoints, node
+  IDs, SPIFFE identities, tenants, or request data as dimensions.
+  Prometheus/runtime telemetry export (`GAP-001-004`) has been fully
+  implemented.
 - **Multi-Process Failure Evidence**: Integration tests simulate multi-process stores and verify leader/follower crashes, network partitions, split-brain resistance, partition heal catch-up, no-quorum writes rejection, schema mismatches, and audit-chain integrity.
 - **Process-Level HA Test Harness (Milestone 4)**: The process-level HA test harness has been fully implemented and verified. This covers process campaigns, failovers, network partitions, and pending commits surviving process restarts.
 - **Out-of-Process Raft Joint Consensus Transitions**: Raft joint consensus transitions (voter membership changes) are fully implemented and verified out-of-process.

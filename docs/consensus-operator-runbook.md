@@ -34,17 +34,103 @@ To bring up a cluster cleanly:
 3. **Database Initialization**: Ensure the SQLite database path is writable.
 4. **Server Loop Launch**:
    - Configure the network listener socket with `SO_REUSEADDR`.
-   - Launch the TCP/TLS server loop, binding the socket and applying connection constraints (semaphore limits to 100 concurrent connections, 5-second handshakes/timeouts).
+   - Launch the TCP/TLS server loop, binding the socket, limiting it to 100
+     concurrent connection handlers, and applying the fixed five-second
+     timeout to the TLS handshake.
+   - Do not interpret that handshake timeout as a five-second timeout for all
+     server I/O. After mTLS completes, request length/body reads and the
+     response write are bounded by the 16 MiB frame limit but currently have no
+     independent server-side I/O deadline. The client logical deadline
+     described below bounds the client call and closes its connection on
+     expiry; it is not a substitute for a server-side post-handshake
+     slow-client deadline.
    - Start the consensus background loops (election timer, heartbeat driver, log replication loop).
+
+### 1.5 Logical RPC Deadline and Retry Contract
+
+`TcpPeer::new(..., timeout)` and the test-node `--rpc-timeout <MS>` option use
+one absolute deadline for one logical peer RPC. The budget starts before local
+authentication and TLS-connector lock acquisition and includes cooperative
+request serialization, TCP connect, the mTLS handshake, request writes,
+response length/body reads, cooperative response decoding, all retry attempts,
+and the 50/100 ms retry backoffs. A stage or retry is not started after the
+deadline. Zero expires before setup or network I/O; a duration that cannot be
+represented by the monotonic clock fails closed.
+
+The transport makes no more than three attempts, and only when the remaining
+logical deadline permits them. Retry behavior is request-specific:
+
+- `RequestVote`, `AppendEntries`, and `InstallSnapshot` repeat the same Raft
+  term/log coordinates and may be replayed after ambiguous delivery.
+- `LoadLatest` and `LoadRollback` are read-only and may be retried.
+- `TimeoutNow` can launch a campaign. Once any request bytes may have reached
+  the server, a lost response is ambiguous and the transport must not replay
+  it. The operator must observe the resulting term/leadership state rather than
+  assuming that the trigger failed.
+- Invalid local identity/TLS configuration and certificate-verification
+  failures are permanent for that call; they fail immediately instead of
+  being retried until reported as a timeout.
+
+Election vote requests and replication across different peers fan out
+concurrently, so peer count does not multiply a single fan-out round's
+transport deadline. Catch-up within one peer remains sequential and is capped
+at 64 snapshot/append rounds per synchronous pass or background trigger. A
+rejected snapshot can fall through to one append in the same round, so a pass
+issues at most 128 sequential logical RPCs. The maximum transport wait for one
+such peer pass is therefore `128 * rpc-timeout`; local database work and
+scheduling add overhead. If the peer is still behind, the task exits and a
+later replication trigger resumes from the stored `next_index`. Size
+election/failover and drain budgets with that distinction in mind.
+
+This is a breaking timing-semantic change from SDK versions that reset the
+configured value for every I/O stage. Before upgrading, retune
+`TcpPeer::timeout`/`--rpc-timeout` as an end-to-end value, update election,
+failover, and drain budgets, and roll out the selected value coherently across
+cluster members. SDK consumers that exhaustively match `PersistErrorKind` must
+also add the typed `ConsensusRpcTimeout` variant.
+
+### 1.6 Seamless Certificate and Trust-Bundle Rotation
+
+`set_identity` atomically replaces the local server identity/acceptor pair, and
+each peer adapter atomically invalidates its cached client connector for new
+RPC attempts. An in-flight attempt may finish with the previous connector; a
+later attempt reads the current connector. Multi-peer propagation is
+serialized but not transactional: failure or cancellation can leave mixed
+peer generations. The caller must retain trust overlap, retry, and gate on
+fresh-handshake evidence. A production CNF must supply the lifecycle around
+that API:
+
+1. Watch the workload identity and trust bundle and call the live
+   `set_identity` path when they change. The `opc-consensus-node` test binary
+   reads PEM files only at startup and is not a production rotation controller.
+2. Distribute a trust bundle containing both old and new issuers before
+   switching leaf certificates.
+3. Rotate leaves without changing the node's exact SPIFFE workload profile or
+   instance identity, allow old in-flight connections to drain, and verify new
+   mTLS connections across every peer.
+4. Remove the old issuer only after the maximum old-connection/authentication
+   age has elapsed and rollback is no longer required.
+
+Replacing leaf and trust material simultaneously without overlap can interrupt
+quorum communication. The CNF operator must gate traffic/readiness on the
+rotation, bound reconnect storms, and alert on authentication failures; a
+certificate expiry timer alone is not a seamless-rotation design.
 
 ---
 
 ## 2. Shutdown & Recovery
 
 ### 2.1 Graceful Shutdown
+
 To shut down a node cleanly:
+
 - Trigger a shutdown via the oneshot shutdown hook (`server_shutdown`) or SIGTERM signal handling.
-- The server loop will stop accepting new connections, finish outstanding RPC processing, close existing connections, flush pending writes to the database, and exit.
+- The shutdown hook stops the listener from accepting new connections.
+  Connection handlers are detached tasks: the hook does not wait for them,
+  close them, or provide a flush barrier.
+- Before invoking the hook, the CNF must remove the pod from readiness, stop
+  new client and peer traffic, and allow in-flight RPCs and durable writes to
+  drain within its termination grace period.
 - Active leaders that are shut down gracefully will fail to send heartbeats, triggering a new election among the remaining online replicas.
 
 ### 2.2 Hard Crash / Kill Recovery
@@ -61,7 +147,12 @@ If a node is killed abruptly (`kill -9` or power outage):
 ## 3. Membership Transitions
 
 ### 3.1 Non-Voter Promotion & Leader Transfer
-- **Non-Voter Promotion**: A new node is added as a non-voter first. The leader replicates the consensus log to the non-voter until its log catch-up index is close to the leader's commit index. Only after the log is verified caught up can the non-voter be promoted to a voting member.
+- **Non-Voter Promotion**: A new node is added as a non-voter first. The leader
+  replicates the consensus log to the non-voter until its log catch-up index is
+  close to the leader's commit index. Each catch-up pass stops after 64 rounds
+  (at most two logical RPCs per round); if more work remains, later triggers
+  resume from `next_index`. Only after the log is verified caught up can the
+  non-voter be promoted to a voting member.
 - **Leader Transfer**: To safely step down a leader, it can trigger a role transition to Follower, allowing a caught-up peer to win the next election campaign.
 
 ### 3.2 Raft Joint Consensus for Additions/Removals
@@ -108,12 +199,28 @@ To add or remove nodes without risk of split-brain:
 
 ### 6.1 Metrics Interpretation
 The consensus engine exports several atomic counters and gauges:
-- `consensus_elections_total`: Monotonic counter of election campaigns started.
-- `consensus_leader_changes_total`: Counter of leadership role transitions.
-- `consensus_rpc_failures_total`: Counter of failed RPC attempts to peers.
-- `consensus_snapshot_installs_total`: Counter of snapshot installations.
-- `consensus_read_quorum_failures_total`: Counter of linearizable read failures due to lack of peer contact.
-- `consensus_connection_limit_hit`: Counter of times incoming TCP connections were rejected due to the 100-connection limit.
+- `election_count`: Monotonic counter of election campaigns started.
+- `leader_changes`: Counter of leadership role transitions.
+- `rpc_failures`: Counter of logical peer RPC calls that ultimately failed
+  after the bounded retry policy. Individual failed transport attempts are
+  debug events, not separate increments of this counter.
+- `rpc_timeouts`: Count of typed logical RPC deadline expirations observed by
+  the consensus store. Permanent authentication/configuration failures are not
+  included.
+- `rpc_timeouts_by_family`: The same logical timeout events split across the
+  fixed `request_vote`, `append_entries`, `install_snapshot`, `load_latest`,
+  `load_rollback`, and `timeout_now` keys.
+- `rpc_timeouts_by_stage`: The same events split across fixed setup,
+  serialization, TCP, TLS, write, response-read/decode, and retry-backoff
+  keys: `deadline_setup`, `authentication_setup`, `request_serialization`,
+  `tls_configuration`, `tcp_connect`, `tls_handshake`, `request_write`,
+  `response_length`, `response_body`, `response_decode`, and `retry_backoff`.
+  Endpoints, node IDs, SPIFFE identities, tenants, and request data are never
+  metric dimensions.
+- `snapshot_installs`: Counter of snapshot installations.
+- `read_quorum_failures`: Counter of linearizable read failures due to lack of peer contact.
+- `server_rejected_connections`: Counter of incoming connections rejected by
+  the bounded server admission or authentication checks.
 
 ### 6.2 Alarm Manager Triggers
 The following alarms are registered and triggered via the `SharedAlarmManager`:
@@ -132,7 +239,7 @@ The following alarms are registered and triggered via the `SharedAlarmManager`:
 ### 7.1 Run Sequential Tests
 Because testing consensus protocols requires clean database states and port availability, run the end-to-end test suite sequentially using:
 ```bash
-ulimit -n 2048 && cargo test -p opc-persist --test e2e_tier1 --test e2e_tier2 --test e2e_tier3_tier4 -- --test-threads=1
+ulimit -n 2048 && cargo test --locked -p opc-persist --all-features -- --test-threads=1
 ```
 
 ### 7.2 Run Formatter Check

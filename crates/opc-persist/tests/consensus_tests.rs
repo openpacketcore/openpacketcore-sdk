@@ -1,7 +1,7 @@
 use opc_persist::{
-    AuditKey, AuditOpType, AuditRecord, ClusterMembership, CommitRecord, CommitSource, ConfigStore,
-    ConsensusClock, ConsensusConfigStore, InstallSnapshotRequest, Role, RollbackTarget,
-    SqliteBackend, StoredConfig,
+    AppendEntriesRequest, AuditKey, AuditOpType, AuditRecord, ClusterMembership, CommitRecord,
+    CommitSource, ConfigStore, ConsensusClock, ConsensusConfigStore, InstallSnapshotRequest,
+    RequestVoteRequest, Role, RollbackTarget, SqliteBackend, StoredConfig, TimeoutNowRequest,
 };
 use opc_types::{ConfigVersion, SchemaDigest, Timestamp, TxId};
 use std::sync::Arc;
@@ -323,6 +323,180 @@ async fn test_consensus_stale_snapshot_install_does_not_regress_follower_state()
 }
 
 #[tokio::test]
+async fn test_consensus_snapshot_install_is_atomic_and_exact_replay_safe() {
+    let temp_dir = TempDir::new().unwrap();
+    let group = setup_consensus_group(&temp_dir).await;
+
+    group[0].campaign().await.unwrap();
+    let original_tx = TxId::new();
+    group[0]
+        .append_commit(
+            make_commit_record(original_tx, 1),
+            vec![make_audit_record(original_tx, 0, "/original")],
+        )
+        .await
+        .unwrap();
+    group[0].sync().await.unwrap();
+
+    let follower = &group[1];
+    follower.set_online(false).await;
+    let target_tx = TxId::new();
+    group[0]
+        .append_commit(
+            make_commit_record(target_tx, 2),
+            vec![make_audit_record(target_tx, 0, "/snapshot")],
+        )
+        .await
+        .unwrap();
+    group[0].add_node_as_non_voter(99).await.unwrap();
+    group[0].sync().await.unwrap();
+
+    let target_index = group[0].inner.consensus_get_applied_index().await.unwrap();
+    group[0].compact_logs(target_index).await.unwrap();
+    let (snapshot_index, snapshot_term, snapshot_data) = group[0]
+        .inner
+        .consensus_get_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot_index, target_index);
+    let target_membership = group[0]
+        .inner
+        .consensus_get_membership()
+        .await
+        .unwrap()
+        .unwrap();
+    follower.set_online(true).await;
+
+    let backend = &follower.inner;
+    // Model a minority fork beyond a missing snapshot boundary. A successful
+    // install must not preserve this unproven suffix.
+    {
+        let conn = backend.conn();
+        let guard = conn.lock().await;
+        guard
+            .execute(
+                "INSERT INTO consensus_log (log_index, term, op_type, payload) VALUES (?1, ?2, 'NO_OP', ?3)",
+                rusqlite::params![
+                    i64::try_from(target_index + 1).unwrap(),
+                    i64::try_from(snapshot_term + 1).unwrap(),
+                    serde_json::to_string(&opc_persist::ConsensusOp::NoOp).unwrap(),
+                ],
+            )
+            .unwrap();
+    }
+    let config_before = serde_json::to_vec(&backend.load_latest().await.unwrap()).unwrap();
+    let membership_before = backend.consensus_get_membership().await.unwrap();
+    let snapshot_before = backend.consensus_get_snapshot().await.unwrap();
+    let applied_before = backend.consensus_get_applied_index().await.unwrap();
+    let logs_before = backend.consensus_get_entries(1).await.unwrap();
+    assert!(
+        !logs_before.is_empty(),
+        "fault injection needs a compacted row"
+    );
+
+    let target_term = group[0].get_term().await;
+    let request = InstallSnapshotRequest {
+        term: target_term,
+        leader_id: 0,
+        last_included_index: target_index,
+        last_included_term: snapshot_term,
+        data: snapshot_data,
+    };
+
+    // Fail the final destructive statement after every other snapshot table has
+    // been staged. SQLite must roll the complete bundle back, not expose a mix
+    // of old log/config state and new snapshot/membership markers.
+    let injector = rusqlite::Connection::open(temp_dir.path().join("consensus_1.db")).unwrap();
+    injector
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_snapshot_compaction \
+             BEFORE DELETE ON consensus_log \
+             WHEN OLD.log_index <= {target_index} \
+             BEGIN SELECT RAISE(ABORT, 'injected late snapshot failure'); END;"
+        ))
+        .unwrap();
+
+    let error = follower
+        .handle_install_snapshot(request.clone())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("injected late snapshot failure"));
+    assert_eq!(
+        serde_json::to_vec(&backend.load_latest().await.unwrap()).unwrap(),
+        config_before
+    );
+    assert_eq!(
+        backend.consensus_get_membership().await.unwrap(),
+        membership_before
+    );
+    assert_eq!(
+        backend.consensus_get_snapshot().await.unwrap(),
+        snapshot_before
+    );
+    assert_eq!(
+        backend.consensus_get_applied_index().await.unwrap(),
+        applied_before
+    );
+    assert_eq!(backend.consensus_get_entries(1).await.unwrap(), logs_before);
+
+    injector
+        .execute_batch("DROP TRIGGER fail_snapshot_compaction;")
+        .unwrap();
+
+    let response = follower
+        .handle_install_snapshot(request.clone())
+        .await
+        .unwrap();
+    assert!(response.success);
+    let installed_config = serde_json::to_vec(&backend.load_latest().await.unwrap()).unwrap();
+    let installed_membership = backend.consensus_get_membership().await.unwrap();
+    let installed_snapshot = backend.consensus_get_snapshot().await.unwrap();
+    let installed_applied = backend.consensus_get_applied_index().await.unwrap();
+    let installed_logs = backend.consensus_get_entries(1).await.unwrap();
+    assert_eq!(
+        backend.load_latest().await.unwrap().unwrap().record.tx_id,
+        target_tx
+    );
+    assert_eq!(installed_membership.as_ref().unwrap().node_id, 1);
+    assert_eq!(
+        installed_membership.as_ref().unwrap().epoch,
+        target_membership.epoch
+    );
+    assert_eq!(
+        installed_membership.as_ref().unwrap().non_voting_members,
+        target_membership.non_voting_members
+    );
+    assert_eq!(installed_applied, target_index);
+    assert!(installed_logs.is_empty());
+
+    // A lost successful response may deliver the exact request again. It must
+    // report success and leave every durable component byte-for-byte unchanged.
+    let replay = follower.handle_install_snapshot(request).await.unwrap();
+    assert!(replay.success);
+    assert_eq!(
+        serde_json::to_vec(&backend.load_latest().await.unwrap()).unwrap(),
+        installed_config
+    );
+    assert_eq!(
+        backend.consensus_get_membership().await.unwrap(),
+        installed_membership
+    );
+    assert_eq!(
+        backend.consensus_get_snapshot().await.unwrap(),
+        installed_snapshot
+    );
+    assert_eq!(
+        backend.consensus_get_applied_index().await.unwrap(),
+        installed_applied
+    );
+    assert_eq!(
+        backend.consensus_get_entries(1).await.unwrap(),
+        installed_logs
+    );
+}
+
+#[tokio::test]
 async fn test_consensus_compaction_requires_applied_index_and_allows_future_writes() {
     let temp_dir = TempDir::new().unwrap();
     let group = setup_consensus_group(&temp_dir).await;
@@ -429,6 +603,10 @@ async fn test_consensus_crashed_replica_cannot_overwrite_newer_data() {
     assert!(
         err_campaign.to_string().contains("did not reach quorum")
             || err_campaign.to_string().contains("peer has newer term")
+            || err_campaign
+                .to_string()
+                .contains("election aborted: term or role changed"),
+        "unexpected stale-candidate campaign error: {err_campaign}"
     );
 
     // Sync from actual leader node 0 should catch node 2 up
@@ -612,6 +790,475 @@ async fn test_consensus_duplicate_replayed_log_entries_idempotent() {
 
     let latest = group[0].inner.load_latest().await.unwrap().unwrap();
     assert_eq!(latest.record.tx_id, tx_id);
+}
+
+#[tokio::test]
+async fn test_append_entries_replays_preserve_newer_suffix_and_reject_applied_conflicts() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("append_replay.db");
+    let backend = Arc::new(
+        SqliteBackend::open_with_audit_key(&db_path, true, 0, test_audit_key())
+            .await
+            .unwrap(),
+    );
+    let store = ConsensusConfigStore::new(
+        1,
+        Arc::clone(&backend),
+        Some(ClusterMembership {
+            cluster_id: "append-replay-test".to_string(),
+            node_id: 1,
+            voting_members: vec![0, 1],
+            non_voting_members: vec![],
+            old_voting_members: None,
+            removed_members: vec![],
+            epoch: 1,
+        }),
+        Some(ConsensusClock {
+            election_timeout_min: std::time::Duration::from_secs(60),
+            election_timeout_max: std::time::Duration::from_secs(60),
+            heartbeat_interval: std::time::Duration::from_secs(60),
+            enable_timers: false,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let tx_id = TxId::new();
+    let first_entry = opc_persist::LogEntry {
+        index: 1,
+        term: 1,
+        op: opc_persist::ConsensusOp::AppendCommit {
+            record: make_commit_record(tx_id, 1),
+            audit: vec![make_audit_record(tx_id, 0, "/append-replay")],
+        },
+    };
+    let second_entry = opc_persist::LogEntry {
+        index: 2,
+        term: 1,
+        op: opc_persist::ConsensusOp::NoOp,
+    };
+    let third_entry = opc_persist::LogEntry {
+        index: 3,
+        term: 1,
+        op: opc_persist::ConsensusOp::NoOp,
+    };
+
+    let first_delivery = AppendEntriesRequest {
+        term: 1,
+        leader_id: 0,
+        prev_log_index: 0,
+        prev_log_term: 0,
+        entries: vec![first_entry.clone()],
+        leader_commit: 0,
+    };
+    let response = store
+        .handle_append_entries(first_delivery.clone())
+        .await
+        .unwrap();
+    assert!(response.success);
+    assert_eq!(backend.consensus_get_applied_index().await.unwrap(), 0);
+
+    let response = store
+        .handle_append_entries(AppendEntriesRequest {
+            term: 1,
+            leader_id: 0,
+            prev_log_index: 1,
+            prev_log_term: 1,
+            entries: vec![second_entry.clone(), third_entry.clone()],
+            leader_commit: 0,
+        })
+        .await
+        .unwrap();
+    assert!(response.success);
+
+    // A delayed retry of the earlier A request must not turn an A/B/A
+    // delivery pattern into truncation of B. Neither entry is applied yet.
+    let response = store.handle_append_entries(first_delivery).await.unwrap();
+    assert!(response.success);
+    assert_eq!(backend.consensus_get_applied_index().await.unwrap(), 0);
+    assert_eq!(
+        backend.consensus_get_entries(1).await.unwrap(),
+        vec![
+            first_entry.clone(),
+            second_entry.clone(),
+            third_entry.clone()
+        ]
+    );
+
+    // An old or duplicated heartbeat proves only its prefix. It must never
+    // truncate a newer uncommitted suffix.
+    let stale_heartbeat = AppendEntriesRequest {
+        term: 1,
+        leader_id: 0,
+        prev_log_index: 1,
+        prev_log_term: 1,
+        entries: vec![],
+        leader_commit: 0,
+    };
+    for _ in 0..2 {
+        let response = store
+            .handle_append_entries(stale_heartbeat.clone())
+            .await
+            .unwrap();
+        assert!(response.success);
+    }
+    assert_eq!(
+        backend.consensus_get_entries(1).await.unwrap(),
+        vec![
+            first_entry.clone(),
+            second_entry.clone(),
+            third_entry.clone()
+        ]
+    );
+
+    let replay_with_suffix = AppendEntriesRequest {
+        term: 1,
+        leader_id: 0,
+        prev_log_index: 0,
+        prev_log_term: 0,
+        entries: vec![first_entry.clone(), second_entry.clone()],
+        leader_commit: 2,
+    };
+    let response = store
+        .handle_append_entries(replay_with_suffix.clone())
+        .await
+        .unwrap();
+    assert!(
+        response.success,
+        "an identical applied prefix must be replay-safe"
+    );
+    assert_eq!(backend.consensus_get_applied_index().await.unwrap(), 2);
+    assert_eq!(backend.consensus_get_last_log().await.unwrap().0, 3);
+
+    // Model a response lost after the follower completed and applied the
+    // request: the transport delivers the exact same request again.
+    let response = store
+        .handle_append_entries(replay_with_suffix)
+        .await
+        .unwrap();
+    assert!(
+        response.success,
+        "a completed request replay must return success"
+    );
+    assert_eq!(backend.consensus_get_applied_index().await.unwrap(), 2);
+    assert_eq!(backend.consensus_get_last_log().await.unwrap().0, 3);
+    assert_eq!(
+        backend.load_latest().await.unwrap().unwrap().record.tx_id,
+        tx_id
+    );
+
+    let conflicting_replay = AppendEntriesRequest {
+        term: 1,
+        leader_id: 0,
+        prev_log_index: 0,
+        prev_log_term: 0,
+        entries: vec![
+            first_entry.clone(),
+            opc_persist::LogEntry {
+                index: 2,
+                term: 1,
+                op: opc_persist::ConsensusOp::MarkConfirmed { tx_id: TxId::new() },
+            },
+        ],
+        leader_commit: 2,
+    };
+    let response = store
+        .handle_append_entries(conflicting_replay)
+        .await
+        .unwrap();
+    assert!(
+        !response.success,
+        "an altered applied entry must be rejected"
+    );
+    assert_eq!(backend.consensus_get_applied_index().await.unwrap(), 2);
+    assert_eq!(
+        backend.consensus_get_entries(1).await.unwrap(),
+        vec![first_entry, second_entry, third_entry]
+    );
+}
+
+#[tokio::test]
+async fn test_consensus_append_rejects_log_indexes_outside_sqlite_integer_range() {
+    let temp_dir = TempDir::new().unwrap();
+    let backend = SqliteBackend::open_with_audit_key(
+        temp_dir.path().join("append-index-range.db"),
+        true,
+        0,
+        test_audit_key(),
+    )
+    .await
+    .unwrap();
+    let prev_index = i64::MAX as u64;
+    let error = backend
+        .consensus_append_logs(
+            prev_index,
+            vec![opc_persist::LogEntry {
+                index: prev_index + 1,
+                term: 1,
+                op: opc_persist::ConsensusOp::NoOp,
+            }],
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("consensus log index exceeds SQLite integer range"));
+    assert_eq!(backend.consensus_get_last_log().await.unwrap(), (0, 0));
+}
+
+#[tokio::test]
+async fn test_snapshot_coordinates_outside_sqlite_range_fail_before_any_mutation() {
+    let temp_dir = TempDir::new().unwrap();
+    let backend = Arc::new(
+        SqliteBackend::open_with_audit_key(
+            temp_dir.path().join("snapshot-coordinate-range.db"),
+            true,
+            0,
+            test_audit_key(),
+        )
+        .await
+        .unwrap(),
+    );
+    let store = ConsensusConfigStore::new(
+        1,
+        Arc::clone(&backend),
+        Some(ClusterMembership {
+            cluster_id: "snapshot-range-test".to_string(),
+            node_id: 1,
+            voting_members: vec![0, 1],
+            non_voting_members: vec![],
+            old_voting_members: None,
+            removed_members: vec![],
+            epoch: 1,
+        }),
+        Some(ConsensusClock {
+            election_timeout_min: std::time::Duration::from_secs(60),
+            election_timeout_max: std::time::Duration::from_secs(60),
+            heartbeat_interval: std::time::Duration::from_secs(60),
+            enable_timers: false,
+        }),
+    )
+    .await
+    .unwrap();
+    let one_over = i64::MAX as u64 + 1;
+
+    let error = store
+        .handle_request_vote(RequestVoteRequest {
+            term: one_over,
+            candidate_id: 0,
+            last_log_index: 0,
+            last_log_term: 0,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("exceeds SQLite integer range"));
+    assert_eq!(store.get_term().await, 0);
+    assert_eq!(backend.consensus_get_state().await.unwrap(), (0, None));
+
+    let error = store
+        .handle_append_entries(AppendEntriesRequest {
+            term: 1,
+            leader_id: 0,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: one_over,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("exceeds SQLite integer range"));
+    assert_eq!(store.get_term().await, 0);
+    assert_eq!(backend.consensus_get_state().await.unwrap(), (0, None));
+
+    let error = store
+        .handle_timeout_now(TimeoutNowRequest {
+            term: one_over,
+            candidate_id: 1,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("exceeds SQLite integer range"));
+    assert_eq!(store.get_term().await, 0);
+    assert_eq!(backend.consensus_get_state().await.unwrap(), (0, None));
+
+    let vote = store
+        .handle_request_vote(RequestVoteRequest {
+            term: 1,
+            candidate_id: 99,
+            last_log_index: 0,
+            last_log_term: 0,
+        })
+        .await
+        .unwrap();
+    assert!(!vote.vote_granted);
+    let timeout_now = store
+        .handle_timeout_now(TimeoutNowRequest {
+            term: 1,
+            candidate_id: 0,
+        })
+        .await
+        .unwrap();
+    assert!(!timeout_now.success);
+    assert_eq!(store.get_term().await, 0);
+    assert_eq!(backend.consensus_get_state().await.unwrap(), (0, None));
+
+    for (index, term) in [(one_over, 1), (1, one_over)] {
+        let error = backend
+            .consensus_set_snapshot(index, term, b"hostile-snapshot")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds SQLite integer range"));
+        assert!(backend.consensus_get_snapshot().await.unwrap().is_none());
+        assert_eq!(backend.consensus_get_applied_index().await.unwrap(), 0);
+    }
+
+    let membership_before = backend.consensus_get_membership().await.unwrap();
+    let error = store
+        .handle_install_snapshot(InstallSnapshotRequest {
+            term: 1,
+            leader_id: 0,
+            last_included_index: one_over,
+            last_included_term: 1,
+            data: b"hostile-snapshot".to_vec(),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("exceeds SQLite integer range"));
+    assert_eq!(store.get_term().await, 0);
+    assert_eq!(
+        backend.consensus_get_membership().await.unwrap(),
+        membership_before
+    );
+    assert!(backend.consensus_get_snapshot().await.unwrap().is_none());
+    assert!(backend.load_latest().await.unwrap().is_none());
+    assert_eq!(backend.consensus_get_applied_index().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_negative_consensus_coordinates_in_sqlite_fail_closed() {
+    let temp_dir = TempDir::new().unwrap();
+    let backend = SqliteBackend::open_with_audit_key(
+        temp_dir.path().join("negative-consensus-coordinate.db"),
+        true,
+        0,
+        test_audit_key(),
+    )
+    .await
+    .unwrap();
+    backend.consensus_set_state(0, None).await.unwrap();
+    backend
+        .consensus_set_membership(&ClusterMembership {
+            cluster_id: "negative-coordinate-test".to_string(),
+            node_id: 1,
+            voting_members: vec![1],
+            non_voting_members: vec![],
+            old_voting_members: None,
+            removed_members: vec![],
+            epoch: 1,
+        })
+        .await
+        .unwrap();
+
+    {
+        let conn = backend.conn();
+        let guard = conn.lock().await;
+        guard
+            .execute("UPDATE consensus_state SET current_term = -1", [])
+            .unwrap();
+    }
+    assert!(backend
+        .consensus_get_state()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("negative consensus term"));
+
+    {
+        let conn = backend.conn();
+        let guard = conn.lock().await;
+        guard
+            .execute("UPDATE consensus_state SET current_term = 0", [])
+            .unwrap();
+        guard
+            .execute("UPDATE consensus_applied SET applied_index = -1", [])
+            .unwrap();
+    }
+    assert!(backend
+        .consensus_get_applied_index()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("negative consensus log index"));
+
+    {
+        let conn = backend.conn();
+        let guard = conn.lock().await;
+        guard
+            .execute("UPDATE consensus_applied SET applied_index = 0", [])
+            .unwrap();
+        guard
+            .execute(
+                "INSERT INTO consensus_log (log_index, term, op_type, payload) VALUES (-1, 1, 'NO_OP', 'null')",
+                [],
+            )
+            .unwrap();
+    }
+    assert!(backend
+        .consensus_get_last_log()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("negative consensus log index"));
+
+    {
+        let conn = backend.conn();
+        let guard = conn.lock().await;
+        guard.execute("DELETE FROM consensus_log", []).unwrap();
+        guard
+            .execute(
+                "INSERT INTO consensus_snapshot (id, snapshot_index, snapshot_term, snapshot_data) VALUES (1, -1, 1, X'00')",
+                [],
+            )
+            .unwrap();
+    }
+    assert!(backend
+        .consensus_get_snapshot()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("negative consensus log index"));
+
+    {
+        let conn = backend.conn();
+        let guard = conn.lock().await;
+        guard
+            .execute("UPDATE consensus_membership SET epoch = -1", [])
+            .unwrap();
+    }
+    assert!(backend
+        .consensus_get_active_membership()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("negative consensus membership epoch"));
+
+    {
+        let conn = backend.conn();
+        let guard = conn.lock().await;
+        guard
+            .execute(
+                "UPDATE consensus_membership SET epoch = 1, node_id = -1",
+                [],
+            )
+            .unwrap();
+    }
+    assert!(backend
+        .consensus_get_membership()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("negative consensus node id"));
 }
 
 #[tokio::test]

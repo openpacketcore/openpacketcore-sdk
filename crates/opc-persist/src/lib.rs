@@ -111,9 +111,9 @@ pub use consensus::{
     AppendEntriesRequest, AppendEntriesResponse, ClusterMembership, ConsensusClock,
     ConsensusConfigStore, ConsensusMetricsDump, ConsensusOp, ConsensusPeer, InstallSnapshotRequest,
     InstallSnapshotResponse, LogEntry, NodeIdentity, PeerStatusDump, RequestVoteRequest,
-    RequestVoteResponse, Role, TcpPeer, TcpRpcServer,
+    RequestVoteResponse, Role, TcpPeer, TcpRpcServer, TimeoutNowRequest, TimeoutNowResponse,
 };
-pub use error::{PersistError, PersistErrorKind};
+pub use error::{ConsensusRpcFamily, ConsensusRpcStage, PersistError, PersistErrorKind};
 #[cfg(feature = "dangerous-test-hooks")]
 pub use mock::{FaultInjectingStore, FaultType};
 pub use mock::{MockConfigStore, UnsafePathMock};

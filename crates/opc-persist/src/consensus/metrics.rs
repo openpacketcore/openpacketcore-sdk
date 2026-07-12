@@ -1,5 +1,5 @@
 use super::{ClusterMembership, ConsensusConfigStore, ConsensusMetricsDump, PeerStatusDump};
-use crate::error::PersistError;
+use crate::error::{ConsensusRpcFamily, ConsensusRpcStage, PersistError};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
@@ -127,6 +127,26 @@ impl ConsensusConfigStore {
             leader_changes: self.metrics.leader_changes.load(Ordering::Relaxed),
             rpc_failures: self.metrics.rpc_failures.load(Ordering::Relaxed),
             rpc_timeouts: self.metrics.rpc_timeouts.load(Ordering::Relaxed),
+            rpc_timeouts_by_family: ConsensusRpcFamily::ALL
+                .into_iter()
+                .map(|family| {
+                    (
+                        family.as_str().to_string(),
+                        self.metrics.rpc_timeouts_by_family[family.metric_index()]
+                            .load(Ordering::Relaxed),
+                    )
+                })
+                .collect(),
+            rpc_timeouts_by_stage: ConsensusRpcStage::ALL
+                .into_iter()
+                .map(|stage| {
+                    (
+                        stage.as_str().to_string(),
+                        self.metrics.rpc_timeouts_by_stage[stage.metric_index()]
+                            .load(Ordering::Relaxed),
+                    )
+                })
+                .collect(),
             snapshot_installs: self.metrics.snapshot_installs.load(Ordering::Relaxed),
             snapshot_failures: self.metrics.snapshot_failures.load(Ordering::Relaxed),
             read_quorum_failures: self.metrics.read_quorum_failures.load(Ordering::Relaxed),

@@ -52,15 +52,19 @@ impl ConsensusConfigStore {
             if !s.online {
                 return Err(PersistError::io("node offline"));
             }
+            let next_term = s
+                .current_term
+                .checked_add(1)
+                .ok_or_else(|| PersistError::inconsistent_state("consensus term overflow"))?;
+            SqliteBackend::consensus_term_to_sqlite(next_term)?;
+            SqliteBackend::consensus_node_id_to_sqlite(node_id)?;
+            inner.consensus_set_state(next_term, Some(node_id)).await?;
+
             s.role = Role::Candidate;
-            s.current_term += 1;
+            s.current_term = next_term;
             s.voted_for = Some(node_id);
             s.leader_id = None;
             s.last_contact = Instant::now();
-
-            inner
-                .consensus_set_state(s.current_term, s.voted_for)
-                .await?;
 
             let (last_index, last_term) = inner.consensus_get_last_log().await?;
             let req = RequestVoteRequest {
@@ -81,6 +85,7 @@ impl ConsensusConfigStore {
             votes += 1; // Vote for self
         }
 
+        let mut vote_requests = tokio::task::JoinSet::new();
         for peer in peer_list {
             let pid = peer.node_id();
             if !membership.voting_members.contains(&pid) {
@@ -93,41 +98,57 @@ impl ConsensusConfigStore {
                     continue;
                 }
             }
-            if let Ok(resp) = peer.request_vote(req.clone()).await {
-                if resp.vote_granted {
-                    votes += 1;
-                } else {
-                    let mut s = state.lock().await;
-                    if resp.term > s.current_term {
-                        s.current_term = resp.term;
-                        s.voted_for = None;
-                        s.role = Role::Follower;
-                        s.leader_id = None;
-                        inner
-                            .consensus_set_state(s.current_term, s.voted_for)
-                            .await?;
+            let request = req.clone();
+            vote_requests.spawn(async move { (pid, peer.request_vote(request).await) });
+        }
+
+        while let Some(result) = vote_requests.join_next().await {
+            match result {
+                Ok((_peer_id, Ok(resp))) => {
+                    if resp.term > req.term {
+                        vote_requests.abort_all();
+                        let mut s = state.lock().await;
+                        if resp.term > s.current_term {
+                            inner.consensus_set_state(resp.term, None).await?;
+                            s.current_term = resp.term;
+                            s.voted_for = None;
+                            s.role = Role::Follower;
+                            s.leader_id = None;
+                        }
                         return Err(PersistError::inconsistent_state("peer has newer term"));
                     }
+                    if resp.term == req.term && resp.vote_granted {
+                        votes += 1;
+                    }
+                }
+                Ok((_peer_id, Err(error))) => {
+                    metrics.record_rpc_failure(&error);
+                }
+                Err(_) => {
+                    metrics.rpc_failures.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
+        vote_requests.abort_all();
 
         let mut s = state.lock().await;
         if s.role == Role::Candidate && s.current_term == req.term {
             if votes >= quorum {
-                s.role = Role::Leader;
-                s.leader_id = Some(node_id);
-                metrics.leader_changes.fetch_add(1, Ordering::Relaxed);
-
                 let (last_log_index, _) = inner.consensus_get_last_log().await?;
                 let entry = LogEntry {
-                    index: last_log_index + 1,
+                    index: last_log_index.checked_add(1).ok_or_else(|| {
+                        PersistError::inconsistent_state("consensus log index overflow")
+                    })?,
                     term: s.current_term,
                     op: ConsensusOp::NoOp,
                 };
                 inner
                     .consensus_append_logs(last_log_index, vec![entry.clone()])
                     .await?;
+
+                s.role = Role::Leader;
+                s.leader_id = Some(node_id);
+                metrics.leader_changes.fetch_add(1, Ordering::Relaxed);
 
                 let new_last_log_index = entry.index;
                 s.next_index.clear();
@@ -157,11 +178,9 @@ impl ConsensusConfigStore {
                 );
                 Ok(())
             } else {
+                inner.consensus_set_state(s.current_term, None).await?;
                 s.role = Role::Follower;
                 s.voted_for = None;
-                inner
-                    .consensus_set_state(s.current_term, s.voted_for)
-                    .await?;
                 Err(PersistError::inconsistent_state(
                     "did not reach quorum of votes",
                 ))
@@ -177,19 +196,27 @@ impl ConsensusConfigStore {
         &self,
         req: RequestVoteRequest,
     ) -> Result<RequestVoteResponse, PersistError> {
+        SqliteBackend::consensus_term_to_sqlite(req.term)?;
+        SqliteBackend::consensus_node_id_to_sqlite(req.candidate_id)?;
+        SqliteBackend::consensus_index_to_sqlite(req.last_log_index)?;
+        SqliteBackend::consensus_term_to_sqlite(req.last_log_term)?;
+        if !self.is_voting_member(req.candidate_id).await? {
+            return Ok(RequestVoteResponse {
+                term: self.state.lock().await.current_term,
+                vote_granted: false,
+            });
+        }
         let mut state = self.state.lock().await;
         if !state.online {
             return Err(PersistError::io("node offline"));
         }
 
         if req.term > state.current_term {
+            self.inner.consensus_set_state(req.term, None).await?;
             state.current_term = req.term;
             state.voted_for = None;
             state.role = Role::Follower;
             state.leader_id = None;
-            self.inner
-                .consensus_set_state(state.current_term, state.voted_for)
-                .await?;
         }
 
         if req.term >= state.current_term {
@@ -205,11 +232,11 @@ impl ConsensusConfigStore {
                 || (req.last_log_term == last_term && req.last_log_index >= last_index);
 
             if log_ok {
+                self.inner
+                    .consensus_set_state(state.current_term, Some(req.candidate_id))
+                    .await?;
                 vote_granted = true;
                 state.voted_for = Some(req.candidate_id);
-                self.inner
-                    .consensus_set_state(state.current_term, state.voted_for)
-                    .await?;
             }
         }
 
@@ -223,15 +250,21 @@ impl ConsensusConfigStore {
         &self,
         req: TimeoutNowRequest,
     ) -> Result<TimeoutNowResponse, PersistError> {
+        SqliteBackend::consensus_term_to_sqlite(req.term)?;
+        SqliteBackend::consensus_node_id_to_sqlite(req.candidate_id)?;
+        if req.candidate_id != self.node_id || !self.is_voting_member(self.node_id).await? {
+            return Ok(TimeoutNowResponse {
+                term: self.state.lock().await.current_term,
+                success: false,
+            });
+        }
         let mut state = self.state.lock().await;
         if state.current_term < req.term {
+            self.inner.consensus_set_state(req.term, None).await?;
             state.current_term = req.term;
             state.voted_for = None;
             state.role = Role::Follower;
             state.leader_id = None;
-            self.inner
-                .consensus_set_state(state.current_term, None)
-                .await?;
         }
 
         let store = self.clone();
@@ -266,12 +299,12 @@ impl ConsensusConfigStore {
 
         {
             let mut state = self.state.lock().await;
-            state.role = Role::Follower;
-            state.voted_for = None;
-            state.leader_id = None;
             self.inner
                 .consensus_set_state(state.current_term, None)
                 .await?;
+            state.role = Role::Follower;
+            state.voted_for = None;
+            state.leader_id = None;
         }
 
         let peer = {
@@ -286,7 +319,10 @@ impl ConsensusConfigStore {
             term: self.state.lock().await.current_term,
             candidate_id: target_node_id,
         };
-        let _ = peer.timeout_now(req).await?;
+        if let Err(error) = peer.timeout_now(req).await {
+            self.metrics.record_rpc_failure(&error);
+            return Err(error);
+        }
 
         Ok(())
     }

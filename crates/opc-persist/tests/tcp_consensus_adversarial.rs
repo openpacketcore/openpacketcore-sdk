@@ -289,8 +289,9 @@ async fn test_adversarial_auth_failures_types() {
     // Auth failures should have incremented
     assert!(m_b.auth_failures > m_a.auth_failures);
 
-    // Mode C: Connect with valid TLS cert but bad SPIFFE ID format (e.g. wrong parts count).
-    {
+    // Mode C: A malformed local SPIFFE profile is rejected while building the
+    // client connector, before TCP is dialed or server auth metrics can change.
+    let bad_spiffe_error = {
         // Cert is signed by the CA but has a malformed SPIFFE ID
         let bad_spiffe_identity = generate_custom_identity(
             &ca_cert,
@@ -311,11 +312,12 @@ async fn test_adversarial_auth_failures_types() {
         )
         .await
         .unwrap();
-        let _ = peer.load_latest_consensus_rpc().await; // Should fail SPIFFE ID check
-    }
+        peer.load_latest_consensus_rpc().await.unwrap_err()
+    };
+    assert!(!bad_spiffe_error.is_consensus_rpc_timeout());
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let m_c = store.dump_metrics().await.unwrap();
-    assert!(m_c.auth_failures > m_b.auth_failures);
+    assert_eq!(m_c.auth_failures, m_b.auth_failures);
 
     server.shutdown().await;
     let _ = handle.await;

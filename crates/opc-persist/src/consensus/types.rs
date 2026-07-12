@@ -42,11 +42,21 @@ pub trait ConsensusPeer: Send + Sync + std::fmt::Debug {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NodeIdentity {
     pub cert_chain_pem: String,
     pub private_key_pem: String,
     pub ca_cert_pem: String,
+}
+
+impl std::fmt::Debug for NodeIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeIdentity")
+            .field("cert_chain_pem", &"[REDACTED]")
+            .field("private_key_pem", &"[REDACTED]")
+            .field("ca_cert_pem", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +130,8 @@ pub struct ConsensusMetrics {
     pub leader_changes: AtomicU64,
     pub rpc_failures: AtomicU64,
     pub rpc_timeouts: AtomicU64,
+    pub(crate) rpc_timeouts_by_family: [AtomicU64; 6],
+    pub(crate) rpc_timeouts_by_stage: [AtomicU64; 11],
     pub snapshot_installs: AtomicU64,
     pub snapshot_failures: AtomicU64,
     pub read_quorum_failures: AtomicU64,
@@ -132,6 +144,19 @@ pub struct ConsensusMetrics {
     pub server_rejected_connections: AtomicU64,
     pub server_shutdown_failures: AtomicU64,
     pub server_start_failures: AtomicU64,
+}
+
+impl ConsensusMetrics {
+    pub(crate) fn record_rpc_failure(&self, error: &PersistError) {
+        use std::sync::atomic::Ordering;
+
+        self.rpc_failures.fetch_add(1, Ordering::Relaxed);
+        if let Some((family, stage)) = error.consensus_rpc_timeout_context() {
+            self.rpc_timeouts.fetch_add(1, Ordering::Relaxed);
+            self.rpc_timeouts_by_family[family.metric_index()].fetch_add(1, Ordering::Relaxed);
+            self.rpc_timeouts_by_stage[stage.metric_index()].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -147,6 +172,10 @@ pub struct ConsensusMetricsDump {
     pub leader_changes: u64,
     pub rpc_failures: u64,
     pub rpc_timeouts: u64,
+    /// Logical RPC timeout counts keyed by bounded request-family label.
+    pub rpc_timeouts_by_family: HashMap<String, u64>,
+    /// Logical RPC timeout counts keyed by bounded transport-stage label.
+    pub rpc_timeouts_by_stage: HashMap<String, u64>,
     pub snapshot_installs: u64,
     pub snapshot_failures: u64,
     pub read_quorum_failures: u64,
@@ -188,7 +217,7 @@ pub enum ConsensusOp {
     NoOp,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct LogEntry {
     pub index: u64,
     pub term: u64,
@@ -304,4 +333,50 @@ pub struct ConsensusNodeState {
     pub partitioned_peers: HashSet<usize>,
     pub finalization_in_progress: bool,
     pub last_finalized_epoch: Option<u64>,
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::{ConsensusMetrics, NodeIdentity};
+    use crate::error::{ConsensusRpcFamily, ConsensusRpcStage};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn logical_timeout_metrics_use_bounded_family_and_stage_dimensions() {
+        let metrics = ConsensusMetrics::default();
+        let error = crate::PersistError::consensus_rpc_timeout(
+            ConsensusRpcFamily::AppendEntries,
+            ConsensusRpcStage::ResponseBody,
+        );
+
+        metrics.record_rpc_failure(&error);
+
+        assert_eq!(metrics.rpc_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.rpc_timeouts.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.rpc_timeouts_by_family[ConsensusRpcFamily::AppendEntries.metric_index()]
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.rpc_timeouts_by_stage[ConsensusRpcStage::ResponseBody.metric_index()]
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn node_identity_debug_never_exposes_tls_material() {
+        let identity = NodeIdentity {
+            cert_chain_pem: "CERTIFICATE-CANARY".to_string(),
+            private_key_pem: "PRIVATE-KEY-CANARY".to_string(),
+            ca_cert_pem: "TRUST-BUNDLE-CANARY".to_string(),
+        };
+
+        let debug = format!("{identity:?}");
+        assert!(!debug.contains("CERTIFICATE-CANARY"));
+        assert!(!debug.contains("PRIVATE-KEY-CANARY"));
+        assert!(!debug.contains("TRUST-BUNDLE-CANARY"));
+        assert_eq!(debug.matches("[REDACTED]").count(), 3);
+    }
 }

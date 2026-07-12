@@ -11,24 +11,54 @@ use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
 
+use super::rpc_timing::RPC_CATCH_UP_MAX_ROUNDS;
+
+type PeerReplicationGate = tokio::sync::Mutex<()>;
+type PeerReplicationGateMap =
+    std::collections::HashMap<(usize, usize), std::sync::Weak<PeerReplicationGate>>;
+
+fn peer_replication_gate(inner: &Arc<SqliteBackend>, peer_id: usize) -> Arc<PeerReplicationGate> {
+    static GATES: std::sync::OnceLock<std::sync::Mutex<PeerReplicationGateMap>> =
+        std::sync::OnceLock::new();
+    let key = (Arc::as_ptr(inner) as usize, peer_id);
+    let mut gates = GATES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(PeerReplicationGate::new(()));
+    gates.insert(key, Arc::downgrade(&gate));
+    gate
+}
+
 impl ConsensusConfigStore {
     pub async fn handle_append_entries(
         &self,
         req: AppendEntriesRequest,
     ) -> Result<AppendEntriesResponse, PersistError> {
+        SqliteBackend::consensus_term_to_sqlite(req.term)?;
+        SqliteBackend::consensus_node_id_to_sqlite(req.leader_id)?;
+        SqliteBackend::consensus_index_to_sqlite(req.prev_log_index)?;
+        SqliteBackend::consensus_term_to_sqlite(req.prev_log_term)?;
+        SqliteBackend::consensus_index_to_sqlite(req.leader_commit)?;
+        for entry in &req.entries {
+            SqliteBackend::consensus_index_to_sqlite(entry.index)?;
+            SqliteBackend::consensus_term_to_sqlite(entry.term)?;
+        }
         let mut state = self.state.lock().await;
         if !state.online {
             return Err(PersistError::io("node offline"));
         }
 
         if req.term > state.current_term {
+            self.inner.consensus_set_state(req.term, None).await?;
             state.current_term = req.term;
             state.voted_for = None;
             state.role = Role::Follower;
             state.leader_id = Some(req.leader_id);
-            self.inner
-                .consensus_set_state(state.current_term, state.voted_for)
-                .await?;
         }
 
         if req.term >= state.current_term {
@@ -64,15 +94,75 @@ impl ConsensusConfigStore {
             }
         }
 
-        if !req.entries.is_empty() {
-            self.inner
-                .consensus_append_logs(req.prev_log_index, req.entries)
+        let mut entries = req.entries;
+        if !entries.is_empty() {
+            let mut expected_index = req
+                .prev_log_index
+                .checked_add(1)
+                .ok_or_else(|| PersistError::inconsistent_state("consensus log index overflow"))?;
+            for entry in &entries {
+                if entry.index != expected_index {
+                    return Err(PersistError::inconsistent_state(
+                        "non-contiguous consensus log append",
+                    ));
+                }
+                expected_index = expected_index.checked_add(1).ok_or_else(|| {
+                    PersistError::inconsistent_state("consensus log index overflow")
+                })?;
+            }
+
+            // A response may be lost after the follower has durably accepted
+            // this exact range.  Treat that retry as an idempotent success and
+            // preserve any newer suffix already present locally.  Calling
+            // `consensus_append_logs` here would truncate that suffix before
+            // rewriting the replayed entries.
+            let exact_replay = self
+                .inner
+                .consensus_log_entries_match(req.prev_log_index, &entries)
                 .await?;
-        } else {
-            let last_log = self.inner.consensus_get_last_log().await?.0;
-            if last_log > req.prev_log_index {
+            let applied_index = self.inner.consensus_get_applied_index().await?;
+            if exact_replay {
+                // The existing range is byte-for-byte equivalent after typed
+                // decoding.  Only the leader commit below may advance state.
+            } else if req.prev_log_index < applied_index {
+                let applied_prefix_len =
+                    entries.partition_point(|entry| entry.index <= applied_index);
+                if applied_prefix_len == 0
+                    || !self
+                        .inner
+                        .consensus_log_entries_match(
+                            req.prev_log_index,
+                            &entries[..applied_prefix_len],
+                        )
+                        .await?
+                {
+                    return Ok(AppendEntriesResponse {
+                        term: state.current_term,
+                        success: false,
+                    });
+                }
+
+                let unapplied_suffix = entries.split_off(applied_prefix_len);
+                if !unapplied_suffix.is_empty() {
+                    if entries.last().map(|entry| entry.index) != Some(applied_index) {
+                        return Ok(AppendEntriesResponse {
+                            term: state.current_term,
+                            success: false,
+                        });
+                    }
+                    if !self
+                        .inner
+                        .consensus_log_entries_match(applied_index, &unapplied_suffix)
+                        .await?
+                    {
+                        self.inner
+                            .consensus_append_logs(applied_index, unapplied_suffix)
+                            .await?;
+                    }
+                }
+            } else {
                 self.inner
-                    .consensus_truncate_unapplied_after(req.prev_log_index)
+                    .consensus_append_logs(req.prev_log_index, entries)
                     .await?;
             }
         }
@@ -81,8 +171,8 @@ impl ConsensusConfigStore {
         let commit_to = req.leader_commit.min(last_log);
         self.inner.consensus_apply_entries(commit_to).await?;
 
-        state.commit_index = commit_to;
-        state.last_applied = commit_to;
+        state.commit_index = state.commit_index.max(commit_to);
+        state.last_applied = state.last_applied.max(commit_to);
 
         Ok(AppendEntriesResponse {
             term: state.current_term,
@@ -90,22 +180,15 @@ impl ConsensusConfigStore {
         })
     }
 
+    /// Replicate one bounded catch-up pass to every configured peer.
+    ///
+    /// Peer fan-out is concurrent. Each peer may run at most
+    /// `RPC_CATCH_UP_MAX_ROUNDS` (currently 64) sequential catch-up rounds. A
+    /// rejected snapshot can fall through to one append in the same round, so
+    /// a pass can issue at most 128 logical RPCs, each with its own end-to-end
+    /// `TcpPeer` deadline. A peer that remains behind is resumed by a later
+    /// replication trigger.
     pub async fn replicate_to_peers_sync(&self) -> Result<(), PersistError> {
-        let store_addr = Arc::as_ptr(&self.inner) as usize;
-        static REPLICATION_LOCKS: std::sync::OnceLock<
-            std::sync::Mutex<
-                std::collections::HashMap<usize, std::sync::Arc<tokio::sync::Mutex<()>>>,
-            >,
-        > = std::sync::OnceLock::new();
-        let lock = REPLICATION_LOCKS
-            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-            .lock()
-            .unwrap()
-            .entry(store_addr)
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let _guard = lock.lock().await;
-
         let peers = {
             let guard = self.peers.read().await;
             guard
@@ -114,127 +197,174 @@ impl ConsensusConfigStore {
                 .collect::<Vec<Arc<dyn ConsensusPeer>>>()
         };
 
+        let mut replication_tasks = tokio::task::JoinSet::new();
         for peer in peers {
             let peer_id = peer.node_id();
             if self.is_partitioned(peer_id).await {
                 continue;
             }
-            loop {
-                let (term, leader_id, commit_index, next_idx) = {
-                    let s = self.state.lock().await;
-                    if s.role != Role::Leader {
-                        return Ok(());
-                    }
-                    let next = s.next_index.get(&peer_id).cloned().unwrap_or(1);
-                    (s.current_term, self.node_id, s.commit_index, next)
-                };
+            let store = self.clone();
+            replication_tasks.spawn(async move { store.replicate_peer_sync(peer).await });
+        }
 
-                let snapshot_opt = self.inner.consensus_get_snapshot().await?;
-                if let Some((snap_idx, snap_term, snap_data)) = snapshot_opt {
-                    if next_idx <= snap_idx {
-                        let req = InstallSnapshotRequest {
-                            term,
-                            leader_id,
-                            last_included_index: snap_idx,
-                            last_included_term: snap_term,
-                            data: snap_data,
-                        };
-                        match peer.install_snapshot(req).await {
-                            Ok(resp) => {
-                                let mut s = self.state.lock().await;
-                                if resp.term > s.current_term {
-                                    s.current_term = resp.term;
-                                    s.voted_for = None;
-                                    s.role = Role::Follower;
-                                    s.leader_id = None;
-                                    let cur_term = s.current_term;
-                                    let voted_for = s.voted_for;
-                                    drop(s);
-                                    let _ =
-                                        self.inner.consensus_set_state(cur_term, voted_for).await;
-                                    return Ok(());
-                                }
-                                if resp.success {
-                                    s.next_index.insert(peer_id, snap_idx + 1);
-                                    s.match_index.insert(peer_id, snap_idx);
-                                    drop(s);
-                                    let _ = self.update_commit_index().await;
-                                    continue;
-                                }
-                            }
-                            Err(e) => {
-                                debug!(error = ?e, peer_id, "install_snapshot failed");
-                                break;
-                            }
-                        }
-                    }
+        while let Some(result) = replication_tasks.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    replication_tasks.abort_all();
+                    return Err(error);
                 }
-
-                let (last_log_index, _) = self.inner.consensus_get_last_log().await?;
-                let is_heartbeat = last_log_index < next_idx;
-                let entries = if is_heartbeat {
-                    vec![]
-                } else {
-                    self.inner.consensus_get_entries(next_idx).await?
-                };
-
-                let (prev_log_index, prev_log_term) = if next_idx <= 1 {
-                    (0, 0)
-                } else {
-                    let idx = next_idx - 1;
-                    let t = self.inner.consensus_get_log_term(idx).await?.unwrap_or(0);
-                    (idx, t)
-                };
-
-                let entries_len = entries.len();
-                let req = AppendEntriesRequest {
-                    term,
-                    leader_id,
-                    prev_log_index,
-                    prev_log_term,
-                    entries,
-                    leader_commit: commit_index,
-                };
-
-                match peer.append_entries(req).await {
-                    Ok(resp) => {
-                        let mut s = self.state.lock().await;
-                        if resp.term > s.current_term {
-                            s.current_term = resp.term;
-                            s.voted_for = None;
-                            s.role = Role::Follower;
-                            s.leader_id = None;
-                            let cur_term = s.current_term;
-                            let voted_for = s.voted_for;
-                            drop(s);
-                            let _ = self.inner.consensus_set_state(cur_term, voted_for).await;
-                            return Ok(());
-                        }
-                        if s.role != Role::Leader {
-                            return Ok(());
-                        }
-                        if resp.success {
-                            let new_match = prev_log_index + entries_len as u64;
-                            let current_match = s.match_index.get(&peer_id).cloned().unwrap_or(0);
-                            if new_match > current_match {
-                                s.match_index.insert(peer_id, new_match);
-                                s.next_index.insert(peer_id, new_match + 1);
-                                drop(s);
-                                let _ = self.update_commit_index().await;
-                            } else {
-                                drop(s);
-                            }
-                            break;
-                        } else if next_idx > 1 {
-                            s.next_index.insert(peer_id, next_idx - 1);
-                        } else {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+                Err(_) => {
+                    replication_tasks.abort_all();
+                    return Err(PersistError::io("synchronous replication task failed"));
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn replicate_peer_sync(&self, peer: Arc<dyn ConsensusPeer>) -> Result<(), PersistError> {
+        let peer_id = peer.node_id();
+        let replication_lock = peer_replication_gate(&self.inner, peer_id);
+        let _replication_guard = replication_lock.lock_owned().await;
+        for _round in 0..RPC_CATCH_UP_MAX_ROUNDS {
+            let (term, leader_id, commit_index, next_idx) = {
+                let s = self.state.lock().await;
+                if s.role != Role::Leader {
+                    return Ok(());
+                }
+                let next = s.next_index.get(&peer_id).cloned().unwrap_or(1);
+                (s.current_term, self.node_id, s.commit_index, next)
+            };
+
+            let snapshot_opt = self.inner.consensus_get_snapshot().await?;
+            if let Some((snap_idx, snap_term, snap_data)) = snapshot_opt {
+                if next_idx <= snap_idx {
+                    let req = InstallSnapshotRequest {
+                        term,
+                        leader_id,
+                        last_included_index: snap_idx,
+                        last_included_term: snap_term,
+                        data: snap_data,
+                    };
+                    match peer.install_snapshot(req).await {
+                        Ok(resp) => {
+                            let mut s = self.state.lock().await;
+                            if resp.term > s.current_term {
+                                self.inner.consensus_set_state(resp.term, None).await?;
+                                s.current_term = resp.term;
+                                s.voted_for = None;
+                                s.role = Role::Follower;
+                                s.leader_id = None;
+                                return Ok(());
+                            }
+                            if s.role != Role::Leader || s.current_term != term || resp.term != term
+                            {
+                                return Ok(());
+                            }
+                            if resp.success {
+                                let current_match =
+                                    s.match_index.get(&peer_id).copied().unwrap_or(0);
+                                let current_next = s.next_index.get(&peer_id).copied().unwrap_or(1);
+                                s.match_index.insert(peer_id, current_match.max(snap_idx));
+                                s.next_index.insert(peer_id, current_next.max(snap_idx + 1));
+                                drop(s);
+                                let _ = self.update_commit_index().await;
+                                continue;
+                            }
+                            if s.next_index.get(&peer_id).copied().unwrap_or(1) != next_idx {
+                                continue;
+                            }
+                        }
+                        Err(error) => {
+                            self.metrics.record_rpc_failure(&error);
+                            debug!(error = %error, peer_id, "install_snapshot failed");
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            {
+                let s = self.state.lock().await;
+                if s.role != Role::Leader || s.current_term != term {
+                    return Ok(());
+                }
+                if s.next_index.get(&peer_id).copied().unwrap_or(1) != next_idx {
+                    continue;
+                }
+            }
+
+            let (last_log_index, _) = self.inner.consensus_get_last_log().await?;
+            let is_heartbeat = last_log_index < next_idx;
+            let entries = if is_heartbeat {
+                vec![]
+            } else {
+                self.inner.consensus_get_entries(next_idx).await?
+            };
+
+            let (prev_log_index, prev_log_term) = if next_idx <= 1 {
+                (0, 0)
+            } else {
+                let idx = next_idx - 1;
+                let term = self.inner.consensus_get_log_term(idx).await?.unwrap_or(0);
+                (idx, term)
+            };
+
+            let entries_len = entries.len();
+            let req = AppendEntriesRequest {
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit: commit_index,
+            };
+
+            match peer.append_entries(req).await {
+                Ok(resp) => {
+                    let mut s = self.state.lock().await;
+                    if resp.term > s.current_term {
+                        self.inner.consensus_set_state(resp.term, None).await?;
+                        s.current_term = resp.term;
+                        s.voted_for = None;
+                        s.role = Role::Follower;
+                        s.leader_id = None;
+                        return Ok(());
+                    }
+                    if s.role != Role::Leader || s.current_term != term || resp.term != term {
+                        return Ok(());
+                    }
+                    if resp.success {
+                        let new_match = prev_log_index + entries_len as u64;
+                        let current_match = s.match_index.get(&peer_id).cloned().unwrap_or(0);
+                        if new_match > current_match {
+                            s.match_index.insert(peer_id, new_match);
+                            s.next_index.insert(peer_id, new_match + 1);
+                            drop(s);
+                            let _ = self.update_commit_index().await;
+                        }
+                        return Ok(());
+                    }
+                    if next_idx > 1 && s.next_index.get(&peer_id).copied().unwrap_or(1) == next_idx
+                    {
+                        s.next_index.insert(peer_id, next_idx - 1);
+                    } else {
+                        return Ok(());
+                    }
+                }
+                Err(error) => {
+                    self.metrics.record_rpc_failure(&error);
+                    return Ok(());
+                }
+            }
+        }
+
+        debug!(
+            peer_id,
+            max_rounds = RPC_CATCH_UP_MAX_ROUNDS,
+            "synchronous replication catch-up pass reached its RPC round bound"
+        );
         Ok(())
     }
 
@@ -303,7 +433,7 @@ impl ConsensusConfigStore {
                                     if let Err(err) = res {
                                         s.last_finalized_epoch = None;
                                         debug!(
-                                            error = ?err,
+                                            error = %err,
                                             "joint consensus finalization failed"
                                         );
                                     }
@@ -687,7 +817,7 @@ impl ConsensusConfigStore {
                 }
             }
 
-            let (last_log_idx, _) = inner.consensus_get_last_log().await.unwrap_or((0, 0));
+            let (last_log_idx, _) = inner.consensus_get_last_log().await?;
             let next_idx = {
                 let s = state.lock().await;
                 s.next_index.get(&peer_id).cloned().unwrap_or(1)
@@ -705,15 +835,15 @@ impl ConsensusConfigStore {
                 );
                 continue;
             }
-            let (prev_log_index, prev_log_term) = {
+            let (request_next_idx, prev_log_index, prev_log_term) = {
                 let s = state.lock().await;
                 let next = s.next_index.get(&peer_id).cloned().unwrap_or(1);
                 let prev = next.saturating_sub(1);
                 if prev == 0 {
-                    (0, 0)
+                    (next, 0, 0)
                 } else {
                     let term = inner.consensus_get_log_term(prev).await?.unwrap_or(0);
-                    (prev, term)
+                    (next, prev, term)
                 }
             };
 
@@ -732,47 +862,54 @@ impl ConsensusConfigStore {
             let metrics_c = Arc::clone(&metrics);
             let commit_notifier_c = Arc::clone(&commit_notifier);
             tokio::spawn(async move {
+                let replication_lock = peer_replication_gate(&inner_c, peer_id);
+                let Ok(_replication_guard) = replication_lock.try_lock_owned() else {
+                    debug!(
+                        peer_id,
+                        "coalesced heartbeat into an active peer replication pass"
+                    );
+                    return;
+                };
                 match peer_c.append_entries(req).await {
                     Ok(resp) => {
                         let mut s = state_c.lock().await;
                         if resp.term > s.current_term {
+                            if inner_c.consensus_set_state(resp.term, None).await.is_err() {
+                                return;
+                            }
                             s.current_term = resp.term;
                             s.voted_for = None;
                             s.role = Role::Follower;
                             s.leader_id = None;
-                            let _ = inner_c
-                                .consensus_set_state(s.current_term, s.voted_for)
-                                .await;
                             return;
                         }
-                        if s.role == Role::Leader {
-                            if resp.success {
-                                let old_match = s.match_index.get(&peer_id).cloned().unwrap_or(0);
-                                if prev_log_index > old_match {
-                                    s.match_index.insert(peer_id, prev_log_index);
-                                    s.next_index.insert(peer_id, prev_log_index + 1);
-                                    drop(s);
-                                    let _ = Self::update_commit_index_static(
-                                        &inner_c,
-                                        &state_c,
-                                        &commit_notifier_c,
-                                        node_id,
-                                    )
-                                    .await;
-                                }
-                            } else {
-                                let next = s.next_index.get(&peer_id).cloned().unwrap_or(1);
-                                if next > 1 {
-                                    s.next_index.insert(peer_id, next - 1);
-                                }
+                        if s.role != Role::Leader || s.current_term != term || resp.term != term {
+                            return;
+                        }
+                        if resp.success {
+                            let old_match = s.match_index.get(&peer_id).cloned().unwrap_or(0);
+                            if prev_log_index > old_match {
+                                s.match_index.insert(peer_id, prev_log_index);
+                                let current_next = s.next_index.get(&peer_id).copied().unwrap_or(1);
+                                s.next_index
+                                    .insert(peer_id, current_next.max(prev_log_index + 1));
+                                drop(s);
+                                let _ = Self::update_commit_index_static(
+                                    &inner_c,
+                                    &state_c,
+                                    &commit_notifier_c,
+                                    node_id,
+                                )
+                                .await;
                             }
+                        } else if request_next_idx > 1
+                            && s.next_index.get(&peer_id).copied().unwrap_or(1) == request_next_idx
+                        {
+                            s.next_index.insert(peer_id, request_next_idx - 1);
                         }
                     }
                     Err(e) => {
-                        metrics_c.rpc_failures.fetch_add(1, Ordering::Relaxed);
-                        if e.to_string().contains("timeout") {
-                            metrics_c.rpc_timeouts.fetch_add(1, Ordering::Relaxed);
-                        }
+                        metrics_c.record_rpc_failure(&e);
                     }
                 }
             });
@@ -809,7 +946,15 @@ impl ConsensusConfigStore {
                 let metrics_c = Arc::clone(&metrics);
 
                 tokio::spawn(async move {
-                    loop {
+                    let replication_lock = peer_replication_gate(&inner, peer_id);
+                    let Ok(_replication_guard) = replication_lock.try_lock_owned() else {
+                        debug!(
+                            peer_id,
+                            "coalesced background replication into an active peer pass"
+                        );
+                        return;
+                    };
+                    for _round in 0..RPC_CATCH_UP_MAX_ROUNDS {
                         let (term, leader_id, commit_index, next_idx, _match_idx) = {
                             let s = state.lock().await;
                             if s.role != Role::Leader {
@@ -822,7 +967,7 @@ impl ConsensusConfigStore {
 
                         let snapshot_opt = match inner.consensus_get_snapshot().await {
                             Ok(opt) => opt,
-                            Err(_) => break,
+                            Err(_) => return,
                         };
 
                         if let Some((snap_idx, snap_term, snap_data)) = snapshot_opt {
@@ -838,18 +983,34 @@ impl ConsensusConfigStore {
                                     Ok(resp) => {
                                         let mut s = state.lock().await;
                                         if resp.term > s.current_term {
+                                            if inner
+                                                .consensus_set_state(resp.term, None)
+                                                .await
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
                                             s.current_term = resp.term;
                                             s.voted_for = None;
                                             s.role = Role::Follower;
                                             s.leader_id = None;
-                                            let _ = inner
-                                                .consensus_set_state(s.current_term, s.voted_for)
-                                                .await;
+                                            return;
+                                        }
+                                        if s.role != Role::Leader
+                                            || s.current_term != term
+                                            || resp.term != term
+                                        {
                                             return;
                                         }
                                         if resp.success {
-                                            s.next_index.insert(peer_id, snap_idx + 1);
-                                            s.match_index.insert(peer_id, snap_idx);
+                                            let current_match =
+                                                s.match_index.get(&peer_id).copied().unwrap_or(0);
+                                            let current_next =
+                                                s.next_index.get(&peer_id).copied().unwrap_or(1);
+                                            s.match_index
+                                                .insert(peer_id, current_match.max(snap_idx));
+                                            s.next_index
+                                                .insert(peer_id, current_next.max(snap_idx + 1));
                                             drop(s);
                                             let _ = Self::update_commit_index_static(
                                                 &inner,
@@ -860,21 +1021,33 @@ impl ConsensusConfigStore {
                                             .await;
                                             continue;
                                         }
+                                        if s.next_index.get(&peer_id).copied().unwrap_or(1)
+                                            != next_idx
+                                        {
+                                            continue;
+                                        }
                                     }
                                     Err(e) => {
-                                        metrics_c.rpc_failures.fetch_add(1, Ordering::Relaxed);
-                                        if e.to_string().contains("timeout") {
-                                            metrics_c.rpc_timeouts.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        break;
+                                        metrics_c.record_rpc_failure(&e);
+                                        return;
                                     }
                                 }
                             }
                         }
 
+                        {
+                            let s = state.lock().await;
+                            if s.role != Role::Leader || s.current_term != term {
+                                return;
+                            }
+                            if s.next_index.get(&peer_id).copied().unwrap_or(1) != next_idx {
+                                continue;
+                            }
+                        }
+
                         let (last_log_index, _) = match inner.consensus_get_last_log().await {
                             Ok(res) => res,
-                            Err(_) => break,
+                            Err(_) => return,
                         };
 
                         let is_heartbeat = last_log_index < next_idx;
@@ -883,7 +1056,7 @@ impl ConsensusConfigStore {
                         } else {
                             match inner.consensus_get_entries(next_idx).await {
                                 Ok(ent) => ent,
-                                Err(_) => break,
+                                Err(_) => return,
                             }
                         };
 
@@ -911,49 +1084,60 @@ impl ConsensusConfigStore {
                             Ok(resp) => {
                                 let mut s = state.lock().await;
                                 if resp.term > s.current_term {
+                                    if inner.consensus_set_state(resp.term, None).await.is_err() {
+                                        return;
+                                    }
                                     s.current_term = resp.term;
                                     s.voted_for = None;
                                     s.role = Role::Follower;
                                     s.leader_id = None;
-                                    let _ = inner
-                                        .consensus_set_state(s.current_term, s.voted_for)
-                                        .await;
                                     return;
                                 }
-                                if s.role != Role::Leader {
+                                if s.role != Role::Leader
+                                    || s.current_term != term
+                                    || resp.term != term
+                                {
                                     return;
                                 }
                                 if resp.success {
                                     if !is_heartbeat {
                                         let new_match = prev_log_index
                                             + last_log_index.saturating_sub(prev_log_index);
-                                        s.match_index.insert(peer_id, new_match);
-                                        s.next_index.insert(peer_id, new_match + 1);
-                                        drop(s);
-                                        let _ = Self::update_commit_index_static(
-                                            &inner,
-                                            &state,
-                                            &commit_notifier,
-                                            node_id,
-                                        )
-                                        .await;
+                                        let old_match =
+                                            s.match_index.get(&peer_id).copied().unwrap_or(0);
+                                        if new_match > old_match {
+                                            s.match_index.insert(peer_id, new_match);
+                                            s.next_index.insert(peer_id, new_match + 1);
+                                            drop(s);
+                                            let _ = Self::update_commit_index_static(
+                                                &inner,
+                                                &state,
+                                                &commit_notifier,
+                                                node_id,
+                                            )
+                                            .await;
+                                        }
                                     }
-                                    break;
-                                } else if next_idx > 1 {
+                                    return;
+                                } else if next_idx > 1
+                                    && s.next_index.get(&peer_id).copied().unwrap_or(1) == next_idx
+                                {
                                     s.next_index.insert(peer_id, next_idx - 1);
                                 } else {
-                                    break;
+                                    return;
                                 }
                             }
                             Err(e) => {
-                                metrics_c.rpc_failures.fetch_add(1, Ordering::Relaxed);
-                                if e.to_string().contains("timeout") {
-                                    metrics_c.rpc_timeouts.fetch_add(1, Ordering::Relaxed);
-                                }
-                                break;
+                                metrics_c.record_rpc_failure(&e);
+                                return;
                             }
                         }
                     }
+                    debug!(
+                        peer_id,
+                        max_rounds = RPC_CATCH_UP_MAX_ROUNDS,
+                        "background replication catch-up trigger reached its RPC round bound"
+                    );
                 });
             }
         });

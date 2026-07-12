@@ -434,15 +434,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- **BREAKING — `opc-persist`**: `TcpPeer` now enforces `--rpc-timeout` as one
+  checked absolute logical-RPC deadline across authentication/TLS setup,
+  bounded cooperative JSON framing, TCP connect, mTLS, writes, response
+  length/body reads, decode,
+  all retry attempts, and 50/100 ms backoff. Zero expires before I/O and
+  unrepresentable durations fail closed. Permanent local identity and
+  certificate-verification failures are not retried into timeout errors;
+  replay-safe Raft/read requests may retry after ambiguous delivery, while
+  `TimeoutNow` never does. Exact `AppendEntries` replays preserve newer
+  uncommitted suffixes, stale heartbeats never truncate them, and applied
+  conflicts fail without mutation. Snapshot config, audit, membership,
+  snapshot/applied markers, and log compaction now install in one SQLite
+  transaction; the former public config-only
+  `consensus_install_snapshot_state` escape hatch is removed. Raft coordinates
+  fail closed at SQLite's signed-integer boundary instead of wrapping.
+  Authenticated peer error strings and `NodeIdentity` debug output cannot expose
+  peer text or TLS material. Mutating wire requests bind candidate/leader IDs
+  to the authenticated voter. Local identity/acceptor publication and each
+  adapter identity swap are cancellation-atomic; registration and multi-peer
+  propagation are serialized and fallible, and callers retain trust overlap
+  and retry until convergence. Production callers can use the new fallible
+  `try_add_peer` API. Vote and peer fan-out are concurrent, abandoned read
+  quorum probes are cancelled, and synchronous/background per-peer catch-up
+  passes share one gate, stop after 64 rounds (at most two logical RPCs per
+  round), coalesce redundant background triggers, and resume later. Typed
+  timeout metrics now expose fixed request-family and failure-stage dimensions
+  without identity or endpoint labels. `PersistErrorKind` gains the public
+  `ConsensusRpcTimeout` variant, so downstream exhaustive matches must add it.
+  The timeout behavior is also intentionally incompatible with the former
+  per-stage reset: operators must retune the value as an end-to-end budget and
+  roll out the new value coherently across cluster members. The CLI help, crate
+  documentation, cancellation/stall tests, and certificate-rotation guidance
+  describe the same contract.
 - `opc-persist`: automatic leader-failover and split-vote recovery coverage now
   uses one shared finite observer instead of undersized fixed polling counts.
   Its test deadline derives four rounds from the configured maximum election
-  timeout plus the transport's current staged I/O timeout, retry, backoff, and
-  peer fan-out budget; success never forces a campaign, while failures report
-  each candidate's last complete role/term/election metrics and latest command
-  error. The shared internal retry constants prevent test/transport drift. This
-  makes CI evidence deterministic for the current implementation; it is not a
-  production RPC deadline guarantee, which remains tracked in #169.
+  timeout plus one logical RPC deadline for concurrent voting-peer fan-out;
+  success never forces a campaign, while failures report each candidate's last
+  complete role/term/election metrics and latest command error. The shared
+  timing helper prevents test/transport drift.
 - `opc-session-store`: `FakeSessionBackend` now stages compound replicated
   entries and whole-state rebuilds before atomically swapping live data. A late
   child/replay failure no longer leaves partial records, leases, fences,

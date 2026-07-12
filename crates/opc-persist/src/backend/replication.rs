@@ -10,6 +10,150 @@ use crate::types::StoredConfig;
 use super::SqliteBackend;
 
 impl SqliteBackend {
+    pub(crate) fn consensus_index_to_sqlite(index: u64) -> Result<i64, PersistError> {
+        i64::try_from(index).map_err(|_| {
+            PersistError::inconsistent_state("consensus log index exceeds SQLite integer range")
+        })
+    }
+
+    pub(crate) fn consensus_term_to_sqlite(term: u64) -> Result<i64, PersistError> {
+        i64::try_from(term).map_err(|_| {
+            PersistError::inconsistent_state("consensus term exceeds SQLite integer range")
+        })
+    }
+
+    pub(crate) fn consensus_node_id_to_sqlite(node_id: usize) -> Result<i64, PersistError> {
+        i64::try_from(node_id).map_err(|_| {
+            PersistError::inconsistent_state("consensus node id exceeds SQLite integer range")
+        })
+    }
+
+    fn consensus_node_id_from_sqlite(node_id: i64) -> Result<usize, PersistError> {
+        usize::try_from(node_id)
+            .map_err(|_| PersistError::inconsistent_state("negative consensus node id in SQLite"))
+    }
+
+    fn membership_epoch_to_sqlite(epoch: u64) -> Result<i64, PersistError> {
+        i64::try_from(epoch).map_err(|_| {
+            PersistError::inconsistent_state(
+                "consensus membership epoch exceeds SQLite integer range",
+            )
+        })
+    }
+
+    fn membership_epoch_from_sqlite(epoch: i64) -> Result<u64, PersistError> {
+        u64::try_from(epoch).map_err(|_| {
+            PersistError::inconsistent_state("negative consensus membership epoch in SQLite")
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn membership_from_sqlite_parts(
+        cluster_id: String,
+        node_id: i64,
+        voting_members: String,
+        non_voting_members: String,
+        old_voting_members: Option<String>,
+        removed_members: String,
+        epoch: i64,
+    ) -> Result<ClusterMembership, PersistError> {
+        let invalid = || PersistError::inconsistent_state("invalid consensus membership in SQLite");
+        Ok(ClusterMembership {
+            cluster_id,
+            node_id: Self::consensus_node_id_from_sqlite(node_id)?,
+            voting_members: serde_json::from_str(&voting_members).map_err(|_| invalid())?,
+            non_voting_members: serde_json::from_str(&non_voting_members).map_err(|_| invalid())?,
+            old_voting_members: old_voting_members
+                .map(|members| serde_json::from_str(&members).map_err(|_| invalid()))
+                .transpose()?,
+            removed_members: serde_json::from_str(&removed_members).map_err(|_| invalid())?,
+            epoch: Self::membership_epoch_from_sqlite(epoch)?,
+        })
+    }
+
+    fn consensus_index_from_sqlite(index: i64) -> Result<u64, PersistError> {
+        u64::try_from(index)
+            .map_err(|_| PersistError::inconsistent_state("negative consensus log index in SQLite"))
+    }
+
+    fn consensus_term_from_sqlite(term: i64) -> Result<u64, PersistError> {
+        u64::try_from(term)
+            .map_err(|_| PersistError::inconsistent_state("negative consensus term in SQLite"))
+    }
+
+    /// Return whether `entries` exactly match one bounded contiguous local log range.
+    ///
+    /// The caller supplies the range, so this never reads an unbounded log tail.
+    /// Missing (including compacted) entries fail closed as a mismatch.
+    pub(crate) async fn consensus_log_entries_match(
+        &self,
+        prev_index: u64,
+        entries: &[LogEntry],
+    ) -> Result<bool, PersistError> {
+        let mut expected_index = prev_index
+            .checked_add(1)
+            .ok_or_else(|| PersistError::inconsistent_state("consensus log index overflow"))?;
+        for entry in entries {
+            if entry.index != expected_index {
+                return Err(PersistError::inconsistent_state(
+                    "non-contiguous consensus log replay",
+                ));
+            }
+            expected_index = expected_index
+                .checked_add(1)
+                .ok_or_else(|| PersistError::inconsistent_state("consensus log index overflow"))?;
+        }
+
+        let Some(last_entry) = entries.last() else {
+            return Ok(true);
+        };
+        let first_index = i64::try_from(entries[0].index).map_err(|_| {
+            PersistError::inconsistent_state("consensus log index exceeds SQLite integer range")
+        })?;
+        let last_index = i64::try_from(last_entry.index).map_err(|_| {
+            PersistError::inconsistent_state("consensus log index exceeds SQLite integer range")
+        })?;
+
+        let conn = Arc::clone(&self.conn);
+        let guard = conn.lock_owned().await;
+        let mut stmt = guard
+            .prepare(
+                "SELECT log_index, term, payload FROM consensus_log \
+                 WHERE log_index >= ?1 AND log_index <= ?2 ORDER BY log_index ASC",
+            )
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        let mut rows = stmt
+            .query(params![first_index, last_index])
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+        for expected in entries {
+            let Some(row) = rows
+                .next()
+                .map_err(|e| PersistError::sqlite(e.to_string()))?
+            else {
+                return Ok(false);
+            };
+            let index = u64::try_from(row.get::<_, i64>(0)?).map_err(|_| {
+                PersistError::inconsistent_state("negative consensus log index in SQLite")
+            })?;
+            let term = u64::try_from(row.get::<_, i64>(1)?).map_err(|_| {
+                PersistError::inconsistent_state("negative consensus log term in SQLite")
+            })?;
+            let payload = row.get::<_, String>(2)?;
+            let op: ConsensusOp = serde_json::from_str(&payload)
+                .map_err(|e| PersistError::inconsistent_state(e.to_string()))?;
+            let actual = LogEntry { index, term, op };
+            if actual != *expected {
+                return Ok(false);
+            }
+        }
+
+        Ok(rows
+            .next()
+            .map_err(|e| PersistError::sqlite(e.to_string()))?
+            .is_none())
+    }
+
     pub async fn consensus_get_state(&self) -> Result<(u64, Option<usize>), PersistError> {
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
@@ -25,7 +169,15 @@ impl SqliteBackend {
         {
             let term: i64 = row.get(0)?;
             let voted_for: Option<i64> = row.get(1)?;
-            Ok((term as u64, voted_for.map(|v| v as usize)))
+            let term = Self::consensus_term_from_sqlite(term)?;
+            let voted_for = voted_for
+                .map(|node_id| {
+                    usize::try_from(node_id).map_err(|_| {
+                        PersistError::inconsistent_state("negative consensus node id in SQLite")
+                    })
+                })
+                .transpose()?;
+            Ok((term, voted_for))
         } else {
             Ok((0, None))
         }
@@ -36,12 +188,16 @@ impl SqliteBackend {
         term: u64,
         voted_for: Option<usize>,
     ) -> Result<(), PersistError> {
+        let term = Self::consensus_term_to_sqlite(term)?;
+        let voted_for = voted_for
+            .map(Self::consensus_node_id_to_sqlite)
+            .transpose()?;
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
         guard
             .execute(
                 "INSERT OR REPLACE INTO consensus_state (node_id, current_term, voted_for) VALUES (1, ?1, ?2)",
-                params![term as i64, voted_for.map(|v| v as i64)],
+                params![term, voted_for],
             )
             .map_err(|e| PersistError::sqlite(e.to_string()))?;
         Ok(())
@@ -57,11 +213,14 @@ impl SqliteBackend {
             |row| {
                 let index: i64 = row.get(0)?;
                 let term: i64 = row.get(1)?;
-                Ok((index as u64, term as u64))
+                Ok((index, term))
             },
         );
         match log_res {
-            Ok(value) => Ok(value),
+            Ok((index, term)) => Ok((
+                Self::consensus_index_from_sqlite(index)?,
+                Self::consensus_term_from_sqlite(term)?,
+            )),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 let snap_res = guard.query_row(
                     "SELECT snapshot_index, snapshot_term FROM consensus_snapshot WHERE id = 1",
@@ -69,11 +228,14 @@ impl SqliteBackend {
                     |row| {
                         let index: i64 = row.get(0)?;
                         let term: i64 = row.get(1)?;
-                        Ok((index as u64, term as u64))
+                        Ok((index, term))
                     },
                 );
                 match snap_res {
-                    Ok(value) => Ok(value),
+                    Ok((index, term)) => Ok((
+                        Self::consensus_index_from_sqlite(index)?,
+                        Self::consensus_term_from_sqlite(term)?,
+                    )),
                     Err(rusqlite::Error::QueryReturnedNoRows) => Ok((0, 0)),
                     Err(e) => Err(PersistError::sqlite(e.to_string())),
                 }
@@ -83,30 +245,31 @@ impl SqliteBackend {
     }
 
     pub async fn consensus_get_log_term(&self, index: u64) -> Result<Option<u64>, PersistError> {
+        let index = Self::consensus_index_to_sqlite(index)?;
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
 
         let log_res = guard.query_row(
             "SELECT term FROM consensus_log WHERE log_index = ?1",
-            params![index as i64],
+            params![index],
             |row| {
                 let term: i64 = row.get(0)?;
-                Ok(term as u64)
+                Ok(term)
             },
         );
         match log_res {
-            Ok(term) => Ok(Some(term)),
+            Ok(term) => Ok(Some(Self::consensus_term_from_sqlite(term)?)),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 let snap_res = guard.query_row(
                     "SELECT snapshot_term FROM consensus_snapshot WHERE id = 1 AND snapshot_index = ?1",
-                    params![index as i64],
+                    params![index],
                     |row| {
                         let term: i64 = row.get(0)?;
-                        Ok(term as u64)
+                        Ok(term)
                     },
                 );
                 match snap_res {
-                    Ok(term) => Ok(Some(term)),
+                    Ok(term) => Ok(Some(Self::consensus_term_from_sqlite(term)?)),
                     Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                     Err(e) => Err(PersistError::sqlite(e.to_string())),
                 }
@@ -124,6 +287,7 @@ impl SqliteBackend {
             return Ok(());
         }
 
+        let prev_index_sql = Self::consensus_index_to_sqlite(prev_index)?;
         let mut expected_index = prev_index
             .checked_add(1)
             .ok_or_else(|| PersistError::inconsistent_state("consensus log index overflow"))?;
@@ -136,6 +300,12 @@ impl SqliteBackend {
             expected_index = expected_index
                 .checked_add(1)
                 .ok_or_else(|| PersistError::inconsistent_state("consensus log index overflow"))?;
+            i64::try_from(entry.index).map_err(|_| {
+                PersistError::inconsistent_state("consensus log index exceeds SQLite integer range")
+            })?;
+            i64::try_from(entry.term).map_err(|_| {
+                PersistError::inconsistent_state("consensus log term exceeds SQLite integer range")
+            })?;
         }
 
         let conn = Arc::clone(&self.conn);
@@ -148,7 +318,10 @@ impl SqliteBackend {
                 |row| row.get(0),
             )
             .map_err(|e| PersistError::sqlite(e.to_string()))?;
-        if prev_index < applied_index as u64 {
+        let applied_index = u64::try_from(applied_index).map_err(|_| {
+            PersistError::inconsistent_state("negative applied consensus index in SQLite")
+        })?;
+        if prev_index < applied_index {
             return Err(PersistError::inconsistent_state(
                 "cannot overwrite applied consensus log",
             ));
@@ -160,16 +333,22 @@ impl SqliteBackend {
 
         tx.execute(
             "DELETE FROM consensus_log WHERE log_index > ?1",
-            params![prev_index as i64],
+            params![prev_index_sql],
         )
         .map_err(|e| PersistError::sqlite(e.to_string()))?;
 
         for entry in entries {
             let payload = serde_json::to_string(&entry.op)
                 .map_err(|e| PersistError::inconsistent_state(e.to_string()))?;
+            let entry_index = i64::try_from(entry.index).map_err(|_| {
+                PersistError::inconsistent_state("consensus log index exceeds SQLite integer range")
+            })?;
+            let entry_term = i64::try_from(entry.term).map_err(|_| {
+                PersistError::inconsistent_state("consensus log term exceeds SQLite integer range")
+            })?;
             tx.execute(
                 "INSERT OR REPLACE INTO consensus_log (log_index, term, op_type, payload) VALUES (?1, ?2, ?3, ?4)",
-                params![entry.index as i64, entry.term as i64, entry.op_name(), payload],
+                params![entry_index, entry_term, entry.op_name(), payload],
             ).map_err(|e| PersistError::sqlite(e.to_string()))?;
         }
 
@@ -179,6 +358,7 @@ impl SqliteBackend {
     }
 
     pub async fn consensus_truncate_unapplied_after(&self, index: u64) -> Result<(), PersistError> {
+        let index_sql = Self::consensus_index_to_sqlite(index)?;
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
         let applied_index: i64 = guard
@@ -189,7 +369,8 @@ impl SqliteBackend {
             )
             .map_err(|e| PersistError::sqlite(e.to_string()))?;
 
-        if index < applied_index as u64 {
+        let applied_index = Self::consensus_index_from_sqlite(applied_index)?;
+        if index < applied_index {
             return Err(PersistError::inconsistent_state(
                 "cannot truncate applied consensus log",
             ));
@@ -198,7 +379,7 @@ impl SqliteBackend {
         guard
             .execute(
                 "DELETE FROM consensus_log WHERE log_index > ?1",
-                params![index as i64],
+                params![index_sql],
             )
             .map_err(|e| PersistError::sqlite(e.to_string()))?;
         Ok(())
@@ -208,13 +389,14 @@ impl SqliteBackend {
         &self,
         start_index: u64,
     ) -> Result<Vec<LogEntry>, PersistError> {
+        let start_index = Self::consensus_index_to_sqlite(start_index)?;
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
         let mut stmt = guard
             .prepare("SELECT log_index, term, payload FROM consensus_log WHERE log_index >= ?1 ORDER BY log_index ASC")
             .map_err(|e| PersistError::sqlite(e.to_string()))?;
         let rows = stmt
-            .query_map(params![start_index as i64], |row| {
+            .query_map(params![start_index], |row| {
                 let index: i64 = row.get(0)?;
                 let term: i64 = row.get(1)?;
                 let payload_str: String = row.get(2)?;
@@ -228,8 +410,8 @@ impl SqliteBackend {
             let op: ConsensusOp = serde_json::from_str(&payload_str)
                 .map_err(|e| PersistError::inconsistent_state(e.to_string()))?;
             entries.push(LogEntry {
-                index: index as u64,
-                term: term as u64,
+                index: Self::consensus_index_from_sqlite(index)?,
+                term: Self::consensus_term_from_sqlite(term)?,
                 op,
             });
         }
@@ -250,13 +432,14 @@ impl SqliteBackend {
             .map_err(|e| PersistError::sqlite(e.to_string()))?
         {
             let applied: i64 = row.get(0)?;
-            Ok(applied as u64)
+            Self::consensus_index_from_sqlite(applied)
         } else {
             Ok(0)
         }
     }
 
     pub async fn consensus_apply_entries(&self, commit_index: u64) -> Result<(), PersistError> {
+        let commit_index_sql = Self::consensus_index_to_sqlite(commit_index)?;
         let conn = Arc::clone(&self.conn);
         let mut guard = conn.lock_owned().await;
 
@@ -269,7 +452,8 @@ impl SqliteBackend {
                 )
                 .map_err(|e| PersistError::sqlite(e.to_string()))?;
 
-            if commit_index as i64 <= applied_index {
+            let applied_index_unsigned = Self::consensus_index_from_sqlite(applied_index)?;
+            if commit_index <= applied_index_unsigned {
                 return Ok(());
             }
 
@@ -278,7 +462,7 @@ impl SqliteBackend {
                 .map_err(|e| PersistError::sqlite(e.to_string()))?;
 
             let rows_iter = stmt
-                .query_map(params![applied_index, commit_index as i64], |row| {
+                .query_map(params![applied_index, commit_index_sql], |row| {
                     let idx: i64 = row.get(0)?;
                     let payload: String = row.get(1)?;
                     Ok((idx, payload))
@@ -364,14 +548,19 @@ impl SqliteBackend {
                         .map_err(|e| PersistError::inconsistent_state(e.to_string()))?;
                     let removed_members_str = serde_json::to_string(&membership.removed_members)
                         .map_err(|e| PersistError::inconsistent_state(e.to_string()))?;
+                    let membership_node_id = Self::consensus_node_id_to_sqlite(membership.node_id)?;
+                    let membership_epoch = Self::membership_epoch_to_sqlite(membership.epoch)?;
 
                     let local_node_id = match tx.query_row(
                         "SELECT node_id FROM consensus_membership WHERE id = 1",
                         [],
                         |row| row.get::<_, i64>(0),
                     ) {
-                        Ok(node_id) => node_id,
-                        Err(rusqlite::Error::QueryReturnedNoRows) => membership.node_id as i64,
+                        Ok(node_id) => {
+                            Self::consensus_node_id_from_sqlite(node_id)?;
+                            node_id
+                        }
+                        Err(rusqlite::Error::QueryReturnedNoRows) => membership_node_id,
                         Err(e) => return Err(PersistError::sqlite(e.to_string())),
                     };
 
@@ -380,7 +569,7 @@ impl SqliteBackend {
                         [],
                         |row| row.get::<_, i64>(0),
                     ) {
-                        Ok(epoch) => epoch as u64,
+                        Ok(epoch) => Self::membership_epoch_from_sqlite(epoch)?,
                         Err(rusqlite::Error::QueryReturnedNoRows) => 0,
                         Err(e) => return Err(PersistError::sqlite(e.to_string())),
                     };
@@ -397,7 +586,7 @@ impl SqliteBackend {
                             non_voting_members_str,
                             old_voting_members_str,
                             removed_members_str,
-                            membership.epoch as i64
+                            membership_epoch
                         ],
                     ).map_err(|e| PersistError::sqlite(e.to_string()))?;
                 }
@@ -453,52 +642,15 @@ impl SqliteBackend {
                 old_voting_members_str,
                 removed_members_str,
                 epoch,
-            )) => {
-                let voting_members: Vec<usize> = serde_json::from_str(&voting_members_str)
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?;
-                let non_voting_members: Vec<usize> = serde_json::from_str(&non_voting_members_str)
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?;
-                let old_voting_members: Option<Vec<usize>> = old_voting_members_str
-                    .map(|s| {
-                        serde_json::from_str(&s).map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(e),
-                            )
-                        })
-                    })
-                    .transpose()?;
-                let removed_members: Vec<usize> = serde_json::from_str(&removed_members_str)
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?;
-                Ok(Some(ClusterMembership {
-                    cluster_id,
-                    node_id: node_id as usize,
-                    voting_members,
-                    non_voting_members,
-                    old_voting_members,
-                    removed_members,
-                    epoch: epoch as u64,
-                }))
-            }
+            )) => Ok(Some(Self::membership_from_sqlite_parts(
+                cluster_id,
+                node_id,
+                voting_members_str,
+                non_voting_members_str,
+                old_voting_members_str,
+                removed_members_str,
+                epoch,
+            )?)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(PersistError::sqlite(e.to_string())),
         }
@@ -510,83 +662,45 @@ impl SqliteBackend {
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
 
-        let log_membership = {
-            let res = guard.query_row(
-                "SELECT payload FROM consensus_log WHERE op_type = 'CHANGE_MEMBERSHIP' ORDER BY log_index DESC LIMIT 1",
-                [],
-                |row| row.get::<_, String>(0),
-            );
-            match res {
-                Ok(payload_str) => {
-                    if let Ok(op) = serde_json::from_str::<ConsensusOp>(&payload_str) {
-                        match op {
-                            ConsensusOp::ChangeMembership { membership } => Some(membership),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    }
+        let log_membership = match guard.query_row(
+            "SELECT payload FROM consensus_log WHERE op_type = 'CHANGE_MEMBERSHIP' ORDER BY log_index DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(payload) => match serde_json::from_str::<ConsensusOp>(&payload) {
+                Ok(ConsensusOp::ChangeMembership { membership }) => Some(membership),
+                _ => {
+                    return Err(PersistError::inconsistent_state(
+                        "invalid consensus membership log entry",
+                    ))
                 }
-                Err(_) => None,
-            }
+            },
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(error) => return Err(PersistError::sqlite(error.to_string())),
         };
 
-        let table_membership = {
-            let stmt = guard
-                .prepare("SELECT cluster_id, node_id, voting_members, non_voting_members, old_voting_members, removed_members, epoch FROM consensus_membership WHERE id = 1");
-            match stmt {
-                Ok(mut s) => {
-                    let res = s.query_row([], |row| {
-                        let cluster_id: String = row.get(0)?;
-                        let node_id: i64 = row.get(1)?;
-                        let voting_members_str: String = row.get(2)?;
-                        let non_voting_members_str: String = row.get(3)?;
-                        let old_voting_members_str: Option<String> = row.get(4)?;
-                        let removed_members_str: String = row.get(5)?;
-                        let epoch: i64 = row.get(6)?;
-                        Ok((
-                            cluster_id,
-                            node_id,
-                            voting_members_str,
-                            non_voting_members_str,
-                            old_voting_members_str,
-                            removed_members_str,
-                            epoch,
-                        ))
-                    });
-                    match res {
-                        Ok((
-                            cluster_id,
-                            node_id,
-                            voting_members_str,
-                            non_voting_members_str,
-                            old_voting_members_str,
-                            removed_members_str,
-                            epoch,
-                        )) => {
-                            let voting_members: Vec<usize> =
-                                serde_json::from_str(&voting_members_str).unwrap_or_default();
-                            let non_voting_members: Vec<usize> =
-                                serde_json::from_str(&non_voting_members_str).unwrap_or_default();
-                            let old_voting_members: Option<Vec<usize>> =
-                                old_voting_members_str.and_then(|s| serde_json::from_str(&s).ok());
-                            let removed_members: Vec<usize> =
-                                serde_json::from_str(&removed_members_str).unwrap_or_default();
-                            Some(ClusterMembership {
-                                cluster_id,
-                                node_id: node_id as usize,
-                                voting_members,
-                                non_voting_members,
-                                old_voting_members,
-                                removed_members,
-                                epoch: epoch as u64,
-                            })
-                        }
-                        _ => None,
-                    }
-                }
-                _ => None,
+        let mut statement = guard
+            .prepare("SELECT cluster_id, node_id, voting_members, non_voting_members, old_voting_members, removed_members, epoch FROM consensus_membership WHERE id = 1")
+            .map_err(|error| PersistError::sqlite(error.to_string()))?;
+        let table_row = statement.query_row([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        });
+        let table_membership = match table_row {
+            Ok((cluster, node, voters, non_voters, old_voters, removed, epoch)) => {
+                Some(Self::membership_from_sqlite_parts(
+                    cluster, node, voters, non_voters, old_voters, removed, epoch,
+                )?)
             }
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(error) => return Err(PersistError::sqlite(error.to_string())),
         };
 
         let active = match (log_membership, table_membership) {
@@ -608,8 +722,9 @@ impl SqliteBackend {
                 [],
                 |row| row.get::<_, i64>(0),
             ) {
-                Ok(nid) => nid as usize,
-                Err(_) => m.node_id,
+                Ok(node_id) => Self::consensus_node_id_from_sqlite(node_id)?,
+                Err(rusqlite::Error::QueryReturnedNoRows) => m.node_id,
+                Err(error) => return Err(PersistError::sqlite(error.to_string())),
             };
             let mut m_clone = m;
             m_clone.node_id = local_node_id;
@@ -623,86 +738,49 @@ impl SqliteBackend {
         &self,
         idx: u64,
     ) -> Result<Option<ClusterMembership>, PersistError> {
+        let idx = Self::consensus_index_to_sqlite(idx)?;
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
 
-        let log_membership = {
-            let res = guard.query_row(
-                "SELECT payload FROM consensus_log WHERE op_type = 'CHANGE_MEMBERSHIP' AND log_index <= ?1 ORDER BY log_index DESC LIMIT 1",
-                params![idx as i64],
-                |row| row.get::<_, String>(0),
-            );
-            match res {
-                Ok(payload_str) => {
-                    if let Ok(op) = serde_json::from_str::<ConsensusOp>(&payload_str) {
-                        match op {
-                            ConsensusOp::ChangeMembership { membership } => Some(membership),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    }
+        let log_membership = match guard.query_row(
+            "SELECT payload FROM consensus_log WHERE op_type = 'CHANGE_MEMBERSHIP' AND log_index <= ?1 ORDER BY log_index DESC LIMIT 1",
+            params![idx],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(payload) => match serde_json::from_str::<ConsensusOp>(&payload) {
+                Ok(ConsensusOp::ChangeMembership { membership }) => Some(membership),
+                _ => {
+                    return Err(PersistError::inconsistent_state(
+                        "invalid consensus membership log entry",
+                    ))
                 }
-                Err(_) => None,
-            }
+            },
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(error) => return Err(PersistError::sqlite(error.to_string())),
         };
 
-        let table_membership = {
-            let stmt = guard
-                .prepare("SELECT cluster_id, node_id, voting_members, non_voting_members, old_voting_members, removed_members, epoch FROM consensus_membership WHERE id = 1");
-            match stmt {
-                Ok(mut s) => {
-                    let res = s.query_row([], |row| {
-                        let cluster_id: String = row.get(0)?;
-                        let node_id: i64 = row.get(1)?;
-                        let voting_members_str: String = row.get(2)?;
-                        let non_voting_members_str: String = row.get(3)?;
-                        let old_voting_members_str: Option<String> = row.get(4)?;
-                        let removed_members_str: String = row.get(5)?;
-                        let epoch: i64 = row.get(6)?;
-                        Ok((
-                            cluster_id,
-                            node_id,
-                            voting_members_str,
-                            non_voting_members_str,
-                            old_voting_members_str,
-                            removed_members_str,
-                            epoch,
-                        ))
-                    });
-                    match res {
-                        Ok((
-                            cluster_id,
-                            node_id,
-                            voting_members_str,
-                            non_voting_members_str,
-                            old_voting_members_str,
-                            removed_members_str,
-                            epoch,
-                        )) => {
-                            let voting_members: Vec<usize> =
-                                serde_json::from_str(&voting_members_str).unwrap_or_default();
-                            let non_voting_members: Vec<usize> =
-                                serde_json::from_str(&non_voting_members_str).unwrap_or_default();
-                            let old_voting_members: Option<Vec<usize>> =
-                                old_voting_members_str.and_then(|s| serde_json::from_str(&s).ok());
-                            let removed_members: Vec<usize> =
-                                serde_json::from_str(&removed_members_str).unwrap_or_default();
-                            Some(ClusterMembership {
-                                cluster_id,
-                                node_id: node_id as usize,
-                                voting_members,
-                                non_voting_members,
-                                old_voting_members,
-                                removed_members,
-                                epoch: epoch as u64,
-                            })
-                        }
-                        _ => None,
-                    }
-                }
-                _ => None,
+        let mut statement = guard
+            .prepare("SELECT cluster_id, node_id, voting_members, non_voting_members, old_voting_members, removed_members, epoch FROM consensus_membership WHERE id = 1")
+            .map_err(|error| PersistError::sqlite(error.to_string()))?;
+        let table_row = statement.query_row([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        });
+        let table_membership = match table_row {
+            Ok((cluster, node, voters, non_voters, old_voters, removed, epoch)) => {
+                Some(Self::membership_from_sqlite_parts(
+                    cluster, node, voters, non_voters, old_voters, removed, epoch,
+                )?)
             }
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(error) => return Err(PersistError::sqlite(error.to_string())),
         };
 
         let active = match (log_membership, table_membership) {
@@ -724,8 +802,9 @@ impl SqliteBackend {
                 [],
                 |row| row.get::<_, i64>(0),
             ) {
-                Ok(nid) => nid as usize,
-                Err(_) => m.node_id,
+                Ok(node_id) => Self::consensus_node_id_from_sqlite(node_id)?,
+                Err(rusqlite::Error::QueryReturnedNoRows) => m.node_id,
+                Err(error) => return Err(PersistError::sqlite(error.to_string())),
             };
             let mut m_clone = m;
             m_clone.node_id = local_node_id;
@@ -751,6 +830,8 @@ impl SqliteBackend {
             .map_err(|e| PersistError::inconsistent_state(e.to_string()))?;
         let removed_members_str = serde_json::to_string(&membership.removed_members)
             .map_err(|e| PersistError::inconsistent_state(e.to_string()))?;
+        let membership_node_id = Self::consensus_node_id_to_sqlite(membership.node_id)?;
+        let membership_epoch = Self::membership_epoch_to_sqlite(membership.epoch)?;
 
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
@@ -761,12 +842,12 @@ impl SqliteBackend {
             |row| row.get::<_, i64>(0),
         ) {
             Ok(node_id) => {
-                if node_id as usize != membership.node_id {
+                if Self::consensus_node_id_from_sqlite(node_id)? != membership.node_id {
                     return Err(PersistError::inconsistent_state("node_id mismatch"));
                 }
                 node_id
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => membership.node_id as i64,
+            Err(rusqlite::Error::QueryReturnedNoRows) => membership_node_id,
             Err(e) => return Err(PersistError::sqlite(e.to_string())),
         };
 
@@ -779,7 +860,7 @@ impl SqliteBackend {
                 &non_voting_members_str,
                 old_voting_members_str,
                 removed_members_str,
-                membership.epoch as i64
+                membership_epoch
             ]
         ).map_err(|e| PersistError::sqlite(e.to_string()))?;
         Ok(())
@@ -797,10 +878,14 @@ impl SqliteBackend {
             let index: i64 = row.get(0)?;
             let term: i64 = row.get(1)?;
             let data: Vec<u8> = row.get(2)?;
-            Ok((index as u64, term as u64, data))
+            Ok((index, term, data))
         });
         match res {
-            Ok(val) => Ok(Some(val)),
+            Ok((index, term, data)) => Ok(Some((
+                Self::consensus_index_from_sqlite(index)?,
+                Self::consensus_term_from_sqlite(term)?,
+                data,
+            ))),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(PersistError::sqlite(e.to_string())),
         }
@@ -812,6 +897,11 @@ impl SqliteBackend {
         term: u64,
         data: &[u8],
     ) -> Result<(), PersistError> {
+        // Validate every signed SQLite coordinate before opening a
+        // transaction so a hostile wire value cannot wrap and partially
+        // advance the durable snapshot/applied markers.
+        let index_sql = Self::consensus_index_to_sqlite(index)?;
+        let term_sql = Self::consensus_term_to_sqlite(term)?;
         let conn = Arc::clone(&self.conn);
         let mut guard = conn.lock_owned().await;
 
@@ -821,12 +911,12 @@ impl SqliteBackend {
 
         tx.execute(
             "INSERT OR REPLACE INTO consensus_snapshot (id, snapshot_index, snapshot_term, snapshot_data) VALUES (1, ?1, ?2, ?3)",
-            params![index as i64, term as i64, data]
+            params![index_sql, term_sql, data]
         ).map_err(|e| PersistError::sqlite(e.to_string()))?;
 
         tx.execute(
             "UPDATE consensus_applied SET applied_index = max(applied_index, ?1) WHERE id = 1",
-            params![index as i64],
+            params![index_sql],
         )
         .map_err(|e| PersistError::sqlite(e.to_string()))?;
 
@@ -836,6 +926,7 @@ impl SqliteBackend {
     }
 
     pub async fn consensus_compact_logs(&self, up_to_index: u64) -> Result<(), PersistError> {
+        let up_to_index_sql = Self::consensus_index_to_sqlite(up_to_index)?;
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
         let applied_index: i64 = guard
@@ -845,7 +936,10 @@ impl SqliteBackend {
                 |row| row.get(0),
             )
             .map_err(|e| PersistError::sqlite(e.to_string()))?;
-        if up_to_index > applied_index as u64 {
+        let applied_index = u64::try_from(applied_index).map_err(|_| {
+            PersistError::inconsistent_state("negative applied consensus index in SQLite")
+        })?;
+        if up_to_index > applied_index {
             return Err(PersistError::inconsistent_state(
                 "cannot compact unapplied logs",
             ));
@@ -854,30 +948,160 @@ impl SqliteBackend {
         guard
             .execute(
                 "DELETE FROM consensus_log WHERE log_index <= ?1",
-                params![up_to_index as i64],
+                params![up_to_index_sql],
             )
             .map_err(|e| PersistError::sqlite(e.to_string()))?;
         Ok(())
     }
 
-    pub async fn consensus_install_snapshot_state(
+    /// Atomically install every durable component carried by a verified Raft snapshot.
+    ///
+    /// The caller is responsible for authenticating the snapshot payload. This method
+    /// validates every value that crosses SQLite's signed-integer boundary before it
+    /// starts changing state, preserves the backend's local node identity, and commits
+    /// the configuration, audit trail, membership, snapshot marker, applied index, and
+    /// log compaction as one transaction.
+    pub(crate) async fn consensus_install_snapshot_bundle(
         &self,
         config: StoredConfig,
+        membership: &ClusterMembership,
+        index: u64,
+        term: u64,
+        data: &[u8],
     ) -> Result<(), PersistError> {
+        let index_sql = Self::consensus_index_to_sqlite(index)?;
+        let term_sql = Self::consensus_term_to_sqlite(term)?;
+        let membership_node_id = Self::consensus_node_id_to_sqlite(membership.node_id)?;
+        let membership_epoch = i64::try_from(membership.epoch).map_err(|_| {
+            PersistError::inconsistent_state(
+                "consensus membership epoch exceeds SQLite integer range",
+            )
+        })?;
+        i64::try_from(config.record.version.get()).map_err(|_| {
+            PersistError::inconsistent_state("config version exceeds SQLite integer range")
+        })?;
+        u32::try_from(config.audit.len())
+            .map_err(|_| PersistError::inconsistent_state("snapshot audit count exceeds range"))?;
+        for audit in &config.audit {
+            i32::try_from(audit.sequence).map_err(|_| {
+                PersistError::inconsistent_state("audit sequence exceeds SQLite integer range")
+            })?;
+        }
+
+        // Serialize before taking the connection lock so serialization failure cannot
+        // occur after the transaction has begun staging destructive replacement work.
+        let voting_members = serde_json::to_string(&membership.voting_members)
+            .map_err(|e| PersistError::inconsistent_state(e.to_string()))?;
+        let non_voting_members = serde_json::to_string(&membership.non_voting_members)
+            .map_err(|e| PersistError::inconsistent_state(e.to_string()))?;
+        let old_voting_members = membership
+            .old_voting_members
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| PersistError::inconsistent_state(e.to_string()))?;
+        let removed_members = serde_json::to_string(&membership.removed_members)
+            .map_err(|e| PersistError::inconsistent_state(e.to_string()))?;
+
         let conn = Arc::clone(&self.conn);
         let mut guard = conn.lock_owned().await;
         let tx = guard
             .transaction()
             .map_err(|e| PersistError::sqlite(e.to_string()))?;
 
+        let local_node_id = match tx.query_row(
+            "SELECT node_id FROM consensus_membership WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(node_id) => {
+                let node_id = usize::try_from(node_id).map_err(|_| {
+                    PersistError::inconsistent_state(
+                        "negative consensus node id in SQLite membership",
+                    )
+                })?;
+                if node_id != membership.node_id {
+                    return Err(PersistError::inconsistent_state("node_id mismatch"));
+                }
+                Self::consensus_node_id_to_sqlite(node_id)?
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => membership_node_id,
+            Err(e) => return Err(PersistError::sqlite(e.to_string())),
+        };
+
+        let applied_index_sql = tx
+            .query_row(
+                "SELECT applied_index FROM consensus_applied WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        let applied_index = Self::consensus_index_from_sqlite(applied_index_sql)?;
+        if index <= applied_index {
+            return Err(PersistError::inconsistent_state(
+                "snapshot install must advance applied consensus state",
+            ));
+        }
+
+        // Raft permits retaining the suffix only when the follower already
+        // has the exact snapshot boundary entry. If that index is absent or
+        // has another term, the suffix belongs to an unproven fork and must be
+        // discarded with the prefix.
+        let retain_log_suffix = match tx.query_row(
+            "SELECT term FROM consensus_log WHERE log_index = ?1",
+            params![index_sql],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(local_term) => Self::consensus_term_from_sqlite(local_term)? == term,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(error) => return Err(PersistError::sqlite(error.to_string())),
+        };
+
         tx.execute("DELETE FROM audit_trail", [])
             .map_err(|e| PersistError::sqlite(e.to_string()))?;
-        tx.execute("DELETE FROM config_history", [])
+        tx.execute("DELETE FROM config_lifecycle_audit", [])
             .map_err(|e| PersistError::sqlite(e.to_string()))?;
         tx.execute("DELETE FROM rollback_labels", [])
             .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        tx.execute("DELETE FROM config_history", [])
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
 
         Self::append_commit_raw(&tx, config.record, config.audit, self.audit_key.as_ref())?;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO consensus_membership (id, cluster_id, node_id, voting_members, non_voting_members, old_voting_members, removed_members, epoch) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                &membership.cluster_id,
+                local_node_id,
+                voting_members,
+                non_voting_members,
+                old_voting_members,
+                removed_members,
+                membership_epoch,
+            ],
+        )
+        .map_err(|e| PersistError::sqlite(e.to_string()))?;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO consensus_snapshot (id, snapshot_index, snapshot_term, snapshot_data) VALUES (1, ?1, ?2, ?3)",
+            params![index_sql, term_sql, data],
+        )
+        .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        tx.execute(
+            "UPDATE consensus_applied SET applied_index = ?1 WHERE id = 1",
+            params![index_sql],
+        )
+        .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        if retain_log_suffix {
+            tx.execute(
+                "DELETE FROM consensus_log WHERE log_index <= ?1",
+                params![index_sql],
+            )
+            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        } else {
+            tx.execute("DELETE FROM consensus_log", [])
+                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        }
 
         tx.commit()
             .map_err(|e| PersistError::sqlite(e.to_string()))?;

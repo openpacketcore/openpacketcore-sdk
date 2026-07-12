@@ -402,8 +402,9 @@ async fn test_empirical_auth_failures_tracking() {
     );
     let auth_failures_after_expired = m2.auth_failures;
 
-    // 3. Bad certificate (malformed SPIFFE ID, e.g., instance/abc instead of node_id)
-    {
+    // 3. A malformed local SPIFFE profile fails before dialing. This is a local
+    // configuration failure, not a server-observed authentication failure.
+    let bad_spiffe_error = {
         let bad_spiffe_identity = generate_custom_identity(
             &ca_cert,
             &ca_key_pair,
@@ -415,16 +416,15 @@ async fn test_empirical_auth_failures_tracking() {
         peer.set_auth(1, "tcp-test-cluster".to_string(), "".to_string())
             .await
             .unwrap();
-        let _ = peer.load_latest_consensus_rpc().await;
-    }
+        peer.load_latest_consensus_rpc().await.unwrap_err()
+    };
+    assert!(!bad_spiffe_error.is_consensus_rpc_timeout());
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let m3 = store.dump_metrics().await.unwrap();
-    assert!(
-        m3.auth_failures > auth_failures_after_expired,
-        "Expected bad spiffe ID certificate to increment auth failures: initial={}, current={}",
-        auth_failures_after_expired,
-        m3.auth_failures
+    assert_eq!(
+        m3.auth_failures, auth_failures_after_expired,
+        "a pre-dial local identity failure must not change server auth metrics"
     );
 
     server.shutdown().await;
